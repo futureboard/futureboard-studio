@@ -53,20 +53,19 @@ mod asio {
     ));
 }
 
-pub use license_activation_dialog::{configured_license_activator, open_license_activation_window};
+pub use license_activation_dialog::open_license_activation_window;
 
-/// Open license activation over the given owner window.
+/// Open the License window over the given owner window.
 ///
 /// One entry point for every surface that offers it — the Welcome footer and the
-/// About panel — so the dialog is always constructed with the same activator and
-/// the same failure handling.
+/// About panel. The window explains this machine's license and hands off to the
+/// Futureboard Launcher; Studio itself no longer activates anything.
 pub fn open_license_activation(
     owner_bounds: Option<gpui::Bounds<gpui::Pixels>>,
     cx: &mut gpui::App,
 ) {
-    let activation = configured_license_activator(env!("CARGO_PKG_VERSION"));
-    if let Err(error) = open_license_activation_window(owner_bounds, activation, cx) {
-        eprintln!("[LicenseActivation] failed to open dialog: {error}");
+    if let Err(error) = open_license_activation_window(owner_bounds, cx) {
+        eprintln!("[LicenseActivation] failed to open the license window: {error}");
     }
 }
 
@@ -123,18 +122,17 @@ pub fn install_licensed_providers() -> Result<(), String> {
 
 /// Install Professional Edition runtime providers before the application starts.
 ///
-/// Providers install from the stored token with no network involved, so this
-/// stays off the critical path. Renewal is kicked onto a background thread: a
-/// slow or unreachable licensing service must never delay the DAW opening.
+/// Providers install from the sealed license file with no network involved, so
+/// this cannot delay the DAW opening however the licensing service is doing.
 ///
-/// The `spawn_renewal_if_due` call is also what re-pulls a lapsed-but-bound
-/// license on a fresh launch: an expired token still triggers a background
-/// re-check with the service, and installs providers again on success.
+/// A lapsed license is not re-pulled here: renewal belongs to the Futureboard
+/// Launcher, which is the only program that talks to the activation service.
+/// The License window says so, and offers to open it.
 pub fn install() -> Result<(), String> {
     sphere_ui_components::edition::set_edition_provider(std::sync::Arc::new(edition_info));
-    // Lets the About panel open activation without the shared crate knowing what
-    // activation is. A machine already inside a project can then enter a key
-    // without closing it.
+    // Lets the About panel open the License window without the shared crate
+    // knowing what licensing is. A machine already inside a project can then
+    // check its license, and reach the Launcher, without closing it.
     sphere_ui_components::edition::set_license_action_handler(std::sync::Arc::new(
         |window: &mut gpui::Window, cx: &mut gpui::App| {
             open_license_activation(Some(window.bounds()), cx);
@@ -145,12 +143,11 @@ pub fn install() -> Result<(), String> {
     // by `sphere_ui_components::account::install_default_account_provider`. A
     // Professional build only adds licensing on top of that identity.
 
+    // Purely local: the sealed license file is read and verified against this
+    // machine, with no network at any point. Renewal and activation live in the
+    // Futureboard Launcher now, so there is nothing to spawn here and nothing
+    // that can delay the DAW opening.
     install_licensed_providers()?;
-    license::spawn_renewal_if_due();
-    // A signed-in account that owns a license licenses this machine on its own,
-    // with no key and no dialog. Background, like renewal: licensing never sits
-    // on the startup path.
-    license::spawn_account_activation_if_needed();
     Ok(())
 }
 
