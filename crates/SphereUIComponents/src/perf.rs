@@ -1368,6 +1368,14 @@ fn running_plugin_host_pids() -> Vec<u32> {
         .collect()
 }
 
+// The plugin-host registry is a Windows bridge; there are no host processes to
+// charge anything to elsewhere, and `read_pid_counters` would return `None` for
+// each of them anyway.
+#[cfg(not(windows))]
+fn running_plugin_host_pids() -> Vec<u32> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod power_mode_tests {
     use super::*;
