@@ -1044,6 +1044,11 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    /// Set once a scroll container has absorbed the wheel event currently being
+    /// dispatched. `HitboxId::should_handle_scroll` is true for every hitbox under
+    /// the pointer, ancestors included, so nested scroll containers would otherwise
+    /// all scroll on the same tick. Reset at the start of each `ScrollWheelEvent`.
+    scroll_consumed: bool,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -1742,6 +1747,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            scroll_consumed: false,
             modifiers,
             capslock,
             scale_factor,
@@ -2605,6 +2611,23 @@ impl Window {
     /// Returns the hitbox that has captured the pointer, if any.
     pub fn captured_hitbox(&self) -> Option<HitboxId> {
         self.captured_hitbox
+    }
+
+    /// Whether a scroll container has already absorbed the wheel event currently
+    /// being dispatched. See [`Window::mark_scroll_consumed`].
+    pub(crate) fn scroll_already_consumed(&self) -> bool {
+        self.scroll_consumed
+    }
+
+    /// Claim the wheel event currently being dispatched for one scroll container.
+    ///
+    /// Scroll containers deliberately do not `stop_propagation`, because that would
+    /// also swallow application `on_scroll_wheel` handlers registered on the same
+    /// element. This flag blocks only the other scroll containers: the innermost one
+    /// that can still move claims the delta, and once it reaches its limit it stops
+    /// claiming so the delta chains outward to its ancestors.
+    pub(crate) fn mark_scroll_consumed(&mut self) {
+        self.scroll_consumed = true;
     }
 
     /// The current state of the keyboard's modifiers
@@ -4686,6 +4709,9 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+        if event.is::<crate::ScrollWheelEvent>() {
+            self.scroll_consumed = false;
+        }
         let hit_test = self.rendered_frame.hit_test(self.mouse_position());
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;

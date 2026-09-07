@@ -1131,6 +1131,9 @@ fn edit_dialog_overlay(
         .absolute()
         .inset_0()
         .bg(Colors::with_alpha(Colors::surface_base(), 0.72))
+        // Modal scrim. Without this the keymap table keeps its hitbox under the
+        // dialog, so the wheel scrolls the rows behind the dialog.
+        .occlude()
         .flex()
         .items_center()
         .justify_center()

@@ -1820,6 +1820,11 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    /// Scrollable distance on each axis, computed during prepaint. The scroll wheel
+    /// listener needs it to tell "this container consumed the delta" apart from
+    /// "this container is already at its limit", which decides whether the event
+    /// keeps bubbling to ancestor scroll containers.
+    pub(crate) scroll_max: Point<Pixels>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -2085,7 +2090,7 @@ impl Interactivity {
     }
 
     fn clamp_scroll_position(
-        &self,
+        &mut self,
         bounds: Bounds<Pixels>,
         style: &Style,
         window: &mut Window,
@@ -2136,7 +2141,10 @@ impl Interactivity {
                 scroll_handle_state.bounds = bounds;
             }
 
-            *scroll_offset
+            let clamped = *scroll_offset;
+            drop(scroll_offset);
+            self.scroll_max = scroll_max;
+            clamped
         } else {
             Point::default()
         }
@@ -2877,8 +2885,12 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
+            let scroll_max = self.scroll_max;
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                if phase == DispatchPhase::Bubble
+                    && hitbox.should_handle_scroll(window)
+                    && !window.scroll_already_consumed()
+                {
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let delta = event.delta.pixel_delta(line_height);
@@ -2906,9 +2918,19 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
+                    // Clamp here rather than leaving it to the next prepaint, so that
+                    // "the offset moved" means "this container actually scrolled".
+                    scroll_offset.y =
+                        (old_scroll_offset.y + delta_y).clamp(-scroll_max.y, Pixels::ZERO);
+                    scroll_offset.x =
+                        (old_scroll_offset.x + delta_x).clamp(-scroll_max.x, Pixels::ZERO);
                     if *scroll_offset != old_scroll_offset {
+                        drop(scroll_offset);
+                        // This container absorbed the delta, so no ancestor scroll
+                        // container should also move on this tick. Once this one is at
+                        // its limit the clamp above leaves the offset unchanged, the
+                        // claim is not made, and the delta chains outward as it should.
+                        window.mark_scroll_consumed();
                         cx.notify(current_view);
                     }
                 }

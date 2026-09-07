@@ -76,6 +76,30 @@ plug-in editor could be clicked but never typed into.
 `raw_window_handles`. Anything else is dispatched to whoever it was addressed
 to, which is what Win32 would have done anyway.
 
+## Nested Scroll Containers All Scrolled At Once
+
+`HitboxId::should_handle_scroll` deliberately returns true for *every* hitbox
+under the pointer -- the hovered element and all of its ancestors -- and
+`Interactivity::paint_scroll_listener` never claimed the event. Every enclosing
+scroll container therefore applied the same wheel delta on the same tick, so
+scrolling an inner list also scrolled the panel, the dialog body, and anything
+else scrollable above it.
+
+The listener now clamps the new offset against the scroll maximum recorded by
+the preceding prepaint (`Interactivity::scroll_max`) instead of leaving the
+clamp to the next frame. That makes "the offset moved" mean "this container
+actually scrolled", which is the signal the fix needs: a container that moved
+claims the event through `Window::mark_scroll_consumed`, and every other scroll
+container skips a claimed event. A container already at its limit does not
+claim, so the delta still chains outward to its ancestors the way a browser
+chains overscroll.
+
+The claim is a window flag rather than `cx.stop_propagation()` on purpose.
+GPUI registers the internal scroll listener *after* the element's own
+`on_scroll_wheel` listeners, and the bubble phase runs listeners in reverse
+registration order, so stopping propagation there would swallow application
+wheel handlers attached to the same scrollable element.
+
 ## Maintenance Notes
 
 When updating GPUI from upstream, preserve this Futureboard patch or port it

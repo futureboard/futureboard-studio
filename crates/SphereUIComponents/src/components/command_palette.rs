@@ -170,6 +170,8 @@ pub fn command_palette_overlay(
                 .absolute()
                 .inset_0()
                 .bg(Colors::with_alpha(Colors::surface_base(), 0.22))
+                // Modal scrim, so the wheel does not reach whatever is behind it.
+                .occlude()
                 .on_mouse_down(gpui::MouseButton::Left, move |_, w, cx| {
                     close_click(&(), w, cx)
                 }),
