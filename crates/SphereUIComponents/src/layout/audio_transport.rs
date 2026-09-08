@@ -966,7 +966,7 @@ impl StudioLayout {
                 self.engine_sync.displayed_bar_beat = bar_beat;
                 transport_display_changed = true;
             }
-            let _ = self.timeline.update(cx, move |timeline, cx| {
+            let playhead_moved = self.timeline.update(cx, move |timeline, cx| {
                 timeline.state.transport.playing = true;
                 // No threshold while playing — even sub-pixel beat motion
                 // matters for the bar:beat:tick readout in the chrome.
@@ -1011,7 +1011,24 @@ impl StudioLayout {
                 } else if playhead_moved {
                     timeline.publish_playhead(cx);
                 }
+                playhead_moved
             });
+            // The MIDI editors draw the same transport, and nothing else
+            // reaches them on a tick. The docked one used to move only when the
+            // shell happened to repaint, and the floating window — which has no
+            // shell above it at all — stepped rather than swept, which is what
+            // a stuttering playhead there actually was.
+            //
+            // Each roll owns a playhead entity, so this repaints a line and not
+            // an editor full of notes. Both are published unconditionally: a
+            // roll with no overlay yet, or one whose x has not moved a whole
+            // pixel, returns false and costs a comparison.
+            if playhead_moved {
+                let docked = self.piano_roll.clone();
+                let floating = self.piano_roll_floating.clone();
+                crate::components::piano_roll::PianoRoll::publish_playhead(&docked, cx);
+                crate::components::piano_roll::PianoRoll::publish_playhead(&floating, cx);
+            }
         } else {
             let _ = self.timeline.update(cx, |timeline, cx| {
                 if timeline.state.transport.playing {
@@ -1019,6 +1036,12 @@ impl StudioLayout {
                     cx.notify();
                 }
             });
+            // Transport just stopped: the line stays where it is but is drawn
+            // dimmer, and only the overlay needs to hear about it.
+            let docked = self.piano_roll.clone();
+            let floating = self.piano_roll_floating.clone();
+            crate::components::piano_roll::PianoRoll::publish_playhead(&docked, cx);
+            crate::components::piano_roll::PianoRoll::publish_playhead(&floating, cx);
         }
 
         // Coalesced dropout notice: when the realtime dropout counter advances,

@@ -1590,11 +1590,25 @@ impl PianoRoll {
         );
         let clip_bounds = self.build_clip_bounds_overlay(clip_len, view_w, view_h);
         let loop_overlay = self.build_loop_overlay(loop_region, view_w, view_h);
-        let playhead_line = if show_playhead {
-            Some(self.build_playhead_line(playhead_rel, playing))
-        } else {
-            None
-        };
+        // The playhead is its own entity, not a child of this render. Building
+        // it here would tie a one-pixel translation to a full rebuild of the
+        // editor — see `piano_roll::playhead`. This only keeps the shared frame
+        // in step, because a scroll or a zoom moves the line without the
+        // transport having moved at all.
+        if self.playhead_overlay.is_none() {
+            let frame = self.playhead_frame.clone();
+            self.playhead_overlay = Some(cx.new(|_| {
+                crate::components::piano_roll::playhead::PianoRollPlayheadOverlay::new(frame)
+            }));
+        }
+        self.playhead_frame.set(
+            crate::components::piano_roll::playhead::PianoRollPlayheadFrame {
+                x: self.beat_to_x(playhead_rel),
+                visible: show_playhead,
+                playing,
+            },
+        );
+        let playhead_overlay = self.playhead_overlay.clone();
         let mut ruler = self.build_ruler(start_beat, end_beat, bpb);
         ruler.extend(self.build_loop_ruler_markers(loop_region));
         let notes_geo = self.build_note_elements(cx, clip_id, track_color);
@@ -1860,7 +1874,7 @@ impl PianoRoll {
                             .children(grid_lines)
                             .children(clip_bounds)
                             .children(loop_overlay)
-                            .when_some(playhead_line, |el, line| el.child(line))
+                            .children(playhead_overlay)
                             .children(grid_empty_hint)
                             .children(notes_geo)
                             .children(quantize_preview)
@@ -2305,20 +2319,6 @@ impl PianoRoll {
             );
         }
         out
-    }
-
-    pub(super) fn build_playhead_line(&self, rel_beat: f32, playing: bool) -> gpui::AnyElement {
-        let x = self.beat_to_x(rel_beat);
-        // Dimmer when parked so a stopped playhead reads as a marker, not motion.
-        let alpha = if playing { 0.9 } else { 0.45 };
-        div()
-            .absolute()
-            .left(px(x))
-            .top_0()
-            .w(px(1.0))
-            .h_full()
-            .bg(Colors::with_alpha(Colors::status_warning(), alpha))
-            .into_any_element()
     }
 
     /// Loop region band + edge lines over the note grid (clip-local beats).

@@ -24,9 +24,9 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     canvas, deferred, div, fill, point, pulsating_between, px, size, svg, Animation, AnimationExt,
-    Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
-    ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Window,
+    AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Render, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Window,
 };
 
 use crate::assets;
@@ -43,6 +43,7 @@ use crate::theme::Colors;
 mod articulation_lane;
 mod cc_lane;
 mod cc_lane_render;
+pub mod playhead;
 mod render;
 
 /// Default note-row height (px per semitone). Reset-zoom restores this value so
@@ -972,6 +973,12 @@ pub struct PianoRoll {
     timeline: Entity<Timeline>,
     /// When `true`, commit logs use `[MIDI Editor]` (floating window instance).
     pub midi_editor_sink: bool,
+    /// Where the playhead is this frame. Shared with the overlay entity below
+    /// so the line can move without rebuilding the editor around it.
+    playhead_frame: playhead::PianoRollPlayheadFrameCell,
+    /// The playhead's own entity, created on first render because it needs no
+    /// geometry until there is some.
+    playhead_overlay: Option<Entity<playhead::PianoRollPlayheadOverlay>>,
     /// Docked editor only: opens the floating MIDI editor window.
     on_pop_out: Option<std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync>>,
     on_midi_preview:
@@ -1263,6 +1270,10 @@ impl PianoRoll {
         Self {
             timeline,
             midi_editor_sink: false,
+            playhead_frame: std::rc::Rc::new(std::cell::Cell::new(
+                playhead::PianoRollPlayheadFrame::default(),
+            )),
+            playhead_overlay: None,
             on_pop_out: None,
             on_midi_preview: None,
             tool: PianoTool::Draw,
@@ -4642,6 +4653,82 @@ impl PianoRoll {
                 })
                 .collect()
         })
+    }
+
+    /// Recompute the playhead's position and repaint only the line.
+    ///
+    /// Called from the audio poll on every transport tick. Returns `true` when
+    /// the overlay was actually notified, so the caller can tell a frame that
+    /// drew something from one that did not.
+    ///
+    /// Takes `&mut App` rather than `&mut Context<Self>` because the point is
+    /// to *not* notify this entity: notifying the roll rebuilds every note,
+    /// grid line and lane in it, which is the whole cost this avoids.
+    /// Takes the entity rather than `&self` because the two halves need the
+    /// app differently: reading the roll to work out where the line goes
+    /// borrows it, and notifying the overlay needs it mutably. Resolving
+    /// everything in one scope lets the read end before the write begins.
+    pub fn publish_playhead(roll: &Entity<Self>, cx: &mut gpui::App) -> bool {
+        let (overlay, frame, next) = {
+            let this = roll.read(cx);
+            let Some(overlay) = this.playhead_overlay.clone() else {
+                // No overlay yet means this roll has never rendered, so there
+                // is no line on screen to move.
+                return false;
+            };
+            (
+                overlay,
+                this.playhead_frame.clone(),
+                this.playhead_frame_now(cx),
+            )
+        };
+
+        // Sub-pixel motion draws the same line. At 144 Hz on a zoomed-out clip
+        // most ticks land inside one pixel, and repainting for them is work
+        // with nothing to show for it. Visibility and transport state still
+        // pass through, because those change what is drawn rather than where.
+        let current = frame.get();
+        if current.visible == next.visible
+            && current.playing == next.playing
+            && (current.x - next.x).abs() < 0.5
+        {
+            return false;
+        }
+        frame.set(next);
+        overlay.update(cx, |_, cx| cx.notify());
+        true
+    }
+
+    /// The playhead frame for the clip currently being edited.
+    ///
+    /// Clip-local, like everything else the roll draws: the transport is a
+    /// project-wide beat, and outside this clip's span there is no line to
+    /// draw because the song is somewhere the editor is not showing.
+    pub(super) fn playhead_frame_now(&self, cx: &gpui::App) -> playhead::PianoRollPlayheadFrame {
+        let tl = self.timeline.read(cx);
+        let playing = tl.state.transport.playing;
+        let playhead = tl.state.transport.playhead_beats;
+
+        let Some(clip_id) = tl.state.selection.selected_clip_ids.first() else {
+            return playhead::PianoRollPlayheadFrame {
+                x: 0.0,
+                visible: false,
+                playing,
+            };
+        };
+        let Some((_track, clip)) = tl.state.find_clip(clip_id) else {
+            return playhead::PianoRollPlayheadFrame {
+                x: 0.0,
+                visible: false,
+                playing,
+            };
+        };
+        let rel = playhead - clip.start_beat;
+        playhead::PianoRollPlayheadFrame {
+            x: self.beat_to_x(rel),
+            visible: rel >= 0.0 && rel <= clip.duration_beats,
+            playing,
+        }
     }
 
     /// Clip-local paste anchor at the playhead, falling back to clip beat 0 when
