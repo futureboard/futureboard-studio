@@ -49,7 +49,7 @@ use crate::components::timeline::timeline_state::{
     vsti_output_child_insert_id, InsertLoadStatus, InsertSlotState, ListenMode, MasterBusState,
     MonitorBusState, SendSlotState, TrackOutputRouting, TrackState, TrackType, MASTER_TRACK_ID,
 };
-use crate::components::timeline::vu_meter::meter_surface;
+use crate::components::timeline::vu_meter::meter_surface_db;
 use crate::i18n::I18n;
 use crate::theme::{typography, Colors};
 
@@ -1238,7 +1238,7 @@ fn fader_area(
             Some(on_vol_reset),
         )
         .into_any_element(),
-        meter_surface(
+        meter_surface_db(
             track.meter_level_l,
             track.meter_level_r,
             track.meter_peak_hold_l,
@@ -1288,6 +1288,7 @@ fn fader_bay(
                 .min_h_0()
                 .w_full()
                 .child(fader)
+                .child(console::meter_scale())
                 .child(meter),
         )
         .child(
@@ -1541,6 +1542,12 @@ fn channel_strip(
                 },
             )
         })
+        .child(console::channel_header(
+            track.color,
+            Some(index + 1),
+            track.name.clone(),
+            is_selected,
+        ))
         .child(strip_top_row(
             track,
             vsti_group.as_ref().map(|(group_key, expanded, count)| {
@@ -1707,6 +1714,12 @@ fn vsti_output_sub_strip(
         // Real callbacks: mute / solo / volume / pan all target the child track
         // id (via button_row / pan_section / fader_area below), so S/M and the
         // fader operate per output bus.
+        .child(console::channel_header(
+            parent_track.color,
+            None,
+            bus_label.clone(),
+            is_selected,
+        ))
         .child(strip_top_row(&sub_track, None, i18n))
         // Real per-bus insert rack: the backing child track is a genuine Bus
         // model track, so its FX chain is added/bypassed/reordered by child
@@ -1820,6 +1833,12 @@ pub(crate) fn master_strip(
         .bg(base)
         .border_l(px(1.0))
         .border_color(Colors::master_strip_border())
+        .child(console::channel_header(
+            console::master_plate_fill(),
+            None,
+            i18n.tr("mixer.master.label"),
+            false,
+        ))
         .child(pinned_top_row(i18n.tr("mixer.master.bus-label")))
         .child(master_inserts_section(
             master, callbacks, insert_h, base, i18n,
@@ -1872,7 +1891,7 @@ pub(crate) fn master_strip(
                         Some(on_master_reset),
                     )
                     .into_any_element(),
-                    meter_surface(
+                    meter_surface_db(
                         master.meter_level_l,
                         master.meter_level_r,
                         master.meter_peak_hold_l,
@@ -2205,6 +2224,12 @@ pub(crate) fn monitor_strip(
         .bg(base)
         .border_l(px(1.0))
         .border_color(console::rule())
+        .child(console::channel_header(
+            console::monitor_plate_fill(),
+            None,
+            i18n.tr("mixer.monitor.label"),
+            false,
+        ))
         .child(pinned_top_row(i18n.tr("mixer.monitor.bus-label")))
         // Routing — Source only. Occupies the channels' insert rack so the two
         // pinned strips stay on matching baselines with them.
@@ -2269,7 +2294,7 @@ pub(crate) fn monitor_strip(
                         Some(on_monitor_reset),
                     )
                     .into_any_element(),
-                    meter_surface(
+                    meter_surface_db(
                         monitor.meter_level_l,
                         monitor.meter_level_r,
                         monitor.meter_peak_hold_l,

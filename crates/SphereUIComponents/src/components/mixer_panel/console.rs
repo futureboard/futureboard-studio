@@ -10,13 +10,18 @@
 //! (cyan), so the two meanings collided: a border could be identity or state.
 //!
 //! This follows Logic's console instead. The strip body is neutral end to end,
-//! and the track colour appears exactly once, as the fill of the **name plate
-//! at the bottom** — the one place the eye already goes to read which channel
-//! it is looking at. Selection is then free to mean one thing: a lifted strip
-//! surface and a bright rule on the plate.
+//! and the track colour is confined to the **name bands** — never the body, the
+//! border, or the controls. Selection is then free to mean one thing: a lifted
+//! strip surface and a bright rule against the bands.
+//!
+//! The colour is stated at both ends. It used to be the bottom plate alone, on
+//! the argument that one statement is enough; with the racks in place a strip
+//! is tall enough that scrolling a panel leaves the top of every column
+//! unidentified, so the header repeats it where the eye enters.
 //!
 //! ```txt
 //! ┌──────────┐
+//! │▓▓ 1 Vocal│  header — track colour, where the eye enters
 //! │ AUD    ⌄ │  top row — channel type, group expander
 //! │ INSERTS +│  rack label
 //! │ ▭ EQ     │  slot
@@ -24,19 +29,26 @@
 //! │ ▭ → Verb │
 //! │ Main   ⌄ │  I/O
 //! │   ( )    │  pan
-//! │  ▮   █   │  fader + meter
+//! │ 0┤▮   █  │  fader + meter, against a printed dB scale
+//! │10┤▮   █  │
+//! │20┤▮   █  │
 //! │  -3.4    │  value
 //! │ M S R I  │
 //! ├──────────┤
-//! │▓▓ 1 Vocal│  name plate — the only colour on the strip
+//! │▓▓ 1 Vocal│  name plate — the same colour, where it leaves
 //! └──────────┘
 //! ```
 //!
 //! # Rules the kit enforces
 //!
-//! * **Colour is meaning.** Track colour: identity, plate only. Blue/amber/red
-//!   /green: mute/solo/record/input, matching the console conventions players
-//!   already know. Accent cyan: selection and drag targets. Nothing decorative.
+//! * **Colour is meaning.** Track colour: identity, name bands only. Blue/amber
+//!   /red/green: mute/solo/record/input, matching the console conventions
+//!   players already know. Accent cyan: selection and drag targets. Nothing
+//!   decorative.
+//! * **A scale is a promise.** The dB numbers beside the meter and the meter's
+//!   own fill are positioned by one function (`vu_meter::db_fraction`). A scale
+//!   printed against a bar drawn some other way is worse than no scale, because
+//!   it is read as fact.
 //! * **Flat, not chipped.** Controls are flat fills with no border at rest;
 //!   depth comes from the recess of the rack area, not from outlining every
 //!   element. Eight bordered chips in an 88 px column read as noise.
@@ -76,6 +88,11 @@ pub(crate) const FADER_MIN_H: f32 = 86.0;
 pub(crate) const BUTTONS_H: f32 = 34.0;
 /// The coloured name plate.
 pub(crate) const PLATE_H: f32 = 24.0;
+/// The coloured name header at the top of the strip.
+pub(crate) const HEADER_H: f32 = 20.0;
+/// Width of the printed dB scale beside the meter. Two digits and a minus at
+/// 8.5 px; anything wider is spending strip on a number nobody reads twice.
+pub(crate) const METER_SCALE_W: f32 = 17.0;
 
 /// Text sizes. Three of them, deliberately.
 pub(crate) mod type_scale {
@@ -442,6 +459,121 @@ pub(crate) fn name_plate(
                 .text_color(text)
                 .child(name.into()),
         )
+}
+
+/// The coloured header at the top of the strip.
+///
+/// The plate at the bottom still carries the name, so the colour is stated
+/// twice — once where the eye enters the strip and once where it leaves. That
+/// is a deliberate reversal of the rule this file used to hold (see the module
+/// header): with the racks in place a strip is tall enough that the bottom
+/// plate alone leaves the top of a column unidentified while scrolling.
+///
+/// It is a band and a name, nothing else. Every control the header could have
+/// absorbed already has a row of its own further down, and a header that is
+/// also a control is a header you cannot click to select the channel.
+pub(crate) fn channel_header(
+    fill: gpui::Rgba,
+    number: Option<usize>,
+    name: impl Into<String>,
+    selected: bool,
+) -> impl IntoElement {
+    let text = Colors::on_color(fill);
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_none()
+        .gap(px(3.0))
+        .h(px(HEADER_H))
+        .px(px(5.0))
+        .bg(fill)
+        // Selection reads as a bright rule under the header, matching the one
+        // the plate puts above itself: the two ends of a selected strip are
+        // bracketed the same way.
+        .when(selected, |s| {
+            s.border_b(px(2.0)).border_color(Colors::text_primary())
+        })
+        .children(number.map(|n| {
+            div()
+                .flex_none()
+                .text_size(px(type_scale::CAPTION))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(Colors::with_alpha(text, 0.65))
+                .child(format!("{n}"))
+        }))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(type_scale::VALUE))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(text)
+                .child(name.into()),
+        )
+}
+
+/// The dB scale printed beside the meter.
+///
+/// Positions come from `vu_meter::db_fraction`, the same function the bar is
+/// painted with, so a tick cannot end up somewhere the level it names would not
+/// reach. Absolute placement rather than a flex column for the same reason: an
+/// evenly distributed stack would space the labels by count instead of by
+/// decibel, which looks identical until the floor moves.
+///
+/// Only every other tick is labelled. Twelve numbers in a 17 px column at
+/// 8.5 px type is a grey texture; six numbers and six bare ticks reads as a
+/// scale.
+pub(crate) fn meter_scale() -> impl IntoElement {
+    use crate::components::timeline::vu_meter::{db_fraction, meter_scale_ticks};
+
+    let mut column = div()
+        .relative()
+        .flex_none()
+        .w(px(METER_SCALE_W))
+        .h_full()
+        .overflow_hidden();
+
+    for db in meter_scale_ticks() {
+        let labelled = (db as i32) % 10 == 0;
+        // `db_fraction` measures up from the floor; the strip measures down
+        // from the top, so a tick's y is the remainder of the height.
+        let from_top = 1.0 - db_fraction(db);
+        let mut row = div()
+            .absolute()
+            .left_0()
+            .right_0()
+            // Half the line box, so the text sits centred on its own tick
+            // rather than hanging below it.
+            .top(gpui::relative(from_top))
+            .mt(px(-4.5))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .gap(px(2.0));
+
+        if labelled {
+            row = row.child(
+                div()
+                    .text_size(px(type_scale::CAPTION))
+                    .text_color(Colors::text_faint())
+                    .child(format!("{}", db as i32)),
+            );
+        }
+
+        column = column.child(
+            row.child(
+                div()
+                    .flex_none()
+                    .w(px(if labelled { 3.0 } else { 2.0 }))
+                    .h(px(1.0))
+                    .bg(Colors::border_subtle()),
+            ),
+        );
+    }
+    column
 }
 
 /// Plate fill for a strip that is not a track: Master reads as the sum of every

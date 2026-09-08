@@ -7,6 +7,54 @@ use gpui::{
 const METER_GREEN_TOP: f32 = 0.70;
 const METER_YELLOW_TOP: f32 = 0.90;
 
+// ── The dB scale ────────────────────────────────────────────────────────────
+//
+// Engine levels arrive as linear peak amplitude in 0..1, and the meters above
+// paint them straight: `level * height`. That is fine for a bare bar, and wrong
+// the moment a scale is printed beside one, because amplitude is not where the
+// ear or the numbers are. On a linear bar -20 dBFS sits at a tenth of the
+// height and -40 dBFS at a hundredth, so the useful half of a mix lives in the
+// bottom sliver and every label below -20 lands on top of the ones under it.
+//
+// So the mixer's meter is drawn against dB, and [`db_fraction`] is the only
+// place that mapping exists. The bar and the printed ticks both go through it,
+// which is what stops a scale from drifting into decoration that disagrees with
+// the bar it labels.
+
+/// Bottom of the scale. Below this a channel reads as silent — far enough down
+/// to see a fade land, not so far that the top of the meter is squeezed.
+pub const METER_FLOOR_DB: f32 = -60.0;
+
+/// Where `db` sits on the meter, as a fraction of its height from the bottom.
+///
+/// Linear in decibels between [`METER_FLOOR_DB`] and 0, which is what makes
+/// evenly spaced numbers correct: -30 dB is halfway up a -60 dB scale because
+/// it is halfway in dB, and that is the claim the printed scale makes.
+pub fn db_fraction(db: f32) -> f32 {
+    ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0)
+}
+
+/// Linear peak amplitude (what the engine reports) to that same fraction.
+///
+/// Zero is the floor rather than negative infinity: `log10(0)` is not a number
+/// a layout can use, and a silent channel should draw an empty meter rather
+/// than a NaN-high one.
+pub fn amplitude_fraction(level: f32) -> f32 {
+    let level = level.clamp(0.0, 1.0);
+    if level <= 0.0 {
+        return 0.0;
+    }
+    db_fraction(20.0 * level.log10())
+}
+
+/// The labelled ticks, top down, as the reference marks them: every 5 dB.
+///
+/// Returned as dB rather than as positions so the caller runs them through
+/// [`db_fraction`] itself — the same call the bar makes.
+pub fn meter_scale_ticks() -> impl Iterator<Item = f32> {
+    (0..=((-METER_FLOOR_DB / 5.0) as i32)).map(|step| -(step as f32) * 5.0)
+}
+
 /// GPU-composited meter renderer.
 ///
 /// Replaces the per-segment nested-`div` meter (`vu_meter_vertical_full`) with a
@@ -44,6 +92,116 @@ pub fn meter_surface(
         )
         .size_full(),
     )
+}
+
+/// The mixer's meter: the same bars, positioned in decibels.
+///
+/// Separate from [`meter_surface`] rather than replacing it, because the two
+/// answer different questions. The track header's meter is a glance — is this
+/// channel making sound — and a linear bar answers it. The mixer's meter is
+/// read against a printed scale, and a scale is a promise about where a number
+/// lands.
+///
+/// The colour bands move with it: they are stated in dB here, where a mix
+/// engineer already thinks in them, instead of as fractions of a bar.
+pub fn meter_surface_db(
+    level_l: f32,
+    level_r: f32,
+    hold_l: f32,
+    hold_r: f32,
+    clip: bool,
+) -> impl IntoElement {
+    let bar_w = 5.0_f32;
+    let gap = 1.0_f32;
+    let total_w = bar_w * 2.0 + gap;
+    div().w(px(total_w)).h_full().child(
+        canvas(
+            |_bounds, _window, _cx| (),
+            move |bounds, _state, window, _cx| {
+                paint_meter_bar_db(bounds, 0.0, bar_w, level_l, hold_l, window);
+                paint_meter_bar_db(bounds, bar_w + gap, bar_w, level_r, hold_r, window);
+                if clip {
+                    paint_clip_cap(bounds, total_w, window);
+                }
+            },
+        )
+        .size_full(),
+    )
+}
+
+/// Top of the green band. Below this is headroom a mix lives in.
+const METER_GREEN_TOP_DB: f32 = -12.0;
+/// Top of the yellow band. Above it is the last 3 dB before clipping.
+const METER_YELLOW_TOP_DB: f32 = -3.0;
+
+/// One channel bar, positioned in dB. Mirrors [`paint_meter_bar`] segment for
+/// segment; only the mapping from level to height differs.
+fn paint_meter_bar_db(
+    canvas_bounds: Bounds<Pixels>,
+    x_offset: f32,
+    width: f32,
+    level: f32,
+    hold: f32,
+    window: &mut gpui::Window,
+) {
+    let origin_x = f32::from(canvas_bounds.origin.x) + x_offset;
+    let origin_y = f32::from(canvas_bounds.origin.y);
+    let h = f32::from(canvas_bounds.size.height).max(0.0);
+    if h <= 0.0 {
+        return;
+    }
+    let bottom = origin_y + h;
+
+    let rect = |y: f32, height: f32| Bounds {
+        origin: Point {
+            x: px(origin_x),
+            y: px(y),
+        },
+        size: Size {
+            width: px(width),
+            height: px(height.max(0.0)),
+        },
+    };
+
+    window.paint_quad(fill(rect(origin_y, h), Colors::meter_rail()));
+
+    let level_n = amplitude_fraction(level);
+    if level_n <= 0.0 {
+        return;
+    }
+    let green_top = db_fraction(METER_GREEN_TOP_DB);
+    let yellow_top = db_fraction(METER_YELLOW_TOP_DB);
+
+    let green_n = level_n.min(green_top);
+    let yellow_n = (level_n.min(yellow_top) - green_n).max(0.0);
+    let red_n = (level_n - green_n - yellow_n).max(0.0);
+
+    let green_h = green_n * h;
+    let yellow_h = yellow_n * h;
+    let red_h = red_n * h;
+
+    if green_h > 0.0 {
+        window.paint_quad(fill(rect(bottom - green_h, green_h), Colors::meter_low()));
+    }
+    if yellow_h > 0.0 {
+        window.paint_quad(fill(
+            rect(bottom - green_h - yellow_h, yellow_h),
+            Colors::meter_mid(),
+        ));
+    }
+    if red_h > 0.0 {
+        window.paint_quad(fill(
+            rect(bottom - green_h - yellow_h - red_h, red_h),
+            Colors::meter_high(),
+        ));
+    }
+
+    let hold_n = amplitude_fraction(hold);
+    if hold_n > 0.0 {
+        let tick_h = 2.0_f32;
+        let tick_y = (bottom - hold_n * h - tick_h * 0.5).clamp(origin_y, bottom - tick_h);
+        window.paint_quad(fill(rect(tick_y, tick_h), Colors::text_primary()));
+    }
 }
 
 /// Paint a clip-indicator cap across the top of the meter (both bars) when a
@@ -533,5 +691,75 @@ mod track_meter_tests {
     fn a_new_meter_has_not_drawn_silence_yet() {
         let meter = TrackMeterView::new();
         assert_ne!(meter.last_sig, TrackMeterView::signature(0.0, 0.0));
+    }
+}
+
+#[cfg(test)]
+mod meter_scale_tests {
+    use super::*;
+
+    /// The claim a printed scale makes: evenly spaced numbers are evenly spaced
+    /// positions. If this ever fails the labels are decoration.
+    #[test]
+    fn the_scale_is_linear_in_decibels() {
+        let half = db_fraction(METER_FLOOR_DB / 2.0);
+        assert!((half - 0.5).abs() < 1e-6, "midpoint of the scale: {half}");
+        // Equal dB steps are equal distances, anywhere on the scale.
+        let low = db_fraction(-50.0) - db_fraction(-55.0);
+        let high = db_fraction(-5.0) - db_fraction(-10.0);
+        assert!((low - high).abs() < 1e-6, "{low} vs {high}");
+    }
+
+    #[test]
+    fn the_scale_ends_where_it_says_it_does() {
+        assert_eq!(db_fraction(0.0), 1.0);
+        assert_eq!(db_fraction(METER_FLOOR_DB), 0.0);
+        // Nothing escapes the meter: above 0 dBFS is the clip cap's business.
+        assert_eq!(db_fraction(12.0), 1.0);
+        assert_eq!(db_fraction(-200.0), 0.0);
+    }
+
+    /// The bar is painted from an amplitude and the ticks from a dB, so the two
+    /// paths have to meet: an amplitude of -20 dB must land on the -20 tick.
+    #[test]
+    fn amplitude_and_decibels_land_in_the_same_place() {
+        for db in [-3.0_f32, -6.0, -12.0, -20.0, -40.0] {
+            let amplitude = 10.0_f32.powf(db / 20.0);
+            let from_amplitude = amplitude_fraction(amplitude);
+            let from_db = db_fraction(db);
+            assert!(
+                (from_amplitude - from_db).abs() < 1e-4,
+                "{db} dB: bar {from_amplitude} vs tick {from_db}"
+            );
+        }
+    }
+
+    /// Silence draws nothing rather than a NaN, which `log10(0)` would give.
+    #[test]
+    fn silence_is_an_empty_meter() {
+        assert_eq!(amplitude_fraction(0.0), 0.0);
+        assert!(amplitude_fraction(-1.0).is_finite());
+    }
+
+    /// The reference marks every 5 dB down to the floor.
+    #[test]
+    fn ticks_cover_the_scale_every_five_decibels() {
+        let ticks: Vec<f32> = meter_scale_ticks().collect();
+        assert_eq!(ticks.first(), Some(&0.0));
+        assert_eq!(ticks.last(), Some(&METER_FLOOR_DB));
+        assert_eq!(ticks.len(), 13);
+        for pair in ticks.windows(2) {
+            assert!((pair[0] - pair[1] - 5.0).abs() < 1e-6);
+        }
+    }
+
+    /// Why the mapping changed at all: the linear-amplitude bar crushes the
+    /// bottom two thirds of the scale into a sliver, so a printed number would
+    /// sit nowhere near the level it names.
+    #[test]
+    fn a_linear_bar_could_not_carry_this_scale() {
+        let amplitude_at_minus_30 = 10.0_f32.powf(-30.0 / 20.0);
+        assert!(amplitude_at_minus_30 < 0.04);
+        assert!((db_fraction(-30.0) - 0.5).abs() < 1e-6);
     }
 }
