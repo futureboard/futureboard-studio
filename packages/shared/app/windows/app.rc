@@ -16,11 +16,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Futureboard\0"
             VALUE "FileDescription", "Futureboard Studio\0"
-            VALUE "FileVersion", "2026.9.8\0"
+            VALUE "FileVersion", "2026.9.8-beta1.2.2\0"
             VALUE "InternalName", "Futureboard Studio\0"
             VALUE "OriginalFilename", "FutureboardNative.exe\0"
             VALUE "ProductName", "Futureboard Studio\0"
-            VALUE "ProductVersion", "2026.9.8\0"
+            VALUE "ProductVersion", "2026.9.8-beta1.2.2\0"
         END
     END
     BLOCK "VarFileInfo"

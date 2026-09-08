@@ -1,6 +1,6 @@
 [package]
 name = "futureboard-core"
-version = "2026.9.8"
+version = "2026.9.8-beta1.2.2"
 edition = "2024"
 description = "Futureboard Studio DSP Core — WebAudioCore Framework"
 license.workspace = true
