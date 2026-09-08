@@ -1152,6 +1152,7 @@ fn pan_section(track: &TrackState, callbacks: &MixerCallbacks) -> impl IntoEleme
         .gap(px(2.0))
         .h(px(console::PAN_H))
         .py(px(4.0))
+        .px(px(console::STRIP_GUTTER))
         .border_b(px(1.0))
         .border_color(console::rule())
         .child(knob_bipolar(
@@ -1169,6 +1170,7 @@ fn pan_section(track: &TrackState, callbacks: &MixerCallbacks) -> impl IntoEleme
         ))
         .child(
             div()
+                .flex_none()
                 .text_size(px(type_scale::CAPTION))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(Colors::text_muted())
@@ -1542,12 +1544,6 @@ fn channel_strip(
                 },
             )
         })
-        .child(console::channel_header(
-            track.color,
-            Some(index + 1),
-            track.name.clone(),
-            is_selected,
-        ))
         .child(strip_top_row(
             track,
             vsti_group.as_ref().map(|(group_key, expanded, count)| {
@@ -1714,12 +1710,6 @@ fn vsti_output_sub_strip(
         // Real callbacks: mute / solo / volume / pan all target the child track
         // id (via button_row / pan_section / fader_area below), so S/M and the
         // fader operate per output bus.
-        .child(console::channel_header(
-            parent_track.color,
-            None,
-            bus_label.clone(),
-            is_selected,
-        ))
         .child(strip_top_row(&sub_track, None, i18n))
         // Real per-bus insert rack: the backing child track is a genuine Bus
         // model track, so its FX chain is added/bypassed/reordered by child
@@ -1833,12 +1823,6 @@ pub(crate) fn master_strip(
         .bg(base)
         .border_l(px(1.0))
         .border_color(Colors::master_strip_border())
-        .child(console::channel_header(
-            console::master_plate_fill(),
-            None,
-            i18n.tr("mixer.master.label"),
-            false,
-        ))
         .child(pinned_top_row(i18n.tr("mixer.master.bus-label")))
         .child(master_inserts_section(
             master, callbacks, insert_h, base, i18n,
@@ -2224,12 +2208,6 @@ pub(crate) fn monitor_strip(
         .bg(base)
         .border_l(px(1.0))
         .border_color(console::rule())
-        .child(console::channel_header(
-            console::monitor_plate_fill(),
-            None,
-            i18n.tr("mixer.monitor.label"),
-            false,
-        ))
         .child(pinned_top_row(i18n.tr("mixer.monitor.bus-label")))
         // Routing — Source only. Occupies the channels' insert rack so the two
         // pinned strips stay on matching baselines with them.

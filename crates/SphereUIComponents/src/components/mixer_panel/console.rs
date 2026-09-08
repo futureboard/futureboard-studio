@@ -10,18 +10,19 @@
 //! (cyan), so the two meanings collided: a border could be identity or state.
 //!
 //! This follows Logic's console instead. The strip body is neutral end to end,
-//! and the track colour is confined to the **name bands** — never the body, the
-//! border, or the controls. Selection is then free to mean one thing: a lifted
-//! strip surface and a bright rule against the bands.
+//! and the track colour appears exactly once, as the fill of the **name plate
+//! at the bottom** — the one place the eye already goes to read which channel
+//! it is looking at. Selection is then free to mean one thing: a lifted strip
+//! surface and a bright rule on the plate.
 //!
-//! The colour is stated at both ends. It used to be the bottom plate alone, on
-//! the argument that one statement is enough; with the racks in place a strip
-//! is tall enough that scrolling a panel leaves the top of every column
-//! unidentified, so the header repeats it where the eye enters.
+//! A coloured header at the *top* was tried and taken out again. On paper it
+//! labels the head of a column that scrolling would otherwise leave anonymous;
+//! on screen the strips are flush, so five channels' headers merge into one
+//! unbroken band of saturated colour across the panel — the same wall of stripes
+//! the plate-only rule was written to stop, turned on its side.
 //!
 //! ```txt
 //! ┌──────────┐
-//! │▓▓ 1 Vocal│  header — track colour, where the eye enters
 //! │ AUD    ⌄ │  top row — channel type, group expander
 //! │ INSERTS +│  rack label
 //! │ ▭ EQ     │  slot
@@ -35,16 +36,15 @@
 //! │  -3.4    │  value
 //! │ M S R I  │
 //! ├──────────┤
-//! │▓▓ 1 Vocal│  name plate — the same colour, where it leaves
+//! │▓▓ 1 Vocal│  name plate — the only colour on the strip
 //! └──────────┘
 //! ```
 //!
 //! # Rules the kit enforces
 //!
-//! * **Colour is meaning.** Track colour: identity, name bands only. Blue/amber
-//!   /red/green: mute/solo/record/input, matching the console conventions
-//!   players already know. Accent cyan: selection and drag targets. Nothing
-//!   decorative.
+//! * **Colour is meaning.** Track colour: identity, plate only. Blue/amber/red
+//!   /green: mute/solo/record/input, matching the console conventions players
+//!   already know. Accent cyan: selection and drag targets. Nothing decorative.
 //! * **A scale is a promise.** The dB numbers beside the meter and the meter's
 //!   own fill are positioned by one function (`vu_meter::db_fraction`). A scale
 //!   printed against a bar drawn some other way is worse than no scale, because
@@ -81,15 +81,29 @@ pub(crate) const SEND_SLOT_H: f32 = 28.0;
 /// Output / routing row.
 pub(crate) const IO_ROW_H: f32 = 20.0;
 /// Pan knob and its readout.
-pub(crate) const PAN_H: f32 = 44.0;
+///
+/// Sized to what it holds rather than to a round number: a 30 px knob, 2 px,
+/// the readout's line box, and the section's own 4 px top and bottom. It was
+/// 44, which is 7 px short — the knob and its value were being squeezed into a
+/// box that could not fit them, and the pair sat high in the section as a
+/// result.
+pub(crate) const PAN_H: f32 = 52.0;
+
+/// The strip's horizontal inset.
+///
+/// The racks set it: their slots sit 3 px from the strip edge, and they are
+/// most of the strip's height, so everything else lines up with them rather
+/// than the other way round. The output row used to inset 4 px *and* pad its
+/// button another 4, which put its edge and its text each a pixel inside the
+/// slots above — not enough to name, enough to look unaligned in a column 88 px
+/// wide.
+pub(crate) const STRIP_GUTTER: f32 = 3.0;
 /// Smallest fader bay that still leaves the cap somewhere to travel.
 pub(crate) const FADER_MIN_H: f32 = 86.0;
 /// Two rows of channel toggles.
 pub(crate) const BUTTONS_H: f32 = 34.0;
 /// The coloured name plate.
 pub(crate) const PLATE_H: f32 = 24.0;
-/// The coloured name header at the top of the strip.
-pub(crate) const HEADER_H: f32 = 20.0;
 /// Width of the printed dB scale beside the meter. Two digits and a minus at
 /// 8.5 px; anything wider is spending strip on a number nobody reads twice.
 pub(crate) const METER_SCALE_W: f32 = 17.0;
@@ -360,7 +374,7 @@ pub(crate) fn io_button(
         .flex_none()
         .items_center()
         .h(px(IO_ROW_H))
-        .px(px(4.0))
+        .px(px(STRIP_GUTTER))
         .child(
             div()
                 .id(id)
@@ -446,59 +460,6 @@ pub(crate) fn name_plate(
                 .font_weight(gpui::FontWeight::BOLD)
                 // The number is a locator, not a label: it stays legible but
                 // never competes with the name beside it.
-                .text_color(Colors::with_alpha(text, 0.65))
-                .child(format!("{n}"))
-        }))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .truncate()
-                .text_size(px(type_scale::VALUE))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(text)
-                .child(name.into()),
-        )
-}
-
-/// The coloured header at the top of the strip.
-///
-/// The plate at the bottom still carries the name, so the colour is stated
-/// twice — once where the eye enters the strip and once where it leaves. That
-/// is a deliberate reversal of the rule this file used to hold (see the module
-/// header): with the racks in place a strip is tall enough that the bottom
-/// plate alone leaves the top of a column unidentified while scrolling.
-///
-/// It is a band and a name, nothing else. Every control the header could have
-/// absorbed already has a row of its own further down, and a header that is
-/// also a control is a header you cannot click to select the channel.
-pub(crate) fn channel_header(
-    fill: gpui::Rgba,
-    number: Option<usize>,
-    name: impl Into<String>,
-    selected: bool,
-) -> impl IntoElement {
-    let text = Colors::on_color(fill);
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .flex_none()
-        .gap(px(3.0))
-        .h(px(HEADER_H))
-        .px(px(5.0))
-        .bg(fill)
-        // Selection reads as a bright rule under the header, matching the one
-        // the plate puts above itself: the two ends of a selected strip are
-        // bracketed the same way.
-        .when(selected, |s| {
-            s.border_b(px(2.0)).border_color(Colors::text_primary())
-        })
-        .children(number.map(|n| {
-            div()
-                .flex_none()
-                .text_size(px(type_scale::CAPTION))
-                .font_weight(gpui::FontWeight::BOLD)
                 .text_color(Colors::with_alpha(text, 0.65))
                 .child(format!("{n}"))
         }))
