@@ -1,6 +1,6 @@
 [package]
 name = "drumsampler"
-version = "2026.9.7-beta1"
+version = "2026.9.8"
 edition = "2024"
 
 [dependencies]

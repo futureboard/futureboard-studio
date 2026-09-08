@@ -1,6 +1,6 @@
 [package]
 name = "sphere_directaudioengine"
-version = "2026.9.7-beta1"
+version = "2026.9.8"
 edition = "2021"
 description = "SphereDirectAudioEngine — native Rust audio backend for Futureboard Studio"
 

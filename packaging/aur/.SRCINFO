@@ -1,6 +1,6 @@
 pkgbase = futureboard-studio-bin
 	pkgdesc = Futureboard Studio — native Digital Audio Workstation
-	pkgver = 2026.9.7_beta1
+	pkgver = 2026.9.8
 	pkgrel = 1
 	url = https://github.com/arizkami/Futureboard
 	install = futureboard-studio-bin.install

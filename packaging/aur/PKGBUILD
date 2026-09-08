@@ -4,8 +4,8 @@
 # runtime). The AppImage this package extracts is built by
 # packaging/linux/bundle-appimage.sh and published on every nightly release.
 pkgname=futureboard-studio-bin
-pkgver=2026.9.7_beta1
-_appver=2026.9.7-beta1
+pkgver=2026.9.8
+_appver=2026.9.8
 pkgrel=1
 pkgdesc="Futureboard Studio — native Digital Audio Workstation"
 arch=('x86_64')

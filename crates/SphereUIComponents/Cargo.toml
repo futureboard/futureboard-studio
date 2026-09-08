@@ -1,6 +1,6 @@
 [package]
 name = "sphere_ui_components"
-version = "2026.9.7-beta1"
+version = "2026.9.8"
 edition = "2021"
 autobins = false
 # Bakes FUTUREBOARD_AUTH_API_URL for `auth.rs`; see build.rs.

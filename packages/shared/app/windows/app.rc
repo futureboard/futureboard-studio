@@ -2,8 +2,8 @@
 
 // Friendly product information shown by Windows Explorer and Task Manager.
 1 VERSIONINFO
- FILEVERSION 2026,9,7,0
- PRODUCTVERSION 2026,9,7,0
+ FILEVERSION 2026,9,8,0
+ PRODUCTVERSION 2026,9,8,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -16,11 +16,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Futureboard\0"
             VALUE "FileDescription", "Futureboard Studio\0"
-            VALUE "FileVersion", "2026.9.7-beta1\0"
+            VALUE "FileVersion", "2026.9.8\0"
             VALUE "InternalName", "Futureboard Studio\0"
             VALUE "OriginalFilename", "FutureboardNative.exe\0"
             VALUE "ProductName", "Futureboard Studio\0"
-            VALUE "ProductVersion", "2026.9.7-beta1\0"
+            VALUE "ProductVersion", "2026.9.8\0"
         END
     END
     BLOCK "VarFileInfo"
