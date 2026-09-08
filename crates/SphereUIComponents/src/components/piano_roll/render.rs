@@ -4,6 +4,12 @@
 
 use super::*;
 
+/// One bar's worth of beats, for framing decisions that want "a bar" rather
+/// than a number of beats.
+fn bpb_hint(state: &crate::components::timeline::timeline_state::TimelineState) -> f32 {
+    state.beats_per_bar().max(1.0)
+}
+
 impl PianoRoll {
     pub(super) fn display_note(&self, n: &MidiNoteState) -> DisplayNote {
         let mut start = n.start;
@@ -50,7 +56,7 @@ impl PianoRoll {
     }
 
     pub(super) fn note_to_rect(&self, note: &DisplayNote) -> (f32, f32, f32, f32) {
-        let x = self.beat_to_x(note.start);
+        let x = self.clip_beat_to_x(note.start);
         let w = (note.duration * self.ppb).max(NOTE_MIN_W);
         let y = self.pitch_to_y(note.pitch) + 1.0;
         let h = self.note_row_h() - 2.0;
@@ -96,7 +102,7 @@ impl PianoRoll {
             MIN_NOTE_BEATS
         };
         let duration = (hi - lo).max(minimum);
-        let x = self.beat_to_x(lo);
+        let x = self.clip_beat_to_x(lo);
         let w = (duration * self.ppb).max(3.0);
         let y = self.pitch_to_y(*pitch);
         let h = self.note_row_h() - 2.0;
@@ -398,8 +404,8 @@ impl PianoRoll {
                 current_value,
                 ..
             } => {
-                let x0 = self.beat_to_x(*anchor_beat);
-                let x1 = self.beat_to_x(*current_beat);
+                let x0 = self.clip_beat_to_x(*anchor_beat);
+                let x1 = self.clip_beat_to_x(*current_beat);
                 let (_, lane_h) = self.cc_view_size();
                 let usable_h = (lane_h - 8.0).max(1.0);
                 let y0 = 2.0 + (1.0 - (*anchor_value as f32 - 1.0) / 126.0) * usable_h;
@@ -1474,21 +1480,52 @@ impl PianoRoll {
     ) -> impl IntoElement {
         let (view_w, view_h) = self.grid_view_size();
         let track_color = self.track_color_for_clip(cx, clip_id);
-        let (bpb, clip_len, show_playhead, playing, playhead_rel, loop_region) = {
+
+        // The frame this whole render is measured in. Refreshed here because
+        // the edited clip can be moved on the arrangement while the editor is
+        // open, and every conversion below — and every mouse handler until the
+        // next render — reads it.
+        self.scope = crate::components::piano_roll::scope::EditorScope::for_editing_clip(
+            &self.timeline.read(cx).state,
+            clip_id,
+        );
+        self.edit_origin_beats = self
+            .scope
+            .editing()
+            .map(|span| span.start_beat)
+            .unwrap_or(0.0);
+
+        // Frame the clip the first time it is shown. Only on a change, so
+        // scrolling away to look at the previous chorus is not undone on the
+        // next frame — the view belongs to the user once they have moved it.
+        if self.framed_clip_id.as_deref() != Some(clip_id) {
+            self.framed_clip_id = Some(clip_id.to_string());
+            if let Some(span) = self.scope.editing() {
+                // A bar of lead-in, so the clip does not start hard against the
+                // keyboard lane and the note before it stays visible.
+                let lead_in = bpb_hint(&self.timeline.read(cx).state);
+                self.scroll_x = ((span.start_beat - lead_in) * self.ppb).max(0.0);
+            }
+        }
+
+        let (bpb, clip_len, show_playhead, playing, playhead_project, loop_region) = {
             let tl = self.timeline.read(cx);
             let bpb = tl.state.beats_per_bar().max(1.0);
-            let (clip_start, clip_len) = self.clip_meta(cx, clip_id);
+            let clip_len = self
+                .scope
+                .editing()
+                .map(|span| span.duration_beats)
+                .unwrap_or(0.0);
             let t = &tl.state.transport;
-            let playhead_rel = t.playhead_beats - clip_start;
-            // Playhead is visible whenever it sits within the clip — playing or
-            // paused — so the user always sees the current position.
-            let show_playhead = playhead_rel >= 0.0 && playhead_rel <= clip_len;
-            // Loop region in clip-local beats (transport stores project-global).
+            // The playhead is a project beat and so is the axis, so it needs no
+            // shifting — and it is drawn wherever it is rather than only inside
+            // the edited clip. Watching the transport cross the clip before this
+            // one is the point of showing them.
+            let show_playhead = true;
+            // The loop region is stored project-global, which is now also what
+            // the axis speaks.
             let loop_region = if t.loop_enabled && t.loop_end_beats > t.loop_start_beats {
-                Some((
-                    t.loop_start_beats - clip_start,
-                    t.loop_end_beats - clip_start,
-                ))
+                Some((t.loop_start_beats, t.loop_end_beats))
             } else {
                 None
             };
@@ -1497,7 +1534,7 @@ impl PianoRoll {
                 clip_len,
                 show_playhead,
                 t.playing,
-                playhead_rel,
+                t.playhead_beats,
                 loop_region,
             )
         };
@@ -1505,8 +1542,13 @@ impl PianoRoll {
         // Visible ranges (only build geometry for what's on screen).
         let first_pitch = (self.y_to_pitch(view_h) as i32 - 1).max(0);
         let last_pitch = (self.y_to_pitch(0.0) as i32 + 1).min(PITCH_CNT - 1);
-        let start_beat = self.x_to_beat(0.0);
-        let end_beat = self.x_to_beat(view_w);
+        let start_beat = self.x_to_clip_beat(0.0);
+        let end_beat = self.x_to_clip_beat(view_w);
+        // The same span in project beats, for the things that count from the
+        // start of the song rather than from the clip: the ruler's bar numbers,
+        // the grid behind every clip, and the clip boundaries themselves.
+        let project_start = self.x_to_project_beat(0.0);
+        let project_end = self.x_to_project_beat(view_w);
 
         // Piano key lane.
         // Label policy: show every note name when each row has enough vertical
@@ -1579,8 +1621,8 @@ impl PianoRoll {
             .collect();
 
         let grid_lines = self.build_grid_lines(
-            start_beat,
-            end_beat,
+            project_start,
+            project_end,
             view_w,
             view_h,
             first_pitch,
@@ -1588,7 +1630,7 @@ impl PianoRoll {
             bpb,
             clip_len,
         );
-        let clip_bounds = self.build_clip_bounds_overlay(clip_len, view_w, view_h);
+        let clip_bounds = self.build_clip_bounds_overlay(view_w, view_h);
         let loop_overlay = self.build_loop_overlay(loop_region, view_w, view_h);
         // The playhead is its own entity, not a child of this render. Building
         // it here would tie a one-pixel translation to a full rebuild of the
@@ -1603,14 +1645,16 @@ impl PianoRoll {
         }
         self.playhead_frame.set(
             crate::components::piano_roll::playhead::PianoRollPlayheadFrame {
-                x: self.beat_to_x(playhead_rel),
+                x: self.project_beat_to_x(playhead_project),
                 visible: show_playhead,
                 playing,
             },
         );
         let playhead_overlay = self.playhead_overlay.clone();
-        let mut ruler = self.build_ruler(start_beat, end_beat, bpb);
+        let mut ruler = self.build_ruler(project_start, project_end, bpb);
         ruler.extend(self.build_loop_ruler_markers(loop_region));
+        // Under the editable notes and over the grid: context, not content.
+        let context_notes = self.build_context_notes(cx, view_w, view_h);
         let notes_geo = self.build_note_elements(cx, clip_id, track_color);
         let quantize_preview = self.build_quantize_preview(cx, clip_id);
         let marquee_overlay = self.build_marquee_overlay();
@@ -1873,6 +1917,7 @@ impl PianoRoll {
                             .child(grid_canvas)
                             .children(grid_lines)
                             .children(clip_bounds)
+                            .children(context_notes)
                             .children(loop_overlay)
                             .children(playhead_overlay)
                             .children(grid_empty_hint)
@@ -2276,52 +2321,93 @@ impl PianoRoll {
         self.viewport().grid_lines(start_beat, end_beat, bpb)
     }
 
+    /// The track's clips, drawn where they actually sit on the timeline.
+    ///
+    /// Everything outside the clip being edited is shaded, and each neighbour
+    /// gets its own boundary lines and a name — so the editor reads as a window
+    /// onto the song rather than a part with no context. A fill written to land
+    /// on the downbeat of the next clip can now be seen to land on it.
+    ///
+    /// The edited clip is the one left unshaded: it is the only one this pass
+    /// accepts edits for, and shading is how that is said without a second
+    /// colour meaning something new.
     pub(super) fn build_clip_bounds_overlay(
         &self,
-        clip_len: f32,
         view_w: f32,
         view_h: f32,
     ) -> Vec<gpui::AnyElement> {
-        let mut out = Vec::new();
-        let end_x = self.beat_to_x(clip_len);
-        if end_x < view_w {
-            out.push(
-                div()
-                    .absolute()
-                    .left(px(end_x))
-                    .top_0()
-                    .w(px((view_w - end_x).max(0.0)))
-                    .h(px(view_h))
-                    .bg(Colors::with_alpha(Colors::surface_base(), 0.55))
-                    .into_any_element(),
-            );
+        let mut out: Vec<gpui::AnyElement> = Vec::new();
+        let Some(editing) = self.scope.editing() else {
+            return out;
+        };
+
+        let edit_x0 = self.project_beat_to_x(editing.start_beat);
+        let edit_x1 = self.project_beat_to_x(editing.end_beat());
+
+        // Shade everything that is not the edited clip, in two pieces so the
+        // clip itself keeps the grid's own background.
+        for (x0, x1) in [(0.0_f32, edit_x0), (edit_x1, view_w)] {
+            let x0 = x0.max(0.0);
+            let x1 = x1.min(view_w);
+            if x1 > x0 {
+                out.push(
+                    div()
+                        .absolute()
+                        .left(px(x0))
+                        .top_0()
+                        .w(px(x1 - x0))
+                        .h(px(view_h))
+                        .bg(Colors::with_alpha(Colors::surface_base(), 0.55))
+                        .into_any_element(),
+                );
+            }
         }
-        out.push(
-            div()
-                .absolute()
-                .left(px(0.0))
-                .top_0()
-                .w(px(1.0))
-                .h(px(view_h))
-                .bg(Colors::with_alpha(Colors::accent_primary(), 0.35))
-                .into_any_element(),
-        );
-        if end_x > 0.0 && end_x <= view_w + 2.0 {
-            out.push(
-                div()
-                    .absolute()
-                    .left(px(end_x))
-                    .top_0()
-                    .w(px(1.0))
-                    .h(px(view_h))
-                    .bg(Colors::with_alpha(Colors::accent_primary(), 0.55))
-                    .into_any_element(),
-            );
+
+        for span in self.scope.spans() {
+            let x0 = self.project_beat_to_x(span.start_beat);
+            let x1 = self.project_beat_to_x(span.end_beat());
+            if x1 < -2.0 || x0 > view_w + 2.0 {
+                continue;
+            }
+            // The edited clip's edges are stated more strongly than its
+            // neighbours', because they are the bounds an edit is bound by.
+            let alpha = if span.editable { 0.55 } else { 0.28 };
+            for x in [x0, x1] {
+                if x >= -1.0 && x <= view_w + 1.0 {
+                    out.push(
+                        div()
+                            .absolute()
+                            .left(px(x))
+                            .top_0()
+                            .w(px(1.0))
+                            .h(px(view_h))
+                            .bg(Colors::with_alpha(Colors::accent_primary(), alpha))
+                            .into_any_element(),
+                    );
+                }
+            }
+            // A neighbour says which clip it is. The edited one does not need
+            // to — the window title already says, and a label over the notes
+            // being edited is in the way.
+            if !span.editable && x1 - x0 > 24.0 {
+                out.push(
+                    div()
+                        .absolute()
+                        .left(px(x0 + 4.0))
+                        .top(px(2.0))
+                        .max_w(px((x1 - x0 - 8.0).max(0.0)))
+                        .truncate()
+                        .text_size(px(9.0))
+                        .text_color(Colors::text_faint())
+                        .child(span.name.clone())
+                        .into_any_element(),
+                );
+            }
         }
         out
     }
 
-    /// Loop region band + edge lines over the note grid (clip-local beats).
+    /// Loop region band + edge lines over the note grid (project beats).
     /// Returns empty when looping is off or the region is fully off-screen.
     pub(super) fn build_loop_overlay(
         &self,
@@ -2333,8 +2419,8 @@ impl PianoRoll {
         let Some((lo, hi)) = loop_region else {
             return out;
         };
-        let band_x0 = self.beat_to_x(lo).max(0.0);
-        let band_x1 = self.beat_to_x(hi).min(view_w);
+        let band_x0 = self.project_beat_to_x(lo).max(0.0);
+        let band_x1 = self.project_beat_to_x(hi).min(view_w);
         if band_x1 <= 0.0 || band_x0 >= view_w || band_x1 <= band_x0 {
             return out;
         }
@@ -2351,7 +2437,7 @@ impl PianoRoll {
         );
         // Edge lines, drawn only when their exact beat is on-screen.
         for edge in [lo, hi] {
-            let ex = self.beat_to_x(edge);
+            let ex = self.project_beat_to_x(edge);
             if ex >= 0.0 && ex <= view_w {
                 out.push(
                     div()
@@ -2377,8 +2463,8 @@ impl PianoRoll {
         let Some((lo, hi)) = loop_region else {
             return out;
         };
-        let left = self.beat_to_x(lo).max(0.0);
-        let right = self.beat_to_x(hi);
+        let left = self.project_beat_to_x(lo).max(0.0);
+        let right = self.project_beat_to_x(hi);
         if right <= left {
             return out;
         }
@@ -2438,8 +2524,9 @@ impl PianoRoll {
             }
         }
 
-        // Clip end marker inside the visible beat range.
-        let end_x = self.beat_to_x(clip_len);
+        // Clip end marker inside the visible beat range. `clip_len` is the
+        // edited clip's own length, so it converts through the clip frame.
+        let end_x = self.clip_beat_to_x(clip_len);
         if end_x >= 0.0 && end_x <= view_w {
             out.push(
                 div()
@@ -2603,7 +2690,7 @@ impl PianoRoll {
                 if (q_start - n.start).abs() < 1.0e-4 {
                     return None;
                 }
-                let x = self.beat_to_x(q_start);
+                let x = self.clip_beat_to_x(q_start);
                 let w = (n.duration * self.ppb).max(3.0);
                 let y = self.pitch_to_y(n.pitch);
                 if x + w < 0.0 || x > view_w || y + row_h < 0.0 || y > view_h {
@@ -2624,6 +2711,89 @@ impl PianoRoll {
                 )
             })
             .collect()
+    }
+
+    /// The neighbouring clips' notes, painted flat.
+    ///
+    /// One canvas for all of them rather than an element per note: they carry
+    /// no listeners, no selection and no drag state, so there is nothing an
+    /// element would give them. A busy track's neighbours can be thousands of
+    /// notes, and this is the difference between showing the song and paying
+    /// for it every frame.
+    ///
+    /// Deliberately not editable. Routing a drag to whichever clip is under the
+    /// pointer is the next step, and drawing them as if they could be dragged
+    /// before that is true would be the lie.
+    pub(super) fn build_context_notes(
+        &self,
+        cx: &Context<Self>,
+        view_w: f32,
+        view_h: f32,
+    ) -> Option<gpui::AnyElement> {
+        let row_h = self.note_row_h();
+        if row_h <= 0.0 || view_w <= 0.0 || view_h <= 0.0 {
+            return None;
+        }
+
+        // Resolve to plain geometry here, while the timeline is open, so the
+        // paint closure owns everything it needs and borrows nothing.
+        let mut quads: Vec<(f32, f32, f32)> = Vec::new();
+        {
+            let tl = self.timeline.read(cx);
+            for span in self.scope.spans() {
+                if span.editable {
+                    continue;
+                }
+                let Some(notes) = tl.state.midi_clip_notes(&span.clip_id) else {
+                    continue;
+                };
+                for note in notes {
+                    // A note is stored against its own clip, so it is placed by
+                    // that clip's origin — not the edited one's.
+                    let x0 = self.project_beat_to_x(span.to_project(note.start));
+                    let x1 = self
+                        .project_beat_to_x(span.to_project(note.start + note.duration.max(0.0)));
+                    if x1 < 0.0 || x0 > view_w {
+                        continue;
+                    }
+                    let y = self.pitch_to_y(note.pitch);
+                    if y + row_h < 0.0 || y > view_h {
+                        continue;
+                    }
+                    quads.push((x0.max(0.0), (x1 - x0).max(1.0), y));
+                }
+            }
+        }
+        if quads.is_empty() {
+            return None;
+        }
+
+        // Dim enough to read as background, solid enough to see the shape of
+        // the part. The track colour would compete with the edited notes; this
+        // is deliberately colourless.
+        let fill_color = Colors::with_alpha(Colors::text_muted(), 0.30);
+        let height = (row_h - 1.0).max(1.0);
+        Some(
+            gpui::canvas(
+                |_bounds, _window, _cx| (),
+                move |bounds: gpui::Bounds<gpui::Pixels>, (), window, _cx| {
+                    let ox: f32 = bounds.origin.x.into();
+                    let oy: f32 = bounds.origin.y.into();
+                    window.paint_layer(bounds, |window| {
+                        for (x, w, y) in &quads {
+                            let rect = gpui::Bounds {
+                                origin: gpui::point(px(ox + x), px(oy + y)),
+                                size: gpui::size(px(*w), px(height)),
+                            };
+                            window.paint_quad(gpui::fill(rect, fill_color));
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .inset_0()
+            .into_any_element(),
+        )
     }
 
     pub(super) fn build_note_elements(
@@ -2660,7 +2830,7 @@ impl PianoRoll {
                 .filter(|n| self.channel_visible(n.channel))
                 .filter_map(|n| {
                     let d = self.display_note(n);
-                    let x = self.beat_to_x(d.start);
+                    let x = self.clip_beat_to_x(d.start);
                     let w = (d.duration * self.ppb).max(NOTE_MIN_W);
                     let y = self.pitch_to_y(d.pitch);
                     // Cull off-screen notes.
@@ -2866,7 +3036,7 @@ impl PianoRoll {
                 .filter(|n| self.channel_visible(n.channel))
                 .filter_map(|n| {
                     let d = self.display_note(n);
-                    let x = self.beat_to_x(d.start);
+                    let x = self.clip_beat_to_x(d.start);
                     if x < -8.0 || x > view_w {
                         return None;
                     }

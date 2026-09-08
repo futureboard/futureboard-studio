@@ -45,6 +45,7 @@ mod cc_lane;
 mod cc_lane_render;
 pub mod playhead;
 mod render;
+pub mod scope;
 
 /// Default note-row height (px per semitone). Reset-zoom restores this value so
 /// note height matches the editor's default density after Zoom Y changes.
@@ -973,6 +974,22 @@ pub struct PianoRoll {
     timeline: Entity<Timeline>,
     /// When `true`, commit logs use `[MIDI Editor]` (floating window instance).
     pub midi_editor_sink: bool,
+    /// Project beat the edited clip starts at, refreshed each render.
+    ///
+    /// Cached rather than read from the timeline on demand: every coordinate
+    /// conversion needs it, including the ones inside mouse handlers that have
+    /// no `Context` to read an entity through, and an origin that changed
+    /// mid-gesture would move the notes out from under the pointer.
+    edit_origin_beats: f32,
+    /// The clips on screen, refreshed each render.
+    scope: scope::EditorScope,
+    /// The clip the view was last framed for.
+    ///
+    /// With a project-beat axis, opening a clip that starts at bar 33 would
+    /// otherwise leave the view at bar 1 looking at empty grid. This is what
+    /// notices the target changed so the view can go to it — once, so a user
+    /// who then scrolls away is not dragged back every frame.
+    framed_clip_id: Option<String>,
     /// Where the playhead is this frame. Shared with the overlay entity below
     /// so the line can move without rebuilding the editor around it.
     playhead_frame: playhead::PianoRollPlayheadFrameCell,
@@ -1270,6 +1287,9 @@ impl PianoRoll {
         Self {
             timeline,
             midi_editor_sink: false,
+            edit_origin_beats: 0.0,
+            scope: scope::EditorScope::default(),
+            framed_clip_id: None,
             playhead_frame: std::rc::Rc::new(std::cell::Cell::new(
                 playhead::PianoRollPlayheadFrame::default(),
             )),
@@ -1973,12 +1993,41 @@ impl PianoRoll {
         self.snap_beats(beats)
     }
 
-    // ── Coordinate helpers (local px → beat / pitch) ──────────────────────
-    fn x_to_beat(&self, local_x: f32) -> f32 {
+    // ── Coordinate helpers ────────────────────────────────────────────────
+    //
+    // Two frames, and the names say which is which. The axis is project beats —
+    // what the ruler counts, and where the other clips on the track sit. Notes,
+    // CC points and articulations are stored against their own clip's start, so
+    // they go through the clip pair, which is the project pair plus the edited
+    // clip's origin.
+    //
+    // Before this the roll had one frame and called it `beat`, which worked
+    // exactly as long as the editor could only ever show one clip.
+
+    /// Project beat under a local x.
+    fn x_to_project_beat(&self, local_x: f32) -> f32 {
         local_x_to_beat(local_x, self.ppb, self.scroll_x)
     }
-    fn beat_to_x(&self, beat: f32) -> f32 {
+
+    /// Local x for a project beat.
+    fn project_beat_to_x(&self, beat: f32) -> f32 {
         beat_to_local_x(beat, self.ppb, self.scroll_x)
+    }
+
+    /// Where the edited clip starts, in project beats.
+    fn edit_origin(&self) -> f32 {
+        self.edit_origin_beats
+    }
+
+    /// Beat within the edited clip under a local x — the frame a note's
+    /// `start` is measured in.
+    fn x_to_clip_beat(&self, local_x: f32) -> f32 {
+        self.x_to_project_beat(local_x) - self.edit_origin()
+    }
+
+    /// Local x for a beat within the edited clip.
+    fn clip_beat_to_x(&self, beat: f32) -> f32 {
+        self.project_beat_to_x(beat + self.edit_origin())
     }
     fn y_to_pitch(&self, local_y: f32) -> u8 {
         local_y_to_pitch(local_y, self.scroll_y, self.row_h)
@@ -1999,7 +2048,7 @@ impl PianoRoll {
     }
 
     fn point_to_beat_pitch(&self, local_x: f32, local_y: f32) -> (f32, u8) {
-        (self.x_to_beat(local_x), self.y_to_pitch(local_y))
+        (self.x_to_clip_beat(local_x), self.y_to_pitch(local_y))
     }
 
     fn rects_intersect(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
@@ -2266,7 +2315,7 @@ impl PianoRoll {
             return;
         };
         let (clip_start, clip_len) = self.clip_meta(cx, &clip_id);
-        let rel_beat = self.x_to_beat(lx).clamp(0.0, clip_len.max(0.0));
+        let rel_beat = self.x_to_clip_beat(lx).clamp(0.0, clip_len.max(0.0));
         let project_beat = clip_start + rel_beat;
         self.timeline
             .update(cx, |tl, tcx| tl.seek_to_beat(project_beat, tcx));
@@ -2435,14 +2484,19 @@ impl PianoRoll {
         (self.total_pitch_h() - view_h.max(1.0)).max(0.0)
     }
 
-    fn max_scroll_x(&self, cx: &Context<Self>) -> f32 {
+    /// How far the view can scroll, in project pixels.
+    ///
+    /// The whole track, not the edited clip: the editor shows every clip on it,
+    /// and bounding the scroll to one of them would make the rest unreachable.
+    /// A little air past the last clip, so its final bar is not pinned to the
+    /// right edge with nothing after it.
+    fn max_scroll_x(&self, _cx: &Context<Self>) -> f32 {
         let (view_w, _) = self.grid_view_size();
-        self.editing_clip_id(cx)
-            .map(|clip_id| {
-                let (_, clip_len) = self.clip_meta(cx, &clip_id);
-                (clip_len * self.ppb - view_w).max(0.0)
-            })
-            .unwrap_or(0.0)
+        let Some((_, end)) = self.scope.extent() else {
+            return 0.0;
+        };
+        const TRAILING_BEATS: f32 = 4.0;
+        ((end + TRAILING_BEATS) * self.ppb - view_w).max(0.0)
     }
 
     fn clip_meta(&self, cx: &Context<Self>, clip_id: &str) -> (f32, f32) {
@@ -2516,11 +2570,14 @@ impl PianoRoll {
             let span = (max_end - min_start).max(1.0);
             let fit_w = (view_w - PIANO_ROLL_FIT_PAD_PX * 2.0).max(96.0);
             self.ppb = (fit_w / span).clamp(PIANO_ROLL_MIN_PPB, PIANO_ROLL_MAX_PPB);
-            self.scroll_x = (min_start * self.ppb - PIANO_ROLL_FIT_PAD_PX).max(0.0);
+            // The axis is project beats, so a clip-local note start has to be
+            // placed by the clip's origin before it can be scrolled to.
+            self.scroll_x =
+                ((self.edit_origin() + min_start) * self.ppb - PIANO_ROLL_FIT_PAD_PX).max(0.0);
         } else {
             let fit_w = (view_w - PIANO_ROLL_FIT_PAD_PX * 2.0).max(96.0);
             self.ppb = (fit_w / clip_len.max(1.0)).clamp(PIANO_ROLL_MIN_PPB, PIANO_ROLL_MAX_PPB);
-            self.scroll_x = 0.0;
+            self.scroll_x = (self.edit_origin() * self.ppb - PIANO_ROLL_FIT_PAD_PX).max(0.0);
         }
 
         if midi_debug_enabled() {
@@ -2698,7 +2755,7 @@ impl PianoRoll {
             PianoTool::Draw => {
                 let pitch = self.pitch_ctx.constrain_pitch(self.y_to_pitch(ly));
                 let unsnap = event.modifiers.shift;
-                let start = self.snap_beats_live(self.x_to_beat(lx), unsnap);
+                let start = self.snap_beats_live(self.x_to_clip_beat(lx), unsnap);
                 if midi_debug_enabled() {
                     if let Some((track_id, channel)) = self.preview_target(cx) {
                         eprintln!(
@@ -2821,7 +2878,7 @@ impl PianoRoll {
             }
             PianoTool::Split => {
                 if let Some((lx, _)) = self.grid_local(event.position) {
-                    let beat = self.x_to_beat(lx);
+                    let beat = self.x_to_clip_beat(lx);
                     self.split_note(id, beat, cx);
                 }
                 return;
@@ -3084,7 +3141,7 @@ impl PianoRoll {
             .filter(|note| self.channel_visible(note.channel))
             .filter_map(|note| {
                 let d = self.display_note(note);
-                let x = self.beat_to_x(d.start);
+                let x = self.clip_beat_to_x(d.start);
                 let distance = if lx < x {
                     x - lx
                 } else if lx > x + 8.0 {
@@ -3186,8 +3243,8 @@ impl PianoRoll {
         to_y: f32,
         cx: &mut Context<Self>,
     ) {
-        let lo_beat = self.x_to_beat(from_x.min(to_x) - 4.0);
-        let hi_beat = self.x_to_beat(from_x.max(to_x) + 4.0);
+        let lo_beat = self.x_to_clip_beat(from_x.min(to_x) - 4.0);
+        let hi_beat = self.x_to_clip_beat(from_x.max(to_x) + 4.0);
         let (clip_id, updates): (String, Vec<(u64, u8)>) = match &self.drag {
             PianoDrag::VelocityPaint {
                 clip_id,
@@ -3200,7 +3257,7 @@ impl PianoRoll {
                 let updates = original_notes[start..end]
                     .iter()
                     .map(|note| {
-                        let note_x = self.beat_to_x(note.start);
+                        let note_x = self.clip_beat_to_x(note.start);
                         let t = if dx.abs() <= 1.0e-6 {
                             1.0
                         } else {
@@ -3249,7 +3306,7 @@ impl PianoRoll {
         unsnap: bool,
         cx: &mut Context<Self>,
     ) {
-        let anchor_beat = self.snap_beats_live(self.x_to_beat(lx), unsnap);
+        let anchor_beat = self.snap_beats_live(self.x_to_clip_beat(lx), unsnap);
         let anchor_value = self.velocity_from_local_y(ly);
         let original_notes = self.velocity_gesture_notes(cx, &clip_id);
         self.drag = PianoDrag::VelocityLine {
@@ -3272,7 +3329,7 @@ impl PianoRoll {
             PianoDrag::VelocityLine { unsnap, .. } => *unsnap,
             _ => false,
         };
-        let cursor_beat = self.snap_beats_live(self.x_to_beat(lx), unsnap);
+        let cursor_beat = self.snap_beats_live(self.x_to_clip_beat(lx), unsnap);
         let cursor_value = self.velocity_from_local_y(ly);
         let selection = self.selection.clone();
         let (clip_id, updates, affected): (String, Vec<(u64, u8)>, HashSet<u64>) = match &self.drag
@@ -3376,7 +3433,7 @@ impl PianoRoll {
             .velocity_gesture_notes(cx, &clip_id)
             .into_iter()
             .filter(|note| {
-                let x = self.beat_to_x(note.start);
+                let x = self.clip_beat_to_x(note.start);
                 let bar_h = (((note.velocity as f32 - 1.0) / 126.0) * (lane_h - 8.0)).max(1.0);
                 Self::rects_intersect(rect, (x, lane_h - bar_h - 2.0, x + 8.0, lane_h - 2.0))
             })
@@ -3555,7 +3612,7 @@ impl PianoRoll {
         // Track the grid beat under the pointer so paste-at-mouse has an anchor.
         // Cheap field write, no repaint.
         if let Some((lx, ly)) = self.grid_local(event.position) {
-            self.hover_beat = Some(self.x_to_beat(lx));
+            self.hover_beat = Some(self.x_to_clip_beat(lx));
             self.hover_pitch = Some(self.y_to_pitch(ly));
         }
         match self.drag {
@@ -3699,7 +3756,7 @@ impl PianoRoll {
             }
             if let Some((lx, _)) = self.grid_local(event.position) {
                 let live_unsnap = matches!(self.drag, PianoDrag::DrawNote { unsnap: true, .. });
-                let beat = self.snap_beats_live(self.x_to_beat(lx), live_unsnap);
+                let beat = self.snap_beats_live(self.x_to_clip_beat(lx), live_unsnap);
                 if let PianoDrag::DrawNote { end_beat, .. } = &mut self.drag {
                     *end_beat = beat;
                     cx.notify();
@@ -4723,10 +4780,13 @@ impl PianoRoll {
                 playing,
             };
         };
-        let rel = playhead - clip.start_beat;
+        let _ = clip;
         playhead::PianoRollPlayheadFrame {
-            x: self.beat_to_x(rel),
-            visible: rel >= 0.0 && rel <= clip.duration_beats,
+            // Project beats, like the axis. The line is drawn wherever the
+            // transport is, including over the clips either side of the one
+            // being edited — which is the point of showing them.
+            x: self.project_beat_to_x(playhead),
+            visible: true,
             playing,
         }
     }
@@ -5649,8 +5709,8 @@ impl PianoRoll {
         let (view_w, view_h) = self.grid_view_size();
         let first_pitch = (self.y_to_pitch(view_h) as i32 - 1).max(0) as u8;
         let last_pitch = (self.y_to_pitch(0.0) as i32 + 1).min(PITCH_CNT - 1) as u8;
-        let start_beat = self.x_to_beat(0.0);
-        let end_beat = self.x_to_beat(view_w);
+        let start_beat = self.x_to_clip_beat(0.0);
+        let end_beat = self.x_to_clip_beat(view_w);
 
         let row_h = self.note_row_h();
         let tl = self.timeline.read(cx);
@@ -5659,7 +5719,7 @@ impl PianoRoll {
         if let Some(ns) = tl.state.midi_clip_notes(clip_id) {
             for n in ns {
                 let d = self.display_note(n);
-                let x = self.beat_to_x(d.start);
+                let x = self.clip_beat_to_x(d.start);
                 let w = (d.duration * self.ppb).max(3.0);
                 let y = self.pitch_to_y(d.pitch);
                 if x + w < 0.0 || x > view_w || y + row_h < 0.0 || y > view_h {
@@ -5689,7 +5749,7 @@ impl PianoRoll {
         let mut controller_points = Vec::new();
         if let Some(ps) = tl.state.controller_lane_points(clip_id, self.active_cc) {
             for p in ps {
-                let x = self.beat_to_x(p.beat);
+                let x = self.clip_beat_to_x(p.beat);
                 if x < -6.0 || x > view_w + 6.0 {
                     continue;
                 }

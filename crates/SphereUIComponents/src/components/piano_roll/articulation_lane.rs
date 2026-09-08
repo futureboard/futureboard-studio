@@ -62,7 +62,7 @@ impl PianoRoll {
         events
             .iter()
             .filter_map(|e| {
-                let dx = (self.beat_to_x(e.beat) - lx).abs();
+                let dx = (self.clip_beat_to_x(e.beat) - lx).abs();
                 (dx <= ART_MARKER_HIT_PX).then_some((e.id, dx))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -98,7 +98,7 @@ impl PianoRoll {
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
         };
-        let beat = self.snap_beats(self.x_to_beat(lx)).max(0.0);
+        let beat = self.snap_beats(self.x_to_clip_beat(lx)).max(0.0);
         let label = self
             .timeline
             .read(cx)
@@ -200,11 +200,11 @@ impl PianoRoll {
 
         let mut children: Vec<gpui::AnyElement> = Vec::new();
         for (i, event) in events.iter().enumerate() {
-            let x = self.beat_to_x(event.beat);
+            let x = self.clip_beat_to_x(event.beat);
             let end = events
                 .get(i + 1)
-                .map(|next| self.beat_to_x(next.beat))
-                .unwrap_or_else(|| self.beat_to_x(clip_len));
+                .map(|next| self.clip_beat_to_x(next.beat))
+                .unwrap_or_else(|| self.clip_beat_to_x(clip_len));
             // Cull regions fully outside the visible lane.
             if end < 0.0 || x > view_w {
                 continue;
@@ -389,7 +389,7 @@ impl PianoRoll {
                         return;
                     }
                     window.focus(&this.focus, cx);
-                    let beat = this.snap_beats(this.x_to_beat(lx)).max(0.0);
+                    let beat = this.snap_beats(this.x_to_clip_beat(lx)).max(0.0);
                     this.insert_articulation_at(&clip_id, beat, cx);
                 }),
             )

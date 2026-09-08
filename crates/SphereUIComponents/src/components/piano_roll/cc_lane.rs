@@ -212,7 +212,7 @@ impl PianoRoll {
         // distance instead — otherwise a wide drag would mint one point per
         // sample and bloat the lane far past any useful CC resolution.
         let min_gap = if unsnap || step_beats <= 0.0 {
-            (self.x_to_beat(CC_PAINT_SAMPLE_PX) - self.x_to_beat(0.0)).abs()
+            (self.x_to_clip_beat(CC_PAINT_SAMPLE_PX) - self.x_to_clip_beat(0.0)).abs()
         } else {
             0.0
         }
@@ -224,7 +224,9 @@ impl PianoRoll {
             let t = i as f32 / steps as f32;
             let x = from_x + dx * t;
             let y = from_y + dy * t;
-            let beat = self.snap_beats_live(self.x_to_beat(x), unsnap).max(0.0);
+            let beat = self
+                .snap_beats_live(self.x_to_clip_beat(x), unsnap)
+                .max(0.0);
             // Collapse samples that resolve to the same target (snapped strokes
             // land many pixels on one grid line).
             if let Some(previous) = last_beat {
@@ -284,7 +286,7 @@ impl PianoRoll {
         let points = tl.state.controller_lane_points(clip_id, kind)?;
         const R: f32 = 6.0;
         points.iter().find_map(|p| {
-            let x = self.beat_to_x(p.beat);
+            let x = self.clip_beat_to_x(p.beat);
             let y = Self::controller_y_for_value(p.value, cc_h);
             ((lx - x).abs() <= R && (ly - y).abs() <= R).then_some(p.id)
         })
@@ -365,7 +367,7 @@ impl PianoRoll {
         let anchor_value = *anchor_value;
         let unsnap = *unsnap;
         let kind = self.active_cc;
-        let cur_beat = self.snap_beats_live(self.x_to_beat(lx).max(0.0), unsnap);
+        let cur_beat = self.snap_beats_live(self.x_to_clip_beat(lx).max(0.0), unsnap);
         let (_, cc_h) = self.cc_view_size();
         let cur_value = (1.0 - (ly / cc_h.max(1.0))).clamp(0.0, 1.0);
         let d_beat = cur_beat - anchor_beat;
@@ -465,7 +467,7 @@ impl PianoRoll {
                 points
                     .iter()
                     .filter(|point| {
-                        let x = self.beat_to_x(point.beat);
+                        let x = self.clip_beat_to_x(point.beat);
                         let y = Self::controller_y_for_value(point.value, view_h);
                         x >= rect.0 && x <= rect.2 && y >= rect.1 && y <= rect.3
                     })
@@ -681,7 +683,9 @@ impl PianoRoll {
                 .controller_points_snapshot(&clip_id, kind),
         );
         self.cc_edit_target = Some((clip_id.clone(), kind));
-        let anchor_beat = self.snap_beats_live(self.x_to_beat(lx), unsnap).max(0.0);
+        let anchor_beat = self
+            .snap_beats_live(self.x_to_clip_beat(lx), unsnap)
+            .max(0.0);
         let (_, cc_h) = self.cc_view_size();
         let anchor_value = (1.0 - (ly / cc_h.max(1.0))).clamp(0.0, 1.0);
         self.drag = PianoDrag::CcLine {
@@ -715,7 +719,9 @@ impl PianoRoll {
             PianoDrag::CcLine { unsnap, .. } => *unsnap,
             _ => false,
         };
-        let cur_beat = self.snap_beats_live(self.x_to_beat(lx), unsnap).max(0.0);
+        let cur_beat = self
+            .snap_beats_live(self.x_to_clip_beat(lx), unsnap)
+            .max(0.0);
         let (_, cc_h) = self.cc_view_size();
         let cur_value = (1.0 - (ly / cc_h.max(1.0))).clamp(0.0, 1.0);
         self.drag_value_status = Some(format!(
@@ -828,7 +834,7 @@ impl PianoRoll {
             // so one cursor over the points serves every column.
             let mut cursor = 0usize;
             for col in 0..=num_cols {
-                let beat = self.x_to_beat(col as f32).max(0.0);
+                let beat = self.x_to_clip_beat(col as f32).max(0.0);
                 let value = if points.is_empty() {
                     default_value.clamp(0.0, 1.0)
                 } else {
@@ -853,7 +859,7 @@ impl PianoRoll {
             }
 
             for p in &points {
-                let x = self.beat_to_x(p.beat);
+                let x = self.clip_beat_to_x(p.beat);
                 if x < -HANDLE_R || x > view_w + HANDLE_R {
                     continue;
                 }
@@ -1091,7 +1097,7 @@ impl PianoRoll {
 
     fn build_cc_curve_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (lx, ly) = self.open_cc_curve_menu?;
-        let click_beat = self.x_to_beat(lx);
+        let click_beat = self.x_to_clip_beat(lx);
         let mut panel = div()
             .absolute()
             .left(px(lx.clamp(4.0, 240.0)))
