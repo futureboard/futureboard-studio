@@ -3,9 +3,13 @@ use gpui::{
     canvas, div, fill, px, Bounds, IntoElement, ParentElement, Pixels, Point, Size, Styled,
 };
 
-/// Segment thresholds shared by every meter variant (fraction of full scale).
-const METER_GREEN_TOP: f32 = 0.70;
-const METER_YELLOW_TOP: f32 = 0.90;
+/// Segment thresholds, shared by every meter variant.
+///
+/// Stated in dB rather than as fractions of a bar, because that is where a mix
+/// engineer already thinks and because the bar's own height is now a function
+/// of dB — a fraction here would have to be kept in step with that by hand.
+const METER_GREEN_TOP_DB: f32 = -12.0;
+const METER_YELLOW_TOP_DB: f32 = -3.0;
 
 // ── The dB scale ────────────────────────────────────────────────────────────
 //
@@ -94,116 +98,6 @@ pub fn meter_surface(
     )
 }
 
-/// The mixer's meter: the same bars, positioned in decibels.
-///
-/// Separate from [`meter_surface`] rather than replacing it, because the two
-/// answer different questions. The track header's meter is a glance — is this
-/// channel making sound — and a linear bar answers it. The mixer's meter is
-/// read against a printed scale, and a scale is a promise about where a number
-/// lands.
-///
-/// The colour bands move with it: they are stated in dB here, where a mix
-/// engineer already thinks in them, instead of as fractions of a bar.
-pub fn meter_surface_db(
-    level_l: f32,
-    level_r: f32,
-    hold_l: f32,
-    hold_r: f32,
-    clip: bool,
-) -> impl IntoElement {
-    let bar_w = 5.0_f32;
-    let gap = 1.0_f32;
-    let total_w = bar_w * 2.0 + gap;
-    div().w(px(total_w)).h_full().child(
-        canvas(
-            |_bounds, _window, _cx| (),
-            move |bounds, _state, window, _cx| {
-                paint_meter_bar_db(bounds, 0.0, bar_w, level_l, hold_l, window);
-                paint_meter_bar_db(bounds, bar_w + gap, bar_w, level_r, hold_r, window);
-                if clip {
-                    paint_clip_cap(bounds, total_w, window);
-                }
-            },
-        )
-        .size_full(),
-    )
-}
-
-/// Top of the green band. Below this is headroom a mix lives in.
-const METER_GREEN_TOP_DB: f32 = -12.0;
-/// Top of the yellow band. Above it is the last 3 dB before clipping.
-const METER_YELLOW_TOP_DB: f32 = -3.0;
-
-/// One channel bar, positioned in dB. Mirrors [`paint_meter_bar`] segment for
-/// segment; only the mapping from level to height differs.
-fn paint_meter_bar_db(
-    canvas_bounds: Bounds<Pixels>,
-    x_offset: f32,
-    width: f32,
-    level: f32,
-    hold: f32,
-    window: &mut gpui::Window,
-) {
-    let origin_x = f32::from(canvas_bounds.origin.x) + x_offset;
-    let origin_y = f32::from(canvas_bounds.origin.y);
-    let h = f32::from(canvas_bounds.size.height).max(0.0);
-    if h <= 0.0 {
-        return;
-    }
-    let bottom = origin_y + h;
-
-    let rect = |y: f32, height: f32| Bounds {
-        origin: Point {
-            x: px(origin_x),
-            y: px(y),
-        },
-        size: Size {
-            width: px(width),
-            height: px(height.max(0.0)),
-        },
-    };
-
-    window.paint_quad(fill(rect(origin_y, h), Colors::meter_rail()));
-
-    let level_n = amplitude_fraction(level);
-    if level_n <= 0.0 {
-        return;
-    }
-    let green_top = db_fraction(METER_GREEN_TOP_DB);
-    let yellow_top = db_fraction(METER_YELLOW_TOP_DB);
-
-    let green_n = level_n.min(green_top);
-    let yellow_n = (level_n.min(yellow_top) - green_n).max(0.0);
-    let red_n = (level_n - green_n - yellow_n).max(0.0);
-
-    let green_h = green_n * h;
-    let yellow_h = yellow_n * h;
-    let red_h = red_n * h;
-
-    if green_h > 0.0 {
-        window.paint_quad(fill(rect(bottom - green_h, green_h), Colors::meter_low()));
-    }
-    if yellow_h > 0.0 {
-        window.paint_quad(fill(
-            rect(bottom - green_h - yellow_h, yellow_h),
-            Colors::meter_mid(),
-        ));
-    }
-    if red_h > 0.0 {
-        window.paint_quad(fill(
-            rect(bottom - green_h - yellow_h - red_h, red_h),
-            Colors::meter_high(),
-        ));
-    }
-
-    let hold_n = amplitude_fraction(hold);
-    if hold_n > 0.0 {
-        let tick_h = 2.0_f32;
-        let tick_y = (bottom - hold_n * h - tick_h * 0.5).clamp(origin_y, bottom - tick_h);
-        window.paint_quad(fill(rect(tick_y, tick_h), Colors::text_primary()));
-    }
-}
-
 /// Paint a clip-indicator cap across the top of the meter (both bars) when a
 /// channel reached 0 dBFS. Latched/released by the meter poll.
 fn paint_clip_cap(canvas_bounds: Bounds<Pixels>, width: f32, window: &mut gpui::Window) {
@@ -251,13 +145,12 @@ fn paint_meter_bar(
     // Rail (full-height background track).
     window.paint_quad(fill(rect(origin_y, h), Colors::meter_rail()));
 
-    let level_n = level.clamp(0.0, 1.0);
-    let green_n = level_n.min(METER_GREEN_TOP);
-    let yellow_n = if level_n > green_n {
-        (level_n - green_n).min(METER_YELLOW_TOP - METER_GREEN_TOP)
-    } else {
-        0.0
-    };
+    let level_n = amplitude_fraction(level);
+    if level_n <= 0.0 {
+        return;
+    }
+    let green_n = level_n.min(db_fraction(METER_GREEN_TOP_DB));
+    let yellow_n = (level_n.min(db_fraction(METER_YELLOW_TOP_DB)) - green_n).max(0.0);
     let red_n = (level_n - green_n - yellow_n).max(0.0);
 
     let green_h = green_n * h;
@@ -281,7 +174,7 @@ fn paint_meter_bar(
     }
 
     // Peak-hold tick: a thin bright marker at the held-peak position.
-    let hold_n = hold.clamp(0.0, 1.0);
+    let hold_n = amplitude_fraction(hold);
     if hold_n > 0.0 {
         let tick_h = 2.0_f32;
         let tick_y = (bottom - hold_n * h - tick_h * 0.5).clamp(origin_y, bottom - tick_h);
@@ -317,10 +210,10 @@ pub fn vu_meter_vertical_full(level_l: f32, level_r: f32) -> impl IntoElement {
     let gap = 1.0_f32;
 
     let draw_bar = |level: f32| {
-        let green_pct = 0.70_f32;
-        let yellow_pct = 0.90_f32;
+        let green_pct = db_fraction(METER_GREEN_TOP_DB);
+        let yellow_pct = db_fraction(METER_YELLOW_TOP_DB);
 
-        let level_n = level.clamp(0.0, 1.0);
+        let level_n = amplitude_fraction(level);
         let green_n = level_n.min(green_pct);
         let yellow_n = if level_n > green_n {
             (level_n - green_n).min(yellow_pct - green_pct)
@@ -395,10 +288,10 @@ fn vu_meter_sized(
 ) -> impl IntoElement {
     let draw_bar = |level: f32| {
         let total_height = height.max(1.0);
-        let green_pct = 0.70;
-        let yellow_pct = 0.90;
+        let green_pct = db_fraction(METER_GREEN_TOP_DB);
+        let yellow_pct = db_fraction(METER_YELLOW_TOP_DB);
 
-        let level_h = (level.clamp(0.0, 1.0) * total_height).round();
+        let level_h = (amplitude_fraction(level) * total_height).round();
         let green_h = level_h.min((green_pct * total_height).round());
         let yellow_h = if level_h > green_h {
             (level_h - green_h).min(((yellow_pct - green_pct) * total_height).round())
@@ -536,13 +429,9 @@ fn paint_meter_bar_horizontal(
 
     window.paint_quad(fill(rect(origin_x, w), Colors::meter_rail()));
 
-    let level_n = level.clamp(0.0, 1.0);
-    let green_n = level_n.min(METER_GREEN_TOP);
-    let yellow_n = if level_n > green_n {
-        (level_n - green_n).min(METER_YELLOW_TOP - METER_GREEN_TOP)
-    } else {
-        0.0
-    };
+    let level_n = amplitude_fraction(level);
+    let green_n = level_n.min(db_fraction(METER_GREEN_TOP_DB));
+    let yellow_n = (level_n.min(db_fraction(METER_YELLOW_TOP_DB)) - green_n).max(0.0);
     let red_n = (level_n - green_n - yellow_n).max(0.0);
 
     let green_w = green_n * w;
@@ -565,7 +454,7 @@ fn paint_meter_bar_horizontal(
         ));
     }
 
-    let hold_n = hold.clamp(0.0, 1.0);
+    let hold_n = amplitude_fraction(hold);
     if hold_n > 0.0 {
         let tick_w = 2.0_f32;
         let tick_x = (origin_x + hold_n * w - tick_w * 0.5).clamp(origin_x, origin_x + w - tick_w);

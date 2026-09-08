@@ -49,7 +49,7 @@ use crate::components::timeline::timeline_state::{
     vsti_output_child_insert_id, InsertLoadStatus, InsertSlotState, ListenMode, MasterBusState,
     MonitorBusState, SendSlotState, TrackOutputRouting, TrackState, TrackType, MASTER_TRACK_ID,
 };
-use crate::components::timeline::vu_meter::meter_surface_db;
+use crate::components::timeline::vu_meter::meter_surface;
 use crate::i18n::I18n;
 use crate::theme::{typography, Colors};
 
@@ -1240,7 +1240,7 @@ fn fader_area(
             Some(on_vol_reset),
         )
         .into_any_element(),
-        meter_surface_db(
+        meter_surface(
             track.meter_level_l,
             track.meter_level_r,
             track.meter_peak_hold_l,
@@ -1875,7 +1875,7 @@ pub(crate) fn master_strip(
                         Some(on_master_reset),
                     )
                     .into_any_element(),
-                    meter_surface_db(
+                    meter_surface(
                         master.meter_level_l,
                         master.meter_level_r,
                         master.meter_peak_hold_l,
@@ -2272,7 +2272,7 @@ pub(crate) fn monitor_strip(
                         Some(on_monitor_reset),
                     )
                     .into_any_element(),
-                    meter_surface_db(
+                    meter_surface(
                         monitor.meter_level_l,
                         monitor.meter_level_r,
                         monitor.meter_peak_hold_l,
