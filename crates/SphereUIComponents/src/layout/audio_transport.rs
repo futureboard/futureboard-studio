@@ -944,6 +944,9 @@ impl StudioLayout {
         // Realtime recording waveform preview (Part 1) — grow the preview clip
         // and append streamed peaks. Self-contained; notifies the timeline.
         self.update_recording_preview(cx);
+        // A take detached by Stop finishes on the writer's thread; this is
+        // where its files are collected. Cheap when there is none: a bool.
+        self.poll_recording_finalize(cx);
 
         let mut transport_display_changed = false;
         if stats.transport_playing {

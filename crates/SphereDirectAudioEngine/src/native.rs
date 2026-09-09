@@ -1089,6 +1089,22 @@ impl AudioEngine {
         self.inner.stop_recording()
     }
 
+    /// Detach the take without waiting for its files.
+    ///
+    /// Pair with [`Self::poll_stop_recording`]. The blocking `stop_recording`
+    /// above is the same two calls back to back, kept for callers that have
+    /// nothing to do while the disk works — the UI is not one of them.
+    pub fn begin_stop_recording(&self) -> Result<(), SphereAudioError> {
+        self.inner.begin_stop_recording()
+    }
+
+    /// Results of a detached take, or `None` while the writer is still going.
+    pub fn poll_stop_recording(
+        &self,
+    ) -> Option<Result<Vec<crate::types::JsRecordingResult>, SphereAudioError>> {
+        self.inner.poll_stop_recording()
+    }
+
     pub fn export_rauf_to_wav(
         &self,
         rauf_path: &str,

@@ -38,6 +38,13 @@ pub(crate) struct RecordingSessionState {
     pub midi_preview_updated_at: Instant,
     /// Invalidates an outstanding count-in timer when the user cancels/restarts.
     pub count_in_token: u64,
+    /// A take whose audio files the disk writer is still closing.
+    ///
+    /// Set when the engine detaches the take and cleared by
+    /// `poll_recording_finalize`. The UI stays in `Finalizing` in between,
+    /// which is now a state the user can actually see, because the thread that
+    /// draws is no longer the thread waiting on the disk.
+    pub awaiting_finalize: bool,
 }
 
 impl Default for RecordingSessionState {
@@ -50,6 +57,7 @@ impl Default for RecordingSessionState {
             midi_preview_dirty: false,
             midi_preview_updated_at: Instant::now() - Duration::from_secs(1),
             count_in_token: 0,
+            awaiting_finalize: false,
         }
     }
 }
@@ -671,16 +679,16 @@ impl StudioLayout {
             self.cancel_record_count_in(cx);
             return;
         }
-        // Stopping a take runs entirely on this thread, and every step of it can
-        // touch the disk or the audio device. Somewhere in here is the pause the
-        // user sees when a take ends, and reading the code does not say where:
-        // the writer streams during the take, so finalize should be a header
-        // rewrite, and `pause` should be a flag. Measured rather than guessed —
-        // `FUTUREBOARD_RECORDING_DEBUG=1` prints where the time went.
+        // Stopping a take used to block this thread until the disk writer had
+        // drained and closed its files — an unbounded wait on I/O, on the
+        // thread that draws, which is the application freezing at the end of
+        // every take.
         //
-        // Not a fix. Fixing it means not blocking this thread on the engine at
-        // all, which is a split of the engine's stop path, and doing that on a
-        // guess risks misplacing somebody's take.
+        // It does not any more. The engine detaches the take here, which is
+        // immediate, and the files are collected by `poll_recording_finalize`
+        // from the audio tick that already runs. `FUTUREBOARD_RECORDING_DEBUG=1`
+        // still prints where the time goes, because the point of this is that
+        // none of the steps below are allowed to grow one.
         let stop_debug = std::env::var_os("FUTUREBOARD_RECORDING_DEBUG").is_some();
         let stop_started = std::time::Instant::now();
         let mut mark = stop_started;
@@ -716,20 +724,18 @@ impl StudioLayout {
             step("engine pause");
 
             if engine_recording {
-                let results = match engine.stop_recording() {
-                    Ok(results) => results,
-                    Err(error) => {
-                        self.audio_bridge.last_error = Some(error.to_string());
-                        self.recording.ui_state = RecordingUiState::Failed {
-                            reason: error.to_string(),
-                        };
-                        eprintln!("[recording] stop failed: {error}");
-                        return;
-                    }
-                };
-                step("engine stop_recording (disk writer flush + finalize)");
-                self.commit_recording_results(cx, results);
-                step("commit audio results");
+                // Detach only. The writer closes the files on its own thread,
+                // and `poll_recording_finalize` picks them up.
+                if let Err(error) = engine.begin_stop_recording() {
+                    self.audio_bridge.last_error = Some(error.to_string());
+                    self.recording.ui_state = RecordingUiState::Failed {
+                        reason: error.to_string(),
+                    };
+                    eprintln!("[recording] stop failed: {error}");
+                    return;
+                }
+                step("engine detach take");
+                self.recording.awaiting_finalize = true;
             }
         } else if midi_results.is_empty() {
             self.recording.ui_state = RecordingUiState::Failed {
@@ -743,7 +749,12 @@ impl StudioLayout {
         step("commit midi results");
 
         if !matches!(self.recording.ui_state, RecordingUiState::Failed { .. }) {
-            self.recording.ui_state = RecordingUiState::Idle;
+            // Still finalizing means the audio files are not closed yet, so the
+            // take is not done and the state must not say it is. The poll below
+            // moves it to Idle when the writer hands the files over.
+            if !self.recording.awaiting_finalize {
+                self.recording.ui_state = RecordingUiState::Idle;
+            }
             if midi_committed {
                 self.audio_bridge.project_dirty = true;
                 self.audio_bridge.media_dirty = true;
@@ -751,6 +762,45 @@ impl StudioLayout {
             }
             cx.notify();
         }
+    }
+
+    /// Collect a detached take's files once the disk writer has closed them.
+    ///
+    /// Called from the audio tick, which already runs every frame. Cheap when
+    /// there is nothing to collect: one `Option` check, then a `try_recv` that
+    /// never waits.
+    pub(super) fn poll_recording_finalize(&mut self, cx: &mut Context<Self>) {
+        if !self.recording.awaiting_finalize {
+            return;
+        }
+        let Some(engine) = self.audio_bridge.engine.clone() else {
+            self.recording.awaiting_finalize = false;
+            return;
+        };
+        let Some(outcome) = engine.poll_stop_recording() else {
+            return;
+        };
+        self.recording.awaiting_finalize = false;
+
+        match outcome {
+            Ok(results) => {
+                if std::env::var_os("FUTUREBOARD_RECORDING_DEBUG").is_some() {
+                    eprintln!("[recording] finalize collected {} file(s)", results.len());
+                }
+                self.commit_recording_results(cx, results);
+                if !matches!(self.recording.ui_state, RecordingUiState::Failed { .. }) {
+                    self.recording.ui_state = RecordingUiState::Idle;
+                }
+            }
+            Err(error) => {
+                self.audio_bridge.last_error = Some(error.to_string());
+                self.recording.ui_state = RecordingUiState::Failed {
+                    reason: error.to_string(),
+                };
+                eprintln!("[recording] finalize failed: {error}");
+            }
+        }
+        cx.notify();
     }
 
     fn stop_recording_transport_ui(&mut self, cx: &mut Context<Self>) {

@@ -949,6 +949,11 @@ pub struct EngineInner {
     // Engine-owned live input stream for armed/monitored track meters.
     live_input: Mutex<Option<LiveInputHandle>>,
 
+    // A take that has been detached but whose files the disk writer is still
+    // closing. Held here so `stop_recording` no longer has to block its caller
+    // on the disk — see `begin_stop_recording` / `poll_stop_recording`.
+    pending_stop: Mutex<Option<PendingStopContext>>,
+
     // Capabilities of the open ASIO session (None otherwise). Set by
     // `open_daux`, cleared by `close_device_inner`.
     asio_caps: Mutex<Option<crate::backend::AsioSessionCaps>>,
@@ -974,6 +979,36 @@ struct AuditionRequests {
     pending: Mutex<Option<(u64, String)>>,
     ready: parking_lot::Condvar,
     worker_running: AtomicBool,
+}
+
+/// A take that has been detached, and what placing it will need once the disk
+/// writer is done. Held on the engine between `begin_stop_recording` and the
+/// poll that collects it.
+struct PendingStopContext {
+    pending: recording::PendingRecordingStop,
+    placement: TakePlacement,
+}
+
+impl PendingStopContext {
+    fn placement(&self) -> TakePlacement {
+        self.placement
+    }
+}
+
+/// What placing a finished take needs, and nothing else.
+///
+/// Split out from the pending handle so the blocking and polling paths can
+/// share one placement function without one of them having to fabricate a
+/// handle it has already consumed. A take must land on the same beat whichever
+/// way its stop was awaited; the cheapest way to guarantee that is for there to
+/// be one function and one set of inputs.
+#[derive(Clone, Copy)]
+struct TakePlacement {
+    armed_start_sample: u64,
+    first_capture_sample: u64,
+    live_tap: bool,
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    asio_tap: bool,
 }
 
 #[derive(Clone)]
@@ -1065,6 +1100,7 @@ impl EngineInner {
             recording: Mutex::new(None),
             input_test: Mutex::new(None),
             live_input: Mutex::new(None),
+            pending_stop: Mutex::new(None),
             asio_caps: Mutex::new(None),
             input_test_uses_session: std::sync::atomic::AtomicBool::new(false),
             audition_requests: Arc::new(AuditionRequests::default()),
@@ -3680,7 +3716,19 @@ impl EngineInner {
     /// new one: new take id, new file, new clip. There is no path that reuses a
     /// writer, and a second call without a second Record reports "no active
     /// recording session" rather than quietly appending to the last take.
+    /// Detach the take and wait for its files, on this thread.
+    ///
+    /// The behaviour every caller had before the stop was split. Kept because a
+    /// shutdown path and a test both genuinely want to block; the UI does not,
+    /// and uses `begin_stop_recording` + `poll_stop_recording` instead.
     pub fn stop_recording(&self) -> Result<Vec<JsRecordingResult>, SphereAudioError> {
+        self.begin_stop_recording()?;
+        self.wait_stop_recording()
+    }
+
+    /// Detach the take. Returns as soon as capture has stopped; the files are
+    /// closed on the writer's thread and collected by [`Self::poll_stop_recording`].
+    pub fn begin_stop_recording(&self) -> Result<(), SphereAudioError> {
         let session = self.recording.lock().take().ok_or_else(|| {
             SphereAudioError::NativeError("No active recording session".to_string())
         })?;
@@ -3731,7 +3779,73 @@ impl EngineInner {
         let armed_start_sample = session.armed_start_sample;
         let first_capture_sample = session.first_capture_sample.load(Ordering::Relaxed);
 
-        let mut results = recording::stop_recording(session)?;
+        let pending = recording::begin_stop_recording(session);
+        *self.pending_stop.lock() = Some(PendingStopContext {
+            pending,
+            placement: TakePlacement {
+                armed_start_sample,
+                first_capture_sample,
+                live_tap,
+                #[cfg(all(target_os = "windows", feature = "asio"))]
+                asio_tap,
+            },
+        });
+        Ok(())
+    }
+
+    /// Results of a detached take, or `None` while the writer is still going.
+    ///
+    /// Never blocks. The caller polls this from wherever it already ticks; the
+    /// take's files close on the writer's thread and the UI keeps drawing.
+    pub fn poll_stop_recording(&self) -> Option<Result<Vec<JsRecordingResult>, SphereAudioError>> {
+        let ready = {
+            let mut slot = self.pending_stop.lock();
+            let context = slot.as_mut()?;
+            match context.pending.poll() {
+                None => return None,
+                Some(Err(error)) => {
+                    *slot = None;
+                    return Some(Err(error));
+                }
+                Some(Ok(results)) => {
+                    let context = slot.take().expect("checked above");
+                    (results, context)
+                }
+            }
+        };
+        let (results, context) = ready;
+        Some(Ok(self.finish_stop_recording(results, context.placement())))
+    }
+
+    /// Block until a detached take's files are closed.
+    ///
+    /// The behaviour `stop_recording` always had, for callers with nothing else
+    /// to do — shutdown, and tests that want the files on the next line.
+    pub fn wait_stop_recording(&self) -> Result<Vec<JsRecordingResult>, SphereAudioError> {
+        let Some(context) = self.pending_stop.lock().take() else {
+            return Ok(Vec::new());
+        };
+        let placement = context.placement();
+        let results = context.pending.wait()?;
+        Ok(self.finish_stop_recording(results, placement))
+    }
+
+    /// Everything that happens once a take's files are closed: release the
+    /// taps, place the audio against the tempo map, re-sync monitoring.
+    ///
+    /// Identical whichever way the caller waited, which is why it is one
+    /// function — a take placed differently depending on how the stop was
+    /// awaited would be the worst possible outcome of this split.
+    fn finish_stop_recording(
+        &self,
+        mut results: Vec<JsRecordingResult>,
+        placement: TakePlacement,
+    ) -> Vec<JsRecordingResult> {
+        let live_tap = placement.live_tap;
+        let armed_start_sample = placement.armed_start_sample;
+        let first_capture_sample = placement.first_capture_sample;
+        #[cfg(all(target_os = "windows", feature = "asio"))]
+        let asio_tap = placement.asio_tap;
 
         if live_tap {
             if let Some(handle) = self.live_input.lock().as_ref() {
@@ -3817,7 +3931,7 @@ impl EngineInner {
         if let Some(snapshot) = self.project.lock().clone() {
             let _ = self.sync_live_input_stream(&snapshot);
         }
-        Ok(results)
+        results
     }
 
     /// Snapshot of current recording state (for UI status polling).

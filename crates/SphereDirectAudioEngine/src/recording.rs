@@ -1372,9 +1372,126 @@ pub(crate) fn start_recording_asio_tap(
 }
 
 /// Stop recording, finalize RAUF files, and return per-track results.
-pub fn stop_recording(
-    session: RecordingSession,
-) -> Result<Vec<JsRecordingResult>, SphereAudioError> {
+/// A take whose files the disk writer is still finalizing.
+///
+/// Detaching a take is immediate — flags cleared, capture dropped — but the
+/// writer then has to drain whatever is still queued and close its files, and
+/// that is disk work of unbounded duration. It used to be waited on inline,
+/// which meant the caller's thread stopped until the disk was done; on the UI
+/// thread that is the application freezing at the end of every take.
+///
+/// So the wait is a value. [`begin_stop_recording`] hands one back, and the
+/// caller chooses: [`Self::poll`] to check without waiting, or [`Self::wait`]
+/// to block as before.
+pub struct PendingRecordingStop {
+    results_rx: std::sync::mpsc::Receiver<Vec<RecordingResult>>,
+    shared: std::sync::Arc<crate::engine::SharedState>,
+    dropped_blocks: u64,
+    /// Guards against a `poll` after the results were already taken, which
+    /// would otherwise report a finalization timeout for a take that finished.
+    finished: bool,
+}
+
+impl PendingRecordingStop {
+    /// Results if the writer has finished, `None` while it is still going.
+    ///
+    /// Never blocks. Returns `Some(Err(..))` only when the writer died without
+    /// sending — a disconnected channel is a failed take, not a slow one.
+    pub fn poll(&mut self) -> Option<Result<Vec<JsRecordingResult>, SphereAudioError>> {
+        if self.finished {
+            return None;
+        }
+        match self.results_rx.try_recv() {
+            Ok(results) => {
+                self.finished = true;
+                Some(Ok(self.finish(results)))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.finished = true;
+                Some(Err(SphereAudioError::NativeError(
+                    "Recording writer stopped without finalizing the take".to_string(),
+                )))
+            }
+        }
+    }
+
+    /// Block until the writer finishes, as the inline path always did.
+    pub fn wait(mut self) -> Result<Vec<JsRecordingResult>, SphereAudioError> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        // Wait up to 60 s for the disk writer to flush and finalize.
+        let results = self
+            .results_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .map_err(|e| {
+                SphereAudioError::NativeError(format!("Recording finalization timed out: {e}"))
+            })?;
+        self.finished = true;
+        Ok(self.finish(results))
+    }
+
+    /// Everything that happens once the files are closed. Identical whichever
+    /// way the caller waited, which is the point of it being one function.
+    fn finish(&self, mut results: Vec<RecordingResult>) -> Vec<JsRecordingResult> {
+        // Round-trip latency the take must shift earlier by: the output play-out
+        // delay the performer heard plus the ADC→callback capture delay. Both are
+        // published from cpal timestamps during the take; either is 0 when the
+        // backend gives no timestamp, in which case no compensation is applied.
+        let latency_seconds = {
+            let out =
+                crate::engine::f32_load(self.shared.output_latency_secs.load(Ordering::Relaxed));
+            let inp = crate::engine::f32_load(
+                self.shared
+                    .record_input_latency_secs
+                    .load(Ordering::Relaxed),
+            );
+            (out + inp).clamp(0.0, 1.0) as f64
+        };
+
+        eprintln!(
+            "[SphereAudio] Recording stopped: {} file(s) finalized (round-trip latency {:.1} ms)",
+            results.len(),
+            latency_seconds * 1000.0
+        );
+
+        if self.dropped_blocks > 0 {
+            let dropped_blocks = self.dropped_blocks;
+            for result in &mut results {
+                result.success = false;
+                result.error = Some(format!(
+                    "Recording writer could not keep up; dropped {dropped_blocks} input block(s)"
+                ));
+            }
+        }
+
+        results
+            .into_iter()
+            .map(|r| JsRecordingResult {
+                track_id: r.track_id,
+                file_path: r.file_path,
+                relative_path: r.relative_path,
+                start_beat: r.start_beat,
+                duration_seconds: r.duration_seconds,
+                sample_rate: r.sample_rate,
+                channels: r.channels,
+                metadata_path: r.metadata_path,
+                sample_format: r.sample_format,
+                latency_seconds,
+                success: r.success,
+                error: r.error,
+            })
+            .collect()
+    }
+}
+
+/// Detach a take and hand back its finalization.
+///
+/// Everything here is immediate: flags cleared, the capture source dropped, the
+/// stop flag raised. What is left is the writer draining, and that is the
+/// returned handle's business.
+pub fn begin_stop_recording(session: RecordingSession) -> PendingRecordingStop {
     let owns_stream = session.owns_capture_stream();
     // Tell the callback to stop sending.
     session.recording_active.store(false, Ordering::Relaxed);
@@ -1411,62 +1528,23 @@ pub fn stop_recording(
     session.stop_flag.store(true, Ordering::Relaxed);
     drop(session.capture);
 
-    // Wait up to 60 s for the disk writer to flush and finalize.
-    let mut results = session
-        .results_rx
-        .recv_timeout(std::time::Duration::from_secs(60))
-        .map_err(|e| {
-            SphereAudioError::NativeError(format!("Recording finalization timed out: {e}"))
-        })?;
-
-    // Round-trip latency the take must shift earlier by: the output play-out
-    // delay the performer heard plus the ADC→callback capture delay. Both are
-    // published from cpal timestamps during the take; either is 0 when the
-    // backend gives no timestamp, in which case no compensation is applied.
-    let latency_seconds = {
-        let out =
-            crate::engine::f32_load(session.shared.output_latency_secs.load(Ordering::Relaxed));
-        let inp = crate::engine::f32_load(
-            session
-                .shared
-                .record_input_latency_secs
-                .load(Ordering::Relaxed),
-        );
-        (out + inp).clamp(0.0, 1.0) as f64
-    };
-
-    eprintln!(
-        "[SphereAudio] Recording stopped: {} file(s) finalized (round-trip latency {:.1} ms)",
-        results.len(),
-        latency_seconds * 1000.0
-    );
-
-    if dropped_blocks > 0 {
-        for result in &mut results {
-            result.success = false;
-            result.error = Some(format!(
-                "Recording writer could not keep up; dropped {dropped_blocks} input block(s)"
-            ));
-        }
+    PendingRecordingStop {
+        results_rx: session.results_rx,
+        shared: session.shared,
+        dropped_blocks,
+        finished: false,
     }
+}
 
-    Ok(results
-        .into_iter()
-        .map(|r| JsRecordingResult {
-            track_id: r.track_id,
-            file_path: r.file_path,
-            relative_path: r.relative_path,
-            start_beat: r.start_beat,
-            duration_seconds: r.duration_seconds,
-            sample_rate: r.sample_rate,
-            channels: r.channels,
-            metadata_path: r.metadata_path,
-            sample_format: r.sample_format,
-            latency_seconds,
-            success: r.success,
-            error: r.error,
-        })
-        .collect())
+/// Detach a take and wait for its files, on this thread.
+///
+/// The behaviour every caller had before the split, kept for the ones that
+/// genuinely want to block — a shutdown path has nothing else to do, and a test
+/// wants the files on the next line.
+pub fn stop_recording(
+    session: RecordingSession,
+) -> Result<Vec<JsRecordingResult>, SphereAudioError> {
+    begin_stop_recording(session).wait()
 }
 
 #[cfg(test)]
