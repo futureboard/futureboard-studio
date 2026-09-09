@@ -63,6 +63,19 @@ pub fn track_lane(
     let on_add = on_add_clip.clone();
     let track_id_add = track_id.clone();
 
+    // Where this track's clips are, for the empty-lane test in the press
+    // handler. Captured here because the handler cannot borrow the track.
+    let clips_ref: std::rc::Rc<Vec<(f32, f32)>> = std::rc::Rc::new(
+        track
+            .clips
+            .iter()
+            .map(|clip| {
+                let start = clip.start_beat;
+                (start, start + clip.duration_beats.max(0.0))
+            })
+            .collect(),
+    );
+
     let viewport_w = state.viewport.viewport_width.max(1.0);
 
     // Map clips — skip lanes outside the horizontal viewport.
@@ -190,6 +203,27 @@ pub fn track_lane(
                 let bypass_snap = event.modifiers.shift;
                 let snapped_beat = state_ref.snap_beats_with_bypass(click_beat, bypass_snap);
                 let click_count = event.click_count as u32;
+
+                // Both branches below create a clip, and both describe
+                // themselves as empty-lane gestures. Neither checked. They
+                // relied on the clip element above stopping the press from
+                // reaching here, which is a contract held by another file and
+                // one that evidently does not always hold — pressing a clip
+                // that was already selected created a new clip beside it.
+                //
+                // The lane decides for itself now. An invariant this cheap to
+                // test should not be an assumption about somebody else's event
+                // handling.
+                let over_existing_clip = clips_ref
+                    .iter()
+                    .any(|(start, end)| click_beat >= *start && click_beat <= *end);
+                if over_existing_clip {
+                    // Still select the track: pressing a lane is how a track is
+                    // chosen, and a press that lands on a clip is still a press
+                    // on that track.
+                    on_select(&track_id_select, window, cx);
+                    return;
+                }
 
                 if active_tool == TimelineTool::Pen {
                     on_add(
