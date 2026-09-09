@@ -142,6 +142,13 @@ impl PianoRoll {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus, cx);
+        // The lane spans the whole track like the grid above it, so a press
+        // in a neighbouring clip moves the editor there first — otherwise the
+        // point would be written into the clip that happens to be selected,
+        // at a beat that belongs to a different one.
+        if self.retarget_to_clip_under(lx, cx) {
+            return;
+        }
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
         };
@@ -412,6 +419,13 @@ impl PianoRoll {
         mode: MarqueeSelectionMode,
         cx: &mut Context<Self>,
     ) {
+        // The lane spans the whole track like the grid above it, so a press
+        // in a neighbouring clip moves the editor there first — otherwise the
+        // point would be written into the clip that happens to be selected,
+        // at a beat that belongs to a different one.
+        if self.retarget_to_clip_under(lx, cx) {
+            return;
+        }
         self.cc_selection_before_marquee = self.cc_selection.clone();
         self.drag = PianoDrag::CcSelect {
             clip_id,
@@ -669,6 +683,13 @@ impl PianoRoll {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus, cx);
+        // The lane spans the whole track like the grid above it, so a press
+        // in a neighbouring clip moves the editor there first — otherwise the
+        // point would be written into the clip that happens to be selected,
+        // at a beat that belongs to a different one.
+        if self.retarget_to_clip_under(lx, cx) {
+            return;
+        }
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
         };
@@ -934,6 +955,16 @@ impl PianoRoll {
             .controller_lane_points(clip_id, self.active_cc)
             .is_none_or(|points| points.is_empty());
         let curve = self.build_cc_curve(cx, clip_id);
+        // Where the clips divide. The lane spans the track and retargets the
+        // editor on a press, so the division has to be visible or the jump has
+        // no cause the user can see.
+        let (cc_view_w, cc_lane_h) = self.cc_view_size();
+        let clip_divisions = crate::components::piano_roll::scope::clip_division_lines(
+            &self.scope,
+            |beat| self.project_beat_to_x(beat),
+            cc_view_w,
+            cc_lane_h,
+        );
         let value_chip_el = matches!(
             self.drag,
             PianoDrag::CcPaint { .. } | PianoDrag::CcMove { .. } | PianoDrag::CcLine { .. }
@@ -971,6 +1002,7 @@ impl PianoRoll {
             .cursor(gpui::CursorStyle::Crosshair)
             .child(canvas)
             .children(grid)
+            .children(clip_divisions)
             .child(curve)
             .children(selection_overlay)
             .children(empty_state)

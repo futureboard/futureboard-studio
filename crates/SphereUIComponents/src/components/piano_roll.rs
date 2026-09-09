@@ -2847,7 +2847,7 @@ impl PianoRoll {
     /// Returns `true` when it moved, and the caller starts the gesture on the
     /// next press: the scope and the origin are only refreshed by a render, so
     /// continuing here would measure the new clip against the old frame.
-    fn retarget_to_clip_under(&mut self, lx: f32, cx: &mut Context<Self>) -> bool {
+    pub(super) fn retarget_to_clip_under(&mut self, lx: f32, cx: &mut Context<Self>) -> bool {
         let project_beat = self.x_to_project_beat(lx);
         let Some(owner) = self.scope.owner_at(project_beat) else {
             return false;

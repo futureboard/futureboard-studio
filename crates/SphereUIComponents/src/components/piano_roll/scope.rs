@@ -168,6 +168,46 @@ impl EditorScope {
     }
 }
 
+/// Clip-division lines for a lane, given a beat→x mapping and the lane height.
+///
+/// The grid draws its own, with shading and names; a lane is 60 px tall and has
+/// room for a line. It matters more here than it looks: the lanes now span the
+/// whole track and retarget the editor on a press, so without a visible
+/// division a click near a boundary moves the editor for no reason the user
+/// can see.
+pub fn clip_division_lines(
+    scope: &EditorScope,
+    beat_to_x: impl Fn(f32) -> f32,
+    view_w: f32,
+    lane_h: f32,
+) -> Vec<gpui::AnyElement> {
+    use gpui::{div, px, IntoElement, ParentElement, Styled};
+
+    let mut out: Vec<gpui::AnyElement> = Vec::new();
+    for span in scope.spans() {
+        for beat in [span.start_beat, span.end_beat()] {
+            let x = beat_to_x(beat);
+            if x < 0.0 || x > view_w {
+                continue;
+            }
+            out.push(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top_0()
+                    .w(px(1.0))
+                    .h(px(lane_h))
+                    .bg(crate::theme::Colors::with_alpha(
+                        crate::theme::Colors::accent_primary(),
+                        if span.editable { 0.45 } else { 0.22 },
+                    ))
+                    .into_any_element(),
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

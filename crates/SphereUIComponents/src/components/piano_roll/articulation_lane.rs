@@ -381,6 +381,11 @@ impl PianoRoll {
                     if ly <= ART_PALETTE_H {
                         return; // palette row handles its own clicks
                     }
+                    // The lane spans the track, so a press in a neighbouring
+                    // clip moves the editor there before anything is written.
+                    if this.retarget_to_clip_under(lx, cx) {
+                        return;
+                    }
                     let Some(clip_id) = this.editing_clip_id(cx) else {
                         return;
                     };
