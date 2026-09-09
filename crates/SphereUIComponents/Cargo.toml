@@ -136,5 +136,12 @@ x11-dl.workspace = true
 # midir's macOS backend (coremidi) pulls core-foundation 0.10.1, which conflicts
 # with gpui's pinned core-foundation =0.10.0. macOS falls back to an empty scan
 # until that pin is reconciled.
+# The AppKit container view a plug-in's NSView is attached inside. Same crates
+# and same pinned versions SphereWebView already uses for the CEF view on macOS
+# (components/plugin_editor_mac_region/appkit.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation = { workspace = true, features = ["NSGeometry"] }
+
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 midir.workspace = true

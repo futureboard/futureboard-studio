@@ -8034,6 +8034,8 @@ dependencies = [
  "image",
  "midir",
  "mixstation",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
  "pollster 0.4.0",
  "rand 0.9.4",
  "raw-window-handle",
