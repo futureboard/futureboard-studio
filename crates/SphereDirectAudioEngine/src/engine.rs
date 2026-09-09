@@ -2575,11 +2575,12 @@ impl EngineInner {
         snapshot.tracks[track_index].input_monitor = monitor_enabled;
         snapshot.tracks[track_index].input_source = input_source.clone();
 
-        if let Err(error) = self.sync_live_input_stream(snapshot) {
+        // `recording_guard` is still held — see `sync_live_input_stream_locked`.
+        if let Err(error) = self.sync_live_input_stream_locked(snapshot, &recording_guard) {
             snapshot.tracks[track_index].armed = old_armed;
             snapshot.tracks[track_index].input_monitor = old_monitor;
             snapshot.tracks[track_index].input_source = old_source;
-            let _ = self.sync_live_input_stream(snapshot);
+            let _ = self.sync_live_input_stream_locked(snapshot, &recording_guard);
             return Err(error);
         }
 
@@ -2655,7 +2656,7 @@ impl EngineInner {
                         self.jam_slot_for(&old_source),
                     ),
                 );
-                let _ = self.sync_live_input_stream(snapshot);
+                let _ = self.sync_live_input_stream_locked(snapshot, &recording_guard);
                 Err(error)
             }
         };
@@ -4261,9 +4262,36 @@ impl EngineInner {
             .map(|index| index as u32)
     }
 
+    /// Re-derive the standalone capture stream from `snapshot`.
+    ///
+    /// Takes the recording lock itself. A caller that already holds it must go
+    /// through [`Self::sync_live_input_stream_locked`] instead — `recording` is
+    /// a `parking_lot::Mutex`, which is not reentrant, so locking it a second
+    /// time on the same thread is a deadlock rather than a nested read. That is
+    /// what hung the app on pressing R: `update_track_input_state_inner` holds
+    /// the lock for the whole route change, and the take-owns-the-device guard
+    /// added inside this function locked it again. The UI thread parked on its
+    /// own guard and never came back, so the window stopped drawing before a
+    /// single line of this function's tracing could print.
     fn sync_live_input_stream(
         &self,
         snapshot: &EngineProjectSnapshot,
+    ) -> Result<(), SphereAudioError> {
+        let recording = self.recording.lock();
+        self.sync_live_input_stream_locked(snapshot, &recording)
+    }
+
+    /// The body of [`Self::sync_live_input_stream`], for callers that already
+    /// hold the recording lock.
+    ///
+    /// `recording` is taken by reference rather than as a `bool` on purpose:
+    /// the only way to produce one is to be holding the guard, so the call
+    /// cannot be made from a context that would deadlock on it. The invariant
+    /// is in the signature instead of in a comment somebody has to remember.
+    fn sync_live_input_stream_locked(
+        &self,
+        snapshot: &EngineProjectSnapshot,
+        recording: &Option<RecordingSession>,
     ) -> Result<(), SphereAudioError> {
         // Single-capture-stream invariant. While a take is running, the
         // recording stream *is* the live input: it owns the endpoint, and it is
@@ -4280,7 +4308,7 @@ impl EngineInner {
         //
         // Declining costs nothing: `stop_recording` restores this stream from
         // the last snapshot as soon as the take is finalized.
-        if !live_input_sync_may_touch_stream(self.recording.lock().is_some()) {
+        if !live_input_sync_may_touch_stream(recording.is_some()) {
             if recording_debug_enabled() {
                 eprintln!("[recording] live-input sync declined: the take owns the capture device");
             }
@@ -6503,6 +6531,70 @@ mod live_input_tests {
             live_input_sync_may_touch_stream(false),
             "with no take running the sync is the only thing that owns the stream"
         );
+    }
+
+    /// Pressing R on a track hung the application.
+    ///
+    /// `update_track_input_state_inner` holds the recording lock for the whole
+    /// route change — that is what stops a route from moving under a running
+    /// take. `sync_live_input_stream` then grew its own take-owns-the-device
+    /// guard, which locked the same `parking_lot::Mutex` a second time on the
+    /// same thread. Not a nested read: a deadlock. The UI thread parked on its
+    /// own guard, macOS put "Application Not Responding" on the window, and the
+    /// log stopped before this function could print anything at all — the arm
+    /// never reached a device, so there was nothing in the trace to follow.
+    ///
+    /// Run on a worker with a deadline, because the failure mode is a hang: a
+    /// same-thread call would take the test runner down with it rather than
+    /// report.
+    #[test]
+    fn arming_a_track_does_not_deadlock_on_the_recording_lock() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let engine = Arc::new(EngineInner::new());
+        // ASIO with no published capabilities returns from the sync before any
+        // device work, so this exercises the lock order and nothing else.
+        engine.daux_config.lock().backend = BackendKind::Asio;
+        *engine.project.lock() = Some(monitored_audio_snapshot());
+
+        let worker = Arc::clone(&engine);
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = worker.update_track_input_state(
+                "audio-1",
+                true,
+                false,
+                EngineTrackInputSourceSnapshot {
+                    device_id: Some("test-asio-driver".into()),
+                    channels: vec![0, 1],
+                },
+            );
+            let _ = tx.send(result.is_ok());
+        });
+
+        let armed = rx.recv_timeout(Duration::from_secs(10));
+        assert!(
+            armed.is_ok(),
+            "arming a track never returned: the route change is deadlocked on \
+             the recording lock it already holds"
+        );
+        assert_eq!(armed.unwrap(), true, "arming an audio track should succeed");
+        handle.join().expect("worker thread");
+    }
+
+    /// The guard is what makes the deadlock unrepresentable, so check it is
+    /// actually consulted: with a take running, the sync must decline to touch
+    /// the stream even when the caller hands it a snapshot that wants one.
+    #[test]
+    fn a_locked_sync_still_declines_while_a_take_owns_the_device() {
+        let engine = EngineInner::new();
+        engine.daux_config.lock().backend = BackendKind::Asio;
+
+        // `None` is "no take running" — the sync proceeds.
+        let result = engine.sync_live_input_stream_locked(&monitored_audio_snapshot(), &None);
+        assert!(result.is_ok());
     }
 
     #[test]
