@@ -63,6 +63,7 @@ mod performance_overlay;
 pub mod performance_window;
 pub mod piano_roll;
 pub mod plugin_content_host;
+pub mod plugin_editor_backend;
 pub mod plugin_editor_chrome;
 pub mod plugin_editor_window;
 pub mod plugin_format_badge;

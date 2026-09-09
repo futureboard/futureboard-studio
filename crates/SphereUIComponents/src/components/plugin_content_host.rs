@@ -37,8 +37,10 @@
 /// [`ContentChildHwnd::create`] — both are `None` — and reporting the first as
 /// the second is what put a Retry button on a dialog that could never succeed.
 ///
-/// `cfg!` rather than `#[cfg]` on purpose: both branches of every caller stay
-/// compiled and type-checked on every platform.
+/// Which backend each platform uses, and what it is therefore waiting for,
+/// live in [`crate::components::plugin_editor_backend`] — this constant is the
+/// content-child half of that answer and stays here, beside the stub it
+/// describes.
 pub const NATIVE_VIEW_EMBEDDING_SUPPORTED: bool = cfg!(target_os = "windows");
 
 /// Physical-pixel rect (relative to the parent client area) for the content

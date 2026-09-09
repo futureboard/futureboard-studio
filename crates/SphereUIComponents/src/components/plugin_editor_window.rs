@@ -26,8 +26,10 @@ use gpui::{
     Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 
-use crate::components::plugin_content_host::{
-    ContentChildHwnd, ContentRect, NATIVE_VIEW_EMBEDDING_SUPPORTED,
+use crate::components::plugin_content_host::{ContentChildHwnd, ContentRect};
+use crate::components::plugin_editor_backend::{
+    host_region_wait, local_native_view_ready, EditorBackendKind, HostRegionWait,
+    LocalEditorCompatibility,
 };
 use crate::components::plugin_editor_chrome::{
     open_preset_menu as open_preset_menu_window, preset_menu_size, render_chrome_tools,
@@ -228,42 +230,6 @@ enum PluginEditorStatus {
     Unsupported(String),
 }
 
-/// Shown when the platform has no native-view embedding at all.
-///
-/// Deliberately about the *editor window* and nothing else: whether the plug-in
-/// itself is loaded and processing is a separate question with its own
-/// reporting, and a message that guessed at it would be wrong half the time.
-const NO_NATIVE_EMBEDDING_MESSAGE: &str =
-    "Plug-in editor windows are not available on this platform yet. Futureboard \
-     opens a plug-in's own view by embedding it in this window, which currently \
-     has a Windows implementation only.";
-
-/// What "the window gave us no native parent handle" means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MissingParentHandle {
-    /// The window has one, it just is not ready this frame. Keep ticking.
-    WaitForWindow,
-    /// This platform never has one — `native_parent_handle` is a stub that
-    /// returns `None` unconditionally. Ticking is pointless and so is Retry.
-    PlatformUnsupported,
-}
-
-/// The two look identical at the call site (`None`), which is how a permanent
-/// platform gap ended up reported as "host region never became ready" with a
-/// Retry button next to it. `embedding_supported` is the only thing that
-/// separates them.
-///
-/// Split out so both answers are exercised on every platform: the branch that
-/// matters on macOS is never taken by a Windows build, and an untested branch
-/// on the platform that needs it is how this reads wrong in the first place.
-fn missing_parent_handle_outcome(embedding_supported: bool) -> MissingParentHandle {
-    if embedding_supported {
-        MissingParentHandle::WaitForWindow
-    } else {
-        MissingParentHandle::PlatformUnsupported
-    }
-}
-
 /// Phase 6: delays (ms) between visible-UI re-checks after a successful
 /// `IPlugView::attached`. Cap at the last entry — anything still blank past
 /// that turns into a surfaced failure.
@@ -271,6 +237,11 @@ const READY_PROBE_DELAYS_MS: &[u64] = &[100, 500, 1000, 3000, 5000];
 const DEFAULT_PLUGIN_EDITOR_CONTENT_SIZE: (i32, i32) = (900, 600);
 const MIN_PLUGIN_EDITOR_CONTENT_SIZE: i32 = 160;
 const MAX_PLUGIN_EDITOR_PREFERRED_SIZE: i32 = 4096;
+
+/// See [`PluginEditorWindow::unsupported_status_for`].
+fn unsupported_status(reason: &LocalEditorCompatibility) -> PluginEditorStatus {
+    PluginEditorStatus::Unsupported(reason.message().to_string())
+}
 
 pub struct PluginEditorWindow {
     pub track_id: String,
@@ -727,23 +698,56 @@ impl PluginEditorWindow {
     /// ticks will ever change it, and spinning `MAX_WAIT_TICKS` only delays a
     /// message that then blames a timeout for a platform that was never
     /// implemented.
-    fn note_missing_parent_handle(&mut self, mode: &str, cx: &mut Context<Self>) {
-        match missing_parent_handle_outcome(NATIVE_VIEW_EMBEDDING_SUPPORTED) {
-            MissingParentHandle::PlatformUnsupported => {
-                self.status =
-                    PluginEditorStatus::Unsupported(NO_NATIVE_EMBEDDING_MESSAGE.to_string());
-                if plugin_view_debug() {
-                    eprintln!(
-                        "[plugin-view] unsupported platform ({mode}) editor_id={}",
-                        self.editor_id()
-                    );
-                }
-                cx.notify();
+    /// The status a refused editor ends in.
+    ///
+    /// [`PluginEditorStatus::Unsupported`], never [`PluginEditorStatus::Failed`]
+    /// — the difference between them is the Retry button, and offering one for
+    /// a permanent refusal is a control that cannot do what it says.
+    fn unsupported_status_for(reason: &LocalEditorCompatibility) -> PluginEditorStatus {
+        unsupported_status(reason)
+    }
+
+    /// The host region is not ready. Whether that is worth waiting through is
+    /// the backend's question, not a shared one.
+    ///
+    /// The remote backend (Windows) really does get its parent handle a frame
+    /// or two late, so it waits. The local backend (macOS) is not waiting for a
+    /// handle at all — it has no foreign handle in its design — so a miss there
+    /// means the in-process view path is not built yet, and saying "never
+    /// became ready" would invent a timeout for a mechanism that was never
+    /// going to run.
+    fn note_host_region_not_ready(&mut self, cx: &mut Context<Self>) {
+        let backend = EditorBackendKind::current();
+        match host_region_wait(backend, local_native_view_ready()) {
+            HostRegionWait::KeepWaiting => {
+                // Named per backend so the log says what *this* platform is
+                // short of, not what another platform would have been.
+                self.note_waiting(backend.readiness().label(), cx);
             }
-            MissingParentHandle::WaitForWindow => {
-                self.note_waiting(&format!("no native parent handle ({mode})"), cx);
+            HostRegionWait::GiveUp(reason) => {
+                self.note_editor_unsupported(backend, reason, cx);
             }
         }
+    }
+
+    /// Report a permanent refusal with its reason. Never a panic, never a
+    /// fabricated timeout, and never a fallback window opened behind the
+    /// user's back.
+    fn note_editor_unsupported(
+        &mut self,
+        backend: EditorBackendKind,
+        reason: LocalEditorCompatibility,
+        cx: &mut Context<Self>,
+    ) {
+        eprintln!(
+            "[PluginEditorBackend] unsupported plugin='{}' insert={} backend={} reason={}",
+            self.display_name,
+            self.insert_id,
+            backend.label(),
+            reason.log_reason()
+        );
+        self.status = unsupported_status(&reason);
+        cx.notify();
     }
 
     fn note_waiting(&mut self, reason: &str, cx: &mut Context<Self>) {
@@ -842,7 +846,7 @@ impl PluginEditorWindow {
 
         // Phase 4/6: require a valid native parent handle before attaching.
         let Some(parent) = Self::native_parent_handle(window) else {
-            self.note_missing_parent_handle("in-process", cx);
+            self.note_host_region_not_ready(cx);
             return;
         };
         if plugin_view_debug() {
@@ -1298,7 +1302,7 @@ impl PluginEditorWindow {
 
         // 2. Need a valid GPUI top HWND before we can parent a content child.
         let Some(top) = Self::native_parent_handle(window) else {
-            self.note_missing_parent_handle("host mode", cx);
+            self.note_host_region_not_ready(cx);
             return;
         };
         let region = self.host_region_for(window);
@@ -2350,44 +2354,60 @@ pub(crate) fn open_plugin_editor_window(
 mod platform_support_tests {
     use super::*;
 
+    /// Every refusal must land on `Unsupported`, which is the variant whose
+    /// panel has no Retry. `Failed` keeps Retry, and retrying a platform that
+    /// has no implementation runs the same refusal again — the loop the macOS
+    /// dialog put people in.
     #[test]
-    fn a_platform_that_can_embed_waits_for_its_window() {
-        // On Windows the handle really does arrive a frame or two later, and
-        // giving up on the first miss would break opening an editor there.
-        assert_eq!(
-            missing_parent_handle_outcome(true),
-            MissingParentHandle::WaitForWindow
-        );
+    fn a_refused_editor_is_unsupported_not_failed() {
+        for reason in [
+            LocalEditorCompatibility::BackendNotImplemented,
+            LocalEditorCompatibility::UnsupportedSplitController,
+            LocalEditorCompatibility::ControllerCreationFailed,
+            LocalEditorCompatibility::ViewUnsupported,
+            LocalEditorCompatibility::ViewAttachFailed,
+        ] {
+            let status = unsupported_status(&reason);
+            match status {
+                PluginEditorStatus::Unsupported(message) => {
+                    assert_eq!(message, reason.message());
+                    assert!(!message.is_empty());
+                }
+                other => panic!("{reason:?} produced {other:?}, which offers Retry"),
+            }
+        }
     }
 
+    /// The window must not give up on the backend that works. A macOS change
+    /// that made Windows stop waiting for its parent handle would break the
+    /// platform that ships today.
     #[test]
-    fn a_platform_that_cannot_embed_says_so_instead_of_timing_out() {
-        // macOS: `native_parent_handle` returns `None` unconditionally, so the
-        // window used to spin out `MAX_WAIT_TICKS` and then report "host region
-        // never became ready" — a timeout, for something that was never going
-        // to happen — with a Retry button that re-ran the same refusal.
+    fn the_remote_backend_still_waits_for_its_parent_handle() {
         assert_eq!(
-            missing_parent_handle_outcome(false),
-            MissingParentHandle::PlatformUnsupported
+            host_region_wait(
+                EditorBackendKind::RemoteNativeWindow,
+                local_native_view_ready()
+            ),
+            HostRegionWait::KeepWaiting,
+            "Windows must keep waiting regardless of the local-view build-out"
         );
+        assert!(EditorBackendKind::RemoteNativeWindow.waits_for_foreign_parent_handle());
     }
 
+    /// What this build actually does when the host region is not ready.
     #[test]
-    fn the_platform_message_names_the_editor_not_the_plugin() {
-        // The plug-in may well be loaded and running; only its window is
-        // missing. Claiming otherwise sends people to debug the wrong thing.
-        assert!(NO_NATIVE_EMBEDDING_MESSAGE.contains("editor"));
-        assert!(!NO_NATIVE_EMBEDDING_MESSAGE.is_empty());
-    }
-
-    #[test]
-    fn the_windows_build_is_the_one_that_embeds() {
-        assert_eq!(
-            NATIVE_VIEW_EMBEDDING_SUPPORTED,
-            cfg!(target_os = "windows"),
-            "the constant is the single statement of which platforms have a \
-             content-child implementation; it must track the stub in \
-             `plugin_content_host`"
-        );
+    fn this_build_resolves_to_its_own_backend() {
+        let backend = EditorBackendKind::current();
+        let wait = host_region_wait(backend, local_native_view_ready());
+        if cfg!(target_os = "windows") {
+            assert_eq!(wait, HostRegionWait::KeepWaiting);
+        } else {
+            assert_eq!(
+                wait,
+                HostRegionWait::GiveUp(LocalEditorCompatibility::BackendNotImplemented),
+                "a platform without a finished backend reports it instead of \
+                 spinning out a wait it cannot win"
+            );
+        }
     }
 }
