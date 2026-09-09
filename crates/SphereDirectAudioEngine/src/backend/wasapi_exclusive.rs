@@ -26,11 +26,13 @@ use std::sync::Arc;
 use std::thread;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
+use windows::core::GUID;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     eMultimedia, eRender, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
     MMDeviceEnumerator, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-    AUDCLNT_STREAMFLAGS_NOPERSIST, DEVICE_STATE_ACTIVE,
+    AUDCLNT_STREAMFLAGS_NOPERSIST, DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    WAVEFORMATEXTENSIBLE_0,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -40,6 +42,7 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleO
 use crate::backend::render::{drain_commands, fill_output_f32, LocalAudioState};
 use crate::backend::DauxDeviceConfig;
 use crate::command::EngineCommand;
+use crate::dsp::dither::{DitheredOutput, OutputDither};
 use crate::engine::SharedState;
 use crate::error::SphereAudioError;
 use crate::runtime::RuntimeProject;
@@ -77,6 +80,213 @@ fn classify_hresult(code: i32, context: &str) -> String {
         _ => format!("HRESULT 0x{:08X}", code as u32),
     };
     format!("WASAPI Exclusive {context}: {detail}")
+}
+
+// ── Exclusive-mode sample words ──────────────────────────────────────────────
+
+const WAVE_FORMAT_PCM: u16 = 1;
+const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+// ksmedia.h subformat GUIDs.
+const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
+const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
+    GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+
+// KSAUDIO_SPEAKER_* layouts for the common channel counts.
+const SPEAKER_MONO: u32 = 0x4; // FRONT_CENTER
+const SPEAKER_STEREO: u32 = 0x3; // FRONT_LEFT | FRONT_RIGHT
+const SPEAKER_QUAD: u32 = 0x33;
+const SPEAKER_5POINT1: u32 = 0x3F;
+const SPEAKER_7POINT1_SURROUND: u32 = 0x63F;
+
+/// A channel mask for a device that did not give us one. Zero ("any layout")
+/// is legal but some drivers reject it in exclusive mode, so name the standard
+/// layout when the channel count has one.
+fn default_channel_mask(channels: u16) -> u32 {
+    match channels {
+        1 => SPEAKER_MONO,
+        2 => SPEAKER_STEREO,
+        4 => SPEAKER_QUAD,
+        6 => SPEAKER_5POINT1,
+        8 => SPEAKER_7POINT1_SURROUND,
+        // No standard layout: the low `channels` bits, which is what WASAPI
+        // itself does for an unlabelled multichannel endpoint.
+        n if n < 32 => (1u32 << n) - 1,
+        _ => 0,
+    }
+}
+
+/// The sample word an exclusive-mode stream hands the hardware.
+///
+/// Exclusive mode bypasses the Windows audio engine completely: no mixer, no
+/// resampler, no APO chain, no format conversion. Whatever word is negotiated
+/// is what the driver receives, so the preference order below is simply "how
+/// little has to happen to the engine's f32 mix to produce it".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeviceWord {
+    /// 32-bit float — the mix reaches the driver bit-for-bit, over-full-scale
+    /// samples included.
+    F32,
+    /// 24 valid bits left-justified in a 32-bit container. What most audio
+    /// interfaces actually run.
+    I24In32,
+    /// A 32-bit container declared fully valid. Written identically to
+    /// `I24In32` (a converter resolves 24 bits at best); only the declared
+    /// `wValidBitsPerSample` differs, and some drivers accept only this
+    /// spelling.
+    I32,
+    /// 24-bit packed, three bytes per sample.
+    I24,
+    /// 16-bit integer.
+    I16,
+}
+
+impl DeviceWord {
+    /// Probe order: least conversion first.
+    const PREFERENCE: &'static [DeviceWord] = &[
+        DeviceWord::F32,
+        DeviceWord::I24In32,
+        DeviceWord::I32,
+        DeviceWord::I24,
+        DeviceWord::I16,
+    ];
+
+    fn bytes(self) -> usize {
+        match self {
+            DeviceWord::F32 | DeviceWord::I24In32 | DeviceWord::I32 => 4,
+            DeviceWord::I24 => 3,
+            DeviceWord::I16 => 2,
+        }
+    }
+
+    fn container_bits(self) -> u16 {
+        (self.bytes() * 8) as u16
+    }
+
+    fn valid_bits(self) -> u16 {
+        match self {
+            DeviceWord::F32 | DeviceWord::I32 => 32,
+            DeviceWord::I24In32 | DeviceWord::I24 => 24,
+            DeviceWord::I16 => 16,
+        }
+    }
+
+    fn is_float(self) -> bool {
+        matches!(self, DeviceWord::F32)
+    }
+
+    /// Whether this word can also be offered as a plain 18-byte `WAVEFORMATEX`.
+    /// That form cannot express a channel mask or a valid-bit count, so it is
+    /// only legal up to stereo with every container bit valid — but it is the
+    /// only form some older drivers accept.
+    fn fits_plain_waveformatex(self, channels: u16) -> bool {
+        channels <= 2 && self.valid_bits() == self.container_bits()
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            DeviceWord::F32 => "32-bit float",
+            DeviceWord::I24In32 => "24-bit in 32-bit",
+            DeviceWord::I32 => "32-bit integer",
+            DeviceWord::I24 => "24-bit packed",
+            DeviceWord::I16 => "16-bit integer",
+        }
+    }
+}
+
+/// Build a candidate exclusive-mode format.
+///
+/// Always returns a `WAVEFORMATEXTENSIBLE`; `extensible == false` just sets
+/// `cbSize` to 0 and a legacy format tag, so the same value can be passed as a
+/// plain `WAVEFORMATEX` — WASAPI reads exactly `cbSize` extra bytes.
+fn build_wave_format(
+    word: DeviceWord,
+    channels: u16,
+    sample_rate: u32,
+    channel_mask: u32,
+    extensible: bool,
+) -> WAVEFORMATEXTENSIBLE {
+    let container_bits = word.container_bits();
+    let block_align = channels * (container_bits / 8);
+    let legacy_tag = if word.is_float() {
+        WAVE_FORMAT_IEEE_FLOAT
+    } else {
+        WAVE_FORMAT_PCM
+    };
+    WAVEFORMATEXTENSIBLE {
+        Format: WAVEFORMATEX {
+            wFormatTag: if extensible {
+                WAVE_FORMAT_EXTENSIBLE
+            } else {
+                legacy_tag
+            },
+            nChannels: channels,
+            nSamplesPerSec: sample_rate,
+            nAvgBytesPerSec: sample_rate * block_align as u32,
+            nBlockAlign: block_align,
+            wBitsPerSample: container_bits,
+            cbSize: if extensible { 22 } else { 0 },
+        },
+        Samples: WAVEFORMATEXTENSIBLE_0 {
+            wValidBitsPerSample: word.valid_bits(),
+        },
+        dwChannelMask: channel_mask,
+        SubFormat: if word.is_float() {
+            KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        } else {
+            KSDATAFORMAT_SUBTYPE_PCM
+        },
+    }
+}
+
+/// Write one block of engine `f32` into the driver's buffer in `word`.
+///
+/// # Safety
+///
+/// `dst` must point at `src.len() * word.bytes()` writable bytes — the buffer
+/// `IAudioRenderClient::GetBuffer` just handed back for exactly this many
+/// frames.
+#[inline]
+unsafe fn write_device_samples(
+    dst: *mut u8,
+    src: &[f32],
+    word: DeviceWord,
+    dither: &mut OutputDither,
+) {
+    match word {
+        DeviceWord::F32 => {
+            // Bit-exact: the driver gets the mix as the graph produced it.
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr().cast::<u8>(),
+                dst,
+                std::mem::size_of_val(src),
+            )
+        }
+        // Both spellings carry the same payload: 24 valid bits left-justified
+        // in the 32-bit word, low byte zero. `i32::dithered_from_f32` produces
+        // exactly that, and clips — the only bound in the whole output path,
+        // and only because an integer word cannot hold anything else.
+        DeviceWord::I24In32 | DeviceWord::I32 => {
+            for (i, &v) in src.iter().enumerate() {
+                let bytes = i32::dithered_from_f32(v, dither).to_le_bytes();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(i * 4), 4);
+            }
+        }
+        DeviceWord::I24 => {
+            for (i, &v) in src.iter().enumerate() {
+                // The same 24-bit value, right-shifted out of its container.
+                let bytes = (i32::dithered_from_f32(v, dither) >> 8).to_le_bytes();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(i * 3), 3);
+            }
+        }
+        DeviceWord::I16 => {
+            for (i, &v) in src.iter().enumerate() {
+                let bytes = i16::dithered_from_f32(v, dither).to_le_bytes();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(i * 2), 2);
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -289,7 +499,21 @@ unsafe fn open_exclusive_stream(
         }
     };
 
-    // ── Mix format (device's native format) ───────────────────────────────────
+    // ── Device format: what the hardware itself runs ──────────────────────────
+    //
+    // `GetMixFormat` describes the *shared-mode* engine — 32-bit float at the
+    // rate the Windows mixer happens to be running. Its channel count and
+    // channel mask are the device's and worth keeping, but it is not a promise
+    // about exclusive mode: there the driver takes this buffer directly, and
+    // plenty of interfaces accept only their native integer word.
+    //
+    // So read the layout out of the mix format, free it, and negotiate for
+    // real — every candidate word at the wanted rate, then the same list at the
+    // device's own rate. The first one `IsFormatSupported` accepts in EXCLUSIVE
+    // mode is what the DAC receives, with no mixer, no resampler, no APO and no
+    // format conversion anywhere in between. Before this the mix format was the
+    // only thing ever offered, so an interface that wants 24-in-32 could not
+    // open at all and the user was pushed back onto a shared-mode path.
     let mix_fmt = match client.GetMixFormat() {
         Ok(p) => p,
         Err(e) => {
@@ -304,32 +528,71 @@ unsafe fn open_exclusive_stream(
     }
 
     let native_sr = (*mix_fmt).nSamplesPerSec.max(1);
-    let device_ch = (*mix_fmt).nChannels as usize;
-    let block_align = (*mix_fmt).nBlockAlign as u32;
+    let device_ch = (*mix_fmt).nChannels.max(1);
+    let channel_mask = if (*mix_fmt).wFormatTag == WAVE_FORMAT_EXTENSIBLE && (*mix_fmt).cbSize >= 22
+    {
+        (*mix_fmt.cast::<WAVEFORMATEXTENSIBLE>()).dwChannelMask
+    } else {
+        default_channel_mask(device_ch)
+    };
+    windows::Win32::System::Com::CoTaskMemFree(Some(mix_fmt as *const _ as *const _));
 
-    // Negotiate the actual exclusive-mode sample rate. The device mix format is
-    // initialized as-is unless a *different* rate was requested — in which case
-    // it is only honoured when the device supports it in exclusive mode; we fall
-    // back to the device's native rate otherwise. `sample_rate` is the rate
-    // reported to the engine, so it must always equal the rate the hardware
-    // actually runs at — storing the requested rate while initializing the device
-    // at the native rate (the previous behaviour) desyncs transport/tempo/pitch.
-    // Stamping `nSamplesPerSec` requires updating `nAvgBytesPerSec` too or some
-    // drivers reject the format.
-    let mut sample_rate = requested_sr.unwrap_or(native_sr).max(1);
-    if sample_rate != native_sr {
-        (*mix_fmt).nSamplesPerSec = sample_rate;
-        (*mix_fmt).nAvgBytesPerSec = sample_rate.saturating_mul(block_align);
-        let probe = client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, mix_fmt, None);
-        if !probe.is_ok() {
-            eprintln!(
-                "[DAUx WASAPI Excl] Requested {sample_rate} Hz unsupported in exclusive mode — using device rate {native_sr} Hz"
-            );
-            sample_rate = native_sr;
-            (*mix_fmt).nSamplesPerSec = native_sr;
-            (*mix_fmt).nAvgBytesPerSec = native_sr.saturating_mul(block_align);
+    let wanted_sr = requested_sr.unwrap_or(native_sr).max(1);
+    // The rate reported to the engine must always be the rate the hardware
+    // actually runs at — storing the requested rate while the device runs at
+    // its native one desyncs transport, tempo and pitch.
+    let mut rates: Vec<u32> = vec![wanted_sr];
+    if native_sr != wanted_sr {
+        rates.push(native_sr);
+    }
+
+    let mut chosen: Option<(u32, DeviceWord, WAVEFORMATEXTENSIBLE)> = None;
+    'negotiate: for &rate in &rates {
+        for &word in DeviceWord::PREFERENCE {
+            for extensible in [true, false] {
+                if !extensible && !word.fits_plain_waveformatex(device_ch) {
+                    continue;
+                }
+                let candidate = build_wave_format(word, device_ch, rate, channel_mask, extensible);
+                let probe = client.IsFormatSupported(
+                    AUDCLNT_SHAREMODE_EXCLUSIVE,
+                    (&candidate as *const WAVEFORMATEXTENSIBLE).cast::<WAVEFORMATEX>(),
+                    None,
+                );
+                if probe.is_ok() {
+                    chosen = Some((rate, word, candidate));
+                    break 'negotiate;
+                }
+            }
         }
     }
+
+    let Some((sample_rate, word, wfx)) = chosen else {
+        let offered = rates
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let _ = info_tx.send(Err(format!(
+            "WASAPI Exclusive: '{device_name}' accepted no exclusive-mode format \
+             (tried 32-bit float, 24-in-32, 32-bit, 24-bit and 16-bit at {offered} Hz, \
+             {device_ch} ch). Enable exclusive mode in Windows Sound > Advanced, \
+             or choose a sample rate the device supports."
+        )));
+        return false;
+    };
+    let wfx_ptr = (&wfx as *const WAVEFORMATEXTENSIBLE).cast::<WAVEFORMATEX>();
+    let device_ch = device_ch as usize;
+    let frame_bytes = device_ch * word.bytes();
+    if sample_rate != wanted_sr {
+        eprintln!(
+            "[DAUx WASAPI Excl] Requested {wanted_sr} Hz unsupported in exclusive mode — using device rate {sample_rate} Hz"
+        );
+    }
+    eprintln!(
+        "[DAUx WASAPI Excl] Negotiated {} @ {sample_rate} Hz, {device_ch} ch — straight to the driver",
+        word.label()
+    );
 
     // ── Query device periods ───────────────────────────────────────────────────
     // hnsMinimumDevicePeriod is the minimum exclusive-mode period.
@@ -340,21 +603,16 @@ unsafe fn open_exclusive_stream(
     let requested_hns = (buf_frames as i64 * 10_000_000i64) / sample_rate as i64;
     let hns = requested_hns.max(min_period_hns.max(1));
 
-    // ── Check exclusive format support ────────────────────────────────────────
-    // IsFormatSupported returns an HRESULT directly (not a Result).
-    // For exclusive mode ppClosestMatch MUST be null.
-    let fmt_hr = client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, mix_fmt, None);
-    if !fmt_hr.is_ok() {
-        let _ = info_tx.send(Err(classify_hresult(fmt_hr.0, "IsFormatSupported")));
-        windows::Win32::System::Com::CoTaskMemFree(Some(mix_fmt as *const _ as *const _));
-        return false;
-    }
-
     // ── Initialize IAudioClient (exclusive event-driven) ──────────────────────
+    //
+    // Deliberately *not* AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM: that flag puts the
+    // Windows resampler back into the path, which is the one thing an exclusive
+    // stream exists to avoid. An unsupported format is refused above, never
+    // silently converted.
     let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST;
 
     let init_result =
-        client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, flags, hns, hns, mix_fmt, None);
+        client.Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, flags, hns, hns, wfx_ptr, None);
 
     // Handle BUFFER_SIZE_NOT_ALIGNED: re-create client with driver-aligned period.
     let client = match init_result {
@@ -368,9 +626,6 @@ unsafe fn open_exclusive_stream(
                     let _ = info_tx.send(Err(format!(
                         "WASAPI Exclusive: buffer not aligned; GetBufferSize failed: {e2}"
                     )));
-                    windows::Win32::System::Com::CoTaskMemFree(Some(
-                        mix_fmt as *const _ as *const _,
-                    ));
                     return false;
                 }
             };
@@ -386,9 +641,6 @@ unsafe fn open_exclusive_stream(
                     let _ = info_tx.send(Err(format!(
                         "WASAPI Exclusive: Re-Activate for alignment retry failed: {e2}"
                     )));
-                    windows::Win32::System::Com::CoTaskMemFree(Some(
-                        mix_fmt as *const _ as *const _,
-                    ));
                     return false;
                 }
             };
@@ -397,12 +649,11 @@ unsafe fn open_exclusive_stream(
                 flags,
                 aligned_hns,
                 aligned_hns,
-                mix_fmt,
+                wfx_ptr,
                 None,
             ) {
                 let msg = classify_hresult(e2.code().0, "Initialize (aligned retry)");
                 let _ = info_tx.send(Err(msg));
-                windows::Win32::System::Com::CoTaskMemFree(Some(mix_fmt as *const _ as *const _));
                 return false;
             }
             client2
@@ -410,12 +661,9 @@ unsafe fn open_exclusive_stream(
         Err(e) => {
             let msg = classify_hresult(e.code().0, "Initialize");
             let _ = info_tx.send(Err(msg));
-            windows::Win32::System::Com::CoTaskMemFree(Some(mix_fmt as *const _ as *const _));
             return false;
         }
     };
-
-    windows::Win32::System::Com::CoTaskMemFree(Some(mix_fmt as *const _ as *const _));
 
     // ── Actual buffer size ─────────────────────────────────────────────────────
     let actual_buf = match client.GetBufferSize() {
@@ -460,8 +708,13 @@ unsafe fn open_exclusive_stream(
     shared.sample_rate.store(sample_rate, Ordering::Relaxed);
     let _ = info_tx.send(Ok((sample_rate, actual_buf, device_name.to_string())));
     eprintln!(
-        "[DAUx WASAPI Excl] Stream ready: device='{}' sr={} buf={} ch={}",
-        device_name, sample_rate, actual_buf, device_ch
+        "[DAUx WASAPI Excl] Stream ready: device='{}' sr={} buf={} ch={} word={} ({} bytes/frame)",
+        device_name,
+        sample_rate,
+        actual_buf,
+        device_ch,
+        word.label(),
+        frame_bytes
     );
 
     // ── Runtime ───────────────────────────────────────────────────────────────
@@ -469,6 +722,10 @@ unsafe fn open_exclusive_stream(
     runtime.retarget_sample_rate(sample_rate);
     let mut local = LocalAudioState::with_monitor_capacity(sample_rate as f64, actual_buf as usize);
     let mut scratch = vec![0.0f32; actual_buf as usize * device_ch];
+    // Word-length reduction for the integer device words. One xorshift for the
+    // life of the stream, advanced per sample, never reseeded. Unused on the
+    // float path, where samples reach the driver untouched.
+    let mut dither = OutputDither::new();
 
     // ── Render loop ───────────────────────────────────────────────────────────
     loop {
@@ -516,17 +773,23 @@ unsafe fn open_exclusive_stream(
         // never exceeds `scratch.len()` here. Clamp defensively instead of
         // growing — growing would allocate on the audio thread.
         let total = out_len.min(scratch.len());
-        let s = &mut scratch[..total];
-        // `fill_output_f32` fully overwrites every sample of `s` on every
+        let block = &mut scratch[..total];
+        // `fill_output_f32` fully overwrites every sample of `block` on every
         // reachable path (see `backend/render.rs`) — no pre-zero needed.
-        fill_output_f32(s, device_ch, &mut runtime, shared, &mut local);
+        fill_output_f32(block, device_ch, &mut runtime, shared, &mut local);
 
-        let out: &mut [f32] = std::slice::from_raw_parts_mut(buf_ptr as *mut f32, out_len);
-        out[..total].copy_from_slice(s);
+        // Straight into the driver's own buffer in its own word. Float is a
+        // memcpy; the integer words quantize with dither at the resolution the
+        // converter actually resolves. Nothing between here and the DAC.
+        write_device_samples(buf_ptr, block, word, &mut dither);
         if total < out_len {
             // Unreachable in practice (see above) — silence rather than leave
             // the tail of the exclusive-mode buffer holding stale samples.
-            out[total..].fill(0.0);
+            std::ptr::write_bytes(
+                buf_ptr.add(total * word.bytes()),
+                0,
+                (out_len - total) * word.bytes(),
+            );
         }
 
         if let Err(e) = render.ReleaseBuffer(frames, 0) {
@@ -616,5 +879,122 @@ unsafe fn get_device_friendly_name(device: &IMMDevice) -> String {
 unsafe fn cleanup_mmcss(handle: isize) {
     if handle != 0 {
         AvRevertMmThreadCharacteristics(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Read a candidate back the way WASAPI does: the first `cbSize` bytes past
+    /// the 18-byte `WAVEFORMATEX` header are the extensible tail.
+    fn header(fmt: &WAVEFORMATEXTENSIBLE) -> WAVEFORMATEX {
+        fmt.Format
+    }
+
+    #[test]
+    fn extensible_candidates_declare_container_and_valid_bits() {
+        let fmt = build_wave_format(DeviceWord::I24In32, 2, 48_000, SPEAKER_STEREO, true);
+        let head = header(&fmt);
+        assert_eq!({ head.wFormatTag }, WAVE_FORMAT_EXTENSIBLE);
+        assert_eq!({ head.cbSize }, 22, "the extensible tail must be declared");
+        assert_eq!(
+            { head.wBitsPerSample },
+            32,
+            "24-in-32 is a 32-bit container"
+        );
+        assert_eq!(unsafe { fmt.Samples.wValidBitsPerSample }, 24);
+        assert_eq!({ fmt.SubFormat }, KSDATAFORMAT_SUBTYPE_PCM);
+        assert_eq!({ head.nBlockAlign }, 8, "2 ch x 4 bytes");
+        assert_eq!({ head.nAvgBytesPerSec }, 48_000 * 8);
+    }
+
+    #[test]
+    fn the_float_candidate_is_offered_first_and_is_ieee_float() {
+        assert_eq!(DeviceWord::PREFERENCE[0], DeviceWord::F32);
+        let fmt = build_wave_format(DeviceWord::F32, 2, 96_000, SPEAKER_STEREO, true);
+        assert_eq!({ fmt.SubFormat }, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        assert_eq!(unsafe { fmt.Samples.wValidBitsPerSample }, 32);
+    }
+
+    #[test]
+    fn the_plain_form_drops_the_tail_and_uses_a_legacy_tag() {
+        let fmt = build_wave_format(DeviceWord::I16, 2, 44_100, SPEAKER_STEREO, false);
+        let head = header(&fmt);
+        assert_eq!({ head.wFormatTag }, WAVE_FORMAT_PCM);
+        assert_eq!({ head.cbSize }, 0, "a plain WAVEFORMATEX has no tail");
+        assert_eq!({ head.nBlockAlign }, 4);
+
+        let float = build_wave_format(DeviceWord::F32, 2, 44_100, SPEAKER_STEREO, false);
+        assert_eq!({ header(&float).wFormatTag }, WAVE_FORMAT_IEEE_FLOAT);
+    }
+
+    #[test]
+    fn only_words_a_plain_waveformatex_can_describe_are_offered_in_that_form() {
+        // 24-in-32 needs wValidBitsPerSample, and >2 channels needs a mask.
+        assert!(!DeviceWord::I24In32.fits_plain_waveformatex(2));
+        assert!(DeviceWord::I16.fits_plain_waveformatex(2));
+        assert!(DeviceWord::F32.fits_plain_waveformatex(1));
+        assert!(!DeviceWord::F32.fits_plain_waveformatex(6));
+    }
+
+    #[test]
+    fn a_device_without_a_mask_still_gets_a_named_layout() {
+        assert_eq!(default_channel_mask(2), SPEAKER_STEREO);
+        assert_eq!(default_channel_mask(6), SPEAKER_5POINT1);
+        // No standard layout for 3 channels: the low bits, as WASAPI does.
+        assert_eq!(default_channel_mask(3), 0b111);
+    }
+
+    #[test]
+    fn float_reaches_the_driver_bit_for_bit() {
+        let src = [0.0f32, 0.5, -0.75, 1.9, -2.5];
+        let mut buf = vec![0u8; src.len() * 4];
+        let mut dither = OutputDither::new();
+        unsafe { write_device_samples(buf.as_mut_ptr(), &src, DeviceWord::F32, &mut dither) };
+
+        for (i, &expected) in src.iter().enumerate() {
+            let word = f32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+            assert_eq!(
+                word, expected,
+                "sample {i}: a float device buffer must carry the mix untouched,                  over full scale included"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_words_are_left_justified_and_clip_instead_of_wrapping() {
+        let src = [0.5f32, -0.5, 4.0, -4.0];
+        let mut dither = OutputDither::new();
+
+        let mut wide = vec![0u8; src.len() * 4];
+        unsafe { write_device_samples(wide.as_mut_ptr(), &src, DeviceWord::I24In32, &mut dither) };
+        let word = |i: usize| i32::from_le_bytes(wide[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(word(0) & 0xFF, 0, "24 valid bits sit in the high bytes");
+        assert!((word(0) - (1 << 30)).abs() <= 2 << 8, "0.5 -> {}", word(0));
+        // Past full scale an integer word has nowhere to go: clip, never wrap.
+        assert!(word(2) > 0 && word(3) < 0, "+4.0/-4.0 wrapped sign");
+        assert!(word(2) >= i32::MAX - 255);
+
+        let mut packed = vec![0u8; src.len() * 3];
+        unsafe { write_device_samples(packed.as_mut_ptr(), &src, DeviceWord::I24, &mut dither) };
+        let packed_word = |i: usize| {
+            let b = &packed[i * 3..i * 3 + 3];
+            // Sign-extend the 24-bit little-endian value.
+            ((i32::from(b[2]) << 24) | (i32::from(b[1]) << 16) | (i32::from(b[0]) << 8)) >> 8
+        };
+        assert!(packed_word(0) > 0 && packed_word(1) < 0);
+        assert_eq!(
+            packed_word(2),
+            0x7F_FFFF,
+            "+4.0 must clip to 24-bit full scale"
+        );
+        assert_eq!(packed_word(3), -0x80_0000);
+
+        let mut narrow = vec![0u8; src.len() * 2];
+        unsafe { write_device_samples(narrow.as_mut_ptr(), &src, DeviceWord::I16, &mut dither) };
+        let short = |i: usize| i16::from_le_bytes(narrow[i * 2..i * 2 + 2].try_into().unwrap());
+        assert_eq!(short(2), i16::MAX);
+        assert_eq!(short(3), i16::MIN);
     }
 }
