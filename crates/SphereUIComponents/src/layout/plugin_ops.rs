@@ -4362,7 +4362,9 @@ impl StudioLayout {
                     eprintln!(
                         "[PluginRestore] runtime instance already requested instance_id={slot_id}; reusing bridge"
                     );
-                    self.sync_plugin_bridge_sinks_to_engine(cx, "plugin_restore_reuse");
+                    if !self.plugin_restore_batch_active {
+                        self.sync_plugin_bridge_sinks_to_engine(cx, "plugin_restore_reuse");
+                    }
                     self.mark_dirty();
                     return true;
                 }
@@ -4450,16 +4452,24 @@ impl StudioLayout {
                     }
                 };
                 let _ = bridge_sink;
-                self.sync_plugin_bridge_sinks_to_engine(cx, "plugin_restore");
-                if let Some(engine) = self.audio_bridge.engine.as_ref() {
-                    eprintln!(
-                        "[PluginAdd] was_playing={} state_before={:?} source=plugin_restore",
-                        engine.transport_playing(),
-                        engine.engine_state(),
-                    );
-                }
+                // Publishing the sink and forcing a graph rebuild here is right
+                // for a plugin added by hand, and wrong for the dozen a project
+                // open restores: it rebuilt the whole engine graph once per
+                // plugin, each rebuild resolving every track, insert and buffer
+                // in the project. The restore driver does both once, after the
+                // batch, when every sink exists.
                 self.audio_bridge.project_dirty = true;
-                self.schedule_audio_project_sync(cx, true, "plugin_restore");
+                if !self.plugin_restore_batch_active {
+                    self.sync_plugin_bridge_sinks_to_engine(cx, "plugin_restore");
+                    if let Some(engine) = self.audio_bridge.engine.as_ref() {
+                        eprintln!(
+                            "[PluginAdd] was_playing={} state_before={:?} source=plugin_restore",
+                            engine.transport_playing(),
+                            engine.engine_state(),
+                        );
+                    }
+                    self.schedule_audio_project_sync(cx, true, "plugin_restore");
+                }
                 self.mark_dirty();
                 true
             }

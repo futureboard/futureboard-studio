@@ -126,7 +126,24 @@ impl StudioLayout {
                 return;
             }
 
-            let targets = entity.update(cx, |layout, cx| {
+            // ── Dispatch the whole batch ────────────────────────────────
+            //
+            // Every insert is an independent instance in the plugin host, and
+            // asking it to load one is a one-way message — so there was never
+            // anything to gain by waiting for one before requesting the next,
+            // and a great deal to lose. The loop used to `await` each plugin to
+            // a terminal state before it *dispatched* the one behind it, which
+            // made opening a project cost the sum of its plugins' load times
+            // instead of the longest of them, and left the host idle between
+            // each one. Worse, a plugin that never answered held its whole
+            // `PLUGIN_RESTORE_TIMEOUT` against everything behind it: two silent
+            // plugins in a project meant four minutes before the window opened,
+            // and the warning dialog at the end could not say which wait had
+            // cost what.
+            //
+            // The batch now goes to the host in one pass, and the wait below is
+            // one shared deadline over whatever has not answered yet.
+            let (targets, dispatched) = entity.update(cx, |layout, cx| {
                 layout.set_session_install_progress(
                     "Loading Plugins",
                     ProgressBarValue::value(0.2),
@@ -136,88 +153,105 @@ impl StudioLayout {
                 if !super::plugin_bridge_runtime::bridge_enabled() {
                     layout.schedule_audio_project_sync(cx, true, "session_install_in_process");
                 }
-                layout.collect_plugin_restore_targets(cx)
+                let targets = layout.collect_plugin_restore_targets(cx);
+
+                // Each load would otherwise force its own engine graph rebuild.
+                // The final sync after the wait covers the whole batch.
+                layout.plugin_restore_batch_active = true;
+                let mut dispatched = Vec::with_capacity(targets.len());
+                for target in &targets {
+                    let outcome = layout.restore_one_plugin_target(target, cx);
+                    let host_gone = outcome == PluginRestoreWaitOutcome::Disconnected;
+                    dispatched.push(outcome);
+                    if host_gone {
+                        // Nothing behind this can load either.
+                        break;
+                    }
+                }
+                layout.plugin_restore_batch_active = false;
+                (targets, dispatched)
             });
 
             let total = targets.len().max(1);
             let mut report = PluginRestoreReport::default();
 
-            for (index, target) in targets.iter().enumerate() {
-                let progress = 0.2 + (0.55 * (index as f32) / total as f32);
-                let kind = if target.is_instrument {
-                    "instrument"
+            // ── Retire what already has an answer ───────────────────────────
+            let mut waiting: Vec<&PluginRestoreTarget> = Vec::new();
+            for (target, outcome) in targets.iter().zip(dispatched.iter().copied()) {
+                if outcome == PluginRestoreWaitOutcome::Pending {
+                    waiting.push(target);
                 } else {
-                    "insert effect"
-                };
-                let detail = format!(
-                    "Loading Plugin {}/{}: {} on {}",
-                    index + 1,
-                    total,
-                    target.display_name,
-                    target.track_name
-                );
-                let _ = entity.update(cx, |layout, cx| {
-                    layout.set_session_install_progress(
-                        detail.clone(),
-                        ProgressBarValue::value(progress),
-                        cx,
-                    );
-                });
+                    record_outcome(&mut report, target, outcome);
+                }
+            }
+            // A host that went away mid-dispatch left the rest unrequested.
+            report.skipped += targets.len() - dispatched.len();
 
-                let outcome = entity.update(cx, |layout, cx| {
-                    layout.restore_one_plugin_target(target, cx)
-                });
-
-                match outcome {
-                    PluginRestoreWaitOutcome::Ready => {
-                        report.restored += 1;
-                    }
-                    PluginRestoreWaitOutcome::Missing => {
-                        report.failed += 1;
-                        report.warnings.push(format!(
-                            "Missing plugin on {}: {}",
-                            target.track_name, target.display_name
-                        ));
-                    }
-                    PluginRestoreWaitOutcome::Failed | PluginRestoreWaitOutcome::Timeout => {
-                        report.failed += 1;
-                        report.warnings.push(format!(
-                            "Failed to restore {} on {}",
-                            target.display_name, target.track_name
-                        ));
-                    }
-                    PluginRestoreWaitOutcome::Disconnected => {
-                        report.failed += 1;
-                        report.warnings.push(
-                            "Plugin bridge host disconnected during restore.".to_string(),
+            // ── Wait for the rest, all on one deadline ──────────────────────
+            //
+            // They are loading concurrently, so the budget a single plugin used
+            // to get is the right budget for the batch: the longest one sets the
+            // wall clock, and a plugin that never answers no longer costs the
+            // others anything.
+            let deadline = Instant::now() + PLUGIN_RESTORE_TIMEOUT;
+            // The bar is repainted when the count moves, not on every tick: the
+            // poll runs 40 times a second and `set_session_install_progress`
+            // notifies, which would put the loading dialog through a repaint per
+            // poll for as long as the slowest plugin takes.
+            let mut reported_done = usize::MAX;
+            while !waiting.is_empty() && Instant::now() < deadline {
+                let done = total - waiting.len();
+                if done != reported_done {
+                    reported_done = done;
+                    let detail = match waiting.first() {
+                        Some(next) if waiting.len() == 1 => format!(
+                            "Loading Plugin {}/{}: {} on {}",
+                            done + 1,
+                            total,
+                            next.display_name,
+                            next.track_name
+                        ),
+                        _ => format!("Loading Plugins: {done} of {total} ready"),
+                    };
+                    let progress = 0.2 + (0.55 * (done as f32) / total as f32);
+                    let _ = entity.update(cx, |layout, cx| {
+                        layout.set_session_install_progress(
+                            detail,
+                            ProgressBarValue::value(progress),
+                            cx,
                         );
-                        break;
-                    }
-                    PluginRestoreWaitOutcome::Pending => {
-                        let waited =
-                            wait_for_plugin_terminal(&mut cx, &entity, &target.slot_id).await;
-                        match waited {
-                            PluginRestoreWaitOutcome::Ready => report.restored += 1,
-                            PluginRestoreWaitOutcome::Missing => {
-                                report.failed += 1;
-                                report.warnings.push(format!(
-                                    "Missing plugin on {}: {}",
-                                    target.track_name, target.display_name
-                                ));
-                            }
-                            PluginRestoreWaitOutcome::Failed
-                            | PluginRestoreWaitOutcome::Timeout
-                            | PluginRestoreWaitOutcome::Disconnected => {
-                                report.failed += 1;
-                                report.warnings.push(format!(
-                                    "Failed to restore {} on {} ({kind})",
-                                    target.display_name, target.track_name
-                                ));
-                            }
-                            PluginRestoreWaitOutcome::Pending => {}
-                        }
+                    });
+                }
+
+                cx.background_executor().timer(POLL_INTERVAL).await;
+
+                // One drain of the host's event queue answers for every slot in
+                // the batch; polling each slot separately would drain it once
+                // per waiting plugin.
+                let outcomes = entity.update(cx, |layout, cx| {
+                    layout.poll_plugin_bridge_runtime(cx);
+                    waiting
+                        .iter()
+                        .map(|target| layout.plugin_restore_terminal_state_any_owner(&target.slot_id, cx))
+                        .collect::<Vec<_>>()
+                });
+
+                let mut still_waiting = Vec::with_capacity(waiting.len());
+                for (target, outcome) in waiting.iter().copied().zip(outcomes) {
+                    if outcome == PluginRestoreWaitOutcome::Pending {
+                        still_waiting.push(target);
+                    } else {
+                        record_outcome(&mut report, target, outcome);
                     }
                 }
+                waiting = still_waiting;
+            }
+
+            // Whatever is still pending ran out the batch's clock. Say so:
+            // "timed out" and "failed to load" are different problems, and the
+            // dialog was calling both of them the same thing.
+            for target in waiting {
+                record_outcome(&mut report, target, PluginRestoreWaitOutcome::Timeout);
             }
 
             let _ = entity.update(cx, |layout, cx| {
@@ -339,6 +373,20 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) -> PluginRestoreWaitOutcome {
         self.poll_plugin_bridge_runtime(cx);
+        self.plugin_restore_terminal_state_any_owner(slot_id, cx)
+    }
+
+    /// The slot's terminal state without draining the host's event queue.
+    ///
+    /// Separate from [`Self::poll_plugin_restore_terminal`] because a batch
+    /// wait drains once and then asks about every slot it is waiting on; going
+    /// through the polling form would drain the queue once per waiting plugin,
+    /// every tick.
+    pub(super) fn plugin_restore_terminal_state_any_owner(
+        &self,
+        slot_id: &str,
+        cx: &App,
+    ) -> PluginRestoreWaitOutcome {
         let owners = self
             .timeline
             .read(cx)
@@ -478,22 +526,61 @@ fn target_from_slot(
     })
 }
 
-async fn wait_for_plugin_terminal(
-    cx: &mut gpui::AsyncApp,
-    entity: &gpui::Entity<StudioLayout>,
-    slot_id: &str,
-) -> PluginRestoreWaitOutcome {
-    let deadline = Instant::now() + PLUGIN_RESTORE_TIMEOUT;
-    while Instant::now() < deadline {
-        cx.background_executor().timer(POLL_INTERVAL).await;
-        let outcome = entity.update(cx, |layout, cx| {
-            layout.poll_plugin_restore_terminal(slot_id, cx)
-        });
-        if outcome != PluginRestoreWaitOutcome::Pending {
-            return outcome;
+/// Fold one plugin's terminal outcome into the report.
+///
+/// Both phases of the restore end here, so a plugin that answered on dispatch
+/// and one that answered while the batch was being waited on are reported the
+/// same way — they are the same event, only observed at different moments.
+///
+/// `Pending` is the caller's business: it means "still waiting", which is not
+/// an outcome and must never be recorded as one.
+fn record_outcome(
+    report: &mut PluginRestoreReport,
+    target: &PluginRestoreTarget,
+    outcome: PluginRestoreWaitOutcome,
+) {
+    match outcome {
+        PluginRestoreWaitOutcome::Ready => {
+            report.restored += 1;
+        }
+        PluginRestoreWaitOutcome::Missing => {
+            report.failed += 1;
+            report.warnings.push(format!(
+                "Missing plugin on {}: {}",
+                target.track_name, target.display_name
+            ));
+        }
+        // A plugin the host answered about, and could not load.
+        PluginRestoreWaitOutcome::Failed => {
+            report.failed += 1;
+            report.warnings.push(format!(
+                "Failed to restore {} on {}",
+                target.display_name, target.track_name
+            ));
+        }
+        // A plugin the host never answered about at all. Worth its own wording:
+        // the dialog used to call this "failed to restore" too, which sent the
+        // reader looking for a broken plugin when the real story is a host that
+        // went quiet — a different problem with a different fix.
+        PluginRestoreWaitOutcome::Timeout => {
+            report.failed += 1;
+            report.warnings.push(format!(
+                "Timed out restoring {} on {} after {}s",
+                target.display_name,
+                target.track_name,
+                PLUGIN_RESTORE_TIMEOUT.as_secs()
+            ));
+        }
+        PluginRestoreWaitOutcome::Disconnected => {
+            report.failed += 1;
+            report
+                .warnings
+                .push("Plugin bridge host disconnected during restore.".to_string());
+        }
+        PluginRestoreWaitOutcome::Pending => {
+            debug_assert!(false, "Pending is not a terminal outcome");
         }
     }
-    PluginRestoreWaitOutcome::Timeout
 }
 
 async fn wait_until(
@@ -525,3 +612,128 @@ macro_rules! session_log {
     };
 }
 use session_log;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(name: &str, track: &str) -> PluginRestoreTarget {
+        PluginRestoreTarget {
+            track_id: format!("track-{track}"),
+            slot_id: format!("slot-{name}"),
+            display_name: name.to_string(),
+            track_name: track.to_string(),
+            is_instrument: false,
+        }
+    }
+
+    #[test]
+    fn a_restored_plugin_is_counted_and_says_nothing() {
+        let mut report = PluginRestoreReport::default();
+        record_outcome(
+            &mut report,
+            &target("OTT", "Audio 1"),
+            PluginRestoreWaitOutcome::Ready,
+        );
+        assert_eq!(report.restored, 1);
+        assert_eq!(report.failed, 0);
+        assert!(
+            report.warnings.is_empty(),
+            "a plugin that loaded is not a warning"
+        );
+    }
+
+    #[test]
+    fn a_timeout_reads_differently_from_a_failure() {
+        // The dialog in the bug report said "Failed to restore ..." for both,
+        // which is the one thing it could say that does not help: a plugin that
+        // refused to load and a host that never answered need different fixes.
+        let mut failed = PluginRestoreReport::default();
+        record_outcome(
+            &mut failed,
+            &target("Auto-Tune Pro", "Audio 1"),
+            PluginRestoreWaitOutcome::Failed,
+        );
+        let mut timed_out = PluginRestoreReport::default();
+        record_outcome(
+            &mut timed_out,
+            &target("Auto-Tune Pro", "Audio 1"),
+            PluginRestoreWaitOutcome::Timeout,
+        );
+
+        assert_eq!(
+            failed.warnings,
+            vec!["Failed to restore Auto-Tune Pro on Audio 1"]
+        );
+        assert_eq!(
+            timed_out.warnings,
+            vec![format!(
+                "Timed out restoring Auto-Tune Pro on Audio 1 after {}s",
+                PLUGIN_RESTORE_TIMEOUT.as_secs()
+            )]
+        );
+        assert_eq!(failed.failed, 1);
+        assert_eq!(timed_out.failed, 1);
+    }
+
+    #[test]
+    fn a_missing_plugin_names_the_track_it_was_on() {
+        let mut report = PluginRestoreReport::default();
+        record_outcome(
+            &mut report,
+            &target("PSE Stereo", "Audio 1"),
+            PluginRestoreWaitOutcome::Missing,
+        );
+        assert_eq!(
+            report.warnings,
+            vec!["Missing plugin on Audio 1: PSE Stereo"]
+        );
+        assert_eq!(report.failed, 1);
+    }
+
+    #[test]
+    fn a_disconnected_host_reports_itself_not_the_plugin() {
+        let mut report = PluginRestoreReport::default();
+        record_outcome(
+            &mut report,
+            &target("Saturation Knob", "Audio 1"),
+            PluginRestoreWaitOutcome::Disconnected,
+        );
+        assert_eq!(
+            report.warnings,
+            vec!["Plugin bridge host disconnected during restore."],
+            "the plugin is not what went wrong"
+        );
+    }
+
+    #[test]
+    fn a_whole_batch_folds_into_one_report() {
+        // Both phases of the restore record through here, so a mixed batch has
+        // to add up whichever moment each plugin answered at.
+        let targets = [
+            target("OTT", "Audio 1"),
+            target("PSE Stereo", "Audio 1"),
+            target("Auto-Tune Pro", "Audio 1"),
+            target("Saturation Knob", "Audio 2"),
+        ];
+        let outcomes = [
+            PluginRestoreWaitOutcome::Ready,
+            PluginRestoreWaitOutcome::Missing,
+            PluginRestoreWaitOutcome::Timeout,
+            PluginRestoreWaitOutcome::Ready,
+        ];
+        let mut report = PluginRestoreReport::default();
+        for (target, outcome) in targets.iter().zip(outcomes) {
+            record_outcome(&mut report, target, outcome);
+        }
+
+        assert_eq!(report.restored, 2);
+        assert_eq!(report.failed, 2);
+        assert_eq!(
+            report.warnings.len(),
+            report.failed,
+            "every failure gets exactly one line in the dialog, and every \
+             success gets none"
+        );
+    }
+}

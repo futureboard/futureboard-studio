@@ -669,6 +669,12 @@ pub struct StudioLayout {
     session_install_progress: crate::components::progress_dialog::ProgressBarValue,
     /// Non-fatal plugin restore warnings collected during session install.
     session_install_warnings: Vec<String>,
+    /// True while the session-install restore is handing the whole batch of
+    /// project inserts to the plugin host. Each load would otherwise force its
+    /// own engine graph rebuild, so opening a project rebuilt the graph once
+    /// per plugin; the restore driver publishes the sinks and forces one sync
+    /// after the batch instead. See `plugin_restore`.
+    pub(crate) plugin_restore_batch_active: bool,
     /// Last time an autosave was attempted for the current workspace.
     last_autosave_at: std::time::Instant,
     /// Guards the background autosave job so render/poll frames cannot enqueue duplicates.
@@ -1245,6 +1251,7 @@ impl StudioLayout {
             session_install_progress:
                 crate::components::progress_dialog::ProgressBarValue::Indeterminate,
             session_install_warnings: Vec::new(),
+            plugin_restore_batch_active: false,
             last_autosave_at: std::time::Instant::now(),
             autosave_in_flight: false,
             session_generation: 0,
