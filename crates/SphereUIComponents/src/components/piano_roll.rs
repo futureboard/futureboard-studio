@@ -983,13 +983,6 @@ pub struct PianoRoll {
     edit_origin_beats: f32,
     /// The clips on screen, refreshed each render.
     scope: scope::EditorScope,
-    /// The clip the view was last framed for.
-    ///
-    /// With a project-beat axis, opening a clip that starts at bar 33 would
-    /// otherwise leave the view at bar 1 looking at empty grid. This is what
-    /// notices the target changed so the view can go to it — once, so a user
-    /// who then scrolls away is not dragged back every frame.
-    framed_clip_id: Option<String>,
     /// Where the playhead is this frame. Shared with the overlay entity below
     /// so the line can move without rebuilding the editor around it.
     playhead_frame: playhead::PianoRollPlayheadFrameCell,
@@ -1289,7 +1282,6 @@ impl PianoRoll {
             midi_editor_sink: false,
             edit_origin_beats: 0.0,
             scope: scope::EditorScope::default(),
-            framed_clip_id: None,
             playhead_frame: std::rc::Rc::new(std::cell::Cell::new(
                 playhead::PianoRollPlayheadFrame::default(),
             )),
@@ -2833,6 +2825,20 @@ impl PianoRoll {
     // Notes are interactive elements that handle their own select/move/resize/
     // delete (and stop propagation), so the grid surface only deals with empty
     // space: create a note (Draw tool) or clear the selection (Select tool).
+    /// Resolve the clips on screen and the edited clip's origin.
+    ///
+    /// Called before anything that measures a beat — including
+    /// `fit_piano_roll_to_notes`, which places its scroll through the origin
+    /// and was previously fitting a new clip against the previous one's.
+    pub(super) fn refresh_scope(&mut self, cx: &Context<Self>, clip_id: &str) {
+        self.scope = scope::EditorScope::for_editing_clip(&self.timeline.read(cx).state, clip_id);
+        self.edit_origin_beats = self
+            .scope
+            .editing()
+            .map(|span| span.start_beat)
+            .unwrap_or(0.0);
+    }
+
     /// Make the clip under `lx` the one being edited, if it is not already.
     ///
     /// This is what turns the neighbours from a picture into the rest of the

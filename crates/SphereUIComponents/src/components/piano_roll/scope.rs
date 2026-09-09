@@ -181,7 +181,7 @@ pub fn clip_division_lines(
     view_w: f32,
     lane_h: f32,
 ) -> Vec<gpui::AnyElement> {
-    use gpui::{div, px, IntoElement, ParentElement, Styled};
+    use gpui::{div, px, IntoElement, Styled};
 
     let mut out: Vec<gpui::AnyElement> = Vec::new();
     for span in scope.spans() {

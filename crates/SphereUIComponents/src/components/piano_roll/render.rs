@@ -4,12 +4,6 @@
 
 use super::*;
 
-/// One bar's worth of beats, for framing decisions that want "a bar" rather
-/// than a number of beats.
-fn bpb_hint(state: &crate::components::timeline::timeline_state::TimelineState) -> f32 {
-    state.beats_per_bar().max(1.0)
-}
-
 impl PianoRoll {
     pub(super) fn display_note(&self, n: &MidiNoteState) -> DisplayNote {
         let mut start = n.start;
@@ -524,6 +518,18 @@ impl Render for PianoRoll {
             }
             self.last_editing_clip = clip_id.clone();
             self.fitted_clip_id = None;
+        }
+
+        // The frame every conversion is measured in, resolved *before* the fit
+        // rather than after it: `fit_piano_roll_to_notes` places its scroll
+        // through the edited clip's origin, and with the refresh further down
+        // it was fitting the new clip against the previous clip's origin.
+        match clip_id.as_deref() {
+            Some(cid) => self.refresh_scope(cx, cid),
+            None => {
+                self.scope = crate::components::piano_roll::scope::EditorScope::default();
+                self.edit_origin_beats = 0.0;
+            }
         }
 
         if let Some(cid) = clip_id.as_deref() {
@@ -1481,32 +1487,10 @@ impl PianoRoll {
         let (view_w, view_h) = self.grid_view_size();
         let track_color = self.track_color_for_clip(cx, clip_id);
 
-        // The frame this whole render is measured in. Refreshed here because
-        // the edited clip can be moved on the arrangement while the editor is
-        // open, and every conversion below — and every mouse handler until the
-        // next render — reads it.
-        self.scope = crate::components::piano_roll::scope::EditorScope::for_editing_clip(
-            &self.timeline.read(cx).state,
-            clip_id,
-        );
-        self.edit_origin_beats = self
-            .scope
-            .editing()
-            .map(|span| span.start_beat)
-            .unwrap_or(0.0);
-
-        // Frame the clip the first time it is shown. Only on a change, so
-        // scrolling away to look at the previous chorus is not undone on the
-        // next frame — the view belongs to the user once they have moved it.
-        if self.framed_clip_id.as_deref() != Some(clip_id) {
-            self.framed_clip_id = Some(clip_id.to_string());
-            if let Some(span) = self.scope.editing() {
-                // A bar of lead-in, so the clip does not start hard against the
-                // keyboard lane and the note before it stays visible.
-                let lead_in = bpb_hint(&self.timeline.read(cx).state);
-                self.scroll_x = ((span.start_beat - lead_in) * self.ppb).max(0.0);
-            }
-        }
+        // Resolved in `render` above, before the fit that depends on it, and
+        // again here because the edited clip can be moved on the arrangement
+        // while the editor is open.
+        self.refresh_scope(cx, clip_id);
 
         let (bpb, clip_len, show_playhead, playing, playhead_project, loop_region) = {
             let tl = self.timeline.read(cx);
