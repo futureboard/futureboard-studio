@@ -294,6 +294,27 @@ pub(crate) fn snap_buffer_size(
     }
 }
 
+/// How many output channels the session opens on the driver: every one of them,
+/// not just the first pair.
+///
+/// The session already advertises the full output count in [`AsioSessionCaps`],
+/// so the Audio Connections panel offers Out 3-4, Out 5-6 and the rest — but the
+/// stream itself used to be capped at two channels. That put every such pair out
+/// of range of `resolved_output_pair`, and the Control Room then declined to
+/// write rather than write to the wrong place, so choosing an alternate monitor
+/// pair on an ASIO interface produced no sound at all.
+///
+/// `reported` is the driver's own count from `asio_channel_counts`;
+/// `default_config` is what cpal exposes on the default output config, and cpal
+/// refuses to build a stream wider than that. A driver can disagree with itself
+/// between the two, so take the smaller rather than failing an open over a count
+/// nobody asked for.
+fn openable_output_channels(reported: u32, default_config: u16) -> u16 {
+    reported
+        .min(u32::from(default_config))
+        .min(u32::from(u16::MAX)) as u16
+}
+
 /// Open the full-duplex session. Control thread only; the engine must have
 /// closed any previous stream first (the driver loader refuses to open a
 /// second session while one is active).
@@ -356,15 +377,28 @@ pub(crate) fn open_duplex(
         .filter(|&rate| rate > 0)
         .unwrap_or(driver_rate);
 
-    let output_format = device
-        .default_output_config()
-        .map_err(|error| {
-            fail(
-                "format-query",
-                format!("driver '{driver_name}' output format unsupported: {error}"),
-            )
-        })?
-        .sample_format();
+    let default_output = device.default_output_config().map_err(|error| {
+        fail(
+            "format-query",
+            format!("driver '{driver_name}' output format unsupported: {error}"),
+        )
+    })?;
+    let output_format = default_output.sample_format();
+
+    let stream_output_channels = openable_output_channels(out_channels, default_output.channels());
+    if stream_output_channels == 0 {
+        return Err(fail(
+            "channel-query",
+            format!("driver '{driver_name}' offers no usable output channels"),
+        ));
+    }
+    if u32::from(stream_output_channels) != out_channels {
+        eprintln!(
+            "[DAUx ASIO] driver '{driver_name}' reports {out_channels} outputs but its \
+             default config exposes {}; opening {stream_output_channels}",
+            default_output.channels()
+        );
+    }
 
     // ── Streams (input first, then output; both from the same device) ─────
     //
@@ -422,7 +456,7 @@ pub(crate) fn open_duplex(
     };
 
     let output_config = cpal::StreamConfig {
-        channels: out_channels.min(2) as u16,
+        channels: stream_output_channels,
         sample_rate: cpal::SampleRate(sample_rate),
         buffer_size: cpal::BufferSize::Fixed(buffer_frames),
     };
@@ -538,8 +572,8 @@ pub(crate) fn open_duplex(
 
     eprintln!(
         "[DAUx ASIO] session open: driver='{driver_name}' sr={sample_rate} buffer={buffer_frames} \
-         in={effective_in_channels} out={out_channels} latency_in={input_latency} \
-         latency_out={output_latency}"
+         in={effective_in_channels} out={stream_output_channels}/{out_channels} \
+         latency_in={input_latency} latency_out={output_latency}"
     );
 
     Ok(AsioDuplexHandle {
@@ -794,18 +828,20 @@ fn build_input_fanout_typed<T: AsioInputSample>(
 
                 for frame in data.chunks(channels) {
                     let first = frame.first().copied().map(T::to_monitor_f32).unwrap_or(0.0);
+                    // Unclamped: the monitor ring and the input meters carry
+                    // what the driver delivered. A float ASIO driver can hand
+                    // back samples past full scale, and clipping them here made
+                    // both the monitor feed and the meter under-report it.
                     let l = frame
                         .get(mon_l_ch)
                         .copied()
                         .map(T::to_monitor_f32)
-                        .unwrap_or(first)
-                        .clamp(-1.0, 1.0);
+                        .unwrap_or(first);
                     let r = frame
                         .get(mon_r_ch)
                         .copied()
                         .map(T::to_monitor_f32)
-                        .unwrap_or(l)
-                        .clamp(-1.0, 1.0);
+                        .unwrap_or(l);
                     last_l = l;
                     last_r = r;
                     raw_peak_l = raw_peak_l.max(l.abs());
@@ -948,7 +984,8 @@ fn build_input_fanout_typed<T: AsioInputSample>(
 #[cfg(test)]
 mod tests {
     use super::{
-        snap_buffer_size, AsioInputCommand, AsioInputMeterBank, CallbackRecordSinkState, RecordSink,
+        openable_output_channels, snap_buffer_size, AsioInputCommand, AsioInputMeterBank,
+        CallbackRecordSinkState, RecordSink,
     };
     use cpal::platform::AsioBufferSizeInfo;
     use crossbeam_channel::{bounded, Receiver, TryRecvError};
@@ -975,6 +1012,7 @@ mod tests {
                 samples_per_bin: 1,
                 capture_on_transport: false,
                 dropped_blocks: Arc::new(AtomicU64::new(0)),
+                preview_accums: Vec::new(),
             }),
             audio_rx,
         )
@@ -989,6 +1027,27 @@ mod tests {
             audio_rx.try_recv(),
             Err(TryRecvError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn every_driver_output_is_opened_not_just_the_first_pair() {
+        // An 18-out interface opens all 18, so the Control Room can reach
+        // Out 3-4 and everything above it.
+        assert_eq!(openable_output_channels(18, 18), 18);
+        assert_eq!(openable_output_channels(2, 2), 2);
+        // A mono-out driver still opens its one channel.
+        assert_eq!(openable_output_channels(1, 1), 1);
+    }
+
+    #[test]
+    fn a_driver_that_disagrees_with_itself_opens_the_narrower_count() {
+        // cpal refuses a stream wider than its own default config, so the open
+        // must not ask for more than that even when the driver claims more.
+        assert_eq!(openable_output_channels(64, 8), 8);
+        // The other direction is just as possible; never open more than the
+        // driver reports either.
+        assert_eq!(openable_output_channels(8, 64), 8);
+        assert_eq!(openable_output_channels(0, 8), 0);
     }
 
     #[test]
