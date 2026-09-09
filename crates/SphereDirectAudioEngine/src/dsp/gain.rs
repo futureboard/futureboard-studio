@@ -28,29 +28,21 @@ pub fn linear_to_db(linear: f32) -> f32 {
     }
 }
 
-/// Soft-knee master limiter for a single sample.
-///
-/// Replaces a hard `clamp(-1.0, 1.0)` on the master bus. Below `THRESHOLD` the
-/// signal passes through at unity (transparent for normal levels); above it the
-/// excess is smoothly compressed with a `tanh` knee that asymptotes to ±1.0, so
-/// a hot bus is *limited* like a brick-wall limiter instead of hard-clipped into
-/// harsh digital distortion. The output is still guaranteed to stay within
-/// ±1.0, so nothing overflows the audio device.
-///
-/// Stateless and branch-cheap — safe to call per sample on the audio thread.
-#[inline]
-pub fn soft_limit(sample: f32) -> f32 {
-    // Knee starts at ~ -1.9 dBFS. Below this the curve is exactly unity.
-    const THRESHOLD: f32 = 0.8;
-    let mag = sample.abs();
-    if mag <= THRESHOLD {
-        return sample;
-    }
-    let over = (mag - THRESHOLD) / (1.0 - THRESHOLD);
-    let limited = THRESHOLD + (1.0 - THRESHOLD) * over.tanh();
-    // `tanh` asymptotes below 1.0, but clamp defensively against FP edge cases.
-    limited.copysign(sample).clamp(-1.0, 1.0)
-}
+// The master bus does **not** limit, compress, or clip.
+//
+// There used to be a `soft_limit` here — a `tanh` soft knee from -1.9 dBFS that
+// every master sample passed through, on the device path *and* on export. It
+// made the engine's output a function of level: a hot mix came back quieter and
+// differently shaped than it was mixed, and nothing in the UI said so. (It also
+// meant the master meter could never reach 0 dBFS, so the mixer's clip
+// indicator never lit — the overload was hidden as well as reshaped.)
+//
+// A direct engine hands the device exactly what the graph produced. Level
+// control belongs to the master fader and to whatever the engineer chose to put
+// in the master insert chain — not to the output stage. Samples past full scale
+// stay past full scale in `f32`; the only place they are bounded is the
+// quantizer that has to fit them into an integer device word or file format
+// (see `crate::dsp::dither`), because an integer word cannot represent them.
 
 /// Equal-power stereo pan, unity at center — the sin/cos pan-pot law of an
 /// analog console, compensated so a centered channel passes at 0 dB.

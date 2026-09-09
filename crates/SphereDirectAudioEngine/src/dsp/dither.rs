@@ -75,8 +75,11 @@ impl OutputDither {
 
 /// Conversion of one engine `f32` sample into a device sample type.
 ///
-/// Integer types quantize with dither; float types pass through (their own
-/// resolution exceeds the mix's, and the master limiter already bounds them).
+/// Integer types quantize with dither and clip to the representable range —
+/// the one and only place the engine bounds a sample, because an integer word
+/// cannot hold anything past full scale. Float types pass through untouched:
+/// their resolution exceeds the mix's, and a float device buffer carries an
+/// over-full-scale sample exactly as the graph produced it.
 pub trait DitheredOutput: Sized {
     fn dithered_from_f32(sample: f32, dither: &mut OutputDither) -> Self;
 }

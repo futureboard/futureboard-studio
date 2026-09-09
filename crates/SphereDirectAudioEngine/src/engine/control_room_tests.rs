@@ -166,6 +166,49 @@ fn a_normal_audio_track_is_audible_through_monitor() {
 }
 
 #[test]
+fn a_hot_master_bus_is_not_limited_or_clipped() {
+    // Two tracks carrying the same live input sum past full scale.
+    let mut runtime = build(vec![
+        track("audio-1", "audio"),
+        track("audio-2", "audio"),
+        track("master", "master"),
+    ]);
+
+    let master = render_master(&mut runtime, 0.8);
+    let hot = peak(&master);
+    assert!(
+        hot > 1.0,
+        "the two tracks were supposed to sum past full scale, got {hot}"
+    );
+    // The old soft knee started at 0.8 and asymptoted to 1.0, so this sum used
+    // to arrive as ~0.96 no matter how hot it really was. The output stage now
+    // reports the level the mix actually has.
+    assert!(
+        (hot - 1.6).abs() < 1.0e-4,
+        "master peak {hot}: the bus must pass the sum on as it was summed"
+    );
+}
+
+#[test]
+fn the_control_room_passes_a_hot_mix_through_unclipped() {
+    let mut runtime = build(vec![
+        track("audio-1", "audio"),
+        track("audio-2", "audio"),
+        track("master", "master"),
+    ]);
+
+    let (master, monitored) = render_and_monitor(&mut runtime, 0.8);
+    assert!(
+        peak(&master) > 1.0,
+        "expected an over-full-scale master feed"
+    );
+    assert_eq!(
+        monitored, master,
+        "at unity monitor gain the Control Room must hand the device the mix          untouched, over full scale included"
+    );
+}
+
+#[test]
 fn a_virtual_instrument_is_audible_through_monitor() {
     use sphere_soundfont_player::test_font;
 

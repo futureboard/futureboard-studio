@@ -1438,8 +1438,8 @@ fn fill_output_f32_inner(
             for frame in data.chunks_mut(channels) {
                 let tone_l = local.osc_l.next_sample() * TEST_TONE_AMPLITUDE * master_vol;
                 let tone_r = local.osc_r.next_sample() * TEST_TONE_AMPLITUDE * master_vol;
-                frame[0] = (frame[0] + tone_l).clamp(-1.0, 1.0);
-                frame[1] = (frame[1] + tone_r).clamp(-1.0, 1.0);
+                frame[0] += tone_l;
+                frame[1] += tone_r;
             }
         }
         if defer_click {
@@ -1487,8 +1487,8 @@ fn fill_output_f32_inner(
                 metronome_graph_max_samples,
                 metronome_delay_samples,
             ) * master_vol;
-            let l = (tone_l + proj_l + click).clamp(-1.0, 1.0);
-            let r = (tone_r + proj_r + click).clamp(-1.0, 1.0);
+            let l = tone_l + proj_l + click;
+            let r = tone_r + proj_r + click;
             // Live monitor is added afterwards from the input ring (see below).
             frame[0] = l;
             frame[1] = r;
@@ -1519,7 +1519,7 @@ fn fill_output_f32_inner(
                 metronome_graph_max_samples,
                 metronome_delay_samples,
             ) * master_vol;
-            let v = (tone + (proj_l + proj_r) * 0.5 + click).clamp(-1.0, 1.0);
+            let v = tone + (proj_l + proj_r) * 0.5 + click;
             *sample = v;
             frames += 1;
         }
@@ -1872,8 +1872,10 @@ pub(crate) fn run_control_room(
     let mut monitor_peak_l = 0.0f32;
     let mut monitor_peak_r = 0.0f32;
     for i in 0..frames {
-        let l = runtime.monitor.source_l[i].clamp(-1.0, 1.0);
-        let r = runtime.monitor.source_r[i].clamp(-1.0, 1.0);
+        // No clip on the way out: the Control Room hands the device what it
+        // was given, and the meter below reports the real level.
+        let l = runtime.monitor.source_l[i];
+        let r = runtime.monitor.source_r[i];
         monitor_peak_l = monitor_peak_l.max(l.abs());
         monitor_peak_r = monitor_peak_r.max(r.abs());
         let frame = &mut data[i * channels..i * channels + channels];
@@ -2085,8 +2087,8 @@ fn mix_metronome_block(
                 delay_samples,
             );
             if click != 0.0 {
-                frame[0] = (frame[0] + click * master_vol).clamp(-1.0, 1.0);
-                frame[1] = (frame[1] + click * master_vol).clamp(-1.0, 1.0);
+                frame[0] += click * master_vol;
+                frame[1] += click * master_vol;
             }
         }
         callback_offset += segment_frames as usize;

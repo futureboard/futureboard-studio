@@ -208,10 +208,9 @@ pub fn render_project_sample(
         }
     }
 
-    (
-        crate::dsp::gain::soft_limit(out_l * master_volume),
-        crate::dsp::gain::soft_limit(out_r * master_volume),
-    )
+    // Master fader only. No limiter, no soft knee, no clip — the sum leaves
+    // this function exactly as the graph built it, scaled.
+    (out_l * master_volume, out_r * master_volume)
 }
 
 /// Routing track kinds (Phase 3): receive sends rather than hosting clips.
@@ -1613,26 +1612,27 @@ fn render_project_block_interleaved_core(
         }
     }
 
-    // Final master volume + soft-knee limiter (graceful brick-wall instead of
-    // a harsh hard clip when the bus is hot). In realtime the master gain ramps
-    // across the block so dragging the master fader does not zipper; offline
-    // export applies the exact constant gain.
+    // Final master volume — gain and nothing else. The output stage does not
+    // limit or clip: a mix that runs hot leaves here hot, and reads hot on the
+    // meter, instead of being quietly reshaped on its way to the device.
+    // In realtime the gain ramps across the block so dragging the master fader
+    // does not zipper; offline export applies the exact constant gain.
     if runtime.fader_smoothing {
         let start = runtime.smoothed_master_gain;
         let inc = (master_volume - start) / frames as f32;
         for i in 0..frames {
             let g = start + inc * i as f32;
             let out = &mut output[i * channels..i * channels + channels];
-            out[0] = crate::dsp::gain::soft_limit(out[0] * g);
-            out[1] = crate::dsp::gain::soft_limit(out[1] * g);
+            out[0] *= g;
+            out[1] *= g;
         }
         runtime.smoothed_master_gain = master_volume;
     } else {
         runtime.smoothed_master_gain = master_volume;
         for i in 0..frames {
             let out = &mut output[i * channels..i * channels + channels];
-            out[0] = crate::dsp::gain::soft_limit(out[0] * master_volume);
-            out[1] = crate::dsp::gain::soft_limit(out[1] * master_volume);
+            out[0] *= master_volume;
+            out[1] *= master_volume;
         }
     }
     // Audio Jam multitrack tap. Last, so every shared track — source, bus and

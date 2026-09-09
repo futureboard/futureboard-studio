@@ -151,9 +151,9 @@ impl AudioFileAudition {
             let right = sample_at(source_index, right_channel)
                 + (sample_at(next_index, right_channel) - sample_at(source_index, right_channel))
                     * fraction;
-            frame[0] = (frame[0] + left * env).clamp(-1.0, 1.0);
+            frame[0] += left * env;
             if output_channels > 1 {
-                frame[1] = (frame[1] + right * env).clamp(-1.0, 1.0);
+                frame[1] += right * env;
             }
             self.source_frame += self.step;
         }

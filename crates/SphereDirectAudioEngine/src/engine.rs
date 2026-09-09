@@ -4486,12 +4486,11 @@ impl EngineInner {
                     let mut last_r = 0.0f32;
                     for frame in data.chunks(channel_count) {
                         let first = frame.first().copied().unwrap_or(0.0);
-                        let l = frame
-                            .get(mon_l_ch)
-                            .copied()
-                            .unwrap_or(first)
-                            .clamp(-1.0, 1.0);
-                        let r = frame.get(mon_r_ch).copied().unwrap_or(l).clamp(-1.0, 1.0);
+                        // Unclamped: monitoring hands on what the interface
+                        // captured, so a hot input reads hot instead of
+                        // arriving pre-clipped.
+                        let l = frame.get(mon_l_ch).copied().unwrap_or(first);
+                        let r = frame.get(mon_r_ch).copied().unwrap_or(l);
                         last_l = l;
                         last_r = r;
                         peak_l = peak_l.max(l.abs());
@@ -5559,10 +5558,15 @@ fn build_output_stream_typed<T>(
     initial_runtime: RuntimeProject,
 ) -> Result<cpal::Stream, String>
 where
-    T: SizedSample + Sample + FromSample<f32>,
+    T: SizedSample + Sample + FromSample<f32> + crate::dsp::dither::DitheredOutput,
 {
     let output_sample_rate = config.sample_rate.0;
     let sr = output_sample_rate as f64;
+
+    // Word-length reduction for integer device formats, same as the DAUx path:
+    // `from_sample` truncates toward zero, which is a bias plus correlated
+    // distortion at the device word length. Floats pass through untouched.
+    let mut dither = crate::dsp::dither::OutputDither::new();
 
     // Oscillator state — local to the audio callback (no lock needed).
     let mut osc_l = SineOscillator::new(440.0, sr);
@@ -6169,8 +6173,8 @@ where
                         for frame in scratch.chunks_mut(ch) {
                             let tone_l = osc_l.next_sample() * TEST_TONE_AMPLITUDE * master_vol;
                             let tone_r = osc_r.next_sample() * TEST_TONE_AMPLITUDE * master_vol;
-                            frame[0] = (frame[0] + tone_l).clamp(-1.0, 1.0);
-                            frame[1] = (frame[1] + tone_r).clamp(-1.0, 1.0);
+                            frame[0] += tone_l;
+                            frame[1] += tone_r;
                         }
                     }
                     let metronome_graph_max_samples =
@@ -6198,8 +6202,8 @@ where
                                 metronome_delay_samples,
                             );
                             if click != 0.0 {
-                                frame[0] = (frame[0] + click * master_vol).clamp(-1.0, 1.0);
-                                frame[1] = (frame[1] + click * master_vol).clamp(-1.0, 1.0);
+                                frame[0] += click * master_vol;
+                                frame[1] += click * master_vol;
                             }
                         }
                         callback_offset += segment_frames as usize;
@@ -6221,12 +6225,12 @@ where
                     // DAUx/cpal render kernel via the input ring; the old
                     // sample-and-hold monitor was removed (warble).
                     for (out_frame, frame) in data.chunks_mut(ch).zip(scratch.chunks(ch)) {
-                        let l = frame[0].clamp(-1.0, 1.0);
-                        let r = frame[1].clamp(-1.0, 1.0);
-                        out_frame[0] = T::from_sample(l);
-                        out_frame[1] = T::from_sample(r);
+                        let l = frame[0];
+                        let r = frame[1];
+                        out_frame[0] = T::dithered_from_f32(l, &mut dither);
+                        out_frame[1] = T::dithered_from_f32(r, &mut dither);
                         for extra in out_frame.iter_mut().skip(2) {
-                            *extra = T::from_sample(0.0);
+                            *extra = T::dithered_from_f32(0.0, &mut dither);
                         }
                         peak_l = peak_l.max(l.abs());
                         peak_r = peak_r.max(r.abs());
@@ -6260,13 +6264,13 @@ where
                             metronome_graph_max_samples,
                             metronome_delay_samples,
                         ) * master_vol;
-                        let l = (tone_l + project_l + click).clamp(-1.0, 1.0);
-                        let r = (tone_r + project_r + click).clamp(-1.0, 1.0);
-                        frame[0] = T::from_sample(l);
-                        frame[1] = T::from_sample(r);
+                        let l = tone_l + project_l + click;
+                        let r = tone_r + project_r + click;
+                        frame[0] = T::dithered_from_f32(l, &mut dither);
+                        frame[1] = T::dithered_from_f32(r, &mut dither);
                         // Extra channels get silence.
                         for extra in frame.iter_mut().skip(2) {
-                            *extra = T::from_sample(0.0);
+                            *extra = T::dithered_from_f32(0.0, &mut dither);
                         }
                         peak_l = peak_l.max(l.abs());
                         peak_r = peak_r.max(r.abs());
@@ -6298,9 +6302,8 @@ where
                             metronome_graph_max_samples,
                             metronome_delay_samples,
                         ) * master_vol;
-                        let value =
-                            (tone + (project_l + project_r) * 0.5 + click).clamp(-1.0, 1.0);
-                        *sample = T::from_sample(value);
+                        let value = tone + (project_l + project_r) * 0.5 + click;
+                        *sample = T::dithered_from_f32(value, &mut dither);
                         peak_l = peak_l.max(value.abs());
                         sum_sq_l += value * value;
                         frames += 1;
