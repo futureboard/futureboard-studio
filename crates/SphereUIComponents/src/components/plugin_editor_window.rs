@@ -26,7 +26,9 @@ use gpui::{
     Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 
-use crate::components::plugin_content_host::{ContentChildHwnd, ContentRect};
+use crate::components::plugin_content_host::{
+    ContentChildHwnd, ContentRect, NATIVE_VIEW_EMBEDDING_SUPPORTED,
+};
 use crate::components::plugin_editor_chrome::{
     open_preset_menu as open_preset_menu_window, preset_menu_size, render_chrome_tools,
     render_tab_strip, PluginEditorAction, PluginEditorChrome, PluginEditorTab, PresetMenuWindow,
@@ -218,6 +220,48 @@ enum PluginEditorStatus {
     Attached(PluginEditorPresentationMode),
     /// Attach failed — fallback panel with Retry / Close.
     Failed(String),
+    /// This platform has no native-view embedding at all, so there is nothing
+    /// to retry. Distinct from [`Self::Failed`] precisely so the panel can drop
+    /// the Retry button: offering one for a permanent gap is a control that
+    /// cannot do what it says, and it sent people looking for a broken plug-in
+    /// or a timing bug that was never there.
+    Unsupported(String),
+}
+
+/// Shown when the platform has no native-view embedding at all.
+///
+/// Deliberately about the *editor window* and nothing else: whether the plug-in
+/// itself is loaded and processing is a separate question with its own
+/// reporting, and a message that guessed at it would be wrong half the time.
+const NO_NATIVE_EMBEDDING_MESSAGE: &str =
+    "Plug-in editor windows are not available on this platform yet. Futureboard \
+     opens a plug-in's own view by embedding it in this window, which currently \
+     has a Windows implementation only.";
+
+/// What "the window gave us no native parent handle" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingParentHandle {
+    /// The window has one, it just is not ready this frame. Keep ticking.
+    WaitForWindow,
+    /// This platform never has one — `native_parent_handle` is a stub that
+    /// returns `None` unconditionally. Ticking is pointless and so is Retry.
+    PlatformUnsupported,
+}
+
+/// The two look identical at the call site (`None`), which is how a permanent
+/// platform gap ended up reported as "host region never became ready" with a
+/// Retry button next to it. `embedding_supported` is the only thing that
+/// separates them.
+///
+/// Split out so both answers are exercised on every platform: the branch that
+/// matters on macOS is never taken by a Windows build, and an untested branch
+/// on the platform that needs it is how this reads wrong in the first place.
+fn missing_parent_handle_outcome(embedding_supported: bool) -> MissingParentHandle {
+    if embedding_supported {
+        MissingParentHandle::WaitForWindow
+    } else {
+        MissingParentHandle::PlatformUnsupported
+    }
 }
 
 /// Phase 6: delays (ms) between visible-UI re-checks after a successful
@@ -677,6 +721,31 @@ impl PluginEditorWindow {
         .detach();
     }
 
+    /// No parent handle. On Windows that is a frame the window was not ready
+    /// on yet and worth waiting through; off Windows it is the permanent gap —
+    /// `native_parent_handle` returns `None` unconditionally, so no number of
+    /// ticks will ever change it, and spinning `MAX_WAIT_TICKS` only delays a
+    /// message that then blames a timeout for a platform that was never
+    /// implemented.
+    fn note_missing_parent_handle(&mut self, mode: &str, cx: &mut Context<Self>) {
+        match missing_parent_handle_outcome(NATIVE_VIEW_EMBEDDING_SUPPORTED) {
+            MissingParentHandle::PlatformUnsupported => {
+                self.status =
+                    PluginEditorStatus::Unsupported(NO_NATIVE_EMBEDDING_MESSAGE.to_string());
+                if plugin_view_debug() {
+                    eprintln!(
+                        "[plugin-view] unsupported platform ({mode}) editor_id={}",
+                        self.editor_id()
+                    );
+                }
+                cx.notify();
+            }
+            MissingParentHandle::WaitForWindow => {
+                self.note_waiting(&format!("no native parent handle ({mode})"), cx);
+            }
+        }
+    }
+
     fn note_waiting(&mut self, reason: &str, cx: &mut Context<Self>) {
         self.wait_ticks += 1;
         if self.wait_ticks > MAX_WAIT_TICKS {
@@ -755,7 +824,8 @@ impl PluginEditorWindow {
                 self.sync_region(window);
                 return;
             }
-            PluginEditorStatus::Failed(_) => return,
+            // Nothing to retry and nothing to wait for: stop driving.
+            PluginEditorStatus::Failed(_) | PluginEditorStatus::Unsupported(_) => return,
             PluginEditorStatus::Attaching => {
                 self.perform_attach(window, cx);
                 return;
@@ -772,7 +842,7 @@ impl PluginEditorWindow {
 
         // Phase 4/6: require a valid native parent handle before attaching.
         let Some(parent) = Self::native_parent_handle(window) else {
-            self.note_waiting("no native parent handle", cx);
+            self.note_missing_parent_handle("in-process", cx);
             return;
         };
         if plugin_view_debug() {
@@ -1216,7 +1286,8 @@ impl PluginEditorWindow {
                 self.schedule_tick(cx);
                 return;
             }
-            PluginEditorStatus::Failed(_) => return,
+            // Nothing to retry and nothing to wait for: stop driving.
+            PluginEditorStatus::Failed(_) | PluginEditorStatus::Unsupported(_) => return,
             PluginEditorStatus::Attaching | PluginEditorStatus::ProbingReady { .. } => {
                 // Waiting for EditorAttached / EditorAttachFailed.
                 self.schedule_tick(cx);
@@ -1227,7 +1298,7 @@ impl PluginEditorWindow {
 
         // 2. Need a valid GPUI top HWND before we can parent a content child.
         let Some(top) = Self::native_parent_handle(window) else {
-            self.note_waiting("no native parent handle (host mode)", cx);
+            self.note_missing_parent_handle("host mode", cx);
             return;
         };
         let region = self.host_region_for(window);
@@ -1847,6 +1918,61 @@ impl PluginEditorWindow {
             .into_any_element()
     }
 
+    /// A failure panel with no Retry.
+    ///
+    /// The distinction is the whole point of [`PluginEditorStatus::Unsupported`]:
+    /// this window is not waiting for anything and no amount of trying will
+    /// change it, so offering a button that re-runs the same refusal would be a
+    /// control that lies about what it does.
+    fn render_unsupported_panel(&self, reason: &str) -> gpui::AnyElement {
+        let close = div()
+            .id("plugin-editor-close")
+            .px(px(14.0))
+            .py(px(6.0))
+            .rounded(px(crate::theme::radius::CONTROL))
+            .cursor(gpui::CursorStyle::PointingHand)
+            .bg(Colors::surface_raised())
+            .text_size(px(crate::theme::typography::UI_SM))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(Colors::text_secondary())
+            .hover(|s| s.bg(Colors::surface_control_hover()))
+            .child("Close")
+            .on_click(|_ev, window, _cx| window.remove_window());
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .items_center()
+            .justify_center()
+            .size_full()
+            .bg(Colors::surface_base())
+            .p(px(20.0))
+            .child(
+                div()
+                    .text_size(px(crate::theme::typography::UI_MD))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(Colors::text_primary())
+                    .child(self.display_name.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(crate::theme::typography::UI_SM))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(Colors::text_secondary())
+                    .child("Editor not available on this platform"),
+            )
+            .child(
+                div()
+                    .max_w(px(460.0))
+                    .text_size(px(crate::theme::typography::UI_SM))
+                    .text_color(Colors::text_secondary())
+                    .child(reason.to_string()),
+            )
+            .child(close)
+            .into_any_element()
+    }
+
     fn render_failure_panel(&self, err: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
         let retry = div()
             .id("plugin-editor-retry")
@@ -1980,6 +2106,10 @@ impl Render for PluginEditorWindow {
             PluginEditorStatus::Failed(err) => {
                 let err = err.clone();
                 Some(self.render_failure_panel(&err, cx))
+            }
+            PluginEditorStatus::Unsupported(reason) => {
+                let reason = reason.clone();
+                Some(self.render_unsupported_panel(&reason))
             }
             PluginEditorStatus::Attached(PluginEditorPresentationMode::DetachedNativeWindow) => {
                 // The plug-in is in its own standalone OS window — the GPUI shell
@@ -2214,4 +2344,50 @@ pub(crate) fn open_plugin_editor_window(
         }
     }
     result.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod platform_support_tests {
+    use super::*;
+
+    #[test]
+    fn a_platform_that_can_embed_waits_for_its_window() {
+        // On Windows the handle really does arrive a frame or two later, and
+        // giving up on the first miss would break opening an editor there.
+        assert_eq!(
+            missing_parent_handle_outcome(true),
+            MissingParentHandle::WaitForWindow
+        );
+    }
+
+    #[test]
+    fn a_platform_that_cannot_embed_says_so_instead_of_timing_out() {
+        // macOS: `native_parent_handle` returns `None` unconditionally, so the
+        // window used to spin out `MAX_WAIT_TICKS` and then report "host region
+        // never became ready" — a timeout, for something that was never going
+        // to happen — with a Retry button that re-ran the same refusal.
+        assert_eq!(
+            missing_parent_handle_outcome(false),
+            MissingParentHandle::PlatformUnsupported
+        );
+    }
+
+    #[test]
+    fn the_platform_message_names_the_editor_not_the_plugin() {
+        // The plug-in may well be loaded and running; only its window is
+        // missing. Claiming otherwise sends people to debug the wrong thing.
+        assert!(NO_NATIVE_EMBEDDING_MESSAGE.contains("editor"));
+        assert!(!NO_NATIVE_EMBEDDING_MESSAGE.is_empty());
+    }
+
+    #[test]
+    fn the_windows_build_is_the_one_that_embeds() {
+        assert_eq!(
+            NATIVE_VIEW_EMBEDDING_SUPPORTED,
+            cfg!(target_os = "windows"),
+            "the constant is the single statement of which platforms have a \
+             content-child implementation; it must track the stub in \
+             `plugin_content_host`"
+        );
+    }
 }

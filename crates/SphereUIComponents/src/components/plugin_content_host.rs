@@ -21,6 +21,26 @@
 //! so the crate still compiles cross-platform. (macOS NSView hosting is a later
 //! slice.)
 
+/// Whether this platform can embed a plug-in's own native view inside the
+/// app's window.
+///
+/// Windows only, and the design above says why: the main app creates a
+/// `WS_CHILD` content HWND and hands the handle to the host process, which
+/// attaches the VST3 `IPlugView` to it from its own thread. Reparenting a
+/// window across process boundaries is a Win32 facility. macOS has no public
+/// equivalent for `NSView`, so a macOS port is not this file's stub growing a
+/// body — it is a different design (a host-owned `NSWindow` the app tracks, or
+/// in-process editors), and the host process is HWND-typed end to end besides.
+///
+/// Callers consult this to tell "not implemented on this platform" from "the
+/// window was not ready this frame". The two look identical from
+/// [`ContentChildHwnd::create`] — both are `None` — and reporting the first as
+/// the second is what put a Retry button on a dialog that could never succeed.
+///
+/// `cfg!` rather than `#[cfg]` on purpose: both branches of every caller stay
+/// compiled and type-checked on every platform.
+pub const NATIVE_VIEW_EMBEDDING_SUPPORTED: bool = cfg!(target_os = "windows");
+
 /// Physical-pixel rect (relative to the parent client area) for the content
 /// child window.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
