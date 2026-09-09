@@ -184,6 +184,25 @@ pub enum EditCommand {
         prev: Vec<MidiNoteState>,
         next: Vec<MidiNoteState>,
     },
+    /// Notes dragged out of one clip and into another, as one undo entry.
+    ///
+    /// The MIDI editor shows a whole track, so a note can be dragged past the
+    /// edge of the clip that owns it. Leaving it there produces a note the
+    /// clip's own length says does not exist — stored, not played, and
+    /// invisible the moment the editor is closed. It changes owner instead.
+    ///
+    /// Both clips' complete note lists are carried before and after, rather
+    /// than just the notes that moved. Overwriting the destination with only
+    /// the arrivals would delete everything already in it, and an undo built
+    /// from a diff would have to re-derive what the destination held.
+    MoveMidiNotesBetweenClips {
+        from_clip_id: String,
+        to_clip_id: String,
+        from_prev: Vec<MidiNoteState>,
+        from_next: Vec<MidiNoteState>,
+        to_prev: Vec<MidiNoteState>,
+        to_next: Vec<MidiNoteState>,
+    },
     /// Replace a track's automation lanes (point add / move / curve / delete,
     /// and lane create / clear / remove / show-hide). One entry per gesture.
     ///
@@ -330,6 +349,7 @@ impl EditCommand {
             | EditCommand::DeleteMidiNotes { .. }
             | EditCommand::SetMidiNotesMuted { .. }
             | EditCommand::EditMidiNotes { .. }
+            | EditCommand::MoveMidiNotesBetweenClips { .. }
             | EditCommand::SetControllerPoints { .. }
             | EditCommand::SetMidiArticulations { .. }
             | EditCommand::SplitMidiNote { .. } => EditImpact::Midi,
@@ -387,6 +407,7 @@ impl EditCommand {
                 }
             }
             EditCommand::EditMidiNotes { .. } => "Edit MIDI Notes",
+            EditCommand::MoveMidiNotesBetweenClips { .. } => "Move MIDI Notes to Clip",
             EditCommand::SetTrackAutomationLanes { .. } => "Edit Automation",
             EditCommand::SetControllerPoints { .. } => "Edit CC Lane",
             EditCommand::SetMidiArticulations { .. } => "Edit Articulations",
@@ -493,6 +514,16 @@ impl EditCommand {
             }
             EditCommand::EditMidiNotes { clip_id, next, .. } => {
                 state.overwrite_midi_notes(clip_id, next);
+            }
+            EditCommand::MoveMidiNotesBetweenClips {
+                from_clip_id,
+                to_clip_id,
+                from_next,
+                to_next,
+                ..
+            } => {
+                state.overwrite_midi_notes(from_clip_id, from_next);
+                state.overwrite_midi_notes(to_clip_id, to_next);
             }
             EditCommand::SetTrackAutomationLanes { track_id, next, .. } => {
                 state.set_track_automation_lanes(track_id, next.clone());
@@ -637,6 +668,16 @@ impl EditCommand {
             }
             EditCommand::EditMidiNotes { clip_id, prev, .. } => {
                 state.overwrite_midi_notes(clip_id, prev);
+            }
+            EditCommand::MoveMidiNotesBetweenClips {
+                from_clip_id,
+                to_clip_id,
+                from_prev,
+                to_prev,
+                ..
+            } => {
+                state.overwrite_midi_notes(from_clip_id, from_prev);
+                state.overwrite_midi_notes(to_clip_id, to_prev);
             }
             EditCommand::SetTrackAutomationLanes { track_id, prev, .. } => {
                 state.set_track_automation_lanes(track_id, prev.clone());

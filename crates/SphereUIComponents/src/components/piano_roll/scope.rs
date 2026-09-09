@@ -273,6 +273,52 @@ mod tests {
         assert!(scope.editing().is_none());
     }
 
+    /// Rebasing a note from one clip to another must keep it where the user
+    /// dropped it on the timeline. This is the arithmetic the cross-clip drag
+    /// performs, stated on its own so a sign error cannot hide inside a drag.
+    #[test]
+    fn a_note_rebased_between_clips_keeps_its_place_in_the_song() {
+        let from = span("a", 16.0, 16.0, true);
+        let to = span("b", 32.0, 16.0, false);
+
+        // A note 14 beats into the first clip is at project beat 30.
+        let local_in_from = 14.0_f32;
+        let on_timeline = from.to_project(local_in_from);
+        assert_eq!(on_timeline, 30.0);
+
+        // Dragged four beats right it lands at 34, inside the second clip.
+        let dropped_at = on_timeline + 4.0;
+        assert!(to.contains(dropped_at));
+        let local_in_to = to.to_local(dropped_at);
+        assert_eq!(local_in_to, 2.0);
+        // And converting back gives the same place in the song.
+        assert_eq!(to.to_project(local_in_to), dropped_at);
+    }
+
+    /// The gap between two clips owns nothing, so a note dropped there has no
+    /// destination — and the editor leaves it alone rather than deleting it.
+    #[test]
+    fn the_gap_between_clips_owns_no_note() {
+        let scope = scope(vec![span("a", 0.0, 8.0, true), span("b", 16.0, 8.0, false)]);
+        assert!(scope.owner_at(12.0).is_none());
+    }
+
+    /// A note dragged left, out of the front of its clip, migrates the same way
+    /// as one dragged right. Worth its own case: the subtraction changes sign.
+    #[test]
+    fn migration_works_in_both_directions() {
+        let earlier = span("a", 0.0, 16.0, false);
+        let editing = span("b", 16.0, 16.0, true);
+        let scope = scope(vec![earlier.clone(), editing.clone()]);
+
+        // Two beats into the edited clip, dragged five beats left.
+        let dropped_at = editing.to_project(2.0) - 5.0;
+        assert_eq!(dropped_at, 13.0);
+        let owner = scope.owner_at(dropped_at).expect("a clip owns beat 13");
+        assert_eq!(owner.clip_id, "a");
+        assert_eq!(owner.to_local(dropped_at), 13.0);
+    }
+
     /// A zero-length clip owns no beat at all, rather than owning its start
     /// forever. `contains` is half-open, so start == end is empty by
     /// construction — this pins that, because the alternative is a clip that

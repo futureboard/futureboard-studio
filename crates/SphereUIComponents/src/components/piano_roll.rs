@@ -2643,6 +2643,13 @@ impl PianoRoll {
         if prev == next {
             return;
         }
+        // A note dragged past the edge of its clip belongs to whichever clip it
+        // landed in. Handled here because this is the one place every move and
+        // resize passes through, so there is no gesture that can quietly leave
+        // a note outside the clip that owns it.
+        if self.migrate_notes_that_left_the_clip(cx, &clip_id, &prev, &next) {
+            return;
+        }
         self.timeline.update(cx, |tl, tcx| {
             tl.record_executed_command(
                 EditCommand::EditMidiNotes {
@@ -2656,6 +2663,115 @@ impl PianoRoll {
         if self.midi_editor_sink {
             crate::components::midi_editor_window::midi_editor_debug("edit command committed");
         }
+    }
+
+    /// Hand any note that left the edited clip to the clip it landed in.
+    ///
+    /// Returns `true` when it recorded the move, in which case the caller must
+    /// not also record an `EditMidiNotes` — the move command already carries
+    /// both clips' full before and after.
+    ///
+    /// Notes that land on no clip at all are left where they are rather than
+    /// deleted. Dragging into the gap between two clips is a miss, not an
+    /// instruction to discard the note, and the user can drag it back.
+    fn migrate_notes_that_left_the_clip(
+        &mut self,
+        cx: &mut Context<Self>,
+        clip_id: &str,
+        prev: &[MidiNoteState],
+        next: &[MidiNoteState],
+    ) -> bool {
+        let Some(source) = self.scope.span(clip_id).cloned() else {
+            return false;
+        };
+
+        // Which notes ended up somewhere else, and where.
+        let mut moves: Vec<(MidiNoteState, String, f32)> = Vec::new();
+        for note in next {
+            let project_start = source.to_project(note.start);
+            let Some(owner) = self.scope.owner_at(project_start) else {
+                continue;
+            };
+            if owner.clip_id == source.clip_id {
+                continue;
+            }
+            moves.push((note.clone(), owner.clip_id.clone(), owner.start_beat));
+        }
+        if moves.is_empty() {
+            return false;
+        }
+
+        let moved_ids: std::collections::HashSet<u64> =
+            moves.iter().map(|(note, _, _)| note.id).collect();
+
+        // One destination per gesture: a multi-note drag that straddles two
+        // neighbours would need one command per destination, and splitting a
+        // single drag across several undo entries is worse than keeping the
+        // stragglers put. The first destination wins and the rest stay.
+        let (_, to_clip_id, to_origin) = moves[0].clone();
+
+        let (from_prev, to_prev) = {
+            let tl = self.timeline.read(cx);
+            (
+                tl.state
+                    .midi_clip_notes(clip_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                tl.state
+                    .midi_clip_notes(&to_clip_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        };
+
+        let from_next: Vec<MidiNoteState> = next
+            .iter()
+            .filter(|note| !moved_ids.contains(&note.id))
+            .cloned()
+            .collect();
+
+        let mut to_next = to_prev.clone();
+        for (note, destination, origin) in &moves {
+            if destination != &to_clip_id {
+                continue;
+            }
+            let mut moved = note.clone();
+            // Rebased into the destination's frame: the note keeps the place on
+            // the timeline the user dropped it at, which is the whole point of
+            // the gesture.
+            moved.start = source.to_project(note.start) - origin;
+            to_next.push(moved);
+        }
+
+        // Anything bound for a second destination stays where it was.
+        let stayed: Vec<MidiNoteState> = moves
+            .iter()
+            .filter(|(_, destination, _)| destination != &to_clip_id)
+            .filter_map(|(note, _, _)| prev.iter().find(|p| p.id == note.id).cloned())
+            .collect();
+        let from_next: Vec<MidiNoteState> = from_next.into_iter().chain(stayed).collect();
+
+        let _ = to_origin;
+        if midi_debug_enabled() {
+            eprintln!(
+                "[MidiEditor] migrate {} note(s) {clip_id} -> {to_clip_id}",
+                to_next.len().saturating_sub(to_prev.len())
+            );
+        }
+
+        let command = EditCommand::MoveMidiNotesBetweenClips {
+            from_clip_id: clip_id.to_string(),
+            to_clip_id,
+            from_prev,
+            from_next,
+            to_prev,
+            to_next,
+        };
+        self.run_edit_command(command, cx);
+        // The moved notes now live under new ids' clip; a selection pointing
+        // into the old one would delete the wrong thing.
+        self.selection.clear();
+        true
     }
 
     /// Mutate the timeline for a *live* gesture (drag in progress): repaint but
@@ -2717,6 +2833,42 @@ impl PianoRoll {
     // Notes are interactive elements that handle their own select/move/resize/
     // delete (and stop propagation), so the grid surface only deals with empty
     // space: create a note (Draw tool) or clear the selection (Select tool).
+    /// Make the clip under `lx` the one being edited, if it is not already.
+    ///
+    /// This is what turns the neighbours from a picture into the rest of the
+    /// editor. The alternative — teaching all forty edit sites to address a
+    /// clip resolved per gesture — would be the same behaviour with forty
+    /// chances to address the wrong one.
+    ///
+    /// The note selection is dropped on the way across, because note ids belong
+    /// to their clip: keeping them would leave a selection pointing at notes
+    /// that are no longer on screen and would be deleted by the next Delete.
+    ///
+    /// Returns `true` when it moved, and the caller starts the gesture on the
+    /// next press: the scope and the origin are only refreshed by a render, so
+    /// continuing here would measure the new clip against the old frame.
+    fn retarget_to_clip_under(&mut self, lx: f32, cx: &mut Context<Self>) -> bool {
+        let project_beat = self.x_to_project_beat(lx);
+        let Some(owner) = self.scope.owner_at(project_beat) else {
+            return false;
+        };
+        if owner.editable {
+            return false;
+        }
+        let clip_id = owner.clip_id.clone();
+        if midi_debug_enabled() {
+            eprintln!("[MidiEditor] retarget to clip {clip_id} at beat {project_beat:.3}");
+        }
+        self.selection.clear();
+        self.drag = PianoDrag::None;
+        self.timeline.update(cx, |tl, tcx| {
+            tl.state.select_clip(&clip_id);
+            tcx.notify();
+        });
+        cx.notify();
+        true
+    }
+
     fn on_grid_down(
         &mut self,
         event: &MouseDownEvent,
@@ -2735,6 +2887,12 @@ impl PianoRoll {
             // a note at the wrong coordinate.
             return;
         };
+        // Pressing inside a neighbouring clip moves the editor there rather
+        // than doing nothing, which is what makes every clip on the track
+        // reachable without going back to the arrangement to select it.
+        if self.retarget_to_clip_under(lx, cx) {
+            return;
+        }
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
         };
