@@ -102,6 +102,21 @@ impl StudioLayout {
         }
     }
 
+    /// Whether any track is record-armed.
+    ///
+    /// What Space consults before deciding a press means Record rather than
+    /// Play. Arm state only, not input or monitoring: a track can be armed with
+    /// nothing plugged into it, and the transport should still behave the way
+    /// the arm button says it will.
+    pub(super) fn any_track_record_armed(&self, cx: &Context<Self>) -> bool {
+        self.timeline
+            .read(cx)
+            .state
+            .tracks
+            .iter()
+            .any(|track| track.armed)
+    }
+
     pub(super) fn start_native_recording(&mut self, cx: &mut Context<Self>) {
         let (count_in_enabled, count_in_bars, playing, bpm, beats_per_bar, target_beat) = {
             let timeline = self.timeline.read(cx);
@@ -176,7 +191,25 @@ impl StudioLayout {
             })
             .unwrap_or_else(|| Err("audio engine unavailable".to_string()));
 
-        self.recording.ui_state = RecordingUiState::CountingIn { bars };
+        // How long one click is, in the engine's own samples. Taken from the
+        // engine rather than recomputed from the tempo map: it already resolved
+        // the spacing when it accepted the count-in, and two derivations of the
+        // same number are two chances to disagree by a beat.
+        let samples_per_beat = self
+            .audio_bridge
+            .engine
+            .as_ref()
+            .map(|engine| engine.count_in_remaining_samples())
+            .filter(|total| *total > 0)
+            .map(|total| total / beats.max(1) as u64)
+            .unwrap_or(0)
+            .max(1);
+
+        self.recording.ui_state = RecordingUiState::CountingIn {
+            bars,
+            beats_total: beats,
+            beats_left: beats,
+        };
         cx.notify();
 
         // Arm now, play at the downbeat.
@@ -229,6 +262,23 @@ impl StudioLayout {
                         .engine
                         .as_ref()
                         .map(|engine| engine.count_in_remaining_samples());
+
+                    // Publish the number the player is waiting on. Rounded up:
+                    // with two and a half beats to go the count still reads 3,
+                    // because the click for that beat has not sounded yet.
+                    if let Some(remaining) = remaining {
+                        let left = remaining.div_ceil(samples_per_beat.max(1)) as u32;
+                        let left = left.min(beats);
+                        if let RecordingUiState::CountingIn { beats_left, .. } =
+                            &mut this.recording.ui_state
+                        {
+                            if *beats_left != left {
+                                *beats_left = left;
+                                _cx.notify();
+                            }
+                        }
+                    }
+
                     // A stalled or absent engine must not leave the UI
                     // counting forever — the deadline always ends it.
                     let done = match remaining {
@@ -621,13 +671,40 @@ impl StudioLayout {
             self.cancel_record_count_in(cx);
             return;
         }
+        // Stopping a take runs entirely on this thread, and every step of it can
+        // touch the disk or the audio device. Somewhere in here is the pause the
+        // user sees when a take ends, and reading the code does not say where:
+        // the writer streams during the take, so finalize should be a header
+        // rewrite, and `pause` should be a flag. Measured rather than guessed —
+        // `FUTUREBOARD_RECORDING_DEBUG=1` prints where the time went.
+        //
+        // Not a fix. Fixing it means not blocking this thread on the engine at
+        // all, which is a split of the engine's stop path, and doing that on a
+        // guess risks misplacing somebody's take.
+        let stop_debug = std::env::var_os("FUTUREBOARD_RECORDING_DEBUG").is_some();
+        let stop_started = std::time::Instant::now();
+        let mut mark = stop_started;
+        let mut step = |label: &str| {
+            if stop_debug {
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "[recording] stop {label}: {:.1} ms (total {:.1} ms)",
+                    now.duration_since(mark).as_secs_f64() * 1000.0,
+                    now.duration_since(stop_started).as_secs_f64() * 1000.0,
+                );
+                mark = now;
+            }
+        };
+
         self.stop_recording_transport_ui(cx);
         self.recording.ui_state = RecordingUiState::Finalizing;
         cx.notify();
+        step("transport ui");
 
         self.clear_midi_recording_previews(cx);
         let midi_results = self.finish_midi_recording_take(cx);
         let midi_committed = !midi_results.is_empty();
+        step("midi take");
 
         if let Some(engine) = self.audio_bridge.engine.clone() {
             let engine_recording = engine.recording_status().active;
@@ -636,6 +713,7 @@ impl StudioLayout {
                 eprintln!("[audio] stop transport while recording failed: {error}");
             }
             self.audio_bridge.stats = Some(engine.stats());
+            step("engine pause");
 
             if engine_recording {
                 let results = match engine.stop_recording() {
@@ -649,7 +727,9 @@ impl StudioLayout {
                         return;
                     }
                 };
+                step("engine stop_recording (disk writer flush + finalize)");
                 self.commit_recording_results(cx, results);
+                step("commit audio results");
             }
         } else if midi_results.is_empty() {
             self.recording.ui_state = RecordingUiState::Failed {
@@ -660,6 +740,7 @@ impl StudioLayout {
         }
 
         self.commit_midi_recording_results(cx, midi_results);
+        step("commit midi results");
 
         if !matches!(self.recording.ui_state, RecordingUiState::Failed { .. }) {
             self.recording.ui_state = RecordingUiState::Idle;

@@ -213,10 +213,19 @@ impl RendererWarmup {
 pub enum RecordingUiState {
     Idle,
     Preparing,
-    CountingIn { bars: u32 },
+    /// Pre-roll before a take. `beats_left` counts down to zero and is what
+    /// the transport shows — the player needs the number that is about to
+    /// happen, not how many bars were configured.
+    CountingIn {
+        bars: u32,
+        beats_total: u32,
+        beats_left: u32,
+    },
     Recording,
     Finalizing,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 impl RecordingUiState {
@@ -224,7 +233,9 @@ impl RecordingUiState {
         match self {
             Self::Idle => None,
             Self::Preparing => Some("Recording: preparing...".to_string()),
-            Self::CountingIn { bars } => Some(format!("Recording: count-in {bars} bars")),
+            Self::CountingIn { beats_left, .. } => {
+                Some(format!("Recording: count-in {beats_left}"))
+            }
             Self::Recording => Some("Recording".to_string()),
             Self::Finalizing => Some("Recording: finalizing...".to_string()),
             Self::Failed { reason } => Some(format!("Recording failed: {reason}")),

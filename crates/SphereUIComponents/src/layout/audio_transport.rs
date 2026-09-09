@@ -4168,7 +4168,11 @@ mod stop_lifecycle_tests {
     #[test]
     fn a_count_in_is_cancelled_rather_than_finalized() {
         assert!(!stop_must_finalize_recording(
-            &RecordingUiState::CountingIn { bars: 2 },
+            &RecordingUiState::CountingIn {
+                bars: 2,
+                beats_total: 8,
+                beats_left: 8,
+            },
             true
         ));
     }
