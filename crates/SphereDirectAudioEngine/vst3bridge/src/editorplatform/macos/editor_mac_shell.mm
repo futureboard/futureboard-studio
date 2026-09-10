@@ -172,27 +172,42 @@ NSString *ns(const std::string &value) {
 /// Returns nil when the symbol is unavailable, and every draw site treats nil
 /// as "draw nothing" rather than substituting a placeholder box — a chrome with
 /// one missing glyph is better than one with a stand-in nobody recognises.
+///
+/// # Why `respondsToSelector:` and not `@available`
+///
+/// `@available` compiles to a call to `___isPlatformVersionAtLeast`, a
+/// compiler-rt builtin. Rust links this bridge itself and does not pull clang's
+/// runtime library in, so on x86_64 that symbol is simply undefined and the
+/// whole application fails to link. It happens to resolve on arm64, which is
+/// exactly how a build that only ever ran on Apple silicon shipped a link error
+/// for Intel.
+///
+/// Asking the class whether it answers the selector needs no runtime library,
+/// says the same thing, and says it about the API actually being called rather
+/// than about an OS version standing in for it.
 NSImage *chrome_symbol(NSString *name, NSColor *tint, CGFloat size) {
-  if (@available(macOS 11.0, *)) {
-    NSImage *image = [NSImage imageWithSystemSymbolName:name
-                              accessibilityDescription:nil];
-    if (!image) {
-      return nil;
-    }
-    NSImageSymbolConfiguration *config =
-        [NSImageSymbolConfiguration configurationWithPointSize:size
-                                                        weight:NSFontWeightRegular];
-    if (@available(macOS 12.0, *)) {
-      // Colour through the symbol configuration rather than by filling a copy:
-      // the fill route needs `lockFocus`, which rasterises at one scale and
-      // then looks soft on a display with a different one.
-      NSImageSymbolConfiguration *tinted =
-          [NSImageSymbolConfiguration configurationWithHierarchicalColor:tint];
-      config = [config configurationByApplyingConfiguration:tinted];
-    }
-    return [image imageWithSymbolConfiguration:config];
+  if (![NSImage respondsToSelector:@selector(imageWithSystemSymbolName:
+                                                accessibilityDescription:)]) {
+    return nil;
   }
-  return nil;
+  NSImage *image = [NSImage imageWithSystemSymbolName:name
+                             accessibilityDescription:nil];
+  if (!image) {
+    return nil;
+  }
+  NSImageSymbolConfiguration *config =
+      [NSImageSymbolConfiguration configurationWithPointSize:size
+                                                      weight:NSFontWeightRegular];
+  if ([NSImageSymbolConfiguration
+          respondsToSelector:@selector(configurationWithHierarchicalColor:)]) {
+    // Colour through the symbol configuration rather than by filling a copy:
+    // the fill route needs `lockFocus`, which rasterises at one scale and then
+    // looks soft on a display with a different one.
+    NSImageSymbolConfiguration *tinted = [NSImageSymbolConfiguration
+        configurationWithHierarchicalColor:tint];
+    config = [config configurationByApplyingConfiguration:tinted];
+  }
+  return [image imageWithSymbolConfiguration:config];
 }
 
 void draw_text(NSString *text, NSRect rect, NSColor *color, CGFloat size,
