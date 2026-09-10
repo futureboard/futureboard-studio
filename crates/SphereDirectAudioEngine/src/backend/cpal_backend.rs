@@ -176,16 +176,31 @@ pub(crate) fn open_on_host(
             config.mmcss_priority,
         ) {
             Ok(stream) => {
-                // `callback_frames` is what the chosen candidate predicts the
-                // callback block will be: on ALSA the period cpal derives from
-                // the ring it was handed (see `period_candidates`), elsewhere
-                // the requested size itself. cpal exposes no way to read back
-                // what the device really negotiated, so the prediction is the
-                // only answer available; `BufferSize::Default` means we never
-                // asked, so report 0 rather than guess.
-                let buf_size = match stream_config.buffer_size {
+                // `callback_frames` is what the chosen candidate *predicts* the
+                // callback block will be (on ALSA, derived from the ring — see
+                // `period_candidates`; elsewhere, the requested size itself).
+                // The ALSA backend can report what it actually negotiated via
+                // `negotiated_buffer()` (reads back `snd_pcm_hw_params`), which
+                // is the real figure when it disagrees with the prediction —
+                // dmix/PipeWire's ALSA plugin can round `_near` calls away from
+                // what was asked for. `BufferSize::Default` means we never
+                // asked, so report 0 rather than guess when no negotiated value
+                // is available either.
+                let predicted = match stream_config.buffer_size {
                     BufferSize::Fixed(_) => *callback_frames,
                     BufferSize::Default => 0,
+                };
+                let buf_size = match stream.negotiated_buffer() {
+                    Some(negotiated) => {
+                        if negotiated.period_frames != predicted && predicted != 0 {
+                            eprintln!(
+                                "[DAUx cpal] {label}: negotiated period {} frames (requested {predicted})",
+                                negotiated.period_frames
+                            );
+                        }
+                        negotiated.period_frames
+                    }
+                    None => predicted,
                 };
                 return Ok(CpalStreamHandle {
                     stream,
@@ -242,20 +257,36 @@ pub(crate) fn period_candidates(period: u32) -> Vec<(&'static str, u32, u32)> {
     const MAX_RING: u32 = crate::plugin_bridge::MAX_BRIDGE_BLOCK_FRAMES as u32;
     let periods = (MAX_RING / period.max(1)).clamp(1, ALSA_PERIODS_PER_BUFFER);
     let ring = period.saturating_mul(periods);
-    vec![
+    let mut candidates = vec![
         // Preferred: as many periods as fit, so the callback block == the
         // requested period and the rest absorbs scheduling jitter.
         ("requested (ALSA multi-period ring)", ring, period),
-        // `set_buffer_size` is an *exact* match on ALSA, and dmix / the
-        // PipeWire ALSA plugin routinely refuse the larger ring. Retry with the
-        // bare value — worse headroom, but far better than surrendering to the
-        // device default (25 ms period / 100 ms ring) as the next step would.
-        (
-            "requested (ALSA bare ring)",
-            period,
-            (period / ALSA_PERIODS_PER_BUFFER).max(1),
-        ),
-    ]
+    ];
+    // `set_buffer_size` is an *exact* match on ALSA, and dmix / the PipeWire
+    // ALSA plugin routinely refuse the larger ring above. Jumping straight
+    // from a 4-period ring to the single-period "bare ring" below quarters
+    // the callback size (`period` -> `period/4`) — worse headroom on exactly
+    // the systems most likely to reject the preferred candidate. Try a
+    // 2-period ring first: still rejectable on the same exact-match grounds,
+    // but only halves the callback instead of quartering it.
+    //
+    // Only worth trying when it's actually smaller than the preferred ring
+    // above (`periods > 2`); otherwise it would just repeat the same value.
+    if periods > 2 {
+        candidates.push((
+            "requested (ALSA 2-period ring)",
+            period.saturating_mul(2),
+            (period / 2).max(1),
+        ));
+    }
+    // Last resort before surrendering to the device default (25 ms period /
+    // 100 ms ring): the bare requested value as the whole ring.
+    candidates.push((
+        "requested (ALSA bare ring)",
+        period,
+        (period / ALSA_PERIODS_PER_BUFFER).max(1),
+    ));
+    candidates
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -461,6 +492,15 @@ where
                         eprintln!("[DAUx cpal] Stream error: {err}");
                         err_shared.device_lost.store(true, Ordering::Relaxed);
                     }
+                    // The vendored ALSA backend detects the driver-level xrun
+                    // itself (recovering via `snd_pcm_prepare`/`try_recover`)
+                    // and reports it here instead of swallowing it — this is
+                    // the only place a real ALSA underrun becomes visible to
+                    // the UI, distinct from `glitch_counter`'s broader
+                    // "something clipped a block" signal.
+                    cpal::StreamError::Underrun => {
+                        err_shared.device_xruns.fetch_add(1, Ordering::Relaxed);
+                    }
                     _ => eprintln!("[DAUx cpal] Stream error: {err}"),
                 }
             },
@@ -526,13 +566,23 @@ mod rt_priority {
 
     /// Spawn the helper that promotes the audio thread once it announces its
     /// tid. Returns immediately; the helper exits after a single attempt.
+    ///
+    /// The RealtimeKit D-Bus connection is opened here, before the helper
+    /// blocks waiting for the announce — not inside `rtkit::promote` — so the
+    /// (single-digit-to-tens-of-ms) connect handshake happens during stream
+    /// setup instead of racing the audio thread's first few callbacks. On a
+    /// stock desktop (`RLIMIT_RTPRIO` 0) RealtimeKit is the only promotion
+    /// route, and until it completes the callback thread is plain
+    /// `SCHED_OTHER`, preemptable by GPUI's own `SCHED_FIFO` compositor
+    /// thread — exactly the window this closes.
     pub fn spawn_promoter() -> Announcer {
         let (tx, rx) = bounded(1);
         let spawned = std::thread::Builder::new()
             .name("daux-rt-promote".into())
             .spawn(move || {
+                let prewarmed_bus = rtkit::connect_system_bus();
                 if let Ok(tid) = rx.recv_timeout(ANNOUNCE_TIMEOUT) {
-                    let _ = promote(tid);
+                    let _ = promote(tid, prewarmed_bus);
                 }
             });
         if let Err(e) = &spawned {
@@ -554,14 +604,14 @@ mod rt_priority {
         Unchanged,
     }
 
-    fn promote(tid: libc::pid_t) -> Outcome {
+    fn promote(tid: libc::pid_t, prewarmed_bus: Option<zbus::blocking::Connection>) -> Outcome {
         if let Some(priority) = try_sched_fifo(tid) {
             eprintln!("[DAUx] audio thread promoted to SCHED_FIFO priority {priority}");
             return Outcome::Fifo(priority);
         }
         // Expected on a stock desktop: RLIMIT_RTPRIO is 0 there, so the direct
         // syscall above is always refused and RealtimeKit is the only route.
-        match rtkit::promote(tid) {
+        match rtkit::promote(tid, prewarmed_bus) {
             Ok(priority) => {
                 eprintln!(
                     "[DAUx] audio thread promoted to SCHED_RR priority {priority} \
@@ -630,9 +680,24 @@ mod rt_priority {
         /// the daemon advertises no maximum of its own.
         const FALLBACK_RTTIME_US: u64 = 200_000;
 
-        pub fn promote(tid: libc::pid_t) -> Result<i32, String> {
-            let conn = zbus::blocking::Connection::system()
-                .map_err(|e| format!("system bus unavailable: {e}"))?;
+        /// Opened by `spawn_promoter` before it waits for the tid announce, so
+        /// the handshake is off the promotion critical path. Falls back to a
+        /// fresh connection in `promote` if this failed (daemon/bus not up
+        /// yet at helper-thread start) — same behavior as before, just no
+        /// longer the common case.
+        pub fn connect_system_bus() -> Option<zbus::blocking::Connection> {
+            zbus::blocking::Connection::system().ok()
+        }
+
+        pub fn promote(
+            tid: libc::pid_t,
+            prewarmed_bus: Option<zbus::blocking::Connection>,
+        ) -> Result<i32, String> {
+            let conn = match prewarmed_bus {
+                Some(conn) => conn,
+                None => zbus::blocking::Connection::system()
+                    .map_err(|e| format!("system bus unavailable: {e}"))?,
+            };
             let proxy = zbus::blocking::Proxy::new(&conn, SERVICE, PATH, SERVICE)
                 .map_err(|e| format!("proxy setup failed: {e}"))?;
 
@@ -713,7 +778,7 @@ mod rt_priority {
             });
             let tid = ready_rx.recv().expect("worker should report its tid");
 
-            let outcome = super::promote(tid);
+            let outcome = super::promote(tid, super::rtkit::connect_system_bus());
             // SAFETY: `tid` names the still-parked worker thread.
             let policy = unsafe { libc::sched_getscheduler(tid) };
 
@@ -837,8 +902,38 @@ mod buffer_size_tests {
     #[test]
     fn alsa_falls_back_before_surrendering_to_the_device_default() {
         let candidates = period_candidates(256);
-        assert_eq!(candidates.len(), 2, "a retry must exist");
-        assert_eq!(candidates[1].1, 256, "retry asks for the bare value");
+        assert_eq!(
+            candidates.len(),
+            3,
+            "a 2-period and a bare retry must exist"
+        );
+        assert_eq!(candidates[2].1, 256, "final retry asks for the bare value");
+    }
+
+    /// The fallback between the preferred 4-period ring and the bare ring
+    /// must not jump straight from a full-size callback to a quarter-size
+    /// one: a 2-period ring (half-size callback) belongs in between.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn middle_candidate_only_halves_the_callback() {
+        let candidates = period_candidates(256);
+        let (_, mid_fixed, mid_callback) = candidates[1];
+        assert_eq!(mid_fixed, 512, "2-period ring holds two 256-frame periods");
+        assert_eq!(mid_callback, 128, "callback halves instead of quartering");
+
+        // When the preferred ring already has 2 or fewer periods (large
+        // requests), the 2-period middle candidate would duplicate it, so it
+        // must be omitted rather than repeated.
+        assert_eq!(
+            period_candidates(1024).len(),
+            2,
+            "no middle candidate when the preferred ring already has 2 periods"
+        );
+        assert_eq!(
+            period_candidates(2048).len(),
+            2,
+            "no middle candidate when the preferred ring already has 1 period"
+        );
     }
 
     /// Small periods must not report a zero-frame callback block, which would

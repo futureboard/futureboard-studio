@@ -254,6 +254,18 @@ const clap_host_gui_t kHostGui{host_gui_resize_hints_changed,
                                host_gui_request_resize, host_gui_request_show,
                                host_gui_request_hide, host_gui_closed};
 
+#if defined(__linux__)
+// clap.posix-fd-support / clap.timer-support: only meaningful where a plug-in
+// GUI needs the host to drive its event loop (Linux — see
+// clap_editor_linux.cpp). Windows/Cocoa editors have their own native message
+// pump and never query these.
+const clap_host_posix_fd_support_t kHostPosixFdSupport{
+    clap_host_register_fd_linux, clap_host_modify_fd_linux,
+    clap_host_unregister_fd_linux};
+const clap_host_timer_support_t kHostTimerSupport{
+    clap_host_register_timer_linux, clap_host_unregister_timer_linux};
+#endif
+
 const void *CLAP_ABI host_get_extension(const clap_host_t *,
                                         const char *extension_id) {
   if (!extension_id) {
@@ -271,6 +283,12 @@ const void *CLAP_ABI host_get_extension(const clap_host_t *,
     return &kHostState;
   if (std::strcmp(extension_id, CLAP_EXT_GUI) == 0)
     return &kHostGui;
+#if defined(__linux__)
+  if (std::strcmp(extension_id, CLAP_EXT_POSIX_FD_SUPPORT) == 0)
+    return &kHostPosixFdSupport;
+  if (std::strcmp(extension_id, CLAP_EXT_TIMER_SUPPORT) == 0)
+    return &kHostTimerSupport;
+#endif
   // Everything else is genuinely unsupported. Returning null is the contract.
   return nullptr;
 }
