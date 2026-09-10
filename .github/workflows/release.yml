@@ -27,7 +27,7 @@ on:
         # stale default here is worse than none: the dispatch form is prefilled
         # with it, so a hurried release attaches a freshly built installer to
         # whatever tag was current months ago.
-        default: "2026.9.8-beta1.2.2"
+        default: "2026.9.10-beta1.3"
       app-version:
         description: Version to build. Empty uses version.json.
         type: string
