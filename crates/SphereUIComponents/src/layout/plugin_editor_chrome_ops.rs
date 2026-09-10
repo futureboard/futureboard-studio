@@ -30,6 +30,23 @@ use crate::layout::StudioLayout;
 /// with "Clear Plugin Cache".
 const PRESET_EXTENSION: &str = "fbstate";
 
+/// How an ARA editor's window is filed among the insert editors.
+///
+/// It has no insert slot of its own — it is bound to a clip — so the studio
+/// gives it a key of this shape (`ara_studio::ara_insert_id`) to sit alongside
+/// them. Recognising it here is what tells an ARA editor's chrome from an
+/// insert's.
+const ARA_INSERT_PREFIX: &str = "ara:";
+
+/// Whether an editor key belongs to an ARA session rather than an insert slot.
+///
+/// One predicate for every place that has to tell them apart: the chrome an ARA
+/// editor gets, and the stale-editor sweep that would otherwise tear one down
+/// for having no slot behind it.
+pub(super) fn is_ara_editor_key(insert_id: &str) -> bool {
+    insert_id.starts_with(ARA_INSERT_PREFIX)
+}
+
 /// Set to keep the pre-GPUI Win32 editor shell for bridged inserts.
 ///
 /// The editor moved into a GPUI window so its chrome — the insert it belongs
@@ -116,17 +133,77 @@ impl StudioLayout {
                 continue;
             };
             let (track_id, insert_id) = chrome;
-            let Some(chrome) =
-                self.plugin_editor_chrome_for(&track_id, &insert_id, sample_rate, cx)
+            // An ARA editor's window is in `open` like any other, but it has no
+            // insert slot behind it — it is bound to a clip. It gets its own
+            // chrome, which is the plug-in's name and nothing it cannot back up.
+            let Some(chrome) = self
+                .plugin_editor_chrome_for(&track_id, &insert_id, sample_rate, cx)
+                .or_else(|| self.ara_editor_chrome_for(&track_id, &insert_id))
             else {
                 continue;
             };
-            let tabs = self.plugin_editor_tabs_for(&track_id, cx);
+            let tabs = self
+                .ara_editor_tabs_for(&insert_id, &chrome)
+                .unwrap_or_else(|| self.plugin_editor_tabs_for(&track_id, cx));
             let _ = handle.update(cx, |editor, _window, cx| {
                 editor.set_chrome(chrome, cx);
                 editor.set_tabs(tabs, cx);
             });
         }
+    }
+
+    /// Chrome for an ARA editor window.
+    ///
+    /// An ARA plug-in is bound to a clip, not to an insert slot: there is no
+    /// bypass to toggle, no per-slot CPU or latency to read, and no
+    /// insert-keyed preset list. So this fills in the name and leaves the rest
+    /// empty, and the window drops its control row rather than drawing five
+    /// controls with nothing behind them.
+    ///
+    /// `None` for anything that is not an ARA editor, which is what makes this
+    /// usable as a fallback after the insert lookup.
+    fn ara_editor_chrome_for(&self, track_id: &str, insert_id: &str) -> Option<PluginEditorChrome> {
+        let plugin_id = insert_id.strip_prefix(ARA_INSERT_PREFIX)?;
+        let key = crate::layout::ara_ops::AraSessionKey {
+            plugin_id: plugin_id.to_string(),
+            track_id: track_id.to_string(),
+        };
+        let plugin_name = self
+            .ara
+            .plugin_name(&key)
+            .map(str::to_string)
+            .unwrap_or_else(|| plugin_id.to_string());
+        Some(PluginEditorChrome {
+            plugin_name,
+            track_name: String::new(),
+            // Not an insert, so not a slot number. The titlebar drops the
+            // "Insert n" suffix for a 0 rather than inventing a position.
+            insert_number: 0,
+            active: true,
+            latency_samples: 0,
+            sample_rate: 0,
+            cpu_load: None,
+            presets: Vec::new(),
+            preset_index: None,
+        })
+    }
+
+    /// The tab list for an ARA editor: the one plug-in it is bound to.
+    ///
+    /// `None` for anything that is not an ARA editor. A channel's insert tabs
+    /// would be the wrong list here — those editors are somewhere else entirely
+    /// and switching to one from this window is not a thing that can happen.
+    fn ara_editor_tabs_for(
+        &self,
+        insert_id: &str,
+        chrome: &PluginEditorChrome,
+    ) -> Option<Vec<PluginEditorTab>> {
+        insert_id.strip_prefix(ARA_INSERT_PREFIX)?;
+        Some(vec![PluginEditorTab {
+            insert_id: insert_id.to_string(),
+            display_name: chrome.plugin_name.clone(),
+            insert_number: 0,
+        }])
     }
 
     /// Builds one insert's chrome from the project and the engine.
@@ -596,5 +673,27 @@ impl StudioLayout {
             .iter()
             .find(|slot| slot.id == insert_id)
             .and_then(|slot| slot.plugin_id.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ARA key has to be told from an insert key, and both places that ask
+    /// have to get the same answer.
+    ///
+    /// The sweep in `reconcile_open_plugin_editors` tears down any editor whose
+    /// insert slot is gone. An ARA editor never had one — it is bound to a clip
+    /// — so without this predicate every ARA editor window is stale the instant
+    /// it opens, and gets torn down along with the plug-in behind it.
+    #[test]
+    fn an_ara_editor_key_is_not_an_insert_key() {
+        assert!(is_ara_editor_key("ara:com.celemony.melodyne"));
+        assert!(is_ara_editor_key(ARA_INSERT_PREFIX));
+        assert!(!is_ara_editor_key("insert-1"));
+        assert!(!is_ara_editor_key(""));
+        // Not a prefix match anywhere else in the string.
+        assert!(!is_ara_editor_key("track:ara:thing"));
     }
 }

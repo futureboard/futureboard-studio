@@ -297,6 +297,13 @@ pub enum HostCommand {
         tabs: Vec<EditorChromeTab>,
         /// `tabs` entry this window is showing.
         active_tab: String,
+        /// Whether this editor has an insert behind it to control.
+        ///
+        /// `false` for an ARA plug-in, which is bound to a clip rather than to a
+        /// slot: no bypass, no per-slot CPU or latency, no insert-keyed presets.
+        /// The host then draws the tab band alone.
+        #[serde(default = "default_shows_insert_controls")]
+        shows_insert_controls: bool,
         /// Resolved theme colours, so the strip follows the studio's theme
         /// rather than carrying a palette of its own that only matches by
         /// accident.
@@ -647,6 +654,11 @@ fn default_editor_resizable() -> bool {
     true
 }
 
+/// An editor is insert-backed unless it says otherwise — every format but ARA.
+fn default_shows_insert_controls() -> bool {
+    true
+}
+
 /// Serialize `msg` as a single JSON line (object + `\n`) and flush.
 pub fn write_frame<W: Write>(writer: &mut W, msg: &impl Serialize) -> io::Result<()> {
     let line = serde_json::to_string(msg).map_err(io::Error::other)?;
@@ -963,6 +975,7 @@ mod tests {
                 insert_number: 1,
             }],
             active_tab: "track1:insert1".to_string(),
+            shows_insert_controls: true,
             palette: EditorChromePalette {
                 strip_bg: 0x1B1D22FF,
                 row_bg: 0x212429FF,
@@ -979,5 +992,28 @@ mod tests {
         let line = serde_json::to_string(&command).unwrap();
         let decoded: HostCommand = serde_json::from_str(&line).unwrap();
         assert_eq!(decoded, command);
+    }
+
+    /// A chrome frame without the field is an insert-backed editor.
+    ///
+    /// Every format but ARA is, and the flag was added after the command was:
+    /// defaulting it to `false` would silently strip the control row off every
+    /// editor a slightly older studio opens.
+    #[test]
+    fn a_chrome_frame_without_the_flag_still_has_its_controls() {
+        let line = r#"{"cmd":"SetEditorChrome","plugin_instance_id":"i","title":"t",
+            "active":true,"cpu_label":"1%","latency_label":"0 ms","preset_label":"—",
+            "presets":[],"tabs":[],"active_tab":"i","palette":{"strip_bg":0,"row_bg":0,
+            "border":0,"control_bg":0,"control_hover":0,"control_pressed":0,"accent":0,
+            "text_primary":0,"text_secondary":0,"text_faint":0}}"#;
+        let decoded: HostCommand = serde_json::from_str(line).unwrap();
+        let HostCommand::SetEditorChrome {
+            shows_insert_controls,
+            ..
+        } = decoded
+        else {
+            panic!("not a chrome command");
+        };
+        assert!(shows_insert_controls);
     }
 }

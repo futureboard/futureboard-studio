@@ -87,6 +87,15 @@ pub struct AraEditorHost {
     pending_rect: Option<ContentRect>,
     /// Whether a deferred sync is already queued.
     tick_scheduled: bool,
+    /// The session this panel has already asked for a window for.
+    ///
+    /// Only used where the dock cannot embed. Once per session, not once per
+    /// frame and not once per state change: `render` runs constantly, and the
+    /// studio opens the window several frames later. Keyed rather than a plain
+    /// flag so that closing the window leaves it closed — reopening it on the
+    /// next frame would make it unclosable — while binding a different clip
+    /// still gets its own editor.
+    own_window_requested: Option<AraSessionKey>,
     /// Last line written by [`Self::trace`], so a per-frame state is reported
     /// once rather than every frame.
     traced: Option<String>,
@@ -118,6 +127,7 @@ impl AraEditorHost {
             pending: None,
             pending_rect: None,
             tick_scheduled: false,
+            own_window_requested: None,
             traced: None,
             status: AraPanelStatus::Measuring,
             attached: None,
@@ -360,6 +370,34 @@ impl AraEditorHost {
     }
 }
 
+impl AraEditorHost {
+    /// Ask the studio to put this editor in its own window.
+    ///
+    /// Only where the dock cannot embed. Opening a window reaches the platform
+    /// and dispatches messages that re-enter GPUI, so it is never done from a
+    /// render — this only sets the studio's flag, on a later turn of the loop,
+    /// and `pop_out_ara_editor` does the rest on its own schedule.
+    ///
+    /// Asked once per session: `render` runs every frame, and the studio opens
+    /// the window several frames later. Asking again once the window has been
+    /// closed would make it impossible to close.
+    fn request_own_window(&mut self, key: &AraSessionKey, cx: &mut Context<Self>) {
+        if self.own_window_requested.as_ref() == Some(key) {
+            return;
+        }
+        self.own_window_requested = Some(key.clone());
+        let owner = self.owner.clone();
+        cx.spawn(async move |_this, cx| {
+            let _ = owner.update(cx, |layout, cx| {
+                if !layout.ara_editor_is_popped_out() {
+                    layout.pop_out_ara_editor(cx);
+                }
+            });
+        })
+        .detach();
+    }
+}
+
 impl Focusable for AraEditorHost {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus.clone()
@@ -373,23 +411,34 @@ impl Render for AraEditorHost {
         if self.owner.read(cx).ara_editor_is_popped_out() {
             self.trace(|| "render: popped out".to_string());
             self.request_detach(cx);
-            return unavailable_panel(
-                "This editor is open in its own window — use Dock to bring it back.",
-            )
+            return unavailable_panel(if embedding_supported() {
+                "This editor is open in its own window — use Dock to bring it back."
+            } else {
+                "This editor is open in its own window."
+            })
             .into_any_element();
         }
         let target = self.owner.read(cx).ara_panel_target(cx);
         let Some(key) = target else {
             self.trace(|| "render: no ARA target for the selection".to_string());
             self.request_detach(cx);
+            // Nothing bound here, so the next thing that is gets to ask for a
+            // window of its own.
+            self.own_window_requested = None;
             return unavailable_panel("This clip is not being edited by an ARA plug-in.")
                 .into_any_element();
         };
 
         if !embedding_supported() {
+            // No native-child embedding here, so the dock has nothing it can
+            // show. The editor goes to the same window every other plug-in's
+            // does, with the same chrome strip above it — asking the user to
+            // find "Pop Out" first was a dead end dressed as a choice.
             self.request_detach(cx);
+            self.request_own_window(&key, cx);
             return unavailable_panel(
-                "This plug-in's editor opens in its own window on this platform — use Pop Out.",
+                "This plug-in's editor opens in its own window on this platform. \
+                 Closing that window closes the editor.",
             )
             .into_any_element();
         }

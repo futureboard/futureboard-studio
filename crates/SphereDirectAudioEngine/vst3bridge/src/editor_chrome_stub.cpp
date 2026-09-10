@@ -24,7 +24,7 @@ void sphere_daux_editor_chrome_begin(unsigned long long) {}
 
 void sphere_daux_editor_chrome_set_header(unsigned long long, int,
                                           const char *, const char *,
-                                          const char *, const char *) {}
+                                          const char *, const char *, int) {}
 
 void sphere_daux_editor_chrome_add_preset(unsigned long long, const char *,
                                           int) {}

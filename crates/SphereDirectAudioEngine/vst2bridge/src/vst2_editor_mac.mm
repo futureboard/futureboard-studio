@@ -72,7 +72,11 @@ bool attach_into(SphereDauxVst2Processor *p, NSView *container, int width,
   if (w > 0 && h > 0) {
     p->embed_content_w = w;
     p->embed_content_h = h;
-    container.frame = NSMakeRect(0, 0, w, h);
+    // Only the plug-in's own views. The container's frame belongs to whoever
+    // made it — the shell in a host-owned window, the caller in an embedded
+    // one — and writing `(0, 0, w, h)` here is what once put a VST2 editor on
+    // top of the chrome strip: in the shell's flipped coordinates that origin
+    // is the top-left corner, not the bottom-left.
     for (NSView *child in container.subviews) {
       child.frame = NSMakeRect(0, 0, w, h);
     }
@@ -174,33 +178,21 @@ unsigned long long vst2_open_editor_mac(SphereDauxVst2Processor *p,
   int h = height > 0 ? height : 480;
   preferred_size(p, &w, &h);
 
-  // The window carries the editor chrome as well as the plug-in, so its
-  // content is taller than the editor by exactly that strip. `w`/`h` stay the
-  // *plug-in's* size throughout — the only size a plug-in ever agrees to.
-  const CGFloat chrome_h = sphere_daux_editor_chrome_height();
-  NSWindow *window = [[NSWindow alloc]
-      initWithContentRect:NSMakeRect(0, 0, w, h + chrome_h)
-                styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                           NSWindowStyleMaskMiniaturizable)
-                  backing:NSBackingStoreBuffered
-                    defer:NO];
-  window.title = [NSString stringWithUTF8String:p->editor_title.empty()
-                                                    ? "Plug-in Editor"
-                                                    : p->editor_title.c_str()];
-  window.releasedWhenClosed = NO;
-
+  // Window, chrome strip and the container the plug-in attaches into all come
+  // from the shared editor window — the one place that knows a host-owned
+  // editor window is "chrome strip, then plug-in". `w`/`h` stay the *plug-in's*
+  // size throughout, the only size a plug-in ever agrees to.
   DauxVst2EditorWindowDelegate *delegate =
       [[DauxVst2EditorWindowDelegate alloc] init];
   delegate.processor = p;
-  window.delegate = delegate;
 
-  NSView *shell = sphere_daux_editor_shell_create(
-      NSMakeRect(0, 0, w, h + chrome_h));
-  window.contentView = shell;
-  NSView *container = [[NSView alloc]
-      initWithFrame:sphere_daux_editor_shell_plugin_area(shell)];
-  container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  [shell addSubview:container];
+  NSWindow *window = sphere_daux_editor_window_create(
+      NSMakeSize(w, h),
+      [NSString stringWithUTF8String:p->editor_title.empty()
+                                         ? "Plug-in Editor"
+                                         : p->editor_title.c_str()],
+      p->editor_resizable ? YES : NO, delegate);
+  NSView *container = sphere_daux_editor_window_plugin_container(window);
 
   p->editor_native_window = (__bridge_retained void *)window;
   p->editor_native_embed = (__bridge_retained void *)container;
@@ -214,10 +206,12 @@ unsigned long long vst2_open_editor_mac(SphereDauxVst2Processor *p,
     return 0;
   }
 
-  [window setContentSize:NSMakeSize(p->embed_content_w,
-                                    p->embed_content_h + chrome_h)];
-  [window center];
+  // What `effEditGetRect` settled on after the open, which is where several
+  // plug-ins first report their real size.
+  sphere_daux_editor_window_set_plugin_size(
+      window, NSMakeSize(p->embed_content_w, p->embed_content_h));
   [window makeKeyAndOrderFront:nil];
+  [NSApp activateIgnoringOtherApps:YES];
 
   p->editor_handle = vst2_next_editor_handle();
   return p->editor_handle;
@@ -418,24 +412,7 @@ int sphere_daux_vst2_view_set_size(SphereDauxVst2Processor *p, int width,
     height = p->embed_content_h > 0 ? p->embed_content_h : height;
   }
   NSWindow *window = (__bridge NSWindow *)p->editor_native_window;
-  const CGFloat chrome_h = sphere_daux_editor_chrome_height();
-  const NSRect old_frame = window.frame;
-  NSRect frame = [window
-      frameRectForContentRect:NSMakeRect(0, 0, width, height + chrome_h)];
-  // AppKit screen coordinates grow upward. Keep the top-left fixed so a resize
-  // never makes the editor jump around the display.
-  frame.origin.x = old_frame.origin.x;
-  frame.origin.y = NSMaxY(old_frame) - frame.size.height;
-  [window setFrame:frame display:YES];
-
-  NSView *shell = window.contentView;
-  if (p->editor_native_embed) {
-    NSView *container = (__bridge NSView *)p->editor_native_embed;
-    container.frame = sphere_daux_editor_shell_plugin_area(shell);
-    for (NSView *child in container.subviews) {
-      child.frame = NSMakeRect(0, 0, width, height);
-    }
-  }
+  sphere_daux_editor_window_set_plugin_size(window, NSMakeSize(width, height));
   p->embed_content_w = width;
   p->embed_content_h = height;
   return 1;

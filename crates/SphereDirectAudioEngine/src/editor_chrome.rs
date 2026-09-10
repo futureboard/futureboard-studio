@@ -78,8 +78,14 @@ impl EditorChrome {
     ///
     /// `active` is the insert's on/off — bypassed and disabled both read as
     /// `false`, because from the editor's side they say the same thing. The
-    /// rest are finished labels, and `active_tab` is the insert id this window
-    /// is showing.
+    /// labels are finished, and `active_tab` is the insert id this window is
+    /// showing.
+    ///
+    /// `shows_controls` is false for an editor with no insert behind it. An ARA
+    /// plug-in is bound to a clip rather than to a slot, so it has no bypass, no
+    /// per-slot CPU or latency and no insert-keyed preset list; the control row
+    /// is dropped and the window gives its height back to the plug-in, because a
+    /// row of controls that cannot do what they say is worse than no row.
     pub fn set_header(
         &self,
         active: bool,
@@ -87,6 +93,7 @@ impl EditorChrome {
         cpu_label: &str,
         latency_label: &str,
         active_tab: &str,
+        shows_controls: bool,
     ) {
         // A label with an interior NUL is not a label the studio produced, so
         // dropping the update beats truncating it into a lie.
@@ -108,6 +115,7 @@ impl EditorChrome {
                 cpu.as_ptr(),
                 latency.as_ptr(),
                 tab.as_ptr(),
+                i32::from(shows_controls),
             );
         }
     }

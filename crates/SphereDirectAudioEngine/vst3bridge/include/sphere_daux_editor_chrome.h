@@ -43,15 +43,22 @@ double sphere_daux_editor_chrome_height(void);
 /// Begin an update, discarding any half-staged one.
 void sphere_daux_editor_chrome_begin(unsigned long long native_window);
 
-/// The parts that are not lists. `active` is the insert's on/off; the rest are
-/// finished labels, and `active_tab` is the insert id this window is showing.
+/// The parts that are not lists. `active` is the insert's on/off; the labels are
+/// finished, and `active_tab` is the insert id this window is showing.
+///
+/// `shows_controls` is 0 for an editor with no insert behind it — an ARA plug-in
+/// is bound to a clip, so it has no bypass, no per-slot CPU or latency and no
+/// insert-keyed presets. The control row is then dropped and the window gives
+/// its height back to the plug-in, rather than drawing controls that would do
+/// nothing.
 void sphere_daux_editor_chrome_set_header(
     unsigned long long native_window,
     int                active,
     const char*        preset_label,
     const char*        cpu_label,
     const char*        latency_label,
-    const char*        active_tab);
+    const char*        active_tab,
+    int                shows_controls);
 
 /// Append one preset menu row, in menu order.
 void sphere_daux_editor_chrome_add_preset(

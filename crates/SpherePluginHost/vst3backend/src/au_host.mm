@@ -1049,37 +1049,26 @@ SPHERE_AU_HOST_API unsigned long long sphere_au_open_editor(
         std::max<unsigned int>(preferred_height, 360));
     [view setFrameSize:size];
   }
-  // The window carries the editor chrome as well as the unit's own view, so
-  // its content is taller than the view by exactly that strip. `size` stays the
-  // *unit's* size throughout — it is what the caller reports as the editor's
-  // dimensions and what the unit itself laid out for.
-  const CGFloat chrome_h = sphere_daux_editor_chrome_height();
-  NSRect content_rect =
-      NSMakeRect(0.0, 0.0, size.width, size.height + chrome_h);
-  NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                            NSWindowStyleMaskMiniaturizable;
-  NSWindow* window = [[NSWindow alloc] initWithContentRect:content_rect
-                                                 styleMask:style
-                                                   backing:NSBackingStoreBuffered
-                                                     defer:NO];
-  NSString* window_title = [NSString
-      stringWithUTF8String:(title != nullptr && title[0] != '\0') ? title : "Audio Unit"];
-  window.title = window_title;
-  window.backgroundColor = NSColor.blackColor;
-  window.level = NSFloatingWindowLevel;
-  window.releasedWhenClosed = NO;
-  // The unit's view goes *under* the chrome rather than being the content view
-  // itself. It keeps its own size; only where it sits changes.
-  NSView* shell = sphere_daux_editor_shell_create(content_rect);
-  window.contentView = shell;
-  [view setFrame:sphere_daux_editor_shell_plugin_area(shell)];
-  view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  [shell addSubview:view];
-  [window center];
-
+  // Window, chrome strip and the container the unit's view goes in all come
+  // from the shared editor window — the one place that knows a host-owned
+  // editor window is "chrome strip, then plug-in", and the same one a VST3,
+  // VST2 or CLAP editor is built from. `size` stays the *unit's* own size,
+  // which is what the caller reports back as the editor's dimensions.
   SphereAuEditorWindowDelegate* delegate = [[SphereAuEditorWindowDelegate alloc] init];
   delegate.instance = instance;
-  window.delegate = delegate;
+
+  NSString* window_title = [NSString
+      stringWithUTF8String:(title != nullptr && title[0] != '\0') ? title : "Audio Unit"];
+  // An Audio Unit's Cocoa view has no resize contract of its own — the factory
+  // hands back a view at the size it wants — so the window is fixed, like the
+  // fixed-size editors of every other format.
+  NSWindow* window = sphere_daux_editor_window_create(size, window_title, NO, delegate);
+  window.backgroundColor = NSColor.blackColor;
+
+  NSView* container = sphere_daux_editor_window_plugin_container(window);
+  [view setFrame:NSMakeRect(0.0, 0.0, size.width, size.height)];
+  view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [container addSubview:view];
 
   instance->editor_window = (__bridge_retained void*)window;
   instance->editor_view = (__bridge_retained void*)view;

@@ -869,9 +869,9 @@ impl PluginEditorWindow {
                 // The plug-in owns a standalone window; the GPUI shell only
                 // watches for the user closing that window (WM_CLOSE) or the
                 // native window vanishing, then tears the editor down.
-                if self.embed_handle.is_some()
-                    && (processor.embed_take_user_close() || !processor.embed_is_valid())
-                {
+                let closed = self.embed_handle.is_some()
+                    && (processor.embed_take_user_close() || !processor.embed_is_valid());
+                if closed {
                     if plugin_view_debug() {
                         eprintln!(
                             "[plugin-view] detached window closed editor_id={} → removing shell",
@@ -879,7 +879,15 @@ impl PluginEditorWindow {
                         );
                     }
                     window.remove_window();
+                    return;
                 }
+                // The strip is in this process on this path, so its presses are
+                // collected here rather than arriving as `EditorChromeAction`.
+                self.drain_local_chrome_actions(cx);
+                // A host-owned shell is never shown and must not be assumed to
+                // draw, so the tick that notices a user close cannot come from
+                // `render`. It comes from here.
+                self.schedule_tick(cx);
                 return;
             }
             PluginEditorStatus::Attached(_) => {
@@ -1108,6 +1116,12 @@ impl PluginEditorWindow {
             .unwrap_or(DEFAULT_PLUGIN_EDITOR_CONTENT_SIZE);
         let width = width.max(MIN_PLUGIN_EDITOR_CONTENT_SIZE);
         let height = height.max(MIN_PLUGIN_EDITOR_CONTENT_SIZE);
+        // What the bridged path's host does before its own attach, and the
+        // in-process path never did: the bridge stores both and reads them back
+        // when it opens the window, so without this the editor comes up titled
+        // "Plugin Editor" with no instance label on its diagnostics.
+        processor.embed_set_instance_label(&self.insert_id);
+        processor.set_editor_title(&self.window_title());
         match processor.view_attach(0, (width, height)) {
             Some((preferred_w, preferred_h)) => {
                 // The bridge's opaque editor handle, not a window this process
@@ -1127,6 +1141,11 @@ impl PluginEditorWindow {
                 self.apply_host_owned_shell_size(window);
                 let mode = EditorBackendKind::current().presentation();
                 self.status = PluginEditorStatus::Attached(mode);
+                // Anything pushed before now had no window to be drawn in.
+                // Forget what was sent so the next refresh is a full one, and
+                // push straight away rather than waiting for the studio's poll.
+                self.pushed_chrome = None;
+                self.push_host_chrome();
                 eprintln!(
                     "[plugin-view] attach ok editor_id={} mode={mode:?} host_owned=true \
                      size={preferred_w}x{preferred_h} (reused runtime instance)",
@@ -1688,10 +1707,16 @@ impl PluginEditorWindow {
     ///
     /// On the embedding backend that is this window and there is nothing to
     /// send: GPUI draws the strip from `self.chrome` on the next frame. On a
-    /// host-owned backend the strip is an AppKit view beside the plug-in in
-    /// the host process, so the same state goes over the bridge — already
-    /// formatted and with the theme resolved, because the host has neither the
-    /// preset files nor the theme store to work either out.
+    /// host-owned backend the strip is an AppKit view beside the plug-in, so
+    /// the same state goes to it — already formatted and with the theme
+    /// resolved, because the strip has neither the preset files nor the theme
+    /// store to work either out.
+    ///
+    /// Two routes, because there are two kinds of host-owned editor. A bridged
+    /// insert's window is in the plug-in host process and the state travels by
+    /// IPC. An ARA plug-in is hosted *here* — it is bound to a clip, never
+    /// behind the bridge — so its window is this process's and the strip is
+    /// written straight through the runtime handle. Same payload either way.
     ///
     /// Skipped when nothing changed. This is called from every chrome refresh,
     /// which runs on the studio's poll, and a repaint per poll for a CPU
@@ -1701,6 +1726,10 @@ impl PluginEditorWindow {
         if EditorBackendKind::current().embeds_in_editor_window() {
             return;
         }
+        // An ARA editor has no insert slot behind it: no bypass, no per-slot
+        // CPU or latency, no insert-keyed presets. The strip drops its control
+        // row rather than drawing five controls that would do nothing.
+        let shows_insert_controls = self.host.is_some();
         let command = SpherePluginHost::ipc::HostCommand::SetEditorChrome {
             plugin_instance_id: self.insert_id.clone(),
             title: self.window_title(),
@@ -1720,30 +1749,152 @@ impl PluginEditorWindow {
                 })
                 .collect(),
             active_tab: self.insert_id.clone(),
+            shows_insert_controls,
             palette: crate::components::plugin_editor_chrome::resolve_chrome_palette(),
         };
         if self.pushed_chrome.as_ref() == Some(&command) {
             return;
         }
-        let Some(host) = self.host.as_mut() else {
-            return;
+        let sent = match self.host.as_mut() {
+            Some(host) => Self::send_chrome_over_bridge(host, &command),
+            // In-process: the window is this process's, so the strip is written
+            // directly. `editor_chrome()` is `None` until the view is attached,
+            // which is why the attach re-pushes.
+            None => match self.processor.as_ref().and_then(|p| p.editor_chrome()) {
+                Some(chrome) => {
+                    Self::write_chrome(&chrome, &command);
+                    true
+                }
+                None => false,
+            },
         };
-        if let Some(shared) = host.shared.as_ref() {
-            let Ok(mut runtime) = shared.lock() else {
-                return;
-            };
-            runtime.set_editor_chrome(command.clone());
-        } else if let Some(client) = host.client.as_mut() {
-            if client.set_editor_chrome(command.clone()).is_err() {
-                return;
-            }
-        } else {
-            return;
+        if sent {
+            self.pushed_chrome = Some(command);
         }
-        self.pushed_chrome = Some(command);
     }
 
-    /// Size the shell for a host-owned editor: its chrome, and nothing else.
+    /// Send one prepared chrome command to the plug-in host process.
+    fn send_chrome_over_bridge(
+        host: &mut HostEditorBackend,
+        command: &SpherePluginHost::ipc::HostCommand,
+    ) -> bool {
+        if let Some(shared) = host.shared.as_ref() {
+            let Ok(mut runtime) = shared.lock() else {
+                return false;
+            };
+            runtime.set_editor_chrome(command.clone());
+            true
+        } else if let Some(client) = host.client.as_mut() {
+            client.set_editor_chrome(command.clone()).is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Write one prepared chrome command straight into an in-process strip.
+    ///
+    /// The same fields the host process unpacks from the IPC command, in the
+    /// same order — this is the near end of one wire, not a second protocol.
+    fn write_chrome(
+        chrome: &DirectAudio::editor_chrome::EditorChrome,
+        command: &SpherePluginHost::ipc::HostCommand,
+    ) {
+        let SpherePluginHost::ipc::HostCommand::SetEditorChrome {
+            title,
+            active,
+            cpu_label,
+            latency_label,
+            preset_label,
+            presets,
+            preset_index,
+            tabs,
+            active_tab,
+            shows_insert_controls,
+            palette,
+            ..
+        } = command
+        else {
+            return;
+        };
+        chrome.begin();
+        chrome.set_header(
+            *active,
+            preset_label,
+            cpu_label,
+            latency_label,
+            active_tab,
+            *shows_insert_controls,
+        );
+        for (index, name) in presets.iter().enumerate() {
+            chrome.add_preset(name, *preset_index == Some(index as u32));
+        }
+        for tab in tabs {
+            chrome.add_tab(&tab.insert_id, &tab.display_name, tab.insert_number);
+        }
+        chrome.set_palette(&[
+            palette.strip_bg,
+            palette.row_bg,
+            palette.border,
+            palette.control_bg,
+            palette.control_hover,
+            palette.control_pressed,
+            palette.accent,
+            palette.text_primary,
+            palette.text_secondary,
+            palette.text_faint,
+        ]);
+        chrome.commit(title);
+    }
+
+    /// Collect presses from an in-process strip.
+    ///
+    /// The bridged path has the plug-in host drain its strip and send them back
+    /// as `EditorChromeAction`; here there is no boundary to cross, so they come
+    /// straight onto the queue the studio already drains.
+    fn drain_local_chrome_actions(&mut self, cx: &mut Context<Self>) {
+        let Some(chrome) = self.processor.as_ref().and_then(|p| p.editor_chrome()) else {
+            return;
+        };
+        let mut queued = false;
+        while let Some((kind, value, insert_id)) = chrome.take_action() {
+            let Some(action) =
+                SpherePluginHost::ipc::EditorChromeCommand::from_wire(kind, value, insert_id)
+            else {
+                eprintln!("[plugin-editor-chrome] unknown action kind={kind} value={value}");
+                continue;
+            };
+            self.chrome_actions
+                .push(Self::chrome_action_to_editor(action));
+            queued = true;
+        }
+        if queued {
+            cx.notify();
+        }
+    }
+
+    /// One chrome press, as the action the studio applies.
+    ///
+    /// Shared by both routes so a control cannot mean one thing when it came
+    /// over the bridge and another when it did not.
+    fn chrome_action_to_editor(
+        action: SpherePluginHost::ipc::EditorChromeCommand,
+    ) -> PluginEditorAction {
+        use SpherePluginHost::ipc::EditorChromeCommand;
+        match action {
+            EditorChromeCommand::SetActive { active } => PluginEditorAction::SetActive(active),
+            EditorChromeCommand::StepPreset { delta } => PluginEditorAction::StepPreset(delta),
+            EditorChromeCommand::SavePreset => PluginEditorAction::SavePreset,
+            EditorChromeCommand::SelectPreset { index } => {
+                PluginEditorAction::SelectPreset(index as usize)
+            }
+            EditorChromeCommand::SelectTab { insert_id } => {
+                PluginEditorAction::SelectTab(insert_id)
+            }
+            EditorChromeCommand::CloseTab { insert_id } => PluginEditorAction::CloseTab(insert_id),
+        }
+    }
+
+    /// Size the shell for a host-owned editor: its chrome, and nothing else.    /// Size the shell for a host-owned editor: its chrome, and nothing else.
     ///
     /// The plug-in's window is the host process's and carries the plug-in's own
     /// size; this window carries only the controls that cannot be drawn over a
@@ -2036,25 +2187,7 @@ impl PluginEditorWindow {
                 // used. The studio drains it and applies it through one
                 // function, so a press on the AppKit strip and a press on the
                 // GPUI one cannot come to mean different things.
-                use SpherePluginHost::ipc::EditorChromeCommand;
-                let action = match action {
-                    EditorChromeCommand::SetActive { active } => {
-                        PluginEditorAction::SetActive(active)
-                    }
-                    EditorChromeCommand::StepPreset { delta } => {
-                        PluginEditorAction::StepPreset(delta)
-                    }
-                    EditorChromeCommand::SavePreset => PluginEditorAction::SavePreset,
-                    EditorChromeCommand::SelectPreset { index } => {
-                        PluginEditorAction::SelectPreset(index as usize)
-                    }
-                    EditorChromeCommand::SelectTab { insert_id } => {
-                        PluginEditorAction::SelectTab(insert_id)
-                    }
-                    EditorChromeCommand::CloseTab { insert_id } => {
-                        PluginEditorAction::CloseTab(insert_id)
-                    }
-                };
+                let action = Self::chrome_action_to_editor(action);
                 eprintln!("[plugin-editor-chrome] host strip action={action:?} editor_id={id}");
                 self.chrome_actions.push(action);
                 cx.notify();

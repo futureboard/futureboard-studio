@@ -3850,6 +3850,7 @@ fn dispatch(
             preset_index,
             tabs,
             active_tab,
+            shows_insert_controls,
             palette,
         } => {
             // Drawn only where the editor window belongs to this process. On
@@ -3883,6 +3884,7 @@ fn dispatch(
                 &cpu_label,
                 &latency_label,
                 &active_tab,
+                shows_insert_controls,
             );
             for (index, name) in presets.iter().enumerate() {
                 chrome.add_preset(name, preset_index == Some(index as u32));

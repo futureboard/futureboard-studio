@@ -97,6 +97,38 @@ fn an_audio_unit_editor_opens_in_a_host_owned_window() {
     drive_host_owned_editor(&component_id, &component_id, &component_id, None);
 }
 
+/// An editor with no insert behind it — the shape an ARA plug-in has.
+///
+/// ARA binds to a clip, so its editor reaches this same window but has nothing
+/// for the control row to control. Driven here through a plain VST3 because
+/// what is being checked is the strip's answer to `shows_insert_controls`, not
+/// ARA hosting itself.
+#[test]
+fn an_editor_without_an_insert_drops_the_control_row() {
+    let Ok(plugin_path) = std::env::var("FUTUREBOARD_TEST_VST3_PATH") else {
+        eprintln!("skipping: set FUTUREBOARD_TEST_VST3_PATH to a .vst3 bundle");
+        return;
+    };
+    let classes = scan_plugin_bundle(std::path::Path::new(&plugin_path))
+        .unwrap_or_else(|e| panic!("scan {plugin_path}: {e}"));
+    let plugin = classes
+        .into_iter()
+        .find(|info| info.class_id.is_some())
+        .unwrap_or_else(|| panic!("{plugin_path} reported no class id"));
+    let class_id = plugin.class_id.clone().expect("class id");
+    eprintln!(
+        "[test] plugin={} format=VST3 (ARA-shaped chrome)",
+        plugin.name
+    );
+    drive_host_owned_editor_with_chrome(
+        &plugin.name,
+        &plugin_path,
+        &class_id,
+        Some(plugin.format.clone()),
+        false,
+    );
+}
+
 /// Load a plug-in, open its editor with no parent window, push a chrome strip
 /// into it, then close it — the whole host-owned lifecycle the studio drives.
 fn open_and_close_a_host_owned_editor(path_var: &str, what: &str) {
@@ -129,6 +161,21 @@ fn drive_host_owned_editor(
     plugin_path: &str,
     class_id: &str,
     format: Option<String>,
+) {
+    drive_host_owned_editor_with_chrome(display_name, plugin_path, class_id, format, true);
+}
+
+/// As above, but says whether the editor has an insert behind it.
+///
+/// `false` is the ARA shape: bound to a clip rather than to a slot, so no
+/// bypass, no per-slot readouts and no insert-keyed presets — the strip drops
+/// its control row and the window gives that height back to the plug-in.
+fn drive_host_owned_editor_with_chrome(
+    display_name: &str,
+    plugin_path: &str,
+    class_id: &str,
+    format: Option<String>,
+    shows_insert_controls: bool,
 ) {
     let mut client = PluginHostClient::spawn_bridge().expect("spawn plugin host");
     assert!(
@@ -229,6 +276,7 @@ fn drive_host_owned_editor(
                 },
             ],
             active_tab: INSTANCE_ID.to_string(),
+            shows_insert_controls,
             palette: EditorChromePalette {
                 strip_bg: 0x1B1D22FF,
                 row_bg: 0x212429FF,

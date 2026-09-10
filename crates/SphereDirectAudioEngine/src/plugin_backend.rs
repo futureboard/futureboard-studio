@@ -324,6 +324,7 @@ pub(crate) mod editor_chrome {
             cpu_label: *const c_char,
             latency_label: *const c_char,
             active_tab: *const c_char,
+            shows_controls: i32,
         );
         #[link_name = "sphere_daux_editor_chrome_add_preset"]
         pub(crate) fn add_preset(native_window: u64, name: *const c_char, selected: i32);

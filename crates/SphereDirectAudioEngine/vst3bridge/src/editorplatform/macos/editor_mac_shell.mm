@@ -268,6 +268,17 @@ void fill_rounded(NSRect rect, CGFloat radius, NSColor *color) {
   int _hot;     // control under the pointer
   int _pressed; // control the mouse went down on
 
+  /// The strip's height when the staged update began — see `-beginUpdate`.
+  CGFloat _heightAtUpdateStart;
+
+  /// Whether this editor has an insert behind it to control.
+  ///
+  /// An ARA plug-in is bound to a clip, not to an insert slot: it has no
+  /// bypass, no per-slot CPU or latency, and no insert-keyed preset list. The
+  /// row is dropped entirely rather than drawn with controls that would do
+  /// nothing — a control that cannot do what it says is worse than no control.
+  BOOL _showsControls;
+
   // Rects from the last layout pass, in this view's coordinates. Drawing and
   // hit-testing read the same ones, so a control can never be somewhere other
   // than where it is clickable.
@@ -286,6 +297,8 @@ void fill_rounded(NSRect rect, CGFloat radius, NSColor *color) {
     for (int i = 0; i < kPaletteCount; ++i) {
       _palette[i] = kPaletteFallback[i];
     }
+    _showsControls = YES;
+    _heightAtUpdateStart = kTabStripHeight + kChromeRowHeight;
     _presetLabel = "No presets";
     _cpuLabel = "—";
     _latencyLabel = "0 ms";
@@ -306,6 +319,16 @@ void fill_rounded(NSRect rect, CGFloat radius, NSColor *color) {
   return YES;
 }
 
+/// How tall this strip is right now — the tab band, plus the control row when
+/// there is an insert behind it.
+- (CGFloat)chromeHeight {
+  return kTabStripHeight + (_showsControls ? kChromeRowHeight : 0.0);
+}
+
+- (BOOL)showsControls {
+  return _showsControls;
+}
+
 - (NSColor *)slot:(int)index {
   return color_from_rgba(_palette[index]);
 }
@@ -313,15 +336,25 @@ void fill_rounded(NSRect rect, CGFloat radius, NSColor *color) {
 // ── Chrome updates ─────────────────────────────────────────────────────────
 
 - (void)beginUpdate {
+  // Remembered per strip, not in a file-static: two editors can be open, and
+  // one adopting the other's height is a window that jumps for no reason.
+  _heightAtUpdateStart = [self chromeHeight];
   _pendingPresets.clear();
   _pendingTabs.clear();
+}
+
+/// How tall this strip was when the update now being staged began.
+- (CGFloat)heightAtUpdateStart {
+  return _heightAtUpdateStart;
 }
 
 - (void)setHeaderActive:(BOOL)active
             presetLabel:(const char *)presetLabel
                cpuLabel:(const char *)cpuLabel
            latencyLabel:(const char *)latencyLabel
-              activeTab:(const char *)activeTab {
+              activeTab:(const char *)activeTab
+          showsControls:(BOOL)showsControls {
+  _showsControls = showsControls;
   _active = active;
   _presetLabel = presetLabel ? presetLabel : "";
   _cpuLabel = cpuLabel ? cpuLabel : "";
@@ -489,14 +522,20 @@ void fill_rounded(NSRect rect, CGFloat radius, NSColor *color) {
   // Bands.
   [[self slot:kPaletteStripBg] set];
   NSRectFill(NSMakeRect(0, 0, width, kTabStripHeight));
-  [[self slot:kPaletteRowBg] set];
-  NSRectFill(NSMakeRect(0, kTabStripHeight, width, kChromeRowHeight));
   [border set];
   NSRectFill(NSMakeRect(0, kTabStripHeight - 1.0, width, 1.0));
-  NSRectFill(NSMakeRect(0, kTabStripHeight + kChromeRowHeight - 1.0, width, 1.0));
+  if (_showsControls) {
+    [[self slot:kPaletteRowBg] set];
+    NSRectFill(NSMakeRect(0, kTabStripHeight, width, kChromeRowHeight));
+    [border set];
+    NSRectFill(NSMakeRect(0, kTabStripHeight + kChromeRowHeight - 1.0, width,
+                          1.0));
+  }
 
   [self drawTabs];
-  [self drawControls];
+  if (_showsControls) {
+    [self drawControls];
+  }
 }
 
 - (void)drawTabs {
@@ -719,6 +758,19 @@ void fill_rounded(NSRect rect, CGFloat radius, NSColor *color) {
 
 - (int)hitAt:(NSPoint)point {
   [self layoutControls];
+  // Tabs are always live; the control row only exists when it is drawn, and a
+  // hit test that forgot that would fire a bypass nobody can see.
+  if (!_showsControls) {
+    for (size_t i = 0; i < _tabRects.size(); ++i) {
+      if (NSPointInRect(point, _tabCloseRects[i])) {
+        return kHitTabBase + (int)i * 2 + 1;
+      }
+      if (NSPointInRect(point, _tabRects[i])) {
+        return kHitTabBase + (int)i * 2;
+      }
+    }
+    return kHitNone;
+  }
   if (NSPointInRect(point, _powerRect)) {
     return kHitPower;
   }
@@ -877,6 +929,9 @@ void fill_rounded(NSRect rect, CGFloat radius, NSColor *color) {
 
 @interface DauxEditorShellView : NSView
 @property(nonatomic, strong) DauxEditorChromeView *chrome;
+/// The view a plug-in attaches into. Its frame is this view's business, not the
+/// plug-in's and not the bridge's — see `-layoutBands`.
+@property(nonatomic, strong) NSView *pluginContainer;
 @end
 
 @implementation DauxEditorShellView
@@ -892,26 +947,155 @@ void fill_rounded(NSRect rect, CGFloat radius, NSColor *color) {
     _chrome = [[DauxEditorChromeView alloc]
         initWithFrame:NSMakeRect(0, 0, frame.size.width,
                                  kTabStripHeight + kChromeRowHeight)];
-    _chrome.autoresizingMask = NSViewWidthSizable;
     [self addSubview:_chrome];
+
+    _pluginContainer = [[NSView alloc] initWithFrame:[self pluginArea]];
+    _pluginContainer.wantsLayer = YES;
+    [self addSubview:_pluginContainer];
+    [self layoutBands];
   }
   return self;
 }
 
 /// Where the plug-in's own view goes: everything under the chrome.
 - (NSRect)pluginArea {
-  const CGFloat top = kTabStripHeight + kChromeRowHeight;
+  const CGFloat top = [_chrome chromeHeight];
   return NSMakeRect(0, top, self.bounds.size.width,
-                    self.bounds.size.height - top);
+                    MAX(self.bounds.size.height - top, 0.0));
+}
+
+/// Put both bands back where they belong.
+///
+/// Deliberately re-asserted rather than left to autoresizing: a plug-in bridge
+/// that writes the container's frame after attaching — which is exactly how the
+/// strip once ended up underneath a VST2 editor — is corrected here on the next
+/// layout instead of silently winning.
+- (void)layoutBands {
+  _chrome.frame =
+      NSMakeRect(0, 0, self.bounds.size.width, [_chrome chromeHeight]);
+  _pluginContainer.frame = [self pluginArea];
+}
+
+/// Keep the plug-in's area the size it already had after the strip changed
+/// height.
+///
+/// An editor with no insert behind it drops the control row, and the window has
+/// to give that 26 points back rather than leave a gap under the plug-in — the
+/// plug-in's own size is the one thing a resize must never change.
+- (void)adoptChromeHeight:(CGFloat)previousHeight {
+  const CGFloat height = [_chrome chromeHeight];
+  const CGFloat delta = height - previousHeight;
+  if (delta == 0.0 || self.window == nil) {
+    [self layoutBands];
+    return;
+  }
+  NSRect frame = self.window.frame;
+  frame.size.height += delta;
+  // AppKit grows upward, so the top edge is what stays put.
+  frame.origin.y -= delta;
+  [self.window setFrame:frame display:YES];
+  [self layoutBands];
 }
 
 - (void)resizeSubviewsWithOldSize:(NSSize)oldSize {
   [super resizeSubviewsWithOldSize:oldSize];
-  _chrome.frame = NSMakeRect(0, 0, self.bounds.size.width,
-                             kTabStripHeight + kChromeRowHeight);
+  [self layoutBands];
 }
 
 @end
+
+// ── The whole window ────────────────────────────────────────────────────────
+
+namespace {
+
+/// The shell inside a window, or nil for a window that is not one of ours.
+DauxEditorShellView *shell_of(NSWindow *window) {
+  if (![window.contentView isKindOfClass:[DauxEditorShellView class]]) {
+    return nil;
+  }
+  return (DauxEditorShellView *)window.contentView;
+}
+
+/// Smallest plug-in area we will build a window around. A plug-in that reports
+/// nothing usable still gets a window it can be seen in.
+constexpr CGFloat kMinPluginSide = 64.0;
+
+NSSize sane_plugin_size(NSSize size) {
+  return NSMakeSize(MAX(size.width, kMinPluginSide),
+                    MAX(size.height, kMinPluginSide));
+}
+
+} // namespace
+
+NSWindow *sphere_daux_editor_window_create(NSSize plugin_size, NSString *title,
+                                           BOOL resizable,
+                                           id<NSWindowDelegate> delegate) {
+  const NSSize size = sane_plugin_size(plugin_size);
+  const CGFloat chrome_h = kTabStripHeight + kChromeRowHeight;
+  const NSRect content =
+      NSMakeRect(0.0, 0.0, size.width, size.height + chrome_h);
+
+  NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                            NSWindowStyleMaskMiniaturizable;
+  if (resizable) {
+    style |= NSWindowStyleMaskResizable;
+  }
+  NSWindow *window = [[NSWindow alloc] initWithContentRect:content
+                                                 styleMask:style
+                                                   backing:NSBackingStoreBuffered
+                                                     defer:NO];
+  window.title = title.length > 0 ? title : @"Plug-in Editor";
+  window.releasedWhenClosed = NO;
+  // Above the studio, like every other plug-in editor on the platform: the
+  // window belongs to a helper process, so ordinary activation would let the
+  // app the user is actually working in cover it.
+  window.level = NSFloatingWindowLevel;
+  if (delegate != nil) {
+    window.delegate = delegate;
+  }
+  window.contentView = [[DauxEditorShellView alloc] initWithFrame:content];
+  [window center];
+  return window;
+}
+
+NSView *sphere_daux_editor_window_plugin_container(NSWindow *window) {
+  return shell_of(window).pluginContainer;
+}
+
+NSSize sphere_daux_editor_window_plugin_size(NSWindow *window) {
+  DauxEditorShellView *shell = shell_of(window);
+  if (shell == nil) {
+    return NSZeroSize;
+  }
+  return [shell pluginArea].size;
+}
+
+void sphere_daux_editor_window_set_plugin_size(NSWindow *window,
+                                               NSSize plugin_size) {
+  DauxEditorShellView *shell = shell_of(window);
+  if (shell == nil) {
+    return;
+  }
+  const NSSize size = sane_plugin_size(plugin_size);
+  const CGFloat chrome_h = kTabStripHeight + kChromeRowHeight;
+  const NSRect old_frame = window.frame;
+  NSRect frame = [window
+      frameRectForContentRect:NSMakeRect(0.0, 0.0, size.width,
+                                         size.height + chrome_h)];
+  // AppKit screen coordinates grow upward. Keep the title bar where it is so a
+  // plug-in resizing itself never walks the window up the display.
+  frame.origin.x = old_frame.origin.x;
+  frame.origin.y = NSMaxY(old_frame) - frame.size.height;
+  [window setFrame:frame display:YES];
+
+  [shell layoutBands];
+  // The plug-in's own views fill the container. It put them there; nothing
+  // says it will resize them, and a view left at the old size is a plug-in
+  // that redraws into part of its window.
+  for (NSView *child in shell.pluginContainer.subviews) {
+    child.frame = NSMakeRect(0.0, 0.0, size.width, size.height);
+  }
+}
 
 // ── C entry points ───────────────────────────────────────────────────────────
 
@@ -926,12 +1110,19 @@ namespace {
 ///
 /// Also nil for a window that has no shell in it, which is what a caller with
 /// an editor open in some other kind of window gets — a no-op, not an error.
-DauxEditorChromeView *chrome_for(unsigned long long native_window) {
+NSWindow *window_of(unsigned long long native_window) {
   if (native_window == 0 || !NSThread.isMainThread) {
     return nil;
   }
-  NSWindow *window = (__bridge NSWindow *)reinterpret_cast<void *>(
+  return (__bridge NSWindow *)reinterpret_cast<void *>(
       static_cast<std::uintptr_t>(native_window));
+}
+
+DauxEditorChromeView *chrome_for(unsigned long long native_window) {
+  NSWindow *window = window_of(native_window);
+  if (window == nil) {
+    return nil;
+  }
   NSView *content = window.contentView;
   if (![content isKindOfClass:[DauxEditorShellView class]]) {
     return nil;
@@ -939,12 +1130,17 @@ DauxEditorChromeView *chrome_for(unsigned long long native_window) {
   return ((DauxEditorShellView *)content).chrome;
 }
 
-/// Write the strip to a PNG, for looking at it without a running studio.
+/// Write the editor window's content to a PNG, for looking at it without a
+/// running studio.
 ///
 /// Gated on `FUTUREBOARD_PLUGIN_CHROME_SNAPSHOT`, which names the file. Off by
-/// default and read once: this exists so the chrome can be checked on a machine
-/// where a screenshot needs a permission prompt, and it renders the real view
-/// rather than a stand-in, so what it writes is what the window shows.
+/// default and read once.
+///
+/// Renders the whole shell — chrome *and* the plug-in's area — rather than the
+/// strip alone, and that is the point. A snapshot of the strip by itself proves
+/// only that it was updated and can draw; it says nothing about whether it is
+/// visible in the window, which is exactly how a VST2 editor sitting on top of
+/// the chrome passed every check that existed.
 void snapshot_chrome(DauxEditorChromeView *chrome) {
   static const char *path = nullptr;
   static bool resolved = false;
@@ -955,12 +1151,15 @@ void snapshot_chrome(DauxEditorChromeView *chrome) {
   if (!path || !*path || !chrome) {
     return;
   }
+  // The shell, not the strip: a plug-in view over the chrome has to show up
+  // here, and it cannot if the strip is rendered on its own.
+  NSView *target = chrome.superview ? chrome.superview : (NSView *)chrome;
   NSBitmapImageRep *rep =
-      [chrome bitmapImageRepForCachingDisplayInRect:chrome.bounds];
+      [target bitmapImageRepForCachingDisplayInRect:target.bounds];
   if (!rep) {
     return;
   }
-  [chrome cacheDisplayInRect:chrome.bounds toBitmapImageRep:rep];
+  [target cacheDisplayInRect:target.bounds toBitmapImageRep:rep];
   NSData *png = [rep representationUsingType:NSBitmapImageFileTypePNG
                                   properties:@{}];
   NSString *file = [NSString stringWithUTF8String:path];
@@ -995,16 +1194,20 @@ void sphere_daux_editor_chrome_begin(unsigned long long native_window) {
   [chrome resetPresetIndex];
 }
 
+
+
 void sphere_daux_editor_chrome_set_header(unsigned long long native_window,
                                           int active, const char *preset_label,
                                           const char *cpu_label,
                                           const char *latency_label,
-                                          const char *active_tab) {
+                                          const char *active_tab,
+                                          int shows_controls) {
   [chrome_for(native_window) setHeaderActive:(active != 0)
                                  presetLabel:preset_label
                                     cpuLabel:cpu_label
                                 latencyLabel:latency_label
-                                   activeTab:active_tab];
+                                   activeTab:active_tab
+                               showsControls:(shows_controls != 0)];
 }
 
 void sphere_daux_editor_chrome_add_preset(unsigned long long native_window,
@@ -1035,7 +1238,14 @@ void sphere_daux_editor_chrome_commit(unsigned long long native_window,
                  "[PluginEditorChrome] update dropped: no editor window open\n");
     return;
   }
+  const CGFloat height_before = [chrome heightAtUpdateStart];
   [chrome commitUpdate];
+  DauxEditorShellView *shell = shell_of(window_of(native_window));
+  if (shell != nil) {
+    // The strip may have gained or lost its control row; the window gives the
+    // difference back to the plug-in rather than leaving a gap.
+    [shell adoptChromeHeight:height_before];
+  }
   [chrome displayIfNeeded];
   std::fprintf(stderr, "[PluginEditorChrome] applied tabs=%d presets=%d\n",
                (int)[chrome tabCount], (int)[chrome presetCount]);

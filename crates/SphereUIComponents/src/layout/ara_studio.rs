@@ -446,13 +446,17 @@ impl StudioLayout {
     }
 
     /// Opens the bound plug-in's editor in its own window (pop-out mode).
-    fn open_ara_editor_window(&mut self, clip_id: &str, cx: &mut Context<Self>) {
+    ///
+    /// Answers whether a window is now open for it — including "already was",
+    /// which is still the editor being where it should be. The caller uses this
+    /// to decide whether the panel may keep claiming the editor is popped out.
+    fn open_ara_editor_window(&mut self, clip_id: &str, cx: &mut Context<Self>) -> bool {
         ara_trace("open_ara_editor_window (pop-out)");
         let Some((plugin_id, plugin_name)) = self.ara_binding_for_clip(clip_id, cx) else {
-            return;
+            return false;
         };
         let Some(track_id) = self.track_of_clip(clip_id, cx) else {
-            return;
+            return false;
         };
         let key = AraSessionKey {
             plugin_id,
@@ -461,15 +465,15 @@ impl StudioLayout {
         let Some(processor) = self.ara.processor(&key) else {
             self.ara.last_error = Some(format!("{plugin_name} is not running for this clip."));
             cx.notify();
-            return;
+            return false;
         };
         let editor_key = ara_editor_key(&key);
         if self.plugin_editors.open.contains_key(&editor_key) {
-            return;
+            return true;
         }
         let owner_bounds = match self.studio_window_bounds(cx) {
             Some(bounds) => bounds,
-            None => return,
+            None => return false,
         };
         match crate::components::plugin_editor_window::open_plugin_editor_window(
             owner_bounds,
@@ -484,10 +488,12 @@ impl StudioLayout {
         ) {
             Ok(handle) => {
                 self.plugin_editors.open.insert(editor_key, handle);
+                true
             }
             Err(error) => {
                 self.ara.last_error = Some(format!("ARA editor could not open: {error}"));
                 cx.notify();
+                false
             }
         }
     }
@@ -503,7 +509,15 @@ impl StudioLayout {
         // A popped-out editor closed from its own title bar leaves no signal
         // here; without this the panel would stay blank and the button would
         // stay stuck on "Dock".
-        if self.ara_editor_popped_out && !self.ara_editor_window_open(cx) {
+        //
+        // Not while an open is still in flight. Opening is deferred behind the
+        // docked view's detach, and for those frames "popped out with no window"
+        // is the normal state of an editor on its way up — cancelling it here is
+        // why the window never appeared.
+        if self.ara_editor_popped_out
+            && !self.ara_editor_open_pending
+            && !self.ara_editor_window_open(cx)
+        {
             self.ara_editor_popped_out = false;
             cx.notify();
         }
@@ -728,6 +742,7 @@ impl StudioLayout {
         self.ara_editor
             .update(cx, |host, cx| host.request_detach(cx));
         self.ara_editor_popped_out = true;
+        self.ara_editor_open_pending = true;
         // The docked view comes down on a deferred tick, and the plug-in has
         // only one view to give: opening the window before that detach lands
         // would ask the same controller for a second one. Wait for the panel to
@@ -744,8 +759,15 @@ impl StudioLayout {
                 executor.timer(std::time::Duration::from_millis(16)).await;
             }
             let _ = this.update(cx, |layout, cx| {
-                if layout.ara_editor_popped_out {
-                    layout.open_ara_editor_window(&clip_id, cx);
+                // Still wanted? A pop-in during the wait cancels this.
+                let wanted = layout.ara_editor_popped_out;
+                let opened = wanted && layout.open_ara_editor_window(&clip_id, cx);
+                layout.ara_editor_open_pending = false;
+                if wanted && !opened {
+                    // The editor did not open, so the panel must not go on
+                    // claiming it is in a window somewhere.
+                    layout.ara_editor_popped_out = false;
+                    cx.notify();
                 }
             });
         })
@@ -755,6 +777,9 @@ impl StudioLayout {
 
     /// Returns the popped-out editor to the dock.
     pub(crate) fn pop_in_ara_editor(&mut self, cx: &mut Context<Self>) {
+        // Whatever the deferred open was about to do, the user has changed
+        // their mind — its own guard reads this.
+        self.ara_editor_open_pending = false;
         let Some(key) = self.ara_editor_window_key(cx) else {
             self.ara_editor_popped_out = false;
             cx.notify();

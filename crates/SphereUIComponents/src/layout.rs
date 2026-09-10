@@ -548,6 +548,15 @@ pub struct StudioLayout {
     ara_editor: Entity<components::AraEditorHost>,
     /// Set while that view lives in its own window instead of the dock.
     ara_editor_popped_out: bool,
+    /// An ARA editor window has been asked for and has not appeared yet.
+    ///
+    /// Opening one is deferred — the docked view has to let go of the plug-in's
+    /// single view first — so for a few frames the editor is "popped out" with
+    /// nothing in `plugin_editors.open` to show for it. Without this,
+    /// `poll_ara`'s recovery for a window the user closed cannot tell that
+    /// state from a window that was never there, and cancels the open it is
+    /// waiting for.
+    ara_editor_open_pending: bool,
     panels: StudioPanelVisibility,
     settings: gpui::Entity<SettingsModel>,
 
@@ -1201,6 +1210,7 @@ impl StudioLayout {
             ara: ara_ops::AraState::default(),
             ara_editor,
             ara_editor_popped_out: false,
+            ara_editor_open_pending: false,
             panels: StudioPanelVisibility::default(),
             settings,
 
