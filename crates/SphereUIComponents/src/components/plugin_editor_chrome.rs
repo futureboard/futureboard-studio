@@ -83,7 +83,7 @@ impl PluginEditorChrome {
     }
 
     /// Current preset name, or a placeholder when none is loaded.
-    fn preset_label(&self) -> String {
+    pub fn preset_label(&self) -> String {
         self.preset_index
             .and_then(|index| self.presets.get(index))
             .cloned()
@@ -97,7 +97,7 @@ impl PluginEditorChrome {
     }
 
     /// `3.2 ms` / `0 smp` — whichever states the latency most plainly.
-    fn latency_label(&self) -> String {
+    pub fn latency_label(&self) -> String {
         if self.latency_samples == 0 {
             return "0 ms".to_string();
         }
@@ -108,7 +108,8 @@ impl PluginEditorChrome {
         format!("{ms:.1} ms")
     }
 
-    fn cpu_label(&self) -> String {
+    /// `12%`, or a dash while nothing has been measured.
+    pub fn cpu_label(&self) -> String {
         match self.cpu_load {
             // Rounded to whole percent: a per-block share jitters, and a
             // one-decimal readout that never settles reads as noise.
@@ -695,6 +696,40 @@ pub fn render_tab_strip(
     }
 
     strip.into_any_element()
+}
+
+/// The chrome's colours, resolved from the active theme for a host that cannot
+/// read it.
+///
+/// Only the host-owned-window platforms need this: there the strip is drawn in
+/// the plug-in host process, which has no theme store of its own. Resolving
+/// here rather than sending token names keeps one answer to "what colour is a
+/// hovered control" — several of these are composites, and a second
+/// implementation of `Colors::composite` is a second answer waiting to drift.
+///
+/// The order matches `EditorChromePalette`'s fields and the `PaletteSlot`
+/// indices in `editor_mac_shell.mm`.
+pub fn resolve_chrome_palette() -> SpherePluginHost::ipc::EditorChromePalette {
+    fn packed(color: gpui::Rgba) -> u32 {
+        let channel = |value: f32| ((value.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xFF;
+        (channel(color.r) << 24)
+            | (channel(color.g) << 16)
+            | (channel(color.b) << 8)
+            | channel(color.a)
+    }
+    let control = Colors::surface_base();
+    SpherePluginHost::ipc::EditorChromePalette {
+        strip_bg: packed(Colors::surface_panel_alt()),
+        row_bg: packed(Colors::surface_panel()),
+        border: packed(Colors::border_subtle()),
+        control_bg: packed(control),
+        control_hover: packed(Colors::composite(control, Colors::state_hover())),
+        control_pressed: packed(Colors::composite(control, Colors::state_recessed())),
+        accent: packed(Colors::accent_primary()),
+        text_primary: packed(Colors::text_primary()),
+        text_secondary: packed(Colors::text_secondary()),
+        text_faint: packed(Colors::text_faint()),
+    }
 }
 
 /// A control the chrome asks the studio to carry out.

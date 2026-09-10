@@ -3,6 +3,8 @@
 #import <Cocoa/Cocoa.h>
 
 #include "../../../include/sphere_daux_editor_bridge.h"
+#include "../../../include/sphere_daux_editor_chrome.h"
+#include "../../../include/sphere_daux_editor_shell_mac.h"
 
 NSColor *daux_bg_color(void);
 

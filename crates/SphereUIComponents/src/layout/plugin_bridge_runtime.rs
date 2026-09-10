@@ -655,6 +655,15 @@ impl PluginBridgeRuntime {
             .resize_editor(plugin_instance_id, width, height, dpi);
     }
 
+    /// Push a prepared [`HostCommand::SetEditorChrome`] to the host.
+    ///
+    /// Prepared by the caller rather than assembled here: everything in it —
+    /// the presets, the readouts, the theme — belongs to the editor window that
+    /// already knows them, and this is only the pipe.
+    pub fn set_editor_chrome(&mut self, chrome: SpherePluginHost::ipc::HostCommand) {
+        let _ = self.client.set_editor_chrome(chrome);
+    }
+
     pub fn close_editor(&mut self, plugin_instance_id: String) {
         eprintln!("[plugin-bridge] CloseEditor instance={plugin_instance_id}");
         let _ = self.client.close_editor(plugin_instance_id);

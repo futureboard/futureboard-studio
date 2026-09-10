@@ -262,4 +262,13 @@ SPHERE_DAUX_CLAP_API char *
 sphere_daux_clap_list_parameters_json(SphereDauxClapProcessor *processor);
 
 SPHERE_DAUX_CLAP_API void sphere_daux_clap_parameters_json_free(char *data);
+/// The `NSWindow*` of this instance's host-owned editor, as an opaque handle.
+///
+/// 0 on Windows, and 0 whenever no editor is open. The caller passes it to the
+/// shared editor-chrome ABI (`sphere_daux_editor_chrome.h`), which addresses the
+/// strip by the window it lives in, so one strip implementation serves every
+/// format.
+SPHERE_DAUX_CLAP_API unsigned long long
+sphere_daux_clap_editor_native_window(SphereDauxClapProcessor *processor);
+
 }

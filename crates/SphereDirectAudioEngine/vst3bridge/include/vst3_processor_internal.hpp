@@ -341,6 +341,14 @@ unsigned long long open_editor_mac(SphereDauxVst3Processor *, const char *,
 void close_editor_mac(SphereDauxVst3Processor *);
 int focus_editor_mac(SphereDauxVst3Processor *);
 void shutdown_editor_mac(SphereDauxVst3Processor *);
+/// Resize the host-owned editor window's content area and tell the view.
+///
+/// The Cocoa half of `sphere_daux_vst3_view_set_size`: on macOS the editor's
+/// window belongs to this process, so applying a size and reporting it are the
+/// same act. Declared here rather than reached through the AppKit header so
+/// `vst3_processor.cpp` stays free of Cocoa.
+void resize_editor_mac(SphereDauxVst3Processor *, int width, int height,
+                       const char *reason);
 #elif defined(__linux__)
 unsigned long long open_editor_linux(SphereDauxVst3Processor *, const char *,
                                      const char *, int, int);

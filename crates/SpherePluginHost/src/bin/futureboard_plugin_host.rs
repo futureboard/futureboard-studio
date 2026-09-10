@@ -32,7 +32,7 @@ use SpherePluginHost::audio_bridge::{
     bridge_kick_event_name, BridgeKickEvent, SharedAudioRegion, SharedMidiEvent, AUDIO_BUF_LEN,
     MAX_BLOCK_FRAMES, MAX_CHANNELS,
 };
-use SpherePluginHost::ipc::{self, HostCommand, HostEvent, PROTOCOL_VERSION};
+use SpherePluginHost::ipc::{self, EditorChromeCommand, HostCommand, HostEvent, PROTOCOL_VERSION};
 use SpherePluginHost::native_editor::{self, EmbedRegion};
 use SpherePluginHost::plugin_host_preview::{
     try_start_preview_output, BridgeAudioShared, PluginHostPreviewEngine, SharedPluginHostPreview,
@@ -2861,6 +2861,7 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
         //    The preview-engine mutex is shared with the DSP producer thread —
         //    this UI thread must NEVER block on it inside the pump path: use
         //    short bounded try-locks and skip the tick when the lock is busy.
+        let mut chrome_actions: Vec<(String, i32, i32, String)> = Vec::new();
         let user_closed_editors: Vec<String> = timed_section!("editor_refresh", {
             let mut user_closed: Vec<String> = Vec::new();
             let refresh_targets: Option<
@@ -2886,6 +2887,16 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
                     if processor.embed_take_user_close() {
                         user_closed.push(instance_id.clone());
                         continue;
+                    }
+                    // Chrome presses queued by the AppKit strip since the last
+                    // tick. Collected here rather than reported from the strip
+                    // itself: nothing in this process may apply them, and the
+                    // studio is the only place that knows what a preset or a
+                    // bypass means.
+                    if let Some(chrome) = processor.editor_chrome() {
+                        while let Some((kind, value, insert_id)) = chrome.take_action() {
+                            chrome_actions.push((instance_id.clone(), kind, value, insert_id));
+                        }
                     }
                     // VST2 editors repaint and animate only while the host
                     // calls effEditIdle; VST3 and CLAP run their own timers and
@@ -2924,6 +2935,19 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
             }
             user_closed
         });
+        for (instance_id, kind, value, tab_id) in chrome_actions {
+            let Some(action) = EditorChromeCommand::from_wire(kind, value, tab_id) else {
+                eprintln!("[PluginEditorChrome] unknown action kind={kind} value={value}");
+                continue;
+            };
+            let _ = ipc::write_frame(
+                &mut out,
+                &HostEvent::EditorChromeAction {
+                    plugin_instance_id: instance_id,
+                    action,
+                },
+            );
+        }
         for instance_id in user_closed_editors {
             eprintln!(
                 "[PluginEditor] user closed host-owned editor window instance={instance_id} (instance stays active)"
@@ -3814,6 +3838,71 @@ fn dispatch(
                 "[PluginHostEditor] resize queued plugin_instance_id={plugin_instance_id} \
                  width={width} height={height} dpi={dpi}"
             );
+        }
+        HostCommand::SetEditorChrome {
+            plugin_instance_id,
+            title,
+            active,
+            cpu_label,
+            latency_label,
+            preset_label,
+            presets,
+            preset_index,
+            tabs,
+            active_tab,
+            palette,
+        } => {
+            // Drawn only where the editor window belongs to this process. On
+            // Windows the studio draws the strip into its own window and every
+            // call below is a no-op, which is what keeps this one command safe
+            // to send from every platform.
+            //
+            // Whichever runtime owns this instance — an Audio Unit is hosted in
+            // this process rather than through the module bridges, and both
+            // answer the same question: which window is this editor in.
+            //
+            // A bounded try-lock on the module path, like the resize path:
+            // chrome arrives on every studio poll and must never park the IPC
+            // thread on the DSP mutex for a repaint.
+            let chrome = match au_instance(au_processors, &plugin_instance_id) {
+                Some(au) => au.editor_chrome(),
+                None => preview
+                    .try_lock_for(Duration::from_millis(2))
+                    .and_then(|engine| engine.clone_processor_for(&plugin_instance_id))
+                    .and_then(|processor| processor.editor_chrome()),
+            };
+            // No strip: this platform draws its chrome in the studio's own
+            // window, or this instance has no editor open. Neither is an error.
+            let Some(chrome) = chrome else {
+                return;
+            };
+            chrome.begin();
+            chrome.set_header(
+                active,
+                &preset_label,
+                &cpu_label,
+                &latency_label,
+                &active_tab,
+            );
+            for (index, name) in presets.iter().enumerate() {
+                chrome.add_preset(name, preset_index == Some(index as u32));
+            }
+            for tab in &tabs {
+                chrome.add_tab(&tab.insert_id, &tab.display_name, tab.insert_number);
+            }
+            chrome.set_palette(&[
+                palette.strip_bg,
+                palette.row_bg,
+                palette.border,
+                palette.control_bg,
+                palette.control_hover,
+                palette.control_pressed,
+                palette.accent,
+                palette.text_primary,
+                palette.text_secondary,
+                palette.text_faint,
+            ]);
+            chrome.commit(&title);
         }
         HostCommand::CloseEditor { plugin_instance_id } => {
             eprintln!("[PluginEditor] close requested plugin_id={plugin_instance_id}");

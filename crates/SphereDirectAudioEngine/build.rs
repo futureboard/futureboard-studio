@@ -26,7 +26,9 @@ fn main() {
         "src/editorplatform/macos/editor_mac.mm",
         "src/editorplatform/macos/editor_mac_delegate.mm",
         "src/editorplatform/macos/editor_mac_helpers.mm",
+        "src/editorplatform/macos/editor_mac_shell.mm",
         "src/editorplatform/macos/editor_mac_internal.hpp",
+        "src/editor_chrome_stub.cpp",
         "src/editor_linux.cpp",
     ] {
         println!(
@@ -206,6 +208,12 @@ fn apply_vst3_platform_config(
 ) {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
+    // The editor chrome strip's no-op half. Compiled on every target and empty
+    // on macOS, where `editor_mac_shell.mm` provides the real one — one file in
+    // the build list rather than a platform branch that has to be kept in step
+    // with the one below.
+    build.file(bridge_root.join("src/editor_chrome_stub.cpp"));
+
     match target_os.as_str() {
         "windows" => {
             build.define("SMTG_OS_WINDOWS", "1");
@@ -235,6 +243,7 @@ fn apply_vst3_platform_config(
                 "src/editorplatform/macos/editor_mac.mm",
                 "src/editorplatform/macos/editor_mac_delegate.mm",
                 "src/editorplatform/macos/editor_mac_helpers.mm",
+                "src/editorplatform/macos/editor_mac_shell.mm",
             ] {
                 build.file(bridge_root.join(source));
             }

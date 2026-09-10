@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::editor_chrome::EditorChrome;
 use crate::plugin_backend::{backend, PluginModuleFormat};
 
 /// Space presses the C++ editor window procedures claimed for the DAW
@@ -389,6 +390,12 @@ pub(crate) mod ffi {
             out_width: *mut i32,
             out_height: *mut i32,
         ) -> i32;
+        /// `NSWindow*` of this instance's host-owned editor as an opaque handle,
+        /// or 0 when there is no such window. Addresses the shared editor
+        /// chrome strip — see [`crate::plugin_backend::editor_chrome`].
+        pub(crate) fn sphere_daux_vst3_editor_native_window(
+            processor: *mut SphereDauxVst3Processor,
+        ) -> u64;
         pub(crate) fn sphere_daux_vst3_editor_resizable(
             processor: *mut SphereDauxVst3Processor,
         ) -> i32;
@@ -424,7 +431,9 @@ pub(crate) mod ffi {
         sphere_daux_vst3_audio_output_bus_count as audio_output_bus_count,
         sphere_daux_vst3_bridge_probe as bridge_probe,
         sphere_daux_vst3_close_editor as close_editor, sphere_daux_vst3_create as create,
-        sphere_daux_vst3_destroy as destroy, sphere_daux_vst3_editor_resizable as editor_resizable,
+        sphere_daux_vst3_destroy as destroy,
+        sphere_daux_vst3_editor_native_window as editor_native_window,
+        sphere_daux_vst3_editor_resizable as editor_resizable,
         sphere_daux_vst3_embed_attach_hwnd as embed_attach_hwnd,
         sphere_daux_vst3_embed_content_size as embed_content_size,
         sphere_daux_vst3_embed_detach as embed_detach,
@@ -1701,6 +1710,24 @@ impl Vst3RuntimeProcessor {
                 backend::set_editor_title(self.inner.format, self.inner.raw, title.as_ptr());
             }
         }
+    }
+
+    /// This instance's editor chrome strip, when its editor is in a window of
+    /// the host process's own.
+    ///
+    /// `None` on Windows, where the studio's GPUI window draws the strip above
+    /// an embedded plug-in view, and `None` whenever no editor is open. The
+    /// caller pushes chrome wherever it gets one and does nothing where it does
+    /// not, with no platform test of its own — see
+    /// [`crate::editor_chrome::EditorChrome`].
+    pub fn editor_chrome(&self) -> Option<EditorChrome> {
+        if self.inner.raw.is_null() {
+            return None;
+        }
+        // SAFETY: `raw` is a live processor of `format` for as long as this
+        // handle is.
+        let window = unsafe { backend::editor_native_window(self.inner.format, self.inner.raw) };
+        EditorChrome::for_window(window)
     }
 
     /// `createView` + `setFrame` + `getSize` without HWND attach (PrepareEditorView).

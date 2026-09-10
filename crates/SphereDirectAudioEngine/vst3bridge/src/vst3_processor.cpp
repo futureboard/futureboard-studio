@@ -4312,14 +4312,32 @@ sphere_daux_vst3_embed_refresh(SphereDauxVst3Processor *processor) {
 // surface to whatever it can give, and reports back through
 // `sphere_daux_vst3_view_set_size`. A plug-in is never told a size the host did
 // not actually apply.
+
+/// Smallest and largest content size this host will hand a plug-in.
+///
+/// Outside the platform arms below because it is the same promise on all of
+/// them: whoever owns the window, no plug-in is ever told a size outside this
+/// range.
+constexpr int kViewHostMinSide = 64;
+constexpr int kViewHostMaxSide = 8192;
+
+/// Clamps a content size into the range this host is willing to hand a plug-in.
+///
+/// `maybe_unused`: the platform arm that ships on a given target may not clamp
+/// — the fallback stubs below answer 0 to everything and have no size to bound.
+[[maybe_unused]] static void view_host_clamp(int *width, int *height) {
+  if (width) {
+    *width = std::clamp(*width, kViewHostMinSide, kViewHostMaxSide);
+  }
+  if (height) {
+    *height = std::clamp(*height, kViewHostMinSide, kViewHostMaxSide);
+  }
+}
+
 #ifdef _WIN32
 // Not in an anonymous namespace: the processor struct forward-declares
 // `HostViewFrame` so it can hold a pointer to one, and a namespaced class of the
 // same name is a different type to that declaration.
-
-/// Smallest and largest content size this host will hand a plug-in.
-constexpr int kViewHostMinSide = 64;
-constexpr int kViewHostMaxSide = 8192;
 
 /// `IPlugFrame` that records resize requests instead of acting on them.
 class HostViewFrame final : public Steinberg::IPlugFrame {
@@ -4382,16 +4400,6 @@ private:
   SphereDauxVst3Processor *owner_{nullptr};
   std::atomic<int> refs_{1};
 };
-
-/// Clamps a content size into the range this host is willing to hand a plug-in.
-static void view_host_clamp(int *width, int *height) {
-  if (width) {
-    *width = std::clamp(*width, kViewHostMinSide, kViewHostMaxSide);
-  }
-  if (height) {
-    *height = std::clamp(*height, kViewHostMinSide, kViewHostMaxSide);
-  }
-}
 
 /// Releases the view and its frame. Touches no window: the parent belongs to
 /// the host, which decides on its own terms when it goes away.
@@ -4663,6 +4671,165 @@ sphere_daux_vst3_view_take_resize_request(SphereDauxVst3Processor *processor,
   *out_height = processor->view_host_resize_h;
   return 1;
 }
+#elif defined(__APPLE__)
+// ── macOS: the view host is a window of this process's own ──────────────────
+//
+// The comment above describes the Windows mechanism, where the host hands this
+// side a window and this side only fills it. AppKit has no public way to put an
+// `NSView` inside a window another process owns, so there is no handle for the
+// host to hand over and the same job is split differently: the *window* is
+// created here, next to the view, by `open_editor_mac`.
+//
+// Everything else about the contract is unchanged, and deliberately so — the
+// caller drives macOS through the same seven calls it drives Windows through,
+// and never learns which side of the boundary the window came from. What
+// changes is only who applies a size: on Windows the host resizes its own
+// surface and reports back, here the resize *is* the report.
+
+extern "C" int sphere_daux_vst3_view_attach(SphereDauxVst3Processor *processor,
+                                            unsigned long long parent_hwnd,
+                                            int width, int height,
+                                            int *out_width, int *out_height) {
+  if (!processor || !processor->controller) {
+    set_last_error("view host: processor/controller missing");
+    return 0;
+  }
+  // Never a parent. The caller passes 0 on this platform; anything else is an
+  // owner/DPI reference from a process whose window handles mean nothing here.
+  (void)parent_hwnd;
+  if (width <= 0 || height <= 0) {
+    set_last_error("view host: invalid requested editor size");
+    return 0;
+  }
+  view_host_clamp(&width, &height);
+  // A previous window's close flag must not be read as this one's. The host
+  // polls it to report `EditorClosed`, and a stale `true` would tear down an
+  // editor that just opened.
+  processor->editor_user_closed.store(false, std::memory_order_release);
+
+  // Copied out: `open_editor_mac` can re-enter through the main queue and
+  // `sphere_daux_editor_store_native` rewrites both strings on the way.
+  const std::string window_id = processor->editor_window_id;
+  const std::string title = processor->editor_title;
+  const unsigned long long handle =
+      open_editor_mac(processor, window_id.c_str(),
+                      title.empty() ? "Plugin Editor" : title.c_str(), width,
+                      height);
+  if (handle == 0) {
+    set_last_error("view host: the plug-in's macOS editor window could not be "
+                   "opened");
+    return 0;
+  }
+
+  // What the editor actually settled on, which is not always what it was asked
+  // for: `open_editor_mac` re-reads `getSize` after `attached()` because some
+  // editors only choose their real size there, and sizes its window to that.
+  int content_w = width;
+  int content_h = height;
+  if (!sphere_daux_editor_get_view_size(processor, &content_w, &content_h)) {
+    content_w = processor->editor_content_width > 0
+                    ? processor->editor_content_width
+                    : width;
+    content_h = processor->editor_content_height > 0
+                    ? processor->editor_content_height
+                    : height;
+  }
+  view_host_clamp(&content_w, &content_h);
+  if (out_width) {
+    *out_width = content_w;
+  }
+  if (out_height) {
+    *out_height = content_h;
+  }
+  std::fprintf(stderr,
+               "[view-host] attached host_owned=1 handle=%llu content=%dx%d\n",
+               handle, content_w, content_h);
+  return 1;
+}
+
+extern "C" void
+sphere_daux_vst3_view_detach(SphereDauxVst3Processor *processor) {
+  if (!processor) {
+    return;
+  }
+  // `IPlugView::removed()` first, then the window — `close_editor_mac` does
+  // both in that order. The audio instance is untouched.
+  close_editor_mac(processor);
+}
+
+extern "C" int
+sphere_daux_vst3_view_is_attached(SphereDauxVst3Processor *processor) {
+  return (processor && processor->editor_attached &&
+          processor->editor_native_window)
+             ? 1
+             : 0;
+}
+
+extern "C" int
+sphere_daux_vst3_view_set_size(SphereDauxVst3Processor *processor, int width,
+                               int height) {
+  if (!processor || !processor->editor_view ||
+      !processor->editor_native_window) {
+    return 0;
+  }
+  if (width <= 0 || height <= 0) {
+    return 0;
+  }
+  view_host_clamp(&width, &height);
+  // The same size contract the Windows arm applies: a fixed-size view snaps
+  // back to its own `getSize`, a resizable one goes through
+  // `checkSizeConstraint`, and only the agreed size reaches the window.
+  if (!sphere_daux_editor_constrain_view_size(processor, &width, &height)) {
+    return 0;
+  }
+  view_host_clamp(&width, &height);
+  resize_editor_mac(processor, width, height, "view-host-set-size");
+  return 1;
+}
+
+extern "C" int
+sphere_daux_vst3_view_get_size(SphereDauxVst3Processor *processor,
+                               int *out_width, int *out_height) {
+  if (!processor || !out_width || !out_height) {
+    return 0;
+  }
+  return sphere_daux_editor_get_view_size(processor, out_width, out_height);
+}
+
+extern "C" int
+sphere_daux_vst3_view_can_resize(SphereDauxVst3Processor *processor) {
+  if (!processor) {
+    return 0;
+  }
+  return sphere_daux_editor_can_resize(processor);
+}
+
+extern "C" int
+sphere_daux_vst3_view_constrain(SphereDauxVst3Processor *processor,
+                                int *io_width, int *io_height) {
+  if (!processor || !io_width || !io_height) {
+    return 0;
+  }
+  view_host_clamp(io_width, io_height);
+  const int ok =
+      sphere_daux_editor_constrain_view_size(processor, io_width, io_height);
+  view_host_clamp(io_width, io_height);
+  return ok;
+}
+
+extern "C" int
+sphere_daux_vst3_view_take_resize_request(SphereDauxVst3Processor *processor,
+                                          int *out_width, int *out_height) {
+  // Always empty, and not because it is unimplemented: `MacPluginEditorFrame`
+  // applies a plug-in's `resizeView` to the window as it arrives, because that
+  // window is right here. A request is never left pending for the host to
+  // collect, so answering "none" is the truth rather than a stub.
+  (void)processor;
+  (void)out_width;
+  (void)out_height;
+  return 0;
+}
+
 #else
 extern "C" int sphere_daux_vst3_view_attach(SphereDauxVst3Processor *,
                                             unsigned long long, int, int, int *,
@@ -4694,6 +4861,29 @@ sphere_daux_vst3_view_take_resize_request(SphereDauxVst3Processor *, int *,
   return 0;
 }
 #endif
+
+// ── Editor chrome strip ─────────────────────────────────────────────────────
+//
+// The strip itself is shared across every format bridge and addressed by the
+// window it lives in (`sphere_daux_editor_chrome.h`). All this bridge has to
+// supply is which window that is — the studio drives the rest.
+
+/// The `NSWindow*` of this instance's host-owned editor, as an opaque handle.
+///
+/// 0 on Windows, and 0 whenever no editor is open. The caller passes it
+/// straight to the chrome ABI, which treats 0 as "no strip to update".
+extern "C" unsigned long long
+sphere_daux_vst3_editor_native_window(SphereDauxVst3Processor *processor) {
+#if defined(__APPLE__)
+  if (!processor) {
+    return 0;
+  }
+  return reinterpret_cast<unsigned long long>(processor->editor_native_window);
+#else
+  (void)processor;
+  return 0;
+#endif
+}
 
 extern "C" void
 sphere_daux_vst3_embed_detach(SphereDauxVst3Processor *processor) {

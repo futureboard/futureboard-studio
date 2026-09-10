@@ -13,6 +13,12 @@
 
 #include "clap_processor_internal.hpp"
 
+#include "sphere_daux_editor_chrome.h"
+#include "sphere_daux_editor_shell_mac.h"
+
+#include <cstdint>
+#include <string>
+
 #import <Cocoa/Cocoa.h>
 
 @interface DauxClapEditorWindowDelegate : NSObject <NSWindowDelegate>
@@ -194,8 +200,12 @@ unsigned long long clap_open_editor_mac(SphereDauxClapProcessor *p,
   int w = width > 0 ? width : 640;
   int h = height > 0 ? height : 480;
 
+  // The window carries the editor chrome as well as the plug-in, so its
+  // content is taller than the GUI by exactly that strip. `w`/`h` stay the
+  // *plug-in's* size throughout — the only size a plug-in ever agrees to.
+  const CGFloat chrome_h = sphere_daux_editor_chrome_height();
   NSWindow *window = [[NSWindow alloc]
-      initWithContentRect:NSMakeRect(0, 0, w, h)
+      initWithContentRect:NSMakeRect(0, 0, w, h + chrome_h)
                 styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskMiniaturizable)
                   backing:NSBackingStoreBuffered
@@ -210,8 +220,13 @@ unsigned long long clap_open_editor_mac(SphereDauxClapProcessor *p,
   delegate.processor = p;
   window.delegate = delegate;
 
-  NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
-  window.contentView = container;
+  NSView *shell = sphere_daux_editor_shell_create(
+      NSMakeRect(0, 0, w, h + chrome_h));
+  window.contentView = shell;
+  NSView *container = [[NSView alloc]
+      initWithFrame:sphere_daux_editor_shell_plugin_area(shell)];
+  container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [shell addSubview:container];
 
   p->editor_native_window = (__bridge_retained void *)window;
   p->editor_native_embed = (__bridge_retained void *)container;
@@ -224,7 +239,8 @@ unsigned long long clap_open_editor_mac(SphereDauxClapProcessor *p,
     return 0;
   }
 
-  [window setContentSize:NSMakeSize(p->embed_content_w, p->embed_content_h)];
+  [window setContentSize:NSMakeSize(p->embed_content_w,
+                                    p->embed_content_h + chrome_h)];
   [window center];
   [window makeKeyAndOrderFront:nil];
 
@@ -354,37 +370,176 @@ int sphere_daux_clap_focus_editor(SphereDauxClapProcessor *p) {
   return clap_focus_editor_mac(p);
 }
 
+/// The `NSWindow*` of this instance's host-owned editor, as an opaque handle.
+///
+/// 0 whenever no editor is open. The caller passes it straight to the shared
+/// chrome ABI, which treats 0 as "no strip to update".
+unsigned long long
+sphere_daux_clap_editor_native_window(SphereDauxClapProcessor *p) {
+  if (!p) {
+    return 0;
+  }
+  return static_cast<unsigned long long>(
+      reinterpret_cast<std::uintptr_t>(p->editor_native_window));
+}
+
 // ── Host-owned view host ────────────────────────────────────────────────────
 //
-// Windows-only, exactly like the VST3 bridge's: the macOS GUI is hosted in the
-// bridge-owned NSWindow above. These exist so the shared C surface links.
+// On Windows the host hands this side a window and this side only fills it.
+// Cocoa has no way to put a view inside a window another process owns, so the
+// same job is split differently here: the *window* is created next to the GUI,
+// by `clap_open_editor_mac` above. The caller drives macOS through the same
+// calls it drives Windows through and never learns which side made the window.
 
-int sphere_daux_clap_view_attach(SphereDauxClapProcessor *, unsigned long long,
-                                 int, int, int *, int *) {
-  clap_set_last_error("host-owned CLAP view is Windows-only");
+int sphere_daux_clap_view_attach(SphereDauxClapProcessor *p,
+                                 unsigned long long parent_view, int width,
+                                 int height, int *out_width, int *out_height) {
+  if (!p || !p->plugin || !p->ext_gui) {
+    clap_set_last_error("view host: plug-in exposes no GUI");
+    return 0;
+  }
+  // Never a parent. The caller passes 0 on this platform; anything else is an
+  // owner reference from a process whose handles mean nothing here.
+  (void)parent_view;
+  // A previous window's close flag must not be read as this one's — a stale
+  // `true` would tear down an editor that has only just opened.
+  p->embed_user_closed.store(false, std::memory_order_release);
+
+  // The instance label, not `editor_window_id`: the label is what the host set
+  // for this insert, and `editor_window_id` is only ever what a previous open
+  // stored there — empty on the first one.
+  const std::string window_id = p->embed_instance_label;
+  const std::string title = p->editor_title;
+  const unsigned long long handle = clap_open_editor_mac(
+      p, window_id.c_str(), title.empty() ? "Plugin Editor" : title.c_str(),
+      width, height);
+  if (handle == 0) {
+    return 0;
+  }
+  // What the GUI settled on: `clap_plugin_gui->get_size` after `show`, which is
+  // where a plug-in that scales to the display reports its real size.
+  if (out_width) {
+    *out_width = p->embed_content_w > 0 ? p->embed_content_w : width;
+  }
+  if (out_height) {
+    *out_height = p->embed_content_h > 0 ? p->embed_content_h : height;
+  }
+  return 1;
+}
+
+void sphere_daux_clap_view_detach(SphereDauxClapProcessor *p) {
+  // `clap_plugin_gui->destroy` first, then the window —
+  // `clap_close_editor_mac` does both in that order. The audio instance is
+  // untouched.
+  clap_close_editor_mac(p);
+}
+
+int sphere_daux_clap_view_is_attached(SphereDauxClapProcessor *p) {
+  return (p && p->editor_attached && p->editor_native_window) ? 1 : 0;
+}
+
+int sphere_daux_clap_view_set_size(SphereDauxClapProcessor *p, int width,
+                                   int height) {
+  if (!p || !p->editor_native_window || width <= 0 || height <= 0) {
+    return 0;
+  }
+  // The plug-in gets the last word on its own size, exactly as the embedded
+  // path does: `adjust_size` snaps the request, `set_size` applies it.
+  auto w = static_cast<uint32_t>(width);
+  auto h = static_cast<uint32_t>(height);
+  if (p->editor_resizable && p->gui_created && p->ext_gui) {
+    if (p->ext_gui->adjust_size) {
+      p->ext_gui->adjust_size(p->plugin, &w, &h);
+    }
+    if (p->ext_gui->set_size) {
+      p->ext_gui->set_size(p->plugin, w, h);
+    }
+  } else {
+    w = static_cast<uint32_t>(p->embed_content_w > 0 ? p->embed_content_w
+                                                     : width);
+    h = static_cast<uint32_t>(p->embed_content_h > 0 ? p->embed_content_h
+                                                     : height);
+  }
+
+  NSWindow *window = (__bridge NSWindow *)p->editor_native_window;
+  const CGFloat chrome_h = sphere_daux_editor_chrome_height();
+  const NSRect old_frame = window.frame;
+  NSRect frame = [window frameRectForContentRect:NSMakeRect(0, 0, (CGFloat)w,
+                                                            (CGFloat)h +
+                                                                chrome_h)];
+  // AppKit screen coordinates grow upward. Keep the top-left fixed so a resize
+  // never makes the editor jump around the display.
+  frame.origin.x = old_frame.origin.x;
+  frame.origin.y = NSMaxY(old_frame) - frame.size.height;
+  [window setFrame:frame display:YES];
+
+  NSView *shell = window.contentView;
+  if (p->editor_native_embed) {
+    NSView *container = (__bridge NSView *)p->editor_native_embed;
+    container.frame = sphere_daux_editor_shell_plugin_area(shell);
+    for (NSView *child in container.subviews) {
+      child.frame = NSMakeRect(0, 0, (CGFloat)w, (CGFloat)h);
+    }
+  }
+  p->embed_content_w = static_cast<int>(w);
+  p->embed_content_h = static_cast<int>(h);
+  return 1;
+}
+
+int sphere_daux_clap_view_get_size(SphereDauxClapProcessor *p, int *out_width,
+                                   int *out_height) {
+  if (!p || !out_width || !out_height) {
+    return 0;
+  }
+  uint32_t w = 0;
+  uint32_t h = 0;
+  if (p->gui_created && p->ext_gui && p->ext_gui->get_size &&
+      p->ext_gui->get_size(p->plugin, &w, &h) && w > 0 && h > 0) {
+    *out_width = static_cast<int>(w);
+    *out_height = static_cast<int>(h);
+    return 1;
+  }
+  if (p->embed_content_w > 0 && p->embed_content_h > 0) {
+    *out_width = p->embed_content_w;
+    *out_height = p->embed_content_h;
+    return 1;
+  }
   return 0;
 }
 
-void sphere_daux_clap_view_detach(SphereDauxClapProcessor *) {}
-
-int sphere_daux_clap_view_is_attached(SphereDauxClapProcessor *) { return 0; }
-
-int sphere_daux_clap_view_set_size(SphereDauxClapProcessor *, int, int) {
-  return 0;
+int sphere_daux_clap_view_can_resize(SphereDauxClapProcessor *p) {
+  return (p && p->editor_resizable) ? 1 : 0;
 }
 
-int sphere_daux_clap_view_get_size(SphereDauxClapProcessor *, int *, int *) {
-  return 0;
+int sphere_daux_clap_view_constrain(SphereDauxClapProcessor *p, int *io_width,
+                                    int *io_height) {
+  if (!p || !io_width || !io_height || *io_width <= 0 || *io_height <= 0) {
+    return 0;
+  }
+  // A fixed-size GUI snaps back to its own size; a resizable one runs the
+  // request through `adjust_size`, which is CLAP's constraint query.
+  if (!p->editor_resizable || !p->gui_created || !p->ext_gui ||
+      !p->ext_gui->adjust_size) {
+    return sphere_daux_clap_view_get_size(p, io_width, io_height);
+  }
+  auto w = static_cast<uint32_t>(*io_width);
+  auto h = static_cast<uint32_t>(*io_height);
+  if (!p->ext_gui->adjust_size(p->plugin, &w, &h) || w == 0 || h == 0) {
+    return sphere_daux_clap_view_get_size(p, io_width, io_height);
+  }
+  *io_width = static_cast<int>(w);
+  *io_height = static_cast<int>(h);
+  return 1;
 }
 
-int sphere_daux_clap_view_can_resize(SphereDauxClapProcessor *) { return 0; }
-
-int sphere_daux_clap_view_constrain(SphereDauxClapProcessor *, int *, int *) {
-  return 0;
-}
-
-int sphere_daux_clap_view_take_resize_request(SphereDauxClapProcessor *, int *,
-                                              int *) {
+int sphere_daux_clap_view_take_resize_request(SphereDauxClapProcessor *p,
+                                              int *out_width, int *out_height) {
+  // A CLAP plug-in asks for a size through `clap_host_gui->request_resize`,
+  // which the bridge applies to its own window as it arrives, because that
+  // window is right here. Nothing is ever left pending for the host to collect.
+  (void)p;
+  (void)out_width;
+  (void)out_height;
   return 0;
 }
 

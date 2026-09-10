@@ -207,6 +207,11 @@ pub(crate) mod backend {
         fn prepare_editor_view(out_width: *mut i32, out_height: *mut i32) -> i32;
         fn take_pending_shell_resize(out_width: *mut i32, out_height: *mut i32) -> i32;
         fn editor_resizable() -> i32;
+        // `NSWindow*` of this instance's host-owned editor, as an opaque
+        // handle, or 0 where there is none. Dispatched like everything else
+        // because each bridge owns its own window; what it addresses — the
+        // chrome strip — is shared, and lives in `editor_chrome` below.
+        fn editor_native_window() -> u64;
         fn get_state(
             out_component: *mut *mut u8,
             out_component_len: *mut i32,
@@ -290,6 +295,57 @@ pub(crate) mod backend {
             PluginModuleFormat::Vst2 => vst2::parameters_json_free(data),
             PluginModuleFormat::Clap => clap::parameters_json_free(data),
         }
+    }
+}
+
+/// The editor chrome strip: the tab strip and control row a host-owned editor
+/// window carries above the plug-in's own view.
+///
+/// Deliberately outside [`backend`]'s format dispatch. The strip is drawn once,
+/// for every format, and is addressed by the *window* it lives in rather than
+/// by a processor — each bridge has a processor type of its own and none of
+/// them can name the others', but every one of them can say which window its
+/// editor is in ([`backend::editor_native_window`]).
+///
+/// A handle of 0 is not an error: it is how a platform with no host-owned
+/// window, or an instance with no editor open, says so, and every call is then
+/// a no-op. That is what lets the studio push chrome without asking first.
+pub(crate) mod editor_chrome {
+    use std::os::raw::c_char;
+
+    extern "C" {
+        #[link_name = "sphere_daux_editor_chrome_begin"]
+        pub(crate) fn begin(native_window: u64);
+        #[link_name = "sphere_daux_editor_chrome_set_header"]
+        pub(crate) fn set_header(
+            native_window: u64,
+            active: i32,
+            preset_label: *const c_char,
+            cpu_label: *const c_char,
+            latency_label: *const c_char,
+            active_tab: *const c_char,
+        );
+        #[link_name = "sphere_daux_editor_chrome_add_preset"]
+        pub(crate) fn add_preset(native_window: u64, name: *const c_char, selected: i32);
+        #[link_name = "sphere_daux_editor_chrome_add_tab"]
+        pub(crate) fn add_tab(
+            native_window: u64,
+            insert_id: *const c_char,
+            display_name: *const c_char,
+            insert_number: i32,
+        );
+        #[link_name = "sphere_daux_editor_chrome_set_palette"]
+        pub(crate) fn set_palette(native_window: u64, colors: *const u32, count: i32);
+        #[link_name = "sphere_daux_editor_chrome_commit"]
+        pub(crate) fn commit(native_window: u64, window_title: *const c_char);
+        #[link_name = "sphere_daux_editor_chrome_take_action"]
+        pub(crate) fn take_action(
+            native_window: u64,
+            out_kind: *mut i32,
+            out_value: *mut i32,
+            out_id: *mut c_char,
+            out_id_capacity: i32,
+        ) -> i32;
     }
 }
 

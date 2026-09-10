@@ -13,6 +13,11 @@
 
 #include "vst2_processor_internal.hpp"
 
+#include "sphere_daux_editor_chrome.h"
+#include "sphere_daux_editor_shell_mac.h"
+
+#include <string>
+
 #import <Cocoa/Cocoa.h>
 
 @interface DauxVst2EditorWindowDelegate : NSObject <NSWindowDelegate>
@@ -169,8 +174,12 @@ unsigned long long vst2_open_editor_mac(SphereDauxVst2Processor *p,
   int h = height > 0 ? height : 480;
   preferred_size(p, &w, &h);
 
+  // The window carries the editor chrome as well as the plug-in, so its
+  // content is taller than the editor by exactly that strip. `w`/`h` stay the
+  // *plug-in's* size throughout — the only size a plug-in ever agrees to.
+  const CGFloat chrome_h = sphere_daux_editor_chrome_height();
   NSWindow *window = [[NSWindow alloc]
-      initWithContentRect:NSMakeRect(0, 0, w, h)
+      initWithContentRect:NSMakeRect(0, 0, w, h + chrome_h)
                 styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskMiniaturizable)
                   backing:NSBackingStoreBuffered
@@ -185,8 +194,13 @@ unsigned long long vst2_open_editor_mac(SphereDauxVst2Processor *p,
   delegate.processor = p;
   window.delegate = delegate;
 
-  NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, w, h)];
-  window.contentView = container;
+  NSView *shell = sphere_daux_editor_shell_create(
+      NSMakeRect(0, 0, w, h + chrome_h));
+  window.contentView = shell;
+  NSView *container = [[NSView alloc]
+      initWithFrame:sphere_daux_editor_shell_plugin_area(shell)];
+  container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [shell addSubview:container];
 
   p->editor_native_window = (__bridge_retained void *)window;
   p->editor_native_embed = (__bridge_retained void *)container;
@@ -200,7 +214,8 @@ unsigned long long vst2_open_editor_mac(SphereDauxVst2Processor *p,
     return 0;
   }
 
-  [window setContentSize:NSMakeSize(p->embed_content_w, p->embed_content_h)];
+  [window setContentSize:NSMakeSize(p->embed_content_w,
+                                    p->embed_content_h + chrome_h)];
   [window center];
   [window makeKeyAndOrderFront:nil];
 
@@ -324,40 +339,157 @@ int sphere_daux_vst2_focus_editor(SphereDauxVst2Processor *p) {
   return vst2_focus_editor_mac(p);
 }
 
+/// The `NSWindow*` of this instance's host-owned editor, as an opaque handle.
+///
+/// 0 whenever no editor is open. The caller passes it straight to the shared
+/// chrome ABI, which treats 0 as "no strip to update".
+unsigned long long
+sphere_daux_vst2_editor_native_window(SphereDauxVst2Processor *p) {
+  if (!p) {
+    return 0;
+  }
+  return static_cast<unsigned long long>(
+      reinterpret_cast<std::uintptr_t>(p->editor_native_window));
+}
+
 // ── Host-owned view host ────────────────────────────────────────────────────
 //
-// Windows-only, exactly like the VST3 bridge's: the macOS editor is hosted in
-// the bridge-owned NSWindow above. These exist so the shared C surface links.
+// On Windows the host hands this side a window and this side only fills it.
+// Cocoa has no way to put a view inside a window another process owns, so the
+// same job is split differently here: the *window* is created next to the view,
+// by `vst2_open_editor_mac` above. The caller drives macOS through the same
+// calls it drives Windows through and never learns which side made the window.
 
-int sphere_daux_vst2_view_attach(SphereDauxVst2Processor *, unsigned long long,
-                                 int, int, int *, int *) {
-  vst2_set_last_error("host-owned VST2 view is Windows-only");
+int sphere_daux_vst2_view_attach(SphereDauxVst2Processor *p,
+                                 unsigned long long parent_view, int width,
+                                 int height, int *out_width, int *out_height) {
+  if (!p || !p->effect || !p->has_editor) {
+    vst2_set_last_error("view host: no editor on this plug-in");
+    return 0;
+  }
+  // Never a parent. The caller passes 0 on this platform; anything else is an
+  // owner reference from a process whose handles mean nothing here.
+  (void)parent_view;
+  // A previous window's close flag must not be read as this one's — a stale
+  // `true` would tear down an editor that has only just opened.
+  p->embed_user_closed.store(false, std::memory_order_release);
+
+  // The instance label, not `editor_window_id`: the label is what the host set
+  // for this insert, and `editor_window_id` is only ever what a previous open
+  // stored there — empty on the first one.
+  const std::string window_id = p->embed_instance_label;
+  const std::string title = p->editor_title;
+  const unsigned long long handle = vst2_open_editor_mac(
+      p, window_id.c_str(), title.empty() ? "Plugin Editor" : title.c_str(),
+      width, height);
+  if (handle == 0) {
+    return 0;
+  }
+  // What the editor settled on: `effEditGetRect` after `effEditOpen`, which is
+  // where several plug-ins first report their real size.
+  if (out_width) {
+    *out_width = p->embed_content_w > 0 ? p->embed_content_w : width;
+  }
+  if (out_height) {
+    *out_height = p->embed_content_h > 0 ? p->embed_content_h : height;
+  }
+  return 1;
+}
+
+void sphere_daux_vst2_view_detach(SphereDauxVst2Processor *p) {
+  // `effEditClose` first, then the window — `vst2_close_editor_mac` does both
+  // in that order. The audio instance is untouched.
+  vst2_close_editor_mac(p);
+}
+
+int sphere_daux_vst2_view_is_attached(SphereDauxVst2Processor *p) {
+  return (p && p->editor_attached && p->editor_native_window) ? 1 : 0;
+}
+
+int sphere_daux_vst2_view_set_size(SphereDauxVst2Processor *p, int width,
+                                   int height) {
+  if (!p || !p->editor_native_window || width <= 0 || height <= 0) {
+    return 0;
+  }
+  // A VST2 editor that cannot resize keeps the size it reported; only a
+  // `sizeWindow`-capable one is given a different one.
+  if (!p->editor_resizable) {
+    width = p->embed_content_w > 0 ? p->embed_content_w : width;
+    height = p->embed_content_h > 0 ? p->embed_content_h : height;
+  }
+  NSWindow *window = (__bridge NSWindow *)p->editor_native_window;
+  const CGFloat chrome_h = sphere_daux_editor_chrome_height();
+  const NSRect old_frame = window.frame;
+  NSRect frame = [window
+      frameRectForContentRect:NSMakeRect(0, 0, width, height + chrome_h)];
+  // AppKit screen coordinates grow upward. Keep the top-left fixed so a resize
+  // never makes the editor jump around the display.
+  frame.origin.x = old_frame.origin.x;
+  frame.origin.y = NSMaxY(old_frame) - frame.size.height;
+  [window setFrame:frame display:YES];
+
+  NSView *shell = window.contentView;
+  if (p->editor_native_embed) {
+    NSView *container = (__bridge NSView *)p->editor_native_embed;
+    container.frame = sphere_daux_editor_shell_plugin_area(shell);
+    for (NSView *child in container.subviews) {
+      child.frame = NSMakeRect(0, 0, width, height);
+    }
+  }
+  p->embed_content_w = width;
+  p->embed_content_h = height;
+  return 1;
+}
+
+int sphere_daux_vst2_view_get_size(SphereDauxVst2Processor *p, int *out_width,
+                                   int *out_height) {
+  if (!p || !out_width || !out_height) {
+    return 0;
+  }
+  int w = p->embed_content_w;
+  int h = p->embed_content_h;
+  preferred_size(p, &w, &h);
+  if (w <= 0 || h <= 0) {
+    return 0;
+  }
+  *out_width = w;
+  *out_height = h;
+  return 1;
+}
+
+int sphere_daux_vst2_view_can_resize(SphereDauxVst2Processor *p) {
+  return (p && p->editor_resizable) ? 1 : 0;
+}
+
+int sphere_daux_vst2_view_constrain(SphereDauxVst2Processor *p, int *io_width,
+                                    int *io_height) {
+  if (!p || !io_width || !io_height) {
+    return 0;
+  }
+  // Fixed-size editors snap back to what they reported; VST2 has no
+  // constraint query for the resizable ones, so their request stands.
+  if (!p->editor_resizable) {
+    return sphere_daux_vst2_view_get_size(p, io_width, io_height);
+  }
+  return 1;
+}
+
+int sphere_daux_vst2_view_take_resize_request(SphereDauxVst2Processor *p,
+                                              int *out_width, int *out_height) {
+  // A VST2 plug-in asks for a size through `audioMasterSizeWindow`, which the
+  // bridge applies to its own window as it arrives, because that window is
+  // right here. Nothing is ever left pending for the host to collect.
+  (void)p;
+  (void)out_width;
+  (void)out_height;
   return 0;
 }
 
-void sphere_daux_vst2_view_detach(SphereDauxVst2Processor *) {}
-
-int sphere_daux_vst2_view_is_attached(SphereDauxVst2Processor *) { return 0; }
-
-int sphere_daux_vst2_view_set_size(SphereDauxVst2Processor *, int, int) {
-  return 0;
+void sphere_daux_vst2_view_idle(SphereDauxVst2Processor *p) {
+  // Not optional and not a no-op: a VST2 editor repaints and animates only
+  // while the host calls `effEditIdle`. Without this the window opens and then
+  // sits frozen, which reads as a hung plug-in rather than a missing call.
+  vst2_editor_idle_mac(p);
 }
-
-int sphere_daux_vst2_view_get_size(SphereDauxVst2Processor *, int *, int *) {
-  return 0;
-}
-
-int sphere_daux_vst2_view_can_resize(SphereDauxVst2Processor *) { return 0; }
-
-int sphere_daux_vst2_view_constrain(SphereDauxVst2Processor *, int *, int *) {
-  return 0;
-}
-
-int sphere_daux_vst2_view_take_resize_request(SphereDauxVst2Processor *, int *,
-                                              int *) {
-  return 0;
-}
-
-void sphere_daux_vst2_view_idle(SphereDauxVst2Processor *) {}
 
 } // extern "C"

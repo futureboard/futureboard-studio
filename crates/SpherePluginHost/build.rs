@@ -82,6 +82,11 @@ fn main() {
         // Shared VST2 ABI header — same file the runtime bridge uses, so the
         // scanner and the host can never disagree about the AEffect layout.
         .include(manifest_dir.join("../SphereDirectAudioEngine/vst2bridge/include"))
+        // The shared editor chrome strip, so an Audio Unit's editor window
+        // carries the same one a VST3, VST2 or CLAP editor does. Declarations
+        // only — the strip itself is implemented in the VST3 bridge and both
+        // static libraries end up in the same binary.
+        .include(manifest_dir.join("../SphereDirectAudioEngine/vst3bridge/include"))
         .file(backend_root.join("src/vst3_scanner.cpp"))
         .file(sdk_root.join("pluginterfaces/base/coreiids.cpp"))
         .file(sdk_root.join("pluginterfaces/base/funknown.cpp"))

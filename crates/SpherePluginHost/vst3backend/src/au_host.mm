@@ -22,6 +22,9 @@
 
 #include "sphere_au_host.h"
 
+#include "sphere_daux_editor_chrome.h"
+#include "sphere_daux_editor_shell_mac.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -969,6 +972,8 @@ SPHERE_AU_HOST_API unsigned long long sphere_au_open_editor(
 
   if (instance->editor_window != nullptr) {
     NSWindow* window = (__bridge NSWindow*)instance->editor_window;
+    // The unit's own view, not the window's content view — the content view is
+    // the shell, and its height includes the chrome.
     NSView* view = (__bridge NSView*)instance->editor_view;
     if (out_width != nullptr) {
       *out_width = static_cast<unsigned int>(std::max<CGFloat>(view.frame.size.width, 1.0));
@@ -1044,7 +1049,13 @@ SPHERE_AU_HOST_API unsigned long long sphere_au_open_editor(
         std::max<unsigned int>(preferred_height, 360));
     [view setFrameSize:size];
   }
-  NSRect content_rect = NSMakeRect(0.0, 0.0, size.width, size.height);
+  // The window carries the editor chrome as well as the unit's own view, so
+  // its content is taller than the view by exactly that strip. `size` stays the
+  // *unit's* size throughout — it is what the caller reports as the editor's
+  // dimensions and what the unit itself laid out for.
+  const CGFloat chrome_h = sphere_daux_editor_chrome_height();
+  NSRect content_rect =
+      NSMakeRect(0.0, 0.0, size.width, size.height + chrome_h);
   NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                             NSWindowStyleMaskMiniaturizable;
   NSWindow* window = [[NSWindow alloc] initWithContentRect:content_rect
@@ -1057,7 +1068,13 @@ SPHERE_AU_HOST_API unsigned long long sphere_au_open_editor(
   window.backgroundColor = NSColor.blackColor;
   window.level = NSFloatingWindowLevel;
   window.releasedWhenClosed = NO;
-  window.contentView = view;
+  // The unit's view goes *under* the chrome rather than being the content view
+  // itself. It keeps its own size; only where it sits changes.
+  NSView* shell = sphere_daux_editor_shell_create(content_rect);
+  window.contentView = shell;
+  [view setFrame:sphere_daux_editor_shell_plugin_area(shell)];
+  view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [shell addSubview:view];
   [window center];
 
   SphereAuEditorWindowDelegate* delegate = [[SphereAuEditorWindowDelegate alloc] init];
@@ -1084,6 +1101,20 @@ SPHERE_AU_HOST_API unsigned long long sphere_au_open_editor(
       handle, out_width != nullptr ? *out_width : 0,
       out_height != nullptr ? *out_height : 0);
   return handle;
+}
+
+/// The `NSWindow*` of this unit's editor, as an opaque handle.
+///
+/// 0 whenever no editor is open. The caller passes it straight to the shared
+/// editor-chrome ABI, which addresses the strip by the window it lives in — the
+/// same way it is addressed for a VST3, VST2 or CLAP editor, none of whose
+/// instance types this one can name.
+SPHERE_AU_HOST_API unsigned long long
+sphere_au_editor_native_window(SphereAuInstance* instance) {
+  if (instance == nullptr) {
+    return 0;
+  }
+  return reinterpret_cast<unsigned long long>(instance->editor_window);
 }
 
 SPHERE_AU_HOST_API void sphere_au_close_editor(SphereAuInstance* instance) {

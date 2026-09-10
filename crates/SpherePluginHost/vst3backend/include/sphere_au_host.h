@@ -153,6 +153,13 @@ SPHERE_AU_HOST_API unsigned long long sphere_au_open_editor(
     unsigned int* out_height);
 
 /// Close only the Cocoa editor; the Audio Unit DSP instance remains alive.
+/// The `NSWindow*` of this unit's editor, as an opaque handle; 0 when none is
+/// open. Addresses the shared editor chrome strip
+/// (`sphere_daux_editor_chrome.h`), which is keyed by window so one strip
+/// serves every plug-in format.
+SPHERE_AU_HOST_API unsigned long long
+sphere_au_editor_native_window(SphereAuInstance* instance);
+
 SPHERE_AU_HOST_API void sphere_au_close_editor(SphereAuInstance* instance);
 
 /// Bring an already-open Cocoa editor to the front.

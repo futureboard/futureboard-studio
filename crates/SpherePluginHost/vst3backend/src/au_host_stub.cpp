@@ -115,6 +115,11 @@ SPHERE_AU_HOST_API unsigned long long sphere_au_open_editor(
   return 0;
 }
 
+SPHERE_AU_HOST_API unsigned long long
+sphere_au_editor_native_window(SphereAuInstance* /*instance*/) {
+  return 0;
+}
+
 SPHERE_AU_HOST_API void sphere_au_close_editor(SphereAuInstance* /*instance*/) {}
 
 SPHERE_AU_HOST_API int sphere_au_focus_editor(SphereAuInstance* /*instance*/) {

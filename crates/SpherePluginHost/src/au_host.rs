@@ -125,6 +125,7 @@ extern "C" {
         out_width: *mut c_uint,
         out_height: *mut c_uint,
     ) -> u64;
+    fn sphere_au_editor_native_window(instance: *mut SphereAuInstance) -> u64;
     fn sphere_au_close_editor(instance: *mut SphereAuInstance);
     fn sphere_au_focus_editor(instance: *mut SphereAuInstance) -> c_int;
     fn sphere_au_take_editor_user_close(instance: *mut SphereAuInstance) -> c_int;
@@ -394,6 +395,20 @@ impl AuHostProcessor {
             )
         };
         (handle != 0).then_some((handle, width.max(1), height.max(1)))
+    }
+
+    /// This unit's editor chrome strip, when its editor is open.
+    ///
+    /// The strip is the studio's — same tab strip and control row a VST3, VST2
+    /// or CLAP editor gets — and is addressed by the window it lives in, which
+    /// is the one piece every format has in common. `None` when no editor is
+    /// open, and on any platform that has no host-owned editor window.
+    pub fn editor_chrome(&self) -> Option<DirectAudio::editor_chrome::EditorChrome> {
+        let instance = self.editor_instance();
+        // SAFETY: `instance` is this processor's live unit for as long as it is
+        // alive; the call only reads a stored pointer.
+        let window = unsafe { sphere_au_editor_native_window(instance) };
+        DirectAudio::editor_chrome::EditorChrome::for_window(window)
     }
 
     pub fn close_editor(&self) {

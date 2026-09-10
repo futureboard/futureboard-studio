@@ -81,4 +81,12 @@ int sphere_daux_clap_view_take_resize_request(SphereDauxClapProcessor *, int *,
   return 0;
 }
 
+
+/// No host-owned editor window on this platform, so nothing for the chrome to
+/// attach to — and a 0 handle is exactly how the chrome ABI says so.
+unsigned long long
+sphere_daux_clap_editor_native_window(SphereDauxClapProcessor *) {
+  return 0;
+}
+
 } // extern "C"

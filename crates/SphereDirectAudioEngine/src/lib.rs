@@ -30,6 +30,7 @@ pub mod clap_processor;
 mod command;
 pub mod device;
 mod dsp;
+pub mod editor_chrome;
 pub mod engine;
 pub mod error;
 pub mod export;

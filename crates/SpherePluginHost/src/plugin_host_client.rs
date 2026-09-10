@@ -683,6 +683,19 @@ impl PluginHostClient {
         })
     }
 
+    /// Push what the editor's chrome strip should show.
+    ///
+    /// Only the host-owned-window platforms draw one; elsewhere the host
+    /// receives this and does nothing, which is what lets the studio send it
+    /// unconditionally instead of branching on the platform at every call site.
+    pub fn set_editor_chrome(&mut self, chrome: HostCommand) -> Result<(), PluginHostClientError> {
+        debug_assert!(
+            matches!(chrome, HostCommand::SetEditorChrome { .. }),
+            "set_editor_chrome takes the command it names"
+        );
+        self.send(&chrome)
+    }
+
     pub fn preview_note_on(
         &mut self,
         plugin_instance_id: impl Into<String>,

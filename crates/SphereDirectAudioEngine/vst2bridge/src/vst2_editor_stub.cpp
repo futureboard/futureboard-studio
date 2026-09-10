@@ -81,4 +81,12 @@ int sphere_daux_vst2_view_take_resize_request(SphereDauxVst2Processor *, int *,
 
 void sphere_daux_vst2_view_idle(SphereDauxVst2Processor *) {}
 
+
+/// No host-owned editor window on this platform, so nothing for the chrome to
+/// attach to — and a 0 handle is exactly how the chrome ABI says so.
+unsigned long long
+sphere_daux_vst2_editor_native_window(SphereDauxVst2Processor *) {
+  return 0;
+}
+
 } // extern "C"

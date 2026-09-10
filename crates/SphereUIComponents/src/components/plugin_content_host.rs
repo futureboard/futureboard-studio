@@ -18,8 +18,10 @@
 //! - the child's parent is the supplied top HWND.
 //!
 //! On non-Windows targets every entry point is a no-op stub returning `None`,
-//! so the crate still compiles cross-platform. (macOS NSView hosting is a later
-//! slice.)
+//! and nothing asks: macOS and Linux use the host-owned-window backend, where
+//! the plug-in's view lives in a top-level window the host process created and
+//! there is no content child in this process at all. See
+//! [`crate::components::plugin_editor_backend::EditorBackendKind`].
 
 /// Whether this platform can embed a plug-in's own native view inside the
 /// app's window.
@@ -28,9 +30,9 @@
 /// `WS_CHILD` content HWND and hands the handle to the host process, which
 /// attaches the VST3 `IPlugView` to it from its own thread. Reparenting a
 /// window across process boundaries is a Win32 facility. macOS has no public
-/// equivalent for `NSView`, so a macOS port is not this file's stub growing a
-/// body — it is a different design (a host-owned `NSWindow` the app tracks, or
-/// in-process editors), and the host process is HWND-typed end to end besides.
+/// equivalent for `NSView`, so its editor is not this file's stub growing a
+/// body — it is the host-owned backend, where the host process opens the
+/// `NSWindow` itself and this file is never consulted.
 ///
 /// Callers consult this to tell "not implemented on this platform" from "the
 /// window was not ready this frame". The two look identical from

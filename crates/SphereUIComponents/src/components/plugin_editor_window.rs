@@ -14,6 +14,22 @@
 //! - No audio-thread interaction: attach/resize/detach run on the UI thread.
 //! - Editor failure never crashes — a GPUI fallback panel is shown instead.
 //!
+//! The bullets above describe the *Windows* mechanism, which is the one this
+//! window was written against. There are two backends — see
+//! [`crate::components::plugin_editor_backend::EditorBackendKind`]:
+//!
+//! - **Windows** embeds the plug-in's view in this window, through a content
+//!   child HWND handed to the plug-in host process.
+//! - **macOS and Linux** have no public way to reparent a view across a process
+//!   boundary, so the plug-in's view is attached inside a top-level window the
+//!   *host process* owns. This window then has no plug-in region at all: it
+//!   creates no content child, pushes no geometry, and does not grow to the
+//!   plug-in's size. It carries the chrome that cannot be drawn over a plug-in's
+//!   surface, and it goes when the host reports `EditorClosed`.
+//!
+//! Every branch between the two reads `embeds_in_editor_window()`, and none
+//! reads the target directly, so the Windows path stays the code it always was.
+//!
 //! The old C++ NanoVG/D3D top-level window is no longer used on this path.
 
 use std::cell::Cell;
@@ -235,6 +251,31 @@ enum PluginEditorStatus {
 /// that turns into a surfaced failure.
 const READY_PROBE_DELAYS_MS: &[u64] = &[100, 500, 1000, 3000, 5000];
 const DEFAULT_PLUGIN_EDITOR_CONTENT_SIZE: (i32, i32) = (900, 600);
+
+/// DPI reported alongside a host-owned editor's requested size.
+///
+/// That size is in the plug-in's own logical units (points on macOS), so the
+/// DPI that describes it is the unscaled one. The host records the pair in its
+/// open log; a backing-scaled number beside a logical size would only make the
+/// log lie about which space the request was in.
+const HOST_OWNED_EDITOR_DPI: u32 = 96;
+
+/// Logical width of the shell window when the plug-in's editor is a window of
+/// the host process's own.
+///
+/// Wide enough for the chrome row — bypass, preset stepper, Save, CPU and
+/// latency — plus a tab with a real plug-in name on it. There is no plug-in
+/// surface in this window to size around, so nothing else argues for a width.
+const HOST_OWNED_SHELL_WIDTH: f32 = 480.0;
+
+/// Logical height below the chrome for the line that says where the plug-in's
+/// window went.
+///
+/// Derived rather than chosen: it is whatever is left once the chrome has taken
+/// its share of the window's own minimum height. The shell would be clamped up
+/// to that minimum anyway, so a smaller target would only be a number that the
+/// window never takes — and it comfortably fits the two lines the panel draws.
+const HOST_OWNED_SHELL_BODY_H: f32 = EDITOR_WINDOW_MIN_HEIGHT - HEADER_H;
 const MIN_PLUGIN_EDITOR_CONTENT_SIZE: i32 = 160;
 const MAX_PLUGIN_EDITOR_PREFERRED_SIZE: i32 = 4096;
 
@@ -292,7 +333,22 @@ pub struct PluginEditorWindow {
     /// itself would be a second place each of them is decided.
     chrome: PluginEditorChrome,
     /// Chrome controls the user pressed, waiting for the studio to apply them.
+    ///
+    /// Filled by this window's own strip on the embedding backend, and by
+    /// `EditorChromeAction` from the host on a host-owned one. The studio
+    /// drains the same queue either way, so a control means one thing on every
+    /// platform.
     chrome_actions: Vec<PluginEditorAction>,
+    /// The last chrome pushed to the host, so an unchanged one is not resent.
+    ///
+    /// `None` on the embedding backend, which never pushes at all.
+    pushed_chrome: Option<SpherePluginHost::ipc::HostCommand>,
+    /// Whether a failure has already put this window on screen.
+    ///
+    /// Only a host-owned shell is ever off screen to begin with, and only the
+    /// first failure shows it — activating on every tick would take focus back
+    /// from whatever the user moved on to.
+    failure_surfaced: bool,
     /// The open preset list, which is a window of its own.
     ///
     /// Window state, not the studio's: which menu is open is nobody else's
@@ -418,6 +474,8 @@ impl PluginEditorWindow {
                 ..PluginEditorChrome::default()
             },
             chrome_actions: Vec::new(),
+            pushed_chrome: None,
+            failure_surfaced: false,
             preset_menu: None,
             preset_menu_requested: false,
             preset_menu_dismissed_at: None,
@@ -844,6 +902,17 @@ impl PluginEditorWindow {
             PluginEditorStatus::Opening | PluginEditorStatus::WaitingForHostHandle => {}
         }
 
+        // A host-owned backend attaches into a top-level window the bridge
+        // creates, so there is no parent to require and no region to reserve —
+        // the same shape as the bridged path above, minus the process boundary.
+        if !EditorBackendKind::current().embeds_in_editor_window() {
+            self.wait_ticks = 0;
+            self.status = PluginEditorStatus::Attaching;
+            self.schedule_tick(cx);
+            cx.notify();
+            return;
+        }
+
         // Phase 4/6: require a valid native parent handle before attaching.
         let Some(parent) = Self::native_parent_handle(window) else {
             self.note_host_region_not_ready(cx);
@@ -901,6 +970,10 @@ impl PluginEditorWindow {
             cx.notify();
             return;
         };
+        if !EditorBackendKind::current().embeds_in_editor_window() {
+            self.perform_host_owned_attach(processor, window, cx);
+            return;
+        }
         let Some(parent) = Self::native_parent_handle(window) else {
             // Lost the handle between scheduling and now — go back to waiting.
             self.status = PluginEditorStatus::WaitingForHostHandle;
@@ -1014,6 +1087,65 @@ impl PluginEditorWindow {
             }
         }
         cx.notify();
+    }
+
+    /// Attach an in-process editor into a window the bridge owns.
+    ///
+    /// The legacy in-process path's arm of the same split the bridged path
+    /// makes: `view_attach(0, …)` reaches `sphere_daux_vst3_embed_editor`,
+    /// which on macOS and Linux creates its own top-level window and attaches
+    /// the view there. The size handed over is the plug-in's own logical size,
+    /// not this window's physical region — that region belongs to a surface
+    /// this path never creates.
+    fn perform_host_owned_attach(
+        &mut self,
+        processor: DirectAudio::Vst3RuntimeProcessor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (width, height) = self
+            .editor_content_size
+            .unwrap_or(DEFAULT_PLUGIN_EDITOR_CONTENT_SIZE);
+        let width = width.max(MIN_PLUGIN_EDITOR_CONTENT_SIZE);
+        let height = height.max(MIN_PLUGIN_EDITOR_CONTENT_SIZE);
+        match processor.view_attach(0, (width, height)) {
+            Some((preferred_w, preferred_h)) => {
+                // The bridge's opaque editor handle, not a window this process
+                // owns — `Drop`, `retry` and the user-close poll read it only as
+                // "there is an editor to detach", which is what it means here.
+                // Floored at 1 rather than trusted: a zero would make `Drop`
+                // skip the detach and leave the plug-in's window behind after
+                // this shell is gone.
+                self.embed_handle = Some(processor.embed_attach_hwnd().max(1));
+                if let Some(size) = u32::try_from(preferred_w)
+                    .ok()
+                    .zip(u32::try_from(preferred_h).ok())
+                    .and_then(|(w, h)| Self::valid_preferred_size(w, h))
+                {
+                    self.editor_content_size = Some(size);
+                }
+                self.apply_host_owned_shell_size(window);
+                let mode = EditorBackendKind::current().presentation();
+                self.status = PluginEditorStatus::Attached(mode);
+                eprintln!(
+                    "[plugin-view] attach ok editor_id={} mode={mode:?} host_owned=true \
+                     size={preferred_w}x{preferred_h} (reused runtime instance)",
+                    self.editor_id()
+                );
+                cx.notify();
+            }
+            None => {
+                let err = processor
+                    .last_error()
+                    .unwrap_or_else(|| "the plug-in's editor could not be opened".to_string());
+                eprintln!(
+                    "[plugin-view] attach failed error={err} editor_id={}",
+                    self.editor_id()
+                );
+                self.status = PluginEditorStatus::Failed(err);
+                cx.notify();
+            }
+        }
     }
 
     /// Tells the view the size this window is actually giving it, and moves the
@@ -1283,6 +1415,34 @@ impl PluginEditorWindow {
         self.apply_host_preferred_size(window);
 
         match self.status.clone() {
+            PluginEditorStatus::Attached(PluginEditorPresentationMode::DetachedNativeWindow) => {
+                // The plug-in's window belongs to the host process, which sizes
+                // it and reports back. Pushing this shell's region at it would
+                // fight the plug-in over a window this process does not own.
+                //
+                // The user closing that window arrives as `EditorClosed`, which
+                // the studio routes here and then drops this shell with it, so
+                // there is nothing to poll for — only the light tick that
+                // notices the host going away.
+                self.schedule_tick(cx);
+                return;
+            }
+            // A host-owned shell is never shown, so a failure would otherwise
+            // be silent: the editor simply would not appear, with nothing
+            // anywhere saying why. Showing the window is the whole point of
+            // having kept it.
+            PluginEditorStatus::Failed(_) | PluginEditorStatus::Unsupported(_)
+                if !self.failure_surfaced =>
+            {
+                self.failure_surfaced = true;
+                eprintln!(
+                    "[plugin-editor-window] surfacing the shell to report a failure editor_id={}",
+                    self.editor_id()
+                );
+                window.activate_window();
+                cx.notify();
+                return;
+            }
             PluginEditorStatus::Attached(_) => {
                 self.sync_host_region(window);
                 // Keep a light tick so a host crash (EditorDisconnected) is
@@ -1300,7 +1460,17 @@ impl PluginEditorWindow {
             PluginEditorStatus::Opening | PluginEditorStatus::WaitingForHostHandle => {}
         }
 
-        // 2. Need a valid GPUI top HWND before we can parent a content child.
+        // 2. A host-owned backend has no parent handle and no content child in
+        //    this process: the plug-in's window belongs to the host, so the
+        //    steps below — top HWND, content child, region — have nothing to
+        //    operate on. Asking for them anyway is what refused every editor on
+        //    macOS.
+        if !EditorBackendKind::current().embeds_in_editor_window() {
+            self.request_host_owned_editor(window, cx);
+            return;
+        }
+
+        // 3. Need a valid GPUI top HWND before we can parent a content child.
         let Some(top) = Self::native_parent_handle(window) else {
             self.note_host_region_not_ready(cx);
             return;
@@ -1319,7 +1489,7 @@ impl PluginEditorWindow {
         let dpi = (window.scale_factor().max(0.5) * 96.0).round() as u32;
         let id = self.editor_id();
 
-        // 3. Create the main-app-owned content child HWND (content != top).
+        // 4. Create the main-app-owned content child HWND (content != top).
         let Some(content) = ContentChildHwnd::create(top, rect) else {
             self.status =
                 PluginEditorStatus::Failed("failed to create content child HWND".to_string());
@@ -1335,7 +1505,7 @@ impl PluginEditorWindow {
         eprintln!("[plugin-editor-window] content_hwnd=0x{content_hwnd:x}");
         eprintln!("[plugin-editor-window] content_parent=shell_hwnd");
 
-        // 4. Send OpenEditorWithParentHwnd to the host process.
+        // 5. Send OpenEditorWithParentHwnd to the host process.
         let (path, class_id) = {
             let host = self.host.as_ref().unwrap();
             (host.plugin_path.clone(), host.class_id.clone())
@@ -1403,6 +1573,203 @@ impl PluginEditorWindow {
         cx.notify();
     }
 
+    /// Ask the host process to open the plug-in's editor in a window it owns.
+    ///
+    /// macOS and Linux both land here. Neither has public cross-process view
+    /// reparenting, so the plug-in's `NSView`/`GtkWidget` is created and
+    /// attached inside the host process, in a top-level window that process
+    /// owns — `sphere_daux_vst3_embed_editor` has taken that branch since the
+    /// Linux path landed, and the host brings up and pumps `NSApplication` for
+    /// it. Nothing is embedded in this window, so there is no parent handle to
+    /// wait for, no content child to create, and no region to push.
+    ///
+    /// `parent_hwnd` is deliberately `0`. The host treats it as an optional
+    /// owner/DPI reference for its own top-level window and never as a
+    /// `SetParent` target (`schedule_unified_editor_attach`), and this process
+    /// has no handle whose meaning would survive the boundary anyway.
+    fn request_host_owned_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The plug-in's own coordinate space — points on macOS, logical pixels
+        // on Linux — never this window's physical region. The region is the
+        // shell's geometry and has nothing to do with a window in another
+        // process; sending it would open a Retina editor at twice its size.
+        let (width, height) = self
+            .editor_content_size
+            .unwrap_or(DEFAULT_PLUGIN_EDITOR_CONTENT_SIZE);
+        let width = width.max(MIN_PLUGIN_EDITOR_CONTENT_SIZE) as u32;
+        let height = height.max(MIN_PLUGIN_EDITOR_CONTENT_SIZE) as u32;
+        // Both sizes above are already logical, so the DPI that goes with them
+        // is the unscaled one. The host logs it against the requested size, and
+        // a scaled number beside a logical size would only misdescribe it.
+        let dpi = HOST_OWNED_EDITOR_DPI;
+        let id = self.editor_id();
+        let backend = EditorBackendKind::current();
+
+        let (path, class_id) = {
+            let Some(host) = self.host.as_ref() else {
+                return;
+            };
+            (host.plugin_path.clone(), host.class_id.clone())
+        };
+        let Some(host) = self.host.as_mut() else {
+            return;
+        };
+        // No content child on this path, and no region either: the plug-in's
+        // window sizes itself and reports back through `EditorContentResize`.
+        host.content = None;
+        host.last_region = None;
+        eprintln!(
+            "[plugin-editor-window] ownership=host_owned backend={} editor_id={id}",
+            backend.label()
+        );
+        eprintln!(
+            "[plugin-bridge] sending OpenEditor (host-owned window) instance={id} size={width}x{height} dpi={dpi}"
+        );
+        let open_result = if let Some(shared) = host.shared.as_ref() {
+            shared
+                .lock()
+                .map_err(|_| "bridge runtime lock poisoned".to_string())
+                .and_then(|mut runtime| {
+                    runtime
+                        .open_editor_with_parent(self.insert_id.clone(), 0, width, height, dpi)
+                        .map_err(|e| e.to_string())
+                })
+        } else if let Some(client) = host.client.as_mut() {
+            client
+                .open_editor(id.clone(), path, class_id, 0, width, height, dpi)
+                .map_err(|e| e.to_string())
+        } else {
+            Err("bridge host client unavailable".to_string())
+        };
+        if let Err(e) = open_result {
+            self.status = PluginEditorStatus::Failed(format!("send OpenEditor failed: {e}"));
+            cx.notify();
+            return;
+        }
+        // The shell has no plug-in surface to make room for, so it takes the
+        // size of its own chrome now rather than after the plug-in answers.
+        self.apply_host_owned_shell_size(window);
+        self.wait_ticks = 0;
+        self.status = PluginEditorStatus::Attaching;
+        self.schedule_tick(cx);
+        cx.notify();
+    }
+
+    /// Bring the editor to the front when the user opens it again.
+    ///
+    /// On the embedding backend the studio activates this window and that is
+    /// the whole gesture. On a host-owned backend this window is not on screen
+    /// at all, so activating it raises nothing — the editor the user is asking
+    /// for is a window in the host process, and only the host can raise it. A
+    /// repeated open is how it is told to: the host answers an open for an
+    /// instance it already has attached by focusing it.
+    pub(crate) fn focus_editor_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if EditorBackendKind::current().embeds_in_editor_window() {
+            window.activate_window();
+            return;
+        }
+        match self.status {
+            // Already reported, and already on screen. Bring it forward again:
+            // the user asked for this editor and the message is the answer.
+            PluginEditorStatus::Failed(_) | PluginEditorStatus::Unsupported(_) => {
+                window.activate_window();
+            }
+            // Attached: ask the host again. It answers an open for an instance
+            // it already has by focusing that window, which is the window the
+            // user is actually pointing at.
+            PluginEditorStatus::Attached(_) => self.request_host_owned_editor(window, cx),
+            // Still opening. Showing the shell now would put an empty frame on
+            // screen a moment before the plug-in's own window arrives beside
+            // it, which is the pair of windows this backend exists to avoid.
+            _ => {}
+        }
+    }
+
+    /// Hand the chrome to whoever is drawing it.
+    ///
+    /// On the embedding backend that is this window and there is nothing to
+    /// send: GPUI draws the strip from `self.chrome` on the next frame. On a
+    /// host-owned backend the strip is an AppKit view beside the plug-in in
+    /// the host process, so the same state goes over the bridge — already
+    /// formatted and with the theme resolved, because the host has neither the
+    /// preset files nor the theme store to work either out.
+    ///
+    /// Skipped when nothing changed. This is called from every chrome refresh,
+    /// which runs on the studio's poll, and a repaint per poll for a CPU
+    /// reading that landed on the same percent is exactly the churn the GPUI
+    /// path already avoids.
+    fn push_host_chrome(&mut self) {
+        if EditorBackendKind::current().embeds_in_editor_window() {
+            return;
+        }
+        let command = SpherePluginHost::ipc::HostCommand::SetEditorChrome {
+            plugin_instance_id: self.insert_id.clone(),
+            title: self.window_title(),
+            active: self.chrome.active,
+            cpu_label: self.chrome.cpu_label(),
+            latency_label: self.chrome.latency_label(),
+            preset_label: self.chrome.preset_label(),
+            presets: self.chrome.presets.clone(),
+            preset_index: self.chrome.preset_index.map(|index| index as u32),
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| SpherePluginHost::ipc::EditorChromeTab {
+                    insert_id: tab.insert_id.clone(),
+                    display_name: tab.display_name.clone(),
+                    insert_number: tab.insert_number as u32,
+                })
+                .collect(),
+            active_tab: self.insert_id.clone(),
+            palette: crate::components::plugin_editor_chrome::resolve_chrome_palette(),
+        };
+        if self.pushed_chrome.as_ref() == Some(&command) {
+            return;
+        }
+        let Some(host) = self.host.as_mut() else {
+            return;
+        };
+        if let Some(shared) = host.shared.as_ref() {
+            let Ok(mut runtime) = shared.lock() else {
+                return;
+            };
+            runtime.set_editor_chrome(command.clone());
+        } else if let Some(client) = host.client.as_mut() {
+            if client.set_editor_chrome(command.clone()).is_err() {
+                return;
+            }
+        } else {
+            return;
+        }
+        self.pushed_chrome = Some(command);
+    }
+
+    /// Size the shell for a host-owned editor: its chrome, and nothing else.
+    ///
+    /// The plug-in's window is the host process's and carries the plug-in's own
+    /// size; this window carries only the controls that cannot be drawn over a
+    /// plug-in's surface. Growing it to the plug-in's size would reserve a
+    /// region that nothing will ever paint into.
+    fn apply_host_owned_shell_size(&mut self, window: &mut Window) {
+        if self.host_auto_size_applied {
+            return;
+        }
+        self.host_auto_size_applied = true;
+        self.host_auto_size_settled = true;
+        let target_w = HOST_OWNED_SHELL_WIDTH.max(EDITOR_WINDOW_MIN_WIDTH);
+        let target_h = (HEADER_H + HOST_OWNED_SHELL_BODY_H).max(EDITOR_WINDOW_MIN_HEIGHT);
+        let viewport = window.viewport_size();
+        let current_w: f32 = viewport.width.into();
+        let current_h: f32 = viewport.height.into();
+        if (current_w - target_w).abs() <= 1.0 && (current_h - target_h).abs() <= 1.0 {
+            return;
+        }
+        eprintln!(
+            "[plugin-editor-window] host_owned_shell_size {target_w:.0}x{target_h:.0} \
+             (the plug-in's window is the host process's)"
+        );
+        window.resize(size(px(target_w), px(target_h)));
+    }
+
     /// Refreshes what the titlebar strip shows.
     ///
     /// Cheap to call every poll: an unchanged chrome notifies nothing, so the
@@ -1420,6 +1787,7 @@ impl PluginEditorWindow {
             self.close_preset_menu(cx);
         }
         self.chrome = chrome;
+        self.push_host_chrome();
         cx.notify();
     }
 
@@ -1443,6 +1811,7 @@ impl PluginEditorWindow {
             return;
         }
         self.tabs = tabs;
+        self.push_host_chrome();
         cx.notify();
     }
 
@@ -1572,6 +1941,9 @@ impl PluginEditorWindow {
             })
             | ClientEvent::Host(HostEvent::EditorUnresponsive {
                 plugin_instance_id, ..
+            })
+            | ClientEvent::Host(HostEvent::EditorChromeAction {
+                plugin_instance_id, ..
             }) => Some(plugin_instance_id.as_str()),
             _ => None,
         }
@@ -1603,20 +1975,41 @@ impl PluginEditorWindow {
                     "[plugin-view][host] EditorAttached editor_id={id} attached_result={result} \
                      preferred={preferred_width}x{preferred_height}"
                 );
-                // Content is a WS_CHILD embed under the GPUI window.
-                if !self.host_auto_size_applied {
-                    let size = Self::preferred_size_or_default(preferred_width, preferred_height);
-                    if Self::valid_preferred_size(preferred_width, preferred_height).is_none() {
-                        eprintln!(
-                            "[plugin-editor-window] preferred_size_invalid using_default={}x{}",
-                            size.0, size.1
-                        );
+                let backend = EditorBackendKind::current();
+                if backend.embeds_in_editor_window() {
+                    // Content is a WS_CHILD embed under the GPUI window, so the
+                    // shell grows to make room for it.
+                    if !self.host_auto_size_applied {
+                        let size =
+                            Self::preferred_size_or_default(preferred_width, preferred_height);
+                        if Self::valid_preferred_size(preferred_width, preferred_height).is_none() {
+                            eprintln!(
+                                "[plugin-editor-window] preferred_size_invalid using_default={}x{}",
+                                size.0, size.1
+                            );
+                        }
+                        self.host_preferred_size = Some(size);
                     }
-                    self.host_preferred_size = Some(size);
+                } else {
+                    // A host-owned window carries its own size. Recording it is
+                    // still worth doing — a reopen asks for the size the plug-in
+                    // last reported instead of the 900x600 fallback — but this
+                    // shell must not grow to it.
+                    if let Some(size) =
+                        Self::valid_preferred_size(preferred_width, preferred_height)
+                    {
+                        self.editor_content_size = Some(size);
+                    }
                 }
                 let was = self.status.clone();
-                self.status =
-                    PluginEditorStatus::Attached(PluginEditorPresentationMode::ChildHwndEmbed);
+                self.status = PluginEditorStatus::Attached(backend.presentation());
+                if !backend.embeds_in_editor_window() {
+                    // Anything pushed before now was dropped: the host had no
+                    // editor window to draw a strip in. Forget what was sent so
+                    // the next refresh is a full one rather than a no-op.
+                    self.pushed_chrome = None;
+                    self.push_host_chrome();
+                }
                 if !matches!(was, PluginEditorStatus::Attached(_)) {
                     eprintln!(
                         "[plugin-editor-window] plugin_instance_id={} editor_window_id={id}",
@@ -1637,6 +2030,34 @@ impl PluginEditorWindow {
             }
             ClientEvent::Host(HostEvent::EditorClosed { .. }) => {
                 eprintln!("[plugin-view][host] EditorClosed editor_id={id}");
+            }
+            ClientEvent::Host(HostEvent::EditorChromeAction { action, .. }) => {
+                // Straight onto the queue this window's own strip would have
+                // used. The studio drains it and applies it through one
+                // function, so a press on the AppKit strip and a press on the
+                // GPUI one cannot come to mean different things.
+                use SpherePluginHost::ipc::EditorChromeCommand;
+                let action = match action {
+                    EditorChromeCommand::SetActive { active } => {
+                        PluginEditorAction::SetActive(active)
+                    }
+                    EditorChromeCommand::StepPreset { delta } => {
+                        PluginEditorAction::StepPreset(delta)
+                    }
+                    EditorChromeCommand::SavePreset => PluginEditorAction::SavePreset,
+                    EditorChromeCommand::SelectPreset { index } => {
+                        PluginEditorAction::SelectPreset(index as usize)
+                    }
+                    EditorChromeCommand::SelectTab { insert_id } => {
+                        PluginEditorAction::SelectTab(insert_id)
+                    }
+                    EditorChromeCommand::CloseTab { insert_id } => {
+                        PluginEditorAction::CloseTab(insert_id)
+                    }
+                };
+                eprintln!("[plugin-editor-chrome] host strip action={action:?} editor_id={id}");
+                self.chrome_actions.push(action);
+                cx.notify();
             }
             ClientEvent::Host(HostEvent::EditorUnresponsive { gap_ms, .. }) => {
                 // Freeze-watchdog notification; the host usually recovers, so
@@ -1897,7 +2318,13 @@ impl Drop for PluginEditorWindow {
 
 impl PluginEditorWindow {
     fn render_status_message(&self, headline: &str) -> gpui::AnyElement {
-        div()
+        self.render_status_panel(headline, None)
+    }
+
+    /// The plug-in name, a headline, and optionally the sentence that explains
+    /// it — the one surface every non-attached state of this window renders.
+    fn render_status_panel(&self, headline: &str, detail: Option<&str>) -> gpui::AnyElement {
+        let mut panel = div()
             .flex()
             .flex_col()
             .gap(px(6.0))
@@ -1918,8 +2345,16 @@ impl PluginEditorWindow {
                     .text_size(px(crate::theme::typography::UI_SM))
                     .text_color(Colors::text_secondary())
                     .child(headline.to_string()),
-            )
-            .into_any_element()
+            );
+        if let Some(detail) = detail {
+            panel = panel.child(
+                div()
+                    .text_size(px(crate::theme::typography::UI_XS))
+                    .text_color(Colors::text_muted())
+                    .child(detail.to_string()),
+            );
+        }
+        panel.into_any_element()
     }
 
     /// A failure panel with no Retry.
@@ -2116,11 +2551,17 @@ impl Render for PluginEditorWindow {
                 Some(self.render_unsupported_panel(&reason))
             }
             PluginEditorStatus::Attached(PluginEditorPresentationMode::DetachedNativeWindow) => {
-                // The plug-in is in its own standalone OS window — the GPUI shell
-                // has no native plugin region to expose, so fill it with an
-                // explanatory panel (closing this shell closes the editor).
-                Some(self.render_status_message(
-                    "Editor opened in a separate window. Closing this window closes the editor.",
+                // The plug-in is in a window the host process owns, so this
+                // shell has no plug-in region to expose. It keeps the controls
+                // that belong to the plug-in but cannot be drawn over its
+                // surface, and says where the surface went — an empty panel
+                // here reads as an editor that failed to open.
+                Some(self.render_status_panel(
+                    "Its editor is open in a window of its own.",
+                    Some(
+                        "The controls above still apply to it. Closing this window \
+                         closes the editor.",
+                    ),
                 ))
             }
             PluginEditorStatus::Attached(mode) => {
@@ -2326,6 +2767,14 @@ pub(crate) fn open_plugin_editor_window(
     // wrong screen, and the preset list that anchors to it follows. Every other
     // external window in this crate already does this.
     crate::window_position::apply_owner_display(&mut options, Some(owner_bounds), cx);
+    // On a host-owned backend this window has nothing to show: the plug-in and
+    // the chrome above it are both in the host process's own window. The entity
+    // still exists and still does its job — it drives the attach, carries the
+    // tabs, pushes the chrome and closes the editor when it goes — but it is
+    // never ordered on screen, because a second empty frame beside the editor
+    // is exactly what porting the strip to AppKit was for.
+    options.show = EditorBackendKind::current().embeds_in_editor_window();
+    options.focus = options.show;
 
     let editor_id = format!("{track_id}::{insert_id}");
     let result = cx.open_window(options, |_window, cx| {
@@ -2345,6 +2794,16 @@ pub(crate) fn open_plugin_editor_window(
         match &result {
             Ok(_) => eprintln!("[plugin-view] gpui window created id={editor_id}"),
             Err(e) => eprintln!("[plugin-view] gpui window create FAILED id={editor_id} err={e}"),
+        }
+    }
+    // The attach lifecycle is normally started by the first `render`, which is
+    // where `schedule_tick` is called from. A host-owned shell is never shown
+    // and must not be assumed to draw, so it is started here instead —
+    // otherwise the editor would depend on a frame that may never come. The
+    // tick is idempotent, so this is a no-op if a frame does arrive first.
+    if let Ok(handle) = result.as_ref() {
+        if !EditorBackendKind::current().embeds_in_editor_window() {
+            let _ = handle.update(cx, |editor, _window, cx| editor.schedule_tick(cx));
         }
     }
     result.map_err(|e| e.to_string())
@@ -2399,8 +2858,12 @@ mod platform_support_tests {
     fn this_build_resolves_to_its_own_backend() {
         let backend = EditorBackendKind::current();
         let wait = host_region_wait(backend, local_native_view_ready());
-        if cfg!(target_os = "windows") {
-            assert_eq!(wait, HostRegionWait::KeepWaiting);
+        if cfg!(target_os = "windows") || cfg!(target_os = "macos") || cfg!(target_os = "linux") {
+            assert_eq!(
+                wait,
+                HostRegionWait::KeepWaiting,
+                "every platform that ships has a backend that can open an editor"
+            );
         } else {
             assert_eq!(
                 wait,
@@ -2409,5 +2872,46 @@ mod platform_support_tests {
                  spinning out a wait it cannot win"
             );
         }
+    }
+
+    /// The shell only reserves a plug-in region on the backends that put a
+    /// plug-in surface in it.
+    ///
+    /// A host-owned editor presented as a child embed is the failure this
+    /// guards: the shell would grow to a size nothing paints into, and
+    /// `sync_host_region` would push this window's geometry at a window in
+    /// another process on every layout pass.
+    #[test]
+    fn only_an_embedded_backend_owns_a_plugin_region() {
+        let backend = EditorBackendKind::current();
+        assert_eq!(
+            backend.embeds_in_editor_window(),
+            cfg!(target_os = "windows"),
+            "Windows is the only platform that can reparent a plug-in's view \
+             into this window"
+        );
+        assert_eq!(
+            backend.presentation() == PluginEditorPresentationMode::DetachedNativeWindow,
+            !backend.embeds_in_editor_window()
+        );
+    }
+
+    /// The compact shell has to leave room for the chrome it exists to carry.
+    #[test]
+    fn the_host_owned_shell_is_at_least_its_own_chrome() {
+        let height = HEADER_H + HOST_OWNED_SHELL_BODY_H;
+        assert!(height > HEADER_H);
+        assert!(height >= EDITOR_WINDOW_MIN_HEIGHT);
+        assert!(HOST_OWNED_SHELL_WIDTH >= EDITOR_WINDOW_MIN_WIDTH);
+    }
+
+    /// The size a host-owned editor is opened at is the plug-in's own logical
+    /// size, so the DPI sent beside it must be the unscaled one. Sending a
+    /// backing-scaled DPI with a point size describes neither.
+    #[test]
+    fn a_host_owned_editor_is_requested_in_logical_units() {
+        assert_eq!(HOST_OWNED_EDITOR_DPI, 96);
+        let (w, h) = DEFAULT_PLUGIN_EDITOR_CONTENT_SIZE;
+        assert!(w >= MIN_PLUGIN_EDITOR_CONTENT_SIZE && h >= MIN_PLUGIN_EDITOR_CONTENT_SIZE);
     }
 }

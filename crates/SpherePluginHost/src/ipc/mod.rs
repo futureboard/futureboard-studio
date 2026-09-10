@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// [`HostEvent`]. The client sends it in [`HostCommand::Hello`] and the host
 /// echoes its own in [`HostEvent::Ready`]; a mismatch should be surfaced, not
 /// silently tolerated.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Commands sent **client → host** (written to the host's stdin).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,8 +262,108 @@ pub enum HostCommand {
         name: String,
         wav_b64: String,
     },
+    /// What the plug-in editor's chrome strip should show.
+    ///
+    /// Only the host-owned-window platforms use this. On Windows the plug-in's
+    /// view is embedded in the studio's own window and GPUI draws the chrome
+    /// above it; on macOS the window belongs to this process, so the strip has
+    /// to be drawn here — and everything in it still belongs to the studio,
+    /// which is why it arrives already resolved rather than as state the host
+    /// would have to interpret.
+    ///
+    /// Every field is a finished string or a resolved colour. The host formats
+    /// nothing: a second implementation of "how a latency reads" or "which
+    /// grey a hovered tab is" is a second answer waiting to disagree with the
+    /// first.
+    SetEditorChrome {
+        plugin_instance_id: String,
+        /// The window's title bar text.
+        title: String,
+        /// Whether the insert is processing (bypassed and disabled both read
+        /// as `false` here — from the editor's side they say the same thing).
+        active: bool,
+        /// Already formatted: `12%` / `—`.
+        cpu_label: String,
+        /// Already formatted: `3.2 ms` / `0 smp`.
+        latency_label: String,
+        /// Already formatted: the loaded preset, `Unsaved`, or `No presets`.
+        preset_label: String,
+        /// The preset menu's rows, in menu order.
+        presets: Vec<String>,
+        /// Which row is loaded, when the studio knows.
+        #[serde(default)]
+        preset_index: Option<u32>,
+        /// Every plug-in open on this channel, in slot order.
+        tabs: Vec<EditorChromeTab>,
+        /// `tabs` entry this window is showing.
+        active_tab: String,
+        /// Resolved theme colours, so the strip follows the studio's theme
+        /// rather than carrying a palette of its own that only matches by
+        /// accident.
+        palette: EditorChromePalette,
+    },
     /// Graceful host shutdown: detach everything and exit 0.
     Shutdown,
+}
+
+/// One plug-in open on the channel this editor window belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditorChromeTab {
+    /// Insert slot id — how the studio and the host both address it.
+    pub insert_id: String,
+    /// Plug-in name, as the tab shows it.
+    pub display_name: String,
+    /// 1-based slot position on the channel.
+    pub insert_number: u32,
+}
+
+/// The chrome strip's colours, resolved by the studio from the active theme.
+///
+/// Packed `0xRRGGBBAA`. Resolved rather than named because several of these are
+/// composites — a hovered control is its rest fill lifted by a state layer, and
+/// working that out needs `Colors::composite` and the theme it reads. Sending
+/// the finished colour keeps one place that knows how a state layer lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EditorChromePalette {
+    /// Tab strip ground, and an unselected tab.
+    pub strip_bg: u32,
+    /// Chrome row ground, and the selected tab.
+    pub row_bg: u32,
+    /// Hairline under each band.
+    pub border: u32,
+    /// Button and preset-trigger rest fill.
+    pub control_bg: u32,
+    /// The same, hovered.
+    pub control_hover: u32,
+    /// The same, pressed.
+    pub control_pressed: u32,
+    /// A latched control's fill (the power button when the insert is on).
+    pub accent: u32,
+    pub text_primary: u32,
+    pub text_secondary: u32,
+    pub text_faint: u32,
+}
+
+/// A chrome control the user operated, on its way back to the studio.
+///
+/// Deliberately the same set as the GPUI chrome's own action enum: the studio
+/// applies both through one function, so a control cannot mean one thing on
+/// Windows and another on macOS.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum EditorChromeCommand {
+    /// Turn the insert's processing on or off.
+    SetActive { active: bool },
+    /// Move `delta` places through the preset list, wrapping.
+    StepPreset { delta: i32 },
+    /// Store the plug-in's current state as a new preset.
+    SavePreset,
+    /// Load the preset at this index.
+    SelectPreset { index: u32 },
+    /// Bring another of this channel's open plug-ins to the front.
+    SelectTab { insert_id: String },
+    /// Close one plug-in's tab.
+    CloseTab { insert_id: String },
 }
 
 /// Events sent **host → client** (written to the host's stdout).
@@ -477,6 +577,54 @@ pub enum HostEvent {
         #[serde(default)]
         truncated: bool,
     },
+    /// The user operated a control in a host-drawn chrome strip
+    /// ([`HostCommand::SetEditorChrome`]).
+    ///
+    /// The host neither applies nor interprets it: the insert, the engine and
+    /// the preset files are the studio's, and this is the same queue the GPUI
+    /// chrome puts its own presses on.
+    EditorChromeAction {
+        plugin_instance_id: String,
+        action: EditorChromeCommand,
+    },
+}
+
+impl EditorChromeCommand {
+    /// The wire discriminant a host-drawn strip queues for this command.
+    ///
+    /// The strip is Objective-C and cannot name this enum, so it queues an
+    /// integer and the host turns it back. Append only: a renumbering would
+    /// make a tab close when the user meant to select it, silently and only on
+    /// the platform that draws its own chrome.
+    pub const fn wire_kind(&self) -> i32 {
+        match self {
+            Self::SetActive { .. } => 0,
+            Self::StepPreset { .. } => 1,
+            Self::SavePreset => 2,
+            Self::SelectPreset { .. } => 3,
+            Self::SelectTab { .. } => 4,
+            Self::CloseTab { .. } => 5,
+        }
+    }
+
+    /// Rebuild one command from what a host-drawn strip queued.
+    ///
+    /// `insert_id` is empty for every control that is not per-tab, and an
+    /// unrecognised or malformed press is `None` rather than a guess: a press
+    /// this side does not understand is one the studio must not act on.
+    pub fn from_wire(kind: i32, value: i32, insert_id: String) -> Option<Self> {
+        match kind {
+            0 => Some(Self::SetActive { active: value != 0 }),
+            1 => Some(Self::StepPreset { delta: value }),
+            2 => Some(Self::SavePreset),
+            3 => u32::try_from(value)
+                .ok()
+                .map(|index| Self::SelectPreset { index }),
+            4 => (!insert_id.is_empty()).then_some(Self::SelectTab { insert_id }),
+            5 => (!insert_id.is_empty()).then_some(Self::CloseTab { insert_id }),
+            _ => None,
+        }
+    }
 }
 
 /// One VST3 parameter entry returned by the plugin host.
@@ -714,5 +862,122 @@ mod tests {
             json,
             format!(r#"{{"event":"Ready","protocol_version":{PROTOCOL_VERSION},"pid":42}}"#)
         );
+    }
+
+    /// The one contract a host-drawn chrome strip cannot express in Rust.
+    ///
+    /// `editor_mac_shell.mm` queues these integers by hand; if the two tables
+    /// ever disagree, a press does something other than what it says — a tab
+    /// closes instead of selecting, or a preset step becomes a bypass. Pinning
+    /// the numbers here is what makes a renumbering fail a test rather than a
+    /// user's session.
+    #[test]
+    fn chrome_action_wire_numbers_are_pinned() {
+        for (kind, command) in [
+            (0, EditorChromeCommand::SetActive { active: true }),
+            (1, EditorChromeCommand::StepPreset { delta: -1 }),
+            (2, EditorChromeCommand::SavePreset),
+            (3, EditorChromeCommand::SelectPreset { index: 7 }),
+            (
+                4,
+                EditorChromeCommand::SelectTab {
+                    insert_id: "insert-2".to_string(),
+                },
+            ),
+            (
+                5,
+                EditorChromeCommand::CloseTab {
+                    insert_id: "insert-2".to_string(),
+                },
+            ),
+        ] {
+            assert_eq!(command.wire_kind(), kind, "{command:?} moved");
+        }
+    }
+
+    #[test]
+    fn a_chrome_press_survives_the_round_trip() {
+        let cases = [
+            EditorChromeCommand::SetActive { active: false },
+            EditorChromeCommand::SetActive { active: true },
+            EditorChromeCommand::StepPreset { delta: 1 },
+            EditorChromeCommand::StepPreset { delta: -1 },
+            EditorChromeCommand::SavePreset,
+            EditorChromeCommand::SelectPreset { index: 0 },
+            EditorChromeCommand::SelectPreset { index: 12 },
+            EditorChromeCommand::SelectTab {
+                insert_id: "track1:insert3".to_string(),
+            },
+            EditorChromeCommand::CloseTab {
+                insert_id: "track1:insert3".to_string(),
+            },
+        ];
+        for command in cases {
+            let (value, id) = match &command {
+                EditorChromeCommand::SetActive { active } => (i32::from(*active), String::new()),
+                EditorChromeCommand::StepPreset { delta } => (*delta, String::new()),
+                EditorChromeCommand::SavePreset => (0, String::new()),
+                EditorChromeCommand::SelectPreset { index } => (*index as i32, String::new()),
+                EditorChromeCommand::SelectTab { insert_id }
+                | EditorChromeCommand::CloseTab { insert_id } => (0, insert_id.clone()),
+            };
+            assert_eq!(
+                EditorChromeCommand::from_wire(command.wire_kind(), value, id),
+                Some(command.clone()),
+                "{command:?} did not survive the wire"
+            );
+        }
+    }
+
+    /// A press this side does not understand must not reach the studio: it
+    /// would be applied as *something*, and the wrong something is worse than
+    /// nothing happening.
+    #[test]
+    fn a_malformed_chrome_press_is_dropped_not_guessed() {
+        assert_eq!(EditorChromeCommand::from_wire(99, 0, String::new()), None);
+        assert_eq!(EditorChromeCommand::from_wire(-1, 0, String::new()), None);
+        // A negative preset row is not row zero.
+        assert_eq!(EditorChromeCommand::from_wire(3, -1, String::new()), None);
+        // A tab action with no tab names nothing to act on.
+        assert_eq!(EditorChromeCommand::from_wire(4, 0, String::new()), None);
+        assert_eq!(EditorChromeCommand::from_wire(5, 0, String::new()), None);
+    }
+
+    /// The chrome command has to survive the transport it was added to, and its
+    /// palette has to arrive as the same numbers that went in — a colour that
+    /// silently round-trips wrong is a strip that does not match the theme.
+    #[test]
+    fn chrome_state_survives_the_transport() {
+        let command = HostCommand::SetEditorChrome {
+            plugin_instance_id: "track1:insert1".to_string(),
+            title: "Drums - Pro-Q 4".to_string(),
+            active: true,
+            cpu_label: "12%".to_string(),
+            latency_label: "3.2 ms".to_string(),
+            preset_label: "Vocal Bus".to_string(),
+            presets: vec!["Vocal Bus".to_string(), "Drum Glue".to_string()],
+            preset_index: Some(0),
+            tabs: vec![EditorChromeTab {
+                insert_id: "track1:insert1".to_string(),
+                display_name: "Pro-Q 4".to_string(),
+                insert_number: 1,
+            }],
+            active_tab: "track1:insert1".to_string(),
+            palette: EditorChromePalette {
+                strip_bg: 0x1B1D22FF,
+                row_bg: 0x212429FF,
+                border: 0x00000033,
+                control_bg: 0x16181CFF,
+                control_hover: 0x2A2E35FF,
+                control_pressed: 0x101216FF,
+                accent: 0x4FC9D8FF,
+                text_primary: 0xE8EAEEFF,
+                text_secondary: 0xB9BDC6FF,
+                text_faint: 0x8F949FFF,
+            },
+        };
+        let line = serde_json::to_string(&command).unwrap();
+        let decoded: HostCommand = serde_json::from_str(&line).unwrap();
+        assert_eq!(decoded, command);
     }
 }

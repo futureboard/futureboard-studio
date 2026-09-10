@@ -12,9 +12,11 @@
   if (!proc || !window)
     return;
 
+  // The content view holds the chrome strip as well as the plug-in, and the
+  // size the plug-in has to agree to is only its own share of it.
   NSSize size = window.contentView.bounds.size;
   int width = (int)std::llround(size.width);
-  int height = (int)std::llround(size.height);
+  int height = (int)std::llround(size.height - sphere_daux_editor_chrome_height());
   if (width <= 0 || height <= 0)
     return;
 

@@ -2075,8 +2075,12 @@ impl StudioLayout {
         // one. Only drop the handle when its window is actually gone.
         if let Some(handle) = self.plugin_editors.open.get(&key) {
             if handle
-                .update(cx, |_, window, _| {
-                    window.activate_window();
+                .update(cx, |editor, window, cx| {
+                    // Not `activate_window` directly: on a host-owned backend
+                    // this window is not the one the user is asking for — the
+                    // editor is in the plug-in host's own window, and raising
+                    // an off-screen shell would look like nothing happened.
+                    editor.focus_editor_surface(window, cx);
                 })
                 .is_ok()
             {
