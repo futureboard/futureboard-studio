@@ -30,9 +30,18 @@
 //!
 //! # Platforms
 //!
-//! Windows embeds. macOS has no native-child embedding anywhere in this crate
-//! (`ContentChildHwnd` is a stub there), so the panel explains that and offers
-//! the pop-out window, which macOS does support.
+//! Windows and macOS both embed, and for the same reason: an ARA plug-in is
+//! hosted by the app itself, so its view has no process boundary to cross. The
+//! surfaces differ — a `WS_CHILD` window under the studio window, or an
+//! `NSView` container mounted in it — and `DockSurface` below is the one type
+//! the panel talks to.
+//!
+//! That is not true of the bridged insert editors, whose plug-ins live in the
+//! plug-in host process: AppKit cannot put their views in this window at all,
+//! which is why those open in a window the host owns. Same product, two
+//! genuinely different problems.
+//!
+//! Anywhere else, the panel says so and offers the editor its own window.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -44,6 +53,88 @@ use gpui::{
 };
 
 use crate::components::plugin_content_host::{ContentChildHwnd, ContentRect};
+
+/// The native surface the plug-in's view is parked in.
+///
+/// Windows parents a `WS_CHILD` window under the studio window; macOS mounts an
+/// `NSView` container in it. Same job, same lifetime, same geometry in physical
+/// pixels relative to the window — so the panel below talks to one type and
+/// never branches on the platform itself.
+#[cfg(target_os = "macos")]
+type DockSurface = crate::components::plugin_editor_mac_region::DockedPluginSurface;
+#[cfg(not(target_os = "macos"))]
+type DockSurface = ContentChildHwnd;
+
+/// The size to hand the plug-in for a measured panel rect.
+///
+/// Not the same number as the surface's rect, and that is the whole point.
+/// `ContentRect` is physical pixels because that is what positions a native
+/// surface; a plug-in is told its size in *its own* coordinate space, and the
+/// two only agree where the two spaces do.
+///
+/// Win32 is pixels, so Windows hands the rect straight over. `IPlugView` on
+/// macOS is points — a plug-in never sees backing pixels — so a Retina panel
+/// measured at 2560x800 is a 1280x400 editor. Passing the pixels there makes
+/// the plug-in lay out at twice the room it has and get cut off by the clip.
+#[cfg(target_os = "macos")]
+fn plugin_size(rect: ContentRect, scale: f32) -> (i32, i32) {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    (
+        (rect.width as f32 / scale).round() as i32,
+        (rect.height as f32 / scale).round() as i32,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn plugin_size(rect: ContentRect, _scale: f32) -> (i32, i32) {
+    (rect.width, rect.height)
+}
+
+/// Create the surface at a measured rect, or `None` when it cannot be made.
+#[cfg(target_os = "macos")]
+fn dock_surface_create(parent: u64, rect: ContentRect) -> Option<DockSurface> {
+    DockSurface::create(parent, region_px(rect))
+}
+#[cfg(not(target_os = "macos"))]
+fn dock_surface_create(parent: u64, rect: ContentRect) -> Option<DockSurface> {
+    DockSurface::create(parent, rect)
+}
+
+/// The handle the plug-in attaches to: an `HWND` on Windows, an `NSView*` on
+/// macOS. Opaque to the panel either way.
+#[cfg(target_os = "macos")]
+fn dock_surface_handle(surface: &DockSurface) -> u64 {
+    surface.handle()
+}
+#[cfg(not(target_os = "macos"))]
+fn dock_surface_handle(surface: &DockSurface) -> u64 {
+    surface.hwnd()
+}
+
+/// Move the surface to a freshly measured rect.
+#[cfg(target_os = "macos")]
+fn dock_surface_set_bounds(surface: &DockSurface, parent: u64, rect: ContentRect) {
+    surface.set_bounds(parent, region_px(rect));
+}
+#[cfg(not(target_os = "macos"))]
+fn dock_surface_set_bounds(surface: &DockSurface, _parent: u64, rect: ContentRect) {
+    surface.set_bounds(rect);
+}
+
+/// The same rect, in the type the AppKit side names it with.
+#[cfg(target_os = "macos")]
+fn region_px(rect: ContentRect) -> crate::components::plugin_editor_mac_region::RegionPx {
+    crate::components::plugin_editor_mac_region::RegionPx {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    }
+}
 use crate::layout::ara_ops::AraSessionKey;
 use crate::layout::StudioLayout;
 use crate::theme::Colors;
@@ -73,8 +164,8 @@ pub struct AraEditorHost {
     /// Panel rect measured during the previous frame's prepaint, in logical
     /// pixels relative to the window.
     measured: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// Native child currently hosting the plug-in view.
-    content: Option<ContentChildHwnd>,
+    /// Native surface currently hosting the plug-in view.
+    content: Option<DockSurface>,
     /// Last rect pushed to the child, so an unchanged layout costs nothing.
     last_rect: Option<ContentRect>,
     /// What the panel should be showing right now.
@@ -85,6 +176,11 @@ pub struct AraEditorHost {
     pending: Option<AraSessionKey>,
     /// Rect the panel wants the view at, as of the last render.
     pending_rect: Option<ContentRect>,
+    /// Backing scale the rect above was measured at.
+    ///
+    /// Kept because the native work runs on a deferred tick with no `Window` to
+    /// ask, and the plug-in's size is derived from it — see [`plugin_size`].
+    scale: f32,
     /// Whether a deferred sync is already queued.
     tick_scheduled: bool,
     /// The session this panel has already asked for a window for.
@@ -126,6 +222,7 @@ impl AraEditorHost {
             parent_hwnd: None,
             pending: None,
             pending_rect: None,
+            scale: 1.0,
             tick_scheduled: false,
             own_window_requested: None,
             traced: None,
@@ -306,7 +403,7 @@ impl AraEditorHost {
                 "perform_sync: creating child parent=0x{parent:x} rect=({},{},{}x{})",
                 rect.x, rect.y, rect.width, rect.height
             ));
-            let Some(content) = ContentChildHwnd::create(parent, rect) else {
+            let Some(content) = dock_surface_create(parent, rect) else {
                 self.fail("could not create the editor surface");
                 cx.notify();
                 return;
@@ -315,13 +412,14 @@ impl AraEditorHost {
             // plug-in's view and attaches it to the child above — it does not
             // create a shell, a titlebar, or a window procedure of its own, so
             // this panel is the single owner of the editor's geometry.
-            let Some(preferred) = processor.view_attach(content.hwnd(), (rect.width, rect.height))
+            let offered = plugin_size(rect, self.scale);
+            let Some(preferred) = processor.view_attach(dock_surface_handle(&content), offered)
             else {
                 self.fail("the plug-in did not open its editor");
                 cx.notify();
                 return;
             };
-            let granted = Self::grant_size(&processor, rect);
+            let granted = Self::grant_size(&processor, offered);
             Self::trace_event(&format!(
                 "perform_sync: view attached preferred={}x{} granted={}x{}",
                 preferred.0, preferred.1, granted.0, granted.1
@@ -336,17 +434,17 @@ impl AraEditorHost {
         }
 
         if self.last_rect != Some(rect) {
-            if let Some(content) = self.content.as_ref() {
-                content.set_bounds(rect);
+            if let (Some(content), Some(parent)) = (self.content.as_ref(), self.parent_hwnd) {
+                dock_surface_set_bounds(content, parent, rect);
             }
-            Self::grant_size(&processor, rect);
+            Self::grant_size(&processor, plugin_size(rect, self.scale));
             self.last_rect = Some(rect);
             self.pending_view_resize = None;
         } else if let Some((request_w, request_h)) = self.pending_view_resize.take() {
             // The plug-in asked to change size. A docked panel has no size of
             // its own to give, so it is answered with the region it already
             // has: the view relays out inside it instead of the window moving.
-            let granted = Self::grant_size(&processor, rect);
+            let granted = Self::grant_size(&processor, plugin_size(rect, self.scale));
             Self::trace_event(&format!(
                 "perform_sync: resize request {request_w}x{request_h} answered with {}x{}",
                 granted.0, granted.1
@@ -360,11 +458,16 @@ impl AraEditorHost {
 
     /// Tells the view the size the panel is actually giving it.
     ///
-    /// Run through the VST3 size contract first: a resizable view takes the
-    /// region as-is, a fixed one keeps its own size and is simply clipped by
-    /// the panel rather than being told a size it cannot honour.
-    fn grant_size(processor: &DirectAudio::Vst3RuntimeProcessor, rect: ContentRect) -> (i32, i32) {
-        let (width, height) = processor.view_constrain(rect.width, rect.height);
+    /// `offered` is already in the plug-in's own coordinate space — see
+    /// [`plugin_size`]. Run through the VST3 size contract first: a resizable
+    /// view takes the region as-is, a fixed one keeps its own size and is
+    /// simply clipped by the panel rather than being told a size it cannot
+    /// honour.
+    fn grant_size(
+        processor: &DirectAudio::Vst3RuntimeProcessor,
+        offered: (i32, i32),
+    ) -> (i32, i32) {
+        let (width, height) = processor.view_constrain(offered.0, offered.1);
         processor.view_set_size(width, height);
         (width, height)
     }
@@ -446,10 +549,11 @@ impl Render for AraEditorHost {
         // Record the target and let the deferred tick do the native work.
         self.parent_hwnd = native_window_handle(window);
         self.pending = Some(key.clone());
+        self.scale = window.scale_factor();
         self.pending_rect = self
             .measured
             .get()
-            .and_then(|bounds| Self::embed_rect(bounds, window.scale_factor()));
+            .and_then(|bounds| Self::embed_rect(bounds, self.scale));
         let pending_rect = self.pending_rect;
         let attached = self.attached.is_some();
         let status = self.status.clone();
@@ -566,16 +670,24 @@ fn view_debug() -> bool {
 }
 
 /// Whether a plug-in view can be parked inside a GPUI panel on this platform.
-#[cfg(target_os = "windows")]
+///
+/// True where the panel can put the plug-in's own view inside the studio's
+/// window. That is a *cross-process* question, and it only ever comes up for
+/// plug-ins the app does not host itself — which is not this path. An ARA
+/// plug-in is bound to a clip by the app, in the app's own process, so its view
+/// is an ordinary subview on both platforms: a `WS_CHILD` window on Windows,
+/// and an `NSView` container on macOS.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn embedding_supported() -> bool {
     true
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn embedding_supported() -> bool {
     false
 }
 
+/// The studio window's own native view, as the surface below parents into.
 #[cfg(target_os = "windows")]
 fn native_window_handle(window: &Window) -> Option<u64> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -588,7 +700,19 @@ fn native_window_handle(window: &Window) -> Option<u64> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn native_window_handle(window: &Window) -> Option<u64> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        // The window's content view. `MacHostRegion` mounts the container as a
+        // subview of it, which is why nothing here needs the `NSWindow`.
+        RawWindowHandle::AppKit(w) => Some(w.ns_view.as_ptr() as u64),
+        _ => None,
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn native_window_handle(_window: &Window) -> Option<u64> {
     None
 }
@@ -619,6 +743,47 @@ mod tests {
         // Dragging the dock shut must not hand the plug-in a 0-height view.
         assert!(AraEditorHost::embed_rect(bounds(0.0, 0.0, 400.0, 4.0), 1.0).is_none());
         assert!(AraEditorHost::embed_rect(bounds(0.0, 0.0, 4.0, 400.0), 1.0).is_none());
+    }
+
+    /// The measurement the surface is placed with, and the one the plug-in is
+    /// told, are not the same number on a Retina display.
+    ///
+    /// `ContentRect` is physical pixels — that is what positions a native
+    /// surface — but `IPlugView` on macOS is points. Handing the pixels over
+    /// makes the plug-in lay out at twice the room it has, and the clip that
+    /// keeps it inside the panel then cuts the other half off. Win32 is pixels,
+    /// so Windows passes the rect through untouched.
+    #[test]
+    fn a_plugin_is_told_its_size_in_its_own_units() {
+        let rect = ContentRect {
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 800,
+        };
+        if cfg!(target_os = "macos") {
+            assert_eq!(plugin_size(rect, 2.0), (1280, 400));
+            // One-to-one where the two spaces agree.
+            assert_eq!(plugin_size(rect, 1.0), (2560, 800));
+        } else {
+            assert_eq!(plugin_size(rect, 2.0), (2560, 800));
+        }
+    }
+
+    /// A scale of zero would divide the editor away; window teardown has
+    /// produced one before (see the rect test below).
+    #[test]
+    fn a_plugin_size_survives_a_broken_scale_factor() {
+        let rect = ContentRect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 400,
+        };
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let (width, height) = plugin_size(rect, bad);
+            assert_eq!((width, height), (800, 400), "scale {bad} should pin to 1.0");
+        }
     }
 
     #[test]

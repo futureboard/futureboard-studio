@@ -4686,6 +4686,58 @@ sphere_daux_vst3_view_take_resize_request(SphereDauxVst3Processor *processor,
 // changes is only who applies a size: on Windows the host resizes its own
 // surface and reports back, here the resize *is* the report.
 
+/// Attach the plug-in's view inside a view this process already owns.
+///
+/// The docked case: no window is created, nothing is stored in
+/// `editor_native_window`, and the caller keeps every bit of the geometry. That
+/// absence is load-bearing — `sphere_daux_vst3_editor_native_window` answers 0
+/// here, which is how the editor chrome strip knows there is no window of ours
+/// to draw itself into. A docked editor's chrome is the panel around it.
+static int daux_view_attach_into_nsview(SphereDauxVst3Processor *processor,
+                                        unsigned long long parent_view,
+                                        int width, int height, int *out_width,
+                                        int *out_height) {
+  if (width <= 0 || height <= 0) {
+    set_last_error("view host: invalid requested editor size");
+    return 0;
+  }
+  view_host_clamp(&width, &height);
+
+  int view_w = width;
+  int view_h = height;
+  if (!sphere_daux_editor_create_view(processor, "NSView", &view_w, &view_h)) {
+    set_last_error("view host: the plug-in offers no NSView editor");
+    return 0;
+  }
+  void *parent = reinterpret_cast<void *>(
+      static_cast<std::uintptr_t>(parent_view));
+  if (!sphere_daux_editor_attach_view(processor, parent, "NSView")) {
+    set_last_error("view host: the plug-in refused the host view");
+    return 0;
+  }
+
+  // What the editor settled on, which is not always what it was asked for:
+  // several only choose their real size inside `attached()`.
+  int content_w = view_w;
+  int content_h = view_h;
+  if (!sphere_daux_editor_get_view_size(processor, &content_w, &content_h)) {
+    content_w = view_w;
+    content_h = view_h;
+  }
+  view_host_clamp(&content_w, &content_h);
+  sphere_daux_editor_set_content_size(processor, content_w, content_h);
+  if (out_width) {
+    *out_width = content_w;
+  }
+  if (out_height) {
+    *out_height = content_h;
+  }
+  std::fprintf(stderr,
+               "[view-host] attached docked=1 parent=0x%llx content=%dx%d\n",
+               parent_view, content_w, content_h);
+  return 1;
+}
+
 extern "C" int sphere_daux_vst3_view_attach(SphereDauxVst3Processor *processor,
                                             unsigned long long parent_hwnd,
                                             int width, int height,
@@ -4694,9 +4746,17 @@ extern "C" int sphere_daux_vst3_view_attach(SphereDauxVst3Processor *processor,
     set_last_error("view host: processor/controller missing");
     return 0;
   }
-  // Never a parent. The caller passes 0 on this platform; anything else is an
-  // owner/DPI reference from a process whose window handles mean nothing here.
-  (void)parent_hwnd;
+  // A non-zero parent is an `NSView*` in *this* process — the docked case.
+  //
+  // Cross-process reparenting is what AppKit cannot do; a view inside another
+  // view of the same process is ordinary. An ARA plug-in is hosted in the app
+  // itself, so its editor can sit in a panel there, and this is that path. The
+  // bridged editors, which live in the plug-in host process, always pass 0 and
+  // get a window of their own below.
+  if (parent_hwnd != 0) {
+    return daux_view_attach_into_nsview(processor, parent_hwnd, width, height,
+                                        out_width, out_height);
+  }
   if (width <= 0 || height <= 0) {
     set_last_error("view host: invalid requested editor size");
     return 0;
@@ -4752,24 +4812,29 @@ sphere_daux_vst3_view_detach(SphereDauxVst3Processor *processor) {
   if (!processor) {
     return;
   }
-  // `IPlugView::removed()` first, then the window — `close_editor_mac` does
-  // both in that order. The audio instance is untouched.
-  close_editor_mac(processor);
+  if (processor->editor_native_window) {
+    // Ours: `IPlugView::removed()` first, then the window — `close_editor_mac`
+    // does both in that order. The audio instance is untouched.
+    close_editor_mac(processor);
+    return;
+  }
+  // Docked: the host owns the view the plug-in was put in, so only the plug-in
+  // side comes down. Destroying the caller's view here is exactly what
+  // `DESIGN.md` forbids.
+  sphere_daux_editor_detach_view(processor);
 }
 
 extern "C" int
 sphere_daux_vst3_view_is_attached(SphereDauxVst3Processor *processor) {
-  return (processor && processor->editor_attached &&
-          processor->editor_native_window)
-             ? 1
-             : 0;
+  // `editor_attached` alone: a docked editor has no window of ours, and asking
+  // for one would report every docked editor as detached.
+  return (processor && processor->editor_attached) ? 1 : 0;
 }
 
 extern "C" int
 sphere_daux_vst3_view_set_size(SphereDauxVst3Processor *processor, int width,
                                int height) {
-  if (!processor || !processor->editor_view ||
-      !processor->editor_native_window) {
+  if (!processor || !processor->editor_view) {
     return 0;
   }
   if (width <= 0 || height <= 0) {
@@ -4778,12 +4843,19 @@ sphere_daux_vst3_view_set_size(SphereDauxVst3Processor *processor, int width,
   view_host_clamp(&width, &height);
   // The same size contract the Windows arm applies: a fixed-size view snaps
   // back to its own `getSize`, a resizable one goes through
-  // `checkSizeConstraint`, and only the agreed size reaches the window.
+  // `checkSizeConstraint`, and only the agreed size reaches the plug-in.
   if (!sphere_daux_editor_constrain_view_size(processor, &width, &height)) {
     return 0;
   }
   view_host_clamp(&width, &height);
-  resize_editor_mac(processor, width, height, "view-host-set-size");
+  if (processor->editor_native_window) {
+    resize_editor_mac(processor, width, height, "view-host-set-size");
+    return 1;
+  }
+  // Docked: the host's panel decides how much room there is, so the agreed size
+  // is reported to the view and nothing else is moved.
+  sphere_daux_editor_notify_resize(processor, width, height);
+  sphere_daux_editor_set_content_size(processor, width, height);
   return 1;
 }
 

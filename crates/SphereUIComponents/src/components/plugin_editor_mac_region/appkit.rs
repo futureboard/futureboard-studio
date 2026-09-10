@@ -53,6 +53,59 @@ fn is_main_thread() -> bool {
     }
 }
 
+/// The container's class: an `NSView` that answers `isFlipped` with `YES`.
+///
+/// Registered once, at first use. A plain `NSView` counts from the bottom-left,
+/// so a plug-in that puts its own view at the origin — which is what every
+/// `IPlugView` does — lands at the *bottom* of the panel and grows upward,
+/// straight over the rest of the studio window. Every host parents plug-in
+/// views into a flipped container for exactly this reason, and it is the other
+/// half of the clip: clipping stops the overflow, this puts the editor where
+/// the panel actually is.
+fn container_class() -> Option<&'static objc2::runtime::AnyClass> {
+    use std::sync::OnceLock;
+
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    let ptr = *CLASS.get_or_init(|| {
+        // A name of our own so this can never collide with a plug-in's class.
+        let Some(builder) = objc2::runtime::ClassBuilder::new(
+            c"FutureboardPluginHostRegionView",
+            objc2::runtime::AnyClass::get(c"NSView")
+                .expect("AppKit is loaded before any editor is hosted"),
+        ) else {
+            // Already registered by an earlier process-wide init, which is the
+            // only way `new` fails here; take the existing one.
+            return objc2::runtime::AnyClass::get(c"FutureboardPluginHostRegionView")
+                .map(|cls| cls as *const _ as usize)
+                .unwrap_or(0);
+        };
+        let mut builder = builder;
+        // SAFETY: `-[NSView isFlipped]` is a BOOL getter taking no arguments;
+        // this override matches that signature exactly.
+        unsafe {
+            builder.add_method(
+                objc2::sel!(isFlipped),
+                is_flipped as unsafe extern "C-unwind" fn(_, _) -> _,
+            );
+        }
+        builder.register() as *const _ as usize
+    });
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: the pointer came from `register`/`AnyClass::get` above and a
+    // registered class lives for the life of the process.
+    Some(unsafe { &*(ptr as *const objc2::runtime::AnyClass) })
+}
+
+/// `-[FutureboardPluginHostRegionView isFlipped]`.
+unsafe extern "C-unwind" fn is_flipped(
+    _this: *mut AnyObject,
+    _cmd: objc2::runtime::Sel,
+) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::YES
+}
+
 /// An `NSView` this process owns, mounted inside the GPUI window's view, that a
 /// plug-in's `IPlugView` is attached into.
 pub struct MacHostRegion {
@@ -78,22 +131,33 @@ impl MacHostRegion {
         if parent_ns_view.is_null() || !is_main_thread() {
             return None;
         }
-        let cls = objc2::runtime::AnyClass::get(c"NSView")?;
+        let cls = container_class()?;
         let rect = ns_rect(frame);
 
-        // SAFETY: `-[NSView initWithFrame:]` on a freshly allocated NSView. The
-        // result is owned (alloc/init), so `Retained::from_raw` takes that
-        // ownership rather than adding a reference.
+        // SAFETY: `-[NSView initWithFrame:]` on a freshly allocated view of our
+        // own subclass. The result is owned (alloc/init), so
+        // `Retained::from_raw` takes that ownership rather than adding a
+        // reference.
         let container: *mut NSObject = unsafe {
             let allocated: *mut NSObject = msg_send![cls, alloc];
             msg_send![allocated, initWithFrame: rect]
         };
         let container = unsafe { Retained::from_raw(container) }?;
 
-        // A layer-backed container keeps the plug-in's own layers composited
-        // against something, rather than against whatever GPUI last drew there.
         unsafe {
+            // A layer-backed container keeps the plug-in's own layers composited
+            // against something, rather than against whatever GPUI last drew
+            // there — and gives the clip below something to clip with.
             let _: () = msg_send![&*container, setWantsLayer: true];
+            // Clip to the panel. `NSView` does not clip its subviews by
+            // default, and a plug-in's own view is whatever size the plug-in
+            // wants: without this, an editor larger than the panel simply draws
+            // over the rest of the studio window. This is what the Windows path
+            // gets for free from child-window clipping.
+            let layer: *mut AnyObject = msg_send![&*container, layer];
+            if !layer.is_null() {
+                let _: () = msg_send![&*layer, setMasksToBounds: true];
+            }
             let parent: &AnyObject = &*parent_ns_view;
             let _: () = msg_send![parent, addSubview: &*container];
         }

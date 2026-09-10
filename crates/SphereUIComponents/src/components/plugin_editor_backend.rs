@@ -169,12 +169,18 @@ impl HostRegionReadiness {
 /// Whether the local-native-view backend is finished enough to attach.
 ///
 /// Separate from [`EditorBackendKind::current`] on purpose, and today no
-/// platform selects that backend: putting the editor back *inside* the Studio
-/// window on macOS needs an in-process `IEditController`, the AppKit container
-/// view in [`crate::components::plugin_editor_mac_region`], and a
-/// processor/controller bridge between this process and the host. Until all
-/// three land, macOS opens the plug-in's editor in the host process's own
-/// window, which is a finished path rather than a degraded one.
+/// platform selects that backend *for a bridged plug-in*: putting one back
+/// inside the Studio window on macOS would need an in-process
+/// `IEditController` beside a processor that lives in the host, plus a bridge
+/// between the two. Until that lands, a bridged editor opens in the host
+/// process's own window, which is a finished path rather than a degraded one.
+///
+/// The container view this would use is not idle in the meantime. A plug-in the
+/// app hosts *itself* has no process boundary to cross, and ARA is exactly
+/// that: its editor is mounted in the studio's own window through
+/// [`crate::components::plugin_editor_mac_region::DockedPluginSurface`], on
+/// macOS as much as on Windows. What this flag gates is the harder case — a
+/// plug-in whose DSP is somewhere else.
 pub const fn local_native_view_ready() -> bool {
     false
 }

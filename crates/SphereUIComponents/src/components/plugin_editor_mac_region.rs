@@ -304,6 +304,90 @@ pub struct ParentGeometry {
 #[cfg(target_os = "macos")]
 pub mod appkit;
 
+#[cfg(target_os = "macos")]
+mod docked {
+    use super::appkit::MacHostRegion;
+    use super::{region_to_frame, RegionPx};
+
+    /// A plug-in's view parked inside a panel of the studio's own window.
+    ///
+    /// The counterpart of `ContentChildHwnd` on Windows, and the reason macOS
+    /// can have one at all: this is only ever used for a plug-in hosted *in this
+    /// process*. An ARA plug-in is — it is bound to a clip by the app itself,
+    /// never behind the plug-in-host bridge — so its `NSView` can be a subview
+    /// of the app's window like any other. The bridged editors cannot, which is
+    /// what the host-owned window exists for, and why that story is unchanged.
+    ///
+    /// Geometry is the caller's: it measures the panel and hands over a
+    /// physical-pixel rect, exactly as the Windows path does. The conversion to
+    /// AppKit's points and bottom-left origin happens here, once, through
+    /// [`region_to_frame`].
+    pub struct DockedPluginSurface {
+        region: MacHostRegion,
+    }
+
+    impl DockedPluginSurface {
+        /// Mount a container inside `parent_ns_view` at `rect`.
+        ///
+        /// `parent_ns_view` is the studio window's own view, as
+        /// `RawWindowHandle::AppKit` reports it. `None` off the main thread, on
+        /// a null parent, or when the container could not be made — never a
+        /// panic and never a half-mounted view.
+        pub fn create(parent_ns_view: u64, rect: RegionPx) -> Option<Self> {
+            let parent = parent_ns_view as *mut objc2::runtime::AnyObject;
+            let frame = Self::frame_for(parent, rect)?;
+            // SAFETY: `parent` is the pointer GPUI reported for this window's
+            // view, used on the thread that owns it.
+            let region = unsafe { MacHostRegion::mount(parent, frame) }?;
+            Some(Self { region })
+        }
+
+        /// The container's `NSView*`, for `IPlugView::attached(…, "NSView")`.
+        ///
+        /// Borrowed, never transferred: the plug-in attaches to it and lets go
+        /// of it, and this surface destroys it.
+        pub fn handle(&self) -> u64 {
+            self.region.view_ptr() as u64
+        }
+
+        /// Move or resize the container to a freshly measured panel rect.
+        pub fn set_bounds(&self, parent_ns_view: u64, rect: RegionPx) {
+            let parent = parent_ns_view as *mut objc2::runtime::AnyObject;
+            if let Some(frame) = Self::frame_for(parent, rect) {
+                self.region.set_frame(frame);
+            }
+        }
+
+        /// The AppKit frame for a measured region, in the parent's own terms.
+        ///
+        /// Both the scale and the parent's coordinate system are read from the
+        /// parent rather than assumed: a Retina display and a flipped superview
+        /// each put the container somewhere plausible-looking but wrong if
+        /// guessed, and the two compose.
+        fn frame_for(
+            parent: *mut objc2::runtime::AnyObject,
+            rect: RegionPx,
+        ) -> Option<super::FramePoints> {
+            if !rect.is_valid() {
+                return None;
+            }
+            // SAFETY: `parent` is a live `NSView*` or null; both are handled.
+            let geometry = unsafe { MacHostRegion::parent_geometry(parent) }?;
+            // SAFETY: same.
+            let scale = unsafe { MacHostRegion::backing_scale(parent) }.unwrap_or(1.0);
+            Some(region_to_frame(
+                rect,
+                scale,
+                geometry.height_points,
+                geometry.is_flipped,
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use docked::DockedPluginSurface;
+
 #[cfg(test)]
 mod tests {
     use super::*;
