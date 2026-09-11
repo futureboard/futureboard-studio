@@ -75,6 +75,26 @@ unsigned long long clap_embed_editor_mac(SphereDauxClapProcessor *,
 void clap_embed_set_bounds_mac(SphereDauxClapProcessor *, int, int, int, int);
 void clap_close_editor_mac(SphereDauxClapProcessor *);
 int clap_focus_editor_mac(SphereDauxClapProcessor *);
+#elif defined(__linux__)
+unsigned long long clap_open_editor_linux(SphereDauxClapProcessor *,
+                                          const char *, const char *, int,
+                                          int);
+void clap_close_editor_linux(SphereDauxClapProcessor *);
+int clap_focus_editor_linux(SphereDauxClapProcessor *);
+
+// Host side of clap.posix-fd-support / clap.timer-support — CLAP's Linux
+// equivalent of VST3's Linux::IRunLoop, for the minority of GUI-bearing
+// plug-ins that register fds/timers with the host instead of running their
+// own loop. Implemented in clap_editor_linux.cpp (bridged onto the GTK
+// thread's GLib main context); advertised from clap_processor.cpp's
+// host_get_extension only on this platform, since Win32/Cocoa editors don't
+// need it.
+bool clap_host_register_fd_linux(const clap_host_t *, int,
+                                 clap_posix_fd_flags_t);
+bool clap_host_modify_fd_linux(const clap_host_t *, int, clap_posix_fd_flags_t);
+bool clap_host_unregister_fd_linux(const clap_host_t *, int);
+bool clap_host_register_timer_linux(const clap_host_t *, uint32_t, clap_id *);
+bool clap_host_unregister_timer_linux(const clap_host_t *, clap_id);
 #endif
 
 /// One CLAP event as it sits in our preallocated input list. CLAP events are a
@@ -256,6 +276,8 @@ struct SphereDauxClapProcessor {
   void *editor_native_window{nullptr};   // NSWindow*
   void *editor_native_embed{nullptr};    // NSView* handed to gui->set_parent
   void *editor_native_delegate{nullptr}; // DauxClapEditorWindowDelegate*
+#elif defined(__linux__)
+  void *editor_native_window{nullptr}; // GtkWidget* (GtkWindow), g_object_ref'd
 #endif
 
   // ── Lifecycle ────────────────────────────────────────────────────────────

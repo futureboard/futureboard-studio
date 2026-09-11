@@ -110,6 +110,7 @@ fn build_clap_bridge(manifest_dir: &std::path::Path, vst3_bridge_root: &std::pat
         "src/clap_processor.cpp",
         "src/clap_editor_windows.cpp",
         "src/clap_editor_mac.mm",
+        "src/clap_editor_linux.cpp",
         "src/clap_editor_stub.cpp",
     ] {
         println!("cargo:rerun-if-changed={}", root.join(name).display());
@@ -139,9 +140,25 @@ fn build_clap_bridge(manifest_dir: &std::path::Path, vst3_bridge_root: &std::pat
                 .flag("-fobjc-arc")
                 .file(root.join("src/clap_editor_mac.mm"));
         }
+        "linux" => {
+            build.file(root.join("src/clap_editor_linux.cpp"));
+
+            let gtk4 = pkg_config::probe_library("gtk4").expect(
+                "GTK4 not found — install libgtk-4-dev (Debian/Ubuntu) or gtk4-devel (Fedora)",
+            );
+            for path in &gtk4.include_paths {
+                build.include(path);
+            }
+            for (key, val) in &gtk4.defines {
+                build.define(key, val.as_deref());
+            }
+
+            println!("cargo:rustc-link-lib=dl");
+            println!("cargo:rustc-link-lib=X11");
+        }
         _ => {
-            // Linux and anything else: CLAP plug-ins still load and process;
-            // only the embedded editor is stubbed out.
+            // Anything else: CLAP plug-ins still load and process; only the
+            // embedded editor is stubbed out.
             build.file(root.join("src/clap_editor_stub.cpp"));
         }
     }
