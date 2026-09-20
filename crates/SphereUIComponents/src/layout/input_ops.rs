@@ -1087,6 +1087,21 @@ impl StudioLayout {
         target: &ContextTarget,
         cx: &mut Context<Self>,
     ) -> Vec<ContextMenuEntry> {
+        // Backfill each dispatching item's keyboard shortcut from the active
+        // keymap so context menus stay in sync with the profile without every
+        // arm hardcoding accelerators. Explicit `with_shortcut` calls still win.
+        let entries = self.context_entries_raw(target, cx);
+        let manager = &self.keymap_manager;
+        crate::components::context_menu::backfill_shortcuts(entries, |command| {
+            manager.shortcut_for_command(command)
+        })
+    }
+
+    fn context_entries_raw(
+        &self,
+        target: &ContextTarget,
+        cx: &mut Context<Self>,
+    ) -> Vec<ContextMenuEntry> {
         let i18n = I18n::new(&self.settings.read(cx).current.general.language);
         match target {
             ContextTarget::TimelineEmpty => vec![
@@ -1098,8 +1113,7 @@ impl StudioLayout {
                     i18n.tr("context.paste"),
                     "edit:paste",
                     !self.clip_clipboard.is_empty(),
-                )
-                .with_shortcut("Ctrl+V"),
+                ),
                 ContextMenuEntry::Separator,
                 ContextMenuEntry::item(i18n.tr("context.zoom-in"), "view:zoom-in"),
                 ContextMenuEntry::item(i18n.tr("context.zoom-out"), "view:zoom-out"),
@@ -1121,8 +1135,7 @@ impl StudioLayout {
                         i18n.tr("context.paste"),
                         "edit:paste",
                         !self.clip_clipboard.is_empty(),
-                    )
-                    .with_shortcut("Ctrl+V"),
+                    ),
                     menu_item_enabled(
                         i18n.tr("context.clip.split-at-playhead"),
                         "clip:split-at-playhead",
@@ -1195,7 +1208,7 @@ impl StudioLayout {
                         "clip:duplicate",
                         exists || selected_count > 0,
                     )
-                    .with_shortcut("Ctrl+D"),
+                    .with_shortcut(crate::keymap::accel_display("Ctrl+D")),
                 );
                 let erase_label = if is_audio {
                     "Erase".to_string()

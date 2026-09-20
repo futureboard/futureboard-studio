@@ -34,7 +34,7 @@ use gpui::{
 };
 
 use crate::assets;
-use crate::components::controls::fb_tooltip;
+use crate::components::controls::{fb_shortcut_hint, fb_tooltip};
 use crate::components::file_browser::{
     format_size, BrowserCrumb, BrowserIcon, BrowserNodeKind, BrowserVisibleNode, FileBrowserState,
     MAX_VISUAL_DEPTH,
@@ -233,6 +233,7 @@ pub fn sidebar(
                 })
                 .child(i18n.tr("browser.panel.title")),
         )
+        .child(fb_shortcut_hint(crate::keymap::accel_display("Ctrl+1")))
         .child(
             div()
                 .flex_shrink_0()

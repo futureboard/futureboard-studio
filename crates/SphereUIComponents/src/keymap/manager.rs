@@ -213,6 +213,32 @@ impl KeymapManager {
         command
     }
 
+    /// Display string for the accelerator bound to `command` under the active
+    /// profile, e.g. `"Ctrl+D"` — or `None` when the command has no binding.
+    ///
+    /// Used to backfill shortcut hints on context-menu items so every surface
+    /// that dispatches a command can surface its key binding without hardcoding
+    /// it. The first resolved keystroke wins, matching the menubar convention.
+    pub fn shortcut_for_command(&self, command: &str) -> Option<String> {
+        let binding = self.resolved.iter().find(|b| b.action == command)?;
+        let key = binding.keys.iter().find(|key| !key.trim().is_empty())?;
+        Some(format_keystroke_list(std::slice::from_ref(key)))
+    }
+
+    /// The raw authored accelerator (e.g. `"Ctrl+Z"`) bound to `command` under
+    /// the active profile, before any platform display formatting. Style-neutral,
+    /// so tests and lookups can assert bindings without depending on the host OS
+    /// or the `FUTUREBOARD_ACCEL_STYLE` env override.
+    #[allow(dead_code)]
+    pub fn raw_accel_for_command(&self, command: &str) -> Option<String> {
+        let binding = self.resolved.iter().find(|b| b.action == command)?;
+        binding
+            .keys
+            .iter()
+            .find(|key| !key.trim().is_empty())
+            .cloned()
+    }
+
     pub fn rebuild(&mut self) {
         self.resolved = resolve_effective_bindings(
             &self.active_profile_id,
@@ -268,7 +294,31 @@ fn effective_base_profile(profile_id: &str) -> Result<KeymapProfile, String> {
     if profile_id == "custom" {
         return load_builtin_profile("default");
     }
-    load_builtin_profile(profile_id)
+    // Every built-in profile layers on top of the default map: a DAW profile
+    // (Ableton, Cubase, …) only ships the accelerators it deliberately changes,
+    // so without the default base those profiles would silently drop every
+    // command they don't re-map (e.g. Undo, Save, the panel toggles). Load the
+    // default first, then overlay the profile's own bindings so switching a
+    // profile re-skins the shortcuts it defines and inherits the rest.
+    if profile_id == "default" {
+        return load_builtin_profile("default");
+    }
+    let mut merged = load_builtin_profile("default")?;
+    let overlay = load_builtin_profile(profile_id)?;
+    overlay_bindings(&mut merged, overlay.bindings);
+    merged.name = overlay.name;
+    merged.extends = Some("default".to_string());
+    Ok(merged)
+}
+
+/// Overlay `overrides` onto `base` in place: an override for an action replaces
+/// the base binding for that same action; actions the override does not mention
+/// keep their base binding. Matches the per-action override semantics used by
+/// user overrides in [`resolve_effective_bindings`].
+fn overlay_bindings(base: &mut KeymapProfile, overrides: Vec<KeyBinding>) {
+    for binding in overrides {
+        upsert_override(base, binding);
+    }
 }
 
 fn resolve_effective_bindings(
@@ -516,5 +566,104 @@ mod default_binding_tests {
             Some("tools:select-pointer"),
             "F8 is the Grabber"
         );
+    }
+
+    /// Non-default built-in profiles inherit the default map: a DAW profile only
+    /// ships the accelerators it re-maps, so commands it does not mention must
+    /// still resolve from the default base. Regression guard for the bug where
+    /// selecting Ableton/Cubase/… silently dropped every un-remapped command.
+    #[test]
+    fn builtin_profiles_inherit_default_bindings() {
+        // `edit:undo` (Ctrl+Z) and `project:save` (Ctrl+S) are default-only —
+        // no DAW override touches them — so every profile must still bind them.
+        for profile in [
+            "ableton-live",
+            "cubase",
+            "fl-studio",
+            "pro-tools",
+            "futureboard",
+        ] {
+            let mut manager = KeymapManager::new(std::env::temp_dir());
+            manager
+                .set_active_profile(profile)
+                .unwrap_or_else(|error| panic!("profile {profile}: {error}"));
+            assert_eq!(
+                manager.raw_accel_for_command("edit:undo").as_deref(),
+                Some("Ctrl+Z"),
+                "{profile} must inherit edit:undo from the default map"
+            );
+            assert!(
+                manager.raw_accel_for_command("project:save").is_some(),
+                "{profile} must inherit project:save from the default map"
+            );
+        }
+    }
+
+    /// A profile override replaces the default for the same command rather than
+    /// stacking beside it: Ableton records on F9, not the default R.
+    #[test]
+    fn profile_override_replaces_default_binding() {
+        let mut manager = KeymapManager::new(std::env::temp_dir());
+        manager.set_active_profile("ableton-live").expect("ableton");
+        assert_eq!(
+            manager.raw_accel_for_command("transport:record").as_deref(),
+            Some("F9"),
+            "Ableton overrides Record to F9"
+        );
+        let reverse = manager.dispatch_reverse();
+        assert_eq!(
+            reverse.get("f9").map(String::as_str),
+            Some("transport:record"),
+            "F9 must resolve to Record under Ableton"
+        );
+    }
+
+    /// The actionable commands that gained accelerators must resolve on the
+    /// default profile. Regression guard for keymap coverage: these were `null`
+    /// in the manifest and unreachable from the keyboard before.
+    #[test]
+    fn newly_bound_actionable_commands_resolve() {
+        let manager = KeymapManager::new(std::env::temp_dir());
+        for (command, accel) in [
+            ("panel:toggle-bottom", "Ctrl+7"),
+            ("track:delete", "Ctrl+Shift+Delete"),
+            ("midi:open-editor", "Ctrl+Shift+M"),
+            ("track:add-audio", "Ctrl+Shift+A"),
+            ("project:save-copy", "Ctrl+Alt+Shift+S"),
+            // Second-wave global actions wired from the dispatcher audit: track
+            // state, clip actions, window openers, and export — all reachable
+            // from the keyboard now, not just the right-click / menu path.
+            ("track:mute", "Ctrl+Shift+H"),
+            ("track:solo", "Ctrl+Shift+L"),
+            ("track:arm", "Ctrl+Shift+B"),
+            ("clip:rename", "F2"),
+            ("clip:properties", "Ctrl+Shift+P"),
+            ("plugins:scan", "Ctrl+Alt+U"),
+            ("file:export-audio", "Ctrl+Shift+X"),
+            ("window:big-clock", "Ctrl+Alt+K"),
+            ("window:performance", "Ctrl+Alt+P"),
+            ("midi:export-clip", "Ctrl+Alt+I"),
+            // Third-wave audit: MIDI editor, mixer, solfege, and secondary
+            // window commands that were dispatchable but had no keyboard path.
+            ("midi:tool-select", "Ctrl+Alt+1"),
+            ("midi:tool-draw", "Ctrl+Alt+2"),
+            ("midi:velocity-increase", "Ctrl+Alt+Up"),
+            ("midi:toggle-snap", "Ctrl+Alt+4"),
+            ("midi:fit-notes", "Ctrl+Alt+5"),
+            ("editor:open-bottom", "Ctrl+Alt+6"),
+            ("mixer:create-bus", "Ctrl+Alt+7"),
+            ("mixer:reset-volume", "Ctrl+Alt+8"),
+            ("mixer:reset-pan", "Ctrl+Alt+9"),
+            ("solfege:analyze-accent", "Ctrl+Alt+A"),
+            ("automation:select-all-points", "Ctrl+Alt+Shift+P"),
+            ("audio:stem-extractor", "Ctrl+Alt+Shift+E"),
+            ("jam:open", "Ctrl+Alt+Shift+J"),
+        ] {
+            assert_eq!(
+                manager.raw_accel_for_command(command).as_deref(),
+                Some(accel),
+                "{command} must bind to {accel} on the default profile"
+            );
+        }
     }
 }

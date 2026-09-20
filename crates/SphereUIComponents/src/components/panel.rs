@@ -25,7 +25,9 @@ use crate::components::color_picker::{
     ColorPickerState,
 };
 use crate::components::combo_box::{combo_box_string_menu, combo_box_trigger};
-use crate::components::controls::{fb_button, fb_checkbox, fb_form_row, FbButtonKind};
+use crate::components::controls::{
+    fb_button, fb_checkbox, fb_form_row, fb_shortcut_hint, FbButtonKind,
+};
 use crate::components::inspector::{
     inspector_checkbox as shared_inspector_checkbox, inspector_hint_text, inspector_mini_button,
     inspector_numeric_stepper, inspector_numeric_stepper_with_drag_callbacks,
@@ -462,7 +464,8 @@ fn inspector_shell(active: bool, i18n: I18n) -> gpui::Div {
                         .text_size(px(typography::DENSE_LABEL))
                         .font_weight(gpui::FontWeight::BOLD)
                         .child(i18n.tr("panel.inspector")),
-                ),
+                )
+                .child(fb_shortcut_hint(crate::keymap::accel_display("Ctrl+2"))),
         )
 }
 

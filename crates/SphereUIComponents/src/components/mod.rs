@@ -141,7 +141,8 @@ pub use command_palette::{
 };
 pub use controls::{
     fb_button, fb_checkbox, fb_color_swatch, fb_field_label, fb_form_row, fb_section_header,
-    fb_section_label, fb_segmented_button, fb_stepper_button, fb_tooltip, FbButtonKind,
+    fb_section_header_shortcut, fb_section_label, fb_segmented_button, fb_shortcut_hint,
+    fb_stepper_button, fb_tooltip, FbButtonKind,
 };
 pub use editor_panel::ClipEditorPanel;
 pub(crate) use effect_editor_tab_view::EffectEditorTabView;

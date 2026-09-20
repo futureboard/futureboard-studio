@@ -163,6 +163,17 @@ pub fn crashpad_handler_name(target: &str) -> Option<&'static str> {
 /// packaging error rather than an optional runtime dependency. The prebuilt
 /// Crashpad build script places this file in the same target/profile directory
 /// as the application when `CARGO_TARGET_DIR` is propagated by `xtask`.
+///
+/// # Fallback for host-triple builds
+///
+/// When a build is invoked with an explicit `--target <triple>` that matches
+/// the host (e.g. `--target aarch64-apple-darwin` on Apple Silicon), Cargo
+/// places executables under `<target_dir>/<triple>/<profile>/` but
+/// `crashpad-handler-bundler` runs as a build script and sees `HOST == TARGET`,
+/// so `is_cross_compile()` returns `false` and it writes the handler to
+/// `<target_dir>/<profile>/` (no triple subdirectory). If the handler is not
+/// found beside the executable we therefore also check the profile directory
+/// one level above the triple component.
 pub fn stage_crashpad_handler(
     staging_dir: &Path,
     executable: &Path,
@@ -175,14 +186,32 @@ pub fn stage_crashpad_handler(
         .parent()
         .context("executable has no parent directory")?;
     let source = source_dir.join(handler_name);
-    if !source.is_file() {
-        bail!(
-            "Crashpad handler `{handler_name}` is missing beside {}: {}",
-            executable.display(),
-            source.display()
-        );
-    }
-    copy_into(staging_dir, handler_name, &source)?;
+
+    // Primary location: beside the executable (cross-compile or no explicit --target).
+    let resolved = if source.is_file() {
+        source
+    } else {
+        // Fallback: <target_dir>/<profile>/ — the location crashpad-handler-bundler
+        // writes when HOST == TARGET (explicit --target matching the host).
+        // Layout: source_dir = …/<triple>/<profile>/
+        //         parent      = …/<triple>/
+        //         grandparent = …/<target_dir>/   → join <profile> → …/<profile>/
+        let fallback = source_dir
+            .parent()
+            .and_then(|triple_dir| triple_dir.parent())
+            .and_then(|root| source_dir.file_name().map(|profile| root.join(profile)))
+            .map(|dir| dir.join(handler_name));
+        match fallback {
+            Some(fb) if fb.is_file() => fb,
+            _ => bail!(
+                "Crashpad handler `{handler_name}` is missing beside {}: {}",
+                executable.display(),
+                source.display()
+            ),
+        }
+    };
+
+    copy_into(staging_dir, handler_name, &resolved)?;
     Ok(handler_name.to_string())
 }
 
@@ -439,6 +468,38 @@ mod tests {
             crashpad_handler_name("aarch64-unknown-linux-gnu"),
             Some("crashpad_handler")
         );
+    }
+
+    /// When `--target <triple>` matches the host, the bundler writes
+    /// `crashpad_handler` one level above the triple directory:
+    ///   target_dir/<profile>/crashpad_handler     ← bundler writes here
+    ///   target_dir/<triple>/<profile>/FutureboardNative  ← executable
+    /// `stage_crashpad_handler` must find the handler via the fallback.
+    #[test]
+    fn stage_crashpad_handler_fallback_for_host_target_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        // Mimic the layout xtask produces for --target aarch64-apple-darwin on arm64 macOS.
+        let triple_profile = root.join("aarch64-apple-darwin/release");
+        let profile_only = root.join("release");
+        fs::create_dir_all(&triple_profile).unwrap();
+        fs::create_dir_all(&profile_only).unwrap();
+
+        // Executable sits in the triple/profile dir.
+        let executable = triple_profile.join("FutureboardNative");
+        fs::write(&executable, b"binary").unwrap();
+
+        // Crashpad handler is in the profile-only dir (no triple).
+        fs::write(profile_only.join("crashpad_handler"), b"handler").unwrap();
+
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+
+        let name =
+            stage_crashpad_handler(&staging, &executable, "aarch64-apple-darwin").unwrap();
+        assert_eq!(name, "crashpad_handler");
+        assert!(staging.join("crashpad_handler").is_file());
     }
 
     #[test]

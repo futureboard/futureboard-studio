@@ -95,6 +95,11 @@ pub struct GeneralSettings {
     pub update_channel: UpdateChannel,
     #[serde(default = "default_true")]
     pub discord_rpc_enabled: bool,
+    /// Active keyboard shortcut profile id (e.g. `"default"`, `"ableton-live"`).
+    /// Matches [`crate::keymap::PROFILE_DESCRIPTORS`] ids. Persisted so a chosen
+    /// keymap survives a restart; an unknown id falls back to the default map.
+    #[serde(default = "default_keymap_profile")]
+    pub keymap_profile: String,
     /// True after the user has answered the first-launch plug-in scan prompt.
     /// This records that the choice was made, not whether they chose to scan.
     #[serde(default)]
@@ -120,6 +125,7 @@ impl Default for GeneralSettings {
             check_updates: default_true(),
             update_channel: UpdateChannel::default(),
             discord_rpc_enabled: default_true(),
+            keymap_profile: default_keymap_profile(),
             plugin_scan_prompt_answered: false,
             default_project_directory: None,
             project_defaults: ProjectDefaults::default(),
@@ -150,6 +156,13 @@ impl GeneralSettings {
 
 fn default_language() -> String {
     "en".to_string()
+}
+
+/// Default keyboard shortcut profile id. Mirrors [`KeymapManager`]'s own
+/// startup default so an absent `keymap_profile` in an older settings file
+/// resolves to the same map the app has always shipped.
+fn default_keymap_profile() -> String {
+    "default".to_string()
 }
 
 fn default_true() -> bool {

@@ -88,6 +88,38 @@ impl ContextMenuEntry {
         }
         self
     }
+
+    /// Fill in this item's shortcut hint from `lookup` unless it already carries
+    /// one (an explicit `with_shortcut` always wins) or the item is disabled or
+    /// a non-dispatching `noop`. `lookup` maps a command id to its display
+    /// accelerator, e.g. `KeymapManager::shortcut_for_command`.
+    pub fn backfill_shortcut(mut self, lookup: impl Fn(&str) -> Option<String>) -> Self {
+        if let Self::Item {
+            command,
+            shortcut,
+            disabled,
+            ..
+        } = &mut self
+        {
+            if shortcut.is_none() && !*disabled && command != "noop" {
+                *shortcut = lookup(command);
+            }
+        }
+        self
+    }
+}
+
+/// Backfill shortcut hints on every entry in place, leaving explicit shortcuts,
+/// disabled rows, headers, separators, and `noop` items untouched. One call
+/// annotates a whole context menu from the active keymap.
+pub fn backfill_shortcuts(
+    entries: Vec<ContextMenuEntry>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<ContextMenuEntry> {
+    entries
+        .into_iter()
+        .map(|entry| entry.backfill_shortcut(&lookup))
+        .collect()
 }
 
 pub fn context_menu_overlay(

@@ -250,6 +250,10 @@ impl StudioLayout {
         }
         shutdown::log("shutdown_studio begin");
 
+        // Save workspace layout before teardown so nothing is null / stale.
+        shutdown::log("phase: save workspace layout");
+        self.save_workspace_layout(cx);
+
         shutdown::log("phase: stop transport");
         self.stop_native_playback(cx);
 

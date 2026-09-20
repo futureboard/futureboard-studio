@@ -130,6 +130,64 @@ pub fn fb_section_header(label: impl Into<String>) -> impl IntoElement {
         .child(div().flex_1().h(px(1.0)).bg(Colors::border_subtle()))
 }
 
+/// Same as [`fb_section_header`] but appends a keyboard shortcut hint pill
+/// between the title and the hairline rule.
+///
+/// ```text
+/// SECTION TITLE  ⌘K  ─────────────────
+/// ```
+///
+/// Pass the display string exactly as it should appear, e.g. `"Ctrl+1"` or
+/// `"⌘K"`. Use [`fb_shortcut_hint`] directly when you only need the pill.
+pub fn fb_section_header_shortcut(
+    label: impl Into<String>,
+    shortcut: impl Into<String>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::BASE))
+        .h(px(18.0))
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(typography::DENSE_CAPTION))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(Colors::text_faint())
+                .child(label.into()),
+        )
+        .child(fb_shortcut_hint(shortcut))
+        .child(div().flex_1().h(px(1.0)).bg(Colors::border_subtle()))
+}
+
+/// Keyboard shortcut hint pill — a `<kbd>`-style chip that sits after a label
+/// or section header to surface the bound accelerator at a glance.
+///
+/// Styled to read quiet at rest: low-alpha background, `border_subtle` outline,
+/// `text_faint` foreground. Monospace text so key combinations stay compact and
+/// aligned across rows.
+///
+/// Use inside [`fb_section_header_shortcut`] for a section with a toggle
+/// shortcut, or drop standalone into any flex row where you want to annotate a
+/// control with its key binding.
+pub fn fb_shortcut_hint(text: impl Into<String>) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .h(px(size::MICRO))
+        .px(px(space::TIGHT))
+        .rounded(px(radius::MICRO))
+        .bg(Colors::with_alpha(Colors::text_faint(), 0.07))
+        .border(px(1.0))
+        .border_color(Colors::border_subtle())
+        .text_size(px(typography::DENSE_CAPTION))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(Colors::text_faint())
+        .child(text.into())
+}
+
 /// Small color chip. This is the visual swatch only; an interactive caller
 /// wraps it in its own clickable container.
 pub fn fb_color_swatch(color: gpui::Rgba, size: f32) -> impl IntoElement {

@@ -1669,7 +1669,20 @@ impl StudioLayout {
         let studio = cx.entity().clone();
         let on_changed: KeymapChangedCb = Arc::new(move |manager, app| {
             let _ = studio.update(app, |layout, cx| {
+                let profile_id = manager.active_profile_id().to_string();
                 layout.keymap_manager = manager;
+                // Persist the active profile so the chosen keymap survives a
+                // restart. `update_setting` writes settings.json and notifies;
+                // skip the write when the id is unchanged to avoid churn from
+                // binding-only edits that keep the same profile.
+                let _ = layout.settings.update(cx, |settings, cx| {
+                    if settings.current.general.keymap_profile != profile_id {
+                        settings.update_setting(
+                            |schema| schema.general.keymap_profile = profile_id.clone(),
+                            cx,
+                        );
+                    }
+                });
                 cx.notify();
             });
         });

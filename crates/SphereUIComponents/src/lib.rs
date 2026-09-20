@@ -82,6 +82,7 @@ pub mod tap_tempo;
 pub mod update_service;
 pub mod window_lifecycle;
 pub mod window_position;
+pub mod workspace_layout;
 pub use shutdown::ShutdownState;
 /// Re-export of the separated plugin-host bridge client so the native app can
 /// log bridge env / drive the bridge without a direct `sphere-plugin-host` dep.

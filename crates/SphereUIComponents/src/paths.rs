@@ -72,6 +72,8 @@ pub struct FutureboardPaths {
     pub settings_file: PathBuf,
     /// `<app_data>/studio_window.json` — last main workspace window bounds.
     pub studio_window_file: PathBuf,
+    /// `<app_data>/workspace_layout.json` — panel visibility, sizes, and tabs.
+    pub workspace_layout_file: PathBuf,
     /// `<app_data>/recent.json`
     pub recent_file: PathBuf,
     /// `<app_data>/indexfile.dat` — SQLite index database.
@@ -146,6 +148,7 @@ impl FutureboardPaths {
 
         let settings_file = app_data.join("settings.json");
         let studio_window_file = app_data.join("studio_window.json");
+        let workspace_layout_file = app_data.join("workspace_layout.json");
         let recent_file = app_data.join("recent.json");
         let index_db = app_data.join("indexfile.dat");
         let logs = app_data.join("Logs");
@@ -181,6 +184,7 @@ impl FutureboardPaths {
             app_data,
             settings_file,
             studio_window_file,
+            workspace_layout_file,
             recent_file,
             index_db,
             logs,

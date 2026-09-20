@@ -130,7 +130,7 @@ pub fn install_native_macos_menu(cx: &mut App) {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use gpui::{App, Menu, MenuItem as GpuiMenuItem, SharedString, SystemMenuType};
+    use gpui::{App, KeyBinding, Menu, MenuItem as GpuiMenuItem, SharedString, SystemMenuType};
 
     use super::{ApplicationMenuEntry, APP_WINDOW_TITLE};
     use crate::menu::{MenuItem as AppMenuItem, MenuItemKind, MenuManifest};
@@ -139,6 +139,147 @@ mod macos {
     #[action(no_json)]
     pub(super) struct RunMenuCommand {
         pub command_id: SharedString,
+    }
+
+    /// Commands whose accelerator is focus-gated in the studio key handler: the
+    /// timeline and the docked MIDI/Solfege editors share these, and the
+    /// keyboard path routes them to whichever holds focus. An AppKit key
+    /// equivalent fires the menu action *before* that handler runs, so the piano
+    /// roll would lose Cmd+C / Cmd+A / etc. to the timeline. These stay in the
+    /// menu; they just carry no printed accelerator. Keep in sync with
+    /// `layout::helpers::is_midi_routable_edit_command`.
+    const FOCUS_GATED_COMMANDS: &[&str] = &[
+        "edit:select-all",
+        "edit:copy",
+        "edit:cut",
+        "edit:paste",
+        "edit:duplicate",
+        "edit:delete",
+        "edit:delete-backspace",
+        "clip:delete",
+        "clip:duplicate",
+    ];
+
+    /// Translate a shared-manifest accelerator (authored Windows-first, e.g.
+    /// `"Ctrl+Shift+S"`, `"Alt+F4"`) into a GPUI keystroke string for the macOS
+    /// menubar, where the primary modifier is Cmd. Returns `None` for anything
+    /// that must not become an AppKit key equivalent — the binding is skipped so
+    /// the menu still lists the command without stealing the key:
+    ///   * bare keys and Shift-only chords (would swallow a plain keypress),
+    ///   * focus-gated edit commands (see `FOCUS_GATED_COMMANDS`),
+    ///   * keys we can't map.
+    /// `app:quit` ships as `Alt+F4` for Windows; macOS quit is Cmd+Q.
+    pub(super) fn manifest_accel_to_mac_keystroke(command: &str, accel: &str) -> Option<String> {
+        if FOCUS_GATED_COMMANDS.contains(&command) {
+            return None;
+        }
+        if command == "app:quit" {
+            return Some("cmd-q".to_string());
+        }
+        let mut cmd = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut key: Option<String> = None;
+        for raw in accel.split('+') {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "" => {}
+                "ctrl" | "control" | "cmd" | "command" | "meta" | "super" => cmd = true,
+                "alt" | "option" | "opt" => alt = true,
+                "shift" => shift = true,
+                other => key = Some(map_key(other)?),
+            }
+        }
+        let key = key?;
+        // Require a Cmd/Alt anchor: a bare or Shift-only key equivalent would let
+        // the menubar intercept an ordinary keystroke (e.g. Space, R, Shift+B).
+        if !cmd && !alt {
+            return None;
+        }
+        let mut out = String::new();
+        if cmd {
+            out.push_str("cmd-");
+        }
+        if alt {
+            out.push_str("alt-");
+        }
+        if shift {
+            out.push_str("shift-");
+        }
+        out.push_str(&key);
+        Some(out)
+    }
+
+    /// Map a manifest key token to the GPUI keystroke key spelling.
+    fn map_key(token: &str) -> Option<String> {
+        let mapped = match token {
+            "esc" | "escape" => "escape",
+            "del" | "delete" => "delete",
+            "backspace" => "backspace",
+            "enter" | "return" => "enter",
+            "tab" => "tab",
+            "space" => "space",
+            "home" => "home",
+            "end" => "end",
+            "pageup" | "page_up" | "pgup" => "pageup",
+            "pagedown" | "page_down" | "pgdn" => "pagedown",
+            "left" | "arrowleft" | "arrow_left" => "left",
+            "right" | "arrowright" | "arrow_right" => "right",
+            "up" | "arrowup" | "arrow_up" => "up",
+            "down" | "arrowdown" | "arrow_down" => "down",
+            "plus" | "=" => "=",
+            "minus" | "-" => "-",
+            "," | "." | "/" | ";" | "'" | "[" | "]" | "\\" | "`" => token,
+            f if f.len() > 1
+                && f.starts_with('f')
+                && f[1..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                return Some(f.to_string());
+            }
+            other if other.chars().count() == 1 => other,
+            _ => return None,
+        };
+        Some(mapped.to_string())
+    }
+
+    /// Walk the manifest and collect `(command, keystroke)` pairs for every
+    /// item whose accelerator survives [`manifest_accel_to_mac_keystroke`].
+    fn collect_menu_keystrokes(items: &[AppMenuItem], out: &mut Vec<(String, String)>) {
+        for item in items {
+            if let (Some(command), Some(accel)) =
+                (item.command.as_deref(), item.shortcut.as_deref())
+            {
+                if !command.is_empty() && !accel.is_empty() {
+                    if let Some(keystroke) = manifest_accel_to_mac_keystroke(command, accel) {
+                        out.push((command.to_string(), keystroke));
+                    }
+                }
+            }
+            collect_menu_keystrokes(&item.children, out);
+        }
+    }
+
+    /// GPUI key bindings that back the macOS menubar's key equivalents. Without
+    /// these, `create_menu_item` finds no binding for a `RunMenuCommand` and the
+    /// dropdown shows no accelerator. Reflects the default profile's accelerators
+    /// (the shared manifest); a non-default keymap profile still dispatches via
+    /// the studio's own handler, the printed equivalent just tracks the default.
+    fn menu_key_bindings() -> Vec<KeyBinding> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for menu in &MenuManifest::load().menus {
+            collect_menu_keystrokes(&menu.items, &mut pairs);
+        }
+        pairs
+            .into_iter()
+            .map(|(command, keystroke)| {
+                KeyBinding::new(
+                    &keystroke,
+                    RunMenuCommand {
+                        command_id: command.into(),
+                    },
+                    None,
+                )
+            })
+            .collect()
     }
 
     pub(super) fn install(cx: &mut App) {
@@ -150,6 +291,8 @@ mod macos {
                 eprintln!("[macos-menu] no dispatcher for command {command_id}");
             }
         });
+
+        cx.bind_keys(menu_key_bindings());
 
         let manifest = MenuManifest::load();
         let mut menus: Vec<Menu> = Vec::with_capacity(manifest.menus.len() + 1);

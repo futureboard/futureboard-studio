@@ -91,6 +91,7 @@ export const APP_MENUS: AppMenuGroup[] = [
       {
         id: "file.save_copy",
         label: "Save a Copy...",
+        accelerator: "Ctrl+Alt+Shift+S",
         icon: "copy",
         action: "project:save-copy",
       },
@@ -259,7 +260,7 @@ export const APP_MENUS: AppMenuGroup[] = [
       {
         id: "midi.open_editor",
         label: "Open MIDI Editor",
-        accelerator: "Ctrl+E",
+        accelerator: "Ctrl+Shift+M",
         icon: "keyboard-music",
         action: "midi:open-editor",
       },
@@ -300,6 +301,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "midi.fit_notes",
         label: "Fit Notes",
         icon: "maximize-2",
+        accelerator: "Ctrl+Alt+5",
         action: "midi:fit-notes",
       },
       {
@@ -310,6 +312,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "midi.analyze_accent",
         label: "Analyze Accent",
         icon: "wand-sparkles",
+        accelerator: "Ctrl+Alt+A",
         action: "solfege:analyze-accent",
         description:
           "Estimate how strongly each note should be emphasised, keeping accents edited by hand",
@@ -318,6 +321,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "midi.analyze_accent_replace",
         label: "Analyze Accent (Replace All)",
         icon: "wand-sparkles",
+        accelerator: "Ctrl+Alt+Shift+R",
         action: "solfege:analyze-accent-replace-all",
         description: "Re-analyse every note, discarding accents edited by hand",
       },
@@ -325,6 +329,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "midi.apply_accent",
         label: "Apply Accent to Performance",
         icon: "audio-waveform",
+        accelerator: "Ctrl+Alt+Shift+A",
         action: "solfege:apply-accent",
         description:
           "Write the analysed accents into note timing, velocity and the Dynamics lane",
@@ -350,6 +355,7 @@ export const APP_MENUS: AppMenuGroup[] = [
       {
         id: "project.add_audio_track",
         label: "Add Audio Track",
+        accelerator: "Ctrl+Shift+A",
         icon: "mic",
         action: "track:add-audio",
       },
@@ -364,6 +370,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "project.add_instrument_track",
         label: "Add Instrument Track",
         icon: "keyboard-music",
+        accelerator: "Ctrl+Shift+G",
         action: "track:add-instrument",
       },
       {
@@ -376,12 +383,14 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "project.add_bus_track",
         label: "Add Bus Track",
         icon: "route",
+        accelerator: "Ctrl+Shift+J",
         action: "track:add-bus",
       },
       {
         id: "project.add_return_track",
         label: "Add Return Track",
         icon: "corner-down-left",
+        accelerator: "Ctrl+Shift+K",
         action: "track:add-return",
       },
       {
@@ -391,6 +400,7 @@ export const APP_MENUS: AppMenuGroup[] = [
       {
         id: "project.delete_track",
         label: "Delete Selected Track",
+        accelerator: "Ctrl+Shift+Delete",
         icon: "trash-2",
         danger: true,
         action: "track:delete",
@@ -525,6 +535,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "audio.plugin_scanner",
         label: "Audio Plug-in Scanner...",
         icon: "scan",
+        accelerator: "Ctrl+Alt+U",
         action: "plugins:scan",
         description: "Scan for installed VST3 and CLAP plug-ins",
       },
@@ -536,6 +547,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "audio.stem_extractor",
         label: "Stem Extractor...",
         icon: "audio-lines",
+        accelerator: "Ctrl+Alt+Shift+E",
         action: "audio:stem-extractor",
         description: "Separate a mix into stems with MDX-NET (CPU/GPU)",
       },
@@ -547,6 +559,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "audio.connections",
         label: "Audio Connections...",
         icon: "route",
+        accelerator: "Ctrl+Alt+O",
         action: "window:audio-connections",
         description: "Edit the project's logical audio input and output buses",
       },
@@ -575,6 +588,7 @@ export const APP_MENUS: AppMenuGroup[] = [
       {
         id: "automation.clear_selection",
         label: "Clear Selection",
+        accelerator: "Ctrl+Shift+D",
         icon: "scan-x",
         action: "automation:clear-selection",
       },
@@ -585,12 +599,14 @@ export const APP_MENUS: AppMenuGroup[] = [
       {
         id: "automation.toggle_mode",
         label: "Toggle Automation Mode",
+        accelerator: "Ctrl+Shift+O",
         icon: "activity",
         action: "automation:toggle-mode",
       },
       {
         id: "automation.cycle_target",
         label: "Cycle Automation Target",
+        accelerator: "Ctrl+Shift+Y",
         icon: "workflow",
         action: "automation:cycle-target",
       },
@@ -628,6 +644,7 @@ export const APP_MENUS: AppMenuGroup[] = [
       {
         id: "window.show_bottom_panel",
         label: "Show Bottom Panel",
+        accelerator: "Ctrl+7",
         icon: "panel-bottom",
         checked: true,
         action: "panel:toggle-bottom",
@@ -638,12 +655,14 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "window.float_mixer",
         label: "Open Mixer in Window",
         icon: "external-link",
+        accelerator: "Ctrl+Alt+F",
         action: "floatingwindow:mixer",
       },
       {
         id: "window.routing_matrix",
         label: "Routing Matrix",
         icon: "route",
+        accelerator: "Ctrl+Alt+G",
         action: "floatingwindow:routing-matrix",
         description:
           "Cross-point grid of every track against Main, the buses and the returns, for toggling sends",
@@ -652,6 +671,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "window.video_player",
         label: "Video Player",
         icon: "film",
+        accelerator: "Ctrl+Alt+V",
         action: "window:video-player",
         description:
           "Preview the Video track's reference video against the playhead",
@@ -660,6 +680,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "window.audio_jam",
         label: "Audio Jam",
         icon: "radio",
+        accelerator: "Ctrl+Alt+J",
         action: "window:audio-jam",
         description:
           "Play with other Futureboard accounts over the network, and route their streams to tracks",
@@ -672,6 +693,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "window.big_clock",
         label: "Big Clock",
         icon: "clock",
+        accelerator: "Ctrl+Alt+K",
         action: "window:big-clock",
         description:
           "The playhead in bars and beats, large enough to read from across the room",
@@ -680,6 +702,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "window.timecode",
         label: "Timecode",
         icon: "timer",
+        accelerator: "Ctrl+Alt+T",
         action: "window:timecode",
         description:
           "The same clock led by SMPTE timecode, at 24, 25, 29.97 DF or 30 fps",
@@ -688,6 +711,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "window.performance",
         label: "Performance Monitor",
         icon: "gauge",
+        accelerator: "Ctrl+Alt+P",
         action: "window:performance",
         description:
           "Audio engine latency and PDC, plus every CPU core, memory and local drive",
@@ -700,6 +724,7 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "window.extensions",
         label: "Extensions...",
         icon: "blocks",
+        accelerator: "Ctrl+Alt+X",
         action: "window:extensions",
         description:
           "Browse and install community themes and extensions from the registry",
@@ -712,12 +737,14 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "window.chord_display_panel",
         label: "Chord Display in Right Dock",
         icon: "music",
+        accelerator: "Ctrl+8",
         action: "panel:show-chord-display",
       },
       {
         id: "window.lyric_display_panel",
         label: "Lyric Display in Right Dock",
         icon: "music",
+        accelerator: "Ctrl+9",
         action: "panel:show-lyric-display",
       },
       {
@@ -796,18 +823,21 @@ export const APP_MENUS: AppMenuGroup[] = [
         id: "window.chord_display",
         label: "Open Chord Display Window",
         icon: "external-link",
+        accelerator: "Ctrl+Alt+Shift+C",
         action: "window:chord-display",
       },
       {
         id: "window.lyric_display",
         label: "Open Lyric Display Window",
         icon: "external-link",
+        accelerator: "Ctrl+Alt+Shift+D",
         action: "window:lyric-display",
       },
       {
         id: "window.lyric_editor",
         label: "Open Lyric Editor Window",
         icon: "external-link",
+        accelerator: "Ctrl+Alt+Shift+M",
         action: "window:lyric-editor",
       },
       {

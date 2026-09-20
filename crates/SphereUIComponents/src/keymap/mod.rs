@@ -12,8 +12,8 @@ pub use model::{
     ResolvedKeyBinding, PROFILE_DESCRIPTORS, USER_OVERRIDES_FILE,
 };
 pub use normalize::{
-    canonical_accel, canonical_event, canonical_keystroke, event_to_accel_string,
-    format_accel_display, is_modifier_only_key, keystroke_to_accel_string,
+    accel_display, canonical_accel, canonical_event, canonical_keystroke, event_to_accel_string,
+    format_accel_display, is_modifier_only_key, keystroke_to_accel_string, use_mac_accel_style,
 };
 pub use storage::{ensure_user_keymaps_dir, user_keymaps_dir};
 

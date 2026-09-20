@@ -1310,7 +1310,7 @@ fn menu_item(
         ContextMenuEntry::disabled_item(label, command)
     };
     if let Some(shortcut) = shortcut {
-        item.with_shortcut(shortcut)
+        item.with_shortcut(crate::keymap::accel_display(shortcut))
     } else {
         item
     }
