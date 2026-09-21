@@ -375,6 +375,11 @@ fn tab_button(
     // workspace panel that owns focus, because those can disagree while a
     // plug-in editor holds the Editor slot.
     let active = tab == active_tab || active_panel_matches_tab(active_panel, tab);
+    let shortcut = match tab {
+        BottomTab::Mixer => Some(crate::keymap::accel_display("Ctrl+3")),
+        BottomTab::Editor => Some(crate::keymap::accel_display("Ctrl+5")),
+        BottomTab::EffectEditor => Some(crate::keymap::accel_display("Ctrl+6")),
+    };
     fb_dock_tab(
         id,
         label,
@@ -382,6 +387,7 @@ fn tab_button(
         active,
         dock_planes(),
         move |_event, window, cx| on_click(&tab, window, cx),
+        shortcut,
     )
 }
 

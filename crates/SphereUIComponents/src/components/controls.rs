@@ -524,6 +524,45 @@ pub fn fb_tooltip(
     }
 }
 
+/// Wrap an element to show its keyboard shortcut as a tooltip on hover.
+/// Usage: `with_shortcut_hint(element, "command:id")`
+pub fn with_shortcut_hint<E: gpui::StatefulInteractiveElement + gpui::IntoElement>(element: E, command: &str) -> impl IntoElement {
+    let shortcut = crate::keymap::shortcut_for_command(command).unwrap_or_else(|| "—".to_string());
+    element.tooltip(fb_tooltip(shortcut))
+}
+
+/// Extension trait to add shortcut hint tooltip to any element.
+/// Requires the element to implement `StatefulInteractiveElement` for tooltip support.
+pub trait ShortcutHintExt: gpui::StatefulInteractiveElement + Sized {
+    fn shortcut_hint(self, command: &str) -> Self {
+        let shortcut = crate::keymap::shortcut_for_command(command).unwrap_or_else(|| "—".to_string());
+        self.tooltip(fb_tooltip(shortcut))
+    }
+}
+
+impl<E: gpui::StatefulInteractiveElement + Sized> ShortcutHintExt for E {}
+
+/// Example usage:
+///
+/// ```rust
+/// use crate::components::controls::{fb_button, FbButtonKind, ShortcutHintExt};
+///
+/// // Method 1: Using the extension trait on any StatefulInteractiveElement
+/// fb_button("my-button", "Save", FbButtonKind::Primary, true, on_click)
+///     .shortcut_hint("project:save");
+///
+/// // Method 2: Using the wrapper function
+/// use crate::components::controls::with_shortcut_hint;
+/// with_shortcut_hint(
+///     fb_button("my-button", "Save", FbButtonKind::Primary, true, on_click),
+///     "project:save"
+/// );
+///
+/// // Method 3: Using the tooltip directly
+/// fb_button("my-button", "Save", FbButtonKind::Primary, true, on_click)
+///     .tooltip(shortcut_tooltip("project:save"));
+/// ```
+
 /// Non-interactive identity chip — plugin format, track type, counts, status.
 pub fn fb_badge(label: impl Into<String>, tone: Rgba) -> impl IntoElement {
     let label: String = label.into();
@@ -798,6 +837,7 @@ pub fn fb_dock_tab(
     active: bool,
     planes: FbDockPlanes,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    shortcut: Option<String>,
 ) -> impl IntoElement {
     let label: String = label.into();
     let r = radius::CONTROL;
@@ -852,6 +892,7 @@ pub fn fb_dock_tab(
         })
         .children(icon_path.map(|path| svg().path(path).w(px(14.0)).h(px(14.0)).text_color(text)))
         .child(label)
+        .children(shortcut.as_deref().map(|s| fb_shortcut_hint(s)))
         .on_click(on_click)
 }
 

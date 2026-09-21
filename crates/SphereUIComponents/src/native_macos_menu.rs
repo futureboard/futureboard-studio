@@ -132,7 +132,7 @@ pub fn install_native_macos_menu(cx: &mut App) {
 mod macos {
     use gpui::{App, KeyBinding, Menu, MenuItem as GpuiMenuItem, SharedString, SystemMenuType};
 
-    use super::{ApplicationMenuEntry, APP_WINDOW_TITLE};
+    use super::{APP_WINDOW_TITLE, ApplicationMenuEntry};
     use crate::menu::{MenuItem as AppMenuItem, MenuItemKind, MenuManifest};
 
     #[derive(Clone, PartialEq, gpui::Action)]
@@ -141,38 +141,21 @@ mod macos {
         pub command_id: SharedString,
     }
 
-    /// Commands whose accelerator is focus-gated in the studio key handler: the
-    /// timeline and the docked MIDI/Solfege editors share these, and the
-    /// keyboard path routes them to whichever holds focus. An AppKit key
-    /// equivalent fires the menu action *before* that handler runs, so the piano
-    /// roll would lose Cmd+C / Cmd+A / etc. to the timeline. These stay in the
-    /// menu; they just carry no printed accelerator. Keep in sync with
-    /// `layout::helpers::is_midi_routable_edit_command`.
-    const FOCUS_GATED_COMMANDS: &[&str] = &[
-        "edit:select-all",
-        "edit:copy",
-        "edit:cut",
-        "edit:paste",
-        "edit:duplicate",
-        "edit:delete",
-        "edit:delete-backspace",
-        "clip:delete",
-        "clip:duplicate",
-    ];
-
     /// Translate a shared-manifest accelerator (authored Windows-first, e.g.
     /// `"Ctrl+Shift+S"`, `"Alt+F4"`) into a GPUI keystroke string for the macOS
     /// menubar, where the primary modifier is Cmd. Returns `None` for anything
-    /// that must not become an AppKit key equivalent — the binding is skipped so
-    /// the menu still lists the command without stealing the key:
+    /// that must not become an AppKit key equivalent:
     ///   * bare keys and Shift-only chords (would swallow a plain keypress),
-    ///   * focus-gated edit commands (see `FOCUS_GATED_COMMANDS`),
     ///   * keys we can't map.
+    ///
+    /// Note: focus-gated edit commands (Ctrl+C/X/V/A/D/Delete) DO receive key
+    /// equivalents. Their `RunMenuCommand` action routes through
+    /// `dispatch_command_id` which applies focus routing internally (MIDI editor
+    /// vs timeline), so AppKit firing the menu action is safe — it never touches
+    /// NSTextView's cut:/copy:/paste: selectors.
+    ///
     /// `app:quit` ships as `Alt+F4` for Windows; macOS quit is Cmd+Q.
     pub(super) fn manifest_accel_to_mac_keystroke(command: &str, accel: &str) -> Option<String> {
-        if FOCUS_GATED_COMMANDS.contains(&command) {
-            return None;
-        }
         if command == "app:quit" {
             return Some("cmd-q".to_string());
         }
@@ -190,11 +173,10 @@ mod macos {
             }
         }
         let key = key?;
-        // Require a Cmd/Alt anchor: a bare or Shift-only key equivalent would let
-        // the menubar intercept an ordinary keystroke (e.g. Space, R, Shift+B).
-        if !cmd && !alt {
-            return None;
-        }
+        // The native menu is also the shortcut reference surface. Keep bare and
+        // Shift-only accelerators here so macOS renders every manifest shortcut
+        // in the menu (Space, R, L, K, V, P, arrows, etc.). The command is still
+        // dispatched through RunMenuCommand, the same path as the in-app keymap.
         let mut out = String::new();
         if cmd {
             out.push_str("cmd-");
@@ -355,8 +337,8 @@ mod macos {
                 if command == "noop" && !item.enabled {
                     return None;
                 }
-                let name = item.label.clone().unwrap_or_else(|| item.id.clone());
-                // Ensure the action payload owns its command id ('static).
+                let name: SharedString =
+                    item.label.clone().unwrap_or_else(|| item.id.clone()).into();
                 let command_id: SharedString = command.to_string().into();
                 Some(GpuiMenuItem::action(name, RunMenuCommand { command_id }))
             }

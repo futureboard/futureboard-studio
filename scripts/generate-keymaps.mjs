@@ -44,6 +44,78 @@ function assignedOnly(bindings) {
 }
 
 /**
+ * Extra bindings that exist in the default keymap but are not present in
+ * the menu manifest. These are commands that have keyboard shortcuts but
+ * no corresponding menu entry (e.g., MIDI editor keys, tool shortcuts,
+ * track state toggles, etc.).
+ * @type {Record<string, string|null>}
+ */
+const DEFAULT_OVERRIDES = {
+  "project:new-from-template": "Ctrl+Shift+N",
+  "project:snapshot": "Ctrl+Alt+S",
+  "file:import-audio": "Ctrl+I",
+  "file:export-stems": "Ctrl+Shift+E",
+  "edit:delete-backspace": "Backspace",
+  "clip:split-at-playhead": "S",
+  "clip:consolidate": "Ctrl+J",
+  "timeline:toggle-snap": "Ctrl+G",
+  "project:reveal-folder": "Ctrl+Alt+R",
+  "extensions:manager": "Ctrl+Alt+N",
+  "midi:duplicate-selected": "Ctrl+D",
+  "midi:nudge-left": "ArrowLeft",
+  "midi:nudge-right": "ArrowRight",
+  "midi:transpose-up": "ArrowUp",
+  "midi:transpose-down": "ArrowDown",
+  "midi:transpose-octave-up": "Shift+ArrowUp",
+  "midi:transpose-octave-down": "Shift+ArrowDown",
+  "audio:create-crossfade": "X",
+  "audio:bounce-in-place": "Ctrl+B",
+  "audio:render-selection": "Ctrl+R",
+  "window:minimize": "Ctrl+M",
+  "window:toggle-fullscreen": "F11",
+  "panel:toggle-device-panel": "Ctrl+4",
+  "panel:toggle-midi-editor": "Ctrl+5",
+  "panel:toggle-automation": "Ctrl+6",
+  "tools:select-mute": "U",
+  "tools:command-palette": "Ctrl+K",
+  "tools:quick-search": "Ctrl+P",
+  "tools:developer-tools": "Ctrl+Shift+I",
+  "app:force-reload": "Ctrl+Shift+R",
+  "track:arm": "Ctrl+Shift+B",
+  "track:mute": "Ctrl+Shift+H",
+  "track:solo": "Ctrl+Shift+L",
+  "track:add": "T",
+  "clip:rename": "F2",
+  "clip:properties": "Ctrl+Shift+P",
+  "midi:export-clip": "Ctrl+Alt+I",
+  "file:export-audio": "Ctrl+Shift+X",
+  "solfege:analyze-accent": "Ctrl+Alt+A",
+  "solfege:apply-accent": "Ctrl+Alt+Shift+A",
+  "solfege:analyze-accent-replace-all": "Ctrl+Alt+Shift+R",
+  "automation:select-all-points": "Ctrl+Alt+Shift+P",
+  "audio:stem-extractor": "Ctrl+Alt+Shift+E",
+  "jam:open": "Ctrl+Alt+Shift+J",
+  "midi:toggle-virtual-keyboard": "Ctrl+Alt+Shift+K",
+  "window:chord-display": "Ctrl+Alt+Shift+C",
+  "window:lyric-display": "Ctrl+Alt+Shift+D",
+  "window:lyric-editor": "Ctrl+Alt+Shift+M",
+  "floatingwindow:video-player": "Ctrl+Alt+Shift+V",
+  "mixer:create-bus": "Ctrl+Alt+7",
+  "mixer:reset-volume": "Ctrl+Alt+8",
+  "mixer:reset-pan": "Ctrl+Alt+9",
+  "midi:tool-select": "Ctrl+Alt+1",
+  "midi:tool-draw": "Ctrl+Alt+2",
+  "midi:tool-line": "Ctrl+Alt+3",
+  "midi:velocity-increase": "Ctrl+Alt+Up",
+  "midi:velocity-decrease": "Ctrl+Alt+Down",
+  "midi:toggle-snap": "Ctrl+Alt+4",
+  "midi:fit-notes": "Ctrl+Alt+5",
+  "editor:open-bottom": "Ctrl+Alt+6",
+  "floatingwindow:mixer": "Ctrl+Alt+F",
+  "floatingwindow:routing-matrix": "Ctrl+Alt+G",
+};
+
+/**
  * DAW-specific overrides keyed by command id.
  * Values of `null` remove a default binding for that profile.
  * @type {Record<string, Record<string, string|null>>}
@@ -108,6 +180,7 @@ const DAW_OVERRIDES = {
     "panel:toggle-browser": null,
     "panel:toggle-mixer": "F3",
     "panel:toggle-inspector": null,
+    "panel:toggle-device-panel": null,
     "panel:toggle-midi-editor": "F2",
     "tools:command-palette": null,
   },
@@ -231,7 +304,8 @@ const PROFILES = [
   {
     id: "default",
     label: "Futureboard Default",
-    description: "Default shortcuts from the application menu manifest.",
+    description: "Default shortcuts from the application menu manifest plus extra bindings.",
+    overrides: DEFAULT_OVERRIDES,
   },
   {
     id: "ableton",

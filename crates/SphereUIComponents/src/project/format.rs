@@ -37,7 +37,7 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v13 adds timeline markers and regions. v14 adds internal RAUF clip sources.
 /// v15 adds persisted master-bus inserts.
 /// v16 adds a per-clip non-destructive stretch/pitch block (mode, algorithm,
-/// ratio, BPM pair, pitch/formant/transient/fade/gain/pan, warp markers). Pre-v16
+/// ratio, BMP pair, pitch/formant/transient/fade/gain/pan, warp markers). Pre-v16
 /// clips load with [`AudioClipStretchState::default`] (mode Off, ratio 1.0,
 /// preserve_pitch false).
 /// v18 persists enabled VSTi output channels per insert.
@@ -69,7 +69,7 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v30 adds arrangement group membership; v31 persists folder collapse state;
 /// v32 persists each track's volume-automation read/bypass state.
 /// v33 adds the reference Video track (track type tag 7) and the video clip
-/// source (clip source tag 4), which stores only the asset id and source path â
+/// source (clip source tag 4), which stores only the asset id and source path —
 /// frames are always decoded from the file, never persisted. Pre-v33 projects
 /// have no Video track, which is exactly what they had before the type existed.
 /// v34 splits the combined per-track input union into an audio Audio Connection
@@ -81,26 +81,19 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v36 persists each insert's registry-resolved instrument/effect role, so an
 /// effect in slot zero is never mistaken for an instrument after project load.
 /// v37 appends the native Solfege instrument state to each track.
-///
-/// This is a *version bump rather than an extension of v34* on purpose. The body
-/// is positional and a v34 file simply ends after the registry, so appending
-/// fields under the same version number would leave the decoder guessing whether
-/// trailing bytes are absent or truncated. A v34 file must decode as v34, with
-/// no output routing and the bootstrap latch clear â which is exactly what makes
-/// the compatibility bootstrap run once for it.
-/// v39 appends per-note musical accent: five normalised components and a
+/// v38 appends per-note musical accent: five normalised components and a
 /// provenance tag, written as an optional block after the pitch curve. A v38
 /// file loads with no accent on any note, which is exactly the state it was
-/// saved in â and "no accent" is a distinct state from "neutral accent", so
+/// saved in — and "no accent" is a distinct state from "neutral accent", so
 /// re-analysis treats a pre-v39 project as never analysed rather than as
 /// analysed-and-found-flat.
-/// v40 appends the conductor lanes' fold state â four collapse latches and five
-/// dragged heights â after the output routing. A v39 file loads with every lane
+/// v39 appends the conductor lanes' fold state — four collapse latches and five
+/// dragged heights — after the output routing. A v39 file loads with every lane
 /// expanded at its default height, which is the state it was saved in, since
 /// that is what v39 always restored.
 /// v41 appended each clip's ARA binding after its stretch block, and the ARA
 /// document archives after the conductor lanes. A v40 file loads with no ARA at
-/// all â the state it was saved in, since v40 could not express a binding.
+/// all — the state it was saved in, since v40 could not express a binding.
 /// v42 moves the binding from the clip to the track, where it belongs: ARA is a
 /// track processor like an insert, and every audio clip on the track becomes one
 /// of its playback regions. The v41 per-clip byte is still read and discarded so
@@ -121,6 +114,12 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// stereo identity with DC and de-hum bypassed.
 pub const PROJECT_VERSION: u32 = 49;
 
+/// Minimum on-disk format version that can be loaded without data loss.
+/// Versions below this will show a warning but can still be loaded.
+/// Currently set to v33 (Video track introduction) since v32 and earlier
+/// lack Video track, modern Audio Connections, and other critical features.
+pub const MIN_SUPPORTED_VERSION: u32 = 33;
+
 /// Minimum on-disk header size: magic (8) + version (4) + reserved (4) + body_len (4).
 pub const PROJECT_HEADER_SIZE: usize = 20;
 
@@ -129,6 +128,9 @@ pub enum ProjectError {
     Io(io::Error),
     InvalidMagic,
     UnsupportedVersion(u32),
+    /// File is from an older version that can be loaded but may lack features.
+    /// Contains the file's version number.
+    OldVersion(u32),
     /// File is shorter than the header or declared payload.
     IncompleteFile {
         reason: String,
@@ -159,6 +161,9 @@ impl ProjectError {
             ProjectError::UnsupportedVersion(_) => {
                 "This project version is not supported by this build of Futureboard."
             }
+            ProjectError::OldVersion(_) => {
+                "This project was created with an older version of Futureboard. It can be opened, but some features may be missing or behave differently."
+            }
             ProjectError::IncompleteFile { .. }
             | ProjectError::UnexpectedEof { .. }
             | ProjectError::ChecksumMismatch { .. } => {
@@ -179,6 +184,7 @@ impl ProjectError {
             ProjectError::Io(e) => format!("I/O error: {e}"),
             ProjectError::InvalidMagic => "invalid magic bytes".to_string(),
             ProjectError::UnsupportedVersion(v) => format!("unsupported version: {v}"),
+            ProjectError::OldVersion(v) => format!("old version: {v} (current {PROJECT_VERSION}, minimum {MIN_SUPPORTED_VERSION})"),
             ProjectError::IncompleteFile { reason } => reason.clone(),
             ProjectError::UnexpectedEof {
                 needed,
@@ -2801,7 +2807,12 @@ pub fn peek_project_header(data: &[u8]) -> Result<u32, ProjectError> {
 
 /// Decodes a `.fbproj` binary blob into a `FutureboardProject`.
 pub fn decode_project(data: &[u8]) -> Result<FutureboardProject, ProjectError> {
-    project_load_log(format_args!("file size: {} bytes", data.len()));
+    decode_project_with_options(data, false)
+}
+
+/// Decode a project with an option to allow loading old versions.
+pub fn decode_project_with_options(data: &[u8], allow_old_version: bool) -> Result<FutureboardProject, ProjectError> {
+    project_load_log(format_args!("file size: {} bytes (allow_old_version={})", data.len(), allow_old_version));
 
     if data.len() < PROJECT_HEADER_SIZE {
         let err = ProjectError::IncompleteFile {
@@ -2825,6 +2836,12 @@ pub fn decode_project(data: &[u8]) -> Result<FutureboardProject, ProjectError> {
     if version == 0 || version > PROJECT_VERSION {
         let err = ProjectError::UnsupportedVersion(version);
         project_load_log(format_args!("failed: {}", err.technical_detail()));
+        return Err(err);
+    }
+    // Warn but allow loading for old versions that are still above minimum
+    if version < PROJECT_VERSION && version >= MIN_SUPPORTED_VERSION && !allow_old_version {
+        let err = ProjectError::OldVersion(version);
+        project_load_log(format_args!("warning: old version {version} (current {PROJECT_VERSION})"));
         return Err(err);
     }
     project_load_log(format_args!("header ok version={version}"));

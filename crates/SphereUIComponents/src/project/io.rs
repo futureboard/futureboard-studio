@@ -1,5 +1,5 @@
 use super::{
-    format::{decode_project, encode_project, ProjectError},
+    format::{decode_project, decode_project_with_options, encode_project, ProjectError},
     now_secs, ClipSource, FutureboardProject, ProjectAsset,
 };
 use crate::paths::{FutureboardPaths, ProjectFolderLayout};
@@ -121,13 +121,9 @@ pub fn save_project(project: &mut FutureboardProject, path: &Path) -> Result<(),
     }
 }
 
-/// Loads a `FutureboardProject` from `path`.
-///
-/// Files another DAW wrote (see [`super::import`]) are parsed by their importer
-/// instead of the native decoder; everything downstream sees the same project
-/// model either way.
-pub fn load_project(path: &Path) -> Result<FutureboardProject, ProjectError> {
-    project_load_log(format_args!("opening: {}", path.display()));
+/// Load a project from disk, optionally allowing old versions.
+pub fn load_project(path: &Path, allow_old_version: bool) -> Result<FutureboardProject, ProjectError> {
+    project_load_log(format_args!("opening: {} (allow_old_version={})", path.display(), allow_old_version));
     if super::import::is_import_path(path) {
         let project = super::import::import_project(path)?;
         project_load_log(format_args!("imported ok: {}", project.name));
@@ -137,15 +133,20 @@ pub fn load_project(path: &Path) -> Result<FutureboardProject, ProjectError> {
         project_load_log(format_args!("failed: I/O error: {error}"));
         ProjectError::Io(error)
     })?;
-    let mut project = decode_project(&bytes)?;
+    let mut project = decode_project_with_options(&bytes, allow_old_version)?;
     resolve_project_relative_assets(&mut project, path);
     project_load_log(format_args!("loaded ok: {}", project.name));
     Ok(project)
 }
 
+/// Load a project from disk without allowing old versions (default).
+pub fn load_project_strict(path: &Path) -> Result<FutureboardProject, ProjectError> {
+    load_project(path, false)
+}
+
 /// Round-trip verify that `path` contains a loadable project file.
 pub fn verify_project_file(path: &Path) -> Result<(), ProjectError> {
-    load_project(path).map(|_| ())
+    load_project_strict(path).map(|_| ())
 }
 
 /// Cheaply validate a project file on disk by reading only its header.
@@ -667,7 +668,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("Empty.fbproj");
         fs::write(&path, &[]).unwrap();
-        let err = load_project(&path).unwrap_err();
+        let err = load_project_strict(&path).unwrap_err();
         assert_eq!(
             err.user_message(),
             "Could not open this project because the file appears to be incomplete or corrupted."
@@ -682,7 +683,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("Trunc.fbproj");
         fs::write(&path, &[0u8; PROJECT_HEADER_SIZE - 1]).unwrap();
-        let err = load_project(&path).unwrap_err();
+        let err = load_project_strict(&path).unwrap_err();
         assert!(matches!(err, ProjectError::IncompleteFile { .. }));
         assert_eq!(
             err.user_message(),
@@ -699,7 +700,7 @@ mod tests {
         let mut bytes = encode_project(&FutureboardProject::new("TruncBody"));
         bytes.truncate(PROJECT_HEADER_SIZE + 2);
         fs::write(&path, &bytes).unwrap();
-        let err = load_project(&path).unwrap_err();
+        let err = load_project_strict(&path).unwrap_err();
         assert!(
             matches!(err, ProjectError::IncompleteFile { .. })
                 || matches!(err, ProjectError::UnexpectedEof { .. })
@@ -730,7 +731,7 @@ mod tests {
         let updated = fs::read(&path).unwrap();
         assert_ne!(updated, original);
         assert!(project_backup_path(&path).exists());
-        let backup = load_project(&project_backup_path(&path)).unwrap();
+        let backup = load_project_strict(&project_backup_path(&path)).unwrap();
         assert_eq!(backup.name, "Song");
         let _ = fs::remove_dir_all(dir);
     }
@@ -747,7 +748,7 @@ mod tests {
         project.name = "Test Song Updated".to_string();
         save_project(&mut project, &project_file).unwrap();
 
-        let loaded = load_project(&project_file).unwrap();
+        let loaded = load_project_strict(&project_file).unwrap();
         assert_eq!(loaded.name, "Test Song Updated");
         assert!(project_backup_path(&project_file).exists());
 
@@ -819,7 +820,7 @@ mod tests {
 
         let copied = root.join("Assets").join("Audio").join("loop.wav");
         assert!(copied.exists());
-        let loaded = load_project(&project_file).unwrap();
+        let loaded = load_project_strict(&project_file).unwrap();
         let ClipSource::Audio {
             source_path: Some(loaded_path),
             ..
@@ -926,7 +927,7 @@ mod tests {
             "identical content must be copied only once"
         );
 
-        let loaded = load_project(&project_file).unwrap();
+        let loaded = load_project_strict(&project_file).unwrap();
         let paths: Vec<PathBuf> = loaded.tracks[0]
             .clips
             .iter()
@@ -1048,7 +1049,7 @@ mod tests {
         let project_file = root.join("FP.fbproj");
         save_project(&mut project, &project_file).unwrap();
 
-        let loaded = load_project(&project_file).unwrap();
+        let loaded = load_project_strict(&project_file).unwrap();
         assert_eq!(loaded.assets.len(), 1);
         assert!(
             loaded.assets[0].source_fingerprint.is_some(),
@@ -1134,7 +1135,7 @@ mod tests {
         let project_file = root.join("PeakA.fbproj");
         save_project(&mut project, &project_file).unwrap();
 
-        let loaded = load_project(&project_file).unwrap();
+        let loaded = load_project_strict(&project_file).unwrap();
         assert_eq!(loaded.assets.len(), 1);
         assert_eq!(
             loaded.assets[0].relative_path.as_deref(),
@@ -1189,7 +1190,7 @@ mod tests {
         let project_file = root.join("PeakB.fbproj");
         save_project(&mut project, &project_file).unwrap();
 
-        let loaded = load_project(&project_file).unwrap();
+        let loaded = load_project_strict(&project_file).unwrap();
         let peak_path = resolve_project_relative_path(
             &root,
             loaded.assets[0]
@@ -1271,7 +1272,7 @@ mod tests {
         let project_file = root.join("PeakE.fbproj");
         save_project(&mut project, &project_file).unwrap();
 
-        let loaded = load_project(&project_file).unwrap();
+        let loaded = load_project_strict(&project_file).unwrap();
         let ClipSource::Audio {
             source_path: Some(resolved),
             ..

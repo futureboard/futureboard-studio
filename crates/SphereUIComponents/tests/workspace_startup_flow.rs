@@ -15,7 +15,7 @@ use sphere_ui_components::loading_session::{
     FailureSurface, LoadStage, ReplacementSurfaces, SessionTransactionSurface,
 };
 use sphere_ui_components::project::{
-    load_project, save_project, validate_project_file, FutureboardProject, PROJECT_FILE_EXT,
+    load_project_strict, load_project, save_project, validate_project_file, FutureboardProject, PROJECT_FILE_EXT,
 };
 
 /// Stages a transaction actually walks, from its first stage onwards.
@@ -86,7 +86,7 @@ fn open_existing_project_validates_and_decodes_before_install() {
 
     let version = validate_project_file(&path).expect("header validates");
     assert!(version > 0);
-    let decoded = load_project(&path).expect("project decodes");
+    let decoded = load_project_strict(&path).expect("project decodes");
     assert_eq!(decoded.name, "Existing Session");
 
     assert_eq!(
