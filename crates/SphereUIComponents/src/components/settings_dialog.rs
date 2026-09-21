@@ -62,6 +62,7 @@ pub enum SettingsTab {
     Audio,
     Midi,
     Recording,
+    Metronome,
     Playback,
     Editing,
     Appearance,
@@ -80,6 +81,7 @@ impl SettingsTab {
             Self::Audio => "settings.tab.audio",
             Self::Midi => "settings.tab.midi",
             Self::Recording => "settings.tab.recording",
+            Self::Metronome => "settings.tab.metronome",
             Self::Playback => "settings.tab.playback",
             Self::Editing => "settings.tab.editing",
             Self::Appearance => "settings.tab.appearance",
@@ -98,6 +100,7 @@ impl SettingsTab {
             Self::Audio => assets::ICON_MIC_PATH,
             Self::Midi => assets::ICON_LINK_PATH,
             Self::Recording => assets::ICON_CIRCLE_PATH,
+            Self::Metronome => assets::ICON_METRONOME_PATH,
             Self::Playback => assets::ICON_PLAY_PATH,
             Self::Editing => assets::ICON_PENCIL_PATH,
             Self::Appearance => assets::ICON_SLIDERS_HORIZONTAL_PATH,
@@ -116,6 +119,7 @@ impl SettingsTab {
             Self::Audio => "settings.tab.audio.description",
             Self::Midi => "settings.tab.midi.description",
             Self::Recording => "settings.tab.recording.description",
+            Self::Metronome => "settings.tab.metronome.description",
             Self::Playback => "settings.tab.playback.description",
             Self::Editing => "settings.tab.editing.description",
             Self::Appearance => "settings.tab.appearance.description",
@@ -138,6 +142,7 @@ impl SettingsTab {
                     Self::Midi,
                     Self::Plugins,
                     Self::Recording,
+                    Self::Metronome,
                     Self::Playback,
                 ],
             ),
@@ -159,6 +164,7 @@ impl SettingsTab {
             Self::Audio,
             Self::Midi,
             Self::Recording,
+            Self::Metronome,
             Self::Playback,
             Self::Editing,
             Self::Appearance,
@@ -942,10 +948,11 @@ fn build_settings_content(
     if (state.active_tab == SettingsTab::Appearance && query.is_empty())
         || (!query.is_empty()
             && (is_match("Theme", &["theme", "fleet", "dark"])
-                || is_match(
-                    "Text Rendering",
-                    &["text", "font", "render", "directwrite", "gdi", "blurry"],
-                )
+                || (cfg!(target_os = "windows")
+                    && is_match(
+                        "Text Rendering",
+                        &["text", "font", "render", "directwrite", "gdi", "blurry"],
+                    ))
                 || is_match("UI Scale", &["scale", "size"])
                 || is_match("Arrangement Grid", &["grid", "intensity", "opacity"])
                 || is_match("Piano Roll Guides", &["piano", "roll", "guides", "keys"])
@@ -973,35 +980,40 @@ fn build_settings_content(
                         callbacks.on_toggle_hardware_combo.clone(),
                     ),
                 ))
-                .child(settings_daw_row(
-                    settings_restart_label(i18n.tr("settings.field.text-rendering"), true),
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .child(settings_segmented(
-                            "settings-text-rendering",
-                            &[
-                                (TextRenderingBackend::DirectWrite, "DirectWrite"),
-                                (TextRenderingBackend::Gdi, "GDI+"),
-                            ],
-                            schema.appearance.text_rendering,
-                            {
-                                let up = on_update.clone();
-                                Arc::new(move |backend: TextRenderingBackend, w, cx| {
-                                    up(
-                                        Arc::new(move |s| s.appearance.text_rendering = backend),
-                                        w,
-                                        cx,
-                                    );
-                                })
-                            },
+                .when(cfg!(target_os = "windows"), |section| {
+                    section
+                        .child(settings_daw_row(
+                            settings_restart_label(i18n.tr("settings.field.text-rendering"), true),
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .child(settings_segmented(
+                                    "settings-text-rendering",
+                                    &[
+                                        (TextRenderingBackend::DirectWrite, "DirectWrite"),
+                                        (TextRenderingBackend::Gdi, "GDI+"),
+                                    ],
+                                    schema.appearance.text_rendering,
+                                    {
+                                        let up = on_update.clone();
+                                        Arc::new(move |backend: TextRenderingBackend, w, cx| {
+                                            up(
+                                                Arc::new(move |s| {
+                                                    s.appearance.text_rendering = backend
+                                                }),
+                                                w,
+                                                cx,
+                                            );
+                                        })
+                                    },
+                                ))
+                                .child(settings_section_hint_text(
+                                    i18n.tr("settings.hint.text-rendering"),
+                                )),
                         ))
-                        .child(settings_section_hint_text(
-                            i18n.tr("settings.hint.text-rendering"),
-                        )),
-                ))
-                .child(settings_restart_footer())
+                        .child(settings_restart_footer())
+                })
                 .child(settings_daw_row(
                     i18n.tr("settings.field.ui-scale"),
                     div()
@@ -1459,15 +1471,11 @@ fn build_settings_content(
         );
     }
 
-    // Recording Panel (Audio recording format, Metronome)
+    // Recording Panel (audio format and input test)
     if (state.active_tab == SettingsTab::Recording && query.is_empty())
         || (!query.is_empty()
             && (is_match("Audio Recording Format", &["format", "bit", "depth", "wav"])
-                || is_match("Input Test Meter", &["input", "test", "meter", "level"])
-                || is_match(
-                    "Metronome Click",
-                    &["metronome", "click", "sound", "volume"],
-                )))
+                || is_match("Input Test Meter", &["input", "test", "meter", "level"])))
     {
         let on_update = callbacks.on_update_setting.clone();
 
@@ -1763,18 +1771,30 @@ fn build_settings_content(
                 ))
                 .into_any_element(),
         );
+    }
 
-        let up = on_update.clone();
+    // Metronome: click volume, sound, and record count-in.
+    if (state.active_tab == SettingsTab::Metronome && query.is_empty())
+        || (!query.is_empty()
+            && is_match(
+                "Metronome Click",
+                &[
+                    "metronome",
+                    "click",
+                    "sound",
+                    "volume",
+                    "count-in",
+                    "countin",
+                ],
+            ))
+    {
+        let up = callbacks.on_update_setting.clone();
         sections.push(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .mt(px(12.0))
+            settings_section_card()
                 .child(settings_i18n_header(
                     i18n,
-                    "settings.section.recording-metronome",
-                    assets::ICON_CIRCLE_PATH,
+                    "settings.section.metronome",
+                    assets::ICON_METRONOME_PATH,
                 ))
                 .child(settings_daw_row(
                     i18n.tr("settings.field.enable-click"),
@@ -1878,6 +1898,58 @@ fn build_settings_content(
                                 },
                             )
                         }),
+                ))
+                .child(settings_daw_row(
+                    i18n.tr("settings.field.enable-count-in"),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child({
+                            let val = schema.recording.metronome.count_in_enabled;
+                            let up_ci = up.clone();
+                            fb_checkbox("met-count-in-enabled", val, move |_, w, cx| {
+                                up_ci(
+                                    Arc::new(move |s| {
+                                        s.recording.metronome.count_in_enabled = !val
+                                    }),
+                                    w,
+                                    cx,
+                                );
+                            })
+                        })
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(Colors::text_muted())
+                                .child(i18n.tr("settings.metronome.count-in")),
+                        ),
+                ))
+                .child(settings_daw_row(
+                    i18n.tr("settings.field.count-in-bars"),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(4.0))
+                        .children((1u32..=4).map(|bars| {
+                            let val = schema.recording.metronome.count_in_bars;
+                            let up_bars = up.clone();
+                            fb_segmented_button(
+                                ("met-count-in-bars", bars as usize),
+                                format!("{bars}"),
+                                val == bars,
+                                move |_, w, cx| {
+                                    up_bars(
+                                        Arc::new(move |s| {
+                                            s.recording.metronome.count_in_bars = bars
+                                        }),
+                                        w,
+                                        cx,
+                                    );
+                                },
+                            )
+                        })),
                 ))
                 .into_any_element(),
         );

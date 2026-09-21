@@ -17,11 +17,10 @@
 //! - content child styles: `WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS`.
 //! - the child's parent is the supplied top HWND.
 //!
-//! On non-Windows targets every entry point is a no-op stub returning `None`,
-//! and nothing asks: macOS and Linux use the host-owned-window backend, where
-//! the plug-in's view lives in a top-level window the host process created and
-//! there is no content child in this process at all. See
-//! [`crate::components::plugin_editor_backend::EditorBackendKind`].
+//! VST3 editors on macOS and Linux still use the host-owned-window backend
+//! (see [`crate::components::plugin_editor_backend::EditorBackendKind`]). Built-in
+//! CEF editors on macOS reuse this module's content child as an in-process
+//! AppKit container so Chromium can parent a real NSView into the GPUI shell.
 
 /// Whether this platform can embed a plug-in's own native view inside the
 /// app's window.
@@ -797,7 +796,97 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::{ContentHostKind, ContentRect};
+    use crate::components::plugin_editor_mac_region::{DockedPluginSurface, RegionPx};
+
+    /// Windowed CEF warm-up still needs a never-shown parent. A hidden
+    /// `NSWindow` is a later slice; first editor open pays the cold start.
+    pub struct HiddenHostWindow {
+        _private: (),
+    }
+
+    impl HiddenHostWindow {
+        pub fn create() -> Option<Self> {
+            None
+        }
+        pub fn hwnd(&self) -> u64 {
+            0
+        }
+    }
+
+    /// In-process AppKit container for a windowed CEF browser.
+    ///
+    /// VST3 editors on macOS still use the host-owned window backend. Built-in
+    /// editors parent Chromium into this container the same way Windows parents
+    /// a child HWND.
+    pub struct ContentChildHwnd {
+        parent_ns_view: u64,
+        surface: DockedPluginSurface,
+    }
+
+    /// No owned-popup owner on AppKit; popups stay CEF's.
+    pub fn place_owned_popup(
+        _popup_hwnd: u64,
+        _owner_hwnd: u64,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> bool {
+        false
+    }
+
+    impl ContentChildHwnd {
+        pub fn create(top_hwnd: u64, rect: ContentRect) -> Option<Self> {
+            Self::create_for(ContentHostKind::NativeView, top_hwnd, rect)
+        }
+
+        pub fn create_for(
+            _kind: ContentHostKind,
+            top_hwnd: u64,
+            rect: ContentRect,
+        ) -> Option<Self> {
+            if top_hwnd == 0 {
+                return None;
+            }
+            let surface = DockedPluginSurface::create(top_hwnd, region_px(rect))?;
+            Some(Self {
+                parent_ns_view: top_hwnd,
+                surface,
+            })
+        }
+
+        pub fn hwnd(&self) -> u64 {
+            self.surface.handle()
+        }
+
+        pub fn top_hwnd(&self) -> u64 {
+            self.parent_ns_view
+        }
+
+        pub fn set_bounds(&self, rect: ContentRect) {
+            self.surface
+                .set_bounds(self.parent_ns_view, region_px(rect));
+        }
+
+        pub fn is_valid(&self) -> bool {
+            self.surface.handle() != 0
+        }
+    }
+
+    fn region_px(rect: ContentRect) -> RegionPx {
+        RegionPx {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod imp {
     use super::{ContentHostKind, ContentRect};
 
@@ -815,13 +904,13 @@ mod imp {
         }
     }
 
-    /// Non-Windows stub. Host-process editor embedding via NSView/X11 is a later
-    /// slice; this keeps the crate compiling everywhere.
+    /// Linux stub. Host-process editor embedding via X11 is a later slice; this
+    /// keeps the crate compiling everywhere.
     pub struct ContentChildHwnd {
         _private: (),
     }
 
-    /// No native child is ever created off Windows, so nothing occludes an
+    /// No native child is ever created off Windows/macOS, so nothing occludes an
     /// ordinary popup and there is no owner to attach.
     pub fn place_owned_popup(
         _popup_hwnd: u64,

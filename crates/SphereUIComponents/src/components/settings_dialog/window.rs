@@ -78,6 +78,16 @@ impl SettingsWindow {
         this
     }
 
+    pub fn set_active_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if tab != SettingsTab::Recording && self.input_test_active {
+            self.stop_input_test(cx);
+        }
+        self.active_tab = tab;
+        self.open_hardware_combo = None;
+        self.hardware_combo_anchor = None;
+        cx.notify();
+    }
+
     /// Refresh the backend-scoped device list (and the Driver Status snapshot)
     /// for the current draft backend **off the UI thread**. Coalesced: while one
     /// refresh is in flight, callers are ignored; the next render re-checks and

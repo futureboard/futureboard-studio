@@ -146,28 +146,30 @@ impl JamWindow {
     }
 
     fn spawn_refresh(cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(REFRESH).await;
-            let alive = this
-                .update(cx, |this, cx| {
-                    // Read only. The controller's own poll thread advances the
-                    // published state, so closing this window does not stop a
-                    // jam that tracks are still listening to.
-                    let next = jam::snapshot();
-                    let changed = next.state_label != this.state.state_label
-                        || next.streams.len() != this.state.streams.len()
-                        || next.participants.len() != this.state.participants.len()
-                        || next.publishing != this.state.publishing;
-                    this.state = next;
-                    if changed {
-                        this.busy = None;
-                    }
-                    this.busy.take_if(|(_, at)| at.elapsed() >= STATUS_LINGER);
-                    cx.notify();
-                })
-                .is_ok();
-            if !alive {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REFRESH).await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        // Read only. The controller's own poll thread advances the
+                        // published state, so closing this window does not stop a
+                        // jam that tracks are still listening to.
+                        let next = jam::snapshot();
+                        let changed = next.state_label != this.state.state_label
+                            || next.streams.len() != this.state.streams.len()
+                            || next.participants.len() != this.state.participants.len()
+                            || next.publishing != this.state.publishing;
+                        this.state = next;
+                        if changed {
+                            this.busy = None;
+                        }
+                        this.busy.take_if(|(_, at)| at.elapsed() >= STATUS_LINGER);
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
             }
         })
         .detach();

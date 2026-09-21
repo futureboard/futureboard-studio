@@ -17,8 +17,27 @@ import { ModelPicker } from "./ModelPicker";
 type NamLoadStatus =
   | { kind: "idle" }
   | { kind: "loading"; name: string }
-  | { kind: "loaded"; name: string; receptiveField: number }
+  | {
+      kind: "loaded";
+      name: string;
+      receptiveField: number;
+      family?: string;
+      slimmable?: boolean;
+      submodelCount?: number;
+    }
   | { kind: "error"; name: string; message: string };
+
+function namLoadedLabel(status: Extract<NamLoadStatus, { kind: "loaded" }>): string {
+  const family =
+    status.family === "a2" || status.slimmable
+      ? status.submodelCount && status.submodelCount > 1
+        ? `NAM A2 (${status.submodelCount} quality tiers)`
+        : "NAM A2"
+      : status.family === "lstm"
+        ? "NAM LSTM"
+        : "NAM A1";
+  return `Loaded “${status.name}” · ${family} · ${status.receptiveField} sample receptive field`;
+}
 
 type ModuleEditorProps = {
   activeCat: CategoryId;
@@ -75,6 +94,9 @@ export function ModuleEditor({
             kind: "loaded",
             name: msg.name,
             receptiveField: msg.receptiveField,
+            family: msg.family,
+            slimmable: msg.slimmable,
+            submodelCount: msg.submodelCount,
           });
         } else {
           setNamStatus({
@@ -87,6 +109,10 @@ export function ModuleEditor({
     [],
   );
 
+  const visibleParams =
+    isNamCapture && namStatus.kind === "loaded" && !namStatus.slimmable
+      ? params.filter((p) => p.id !== "nam_slim_size")
+      : params;
   const paramValue = (id: string, fallback: number) =>
     params.find((p) => p.id === id)?.val ?? fallback;
   const handleCabParamChange = (id: string, value: number) =>
@@ -188,8 +214,7 @@ export function ModuleEditor({
                 aria-live="polite"
               >
                 {namStatus.kind === "loading" && `Loading “${namStatus.name}”…`}
-                {namStatus.kind === "loaded" &&
-                  `Loaded “${namStatus.name}” (${namStatus.receptiveField} sample receptive field)`}
+                {namStatus.kind === "loaded" && namLoadedLabel(namStatus)}
                 {namStatus.kind === "error" &&
                   `“${namStatus.name}” failed: ${namStatus.message}`}
               </div>
@@ -235,7 +260,7 @@ export function ModuleEditor({
           </div>
         ) : (
           <div className="param-bank">
-            {params.map((p) => (
+            {visibleParams.map((p) => (
               <Knob
                 key={p.id}
                 id={p.id}

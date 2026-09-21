@@ -42,7 +42,9 @@ impl GpuiPaintTimelineRenderer {
         // appear above later GPUI elements (clips/playhead/selection). We want
         // strict DOM child ordering: grid/regions must stay behind content.
         if timeline_layer_debug_enabled() {
-            eprintln!("[timeline paint] base->regions->grid (gpui_paint) w={grid_width:.1} h={grid_height:.1}");
+            eprintln!(
+                "[timeline paint] base->regions->grid (gpui_paint) w={grid_width:.1} h={grid_height:.1}"
+            );
         }
 
         for shade in &snapshot.bar_shades {

@@ -182,6 +182,8 @@ pub struct TransportChromeState {
     pub on_count_in_menu: BpmMenuCb,
     pub on_loop_toggle: ChromeActionCb,
     pub on_metronome_toggle: ChromeActionCb,
+    /// Opens the metronome volume / settings menu at the pointer position.
+    pub on_metronome_menu: BpmMenuCb,
     pub on_follow_toggle: ChromeActionCb,
     /// Right-click on FOLLOW: switch auto-scroll between paged and continuous.
     pub on_follow_mode_toggle: ChromeActionCb,
@@ -628,6 +630,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
     let on_count_in_menu = state.on_count_in_menu.clone();
     let on_loop = state.on_loop_toggle.clone();
     let on_metronome = state.on_metronome_toggle.clone();
+    let on_metronome_menu = state.on_metronome_menu.clone();
     let on_follow = state.on_follow_toggle.clone();
     let on_follow_mode = state.on_follow_mode_toggle.clone();
     let on_bpm_drag = state.on_bpm_drag.clone();
@@ -808,6 +811,94 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
                 ),
         );
 
+    let metronome_fill = if state.metronome_enabled {
+        Colors::composite(
+            Colors::surface_titlebar(),
+            Colors::with_alpha(Colors::accent_primary(), crate::theme::state::ARMED_WASH),
+        )
+    } else {
+        Colors::with_alpha(Colors::button_bg(), 0.0)
+    };
+    let metronome_hover = Colors::composite(metronome_fill, Colors::state_hover());
+    let on_metronome_menu_icon = on_metronome_menu.clone();
+    let metronome_split = div()
+        .h(px(crate::theme::size::DENSE))
+        .flex()
+        .flex_row()
+        .items_center()
+        .rounded(px(crate::theme::radius::CONTROL_SM))
+        .overflow_hidden()
+        .border(px(1.0))
+        .border_color(if state.metronome_enabled {
+            Colors::with_alpha(Colors::accent_primary(), crate::theme::state::ARMED_BORDER)
+        } else {
+            Colors::button_border()
+        })
+        .child(
+            div()
+                .id("transport-metronome")
+                .role(Role::Button)
+                .aria_label(label_metronome.clone())
+                .aria_toggled(if state.metronome_enabled {
+                    Toggled::True
+                } else {
+                    Toggled::False
+                })
+                .flex()
+                .items_center()
+                .h_full()
+                .px(px(crate::theme::space::SNUG))
+                .bg(metronome_fill)
+                .text_color(metronome_color)
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(metronome_hover))
+                .tooltip(fb_tooltip("Metronome"))
+                .on_click(move |_, window, cx| on_metronome(&(), window, cx))
+                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    on_metronome_menu_icon(&(x, y), window, cx);
+                })
+                .occlude()
+                .child(
+                    svg()
+                        .path(assets::ICON_METRONOME_PATH)
+                        .w(px(13.0))
+                        .h(px(13.0))
+                        .text_color(metronome_color),
+                ),
+        )
+        .child(div().w(px(1.0)).h_full().bg(Colors::border_subtle()))
+        .child(
+            div()
+                .id("transport-metronome-menu")
+                .role(Role::Button)
+                .aria_label("Metronome settings")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h_full()
+                .w(px(14.0))
+                .bg(metronome_fill)
+                .text_color(Colors::text_muted())
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(metronome_hover))
+                .tooltip(fb_tooltip("Metronome volume and settings"))
+                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    on_metronome_menu(&(x, y), window, cx);
+                })
+                .occlude()
+                .child(
+                    svg()
+                        .path(assets::ICON_CHEVRON_DOWN_PATH)
+                        .w(px(9.0))
+                        .h(px(9.0))
+                        .text_color(Colors::text_muted()),
+                ),
+        );
+
     let mode_group = chrome_cluster()
         .child(chrome_action_button(
             "transport-loop",
@@ -817,14 +908,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             loop_color,
             on_loop,
         ))
-        .child(chrome_action_button(
-            "transport-metronome",
-            assets::ICON_METRONOME_PATH,
-            label_metronome,
-            Some(state.metronome_enabled),
-            metronome_color,
-            on_metronome,
-        ))
+        .child(metronome_split)
         .child(
             chrome_action_button(
                 "transport-follow-playhead",

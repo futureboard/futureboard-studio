@@ -2427,7 +2427,9 @@ impl Drop for PluginEditorWindow {
             } else if let Some(client) = host.client.as_mut() {
                 let _ = client.close_editor(id.clone());
             }
-            eprintln!("[plugin-view][host] CloseEditor sent editor_id={id} (drop) — tearing down content HWND + host process");
+            eprintln!(
+                "[plugin-view][host] CloseEditor sent editor_id={id} (drop) — tearing down content HWND + host process"
+            );
             return;
         }
         if self.embed_handle.take().is_some() {

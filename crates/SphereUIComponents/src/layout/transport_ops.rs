@@ -359,7 +359,11 @@ impl StudioLayout {
             event,
             timeline.state.transport.playing,
             timeline.state.transport.recording,
-            self.recording.preview.values().next().map(|p| p.recording_id),
+            self.recording
+                .preview
+                .values()
+                .next()
+                .map(|p| p.recording_id),
             action
         );
     }
@@ -445,6 +449,25 @@ impl StudioLayout {
         let on_stop = make_command_handler("transport:stop");
         let on_loop_toggle = make_command_handler("transport:toggle-loop");
         let on_metronome_toggle = make_command_handler("transport:toggle-metronome");
+        let on_metronome_menu: components::BpmMenuCb = {
+            let this = cx.entity().clone();
+            Arc::new(
+                move |pos: &(f32, f32), window: &mut Window, cx: &mut gpui::App| {
+                    let (x, y) = *pos;
+                    let _ = this.update(cx, |this, cx| {
+                        this.try_open_context_menu(
+                            ContextMenuRequest::from_window(
+                                window,
+                                x,
+                                y,
+                                ContextMenuTarget::Extended(ContextTarget::Metronome),
+                            ),
+                            cx,
+                        );
+                    });
+                },
+            )
+        };
         let on_follow_toggle = make_command_handler("transport:toggle-follow-playhead");
         let on_follow_mode_toggle = make_command_handler("transport:toggle-autoscroll-mode");
         let on_record = make_command_handler("transport:record");
@@ -647,6 +670,7 @@ impl StudioLayout {
             on_count_in_menu,
             on_loop_toggle,
             on_metronome_toggle,
+            on_metronome_menu,
             on_follow_toggle,
             on_follow_mode_toggle,
             on_set_bpm,

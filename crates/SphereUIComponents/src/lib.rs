@@ -93,6 +93,7 @@ pub use SpherePluginHost::process_manager::PluginHostProcessManager;
 pub mod splash;
 pub mod startup;
 pub mod theme;
+pub mod tone3000;
 pub mod user_manual;
 pub mod welcome;
 

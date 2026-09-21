@@ -398,7 +398,9 @@ fn fs_handle(in: HandleOut) -> @location(0) vec4<f32> {
             let gpu = slot.get_or_insert_with(|| match LaneGpu::new() {
                 Ok(gpu) => Some(gpu),
                 Err(error) => {
-                    eprintln!("[gpu-renderer] controller lane WGPU unavailable: {error}; using GPUI paint");
+                    eprintln!(
+                        "[gpu-renderer] controller lane WGPU unavailable: {error}; using GPUI paint"
+                    );
                     None
                 }
             });

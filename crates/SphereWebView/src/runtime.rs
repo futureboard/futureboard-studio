@@ -975,7 +975,7 @@ fn platform_set_bounds(
     handle: cef::sys::cef_window_handle_t,
     bounds: WindowBounds,
 ) -> Result<(), CefRuntimeError> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
     let ok = unsafe {
         SetWindowPos(
             handle.0.cast(),

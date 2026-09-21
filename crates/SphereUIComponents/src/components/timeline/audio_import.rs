@@ -433,14 +433,16 @@ pub async fn run_import_pipeline(
     match probe {
         Ok(info) => {
             eprintln!(
-                    "[audio-import] metadata read path={} sr={} ch={} frames={} duration={:.3}s size={}",
-                    key,
-                    info.sample_rate,
-                    info.channels,
-                    info.total_frames,
-                    info.duration_seconds,
-                    std::fs::metadata(&path_for_job).map(|m| m.len()).unwrap_or(0)
-                );
+                "[audio-import] metadata read path={} sr={} ch={} frames={} duration={:.3}s size={}",
+                key,
+                info.sample_rate,
+                info.channels,
+                info.total_frames,
+                info.duration_seconds,
+                std::fs::metadata(&path_for_job)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            );
             let format = info.format.as_str().to_string();
             let path_key = key.clone();
             let changed = timeline_probe

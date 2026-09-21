@@ -191,11 +191,19 @@ impl Render for StudioLayout {
         let on_tempo_point_edit: components::timeline::timeline::TempoPointEditCb = {
             let this = cx.entity().clone();
             std::sync::Arc::new(
-                move |point_id: &str, _window: &mut Window, cx: &mut gpui::App| {
+                move |point_id: &str, window: &mut Window, cx: &mut gpui::App| {
                     let point_id = point_id.to_string();
-                    let _ = this.update(cx, |this, cx| {
-                        this.begin_bpm_edit(Some(point_id), cx);
-                    });
+                    // Double-click on a Tempo Track marker fires from Timeline's
+                    // `cx.listener`. `begin_bpm_edit` reads Timeline for the
+                    // marker BPM, so wait until that lease ends.
+                    StudioLayout::defer_update_in_window(
+                        &this,
+                        window,
+                        cx,
+                        move |this, _window, cx| {
+                            this.begin_bpm_edit(Some(point_id), cx);
+                        },
+                    );
                 },
             )
         };

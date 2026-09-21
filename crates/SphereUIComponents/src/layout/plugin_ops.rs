@@ -372,7 +372,9 @@ impl StudioLayout {
                     plugin_instance_id,
                     name,
                 }) => {
-                    eprintln!("[plugin-bridge] event PluginLoaded instance={plugin_instance_id} name={name}");
+                    eprintln!(
+                        "[plugin-bridge] event PluginLoaded instance={plugin_instance_id} name={name}"
+                    );
                     eprintln!(
                         "[PluginRestore] loaded insert instance={plugin_instance_id} name={name}"
                     );
@@ -395,9 +397,13 @@ impl StudioLayout {
                     error,
                     receptive_field,
                     full_rig,
+                    architecture,
+                    family,
+                    slimmable,
+                    submodel_count,
                 }) => {
                     eprintln!(
-                        "[plugin-bridge] event BuiltinNamCaptureResult instance={plugin_instance_id} ok={ok} name={name} error={error:?}"
+                        "[plugin-bridge] event BuiltinNamCaptureResult instance={plugin_instance_id} ok={ok} name={name} error={error:?} family={family}"
                     );
                     // Route into whichever shared built-in editor is bound to
                     // this insert; the window checks the match itself.
@@ -410,6 +416,10 @@ impl StudioLayout {
                                 error.as_deref(),
                                 receptive_field,
                                 full_rig,
+                                &architecture,
+                                &family,
+                                slimmable,
+                                submodel_count,
                             );
                         });
                     }
@@ -446,7 +456,9 @@ impl StudioLayout {
                     plugin_instance_id,
                     error,
                 }) => {
-                    eprintln!("[plugin-bridge] event PluginLoadFailed instance={plugin_instance_id} error={error}");
+                    eprintln!(
+                        "[plugin-bridge] event PluginLoadFailed instance={plugin_instance_id} error={error}"
+                    );
                     if let Ok(mut bridge) = runtime.lock() {
                         bridge.mark_plugin_load_failed(&plugin_instance_id);
                     }
@@ -1982,8 +1994,7 @@ impl StudioLayout {
         }
         eprintln!(
             "[EDITOR OPEN GATE]\nplugin_instance_id={insert_id}\nruntime_state={runtime_state_for_open:?}\nload_status={load_status:?}\nplugin_load_state={load_status:?}\neditor_state={editor_state}\nbridge_instance_exists={bridge_loaded_for_open}\nplugin_host_alive={plugin_host_alive}\ncontroller_known={controller_known}\neditor_created={editor_created}\npending_editor_open={pending_editor_open}\ncontent_hwnd=0x{content_hwnd:x}\ncontent_size={}x{}\nallowed={gate_allowed}\nblock_reason={block_reason}",
-            content_size.0,
-            content_size.1
+            content_size.0, content_size.1
         );
         if !gate_allowed
             && !matches!(
@@ -2094,7 +2105,9 @@ impl StudioLayout {
                 return;
             }
             if debug {
-                eprintln!("[plugin-view] stale editor handle track={track_id} slot={insert_id} → recreating");
+                eprintln!(
+                    "[plugin-view] stale editor handle track={track_id} slot={insert_id} → recreating"
+                );
             }
             self.plugin_editors.open.remove(&key);
         }
@@ -3205,7 +3218,9 @@ impl StudioLayout {
             plugin_is_instrument,
         )) = descriptor
         else {
-            eprintln!("[PluginAdd] plugin instance failed to create reason=plugin_not_in_registry id={plugin_id}");
+            eprintln!(
+                "[PluginAdd] plugin instance failed to create reason=plugin_not_in_registry id={plugin_id}"
+            );
             self.plugin_picker = PluginPickerState::closed();
             cx.notify();
             return None;
@@ -3375,7 +3390,9 @@ impl StudioLayout {
                                     )
                                 };
                                 if let Err(error) = load_result {
-                                    eprintln!("[plugin-runtime] external bridge LoadPlugin failed: {error}");
+                                    eprintln!(
+                                        "[plugin-runtime] external bridge LoadPlugin failed: {error}"
+                                    );
                                     load_dispatch_failed = true;
                                     let _ = self.timeline.update(cx, |timeline, _cx| {
                                         timeline.state.set_insert_runtime(
@@ -3440,7 +3457,9 @@ impl StudioLayout {
                     }
                 }
             } else {
-                eprintln!("[plugin-runtime] backend=in_process reason=FUTUREBOARD_PLUGIN_LEGACY_IN_PROCESS=1");
+                eprintln!(
+                    "[plugin-runtime] backend=in_process reason=FUTUREBOARD_PLUGIN_LEGACY_IN_PROCESS=1"
+                );
                 eprintln!("[plugin-runtime] WARNING using legacy in-process plugin runtime");
                 eprintln!(
                     "[plugin-runtime] legacy path may hang GPU/browser-backed plugin editors"
@@ -4508,8 +4527,8 @@ impl StudioLayout {
                             if let Some(state) = slot.vst3_state.as_ref() {
                                 if let Err(error) = runtime.send_plugin_state(slot_id, state) {
                                     eprintln!(
-                                    "[PluginRestore] SetPluginState send failed instance={slot_id}: {error}"
-                                );
+                                        "[PluginRestore] SetPluginState send failed instance={slot_id}: {error}"
+                                    );
                                 }
                             }
                         }

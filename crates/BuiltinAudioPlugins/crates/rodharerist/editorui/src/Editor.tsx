@@ -862,6 +862,14 @@ export function RodhareistEditor({
     [loadNamCapture],
   );
 
+  const prepareNamEngine = useCallback(() => {
+    setStageModels((prev) => ({ ...prev, amp: "nam_capture" }));
+    if (liveRef.current.activeCat === "amp") setActiveModelId("nam_capture");
+    postModel(categories.amp.node, "nam_capture");
+    flushParamEditsNow();
+    markDirty();
+  }, [markDirty]);
+
   /// A successful IR load switches the Cabinet slot to the convolution
   /// engine — the user clicked an IR to hear it, not to park it. The DSP
   /// keeps the loaded IR either way, so switching back to a modeled voicing
@@ -1291,6 +1299,7 @@ export function RodhareistEditor({
       buildSavePayload={buildSavePayload}
       buildFactorySnapshot={factorySnapshot}
       onLoadNamFile={loadNamFile}
+      onPrepareNamEngine={prepareNamEngine}
       onIrLoaded={onIrLoaded}
       onToggleTest={() => void toggleTest()}
       onSave={saveRig}

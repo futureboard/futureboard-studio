@@ -1875,6 +1875,24 @@ impl StudioLayout {
                 }
                 entries
             }
+            ContextTarget::Metronome => {
+                let volume = self.settings.read(cx).current.recording.metronome.volume;
+                let mut entries = vec![ContextMenuEntry::Header("Click Volume".to_string())];
+                for percent in [25u32, 50, 75, 100] {
+                    let selected = (volume * 100.0 - percent as f32).abs() < 2.5;
+                    entries.push(ContextMenuEntry::checked_item(
+                        format!("{percent}%"),
+                        format!("metronome:set-volume:{percent}"),
+                        selected,
+                    ));
+                }
+                entries.push(ContextMenuEntry::Separator);
+                entries.push(ContextMenuEntry::item(
+                    "Metronome Settings…",
+                    "settings:open-metronome",
+                ));
+                entries
+            }
             ContextTarget::TempoTrack {
                 beat,
                 bpm,

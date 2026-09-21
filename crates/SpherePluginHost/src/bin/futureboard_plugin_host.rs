@@ -2447,7 +2447,13 @@ fn boost_audio_producer_thread() {
             ) == 0;
         eprintln!(
             "[plugin-host-audio] producer qos_user_interactive={qos_ok} mach_time_constraint={rt_ok} fallback={}",
-            if rt_ok { "none" } else if qos_ok { "qos" } else { "default" }
+            if rt_ok {
+                "none"
+            } else if qos_ok {
+                "qos"
+            } else {
+                "default"
+            }
         );
     }
 }
@@ -3578,6 +3584,10 @@ fn dispatch(
                         error: None,
                         receptive_field: info.receptive_field as u64,
                         full_rig: info.full_rig,
+                        architecture: info.architecture,
+                        family: info.family,
+                        slimmable: info.slimmable,
+                        submodel_count: info.submodel_count as u64,
                     }
                 }
                 Err(error) => {
@@ -3591,6 +3601,10 @@ fn dispatch(
                         error: Some(error),
                         receptive_field: 0,
                         full_rig,
+                        architecture: String::new(),
+                        family: String::new(),
+                        slimmable: false,
+                        submodel_count: 0,
                     }
                 }
             };
@@ -4071,8 +4085,8 @@ fn dispatch(
                 let sr = region.bridge().sample_rate.load(Ordering::Relaxed);
                 let block = region.bridge().max_block_size.load(Ordering::Relaxed);
                 eprintln!(
-                        "[plugin-host-bridge] AttachSharedAudio instance={plugin_instance_id} name={name} bytes={bytes} attached=true header_sr={sr} header_block={block}"
-                    );
+                    "[plugin-host-bridge] AttachSharedAudio instance={plugin_instance_id} name={name} bytes={bytes} attached=true header_sr={sr} header_block={block}"
+                );
                 region.bridge().set_dsp_output_ready(true);
                 if let Ok(mut slots) = region_slots.lock() {
                     let key = if plugin_instance_id.is_empty() {
@@ -4095,8 +4109,8 @@ fn dispatch(
             }
             Err(error) => {
                 eprintln!(
-                        "[plugin-host-bridge] AttachSharedAudio name={name} attached=false error={error}"
-                    );
+                    "[plugin-host-bridge] AttachSharedAudio name={name} attached=false error={error}"
+                );
                 let _ = ipc::write_frame(
                     out,
                     &HostEvent::SharedAudioAttached {

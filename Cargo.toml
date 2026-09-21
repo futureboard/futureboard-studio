@@ -152,9 +152,9 @@ verbspace = { path = "crates/BuiltinAudioPlugins/crates/verbspace" }
 
 # MIT/Apache-2.0 DSP libraries used by BuiltinAudioPlugins.
 biquad = "0.6"
-# Pure-Rust, real-time-safe .nam (Neural Amp Modeler) inference — used by
-# rodharerist's NAM Capture tone engine.
-nam-rs = "0.3"
+# Pure-Rust, real-time-safe .nam inference — used by rodharerist's NAM A2
+# capture engine (WaveNet A1/A2, LSTM, SlimmableContainer).
+nam-rs = "0.4"
 # `std` required (fundsp no_std path currently misses Vec imports in resample).
 # Keep `files`/`fft` off to avoid pulling Symphonia into stock synth DSP.
 fundsp = { version = "0.23", default-features = false, features = ["std"] }
@@ -630,7 +630,7 @@ rustysynth = { path = "external/rustysynth" }
 # =============================================================================
 
 # Realtime DSP must run optimized even in dev builds: NAM neural inference
-# (nam-rs WaveNet/LSTM) and the 4×/8× oversampled amp core cannot hit realtime
+# (nam-rs WaveNet/LSTM/A2 Slimmable) and the 4×/8× oversampled amp core cannot hit realtime
 # at opt-level 0 — debug builds audibly stutter without these overrides.
 [profile.dev.package.nam-rs]
 opt-level = 3

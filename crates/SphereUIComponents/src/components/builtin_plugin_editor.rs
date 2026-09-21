@@ -558,13 +558,14 @@ pub struct ViewRect {
 /// Whether built-in editors are hosted off-screen (OSR) or as a native CEF
 /// child window.
 ///
-/// Windows hosts them **windowed**: the editor shell creates a real `WS_CHILD`
-/// content HWND (`plugin_content_host`) and CEF owns a child browser window
-/// inside it, so Chromium paints, composites, and receives input directly —
-/// no shared-texture copy, no frame republishing through the GPUI atlas, no
-/// synthesized input. Other platforms retain the software off-screen path
-/// until their compositor-specific native embedding is enabled.
-pub const OFFSCREEN_HOSTING: bool = cfg!(not(target_os = "windows"));
+/// Windows and macOS host them **windowed**: the editor shell creates a real
+/// content child (`plugin_content_host` HWND, or an AppKit container via
+/// `plugin_editor_mac_region`) and CEF owns a child browser inside it, so
+/// Chromium paints, composites, and receives input directly — no shared-texture
+/// copy, no frame republishing through the GPUI atlas, no synthesized input.
+/// Linux retains the software off-screen path until its native embedding is
+/// enabled.
+pub const OFFSCREEN_HOSTING: bool = cfg!(not(any(target_os = "windows", target_os = "macos")));
 
 /// Optional synchronous GPU sink supplied by the GPUI editor window.
 #[cfg(feature = "builtin-plugin-editor")]
@@ -778,7 +779,8 @@ mod imp {
     };
     use sphere_webview::runtime::cef::rc::Rc as _;
     use sphere_webview::runtime::{
-        CefRuntime, CefRuntimeConfig, NativeParent, WebView, WebViewConfig, WindowBounds,
+        CefRuntime, CefRuntimeConfig, CefRuntimeError, NativeParent, WebView, WebViewConfig,
+        WindowBounds,
     };
     use sphere_webview::scheme::{register_plugin_scheme_factory, BridgeSink, SchemeAsset};
 
@@ -865,8 +867,8 @@ mod imp {
     }
 
     /// Physical rect plus the scale it was measured at. Off-screen browsers are
-    /// told a *logical* size and render at `scale`; a windowed child ignores the
-    /// scale and uses the physical rect directly.
+    /// told a *logical* size and render at `scale`. A windowed Win32 child uses
+    /// the physical rect directly; a windowed AppKit child is placed in points.
     #[derive(Debug, Clone, Copy)]
     struct PendingBounds {
         rect: ViewRect,
@@ -1151,10 +1153,10 @@ mod imp {
                 Ok(subprocess) => subprocess,
                 Err(error) => return remember_runtime_failure(error.to_string()),
             },
-            // Chromium decides this once, at initialize. Windows hosts every
-            // built-in editor (and the warm-up browser) as a native child
-            // window, and CEF advises against enabling OSR support in a
-            // process that never uses it; the other platforms are OSR-hosted.
+            // Chromium decides this once, at initialize. Windows and macOS
+            // host every built-in editor as a native child, and CEF advises
+            // against enabling OSR support in a process that never uses it;
+            // Linux is still OSR-hosted.
             windowless_rendering: super::OFFSCREEN_HOSTING,
             ..Default::default()
         };
@@ -1389,11 +1391,15 @@ mod imp {
         let Some(origin) = origin_for_plugin_id(plugin_id) else {
             return Err(HostAvailability::NoEditorForPlugin(plugin_id.to_string()));
         };
-        // Windowed (Windows): `parent_hwnd` is the shell's content child and
-        // the browser fills it. Off-screen: no native parent is required; one
-        // supplied anyway is used only for monitor info and dialog ownership.
-        WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
-            .map_err(|e| HostAvailability::RuntimeFailed(e.to_string()))?;
+        // Windowed: `parent_hwnd` is the shell's content child and the browser
+        // fills it. Off-screen: no native parent is required; one supplied
+        // anyway is used only for monitor info and dialog ownership.
+        if super::OFFSCREEN_HOSTING {
+            WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
+        } else {
+            windowed_fill_bounds(rect, scale_factor)
+        }
+        .map_err(|e| HostAvailability::RuntimeFailed(e.to_string()))?;
 
         let accelerated_sink = if crate::boot::has_flag("--disable-shared-texture")
             || std::env::var_os("FUTUREBOARD_DISABLE_SHARED_TEXTURE").is_some()
@@ -1465,6 +1471,28 @@ mod imp {
             ((rect.width as f32) / scale).round().max(1.0) as i32,
             ((rect.height as f32) / scale).round().max(1.0) as i32,
         )
+    }
+
+    /// Bounds for a windowed CEF child that fills its content parent.
+    ///
+    /// Win32 child HWNDs are physical pixels. AppKit frames are points, so a
+    /// Retina physical rect has to be divided by the scale the shell measured
+    /// it at — otherwise the browser is created at 2× and overflows the
+    /// container.
+    fn windowed_fill_bounds(
+        rect: ViewRect,
+        scale_factor: f32,
+    ) -> Result<WindowBounds, CefRuntimeError> {
+        #[cfg(target_os = "macos")]
+        {
+            let (width, height) = logical_size(rect, scale_factor);
+            WindowBounds::new(0, 0, width, height)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = scale_factor;
+            WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
+        }
     }
 
     /// Frame counter for `view_id`'s off-screen surface. `0` while the browser
@@ -1833,8 +1861,12 @@ mod imp {
                         });
                         let (mut client, lifecycle) =
                             plugin_browser_client_with_surface(&url, surface.clone());
-                        let result = WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
-                            .map_err(|error| error.to_string())
+                        let result = if surface.is_some() {
+                            WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
+                        } else {
+                            windowed_fill_bounds(rect, bounds_command.scale_factor)
+                        }
+                        .map_err(|error| error.to_string())
                             .and_then(|bounds| {
                                 let mut config = WebViewConfig::new(url, bounds);
                                 if let Some(surface) = surface {
@@ -1923,8 +1955,8 @@ mod imp {
                     if let Some(PendingBounds { rect, scale_factor }) = pending.bounds {
                         if let Some(hosted) = host.views.get_mut(&view_id) {
                             hosted.bounds = PendingBounds { rect, scale_factor };
-                            // A windowed child is placed with the physical rect;
-                            // an off-screen browser is told the logical size it
+                            // A windowed child fills its content parent; an
+                            // off-screen browser is told the logical size it
                             // should lay out at, and the scale it renders with.
                             let bounds = match hosted.view.osr_surface() {
                                 Some(surface) => {
@@ -1937,7 +1969,7 @@ mod imp {
                                     screen_info_stale |= change.scale_changed;
                                     WindowBounds::new(0, 0, width, height)
                                 }
-                                None => WindowBounds::new(rect.x, rect.y, rect.width, rect.height),
+                                None => windowed_fill_bounds(rect, scale_factor),
                             };
                             if let Ok(bounds) = bounds {
                                 // `set_bounds` already issues `WasResized`, which
@@ -2367,5 +2399,20 @@ mod tests {
 
         builtin_state_remove(insert);
         builtin_state_remove(seeded_insert);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn desktop_hosts_builtin_editors_as_native_children() {
+        assert!(
+            !OFFSCREEN_HOSTING,
+            "Windows and macOS must host built-in editors windowed so Chromium owns paint and input"
+        );
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[test]
+    fn linux_hosts_builtin_editors_off_screen() {
+        assert!(OFFSCREEN_HOSTING);
     }
 }

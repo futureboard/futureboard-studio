@@ -106,7 +106,9 @@ mod imp {
         eprintln!("[gpu-editor-diagnostics] plugin_instance_id={plugin_instance_id}");
         eprintln!("[gpu-editor-diagnostics] plugin_path={plugin_path}");
         eprintln!("[gpu-editor-diagnostics] editor_ownership=main_owned");
-        eprintln!("[gpu-editor-diagnostics] shell_hwnd=0x{shell_hwnd:x} content_hwnd=0x{content_hwnd:x} host_hwnd=0x{host_hwnd:x}");
+        eprintln!(
+            "[gpu-editor-diagnostics] shell_hwnd=0x{shell_hwnd:x} content_hwnd=0x{content_hwnd:x} host_hwnd=0x{host_hwnd:x}"
+        );
 
         let mut ctx = EnumCtx {
             children: Vec::new(),

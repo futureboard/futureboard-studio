@@ -849,6 +849,10 @@ pub struct Params {
     pub nam_output_trim_db: f32, // -24..24
     pub nam_mix: f32,            // 0..100 % wet
     pub nam_loudness_norm: bool,
+    /// NAM A2 SlimmableContainer width dial, 0..100 % (100 = full quality).
+    /// Ignored by a single WaveNet/LSTM capture.
+    #[serde(default = "default_nam_slim_size")]
+    pub nam_slim_size: f32,
 
     /// The second instance of each doublable stage (`StageKind::Drive2` and
     /// friends). Absent from a pre-v4 save; `Default` then supplies a full,
@@ -1042,6 +1046,9 @@ fn default_delay_tone() -> f32 {
 fn default_reverb_shimmer() -> f32 {
     62.0
 }
+fn default_nam_slim_size() -> f32 {
+    100.0
+}
 fn default_comp_thresh() -> f32 {
     -24.0
 }
@@ -1137,6 +1144,7 @@ pub fn default_params() -> Params {
         nam_output_trim_db: 0.0,
         nam_mix: 100.0,
         nam_loudness_norm: true,
+        nam_slim_size: default_nam_slim_size(),
         stage_b: StageBParams::default(),
     }
 }
@@ -1709,6 +1717,7 @@ impl Dsp {
             nam_output_trim_db: clamp(params.nam_output_trim_db, -24.0, 24.0),
             nam_mix: clamp(params.nam_mix, 0.0, 100.0),
             nam_loudness_norm: params.nam_loudness_norm,
+            nam_slim_size: clamp(params.nam_slim_size, 0.0, 100.0),
             stage_b: params.stage_b.clamped(),
         };
         self.apply_params();
@@ -1858,6 +1867,7 @@ impl Dsp {
             p.nam_output_trim_db,
             p.nam_mix,
             p.nam_loudness_norm,
+            p.nam_slim_size / 100.0,
         );
         self.mod_stage
             .configure(p.mod_model, p.chorus_rate, p.chorus_depth, p.chorus_mix);
@@ -2131,6 +2141,7 @@ pub fn apply_to_params(p: &mut Params, id: &str, value: f32) -> bool {
         "nam_output_trim" => p.nam_output_trim_db = value,
         "nam_mix" => p.nam_mix = value,
         "nam_loudness_norm" => p.nam_loudness_norm = on,
+        "nam_slim_size" => p.nam_slim_size = value,
 
         // Second instances. Same knob names with the stage's `2` suffix, so an
         // id reads as "which block" then "which knob" — `chorus2_rate` is the
@@ -2274,6 +2285,7 @@ pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
     out.push(("nam_output_trim", p.nam_output_trim_db));
     out.push(("nam_mix", p.nam_mix));
     out.push(("nam_loudness_norm", b(p.nam_loudness_norm)));
+    out.push(("nam_slim_size", p.nam_slim_size));
 
     let sb = &p.stage_b;
     out.push(("drive2_on", b(sb.drive_on)));

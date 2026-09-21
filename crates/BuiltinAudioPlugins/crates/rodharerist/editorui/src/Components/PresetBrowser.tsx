@@ -1,11 +1,12 @@
-// Compact tabbed sidebar: PRESET | IR | NAM, backed by real files under
+// Compact tabbed sidebar: PRESET | IR | NAM A2, backed by real files under
 // Documents/Futureboard Studio/Rodhareist/{Presets, IRs, NAMs} via the
-// native file bridge (list/read/write postMessages). Listings rebuild
-// wholesale on tab switch and after every write — never diffed.
+// native file bridge (list/read/write postMessages), plus TONE3000 NAM A2
+// search/download (native owns the API key; this page never sees it).
 //
 // Presets and NAMs are text, so they come back through `readFile`. IRs are
 // binary `.wav`: the page sends only the file name (`postLoadIr`) and native
-// reads the bytes itself — see `instanceBridge.ts`.
+// reads the bytes itself — see `instanceBridge.ts`. TONE3000 loads send only
+// a tone id; native fetches the A2 file and loads the NAM engine.
 
 import { useEffect, useRef, useState } from "react";
 import { postLoadIr, subscribeIrLoadResult } from "../bridge";
@@ -13,9 +14,13 @@ import {
   onNativeMessage,
   postListFiles,
   postReadFile,
+  postTone3000LoadTone,
+  postTone3000Search,
+  postTone3000Status,
   postWriteFile,
   type FileEntry,
   type FileKind,
+  type Tone3000ToneCard,
 } from "../instanceBridge";
 import {
   parsePresetFile,
@@ -35,6 +40,8 @@ type PresetBrowserProps = {
   buildFactorySnapshot: (id: string) => RigSnapshot | null;
   /** Route a `.nam` file's text into the amp slot's NAM engine. */
   onLoadNamFile: (name: string, json: string) => void;
+  /** Switch the amp slot to NAM A2 before a TONE3000 load. */
+  onPrepareNamEngine?: () => void;
   /** Called after an IR loads, so the editor can switch the cabinet slot to
    * the convolution engine — loading and selecting are separate steps. */
   onIrLoaded?: (name: string) => void;
@@ -43,8 +50,10 @@ type PresetBrowserProps = {
 const TABS: { kind: FileKind; label: string }[] = [
   { kind: "presets", label: "Preset" },
   { kind: "irs", label: "IR" },
-  { kind: "nams", label: "NAM" },
+  { kind: "nams", label: "NAM A2" },
 ];
+
+type NamSource = "local" | "tone3000";
 
 /** `"01A Twin Sparkle.json"` → `{ pid: "01A", pname: "Twin Sparkle" }`. */
 function displayParts(fileName: string): { pid: string; pname: string } {
@@ -63,6 +72,7 @@ export function PresetBrowser({
   buildSavePayload,
   buildFactorySnapshot,
   onLoadNamFile,
+  onPrepareNamEngine,
   onIrLoaded,
 }: PresetBrowserProps) {
   const [tab, setTab] = useState<FileKind>("presets");
@@ -73,18 +83,21 @@ export function PresetBrowser({
   const [status, setStatus] = useState<string | null>(null);
   /** File name of the IR the DSP currently has loaded, if any. */
   const [loadedIr, setLoadedIr] = useState<string | null>(null);
+  const [namSource, setNamSource] = useState<NamSource>("local");
+  const [tone3000Configured, setTone3000Configured] = useState<boolean | null>(null);
+  const [tone3000Error, setTone3000Error] = useState<string | null>(null);
+  const [tone3000Tones, setTone3000Tones] = useState<Tone3000ToneCard[]>([]);
+  const [tone3000Loading, setTone3000Loading] = useState(false);
+  const [loadedToneId, setLoadedToneId] = useState<number | null>(null);
   const seededRef = useRef(false);
   const pendingSeedWrites = useRef(0);
+  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // One native-message subscription drives everything: listings, read
-  // results (preset load / NAM load), and write acks (refresh + status).
   useEffect(
     () =>
       onNativeMessage((msg) => {
         if (msg.type === "futureboard.fileList") {
           setLists((prev) => ({ ...prev, [msg.kind]: msg.files }));
-          // First-run factory seeding: empty Presets folder → write the
-          // factory set once, then re-list when the last ack arrives.
           if (
             msg.kind === "presets" &&
             msg.files.length === 0 &&
@@ -126,14 +139,47 @@ export function PresetBrowser({
           } else if (msg.kind === "nams") {
             onLoadNamFile(msg.fileName.replace(/\.nam$/i, ""), msg.content);
           }
+        } else if (msg.type === "futureboard.tone3000Status") {
+          setTone3000Configured(msg.configured);
+          setTone3000Error(msg.configured ? null : (msg.error ?? null));
+        } else if (msg.type === "futureboard.tone3000SearchResult") {
+          setTone3000Loading(false);
+          if (!msg.ok) {
+            setTone3000Tones([]);
+            setTone3000Error(msg.error ?? "TONE3000 search failed");
+            return;
+          }
+          setTone3000Error(null);
+          setTone3000Tones(msg.tones);
+        } else if (msg.type === "futureboard.tone3000LoadResult") {
+          if (!msg.ok) {
+            setLoadedToneId(null);
+            setStatus(`TONE3000 failed: ${msg.error ?? "unknown"}`);
+            return;
+          }
+          setLoadedToneId(msg.toneId);
+          setStatus(
+            msg.fileName
+              ? `TONE3000: loaded ${msg.name}`
+              : `TONE3000: loading ${msg.name}…`,
+          );
+        } else if (msg.type === "futureboard.namCaptureResult") {
+          if (msg.ok) {
+            const badge =
+              msg.family === "a2"
+                ? "NAM A2"
+                : msg.family === "lstm"
+                  ? "NAM LSTM"
+                  : "NAM";
+            setStatus(`Loaded ${badge}: ${msg.name}`);
+          } else {
+            setStatus(`NAM failed: ${msg.error ?? "unknown"}`);
+          }
         }
       }),
-    // Stable callbacks come from Editor's useCallback wrappers.
     [buildFactorySnapshot, onLoadPresetFile, onLoadNamFile],
   );
 
-  // IR loads report back on their own channel (the bytes never came through
-  // the page, so there is no `fileContent` message to hang this off).
   useEffect(
     () =>
       subscribeIrLoadResult((result) => {
@@ -156,10 +202,23 @@ export function PresetBrowser({
     [onIrLoaded],
   );
 
-  // Initial + per-tab listing.
   useEffect(() => {
     postListFiles(tab);
+    if (tab === "nams") postTone3000Status();
   }, [tab]);
+
+  useEffect(() => {
+    if (tab !== "nams" || namSource !== "tone3000") return;
+    if (tone3000Configured === false) return;
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(() => {
+      setTone3000Loading(true);
+      postTone3000Search(query, 1);
+    }, query.trim() ? 220 : 0);
+    return () => {
+      if (searchTimer.current) clearTimeout(searchTimer.current);
+    };
+  }, [tab, namSource, query, tone3000Configured]);
 
   const entries = (lists[tab] ?? []).filter((f) =>
     f.fileName.toLowerCase().includes(query.trim().toLowerCase()),
@@ -180,6 +239,8 @@ export function PresetBrowser({
     setSaveName("");
   };
 
+  const showTone3000 = tab === "nams" && namSource === "tone3000";
+
   return (
     <aside className="browser">
       <div className="browser-tabs" role="tablist" aria-label="Plugin files">
@@ -197,59 +258,137 @@ export function PresetBrowser({
         ))}
       </div>
 
+      {tab === "nams" && (
+        <div className="browser-source" role="tablist" aria-label="NAM source">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={namSource === "local"}
+            className={`browser-source-btn${namSource === "local" ? " active" : ""}`}
+            onClick={() => setNamSource("local")}
+          >
+            Local
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={namSource === "tone3000"}
+            className={`browser-source-btn${namSource === "tone3000" ? " active" : ""}`}
+            onClick={() => setNamSource("tone3000")}
+          >
+            TONE3000
+          </button>
+        </div>
+      )}
+
       <div className="search-wrap">
         <input
           type="text"
           className="search"
-          placeholder="Search…"
+          placeholder={showTone3000 ? "Search TONE3000 NAM A2…" : "Search…"}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          aria-label={`Search ${tab}`}
+          aria-label={showTone3000 ? "Search TONE3000" : `Search ${tab}`}
         />
       </div>
 
       <div className="preset-list" role="listbox">
-        {entries.length === 0 && (
-          <div className="browser-empty">
-            {tab === "presets" && "No presets yet"}
-            {tab === "irs" &&
-              "Drop .wav IRs into Documents/Futureboard Studio/Rodhareist/IRs"}
-            {tab === "nams" &&
-              "Drop .nam captures into Documents/Futureboard Studio/Rodhareist/NAMs"}
-          </div>
+        {showTone3000 ? (
+          <>
+            {tone3000Configured === false && (
+              <div className="browser-empty">
+                {tone3000Error ??
+                  "TONE3000 is not configured for this build."}
+              </div>
+            )}
+            {tone3000Configured !== false &&
+              tone3000Loading &&
+              tone3000Tones.length === 0 && (
+                <div className="browser-empty">Searching TONE3000…</div>
+              )}
+            {tone3000Configured !== false &&
+              !tone3000Loading &&
+              tone3000Tones.length === 0 && (
+                <div className="browser-empty">
+                  {tone3000Error ?? "No NAM A2 tones match."}
+                </div>
+              )}
+            {tone3000Tones.map((tone) => {
+              const active = tone.id === loadedToneId;
+              return (
+                <button
+                  key={tone.id}
+                  type="button"
+                  role="option"
+                  aria-selected={active}
+                  className={`preset-item${active ? " active" : ""}`}
+                  title={`${tone.title} · ${tone.gear} · @${tone.creator}`}
+                  onClick={() => {
+                    onPrepareNamEngine?.();
+                    setStatus(`Fetching ${tone.title}…`);
+                    setLoadedToneId(tone.id);
+                    postTone3000LoadTone(tone.id, {
+                      stereo: true,
+                      fullRig:
+                        tone.gear === "amp-cab" || tone.gear === "full-rig",
+                    });
+                  }}
+                >
+                  <span className="dot" />
+                  <span className="pid">A2</span>
+                  <span className="pname">
+                    {tone.title}
+                    {tone.creator ? ` · @${tone.creator}` : ""}
+                  </span>
+                </button>
+              );
+            })}
+          </>
+        ) : (
+          <>
+            {entries.length === 0 && (
+              <div className="browser-empty">
+                {tab === "presets" && "No presets yet"}
+                {tab === "irs" &&
+                  "Drop .wav IRs into Documents/Futureboard Studio/Rodhareist/IRs"}
+                {tab === "nams" &&
+                  "Drop .nam captures into Documents/Futureboard Studio/Rodhareist/NAMs, or browse TONE3000"}
+              </div>
+            )}
+            {entries.map((f) => {
+              const { pid, pname } = displayParts(f.fileName);
+              const active =
+                (tab === "presets" && pid === currentPresetId) ||
+                (tab === "irs" && f.fileName === loadedIr);
+              const dirty = tab === "presets" && !!modifiedIds?.has(pid);
+              return (
+                <button
+                  key={f.fileName}
+                  type="button"
+                  role="option"
+                  aria-selected={active}
+                  className={`preset-item${active ? " active" : ""}`}
+                  title={f.fileName}
+                  onClick={() => {
+                    if (tab === "presets") postReadFile("presets", f.fileName);
+                    else if (tab === "nams") postReadFile("nams", f.fileName);
+                    else if (tab === "irs") {
+                      setStatus(`Loading ${f.fileName}…`);
+                      postLoadIr(f.fileName);
+                    }
+                  }}
+                >
+                  <span className="dot" />
+                  <span className="pid">{pid}</span>
+                  <span className="pname">
+                    {pname}
+                    {dirty ? " *" : ""}
+                  </span>
+                </button>
+              );
+            })}
+          </>
         )}
-        {entries.map((f) => {
-          const { pid, pname } = displayParts(f.fileName);
-          const active =
-            (tab === "presets" && pid === currentPresetId) ||
-            (tab === "irs" && f.fileName === loadedIr);
-          const dirty = tab === "presets" && !!modifiedIds?.has(pid);
-          return (
-            <button
-              key={f.fileName}
-              type="button"
-              role="option"
-              aria-selected={active}
-              className={`preset-item${active ? " active" : ""}`}
-              title={f.fileName}
-              onClick={() => {
-                if (tab === "presets") postReadFile("presets", f.fileName);
-                else if (tab === "nams") postReadFile("nams", f.fileName);
-                else if (tab === "irs") {
-                  setStatus(`Loading ${f.fileName}…`);
-                  postLoadIr(f.fileName);
-                }
-              }}
-            >
-              <span className="dot" />
-              <span className="pid">{pid}</span>
-              <span className="pname">
-                {pname}
-                {dirty ? " *" : ""}
-              </span>
-            </button>
-          );
-        })}
       </div>
 
       {tab === "presets" && (

@@ -125,6 +125,7 @@ pub const UI_PARAM_IDS: &[&str] = &[
     "comp2_makeup",  // 106
     "eq_model",      // 107
     "eq2_model",     // 108
+    "nam_slim_size", // 109
 ];
 
 /// String id → wire index. Linear scan over a small table — control/UI
@@ -176,7 +177,7 @@ mod tests {
     /// accidental reorder/insert must fail here, loudly.
     #[test]
     fn wire_indices_are_pinned() {
-        assert_eq!(UI_PARAM_IDS.len(), 109);
+        assert_eq!(UI_PARAM_IDS.len(), 110);
         assert_eq!(ui_param_index("power"), Some(0));
         assert_eq!(ui_param_index("gate_on"), Some(3));
         assert_eq!(ui_param_index("drive_model"), Some(10));
@@ -222,6 +223,7 @@ mod tests {
         assert_eq!(ui_param_index("comp2_makeup"), Some(106));
         assert_eq!(ui_param_index("eq_model"), Some(107));
         assert_eq!(ui_param_index("eq2_model"), Some(108));
+        assert_eq!(ui_param_index("nam_slim_size"), Some(109));
     }
 
     /// `ui_values` must cover every wire id except `clear_clip` (an action,
@@ -275,6 +277,7 @@ mod tests {
         src.comp_ratio = 8.0;
         src.eq_mid2_gain_db = -9.0;
         src.nam_loudness_norm = false;
+        src.nam_slim_size = 40.0;
 
         let mut restored = default_params();
         for (id, value) in ui_values(&src) {

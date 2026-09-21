@@ -1603,7 +1603,7 @@ pub fn read_directory(path: &Path) -> (Vec<FileBrowserEntry>, Option<String>) {
             return (
                 Vec::new(),
                 Some(directory_error_message(error.kind()).to_string()),
-            )
+            );
         }
     };
 

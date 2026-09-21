@@ -11,6 +11,7 @@ use crate::components::keymap_window::{open_keymap_window, KeymapChangedCb};
 use crate::components::midi_editor_window::{midi_editor_debug, open_midi_editor_window};
 use crate::components::settings_dialog::{
     open_settings_window, AudioDeviceListsProvider, OnSettingUpdate, SettingsAudioDeviceLists,
+    SettingsTab,
 };
 use crate::components::timeline::timeline_state::{
     self, ClipType, CreateTrackOptions, InsertPluginFormat, TrackAudioFormat,
@@ -1447,11 +1448,25 @@ impl StudioLayout {
         owner_bounds: Option<Bounds<gpui::Pixels>>,
         cx: &mut Context<Self>,
     ) {
+        self.open_settings_dialog_on_tab(owner_bounds, None, cx);
+    }
+
+    pub(super) fn open_settings_dialog_on_tab(
+        &mut self,
+        owner_bounds: Option<Bounds<gpui::Pixels>>,
+        tab: Option<SettingsTab>,
+        cx: &mut Context<Self>,
+    ) {
         let open_started = std::time::Instant::now();
-        // If window is already open, activate it
+        // If window is already open, activate it — and jump to `tab` when asked.
         if let Some(handle) = self.external_windows.settings.clone() {
             if handle
-                .update(cx, |_settings, window, _cx| window.activate_window())
+                .update(cx, |settings, window, cx| {
+                    if let Some(tab) = tab {
+                        settings.set_active_tab(tab, cx);
+                    }
+                    window.activate_window();
+                })
                 .is_ok()
             {
                 return;
@@ -1630,7 +1645,14 @@ impl StudioLayout {
             on_open_plugin_manager,
             cx,
         ) {
-            Ok(handle) => self.external_windows.settings = Some(handle),
+            Ok(handle) => {
+                if let Some(tab) = tab {
+                    let _ = handle.update(cx, |settings, _window, cx| {
+                        settings.set_active_tab(tab, cx);
+                    });
+                }
+                self.external_windows.settings = Some(handle);
+            }
             Err(err) => eprintln!("[settings] failed to open settings window: {err}"),
         }
 

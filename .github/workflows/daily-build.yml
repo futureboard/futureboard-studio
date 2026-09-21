@@ -40,6 +40,10 @@ jobs:
       # this every built Studio reports "sign-in is not configured". It is
       # a public origin, not a secret; a repository variable can override it.
       FUTUREBOARD_AUTH_API_URL: ${{ vars.FUTUREBOARD_AUTH_API_URL || 'https://futureboard.studio' }}
+      # Partner Bearer key for Rodhareist TONE3000 NAM A2 fetch. Baked at
+      # compile time; nightly/release Studio only has catalog access when this
+      # repository secret is set.
+      FUTUREBOARD_TONE3000_API_KEY: ${{ secrets.FUTUREBOARD_TONE3000_API_KEY }}
       CARGO_BUILD_JOBS: 2
     strategy:
       fail-fast: false

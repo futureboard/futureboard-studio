@@ -1306,7 +1306,8 @@ impl StudioLayout {
             autosave_in_flight: false,
             session_generation: 0,
             last_external_mixer_meter_push: std::time::Instant::now(),
-            pending_secondary_window_restore: crate::workspace_layout::SavedSecondaryWindows::default(),
+            pending_secondary_window_restore:
+                crate::workspace_layout::SavedSecondaryWindows::default(),
         };
 
         layout.ensure_mixer_tree_defaults_once(cx);
@@ -1771,6 +1772,30 @@ impl StudioLayout {
                 self.overlay.open_popover = None;
                 cx.notify();
             }
+            return;
+        }
+        if let Some(value) = command_id.strip_prefix("metronome:set-volume:") {
+            if let Ok(percent) = value.parse::<u32>() {
+                let volume = (percent as f32 / 100.0).clamp(0.0, 1.0);
+                self.settings.update(cx, |settings, cx| {
+                    settings.update_setting(
+                        move |schema| schema.recording.metronome.volume = volume,
+                        cx,
+                    );
+                });
+                self.overlay.open_popover = None;
+                cx.notify();
+            }
+            return;
+        }
+        if command_id == "settings:open-metronome" {
+            self.open_settings_dialog_on_tab(
+                owner_bounds,
+                Some(crate::components::SettingsTab::Metronome),
+                cx,
+            );
+            self.overlay.open_popover = None;
+            cx.notify();
             return;
         }
         if edit_command_debug() && is_midi_routable_edit_command(command_id) {

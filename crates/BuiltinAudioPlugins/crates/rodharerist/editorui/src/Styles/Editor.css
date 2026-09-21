@@ -409,6 +409,32 @@ body {
   border-bottom-color: var(--accent);
 }
 
+.browser-source {
+  display: flex;
+  padding: 0 10px;
+  gap: 0;
+}
+.browser-source-btn {
+  flex: 1;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 7px 0 6px;
+  text-transform: uppercase;
+  border-bottom: 2px solid transparent;
+  transition: color 0.12s var(--ease);
+}
+.browser-source-btn:hover { color: var(--text); }
+.browser-source-btn.active {
+  color: var(--text-hi);
+  border-bottom-color: var(--accent);
+}
+
 .search-wrap { padding: 10px; }
 .search {
   width: 100%; background: var(--bg-inset);

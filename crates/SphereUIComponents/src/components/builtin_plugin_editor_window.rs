@@ -1,10 +1,9 @@
 //! Floating shell window for a built-in plugin's CEF editor.
 //!
-//! Built-in editors use off-screen CEF on every platform. Windows takes the
-//! accelerated path: CEF supplies D3D11 shared textures which are copied into
-//! stable GPUI atlas tiles on the GPU. Other platforms use the software BGRA
-//! framebuffer path. The same GPUI region forwards mouse and keyboard input in
-//! both cases; see `builtin_plugin_editor_surface.rs`.
+//! Windows and macOS host the browser as a native CEF child (HWND / NSView).
+//! Linux still uses off-screen CEF: software BGRA frames are presented by
+//! GPUI and the same region forwards mouse and keyboard input; see
+//! `builtin_plugin_editor_surface.rs`.
 //!
 //! ## Lifecycle
 //!
@@ -331,6 +330,43 @@ struct NamCaptureResultMsg {
     error: Option<String>,
     receptive_field: u64,
     full_rig: bool,
+    architecture: String,
+    family: String,
+    slimmable: bool,
+    submodel_count: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Tone3000StatusMsg {
+    r#type: &'static str,
+    protocol_version: u32,
+    configured: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Tone3000SearchResultMsg {
+    r#type: &'static str,
+    protocol_version: u32,
+    ok: bool,
+    query: String,
+    page: u32,
+    tones: Vec<crate::tone3000::ToneCard>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Tone3000LoadResultMsg {
+    r#type: &'static str,
+    protocol_version: u32,
+    ok: bool,
+    tone_id: u64,
+    name: String,
+    file_name: Option<String>,
+    error: Option<String>,
 }
 
 /// Native -> React: async outcome of a `futureboard.loadIr` request.
@@ -455,6 +491,37 @@ enum InboundMsg {
         instance_id: String,
         binding_generation: u64,
         file_name: String,
+    },
+    /// Ask whether TONE3000 fetch is configured (API key present). No secrets
+    /// come back — only a boolean and a user-facing reason when it is not.
+    #[serde(rename = "futureboard.tone3000Status", rename_all = "camelCase")]
+    Tone3000Status {
+        #[allow(dead_code)]
+        plugin_id: String,
+    },
+    /// Search NAM A2 tones on TONE3000. Native owns the API key and the HTTP.
+    #[serde(rename = "futureboard.tone3000Search", rename_all = "camelCase")]
+    Tone3000Search {
+        #[allow(dead_code)]
+        plugin_id: String,
+        #[serde(default)]
+        query: String,
+        #[serde(default)]
+        page: u32,
+    },
+    /// Download a TONE3000 tone's NAM A2 file and load it into the bound
+    /// instance. Native fetches the bytes; the editor never sees a URL or key.
+    #[serde(rename = "futureboard.tone3000LoadTone", rename_all = "camelCase")]
+    Tone3000LoadTone {
+        #[allow(dead_code)]
+        plugin_id: String,
+        instance_id: String,
+        binding_generation: u64,
+        tone_id: u64,
+        #[serde(default)]
+        size: String,
+        stereo: bool,
+        full_rig: bool,
     },
     #[serde(other)]
     Unknown,
@@ -1343,6 +1410,31 @@ impl BuiltinPluginEditorWindow {
                     );
                 }
             }
+            InboundMsg::Tone3000Status { .. } => {
+                self.post_tone3000_status();
+            }
+            InboundMsg::Tone3000Search { query, page, .. } => {
+                self.start_tone3000_search(query, page, cx);
+            }
+            InboundMsg::Tone3000LoadTone {
+                instance_id,
+                binding_generation,
+                tone_id,
+                size,
+                stereo,
+                full_rig,
+                ..
+            } => {
+                self.start_tone3000_load(
+                    instance_id,
+                    binding_generation,
+                    tone_id,
+                    size,
+                    stereo,
+                    full_rig,
+                    cx,
+                );
+            }
             InboundMsg::Unknown => {}
         }
     }
@@ -1350,6 +1442,7 @@ impl BuiltinPluginEditorWindow {
     /// Route a host `BuiltinNamCaptureResult` into the page, if this window's
     /// bound instance matches the reporting insert. Called from
     /// `poll_plugin_bridge_runtime` in `plugin_ops.rs`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn notify_nam_capture_result(
         &self,
         plugin_instance_id: &str,
@@ -1358,6 +1451,10 @@ impl BuiltinPluginEditorWindow {
         error: Option<&str>,
         receptive_field: u64,
         full_rig: bool,
+        architecture: &str,
+        family: &str,
+        slimmable: bool,
+        submodel_count: u64,
     ) {
         let Some(active) = self.active_instance.as_ref() else {
             return;
@@ -1374,7 +1471,195 @@ impl BuiltinPluginEditorWindow {
             error: error.map(str::to_string),
             receptive_field,
             full_rig,
+            architecture: architecture.to_string(),
+            family: family.to_string(),
+            slimmable,
+            submodel_count,
         });
+    }
+
+    fn post_tone3000_status(&self) {
+        let configured = crate::tone3000::configured();
+        self.post_to_view(&Tone3000StatusMsg {
+            r#type: "futureboard.tone3000Status",
+            protocol_version: BRIDGE_PROTOCOL_VERSION,
+            configured,
+            error: if configured {
+                None
+            } else {
+                Some(
+                    "TONE3000 is not configured for this build. Set FUTUREBOARD_TONE3000_API_KEY in .env and rebuild, or export it at runtime."
+                        .to_string(),
+                )
+            },
+        });
+    }
+
+    fn start_tone3000_search(&self, query: String, page: u32, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let query_for_search = query.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::tone3000::search_tones(&query_for_search, page) })
+                .await;
+            let _ = this.update(cx, |this, _cx| {
+                let (ok, tones, error, result_page) = match result {
+                    Ok((tones, result_page)) => (true, tones, None, result_page),
+                    Err(error) => (false, Vec::new(), Some(error), page.max(1)),
+                };
+                this.post_to_view(&Tone3000SearchResultMsg {
+                    r#type: "futureboard.tone3000SearchResult",
+                    protocol_version: BRIDGE_PROTOCOL_VERSION,
+                    ok,
+                    query,
+                    page: result_page,
+                    tones,
+                    error,
+                });
+            });
+        })
+        .detach();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_tone3000_load(
+        &mut self,
+        instance_id: String,
+        binding_generation: u64,
+        tone_id: u64,
+        size: String,
+        stereo: bool,
+        full_rig: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if binding_generation != self.binding_generation {
+            return;
+        }
+        let Some(active) = self.active_instance.clone() else {
+            return;
+        };
+        if wire_instance_id(&active) != instance_id {
+            return;
+        }
+        if self.host_ops.load_nam_capture.is_none() {
+            self.post_to_view(&Tone3000LoadResultMsg {
+                r#type: "futureboard.tone3000LoadResult",
+                protocol_version: BRIDGE_PROTOCOL_VERSION,
+                ok: false,
+                tone_id,
+                name: String::new(),
+                file_name: None,
+                error: Some("NAM loader is not wired".to_string()),
+            });
+            return;
+        }
+        let Some(root) = self.ensure_files_root() else {
+            self.post_to_view(&Tone3000LoadResultMsg {
+                r#type: "futureboard.tone3000LoadResult",
+                protocol_version: BRIDGE_PROTOCOL_VERSION,
+                ok: false,
+                tone_id,
+                name: String::new(),
+                file_name: None,
+                error: Some("user folder unavailable".to_string()),
+            });
+            return;
+        };
+        let preferred = if size.trim().is_empty() {
+            None
+        } else {
+            Some(size)
+        };
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let preferred_ref = preferred.as_deref();
+                    crate::tone3000::download_a2_tone(tone_id, preferred_ref)
+                })
+                .await;
+            let _ = this.update(cx, move |this, _cx| {
+                let still_bound = this.binding_generation == binding_generation
+                    && this
+                        .active_instance
+                        .as_ref()
+                        .is_some_and(|current| wire_instance_id(current) == instance_id);
+                let download = match result {
+                    Ok(download) => download,
+                    Err(error) => {
+                        if still_bound {
+                            this.post_to_view(&Tone3000LoadResultMsg {
+                                r#type: "futureboard.tone3000LoadResult",
+                                protocol_version: BRIDGE_PROTOCOL_VERSION,
+                                ok: false,
+                                tone_id,
+                                name: String::new(),
+                                file_name: None,
+                                error: Some(error),
+                            });
+                        }
+                        return;
+                    }
+                };
+                use crate::components::builtin_plugin_files as files;
+                let file_name = crate::tone3000::nam_file_name(&download);
+                let written = files::write_file(
+                    &root,
+                    files::BuiltinFileKind::Nams,
+                    &file_name,
+                    &download.json,
+                );
+                let stored_name = match written {
+                    Ok(name) => Some(name),
+                    Err(error) => {
+                        eprintln!(
+                            "[plugin-bridge] TONE3000 cache write failed tone={tone_id} error={error}"
+                        );
+                        None
+                    }
+                };
+                if still_bound {
+                    this.post_to_view(&Tone3000LoadResultMsg {
+                        r#type: "futureboard.tone3000LoadResult",
+                        protocol_version: BRIDGE_PROTOCOL_VERSION,
+                        ok: true,
+                        tone_id,
+                        name: download.title.clone(),
+                        file_name: stored_name.clone(),
+                        error: None,
+                    });
+                    if stored_name.is_some() {
+                        let listing = files::list_files(&root, files::BuiltinFileKind::Nams);
+                        this.post_to_view(&FileListMsg {
+                            r#type: "futureboard.fileList",
+                            protocol_version: BRIDGE_PROTOCOL_VERSION,
+                            kind: "nams".to_string(),
+                            files: listing,
+                        });
+                    }
+                }
+                if let Some(forwarder) = this.host_ops.load_nam_capture.as_ref() {
+                    let name = download.title.clone();
+                    eprintln!(
+                        "[plugin-bridge] tone3000LoadTone plugin={} instance={instance_id} tone={tone_id} name={name} bytes={}",
+                        this.plugin_id,
+                        download.json.len()
+                    );
+                    forwarder(
+                        &active,
+                        BuiltinNamLoadRequest {
+                            name,
+                            json: download.json,
+                            stereo,
+                            full_rig: full_rig
+                                || download.gear.eq_ignore_ascii_case("amp-cab")
+                                || download.gear.eq_ignore_ascii_case("full-rig"),
+                        },
+                    );
+                }
+            });
+        })
+        .detach();
     }
 
     /// Route a host `BuiltinIrResult` into the page, if this window's bound
@@ -1744,9 +2029,8 @@ impl BuiltinPluginEditorWindow {
             self.attach_attempts
         );
 
-        // Off-screen hosting has no content child. On Windows the top-level
-        // handle is still useful to CEF for monitor/dialog ownership; other
-        // platforms may pass no native parent.
+        // Off-screen hosting has no content child. Windowed hosting needs the
+        // shell's native view so CEF can parent a real child into it.
         let parent_hwnd = if OFFSCREEN_HOSTING {
             native_hwnd(window).unwrap_or(0)
         } else {
@@ -1791,8 +2075,8 @@ impl BuiltinPluginEditorWindow {
             width: rect.width,
             height: rect.height,
         };
-        // A windowed browser paints into its own HWND; only off-screen hosting
-        // has frames for the GPUI surface to present.
+        // A windowed browser paints into its own child view; only off-screen
+        // hosting has frames for the GPUI surface to present.
         let accelerated_sink = if OFFSCREEN_HOSTING {
             self.surface.accelerated_sink(window)
         } else {
@@ -2110,9 +2394,19 @@ fn native_hwnd(window: &Window) -> Option<u64> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn native_hwnd(window: &Window) -> Option<u64> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::AppKit(w) => Some(w.ns_view.as_ptr() as u64),
+        _ => None,
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn native_hwnd(_window: &Window) -> Option<u64> {
-    // Non-Windows OSR does not need a native parent handle.
+    // Linux OSR does not need a native parent handle.
     None
 }
 
@@ -3364,6 +3658,8 @@ mod tests {
             "paymentSessionSecret",
             "macOSKeychainValue",
             "encryption-key",
+            "apiKey",
+            "oauthToken",
         ] {
             let mut secret = serde_json::Map::new();
             secret.insert(field.to_owned(), serde_json::json!("must-not-cross"));
@@ -3551,6 +3847,34 @@ mod tests {
             }
             other => panic!("expected WriteFile, got {other:?}"),
         }
+        let search = br#"{"type":"futureboard.tone3000Search","pluginId":"rodharerist","query":"twin","page":1}"#;
+        match serde_json::from_slice::<InboundMsg>(search).unwrap() {
+            InboundMsg::Tone3000Search { query, page, .. } => {
+                assert_eq!(query, "twin");
+                assert_eq!(page, 1);
+            }
+            other => panic!("expected Tone3000Search, got {other:?}"),
+        }
+        let load = br#"{"type":"futureboard.tone3000LoadTone","pluginId":"rodharerist","instanceId":"track-1::insert-1","bindingGeneration":1,"toneId":42,"stereo":true,"fullRig":false}"#;
+        match serde_json::from_slice::<InboundMsg>(load).unwrap() {
+            InboundMsg::Tone3000LoadTone {
+                tone_id,
+                size,
+                stereo,
+                full_rig,
+                ..
+            } => {
+                assert_eq!(tone_id, 42);
+                assert!(size.is_empty());
+                assert!(stereo);
+                assert!(!full_rig);
+            }
+            other => panic!("expected Tone3000LoadTone, got {other:?}"),
+        }
+        assert!(parse_inbound_message(search).is_ok());
+        assert!(parse_inbound_message(load).is_ok());
+        let rejected = br#"{"type":"futureboard.tone3000Search","pluginId":"rodharerist","query":"twin","apiKey":"t3k_cs_must-not-cross"}"#;
+        assert!(parse_inbound_message(rejected).is_err());
     }
 
     #[test]

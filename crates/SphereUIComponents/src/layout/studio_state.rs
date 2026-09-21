@@ -192,6 +192,8 @@ pub enum ContextTarget {
     TapTempo,
     /// Record count-in duration dropdown from the transport control.
     CountIn,
+    /// Metronome volume / settings menu from the transport control.
+    Metronome,
     /// The compact time signature menu from the transport display.
     TimeSignature,
     /// Right-click on a time signature marker on the ruler or lane.

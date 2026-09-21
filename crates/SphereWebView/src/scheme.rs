@@ -30,12 +30,12 @@ use cef::rc::Rc as _;
 // blocks, so every one of these traits has to be nameable here.
 use cef::wrapper::stream_resource_handler::StreamResourceHandler;
 use cef::{
+    wrap_app, wrap_browser_process_handler, wrap_resource_handler, wrap_scheme_handler_factory,
     App, BrowserProcessHandler, CefString, CefStringUtf16, ImplApp, ImplBrowserProcessHandler,
     ImplCommandLine, ImplPostData, ImplPostDataElement, ImplRequest, ImplResourceHandler,
     ImplResponse, ImplSchemeHandlerFactory, ImplSchemeRegistrar, ResourceHandler,
     SchemeHandlerFactory, SchemeOptions, WrapApp, WrapBrowserProcessHandler, WrapResourceHandler,
-    WrapSchemeHandlerFactory, wrap_app, wrap_browser_process_handler, wrap_resource_handler,
-    wrap_scheme_handler_factory,
+    WrapSchemeHandlerFactory,
 };
 
 /// Scheme built-in plugin editors are served under. Must match
@@ -62,7 +62,11 @@ fn cef_gpu_disabled() -> bool {
 fn local_ui_command_line_switches(target_os: &str) -> &'static [&'static str] {
     const COMMON: &[&str] = &[CEF_DISABLE_PINCH];
     const MACOS: &[&str] = &[CEF_DISABLE_PINCH, MACOS_CEF_USE_MOCK_KEYCHAIN];
-    if target_os == "macos" { MACOS } else { COMMON }
+    if target_os == "macos" {
+        MACOS
+    } else {
+        COMMON
+    }
 }
 
 /// Reserved path React's bridge client POSTs JSON envelopes to

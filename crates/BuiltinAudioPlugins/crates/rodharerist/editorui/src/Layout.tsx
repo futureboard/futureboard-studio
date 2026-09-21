@@ -136,6 +136,7 @@ export type LayoutProps = {
   buildSavePayload: (name: string) => { fileName: string; content: string } | null;
   buildFactorySnapshot: (id: string) => import("./Editor").RigSnapshot | null;
   onLoadNamFile: (name: string, json: string) => void;
+  onPrepareNamEngine: () => void;
   onIrLoaded: (name: string) => void;
   onToggleTest: () => void;
   onSave: () => void;
@@ -190,6 +191,7 @@ export function Layout({
   buildSavePayload,
   buildFactorySnapshot,
   onLoadNamFile,
+  onPrepareNamEngine,
   onIrLoaded,
   onToggleTest,
   onSave,
@@ -252,6 +254,7 @@ export function Layout({
           buildSavePayload={buildSavePayload}
           buildFactorySnapshot={buildFactorySnapshot}
           onLoadNamFile={onLoadNamFile}
+          onPrepareNamEngine={onPrepareNamEngine}
           onIrLoaded={onIrLoaded}
         />
         <SidebarResizer workspaceRef={workspaceRef} />

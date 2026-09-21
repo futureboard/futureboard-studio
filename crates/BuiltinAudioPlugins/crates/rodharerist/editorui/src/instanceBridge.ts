@@ -90,6 +90,10 @@ export type NamCaptureResultMessage = {
   error?: string | null;
   receptiveField: number;
   fullRig: boolean;
+  architecture?: string;
+  family?: string;
+  slimmable?: boolean;
+  submodelCount?: number;
 };
 
 /** Native -> React: async outcome of a `loadIr` request. */
@@ -148,6 +152,42 @@ export type FileWrittenMessage = {
   error?: string | null;
 };
 
+export type Tone3000ToneCard = {
+  id: number;
+  title: string;
+  creator: string;
+  gear: string;
+  format: string;
+  image?: string | null;
+};
+
+export type Tone3000StatusMessage = {
+  type: "futureboard.tone3000Status";
+  protocolVersion: number;
+  configured: boolean;
+  error?: string | null;
+};
+
+export type Tone3000SearchResultMessage = {
+  type: "futureboard.tone3000SearchResult";
+  protocolVersion: number;
+  ok: boolean;
+  query: string;
+  page: number;
+  tones: Tone3000ToneCard[];
+  error?: string | null;
+};
+
+export type Tone3000LoadResultMessage = {
+  type: "futureboard.tone3000LoadResult";
+  protocolVersion: number;
+  ok: boolean;
+  toneId: number;
+  name: string;
+  fileName?: string | null;
+  error?: string | null;
+};
+
 export type NativeMessage =
   | SelectInstanceMessage
   | InstanceRemovedMessage
@@ -157,7 +197,10 @@ export type NativeMessage =
   | IrLoadResultMessage
   | FileListMessage
   | FileContentMessage
-  | FileWrittenMessage;
+  | FileWrittenMessage
+  | Tone3000StatusMessage
+  | Tone3000SearchResultMessage
+  | Tone3000LoadResultMessage;
 
 const NATIVE_MESSAGE_TYPES = new Set([
   "futureboard.selectInstance",
@@ -169,6 +212,9 @@ const NATIVE_MESSAGE_TYPES = new Set([
   "futureboard.fileList",
   "futureboard.fileContent",
   "futureboard.fileWritten",
+  "futureboard.tone3000Status",
+  "futureboard.tone3000SearchResult",
+  "futureboard.tone3000LoadResult",
 ]);
 
 function isNativeMessage(data: unknown): data is NativeMessage {
@@ -379,6 +425,47 @@ export function postLoadIrForBoundInstance(fileName: string): void {
     instanceId: binding.instanceId,
     bindingGeneration: binding.bindingGeneration,
     fileName,
+  });
+}
+
+export function postTone3000Status(): void {
+  const binding = activeParamBinding;
+  if (!binding) return;
+  post({
+    type: "futureboard.tone3000Status",
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    pluginId: binding.pluginId,
+  });
+}
+
+export function postTone3000Search(query: string, page = 1): void {
+  const binding = activeParamBinding;
+  if (!binding) return;
+  post({
+    type: "futureboard.tone3000Search",
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    pluginId: binding.pluginId,
+    query,
+    page,
+  });
+}
+
+export function postTone3000LoadTone(
+  toneId: number,
+  opts: { stereo: boolean; fullRig: boolean; size?: string },
+): void {
+  const binding = activeParamBinding;
+  if (!binding) return;
+  post({
+    type: "futureboard.tone3000LoadTone",
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    pluginId: binding.pluginId,
+    instanceId: binding.instanceId,
+    bindingGeneration: binding.bindingGeneration,
+    toneId,
+    size: opts.size ?? "",
+    stereo: opts.stereo,
+    fullRig: opts.fullRig,
   });
 }
 

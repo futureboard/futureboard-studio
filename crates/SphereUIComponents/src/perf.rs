@@ -439,7 +439,11 @@ impl Collector {
                 .take(8)
                 .map(|(n, a)| format!(
                     "  {} = {:.2}ms/s (x{})",
-                    if *n == ROOT_SCOPE { "StudioLayout(self)" } else { *n },
+                    if *n == ROOT_SCOPE {
+                        "StudioLayout(self)"
+                    } else {
+                        *n
+                    },
                     a.total_ns as f32 / 1_000_000.0,
                     a.count
                 ))
@@ -715,7 +719,7 @@ impl PowerMode {
 pub fn resolve_power_mode(override_label: Option<&str>, class: GpuClass) -> PowerMode {
     match override_label.map(str::to_ascii_lowercase).as_deref() {
         Some("lowend") | Some("low-end") | Some("low_end") | Some("low") => {
-            return PowerMode::LowEnd
+            return PowerMode::LowEnd;
         }
         Some("performance") | Some("perf") | Some("high") => return PowerMode::Performance,
         Some("balanced") | Some("normal") => return PowerMode::Balanced,

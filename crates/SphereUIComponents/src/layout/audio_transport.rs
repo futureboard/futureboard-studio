@@ -1353,11 +1353,7 @@ impl StudioLayout {
                     );
                 eprintln!(
                     "[METER PUBLISH]\naudio_callback_seq=0\nplugin_instance_id={}\nbus_index={}\nmixer_channel_id={}\npeak_l={:.6}\npeak_r={:.6}\nrms_l=0.000000\nrms_r=0.000000\nsubscriber_count=1",
-                    meter.insert_id,
-                    bus_index,
-                    mixer_channel_id,
-                    meter.peak,
-                    meter.peak
+                    meter.insert_id, bus_index, mixer_channel_id, meter.peak, meter.peak
                 );
             }
             changed |= smooth_meter_value(&mut entry.level, next, meter_dt);

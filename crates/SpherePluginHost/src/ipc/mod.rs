@@ -559,6 +559,17 @@ pub enum HostEvent {
         /// Capture already models amp + cab + mic ("Bypass Cab" hint).
         #[serde(default)]
         full_rig: bool,
+        /// File architecture (`WaveNet`, `SlimmableContainer`, …).
+        #[serde(default)]
+        architecture: String,
+        /// Coarse family: `a2`, `a1`, or `lstm`.
+        #[serde(default)]
+        family: String,
+        /// NAM A2 SlimmableContainer.
+        #[serde(default)]
+        slimmable: bool,
+        #[serde(default)]
+        submodel_count: u64,
     },
     /// Reply to [`HostCommand::LoadBuiltinIr`]. On success the IR has been
     /// submitted and will be adopted at the next audio block; on failure
