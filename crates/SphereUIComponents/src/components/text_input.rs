@@ -1642,6 +1642,10 @@ fn text_field_inner(
             if disabled {
                 return;
             }
+            // Keep a text field's context menu from being replaced by a
+            // parent surface's right-click handler (timeline, mixer, etc.).
+            // The field owns this gesture once it has received the event.
+            cx.stop_propagation();
             fh_right.focus(window, cx);
             if let Some(callback) = on_context_menu.as_ref() {
                 let x: f32 = event.position.x.into();

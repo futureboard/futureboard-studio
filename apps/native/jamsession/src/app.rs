@@ -31,7 +31,9 @@ use sphere_ui_components::components::controls::{
     FbButtonKind, fb_badge, fb_button, fb_section_header,
 };
 use sphere_ui_components::components::slider::slider;
-use sphere_ui_components::components::text_input::{TextInputState, text_field};
+use sphere_ui_components::components::text_input::{
+    TextInputState, bind_mouse_selection, text_field_with_callbacks,
+};
 use sphere_ui_components::components::title_bar::external_window_titlebar;
 use sphere_ui_components::components::{account_chip, account_menu_overlay};
 use sphere_ui_components::jam::{self, JamStreamView, JamUiState};
@@ -506,7 +508,13 @@ impl JamApp {
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .child(text_field(&self.link_input, false)),
+                            .child(text_field_with_callbacks(
+                                &self.link_input,
+                                false,
+                                bind_mouse_selection(cx.entity().clone(), |this| {
+                                    &mut this.link_input
+                                }),
+                            )),
                     )
                     .child(fb_button(
                         "jam-app-join",
