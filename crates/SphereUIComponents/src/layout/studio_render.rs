@@ -807,6 +807,27 @@ impl Render for StudioLayout {
                         });
                     }
                 }),
+                on_drop_plugin: Arc::new({
+                    let this = cx.entity().clone();
+                    move |item, window, cx| {
+                        let plugin_id = item.plugin_id.clone();
+                        let track_id = match this
+                            .read(cx)
+                            .timeline
+                            .read(cx)
+                            .resolve_context_target_from_window_point(window.mouse_position()) {
+                            crate::components::timeline::timeline::TimelineContextTarget::TrackLane { track_id, .. }
+                            | crate::components::timeline::timeline::TimelineContextTarget::AudioClip { track_id, .. }
+                            | crate::components::timeline::timeline::TimelineContextTarget::MidiClip { track_id, .. }
+                            | crate::components::timeline::timeline::TimelineContextTarget::TrackHeader(track_id) => track_id,
+                            _ => String::new(),
+                        };
+                        let kind = item.kind;
+                        let _ = this.update(cx, |this, cx| {
+                            this.apply_dropped_plugin_drag(&plugin_id, &track_id, kind, cx);
+                        });
+                    }
+                }),
             };
             let catalog_status = self.plugin_catalog.status.clone();
             Some(

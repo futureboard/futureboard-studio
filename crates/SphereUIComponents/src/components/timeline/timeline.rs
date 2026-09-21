@@ -4,8 +4,8 @@ pub(crate) use render::*;
 
 use crate::assets;
 use crate::components::edit::{
-    normalize_range, ClipSnapshot, EditCommand, EditHistory, EditImpact, TempoStateSnapshot,
-    TimeSignatureStateSnapshot,
+    ClipSnapshot, EditCommand, EditHistory, EditImpact, TempoStateSnapshot,
+    TimeSignatureStateSnapshot, normalize_range,
 };
 use crate::components::sidebar::BrowserDragItem;
 use crate::components::timeline::floating_tools_bar::floating_tools_bar;
@@ -15,29 +15,29 @@ use crate::components::timeline::global_lane_header::{
 use crate::components::timeline::marker_track::marker_track_lane;
 use crate::components::timeline::region_track::region_track_lane;
 use crate::components::timeline::song_text_track::{
-    song_text_drag_positions, song_text_track_lane, SongTextDragPreview, SongTextDragSession,
-    SongTextMarkerDown,
+    SongTextDragPreview, SongTextDragSession, SongTextMarkerDown, song_text_drag_positions,
+    song_text_track_lane,
 };
 use crate::components::timeline::tempo_track::tempo_track_lane;
 use crate::components::timeline::time_signature_track::time_signature_track_lane;
 use crate::components::timeline::timeline_ruler::{
-    timeline_ruler, LaneOriginProbe, TimelineLoopDragUpdate, TimelineRegionDrag,
-    TimelineRegionDragUpdate,
+    LaneOriginProbe, TimelineLoopDragUpdate, TimelineRegionDrag, TimelineRegionDragUpdate,
+    timeline_ruler,
 };
 use crate::components::timeline::timeline_state::{
-    hit_test_arrangement, ArrangementCoordinateContext, ArrangementHitTarget, ClipDragItem,
-    ClipResizeDrag, ClipState, ClipType, GlobalLaneKind, GlobalLaneResizeDrag, SnapDivision,
-    TempoPointDrag, TimeSignaturePointDrag, TimelineMarkerDrag, TimelineMarkerState,
-    TimelineRangeSelection, TimelineRegionState, TimelineState, TimelineTool, TrackDragItem,
-    TrackHeightResizeDrag, TrackType, DEFAULT_TRACK_HEIGHT, HEADER_WIDTH, RULER_HEIGHT,
+    ArrangementCoordinateContext, ArrangementHitTarget, ClipDragItem, ClipResizeDrag, ClipState,
+    ClipType, DEFAULT_TRACK_HEIGHT, GlobalLaneKind, GlobalLaneResizeDrag, HEADER_WIDTH,
+    RULER_HEIGHT, SnapDivision, TempoPointDrag, TimeSignaturePointDrag, TimelineMarkerDrag,
+    TimelineMarkerState, TimelineRangeSelection, TimelineRegionState, TimelineState, TimelineTool,
+    TrackDragItem, TrackHeightResizeDrag, TrackType, hit_test_arrangement,
 };
 use crate::components::timeline::track_list::track_list;
 use crate::theme::Colors;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, pulsating_between, px, svg, Animation, AnimationExt, AppContext, Context, Empty,
-    ExternalPaths, InteractiveElement, IntoElement, ParentElement, PinchEvent, Render, ScrollDelta,
-    StatefulInteractiveElement, Styled, Subscription, Window,
+    Animation, AnimationExt, AppContext, Context, Empty, ExternalPaths, InteractiveElement,
+    IntoElement, ParentElement, PinchEvent, Render, ScrollDelta, StatefulInteractiveElement,
+    Styled, Subscription, Window, div, pulsating_between, px, svg,
 };
 use std::time::Duration;
 
@@ -163,6 +163,8 @@ pub struct Timeline {
     on_media_changed: Option<TimelineProjectChangedCb>,
     on_add_track: Option<TimelineAddTrackCb>,
     on_plugin_preset_drop: Option<TimelinePluginPresetDropCb>,
+    on_plugin_drag_drop: Option<TimelinePluginDragDropCb>,
+
     /// Asks the owner to confirm what a dropped MIDI file should bring in
     /// besides its notes. Unset (tests, embedded editors) imports everything,
     /// which is what a drop did before the dialog existed.
@@ -404,6 +406,14 @@ pub type TimelineAddTrackCb =
 
 pub type TimelinePluginPresetDropCb = std::sync::Arc<
     dyn Fn(&(std::path::PathBuf, String), &mut gpui::Window, &mut gpui::App) + 'static,
+>;
+pub type TimelinePluginDragDropCb = std::sync::Arc<
+    dyn Fn(
+            &crate::components::plugin_picker::PluginDragItem,
+            &str,
+            &mut gpui::Window,
+            &mut gpui::App,
+        ) + 'static,
 >;
 
 /// A dropped MIDI file that carries optional payload (markers, controller
