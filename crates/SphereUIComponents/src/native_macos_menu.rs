@@ -173,10 +173,12 @@ mod macos {
             }
         }
         let key = key?;
-        // The native menu is also the shortcut reference surface. Keep bare and
-        // Shift-only accelerators here so macOS renders every manifest shortcut
-        // in the menu (Space, R, L, K, V, P, arrows, etc.). The command is still
-        // dispatched through RunMenuCommand, the same path as the in-app keymap.
+        // AppKit key equivalents run before GPUI's focused control. Bare and
+        // Shift-only accelerators would therefore steal ordinary text entry
+        // (Space, R, V, arrows, etc.) from a focused GPUI field.
+        if !cmd && !alt {
+            return None;
+        }
         let mut out = String::new();
         if cmd {
             out.push_str("cmd-");
@@ -230,7 +232,11 @@ mod macos {
             if let (Some(command), Some(accel)) =
                 (item.command.as_deref(), item.shortcut.as_deref())
             {
-                if !command.is_empty() && !accel.is_empty() {
+                let text_edit_command = matches!(
+                    command,
+                    "edit:select-all" | "edit:copy" | "edit:cut" | "edit:paste"
+                );
+                if !text_edit_command && !command.is_empty() && !accel.is_empty() {
                     if let Some(keystroke) = manifest_accel_to_mac_keystroke(command, accel) {
                         out.push((command.to_string(), keystroke));
                     }

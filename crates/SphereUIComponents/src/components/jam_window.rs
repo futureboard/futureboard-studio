@@ -30,7 +30,7 @@ use crate::components::controls::{
     fb_badge, fb_button, fb_checkbox, fb_section_header, fb_segment, fb_segmented_track,
     FbButtonKind, FbSegment,
 };
-use crate::components::text_input::{text_field, TextInputState};
+use crate::components::text_input::{bind_mouse_selection, text_field_with_callbacks, TextInputState};
 use crate::components::title_bar::external_window_titlebar;
 use sphere_jam_client::protocol::ParticipantSummary;
 
@@ -653,9 +653,10 @@ impl JamWindow {
                     .flex_row()
                     .items_center()
                     .gap(px(space::BASE))
-                    .child(div().flex_1().min_w(px(0.0)).child(text_field(
+                    .child(div().flex_1().min_w(px(0.0)).child(text_field_with_callbacks(
                         &self.link_input,
                         self.link_input.is_focused(window),
+                        bind_mouse_selection(cx.entity().clone(), |this| &mut this.link_input),
                     )))
                     .child(div().flex_none().child(fb_button(
                         "jam-join",
