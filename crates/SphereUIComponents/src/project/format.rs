@@ -184,7 +184,9 @@ impl ProjectError {
             ProjectError::Io(e) => format!("I/O error: {e}"),
             ProjectError::InvalidMagic => "invalid magic bytes".to_string(),
             ProjectError::UnsupportedVersion(v) => format!("unsupported version: {v}"),
-            ProjectError::OldVersion(v) => format!("old version: {v} (current {PROJECT_VERSION}, minimum {MIN_SUPPORTED_VERSION})"),
+            ProjectError::OldVersion(v) => format!(
+                "old version: {v} (current {PROJECT_VERSION}, minimum {MIN_SUPPORTED_VERSION})"
+            ),
             ProjectError::IncompleteFile { reason } => reason.clone(),
             ProjectError::UnexpectedEof {
                 needed,
@@ -588,8 +590,8 @@ fn encode_midi_note(w: &mut FbWriter, n: &MidiNote) {
     w.write_u8(n.articulation); // v25 (0 = none)
     w.write_u64(n.id); // v26 (0 = mint on load for legacy writers)
     w.write_u8(n.release_velocity); // v26 (0 = unset)
-                                    // v38: continuous pitch performance. Cent deviations keyed by beats from
-                                    // the note start, so the shape survives transposition and moves.
+    // v38: continuous pitch performance. Cent deviations keyed by beats from
+    // the note start, so the shape survives transposition and moves.
     w.write_u32(n.pitch_curve.len() as u32);
     for point in &n.pitch_curve {
         w.write_u64(point.id);
@@ -1030,8 +1032,8 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack) {
     encode_soundfont_player(w, t.soundfont.as_ref()); // v28
     w.write_bool(t.volume_automation_read); // v32
     encode_solfege_engine(w, t.solfege.as_ref()); // v37
-                                                  // v42: the track's ARA plug-in. Identity only â its edits live in the
-                                                  // project-level document archive keyed by (plug-in, track).
+    // v42: the track's ARA plug-in. Identity only â its edits live in the
+    // project-level document archive keyed by (plug-in, track).
     match &t.ara {
         Some(ara) => {
             w.write_u8(1);
@@ -2811,8 +2813,15 @@ pub fn decode_project(data: &[u8]) -> Result<FutureboardProject, ProjectError> {
 }
 
 /// Decode a project with an option to allow loading old versions.
-pub fn decode_project_with_options(data: &[u8], allow_old_version: bool) -> Result<FutureboardProject, ProjectError> {
-    project_load_log(format_args!("file size: {} bytes (allow_old_version={})", data.len(), allow_old_version));
+pub fn decode_project_with_options(
+    data: &[u8],
+    allow_old_version: bool,
+) -> Result<FutureboardProject, ProjectError> {
+    project_load_log(format_args!(
+        "file size: {} bytes (allow_old_version={})",
+        data.len(),
+        allow_old_version
+    ));
 
     if data.len() < PROJECT_HEADER_SIZE {
         let err = ProjectError::IncompleteFile {
@@ -2841,7 +2850,9 @@ pub fn decode_project_with_options(data: &[u8], allow_old_version: bool) -> Resu
     // Warn but allow loading for old versions that are still above minimum
     if version < PROJECT_VERSION && version >= MIN_SUPPORTED_VERSION && !allow_old_version {
         let err = ProjectError::OldVersion(version);
-        project_load_log(format_args!("warning: old version {version} (current {PROJECT_VERSION})"));
+        project_load_log(format_args!(
+            "warning: old version {version} (current {PROJECT_VERSION})"
+        ));
         return Err(err);
     }
     project_load_log(format_args!("header ok version={version}"));
@@ -3023,10 +3034,12 @@ mod tests {
         encode_midi_note(&mut w, &note(60, false));
         let bytes = w.into_bytes();
         let mut r = FbReader::new(&bytes);
-        assert!(decode_midi_note(&mut r, PROJECT_VERSION)
-            .unwrap()
-            .accent
-            .is_none());
+        assert!(
+            decode_midi_note(&mut r, PROJECT_VERSION)
+                .unwrap()
+                .accent
+                .is_none()
+        );
     }
 
     /// A v38 file has no accent bytes at all. Reading it as v39 would consume

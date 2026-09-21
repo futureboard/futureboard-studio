@@ -1,6 +1,7 @@
 use super::{
-    format::{decode_project, decode_project_with_options, encode_project, ProjectError},
-    now_secs, ClipSource, FutureboardProject, ProjectAsset,
+    ClipSource, FutureboardProject, ProjectAsset,
+    format::{ProjectError, decode_project, decode_project_with_options, encode_project},
+    now_secs,
 };
 use crate::paths::{FutureboardPaths, ProjectFolderLayout};
 use std::collections::HashMap;
@@ -20,6 +21,32 @@ pub fn project_temp_path(path: &Path) -> PathBuf {
 /// Backup path written before each successful save: `<project>.fbproj.bak`.
 pub fn project_backup_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.bak", path.display()))
+}
+
+/// Stable backup path for a legacy project before it is opened and potentially
+/// upgraded on the next save. The first backup for a version is preserved.
+pub fn legacy_project_backup_path(path: &Path, version: u32) -> PathBuf {
+    PathBuf::from(format!("{}.v{version}.bak", path.display()))
+}
+
+/// Preserve the exact legacy bytes before allowing an old project to load.
+/// Existing backups are never overwritten, so the original source remains
+/// recoverable even if the project is opened and saved repeatedly.
+pub fn backup_legacy_project(path: &Path, version: u32) -> Result<PathBuf, ProjectError> {
+    let backup = legacy_project_backup_path(path, version);
+    if backup.exists() {
+        return Ok(backup);
+    }
+    if let Some(parent) = backup.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(path, &backup)?;
+    project_save_log(format_args!(
+        "legacy backup written: {} (source version {})",
+        backup.display(),
+        version
+    ));
+    Ok(backup)
 }
 
 /// Platform-aware default projects directory: `~/Documents/Futureboard Studio/Projects/`.
@@ -122,8 +149,15 @@ pub fn save_project(project: &mut FutureboardProject, path: &Path) -> Result<(),
 }
 
 /// Load a project from disk, optionally allowing old versions.
-pub fn load_project(path: &Path, allow_old_version: bool) -> Result<FutureboardProject, ProjectError> {
-    project_load_log(format_args!("opening: {} (allow_old_version={})", path.display(), allow_old_version));
+pub fn load_project(
+    path: &Path,
+    allow_old_version: bool,
+) -> Result<FutureboardProject, ProjectError> {
+    project_load_log(format_args!(
+        "opening: {} (allow_old_version={})",
+        path.display(),
+        allow_old_version
+    ));
     if super::import::is_import_path(path) {
         let project = super::import::import_project(path)?;
         project_load_log(format_args!("imported ok: {}", project.name));
@@ -646,9 +680,9 @@ mod tests {
     use super::*;
     use crate::components::timeline::timeline_state::AudioClipStretchState;
     use crate::project::{
-        format::{encode_project, ProjectError, PROJECT_HEADER_SIZE},
         ClipSource, FutureboardProject, ProjectAsset, ProjectClip, ProjectSession, ProjectTrack,
         ProjectTrackType, TrackRouting,
+        format::{PROJECT_HEADER_SIZE, ProjectError, encode_project},
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -660,6 +694,24 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn legacy_backup_preserves_original_bytes_and_is_not_overwritten() {
+        let dir = temp_dir("legacy-backup");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Old.fbproj");
+        fs::write(&path, b"legacy-project-bytes").unwrap();
+
+        let backup = backup_legacy_project(&path, 7).unwrap();
+        assert_eq!(backup, legacy_project_backup_path(&path, 7));
+        assert_eq!(fs::read(&backup).unwrap(), b"legacy-project-bytes");
+
+        fs::write(&path, b"mutated-current-project").unwrap();
+        assert_eq!(backup_legacy_project(&path, 7).unwrap(), backup);
+        assert_eq!(fs::read(&backup).unwrap(), b"legacy-project-bytes");
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1233,7 +1285,7 @@ mod tests {
     /// Test D: missing peak file is a disk miss (regeneration path).
     #[test]
     fn missing_peak_file_reports_disk_miss() {
-        use crate::components::timeline::waveform_peak_file::{read_peak_file, PeakFileError};
+        use crate::components::timeline::waveform_peak_file::{PeakFileError, read_peak_file};
 
         let root = temp_dir("peak-d");
         let asset_id = "Assets/Audio/loop.wav";

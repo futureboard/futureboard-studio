@@ -54,7 +54,7 @@ impl Timeline {
         }
     }
 
-    pub(super) fn resolve_context_target_from_window_point(
+    pub(crate) fn resolve_context_target_from_window_point(
         &self,
         position: gpui::Point<gpui::Pixels>,
     ) -> TimelineContextTarget {
@@ -190,6 +190,7 @@ impl Timeline {
             on_media_changed: None,
             on_add_track: None,
             on_plugin_preset_drop: None,
+            on_plugin_drag_drop: None,
             on_midi_import_prompt: None,
             last_drag_position: None,
             file_drop_hint: None,
@@ -262,6 +263,7 @@ impl Timeline {
             on_media_changed: None,
             on_add_track: None,
             on_plugin_preset_drop: None,
+            on_plugin_drag_drop: None,
             on_midi_import_prompt: None,
             last_drag_position: None,
             file_drop_hint: None,
@@ -702,6 +704,10 @@ impl Timeline {
         self.on_plugin_preset_drop = callback;
     }
 
+    pub fn set_plugin_drag_drop_callback(&mut self, callback: Option<TimelinePluginDragDropCb>) {
+        self.on_plugin_drag_drop = callback;
+    }
+
     pub fn set_midi_import_prompt_callback(
         &mut self,
         callback: Option<TimelineMidiImportPromptCb>,
@@ -933,7 +939,7 @@ impl Timeline {
     }
 
     pub(super) fn finish_pen_midi_clip(&mut self, end_beat: f32, cx: &mut gpui::Context<Self>) {
-        use crate::components::timeline::timeline_state::{TrackType, MIN_MIDI_CLIP_BEATS};
+        use crate::components::timeline::timeline_state::{MIN_MIDI_CLIP_BEATS, TrackType};
         let Some(preview) = self.pen_clip_draw.take() else {
             return;
         };
@@ -1107,7 +1113,7 @@ impl Timeline {
         window_y: f32,
     ) -> f32 {
         use crate::components::timeline::timeline_state::{
-            automation_y_to_value, AUTOMATION_SUBLANE_HEIGHT,
+            AUTOMATION_SUBLANE_HEIGHT, automation_y_to_value,
         };
         // Map against the lane's own sub-row bounds so a drag stays anchored to
         // the lane the gesture started in.
@@ -1577,8 +1583,8 @@ impl Timeline {
         cx: &mut Context<Self>,
     ) {
         use crate::components::timeline::timeline_state::{
-            AutomationCurveDrag, AutomationHover, AutomationMarquee, AutomationPointDrag,
-            TrackLaneMode, AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT,
+            AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT, AutomationCurveDrag, AutomationHover,
+            AutomationMarquee, AutomationPointDrag, TrackLaneMode,
         };
         self.state.select_track(track_id);
         if self.state.track_lane_mode(track_id) != TrackLaneMode::Automation {
@@ -1840,7 +1846,7 @@ impl Timeline {
         cx: &mut Context<Self>,
     ) {
         use crate::components::timeline::timeline_state::{
-            AutomationHover, TrackLaneMode, AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT,
+            AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT, AutomationHover, TrackLaneMode,
         };
         if self.automation_drag.is_some()
             || self.automation_curve_drag.is_some()

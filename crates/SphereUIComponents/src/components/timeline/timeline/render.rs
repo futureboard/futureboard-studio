@@ -1813,6 +1813,22 @@ impl Render for Timeline {
             }
         });
 
+        let on_plugin_drag_dropped = cx.listener(
+            |this, item: &crate::components::plugin_picker::PluginDragItem, window, cx| {
+                let target = this.resolve_context_target_from_window_point(window.mouse_position());
+                let track_id = match target {
+                    TimelineContextTarget::TrackLane { track_id, .. }
+                    | TimelineContextTarget::AudioClip { track_id, .. }
+                    | TimelineContextTarget::MidiClip { track_id, .. }
+                    | TimelineContextTarget::TrackHeader(track_id) => track_id,
+                    _ => String::new(),
+                };
+                if let Some(callback) = this.on_plugin_drag_drop.as_ref() {
+                    callback(item, &track_id, window, cx);
+                }
+            },
+        );
+
         let on_clip_drag_move = cx.listener(
             |this, event: &gpui::DragMoveEvent<ClipDragItem>, window, cx| {
                 let drag = event.drag(cx).clone();
@@ -2371,6 +2387,7 @@ impl Render for Timeline {
             .on_drop::<ExternalPaths>(on_files_dropped)
             .on_drag_move::<BrowserDragItem>(on_browser_drag_track)
             .on_drop::<BrowserDragItem>(on_browser_file_dropped)
+            .on_drop::<crate::components::plugin_picker::PluginDragItem>(on_plugin_drag_dropped)
             .on_drag_move::<ClipDragItem>(on_clip_drag_move)
             .on_drop::<ClipDragItem>(on_clip_dropped)
             .on_drag_move::<ClipResizeDrag>(on_clip_resize_move)

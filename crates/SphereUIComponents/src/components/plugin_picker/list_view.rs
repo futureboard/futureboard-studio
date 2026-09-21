@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, svg, App, Div, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, Window,
+    App, AppContext, Div, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, Window, div, px, svg,
 };
 
 use crate::assets;
@@ -30,6 +30,13 @@ const COL_TYPE: f32 = 86.0;
 const COL_FORMAT: f32 = 80.0;
 
 type StringCb = Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>;
+
+#[derive(Clone, Debug)]
+pub struct PluginDragItem {
+    pub plugin_id: String,
+    pub label: String,
+    pub kind: PluginKind,
+}
 
 fn col_name_cell(label: impl Into<String>) -> Div {
     div()
@@ -173,6 +180,11 @@ pub fn plugin_row(
     let insertable = is_insertable(plugin);
     let (kind_icon, kind_color) = kind_icon_for(plugin.kind);
     let status = scan_status_label(plugin);
+    let drag_item = PluginDragItem {
+        plugin_id: plugin.id.clone(),
+        label: plugin.name.clone(),
+        kind: plugin.kind,
+    };
 
     div()
         .id(("plugin-picker-row", list_index))
@@ -194,6 +206,13 @@ pub fn plugin_row(
             el.hover(|s| s.bg(Colors::surface_hover()))
         })
         .when(!insertable, |el| el.opacity(0.55))
+        .when(insertable, |el| {
+            el.on_drag(drag_item, move |drag, _offset, _window, cx| {
+                cx.new(|_| crate::components::plugin_picker::PluginDragPreview {
+                    label: drag.label.clone(),
+                })
+            })
+        })
         .cursor(if insertable {
             gpui::CursorStyle::PointingHand
         } else {

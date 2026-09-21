@@ -13,13 +13,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{BorrowAppContext, Context, Window, AppContext};
+use gpui::{AppContext, BorrowAppContext, Context, Window};
 
 use crate::app_state::{AppMode, AppSessionGate, ProjectState, SessionInstallStatus};
 use crate::loading_session::{
     LoadedSessionPackage, SessionInstallHandoff, SessionRollbackSnapshot,
 };
-use crate::project::io::{load_project_strict, validate_project_file};
+use crate::project::io::{
+    backup_legacy_project, load_project, load_project_strict, validate_project_file,
+};
 use crate::project::{apply_to_timeline, now_secs};
 
 /// Map a project-load warning onto the aggregated routing surface.
@@ -38,11 +40,12 @@ fn project_load_warning_to_routing_warning(
     };
     RoutingWarning::new(kind, warning.message.clone())
 }
+use crate::components::message_box_dialog::{
+    MessageBoxKind, MessageBoxOptions, MessageBoxResponseCb, MessageBoxResult,
+    open_message_box_window,
+};
 use crate::session_shutdown::{
     PluginUnloadTarget, SessionLifecycleStep, SessionShutdownReason, SessionShutdownSnapshot,
-};
-use crate::components::message_box_dialog::{
-    open_message_box_window, MessageBoxKind, MessageBoxOptions, MessageBoxResponseCb, MessageBoxResult,
 };
 
 use super::project_ops::ProjectOpenOptions;
@@ -362,6 +365,16 @@ impl StudioLayout {
         open_options: ProjectOpenOptions,
         cx: &mut Context<Self>,
     ) {
+        self.begin_in_studio_project_switch_with_policy(path, open_options, false, cx);
+    }
+
+    fn begin_in_studio_project_switch_with_policy(
+        &mut self,
+        path: PathBuf,
+        open_options: ProjectOpenOptions,
+        allow_old_version: bool,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(request_load) = self.window_hooks.on_request_project_load.clone() {
             request_load(path, open_options, cx);
             return;
@@ -399,8 +412,20 @@ impl StudioLayout {
                     if !path_for_job.exists() {
                         return Err(LoadSwitchError::NotFound(path_for_job));
                     }
-                    validate_project_file(&path_for_job).map_err(LoadSwitchError::Project)?;
-                    load_project_strict(&path_for_job)
+                    let version = validate_project_file(&path_for_job).map_err(LoadSwitchError::Project)?;
+                    if !allow_old_version
+                        && version >= crate::project::format::MIN_SUPPORTED_VERSION
+                        && version < crate::project::format::PROJECT_VERSION
+                    {
+                        backup_legacy_project(&path_for_job, version)
+                            .map_err(LoadSwitchError::Project)?;
+                    }
+                    let project = if allow_old_version {
+                        load_project(&path_for_job, true)
+                    } else {
+                        load_project_strict(&path_for_job)
+                    };
+                    project
                         .map_err(LoadSwitchError::Project)
                         .map(|project| (project, path_for_job))
                 })
@@ -533,6 +558,7 @@ impl StudioLayout {
         let entity = cx.entity().clone();
 
         let owner_bounds = self.studio_window_bounds(cx);
+        let backup_path = crate::project::legacy_project_backup_path(&path, version);
         let options = MessageBoxOptions {
             kind: MessageBoxKind::Warning,
             title: "Old Project Version".to_string(),
@@ -540,13 +566,18 @@ impl StudioLayout {
                 "This project was created with Futureboard v{} (current is v{}).\n\
                  It can be opened, but some features may be missing or behave differently.\n\
                  The project will be upgraded to the current format when saved.",
-                version, crate::project::format::PROJECT_VERSION
+                version,
+                crate::project::format::PROJECT_VERSION
             ),
             detail: Some(format!(
                 "Minimum supported version: v{}\n\
                  Your project version: v{}\n\
-                 Current version: v{}",
-                crate::project::format::MIN_SUPPORTED_VERSION, version, crate::project::format::PROJECT_VERSION
+                 Current version: v{}\n\
+                 Backup: {}",
+                crate::project::format::MIN_SUPPORTED_VERSION,
+                version,
+                crate::project::format::PROJECT_VERSION,
+                backup_path.display()
             )),
             buttons: vec!["Open Anyway".to_string(), "Cancel".to_string()],
             default_id: 0,
@@ -570,21 +601,25 @@ impl StudioLayout {
                 if result.response == 0 {
                     eprintln!("[ProjectSwitch] User chose to open old version project anyway");
                     let _ = entity.update(app, move |this, cx| {
+                        let path = (*path).clone();
+                        let open_options = (*open_options).clone();
                         this.restore_session_rollback_snapshot((*rollback).clone(), cx);
-                        cx.update_global::<AppSessionGate, _>(|gate, _| gate.mode = AppMode::Studio);
-                        this.show_project_open_failed_dialog(
-                            "Old Version Project",
-                            "This project was created with an older version. Please use File > Open Project to reopen it.",
-                            Some("The project will be upgraded to the current format when saved.".to_string()),
-                            Some((*path).clone()),
-                            (*open_options).clone(),
+                        cx.update_global::<AppSessionGate, _>(|gate, _| {
+                            gate.mode = AppMode::Studio
+                        });
+                        this.begin_in_studio_project_switch_with_policy(
+                            path,
+                            open_options,
+                            true,
                             cx,
                         );
                     });
                 } else {
                     let _ = entity.update(app, move |this, cx| {
                         this.restore_session_rollback_snapshot((*rollback).clone(), cx);
-                        cx.update_global::<AppSessionGate, _>(|gate, _| gate.mode = AppMode::Studio);
+                        cx.update_global::<AppSessionGate, _>(|gate, _| {
+                            gate.mode = AppMode::Studio
+                        });
                         this.show_project_open_failed_dialog(
                             "Open Project Cancelled",
                             "Opening the old version project was cancelled.",
@@ -600,7 +635,10 @@ impl StudioLayout {
 
         let owner_bounds = self.studio_window_bounds(cx);
         if let Err(err) = open_message_box_window(owner_bounds, options, on_response, cx) {
-            eprintln!("[ProjectSwitch] failed to show old version warning: {}", err);
+            eprintln!(
+                "[ProjectSwitch] failed to show old version warning: {}",
+                err
+            );
             self.restore_session_rollback_snapshot((*rollback).clone(), cx);
             cx.update_global::<AppSessionGate, _>(|gate, _| gate.mode = AppMode::Studio);
             let i18n = crate::i18n::I18n::from_app(cx);
@@ -615,7 +653,7 @@ impl StudioLayout {
         }
     }
 
-/// Prepare rollback for an in-studio project switch. Session shutdown runs
+    /// Prepare rollback for an in-studio project switch. Session shutdown runs
     /// asynchronously once the loading dialog is visible.
     pub fn prepare_for_in_studio_project_switch_transaction(
         &mut self,
@@ -1016,4 +1054,3 @@ enum LoadSwitchError {
     NotFound(PathBuf),
     Project(crate::project::ProjectError),
 }
-
