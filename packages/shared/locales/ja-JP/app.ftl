@@ -936,3 +936,17 @@ wizard.summary.template = Template
 wizard.summary.tracks = Tracks
 wizard.summary.tracks-value = { $audio } audio / { $midi } MIDI
 wizard.title = New Project
+
+## Dialogs
+
+dialog.old-version-project.title = 古いプロジェクトバージョン
+dialog.old-version-project.message = このプロジェクトは Futureboard v{ $version } で作成されました (現在のバージョンは v{ $currentVersion } です)。\n開くことはできますが、一部の機能が欠けているか、動作が異なる場合があります。\nプロジェクトを保存すると、現在のフォーマットにアップグレードされます。
+dialog.old-version-project.detail = 最小対応バージョン: v{ $minVersion }\nプロジェクトのバージョン: v{ $version }\n現在のバージョン: v{ $currentVersion }
+dialog.old-version-project.button.open-anyway = このまま開く
+dialog.old-version-project.button.cancel = キャンセル
+dialog.old-version-project.open-failed = プロジェクトファイルを開けませんでした。
+dialog.old-version-project.open-failed-detail = 復元された配置がプロジェクトファイルと一致しません。
+dialog.old-version-project.cancelled = 古いバージョンのプロジェクトを開く操作がキャンセルされました。
+dialog.old-version-project.warning-dialog-failed = バージョン警告ダイアログを表示できませんでした。
+
+wizard.bpm = BPM

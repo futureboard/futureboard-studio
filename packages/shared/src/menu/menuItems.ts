@@ -237,6 +237,7 @@ export const APP_MENUS: AppMenuGroup[] = [
           {
             id: "view.developer.perf_metrics",
             label: "Show Performance Metrics",
+            accelerator: "F3",
             checked: false,
             action: "view:toggle-perf-metrics",
             description: "Compact FPS and frame time in the status bar",
@@ -244,6 +245,7 @@ export const APP_MENUS: AppMenuGroup[] = [
           {
             id: "view.developer.perf_overlay",
             label: "Toggle Performance Overlay",
+            accelerator: "F4",
             checked: false,
             action: "view:toggle-perf-overlay",
             description: "Verbose real-time performance overlay",
@@ -376,6 +378,7 @@ export const APP_MENUS: AppMenuGroup[] = [
       {
         id: "project.add_plugin_track",
         label: "Add Plugin Track",
+        accelerator: "F5",
         icon: "cpu",
         action: "track:add-plugin",
       },
@@ -750,6 +753,7 @@ export const APP_MENUS: AppMenuGroup[] = [
       {
         id: "window.lyric_editor_panel",
         label: "Lyric Editor in Right Dock",
+        accelerator: "Ctrl+Alt+Shift+L",
         icon: "pencil",
         action: "panel:show-lyric-editor",
       },
@@ -780,41 +784,49 @@ export const APP_MENUS: AppMenuGroup[] = [
           {
             id: "song_text.commit",
             label: "Commit Song Text Edit",
+            accelerator: "Enter",
             action: "song_text.commit",
           },
           {
             id: "song_text.commit_next_grid",
             label: "Commit and Advance to Next Grid",
+            accelerator: "Shift+Enter",
             action: "song_text.commit_next_grid",
           },
           {
             id: "song_text.commit_next_beat",
             label: "Commit and Advance to Next Beat",
+            accelerator: "Ctrl+Enter",
             action: "song_text.commit_next_beat",
           },
           {
             id: "song_text.commit_next_bar",
             label: "Commit and Advance to Next Bar",
+            accelerator: "Ctrl+Shift+Enter",
             action: "song_text.commit_next_bar",
           },
           {
             id: "song_text.previous_event",
             label: "Previous Song Text Event",
+            accelerator: "Ctrl+Alt+W",
             action: "song_text.previous_event",
           },
           {
             id: "song_text.next_event",
             label: "Next Song Text Event",
+            accelerator: "Ctrl+Alt+Y",
             action: "song_text.next_event",
           },
           {
             id: "song_text.move_to_playhead",
             label: "Move Song Text to Playhead",
+            accelerator: "F6",
             action: "song_text.move_to_playhead",
           },
           {
             id: "song_text.delete_selected",
             label: "Delete Selected Song Text",
+            accelerator: "Shift+Delete",
             action: "song_text.delete_selected",
           },
         ],

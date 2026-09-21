@@ -462,6 +462,66 @@ fn build_action_catalog() -> HashMap<String, String> {
     for menu in &MenuManifest::load().menus {
         collect_menu_actions(&menu.items, &menu.label, &mut out);
     }
+    // Actions that are bound to shortcuts but do not appear in the native menu
+    // bar (context-menu-only, shortcut-only, or floating-window commands). Menu
+    // labels are the source of truth; these fill the gaps so the Keymap panel
+    // shows human-readable names instead of raw action IDs.
+    let fallback: &[(&str, &str)] = &[
+        ("app:force-reload",               "App › Force Reload"),
+        ("audio:bounce-in-place",          "Audio › Bounce in Place"),
+        ("audio:create-crossfade",         "Audio › Create Crossfade"),
+        ("audio:render-selection",         "Audio › Render Selection"),
+        ("clip:consolidate",               "Clip › Consolidate"),
+        ("clip:properties",                "Clip › Properties"),
+        ("clip:rename",                    "Clip › Rename"),
+        ("clip:split-at-playhead",         "Clip › Split at Playhead"),
+        ("edit:delete-backspace",          "Edit › Delete (Backspace)"),
+        ("editor:open-bottom",             "Editor › Open in Bottom Panel"),
+        ("extensions:manager",             "Tools › Extensions Manager"),
+        ("file:export-audio",              "File › Export Audio"),
+        ("file:export-stems",              "File › Export Stems"),
+        ("file:import-audio",              "File › Import Audio"),
+        ("floatingwindow:video-player",    "Window › Video Player"),
+        ("jam:open",                       "Window › Jam Session"),
+        ("midi:duplicate-selected",        "MIDI › Duplicate Selected"),
+        ("midi:export-clip",               "MIDI › Export Clip"),
+        ("midi:nudge-left",                "MIDI › Nudge Left"),
+        ("midi:nudge-right",               "MIDI › Nudge Right"),
+        ("midi:toggle-snap",               "MIDI › Toggle Snap"),
+        ("midi:toggle-virtual-keyboard",   "MIDI › Toggle Virtual Keyboard"),
+        ("midi:tool-draw",                 "MIDI › Draw Tool"),
+        ("midi:tool-line",                 "MIDI › Line Tool"),
+        ("midi:tool-select",               "MIDI › Select Tool"),
+        ("midi:transpose-down",            "MIDI › Transpose Down"),
+        ("midi:transpose-octave-down",     "MIDI › Transpose Down One Octave"),
+        ("midi:transpose-octave-up",       "MIDI › Transpose Up One Octave"),
+        ("midi:transpose-up",              "MIDI › Transpose Up"),
+        ("midi:velocity-decrease",         "MIDI › Decrease Velocity"),
+        ("midi:velocity-increase",         "MIDI › Increase Velocity"),
+        ("mixer:create-bus",               "Mixer › Create Bus"),
+        ("mixer:reset-pan",                "Mixer › Reset Pan"),
+        ("mixer:reset-volume",             "Mixer › Reset Volume"),
+        ("panel:toggle-automation",        "View › Automation Panel"),
+        ("panel:toggle-device-panel",      "View › Device Panel"),
+        ("panel:toggle-midi-editor",       "View › MIDI Editor"),
+        ("project:new-from-template",      "Project › New from Template"),
+        ("project:reveal-folder",          "Project › Reveal in Finder"),
+        ("project:snapshot",               "Project › Snapshot"),
+        ("timeline:toggle-snap",           "View › Toggle Snap"),
+        ("tools:command-palette",          "Tools › Command Palette"),
+        ("tools:developer-tools",          "Tools › Developer Tools"),
+        ("tools:quick-search",             "Tools › Quick Search"),
+        ("tools:select-mute",              "Tools › Select / Mute Tool"),
+        ("track:add",                      "Project › Add Track"),
+        ("track:arm",                      "Track › Arm for Recording"),
+        ("track:mute",                     "Track › Mute"),
+        ("track:solo",                     "Track › Solo"),
+        ("window:minimize",                "Window › Minimize"),
+        ("window:toggle-fullscreen",       "Window › Toggle Full Screen"),
+    ];
+    for (id, label) in fallback {
+        out.entry(id.to_string()).or_insert_with(|| label.to_string());
+    }
     out
 }
 

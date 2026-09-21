@@ -1293,7 +1293,11 @@ impl StudioLayout {
             window_hooks: window_ops::StudioWindowHooks::default(),
             lifecycle_guard: close_ops::LifecycleGuardState::default(),
             project_switch: project_switch::ProjectSwitchGuardState::default(),
-            keymap_manager: crate::keymap::KeymapManager::new(app_data),
+            keymap_manager: {
+            let manager = crate::keymap::KeymapManager::new(app_data.clone());
+            crate::keymap::init_global_keymap(app_data);
+            manager
+        },
             project_state: crate::app_state::ProjectState::NoProject,
             last_window_title: None,
             session_install_status: crate::app_state::SessionInstallStatus::Ready,

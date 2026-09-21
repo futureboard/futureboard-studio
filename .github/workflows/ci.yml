@@ -11,7 +11,7 @@ on:
     branches:
       - main
       - master
-      - develop
+      - dev
   pull_request:
   workflow_dispatch:
 

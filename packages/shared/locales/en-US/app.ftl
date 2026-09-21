@@ -609,7 +609,12 @@ project.error.corrupted = Corrupted project: { $msg }
 project.error.invalid-magic = Not a Futureboard project file
 project.error.io = I/O error: { $e }
 project.error.unsupported-version = Unsupported project version: { $v }
+project.error.old-version = This project was created with an older version of Futureboard. It can be opened, but some features may be missing or behave differently.
 project.file.missing = Missing
+project.error.restore-failed = The restored arrangement did not match the project file.
+project.error.file-not-found = The project file could not be found at the saved location.
+project.error.restore-session-failed = The project file could not be restored into the session.
+project.error.warning-dialog-failed = Could not show version warning dialog.
 project.subtitle.opened = Opened
 project.subtitle.save-failed = Save failed: { $error }
 project.subtitle.saved = Saved
@@ -910,6 +915,16 @@ window.minimize = -
 window.restore = RESTORE
 
 ## Dialogs
+
+dialog.old-version-project.title = Old Project Version
+dialog.old-version-project.message = This project was created with Futureboard v{ $version } (current is v{ $currentVersion }).\nIt can be opened, but some features may be missing or behave differently.\nThe project will be upgraded to the current format when saved.
+dialog.old-version-project.detail = Minimum supported version: v{ $minVersion }\nYour project version: v{ $version }\nCurrent version: v{ $currentVersion }
+dialog.old-version-project.button.open-anyway = Open Anyway
+dialog.old-version-project.button.cancel = Cancel
+dialog.old-version-project.open-failed = The project file could not be opened.
+dialog.old-version-project.open-failed-detail = The restored arrangement did not match the project file.
+dialog.old-version-project.cancelled = Opening the old version project was cancelled.
+dialog.old-version-project.warning-dialog-failed = Could not show version warning dialog.
 
 wizard.bpm = BPM
 wizard.button.browse = Browse

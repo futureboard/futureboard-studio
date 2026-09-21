@@ -940,3 +940,17 @@ wizard.summary.template = 模板
 wizard.summary.tracks = 轨道
 wizard.summary.tracks-value = { $audio } 音频 / { $midi } MIDI
 wizard.title = 新建项目
+
+## Dialogs
+
+dialog.old-version-project.title = 旧版本项目
+dialog.old-version-project.message = 此项目是使用 Futureboard v{ $version } 创建的（当前版本为 v{ $currentVersion }）。\n仍可打开，但部分功能可能缺失或表现异常。\n保存时将升级为当前格式。
+dialog.old-version-project.detail = 最低支持版本: v{ $minVersion }\n项目版本: v{ $version }\n当前版本: v{ $currentVersion }
+dialog.old-version-project.button.open-anyway = 仍要打开
+dialog.old-version-project.button.cancel = 取消
+dialog.old-version-project.open-failed = 无法打开项目文件。
+dialog.old-version-project.open-failed-detail = 恢复的排列与项目文件不匹配。
+dialog.old-version-project.cancelled = 打开旧版本项目的操作已取消。
+dialog.old-version-project.warning-dialog-failed = 无法显示版本警告对话框。
+
+wizard.bpm = BPM

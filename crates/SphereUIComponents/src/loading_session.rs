@@ -19,7 +19,7 @@ use crate::components::timeline::timeline_state::TimelineState;
 use crate::components::title_bar::chromeless_window_titlebar;
 use crate::layout::ProjectOpenOptions;
 use crate::layout::StudioLayout;
-use crate::project::io::{load_project, validate_project_file};
+use crate::project::io::{load_project, load_project_strict, validate_project_file};
 use crate::project::{FutureboardProject, ProjectSession};
 use crate::session_shutdown::{
     flush_autosave_blocking, run_session_shutdown, SessionShutdownError, POST_SHUTDOWN_UI_STEPS,
@@ -688,9 +688,10 @@ impl LoadingSessionWindow {
                     }
                 };
                 if !path.exists() {
+                    let i18n = crate::i18n::I18n::from_app(cx);
                     self.finish_failure(
                         "Open Project Failed",
-                        "The project file could not be found at the saved location.",
+                        &i18n.tr("project.error.file-not-found"),
                         Some(format!("Details: {}", path.display())),
                         cx,
                     );
@@ -730,7 +731,7 @@ impl LoadingSessionWindow {
                 cx.spawn(async move |_entity, cx| {
                     let decoded = cx
                         .background_executor()
-                        .spawn(async move { load_project(&path) })
+                        .spawn(async move { load_project(&path, false) })
                         .await;
                     let _ = this.update(cx, |this, cx| this.on_decode_complete(decoded, cx));
                 })
@@ -742,9 +743,10 @@ impl LoadingSessionWindow {
                 };
                 let Some(project) = transaction.project.take() else {
                     self.transaction = Some(transaction);
+                    let i18n = crate::i18n::I18n::from_app(cx);
                     self.finish_failure(
                         "Open Project Failed",
-                        "The project file could not be restored into the session.",
+                        &i18n.tr("project.error.restore-session-failed"),
                         Some("Decoded project data was missing.".to_string()),
                         cx,
                     );
@@ -1005,9 +1007,10 @@ fn spawn_session_install(
                 }
                 Err(error) => {
                     session_log!("session install failed: {error}");
+                    let i18n = crate::i18n::I18n::from_app(cx);
                     let ctx = LoadFailedContext {
                         title: "Open Project Failed".to_string(),
-                        message: "The project could not be restored into the session.".to_string(),
+                        message: i18n.tr("project.error.restore-session-failed"),
                         detail: Some(format!("Details: {error}")),
                         path: Some(path),
                         open_options,
@@ -1284,7 +1287,7 @@ fn run_headless_load(
         return;
     }
     match validate_project_file(&path) {
-        Ok(_) => match load_project(&path) {
+        Ok(_) => match load_project_strict(&path) {
             Ok(project) => on_success(
                 LoadedSessionPackage {
                     project,

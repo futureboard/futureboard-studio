@@ -940,3 +940,17 @@ wizard.summary.template = เทมเพลต
 wizard.summary.tracks = แทร็ก
 wizard.summary.tracks-value = เสียง { $audio } / MIDI { $midi }
 wizard.title = โปรเจกต์ใหม่
+
+## Dialogs
+
+dialog.old-version-project.title = โปรเจกต์รุ่นเก่า
+dialog.old-version-project.message = โปรเจกต์นี้สร้างด้วย Futureboard v{ $version } (รุ่นปัจจุบันคือ v{ $currentVersion })\nยังเปิดได้ แต่บางฟีเจอร์อาจหายไปหรือทำงานต่างออกไป\nบันทึกแล้วจะอัปเกรดเป็นรูปแบบรุ่นใหม่
+dialog.old-version-project.detail = รุ่นขั้นต่ำที่รองรับ: v{ $minVersion }\nรุ่นของโปรเจกต์นี้: v{ $version }\nรุ่นปัจจุบัน: v{ $currentVersion }
+dialog.old-version-project.button.open-anyway = เปิดอยู่ดี
+dialog.old-version-project.button.cancel = ยกเลิก
+dialog.old-version-project.open-failed = ไม่สามารถเปิดไฟล์โปรเจกต์ได้
+dialog.old-version-project.open-failed-detail = การจัดวางที่กู้คืนมาไม่ตรงกับไฟล์โปรเจกต์
+dialog.old-version-project.cancelled = การเปิดโปรเจกต์รุ่นเก่าถูกยกเลิก
+dialog.old-version-project.warning-dialog-failed = ไม่สามารถแสดงกล่องเตือนเวอร์ชันได้
+
+wizard.bpm = BPM
