@@ -17,7 +17,8 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
+import { workspaceSuffix } from "../app/workspace";
 import {
   clearActiveParamBinding,
   onNativeMessage,
@@ -64,15 +65,23 @@ export function useBoundInstance(): BoundInstanceState {
 /** Must match `UI_ORIGIN` / the catalog id native routes this editor under. */
 const PLUGIN_ID = "rodharerist";
 
+function instanceIdFromPath(pathname: string): string | null {
+  const parts = pathname.split("/").filter(Boolean);
+  if (parts[0] !== "instance" || !parts[1]) return null;
+  return parts[1];
+}
+
 export function BoundInstanceProvider({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
-  const params = useParams<{ instanceId: string }>();
+  const location = useLocation();
   const [state, setState] = useState<BoundInstanceState>(initialState);
 
   // The instance id the last *approved* `selectInstance` set. Lets the route
   // effect below tell "native just navigated us here" apart from "the route
   // changed some other way (typed URL, back/forward)" without a render race.
   const approvedInstanceRef = useRef<string | null>(null);
+  const pathRef = useRef(location.pathname);
+  pathRef.current = location.pathname;
 
   useEffect(() => {
     sendBridgeReady(PLUGIN_ID);
@@ -95,7 +104,10 @@ export function BoundInstanceProvider({ children }: { children: ReactNode }) {
           connectionStatus: "active",
           state: msg.state,
         });
-        navigate(`/instance/${msg.instanceId}`, { replace: true });
+        navigate(
+          `/instance/${msg.instanceId}${workspaceSuffix(pathRef.current)}`,
+          { replace: true },
+        );
         // Acknowledge only after the state above is committed — React 19
         // batches this synchronously within the handler, so by the time this
         // runs the bound state this instance will render with is already set.
@@ -120,12 +132,13 @@ export function BoundInstanceProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // The route says an instance native hasn't approved — ask, don't assume.
+  // Browse/Rig suffixes are ignored: only the opaque instance token matters.
   useEffect(() => {
-    const routeInstanceId = params.instanceId;
+    const routeInstanceId = instanceIdFromPath(location.pathname);
     if (!routeInstanceId) return;
     if (routeInstanceId === approvedInstanceRef.current) return;
     requestSelectInstance(routeInstanceId);
-  }, [params.instanceId]);
+  }, [location.pathname]);
 
   return (
     <BoundInstanceContext.Provider value={state}>

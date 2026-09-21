@@ -67,7 +67,7 @@ import {
   type SerializedSnapshotBank,
 } from "./presetFiles";
 import "./Styles/Editor.css";
-import { HashRouter, Routes, Route } from "react-router-dom";
+import { HashRouter, Navigate, Route, Routes } from "react-router-dom";
 import {
   BoundInstanceProvider,
   useBoundInstance,
@@ -1363,7 +1363,13 @@ function BoundEditor() {
 
 function AppRoot() {
   if (import.meta.env.DEV) {
-    return <RodhareistEditor />;
+    return (
+      <HashRouter>
+        <Routes>
+          <Route path="/*" element={<RodhareistEditor />} />
+        </Routes>
+      </HashRouter>
+    );
   }
 
   return (
@@ -1371,7 +1377,11 @@ function AppRoot() {
       <BoundInstanceProvider>
         <Routes>
           <Route path="/" element={<NoInstanceSelected />} />
-          <Route path="/instance/:instanceId" element={<BoundEditor />} />
+          <Route
+            path="/instance/:instanceId"
+            element={<Navigate to="rig" replace />}
+          />
+          <Route path="/instance/:instanceId/*" element={<BoundEditor />} />
         </Routes>
       </BoundInstanceProvider>
     </HashRouter>

@@ -1,98 +1,16 @@
-import { useEffect, useRef } from "react";
-import type { CategoryId, Param, Preset } from "./data";
+import type { CategoryId, Param } from "./data";
 import type { NamCaptureLoadOptions } from "./bridge";
 import type { AbSlot } from "./state/history";
+import { useWorkspaceNav } from "./app/useWorkspaceNav";
+import { BrowseIntentProvider } from "./browse/BrowseIntent";
+import { BrowseWorkspace } from "./browse/BrowseWorkspace";
 import { DiscardDialog } from "./Components/DiscardDialog";
 import { Footer } from "./Components/Footer";
 import { Header } from "./Components/Header";
-import { IoStrip } from "./Components/IoStrip";
-import { ModuleEditor } from "./Components/ModuleEditor";
-import { PresetBrowser } from "./Components/PresetBrowser";
-import { SignalChain } from "./Components/SignalChain";
+import { RigWorkspace } from "./rig/RigWorkspace";
 
 // Supports weights 100-700
-import '@fontsource-variable/ibm-plex-sans/wght.css';
-
-/** Sidebar width bounds + persistence for the drag divider. */
-const SIDEBAR_DEFAULT_PX = 176;
-const SIDEBAR_MIN_PX = 140;
-const SIDEBAR_MAX_PX = 360;
-const SIDEBAR_WIDTH_KEY = "rodhareist.sidebarWidth";
-
-function clampSidebar(px: number): number {
-  return Math.min(SIDEBAR_MAX_PX, Math.max(SIDEBAR_MIN_PX, Math.round(px)));
-}
-
-function storedSidebarWidth(): number {
-  try {
-    const raw = window.localStorage.getItem(SIDEBAR_WIDTH_KEY);
-    const parsed = raw === null ? NaN : Number(raw);
-    return Number.isFinite(parsed) ? clampSidebar(parsed) : SIDEBAR_DEFAULT_PX;
-  } catch {
-    return SIDEBAR_DEFAULT_PX;
-  }
-}
-
-/**
- * Drag divider on the sidebar's right edge. Width is applied straight to the
- * workspace's CSS variable during the drag (no React re-render per move) and
- * persisted on release. Double-click resets to the default.
- */
-function SidebarResizer({
-  workspaceRef,
-}: {
-  workspaceRef: React.RefObject<HTMLDivElement | null>;
-}) {
-  const applyWidth = (px: number) => {
-    workspaceRef.current?.style.setProperty("--sidebar-w", `${clampSidebar(px)}px`);
-  };
-
-  return (
-    <div
-      className="sidebar-resize"
-      role="separator"
-      aria-orientation="vertical"
-      aria-label="Resize sidebar"
-      onDoubleClick={() => {
-        applyWidth(SIDEBAR_DEFAULT_PX);
-        try {
-          window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(SIDEBAR_DEFAULT_PX));
-        } catch {
-          /* no-op */
-        }
-      }}
-      onPointerDown={(e) => {
-        e.preventDefault();
-        const startX = e.clientX;
-        const startW =
-          workspaceRef.current
-            ?.style.getPropertyValue("--sidebar-w")
-            .match(/^(\d+)px$/)?.[1] ?? String(storedSidebarWidth());
-        const base = Number(startW) || SIDEBAR_DEFAULT_PX;
-        const target = e.currentTarget;
-        target.setPointerCapture(e.pointerId);
-        let latest = base;
-        const onMove = (ev: PointerEvent) => {
-          latest = clampSidebar(base + (ev.clientX - startX));
-          applyWidth(latest);
-        };
-        const onUp = () => {
-          target.removeEventListener("pointermove", onMove);
-          target.removeEventListener("pointerup", onUp);
-          target.removeEventListener("pointercancel", onUp);
-          try {
-            window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(latest));
-          } catch {
-            /* no-op */
-          }
-        };
-        target.addEventListener("pointermove", onMove);
-        target.addEventListener("pointerup", onUp);
-        target.addEventListener("pointercancel", onUp);
-      }}
-    />
-  );
-}
+import "@fontsource-variable/ibm-plex-sans/wght.css";
 
 export type DiscardPrompt = {
   presetName: string;
@@ -156,160 +74,90 @@ export type LayoutProps = {
   onBypassCab: () => void;
 };
 
-export function Layout({
-  currentPresetId,
-  presetName,
-  modified,
-  dirtyPresetIds,
-  activeCat,
-  activeModelId,
-  stageModels,
-  pathOrder,
-  bypassed,
-  params,
-  testing,
-  showTestDi,
-  inputTrim,
-  outputTrim,
-  globalBypass,
-  canUndo,
-  canRedo,
-  abSlot,
-  snapshotSlots,
-  activeSnapshotIndex,
-  onSelectSnapshot,
-  onSaveSnapshot,
-  onRenameSnapshot,
-  clipboardCat,
-  discardPrompt,
-  onUndo,
-  onRedo,
-  onSelectAb,
-  onCopyAb,
-  onStepPreset,
-  onLoadPresetFile,
-  buildSavePayload,
-  buildFactorySnapshot,
-  onLoadNamFile,
-  onPrepareNamEngine,
-  onIrLoaded,
-  onToggleTest,
-  onSave,
-  onRevert,
-  onSelectCategory,
-  onToggleModule,
-  onReorderPath,
-  onSelectModel,
-  onToggleBypass,
-  onToggleGlobalBypass,
-  onParamChange,
-  onGlobalParamChange,
-  onCopySettings,
-  onPasteSettings,
-  onResetModule,
-  onLoadNamCapture,
-  onBypassCab,
-}: LayoutProps) {
-  const workspaceRef = useRef<HTMLDivElement | null>(null);
-
-  // Restore the persisted sidebar width once per mount.
-  useEffect(() => {
-    workspaceRef.current?.style.setProperty(
-      "--sidebar-w",
-      `${storedSidebarWidth()}px`,
-    );
-  }, []);
+export function Layout(props: LayoutProps) {
+  const { workspace } = useWorkspaceNav();
+  const browse = workspace.mode === "browse";
 
   return (
-    <div className="plugin">
-      <Header
-        presetId={currentPresetId}
-        presetName={presetName}
-        modified={modified}
-        testing={testing}
-        showTestDi={showTestDi}
-        canUndo={canUndo}
-        canRedo={canRedo}
-        abSlot={abSlot}
-        onUndo={onUndo}
-        onRedo={onRedo}
-        onSelectAb={onSelectAb}
-        onCopyAb={onCopyAb}
-        onStepPreset={onStepPreset}
-        onToggleTest={onToggleTest}
-        onSave={onSave}
-        onRevert={onRevert}
-        snapshotSlots={snapshotSlots}
-        activeSnapshotIndex={activeSnapshotIndex}
-        onSelectSnapshot={onSelectSnapshot}
-        onSaveSnapshot={onSaveSnapshot}
-        onRenameSnapshot={onRenameSnapshot}
-      />
-
-      <div className="workspace" ref={workspaceRef}>
-        <PresetBrowser
-          currentPresetId={currentPresetId}
-          modifiedIds={dirtyPresetIds}
-          onLoadPresetFile={onLoadPresetFile}
-          buildSavePayload={buildSavePayload}
-          buildFactorySnapshot={buildFactorySnapshot}
-          onLoadNamFile={onLoadNamFile}
-          onPrepareNamEngine={onPrepareNamEngine}
-          onIrLoaded={onIrLoaded}
+    <BrowseIntentProvider>
+      <div className="plugin">
+        <Header
+          presetId={props.currentPresetId}
+          presetName={props.presetName}
+          modified={props.modified}
+          testing={props.testing}
+          showTestDi={props.showTestDi}
+          canUndo={props.canUndo}
+          canRedo={props.canRedo}
+          abSlot={props.abSlot}
+          onUndo={props.onUndo}
+          onRedo={props.onRedo}
+          onSelectAb={props.onSelectAb}
+          onCopyAb={props.onCopyAb}
+          onStepPreset={props.onStepPreset}
+          onToggleTest={props.onToggleTest}
+          onSave={props.onSave}
+          onRevert={props.onRevert}
+          snapshotSlots={props.snapshotSlots}
+          activeSnapshotIndex={props.activeSnapshotIndex}
+          onSelectSnapshot={props.onSelectSnapshot}
+          onSaveSnapshot={props.onSaveSnapshot}
+          onRenameSnapshot={props.onRenameSnapshot}
         />
-        <SidebarResizer workspaceRef={workspaceRef} />
 
-        <main className="dashboard">
-          {/* Gain staging brackets the chain so input and output levels are
-              always on screen, in the order the signal actually travels. */}
-          <div className="chain-region">
-            <IoStrip side="in" trim={inputTrim} onTrimChange={onGlobalParamChange} />
-            <SignalChain
-              pathOrder={pathOrder}
-              activeCat={activeCat}
-              stageModels={stageModels}
-              bypassed={bypassed}
-              clipboardCat={clipboardCat}
-              onSelectCategory={onSelectCategory}
-              onToggleModule={onToggleModule}
-              onReorderPath={onReorderPath}
-              onCopySettings={onCopySettings}
-              onPasteSettings={onPasteSettings}
-              onResetModule={onResetModule}
+        <div className={`workspace ${browse ? "browse-mode" : "rig-mode"}`}>
+          {browse && (
+            <BrowseWorkspace
+              currentPresetId={props.currentPresetId}
+              modifiedIds={props.dirtyPresetIds}
+              onLoadPresetFile={props.onLoadPresetFile}
+              buildSavePayload={props.buildSavePayload}
+              buildFactorySnapshot={props.buildFactorySnapshot}
+              onLoadNamFile={props.onLoadNamFile}
+              onPrepareNamEngine={props.onPrepareNamEngine}
+              onIrLoaded={props.onIrLoaded}
             />
-            <IoStrip
-              side="out"
-              trim={outputTrim}
-              onTrimChange={onGlobalParamChange}
-              globalBypass={globalBypass}
-              onToggleGlobalBypass={onToggleGlobalBypass}
+          )}
+          <div className="workspace-pane" hidden={browse}>
+            <RigWorkspace
+              activeCat={props.activeCat}
+              activeModelId={props.activeModelId}
+              stageModels={props.stageModels}
+              pathOrder={props.pathOrder}
+              bypassed={props.bypassed}
+              params={props.params}
+              inputTrim={props.inputTrim}
+              outputTrim={props.outputTrim}
+              globalBypass={props.globalBypass}
+              clipboardCat={props.clipboardCat}
+              onSelectCategory={props.onSelectCategory}
+              onToggleModule={props.onToggleModule}
+              onReorderPath={props.onReorderPath}
+              onSelectModel={props.onSelectModel}
+              onToggleBypass={props.onToggleBypass}
+              onToggleGlobalBypass={props.onToggleGlobalBypass}
+              onParamChange={props.onParamChange}
+              onGlobalParamChange={props.onGlobalParamChange}
+              onCopySettings={props.onCopySettings}
+              onPasteSettings={props.onPasteSettings}
+              onResetModule={props.onResetModule}
+              onLoadNamCapture={props.onLoadNamCapture}
+              onBypassCab={props.onBypassCab}
             />
           </div>
+        </div>
 
-          <ModuleEditor
-            activeCat={activeCat}
-            activeModelId={activeModelId}
-            bypassed={!!bypassed[activeCat]}
-            params={params}
-            onSelectModel={onSelectModel}
-            onToggleBypass={onToggleBypass}
-            onParamChange={onParamChange}
-            onLoadNamCapture={onLoadNamCapture}
-            onBypassCab={onBypassCab}
+        <Footer globalBypass={props.globalBypass} />
+
+        {props.discardPrompt && (
+          <DiscardDialog
+            presetName={props.discardPrompt.presetName}
+            onSave={props.discardPrompt.onSave}
+            onDiscard={props.discardPrompt.onDiscard}
+            onCancel={props.discardPrompt.onCancel}
           />
-        </main>
+        )}
       </div>
-
-      <Footer globalBypass={globalBypass} />
-
-      {discardPrompt && (
-        <DiscardDialog
-          presetName={discardPrompt.presetName}
-          onSave={discardPrompt.onSave}
-          onDiscard={discardPrompt.onDiscard}
-          onCancel={discardPrompt.onCancel}
-        />
-      )}
-    </div>
+    </BrowseIntentProvider>
   );
 }

@@ -3,6 +3,7 @@ Nawaphol Bunchuea (Arizkami)
 
 Futureboard Studio Application
 Kittinan Srikokpho (YuumaHanazawa) - Developer
+Awarin Warraekalak (EvarinthoSec) - Developer
 Supakit Thongniem (Rondoknight) - UX/UI Designer
 Fam Kramonmanit - Quality Assurance
 

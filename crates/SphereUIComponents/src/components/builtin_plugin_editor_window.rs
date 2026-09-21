@@ -85,6 +85,43 @@ fn default_editor_window_size(plugin_id: &str) -> (f32, f32) {
     }
 }
 
+/// Keep the initial editor window inside the visible area of the display that
+/// owns Studio. On smaller laptop displays, asking AppKit/Win32 for the full
+/// design size can leave the close affordance or the lower editor surface
+/// beyond the work area. The minimum follows the fitted size so the user can
+/// still resize the window on displays smaller than the nominal minimum.
+fn fitted_editor_window_size(
+    requested: (f32, f32),
+    owner_bounds: Bounds<Pixels>,
+    cx: &App,
+) -> (f32, f32) {
+    let center = owner_bounds.center();
+    let display = cx.displays().into_iter().find(|display| {
+        let bounds = display.bounds();
+        let x = f32::from(center.x);
+        let y = f32::from(center.y);
+        let left = f32::from(bounds.origin.x);
+        let top = f32::from(bounds.origin.y);
+        x >= left
+            && y >= top
+            && x < left + f32::from(bounds.size.width)
+            && y < top + f32::from(bounds.size.height)
+    });
+    let work_area = display
+        .map(|display| display.visible_bounds())
+        .or_else(|| cx.primary_display().map(|display| display.visible_bounds()));
+    let Some(work_area) = work_area else {
+        return requested;
+    };
+
+    // Leave enough room to grab a resize edge without placing the window under
+    // the menu bar, Dock, taskbar, or display edge.
+    const WORK_AREA_MARGIN: f32 = 16.0;
+    let max_width = (f32::from(work_area.size.width) - WORK_AREA_MARGIN).max(1.0);
+    let max_height = (f32::from(work_area.size.height) - WORK_AREA_MARGIN).max(1.0);
+    (requested.0.min(max_width), requested.1.min(max_height))
+}
+
 /// Identity of one DSP insert that can be shown in a shared built-in editor.
 /// `track_id`/`insert_id` are the same stable, session-monotonic ids
 /// `InsertSlotState` already uses (see `plugin_chain.rs`) — never reused
@@ -2511,19 +2548,21 @@ impl Render for BuiltinPluginEditorWindow {
             .capture_key_down(transport_claim)
             .child(
                 // Shared external-dialog titlebar: gives this window the same
-                // chrome as every other floating Studio surface, plus the drag
-                // region and close button that a borderless shell needs (a
-                // hand-rolled header has no way to move the window).
-                div().flex_none().child(external_window_titlebar(
-                    self.display_name.clone(),
-                    "builtin-plugin-editor-close",
-                    {
-                        let this = cx.weak_entity();
-                        move |_window, cx| {
-                            let _ = this.update(cx, |this, cx| this.request_close(cx));
-                        }
-                    },
-                )),
+                // chrome and drag region as every other floating Studio surface.
+                // Caption controls come from the platform policy: native traffic
+                // lights on macOS, drawn controls on Linux and Windows.
+                div()
+                    .flex_none()
+                    .child(external_window_titlebar(
+                        self.display_name.clone(),
+                        "builtin-plugin-editor-close",
+                        {
+                            let this = cx.weak_entity();
+                            move |_window, cx| {
+                                let _ = this.update(cx, |this, cx| this.request_close(cx));
+                            }
+                        },
+                    )),
             )
             .child(
                 div()
@@ -3222,29 +3261,22 @@ pub fn open_builtin_editor_window(
     host_ops: BuiltinEditorHostOps,
     cx: &mut App,
 ) -> Result<WindowHandle<BuiltinPluginEditorWindow>, String> {
-    let parent_x: f32 = owner_bounds.origin.x.into();
-    let parent_y: f32 = owner_bounds.origin.y.into();
-    let parent_w: f32 = owner_bounds.size.width.into();
-    let parent_h: f32 = owner_bounds.size.height.into();
-    let (editor_width, editor_height) = default_editor_window_size(&plugin_id);
-    let origin = Point {
-        x: px(parent_x + ((parent_w - editor_width) / 2.0).max(24.0)),
-        y: px(parent_y + ((parent_h - editor_height) / 2.0).max(24.0)),
-    };
+    let (editor_width, editor_height) =
+        fitted_editor_window_size(default_editor_window_size(&plugin_id), owner_bounds, cx);
+    let editor_size = size(px(editor_width), px(editor_height));
+    let editor_bounds =
+        crate::window_position::centered_window_bounds(Some(owner_bounds), editor_size, cx);
 
     let mut options = crate::platform_chrome::external_dialog_window_options_partial();
-    options.window_bounds = Some(WindowBounds::Windowed(Bounds {
-        origin,
-        size: size(px(editor_width), px(editor_height)),
-    }));
+    options.window_bounds = Some(WindowBounds::Windowed(editor_bounds));
     options.kind = WindowKind::Floating;
     options.is_resizable = true;
     options.is_minimizable = false;
     // Opaque: an unpainted OSR frame must never reveal the timeline behind it.
     options.window_background = WindowBackgroundAppearance::Opaque;
     options.window_min_size = Some(size(
-        px(BUILTIN_EDITOR_MIN_WIDTH),
-        px(BUILTIN_EDITOR_MIN_HEIGHT),
+        px(BUILTIN_EDITOR_MIN_WIDTH.min(editor_width)),
+        px(BUILTIN_EDITOR_MIN_HEIGHT.min(editor_height)),
     ));
     // Attach the monitor that holds the owner, or the requested rect is
     // validated against the PRIMARY display and swapped for a default centred
@@ -3264,10 +3296,12 @@ pub fn open_builtin_editor_window(
         });
         let weak = view.downgrade();
         window.on_window_should_close(cx, move |_window, cx| {
-            let _ = weak.update(cx, |view, cx| view.request_close(cx));
-            // Always veto the platform close. `Closed` removes the shell after
-            // CEF has processed its queued close command.
-            false
+            let close_was_queued = weak
+                .update(cx, |view, cx| view.request_close(cx))
+                .is_ok();
+            // Defer while the entity owns a CEF view; if it is already gone,
+            // allow AppKit to finish closing instead of vetoing forever.
+            !close_was_queued
         });
         view
     })

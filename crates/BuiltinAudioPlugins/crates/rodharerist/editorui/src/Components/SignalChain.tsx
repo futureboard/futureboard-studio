@@ -173,6 +173,15 @@ function EmptyPathDropTarget() {
  * Rendered even when every stage is in the path (nothing left to add), because
  * it is still the place a block is dragged to in order to leave.
  */
+const ADD_GROUPS: { label: string; cats: CategoryId[] }[] = [
+  { label: "Dynamics", cats: ["dyn", "comp", "comp2"] },
+  { label: "Drive", cats: ["wah", "dist", "dist2", "amp"] },
+  { label: "EQ", cats: ["eq", "eq2"] },
+  { label: "Mod", cats: ["mod", "mod2"] },
+  { label: "Time", cats: ["delay", "delay2", "verb"] },
+  { label: "Cab", cats: ["cab"] },
+];
+
 function Rack({
   rack,
   onAdd,
@@ -181,12 +190,22 @@ function Rack({
   onAdd: (cat: CategoryId) => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: RACK_DROP_ID });
+  const available = new Set(rack);
   return (
     <div ref={setNodeRef} className={`rack${isOver ? " drag-over" : ""}`}>
-      <span className="rack-label">Rack</span>
-      {rack.map((cat) => (
-        <RackItem key={cat} cat={cat} onAdd={onAdd} />
-      ))}
+      <span className="rack-label">Add Block</span>
+      {ADD_GROUPS.map((group) => {
+        const cats = group.cats.filter((cat) => available.has(cat));
+        if (cats.length === 0) return null;
+        return (
+          <div key={group.label} className="rack-group">
+            <span className="rack-group-label">{group.label}</span>
+            {cats.map((cat) => (
+              <RackItem key={cat} cat={cat} onAdd={onAdd} />
+            ))}
+          </div>
+        );
+      })}
       {rack.length === 0 && (
         <span className="rack-empty">
           Every block is in the path — drag one here to remove it
