@@ -575,6 +575,7 @@ impl StudioLayout {
             }
         }
         if dirty {
+            self.ara.document_data_changed();
             self.project_session.mark_dirty();
             cx.notify();
         }
@@ -620,27 +621,68 @@ impl StudioLayout {
                 )
             }));
 
-        // One session per ARA track. A parked archive whose track no longer has
-        // that plug-in stays parked and is saved back untouched rather than
-        // silently discarded.
-        let mut wanted: Vec<AraSessionKey> = Vec::new();
-        for track in &project.tracks {
-            if let Some(binding) = track.ara.as_ref() {
+        self.open_pending_ara_sessions(cx);
+        // Until a session is live its clips play from their files (see
+        // `sync_engine_ara_rendering`); resync so the engine hears that now.
+        self.mark_engine_project_dirty();
+    }
+
+    /// Opens the session of every ARA-bound track that has none yet.
+    ///
+    /// A project is restored before either of the things a session needs is
+    /// guaranteed to exist: the plug-in catalog and the audio engine both load
+    /// asynchronously, and a project opened from the Welcome screen reaches
+    /// the studio ahead of both. Restoring once and giving up left those
+    /// tracks with no plug-in — nothing to show, nothing rendering — so this
+    /// runs again when the catalog and the engine arrive. Archives stay
+    /// parked until their session opens, so nothing is lost while waiting.
+    ///
+    /// One session per ARA track. A parked archive whose track no longer has
+    /// that plug-in stays parked and is saved back untouched rather than
+    /// silently discarded.
+    pub(crate) fn open_pending_ara_sessions(&mut self, cx: &mut Context<Self>) {
+        let pending: Vec<AraSessionKey> = {
+            let state = &self.timeline.read(cx).state;
+            let mut keys: Vec<AraSessionKey> = Vec::new();
+            for track in &state.tracks {
+                let Some(binding) = track.ara.as_ref() else {
+                    continue;
+                };
                 let key = AraSessionKey {
                     plugin_id: binding.plugin_id.clone(),
                     track_id: track.id.clone(),
                 };
-                if !wanted.contains(&key) {
-                    wanted.push(key);
+                if self.ara.processor(&key).is_none() && !keys.contains(&key) {
+                    keys.push(key);
                 }
             }
+            keys
+        };
+        if pending.is_empty() {
+            return;
+        }
+        // Not failures yet — just early. The catalog load and the engine
+        // start both call back in here.
+        if self.plugin_catalog.available.is_none() || self.audio_bridge.engine.is_none() {
+            ara_trace(&format!(
+                "{} ARA session(s) waiting for the {}",
+                pending.len(),
+                if self.plugin_catalog.available.is_none() {
+                    "plug-in catalog"
+                } else {
+                    "audio engine"
+                }
+            ));
+            return;
         }
         let choices = self.ara_plugin_choices();
-        for key in wanted {
+        let mut opened = false;
+        for key in pending {
             match choices.iter().find(|choice| choice.id == key.plugin_id) {
                 Some(choice) => {
                     let choice = choice.clone();
                     self.sync_ara_session(&key, &choice, cx);
+                    opened |= self.ara.processor(&key).is_some();
                 }
                 None => {
                     self.ara.last_error = Some(format!(
@@ -650,6 +692,39 @@ impl StudioLayout {
                     ));
                 }
             }
+        }
+        if opened {
+            // The engine switches those tracks from their files to the plug-in.
+            self.mark_engine_project_dirty();
+        }
+        cx.notify();
+    }
+
+    /// Clears `ara_rendered` on clips whose track has no live ARA session.
+    ///
+    /// The snapshot is built from the timeline alone, where a binding is
+    /// enough to mark a clip as the plug-in's to render. With no session
+    /// behind it — still opening, or its plug-in missing — that silenced the
+    /// track, where the promise (and the error message) is that it plays from
+    /// its files until the plug-in is back.
+    pub(crate) fn sync_engine_ara_rendering(
+        &self,
+        snapshot: &mut DirectAudio::types::EngineProjectSnapshot,
+    ) {
+        let live: std::collections::HashSet<&str> =
+            self.ara.keys().map(|key| key.track_id.as_str()).collect();
+        clear_ara_rendering_without_session(snapshot, &live);
+    }
+}
+
+/// See [`StudioLayout::sync_engine_ara_rendering`].
+fn clear_ara_rendering_without_session(
+    snapshot: &mut DirectAudio::types::EngineProjectSnapshot,
+    live_tracks: &std::collections::HashSet<&str>,
+) {
+    for clip in snapshot.clips.iter_mut() {
+        if clip.ara_rendered && !live_tracks.contains(clip.track_id.as_str()) {
+            clip.ara_rendered = false;
         }
     }
 }
@@ -893,6 +968,37 @@ mod tests {
         assert_eq!(
             StudioLayout::selected_ara_session_key_from_state(&state),
             None
+        );
+    }
+
+    fn clip_on(track: &str) -> DirectAudio::types::EngineClipSnapshot {
+        let mut clip: DirectAudio::types::EngineClipSnapshot = serde_json::from_str(
+            r#"{"id":"c","trackId":"","assetId":"","startBeat":0,"durationBeats":1,"offsetSeconds":0,"gain":1}"#,
+        )
+        .expect("minimal clip snapshot");
+        clip.track_id = track.to_string();
+        clip.ara_rendered = true;
+        clip
+    }
+
+    #[test]
+    fn a_bound_track_without_a_live_session_plays_its_files() {
+        let mut snapshot = crate::layout::engine_snapshot::build_engine_project_snapshot(
+            &crate::components::timeline::timeline_state::TimelineState::default(),
+            48_000,
+            None,
+            None,
+        );
+        snapshot.clips = vec![clip_on("live"), clip_on("waiting")];
+        let live: std::collections::HashSet<&str> = ["live"].into_iter().collect();
+        clear_ara_rendering_without_session(&mut snapshot, &live);
+        assert!(
+            snapshot.clips[0].ara_rendered,
+            "the plug-in renders a live track"
+        );
+        assert!(
+            !snapshot.clips[1].ara_rendered,
+            "a track still waiting plays its files"
         );
     }
 }

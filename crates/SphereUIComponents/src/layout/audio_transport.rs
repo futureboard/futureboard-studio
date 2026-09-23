@@ -1459,6 +1459,7 @@ impl StudioLayout {
                 Some(preferred_input_device.as_str()),
             );
             self.overlay_audio_tool_previews(&mut snapshot);
+            self.sync_engine_ara_rendering(&mut snapshot);
             snapshot
         };
         log_engine_sync_snapshot(

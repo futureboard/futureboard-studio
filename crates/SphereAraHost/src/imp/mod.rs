@@ -904,32 +904,61 @@ impl Session {
         );
 
         let document = self.document_mut()?;
-        let result = document.store_document_to_archive(token.as_ref());
+        // ARA 2 Final replaced whole-document persistence with object
+        // persistence; store with the call the restore below will read with.
+        let result = if document.generation() >= ApiGeneration::V2Final {
+            document.store_objects_to_archive(token.as_ref(), None)
+        } else {
+            document.store_document_to_archive(token.as_ref())
+        };
         let slot = self.archives.take(address);
         drop(token);
         result.map_err(map_error)?;
         Ok(slot.map(|slot| slot.bytes).unwrap_or_default())
     }
 
-    pub(crate) fn restore_archive(&mut self, bytes: &[u8]) -> AraResult<()> {
+    /// Restores `bytes`, stored under `archive_id`, into the document.
+    ///
+    /// The graph must already exist with the persistent IDs it was saved
+    /// with: both paths match the archive's objects to live ones by ID.
+    ///
+    /// ARA 2 Final and later restore objects inside an ordinary edit cycle.
+    /// Earlier plug-ins get the legacy restore scope, which (in every
+    /// ARA-library controller) is an edit cycle that restores all live
+    /// objects when it ends. The legacy call is refused outright at 2 Final
+    /// and later — which, since this host negotiates the newest generation
+    /// first and Apple Silicon allows nothing older, used to be every
+    /// session: saved ARA edits were silently dropped on every reopen.
+    pub(crate) fn restore_archive(&mut self, archive_id: &str, bytes: &[u8]) -> AraResult<()> {
         let token = Box::new(ArchiveToken {
             _sequence: self.next_archive,
         });
         self.next_archive += 1;
         let address = std::ptr::from_ref(token.as_ref()) as usize;
-        let archive_id = self.info.document_archive_id.clone();
+        // The ID the bytes were written under, not the plug-in's current one:
+        // an archive from an older version must be read as that version.
         self.archives.open(
             address,
             ArchiveSlot {
                 bytes: bytes.to_vec(),
-                archive_id: Some(archive_id),
+                archive_id: Some(archive_id.to_owned()),
             },
         );
 
         let document = self.document_mut()?;
-        let outcome = document
-            .restore_document_from_archive(token.as_ref())
-            .and_then(|edit| edit.finish());
+        let outcome = if document.generation() >= ApiGeneration::V2Final {
+            document.edit().and_then(|mut edit| {
+                let restored = edit.restore_objects_from_archive(token.as_ref(), None);
+                // End the cycle whatever the restore said, so a refused
+                // archive does not leave the document stuck in editing.
+                let finished = edit.finish();
+                restored.and(finished)
+            })
+        } else {
+            document
+                .restore_document_from_archive(token.as_ref())
+                .and_then(|edit| edit.finish())
+        };
         self.archives.take(address);
         drop(token);
         outcome.map_err(map_error)

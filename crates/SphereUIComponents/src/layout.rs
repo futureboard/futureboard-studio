@@ -1421,6 +1421,9 @@ impl StudioLayout {
                         this.audio_bridge.last_error = None;
                         this.audio_bridge.engine = Some(engine);
                         this.sync_plugin_bridge_sinks_to_engine(cx, "studio_audio_ready");
+                        // ARA sessions of a project restored before the engine
+                        // existed open now.
+                        this.open_pending_ara_sessions(cx);
                         this.schedule_audio_project_sync(cx, true, "studio_audio_ready");
                         crate::boot::log("audio engine handle ready");
                         cx.notify();

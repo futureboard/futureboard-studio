@@ -111,7 +111,7 @@ impl Session {
         unsupported()
     }
 
-    pub(crate) fn restore_archive(&mut self, _bytes: &[u8]) -> AraResult<()> {
+    pub(crate) fn restore_archive(&mut self, _archive_id: &str, _bytes: &[u8]) -> AraResult<()> {
         unsupported()
     }
 

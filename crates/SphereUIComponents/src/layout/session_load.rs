@@ -192,6 +192,12 @@ impl StudioLayout {
             return;
         }
 
+        // The pre-studio path hands over a timeline that already carries the
+        // tracks' ARA bindings, but nothing had reopened their sessions or
+        // parked their saved documents: the plug-in never loaded, and the next
+        // save wrote the project without its ARA state.
+        self.restore_ara_archives(&package.project, cx);
+
         self.validate_session_references(cx);
         self.update_virtual_keyboard_target_status(cx);
         self.schedule_loaded_project_waveforms(&package, cx);

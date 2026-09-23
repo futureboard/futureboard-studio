@@ -2962,6 +2962,9 @@ impl StudioLayout {
                     }
                 }
                 this.notify_insert_picker_window(cx);
+                // ARA sessions of a project restored before the catalog had
+                // loaded open now, rather than reporting their plug-in missing.
+                this.open_pending_ara_sessions(cx);
                 cx.notify();
             });
         })
