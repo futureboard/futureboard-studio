@@ -77,6 +77,7 @@ mod shell_regions;
 mod stretch_tempo_ops;
 mod studio_render;
 mod studio_state;
+mod tempo_key_ops;
 mod track_clip_ops;
 mod transport_freeze_debug;
 mod transport_ops;
@@ -1143,21 +1144,16 @@ impl StudioLayout {
             let target = cx.entity().clone();
             let _ = timeline.update(cx, |timeline, _cx| {
                 timeline.set_plugin_drag_drop_callback(Some(Arc::new(
-                    move |item, track_id, window, cx| {
+                    move |item, drop_target, window, cx| {
                         let plugin_id = item.plugin_id.clone();
-                        let target_track_id = track_id.to_string();
+                        let drop_target = drop_target.clone();
                         let kind = item.kind;
                         StudioLayout::defer_update_in_window(
                             &target,
                             window,
                             cx,
                             move |this, _window, cx| {
-                                this.apply_dropped_plugin_drag(
-                                    &plugin_id,
-                                    &target_track_id,
-                                    kind,
-                                    cx,
-                                );
+                                this.apply_dropped_plugin_drag(&plugin_id, &drop_target, kind, cx);
                             },
                         );
                     },
@@ -2696,6 +2692,7 @@ impl StudioLayout {
                 }
             }
             "clip:split-at-playhead" => self.split_selected_audio_clip_at_playhead(cx),
+            "audio:find-tempo-key" => self.open_tempo_key_finder(cx),
 
             // ── Tools — switch the active timeline tool. UI-only; never dirties
             // the engine. The piano roll owns its own tool keys when focused.

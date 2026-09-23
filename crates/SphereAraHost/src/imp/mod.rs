@@ -414,6 +414,40 @@ impl Session {
 
         let supported = self.info.supported_transforms;
 
+        // An open editor view is holding the regions it was last shown. Before
+        // any of them is destroyed, show it the set without them, so no view
+        // keeps a reference to a region that no longer exists.
+        {
+            let wanted_clips: HashSet<&AraClipKey> =
+                graph.regions.iter().map(|region| &region.key).collect();
+            if self.clips.keys().any(|key| !wanted_clips.contains(key)) {
+                let wanted_sequences: HashSet<&AraTrackKey> = graph
+                    .sequences
+                    .iter()
+                    .map(|sequence| &sequence.key)
+                    .collect();
+                let remaining: Vec<AraClipKey> = self
+                    .clips
+                    .keys()
+                    .filter(|key| wanted_clips.contains(key))
+                    .cloned()
+                    .collect();
+                let tracks: Vec<AraTrackKey> = self
+                    .sequences
+                    .keys()
+                    .filter(|key| wanted_sequences.contains(key))
+                    .cloned()
+                    .collect();
+                let renderers: Vec<AraRendererId> = self.renderers.keys().copied().collect();
+                for renderer in renderers {
+                    if let Err(error) = self.notify_editor_selection(renderer, &remaining, &tracks)
+                    {
+                        trace(&format!("editor selection before teardown: {error}"));
+                    }
+                }
+            }
+        }
+
         // One destructuring borrow: `document` is mutated through the edit scope
         // while the graph maps below are updated in the same pass, and the
         // borrow checker only allows that on disjoint fields.
@@ -451,10 +485,16 @@ impl Session {
             .collect();
 
         // A playback region may not be destroyed while a renderer still holds
-        // it, so drop those RAII assignments first.
+        // it, so drop those RAII assignments first — in **both** roles. The
+        // editor-renderer assignment used to survive: the region was destroyed
+        // under it, and dropping it afterwards (in `set_renderer_regions`)
+        // handed the plug-in a dangling region in `removePlaybackRegion`.
+        // Cutting or deleting a clip on an ARA track with the ARA panel open
+        // took the app down that way.
         for key in &stale_clips {
             for renderer in renderers.values_mut() {
                 renderer.assignments.remove(key);
+                renderer.editor_assignments.remove(key);
             }
         }
 
@@ -492,6 +532,13 @@ impl Session {
             .collect();
         for key in stale_sources {
             if let Some(entry) = sources.remove(&key) {
+                // Access off before the source goes: the plug-in may be reading
+                // it on an analysis thread, and disabling access is what makes
+                // it close those readers. Destroying a source that is still
+                // readable is an ARA API violation the SDK's controllers assert
+                // on.
+                edit.set_audio_source_samples_access(entry.handle, false)
+                    .map_err(map_error)?;
                 edit.destroy_audio_source(entry.handle).map_err(map_error)?;
                 index.remove_source(entry.address);
             }

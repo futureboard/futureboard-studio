@@ -1114,6 +1114,14 @@ pub fn drain_commands(
             } => {
                 runtime.bridge_preview_all_notes_off(&track_id, &plugin_instance_id);
             }
+            EngineCommand::PluginPreviewPitchBend {
+                track_id,
+                plugin_instance_id,
+                channel,
+                value,
+            } => {
+                runtime.bridge_preview_pitch_bend(&track_id, &plugin_instance_id, channel, value);
+            }
         }
     }
     // Publish the count-in's remaining length once per block. One atomic store;

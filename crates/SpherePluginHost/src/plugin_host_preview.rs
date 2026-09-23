@@ -77,11 +77,21 @@ impl VoiceMidiState {
     }
 
     fn preview_control_change(&mut self, channel: u8, controller: u8, value: u8) {
+        // `128`/`129` are the VST3 channel-pressure/pitch-bend controllers;
+        // clamping them to 127 would send CC 127 (Poly Mode On) instead.
+        let controller = controller.min(129);
+        let value = value.min(127);
+        let normalized = if controller == 129 {
+            // Expand the 7-bit value so centre (64) is the unbent 8192.
+            f32::from(u16::from(value) << 7) / 16_383.0
+        } else {
+            f32::from(value) / 127.0
+        };
         self.pending_events.push(Vst3MidiEvent::control_change(
             0,
             channel.min(15),
-            controller.min(127) as u16,
-            value.min(127) as f32 / 127.0,
+            u16::from(controller),
+            normalized,
         ));
         self.tail_blocks = PREVIEW_TAIL_BLOCKS;
     }
@@ -158,6 +168,28 @@ impl VoiceMidiState {
                     channel,
                     ev.data1 as u16,
                     ev.data2 as f32 / 127.0,
+                ));
+                self.tail_blocks = PREVIEW_TAIL_BLOCKS;
+            }
+            // Raw channel pressure / pitch bend map back to the VST3
+            // `kAfterTouch` (128) / `kPitchBend` (129) controllers, which the
+            // processor resolves through the plugin's IMidiMapping.
+            0xD0 => {
+                self.pending_events.push(Vst3MidiEvent::control_change(
+                    ev.sample_offset,
+                    channel,
+                    128,
+                    ev.data1.min(127) as f32 / 127.0,
+                ));
+                self.tail_blocks = PREVIEW_TAIL_BLOCKS;
+            }
+            0xE0 => {
+                let bend = u16::from(ev.data1 & 0x7F) | (u16::from(ev.data2 & 0x7F) << 7);
+                self.pending_events.push(Vst3MidiEvent::control_change(
+                    ev.sample_offset,
+                    channel,
+                    129,
+                    f32::from(bend) / 16_383.0,
                 ));
                 self.tail_blocks = PREVIEW_TAIL_BLOCKS;
             }
@@ -1165,4 +1197,54 @@ pub fn try_start_preview_output(shared: &SharedPluginHostPreview) -> bool {
     eprintln!("[plugin-host-midi] preview dsp_output=ready sr={sample_rate}");
     std::mem::forget(stream);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use DirectAudio::vst3_processor::Vst3MidiEventKind;
+
+    fn shared(status: u8, data1: u8, data2: u8) -> SharedMidiEvent {
+        SharedMidiEvent {
+            sample_offset: 7,
+            status,
+            data1,
+            data2,
+            _pad: 0,
+        }
+    }
+
+    /// Raw pitch bend / channel pressure from the engine ring used to be
+    /// dropped here, so a bridged VST3 never saw a keyboard's bend wheel.
+    #[test]
+    fn shared_pitch_bend_and_pressure_reach_the_vst3_controllers() {
+        let mut state = VoiceMidiState::default();
+        state.apply_shared(&shared(0xE3, 0x7F, 0x7F), "insert-1");
+        state.apply_shared(&shared(0xE3, 0x00, 0x40), "insert-1");
+        state.apply_shared(&shared(0xD3, 100, 0), "insert-1");
+
+        let events: Vec<(u8, u8, u8, f32)> = state
+            .pending_events
+            .iter()
+            .map(|ev| (ev.kind, ev.channel, ev.pitch, ev.velocity))
+            .collect();
+        let cc = Vst3MidiEventKind::ControlChange as u8;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], (cc, 3, 129, 1.0));
+        assert_eq!((events[1].0, events[1].1, events[1].2), (cc, 3, 129));
+        assert!((events[1].3 - 0.5).abs() < 1.0e-3, "centre stays unbent");
+        assert_eq!((events[2].0, events[2].1, events[2].2), (cc, 3, 128));
+        assert!(state.pending_events.iter().all(|ev| ev.sample_offset == 7));
+    }
+
+    /// The IPC preview fallback carries a 7-bit bend on controller 129; it
+    /// must stay a bend (not CC 127) and centre on the unbent value.
+    #[test]
+    fn preview_control_change_keeps_pitch_bend_controller() {
+        let mut state = VoiceMidiState::default();
+        state.preview_control_change(0, 129, 64);
+        let ev = state.pending_events[0];
+        assert_eq!(ev.pitch, 129);
+        assert!((ev.velocity - 0.5).abs() < 1.0e-3);
+    }
 }

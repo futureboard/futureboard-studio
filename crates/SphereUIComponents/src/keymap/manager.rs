@@ -470,6 +470,7 @@ fn build_action_catalog() -> HashMap<String, String> {
         ("app:force-reload",               "App › Force Reload"),
         ("audio:bounce-in-place",          "Audio › Bounce in Place"),
         ("audio:create-crossfade",         "Audio › Create Crossfade"),
+        ("audio:find-tempo-key",           "Audio › Find Tempo & Key"),
         ("audio:render-selection",         "Audio › Render Selection"),
         ("clip:consolidate",               "Clip › Consolidate"),
         ("clip:properties",                "Clip › Properties"),

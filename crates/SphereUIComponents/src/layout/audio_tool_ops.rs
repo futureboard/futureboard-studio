@@ -131,7 +131,11 @@ impl StudioLayout {
         }
     }
 
-    fn handle_audio_tool_command(&mut self, command: AudioToolCommand, cx: &mut Context<Self>) {
+    pub(super) fn handle_audio_tool_command(
+        &mut self,
+        command: AudioToolCommand,
+        cx: &mut Context<Self>,
+    ) {
         match command {
             AudioToolCommand::Preview(preview) => {
                 self.audio_tools

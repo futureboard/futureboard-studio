@@ -13,6 +13,11 @@ fn playhead_debug_enabled() -> bool {
 impl Render for Timeline {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _tl_scope = crate::perf::PerfScope::enter("Timeline");
+        // A plug-in drag released anywhere but here leaves no event on this
+        // element; drop its hint once no drag is in flight.
+        if self.plugin_drop_hint.is_some() && !cx.has_active_drag() {
+            self.plugin_drop_hint = None;
+        }
         // `Timeline` is the arrangement's whole render and it dominates the
         // profiler's hot-scope list, which makes it the least useful entry on
         // it: knowing the arrangement is expensive says nothing about which
@@ -1711,6 +1716,10 @@ impl Render for Timeline {
             .clip_clone_hint
             .as_ref()
             .and_then(|hint| clip_clone_hint_overlay(hint, state));
+        let plugin_drop_overlay = self
+            .plugin_drop_hint
+            .as_ref()
+            .and_then(|hint| plugin_drop::plugin_drop_hint_overlay(hint, state));
         let on_zoom_in_btn = on_zoom_in.clone();
         let on_zoom_out_btn = on_zoom_out.clone();
 
@@ -1813,19 +1822,53 @@ impl Render for Timeline {
             }
         });
 
+        // Plug-in from the Browser: a header takes it, the timeline makes a
+        // new track for it. The hint and the drop resolve through the same
+        // function, so the hint never promises something the drop won't do.
+        let on_plugin_drag_move = cx.listener(
+            |this,
+             event: &gpui::DragMoveEvent<crate::components::plugin_picker::PluginDragItem>,
+             _window,
+             cx| {
+                // Drag moves arrive while the pointer is anywhere in the
+                // window; only the arrangement shows a target.
+                if !event.bounds.contains(&event.event.position) {
+                    if this.plugin_drop_hint.take().is_some() {
+                        cx.notify();
+                    }
+                    return;
+                }
+                let item = event.drag(cx).clone();
+                let target = this.resolve_context_target_from_window_point(event.event.position);
+                let hint = plugin_drop::PluginDropHint {
+                    target: plugin_drop::resolve_plugin_drop(
+                        &this.state,
+                        &target,
+                        item.kind == SpherePluginHost::PluginKind::Instrument,
+                    ),
+                    plugin_name: item.label,
+                };
+                if this.plugin_drop_hint.as_ref().map(|h| &h.target) != Some(&hint.target) {
+                    this.plugin_drop_hint = Some(hint);
+                    cx.notify();
+                }
+            },
+        );
         let on_plugin_drag_dropped = cx.listener(
             |this, item: &crate::components::plugin_picker::PluginDragItem, window, cx| {
+                this.plugin_drop_hint = None;
                 let target = this.resolve_context_target_from_window_point(window.mouse_position());
-                let track_id = match target {
-                    TimelineContextTarget::TrackLane { track_id, .. }
-                    | TimelineContextTarget::AudioClip { track_id, .. }
-                    | TimelineContextTarget::MidiClip { track_id, .. }
-                    | TimelineContextTarget::TrackHeader(track_id) => track_id,
-                    _ => String::new(),
-                };
-                if let Some(callback) = this.on_plugin_drag_drop.as_ref() {
-                    callback(item, &track_id, window, cx);
+                let drop = plugin_drop::resolve_plugin_drop(
+                    &this.state,
+                    &target,
+                    item.kind == SpherePluginHost::PluginKind::Instrument,
+                );
+                if !matches!(drop, PluginDropTarget::Refused { .. }) {
+                    if let Some(callback) = this.on_plugin_drag_drop.as_ref() {
+                        callback(item, &drop, window, cx);
+                    }
                 }
+                cx.notify();
             },
         );
 
@@ -2387,6 +2430,7 @@ impl Render for Timeline {
             .on_drop::<ExternalPaths>(on_files_dropped)
             .on_drag_move::<BrowserDragItem>(on_browser_drag_track)
             .on_drop::<BrowserDragItem>(on_browser_file_dropped)
+            .on_drag_move::<crate::components::plugin_picker::PluginDragItem>(on_plugin_drag_move)
             .on_drop::<crate::components::plugin_picker::PluginDragItem>(on_plugin_drag_dropped)
             .on_drag_move::<ClipDragItem>(on_clip_drag_move)
             .on_drop::<ClipDragItem>(on_clip_dropped)
@@ -2611,6 +2655,18 @@ impl Render for Timeline {
                 div()
                     .absolute()
                     .left(px(HEADER_WIDTH))
+                    .right_0()
+                    .top(px(content_top))
+                    .bottom_0()
+                    .overflow_hidden()
+                    .child(overlay)
+            }))
+            // Plug-in drop hint. Full width, headers included: the header is
+            // one of the two places a plug-in can go.
+            .children(plugin_drop_overlay.map(|overlay| {
+                div()
+                    .absolute()
+                    .left_0()
                     .right_0()
                     .top(px(content_top))
                     .bottom_0()

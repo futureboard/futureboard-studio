@@ -223,6 +223,9 @@ pub struct TransportChromeState {
     /// Left-click registers a tap; right-click opens the tap tempo menu.
     pub on_tap_tempo: ChromeActionCb,
     pub on_tap_tempo_menu: BpmMenuCb,
+    /// Find Tempo & Key is offered only while an audio clip is selected.
+    pub find_tempo_key_enabled: bool,
+    pub on_find_tempo_key: ChromeActionCb,
     /// Master level strip (meter + fader), rendered as its own entity so the
     /// meter poll repaints it alone instead of the whole shell. `None` in
     /// surfaces that have no engine behind them.
@@ -301,6 +304,52 @@ fn tap_tempo_chip(
                 on_menu(&(pos.x.into(), pos.y.into()), window, cx);
             },
         )
+        .into_any_element()
+}
+
+/// Opens Find Tempo & Key for the selected audio clip. Ghost like the tap
+/// chip beside it; disabled (no hover, no click) until an audio clip is
+/// selected, with a tooltip that says why.
+fn find_tempo_key_chip(enabled: bool, on_open: ChromeActionCb) -> gpui::AnyElement {
+    let color = if enabled {
+        Colors::text_secondary()
+    } else {
+        Colors::text_disabled()
+    };
+    div()
+        .id("transport-find-tempo-key")
+        .role(Role::Button)
+        .aria_label("Find tempo and key")
+        .aria_disabled(!enabled)
+        .h(px(20.0))
+        .min_w(px(26.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(6.0))
+        .rounded(px(crate::theme::radius::CONTROL_SM))
+        .text_color(color)
+        .tooltip(fb_tooltip(if enabled {
+            "Find tempo and key of the selected audio clip"
+        } else {
+            "Find tempo and key — select an audio clip first"
+        }))
+        .child(
+            svg()
+                .path(assets::ICON_SCAN_SEARCH_PATH)
+                .w(px(13.0))
+                .h(px(13.0))
+                .text_color(color),
+        )
+        .when(enabled, |chip| {
+            chip.focusable()
+                .tab_stop(true)
+                .focus_visible(|style| style.bg(Colors::surface_control_hover()))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(|s| s.bg(Colors::surface_control_hover()))
+                .on_click(move |_, window, cx| on_open(&(), window, cx))
+        })
+        .occlude()
         .into_any_element()
 }
 
@@ -679,6 +728,8 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
     let perf_meter = state.perf_meter.clone().filter(|_| gutters_fit);
     let on_tap_tempo = state.on_tap_tempo.clone();
     let on_tap_tempo_menu = state.on_tap_tempo_menu.clone();
+    let find_tempo_key_enabled = state.find_tempo_key_enabled;
+    let on_find_tempo_key = state.on_find_tempo_key.clone();
     let ts_has_markers = state.ts_has_markers;
     let on_ts_menu = state.on_ts_menu.clone();
     let on_ts_edit_start = state.on_ts_edit_start.clone();
@@ -1141,11 +1192,19 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
         .child(lcd_divider())
         .child(
             div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(crate::theme::space::HAIR))
                 .px(px(crate::theme::space::BASE))
                 .child(tap_tempo_chip(
                     tap_tempo_session_taps,
                     on_tap_tempo,
                     on_tap_tempo_menu,
+                ))
+                .child(find_tempo_key_chip(
+                    find_tempo_key_enabled,
+                    on_find_tempo_key,
                 )),
         );
 

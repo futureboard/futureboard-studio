@@ -1,5 +1,7 @@
 mod methods;
+mod plugin_drop;
 mod render;
+pub use plugin_drop::{resolve_plugin_drop, NewTrackKind, PluginDropTarget};
 pub(crate) use render::*;
 
 use crate::assets;
@@ -164,6 +166,8 @@ pub struct Timeline {
     on_add_track: Option<TimelineAddTrackCb>,
     on_plugin_preset_drop: Option<TimelinePluginPresetDropCb>,
     on_plugin_drag_drop: Option<TimelinePluginDragDropCb>,
+    /// What releasing the plug-in being dragged over the arrangement would do.
+    plugin_drop_hint: Option<plugin_drop::PluginDropHint>,
 
     /// Asks the owner to confirm what a dropped MIDI file should bring in
     /// besides its notes. Unset (tests, embedded editors) imports everything,
@@ -410,7 +414,7 @@ pub type TimelinePluginPresetDropCb = std::sync::Arc<
 pub type TimelinePluginDragDropCb = std::sync::Arc<
     dyn Fn(
             &crate::components::plugin_picker::PluginDragItem,
-            &str,
+            &PluginDropTarget,
             &mut gpui::Window,
             &mut gpui::App,
         ) + 'static,

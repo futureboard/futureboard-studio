@@ -1926,6 +1926,31 @@ impl EngineInner {
         })
     }
 
+    /// 14-bit pitch bend preview for the track's in-process instrument.
+    pub fn midi_preview_pitch_bend(
+        &self,
+        track_id: String,
+        channel: u8,
+        value: u16,
+    ) -> Result<(), SphereAudioError> {
+        self.plugin_preview_pitch_bend(track_id, String::new(), channel, value)
+    }
+
+    pub fn plugin_preview_pitch_bend(
+        &self,
+        track_id: String,
+        plugin_instance_id: String,
+        channel: u8,
+        value: u16,
+    ) -> Result<(), SphereAudioError> {
+        self.send_command(EngineCommand::PluginPreviewPitchBend {
+            track_id,
+            plugin_instance_id,
+            channel,
+            value,
+        })
+    }
+
     /// Read the current transport/clock snapshot for UI polling.
     pub fn transport_snapshot(&self) -> RuntimeTransportSnapshot {
         RuntimeTransportSnapshot::from_shared(&self.shared, &self.tempo_map())
@@ -5264,6 +5289,7 @@ impl EngineInner {
                 EngineCommand::PluginPreviewNoteOff { .. } => "PluginPreviewNoteOff",
                 EngineCommand::PluginPreviewControlChange { .. } => "PluginPreviewControlChange",
                 EngineCommand::PluginPreviewAllNotesOff { .. } => "PluginPreviewAllNotesOff",
+                EngineCommand::PluginPreviewPitchBend { .. } => "PluginPreviewPitchBend",
                 EngineCommand::StartTransport => "StartTransport",
                 EngineCommand::StopTransport => "StopTransport",
                 EngineCommand::Seek { .. } => "Seek",
@@ -6100,6 +6126,19 @@ where
                             plugin_instance_id,
                         } => {
                             runtime.bridge_preview_all_notes_off(&track_id, &plugin_instance_id);
+                        }
+                        EngineCommand::PluginPreviewPitchBend {
+                            track_id,
+                            plugin_instance_id,
+                            channel,
+                            value,
+                        } => {
+                            runtime.bridge_preview_pitch_bend(
+                                &track_id,
+                                &plugin_instance_id,
+                                channel,
+                                value,
+                            );
                         }
                     }
                 }

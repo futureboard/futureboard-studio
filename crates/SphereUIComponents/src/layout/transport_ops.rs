@@ -667,6 +667,16 @@ impl StudioLayout {
             .master_transport_meter
             .update(cx, |meter, _| meter.set_callbacks(master_volume));
 
+        let on_find_tempo_key: components::ChromeActionCb = {
+            let this = cx.entity().clone();
+            Arc::new(move |_: &(), _window: &mut Window, cx: &mut gpui::App| {
+                let _ = this.update(cx, |this, cx| {
+                    this.dispatch_command_id("audio:find-tempo-key", cx);
+                });
+            })
+        };
+        let find_tempo_key_enabled = self.tempo_key_finder_available(cx);
+
         let ts_num_input_callbacks = bind_time_signature_mouse_selection(cx.entity().clone(), true);
         let ts_den_input_callbacks =
             bind_time_signature_mouse_selection(cx.entity().clone(), false);
@@ -718,6 +728,8 @@ impl StudioLayout {
             on_bpm_edit_start,
             on_tap_tempo,
             on_tap_tempo_menu,
+            find_tempo_key_enabled,
+            on_find_tempo_key,
             master_meter: Some(self.master_transport_meter.clone().into()),
             perf_meter: Some(self.transport_perf_meter.clone().into()),
         }

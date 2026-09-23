@@ -21,7 +21,7 @@ pub use analysis::{
     SpectrumSnapshot, SpectrumWindow, TempoCandidate, TempoEstimate, TransientDetectParams,
     TransientMarker, analyze_loudness, analyze_mono, analyze_mono_with, analyze_ring_window,
     analyze_spectrum, analyze_stereo, detect_transients, estimate_bpm_candidates,
-    estimate_key_ranked, measure_phase,
+    estimate_key_ranked, measure_phase, pitch_class_profile, rank_keys,
 };
 
 pub use clip_process::{

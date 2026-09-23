@@ -34,6 +34,8 @@ pub mod icons {
     pub const MINUS: &str = include_str!("../../../packages/shared/lucide/icons/minus.svg");
     pub const MENU: &str = include_str!("../../../packages/shared/lucide/icons/menu.svg");
     pub const SEARCH: &str = include_str!("../../../packages/shared/lucide/icons/search.svg");
+    pub const SCAN_SEARCH: &str =
+        include_str!("../../../packages/shared/lucide/icons/scan-search.svg");
     pub const X: &str = include_str!("../../../packages/shared/lucide/icons/x.svg");
     pub const POWER: &str = include_str!("../../../packages/shared/lucide/icons/power.svg");
     pub const TRASH: &str = include_str!("../../../packages/shared/lucide/icons/trash-2.svg");
@@ -136,6 +138,7 @@ pub const ICON_X_PATH: &str = "icons/generic_close.svg";
 pub const ICON_MINUS_PATH: &str = "icons/minus.svg";
 pub const ICON_MENU_PATH: &str = "icons/menu.svg";
 pub const ICON_SEARCH_PATH: &str = "icons/search.svg";
+pub const ICON_SCAN_SEARCH_PATH: &str = "icons/scan-search.svg";
 
 // New path constants
 pub const ICON_MOUSE_POINTER_PATH: &str = "icons/mouse-pointer.svg";

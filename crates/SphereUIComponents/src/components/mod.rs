@@ -93,6 +93,7 @@ mod status_bar;
 mod status_bar_view;
 pub mod stem_extractor_dialog;
 pub mod sysex_editor_window;
+pub mod tempo_key_finder;
 pub mod text_input;
 pub mod timeline;
 pub mod title_bar;

@@ -235,14 +235,12 @@ impl StudioLayout {
                     controller.min(127),
                     value.min(127),
                 ),
-                MidiInputEvent::PitchBend { value, channel } => engine
-                    .plugin_preview_control_change(
-                        target.track_id.clone(),
-                        instance_id,
-                        MidiInputRouter::sanitize_channel(channel),
-                        129,
-                        (value.min(16_383) >> 7) as u8,
-                    ),
+                MidiInputEvent::PitchBend { value, channel } => engine.plugin_preview_pitch_bend(
+                    target.track_id.clone(),
+                    instance_id,
+                    MidiInputRouter::sanitize_channel(channel),
+                    value.min(16_383),
+                ),
                 MidiInputEvent::ChannelPressure { value, channel } => engine
                     .plugin_preview_control_change(
                         target.track_id.clone(),
@@ -342,11 +340,10 @@ impl StudioLayout {
                 controller.min(127),
                 value.min(127),
             ),
-            MidiInputEvent::PitchBend { value, channel } => engine.midi_preview_control_change(
+            MidiInputEvent::PitchBend { value, channel } => engine.midi_preview_pitch_bend(
                 target.track_id.clone(),
                 MidiInputRouter::sanitize_channel(channel),
-                129,
-                (value.min(16_383) >> 7) as u8,
+                value.min(16_383),
             ),
             MidiInputEvent::ChannelPressure { value, channel } => engine
                 .midi_preview_control_change(

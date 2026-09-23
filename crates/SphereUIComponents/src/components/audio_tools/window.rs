@@ -99,6 +99,9 @@ pub struct AudioToolWindowManager {
     pub windows: HashMap<AudioToolKind, WindowHandle<AudioToolWindow>>,
     pub last_bounds: HashMap<AudioToolKind, Bounds<Pixels>>,
     pub previews: HashMap<String, ClipPreviewOverride>,
+    /// The Find Tempo & Key window, opened from the transport.
+    pub tempo_key: Option<WindowHandle<crate::components::tempo_key_finder::TempoKeyFinderWindow>>,
+    pub tempo_key_bounds: Option<Bounds<Pixels>>,
 }
 
 impl Default for AudioToolWindowManager {
@@ -107,6 +110,8 @@ impl Default for AudioToolWindowManager {
             windows: HashMap::new(),
             last_bounds: HashMap::new(),
             previews: HashMap::new(),
+            tempo_key: None,
+            tempo_key_bounds: None,
         }
     }
 }
@@ -136,6 +141,9 @@ impl AudioToolWindowManager {
             });
         }
         self.windows.clear();
+        if let Some(handle) = self.tempo_key.take() {
+            let _ = handle.update(cx, |_this, window, _cx| window.remove_window());
+        }
         self.previews.clear();
         DirectAudio::analysis_tap().set_target_clip(None);
     }

@@ -813,20 +813,21 @@ impl Render for StudioLayout {
                     let this = cx.entity().clone();
                     move |item, window, cx| {
                         let plugin_id = item.plugin_id.clone();
-                        let track_id = match this
-                            .read(cx)
-                            .timeline
-                            .read(cx)
-                            .resolve_context_target_from_window_point(window.mouse_position()) {
-                            crate::components::timeline::timeline::TimelineContextTarget::TrackLane { track_id, .. }
-                            | crate::components::timeline::timeline::TimelineContextTarget::AudioClip { track_id, .. }
-                            | crate::components::timeline::timeline::TimelineContextTarget::MidiClip { track_id, .. }
-                            | crate::components::timeline::timeline::TimelineContextTarget::TrackHeader(track_id) => track_id,
-                            _ => String::new(),
-                        };
                         let kind = item.kind;
+                        // Same rule as a drop on the arrangement itself:
+                        // header → that track, timeline → a new track.
+                        let drop_target = {
+                            let timeline = this.read(cx).timeline.read(cx);
+                            let target = timeline
+                                .resolve_context_target_from_window_point(window.mouse_position());
+                            crate::components::timeline::resolve_plugin_drop(
+                                &timeline.state,
+                                &target,
+                                kind == SpherePluginHost::PluginKind::Instrument,
+                            )
+                        };
                         let _ = this.update(cx, |this, cx| {
-                            this.apply_dropped_plugin_drag(&plugin_id, &track_id, kind, cx);
+                            this.apply_dropped_plugin_drag(&plugin_id, &drop_target, kind, cx);
                         });
                     }
                 }),

@@ -1486,6 +1486,15 @@ impl PianoRoll {
         }
     }
 
+    /// Set the scale guide, exactly as picking root and scale in the header
+    /// does: a non-chromatic scale also constrains note gestures to it.
+    pub fn set_scale(&mut self, root: ScaleRoot, kind: ScaleKind, cx: &mut Context<Self>) {
+        self.pitch_ctx.scale.root = root;
+        self.pitch_ctx.scale.kind = kind;
+        self.pitch_ctx.constrain = kind != ScaleKind::Chromatic;
+        cx.notify();
+    }
+
     pub fn set_pop_out_handler(
         &mut self,
         handler: Option<std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync>>,

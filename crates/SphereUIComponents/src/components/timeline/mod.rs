@@ -40,4 +40,6 @@ pub mod waveform_samples;
 pub use render::{
     TimelineRenderSnapshot, TimelineRenderer, TimelineRendererBackend, TimelineViewport,
 };
-pub use timeline::{Timeline, TimelineChromeMetrics};
+pub use timeline::{
+    resolve_plugin_drop, NewTrackKind, PluginDropTarget, Timeline, TimelineChromeMetrics,
+};

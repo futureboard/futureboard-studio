@@ -3788,16 +3788,35 @@ impl RuntimeProject {
         value: u8,
     ) {
         let channel = channel.min(15);
-        let controller = controller.min(127);
         let value = value.min(127);
+        // `128`/`129` are the VST3 out-of-band controller numbers for channel
+        // pressure and pitch bend. Clamping them to 127 turned every bend into
+        // CC 127 (Poly Mode On), so they keep their own meaning here.
+        if controller == 129 {
+            // 7-bit lane value: expand so centre (64) lands on 8192.
+            let bend = u16::from(value) << 7;
+            self.bridge_preview_pitch_bend(track_id, plugin_instance_id, channel, bend);
+            return;
+        }
+        let controller = controller.min(128);
         if self.plugin_bridge_sinks.contains_key(plugin_instance_id) {
-            self.push_bridge_preview_midi(
-                plugin_instance_id,
-                0xB0 | channel,
-                controller,
-                value,
-                "control_change",
-            );
+            if controller == 128 {
+                self.push_bridge_preview_midi(
+                    plugin_instance_id,
+                    0xD0 | channel,
+                    value,
+                    0,
+                    "channel_pressure",
+                );
+            } else {
+                self.push_bridge_preview_midi(
+                    plugin_instance_id,
+                    0xB0 | channel,
+                    controller,
+                    value,
+                    "control_change",
+                );
+            }
             return;
         }
         let _ = self.queue_preview_event(
@@ -3806,6 +3825,37 @@ impl RuntimeProject {
             "control_change",
             channel,
             controller,
+        );
+    }
+
+    /// Push a 14-bit preview pitch bend (`8192` = centre) on the audio thread.
+    /// A bridge sink gets the raw `0xE0` status; an in-process instrument gets
+    /// the VST3 `kPitchBend` controller (129) with a normalized value.
+    pub fn bridge_preview_pitch_bend(
+        &mut self,
+        track_id: &str,
+        plugin_instance_id: &str,
+        channel: u8,
+        value: u16,
+    ) {
+        let channel = channel.min(15);
+        let value = value.min(16_383);
+        if self.plugin_bridge_sinks.contains_key(plugin_instance_id) {
+            self.push_bridge_preview_midi(
+                plugin_instance_id,
+                0xE0 | channel,
+                (value & 0x7F) as u8,
+                (value >> 7) as u8,
+                "pitch_bend",
+            );
+            return;
+        }
+        let _ = self.queue_preview_event(
+            track_id,
+            Vst3MidiEvent::control_change(0, channel, 129, f32::from(value) / 16_383.0),
+            "pitch_bend",
+            channel,
+            129,
         );
     }
 
@@ -7375,6 +7425,28 @@ mod midi_tests {
         assert_eq!(events[0], (0x80, 72, 0, 0));
         assert!(events.contains(&(0xB0, 123, 0, 0)));
         assert!(!p.has_active_midi_preview());
+    }
+
+    /// A keyboard bend used to arrive as CC 127 (Poly Mode On): controller
+    /// 129 was clamped into the CC range before it reached the sink.
+    #[test]
+    fn bridge_preview_pitch_bend_and_pressure_keep_their_status_bytes() {
+        let (mut p, sink) = bridged_project();
+
+        p.bridge_preview_pitch_bend("track-1", "insert-1", 2, 0x3FFF);
+        p.bridge_preview_pitch_bend("track-1", "insert-1", 2, 8192);
+        p.bridge_preview_control_change("track-1", "insert-1", 2, 129, 64);
+        p.bridge_preview_control_change("track-1", "insert-1", 2, 128, 90);
+
+        assert_eq!(
+            sink.take(),
+            vec![
+                (0xE2, 0x7F, 0x7F, 0),
+                (0xE2, 0x00, 0x40, 0),
+                (0xE2, 0x00, 0x40, 0),
+                (0xD2, 90, 0, 0),
+            ]
+        );
     }
 }
 

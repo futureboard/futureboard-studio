@@ -3533,15 +3533,22 @@ impl StudioLayout {
         cx.notify();
     }
 
+    /// Apply a plug-in dropped from the Browser onto the arrangement.
+    ///
+    /// `target` comes from [`crate::components::timeline::PluginDropTarget`]'s
+    /// resolver, the same one that drew the drag-over hint: onto an existing
+    /// track (a header drop), or onto a new track at a given position (a
+    /// timeline drop) — MIDI for an instrument, audio for an effect.
     pub(super) fn apply_dropped_plugin_drag(
         &mut self,
         plugin_id: &str,
-        target_track_id: &str,
+        target: &crate::components::timeline::PluginDropTarget,
         kind: SpherePluginHost::PluginKind,
         cx: &mut Context<Self>,
     ) {
         use crate::components::plugin_picker::{PluginInsertKind, PluginPickerState};
         use crate::components::timeline::timeline_state::{InputMonitorMode, TrackType};
+        use crate::components::timeline::{NewTrackKind, PluginDropTarget};
 
         let Some(plugin) = self
             .plugin_catalog
@@ -3557,39 +3564,53 @@ impl StudioLayout {
             SpherePluginHost::PluginKind::Instrument => PluginInsertKind::Instrument,
             _ => PluginInsertKind::Effect,
         };
-        let track_id = if target_track_id.is_empty() && desired_kind == PluginInsertKind::Instrument
-        {
-            let name = format!("MIDI — {}", plugin.name);
-            self.timeline.update(cx, |timeline, _cx| {
-                timeline.state.create_track(
-                    crate::components::timeline::timeline_state::CreateTrackOptions {
-                        track_type: TrackType::Midi,
-                        name,
-                        color: timeline
-                            .state
-                            .track_color_for_index(timeline.state.tracks.len()),
-                        volume: crate::components::timeline::timeline_state::volume::db_to_norm(
-                            0.0,
-                        ),
-                        pan: 0.0,
-                        armed: false,
-                        input_monitor: InputMonitorMode::Off,
-                    },
-                )
-            })
-        } else if target_track_id.is_empty() {
-            eprintln!("[PluginDrop] effect requires an existing track");
-            return;
-        } else {
-            target_track_id.to_string()
+        let track_id = match target {
+            PluginDropTarget::Track { track_id } => track_id.clone(),
+            PluginDropTarget::NewTrack {
+                insert_index,
+                kind: new_kind,
+            } => {
+                let (track_type, prefix) = match new_kind {
+                    NewTrackKind::Midi => (TrackType::Midi, "MIDI"),
+                    NewTrackKind::Audio => (TrackType::Audio, "Audio"),
+                };
+                let name = format!("{prefix} — {}", plugin.name);
+                let insert_index = *insert_index;
+                self.timeline.update(cx, |timeline, cx| {
+                    let id = timeline.state.create_track(
+                        crate::components::timeline::timeline_state::CreateTrackOptions {
+                            track_type,
+                            name,
+                            color: timeline
+                                .state
+                                .track_color_for_index(timeline.state.tracks.len()),
+                            volume: crate::components::timeline::timeline_state::volume::db_to_norm(
+                                0.0,
+                            ),
+                            pan: 0.0,
+                            armed: false,
+                            input_monitor: InputMonitorMode::Off,
+                        },
+                    );
+                    // Created at the end, then moved to where the drop said —
+                    // below the track the plug-in was released over.
+                    if insert_index < timeline.state.tracks.len() - 1 {
+                        timeline.state.reorder_track(&id, insert_index);
+                    }
+                    timeline.state.select_track(&id);
+                    cx.notify();
+                    id
+                })
+            }
+            PluginDropTarget::Refused { .. } => return,
         };
-        let track_name = self
+        let (track_name, track_type) = self
             .timeline
             .read(cx)
             .state
             .find_track(&track_id)
-            .map(|track| track.name.clone())
-            .unwrap_or_else(|| "MIDI Track".to_string());
+            .map(|track| (track.name.clone(), track.track_type))
+            .unwrap_or_else(|| ("MIDI Track".to_string(), TrackType::Midi));
         let next_slot_index = self
             .timeline
             .read(cx)
@@ -3597,10 +3618,13 @@ impl StudioLayout {
             .insert_slots(&track_id)
             .map(|slots| slots.len())
             .unwrap_or(0);
+        // The real track type: the picker's validation decides from it, and
+        // pretending every target was a MIDI track refused every effect
+        // dropped on a header.
         self.plugin_picker = PluginPickerState::open_for_with_filter(
             &track_id,
             &track_name,
-            TrackType::Midi,
+            track_type,
             next_slot_index,
             false,
             crate::components::plugin_picker::PickerFilter::All,
