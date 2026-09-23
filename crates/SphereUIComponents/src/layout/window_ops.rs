@@ -269,6 +269,9 @@ pub(crate) struct ExternalWindows {
     /// Performance Monitor — engine latency and PDC, cores, memory and drives.
     pub performance:
         Option<gpui::WindowHandle<crate::components::performance_window::PerformanceWindow>>,
+    /// SysEx Editor — clip and marker System Exclusive messages.
+    pub sysex_editor:
+        Option<gpui::WindowHandle<crate::components::sysex_editor_window::SysExEditorWindow>>,
 }
 
 impl StudioLayout {
@@ -2035,6 +2038,38 @@ impl StudioLayout {
             self.stop_native_playback(cx);
         }
         self.reopen_audio_with_sample_rate(rate, cx);
+    }
+
+    pub(super) fn open_sysex_editor_window(
+        &mut self,
+        owner_bounds: Option<Bounds<gpui::Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = self.external_windows.sysex_editor.clone() {
+            if handle
+                .update(cx, |_view, window, _cx| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.external_windows.sysex_editor = None;
+        }
+        let owner = cx.entity().downgrade();
+        let on_close: Arc<dyn Fn(&mut App) + Send + Sync> = Arc::new(move |app| {
+            let _ = owner.update(app, |layout, cx| {
+                layout.external_windows.sysex_editor = None;
+                cx.notify();
+            });
+        });
+        match crate::components::sysex_editor_window::open_sysex_editor_window(
+            owner_bounds,
+            self.timeline.clone(),
+            on_close,
+            cx,
+        ) {
+            Ok(handle) => self.external_windows.sysex_editor = Some(handle),
+            Err(err) => eprintln!("[sysex-editor] failed to open window: {err}"),
+        }
     }
 
     pub(super) fn open_performance_window(

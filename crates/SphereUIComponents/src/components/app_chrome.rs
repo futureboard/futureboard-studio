@@ -3,8 +3,8 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, svg, AccessibleAction, App, AppContext, DragMoveEvent, Empty, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, Role, StatefulInteractiveElement,
-    Styled, Toggled, Window, WindowControlArea,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, Role,
+    StatefulInteractiveElement, Styled, Toggled, Window, WindowControlArea,
 };
 
 use crate::assets;
@@ -14,8 +14,8 @@ use crate::components::text_input::{
     text_field_with_callbacks, TextInputCallbacks, TextInputState,
 };
 use crate::components::title_bar::{
-    chrome_button, chrome_button_hover, chrome_button_pressed, chrome_cluster, draggable_spacer,
-    section_separator, CHROME_TITLE_SIZE, WINDOW_CONTROL_WIDTH,
+    begin_titlebar_drag, chrome_button, chrome_button_hover, chrome_button_pressed, chrome_cluster,
+    draggable_spacer, section_separator, CHROME_TITLE_SIZE, WINDOW_CONTROL_WIDTH,
 };
 use crate::i18n::I18n;
 use crate::keymap::accel_display;
@@ -1220,7 +1220,16 @@ fn panel_toggle_button(
     } else {
         Colors::text_muted()
     };
-    chrome_action_button(id, icon_path, fallback, Some(active), color, on_click, shortcut, None)
+    chrome_action_button(
+        id,
+        icon_path,
+        fallback,
+        Some(active),
+        color,
+        on_click,
+        shortcut,
+        None,
+    )
 }
 
 fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
@@ -1266,8 +1275,8 @@ fn utility_buttons(_i18n: I18n) -> impl IntoElement {
         .items_center()
         .gap(px(2.0))
         .px(px(2.0))
-        // Import audio, Save, Share - actions handled by menu commands
-        // Use menu bar or command palette for these instead
+    // Import audio, Save, Share - actions handled by menu commands
+    // Use menu bar or command palette for these instead
 }
 
 #[allow(dead_code)]
@@ -1744,18 +1753,16 @@ pub fn app_chrome(
         // Windows: NCHITTEST callback returns `HTCAPTION` for hitboxes
         // tagged Drag, letting DefWindowProc start the system move.
         .window_control_area(WindowControlArea::Drag)
-        // Linux (Wayland / X11) and macOS: `start_window_move` is the
+        // Linux (Wayland / X11) and macOS: `begin_titlebar_drag` is the
         // implemented drag API there; the WindowControlArea path is a
-        // no-op on those platforms. Safe to attach here because every
-        // interactive child below (menu buttons, transport buttons,
-        // window controls, report-bug) calls `.occlude()`. Occlude is
-        // `HitboxBehavior::BlockMouse`, which breaks the `hit_test`
-        // iteration at that child — the chrome's id is then NOT in
-        // `mouse_hit_test.ids`, so this on_mouse_down does NOT fire
-        // for clicks on those buttons.
-        .on_mouse_down(MouseButton::Left, |_, window, _cx| {
-            window.start_window_move();
-        });
+        // no-op on those platforms. On macOS the second click zooms.
+        // Safe to attach here because every interactive child below
+        // (menu buttons, transport buttons, window controls, report-bug)
+        // calls `.occlude()`. Occlude is `HitboxBehavior::BlockMouse`,
+        // which breaks the `hit_test` iteration at that child — the
+        // chrome's id is then NOT in `mouse_hit_test.ids`, so this
+        // on_mouse_down does NOT fire for clicks on those buttons.
+        .on_mouse_down(MouseButton::Left, begin_titlebar_drag);
 
     // Three tracks, so the project control lands on the true window centre
     // regardless of how wide the menu bar or the right-hand cluster is. Both

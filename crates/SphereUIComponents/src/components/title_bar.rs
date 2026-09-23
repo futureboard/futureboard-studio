@@ -1,6 +1,7 @@
 use gpui::{
-    div, px, svg, AccessibleAction, App, Div, InteractiveElement, IntoElement, ParentElement, Rgba,
-    Role, SharedString, StatefulInteractiveElement, Styled, Window, WindowControlArea,
+    div, px, svg, AccessibleAction, App, Div, InteractiveElement, IntoElement, MouseDownEvent,
+    ParentElement, Rgba, Role, SharedString, StatefulInteractiveElement, Styled, Window,
+    WindowControlArea,
 };
 
 use crate::assets;
@@ -274,8 +275,9 @@ pub fn window_control_button(
 /// So the title *is* the drag region. It takes the free space, truncates inside
 /// it, and carries both halves of window dragging: `WindowControlArea::Drag`,
 /// which is what the Win32 caption hit-test reads (and what makes double-click
-/// to maximise and the system window menu work), and `start_window_move` for
-/// the platforms that need the move started explicitly.
+/// to maximise and the system window menu work), and [`begin_titlebar_drag`]
+/// for the platforms that need the move started explicitly. On macOS that
+/// helper also turns the second click into the system title-bar action.
 pub fn draggable_title(
     icon_path: Option<&'static str>,
     text: impl Into<SharedString>,
@@ -290,9 +292,7 @@ pub fn draggable_title(
         .min_w(px(0.0))
         .h_full()
         .window_control_area(WindowControlArea::Drag)
-        .on_mouse_down(gpui::MouseButton::Left, |_, window, _cx| {
-            window.start_window_move();
-        });
+        .on_mouse_down(gpui::MouseButton::Left, begin_titlebar_drag);
     if let Some(path) = icon_path {
         row = row.child(
             svg()
@@ -321,9 +321,30 @@ pub fn draggable_spacer() -> Div {
         .flex_1()
         .h_full()
         .window_control_area(WindowControlArea::Drag)
-        .on_mouse_down(gpui::MouseButton::Left, |_, window, _cx| {
-            window.start_window_move();
-        })
+        .on_mouse_down(gpui::MouseButton::Left, begin_titlebar_drag)
+}
+
+/// Left click on a title-bar drag region.
+///
+/// Windows maximises from the caption hit-test, so this only starts a move
+/// there. macOS has no system caption under a transparent title bar:
+/// `performWindowDragWithEvent` consumes every click, including the second
+/// click of a double-click, unless that click is handed to
+/// [`Window::titlebar_double_click`] (zoom, fill, or minimize, following
+/// `AppleActionOnDoubleClick`).
+pub fn begin_titlebar_drag(event: &MouseDownEvent, window: &mut Window, cx: &mut App) {
+    cx.stop_propagation();
+    if macos_titlebar_double_click(event.click_count) {
+        window.titlebar_double_click();
+    } else {
+        window.start_window_move();
+    }
+}
+
+/// `click_count` is AppKit's `NSEvent.clickCount`. Two or more is the click
+/// that should zoom rather than drag.
+fn macos_titlebar_double_click(click_count: usize) -> bool {
+    cfg!(target_os = "macos") && click_count >= 2
 }
 
 /// Compact title bar for external floating dialogs (Project Wizard, Preferences).
@@ -554,6 +575,19 @@ fn external_window_control_button(
         .occlude()
         .on_click(move |_, window, cx| on_click(window, cx))
         .child(window_control_icon(area, icon_path, "").text_color(Colors::text_faint()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::macos_titlebar_double_click;
+
+    #[test]
+    fn a_second_titlebar_click_zooms_only_on_macos() {
+        assert!(!macos_titlebar_double_click(0));
+        assert!(!macos_titlebar_double_click(1));
+        assert_eq!(macos_titlebar_double_click(2), cfg!(target_os = "macos"));
+        assert_eq!(macos_titlebar_double_click(3), cfg!(target_os = "macos"));
+    }
 }
 
 pub fn status_item(text: impl Into<String>, strong: bool) -> impl gpui::IntoElement {

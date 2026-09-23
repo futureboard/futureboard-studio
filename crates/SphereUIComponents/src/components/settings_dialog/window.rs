@@ -425,6 +425,7 @@ impl Render for SettingsWindow {
         let search_mouse_callbacks =
             bind_mouse_selection(target.clone(), |this| &mut this.search_input);
         let search_callbacks = TextInputCallbacks {
+            on_mouse_down_out: None,
             on_context_command: None,
             on_context_menu: Some(Arc::new({
                 let target = target.clone();

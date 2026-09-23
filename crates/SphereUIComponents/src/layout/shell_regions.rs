@@ -142,6 +142,7 @@ impl StudioLayout {
             |layout: &mut StudioLayout| &mut layout.browser_search_input,
         );
         let browser_search_callbacks = TextInputCallbacks {
+            on_mouse_down_out: None,
             on_context_command: None,
             on_context_menu: Some(on_browser_search_context),
             on_mouse: browser_search_mouse_callbacks.on_mouse,
@@ -720,6 +721,7 @@ impl StudioLayout {
             })
         };
         let inspector_color_hex_callbacks = TextInputCallbacks {
+            on_mouse_down_out: None,
             on_context_command: None,
             on_context_menu: Some(inspector_color_hex_context),
             on_mouse: inspector_color_hex_callbacks.on_mouse,

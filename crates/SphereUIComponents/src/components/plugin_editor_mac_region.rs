@@ -334,11 +334,27 @@ mod docked {
         /// a null parent, or when the container could not be made — never a
         /// panic and never a half-mounted view.
         pub fn create(parent_ns_view: u64, rect: RegionPx) -> Option<Self> {
+            Self::create_with(parent_ns_view, rect, false)
+        }
+
+        /// CEF browsers must not be subviews of GPUI's `CAMetalLayer` view.
+        /// See [`MacHostRegion::mount_above_metal_view`].
+        pub fn create_above_metal(parent_ns_view: u64, rect: RegionPx) -> Option<Self> {
+            Self::create_with(parent_ns_view, rect, true)
+        }
+
+        fn create_with(parent_ns_view: u64, rect: RegionPx, above_metal: bool) -> Option<Self> {
             let parent = parent_ns_view as *mut objc2::runtime::AnyObject;
             let frame = Self::frame_for(parent, rect)?;
             // SAFETY: `parent` is the pointer GPUI reported for this window's
             // view, used on the thread that owns it.
-            let region = unsafe { MacHostRegion::mount(parent, frame) }?;
+            let region = unsafe {
+                if above_metal {
+                    MacHostRegion::mount_above_metal_view(parent, frame)
+                } else {
+                    MacHostRegion::mount(parent, frame)
+                }
+            }?;
             Some(Self { region })
         }
 

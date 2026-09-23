@@ -1512,9 +1512,12 @@ impl PianoRoll {
         // while the editor is open.
         self.refresh_scope(cx, clip_id);
 
-        let (bpb, clip_len, show_playhead, playing, playhead_project, loop_region) = {
+        let (meter, clip_len, show_playhead, playing, playhead_project, loop_region) = {
             let tl = self.timeline.read(cx);
-            let bpb = tl.state.beats_per_bar().max(1.0);
+            // The whole meter map, not the beats-per-bar at the playhead: the
+            // grid spans the track, and one bar length applied from beat 0 put
+            // every line after a meter change in the wrong place.
+            let meter = EditorMeter::from_map(&tl.state.time_signature_map);
             let clip_len = self
                 .scope
                 .editing()
@@ -1534,7 +1537,7 @@ impl PianoRoll {
                 None
             };
             (
-                bpb,
+                meter,
                 clip_len,
                 show_playhead,
                 t.playing,
@@ -1546,8 +1549,7 @@ impl PianoRoll {
         // Visible ranges (only build geometry for what's on screen).
         let first_pitch = (self.y_to_pitch(view_h) as i32 - 1).max(0);
         let last_pitch = (self.y_to_pitch(0.0) as i32 + 1).min(PITCH_CNT - 1);
-        let start_beat = self.x_to_clip_beat(0.0);
-        let end_beat = self.x_to_clip_beat(view_w);
+        self.meter = meter;
         // The same span in project beats, for the things that count from the
         // start of the song rather than from the clip: the ruler's bar numbers,
         // the grid behind every clip, and the clip boundaries themselves.
@@ -1639,10 +1641,8 @@ impl PianoRoll {
             project_start,
             project_end,
             view_w,
-            view_h,
             first_pitch,
             last_pitch,
-            bpb,
             clip_len,
         );
         let clip_bounds = self.build_clip_bounds_overlay(view_w, view_h);
@@ -1666,7 +1666,7 @@ impl PianoRoll {
             },
         );
         let playhead_overlay = self.playhead_overlay.clone();
-        let mut ruler = self.build_ruler(project_start, project_end, bpb);
+        let mut ruler = self.build_ruler(project_start, project_end);
         ruler.extend(self.build_loop_ruler_markers(loop_region));
         // Under the editable notes and over the grid: context, not content.
         let context_notes = self.build_context_notes(cx, view_w, view_h);
@@ -1726,11 +1726,11 @@ impl PianoRoll {
             None
         } else if self.lane_view == PianoLaneView::Articulations {
             Some(
-                self.render_articulation_lane(cx, clip_id, start_beat, end_beat, bpb)
+                self.render_articulation_lane(cx, clip_id)
                     .into_any_element(),
             )
         } else if self.lane_view == PianoLaneView::Velocity {
-            let vel_grid = self.build_velocity_grid(start_beat, end_beat, bpb);
+            let vel_grid = self.build_velocity_grid();
             let vel_bars = self.build_velocity_bars(cx, clip_id, track_color);
             let velocity_gesture_overlay = self.build_velocity_gesture_overlay();
             let velocity_context_menu = self.build_velocity_context_menu(cx);
@@ -1798,10 +1798,7 @@ impl PianoRoll {
                     .into_any_element(),
             )
         } else {
-            Some(
-                self.render_cc_lane(cx, clip_id, start_beat, end_beat, bpb)
-                    .into_any_element(),
-            )
+            Some(self.render_cc_lane(cx, clip_id).into_any_element())
         };
         let grid_cursor = if matches!(self.tool, PianoTool::Draw | PianoTool::Line) {
             gpui::CursorStyle::Crosshair
@@ -2431,11 +2428,10 @@ impl PianoRoll {
         &self,
         start_beat: f32,
         end_beat: f32,
-        bpb: f32,
     ) -> Vec<(f32, GridLineKind)> {
-        self.viewport().grid_lines(start_beat, end_beat, bpb)
+        self.viewport()
+            .grid_lines_in(start_beat, end_beat, &self.meter)
     }
-
     /// The track's clips, drawn where they actually sit on the timeline.
     ///
     /// Everything outside the clip being edited is shaded, and each neighbour
@@ -2601,132 +2597,79 @@ impl PianoRoll {
         start_beat: f32,
         end_beat: f32,
         view_w: f32,
-        _view_h: f32,
         first_pitch: i32,
         last_pitch: i32,
-        bpb: f32,
         clip_len: f32,
     ) -> Vec<gpui::AnyElement> {
-        let mut out: Vec<gpui::AnyElement> = Vec::new();
-
         let row_h = self.note_row_h();
         let scale = self.pitch_ctx.scale;
         let scale_active = scale.kind != ScaleKind::Chromatic;
+
         // ── Pitch row backgrounds: shade black-key rows, highlight C / scale ──
+        let out_of_scale = Colors::with_alpha(Colors::surface_canvas(), 0.55);
+        let root_row = Colors::with_alpha(Colors::accent_primary(), 0.08);
+        let black_row = Colors::with_alpha(Colors::surface_base(), 0.45);
+        let c_row = Colors::with_alpha(Colors::text_primary(), 0.03);
+        let mut rows = Vec::new();
+        let mut row_lines = Vec::new();
         for p in first_pitch..=last_pitch {
-            let y = self.pitch_to_y(p as u8);
             let pitch = p as u8;
+            let y = self.pitch_to_y(pitch);
             let in_scale = !scale_active || scale.contains_pitch(pitch);
             let is_root = scale_active && pitch % 12 == scale.root.pitch_class();
-            if !in_scale {
-                out.push(
-                    div()
-                        .absolute()
-                        .top(px(y))
-                        .left_0()
-                        .w(px(view_w))
-                        .h(px(row_h))
-                        .bg(Colors::with_alpha(Colors::surface_canvas(), 0.55))
-                        .into_any_element(),
-                );
+            let fill = if !in_scale {
+                Some(out_of_scale)
             } else if is_root {
-                out.push(
-                    div()
-                        .absolute()
-                        .top(px(y))
-                        .left_0()
-                        .w(px(view_w))
-                        .h(px(row_h))
-                        .bg(Colors::with_alpha(Colors::accent_primary(), 0.08))
-                        .into_any_element(),
-                );
+                Some(root_row)
             } else if is_black(p) {
-                out.push(
-                    div()
-                        .absolute()
-                        .top(px(y))
-                        .left_0()
-                        .w(px(view_w))
-                        .h(px(row_h))
-                        .bg(Colors::with_alpha(Colors::surface_base(), 0.45))
-                        .into_any_element(),
-                );
+                Some(black_row)
             } else if p % 12 == 0 {
                 // C row — a touch brighter so octaves are easy to scan.
-                out.push(
-                    div()
-                        .absolute()
-                        .top(px(y))
-                        .left_0()
-                        .w(px(view_w))
-                        .h(px(row_h))
-                        .bg(Colors::with_alpha(Colors::text_primary(), 0.03))
-                        .into_any_element(),
-                );
+                Some(c_row)
+            } else {
+                None
+            };
+            if let Some(color) = fill {
+                rows.push((y, y + row_h, color));
             }
+            // Row separators along each row's bottom edge, where the key lane
+            // draws its key borders: C strongest (B|C, the octave boundary),
+            // F medium (E|F, the other white/white seam), every other a
+            // hairline. On the top edge the "octave" line fell between C and
+            // C♯, one row off from the keys beside it.
+            let alpha = match p.rem_euclid(12) {
+                0 => 0.14,
+                5 => 0.07,
+                _ => 0.035,
+            };
+            row_lines.push((y + row_h, Colors::with_alpha(Colors::text_primary(), alpha)));
         }
 
-        // Clip end marker inside the visible beat range. `clip_len` is the
-        // edited clip's own length, so it converts through the clip frame.
+        // ── Vertical timing lines (zoom- and meter-aware hierarchy) ──
+        // Across the whole visible range: the editor shows every clip on the
+        // track, and the neighbours need the same bars under them.
+        let mut columns: Vec<(f32, gpui::Rgba)> = self
+            .visible_grid_lines(start_beat, end_beat)
+            .into_iter()
+            .filter(|(x, _)| *x >= -1.0 && *x <= view_w + 1.0)
+            .map(|(x, kind)| (x, kind.color()))
+            .collect();
+
+        // Clip end marker. `clip_len` is the edited clip's own length, so it
+        // converts through the clip frame.
         let end_x = self.clip_beat_to_x(clip_len);
         if end_x >= 0.0 && end_x <= view_w {
-            out.push(
-                div()
-                    .absolute()
-                    .left(px((end_x - 0.5).max(0.0)))
-                    .top_0()
-                    .w(px(1.0))
-                    .h_full()
-                    .bg(Colors::with_alpha(Colors::accent_primary(), 0.4))
-                    .into_any_element(),
-            );
+            columns.push((end_x, Colors::with_alpha(Colors::accent_primary(), 0.4)));
         }
 
-        // ── Vertical timing gridlines (zoom-aware hierarchy) ──
-        for (x, kind) in self.visible_grid_lines(start_beat, end_beat.min(clip_len + bpb), bpb) {
-            let (alpha, w) = match kind {
-                GridLineKind::Bar => (0.26, 1.0),
-                GridLineKind::Beat => (0.13, 1.0),
-                GridLineKind::Subdivision => (0.06, 1.0),
-            };
-            out.push(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left(px(x))
-                    .w(px(w))
-                    .h_full()
-                    .bg(Colors::with_alpha(Colors::text_primary(), alpha))
-                    .into_any_element(),
-            );
-        }
-
-        // ── Horizontal pitch row lines ──
-        // Draw a line for every visible semitone row so editing reads like a
-        // real piano roll. C gets the strongest line (octave boundary), F gets
-        // a medium line (the other white-white separator on a piano), and every
-        // other row gets a faint hairline.
-        for p in first_pitch..=last_pitch {
-            let m = p.rem_euclid(12);
-            let alpha = match m {
-                0 => 0.14,  // C: octave boundary
-                5 => 0.07,  // F: white/white separator
-                _ => 0.035, // every other semitone row
-            };
-            let y = self.pitch_to_y(p as u8);
-            out.push(
-                div()
-                    .absolute()
-                    .top(px(y))
-                    .left_0()
-                    .w(px(view_w))
-                    .h(px(1.0))
-                    .bg(Colors::with_alpha(Colors::text_primary(), alpha))
-                    .into_any_element(),
-            );
-        }
-
-        out
+        vec![grid_render::render_note_grid(
+            grid_render::NoteGridSnapshot {
+                scale: self.window_scale,
+                rows,
+                row_lines,
+                columns,
+            },
+        )]
     }
 
     /// Bar/beat ruler header labels, aligned to the note grid via `beat_to_x`.
@@ -2734,19 +2677,20 @@ impl PianoRoll {
     ///
     /// Mark positions come from [`PianoRollViewport::ruler_marks`], the single
     /// source of ruler geometry in the editor; only the styling is local.
-    pub(super) fn build_ruler(
-        &self,
-        start_beat: f32,
-        end_beat: f32,
-        bpb: f32,
-    ) -> Vec<gpui::AnyElement> {
+    pub(super) fn build_ruler(&self, start_beat: f32, end_beat: f32) -> Vec<gpui::AnyElement> {
         let mut out: Vec<gpui::AnyElement> = Vec::new();
-        for mark in self.viewport().ruler_marks(start_beat, end_beat, bpb) {
+        let scale = self.window_scale;
+        let tick_w = grid_render::hairline(scale);
+        for mark in self
+            .viewport()
+            .ruler_marks_in(start_beat, end_beat, &self.meter)
+        {
+            let x = grid_render::snap(mark.x, scale);
             out.push(
                 div()
                     .absolute()
                     .top_0()
-                    .left(px(mark.x + 2.0))
+                    .left(px(x + 2.0))
                     .text_size(px(8.5))
                     .text_color(if mark.on_bar {
                         Colors::text_secondary()
@@ -2760,47 +2704,38 @@ impl PianoRoll {
             out.push(
                 div()
                     .absolute()
-                    .left(px(mark.x))
+                    .left(px(x))
                     .bottom_0()
-                    .w(px(1.0))
+                    .w(px(tick_w))
                     .h(px(if mark.on_bar { 6.0 } else { 4.0 }))
-                    .bg(Colors::with_alpha(
-                        Colors::text_primary(),
-                        if mark.on_bar { 0.26 } else { 0.13 },
-                    ))
+                    .bg(if mark.on_bar {
+                        GridLineKind::Bar.color()
+                    } else {
+                        GridLineKind::Beat.color()
+                    })
                     .into_any_element(),
             );
         }
         out
     }
 
-    /// Bar/beat vertical lines through the velocity lane (aligned with the grid;
-    /// subdivisions omitted to keep the lane uncluttered).
-    pub(super) fn build_velocity_grid(
-        &self,
-        start_beat: f32,
-        end_beat: f32,
-        bpb: f32,
-    ) -> Vec<gpui::AnyElement> {
-        self.visible_grid_lines(start_beat, end_beat, bpb)
+    /// Bar/beat vertical lines through the lane under the grid (velocity,
+    /// controller, articulation), from the same lines as the grid itself —
+    /// project beats across the whole visible width, so a lane's bar line
+    /// continues the grid's. Subdivisions are left out to keep a lane quiet.
+    pub(super) fn build_velocity_grid(&self) -> Vec<gpui::AnyElement> {
+        let (view_w, _) = self.grid_view_size();
+        let start = self.x_to_project_beat(0.0);
+        let end = self.x_to_project_beat(view_w);
+        let columns = self
+            .visible_grid_lines(start, end)
             .into_iter()
-            .filter(|(_, kind)| *kind != GridLineKind::Subdivision)
-            .map(|(x, kind)| {
-                let alpha = if kind == GridLineKind::Bar {
-                    0.20
-                } else {
-                    0.10
-                };
-                div()
-                    .absolute()
-                    .top_0()
-                    .left(px(x))
-                    .w(px(1.0))
-                    .h_full()
-                    .bg(Colors::with_alpha(Colors::text_primary(), alpha))
-                    .into_any_element()
+            .filter(|(x, kind)| {
+                *kind != GridLineKind::Subdivision && *x >= -1.0 && *x <= view_w + 1.0
             })
-            .collect()
+            .map(|(x, kind)| (x, kind.color()))
+            .collect();
+        vec![grid_render::render_lane_grid(self.window_scale, columns)]
     }
 
     /// Ghost outlines showing where the affected notes would land after a

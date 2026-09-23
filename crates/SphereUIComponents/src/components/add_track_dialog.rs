@@ -1962,7 +1962,8 @@ impl AddTrackWindow {
         track_name_input.set_value(initial_state.track_name.clone());
         track_name_input.select_all();
         let mut count_input = TextInputState::new("add-track-window-count", cx.focus_handle())
-            .with_accessible_label("Number of tracks");
+            .with_accessible_label("Number of tracks")
+            .with_ascii_charset("0123456789");
         count_input.set_value(initial_state.count.to_string());
         let color_picker = ColorPickerState::new(
             "add-track-hex",
@@ -2819,6 +2820,7 @@ impl Render for AddTrackWindow {
             callbacks: picker_callbacks,
         };
         let name_callbacks = TextInputCallbacks {
+            on_mouse_down_out: None,
             on_context_command: None,
             on_context_menu: Some(Arc::new({
                 let target = target.clone();
@@ -2857,6 +2859,7 @@ impl Render for AddTrackWindow {
             })),
         };
         let count_callbacks = TextInputCallbacks {
+            on_mouse_down_out: None,
             on_context_command: None,
             on_context_menu: Some(Arc::new({
                 let target = target.clone();
@@ -2896,6 +2899,7 @@ impl Render for AddTrackWindow {
         };
 
         let instrument_search_callbacks = TextInputCallbacks {
+            on_mouse_down_out: None,
             on_context_command: None,
             on_context_menu: Some(Arc::new({
                 let target = target.clone();

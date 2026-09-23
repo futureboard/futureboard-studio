@@ -34,6 +34,7 @@ mod routing;
 mod selection;
 mod song_text;
 mod stretch;
+mod sysex;
 mod take;
 mod tempo;
 mod time_display;

@@ -44,6 +44,7 @@ use sphere_midi_service::{NoteExpression, NoteExpressionLane};
 mod articulation_lane;
 mod cc_lane;
 mod cc_lane_render;
+mod grid_render;
 pub mod playhead;
 mod render;
 pub mod scope;
@@ -149,16 +150,120 @@ pub enum GridLineKind {
 }
 
 impl GridLineKind {
-    /// Opacity the MIDI editor paints this tier at, over
-    /// [`Colors::text_primary`]. Shared so every surface in the editor draws
-    /// the same grid weight.
-    pub fn alpha(self) -> f32 {
+    /// Colour the MIDI editor paints this tier in. The arrangement's grid
+    /// tokens, so a bar line reads the same weight in the editor as under the
+    /// clip it belongs to, and follows the theme. Shared so every surface in
+    /// the editor draws the same grid.
+    pub fn color(self) -> gpui::Rgba {
         match self {
-            Self::Bar => 0.26,
-            Self::Beat => 0.13,
-            Self::Subdivision => 0.06,
+            Self::Bar => Colors::timeline_grid_bar(),
+            Self::Beat => Colors::timeline_grid_major(),
+            Self::Subdivision => Colors::timeline_grid_minor(),
         }
     }
+}
+
+/// One stretch of constant meter on the editor's axis, in project beats
+/// (quarter notes).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MeterSegment {
+    start: f32,
+    /// First beat of the next meter; `f32::INFINITY` for the last one.
+    end: f32,
+    /// Bar length in quarter beats (`6/8` → 3.0, `7/8` → 3.5).
+    bar_beats: f32,
+    /// One counted beat in quarter beats (the denominator: `/8` → 0.5).
+    beat_unit: f32,
+    /// Counted beats per bar (the numerator).
+    beats: u16,
+    /// Song bar number of this segment's first bar (1-based).
+    first_bar: i64,
+}
+
+/// The project's meter as the MIDI editor's grid and ruler see it.
+///
+/// The grid used to take a single beats-per-bar, sampled at the playhead and
+/// applied from beat 0. Any meter change put every bar line after it in the
+/// wrong place — and moved them all when the playhead crossed the change.
+/// This carries the whole time-signature map instead, numbered the way
+/// [`TimeSignatureMap::bar_beat_at_beat`] numbers bars, so the ruler, the
+/// arrangement and the editor agree on which bar is which.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditorMeter {
+    segments: Vec<MeterSegment>,
+}
+
+impl EditorMeter {
+    /// One meter for the whole axis: `bar_beats` quarter beats per bar,
+    /// counted in quarters.
+    pub fn constant(bar_beats: f32) -> Self {
+        let bar_beats = bar_beats.max(0.25);
+        Self {
+            segments: vec![MeterSegment {
+                start: 0.0,
+                end: f32::INFINITY,
+                bar_beats,
+                beat_unit: 1.0,
+                beats: bar_beats.ceil().max(1.0) as u16,
+                first_bar: 1,
+            }],
+        }
+    }
+
+    pub fn from_map(map: &crate::components::timeline::timeline_state::TimeSignatureMap) -> Self {
+        use crate::components::timeline::timeline_state::{
+            beats_per_bar_from_sig, denominator_unit_quarter_beats,
+        };
+        let mut points: Vec<(f64, u16, u16)> = map
+            .points
+            .iter()
+            .map(|p| (p.beat.max(0.0), p.numerator.max(1), p.denominator))
+            .collect();
+        points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if points.is_empty() {
+            return Self::constant(4.0);
+        }
+        let mut segments = Vec::with_capacity(points.len());
+        let mut first_bar: i64 = 1;
+        for (i, &(beat, numerator, denominator)) in points.iter().enumerate() {
+            // The first meter reaches back to the song start: nothing precedes
+            // it, and `bar_beat_at_beat` counts that stretch as its bar 1 too.
+            let start = if i == 0 { 0.0 } else { beat as f32 };
+            let end = points
+                .get(i + 1)
+                .map(|p| p.0 as f32)
+                .unwrap_or(f32::INFINITY);
+            let bar_beats = (beats_per_bar_from_sig(numerator, denominator) as f32).max(0.25);
+            segments.push(MeterSegment {
+                start,
+                end,
+                bar_beats,
+                beat_unit: denominator_unit_quarter_beats(denominator) as f32,
+                beats: numerator,
+                first_bar,
+            });
+            if end.is_finite() {
+                first_bar += ((end - start) / bar_beats).floor().max(0.0) as i64;
+            }
+        }
+        Self { segments }
+    }
+
+    /// Segments overlapping `[start, end]`.
+    fn overlapping(&self, start: f32, end: f32) -> impl Iterator<Item = &MeterSegment> {
+        self.segments
+            .iter()
+            .filter(move |seg| seg.end > start && seg.start <= end)
+    }
+}
+
+/// Smallest bar step (1, 2, 4, …) that keeps bars at least `min_px` apart.
+fn thinned_bar_step(bar_px: f32, min_px: f32) -> i64 {
+    let mut step: i64 = 1;
+    while (step as f32) * bar_px < min_px && step < 256 {
+        step *= 2;
+    }
+    step
 }
 
 /// The shared transform of the MIDI editor, handed to surfaces that must stay
@@ -244,105 +349,131 @@ impl PianoRollViewport {
         (low.max(0), high.min(PITCH_COUNT - 1))
     }
 
-    /// Bar/beat marks across `[start_beat, end_beat]`.
-    ///
-    /// Labels each beat when zoomed in past 36 px/beat, otherwise labels bar
-    /// starts, doubling the bar step until labels are at least 56 px apart.
-    /// The single source of ruler geometry for the whole MIDI editor.
+    /// Bar/beat marks across `[start_beat, end_beat]` in one constant meter.
+    /// See [`Self::ruler_marks_in`].
     pub fn ruler_marks(&self, start_beat: f32, end_beat: f32, bpb: f32) -> Vec<RulerMark> {
-        let ppb = self.ppb.max(0.0001);
-        let bpb = bpb.max(1.0);
-        let label_beats = ppb >= 36.0;
-        let step = if label_beats {
-            1.0
-        } else if ppb * bpb >= 56.0 {
-            bpb
-        } else {
-            let mut bars = 2.0_f32;
-            while bars * bpb * ppb < 56.0 && bars < 256.0 {
-                bars *= 2.0;
-            }
-            bpb * bars
-        };
+        self.ruler_marks_in(start_beat, end_beat, &EditorMeter::constant(bpb))
+    }
 
+    /// Bar/beat marks across `[start_beat, end_beat]`, following the meter.
+    ///
+    /// Labels each counted beat once a beat is 36 px wide, otherwise labels
+    /// bar starts, doubling the bar step until labels are at least 56 px
+    /// apart. The single source of ruler geometry for the whole MIDI editor.
+    pub fn ruler_marks_in(
+        &self,
+        start_beat: f32,
+        end_beat: f32,
+        meter: &EditorMeter,
+    ) -> Vec<RulerMark> {
+        let ppb = self.ppb.max(0.0001);
+        let start_beat = start_beat.max(0.0);
         let mut out = Vec::new();
-        let mut beat = (start_beat / step).floor() * step;
-        let mut guard = 0;
-        while beat <= end_beat + step && guard < 2000 {
-            guard += 1;
-            let b = beat;
-            beat += step;
-            if b < -1.0e-3 {
-                continue;
-            }
-            let bar = (b / bpb).floor() as i32 + 1;
-            let on_bar = is_multiple(b, bpb);
-            let label = if label_beats {
-                let beat_in_bar = (b - (bar - 1) as f32 * bpb).floor() as i32 + 1;
-                format!("{bar}.{beat_in_bar}")
+        for seg in meter.overlapping(start_beat, end_beat) {
+            let label_beats = seg.beat_unit * ppb >= 36.0;
+            let bar_step = if label_beats {
+                1
             } else {
-                format!("{bar}")
+                thinned_bar_step(seg.bar_beats * ppb, 56.0)
             };
-            out.push(RulerMark {
-                x: self.beat_to_x(b),
-                beat: b,
-                label,
-                on_bar,
-            });
+            let from = ((start_beat.max(seg.start) - seg.start) / seg.bar_beats).floor() as i64;
+            let to = ((end_beat.min(seg.end) - seg.start) / seg.bar_beats).ceil() as i64;
+            for i in from.max(0)..=to.max(0) {
+                let bar_start = seg.start + i as f32 * seg.bar_beats;
+                if bar_start >= seg.end - 1.0e-4 || out.len() >= 2000 {
+                    break;
+                }
+                let bar = seg.first_bar + i;
+                if label_beats {
+                    for k in 0..seg.beats {
+                        let b = bar_start + f32::from(k) * seg.beat_unit;
+                        if b >= seg.end - 1.0e-4 || b > end_beat + seg.bar_beats {
+                            break;
+                        }
+                        out.push(RulerMark {
+                            x: self.beat_to_x(b),
+                            beat: b,
+                            label: format!("{bar}.{}", k + 1),
+                            on_bar: k == 0,
+                        });
+                    }
+                } else if (bar - 1).rem_euclid(bar_step) == 0 {
+                    out.push(RulerMark {
+                        x: self.beat_to_x(bar_start),
+                        beat: bar_start,
+                        label: format!("{bar}"),
+                        on_bar: true,
+                    });
+                }
+            }
         }
         out
     }
 
-    /// Vertical grid lines across `[start_beat, end_beat]`, thinned by zoom.
-    /// The single source of grid geometry for the whole MIDI editor.
+    /// Vertical grid lines in one constant meter. See [`Self::grid_lines_in`].
     pub fn grid_lines(&self, start_beat: f32, end_beat: f32, bpb: f32) -> Vec<(f32, GridLineKind)> {
+        self.grid_lines_in(start_beat, end_beat, &EditorMeter::constant(bpb))
+    }
+
+    /// Vertical grid lines across `[start_beat, end_beat]`, following the
+    /// meter and thinned by zoom: bars always (every 2nd/4th… when they would
+    /// sit closer than 18 px), counted beats from 10 px apart, and the grid
+    /// subdivision from 7 px apart. Subdivisions count from each bar's start,
+    /// so an odd meter's grid lands on its own downbeats.
+    ///
+    /// The single source of grid geometry for the whole MIDI editor.
+    pub fn grid_lines_in(
+        &self,
+        start_beat: f32,
+        end_beat: f32,
+        meter: &EditorMeter,
+    ) -> Vec<(f32, GridLineKind)> {
+        const MAX_LINES: usize = 8000;
         let ppb = self.ppb.max(0.0001);
-        let bpb = bpb.max(1.0);
-        let show_beats = ppb >= 10.0;
         let sub_step = self.sub_step_beats.max(1.0 / 32.0);
-        let show_subs = show_beats && sub_step * ppb >= 7.0 && ppb >= 24.0;
-        let bar_step = if ppb * bpb >= 18.0 {
-            bpb
-        } else {
-            let mut bars = 2.0_f32;
-            while bars * bpb * ppb < 18.0 && bars < 256.0 {
-                bars *= 2.0;
-            }
-            bpb * bars
-        };
-
-        let iter_step = if show_subs {
-            sub_step
-        } else if show_beats {
-            1.0
-        } else {
-            bar_step
-        };
-
+        let start_beat = start_beat.max(0.0);
         let mut out = Vec::new();
-        let mut beat = (start_beat / iter_step).floor() * iter_step;
-        let mut guard = 0;
-        while beat <= end_beat + iter_step && guard < 8000 {
-            guard += 1;
-            let b = beat;
-            beat += iter_step;
-            if b < -1.0e-3 {
-                continue;
-            }
-            let kind = if is_multiple(b, bpb) {
-                GridLineKind::Bar
-            } else if is_multiple(b, 1.0) {
-                GridLineKind::Beat
-            } else {
-                GridLineKind::Subdivision
-            };
-            let keep = match kind {
-                GridLineKind::Bar => is_multiple(b, bar_step),
-                GridLineKind::Beat => show_beats,
-                GridLineKind::Subdivision => show_subs,
-            };
-            if keep {
-                out.push((self.beat_to_x(b), kind));
+        for seg in meter.overlapping(start_beat, end_beat) {
+            let bar_step = thinned_bar_step(seg.bar_beats * ppb, 18.0);
+            let show_beats = seg.beat_unit * ppb >= 10.0;
+            let show_subs = show_beats && sub_step * ppb >= 7.0 && ppb >= 24.0;
+            let from = ((start_beat.max(seg.start) - seg.start) / seg.bar_beats).floor() as i64;
+            let to = ((end_beat.min(seg.end) - seg.start) / seg.bar_beats).ceil() as i64;
+            for i in from.max(0)..=to.max(0) {
+                let bar_start = seg.start + i as f32 * seg.bar_beats;
+                if bar_start >= seg.end - 1.0e-4 || out.len() >= MAX_LINES {
+                    break;
+                }
+                let bar = seg.first_bar + i;
+                if (bar - 1).rem_euclid(bar_step) == 0 {
+                    out.push((self.beat_to_x(bar_start), GridLineKind::Bar));
+                }
+                if !show_beats {
+                    continue;
+                }
+                let bar_end = (bar_start + seg.bar_beats).min(seg.end);
+                for k in 1..seg.beats {
+                    let b = bar_start + f32::from(k) * seg.beat_unit;
+                    if b >= bar_end - 1.0e-4 {
+                        break;
+                    }
+                    out.push((self.beat_to_x(b), GridLineKind::Beat));
+                }
+                if !show_subs {
+                    continue;
+                }
+                let mut j = 1;
+                loop {
+                    let offset = j as f32 * sub_step;
+                    let b = bar_start + offset;
+                    if b >= bar_end - 1.0e-4 || out.len() >= MAX_LINES {
+                        break;
+                    }
+                    if !is_multiple(offset, seg.beat_unit) {
+                        out.push((self.beat_to_x(b), GridLineKind::Subdivision));
+                    }
+                    j += 1;
+                }
             }
         }
         out
@@ -937,8 +1068,10 @@ enum PianoDrag {
         unsnap: bool,
     },
     /// Drag one or more selected CC points. `prev` snapshots `(id, beat, value)`
-    /// at drag start; each point moves by the same Δbeat/Δvalue from the grabbed
-    /// anchor so relative offsets are preserved. One undo entry on release.
+    /// at drag start; each point moves by the cursor's Δbeat/Δvalue from where
+    /// the press landed (`anchor_*`, unsnapped), so grabbing a handle
+    /// off-centre does not make it jump and relative offsets are preserved.
+    /// One undo entry on release.
     CcMove {
         ids: Vec<u64>,
         prev: Vec<(u64, f32, f32)>,
@@ -1060,6 +1193,9 @@ pub struct PianoRoll {
     /// The window's device scale, recorded each render so the controller
     /// lane's GPU painter rasterises at physical resolution.
     window_scale: f32,
+    /// The project's meter, refreshed each render; drives the grid, the
+    /// ruler and the lane grids.
+    meter: EditorMeter,
     /// Lane points snapshotted when a CC paint/erase gesture begins (undo prev).
     cc_edit_prev: Option<Vec<MidiControllerPoint>>,
     /// Clip/controller captured with `cc_edit_prev`; cancellation and commit must
@@ -1069,6 +1205,9 @@ pub struct PianoRoll {
     cc_selection: HashSet<u64>,
     /// Point selection captured when a CC marquee starts.
     cc_selection_before_marquee: HashSet<u64>,
+    /// CC point a Select-tool press would grab, so the target is visible
+    /// before the click rather than discovered by it.
+    cc_hover_point: Option<u64>,
     /// Right-click CC curve context menu (local strip px of the click).
     open_cc_curve_menu: Option<(f32, f32)>,
     /// Right-click velocity transform menu (local lane px).
@@ -1325,10 +1464,12 @@ impl PianoRoll {
             custom_cc: 74,
             cc_bounds: Rc::new(Cell::new(None)),
             window_scale: 1.0,
+            meter: EditorMeter::constant(4.0),
             cc_edit_prev: None,
             cc_edit_target: None,
             cc_selection: HashSet::new(),
             cc_selection_before_marquee: HashSet::new(),
+            cc_hover_point: None,
             open_cc_curve_menu: None,
             open_velocity_menu: None,
             open_note_menu: None,
@@ -3851,46 +3992,14 @@ impl PianoRoll {
                 }
                 return;
             }
-            PianoDrag::CcSelect { .. } => {
-                if let Some((lx, ly)) = self.cc_local(event.position) {
-                    self.update_cc_select(lx, ly, cx);
-                }
-                return;
-            }
-            PianoDrag::CcPaint { erase, .. } => {
-                // Alt is the live "free" modifier: releasing the grid mid-stroke
-                // takes effect on the next segment rather than only at press.
-                if let PianoDrag::CcPaint { unsnap, .. } = &mut self.drag {
-                    *unsnap = event.modifiers.alt;
-                }
-                if let Some((lx, ly)) = self.cc_local(event.position) {
-                    self.cc_paint_stroke_to(lx, ly, erase, cx);
-                }
-                return;
-            }
-            PianoDrag::CcMove { .. } => {
-                if let PianoDrag::CcMove { unsnap, .. } = &mut self.drag {
-                    *unsnap = event.modifiers.alt || event.modifiers.shift;
-                }
-                if let Some((lx, ly)) = self.cc_local(event.position) {
-                    self.cc_move_selection_to(lx, ly, cx);
-                }
-                return;
-            }
-            PianoDrag::CcLine {
-                anchor_beat,
-                anchor_value,
-                ..
-            } => {
-                if let PianoDrag::CcLine { unsnap, .. } = &mut self.drag {
-                    *unsnap = event.modifiers.alt
-                        || (self.tool == PianoTool::Line && event.modifiers.shift);
-                }
-                if let Some((lx, ly)) = self.cc_local(event.position) {
-                    self.cc_line_to(anchor_beat, anchor_value, lx, ly, cx);
-                }
-                return;
-            }
+            // The CC lane follows its drags from a window-level listener
+            // (`PianoRoll::on_cc_pointer_move`) so a stroke keeps tracking
+            // past the editor's edge; handling them here too would apply
+            // every move twice.
+            PianoDrag::CcSelect { .. }
+            | PianoDrag::CcPaint { .. }
+            | PianoDrag::CcMove { .. }
+            | PianoDrag::CcLine { .. } => return,
             PianoDrag::ArtMove { id } => {
                 if let Some((lx, _ly)) = self.cc_local(event.position) {
                     self.articulation_move_to(id, lx, cx);
@@ -4198,24 +4307,7 @@ impl PianoRoll {
             cx.notify();
             return;
         }
-        if matches!(self.drag, PianoDrag::CcSelect { .. }) {
-            let drag = std::mem::replace(&mut self.drag, PianoDrag::None);
-            if let PianoDrag::CcSelect { mode, dragging, .. } = drag {
-                if !dragging && mode == MarqueeSelectionMode::Replace {
-                    self.cc_selection.clear();
-                }
-            }
-            self.cc_selection_before_marquee.clear();
-            cx.notify();
-            return;
-        }
-        if matches!(
-            self.drag,
-            PianoDrag::CcPaint { .. } | PianoDrag::CcMove { .. } | PianoDrag::CcLine { .. }
-        ) {
-            self.drag = PianoDrag::None;
-            self.drag_value_status = None;
-            self.commit_cc_edit(cx);
+        if self.end_cc_drag(cx) {
             return;
         }
         if matches!(self.drag, PianoDrag::ArtMove { .. }) {
@@ -6286,5 +6378,101 @@ mod note_hit_geometry_tests {
     #[test]
     fn resize_handle_never_covers_the_whole_note() {
         assert!(NOTE_RESIZE_MIN_W - RESIZE_ZONE >= RESIZE_ZONE);
+    }
+}
+
+#[cfg(test)]
+mod editor_meter_tests {
+    use super::*;
+    use crate::components::timeline::timeline_state::{TimeSignatureMap, TimeSignaturePoint};
+
+    fn viewport(ppb: f32, sub: f32) -> PianoRollViewport {
+        PianoRollViewport {
+            ppb,
+            scroll_x: 0.0,
+            row_h: 12.0,
+            scroll_y: 0.0,
+            key_lane_width: 0.0,
+            snap_step_beats: sub,
+            sub_step_beats: sub,
+            grid_width: 2000.0,
+            grid_height: 400.0,
+        }
+    }
+
+    /// 4/4 for two bars, then 3/4.
+    fn four_then_three() -> TimeSignatureMap {
+        TimeSignatureMap::with_points(vec![
+            TimeSignaturePoint::with_id("a", 0.0, 4, 4),
+            TimeSignaturePoint::with_id("b", 8.0, 3, 4),
+        ])
+    }
+
+    fn bars(lines: &[(f32, GridLineKind)], ppb: f32) -> Vec<f32> {
+        lines
+            .iter()
+            .filter(|(_, kind)| *kind == GridLineKind::Bar)
+            .map(|(x, _)| x / ppb)
+            .collect()
+    }
+
+    #[test]
+    fn bar_lines_follow_a_meter_change() {
+        let v = viewport(20.0, 1.0);
+        let meter = EditorMeter::from_map(&four_then_three());
+        let lines = v.grid_lines_in(0.0, 18.0, &meter);
+        // 0, 4, 8 in 4/4; then every 3 beats: 11, 14, 17 (and one bar of
+        // overscan past the right edge, so a bar straddling it still draws).
+        assert_eq!(
+            bars(&lines, 20.0),
+            vec![0.0, 4.0, 8.0, 11.0, 14.0, 17.0, 20.0]
+        );
+        // The playhead-sampled single meter got this wrong from beat 8 on.
+        let constant = v.grid_lines(0.0, 18.0, 4.0);
+        assert_ne!(bars(&constant, 20.0), bars(&lines, 20.0));
+    }
+
+    #[test]
+    fn ruler_numbers_bars_the_way_the_time_signature_map_does() {
+        let map = four_then_three();
+        let v = viewport(20.0, 1.0);
+        let marks = v.ruler_marks_in(0.0, 18.0, &EditorMeter::from_map(&map));
+        for mark in marks.iter().filter(|m| m.on_bar) {
+            let expected = map.bar_beat_at_beat(f64::from(mark.beat)).bar;
+            assert_eq!(mark.label, expected.to_string(), "beat {}", mark.beat);
+        }
+        assert_eq!(
+            marks.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
+            vec!["1", "2", "3", "4", "5", "6", "7"]
+        );
+    }
+
+    #[test]
+    fn odd_meters_count_their_own_beats() {
+        // 7/8: seven eighth-note beats, a bar every 3.5 quarters.
+        let map = TimeSignatureMap::with_points(vec![TimeSignaturePoint::with_id("a", 0.0, 7, 8)]);
+        let v = viewport(40.0, 0.25);
+        let lines = v.grid_lines_in(0.0, 7.0, &EditorMeter::from_map(&map));
+        assert_eq!(bars(&lines, 40.0), vec![0.0, 3.5, 7.0]);
+        let beats = lines
+            .iter()
+            .filter(|(x, kind)| *kind == GridLineKind::Beat && *x < 3.5 * 40.0)
+            .count();
+        assert_eq!(beats, 6, "beats 2–7 of the first bar");
+        // Sixteenth subdivisions fall between the eighths, never on them.
+        assert!(lines
+            .iter()
+            .filter(|(_, kind)| *kind == GridLineKind::Subdivision)
+            .all(|(x, _)| ((x / 40.0) / 0.5).fract().abs() > 1e-3));
+    }
+
+    #[test]
+    fn zoomed_out_bars_thin_from_bar_one() {
+        let v = viewport(1.0, 1.0); // a 4/4 bar is 4 px
+        let lines = v.grid_lines_in(0.0, 64.0, &EditorMeter::constant(4.0));
+        let xs = bars(&lines, 1.0);
+        assert_eq!(xs.first(), Some(&0.0));
+        assert!(xs.windows(2).all(|w| w[1] - w[0] >= 18.0));
+        assert!(lines.iter().all(|(_, kind)| *kind == GridLineKind::Bar));
     }
 }

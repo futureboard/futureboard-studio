@@ -2518,6 +2518,9 @@ impl StudioLayout {
             "window:performance" | "view:performance" => {
                 self.open_performance_window(owner_bounds, cx)
             }
+            "midi:sysex-editor" | "window:sysex-editor" => {
+                self.open_sysex_editor_window(owner_bounds, cx)
+            }
 
             "track:add" | "track:show-add-dialog" | "project:add-track" => {
                 self.open_add_track_external_window(AddTrackKind::Audio, owner_bounds, cx)

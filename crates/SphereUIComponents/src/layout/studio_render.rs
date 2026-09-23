@@ -498,6 +498,7 @@ impl Render for StudioLayout {
                 |layout: &mut StudioLayout| &mut layout.project_switcher_search_input,
             );
             let search_context_callbacks = TextInputCallbacks {
+                on_mouse_down_out: None,
                 on_context_command: None,
                 on_context_menu: Some(Arc::new({
                     let this = cx.entity().clone();
@@ -677,6 +678,7 @@ impl Render for StudioLayout {
                 |layout: &mut StudioLayout| &mut layout.plugin_picker_search_input,
             );
             let search_context_callbacks = TextInputCallbacks {
+                on_mouse_down_out: None,
                 on_context_command: None,
                 on_context_menu: Some(Arc::new({
                     let this = cx.entity().clone();

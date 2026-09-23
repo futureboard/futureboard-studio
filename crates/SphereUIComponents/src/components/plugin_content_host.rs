@@ -801,18 +801,84 @@ mod imp {
     use super::{ContentHostKind, ContentRect};
     use crate::components::plugin_editor_mac_region::{DockedPluginSurface, RegionPx};
 
-    /// Windowed CEF warm-up still needs a never-shown parent. A hidden
-    /// `NSWindow` is a later slice; first editor open pays the cold start.
+    /// Windowed CEF warm-up and the stress harness need a parent that is not
+    /// the studio's Metal-backed view. A borderless window kept off-screen
+    /// satisfies CEF without covering the DAW.
     pub struct HiddenHostWindow {
-        _private: (),
+        window: objc2::rc::Retained<objc2::runtime::NSObject>,
+        content: u64,
     }
 
     impl HiddenHostWindow {
         pub fn create() -> Option<Self> {
-            None
+            if !appkit_main_thread() {
+                return None;
+            }
+            let cls = objc2::runtime::AnyClass::get(c"NSWindow")?;
+            let rect = objc2_foundation::NSRect {
+                origin: objc2_foundation::NSPoint {
+                    x: -10_000.0,
+                    y: -10_000.0,
+                },
+                size: objc2_foundation::NSSize {
+                    width: 2.0,
+                    height: 2.0,
+                },
+            };
+            // Borderless (0) + buffered backing (2). `defer: true` avoids a
+            // window device until something actually orders the window.
+            let window: *mut objc2::runtime::NSObject = unsafe {
+                let allocated: *mut objc2::runtime::NSObject = objc2::msg_send![cls, alloc];
+                objc2::msg_send![
+                    allocated,
+                    initWithContentRect: rect,
+                    styleMask: 0usize,
+                    backing: 2usize,
+                    defer: true
+                ]
+            };
+            let window = unsafe { objc2::rc::Retained::from_raw(window) }?;
+            let content: *mut objc2::runtime::AnyObject = unsafe {
+                let _: () = objc2::msg_send![&*window, setReleasedWhenClosed: false];
+                let _: () = objc2::msg_send![&*window, setIgnoresMouseEvents: true];
+                let _: () = objc2::msg_send![&*window, setAlphaValue: 0.0f64];
+                let _: () = objc2::msg_send![&*window, orderOut: std::ptr::null::<objc2::runtime::AnyObject>()];
+                objc2::msg_send![&*window, contentView]
+            };
+            if content.is_null() {
+                return None;
+            }
+            Some(Self {
+                window,
+                content: content as u64,
+            })
         }
+
         pub fn hwnd(&self) -> u64 {
-            0
+            self.content
+        }
+    }
+
+    impl Drop for HiddenHostWindow {
+        fn drop(&mut self) {
+            if !appkit_main_thread() {
+                let leaked = self.window.clone();
+                std::mem::forget(leaked);
+                return;
+            }
+            unsafe {
+                let _: () = objc2::msg_send![&*self.window, orderOut: std::ptr::null::<objc2::runtime::AnyObject>()];
+                let _: () = objc2::msg_send![&*self.window, close];
+            }
+        }
+    }
+
+    fn appkit_main_thread() -> bool {
+        unsafe {
+            let Some(cls) = objc2::runtime::AnyClass::get(c"NSThread") else {
+                return false;
+            };
+            objc2::msg_send![cls, isMainThread]
         }
     }
 
@@ -851,7 +917,12 @@ mod imp {
             if top_hwnd == 0 {
                 return None;
             }
-            let surface = DockedPluginSurface::create(top_hwnd, region_px(rect))?;
+            let region = region_px(rect);
+            let surface = if _kind == ContentHostKind::WebView {
+                DockedPluginSurface::create_above_metal(top_hwnd, region)
+            } else {
+                DockedPluginSurface::create(top_hwnd, region)
+            }?;
             Some(Self {
                 parent_ns_view: top_hwnd,
                 surface,

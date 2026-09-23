@@ -54,23 +54,32 @@ pub(crate) struct TempoEditState {
     pub ts_edit_point_id: Option<String>,
     /// True while the numerator field holds focus (false → denominator).
     pub ts_edit_focus_num: bool,
+    /// A press landed outside an inline editor field and has not (yet) been
+    /// claimed by one — see [`StudioLayout::note_inline_edit_outside_press`].
+    pub outside_press_pending: bool,
 }
 
 impl TempoEditState {
     pub(super) fn new(cx: &mut Context<StudioLayout>) -> Self {
         Self {
+            // ASCII-only by layout: a Thai (or any non-Latin) layout's number
+            // row must still type digits here.
             bpm_input: TextInputState::new("transport-bpm-input", cx.focus_handle())
-                .with_accessible_label("Tempo in BPM"),
+                .with_accessible_label("Tempo in BPM")
+                .with_ascii_charset("0123456789.,"),
             bpm_editing: false,
             bpm_session: None,
             bpm_edit_point_id: None,
             ts_num_input: TextInputState::new("transport-ts-num-input", cx.focus_handle())
-                .with_accessible_label("Time signature numerator"),
+                .with_accessible_label("Time signature numerator")
+                .with_ascii_charset("0123456789"),
             ts_den_input: TextInputState::new("transport-ts-den-input", cx.focus_handle())
-                .with_accessible_label("Time signature denominator"),
+                .with_accessible_label("Time signature denominator")
+                .with_ascii_charset("0123456789"),
             ts_editing: false,
             ts_edit_point_id: None,
             ts_edit_focus_num: true,
+            outside_press_pending: false,
         }
     }
 }
@@ -96,11 +105,23 @@ fn transport_text_context(
     })
 }
 
+/// Outside-press hook shared by the transport's inline editors: note the
+/// press, and let [`StudioLayout::note_inline_edit_outside_press`] decide once
+/// the whole press has been dispatched.
+fn inline_edit_outside_press(
+    target: gpui::Entity<StudioLayout>,
+) -> crate::components::text_input::TextInputOutsideCb {
+    Arc::new(move |_window, cx| {
+        let _ = target.update(cx, |layout, cx| layout.note_inline_edit_outside_press(cx));
+    })
+}
+
 fn bind_time_signature_mouse_selection(
     target: gpui::Entity<StudioLayout>,
     numerator: bool,
 ) -> TextInputCallbacks {
     TextInputCallbacks {
+        on_mouse_down_out: Some(inline_edit_outside_press(target.clone())),
         on_context_command: None,
         on_context_menu: Some(transport_text_context(
             target.clone(),
@@ -114,6 +135,9 @@ fn bind_time_signature_mouse_selection(
             let _ = target.update(cx, |layout, cx| {
                 if matches!(event.phase, TextInputMousePhase::Down) {
                     layout.tempo_edit.ts_edit_focus_num = numerator;
+                    // Moving between the two meter fields is not leaving
+                    // the editor.
+                    layout.tempo_edit.outside_press_pending = false;
                 }
                 let input = if numerator {
                     &mut layout.tempo_edit.ts_num_input
@@ -612,13 +636,27 @@ impl StudioLayout {
             bind_mouse_selection(cx.entity().clone(), |layout: &mut StudioLayout| {
                 &mut layout.tempo_edit.bpm_input
             });
+        let bpm_on_mouse = bpm_mouse_callbacks.on_mouse.map(|inner| {
+            let target = cx.entity().clone();
+            let on_mouse: crate::components::text_input::TextInputMouseCb =
+                Arc::new(move |event: &TextInputMouseEvent, window, cx| {
+                    if matches!(event.phase, TextInputMousePhase::Down) {
+                        let _ = target.update(cx, |layout, _cx| {
+                            layout.tempo_edit.outside_press_pending = false;
+                        });
+                    }
+                    inner(event, window, cx);
+                });
+            on_mouse
+        });
         let bpm_input_callbacks = TextInputCallbacks {
+            on_mouse_down_out: Some(inline_edit_outside_press(cx.entity().clone())),
             on_context_command: None,
             on_context_menu: Some(transport_text_context(
                 cx.entity().clone(),
                 crate::layout::studio_state::TextMenuTarget::TransportBpm,
             )),
-            on_mouse: bpm_mouse_callbacks.on_mouse,
+            on_mouse: bpm_on_mouse,
         };
         // The master strip's gesture is rebuilt here rather than inside the
         // meter entity: this runs at the shell's render rate, while the meter

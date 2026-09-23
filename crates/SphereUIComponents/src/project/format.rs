@@ -112,7 +112,9 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// bypassed.
 /// v49 appends clip channel/DC/de-hum process fields. Pre-v49 clips load as
 /// stereo identity with DC and de-hum bypassed.
-pub const PROJECT_VERSION: u32 = 49;
+/// v50 appends per-marker SysEx messages at the tail of the body, keyed by
+/// marker id. Pre-v50 markers load without SysEx.
+pub const PROJECT_VERSION: u32 = 50;
 
 /// Minimum on-disk format version that can be loaded without data loss.
 /// Versions below this will show a warning but can still be loaded.
@@ -1547,6 +1549,24 @@ fn encode_body(project: &FutureboardProject) -> Vec<u8> {
     w.write_u8(project.settings.time_display_format);
     w.write_u8(project.settings.timecode_rate);
 
+    // Marker SysEx (v50+). Keyed by marker id rather than folded into the v13
+    // marker block, which sits mid-body: the body is positional, so a v49
+    // file simply ends at the timebase.
+    let with_sysex: Vec<_> = project
+        .settings
+        .timeline_markers
+        .iter()
+        .filter(|marker| !marker.sysex.is_empty())
+        .collect();
+    w.write_u32(with_sysex.len() as u32);
+    for marker in with_sysex {
+        w.write_str(&marker.id);
+        w.write_u32(marker.sysex.len() as u32);
+        for message in &marker.sysex {
+            w.write_bytes(message);
+        }
+    }
+
     w.into_bytes()
 }
 
@@ -2580,6 +2600,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
                 beat: r.read_f64()?,
                 name: r.read_str()?,
                 color_hex: r.read_str()?,
+                sysex: Vec::new(),
             });
         }
         let region_count = r.read_u32()? as usize;
@@ -2744,6 +2765,33 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
         let defaults = super::ProjectSettings::default();
         (defaults.time_display_format, defaults.timecode_rate)
     };
+
+    // Marker SysEx (v50+), matched back to its marker by id.
+    let mut timeline_markers = timeline_markers;
+    if version >= 50 {
+        let count = r.read_u32()? as usize;
+        if count > r.remaining() / 8 {
+            return Err(ProjectError::Corrupted(
+                "invalid marker SysEx count".to_string(),
+            ));
+        }
+        for _ in 0..count {
+            let marker_id = r.read_str()?;
+            let message_count = r.read_u32()? as usize;
+            if message_count > r.remaining() / 4 {
+                return Err(ProjectError::Corrupted(
+                    "invalid marker SysEx message count".to_string(),
+                ));
+            }
+            let mut messages = Vec::with_capacity(message_count);
+            for _ in 0..message_count {
+                messages.push(r.read_bytes()?);
+            }
+            if let Some(marker) = timeline_markers.iter_mut().find(|m| m.id == marker_id) {
+                marker.sysex = messages;
+            }
+        }
+    }
 
     Ok(FutureboardProject {
         audio_connections,
@@ -3151,15 +3199,15 @@ mod tests {
         // Connections count, the v35 output-routing block (two absent optional
         // strings plus the bootstrap latch), the v40 conductor-lane fold block
         // (four collapse latches plus five absent optional heights), the v41
-        // ARA document count, and the v43 timebase pair. A v24-v26 fixture reads
-        // none of them, so drop the whole tail before appending the legacy cue
-        // block in its place.
+        // ARA document count, the v43 timebase pair, and the v50 marker SysEx
+        // count. A v24-v26 fixture reads none of them, so drop the whole tail
+        // before appending the legacy cue block in its place.
         let v35_output_routing_bytes = 1 + 1 + 1;
         let v40_global_lane_bytes = 4 + 5;
         let v43_timebase_bytes = 1 + 1;
         body.truncate(
             body.len()
-                - 3 * std::mem::size_of::<u32>()
+                - 4 * std::mem::size_of::<u32>()
                 - v35_output_routing_bytes
                 - v40_global_lane_bytes
                 - v43_timebase_bytes,
@@ -4298,6 +4346,38 @@ mod tests {
             Err(ProjectError::Corrupted(_))
         ));
     }
+
+    /// Marker SysEx (v50) survives save/load and stays on its own marker.
+    #[test]
+    fn marker_sysex_roundtrips_v50() {
+        let mut project = FutureboardProject::new("SysEx");
+        let gs_reset = vec![
+            0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7,
+        ];
+        let xg_on = vec![0xF0, 0x43, 0x10, 0x4C, 0x00, 0x00, 0x7E, 0x00, 0xF7];
+        project.settings.timeline_markers = vec![
+            ProjectTimelineMarker {
+                id: "plain".into(),
+                beat: 0.0,
+                name: "Intro".into(),
+                color_hex: "#fff".into(),
+                sysex: Vec::new(),
+            },
+            ProjectTimelineMarker {
+                id: "setup".into(),
+                beat: 4.0,
+                name: "Setup".into(),
+                color_hex: "#fff".into(),
+                sysex: vec![gs_reset.clone(), xg_on.clone()],
+            },
+        ];
+        let decoded = decode_project(&encode_project(&project)).expect("decode");
+        assert_eq!(
+            decoded.settings.timeline_markers,
+            project.settings.timeline_markers
+        );
+    }
+
 
     /// The conductor lanes' fold state is view state, but it is view state the
     /// player set by hand, so it has to survive the file like a track height.

@@ -149,10 +149,28 @@ pub fn is_intermediate_draft(draft: &str, allow_negative: bool) -> bool {
     matches!(trimmed, "." | "-." | "+.") || trimmed.ends_with('.')
 }
 
+/// The draft as Rust's float parser reads it: native digits (Thai ๐–๙ and
+/// the other scripts [`ascii_digit_equivalent`] knows) become ASCII, and a
+/// lone comma is a decimal point — `120,5` is how half the world writes
+/// 120.5, and rejecting it made Enter look broken.
+///
+/// [`ascii_digit_equivalent`]: crate::components::text_input::ascii_digit_equivalent
+fn normalize_draft(draft: &str) -> String {
+    let mut out: String = draft
+        .chars()
+        .map(|c| crate::components::text_input::ascii_digit_equivalent(c).unwrap_or(c))
+        .collect();
+    if !out.contains('.') && out.matches(',').count() == 1 {
+        out = out.replace(',', ".");
+    }
+    out
+}
+
 /// Parse a numeric draft, honouring the sign/integer policy. Returns `None`
 /// for empty, intermediate, or malformed drafts.
 pub fn parse_draft(draft: &str, format: &NumberFormat) -> Option<f64> {
-    let trimmed = draft.trim();
+    let normalized = normalize_draft(draft);
+    let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -428,5 +446,15 @@ mod tests {
         let s = NumericEditSession::begin(120.0, bpm_format(), CommitPolicy::OnEnter);
         assert_eq!(s.commit("-5"), None);
         assert!(!s.is_committable("-5"));
+    }
+
+    #[test]
+    fn drafts_in_native_digits_or_with_a_decimal_comma_parse() {
+        let format = NumberFormat::decimal(20.0, 999.0, 2);
+        assert_eq!(parse_draft("๑๒๐", &format), Some(120.0));
+        assert_eq!(parse_draft("120,5", &format), Some(120.5));
+        assert_eq!(parse_draft("１２０", &format), Some(120.0));
+        // A comma next to a point is a thousands separator: still refused.
+        assert_eq!(parse_draft("1,234.5", &format), None);
     }
 }

@@ -267,6 +267,14 @@ export const APP_MENUS: AppMenuGroup[] = [
         action: "midi:open-editor",
       },
       {
+        id: "midi.sysex_editor",
+        label: "SysEx Editor...",
+        icon: "binary",
+        action: "midi:sysex-editor",
+        description:
+          "View, write and fix Roland, Yamaha, Korg and Universal SysEx on a clip or on markers",
+      },
+      {
         id: "midi.virtual_keyboard",
         label: "Virtual Keyboard",
         accelerator: "Alt+K",

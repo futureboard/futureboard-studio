@@ -310,6 +310,7 @@ impl Render for InsertPickerWindow {
         let owner = self.owner.clone();
         let target_for_search = target.clone();
         let search_callbacks = TextInputCallbacks {
+            on_mouse_down_out: None,
             on_context_command: None,
             on_context_menu: Some(Arc::new({
                 let target = target.clone();

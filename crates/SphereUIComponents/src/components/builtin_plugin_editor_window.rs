@@ -1862,6 +1862,10 @@ impl BuiltinPluginEditorWindow {
                         #[cfg(windows)]
                         drop(tick.content_to_drop);
                         if !tick.keep_going {
+                            // One more turn so a browser queued for release
+                            // during this pump is dropped off the CEF callback
+                            // stack, after this tick has dropped the NSView.
+                            host::pump();
                             break;
                         }
                     }
@@ -1900,7 +1904,9 @@ impl BuiltinPluginEditorWindow {
                 }
                 ViewEvent::OpenFailed(error) if matches!(self.status, Status::Attaching) => {
                     self.status = Status::Failed(format!("CEF failed to open the editor: {error}"));
-                    content_to_drop = self.content.take();
+                    if !host::browser_holds_native_parent(self.view_id) {
+                        content_to_drop = self.content.take();
+                    }
                     cx.notify();
                 }
                 ViewEvent::AcceleratedFallback
@@ -2175,22 +2181,30 @@ impl BuiltinPluginEditorWindow {
 
     /// Begin an asynchronous close. The shell remains alive until the CEF pump
     /// confirms it processed the close, preserving the native parent HWND for
-    /// the browser's entire lifetime.
-    pub(crate) fn request_close(&mut self, cx: &mut Context<Self>) {
+    /// the browser's entire lifetime. Returns whether the platform window may
+    /// continue closing immediately; while CEF is still tearing down, callers
+    /// must veto the native close request and wait for `ViewEvent::Closed`.
+    pub(crate) fn request_close(&mut self, cx: &mut Context<Self>) -> bool {
         // Before anything is torn down: a close mid-drag would otherwise leave
         // the page holding a pointer capture it can never release.
         self.handle_capture_lost();
-        match self.status {
-            Status::Closing | Status::Closed => return,
+        let allow_platform_close = match self.status {
+            Status::Closing => false,
+            // The CEF pump has already retired the browser. Let AppKit/Win32
+            // finish the close instead of vetoing the same request forever.
+            Status::Closed => true,
             Status::WaitingForHandle { .. } | Status::Failed(_) => {
                 self.status = Status::Closed;
+                true
             }
             Status::Attaching | Status::Attached => {
                 host::close_view(self.view_id);
                 self.status = Status::Closing;
+                false
             }
-        }
+        };
         cx.notify();
+        allow_platform_close
     }
 }
 
@@ -2200,6 +2214,14 @@ impl Drop for BuiltinPluginEditorWindow {
         // through `Closing` and waits for the pump's `Closed` event.
         if !matches!(self.status, Status::Closed | Status::Failed(_)) {
             host::close_view(self.view_id);
+        }
+        if host::browser_holds_native_parent(self.view_id) {
+            // OnBeforeClose has not run. `MacHostRegion`'s drop removes the
+            // view from the hierarchy; doing that under a live CEF compositor
+            // is the macOS vm_map failure this editor is built to avoid.
+            if let Some(content) = self.content.take() {
+                std::mem::forget(content);
+            }
         }
     }
 }
@@ -2551,18 +2573,16 @@ impl Render for BuiltinPluginEditorWindow {
                 // chrome and drag region as every other floating Studio surface.
                 // Caption controls come from the platform policy: native traffic
                 // lights on macOS, drawn controls on Linux and Windows.
-                div()
-                    .flex_none()
-                    .child(external_window_titlebar(
-                        self.display_name.clone(),
-                        "builtin-plugin-editor-close",
-                        {
-                            let this = cx.weak_entity();
-                            move |_window, cx| {
-                                let _ = this.update(cx, |this, cx| this.request_close(cx));
-                            }
-                        },
-                    )),
+                div().flex_none().child(external_window_titlebar(
+                    self.display_name.clone(),
+                    "builtin-plugin-editor-close",
+                    {
+                        let this = cx.weak_entity();
+                        move |_window, cx| {
+                            let _ = this.update(cx, |this, cx| this.request_close(cx));
+                        }
+                    },
+                )),
             )
             .child(
                 div()
@@ -2573,34 +2593,70 @@ impl Render for BuiltinPluginEditorWindow {
                     .child(self.render_sidebar(cx))
                     .child(match failure {
                         None => self.render_browser_region(cx),
-                        Some(reason) => div()
-                            .flex_1()
-                            .min_h(px(0.0))
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(6.0))
-                            .p(px(16.0))
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(Colors::text_primary())
-                                    .child("This editor could not be opened"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(Colors::text_secondary())
-                                    .child(reason),
-                            )
-                            .into_any_element(),
+                        Some(reason) => self.render_failure(reason, cx),
                     }),
             )
     }
 }
 
 impl BuiltinPluginEditorWindow {
+    fn render_failure(&self, reason: String, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(8.0))
+            .p(px(16.0))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(Colors::text_primary())
+                    .child("Web interface failed to initialize."),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(Colors::text_secondary())
+                    .child(reason),
+            )
+            .child(
+                div()
+                    .id("builtin-plugin-editor-reload")
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .rounded(px(6.0))
+                    .bg(Colors::accent_primary())
+                    .text_size(px(11.5))
+                    .text_color(Colors::on_accent())
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .child("Reload UI")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.reload_editor_ui(cx);
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn reload_editor_ui(&mut self, cx: &mut Context<Self>) {
+        if host::is_view_open(self.view_id) || host::browser_holds_native_parent(self.view_id) {
+            host::reload_view(self.view_id);
+            self.browser_ready = false;
+            self.bridge_ready_retries = 0;
+            self.attached_at = Some(Instant::now());
+            self.status = Status::Attached;
+        } else {
+            self.attach_attempts = 0;
+            self.status = Status::WaitingForHandle { ticks: 0 };
+        }
+        cx.notify();
+    }
+
     /// The region the browser occupies.
     ///
     /// Draws the latest accelerated or software frame and owns all forwarded
@@ -3296,12 +3352,8 @@ pub fn open_builtin_editor_window(
         });
         let weak = view.downgrade();
         window.on_window_should_close(cx, move |_window, cx| {
-            let close_was_queued = weak
-                .update(cx, |view, cx| view.request_close(cx))
-                .is_ok();
-            // Defer while the entity owns a CEF view; if it is already gone,
-            // allow AppKit to finish closing instead of vetoing forever.
-            !close_was_queued
+            weak.update(cx, |view, cx| view.request_close(cx))
+                .unwrap_or(true)
         });
         view
     })

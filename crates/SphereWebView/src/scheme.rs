@@ -54,9 +54,49 @@ fn runtime_flag_enabled(flag: &str) -> bool {
         .any(|arg| arg.to_string_lossy().eq_ignore_ascii_case(flag))
 }
 
+fn cef_gpu_isolation_enabled() -> bool {
+    std::env::var_os("FUTUREBOARD_CEF_DISABLE_GPU").is_some()
+}
+
 fn cef_gpu_disabled() -> bool {
     runtime_flag_enabled("--disable-cef-gpu")
         || std::env::var_os("FUTUREBOARD_DISABLE_CEF_GPU").is_some()
+        || cef_gpu_isolation_enabled()
+}
+
+/// `FUTUREBOARD_CEF_STATIC_TEST=1` serves one trivial document and never the
+/// embedded React bundle.
+pub fn cef_static_test_enabled() -> bool {
+    std::env::var_os("FUTUREBOARD_CEF_STATIC_TEST").is_some()
+}
+
+/// React→native and native→React bridge traffic. Static-test mode implies off.
+pub fn cef_ipc_enabled() -> bool {
+    !cef_static_test_enabled() && std::env::var_os("FUTUREBOARD_CEF_DISABLE_IPC").is_none()
+}
+
+/// Extra Chromium switches for diagnostics and GPU isolation.
+///
+/// `disable-gpu-compositing` is paired with `disable-gpu` only for
+/// `FUTUREBOARD_CEF_DISABLE_GPU`. The older disable-GPU flag leaves
+/// compositing policy alone so the two modes stay distinguishable.
+pub(crate) fn extra_diagnostic_switches(
+    disable_gpu: bool,
+    disable_gpu_compositing: bool,
+    verbose_logging: bool,
+) -> Vec<(&'static str, Option<&'static str>)> {
+    let mut switches = Vec::new();
+    if disable_gpu {
+        switches.push((CEF_DISABLE_GPU, None));
+    }
+    if disable_gpu_compositing {
+        switches.push(("disable-gpu-compositing", None));
+    }
+    if verbose_logging {
+        switches.push(("enable-logging", None));
+        switches.push(("v", Some("1")));
+    }
+    switches
 }
 
 fn local_ui_command_line_switches(target_os: &str) -> &'static [&'static str] {
@@ -84,6 +124,12 @@ const BRIDGE_ACK: SchemeAsset = SchemeAsset {
 /// Under 100 bytes and self-verifying: the console message proves JavaScript ran.
 const MINIMAL_TEST_DOCUMENT: SchemeAsset = SchemeAsset {
     bytes: b"<!doctype html><script>console.log('minimal-js-ok')</script><p>minimal</p>",
+    mime_type: "text/html",
+};
+
+/// Isolation page for `FUTUREBOARD_CEF_STATIC_TEST`. No scripts, no router.
+const STATIC_TEST_DOCUMENT: SchemeAsset = SchemeAsset {
+    bytes: b"<html>\n<body>Futureboard CEF Test</body>\n</html>\n",
     mime_type: "text/html",
 };
 
@@ -130,7 +176,7 @@ impl Drop for ObjectLifetimeInner {
     }
 }
 
-pub(crate) fn cef_diagnostics_enabled() -> bool {
+pub fn cef_diagnostics_enabled() -> bool {
     cfg!(debug_assertions)
         || std::env::var_os("FUTUREBOARD_PLUGIN_VIEW_DEBUG").is_some()
         || std::env::var_os("FUTUREBOARD_GPU_DIAGNOSTICS").is_some()
@@ -268,12 +314,25 @@ wrap_app! {
                 for switch in local_ui_command_line_switches(std::env::consts::OS) {
                     command_line.append_switch(Some(&CefString::from(*switch)));
                 }
-                if cef_gpu_disabled() {
-                    // `disable-gpu` is Chromium's supported command-line
-                    // switch; CEF forwards it through this app callback for
-                    // both browser and child processes.
-                    command_line.append_switch(Some(&CefString::from(CEF_DISABLE_GPU)));
-                    log::info!("CEF GPU acceleration disabled by diagnostic/safe graphics mode");
+                let disable_gpu = cef_gpu_disabled();
+                let disable_compositing = cef_gpu_isolation_enabled();
+                if disable_gpu {
+                    log::info!(
+                        "CEF GPU acceleration disabled by diagnostic/safe graphics mode compositing_disabled={disable_compositing}"
+                    );
+                }
+                for (name, value) in extra_diagnostic_switches(
+                    disable_gpu,
+                    disable_compositing,
+                    cef_diagnostics_enabled(),
+                ) {
+                    match value {
+                        Some(value) => command_line.append_switch_with_value(
+                            Some(&CefString::from(name)),
+                            Some(&CefString::from(value)),
+                        ),
+                        None => command_line.append_switch(Some(&CefString::from(name))),
+                    }
                 }
             }
         }
@@ -340,7 +399,7 @@ wrap_scheme_handler_factory! {
 
             if path == BRIDGE_PATH {
                 let method = CefStringUtf16::from(&request.method()).to_string();
-                if method.eq_ignore_ascii_case("POST") {
+                if method.eq_ignore_ascii_case("POST") && cef_ipc_enabled() {
                     if let Some(sink) = &self.bridge {
                         let body = read_post_data(request);
                         if std::env::var_os("FUTUREBOARD_PLUGIN_VIEW_DEBUG").is_some() {
@@ -351,8 +410,23 @@ wrap_scheme_handler_factory! {
                         }
                         sink(&plugin, body);
                     }
+                } else if method.eq_ignore_ascii_case("POST") && cef_diagnostics_enabled() {
+                    eprintln!(
+                        "[plugin-bridge] inbound dropped plugin={plugin} reason=ipc-disabled"
+                    );
                 }
                 return Some(make_resource_handler(Some(BRIDGE_ACK), request_id));
+            }
+
+            if cef_static_test_enabled() {
+                let asset = (path == "/index.html").then_some(STATIC_TEST_DOCUMENT);
+                if cef_diagnostics_enabled() {
+                    eprintln!(
+                        "[plugin-scheme] request_id={request_id} url={url} static_test=true resolved={}",
+                        asset.is_some()
+                    );
+                }
+                return Some(make_resource_handler(asset, request_id));
             }
 
             // A miss still gets a handler, so the renderer sees a clean 404
@@ -806,6 +880,28 @@ mod tests {
         for target in ["windows", "linux"] {
             assert!(!local_ui_command_line_switches(target).contains(&MACOS_CEF_USE_MOCK_KEYCHAIN));
         }
+    }
+
+    #[test]
+    fn gpu_isolation_adds_compositing_switch_without_replacing_legacy_gpu_off() {
+        let legacy = extra_diagnostic_switches(true, false, false);
+        assert_eq!(legacy, vec![(CEF_DISABLE_GPU, None)]);
+
+        let isolation = extra_diagnostic_switches(true, true, false);
+        assert!(isolation.contains(&(CEF_DISABLE_GPU, None)));
+        assert!(isolation.contains(&("disable-gpu-compositing", None)));
+
+        let verbose = extra_diagnostic_switches(false, false, true);
+        assert!(verbose.contains(&("enable-logging", None)));
+        assert!(verbose.contains(&("v", Some("1"))));
+    }
+
+    #[test]
+    fn static_test_document_is_inert_html() {
+        let text = std::str::from_utf8(STATIC_TEST_DOCUMENT.bytes).expect("utf-8");
+        assert!(text.contains("Futureboard CEF Test"));
+        assert!(!text.contains("<script"));
+        assert!(!text.contains("mikoplugin"));
     }
 
     #[test]

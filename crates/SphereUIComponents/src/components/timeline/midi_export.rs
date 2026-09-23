@@ -79,6 +79,9 @@ pub struct ExportTimeSignature {
 pub struct ExportMarker {
     pub beat: f64,
     pub text: String,
+    /// Complete `F0 … F7` messages carried by the marker, written to the
+    /// conductor track at the marker's tick.
+    pub sysex: Vec<Vec<u8>>,
 }
 
 /// Everything one exported `.mid` file contains.
@@ -175,15 +178,24 @@ impl MidiExport {
             ));
         }
         for marker in &self.markers {
+            let tick = beats_to_ticks(marker.beat);
             let text = marker.text.trim();
-            if text.is_empty() {
-                continue;
+            if !text.is_empty() {
+                events.push((tick, 2, meta_event(0x06, text.as_bytes())));
             }
-            events.push((
-                beats_to_ticks(marker.beat),
-                2,
-                meta_event(0x06, text.as_bytes()),
-            ));
+            for message in &marker.sysex {
+                // SMF stores a normal SysEx as F0 <len> <bytes after F0>.
+                let Some(payload) = sphere_midi_service::sysex::to_smf_payload(message) else {
+                    continue;
+                };
+                if payload.is_empty() {
+                    continue;
+                }
+                let mut bytes = vec![0xF0];
+                write_vlq(&mut bytes, payload.len() as u32);
+                bytes.extend_from_slice(&payload);
+                events.push((tick, 3, bytes));
+            }
         }
 
         let end_tick = beats_to_ticks(self.content_end_beats());
@@ -528,7 +540,7 @@ pub fn build_arrangement_export(
             Vec::new()
         },
         markers: if options.include_markers {
-            collect_markers(state, &range)
+            collect_markers(state, &range, options.include_sysex)
         } else {
             Vec::new()
         },
@@ -598,7 +610,7 @@ pub fn build_clip_export(
             numerator: signature.numerator,
             denominator: signature.denominator,
         }],
-        markers: collect_markers(state, &range),
+        markers: collect_markers(state, &range, true),
         tracks: if export_track.is_empty() {
             Vec::new()
         } else {
@@ -779,7 +791,11 @@ fn collect_time_signatures(state: &TimelineState, range: &ExportRange) -> Vec<Ex
     out
 }
 
-fn collect_markers(state: &TimelineState, range: &ExportRange) -> Vec<ExportMarker> {
+fn collect_markers(
+    state: &TimelineState,
+    range: &ExportRange,
+    include_sysex: bool,
+) -> Vec<ExportMarker> {
     let mut out: Vec<ExportMarker> = state
         .markers
         .iter()
@@ -787,6 +803,11 @@ fn collect_markers(state: &TimelineState, range: &ExportRange) -> Vec<ExportMark
         .map(|marker| ExportMarker {
             beat: marker.beat - range.start_beats,
             text: marker.name.clone(),
+            sysex: if include_sysex {
+                marker.sysex.clone()
+            } else {
+                Vec::new()
+            },
         })
         .collect();
     out.sort_by(|a, b| a.beat.total_cmp(&b.beat));
@@ -962,9 +983,13 @@ mod tests {
             }],
             ..Default::default()
         }]);
+        let gs_reset = vec![
+            0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7,
+        ];
         export.markers = vec![ExportMarker {
             beat: 4.0,
             text: "Chorus".to_string(),
+            sysex: vec![gs_reset.clone()],
         }];
 
         let tracks = parse_smf_tracks(&export.to_smf_bytes()).expect("parse");
@@ -972,6 +997,13 @@ mod tests {
         assert_eq!(conductor.clip.markers.len(), 1);
         assert_eq!(conductor.clip.markers[0].text, "Chorus");
         assert!((conductor.clip.markers[0].beat - 4.0).abs() < 1e-4);
+        // The marker's SysEx lands on the conductor track at the marker tick.
+        assert_eq!(conductor.clip.sysex_events.len(), 1);
+        assert!((conductor.clip.sysex_events[0].beat - 4.0).abs() < 1e-4);
+        assert_eq!(
+            sphere_midi_service::sysex::from_smf_payload(&conductor.clip.sysex_events[0].data),
+            gs_reset
+        );
 
         let sys = tracks
             .iter()
@@ -1245,12 +1277,14 @@ mod tests {
                     beat: 1.0,
                     name: "Intro".to_string(),
                     color_hex: "#fff".to_string(),
+                    sysex: Vec::new(),
                 },
                 TimelineMarkerState {
                     id: "m2".to_string(),
                     beat: 99.0,
                     name: "Way out".to_string(),
                     color_hex: "#fff".to_string(),
+                    sysex: Vec::new(),
                 },
             ];
             state.transport.loop_enabled = true;
@@ -1272,6 +1306,7 @@ mod tests {
                 beat: 1.0,
                 name: "Intro".to_string(),
                 color_hex: "#fff".to_string(),
+                sysex: Vec::new(),
             }];
 
             let all = build_arrangement_export(&state, "Song", &MidiExportOptions::default());

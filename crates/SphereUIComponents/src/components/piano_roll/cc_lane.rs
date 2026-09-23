@@ -13,10 +13,19 @@ use super::cc_lane_render::{self, CcHandle, CcLaneSnapshot};
 const CC_PAINT_SAMPLE_PX: f32 = 2.0;
 const CC_POINT_MERGE_EPS: f32 = 1.0e-3;
 
-/// Radius of a CC point handle, in lane pixels. Kept just under the ~6 px
-/// hit-test radius in [`PianoRoll::cc_point_at`] so a handle is never smaller
-/// than the area that grabs it.
+/// Radius of a CC point handle, in lane pixels. Kept under [`CC_HIT_R`] so a
+/// handle is never larger than the area that grabs it.
 const HANDLE_R: f32 = 4.0;
+
+/// Grab radius around a CC point, in lane pixels. The 8 px handle sits inside
+/// a 16 px target — the same "draw small, hit big" split as `size::hit_target`.
+const CC_HIT_R: f32 = 8.0;
+
+/// Inset of the value axis from the lane's top and bottom edge, so the 0 and
+/// 127 handles are drawn whole instead of half-clipped. The inverse mapping
+/// clamps inside the inset, which turns both edges into a few pixels of
+/// "exactly min / max" rather than a one-pixel target.
+const CC_VALUE_PAD: f32 = 5.0;
 
 /// Keep a controller lane single-valued at each beat. Freehand painting can
 /// revisit the same x range many times, and retaining near-identical points
@@ -95,9 +104,24 @@ impl PianoRoll {
         Some((x - ox, y - oy))
     }
 
-    /// Begin a CC paint (`erase = false`) or erase (`erase = true`) gesture:
-    /// ensure the active lane, snapshot its points for undo, and apply the first
-    /// edit at the cursor.
+    /// Beat range a CC edit may write into: the edited clip's own span. A
+    /// stroke that runs past the clip's end (or into the gap before a
+    /// neighbour) would otherwise leave points no playback ever reaches.
+    fn cc_beat_range(&self) -> (f32, f32) {
+        let end = self
+            .scope
+            .editing()
+            .map(|span| span.duration_beats)
+            .filter(|len| *len > 0.0)
+            .unwrap_or(f32::INFINITY);
+        (0.0, end)
+    }
+
+    fn clamp_cc_beat(&self, beat: f32) -> f32 {
+        let (lo, hi) = self.cc_beat_range();
+        beat.clamp(lo, hi)
+    }
+
     /// Delete one controller point, as its own undo step.
     ///
     /// The right-click gesture: it acts on the point under the cursor, so it
@@ -132,6 +156,9 @@ impl PianoRoll {
         true
     }
 
+    /// Begin a CC paint (`erase = false`) or erase (`erase = true`) gesture:
+    /// ensure the active lane, snapshot its points for undo, and apply the first
+    /// edit at the cursor.
     pub(super) fn begin_cc_paint(
         &mut self,
         erase: bool,
@@ -203,8 +230,9 @@ impl PianoRoll {
         let (from_x, from_y) = last.unwrap_or((lx, ly));
 
         let (_, cc_h) = self.cc_view_size();
-        let lane_h = cc_h.max(1.0);
-        let value_at = |y: f32| (1.0 - (y / lane_h)).clamp(0.0, 1.0);
+        // The inverse of the transform the curve is drawn with, so the value
+        // written is the one under the pointer.
+        let value_at = |y: f32| Self::controller_value_for_y(y, cc_h);
 
         // One sample per CC_PAINT_SAMPLE_PX of travel, always including both
         // endpoints so the stroke starts and ends exactly under the cursor.
@@ -231,9 +259,7 @@ impl PianoRoll {
             let t = i as f32 / steps as f32;
             let x = from_x + dx * t;
             let y = from_y + dy * t;
-            let beat = self
-                .snap_beats_live(self.x_to_clip_beat(x), unsnap)
-                .max(0.0);
+            let beat = self.clamp_cc_beat(self.snap_beats_live(self.x_to_clip_beat(x), unsnap));
             // Collapse samples that resolve to the same target (snapped strokes
             // land many pixels on one grid line).
             if let Some(previous) = last_beat {
@@ -278,8 +304,12 @@ impl PianoRoll {
         }
     }
 
-    /// Hit-test the active lane's points; return the id of one within ~6 px of
-    /// the local strip coordinate.
+    /// Hit-test the active lane's points: the id of the point **nearest** the
+    /// local strip coordinate, within [`CC_HIT_R`].
+    ///
+    /// Nearest, not first: a drawn curve puts a point on every grid step, so
+    /// several handles overlap one hit radius, and taking the leftmost one
+    /// grabbed a neighbour of the handle actually under the cursor.
     pub(super) fn cc_point_at(
         &self,
         cx: &Context<Self>,
@@ -291,12 +321,19 @@ impl PianoRoll {
         let kind = self.active_cc;
         let tl = self.timeline.read(cx);
         let points = tl.state.controller_lane_points(clip_id, kind)?;
-        const R: f32 = 6.0;
-        points.iter().find_map(|p| {
-            let x = self.clip_beat_to_x(p.beat);
-            let y = Self::controller_y_for_value(p.value, cc_h);
-            ((lx - x).abs() <= R && (ly - y).abs() <= R).then_some(p.id)
-        })
+        let mut best: Option<(u64, f32)> = None;
+        for p in points {
+            let dx = lx - self.clip_beat_to_x(p.beat);
+            if dx.abs() > CC_HIT_R {
+                continue;
+            }
+            let dy = ly - Self::controller_y_for_value(p.value, cc_h);
+            let d2 = dx * dx + dy * dy;
+            if d2 <= CC_HIT_R * CC_HIT_R && best.is_none_or(|(_, bd)| d2 < bd) {
+                best = Some((p.id, d2));
+            }
+        }
+        best.map(|(id, _)| id)
     }
 
     /// Begin dragging an existing CC point (and any multi-selection that
@@ -305,6 +342,8 @@ impl PianoRoll {
     pub(super) fn begin_cc_move(
         &mut self,
         id: u64,
+        lx: f32,
+        ly: f32,
         unsnap: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -330,11 +369,12 @@ impl PianoRoll {
                     .collect()
             })
             .unwrap_or_default();
-        let (anchor_beat, anchor_value) = prev
-            .iter()
-            .find(|(pid, _, _)| *pid == id)
-            .map(|(_, b, v)| (*b, *v))
-            .unwrap_or((0.0, 0.0));
+        // Anchor at the press, not at the point: the handle may be grabbed a
+        // few pixels off-centre, and measuring from its centre made it jump
+        // to the cursor on the first move.
+        let (_, cc_h) = self.cc_view_size();
+        let anchor_beat = self.x_to_clip_beat(lx);
+        let anchor_value = Self::controller_value_for_y(ly, cc_h);
         self.cc_edit_prev = Some(
             self.timeline
                 .read(cx)
@@ -353,8 +393,10 @@ impl PianoRoll {
         cx.notify();
     }
 
-    /// Move every selected CC point by the same relative Δbeat/Δvalue from the
-    /// grab anchor. Beat snaps unless Shift (`unsnap`) is held.
+    /// Move every selected CC point by the cursor's Δbeat/Δvalue since the
+    /// press. Each point's beat snaps on its own (so a point on the grid stays
+    /// there until the cursor has travelled half a step) unless Shift/Alt
+    /// (`unsnap`) is held.
     pub(super) fn cc_move_selection_to(&mut self, lx: f32, ly: f32, cx: &mut Context<Self>) {
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
@@ -374,17 +416,15 @@ impl PianoRoll {
         let anchor_value = *anchor_value;
         let unsnap = *unsnap;
         let kind = self.active_cc;
-        let cur_beat = self.snap_beats_live(self.x_to_clip_beat(lx).max(0.0), unsnap);
         let (_, cc_h) = self.cc_view_size();
-        let cur_value = (1.0 - (ly / cc_h.max(1.0))).clamp(0.0, 1.0);
-        let d_beat = cur_beat - anchor_beat;
-        let d_value = cur_value - anchor_value;
-        let step = self.step_beats();
+        let d_beat = self.x_to_clip_beat(lx) - anchor_beat;
+        let d_value = Self::controller_value_for_y(ly, cc_h) - anchor_value;
+        let (lo_beat, hi_beat) = self.cc_beat_range();
         self.drag_value_status = Some(if prev.len() == 1 {
             format!(
                 "{}: {}",
                 cc_kind_label(kind),
-                controller_display_value(kind, cur_value)
+                controller_display_value(kind, (prev[0].2 + d_value).clamp(0.0, 1.0))
             )
         } else {
             format!(
@@ -394,17 +434,19 @@ impl PianoRoll {
                 prev.len()
             )
         });
+        let moved: Vec<(u64, f32, f32)> = prev
+            .iter()
+            .map(|(id, beat, value)| {
+                let next_beat = self
+                    .snap_beats_live(*beat + d_beat, unsnap)
+                    .clamp(lo_beat, hi_beat);
+                (*id, next_beat, (*value + d_value).clamp(0.0, 1.0))
+            })
+            .collect();
         self.timeline.update(cx, |tl, tcx| {
-            for (id, beat, value) in &prev {
-                let raw = (*beat + d_beat).max(0.0);
-                let next_beat = if unsnap || step <= 0.0 {
-                    raw
-                } else {
-                    ((raw / step).round() * step).max(0.0)
-                };
-                let next_value = (*value + d_value).clamp(0.0, 1.0);
+            for (id, beat, value) in moved {
                 tl.state
-                    .set_controller_point(&clip_id, kind, *id, next_beat, next_value);
+                    .set_controller_point(&clip_id, kind, id, beat, value);
             }
             tcx.notify();
         });
@@ -704,11 +746,9 @@ impl PianoRoll {
                 .controller_points_snapshot(&clip_id, kind),
         );
         self.cc_edit_target = Some((clip_id.clone(), kind));
-        let anchor_beat = self
-            .snap_beats_live(self.x_to_clip_beat(lx), unsnap)
-            .max(0.0);
+        let anchor_beat = self.clamp_cc_beat(self.snap_beats_live(self.x_to_clip_beat(lx), unsnap));
         let (_, cc_h) = self.cc_view_size();
-        let anchor_value = (1.0 - (ly / cc_h.max(1.0))).clamp(0.0, 1.0);
+        let anchor_value = Self::controller_value_for_y(ly, cc_h);
         self.drag = PianoDrag::CcLine {
             anchor_beat,
             anchor_value,
@@ -740,11 +780,9 @@ impl PianoRoll {
             PianoDrag::CcLine { unsnap, .. } => *unsnap,
             _ => false,
         };
-        let cur_beat = self
-            .snap_beats_live(self.x_to_clip_beat(lx), unsnap)
-            .max(0.0);
+        let cur_beat = self.clamp_cc_beat(self.snap_beats_live(self.x_to_clip_beat(lx), unsnap));
         let (_, cc_h) = self.cc_view_size();
-        let cur_value = (1.0 - (ly / cc_h.max(1.0))).clamp(0.0, 1.0);
+        let cur_value = Self::controller_value_for_y(ly, cc_h);
         self.drag_value_status = Some(format!(
             "{} line: {}→{}",
             cc_kind_label(kind),
@@ -818,7 +856,111 @@ impl PianoRoll {
     }
 
     pub(super) fn controller_y_for_value(value: f32, lane_h: f32) -> f32 {
-        (1.0 - value.clamp(0.0, 1.0)) * (lane_h - 10.0) + 5.0
+        let span = (lane_h - 2.0 * CC_VALUE_PAD).max(1.0);
+        (1.0 - value.clamp(0.0, 1.0)) * span + CC_VALUE_PAD
+    }
+
+    /// Inverse of [`Self::controller_y_for_value`]. Every gesture that turns a
+    /// pointer into a value goes through this, so the curve lands under the
+    /// cursor instead of up to `CC_VALUE_PAD` pixels away from it.
+    pub(super) fn controller_value_for_y(y: f32, lane_h: f32) -> f32 {
+        let span = (lane_h - 2.0 * CC_VALUE_PAD).max(1.0);
+        (1.0 - (y - CC_VALUE_PAD) / span).clamp(0.0, 1.0)
+    }
+
+    /// Follow a CC-lane pointer move from anywhere in the window.
+    ///
+    /// Registered window-wide by the lane (see `render_cc_lane`) instead of
+    /// relying on the editor root's hover-scoped `on_mouse_move`: the lane
+    /// sits on the editor's bottom edge, so overshooting it to slam a value
+    /// to 0 left the root and froze the stroke a few pixels short. Outside
+    /// the lane the value clamps, which is what an overshoot means.
+    pub(super) fn on_cc_pointer_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let cc_drag = matches!(
+            self.drag,
+            PianoDrag::CcPaint { .. }
+                | PianoDrag::CcMove { .. }
+                | PianoDrag::CcLine { .. }
+                | PianoDrag::CcSelect { .. }
+        );
+        if cc_drag && event.pressed_button.is_none() {
+            // The release happened where no up listener saw it; finish the
+            // gesture rather than keep drawing with no button held.
+            self.end_cc_drag(cx);
+            return;
+        }
+        let Some((lx, ly)) = self.cc_local(event.position) else {
+            return;
+        };
+        match self.drag {
+            PianoDrag::CcSelect { .. } => self.update_cc_select(lx, ly, cx),
+            PianoDrag::CcPaint { erase, .. } => {
+                // Alt is the live "free" modifier: releasing the grid
+                // mid-stroke takes effect on the next segment.
+                if let PianoDrag::CcPaint { unsnap, .. } = &mut self.drag {
+                    *unsnap = event.modifiers.alt;
+                }
+                self.cc_paint_stroke_to(lx, ly, erase, cx);
+            }
+            PianoDrag::CcMove { .. } => {
+                if let PianoDrag::CcMove { unsnap, .. } = &mut self.drag {
+                    *unsnap = event.modifiers.alt || event.modifiers.shift;
+                }
+                self.cc_move_selection_to(lx, ly, cx);
+            }
+            PianoDrag::CcLine {
+                anchor_beat,
+                anchor_value,
+                ..
+            } => {
+                if let PianoDrag::CcLine { unsnap, .. } = &mut self.drag {
+                    *unsnap = event.modifiers.alt
+                        || (self.tool == PianoTool::Line && event.modifiers.shift);
+                }
+                self.cc_line_to(anchor_beat, anchor_value, lx, ly, cx);
+            }
+            PianoDrag::None => {
+                // Only the Select tool grabs points with a plain press, so
+                // only it previews the grab.
+                let (w, h) = self.cc_view_size();
+                let inside = lx >= 0.0 && lx <= w && ly >= 0.0 && ly <= h;
+                let hover = if inside && self.tool == PianoTool::Select {
+                    self.editing_clip_id(cx)
+                        .and_then(|cid| self.cc_point_at(cx, &cid, lx, ly))
+                } else {
+                    None
+                };
+                if hover != self.cc_hover_point {
+                    self.cc_hover_point = hover;
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Finish whichever CC gesture is active. Returns `false` when none was.
+    pub(super) fn end_cc_drag(&mut self, cx: &mut Context<Self>) -> bool {
+        match std::mem::replace(&mut self.drag, PianoDrag::None) {
+            PianoDrag::CcSelect { mode, dragging, .. } => {
+                if !dragging && mode == MarqueeSelectionMode::Replace {
+                    self.cc_selection.clear();
+                }
+                self.cc_selection_before_marquee.clear();
+                cx.notify();
+                true
+            }
+            PianoDrag::CcPaint { .. } | PianoDrag::CcMove { .. } | PianoDrag::CcLine { .. } => {
+                self.drag_value_status = None;
+                self.commit_cc_edit(cx);
+                cx.notify();
+                true
+            }
+            other => {
+                self.drag = other;
+                false
+            }
+        }
     }
 
     /// The controller curve **and** its point handles.
@@ -908,6 +1050,39 @@ impl PianoRoll {
         cc_lane_render::render_gpui(&snapshot)
     }
 
+    /// Ring around the point a Select-tool press would grab. An overlay on top
+    /// of the curve rather than a handle state, so both curve painters show it
+    /// without either carrying a hover flag.
+    fn cc_hover_ring(&self, cx: &Context<Self>, clip_id: &str) -> Option<gpui::AnyElement> {
+        if self.tool != PianoTool::Select || !matches!(self.drag, PianoDrag::None) {
+            return None;
+        }
+        let id = self.cc_hover_point?;
+        let (_, cc_h) = self.cc_view_size();
+        let point = self
+            .timeline
+            .read(cx)
+            .state
+            .controller_lane_points(clip_id, self.active_cc)?
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| (p.beat, p.value))?;
+        let x = self.clip_beat_to_x(point.0);
+        let y = Self::controller_y_for_value(point.1, cc_h);
+        let r = HANDLE_R + 3.0;
+        Some(
+            div()
+                .absolute()
+                .left(px(x - r))
+                .top(px(y - r))
+                .size(px(r * 2.0))
+                .rounded_full()
+                .border(px(1.5))
+                .border_color(Colors::accent_primary())
+                .into_any_element(),
+        )
+    }
+
     fn build_cc_selection_overlay(&self) -> Option<gpui::AnyElement> {
         let PianoDrag::CcSelect {
             start_x,
@@ -943,11 +1118,8 @@ impl PianoRoll {
         &mut self,
         cx: &mut Context<Self>,
         clip_id: &str,
-        start_beat: f32,
-        end_beat: f32,
-        bpb: f32,
     ) -> impl IntoElement {
-        let grid = self.build_velocity_grid(start_beat, end_beat, bpb);
+        let grid = self.build_velocity_grid();
         let is_empty = self
             .timeline
             .read(cx)
@@ -979,14 +1151,33 @@ impl PianoRoll {
                 .justify_center()
                 .text_size(px(9.0))
                 .text_color(Colors::text_faint())
-                .child("Drag to draw · Alt+drag draws free (no snap) · Shift-drag line · Right-click a point to delete")
+                .child(match self.tool {
+                    PianoTool::Select => {
+                        "Drag a point to move · drag empty space to select · Alt+drag draws free"
+                    }
+                    PianoTool::Line => "Drag a ramp · Alt or Shift releases the grid",
+                    PianoTool::Erase => "Drag across points to erase",
+                    _ => {
+                        "Drag to draw · Alt+drag draws free (no snap) · Shift-drag line · Right-click a point to delete"
+                    }
+                })
         });
+        let hover_ring = self.cc_hover_ring(cx, clip_id);
         let curve_menu = self.build_cc_curve_menu(cx);
         let selection_overlay = self.build_cc_selection_overlay();
         let cc_bounds = self.cc_bounds.clone();
+        let this = cx.weak_entity();
         let canvas = canvas(
             move |bounds, _w, _cx| cc_bounds.set(Some(bounds)),
-            |_b, _r, _w, _cx| {},
+            move |_b, _r, window, _cx| {
+                // Window-wide, not hover-scoped: see `on_cc_pointer_move`.
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                    if phase != gpui::DispatchPhase::Bubble {
+                        return;
+                    }
+                    let _ = this.update(cx, |this, cx| this.on_cc_pointer_move(event, cx));
+                });
+            },
         )
         .absolute()
         .inset_0();
@@ -1004,6 +1195,7 @@ impl PianoRoll {
             .children(grid)
             .children(clip_divisions)
             .child(curve)
+            .children(hover_ring)
             .children(selection_overlay)
             .children(empty_state)
             .children(value_chip_el)
@@ -1013,80 +1205,79 @@ impl PianoRoll {
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
                     this.open_cc_curve_menu = None;
-                    if let Some((lx, ly)) = this.cc_local(ev.position) {
-                        // Alt is the lane-wide "free" modifier: it releases the
-                        // grid for whichever gesture the click starts.
-                        let free = ev.modifiers.alt;
-                        // Alt+click on empty lane is *free draw* in every tool
-                        // (Line keeps Alt as its free ramp). With the Select
-                        // tool this used to start a subtract-marquee, so the
-                        // one gesture the hint advertised did nothing there;
-                        // a point under the cursor still moves, freely.
-                        if free && this.tool != PianoTool::Line {
-                            if let Some(cid) = this.editing_clip_id(cx) {
-                                if let Some(id) = this.cc_point_at(cx, &cid, lx, ly) {
-                                    this.begin_cc_move(id, true, window, cx);
-                                    return;
-                                }
-                            }
-                            this.cc_selection.clear();
-                            this.begin_cc_paint(false, true, lx, ly, window, cx);
-                            return;
-                        }
-                        // The Line tool draws a ramp; Shift is retained as the
-                        // established temporary line gesture from other tools.
-                        if this.tool == PianoTool::Line
-                            || (ev.modifiers.shift && this.tool != PianoTool::Select)
-                        {
-                            let unsnap =
-                                free || (this.tool == PianoTool::Line && ev.modifiers.shift);
-                            this.begin_cc_line(lx, ly, unsnap, window, cx);
-                            return;
-                        }
-                        // Grab an existing point to move it; Ctrl/Cmd toggles
-                        // multi-selection. Empty click clears selection and paints.
-                        if let Some(cid) = this.editing_clip_id(cx) {
-                            if let Some(id) = this.cc_point_at(cx, &cid, lx, ly) {
-                                let toggle = ev.modifiers.control || ev.modifiers.platform;
-                                if toggle {
-                                    // Toggle, then fall through into the move so
-                                    // Ctrl+*drag* still drags. This used to
-                                    // return here, which left Ctrl+drag doing
-                                    // nothing at all: the press was spent on the
-                                    // selection and the gesture never started.
-                                    // A Ctrl+click that does not move commits
-                                    // nothing — `commit_cc_edit` no-ops when the
-                                    // points are unchanged — so the toggle still
-                                    // reads as a plain click.
-                                    if this.cc_selection.contains(&id) {
-                                        this.cc_selection.remove(&id);
-                                        // Nothing left under the cursor to drag.
-                                        cx.notify();
-                                        return;
-                                    }
-                                    this.cc_selection.insert(id);
-                                    this.begin_cc_move(id, free, window, cx);
-                                    return;
-                                }
-                                if ev.modifiers.shift && this.tool == PianoTool::Select {
-                                    this.cc_selection.insert(id);
-                                    cx.notify();
-                                    return;
-                                }
-                                this.begin_cc_move(id, free || ev.modifiers.shift, window, cx);
+                    this.cc_hover_point = None;
+                    let Some((lx, ly)) = this.cc_local(ev.position) else {
+                        return;
+                    };
+                    // Alt is the lane-wide "free" modifier: it releases the
+                    // grid for whichever gesture the click starts.
+                    let free = ev.modifiers.alt;
+                    let toggle = ev.modifiers.control || ev.modifiers.platform;
+
+                    // The Line tool draws a ramp; Shift is retained as the
+                    // established temporary line gesture from the Draw tool.
+                    if this.tool == PianoTool::Line
+                        || (ev.modifiers.shift
+                            && !toggle
+                            && !matches!(this.tool, PianoTool::Select | PianoTool::Erase))
+                    {
+                        let unsnap = free || (this.tool == PianoTool::Line && ev.modifiers.shift);
+                        this.begin_cc_line(lx, ly, unsnap, window, cx);
+                        return;
+                    }
+                    if this.tool == PianoTool::Erase {
+                        this.begin_cc_paint(true, free, lx, ly, window, cx);
+                        return;
+                    }
+
+                    // Only the Select tool (or Ctrl/Cmd from any tool) grabs
+                    // points. The Draw tool used to grab them too, and a drawn
+                    // curve has a handle on every grid step — so re-drawing
+                    // over it caught a handle on nearly every press and
+                    // dragged that one point around instead of painting.
+                    let grabs_points = this.tool == PianoTool::Select || toggle;
+                    let hit = if grabs_points {
+                        this.editing_clip_id(cx)
+                            .and_then(|cid| this.cc_point_at(cx, &cid, lx, ly))
+                    } else {
+                        None
+                    };
+                    if let Some(id) = hit {
+                        if toggle {
+                            // Toggle, then fall through into the move so
+                            // Ctrl+drag still drags. A Ctrl+click that does
+                            // not move commits nothing — `commit_cc_edit`
+                            // no-ops when the points are unchanged.
+                            if this.cc_selection.remove(&id) {
+                                // Nothing left under the cursor to drag.
+                                cx.notify();
                                 return;
                             }
+                            this.cc_selection.insert(id);
+                            this.begin_cc_move(id, lx, ly, free, window, cx);
+                            return;
                         }
-                        if this.tool == PianoTool::Select {
-                            let mode = MarqueeSelectionMode::from_modifiers(&ev.modifiers);
-                            if let Some(clip_id) = this.editing_clip_id(cx) {
-                                this.begin_cc_select(clip_id, this.active_cc, lx, ly, mode, cx);
-                            }
-                        } else {
-                            this.cc_selection.clear();
-                            this.begin_cc_paint(false, free, lx, ly, window, cx);
+                        if ev.modifiers.shift {
+                            this.cc_selection.insert(id);
+                            cx.notify();
+                            return;
                         }
+                        this.begin_cc_move(id, lx, ly, free, window, cx);
+                        return;
                     }
+
+                    // Empty space: the Select tool marquees, except that Alt
+                    // is free draw in every tool (the gesture the hint
+                    // advertises); every other tool paints.
+                    if this.tool == PianoTool::Select && !free {
+                        let mode = MarqueeSelectionMode::from_modifiers(&ev.modifiers);
+                        if let Some(clip_id) = this.editing_clip_id(cx) {
+                            this.begin_cc_select(clip_id, this.active_cc, lx, ly, mode, cx);
+                        }
+                        return;
+                    }
+                    this.cc_selection.clear();
+                    this.begin_cc_paint(false, free, lx, ly, window, cx);
                 }),
             )
             .on_mouse_down(
@@ -1213,6 +1404,26 @@ mod tests {
         assert!(points
             .windows(2)
             .all(|pair| (pair[1].beat - pair[0].beat) > CC_POINT_MERGE_EPS));
+    }
+
+    #[test]
+    fn value_for_y_inverts_the_drawn_transform() {
+        for lane_h in [60.0_f32, 140.0] {
+            for value in [0.0_f32, 0.25, 0.5, 0.9, 1.0] {
+                let y = PianoRoll::controller_y_for_value(value, lane_h);
+                let back = PianoRoll::controller_value_for_y(y, lane_h);
+                assert!((back - value).abs() < 1.0e-5, "{value} -> {y} -> {back}");
+            }
+            // The inset edges clamp to the extremes, so min and max are
+            // reachable without pixel-exact aim (or by overshooting).
+            assert_eq!(PianoRoll::controller_value_for_y(0.0, lane_h), 1.0);
+            assert_eq!(PianoRoll::controller_value_for_y(-40.0, lane_h), 1.0);
+            assert_eq!(PianoRoll::controller_value_for_y(lane_h, lane_h), 0.0);
+            assert_eq!(
+                PianoRoll::controller_value_for_y(lane_h + 40.0, lane_h),
+                0.0
+            );
+        }
     }
 
     #[test]

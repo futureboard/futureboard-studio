@@ -224,6 +224,7 @@ impl Render for MixerTreeSidebar {
         let filter_mouse_callbacks =
             bind_mouse_selection(cx.entity().clone(), |this| &mut this.filter_input);
         let filter_callbacks = TextInputCallbacks {
+            on_mouse_down_out: None,
             on_context_command: None,
             on_context_menu: Some(self.filter_context_menu.clone()),
             on_mouse: filter_mouse_callbacks.on_mouse,

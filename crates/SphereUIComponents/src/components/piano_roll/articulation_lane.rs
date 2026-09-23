@@ -179,12 +179,9 @@ impl PianoRoll {
         &mut self,
         cx: &mut Context<Self>,
         clip_id: &str,
-        start_beat: f32,
-        end_beat: f32,
-        bpb: f32,
     ) -> impl IntoElement {
         let (view_w, _) = self.cc_view_size();
-        let grid = self.build_velocity_grid(start_beat, end_beat, bpb);
+        let grid = self.build_velocity_grid();
         let (_, clip_len) = self.clip_meta(cx, clip_id);
 
         // Owned copy of the visible events (culled below) so the timeline read

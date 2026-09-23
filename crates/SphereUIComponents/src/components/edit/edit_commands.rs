@@ -4,9 +4,9 @@ use std::collections::VecDeque;
 
 use crate::components::timeline::timeline_state::{
     AudioClipStretchState, AutomationLaneState, ClipState, GlobalLaneHeights,
-    MidiArticulationEvent, MidiControllerKind, MidiControllerPoint, MidiNoteState, SongTextEvent,
-    TempoPoint, TimeSignaturePoint, TimelineMarkerState, TimelineRegionState, TimelineState,
-    TrackState,
+    MidiArticulationEvent, MidiControllerKind, MidiControllerPoint, MidiNoteState, MidiSysExEvent,
+    SongTextEvent, TempoPoint, TimeSignaturePoint, TimelineMarkerState, TimelineRegionState,
+    TimelineState, TrackState,
 };
 use sphere_midi_service::mpe::MpeTrackConfiguration;
 
@@ -231,6 +231,14 @@ pub enum EditCommand {
         prev: Vec<MidiArticulationEvent>,
         next: Vec<MidiArticulationEvent>,
     },
+    /// Replace a clip's SysEx events (SysEx Editor add / edit / move /
+    /// delete). Whole-list snapshots: a clip carries a handful of messages.
+    SetClipSysEx {
+        label: &'static str,
+        clip_id: String,
+        prev: Vec<MidiSysExEvent>,
+        next: Vec<MidiSysExEvent>,
+    },
     /// Split one note into `parts` (two or more contiguous notes). Atomic so a
     /// single undo restores the original note and removes every part.
     SplitMidiNote {
@@ -359,6 +367,7 @@ impl EditCommand {
             | EditCommand::MoveMidiNotesBetweenClips { .. }
             | EditCommand::SetControllerPoints { .. }
             | EditCommand::SetMidiArticulations { .. }
+            | EditCommand::SetClipSysEx { .. }
             | EditCommand::SplitMidiNote { .. } => EditImpact::Midi,
             EditCommand::SetSongTextEvents { .. } => EditImpact::Metadata,
             EditCommand::SetGlobalLaneHeights { .. } => EditImpact::Metadata,
@@ -418,6 +427,7 @@ impl EditCommand {
             EditCommand::SetTrackAutomationLanes { .. } => "Edit Automation",
             EditCommand::SetControllerPoints { .. } => "Edit CC Lane",
             EditCommand::SetMidiArticulations { .. } => "Edit Articulations",
+            EditCommand::SetClipSysEx { label, .. } => label,
             EditCommand::SplitMidiNote { .. } => "Split MIDI Note",
             EditCommand::SetClipStretch { .. } => "Edit Stretch",
             EditCommand::ReorderFxSlot { .. } => "Reorder FX",
@@ -545,6 +555,9 @@ impl EditCommand {
             }
             EditCommand::SetMidiArticulations { clip_id, next, .. } => {
                 state.set_midi_articulations(clip_id, next.clone());
+            }
+            EditCommand::SetClipSysEx { clip_id, next, .. } => {
+                state.set_midi_clip_sysex(clip_id, next.clone());
             }
             EditCommand::SplitMidiNote {
                 clip_id,
@@ -701,6 +714,9 @@ impl EditCommand {
             }
             EditCommand::SetMidiArticulations { clip_id, prev, .. } => {
                 state.set_midi_articulations(clip_id, prev.clone());
+            }
+            EditCommand::SetClipSysEx { clip_id, prev, .. } => {
+                state.set_midi_clip_sysex(clip_id, prev.clone());
             }
             EditCommand::SplitMidiNote {
                 clip_id,

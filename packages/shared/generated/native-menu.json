@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-09-20T05:25:02.151Z",
+  "generatedAt": "2026-09-23T12:20:00.189Z",
   "menus": [
     {
       "id": "file",
@@ -442,6 +442,21 @@
           "checked": false,
           "danger": false,
           "description": null,
+          "children": []
+        },
+        {
+          "id": "midi.sysex_editor",
+          "kind": "normal",
+          "label": "SysEx Editor...",
+          "icon": "binary",
+          "shortcut": null,
+          "command": "midi:sysex-editor",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": "View, write and fix Roland, Yamaha, Korg and Universal SysEx on a clip or on markers",
           "children": []
         },
         {

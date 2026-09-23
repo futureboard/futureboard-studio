@@ -266,10 +266,17 @@ impl StudioLayout {
     pub(super) fn handle_bpm_edit_key(
         &mut self,
         event: &KeyDownEvent,
-        _window: &Window,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.tempo_edit.bpm_editing {
+            return false;
+        }
+        // Another text field holds focus: the user has moved on. Close the
+        // editor (as a click away would) and let that field have the key —
+        // this editor sits first in the key chain and used to take it.
+        if self.focused_text_target(window).is_some() {
+            self.commit_bpm_edit(cx);
             return false;
         }
         if event.is_held && !is_repeatable_edit_key(event) {
@@ -308,10 +315,16 @@ impl StudioLayout {
     pub(super) fn handle_ts_edit_key(
         &mut self,
         event: &KeyDownEvent,
-        _window: &Window,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.tempo_edit.ts_editing {
+            return false;
+        }
+        // Same hand-off as the BPM editor: a focused text field elsewhere
+        // wins the key.
+        if self.focused_text_target(window).is_some() {
+            self.commit_ts_edit(cx);
             return false;
         }
         if event.is_held && !is_repeatable_edit_key(event) {

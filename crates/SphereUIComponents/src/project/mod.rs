@@ -744,6 +744,8 @@ pub struct ProjectTimelineMarker {
     pub beat: f64,
     pub name: String,
     pub color_hex: String,
+    /// Complete `F0 … F7` messages (v50+).
+    pub sysex: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1429,6 +1431,7 @@ impl From<&TimelineState> for FutureboardProject {
                 beat: marker.beat,
                 name: marker.name.clone(),
                 color_hex: marker.color_hex.clone(),
+                sysex: marker.sysex.clone(),
             })
             .collect();
         project.settings.timeline_regions = tl
@@ -1618,12 +1621,14 @@ pub fn apply_to_timeline(
         .timeline_markers
         .iter()
         .map(|marker| {
-            TimelineMarkerState::with_id(
+            let mut state = TimelineMarkerState::with_id(
                 marker.id.clone(),
                 marker.beat,
                 marker.name.clone(),
                 marker.color_hex.clone(),
-            )
+            );
+            state.sysex = marker.sysex.clone();
+            state
         })
         .collect();
     tl.markers

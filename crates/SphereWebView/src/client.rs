@@ -201,28 +201,24 @@ wrap_life_span_handler! {
 
         fn do_close(&self, browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
             let id = browser_id(browser);
-            if cef_diagnostics_enabled() {
-                eprintln!(
-                    "[cef-lifecycle] event=DoClose browser_id={id} return=false thread={:?}",
-                    std::thread::current().id()
-                );
-            }
+            eprintln!(
+                "[CEF][Browser {id}] DoClose {}",
+                crate::runtime::thread_label()
+            );
             0
         }
 
         fn on_before_close(&self, browser: Option<&mut Browser>) {
             let id = browser_id(browser);
             self.lifecycle.mark_before_close();
-            if cef_diagnostics_enabled() {
-                eprintln!(
-                    "[cef-lifecycle] event=OnBeforeClose browser_id={id} thread={:?}",
-                    std::thread::current().id()
-                );
-                log::info!(
-                    "event=OnBeforeClose browser_id={id} thread={:?}",
-                    std::thread::current().id()
-                );
-            }
+            eprintln!(
+                "[CEF][Browser {id}] OnBeforeClose {}",
+                crate::runtime::thread_label()
+            );
+            log::info!(
+                "event=OnBeforeClose browser_id={id} thread={}",
+                crate::runtime::thread_label()
+            );
         }
     }
 }
