@@ -1,6 +1,6 @@
 [package]
 name = "sphere-plugin-host"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 edition = "2021"
 description = "SpherePluginHost — N-API control bridge and native plugin host shell for Futureboard Studio"
 license.workspace = true

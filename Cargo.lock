@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "BuiltinAudioPlugins"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "builtin_dsp_core",
  "builtin_ui_embed",
@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "SphereAraHost"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "ara2-bridge-companion",
  "ara2-bridge-core",
@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "SphereDiscordRPC"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "discord-rich-presence",
  "serde_json",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "SphereFBStemExtractor"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "dirs 5.0.1",
  "log",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "SphereMidiService"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "libc",
  "midir",
@@ -71,18 +71,18 @@ dependencies = [
 
 [[package]]
 name = "SphereNotationEngine"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 
 [[package]]
 name = "SpherePlatform"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "windows 0.61.3",
 ]
 
 [[package]]
 name = "SphereSoundfontPlayer"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "rustysynth",
  "serde",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "SphereWebView"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "cef",
  "dispatch2",
@@ -397,7 +397,7 @@ checksum = "fb5dfbc6d8d2675589ccbe4d0fd61df2419075625f8c1a62325e718e2b0049f9"
 
 [[package]]
 name = "apak"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "apakinstaller"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "apak",
  "clap",
@@ -1213,14 +1213,14 @@ checksum = "5c0e531d93d39c34eef561e929e8a7f86d77a5af08aac4f6d6e39976c51858e9"
 
 [[package]]
 name = "builtin_dsp_core"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "biquad",
 ]
 
 [[package]]
 name = "builtin_ui_embed"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "tempfile",
 ]
@@ -1233,7 +1233,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "burnlimit"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "builtin_dsp_core",
  "builtin_ui_embed",
@@ -1310,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "c1073"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -1564,7 +1564,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clipper67"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "builtin_dsp_core",
  "builtin_ui_embed",
@@ -1696,7 +1696,7 @@ dependencies = [
 
 [[package]]
 name = "compresser"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "builtin_dsp_core",
 ]
@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "echospace"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -2771,7 +2771,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "equz8"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -2782,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "equzx"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -2881,7 +2881,7 @@ checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
 name = "fa2a"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "builtin_dsp_core",
  "builtin_ui_embed",
@@ -2891,7 +2891,7 @@ dependencies = [
 
 [[package]]
 name = "fa76"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "builtin_dsp_core",
  "builtin_ui_embed",
@@ -3201,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "futureboard-core"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "console_error_panic_hook",
  "serde",
@@ -3213,14 +3213,14 @@ dependencies = [
 
 [[package]]
 name = "futureboard_cef_helper"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "SphereWebView",
 ]
 
 [[package]]
 name = "futureboard_native"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "SphereDiscordRPC",
  "SpherePlatform",
@@ -4500,7 +4500,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jamsession"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "gpui",
  "gpui_linux",
@@ -4818,7 +4818,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "livestage"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 
 [[package]]
 name = "lock_api"
@@ -5027,7 +5027,7 @@ dependencies = [
 
 [[package]]
 name = "meowsyn"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "builtin_dsp_core",
  "fundsp",
@@ -5145,7 +5145,7 @@ dependencies = [
 
 [[package]]
 name = "mixstation"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "builtin_dsp_core",
  "builtin_ui_embed",
@@ -7174,7 +7174,7 @@ dependencies = [
 
 [[package]]
 name = "rodharerist"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -7814,7 +7814,7 @@ dependencies = [
 
 [[package]]
 name = "singer"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "cpal",
  "crossbeam-channel",
@@ -8028,7 +8028,7 @@ source = "git+https://github.com/futureboard/solfage-engine#6cf3c67f7dfb232f5c2b
 
 [[package]]
 name = "sphere-audio-editor"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "gpui",
  "rustfft",
@@ -8036,7 +8036,7 @@ dependencies = [
 
 [[package]]
 name = "sphere-audio-plugins"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -8044,7 +8044,7 @@ dependencies = [
 
 [[package]]
 name = "sphere-audio-processor"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "SphereFBStemExtractor",
  "cc",
@@ -8060,7 +8060,7 @@ dependencies = [
 
 [[package]]
 name = "sphere-encoder"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "flacenc",
  "mp3lame-encoder",
@@ -8069,7 +8069,7 @@ dependencies = [
 
 [[package]]
 name = "sphere-graphic-engine"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "windows 0.61.3",
  "windows-core 0.61.2",
@@ -8077,7 +8077,7 @@ dependencies = [
 
 [[package]]
 name = "sphere-jam-client"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "http",
  "rand 0.9.4",
@@ -8094,7 +8094,7 @@ dependencies = [
 
 [[package]]
 name = "sphere-plugin-host"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "base64",
  "builtin_dsp_core",
@@ -8130,7 +8130,7 @@ dependencies = [
 
 [[package]]
 name = "sphere-video-player"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "objc2 0.6.4",
  "objc2-av-foundation",
@@ -8143,7 +8143,7 @@ dependencies = [
 
 [[package]]
 name = "sphere_directaudioengine"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "SphereMidiService",
  "SphereSoundfontPlayer",
@@ -8177,7 +8177,7 @@ dependencies = [
 
 [[package]]
 name = "sphere_ui_components"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "SphereAraHost",
  "SphereMidiService",
@@ -9301,7 +9301,7 @@ dependencies = [
 
 [[package]]
 name = "transient"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "builtin_dsp_core",
  "builtin_ui_embed",
@@ -9732,7 +9732,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "verbspace"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
@@ -11090,7 +11090,7 @@ dependencies = [
 
 [[package]]
 name = "wrapsynth"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "builtin_dsp_core",
  "builtin_ui_embed",
@@ -11399,7 +11399,7 @@ dependencies = [
 
 [[package]]
 name = "zcomp"
-version = "2026.9.19-beta1.4"
+version = "2026.9.25-beta1.4"
 dependencies = [
  "builtin_dsp_core",
  "builtin_ui_embed",
