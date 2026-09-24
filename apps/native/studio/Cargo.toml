@@ -54,9 +54,8 @@ rand = { workspace = true, optional = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows GPUI backend.
 gpui_windows.workspace = true
-# Real MDX-NET stem separation with the DirectML GPU execution provider is a
-# default on Windows (auto-used when a GPU is detected, CPU fallback otherwise).
-sphere_ui_components = { workspace = true, features = ["stem-directml"] }
+# Stem extraction on Windows uses ONNX Runtime CPU through the default
+# `stem-onnx` feature; do not opt into DirectML here.
 # Professional Edition's private source registers this host at startup. Keeping
 # the dependency here lets the public Community manifest remain valid when the
 # ignored `crates/ExclusiveEdition` directory is absent.
@@ -67,6 +66,9 @@ windows-registry = { workspace = true, optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS GPUI backend.
 gpui_macos.workspace = true
+# Stem extraction on macOS uses the ONNX Runtime Core ML execution provider
+# against the same ONNX model packages as Windows.
+sphere_ui_components = { workspace = true, features = ["stem-coreml"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux GPUI backend.

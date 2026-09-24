@@ -251,7 +251,7 @@ tract-onnx = "0.21"
 # `ORT_DYLIB_PATH` or the system path) instead of downloading/linking at build
 # time — this keeps the build offline-friendly and lets users drop in a
 # GPU-enabled onnxruntime without recompiling. GPU EPs are opt-in per-crate.
-ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+ort = { version = "=2.0.0-rc.11", default-features = false, features = [
     "ndarray",
     "load-dynamic",
 ] }

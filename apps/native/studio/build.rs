@@ -78,7 +78,10 @@ fn bundle_crashpad_handler() {
 
 /// Default ONNX Runtime release fetched for the real MDX-NET stem backend.
 /// Override with `FUTUREBOARD_ORT_VERSION`.
-const ORT_DEFAULT_VERSION: &str = "1.27.1";
+// `ort 2.0.0-rc.11` requires an ONNX Runtime 1.23.x shared library.
+// Keep the default aligned with the Rust binding; newer runtime releases can
+// be selected explicitly once the binding is upgraded with them.
+const ORT_DEFAULT_VERSION: &str = "1.23.2";
 
 /// Download the ONNX Runtime shared library from the microsoft/onnxruntime
 /// GitHub release and place it next to the built binary, so the Stem Extractor
@@ -126,8 +129,13 @@ fn download_onnxruntime() {
         }
     };
     let dest = profile_dir.join(dest_name);
-    if dest.is_file() {
-        return; // Cached from a previous build.
+    let version_marker = profile_dir.join(format!("{dest_name}.version"));
+    if dest.is_file()
+        && std::fs::read_to_string(&version_marker)
+            .map(|cached| cached.trim() == version)
+            .unwrap_or(false)
+    {
+        return; // Cached from a previous build of this exact runtime version.
     }
 
     let (platform, ext) = match (target_os.as_str(), target_arch.as_str()) {
@@ -177,6 +185,7 @@ fn download_onnxruntime() {
         match extracted {
             Some(lib) => match std::fs::write(&dest, lib) {
                 Ok(()) => {
+                    let _ = std::fs::write(&version_marker, &version);
                     println!("cargo:warning=ONNX Runtime staged at {}", dest.display());
                     return;
                 }
