@@ -936,3 +936,17 @@ wizard.summary.template = ເທັມເພດ
 wizard.summary.tracks = ແທຣັກ
 wizard.summary.tracks-value = { $audio } ສຽງ / { $midi } MIDI
 wizard.title = ໂປຣເຈັກໃໝ່
+
+## Dialogs
+
+dialog.old-version-project.title = ໂປຣເຈັກລຸ່ມເກັນ
+dialog.old-version-project.message = ໂປຣເຈັກນີ້ຖືກສ້າງດ້ວຍ Futureboard v{ $version } (ລະດັບປະຈຸບັນເຂົ້າສູ່ v{ $currentVersion })ແລ້ວ\nສາມາດເປີດໄດ້, ແຕ່ອາດຸນສຸດທິການອາດຈະບໍ່ມີ ຫຼື ເຮັດວຽກແຕ່ກ່ອນນີ້.\nເມື່ອບັນທຶກຈະອັບເກຣດເປັນຮູບແບບປະຈຸບັນປະຈຸບັນ.
+dialog.old-version-project.detail = ລະດັບຕໍ່ຕໍ່: v{ $minVersion }\nລະດັບຂອງໂປຣເຈັກ: v{ $version }\nລະດັບປະຈຸບັນ: v{ $currentVersion }
+dialog.old-version-project.button.open-anyway = ເປີດພາຍໃນ
+dialog.old-version-project.button.cancel = ຍົກເລີກ
+dialog.old-version-project.open-failed = ບໍ່ສາມາດເປີດໄຟລ໌ໂປຣເຈັກໄດ້
+dialog.old-version-project.open-failed-detail = ການກູ້ຄືນມາບໍ່ຕົງກັບໄຟລ໌ໂປຣເຈັກ
+dialog.old-version-project.cancelled = ການເປີດໂປຣເຈັກລຸ່ມເກັນຖືກຍົກເລີກ
+dialog.old-version-project.warning-dialog-failed = ບໍ່ສາມາດສະແດງກໍ່ເຕືອນເວີແນກລະດັບ
+
+wizard.bpm = BPM

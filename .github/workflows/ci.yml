@@ -11,7 +11,7 @@ on:
     branches:
       - main
       - master
-      - develop
+      - dev
   pull_request:
   workflow_dispatch:
 
@@ -129,6 +129,10 @@ jobs:
       # this every built Studio reports "sign-in is not configured". It is
       # a public origin, not a secret; a repository variable can override it.
       FUTUREBOARD_AUTH_API_URL: ${{ vars.FUTUREBOARD_AUTH_API_URL || 'https://futureboard.studio' }}
+      # Partner Bearer key for Rodhareist TONE3000 NAM A2 fetch. Baked at
+      # compile time the same way as AUTH_API_URL. Absent in CI unless the
+      # repository secret is set; then TONE3000 browse is simply unconfigured.
+      FUTUREBOARD_TONE3000_API_KEY: ${{ secrets.FUTUREBOARD_TONE3000_API_KEY }}
       CARGO_BUILD_JOBS: 2
     strategy:
       fail-fast: false

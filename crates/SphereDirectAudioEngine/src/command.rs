@@ -152,6 +152,15 @@ pub enum EngineCommand {
         track_id: String,
         plugin_instance_id: String,
     },
+    /// Immediate 14-bit pitch bend (`8192` = centre). Carried apart from the
+    /// CC commands so the bend keeps its full resolution; an empty
+    /// `plugin_instance_id` targets the track's in-process instrument.
+    PluginPreviewPitchBend {
+        track_id: String,
+        plugin_instance_id: String,
+        channel: u8,
+        value: u16,
+    },
     /// Start transport (playback) from current position.
     StartTransport,
     /// Stop transport (but keep position).

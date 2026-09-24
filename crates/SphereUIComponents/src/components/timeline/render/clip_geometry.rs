@@ -14,8 +14,86 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::components::timeline::timeline_state::{
-    midi_edit_revision, MidiControllerKind, MidiControllerLane, MidiNoteState,
+    midi_edit_revision, MidiControllerKind, MidiControllerLane, MidiNoteState, TimeWarp,
 };
+
+/// Clip-local beat ↔ clip-local px for content drawn inside a clip.
+///
+/// The arrangement's x axis follows the tempo map (see [`TimeWarp`]), so a
+/// note's x inside a clip is not `beat × ppb` once the tempo varies across the
+/// clip: it is the warp taken relative to the clip's start. With a constant
+/// tempo this is exactly `beat × ppb`.
+#[derive(Debug, Clone)]
+pub struct ClipAxis {
+    ppb: f32,
+    pps: f32,
+    clip_start: f64,
+    origin: f64,
+    warp: TimeWarp,
+}
+
+impl ClipAxis {
+    pub fn new(
+        warp: TimeWarp,
+        clip_start: f32,
+        pixels_per_second: f32,
+        pixels_per_beat: f32,
+    ) -> Self {
+        let origin = warp.content_x(clip_start as f64, pixels_per_second, pixels_per_beat);
+        Self {
+            ppb: pixels_per_beat,
+            pps: pixels_per_second,
+            clip_start: clip_start as f64,
+            origin,
+            warp,
+        }
+    }
+
+    /// Constant tempo at `pixels_per_beat`.
+    pub fn linear(pixels_per_beat: f32) -> Self {
+        Self::new(TimeWarp::default(), 0.0, pixels_per_beat, pixels_per_beat)
+    }
+
+    /// Nominal pixels per beat (the zoom), for density decisions.
+    pub fn pixels_per_beat(&self) -> f32 {
+        self.ppb
+    }
+
+    #[inline]
+    pub fn x(&self, local_beat: f32) -> f32 {
+        if self.warp.is_linear() {
+            return local_beat * self.ppb;
+        }
+        (self
+            .warp
+            .content_x(self.clip_start + local_beat as f64, self.pps, self.ppb)
+            - self.origin) as f32
+    }
+
+    #[inline]
+    pub fn beat(&self, local_x: f32) -> f32 {
+        if self.warp.is_linear() {
+            return local_x / self.ppb.max(0.0001);
+        }
+        (self
+            .warp
+            .beat_at_content_x(self.origin + local_x as f64, self.pps, self.ppb)
+            - self.clip_start) as f32
+    }
+
+    /// What a cached preview built against this axis depends on.
+    fn cache_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.ppb.to_bits().hash(&mut hasher);
+        if !self.warp.is_linear() {
+            self.warp.key().hash(&mut hasher);
+            self.pps.to_bits().hash(&mut hasher);
+            self.clip_start.to_bits().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+}
 
 // ── Preview cache ─────────────────────────────────────────────────────────────
 //
@@ -117,10 +195,11 @@ pub fn note_previews_built() -> u64 {
 /// the geometry values identify the window it is being drawn into. A miss on
 /// any of them rebuilds; there is no path that reuses geometry built for
 /// different notes or a different zoom.
-fn preview_key(clip_id: &str, content_len: usize, geometry: &[f32]) -> u64 {
+fn preview_key(clip_id: &str, content_len: usize, axis: u64, geometry: &[f32]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     clip_id.hash(&mut hasher);
+    axis.hash(&mut hasher);
     midi_edit_revision().hash(&mut hasher);
     content_len.hash(&mut hasher);
     for value in geometry {
@@ -161,13 +240,18 @@ pub fn note_preview_cached(
     clip_id: &str,
     notes: &[MidiNoteState],
     clip_len: f32,
-    ppb: f32,
+    axis: &ClipAxis,
     px_start: f32,
     px_end: f32,
 ) -> Option<Arc<NotePreview>> {
-    let clip_width_px = (clip_len.max(0.0) * ppb).max(px_end);
+    let clip_width_px = axis.x(clip_len.max(0.0)).max(px_end);
     let (px_start, px_end) = tiled_window(px_start, px_end, clip_width_px);
-    let key = preview_key(clip_id, notes.len(), &[clip_len, ppb, px_start, px_end]);
+    let key = preview_key(
+        clip_id,
+        notes.len(),
+        axis.cache_key(),
+        &[clip_len, px_start, px_end],
+    );
     if let Some(hit) = note_preview_cache()
         .lock()
         .ok()
@@ -178,7 +262,7 @@ pub fn note_preview_cached(
     }
     crate::perf::count("midi_preview_cache_miss", 1);
     NOTE_PREVIEWS_BUILT.with(|built| built.set(built.get().saturating_add(1)));
-    let built = build_note_preview(notes, clip_len, ppb, px_start, px_end).map(Arc::new);
+    let built = build_note_preview(notes, clip_len, axis, px_start, px_end).map(Arc::new);
     if let Ok(mut cache) = note_preview_cache().lock() {
         cache.insert(key, built.clone());
     }
@@ -190,11 +274,16 @@ pub fn controller_preview_cached(
     clip_id: &str,
     lanes: &[MidiControllerLane],
     clip_len: f32,
-    ppb: f32,
+    axis: &ClipAxis,
     width: f32,
 ) -> Option<Arc<ControllerPreview>> {
     let content_len: usize = lanes.iter().map(|lane| lane.points.len()).sum();
-    let key = preview_key(clip_id, content_len, &[clip_len, ppb, width, -1.0]);
+    let key = preview_key(
+        clip_id,
+        content_len,
+        axis.cache_key(),
+        &[clip_len, width, -1.0],
+    );
     if let Some(hit) = controller_preview_cache()
         .lock()
         .ok()
@@ -202,7 +291,7 @@ pub fn controller_preview_cached(
     {
         return hit;
     }
-    let built = build_controller_preview(lanes, clip_len, ppb, width).map(Arc::new);
+    let built = build_controller_preview(lanes, clip_len, axis, width).map(Arc::new);
     if let Ok(mut cache) = controller_preview_cache().lock() {
         cache.insert(key, built.clone());
     }
@@ -256,16 +345,17 @@ pub struct NotePreview {
 pub fn build_note_preview(
     notes: &[MidiNoteState],
     clip_len: f32,
-    ppb: f32,
+    axis: &ClipAxis,
     px_start: f32,
     px_end: f32,
 ) -> Option<NotePreview> {
+    let ppb = axis.pixels_per_beat();
     if notes.is_empty() || ppb <= 0.0 || px_end <= px_start {
         return None;
     }
 
-    let visible_start_beat = (px_start / ppb).max(0.0);
-    let visible_end_beat = (px_end / ppb).min(clip_len).max(0.0);
+    let visible_start_beat = axis.beat(px_start).max(0.0);
+    let visible_end_beat = axis.beat(px_end).min(clip_len).max(0.0);
     let visible_width = px_end - px_start;
 
     // Very dense / zoomed-out MIDI maps many notes to the same pixel. Coalesce to
@@ -301,10 +391,10 @@ pub fn build_note_preview(
             continue;
         }
         if dense {
-            let x0 = ((start * ppb) - px_start)
+            let x0 = (axis.x(start) - px_start)
                 .floor()
                 .clamp(0.0, (columns - 1) as f32) as usize;
-            let x1 = ((end * ppb) - px_start)
+            let x1 = (axis.x(end) - px_start)
                 .ceil()
                 .clamp(x0 as f32, (columns - 1) as f32) as usize;
             for cell in &mut spans[x0..=x1] {
@@ -314,11 +404,8 @@ pub fn build_note_preview(
                 });
             }
         } else {
-            raw_quads.push((
-                start * ppb,
-                ((end - start) * ppb).max(min_note_w),
-                note.pitch,
-            ));
+            let x = axis.x(start);
+            raw_quads.push((x, (axis.x(end) - x).max(min_note_w), note.pitch));
         }
     }
     if in_bounds == 0 {
@@ -374,9 +461,10 @@ pub struct ControllerPreview {
 pub fn build_controller_preview(
     lanes: &[MidiControllerLane],
     clip_len: f32,
-    ppb: f32,
+    axis: &ClipAxis,
     width: f32,
 ) -> Option<ControllerPreview> {
+    let ppb = axis.pixels_per_beat();
     if width <= 1.0 {
         return None;
     }
@@ -398,7 +486,7 @@ pub fn build_controller_preview(
             let beat = if ppb <= 0.0 {
                 0.0
             } else {
-                (x / ppb).clamp(0.0, clip_len.max(0.0))
+                axis.beat(x).clamp(0.0, clip_len.max(0.0))
             };
             values.push(evaluate_midi_controller_points_cursor(
                 &lane.points,
@@ -509,8 +597,8 @@ mod tests {
         let notes: Vec<MidiNoteState> = (0..20_000)
             .map(|i| note(48 + (i % 24) as u8, i as f32 * 0.01, 0.05))
             .collect();
-        let preview =
-            build_note_preview(&notes, 200.0, 1.0, 0.0, 200.0).expect("notes produce a preview");
+        let preview = build_note_preview(&notes, 200.0, &ClipAxis::linear(1.0), 0.0, 200.0)
+            .expect("notes produce a preview");
         assert!(
             preview.quads.is_empty(),
             "dense zoom coalesces into columns"
@@ -526,8 +614,8 @@ mod tests {
     #[test]
     fn zoomed_in_preview_draws_one_quad_per_visible_note() {
         let notes = vec![note(60, 0.0, 1.0), note(64, 1.0, 1.0), note(67, 2.0, 1.0)];
-        let preview =
-            build_note_preview(&notes, 4.0, 40.0, 0.0, 160.0).expect("notes produce a preview");
+        let preview = build_note_preview(&notes, 4.0, &ClipAxis::linear(40.0), 0.0, 160.0)
+            .expect("notes produce a preview");
         assert!(preview.columns.is_empty());
         assert_eq!(preview.quads.len(), 3);
         assert_eq!(preview.quads[0].width, 40.0);
@@ -536,8 +624,10 @@ mod tests {
     #[test]
     fn scrolling_culls_notes_without_shifting_the_pitch_mapping() {
         let notes = vec![note(36, 0.0, 1.0), note(96, 100.0, 1.0)];
-        let full = build_note_preview(&notes, 200.0, 10.0, 0.0, 2000.0).expect("preview");
-        let scrolled = build_note_preview(&notes, 200.0, 10.0, 990.0, 1020.0).expect("preview");
+        let full = build_note_preview(&notes, 200.0, &ClipAxis::linear(10.0), 0.0, 2000.0)
+            .expect("preview");
+        let scrolled = build_note_preview(&notes, 200.0, &ClipAxis::linear(10.0), 990.0, 1020.0)
+            .expect("preview");
         let high_in_full = full
             .quads
             .iter()
@@ -552,8 +642,22 @@ mod tests {
 
     #[test]
     fn empty_and_degenerate_inputs_produce_no_preview() {
-        assert!(build_note_preview(&[], 4.0, 40.0, 0.0, 160.0).is_none());
-        assert!(build_note_preview(&[note(60, 0.0, 1.0)], 4.0, 0.0, 0.0, 160.0).is_none());
-        assert!(build_note_preview(&[note(60, 8.0, 1.0)], 4.0, 40.0, 0.0, 160.0).is_none());
+        assert!(build_note_preview(&[], 4.0, &ClipAxis::linear(40.0), 0.0, 160.0).is_none());
+        assert!(build_note_preview(
+            &[note(60, 0.0, 1.0)],
+            4.0,
+            &ClipAxis::linear(0.0),
+            0.0,
+            160.0
+        )
+        .is_none());
+        assert!(build_note_preview(
+            &[note(60, 8.0, 1.0)],
+            4.0,
+            &ClipAxis::linear(40.0),
+            0.0,
+            160.0
+        )
+        .is_none());
     }
 }

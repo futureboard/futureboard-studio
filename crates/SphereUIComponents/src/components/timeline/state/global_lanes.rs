@@ -8,6 +8,7 @@ pub enum GlobalLaneKind {
     SongText,
     Marker,
     Arranger,
+    Chord,
 }
 
 /// Shortest a global lane may be dragged. Below this the header controls stop
@@ -34,6 +35,7 @@ pub struct GlobalLaneHeights {
     pub song_text: Option<f32>,
     pub marker: Option<f32>,
     pub region: Option<f32>,
+    pub chord: Option<f32>,
 }
 
 impl GlobalLaneHeights {
@@ -44,6 +46,7 @@ impl GlobalLaneHeights {
             GlobalLaneKind::SongText => self.song_text,
             GlobalLaneKind::Marker => self.marker,
             GlobalLaneKind::Arranger => self.region,
+            GlobalLaneKind::Chord => self.chord,
         }
     }
 
@@ -55,6 +58,7 @@ impl GlobalLaneHeights {
             GlobalLaneKind::SongText => self.song_text = height,
             GlobalLaneKind::Marker => self.marker = height,
             GlobalLaneKind::Arranger => self.region = height,
+            GlobalLaneKind::Chord => self.chord = height,
         }
     }
 }
@@ -144,6 +148,7 @@ impl TimelineState {
             }
             GlobalLaneKind::Marker => MARKER_TRACK_HEIGHT,
             GlobalLaneKind::Arranger => REGION_TRACK_HEIGHT,
+            GlobalLaneKind::Chord => CHORD_TRACK_HEIGHT,
         }
     }
 
@@ -159,6 +164,7 @@ impl TimelineState {
             GlobalLaneKind::Arranger if self.region_track_collapsed => {
                 REGION_TRACK_HEIGHT_COLLAPSED
             }
+            GlobalLaneKind::Chord if self.chord_track_collapsed => CHORD_TRACK_HEIGHT_COLLAPSED,
             _ => self
                 .global_lane_heights
                 .get(kind)
@@ -311,6 +317,11 @@ impl TimelineState {
         }
         if self.show_marker_track {
             lanes.push(GlobalLaneKind::Marker);
+        }
+        // Harmony reads with the structure it belongs to: sections and cues
+        // above, the conductor data below.
+        if self.show_chord_track {
+            lanes.push(GlobalLaneKind::Chord);
         }
         if self.show_tempo_track {
             lanes.push(GlobalLaneKind::Tempo);

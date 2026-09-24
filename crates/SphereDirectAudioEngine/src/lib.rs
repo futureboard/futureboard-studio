@@ -68,9 +68,10 @@ pub mod vst3_processor;
 // the `SphereDirectAudioEngine` NAPI class wrap the same `EngineInner`.
 pub use crate::analysis_tap::{analysis_tap, clip_id_hash, AnalysisTap};
 pub use crate::audio_file::{
-    generate_audio_peaks, load_audio_file, probe_audio_file, AudioFileBuffer, AudioFileFormat,
-    AudioFileInfo, AudioPeak, AudioPeakFile, AudioPeakLod, AUDITION_PREVIEW_SECONDS,
-    MAX_IN_MEMORY_DECODE_BYTES, PEAK_LOD_LEVELS, STREAMING_WAV_THRESHOLD_BYTES,
+    generate_audio_peaks, load_audio_file, load_audio_file_for_edit, probe_audio_file,
+    AudioFileBuffer, AudioFileFormat, AudioFileInfo, AudioPeak, AudioPeakFile, AudioPeakLod,
+    AUDITION_PREVIEW_SECONDS, MAX_EDIT_DECODE_BYTES, MAX_IN_MEMORY_DECODE_BYTES, PEAK_LOD_LEVELS,
+    STREAMING_WAV_THRESHOLD_BYTES,
 };
 pub use crate::audio_graph::{
     plan_runtime_audio_graph, AudioGraphNode, AudioGraphNodeKind, GraphRouteIssue, GraphRouteKind,

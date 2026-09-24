@@ -1,11 +1,13 @@
 //! Keyboard shortcut profiles and the central [`KeymapManager`] service.
 
 pub mod conflicts;
+pub mod global;
 pub mod manager;
 pub mod model;
 pub mod normalize;
 pub mod storage;
 
+pub use global::{init_global_keymap, global_keymap, shortcut_for_command, shortcut_tooltip};
 pub use manager::{format_keystroke_list, profile_label, shortcut_debug_enabled, KeymapManager};
 pub use model::{
     KeyBinding, KeymapConflict, KeymapProfile, KeymapRow, KeymapSource, ProfileDescriptor,

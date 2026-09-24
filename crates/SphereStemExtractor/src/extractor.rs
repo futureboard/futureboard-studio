@@ -1,5 +1,5 @@
 use crate::backend::{InferBackendKind, SeparatedStem, create_mdx_net_backend};
-use crate::device::resolve_device;
+use crate::device::{StemPlatformRuntime, resolve_current_platform_runtime};
 use crate::error::StemExtractError;
 use crate::params::StemExtractParams;
 use crate::progress::{StemExtractCancelToken, StemExtractProgress, StemExtractStage};
@@ -39,6 +39,7 @@ pub struct StemExtractOutput {
 pub struct StemExtractResult {
     pub model: crate::model::StemModel,
     pub device: crate::device::InferDevice,
+    pub runtime: StemPlatformRuntime,
     pub backend: InferBackendKind,
     pub stems: Vec<StemExtractOutput>,
 }
@@ -76,7 +77,8 @@ pub fn extract_stems(
         ),
     ));
 
-    let device = resolve_device(params.device, params.allow_cpu_fallback)?;
+    let runtime = resolve_current_platform_runtime()?;
+    let device = runtime.device();
     let mut effective = params.clone();
     effective.device = device;
 
@@ -103,6 +105,7 @@ pub fn extract_stems(
     Ok(StemExtractResult {
         model: effective.model,
         device,
+        runtime,
         backend: backend.kind(),
         stems: separated
             .into_iter()
@@ -119,18 +122,19 @@ pub fn extract_stems(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::InferDevice;
+    use crate::device::{InferDevice, StemPlatformRuntime};
     use crate::model::StemModel;
     use crate::params::StemExtractParams;
 
     #[test]
-    fn extract_mdx_net_cpu_returns_four_stems() {
+    fn extract_mdx_net_uses_the_current_platform_runtime() {
         let input = StemExtractInput::new(48_000, 2, vec![0.1; 48_000 * 2]);
         let params = StemExtractParams::mdx_net_cpu();
         let result =
             extract_stems(&input, &params, &StemExtractCancelToken::new(), |_| {}).unwrap();
         assert_eq!(result.model, StemModel::MdxNet);
-        assert_eq!(result.device, InferDevice::Cpu);
+        assert_eq!(result.runtime, StemPlatformRuntime::CoreMl);
+        assert_eq!(result.device, InferDevice::Gpu);
         assert_eq!(result.stems.len(), 4);
     }
 

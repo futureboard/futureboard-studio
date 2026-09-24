@@ -245,7 +245,7 @@ impl AraSession {
                 self.factory().document_archive_id
             )));
         }
-        self.inner.restore_archive(bytes)
+        self.inner.restore_archive(archive_id, bytes)
     }
 
     /// Whether the session was quarantined by an ARA assertion or an impossible

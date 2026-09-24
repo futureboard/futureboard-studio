@@ -294,6 +294,7 @@ export function snapshotFromRodhareistState(state: unknown): RigSnapshot | null 
   setVal(nam, "nam_input_trim", num(p, "nam_input_trim_db"));
   setVal(nam, "nam_output_trim", num(p, "nam_output_trim_db"));
   setVal(nam, "nam_mix", num(p, "nam_mix"));
+  setVal(nam, "nam_slim_size", num(p, "nam_slim_size"));
   const softknee = parameters.softknee;
   setVal(softknee, "comp_thresh", num(p, "comp_thresh_db"));
   setVal(softknee, "comp_ratio", num(p, "comp_ratio"));

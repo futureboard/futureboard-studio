@@ -99,7 +99,7 @@ pub fn cached_or_analyze(
         }
     }
 
-    let buffer = DirectAudio::load_audio_file(path)?;
+    let buffer = DirectAudio::load_audio_file_for_edit(path)?;
     if buffer.channels == 0 || buffer.frames == 0 {
         return Err("audio source contains no frames".to_string());
     }

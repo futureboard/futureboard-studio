@@ -124,8 +124,11 @@ pub fn marker_track_lane(
     // a beat, then asks the state whether a marker is close enough. Keeping the
     // hit test in one place is why a click on a flag and a click 3 px beside it
     // cannot disagree about which marker was meant.
+    // Handlers own only the gesture geometry — never a clone of the whole
+    // project (see `TimelineGestureContext`).
+    let gesture = std::rc::Rc::new(state.gesture_context());
     let interaction = on_down.map(|cb| {
-        let state_hit = state.clone();
+        let state_hit = gesture.clone();
         let ids_hit = hit_ids.clone();
         let spans_hit = hit_spans.clone();
         let mut layer = div()
@@ -159,7 +162,7 @@ pub fn marker_track_lane(
                 },
             );
         if let Some(ctx_cb) = on_context {
-            let state_ctx = state.clone();
+            let state_ctx = gesture.clone();
             let ids_ctx = hit_ids.clone();
             let spans_ctx = hit_spans.clone();
             layer = layer.on_mouse_down(

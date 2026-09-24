@@ -22,6 +22,9 @@ import {
 } from "./bridge";
 import {
   clearActiveParamBinding,
+  postTone3000LoadTone,
+  postTone3000Search,
+  postTone3000Status,
   setActiveParamBinding,
 } from "./instanceBridge";
 import { PATH_SLOTS } from "./data";
@@ -348,6 +351,45 @@ describe("param edit coalescing", () => {
         fullRig: false,
       },
     ]);
+  });
+
+  test("TONE3000 posts never carry a token, only search query and tone id", () => {
+    const posts: Record<string, unknown>[] = [];
+    globalThis.fetch = ((_url: unknown, init?: { body?: unknown }) => {
+      posts.push(JSON.parse(String(init?.body ?? "{}")));
+      return Promise.resolve(new Response("{}"));
+    }) as typeof fetch;
+    postTone3000Status();
+    postTone3000Search("twin", 2);
+    postTone3000LoadTone(42, { stereo: true, fullRig: false, size: "lite" });
+    expect(posts).toEqual([
+      {
+        type: "futureboard.tone3000Status",
+        protocolVersion: 1,
+        pluginId: "rodharerist",
+      },
+      {
+        type: "futureboard.tone3000Search",
+        protocolVersion: 1,
+        pluginId: "rodharerist",
+        query: "twin",
+        page: 2,
+      },
+      {
+        type: "futureboard.tone3000LoadTone",
+        protocolVersion: 1,
+        pluginId: "rodharerist",
+        instanceId: "track-1::insert-1",
+        bindingGeneration: 1,
+        toneId: 42,
+        size: "lite",
+        stereo: true,
+        fullRig: false,
+      },
+    ]);
+    for (const body of posts) {
+      expect(JSON.stringify(body)).not.toMatch(/t3k_|apiKey|accessToken|oauth/i);
+    }
   });
 
   test("rebinding drops edits queued under the old instance", () => {

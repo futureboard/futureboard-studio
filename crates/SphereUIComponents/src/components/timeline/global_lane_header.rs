@@ -31,6 +31,7 @@ fn lane_id_index(kind: GlobalLaneKind) -> usize {
         GlobalLaneKind::SongText => 2,
         GlobalLaneKind::Marker => 3,
         GlobalLaneKind::Arranger => 4,
+        GlobalLaneKind::Chord => 5,
     }
 }
 
@@ -183,10 +184,12 @@ pub fn global_lane_header(
         action_row = action_row.child(lane_icon_button(
             format!("global-lane-add-{lane_id}"),
             assets::ICON_PLUS_PATH,
-            if lane_id == "tempo" {
-                "Add tempo point at playhead"
-            } else {
-                "Add time signature marker at playhead"
+            match lane_id {
+                "tempo" => "Add tempo point at playhead",
+                "region" => "Add region at playhead",
+                "marker" => "Add marker at playhead",
+                "chord" => "Open Chord Generator",
+                _ => "Add time signature marker at playhead",
             },
             true,
             move |_event, window, cx| add(&(), window, cx),

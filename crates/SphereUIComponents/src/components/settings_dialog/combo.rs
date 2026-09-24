@@ -13,10 +13,7 @@ pub(crate) fn combo_menu_position(
     if crate::components::combo_box::combobox_debug_enabled() {
         eprintln!(
             "[combobox] settings_menu scale_factor={scale:.2} layout=({:.0},{:.0}) anchor={:?} content={:?}",
-            layout.value_left,
-            layout.value_width,
-            refreshed.bounds,
-            content_bounds
+            layout.value_left, layout.value_width, refreshed.bounds, content_bounds
         );
     }
     compute_overlay_position(

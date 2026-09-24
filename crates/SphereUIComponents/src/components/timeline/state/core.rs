@@ -154,6 +154,9 @@ pub struct TimelineState {
     /// Frame rate used when [`Self::time_display_format`] is
     /// [`TimeDisplayFormat::Timecode`]. Ignored by every other format.
     pub timecode_rate: TimecodeRate,
+    /// The project's key: root and scale. `None` until someone sets one — a
+    /// project has no key by default, and "C major" would be a guess.
+    pub project_key: Option<MidiScale>,
     /// Timeline markers shown on the arrangement ruler.
     pub markers: Vec<TimelineMarkerState>,
     /// Named timeline regions spanning a beat range.
@@ -232,6 +235,14 @@ pub struct TimelineState {
     pub region_track_collapsed: bool,
     /// Selected arrangement region (stable id).
     pub selected_region_id: Option<String>,
+    /// Chord Track events, ordered by start beat and never overlapping.
+    pub chord_events: Vec<ChordTrackEvent>,
+    /// When true, the global Chord Track is shown below the ruler.
+    pub show_chord_track: bool,
+    pub chord_track_collapsed: bool,
+    pub selected_chord_event_id: Option<u64>,
+    /// Ghost of a progression being dragged in from the Chord Generator.
+    pub chord_drop_preview: Option<ChordDropPreview>,
     /// When true, the global Marker lane is shown below the ruler.
     pub show_marker_track: bool,
     pub marker_track_collapsed: bool,
@@ -284,6 +295,7 @@ impl Default for TimelineState {
             time_signature_map: TimeSignatureMap::with_default_4_4(),
             time_display_format: TimeDisplayFormat::default(),
             timecode_rate: TimecodeRate::default(),
+            project_key: None,
             markers: Vec::new(),
             regions: Vec::new(),
             song_text_events: Vec::new(),
@@ -303,6 +315,7 @@ impl Default for TimelineState {
                 track_area_height: 500.0,
                 panel_origin_x: 0.0,
                 lane_origin_x_measured: None,
+                time_warp: TimeWarp::default(),
             },
             transport: TransportState {
                 playing: false,
@@ -383,6 +396,14 @@ impl Default for TimelineState {
             show_region_track: true,
             region_track_collapsed: false,
             selected_region_id: None,
+            chord_events: Vec::new(),
+            // Off until a project has chords: an empty harmony lane is noise
+            // above every arrangement that never uses it. Dropping chords or
+            // opening it from the ruler menu shows it.
+            show_chord_track: false,
+            chord_track_collapsed: false,
+            selected_chord_event_id: None,
+            chord_drop_preview: None,
             show_marker_track: true,
             marker_track_collapsed: false,
             selected_marker_id: None,

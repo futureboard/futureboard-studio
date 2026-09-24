@@ -558,13 +558,43 @@ pub struct ViewRect {
 /// Whether built-in editors are hosted off-screen (OSR) or as a native CEF
 /// child window.
 ///
-/// Windows hosts them **windowed**: the editor shell creates a real `WS_CHILD`
-/// content HWND (`plugin_content_host`) and CEF owns a child browser window
-/// inside it, so Chromium paints, composites, and receives input directly —
-/// no shared-texture copy, no frame republishing through the GPUI atlas, no
-/// synthesized input. Other platforms retain the software off-screen path
-/// until their compositor-specific native embedding is enabled.
-pub const OFFSCREEN_HOSTING: bool = cfg!(not(target_os = "windows"));
+/// Windows and macOS host them **windowed**: the editor shell creates a real
+/// content child (`plugin_content_host` HWND, or an AppKit container via
+/// `plugin_editor_mac_region`) and CEF owns a child browser inside it, so
+/// Chromium paints, composites, and receives input directly — no shared-texture
+/// copy, no frame republishing through the GPUI atlas, no synthesized input.
+/// Linux retains the software off-screen path until its native embedding is
+/// enabled.
+pub const OFFSCREEN_HOSTING: bool = cfg!(not(any(target_os = "windows", target_os = "macos")));
+
+/// Explicit browser lifetime. Illegal edges are rejected instead of being
+/// applied to a closing or already-closed instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserPhase {
+    Creating,
+    Ready,
+    Attached,
+    Detached,
+    Closing,
+    Closed,
+}
+
+fn transition_browser_phase(from: BrowserPhase, to: BrowserPhase) -> Option<BrowserPhase> {
+    use BrowserPhase::*;
+    let allowed = matches!(
+        (from, to),
+        (Creating, Ready)
+            | (Creating, Closing)
+            | (Ready, Attached)
+            | (Ready, Closing)
+            | (Attached, Detached)
+            | (Attached, Closing)
+            | (Detached, Attached)
+            | (Detached, Closing)
+            | (Closing, Closed)
+    );
+    allowed.then_some(to)
+}
 
 /// Optional synchronous GPU sink supplied by the GPUI editor window.
 #[cfg(feature = "builtin-plugin-editor")]
@@ -745,6 +775,10 @@ mod imp {
 
     pub fn close_view(_view_id: ViewId) {}
 
+    pub fn browser_holds_native_parent(_view_id: ViewId) -> bool {
+        false
+    }
+
     pub fn take_view_events(_view_id: ViewId) -> Vec<ViewEvent> {
         Vec::new()
     }
@@ -778,7 +812,8 @@ mod imp {
     };
     use sphere_webview::runtime::cef::rc::Rc as _;
     use sphere_webview::runtime::{
-        CefRuntime, CefRuntimeConfig, NativeParent, WebView, WebViewConfig, WindowBounds,
+        CefRuntime, CefRuntimeConfig, CefRuntimeError, NativeParent, WebView, WebViewConfig,
+        WindowBounds,
     };
     use sphere_webview::scheme::{register_plugin_scheme_factory, BridgeSink, SchemeAsset};
 
@@ -802,11 +837,13 @@ mod imp {
         screen_geometry: ViewScreenGeometry,
         opened_at: std::time::Instant,
         stability_reported: bool,
+        phase: super::BrowserPhase,
     }
 
     struct ClosingView {
         hosted: HostedView,
         pump_ticks: u16,
+        timeout_logged: bool,
     }
 
     struct FallbackClosingView {
@@ -848,6 +885,10 @@ mod imp {
         /// fallback. They must stay alive through OnBeforeClose but must not
         /// emit `Closed` for the still-open GPUI editor window.
         fallback_closing_views: Vec<FallbackClosingView>,
+        /// Browsers whose `OnBeforeClose` already ran. Dropped on the next
+        /// pump, after this call has returned to the host run loop, so the
+        /// CefRefPtr is not released on the CEF callback stack.
+        deferred_release: Vec<HostedView>,
         warmup: Option<WarmupBrowser>,
         runtime: CefRuntime,
         // The exact CefApp passed to execute_process in the browser process.
@@ -865,8 +906,8 @@ mod imp {
     }
 
     /// Physical rect plus the scale it was measured at. Off-screen browsers are
-    /// told a *logical* size and render at `scale`; a windowed child ignores the
-    /// scale and uses the physical rect directly.
+    /// told a *logical* size and render at `scale`. A windowed Win32 child uses
+    /// the physical rect directly; a windowed AppKit child is placed in points.
     #[derive(Debug, Clone, Copy)]
     struct PendingBounds {
         rect: ViewRect,
@@ -1018,6 +1059,50 @@ mod imp {
         })
     }
 
+    fn origin_still_attached(host: &Host, origin: &str) -> bool {
+        host.views
+            .values()
+            .any(|hosted| hosted.open.origin == origin)
+    }
+
+    fn log_resource_counters(host: &Host) {
+        if !sphere_webview::scheme::cef_diagnostics_enabled()
+            && !crate::boot::has_flag("--cef-stress-test")
+        {
+            return;
+        }
+        thread_local! {
+            static LAST_LOG: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+        }
+        let due = LAST_LOG.with(|last| {
+            let now = std::time::Instant::now();
+            let due = last
+                .get()
+                .is_none_or(|previous| previous.elapsed() >= std::time::Duration::from_secs(5));
+            if due {
+                last.set(Some(now));
+            }
+            due
+        });
+        if !due {
+            return;
+        }
+        let browsers = host.views.len()
+            + host.closing_views.len()
+            + host.fallback_closing_views.len()
+            + host.deferred_release.len()
+            + usize::from(host.warmup.is_some());
+        let pending_close = host.closing_views.len() + host.fallback_closing_views.len();
+        #[cfg(target_os = "macos")]
+        let memory = crate::components::plugin_editor_mac_region::appkit::task_memory();
+        #[cfg(not(target_os = "macos"))]
+        let memory: Option<(u64, u64)> = None;
+        let (resident, virtual_size) = memory.unwrap_or((0, 0));
+        eprintln!(
+            "[cef-resources] active_browser_count={browsers} pending_browser_close_count={pending_close} active_surface_count={browsers} active_texture_count=0 active_iosurface_count=host-does-not-own resident_bytes={resident} virtual_bytes={virtual_size}"
+        );
+    }
+
     fn discard_inbound(origin: &str) {
         if let Ok(mut map) = inbound_map().lock() {
             map.remove(origin);
@@ -1038,10 +1123,19 @@ mod imp {
     /// isn't open yet or already closed — callers already gate on
     /// `is_view_open`/`ViewEvent::Opened` where it matters.
     pub fn send_to_view(view_id: ViewId, code: &str) {
+        if !sphere_webview::scheme::cef_ipc_enabled() {
+            return;
+        }
         HOST.with(|cell| {
             if let Ok(slot) = cell.try_borrow() {
                 if let Some(host) = slot.as_ref() {
                     if let Some(hosted) = host.views.get(&view_id) {
+                        if !matches!(
+                            hosted.phase,
+                            super::BrowserPhase::Ready | super::BrowserPhase::Attached
+                        ) {
+                            return;
+                        }
                         if let Err(error) = hosted.view.execute_javascript(code) {
                             eprintln!(
                                 "[plugin-bridge] execute_javascript failed view_id={view_id:?} err={error}"
@@ -1063,6 +1157,12 @@ mod imp {
             if let Ok(slot) = cell.try_borrow() {
                 if let Some(host) = slot.as_ref() {
                     if let Some(hosted) = host.views.get(&view_id) {
+                        if !matches!(
+                            hosted.phase,
+                            super::BrowserPhase::Ready | super::BrowserPhase::Attached
+                        ) {
+                            return;
+                        }
                         if let Err(error) = hosted.view.reload() {
                             eprintln!(
                                 "[plugin-bridge] reload failed view_id={view_id:?} err={error}"
@@ -1151,10 +1251,10 @@ mod imp {
                 Ok(subprocess) => subprocess,
                 Err(error) => return remember_runtime_failure(error.to_string()),
             },
-            // Chromium decides this once, at initialize. Windows hosts every
-            // built-in editor (and the warm-up browser) as a native child
-            // window, and CEF advises against enabling OSR support in a
-            // process that never uses it; the other platforms are OSR-hosted.
+            // Chromium decides this once, at initialize. Windows and macOS
+            // host every built-in editor as a native child, and CEF advises
+            // against enabling OSR support in a process that never uses it;
+            // Linux is still OSR-hosted.
             windowless_rendering: super::OFFSCREEN_HOSTING,
             ..Default::default()
         };
@@ -1174,6 +1274,7 @@ mod imp {
             views: HashMap::new(),
             closing_views: HashMap::new(),
             fallback_closing_views: Vec::new(),
+            deferred_release: Vec::new(),
             warmup: None,
             runtime,
             _application: app,
@@ -1283,21 +1384,144 @@ mod imp {
             if ensure_runtime(&mut slot).is_ok() {
                 if let Some(host) = slot.as_mut() {
                     ensure_warmup(host);
+                    if crate::boot::has_flag("--cef-stress-test") {
+                        run_cef_stress(host);
+                    }
                 }
             }
         });
+    }
+
+    fn run_cef_stress(host: &mut Host) {
+        let cycles = std::env::var("FUTUREBOARD_CEF_STRESS_CYCLES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|cycles| *cycles > 0)
+            .unwrap_or(500);
+        let Some(parent_window) =
+            crate::components::plugin_content_host::HiddenHostWindow::create()
+        else {
+            eprintln!("[cef-stress] skipped reason=no-hidden-parent");
+            return;
+        };
+        eprintln!(
+            "[cef-stress] begin cycles={cycles} static_test={} gpu_isolation={}",
+            sphere_webview::scheme::cef_static_test_enabled(),
+            std::env::var_os("FUTUREBOARD_CEF_DISABLE_GPU").is_some()
+        );
+        let mut failed_to_close = 0u32;
+        for cycle in 1..=cycles {
+            let url = if sphere_webview::scheme::cef_static_test_enabled() {
+                "mikoplugin://stress/index.html".to_string()
+            } else {
+                "about:blank".to_string()
+            };
+            let (mut client, lifecycle) = plugin_browser_client_with_surface(&url, None);
+            let result = WindowBounds::new(0, 0, 320, 200)
+                .map_err(|error| error.to_string())
+                .and_then(|bounds| {
+                    let config = WebViewConfig::new(url, bounds);
+                    unsafe {
+                        let parent = NativeParent::from_raw(hwnd_to_cef(parent_window.hwnd()));
+                        host.runtime
+                            .create_webview_detached(parent, config, Some(&mut client))
+                    }
+                    .map_err(|error| error.to_string())
+                });
+            let Ok(view) = result else {
+                failed_to_close += 1;
+                eprintln!("[cef-stress] cycle={cycle} create_failed");
+                continue;
+            };
+            if let Ok(bounds) = WindowBounds::new(0, 0, 640, 360) {
+                let _ = view.set_bounds(bounds);
+                let _ = view.set_bounds(bounds);
+            }
+            let _ = view.close(false);
+            let mut closed = lifecycle.before_close();
+            for _ in 0..40 {
+                if closed {
+                    break;
+                }
+                let _ = host.runtime.do_message_loop_work();
+                closed = lifecycle.before_close();
+            }
+            if closed {
+                drop(view);
+                drop(client);
+            } else {
+                failed_to_close += 1;
+                let view_id = ViewId(u64::MAX - u64::from(cycle));
+                host.closing_views.insert(
+                    view_id,
+                    ClosingView {
+                        hosted: HostedView {
+                            _editor_id: format!("stress-{cycle}"),
+                            view,
+                            _client: client,
+                            lifecycle,
+                            open: PendingOpen {
+                                editor_id: format!("stress-{cycle}"),
+                                origin: "stress",
+                                parent_hwnd: parent_window.hwnd(),
+                                rect: ViewRect {
+                                    x: 0,
+                                    y: 0,
+                                    width: 320,
+                                    height: 200,
+                                },
+                                accelerated_sink: None,
+                            },
+                            bounds: PendingBounds {
+                                rect: ViewRect {
+                                    x: 0,
+                                    y: 0,
+                                    width: 320,
+                                    height: 200,
+                                },
+                                scale_factor: 1.0,
+                            },
+                            screen_geometry: ViewScreenGeometry::default(),
+                            opened_at: std::time::Instant::now(),
+                            stability_reported: true,
+                            phase: super::BrowserPhase::Closing,
+                        },
+                        pump_ticks: 0,
+                        timeout_logged: false,
+                    },
+                );
+            }
+            if cycle % 50 == 0 || cycle == cycles {
+                log_resource_counters(host);
+                eprintln!(
+                    "[cef-stress] cycle={cycle}/{cycles} not_closed_yet={failed_to_close} active_browsers={}",
+                    host.views.len()
+                        + host.closing_views.len()
+                        + host.deferred_release.len()
+                        + usize::from(host.warmup.is_some())
+                );
+            }
+        }
+        eprintln!("[cef-stress] complete cycles={cycles} close_timeouts={failed_to_close}");
+        if failed_to_close > 0 {
+            // The hidden window is the parent of browsers that have not
+            // reached OnBeforeClose. Destroying it here would unmap their
+            // compositor surfaces on the close stack.
+            std::mem::forget(parent_window);
+        }
     }
 
     /// Close every CEF browser and finish process-global shutdown on the UI
     /// thread after GPUI's application loop exits.
     pub fn shutdown() {
         HOST.with(|cell| {
-            let Some(host) = cell.borrow_mut().take() else {
+            let Some(mut host) = cell.borrow_mut().take() else {
                 return;
             };
             let open_count = host.views.len()
                 + host.closing_views.len()
                 + host.fallback_closing_views.len()
+                + host.deferred_release.len()
                 + usize::from(host.warmup.is_some());
             eprintln!("[cef-runtime] shutdown requested open_browser_count={open_count}");
             for hosted in host.views.values() {
@@ -1335,12 +1559,33 @@ mod imp {
                         .warmup
                         .as_ref()
                         .filter(|warmup| !warmup._lifecycle.before_close())
-                        .map_or(0, |_| 1);
+                        .map_or(0, |_| 1)
+                    + host
+                        .deferred_release
+                        .iter()
+                        .filter(|hosted| !hosted.lifecycle.before_close())
+                        .count();
                 if remaining == 0 {
                     break;
                 }
             }
             eprintln!("[cef-runtime] shutdown close_pump_complete remaining_open={remaining}");
+            if remaining != 0 {
+                eprintln!(
+                    "[cef-runtime] shutdown refused CefShutdown active_browser_count={remaining}"
+                );
+                host.runtime.suppress_shutdown();
+                // Keep the CefRefPtrs alive. Dropping them, or calling
+                // CefShutdown, while OnBeforeClose is still outstanding is the
+                // SIGTRAP this path exists to avoid.
+                std::mem::forget(host);
+                debug_assert_eq!(
+                    remaining, 0,
+                    "CefShutdown requires every browser to have finished OnBeforeClose"
+                );
+                return;
+            }
+            debug_assert_eq!(remaining, 0);
             // Field order now releases all browser/client handles before
             // `CefRuntime::drop` invokes cef_shutdown exactly once.
             drop(host);
@@ -1389,11 +1634,15 @@ mod imp {
         let Some(origin) = origin_for_plugin_id(plugin_id) else {
             return Err(HostAvailability::NoEditorForPlugin(plugin_id.to_string()));
         };
-        // Windowed (Windows): `parent_hwnd` is the shell's content child and
-        // the browser fills it. Off-screen: no native parent is required; one
-        // supplied anyway is used only for monitor info and dialog ownership.
-        WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
-            .map_err(|e| HostAvailability::RuntimeFailed(e.to_string()))?;
+        // Windowed: `parent_hwnd` is the shell's content child and the browser
+        // fills it. Off-screen: no native parent is required; one supplied
+        // anyway is used only for monitor info and dialog ownership.
+        if super::OFFSCREEN_HOSTING {
+            WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
+        } else {
+            windowed_fill_bounds(rect, scale_factor)
+        }
+        .map_err(|e| HostAvailability::RuntimeFailed(e.to_string()))?;
 
         let accelerated_sink = if crate::boot::has_flag("--disable-shared-texture")
             || std::env::var_os("FUTUREBOARD_DISABLE_SHARED_TEXTURE").is_some()
@@ -1465,6 +1714,28 @@ mod imp {
             ((rect.width as f32) / scale).round().max(1.0) as i32,
             ((rect.height as f32) / scale).round().max(1.0) as i32,
         )
+    }
+
+    /// Bounds for a windowed CEF child that fills its content parent.
+    ///
+    /// Win32 child HWNDs are physical pixels. AppKit frames are points, so a
+    /// Retina physical rect has to be divided by the scale the shell measured
+    /// it at — otherwise the browser is created at 2× and overflows the
+    /// container.
+    fn windowed_fill_bounds(
+        rect: ViewRect,
+        scale_factor: f32,
+    ) -> Result<WindowBounds, CefRuntimeError> {
+        #[cfg(target_os = "macos")]
+        {
+            let (width, height) = logical_size(rect, scale_factor);
+            WindowBounds::new(0, 0, width, height)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = scale_factor;
+            WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
+        }
     }
 
     /// Frame counter for `view_id`'s off-screen surface. `0` while the browser
@@ -1674,6 +1945,24 @@ mod imp {
         EVENTS.with(|events| events.borrow_mut().remove(&view_id).unwrap_or_default())
     }
 
+    pub fn browser_holds_native_parent(view_id: ViewId) -> bool {
+        HOST.with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .and_then(|slot| {
+                    slot.as_ref().map(|host| {
+                        host.views.contains_key(&view_id)
+                            || host.closing_views.contains_key(&view_id)
+                            || host
+                                .fallback_closing_views
+                                .iter()
+                                .any(|fallback| fallback.view_id == view_id)
+                    })
+                })
+                .unwrap_or(false)
+        })
+    }
+
     pub fn is_view_open(view_id: ViewId) -> bool {
         let pending_open = COMMANDS.with(|commands| {
             commands
@@ -1726,9 +2015,12 @@ mod imp {
             return;
         };
         const MIN_PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
-        let should_pump = LAST_CEF_PUMP.with(|last| {
+        let (should_pump, stalled) = LAST_CEF_PUMP.with(|last| {
             let now = std::time::Instant::now();
-            if !force
+            let stalled = last.get().is_some_and(|previous| {
+                now.duration_since(previous) > std::time::Duration::from_secs(2)
+            });
+            let should_pump = if !force
                 && last
                     .get()
                     .is_some_and(|previous| now.duration_since(previous) < MIN_PUMP_INTERVAL)
@@ -1737,7 +2029,8 @@ mod imp {
             } else {
                 last.set(Some(now));
                 true
-            }
+            };
+            (should_pump, stalled)
         });
         if !should_pump {
             return;
@@ -1759,6 +2052,17 @@ mod imp {
                 return;
             }
             let host = slot.as_mut().expect("ensure_runtime installs the host");
+            drop(std::mem::take(&mut host.deferred_release));
+            if stalled {
+                for hosted in host.views.values() {
+                    if hosted.view.osr_surface().is_none()
+                        && matches!(hosted.phase, super::BrowserPhase::Attached)
+                    {
+                        let _ = hosted.view.refresh_compositor();
+                    }
+                }
+            }
+            log_resource_counters(host);
 
             for (view_id, pending) in commands {
                 if pending.close {
@@ -1770,15 +2074,29 @@ mod imp {
                         fallback.cancel_reopen = true;
                         continue;
                     }
-                    if let Some(hosted) = host.views.remove(&view_id) {
+                    if let Some(mut hosted) = host.views.remove(&view_id) {
                         let browser_id = hosted.view.browser_identifier();
+                        let origin = hosted.open.origin;
+                        hosted.phase = super::transition_browser_phase(
+                            hosted.phase,
+                            super::BrowserPhase::Closing,
+                        )
+                        .unwrap_or(super::BrowserPhase::Closing);
                         let _ = hosted.view.close(true);
                         host.closing_views.insert(
                             view_id,
                             ClosingView {
                                 hosted,
                                 pump_ticks: 0,
+                                timeout_logged: false,
                             },
+                        );
+                        if !origin_still_attached(host, origin) {
+                            discard_inbound(origin);
+                        }
+                        eprintln!(
+                            "[CEF][Browser {browser_id}] detach view_id={view_id:?} {}",
+                            sphere_webview::runtime::thread_label()
                         );
                         eprintln!(
                             "[cef-registry] event=close_requested view_id={view_id:?} browser_id={browser_id} editor_count={} removal_deferred_until=OnBeforeClose",
@@ -1833,8 +2151,12 @@ mod imp {
                         });
                         let (mut client, lifecycle) =
                             plugin_browser_client_with_surface(&url, surface.clone());
-                        let result = WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
-                            .map_err(|error| error.to_string())
+                        let result = if surface.is_some() {
+                            WindowBounds::new(rect.x, rect.y, rect.width, rect.height)
+                        } else {
+                            windowed_fill_bounds(rect, bounds_command.scale_factor)
+                        }
+                        .map_err(|error| error.to_string())
                             .and_then(|bounds| {
                                 let mut config = WebViewConfig::new(url, bounds);
                                 if let Some(surface) = surface {
@@ -1868,10 +2190,11 @@ mod imp {
                                     );
                                 }
                                 let browser_id = view.browser_identifier();
+                                let editor_id = open.editor_id.clone();
                                 host.views.insert(
                                     view_id,
                                     HostedView {
-                                        _editor_id: open.editor_id.clone(),
+                                        _editor_id: editor_id.clone(),
                                         view,
                                         _client: client,
                                         lifecycle,
@@ -1880,7 +2203,12 @@ mod imp {
                                         screen_geometry,
                                         opened_at: std::time::Instant::now(),
                                         stability_reported: false,
+                                        phase: super::BrowserPhase::Attached,
                                     },
+                                );
+                                eprintln!(
+                                    "[CEF][Browser {browser_id}] attach view_id={view_id:?} editor={editor_id} {}",
+                                    sphere_webview::runtime::thread_label()
                                 );
                                 eprintln!(
                                     "[cef-registry] event=insert source=OnAfterCreated view_id={view_id:?} browser_id={browser_id} editor_count={}",
@@ -1892,6 +2220,25 @@ mod imp {
                             Ok(view) => {
                                 let browser_id = view.browser_identifier();
                                 let _ = view.close(true);
+                                host.closing_views.insert(
+                                    view_id,
+                                    ClosingView {
+                                        hosted: HostedView {
+                                            _editor_id: open.editor_id.clone(),
+                                            view,
+                                            _client: client,
+                                            lifecycle,
+                                            open,
+                                            bounds: bounds_command,
+                                            screen_geometry,
+                                            opened_at: std::time::Instant::now(),
+                                            stability_reported: false,
+                                            phase: super::BrowserPhase::Closing,
+                                        },
+                                        pump_ticks: 0,
+                                        timeout_logged: false,
+                                    },
+                                );
                                 completed.push((
                                     view_id,
                                     ViewEvent::OpenFailed(format!(
@@ -1923,8 +2270,8 @@ mod imp {
                     if let Some(PendingBounds { rect, scale_factor }) = pending.bounds {
                         if let Some(hosted) = host.views.get_mut(&view_id) {
                             hosted.bounds = PendingBounds { rect, scale_factor };
-                            // A windowed child is placed with the physical rect;
-                            // an off-screen browser is told the logical size it
+                            // A windowed child fills its content parent; an
+                            // off-screen browser is told the logical size it
                             // should lay out at, and the scale it renders with.
                             let bounds = match hosted.view.osr_surface() {
                                 Some(surface) => {
@@ -1937,7 +2284,7 @@ mod imp {
                                     screen_info_stale |= change.scale_changed;
                                     WindowBounds::new(0, 0, width, height)
                                 }
-                                None => WindowBounds::new(rect.x, rect.y, rect.width, rect.height),
+                                None => windowed_fill_bounds(rect, scale_factor),
                             };
                             if let Ok(bounds) = bounds {
                                 // `set_bounds` already issues `WasResized`, which
@@ -1990,6 +2337,7 @@ mod imp {
                     closing: ClosingView {
                         hosted,
                         pump_ticks: 0,
+                        timeout_logged: false,
                     },
                     view_id,
                     reopen,
@@ -2040,20 +2388,30 @@ mod imp {
             for (view_id, closing) in &mut host.closing_views {
                 closing.pump_ticks = closing.pump_ticks.saturating_add(1);
                 if closing.hosted.lifecycle.before_close() {
-                    closed.push((*view_id, "OnBeforeClose"));
-                } else if closing.pump_ticks >= MAX_CLOSE_PUMP_TICKS {
-                    closed.push((*view_id, "timeout"));
+                    closed.push(*view_id);
+                } else if closing.pump_ticks >= MAX_CLOSE_PUMP_TICKS && !closing.timeout_logged {
+                    closing.timeout_logged = true;
+                    let browser_id = closing.hosted.view.browser_identifier();
+                    eprintln!(
+                        "[CEF][Browser {browser_id}] close still pending view_id={view_id:?} pump_ticks={} — keeping the browser and its native parent until OnBeforeClose",
+                        closing.pump_ticks
+                    );
                 }
             }
-            for (view_id, reason) in closed {
-                let browser_id = host
-                    .closing_views
-                    .get(&view_id)
-                    .map(|closing| closing.hosted.view.browser_identifier())
-                    .unwrap_or(-1);
-                host.closing_views.remove(&view_id);
+            for view_id in closed {
+                let Some(closing) = host.closing_views.remove(&view_id) else {
+                    continue;
+                };
+                let browser_id = closing.hosted.view.browser_identifier();
+                let mut hosted = closing.hosted;
+                hosted.phase = super::transition_browser_phase(
+                    hosted.phase,
+                    super::BrowserPhase::Closed,
+                )
+                .unwrap_or(super::BrowserPhase::Closed);
+                host.deferred_release.push(hosted);
                 eprintln!(
-                    "[cef-registry] event=remove source={reason} view_id={view_id:?} browser_id={browser_id} editor_count={}",
+                    "[cef-registry] event=remove source=OnBeforeClose view_id={view_id:?} browser_id={browser_id} editor_count={} release=next-pump",
                     host.views.len() + host.closing_views.len()
                 );
                 completed.push((view_id, ViewEvent::Closed));
@@ -2066,19 +2424,24 @@ mod imp {
                 let before_close = fallback.closing.hosted.lifecycle.before_close();
                 if before_close {
                     let fallback = host.fallback_closing_views.swap_remove(index);
-                    if fallback.cancel_reopen {
-                        completed.push((fallback.view_id, ViewEvent::Closed));
-                    } else if !fallback.timeout_reported {
+                    let FallbackClosingView {
+                        closing,
+                        view_id,
+                        reopen,
+                        bounds,
+                        screen_geometry,
+                        cancel_reopen,
+                        timeout_reported,
+                    } = fallback;
+                    host.deferred_release.push(closing.hosted);
+                    if cancel_reopen {
+                        completed.push((view_id, ViewEvent::Closed));
+                    } else if !timeout_reported {
                         // This origin had exactly one shared built-in editor.
                         // Drop any late messages from the retired page before
                         // the replacement browser is allowed to post.
-                        discard_inbound(fallback.reopen.origin);
-                        fallback_reopens.push((
-                            fallback.view_id,
-                            fallback.reopen,
-                            fallback.bounds,
-                            fallback.screen_geometry,
-                        ));
+                        discard_inbound(reopen.origin);
+                        fallback_reopens.push((view_id, reopen, bounds, screen_geometry));
                     }
                 } else {
                     if fallback.closing.pump_ticks >= MAX_CLOSE_PUMP_TICKS
@@ -2160,8 +2523,8 @@ pub use imp::install_process_app;
 #[cfg(feature = "builtin-plugin-editor")]
 pub use imp::shutdown;
 pub use imp::{
-    availability, close_view, init_at_boot, is_view_open, open_view, preload, pump,
-    pump_after_input, reload_view, send_to_view, send_view_input, set_view_bounds,
+    availability, browser_holds_native_parent, close_view, init_at_boot, is_view_open, open_view,
+    preload, pump, pump_after_input, reload_view, send_to_view, send_view_input, set_view_bounds,
     set_view_screen_geometry, take_global_play_pause_requests, take_inbound, take_view_events,
     view_frame_generation, view_uses_accelerated_osr, with_view_frame,
 };
@@ -2169,6 +2532,55 @@ pub use imp::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_phase_rejects_use_after_close() {
+        assert_eq!(
+            transition_browser_phase(BrowserPhase::Creating, BrowserPhase::Ready),
+            Some(BrowserPhase::Ready)
+        );
+        assert_eq!(
+            transition_browser_phase(BrowserPhase::Ready, BrowserPhase::Attached),
+            Some(BrowserPhase::Attached)
+        );
+        assert_eq!(
+            transition_browser_phase(BrowserPhase::Attached, BrowserPhase::Closing),
+            Some(BrowserPhase::Closing)
+        );
+        assert_eq!(
+            transition_browser_phase(BrowserPhase::Closing, BrowserPhase::Closed),
+            Some(BrowserPhase::Closed)
+        );
+        assert_eq!(
+            transition_browser_phase(BrowserPhase::Closed, BrowserPhase::Attached),
+            None
+        );
+        assert_eq!(
+            transition_browser_phase(BrowserPhase::Closing, BrowserPhase::Ready),
+            None
+        );
+        assert_eq!(
+            transition_browser_phase(BrowserPhase::Closed, BrowserPhase::Closing),
+            None
+        );
+    }
+
+    #[test]
+    fn five_hundred_open_close_cycles_end_closed() {
+        for _ in 0..500 {
+            let mut phase = BrowserPhase::Creating;
+            for next in [
+                BrowserPhase::Ready,
+                BrowserPhase::Attached,
+                BrowserPhase::Closing,
+                BrowserPhase::Closed,
+            ] {
+                phase = transition_browser_phase(phase, next).expect("legal editor cycle");
+            }
+            assert_eq!(phase, BrowserPhase::Closed);
+            assert!(transition_browser_phase(phase, BrowserPhase::Attached).is_none());
+        }
+    }
 
     #[test]
     fn built_in_ids_map_to_their_url_origin() {
@@ -2367,5 +2779,20 @@ mod tests {
 
         builtin_state_remove(insert);
         builtin_state_remove(seeded_insert);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn desktop_hosts_builtin_editors_as_native_children() {
+        assert!(
+            !OFFSCREEN_HOSTING,
+            "Windows and macOS must host built-in editors windowed so Chromium owns paint and input"
+        );
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[test]
+    fn linux_hosts_builtin_editors_off_screen() {
+        assert!(OFFSCREEN_HOSTING);
     }
 }

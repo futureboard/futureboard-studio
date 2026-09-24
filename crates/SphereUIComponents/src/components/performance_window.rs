@@ -132,22 +132,24 @@ impl PerformanceWindow {
         // anything in Studio is being edited, so this window drives its own
         // refresh. Taking the engine reading here rather than in `render` is
         // what keeps it off a leased entity.
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(REFRESH).await;
-            // Two steps, deliberately not nested: take the reading with nothing
-            // leased, then apply it. Reading the Studio from inside this
-            // window's own update would be a nested entity update, which is the
-            // shape this project avoids everywhere else for the same reason.
-            let reading = cx.update(|cx| read_engine(cx));
-            let updated = this.update(cx, |view, cx| {
-                view.engine = reading;
-                if view.restarting && view.engine.running {
-                    view.restarting = false;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REFRESH).await;
+                // Two steps, deliberately not nested: take the reading with nothing
+                // leased, then apply it. Reading the Studio from inside this
+                // window's own update would be a nested entity update, which is the
+                // shape this project avoids everywhere else for the same reason.
+                let reading = cx.update(|cx| read_engine(cx));
+                let updated = this.update(cx, |view, cx| {
+                    view.engine = reading;
+                    if view.restarting && view.engine.running {
+                        view.restarting = false;
+                    }
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
                 }
-                cx.notify();
-            });
-            if updated.is_err() {
-                break;
             }
         })
         .detach();

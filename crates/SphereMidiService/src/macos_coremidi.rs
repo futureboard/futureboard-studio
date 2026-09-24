@@ -47,6 +47,8 @@ const K_MIDI_PROPERTY_OFFLINE: &[u8] = b"offline\0";
 const K_MIDI_PROPERTY_PRIVATE: &[u8] = b"private\0";
 const K_CF_STRING_ENCODING_UTF8: CFStringEncoding = 0x0800_0100;
 const MIDI_PACKET_LIST_BUF: usize = 512;
+/// Largest message one `MIDIPacket` in [`MIDI_PACKET_LIST_BUF`] carries.
+const MAX_PACKET_BYTES: usize = 256;
 
 /// Maximum payload of a single `MIDIPacket`, from `MIDIServices.h`.
 const PACKET_DATA_CAPACITY: usize = 256;
@@ -893,9 +895,25 @@ impl Drop for MacMidiOutputConnection {
 
 impl MacMidiOutputConnection {
     pub fn send(&self, message: &[u8]) -> Result<(), OSStatus> {
-        if message.is_empty() || message.len() > 256 {
+        if message.is_empty() {
             return Err(-1);
         }
+        // A bulk dump outgrows one packet. CoreMIDI accepts a SysEx split
+        // across consecutive packets, so send it in packet-sized pieces
+        // rather than refusing it.
+        if message.len() > MAX_PACKET_BYTES {
+            if message[0] != 0xF0 {
+                return Err(-1);
+            }
+            for chunk in message.chunks(MAX_PACKET_BYTES) {
+                self.send_packet(chunk)?;
+            }
+            return Ok(());
+        }
+        self.send_packet(message)
+    }
+
+    fn send_packet(&self, message: &[u8]) -> Result<(), OSStatus> {
         let mut buf = PacketListBuffer([0u8; MIDI_PACKET_LIST_BUF]);
         let pktlist = buf.0.as_mut_ptr() as *mut MIDIPacketList;
         unsafe {

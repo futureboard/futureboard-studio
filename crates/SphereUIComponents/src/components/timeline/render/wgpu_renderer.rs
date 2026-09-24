@@ -412,7 +412,12 @@ impl WgpuTimelineRenderer {
             let info = adapter.get_info();
             eprintln!(
                 "[gpu-renderer] adapter selected: name={:?} backend={:?} device_type={:?} vendor=0x{:x} device=0x{:x} preference={:?}",
-                info.name, info.backend, info.device_type, info.vendor, info.device, self.preference
+                info.name,
+                info.backend,
+                info.device_type,
+                info.vendor,
+                info.device,
+                self.preference
             );
         }
 

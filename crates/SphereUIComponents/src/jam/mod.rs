@@ -421,20 +421,22 @@ fn spawn_poll_thread() {
     }
     let _ = std::thread::Builder::new()
         .name("jam-poll".to_string())
-        .spawn(|| loop {
-            let live = match controller().lock() {
-                Ok(mut guard) => match guard.as_mut() {
-                    Some(controller) => {
-                        controller.poll();
-                        controller.state().live()
-                    }
-                    None => false,
-                },
-                // A poisoned lock means a panic elsewhere already took the
-                // controller down; there is nothing left to poll.
-                Err(_) => return,
-            };
-            std::thread::sleep(if live { POLL_ACTIVE } else { POLL_IDLE });
+        .spawn(|| {
+            loop {
+                let live = match controller().lock() {
+                    Ok(mut guard) => match guard.as_mut() {
+                        Some(controller) => {
+                            controller.poll();
+                            controller.state().live()
+                        }
+                        None => false,
+                    },
+                    // A poisoned lock means a panic elsewhere already took the
+                    // controller down; there is nothing left to poll.
+                    Err(_) => return,
+                };
+                std::thread::sleep(if live { POLL_ACTIVE } else { POLL_IDLE });
+            }
         });
 }
 

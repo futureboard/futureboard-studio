@@ -27,6 +27,7 @@ use std::time::Instant;
 use crate::components::timeline::audio_clip::audio_clip_timeline_geometry;
 use crate::components::timeline::render::clip_geometry::{
     controller_preview_cached, note_preview_cached, note_previews_built, visible_clip_px_range,
+    ClipAxis,
 };
 use crate::components::timeline::timeline_state::{
     tempo_maps_built, AudioClipStretchState, AudioImportState, ClipState, ClipType,
@@ -266,7 +267,7 @@ impl Session {
                             &clip.id,
                             notes,
                             clip.duration_beats,
-                            ppb,
+                            &ClipAxis::linear(ppb),
                             px_start,
                             px_end,
                         ) {
@@ -277,7 +278,7 @@ impl Session {
                         &clip.id,
                         controller_lanes,
                         clip.duration_beats,
-                        ppb,
+                        &ClipAxis::linear(ppb),
                         width,
                     ) {
                         work.painted_controller_columns +=
@@ -488,4 +489,44 @@ fn audio_clip_geometry_does_not_scale_with_tempo_marker_count() {
          per clip",
         curved_work.clips
     );
+}
+
+/// What one `TimelineState` clone costs. Global lanes used to clone the whole
+/// state into their pointer handlers on every render.
+#[test]
+#[ignore = "measurement, not an assertion"]
+fn timeline_state_clone_cost_by_session_size() {
+    let cases = [
+        ("small: 8 MIDI × 4 clips × 200 notes", 8, 4, 200, 64, 4, 4),
+        (
+            "medium: 32 MIDI × 8 clips × 1k notes",
+            32,
+            8,
+            1_000,
+            256,
+            16,
+            8,
+        ),
+        (
+            "large: 64 MIDI × 16 clips × 4k notes",
+            64,
+            16,
+            4_000,
+            512,
+            32,
+            16,
+        ),
+    ];
+    println!();
+    for (label, midi_tracks, clips, notes, cc, audio_tracks, audio_clips) in cases {
+        let session = Session::build(midi_tracks, clips, notes, cc, audio_tracks, audio_clips);
+        let runs = 10;
+        let start = Instant::now();
+        for _ in 0..runs {
+            std::hint::black_box(session.state.clone());
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+        println!("{label:<40} clone {ms:>8.3} ms");
+    }
+    println!();
 }

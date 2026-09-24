@@ -54,23 +54,32 @@ pub(crate) struct TempoEditState {
     pub ts_edit_point_id: Option<String>,
     /// True while the numerator field holds focus (false → denominator).
     pub ts_edit_focus_num: bool,
+    /// A press landed outside an inline editor field and has not (yet) been
+    /// claimed by one — see [`StudioLayout::note_inline_edit_outside_press`].
+    pub outside_press_pending: bool,
 }
 
 impl TempoEditState {
     pub(super) fn new(cx: &mut Context<StudioLayout>) -> Self {
         Self {
+            // ASCII-only by layout: a Thai (or any non-Latin) layout's number
+            // row must still type digits here.
             bpm_input: TextInputState::new("transport-bpm-input", cx.focus_handle())
-                .with_accessible_label("Tempo in BPM"),
+                .with_accessible_label("Tempo in BPM")
+                .with_ascii_charset("0123456789.,"),
             bpm_editing: false,
             bpm_session: None,
             bpm_edit_point_id: None,
             ts_num_input: TextInputState::new("transport-ts-num-input", cx.focus_handle())
-                .with_accessible_label("Time signature numerator"),
+                .with_accessible_label("Time signature numerator")
+                .with_ascii_charset("0123456789"),
             ts_den_input: TextInputState::new("transport-ts-den-input", cx.focus_handle())
-                .with_accessible_label("Time signature denominator"),
+                .with_accessible_label("Time signature denominator")
+                .with_ascii_charset("0123456789"),
             ts_editing: false,
             ts_edit_point_id: None,
             ts_edit_focus_num: true,
+            outside_press_pending: false,
         }
     }
 }
@@ -96,11 +105,23 @@ fn transport_text_context(
     })
 }
 
+/// Outside-press hook shared by the transport's inline editors: note the
+/// press, and let [`StudioLayout::note_inline_edit_outside_press`] decide once
+/// the whole press has been dispatched.
+fn inline_edit_outside_press(
+    target: gpui::Entity<StudioLayout>,
+) -> crate::components::text_input::TextInputOutsideCb {
+    Arc::new(move |_window, cx| {
+        let _ = target.update(cx, |layout, cx| layout.note_inline_edit_outside_press(cx));
+    })
+}
+
 fn bind_time_signature_mouse_selection(
     target: gpui::Entity<StudioLayout>,
     numerator: bool,
 ) -> TextInputCallbacks {
     TextInputCallbacks {
+        on_mouse_down_out: Some(inline_edit_outside_press(target.clone())),
         on_context_command: None,
         on_context_menu: Some(transport_text_context(
             target.clone(),
@@ -114,6 +135,9 @@ fn bind_time_signature_mouse_selection(
             let _ = target.update(cx, |layout, cx| {
                 if matches!(event.phase, TextInputMousePhase::Down) {
                     layout.tempo_edit.ts_edit_focus_num = numerator;
+                    // Moving between the two meter fields is not leaving
+                    // the editor.
+                    layout.tempo_edit.outside_press_pending = false;
                 }
                 let input = if numerator {
                     &mut layout.tempo_edit.ts_num_input
@@ -359,7 +383,11 @@ impl StudioLayout {
             event,
             timeline.state.transport.playing,
             timeline.state.transport.recording,
-            self.recording.preview.values().next().map(|p| p.recording_id),
+            self.recording
+                .preview
+                .values()
+                .next()
+                .map(|p| p.recording_id),
             action
         );
     }
@@ -445,6 +473,25 @@ impl StudioLayout {
         let on_stop = make_command_handler("transport:stop");
         let on_loop_toggle = make_command_handler("transport:toggle-loop");
         let on_metronome_toggle = make_command_handler("transport:toggle-metronome");
+        let on_metronome_menu: components::BpmMenuCb = {
+            let this = cx.entity().clone();
+            Arc::new(
+                move |pos: &(f32, f32), window: &mut Window, cx: &mut gpui::App| {
+                    let (x, y) = *pos;
+                    let _ = this.update(cx, |this, cx| {
+                        this.try_open_context_menu(
+                            ContextMenuRequest::from_window(
+                                window,
+                                x,
+                                y,
+                                ContextMenuTarget::Extended(ContextTarget::Metronome),
+                            ),
+                            cx,
+                        );
+                    });
+                },
+            )
+        };
         let on_follow_toggle = make_command_handler("transport:toggle-follow-playhead");
         let on_follow_mode_toggle = make_command_handler("transport:toggle-autoscroll-mode");
         let on_record = make_command_handler("transport:record");
@@ -576,6 +623,26 @@ impl StudioLayout {
             )
         };
 
+        let key_menu = |root: bool| -> components::BpmMenuCb {
+            let this = cx.entity().clone();
+            Arc::new(
+                move |pos: &(f32, f32), window: &mut Window, cx: &mut gpui::App| {
+                    let (x, y) = *pos;
+                    let _ = this.update(cx, |this, cx| {
+                        this.open_project_key_menu(window, x, y, root, cx);
+                    });
+                },
+            )
+        };
+        let on_key_root_menu = key_menu(true);
+        let on_key_scale_menu = key_menu(false);
+        let project_key = self.timeline.read(cx).state.project_key.map(|key| {
+            (
+                key.root.label().to_string(),
+                key.kind.short_label().to_string(),
+            )
+        });
+
         let on_ts_edit_start: components::ChromeActionCb = {
             let this = cx.entity().clone();
             Arc::new(move |_: &(), _window: &mut Window, cx: &mut gpui::App| {
@@ -589,13 +656,27 @@ impl StudioLayout {
             bind_mouse_selection(cx.entity().clone(), |layout: &mut StudioLayout| {
                 &mut layout.tempo_edit.bpm_input
             });
+        let bpm_on_mouse = bpm_mouse_callbacks.on_mouse.map(|inner| {
+            let target = cx.entity().clone();
+            let on_mouse: crate::components::text_input::TextInputMouseCb =
+                Arc::new(move |event: &TextInputMouseEvent, window, cx| {
+                    if matches!(event.phase, TextInputMousePhase::Down) {
+                        let _ = target.update(cx, |layout, _cx| {
+                            layout.tempo_edit.outside_press_pending = false;
+                        });
+                    }
+                    inner(event, window, cx);
+                });
+            on_mouse
+        });
         let bpm_input_callbacks = TextInputCallbacks {
+            on_mouse_down_out: Some(inline_edit_outside_press(cx.entity().clone())),
             on_context_command: None,
             on_context_menu: Some(transport_text_context(
                 cx.entity().clone(),
                 crate::layout::studio_state::TextMenuTarget::TransportBpm,
             )),
-            on_mouse: bpm_mouse_callbacks.on_mouse,
+            on_mouse: bpm_on_mouse,
         };
         // The master strip's gesture is rebuilt here rather than inside the
         // meter entity: this runs at the shell's render rate, while the meter
@@ -605,6 +686,16 @@ impl StudioLayout {
         let _ = self
             .master_transport_meter
             .update(cx, |meter, _| meter.set_callbacks(master_volume));
+
+        let on_find_tempo_key: components::ChromeActionCb = {
+            let this = cx.entity().clone();
+            Arc::new(move |_: &(), _window: &mut Window, cx: &mut gpui::App| {
+                let _ = this.update(cx, |this, cx| {
+                    this.dispatch_command_id("audio:find-tempo-key", cx);
+                });
+            })
+        };
+        let find_tempo_key_enabled = self.tempo_key_finder_available(cx);
 
         let ts_num_input_callbacks = bind_time_signature_mouse_selection(cx.entity().clone(), true);
         let ts_den_input_callbacks =
@@ -639,6 +730,9 @@ impl StudioLayout {
             ts_edit_focus_num: self.tempo_edit.ts_edit_focus_num,
             on_ts_menu,
             on_ts_edit_start,
+            project_key,
+            on_key_root_menu,
+            on_key_scale_menu,
             on_return_to_start,
             on_play_toggle,
             on_stop,
@@ -647,6 +741,7 @@ impl StudioLayout {
             on_count_in_menu,
             on_loop_toggle,
             on_metronome_toggle,
+            on_metronome_menu,
             on_follow_toggle,
             on_follow_mode_toggle,
             on_set_bpm,
@@ -656,6 +751,8 @@ impl StudioLayout {
             on_bpm_edit_start,
             on_tap_tempo,
             on_tap_tempo_menu,
+            find_tempo_key_enabled,
+            on_find_tempo_key,
             master_meter: Some(self.master_transport_meter.clone().into()),
             perf_meter: Some(self.transport_perf_meter.clone().into()),
         }

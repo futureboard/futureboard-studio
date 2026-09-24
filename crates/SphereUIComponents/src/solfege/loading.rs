@@ -189,7 +189,7 @@ pub fn model_load_state(path: &Path) -> ModelLoadState {
                 model: display_name(path),
                 stage: ModelLoadStage::Opening,
                 cause: format!("cannot read {}: {error}", path.display()),
-            })
+            });
         }
     };
 

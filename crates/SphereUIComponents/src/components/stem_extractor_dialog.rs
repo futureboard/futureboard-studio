@@ -1,6 +1,6 @@
 //! Native Stem Extractor dialog.
 //!
-//! Compact Futureboard dialog for offline MDX-NET stem separation (CPU/GPU).
+//! Compact Futureboard dialog for offline MDX-NET stem separation.
 //! Owns serializable [`StemExtractParams`] from SphereAudioProcessor, edits them
 //! in the UI, and runs a cancellable background job that never leases GPUI
 //! entities during decode/separate/encode work.
@@ -34,7 +34,6 @@ const LABEL_W: f32 = 96.0;
 enum SelectField {
     Clip,
     Model,
-    Device,
     Quality,
 }
 
@@ -88,6 +87,7 @@ pub struct StemExtractApplyRequest {
 pub struct StemExtractJobSummary {
     pub model: SphereAudioProcessor::StemModel,
     pub device: SphereAudioProcessor::InferDevice,
+    pub runtime: SphereAudioProcessor::StemPlatformRuntime,
     pub backend: SphereAudioProcessor::InferBackendKind,
     pub apply: StemExtractApplyRequest,
 }
@@ -147,7 +147,7 @@ pub struct StemExtractorWindow {
     models_dir: PathBuf,
     model_installed: bool,
     focus_handle: FocusHandle,
-    gpu_available: bool,
+
     on_apply: Arc<dyn Fn(StemExtractApplyRequest, &mut App) + 'static>,
     applied: bool,
 }
@@ -174,7 +174,7 @@ impl StemExtractorWindow {
             .clone()
             .unwrap_or_else(SphereAudioProcessor::default_models_dir);
         let _ = SphereAudioProcessor::ensure_models_dir(&models_dir);
-        // Auto-select GPU when the startup probe found one (CPU fallback).
+        // The worker resolves the platform runtime when extraction starts.
         let params = SphereAudioProcessor::auto_stem_extract_params();
         let model_installed = SphereAudioProcessor::model_installed(params.model, &models_dir);
         Self {
@@ -190,7 +190,7 @@ impl StemExtractorWindow {
             models_dir,
             model_installed,
             focus_handle: cx.focus_handle(),
-            gpu_available: SphereAudioProcessor::gpu_available(),
+
             on_apply,
             applied: false,
         }
@@ -289,6 +289,7 @@ impl StemExtractorWindow {
             && self.source_path.is_some()
             && self.params.validate().is_ok()
             && !self.params.stems.is_empty()
+            && SphereAudioProcessor::resolve_current_platform_runtime().is_ok()
     }
 
     fn start_download(&mut self, cx: &mut Context<Self>) {
@@ -478,8 +479,9 @@ impl StemExtractorWindow {
                     if cancel.is_cancelled() {
                         return Err("cancelled".into());
                     }
-                    let buffer = DirectAudio::load_audio_file(&source_path.to_string_lossy())
-                        .map_err(|e| e.to_string())?;
+                    let buffer =
+                        DirectAudio::load_audio_file_for_edit(&source_path.to_string_lossy())
+                            .map_err(|e| e.to_string())?;
                     let channels = buffer.channels.max(1);
                     let input = SphereAudioProcessor::StemExtractInput::new(
                         buffer.sample_rate,
@@ -528,6 +530,7 @@ impl StemExtractorWindow {
                     Ok(StemExtractJobSummary {
                         model: extracted.model,
                         device: extracted.device,
+                        runtime: extracted.runtime,
                         backend: extracted.backend,
                         apply: StemExtractApplyRequest {
                             stems,
@@ -612,11 +615,7 @@ impl StemExtractorWindow {
                     }
                 }
             }
-            SelectField::Device => {
-                if let Some(device) = SphereAudioProcessor::InferDevice::parse(value) {
-                    self.params.device = device;
-                }
-            }
+
             SelectField::Quality => {
                 if let Some(quality) = SphereAudioProcessor::StemExtractQuality::parse(value) {
                     self.params.quality = quality;
@@ -704,7 +703,7 @@ impl StemExtractorWindow {
         } else if self.defaults.audio_clips.is_empty() {
             "MDX-NET · select an audio clip on a track".to_string()
         } else {
-            "MDX-NET stem separation · CPU / GPU".to_string()
+            format!("MDX-NET stem separation · {}", platform_runtime_label())
         }
     }
 
@@ -730,7 +729,7 @@ impl StemExtractorWindow {
             .child(section_label("MODEL"))
             .child(self.model_row(target.clone()))
             .child(self.model_status_row(target.clone()))
-            .child(self.device_row(target.clone()))
+            .child(self.runtime_row())
             .child(self.quality_row(target.clone()))
             .child(section_label("STEMS"))
             .child(self.stems_row(target.clone()))
@@ -758,6 +757,8 @@ impl StemExtractorWindow {
             col = col.child(hint_banner(
                 "No audio clips on tracks. Import or record audio first.".into(),
             ));
+        } else if let Err(error) = SphereAudioProcessor::resolve_current_platform_runtime() {
+            col = col.child(hint_banner(error.user_message()));
         } else if !self.can_extract() && !self.is_downloading() {
             col = col.child(hint_banner(
                 "Select an audio clip and at least one stem.".into(),
@@ -957,19 +958,14 @@ impl StemExtractorWindow {
             )))
     }
 
-    fn device_row(&self, target: gpui::Entity<Self>) -> impl IntoElement {
-        let options = vec![
-            SelectOption::new("cpu", "CPU"),
-            SelectOption::new("gpu", "GPU").disabled(!self.gpu_available),
-        ];
-        let control = self.dropdown(
-            SelectField::Device,
-            "stem-device",
-            self.params.device.as_str().to_string(),
-            options,
-            target,
-        );
-        self.labeled("Device", control)
+    fn runtime_row(&self) -> impl IntoElement {
+        self.labeled(
+            "Runtime",
+            div()
+                .text_size(px(11.0))
+                .text_color(Colors::text_secondary())
+                .child(platform_runtime_label()),
+        )
     }
 
     fn quality_row(&self, target: gpui::Entity<Self>) -> impl IntoElement {
@@ -1303,27 +1299,23 @@ fn model_hint(
     installed: bool,
     models_dir: &std::path::Path,
 ) -> String {
-    let device = if params.device == SphereAudioProcessor::InferDevice::Gpu {
-        if SphereAudioProcessor::gpu_available() {
-            "GPU"
-        } else if params.allow_cpu_fallback {
-            "GPU (falls back to CPU if unavailable)"
-        } else {
-            "GPU (unavailable)"
-        }
-    } else {
-        "CPU"
-    };
+    let runtime = platform_runtime_label();
     let weights = if installed {
         format!("weights in {}", models_dir.display())
     } else {
         "weights not installed — Download saves to Utilities/Models".to_string()
     };
     format!(
-        "{} · {device} · {} · {weights}",
+        "{} · {runtime} · {} · {weights}",
         params.model.description(),
         params.quality.label()
     )
+}
+
+fn platform_runtime_label() -> String {
+    SphereAudioProcessor::resolve_current_platform_runtime()
+        .map(|runtime| runtime.label().to_string())
+        .unwrap_or_else(|error| error.user_message())
 }
 
 fn section_label(label: &'static str) -> impl IntoElement {

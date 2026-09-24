@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::device::InferDevice;
+use crate::device::{InferDevice, StemPlatform};
 use crate::model::StemModel;
 use crate::stems::StemKind;
 
@@ -23,6 +23,9 @@ pub enum StemExtractError {
 
     #[error("device {} unavailable: {reason}", device.label())]
     DeviceUnavailable { device: InferDevice, reason: String },
+
+    #[error("stem extraction is not yet supported on {}", platform.label())]
+    UnsupportedPlatform { platform: StemPlatform },
 
     #[error("extraction cancelled")]
     Cancelled,

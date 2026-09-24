@@ -1,12 +1,14 @@
 //! Feature-gated native-window CEF runtime.
 
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, ThreadId};
 
 use cef::rc::Rc as _;
-use cef::{ImplBrowser, ImplBrowserHost, ImplFrame};
+use cef::{ImplBrowser, ImplBrowserHost, ImplFrame, LogSeverity};
 use thiserror::Error;
 
 pub use cef;
@@ -17,6 +19,124 @@ const OPAQUE_BACKGROUND: u32 = 0xFF11_1318;
 
 /// Windowless paint rate cap. CEF clamps this to 1..=60.
 const WINDOWLESS_FRAME_RATE: i32 = 60;
+
+/// Largest browser dimension handed to CEF. Larger backing stores fail macOS
+/// `vm_map` once several editors are live.
+const MAX_BROWSER_DIMENSION: i32 = 8192;
+
+thread_local! {
+    static CEF_UI_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Record the calling thread as the CEF UI thread. `CefRuntime::initialize`
+/// is the only caller.
+pub fn mark_cef_ui_thread() {
+    CEF_UI_THREAD.with(|flag| flag.set(true));
+}
+
+/// Whether the calling thread initialized CEF.
+pub fn on_cef_ui_thread() -> bool {
+    CEF_UI_THREAD.with(Cell::get)
+}
+
+/// Run `operation` only when the caller is already the CEF UI thread.
+///
+/// This does not hop threads. A `dispatch_sync` onto the UI thread from a
+/// CEF callback deadlocks the browser process.
+pub fn run_on_cef_ui(operation_name: &str, operation: impl FnOnce()) {
+    if on_cef_ui_thread() {
+        operation();
+        return;
+    }
+    eprintln!(
+        "[cef-thread] rejected operation={operation_name} reason=not-cef-ui-thread {}",
+        thread_label()
+    );
+}
+
+/// Run `operation` only on the platform main thread.
+///
+/// On macOS that is `pthread_main_np`, which is also where AppKit and the
+/// integrated CEF run loop live. This does not hop threads.
+pub fn run_on_main_thread(operation_name: &str, operation: impl FnOnce()) {
+    if platform_main_thread() {
+        operation();
+        return;
+    }
+    eprintln!(
+        "[cef-thread] rejected operation={operation_name} reason=not-main-thread {}",
+        thread_label()
+    );
+}
+
+fn platform_main_thread() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { pthread_main_np() == 1 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Windows and Linux drive CEF from the thread that called
+        // `CefInitialize`. That thread is the one AppKit would call "main"
+        // on macOS; there is no separate main-thread check.
+        on_cef_ui_thread()
+    }
+}
+
+/// Human-readable thread identity for crash logs.
+pub fn thread_label() -> String {
+    let cef_ui = on_cef_ui_thread();
+    #[cfg(target_os = "macos")]
+    let main = unsafe { pthread_main_np() == 1 };
+    #[cfg(not(target_os = "macos"))]
+    let main = false;
+    format!("{:?} main={main} cef_ui={cef_ui}", thread::current().id())
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_main_np() -> i32;
+}
+
+/// Persistent Chromium log. Fatal CHECK lines land here even when stderr is
+/// not attached to a terminal.
+pub fn cef_diagnostic_log_path() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::temp_dir()
+            .join("futureboard-cef.log")
+            .display()
+            .to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "/tmp/futureboard-cef.log".to_string()
+    }
+}
+
+fn log_browser(browser_id: i32, event: &str) {
+    if !crate::scheme::cef_diagnostics_enabled() {
+        return;
+    }
+    eprintln!("[CEF][Browser {browser_id}] {event} {}", thread_label());
+}
+
+fn sanitize_bounds(bounds: WindowBounds) -> WindowBounds {
+    let width = bounds.width.clamp(1, MAX_BROWSER_DIMENSION);
+    let height = bounds.height.clamp(1, MAX_BROWSER_DIMENSION);
+    if width != bounds.width || height != bounds.height {
+        eprintln!(
+            "[cef-lifecycle] event=clamp_bounds requested={}x{} applied={width}x{height}",
+            bounds.width, bounds.height
+        );
+    }
+    WindowBounds {
+        x: bounds.x,
+        y: bounds.y,
+        width,
+        height,
+    }
+}
 
 /// Futureboard uses CEF only as an ephemeral renderer for local built-in UI.
 /// Application persistence and every secret remain native-owned.
@@ -369,6 +489,7 @@ impl CefRuntime {
         application: Option<&mut cef::App>,
     ) -> Result<Self, CefRuntimeError> {
         prepare_process()?;
+        mark_cef_ui_thread();
         let identity = ProcessIdentity::current()?;
         let args = cef::args::Args::new();
         let browser_subprocess_path = match &config.browser_subprocess {
@@ -428,6 +549,15 @@ impl CefRuntime {
         }
         log_local_ui_runtime_summary();
         eprintln!(
+            "[cef-runtime] log_file={} log_severity={}",
+            cef_diagnostic_log_path(),
+            if crate::scheme::cef_diagnostics_enabled() {
+                "verbose"
+            } else {
+                "default"
+            }
+        );
+        eprintln!(
             "[cef-runtime] initialize result=true owner_thread={:?}",
             thread::current().id()
         );
@@ -470,6 +600,7 @@ impl CefRuntime {
         if config.url.trim().is_empty() {
             return Err(CefRuntimeError::EmptyUrl);
         }
+        let bounds = sanitize_bounds(config.bounds);
         let windowless = matches!(config.render_mode, RenderMode::Windowless { .. });
         let accelerated = matches!(
             &config.render_mode,
@@ -478,7 +609,7 @@ impl CefRuntime {
         let mut window_info = if windowless {
             cef::WindowInfo::default().set_as_windowless(parent.as_raw())
         } else {
-            cef::WindowInfo::default().set_as_child(parent.as_raw(), &config.bounds.as_cef_rect())
+            cef::WindowInfo::default().set_as_child(parent.as_raw(), &bounds.as_cef_rect())
         };
         #[cfg(target_os = "windows")]
         {
@@ -562,10 +693,14 @@ impl CefRuntime {
             );
         }
 
+        let browser_id = browser.identifier();
+        log_browser(browser_id, &format!("created url={:?}", config.url));
         Ok(WebView {
             browser,
             render_mode: config.render_mode,
             owner_thread: self.owner_thread,
+            resize_generation: AtomicU64::new(0),
+            applied_windowless: Cell::new((0, 0, 0)),
             _runtime: PhantomData,
             _not_send: PhantomData,
         })
@@ -596,9 +731,25 @@ impl CefRuntime {
             browser: view.browser.clone(),
             render_mode: view.render_mode.clone(),
             owner_thread: view.owner_thread,
+            resize_generation: AtomicU64::new(view.resize_generation.load(Ordering::Relaxed)),
+            applied_windowless: Cell::new(view.applied_windowless.get()),
             _runtime: PhantomData,
             _not_send: PhantomData,
         })
+    }
+
+    /// Skip `CefShutdown` when browsers are still alive.
+    ///
+    /// Chromium CHECK-fails (SIGTRAP) if shutdown races `OnBeforeClose`.
+    /// The process is exiting; leaking the runtime is safer than that trap.
+    pub fn suppress_shutdown(&mut self) {
+        if !self.shutdown {
+            eprintln!(
+                "[cef-runtime] shutdown suppressed reason=live-browsers {}",
+                thread_label()
+            );
+            self.shutdown = true;
+        }
     }
 
     pub fn shutdown(mut self) -> Result<(), CefRuntimeError> {
@@ -660,6 +811,12 @@ fn build_settings(
         browser_subprocess_path,
         locale: cef_string(config.locale.as_deref()),
         user_agent: cef_string(config.user_agent.as_deref()),
+        log_file: cef::CefString::from(cef_diagnostic_log_path().as_str()),
+        log_severity: if crate::scheme::cef_diagnostics_enabled() {
+            LogSeverity::VERBOSE
+        } else {
+            LogSeverity::DEFAULT
+        },
         remote_debugging_port: config.remote_debugging_port.unwrap_or(0) as i32,
         ..Default::default()
     }
@@ -752,20 +909,30 @@ pub struct WebView<'runtime> {
     browser: cef::Browser,
     render_mode: RenderMode,
     owner_thread: ThreadId,
+    resize_generation: AtomicU64,
+    /// Last logical size and scale bits passed to `was_resized`.
+    ///
+    /// The off-screen surface is often updated by the caller before
+    /// `set_bounds`, so the surface's current size cannot tell us whether CEF
+    /// has already been notified.
+    applied_windowless: Cell<(i32, i32, u32)>,
     _runtime: PhantomData<&'runtime CefRuntime>,
     _not_send: PhantomData<Rc<()>>,
 }
 
 impl Drop for WebView<'_> {
     fn drop(&mut self) {
+        let browser_id = self.browser.identifier();
+        let last_host_ref = self.browser.has_one_ref();
         if crate::scheme::cef_diagnostics_enabled() {
             eprintln!(
-                "[cef-ref] object_type=cef_browser_t browser_id={} event=webview_release has_one_ref={} has_at_least_one_ref={} thread={:?}",
-                self.browser.identifier(),
-                self.browser.has_one_ref(),
+                "[cef-ref] object_type=cef_browser_t browser_id={browser_id} event=webview_release has_one_ref={last_host_ref} has_at_least_one_ref={} thread={:?}",
                 self.browser.has_at_least_one_ref(),
                 std::thread::current().id()
             );
+        }
+        if last_host_ref {
+            log_browser(browser_id, "released");
         }
     }
 }
@@ -784,6 +951,7 @@ impl WebView<'_> {
             .browser
             .main_frame()
             .ok_or(CefRuntimeError::MissingMainFrame)?;
+        log_browser(self.browser.identifier(), &format!("navigate {url}"));
         frame.load_url(Some(&cef::CefString::from(url)));
         Ok(())
     }
@@ -808,23 +976,60 @@ impl WebView<'_> {
     /// `OnPaint` at the new size.
     pub fn set_bounds(&self, bounds: WindowBounds) -> Result<(), CefRuntimeError> {
         self.ensure_thread()?;
+        let bounds = sanitize_bounds(bounds);
         let host = self
             .browser
             .host()
             .ok_or(CefRuntimeError::MissingBrowserHost)?;
         match &self.render_mode {
             RenderMode::Windowed => {
-                platform_set_bounds(host.window_handle(), bounds)?;
-                host.notify_move_or_resize_started();
+                if platform_set_bounds(host.window_handle(), bounds)? {
+                    let generation = self.resize_generation.fetch_add(1, Ordering::Release) + 1;
+                    log_browser(
+                        self.browser.identifier(),
+                        &format!(
+                            "resize {}x{} generation={generation}",
+                            bounds.width, bounds.height
+                        ),
+                    );
+                    host.notify_move_or_resize_started();
+                }
             }
             RenderMode::Windowless { surface } => {
-                let (width, height) = surface.view_size();
-                if (width, height) != (bounds.width, bounds.height) {
-                    surface.set_view_size(bounds.width, bounds.height, surface.scale_factor());
+                let scale = surface.scale_factor();
+                let next = (bounds.width, bounds.height, scale.to_bits());
+                if self.applied_windowless.get() != next {
+                    if surface.view_size() != (bounds.width, bounds.height) {
+                        surface.set_view_size(bounds.width, bounds.height, scale);
+                    }
+                    self.applied_windowless.set(next);
+                    let generation = self.resize_generation.fetch_add(1, Ordering::Release) + 1;
+                    log_browser(
+                        self.browser.identifier(),
+                        &format!(
+                            "resize {}x{} generation={generation}",
+                            bounds.width, bounds.height
+                        ),
+                    );
+                    host.was_resized();
                 }
-                host.was_resized();
             }
         }
+        Ok(())
+    }
+
+    /// Ask a windowed compositor to drop a stale IOSurface after sleep or a
+    /// long main-thread stall. Does not change the view size.
+    pub fn refresh_compositor(&self) -> Result<(), CefRuntimeError> {
+        self.ensure_thread()?;
+        if matches!(self.render_mode, RenderMode::Windowless { .. }) {
+            return Ok(());
+        }
+        log_browser(self.browser.identifier(), "compositor-refresh");
+        self.browser
+            .host()
+            .ok_or(CefRuntimeError::MissingBrowserHost)?
+            .notify_move_or_resize_started();
         Ok(())
     }
 
@@ -931,6 +1136,10 @@ impl WebView<'_> {
             .browser
             .host()
             .ok_or(CefRuntimeError::MissingBrowserHost)?;
+        log_browser(
+            self.browser.identifier(),
+            &format!("close requested force={force}"),
+        );
         host.close_browser(i32::from(force));
         Ok(())
     }
@@ -974,8 +1183,8 @@ fn load_macos_framework() -> Result<(), CefRuntimeError> {
 fn platform_set_bounds(
     handle: cef::sys::cef_window_handle_t,
     bounds: WindowBounds,
-) -> Result<(), CefRuntimeError> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos};
+) -> Result<bool, CefRuntimeError> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
     let ok = unsafe {
         SetWindowPos(
             handle.0.cast(),
@@ -992,14 +1201,14 @@ fn platform_set_bounds(
             std::io::Error::last_os_error().to_string(),
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(target_os = "linux")]
 fn platform_set_bounds(
     handle: cef::sys::cef_window_handle_t,
     bounds: WindowBounds,
-) -> Result<(), CefRuntimeError> {
+) -> Result<bool, CefRuntimeError> {
     let xlib = x11_dl::xlib::Xlib::open()
         .map_err(|error| CefRuntimeError::PlatformResizeFailed(error.to_string()))?;
     let display = unsafe { (xlib.XOpenDisplay)(std::ptr::null()) };
@@ -1020,14 +1229,14 @@ fn platform_set_bounds(
         (xlib.XFlush)(display);
         (xlib.XCloseDisplay)(display);
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
 fn platform_set_bounds(
     handle: cef::sys::cef_window_handle_t,
     bounds: WindowBounds,
-) -> Result<(), CefRuntimeError> {
+) -> Result<bool, CefRuntimeError> {
     use objc2::{msg_send, runtime::AnyObject};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -1047,10 +1256,23 @@ fn platform_set_bounds(
             height: bounds.height as f64,
         },
     };
+    let current: NSRect = unsafe { msg_send![view, frame] };
+    if rects_match(current, frame) {
+        return Ok(false);
+    }
     unsafe {
         let _: () = msg_send![view, setFrame: frame];
     }
-    Ok(())
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn rects_match(left: objc2_foundation::NSRect, right: objc2_foundation::NSRect) -> bool {
+    const EPS: f64 = 0.01;
+    (left.origin.x - right.origin.x).abs() < EPS
+        && (left.origin.y - right.origin.y).abs() < EPS
+        && (left.size.width - right.size.width).abs() < EPS
+        && (left.size.height - right.size.height).abs() < EPS
 }
 
 #[derive(Debug, Error)]

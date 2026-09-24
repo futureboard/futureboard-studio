@@ -25,6 +25,8 @@
 //! owned here — `IPlugView::removed()` takes it out, and that call belongs to
 //! the VST3 layer, not to this container.
 
+use std::ptr::NonNull;
+
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
@@ -110,6 +112,10 @@ unsafe extern "C-unwind" fn is_flipped(
 /// plug-in's `IPlugView` is attached into.
 pub struct MacHostRegion {
     container: Retained<NSObject>,
+    /// GPUI view whose coordinate system `set_frame` receives. Present only
+    /// when the container is a sibling of that view, parented to the window
+    /// content view so it is not a sublayer of `CAMetalLayer`.
+    anchor: Option<NonNull<AnyObject>>,
 }
 
 impl MacHostRegion {
@@ -161,7 +167,67 @@ impl MacHostRegion {
             let parent: &AnyObject = &*parent_ns_view;
             let _: () = msg_send![parent, addSubview: &*container];
         }
-        Some(Self { container })
+        Some(Self {
+            container,
+            anchor: None,
+        })
+    }
+
+    /// Mount beside `gpu_view`, as a child of the window content view.
+    ///
+    /// GPUI's view overrides `makeBackingLayer` and returns a `CAMetalLayer`.
+    /// A CEF browser parented under that view hosts its compositor layer as a
+    /// sublayer of the Metal layer. Chromium presents each frame as an
+    /// IOSurface; the Metal layer never retires those surfaces, so the browser
+    /// process keeps mapping them until `mach_vm_map` returns `KERN_NO_SPACE`
+    /// (`vm_map_enter`) and a Chromium CHECK raises SIGTRAP on `CrBrowserMain`.
+    ///
+    /// The container has to be a sibling of the Metal-backed view, above it,
+    /// so CoreAnimation composites the browser through the window's ordinary
+    /// layer tree.
+    ///
+    /// # Safety
+    ///
+    /// `gpu_view` must be a valid `NSView*` that outlives this region.
+    pub unsafe fn mount_above_metal_view(
+        gpu_view: *mut AnyObject,
+        frame_in_gpu_view: FramePoints,
+    ) -> Option<Self> {
+        if gpu_view.is_null() || !is_main_thread() {
+            return None;
+        }
+        let content = unsafe { window_content_view(gpu_view) };
+        if content.is_null() || std::ptr::eq(content, gpu_view) {
+            eprintln!(
+                "[cef-host] event=mount placement=inside-metal-view reason=no-content-view gpu_view={gpu_view:?}"
+            );
+            return unsafe { Self::mount(gpu_view, frame_in_gpu_view) };
+        }
+        let converted = unsafe { convert_rect(gpu_view, frame_in_gpu_view, content) };
+        let frame = FramePoints {
+            x: converted.origin.x,
+            y: converted.origin.y,
+            width: converted.size.width,
+            height: converted.size.height,
+        };
+        let mut region = unsafe { Self::mount(content, frame) }?;
+        unsafe {
+            // `NSWindowAbove` = 1. Re-adding an existing subview only changes
+            // z-order; the frame set by `mount` is left alone.
+            let above: isize = 1;
+            let _: () = msg_send![
+                &*content,
+                addSubview: &*region.container,
+                positioned: above,
+                relativeTo: &*gpu_view
+            ];
+            apply_contents_scale(&region.container, gpu_view);
+        }
+        region.anchor = NonNull::new(gpu_view);
+        eprintln!(
+            "[cef-host] event=mount placement=content-view-sibling-above-metal gpu_view={gpu_view:?} content_view={content:?}"
+        );
+        Some(region)
     }
 
     /// The container's `NSView*`, for `IPlugView::attached(..., "NSView")`.
@@ -177,7 +243,27 @@ impl MacHostRegion {
         if !is_main_thread() {
             return;
         }
-        let rect = ns_rect(frame);
+        let rect = match self.anchor {
+            Some(anchor) => {
+                let superview: *mut AnyObject = unsafe { msg_send![&*self.container, superview] };
+                if superview.is_null() {
+                    ns_rect(frame)
+                } else {
+                    unsafe { convert_rect(anchor.as_ptr(), frame, superview) }
+                }
+            }
+            None => ns_rect(frame),
+        };
+        let current: NSRect = unsafe { msg_send![&*self.container, frame] };
+        if rects_match(current, rect) {
+            return;
+        }
+        if let Some(anchor) = self.anchor {
+            // A display change (including wake onto another screen) updates
+            // the window scale. The container's layer has to follow or the
+            // browser composites at the scale from when it was mounted.
+            unsafe { apply_contents_scale(&self.container, anchor.as_ptr()) };
+        }
         // SAFETY: `-[NSView setFrame:]` with an NSRect, on a view we own.
         unsafe {
             let _: () = msg_send![&*self.container, setFrame: rect];
@@ -280,4 +366,100 @@ fn ns_rect(frame: FramePoints) -> NSRect {
             height: frame.height,
         },
     }
+}
+
+fn rects_match(left: NSRect, right: NSRect) -> bool {
+    const EPS: f64 = 0.01;
+    (left.origin.x - right.origin.x).abs() < EPS
+        && (left.origin.y - right.origin.y).abs() < EPS
+        && (left.size.width - right.size.width).abs() < EPS
+        && (left.size.height - right.size.height).abs() < EPS
+}
+
+/// # Safety
+///
+/// `view` must be a valid `NSView*` or the result is null.
+unsafe fn window_content_view(view: *mut AnyObject) -> *mut AnyObject {
+    unsafe {
+        let window: *mut AnyObject = msg_send![&*view, window];
+        if window.is_null() {
+            return std::ptr::null_mut();
+        }
+        msg_send![&*window, contentView]
+    }
+}
+
+/// # Safety
+///
+/// `from` and `to` must be valid `NSView*`s in the same window.
+unsafe fn convert_rect(from: *mut AnyObject, frame: FramePoints, to: *mut AnyObject) -> NSRect {
+    let rect = ns_rect(frame);
+    unsafe { msg_send![&*from, convertRect: rect, toView: &*to] }
+}
+
+/// # Safety
+///
+/// `container` is a view we own and `gpu_view` is a live `NSView*`.
+unsafe fn apply_contents_scale(container: &NSObject, gpu_view: *mut AnyObject) {
+    unsafe {
+        let window: *mut AnyObject = msg_send![&*gpu_view, window];
+        if window.is_null() {
+            return;
+        }
+        let scale: f64 = msg_send![&*window, backingScaleFactor];
+        if !scale.is_finite() || scale <= 0.0 {
+            return;
+        }
+        let layer: *mut AnyObject = msg_send![container, layer];
+        if layer.is_null() {
+            return;
+        }
+        let _: () = msg_send![&*layer, setContentsScale: scale];
+    }
+}
+
+/// Resident and virtual sizes of this process, for the editor-lifecycle log.
+pub fn task_memory() -> Option<(u64, u64)> {
+    #[repr(C)]
+    struct TimeValue {
+        seconds: i32,
+        microseconds: i32,
+    }
+    #[repr(C)]
+    struct MachTaskBasicInfo {
+        virtual_size: u64,
+        resident_size: u64,
+        resident_size_max: u64,
+        user_time: TimeValue,
+        system_time: TimeValue,
+        policy: i32,
+        suspend_count: i32,
+    }
+    unsafe extern "C" {
+        // `mach_task_self()` is a macro for this global. Linking the macro
+        // name as a function fails.
+        static mach_task_self_: u32;
+        fn task_info(
+            target_task: u32,
+            flavor: u32,
+            task_info_out: *mut i32,
+            task_info_count: *mut u32,
+        ) -> i32;
+    }
+    const MACH_TASK_BASIC_INFO: u32 = 20;
+    let mut info = std::mem::MaybeUninit::<MachTaskBasicInfo>::uninit();
+    let mut count = (std::mem::size_of::<MachTaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+    let status = unsafe {
+        task_info(
+            mach_task_self_,
+            MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    Some((info.resident_size, info.virtual_size))
 }

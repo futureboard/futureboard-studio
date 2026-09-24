@@ -5,10 +5,10 @@
 //! workspace-local `build/cef/<version>/<platform>` directory, then enable
 //! `cef-runtime` in the executable that owns the CEF process lifecycle.
 //!
-//! On Windows built-in editors are native CEF child windows
-//! ([`runtime::RenderMode::Windowed`]); other platforms use windowless/
-//! off-screen rendering (see [`osr`]), where accelerated D3D11 shared textures
-//! and software BGRA frames remain available.
+//! On Windows and macOS built-in editors are native CEF child windows
+//! ([`runtime::RenderMode::Windowed`]); Linux uses windowless/off-screen
+//! rendering (see [`osr`]), where accelerated D3D11 shared textures and
+//! software BGRA frames remain available.
 
 use std::path::{Path, PathBuf};
 

@@ -64,6 +64,11 @@ impl ScaleRoot {
     pub fn cycle(self) -> Self {
         Self::ALL[(self.pitch_class() as usize + 1) % 12]
     }
+
+    /// Root for a pitch class; any integer folds into `0..12`.
+    pub fn from_pitch_class(pitch_class: u8) -> Self {
+        Self::ALL[(pitch_class % 12) as usize]
+    }
 }
 
 /// Scale (interval set) choices. `Chromatic` disables constraint semantics —
@@ -141,6 +146,47 @@ impl ScaleKind {
         let idx = Self::ALL.iter().position(|k| *k == self).unwrap_or(0);
         Self::ALL[(idx + 1) % Self::ALL.len()]
     }
+
+    /// Compact name for tight readouts ("maj", "min", "Dorian").
+    pub fn short_label(self) -> &'static str {
+        match self {
+            ScaleKind::Chromatic => "chrom",
+            ScaleKind::Major => "maj",
+            ScaleKind::NaturalMinor => "min",
+            ScaleKind::HarmonicMinor => "harm min",
+            ScaleKind::MelodicMinor => "mel min",
+            ScaleKind::MajorPentatonic => "maj pent",
+            ScaleKind::MinorPentatonic => "min pent",
+            ScaleKind::Dorian => "Dorian",
+            ScaleKind::Phrygian => "Phrygian",
+            ScaleKind::Lydian => "Lydian",
+            ScaleKind::Mixolydian => "Mixolydian",
+            ScaleKind::Locrian => "Locrian",
+        }
+    }
+
+    /// Stable on-disk tag. Never renumber: projects store it.
+    pub fn to_tag(self) -> u8 {
+        match self {
+            ScaleKind::Chromatic => 0,
+            ScaleKind::Major => 1,
+            ScaleKind::NaturalMinor => 2,
+            ScaleKind::HarmonicMinor => 3,
+            ScaleKind::MelodicMinor => 4,
+            ScaleKind::MajorPentatonic => 5,
+            ScaleKind::MinorPentatonic => 6,
+            ScaleKind::Dorian => 7,
+            ScaleKind::Phrygian => 8,
+            ScaleKind::Lydian => 9,
+            ScaleKind::Mixolydian => 10,
+            ScaleKind::Locrian => 11,
+        }
+    }
+
+    /// Inverse of [`Self::to_tag`]; `None` for a tag this build does not know.
+    pub fn from_tag(tag: u8) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.to_tag() == tag)
+    }
 }
 
 /// A root + scale pair — the musical scale itself, independent of whether the
@@ -163,6 +209,27 @@ impl Default for MidiScale {
 impl MidiScale {
     pub fn new(root: ScaleRoot, kind: ScaleKind) -> Self {
         Self { root, kind }
+    }
+
+    /// Scales a project key can be set to. Chromatic is "no key", which the
+    /// project stores as the absence of a key rather than as a scale.
+    pub const KEY_KINDS: [ScaleKind; 11] = [
+        ScaleKind::Major,
+        ScaleKind::NaturalMinor,
+        ScaleKind::HarmonicMinor,
+        ScaleKind::MelodicMinor,
+        ScaleKind::MajorPentatonic,
+        ScaleKind::MinorPentatonic,
+        ScaleKind::Dorian,
+        ScaleKind::Phrygian,
+        ScaleKind::Lydian,
+        ScaleKind::Mixolydian,
+        ScaleKind::Locrian,
+    ];
+
+    /// "A Natural Minor".
+    pub fn label(&self) -> String {
+        format!("{} {}", self.root.label(), self.kind.label())
     }
 
     /// `true` if `pitch` (0..=127) is a member of this scale.
@@ -312,6 +379,21 @@ impl PitchTransformContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scale_tags_are_stable_and_round_trip() {
+        for kind in ScaleKind::ALL {
+            assert_eq!(ScaleKind::from_tag(kind.to_tag()), Some(kind));
+        }
+        // Stored in projects: these numbers must never move.
+        assert_eq!(ScaleKind::Major.to_tag(), 1);
+        assert_eq!(ScaleKind::NaturalMinor.to_tag(), 2);
+        assert_eq!(ScaleKind::Locrian.to_tag(), 11);
+        assert_eq!(ScaleKind::from_tag(200), None);
+        assert_eq!(ScaleRoot::from_pitch_class(9), ScaleRoot::A);
+        assert_eq!(ScaleRoot::from_pitch_class(21), ScaleRoot::A);
+        assert!(!MidiScale::KEY_KINDS.contains(&ScaleKind::Chromatic));
+    }
 
     #[test]
     fn chromatic_scale_contains_every_pitch() {

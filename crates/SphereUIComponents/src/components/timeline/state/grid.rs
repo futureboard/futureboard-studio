@@ -192,6 +192,25 @@ impl TimelineState {
         result
     }
 
+    /// Fewest pixels a beat gets anywhere in `[start, end]`: the zoom at the
+    /// fastest tempo in the range. Equals `pixels_per_beat()` for a constant
+    /// tempo. Tempo curves are monotonic between markers, so the fastest point
+    /// is an end of the range or a marker inside it.
+    pub fn densest_pixels_per_beat(&self, start: f64, end: f64) -> f32 {
+        if self.viewport.time_warp.is_linear() {
+            return self.pixels_per_beat();
+        }
+        let mut max_bpm = self
+            .effective_bpm_at_beat(start)
+            .max(self.effective_bpm_at_beat(end));
+        for point in &self.tempo_map.points {
+            if point.beat > start && point.beat < end {
+                max_bpm = max_bpm.max(point.bpm);
+            }
+        }
+        (self.viewport.pixels_per_second as f64 * 60.0 / max_bpm.max(1.0)) as f32
+    }
+
     pub fn get_grid_interval_beats(&self, ppb: f32) -> f32 {
         let min_beats = 100.0 / ppb.max(1.0);
         let intervals = self.build_interval_list();
@@ -247,6 +266,8 @@ impl TimelineState {
             // Tempo automation bends where a wall-clock position sits, so a
             // time-based grid has to invalidate when the map moves.
             self.tempo_map.revision().hash(&mut hasher);
+            // Musical lines sit where the tempo warp puts them.
+            self.viewport.time_warp.key().hash(&mut hasher);
             // The map by content, not only by revision: the cache is
             // thread-wide, and two different maps can sit at the same revision
             // number. Meter changes are a handful of points at most.
@@ -298,11 +319,16 @@ impl TimelineState {
         const MIN_GRID_LINE_SPACING_PX: i32 = 3;
         let max_grid_lines = (MAX_GRID_LINES_BASE as f32 * power.grid_line_budget_scale()) as usize;
 
-        let ppb = self.pixels_per_beat().max(0.0001);
         let viewport_width = viewport_width.max(1.0);
         let (start_beat, end_beat) = self.visible_beat_range(viewport_width);
         let start_beat = start_beat.max(0.0);
         let end_beat = end_beat.max(start_beat);
+        // Density follows the tightest bars on screen: under tempo automation
+        // the fastest stretch has the narrowest bars, and a level chosen for
+        // the base tempo would crowd lines and labels there.
+        let ppb = self
+            .densest_pixels_per_beat(start_beat as f64, end_beat as f64)
+            .max(0.0001);
         let max_bpb = self.beats_per_bar_at_beat(end_beat as f64).max(1.0) as f32;
 
         // One adaptive level-of-detail per frame, resolved from the meter at the
@@ -506,13 +532,23 @@ impl TimelineState {
     ///
     /// Not `beat * seconds_per_beat`: with tempo automation the two disagree,
     /// and only the tempo map knows where the clock actually is.
+    ///
+    /// Reads the cached resolved map: building the engine map per call made
+    /// every position readout, ruler label and editor transform re-sort and
+    /// re-integrate the whole tempo map.
     pub fn seconds_at_beat(&self, beats: f64) -> f64 {
-        super::time_display::seconds_at_beat(&self.tempo_map, beats, self.bpm as f64)
+        if self.tempo_map.points.is_empty() {
+            return super::time_display::seconds_at_beat(&self.tempo_map, beats, self.bpm as f64);
+        }
+        self.resolved_tempo_map().seconds_at_beat(beats.max(0.0))
     }
 
     /// Musical beat at a real elapsed time. Inverse of [`Self::seconds_at_beat`].
     pub fn beat_at_seconds(&self, seconds: f64) -> f64 {
-        super::time_display::beat_at_seconds(&self.tempo_map, seconds, self.bpm as f64)
+        if self.tempo_map.points.is_empty() {
+            return super::time_display::beat_at_seconds(&self.tempo_map, seconds, self.bpm as f64);
+        }
+        self.resolved_tempo_map().beat_at_seconds(seconds.max(0.0))
     }
 
     /// A position rendered in the project's timebase.

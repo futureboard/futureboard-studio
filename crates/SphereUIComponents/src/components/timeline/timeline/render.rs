@@ -13,6 +13,11 @@ fn playhead_debug_enabled() -> bool {
 impl Render for Timeline {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _tl_scope = crate::perf::PerfScope::enter("Timeline");
+        // A plug-in drag released anywhere but here leaves no event on this
+        // element; drop its hint once no drag is in flight.
+        if self.plugin_drop_hint.is_some() && !cx.has_active_drag() {
+            self.plugin_drop_hint = None;
+        }
         // `Timeline` is the arrangement's whole render and it dominates the
         // profiler's hot-scope list, which makes it the least useful entry on
         // it: knowing the arrangement is expensive says nothing about which
@@ -32,6 +37,13 @@ impl Render for Timeline {
         // actually drawn at.
         if let Some(measured) = self.lane_origin_probe.get() {
             self.state.viewport.lane_origin_x_measured = Some(measured);
+        }
+        // Lay the arrangement out against the current tempo map (real time:
+        // slow bars wide, fast bars narrow). Held still while a tempo marker is
+        // being dragged, so the grid under the pointer cannot move and feed
+        // back into the drag; it re-lays out on release.
+        if self.tempo_drag.is_none() {
+            self.state.sync_time_warp();
         }
         let mut row_layout = self.state.track_row_layout();
         let (viewport_w, viewport_h, (scroll_max_x, scroll_max_y)) =
@@ -678,6 +690,7 @@ impl Render for Timeline {
                     this.update_tempo_track_interaction(
                         event.position.x.into(),
                         event.position.y.into(),
+                        event.modifiers.shift,
                         cx,
                     );
                 } else if this.ts_drag.is_some() {
@@ -1081,6 +1094,81 @@ impl Render for Timeline {
         let on_region_drag: std::sync::Arc<
             dyn Fn(&TimelineRegionDragUpdate, &mut gpui::Window, &mut gpui::App) + 'static,
         > = std::sync::Arc::new(on_region_drag);
+
+        // ── Chord Track ─────────────────────────────────────────────────
+        let on_chord_drag = cx.listener(|this, update: &ChordEventDragUpdate, _window, cx| {
+            if this.chord_gesture_origin.is_none() {
+                this.chord_gesture_origin = Some(this.state.chord_events.clone());
+            }
+            // Every move restarts from the gesture's origin, so dragging a
+            // chord across its neighbours trims them only where it finally
+            // lands, not everywhere it passed.
+            if let Some(origin) = this.chord_gesture_origin.clone() {
+                this.state.chord_events = origin;
+            }
+            this.state
+                .set_chord_event_range(update.event_id, update.start_beat, update.end_beat);
+            this.state.select_chord_event(update.event_id);
+            cx.notify();
+        });
+        let on_chord_drag: crate::components::timeline::chord_track::ChordTrackDragCallback =
+            std::sync::Arc::new(on_chord_drag);
+        let on_chord_drag_drop = cx.listener(|this, _drag: &ChordEventDrag, _window, cx| {
+            if let Some(prev) = this.chord_gesture_origin.take() {
+                this.record_chord_edit("Move Chord", prev, cx);
+            }
+            cx.notify();
+        });
+        let on_chord_down = cx.listener(|this, payload: &(f64, Option<u64>, u32), _window, cx| {
+            this.begin_chord_track_interaction(payload.0, payload.1, payload.2, cx);
+        });
+        let on_chord_down: crate::components::timeline::chord_track::ChordTrackDownCallback =
+            std::sync::Arc::new(on_chord_down);
+        let on_chord_context = self.on_context_menu.clone().map(|cb| {
+            std::sync::Arc::new(
+                move |(beat, event_id, x, y): &(f64, Option<u64>, f32, f32),
+                      window: &mut gpui::Window,
+                      cx: &mut gpui::App| {
+                    cb(
+                        &(
+                            TimelineContextTarget::ChordTrack {
+                                beat: *beat,
+                                event_id: *event_id,
+                            },
+                            *x,
+                            *y,
+                        ),
+                        window,
+                        cx,
+                    );
+                },
+            ) as crate::components::timeline::chord_track::ChordTrackContextCallback
+        });
+        let on_chord_open_generator = cx.listener(|this, _: &(), _window, cx| {
+            this.request_command("chords:open-generator", cx);
+        });
+        let on_chord_open_generator: crate::components::timeline::region_track::GlobalLaneVoidCallback =
+            std::sync::Arc::new(on_chord_open_generator);
+        let on_chord_header_menu = self.on_context_menu.clone().map(|cb| {
+            std::sync::Arc::new(
+                move |pos: &(f32, f32), window: &mut gpui::Window, cx: &mut gpui::App| {
+                    cb(&(TimelineContextTarget::ChordLaneHeader, pos.0, pos.1), window, cx);
+                },
+            ) as crate::components::timeline::region_track::GlobalLaneMenuCallback
+        });
+        let on_chord_hide = cx.listener(|this, _: &(), _window, cx| {
+            this.state.hide_chord_track_lane();
+            cx.notify();
+        });
+        let on_chord_hide: crate::components::timeline::region_track::GlobalLaneVoidCallback =
+            std::sync::Arc::new(on_chord_hide);
+        let on_chord_toggle_collapsed = cx.listener(|this, _: &(), _window, cx| {
+            this.state.chord_track_collapsed = !this.state.chord_track_collapsed;
+            this.mark_control_state_changed(cx);
+            cx.notify();
+        });
+        let on_chord_toggle_collapsed: crate::components::timeline::region_track::GlobalLaneVoidCallback =
+            std::sync::Arc::new(on_chord_toggle_collapsed);
         let on_loop_drag = cx.listener(|this, update: &TimelineLoopDragUpdate, _window, cx| {
             let start = update.start_beat.min(update.end_beat).max(0.0);
             let end = update.start_beat.max(update.end_beat).max(start + 1.0e-3);
@@ -1287,26 +1375,19 @@ impl Render for Timeline {
         let on_automation_control = self.on_automation_control.clone();
 
         let on_tempo_down = cx.listener(
-            |this, payload: &(f64, f64, Option<String>, bool, u32), window, cx| {
-                let (beat, bpm, point_id, _additive, click_count) = (
-                    payload.0,
-                    payload.1,
-                    payload.2.clone(),
-                    payload.3,
-                    payload.4,
-                );
+            |this, down: &crate::components::timeline::tempo_track::TempoLaneDown, window, cx| {
                 // Double-click directly on an existing marker opens the
                 // inline BPM editor for that marker instead of the
                 // (previously dead) fallthrough that just re-selected it.
-                if click_count >= 2 {
-                    if let Some(id) = point_id.as_deref() {
+                if down.click_count >= 2 {
+                    if let Some(id) = down.point_id.as_deref() {
                         if let Some(cb) = this.on_tempo_point_edit.clone() {
                             cb(id, window, cx);
                             return;
                         }
                     }
                 }
-                this.begin_tempo_track_interaction(beat, bpm, point_id, click_count, cx);
+                this.begin_tempo_track_interaction(down, cx);
             },
         );
         let on_tempo_down: crate::components::timeline::tempo_track::TempoTrackDownCallback =
@@ -1696,6 +1777,7 @@ impl Render for Timeline {
         let ts_h = state.time_signature_track_height();
         let marker_h = state.marker_track_height();
         let region_h = state.region_track_height();
+        let chord_h = state.chord_track_height();
         let content_top = state.arrangement_content_top();
         // Live pen-draw ghost clip (built before the chain to keep the borrow of
         // `self.pen_clip_draw` separate from the render closures).
@@ -1711,6 +1793,12 @@ impl Render for Timeline {
             .clip_clone_hint
             .as_ref()
             .and_then(|hint| clip_clone_hint_overlay(hint, state));
+        let chord_drop_overlay =
+            crate::components::timeline::chord_track::chord_drop_clip_overlay(state);
+        let plugin_drop_overlay = self
+            .plugin_drop_hint
+            .as_ref()
+            .and_then(|hint| plugin_drop::plugin_drop_hint_overlay(hint, state));
         let on_zoom_in_btn = on_zoom_in.clone();
         let on_zoom_out_btn = on_zoom_out.clone();
 
@@ -1812,6 +1900,56 @@ impl Render for Timeline {
                 cx.notify();
             }
         });
+
+        // Plug-in from the Browser: a header takes it, the timeline makes a
+        // new track for it. The hint and the drop resolve through the same
+        // function, so the hint never promises something the drop won't do.
+        let on_plugin_drag_move = cx.listener(
+            |this,
+             event: &gpui::DragMoveEvent<crate::components::plugin_picker::PluginDragItem>,
+             _window,
+             cx| {
+                // Drag moves arrive while the pointer is anywhere in the
+                // window; only the arrangement shows a target.
+                if !event.bounds.contains(&event.event.position) {
+                    if this.plugin_drop_hint.take().is_some() {
+                        cx.notify();
+                    }
+                    return;
+                }
+                let item = event.drag(cx).clone();
+                let target = this.resolve_context_target_from_window_point(event.event.position);
+                let hint = plugin_drop::PluginDropHint {
+                    target: plugin_drop::resolve_plugin_drop(
+                        &this.state,
+                        &target,
+                        item.kind == SpherePluginHost::PluginKind::Instrument,
+                    ),
+                    plugin_name: item.label,
+                };
+                if this.plugin_drop_hint.as_ref().map(|h| &h.target) != Some(&hint.target) {
+                    this.plugin_drop_hint = Some(hint);
+                    cx.notify();
+                }
+            },
+        );
+        let on_plugin_drag_dropped = cx.listener(
+            |this, item: &crate::components::plugin_picker::PluginDragItem, window, cx| {
+                this.plugin_drop_hint = None;
+                let target = this.resolve_context_target_from_window_point(window.mouse_position());
+                let drop = plugin_drop::resolve_plugin_drop(
+                    &this.state,
+                    &target,
+                    item.kind == SpherePluginHost::PluginKind::Instrument,
+                );
+                if !matches!(drop, PluginDropTarget::Refused { .. }) {
+                    if let Some(callback) = this.on_plugin_drag_drop.as_ref() {
+                        callback(item, &drop, window, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
 
         let on_clip_drag_move = cx.listener(
             |this, event: &gpui::DragMoveEvent<ClipDragItem>, window, cx| {
@@ -1980,10 +2118,12 @@ impl Render for Timeline {
                     return;
                 }
                 let drag = event.drag(cx).clone();
-                let pointer_beat = this.beat_from_window_x(event.event.position.x.into()) as f64;
-                let pixels_per_beat = this.state.viewport.pixels_per_beat.max(1.0) as f64;
-                let raw_anchor =
-                    (pointer_beat - drag.pointer_offset_x as f64 / pixels_per_beat).max(0.0);
+                // Offset in pixels, resolved through the transform so it holds
+                // under tempo automation.
+                let pointer_x: f32 = event.event.position.x.into();
+                let raw_anchor = this
+                    .beat_from_window_x(pointer_x - drag.pointer_offset_x)
+                    .max(0.0) as f64;
                 let snapped_anchor = this
                     .state
                     .snap_beats_with_bypass(raw_anchor as f32, event.event.modifiers.shift)
@@ -2371,6 +2511,8 @@ impl Render for Timeline {
             .on_drop::<ExternalPaths>(on_files_dropped)
             .on_drag_move::<BrowserDragItem>(on_browser_drag_track)
             .on_drop::<BrowserDragItem>(on_browser_file_dropped)
+            .on_drag_move::<crate::components::plugin_picker::PluginDragItem>(on_plugin_drag_move)
+            .on_drop::<crate::components::plugin_picker::PluginDragItem>(on_plugin_drag_dropped)
             .on_drag_move::<ClipDragItem>(on_clip_drag_move)
             .on_drop::<ClipDragItem>(on_clip_dropped)
             .on_drag_move::<ClipResizeDrag>(on_clip_resize_move)
@@ -2385,6 +2527,7 @@ impl Render for Timeline {
             // pointer is released — take it at the surface, like the resize
             // gestures, so the undo entry is always recorded.
             .on_drop::<TimelineRegionDrag>(on_region_drag_drop)
+            .on_drop::<ChordEventDrag>(on_chord_drag_drop)
             .on_drag_move::<TrackDragItem>(on_track_drag_move)
             .on_drop::<TrackDragItem>(on_track_dropped)
             .on_mouse_down(gpui::MouseButton::Middle, on_middle_pan_start)
@@ -2465,6 +2608,23 @@ impl Render for Timeline {
                     on_marker_header_menu.clone(),
                     Some(on_marker_hide.clone()),
                     Some(on_marker_toggle_collapsed.clone()),
+                    Some(on_global_lane_resize_arm.clone()),
+                    Some(on_global_lane_resize_reset.clone()),
+                ))
+            })
+            // Order must match `visible_global_lanes()`: Chord sits between
+            // the structure lanes and the conductor lanes.
+            .when(state.show_chord_track, |this| {
+                this.child(chord_track_lane(
+                    state,
+                    chord_h,
+                    Some(on_chord_down.clone()),
+                    on_chord_context.clone(),
+                    Some(on_chord_drag.clone()),
+                    Some(on_chord_open_generator.clone()),
+                    on_chord_header_menu.clone(),
+                    Some(on_chord_hide.clone()),
+                    Some(on_chord_toggle_collapsed.clone()),
                     Some(on_global_lane_resize_arm.clone()),
                     Some(on_global_lane_resize_reset.clone()),
                 ))
@@ -2594,6 +2754,29 @@ impl Render for Timeline {
                 div()
                     .absolute()
                     .left(px(HEADER_WIDTH))
+                    .right_0()
+                    .top(px(content_top))
+                    .bottom_0()
+                    .overflow_hidden()
+                    .child(overlay)
+            }))
+            // Chord Generator drop ghost (a progression becoming a MIDI clip).
+            .children(chord_drop_overlay.map(|overlay| {
+                div()
+                    .absolute()
+                    .left(px(HEADER_WIDTH))
+                    .right_0()
+                    .top(px(content_top))
+                    .bottom_0()
+                    .overflow_hidden()
+                    .child(overlay)
+            }))
+            // Plug-in drop hint. Full width, headers included: the header is
+            // one of the two places a plug-in can go.
+            .children(plugin_drop_overlay.map(|overlay| {
+                div()
+                    .absolute()
+                    .left_0()
                     .right_0()
                     .top(px(content_top))
                     .bottom_0()

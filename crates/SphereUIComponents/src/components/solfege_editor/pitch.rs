@@ -45,7 +45,7 @@ use gpui::{
 };
 
 use crate::components::edit::edit_commands::EditCommand;
-use crate::components::piano_roll::{is_black, note_name, PianoRollViewport};
+use crate::components::piano_roll::{is_black, note_name, EditorMeter, PianoRollViewport};
 use crate::components::timeline::timeline_state::{
     midi_edit_revision, ArticulationId, MidiNoteState, PitchCurve, PitchPoint, PitchSegmentShape,
     PitchTrajectory, ABUT_EPS_BEATS, LEGATO_BRIDGE_BEATS, PITCH_CURVE_MAX_CENTS,
@@ -325,6 +325,8 @@ impl SolfegeEditorPanel {
     ) -> impl IntoElement {
         let toolbar = self.render_pitch_toolbar(context.as_ref(), cx);
         let viewport = self.viewport(cx);
+        // The project's meter, so this tab's bars sit where the piano roll's do.
+        let meter = EditorMeter::from_map(&self.timeline.read(cx).state.time_signature_map);
         let Some(ctx) = context else {
             return div()
                 .flex()
@@ -332,14 +334,13 @@ impl SolfegeEditorPanel {
                 .size_full()
                 .min_h(px(0.0))
                 .child(toolbar)
-                .child(self.render_pitch_ruler(None, viewport, 4.0, cx))
+                .child(self.render_pitch_ruler(None, viewport, &meter, cx))
                 .child(pitch_empty_canvas(viewport))
                 .into_any_element();
         };
 
-        let bpb = self.timeline.read(cx).state.beats_per_bar().max(1.0);
-        let ruler = self.render_pitch_ruler(Some(&ctx), viewport, bpb, cx);
-        let grid = self.render_pitch_grid(&ctx, viewport, bpb, cx);
+        let ruler = self.render_pitch_ruler(Some(&ctx), viewport, &meter, cx);
+        let grid = self.render_pitch_grid(&ctx, viewport, &meter, cx);
         let waveform = self.render_pitch_waveform(&ctx, viewport, cx);
         let support = self.render_pitch_support_lane(&ctx, cx);
 
@@ -633,13 +634,13 @@ impl SolfegeEditorPanel {
         &self,
         ctx: Option<&SolfegeEditContext>,
         viewport: PianoRollViewport,
-        bpb: f32,
+        meter: &EditorMeter,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (view_w, _) = self.pitch.grid_size();
         let (start_beat, end_beat) = viewport.visible_beats(view_w);
         let labels: Vec<gpui::AnyElement> = viewport
-            .ruler_marks(start_beat, end_beat, bpb)
+            .ruler_marks_in(start_beat, end_beat, meter)
             .into_iter()
             .flat_map(|mark| {
                 [
@@ -731,7 +732,7 @@ impl SolfegeEditorPanel {
         &mut self,
         ctx: &SolfegeEditContext,
         viewport: PianoRollViewport,
-        bpb: f32,
+        meter: &EditorMeter,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (playhead_rel, playing) = {
@@ -745,7 +746,7 @@ impl SolfegeEditorPanel {
         let empty = notes.is_empty();
 
         let keys = self.render_pitch_keys(viewport);
-        let painter = self.build_pitch_canvas(notes, trajectory, viewport, bpb);
+        let painter = self.build_pitch_canvas(notes, trajectory, viewport, meter.clone());
         let marquee = match &self.pitch.drag {
             Some(PitchDrag::Marquee {
                 origin, current, ..
@@ -1038,7 +1039,7 @@ impl SolfegeEditorPanel {
         notes: Rc<Vec<MidiNoteState>>,
         trajectory: Rc<PitchTrajectory>,
         viewport: PianoRollViewport,
-        bpb: f32,
+        meter: EditorMeter,
     ) -> gpui::AnyElement {
         let capture = self.pitch.grid_bounds.clone();
         let selected_note = self.pitch.selected_note;
@@ -1096,17 +1097,11 @@ impl SolfegeEditorPanel {
 
                 // ── Timing grid ───────────────────────────────────────────
                 let (start_beat, end_beat) = viewport.visible_beats(view_w);
-                for (x, kind) in viewport.grid_lines(start_beat, end_beat, bpb) {
+                for (x, kind) in viewport.grid_lines_in(start_beat, end_beat, &meter) {
                     if x < 0.0 || x > view_w {
                         continue;
                     }
-                    window.paint_quad(quad(
-                        x,
-                        0.0,
-                        1.0,
-                        view_h,
-                        Colors::with_alpha(Colors::text_primary(), kind.alpha()),
-                    ));
+                    window.paint_quad(quad(x, 0.0, 1.0, view_h, kind.color()));
                 }
 
                 // ── Note regions (secondary to the curve) ─────────────────

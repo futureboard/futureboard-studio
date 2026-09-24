@@ -5,6 +5,7 @@ pub mod audio_import;
 pub mod automation_control_lane;
 pub mod automation_lane;
 pub mod automation_target_picker;
+pub mod chord_track;
 pub mod floating_tools_bar;
 pub mod global_lane_header;
 pub mod marker_flag;
@@ -40,4 +41,6 @@ pub mod waveform_samples;
 pub use render::{
     TimelineRenderSnapshot, TimelineRenderer, TimelineRendererBackend, TimelineViewport,
 };
-pub use timeline::{Timeline, TimelineChromeMetrics};
+pub use timeline::{
+    resolve_plugin_drop, NewTrackKind, PluginDropTarget, Timeline, TimelineChromeMetrics,
+};

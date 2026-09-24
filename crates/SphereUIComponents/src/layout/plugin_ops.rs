@@ -2,15 +2,15 @@ use std::time::{Duration, Instant};
 
 use gpui::{App, Bounds, Context, Window};
 
-use crate::components::native_editor_shell::{shell_defaults, NativeEditorShell};
+use crate::components::native_editor_shell::{NativeEditorShell, shell_defaults};
 use crate::components::plugin_manager::open_plugin_manager_window;
 use crate::components::plugin_picker::{
-    ensure_default_highlight, PickerFilter, PluginInsertKind, PluginPickerState, STUB_PLUGIN_ID,
+    PickerFilter, PluginInsertKind, PluginPickerState, STUB_PLUGIN_ID, ensure_default_highlight,
 };
 use crate::components::timeline::timeline_state::{PluginRuntimeBackend, PluginRuntimeState};
 use crate::components::transport_key::{self, TransportKeySource};
 use crate::layout::plugin_editor_chrome_ops::is_ara_editor_key;
-use SpherePluginHost::{load_au_cache_state, CatalogLoad};
+use SpherePluginHost::{CatalogLoad, load_au_cache_state};
 
 use super::{PluginCatalogStatus, PluginSearchIndex, StudioLayout};
 
@@ -372,7 +372,9 @@ impl StudioLayout {
                     plugin_instance_id,
                     name,
                 }) => {
-                    eprintln!("[plugin-bridge] event PluginLoaded instance={plugin_instance_id} name={name}");
+                    eprintln!(
+                        "[plugin-bridge] event PluginLoaded instance={plugin_instance_id} name={name}"
+                    );
                     eprintln!(
                         "[PluginRestore] loaded insert instance={plugin_instance_id} name={name}"
                     );
@@ -395,9 +397,13 @@ impl StudioLayout {
                     error,
                     receptive_field,
                     full_rig,
+                    architecture,
+                    family,
+                    slimmable,
+                    submodel_count,
                 }) => {
                     eprintln!(
-                        "[plugin-bridge] event BuiltinNamCaptureResult instance={plugin_instance_id} ok={ok} name={name} error={error:?}"
+                        "[plugin-bridge] event BuiltinNamCaptureResult instance={plugin_instance_id} ok={ok} name={name} error={error:?} family={family}"
                     );
                     // Route into whichever shared built-in editor is bound to
                     // this insert; the window checks the match itself.
@@ -410,6 +416,10 @@ impl StudioLayout {
                                 error.as_deref(),
                                 receptive_field,
                                 full_rig,
+                                &architecture,
+                                &family,
+                                slimmable,
+                                submodel_count,
                             );
                         });
                     }
@@ -446,7 +456,9 @@ impl StudioLayout {
                     plugin_instance_id,
                     error,
                 }) => {
-                    eprintln!("[plugin-bridge] event PluginLoadFailed instance={plugin_instance_id} error={error}");
+                    eprintln!(
+                        "[plugin-bridge] event PluginLoadFailed instance={plugin_instance_id} error={error}"
+                    );
                     if let Ok(mut bridge) = runtime.lock() {
                         bridge.mark_plugin_load_failed(&plugin_instance_id);
                     }
@@ -1982,8 +1994,7 @@ impl StudioLayout {
         }
         eprintln!(
             "[EDITOR OPEN GATE]\nplugin_instance_id={insert_id}\nruntime_state={runtime_state_for_open:?}\nload_status={load_status:?}\nplugin_load_state={load_status:?}\neditor_state={editor_state}\nbridge_instance_exists={bridge_loaded_for_open}\nplugin_host_alive={plugin_host_alive}\ncontroller_known={controller_known}\neditor_created={editor_created}\npending_editor_open={pending_editor_open}\ncontent_hwnd=0x{content_hwnd:x}\ncontent_size={}x{}\nallowed={gate_allowed}\nblock_reason={block_reason}",
-            content_size.0,
-            content_size.1
+            content_size.0, content_size.1
         );
         if !gate_allowed
             && !matches!(
@@ -2094,7 +2105,9 @@ impl StudioLayout {
                 return;
             }
             if debug {
-                eprintln!("[plugin-view] stale editor handle track={track_id} slot={insert_id} → recreating");
+                eprintln!(
+                    "[plugin-view] stale editor handle track={track_id} slot={insert_id} → recreating"
+                );
             }
             self.plugin_editors.open.remove(&key);
         }
@@ -2949,6 +2962,9 @@ impl StudioLayout {
                     }
                 }
                 this.notify_insert_picker_window(cx);
+                // ARA sessions of a project restored before the catalog had
+                // loaded open now, rather than reporting their plug-in missing.
+                this.open_pending_ara_sessions(cx);
                 cx.notify();
             });
         })
@@ -2976,7 +2992,7 @@ impl StudioLayout {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        use crate::components::timeline::timeline_state::{TrackType, MASTER_TRACK_ID};
+        use crate::components::timeline::timeline_state::{MASTER_TRACK_ID, TrackType};
 
         let debug = std::env::var_os("FUTUREBOARD_PLUGIN_PICKER_DEBUG").is_some();
         let started = std::time::Instant::now();
@@ -3205,7 +3221,9 @@ impl StudioLayout {
             plugin_is_instrument,
         )) = descriptor
         else {
-            eprintln!("[PluginAdd] plugin instance failed to create reason=plugin_not_in_registry id={plugin_id}");
+            eprintln!(
+                "[PluginAdd] plugin instance failed to create reason=plugin_not_in_registry id={plugin_id}"
+            );
             self.plugin_picker = PluginPickerState::closed();
             cx.notify();
             return None;
@@ -3375,7 +3393,9 @@ impl StudioLayout {
                                     )
                                 };
                                 if let Err(error) = load_result {
-                                    eprintln!("[plugin-runtime] external bridge LoadPlugin failed: {error}");
+                                    eprintln!(
+                                        "[plugin-runtime] external bridge LoadPlugin failed: {error}"
+                                    );
                                     load_dispatch_failed = true;
                                     let _ = self.timeline.update(cx, |timeline, _cx| {
                                         timeline.state.set_insert_runtime(
@@ -3440,7 +3460,9 @@ impl StudioLayout {
                     }
                 }
             } else {
-                eprintln!("[plugin-runtime] backend=in_process reason=FUTUREBOARD_PLUGIN_LEGACY_IN_PROCESS=1");
+                eprintln!(
+                    "[plugin-runtime] backend=in_process reason=FUTUREBOARD_PLUGIN_LEGACY_IN_PROCESS=1"
+                );
                 eprintln!("[plugin-runtime] WARNING using legacy in-process plugin runtime");
                 eprintln!(
                     "[plugin-runtime] legacy path may hang GPU/browser-backed plugin editors"
@@ -3509,6 +3531,106 @@ impl StudioLayout {
             self.mark_dirty();
         }
         cx.notify();
+    }
+
+    /// Apply a plug-in dropped from the Browser onto the arrangement.
+    ///
+    /// `target` comes from [`crate::components::timeline::PluginDropTarget`]'s
+    /// resolver, the same one that drew the drag-over hint: onto an existing
+    /// track (a header drop), or onto a new track at a given position (a
+    /// timeline drop) — MIDI for an instrument, audio for an effect.
+    pub(super) fn apply_dropped_plugin_drag(
+        &mut self,
+        plugin_id: &str,
+        target: &crate::components::timeline::PluginDropTarget,
+        kind: SpherePluginHost::PluginKind,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::plugin_picker::{PluginInsertKind, PluginPickerState};
+        use crate::components::timeline::timeline_state::{InputMonitorMode, TrackType};
+        use crate::components::timeline::{NewTrackKind, PluginDropTarget};
+
+        let Some(plugin) = self
+            .plugin_catalog
+            .available
+            .as_ref()
+            .and_then(|plugins| plugins.iter().find(|plugin| plugin.id == plugin_id))
+            .cloned()
+        else {
+            eprintln!("[PluginDrop] drag rejected: plugin not in catalog id={plugin_id}");
+            return;
+        };
+        let desired_kind = match kind {
+            SpherePluginHost::PluginKind::Instrument => PluginInsertKind::Instrument,
+            _ => PluginInsertKind::Effect,
+        };
+        let track_id = match target {
+            PluginDropTarget::Track { track_id } => track_id.clone(),
+            PluginDropTarget::NewTrack {
+                insert_index,
+                kind: new_kind,
+            } => {
+                let (track_type, prefix) = match new_kind {
+                    NewTrackKind::Midi => (TrackType::Midi, "MIDI"),
+                    NewTrackKind::Audio => (TrackType::Audio, "Audio"),
+                };
+                let name = format!("{prefix} — {}", plugin.name);
+                let insert_index = *insert_index;
+                self.timeline.update(cx, |timeline, cx| {
+                    let id = timeline.state.create_track(
+                        crate::components::timeline::timeline_state::CreateTrackOptions {
+                            track_type,
+                            name,
+                            color: timeline
+                                .state
+                                .track_color_for_index(timeline.state.tracks.len()),
+                            volume: crate::components::timeline::timeline_state::volume::db_to_norm(
+                                0.0,
+                            ),
+                            pan: 0.0,
+                            armed: false,
+                            input_monitor: InputMonitorMode::Off,
+                        },
+                    );
+                    // Created at the end, then moved to where the drop said —
+                    // below the track the plug-in was released over.
+                    if insert_index < timeline.state.tracks.len() - 1 {
+                        timeline.state.reorder_track(&id, insert_index);
+                    }
+                    timeline.state.select_track(&id);
+                    cx.notify();
+                    id
+                })
+            }
+            PluginDropTarget::Refused { .. } => return,
+        };
+        let (track_name, track_type) = self
+            .timeline
+            .read(cx)
+            .state
+            .find_track(&track_id)
+            .map(|track| (track.name.clone(), track.track_type))
+            .unwrap_or_else(|| ("MIDI Track".to_string(), TrackType::Midi));
+        let next_slot_index = self
+            .timeline
+            .read(cx)
+            .state
+            .insert_slots(&track_id)
+            .map(|slots| slots.len())
+            .unwrap_or(0);
+        // The real track type: the picker's validation decides from it, and
+        // pretending every target was a MIDI track refused every effect
+        // dropped on a header.
+        self.plugin_picker = PluginPickerState::open_for_with_filter(
+            &track_id,
+            &track_name,
+            track_type,
+            next_slot_index,
+            false,
+            crate::components::plugin_picker::PickerFilter::All,
+            desired_kind,
+        );
+        let _ = self.apply_picked_insert(plugin_id, cx);
     }
 
     pub(super) fn apply_dropped_plugin_preset(
@@ -3658,25 +3780,32 @@ impl StudioLayout {
         reg: &SpherePluginHost::RegistryPlugin,
         cx: &mut Context<Self>,
     ) -> Option<(String, usize, String)> {
-        use crate::components::timeline::timeline_state::{
-            self, CreateTrackOptions, InputMonitorMode, TrackType,
-        };
+        use crate::components::timeline::timeline_state::TrackType;
 
         let (plugin_id, plugin_path, plugin_format, vendor, display_name) =
             Self::registry_insert_descriptor(reg);
         let created = self.timeline.update(cx, |timeline, _cx| {
-            let color = timeline
-                .state
-                .track_color_for_index(timeline.state.tracks.len());
-            let track_id = timeline.state.create_track(CreateTrackOptions {
-                track_type: TrackType::Instrument,
-                name: display_name.clone(),
-                color,
-                volume: timeline_state::volume::db_to_norm(0.0),
-                pan: 0.0,
-                armed: false,
-                input_monitor: InputMonitorMode::Off,
-            });
+            // A dropped instrument preset must have a MIDI-producing track
+            // before the plugin instance is created. Creating an Instrument
+            // track directly used to race the bridge's MIDI route setup: the
+            // plugin existed, but no MIDI source was available when its first
+            // state/preview request was dispatched. A MIDI track is also a
+            // valid instrument host in the runtime (`bridge_instrument_instance_id`),
+            // and keeps the stable track/insert ownership in one operation.
+            let track_id = timeline.state.create_track(
+                crate::components::timeline::timeline_state::CreateTrackOptions {
+                    track_type: TrackType::Midi,
+                    name: format!("MIDI — {display_name}"),
+                    color: timeline
+                        .state
+                        .track_color_for_index(timeline.state.tracks.len()),
+                    volume: crate::components::timeline::timeline_state::volume::db_to_norm(0.0),
+                    pan: 0.0,
+                    armed: false,
+                    input_monitor:
+                        crate::components::timeline::timeline_state::InputMonitorMode::Off,
+                },
+            );
             let slot_id = timeline.state.add_insert(&track_id)?;
             timeline.state.set_insert_plugin(
                 &track_id,
@@ -3695,7 +3824,7 @@ impl StudioLayout {
         })?;
 
         eprintln!(
-            "[PluginDrop] instrument track created track={} slot={} plugin={}",
+            "[PluginDrop] midi track created before instrument plugin track={} slot={} plugin={}",
             created.0, created.2, display_name
         );
         self.after_preset_insert_bound(
@@ -4508,8 +4637,8 @@ impl StudioLayout {
                             if let Some(state) = slot.vst3_state.as_ref() {
                                 if let Err(error) = runtime.send_plugin_state(slot_id, state) {
                                     eprintln!(
-                                    "[PluginRestore] SetPluginState send failed instance={slot_id}: {error}"
-                                );
+                                        "[PluginRestore] SetPluginState send failed instance={slot_id}: {error}"
+                                    );
                                 }
                             }
                         }
@@ -4905,8 +5034,8 @@ fn log_bridge_paint_stats(session: &BridgeEditorSession) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bridge_editor_is_open, bridge_editor_is_terminal, editor_reopen_action, BridgeEditorState,
-        EditorReopenAction, PluginEditorWindows,
+        BridgeEditorState, EditorReopenAction, PluginEditorWindows, bridge_editor_is_open,
+        bridge_editor_is_terminal, editor_reopen_action,
     };
 
     // Every non-terminal, non-Loading state. These are "live or in flight" and

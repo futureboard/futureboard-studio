@@ -1,43 +1,48 @@
 mod methods;
+mod plugin_drop;
 mod render;
+pub use plugin_drop::{resolve_plugin_drop, NewTrackKind, PluginDropTarget};
 pub(crate) use render::*;
 
 use crate::assets;
 use crate::components::edit::{
-    normalize_range, ClipSnapshot, EditCommand, EditHistory, EditImpact, TempoStateSnapshot,
-    TimeSignatureStateSnapshot,
+    ClipSnapshot, EditCommand, EditHistory, EditImpact, TempoStateSnapshot,
+    TimeSignatureStateSnapshot, normalize_range,
 };
 use crate::components::sidebar::BrowserDragItem;
 use crate::components::timeline::floating_tools_bar::floating_tools_bar;
 use crate::components::timeline::global_lane_header::{
     GlobalLaneResizeArmCb, GlobalLaneResizeResetCb,
 };
+use crate::components::timeline::chord_track::{
+    chord_track_lane, ChordEventDrag, ChordEventDragUpdate,
+};
 use crate::components::timeline::marker_track::marker_track_lane;
 use crate::components::timeline::region_track::region_track_lane;
 use crate::components::timeline::song_text_track::{
-    song_text_drag_positions, song_text_track_lane, SongTextDragPreview, SongTextDragSession,
-    SongTextMarkerDown,
+    SongTextDragPreview, SongTextDragSession, SongTextMarkerDown, song_text_drag_positions,
+    song_text_track_lane,
 };
 use crate::components::timeline::tempo_track::tempo_track_lane;
 use crate::components::timeline::time_signature_track::time_signature_track_lane;
 use crate::components::timeline::timeline_ruler::{
-    timeline_ruler, LaneOriginProbe, TimelineLoopDragUpdate, TimelineRegionDrag,
-    TimelineRegionDragUpdate,
+    LaneOriginProbe, TimelineLoopDragUpdate, TimelineRegionDrag, TimelineRegionDragUpdate,
+    timeline_ruler,
 };
 use crate::components::timeline::timeline_state::{
-    hit_test_arrangement, ArrangementCoordinateContext, ArrangementHitTarget, ClipDragItem,
-    ClipResizeDrag, ClipState, ClipType, GlobalLaneKind, GlobalLaneResizeDrag, SnapDivision,
-    TempoPointDrag, TimeSignaturePointDrag, TimelineMarkerDrag, TimelineMarkerState,
-    TimelineRangeSelection, TimelineRegionState, TimelineState, TimelineTool, TrackDragItem,
-    TrackHeightResizeDrag, TrackType, DEFAULT_TRACK_HEIGHT, HEADER_WIDTH, RULER_HEIGHT,
+    ArrangementCoordinateContext, ArrangementHitTarget, ClipDragItem, ClipResizeDrag, ClipState,
+    ClipType, DEFAULT_TRACK_HEIGHT, GlobalLaneKind, GlobalLaneResizeDrag, HEADER_WIDTH,
+    RULER_HEIGHT, SnapDivision, TempoLaneDrag, TimeSignaturePointDrag, TimelineMarkerDrag,
+    TimelineMarkerState, TimelineRangeSelection, TimelineRegionState, TimelineState, TimelineTool,
+    TrackDragItem, TrackHeightResizeDrag, TrackType, hit_test_arrangement,
 };
 use crate::components::timeline::track_list::track_list;
 use crate::theme::Colors;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, pulsating_between, px, svg, Animation, AnimationExt, AppContext, Context, Empty,
-    ExternalPaths, InteractiveElement, IntoElement, ParentElement, PinchEvent, Render, ScrollDelta,
-    StatefulInteractiveElement, Styled, Subscription, Window,
+    Animation, AnimationExt, AppContext, Context, Empty, ExternalPaths, InteractiveElement,
+    IntoElement, ParentElement, PinchEvent, Render, ScrollDelta, StatefulInteractiveElement,
+    Styled, Subscription, Window, div, pulsating_between, px, svg,
 };
 use std::time::Duration;
 
@@ -163,6 +168,10 @@ pub struct Timeline {
     on_media_changed: Option<TimelineProjectChangedCb>,
     on_add_track: Option<TimelineAddTrackCb>,
     on_plugin_preset_drop: Option<TimelinePluginPresetDropCb>,
+    on_plugin_drag_drop: Option<TimelinePluginDragDropCb>,
+    /// What releasing the plug-in being dragged over the arrangement would do.
+    plugin_drop_hint: Option<plugin_drop::PluginDropHint>,
+
     /// Asks the owner to confirm what a dropped MIDI file should bring in
     /// besides its notes. Unset (tests, embedded editors) imports everything,
     /// which is what a drop did before the dialog existed.
@@ -215,7 +224,7 @@ pub struct Timeline {
     on_automation_control:
         Option<crate::components::timeline::automation_control_lane::AutomationControlCallback>,
     /// In-flight tempo-point drag on the global Tempo Track lane.
-    tempo_drag: Option<TempoPointDrag>,
+    tempo_drag: Option<TempoLaneDrag>,
     /// Pre-gesture tempo snapshot for the in-flight Tempo lane drag, plus the
     /// history label the release should use (a double-click *creates* a marker
     /// and then drags it — one gesture, but not an "edit"). Kept here rather
@@ -240,6 +249,12 @@ pub struct Timeline {
     /// (before any mutation) so the drop records one undo step for the whole
     /// drag instead of one per mouse-move.
     region_gesture_origin: Option<Vec<TimelineRegionState>>,
+    /// Chord Track events at the start of a chord block drag; the drop turns
+    /// the whole gesture into one undo entry.
+    chord_gesture_origin: Option<Vec<crate::components::timeline::timeline_state::ChordTrackEvent>>,
+    /// Named app commands the timeline asks the Studio to run (e.g. opening
+    /// the Chord Generator from the Chord Track header).
+    on_command: Option<TimelineCommandCb>,
     /// Pre-gesture marker snapshot, for the Marker lane's flag drag. Mirrors
     /// `region_gesture_origin`.
     marker_gesture_origin: Option<Vec<TimelineMarkerState>>,
@@ -383,6 +398,14 @@ pub enum TimelineContextTarget {
     MarkerLaneHeader,
     /// Lane header menu button on the Region track.
     RegionLaneHeader,
+    /// Right-click on the global Chord Track. `event_id` is `None` on the
+    /// empty lane.
+    ChordTrack {
+        beat: f64,
+        event_id: Option<u64>,
+    },
+    /// Lane header menu button on the Chord Track.
+    ChordLaneHeader,
     /// Automation target picker opened from the control lane "+ Add" button.
     AutomationTargetPicker {
         track_id: String,
@@ -405,6 +428,14 @@ pub type TimelineAddTrackCb =
 pub type TimelinePluginPresetDropCb = std::sync::Arc<
     dyn Fn(&(std::path::PathBuf, String), &mut gpui::Window, &mut gpui::App) + 'static,
 >;
+pub type TimelinePluginDragDropCb = std::sync::Arc<
+    dyn Fn(
+            &crate::components::plugin_picker::PluginDragItem,
+            &PluginDropTarget,
+            &mut gpui::Window,
+            &mut gpui::App,
+        ) + 'static,
+>;
 
 /// A dropped MIDI file that carries optional payload (markers, controller
 /// lanes, SysEx), parked until the user says what to bring in.
@@ -425,6 +456,9 @@ pub type TimelineMidiImportPromptCb =
     std::sync::Arc<dyn Fn(&TimelineMidiImportPrompt, &mut gpui::Window, &mut gpui::App) + 'static>;
 
 pub type TimelineProjectChangedCb = std::sync::Arc<dyn Fn(&mut gpui::App) + 'static>;
+
+/// A named Studio command requested from inside the timeline.
+pub type TimelineCommandCb = std::sync::Arc<dyn Fn(&'static str, &mut gpui::App) + 'static>;
 
 #[derive(Clone, Debug)]
 struct ScrollbarDrag {

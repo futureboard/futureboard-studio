@@ -496,8 +496,7 @@ mod tests {
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
 
-        let name =
-            stage_crashpad_handler(&staging, &executable, "aarch64-apple-darwin").unwrap();
+        let name = stage_crashpad_handler(&staging, &executable, "aarch64-apple-darwin").unwrap();
         assert_eq!(name, "crashpad_handler");
         assert!(staging.join("crashpad_handler").is_file());
     }

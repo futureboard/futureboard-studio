@@ -36,6 +36,7 @@ pub mod account;
 pub mod app_state;
 pub mod assets;
 pub mod audio_connections;
+pub mod audio_edit;
 pub mod audio_routing;
 pub mod audio_routing_compile;
 pub mod auth;
@@ -93,6 +94,7 @@ pub use SpherePluginHost::process_manager::PluginHostProcessManager;
 pub mod splash;
 pub mod startup;
 pub mod theme;
+pub mod tone3000;
 pub mod user_manual;
 pub mod welcome;
 

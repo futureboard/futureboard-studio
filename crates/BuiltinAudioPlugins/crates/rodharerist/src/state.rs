@@ -110,6 +110,18 @@ mod tests {
         assert_eq!(restored.params.mic_model, MicModel::Dynamic);
     }
 
+    #[test]
+    fn legacy_state_without_nam_slim_size_defaults_to_full_quality() {
+        let state = RodhareistState::new(default_params());
+        let mut value = serde_json::to_value(state).unwrap();
+        value["params"]
+            .as_object_mut()
+            .unwrap()
+            .remove("nam_slim_size");
+        let restored: RodhareistState = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.params.nam_slim_size, 100.0);
+    }
+
     /// The Delay slot grew models and a Tone knob after v3. Both are additive
     /// with serde defaults, so a v3 blob written before they existed must
     /// still load — as the tape echo it was saved as.

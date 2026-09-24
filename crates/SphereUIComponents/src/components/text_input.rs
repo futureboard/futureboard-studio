@@ -144,6 +144,8 @@ pub struct TextContextMenuAnchor {
     pub clipboard_has_text: bool,
 }
 pub type TextInputMouseCb = Arc<dyn Fn(&TextInputMouseEvent, &mut Window, &mut App) + 'static>;
+/// A mouse press that landed outside the field.
+pub type TextInputOutsideCb = Arc<dyn Fn(&mut Window, &mut App) + 'static>;
 
 #[derive(Clone, Default)]
 pub struct TextInputCallbacks {
@@ -153,6 +155,13 @@ pub struct TextInputCallbacks {
     /// context menu. Owners that render their own menu (the studio shell, the
     /// Add Track / Preferences / plugin-picker windows) leave this `None`.
     pub on_context_command: Option<TextInputContextCommandCb>,
+    /// A mouse press outside the field, whether or not it holds GPUI focus.
+    /// For owners whose edit session outlives focus — the transport's inline
+    /// BPM and meter editors route keys without a focus grab, so losing focus
+    /// alone never ended them and they kept taking keys after the user had
+    /// clicked away. Fires in the capture phase, before the press reaches
+    /// whatever it landed on.
+    pub on_mouse_down_out: Option<TextInputOutsideCb>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -283,6 +292,10 @@ pub struct TextEditBuffer {
     pub context_menu: Option<TextContextMenuAnchor>,
     pub is_password: bool,
     marked_range: Option<Range<usize>>,
+    /// ASCII characters the field accepts, for content that is ASCII by
+    /// definition (numbers, meters, hex). See
+    /// [`TextInputState::with_ascii_charset`].
+    ascii_charset: Option<&'static str>,
 }
 
 #[derive(Clone)]
@@ -323,6 +336,20 @@ impl TextInputState {
             blur_on_click_outside: false,
             mouse_selecting: false,
         }
+    }
+
+    /// Restrict typing to `charset`, independent of the keyboard layout.
+    ///
+    /// A number typed with a non-Latin layout active produces that layout's
+    /// characters — the Thai number row types `ๅ / - ภ …`, not `1 2 3 4` — so
+    /// a BPM field filled with glyphs that never parse, and Enter appeared to
+    /// do nothing. With a charset the field takes the layout's character when
+    /// it belongs to the set, else the physical key's ASCII character (GPUI
+    /// reports it in `keystroke.key` for exactly this reason), else nothing.
+    /// Native digits (Thai ๐–๙, Arabic-Indic, full-width …) become ASCII.
+    pub fn with_ascii_charset(mut self, charset: &'static str) -> Self {
+        self.buffer.ascii_charset = Some(charset);
+        self
     }
 
     pub fn with_placeholder(mut self, p: impl Into<String>) -> Self {
@@ -597,6 +624,18 @@ impl TextEditBuffer {
                     // report a character key as consumed so the host treats it as
                     // text rather than dispatching a shortcut.
                     if event.keystroke.key_char.is_some() || printable_text(key).is_some() {
+                        TextInputAction::Consumed
+                    } else {
+                        TextInputAction::Pass
+                    }
+                } else if let Some(charset) = self.ascii_charset {
+                    // A restricted field swallows every character key, taken or
+                    // not: a letter typed into a number must not fire the
+                    // shortcut bound to it.
+                    if let Some(text) = charset_text(event, charset) {
+                        self.insert_str(&text);
+                        TextInputAction::Consumed
+                    } else if event.keystroke.key_char.is_some() || printable_text(key).is_some() {
                         TextInputAction::Consumed
                     } else {
                         TextInputAction::Pass
@@ -1184,6 +1223,49 @@ fn printable_text(key: &str) -> Option<&str> {
 /// platform-resolved `key_char` (correct for Thai, accents, AltGr, dead-key
 /// results, and case), falling back to the logical key for plain ASCII. Control
 /// characters (Enter/Tab/Backspace, already handled above) are rejected.
+/// ASCII digit for a native decimal digit (Thai ๐–๙, Arabic-Indic,
+/// Extended Arabic-Indic, Devanagari, full-width), the character itself for
+/// ASCII, `None` otherwise.
+pub fn ascii_digit_equivalent(c: char) -> Option<char> {
+    if c.is_ascii() {
+        return Some(c);
+    }
+    let zero = match c as u32 {
+        0x0E50..=0x0E59 => 0x0E50, // Thai
+        0x0660..=0x0669 => 0x0660, // Arabic-Indic
+        0x06F0..=0x06F9 => 0x06F0, // Extended Arabic-Indic
+        0x0966..=0x096F => 0x0966, // Devanagari
+        0xFF10..=0xFF19 => 0xFF10, // Full-width
+        _ => return None,
+    };
+    char::from_digit(c as u32 - zero, 10)
+}
+
+/// What a key types into a field restricted to `charset`: the layout's
+/// character when it (or its ASCII digit) is in the set, else the physical
+/// key's ASCII character when that is. Case-folded for letters, so a hex
+/// field takes `a` and `A` from a set listing either.
+fn charset_text(event: &KeyDownEvent, charset: &str) -> Option<String> {
+    let allowed = |c: char| {
+        charset.contains(c)
+            || (c.is_ascii_alphabetic()
+                && (charset.contains(c.to_ascii_lowercase())
+                    || charset.contains(c.to_ascii_uppercase())))
+    };
+    if let Some(typed) = event.keystroke.key_char.as_deref() {
+        let mapped: Option<String> = typed.chars().map(ascii_digit_equivalent).collect();
+        if let Some(mapped) = mapped.filter(|m| !m.is_empty() && m.chars().all(allowed)) {
+            return Some(mapped);
+        }
+    }
+    let key = event.keystroke.key.as_str();
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii() && allowed(c) => Some(c.to_string()),
+        _ => None,
+    }
+}
+
 fn char_to_insert(event: &KeyDownEvent) -> Option<&str> {
     if let Some(key_char) = event.keystroke.key_char.as_deref() {
         if !key_char.is_empty() && !key_char.chars().next().is_some_and(char::is_control) {
@@ -1253,6 +1335,7 @@ pub fn bind_mouse_selection<T: gpui::Render>(
     let command_get = get.clone();
 
     TextInputCallbacks {
+        on_mouse_down_out: None,
         on_context_menu: Some(Arc::new(move |pos: &(f32, f32), window, cx| {
             let (x, y) = *pos;
             let viewport = window.viewport_size();
@@ -1427,6 +1510,7 @@ fn text_field_inner(
                 }),
             ))
         });
+    let on_mouse_down_out = callbacks.on_mouse_down_out.clone();
     let on_mouse_down = callbacks.on_mouse.clone();
     let on_mouse_move = callbacks.on_mouse.clone();
     let on_mouse_up = callbacks.on_mouse.clone();
@@ -1631,10 +1715,13 @@ fn text_field_inner(
         // phase, so a click landing on another field still transfers focus to it
         // afterward). Only when the field opted in, and only if it is the focused
         // one — so dialogs that keep their field focused are unaffected.
-        .when(blur_outside, |this| {
-            this.on_mouse_down_out(move |_event, window, _cx| {
-                if fh_out.is_focused(window) {
+        .when(blur_outside || on_mouse_down_out.is_some(), |this| {
+            this.on_mouse_down_out(move |_event, window, cx| {
+                if blur_outside && fh_out.is_focused(window) {
                     window.blur();
+                }
+                if let Some(cb) = on_mouse_down_out.as_ref() {
+                    cb(window, cx);
                 }
             })
         })
@@ -1642,6 +1729,10 @@ fn text_field_inner(
             if disabled {
                 return;
             }
+            // Keep a text field's context menu from being replaced by a
+            // parent surface's right-click handler (timeline, mixer, etc.).
+            // The field owns this gesture once it has received the event.
+            cx.stop_propagation();
             fh_right.focus(window, cx);
             if let Some(callback) = on_context_menu.as_ref() {
                 let x: f32 = event.position.x.into();
@@ -2285,5 +2376,83 @@ mod tests {
                 "{k} should not repeat"
             );
         }
+    }
+
+    // ── Layout-independent ASCII fields ─────────────────────────────────────
+
+    /// A key press as a non-Latin layout reports it: `key` is the physical
+    /// key's ASCII character, `key_char` what the layout types.
+    fn layout_key(key: &str, key_char: &str) -> gpui::KeyDownEvent {
+        gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke {
+                key: key.to_string(),
+                key_char: Some(key_char.to_string()),
+                ..Default::default()
+            },
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    use super::TextInputAction;
+
+    fn numeric_buffer() -> TextEditBuffer {
+        TextEditBuffer {
+            ascii_charset: Some("0123456789.,"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn thai_number_row_types_digits_into_a_numeric_field() {
+        // Thai Kedmanee: 1 → ๅ, 2 → /, 0 → จ, . → ใ.
+        let mut b = numeric_buffer();
+        for (key, thai) in [("1", "ๅ"), ("2", "/"), ("0", "จ"), (".", "ใ"), ("5", "ถ")] {
+            assert_eq!(
+                b.handle_key(&layout_key(key, thai)),
+                TextInputAction::Consumed
+            );
+        }
+        assert_eq!(b.value, "120.5");
+        assert_eq!(
+            b.handle_key(&layout_key("enter", "\n")),
+            TextInputAction::Submit,
+            "Enter still submits a restricted field"
+        );
+    }
+
+    #[test]
+    fn native_digits_become_ascii_and_letters_are_swallowed() {
+        let mut b = numeric_buffer();
+        // Shifted Thai number row types Thai digits.
+        b.handle_key(&layout_key("1", "๑"));
+        b.handle_key(&layout_key("2", "๒"));
+        // A letter is consumed — it must not reach a shortcut — but not typed.
+        assert_eq!(
+            b.handle_key(&layout_key("a", "ฟ")),
+            TextInputAction::Consumed
+        );
+        assert_eq!(b.value, "12");
+        // Latin layouts are unaffected.
+        b.handle_key(&layout_key("5", "5"));
+        assert_eq!(b.value, "125");
+    }
+
+    #[test]
+    fn a_hex_field_takes_the_physical_letter() {
+        let mut b = TextEditBuffer {
+            ascii_charset: Some("0123456789ABCDEFabcdef "),
+            ..Default::default()
+        };
+        b.handle_key(&layout_key("f", "ด"));
+        b.handle_key(&layout_key("0", "จ"));
+        assert_eq!(b.value, "f0");
+    }
+
+    #[test]
+    fn unrestricted_fields_still_type_the_layout() {
+        let mut b = TextEditBuffer::default();
+        b.handle_key(&layout_key("1", "ๅ"));
+        assert_eq!(b.value, "ๅ");
     }
 }

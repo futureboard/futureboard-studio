@@ -13,18 +13,15 @@
 
 use crate::layout::studio_state::RightDockTab;
 use crate::workspace_layout::{
-    load_or_default_workspace_layout, save_workspace_layout as persist_to_disk,
-    SavedBottomTab, SavedMixerView, SavedPanelVisibility, SavedRightDockTab,
-    SavedWorkspaceLayout,
+    load_or_default_workspace_layout, save_workspace_layout as persist_to_disk, SavedBottomTab,
+    SavedMixerView, SavedPanelVisibility, SavedRightDockTab, SavedWorkspaceLayout,
 };
 
 use super::StudioLayout;
 
 // ── Tab conversions ───────────────────────────────────────────────────────────
 
-fn bottom_tab_to_saved(
-    tab: crate::components::BottomTab,
-) -> SavedBottomTab {
+fn bottom_tab_to_saved(tab: crate::components::BottomTab) -> SavedBottomTab {
     use crate::components::BottomTab;
     match tab {
         BottomTab::Mixer => SavedBottomTab::Mixer,
@@ -33,9 +30,7 @@ fn bottom_tab_to_saved(
     }
 }
 
-fn bottom_tab_from_saved(
-    tab: SavedBottomTab,
-) -> crate::components::BottomTab {
+fn bottom_tab_from_saved(tab: SavedBottomTab) -> crate::components::BottomTab {
     use crate::components::BottomTab;
     match tab {
         SavedBottomTab::Mixer => BottomTab::Mixer,
@@ -109,35 +104,29 @@ impl StudioLayout {
     ) -> crate::workspace_layout::SavedSecondaryWindows {
         use crate::workspace_layout::{SavedSecondaryWindows, SavedWindowBounds};
 
-        let mixer_bounds = self
-            .external_windows
-            .mixer
-            .as_ref()
-            .and_then(|handle| {
-                handle
-                    .update(cx, |_, window, _| SavedWindowBounds::from_gpui(window.bounds()))
-                    .ok()
-            });
+        let mixer_bounds = self.external_windows.mixer.as_ref().and_then(|handle| {
+            handle
+                .update(cx, |_, window, _| {
+                    SavedWindowBounds::from_gpui(window.bounds())
+                })
+                .ok()
+        });
 
-        let big_clock_bounds = self
-            .external_windows
-            .big_clock
-            .as_ref()
-            .and_then(|handle| {
-                handle
-                    .update(cx, |_, window, _| SavedWindowBounds::from_gpui(window.bounds()))
-                    .ok()
-            });
+        let big_clock_bounds = self.external_windows.big_clock.as_ref().and_then(|handle| {
+            handle
+                .update(cx, |_, window, _| {
+                    SavedWindowBounds::from_gpui(window.bounds())
+                })
+                .ok()
+        });
 
-        let timecode_bounds = self
-            .external_windows
-            .timecode
-            .as_ref()
-            .and_then(|handle| {
-                handle
-                    .update(cx, |_, window, _| SavedWindowBounds::from_gpui(window.bounds()))
-                    .ok()
-            });
+        let timecode_bounds = self.external_windows.timecode.as_ref().and_then(|handle| {
+            handle
+                .update(cx, |_, window, _| {
+                    SavedWindowBounds::from_gpui(window.bounds())
+                })
+                .ok()
+        });
 
         SavedSecondaryWindows {
             mixer: mixer_bounds,
@@ -165,9 +154,10 @@ impl StudioLayout {
         self.panels.bottom_docked = layout.panels.bottom_docked;
 
         // Bottom panel height (clamp inside BottomPanelState limits).
-        let clamped_h = layout
-            .bottom_panel_height_px
-            .clamp(self.bottom_panel_state.min_height_px, self.bottom_panel_state.max_height_px);
+        let clamped_h = layout.bottom_panel_height_px.clamp(
+            self.bottom_panel_state.min_height_px,
+            self.bottom_panel_state.max_height_px,
+        );
         self.bottom_panel_state.height_px = clamped_h;
 
         // Active tabs.

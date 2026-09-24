@@ -636,10 +636,11 @@ pub(crate) fn tab_matches_search(
         }
         SettingsTab::Appearance => {
             is_match("Theme", &["theme"])
-                || is_match(
-                    "Text Rendering",
-                    &["text", "font", "render", "directwrite", "gdi", "blurry"],
-                )
+                || (cfg!(target_os = "windows")
+                    && is_match(
+                        "Text Rendering",
+                        &["text", "font", "render", "directwrite", "gdi", "blurry"],
+                    ))
                 || is_match("UI Scale", &["scale"])
                 || is_match("Grid", &["grid", "timeline"])
                 || is_match("Mixer", &["mixer", "meter"])
@@ -649,9 +650,9 @@ pub(crate) fn tab_matches_search(
                 || is_match("Snap", &["snap", "grid"])
                 || is_match("Undo", &["undo", "history"])
         }
-        SettingsTab::Recording => {
-            is_match("Recording", &["record", "wav", "bit"])
-                || is_match("Metronome", &["metronome", "click"])
+        SettingsTab::Recording => is_match("Recording", &["record", "wav", "bit"]),
+        SettingsTab::Metronome => {
+            is_match("Metronome", &["metronome", "click", "volume", "count-in"])
         }
         SettingsTab::Playback => {
             is_match("Transport", &["transport", "play", "stop"])

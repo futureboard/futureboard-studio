@@ -4,17 +4,18 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, svg, uniform_list, App, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
+    App, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
+    UniformListScrollHandle, Window, div, px, svg, uniform_list,
 };
 
 use crate::assets;
-use crate::components::controls::{fb_button, FbButtonKind};
+use crate::components::controls::{FbButtonKind, fb_button};
+use crate::components::plugin_picker::PluginPickerCallbacks;
 use crate::components::plugin_picker::details::plugin_details_panel;
-use crate::components::plugin_picker::filter::{compute_filter_result, FilterResult};
-use crate::components::plugin_picker::insert::{validate_insert, InsertValidation};
+use crate::components::plugin_picker::filter::{FilterResult, compute_filter_result};
+use crate::components::plugin_picker::insert::{InsertValidation, validate_insert};
 use crate::components::plugin_picker::list_view::{
-    plugin_row, plugin_table_header, skeleton_body, ROW_HEIGHT,
+    ROW_HEIGHT, plugin_row, plugin_table_header, skeleton_body,
 };
 use crate::components::plugin_picker::prefs::PluginPickerPrefs;
 use crate::components::plugin_picker::search_index::PluginSearchIndex;
@@ -22,10 +23,9 @@ use crate::components::plugin_picker::sidebar::plugin_filter_sidebar;
 use crate::components::plugin_picker::state::{
     CatalogStatus, PluginPickerScrollHandles, PluginPickerState,
 };
-use crate::components::plugin_picker::PluginPickerCallbacks;
 use crate::components::scroll_thumb::vertical_scrollbar_thumb;
 use crate::components::text_input::{
-    text_field_with_callbacks, TextInputCallbacks, TextInputState,
+    TextInputCallbacks, TextInputState, text_field_with_callbacks,
 };
 use crate::theme::Colors;
 use SpherePluginHost::RegistryPlugin;
@@ -347,6 +347,10 @@ pub fn plugin_picker_panel(
         .size_full()
         .overflow_hidden()
         .bg(Colors::surface_window())
+        .on_drop::<crate::components::plugin_picker::PluginDragItem>({
+            let on_drop_plugin = callbacks.on_drop_plugin.clone();
+            move |item, window, cx| on_drop_plugin(item, window, cx)
+        })
         .child(
             div()
                 .px(px(10.0))

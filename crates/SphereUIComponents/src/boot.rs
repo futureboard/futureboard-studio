@@ -163,7 +163,9 @@ pub fn init_process() {
             std::env::set_var("FUTUREBOARD_DISABLE_CEF_GPU", "1");
             std::env::set_var("FUTUREBOARD_DISABLE_CEF_WARMUP", "1");
             std::env::set_var("FUTUREBOARD_DISABLE_SHARED_TEXTURE", "1");
-            log("previous startup did not reach its first stable app frame; safe graphics mode enabled with WARP and CEF acceleration disabled");
+            log(
+                "previous startup did not reach its first stable app frame; safe graphics mode enabled with WARP and CEF acceleration disabled",
+            );
         }
         if let Err(error) = File::create(&marker) {
             log(&format!(

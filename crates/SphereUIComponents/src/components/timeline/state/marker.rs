@@ -23,6 +23,12 @@ pub struct TimelineMarkerState {
     pub beat: f64,
     pub name: String,
     pub color_hex: String,
+    /// SysEx messages sent when playback crosses the marker, each a complete
+    /// `F0 … F7` message. Sent to every hardware MIDI output a MIDI track
+    /// routes to — SysEx names its manufacturer, so a GS reset reaches the
+    /// Roland module and is ignored by the rest — and written to the
+    /// conductor track on MIDI export.
+    pub sysex: Vec<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -69,6 +75,7 @@ impl TimelineMarkerState {
             beat: beat.max(0.0),
             name: name.into(),
             color_hex: color_hex.into(),
+            sysex: Vec::new(),
         }
     }
 }

@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
 use gpui::{
-    div, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, Styled, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowKind,
+    App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowKind, div, px, size,
 };
 
 use crate::components::plugin_picker::{
-    compute_filter_result, ensure_default_highlight, picker_perf_debug, plugin_picker_panel,
     CatalogStatus, PickerFilter, PluginPickerCallbacks, PluginPickerPrefs,
-    PluginPickerScrollHandles, PluginPickerState, PluginSearchIndex,
+    PluginPickerScrollHandles, PluginPickerState, PluginSearchIndex, compute_filter_result,
+    ensure_default_highlight, picker_perf_debug, plugin_picker_panel,
 };
 use crate::components::text_input::{
-    bind_mouse_selection, TextInputCallbacks, TextInputMouseCb, TextInputMouseEvent,
+    TextInputCallbacks, TextInputMouseCb, TextInputMouseEvent, bind_mouse_selection,
 };
 use crate::components::title_bar::external_window_titlebar;
 use crate::theme::{self, Colors};
@@ -300,6 +300,7 @@ impl Render for InsertPickerWindow {
                     });
                 }
             }),
+            on_drop_plugin: Arc::new(|_, _, _| {}),
         };
 
         let search_mouse_callbacks =
@@ -309,6 +310,7 @@ impl Render for InsertPickerWindow {
         let owner = self.owner.clone();
         let target_for_search = target.clone();
         let search_callbacks = TextInputCallbacks {
+            on_mouse_down_out: None,
             on_context_command: None,
             on_context_menu: Some(Arc::new({
                 let target = target.clone();

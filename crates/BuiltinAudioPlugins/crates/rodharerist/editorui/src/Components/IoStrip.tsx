@@ -187,6 +187,7 @@ function TrimControl({
 export type IoStripProps = {
   side: "in" | "out";
   trim: number;
+  compact?: boolean;
   onTrimChange: (id: string, value: number) => void;
   /** Output side only: global plugin bypass. */
   globalBypass?: boolean;
@@ -200,13 +201,17 @@ export type IoStripProps = {
 export function IoStrip({
   side,
   trim,
+  compact,
   onTrimChange,
   globalBypass,
   onToggleGlobalBypass,
 }: IoStripProps) {
   const isInput = side === "in";
   return (
-    <section className={`io-strip io-${side}`} aria-label={isInput ? "Input" : "Output"}>
+    <section
+      className={`io-strip io-${side}${compact ? " compact" : ""}`}
+      aria-label={isInput ? "Input" : "Output"}
+    >
       <header className="io-strip-head">
         <span className="io-strip-title">{isInput ? "Input" : "Output"}</span>
         <ClipIndicator side={side} />

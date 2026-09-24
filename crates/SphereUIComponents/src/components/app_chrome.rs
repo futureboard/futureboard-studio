@@ -3,29 +3,31 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, svg, AccessibleAction, App, AppContext, DragMoveEvent, Empty, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, Role, StatefulInteractiveElement, Styled,
-    Toggled, Window, WindowControlArea,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, Role,
+    StatefulInteractiveElement, Styled, Toggled, Window, WindowControlArea,
 };
 
 use crate::assets;
-use crate::components::controls::fb_tooltip;
+use crate::components::controls::{fb_shortcut_hint, fb_tooltip};
 use crate::components::menu_bar;
 use crate::components::text_input::{
     text_field_with_callbacks, TextInputCallbacks, TextInputState,
 };
 use crate::components::title_bar::{
-    chrome_button, chrome_button_hover, chrome_button_pressed, chrome_cluster, draggable_spacer,
-    section_separator, CHROME_TITLE_SIZE, WINDOW_CONTROL_WIDTH,
+    begin_titlebar_drag, chrome_button, chrome_button_hover, chrome_button_pressed, chrome_cluster,
+    draggable_spacer, section_separator, CHROME_TITLE_SIZE, WINDOW_CONTROL_WIDTH,
 };
 use crate::i18n::I18n;
+use crate::keymap::accel_display;
 use crate::platform_chrome::PlatformChromePolicy;
-use crate::theme::Colors;
+use crate::theme::{self, space, Colors};
 
 /// Click handler for top-level menu buttons. Receives `(menu_id, anchor_x)`
 /// — anchor_x is the click X position which the dropdown overlay uses to
 /// align itself under the clicked label.
 pub type MenuOpenCb = menu_bar::MenuOpenCb;
 pub type ChromeActionCb = Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>;
+pub type ChromeRightClickCb = Arc<dyn Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static>;
 pub type ProjectOpenCb = Arc<dyn Fn(&f32, &mut Window, &mut App) + 'static>;
 pub type BpmChangeCb = Arc<dyn Fn(&f32, &mut Window, &mut App) + 'static>;
 pub type BpmDragCb = Arc<dyn Fn(&BpmDragSample, &mut Window, &mut App) + 'static>;
@@ -86,9 +88,16 @@ fn chrome_action_button(
     toggled: Option<bool>,
     color: gpui::Rgba,
     action: ChromeActionCb,
-) -> gpui::Stateful<gpui::Div> {
+    shortcut: Option<String>,
+    on_right_click: Option<ChromeRightClickCb>,
+) -> impl gpui::IntoElement {
     let label = label.into();
-    chrome_button(
+    // Build the 26×26 stateful button first, then wrap it in a flex-col outer
+    // container so the optional shortcut-hint pill sits *below* the icon rather
+    // than beside it inside the fixed-size box. Previously the pill was appended
+    // as a child of the button div itself (flex-row), which pushed it inline
+    // next to the icon and caused the button to overflow its 26 px width.
+    let button = chrome_button(
         Some(icon_path),
         label.clone(),
         toggled.unwrap_or(false),
@@ -118,7 +127,20 @@ fn chrome_action_button(
     .active(move |style| style.bg(chrome_button_pressed(toggled.unwrap_or(false))))
     .cursor(gpui::CursorStyle::PointingHand)
     .on_click(move |_, window, cx| action(&(), window, cx))
-    .occlude()
+    .when_some(on_right_click, |button, handler| {
+        button.on_mouse_down(gpui::MouseButton::Right, move |event, window, cx| {
+            handler(event, window, cx)
+        })
+    })
+    .occlude();
+
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(space::HAIR))
+        .child(button)
+        .children(shortcut.as_deref().map(|s| fb_shortcut_hint(s)))
 }
 
 #[derive(Clone)]
@@ -173,6 +195,12 @@ pub struct TransportChromeState {
     pub ts_edit_focus_num: bool,
     pub on_ts_menu: BpmMenuCb,
     pub on_ts_edit_start: ChromeActionCb,
+    /// The project key as (root, scale) labels; `None` when no key is set.
+    pub project_key: Option<(String, String)>,
+    /// Opens the key-root picker at the pointer.
+    pub on_key_root_menu: BpmMenuCb,
+    /// Opens the scale picker at the pointer.
+    pub on_key_scale_menu: BpmMenuCb,
     pub on_return_to_start: ChromeActionCb,
     pub on_play_toggle: ChromeActionCb,
     pub on_stop: ChromeActionCb,
@@ -182,6 +210,8 @@ pub struct TransportChromeState {
     pub on_count_in_menu: BpmMenuCb,
     pub on_loop_toggle: ChromeActionCb,
     pub on_metronome_toggle: ChromeActionCb,
+    /// Opens the metronome volume / settings menu at the pointer position.
+    pub on_metronome_menu: BpmMenuCb,
     pub on_follow_toggle: ChromeActionCb,
     /// Right-click on FOLLOW: switch auto-scroll between paged and continuous.
     pub on_follow_mode_toggle: ChromeActionCb,
@@ -199,6 +229,9 @@ pub struct TransportChromeState {
     /// Left-click registers a tap; right-click opens the tap tempo menu.
     pub on_tap_tempo: ChromeActionCb,
     pub on_tap_tempo_menu: BpmMenuCb,
+    /// Find Tempo & Key is offered only while an audio clip is selected.
+    pub find_tempo_key_enabled: bool,
+    pub on_find_tempo_key: ChromeActionCb,
     /// Master level strip (meter + fader), rendered as its own entity so the
     /// meter poll repaints it alone instead of the whole shell. `None` in
     /// surfaces that have no engine behind them.
@@ -277,6 +310,52 @@ fn tap_tempo_chip(
                 on_menu(&(pos.x.into(), pos.y.into()), window, cx);
             },
         )
+        .into_any_element()
+}
+
+/// Opens Find Tempo & Key for the selected audio clip. Ghost like the tap
+/// chip beside it; disabled (no hover, no click) until an audio clip is
+/// selected, with a tooltip that says why.
+fn find_tempo_key_chip(enabled: bool, on_open: ChromeActionCb) -> gpui::AnyElement {
+    let color = if enabled {
+        Colors::text_secondary()
+    } else {
+        Colors::text_disabled()
+    };
+    div()
+        .id("transport-find-tempo-key")
+        .role(Role::Button)
+        .aria_label("Find tempo and key")
+        .aria_disabled(!enabled)
+        .h(px(20.0))
+        .min_w(px(26.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(6.0))
+        .rounded(px(crate::theme::radius::CONTROL_SM))
+        .text_color(color)
+        .tooltip(fb_tooltip(if enabled {
+            "Find tempo and key of the selected audio clip"
+        } else {
+            "Find tempo and key — select an audio clip first"
+        }))
+        .child(
+            svg()
+                .path(assets::ICON_SCAN_SEARCH_PATH)
+                .w(px(13.0))
+                .h(px(13.0))
+                .text_color(color),
+        )
+        .when(enabled, |chip| {
+            chip.focusable()
+                .tab_stop(true)
+                .focus_visible(|style| style.bg(Colors::surface_control_hover()))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(|s| s.bg(Colors::surface_control_hover()))
+                .on_click(move |_, window, cx| on_open(&(), window, cx))
+        })
+        .occlude()
         .into_any_element()
 }
 
@@ -628,6 +707,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
     let on_count_in_menu = state.on_count_in_menu.clone();
     let on_loop = state.on_loop_toggle.clone();
     let on_metronome = state.on_metronome_toggle.clone();
+    let on_metronome_menu = state.on_metronome_menu.clone();
     let on_follow = state.on_follow_toggle.clone();
     let on_follow_mode = state.on_follow_mode_toggle.clone();
     let on_bpm_drag = state.on_bpm_drag.clone();
@@ -654,6 +734,8 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
     let perf_meter = state.perf_meter.clone().filter(|_| gutters_fit);
     let on_tap_tempo = state.on_tap_tempo.clone();
     let on_tap_tempo_menu = state.on_tap_tempo_menu.clone();
+    let find_tempo_key_enabled = state.find_tempo_key_enabled;
+    let on_find_tempo_key = state.on_find_tempo_key.clone();
     let ts_has_markers = state.ts_has_markers;
     let on_ts_menu = state.on_ts_menu.clone();
     let on_ts_edit_start = state.on_ts_edit_start.clone();
@@ -663,6 +745,9 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
     let ts_den_input = state.ts_den_input.clone();
     let ts_den_input_callbacks = state.ts_den_input_callbacks.clone();
     let ts_edit_focus_num = state.ts_edit_focus_num;
+    let project_key = state.project_key.clone();
+    let on_key_root_menu = state.on_key_root_menu.clone();
+    let on_key_scale_menu = state.on_key_scale_menu.clone();
 
     let label_skip_back = i18n.tr_or("transport.skip-back", "<<");
     let label_play = i18n.tr_or("transport.play", ">");
@@ -681,6 +766,8 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             None,
             Colors::text_secondary(),
             on_return,
+            None,
+            None,
         ))
         .child(chrome_action_button(
             "transport-play",
@@ -689,6 +776,8 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Some(state.playing),
             play_color,
             on_play,
+            None,
+            None,
         ))
         .child(chrome_action_button(
             "transport-stop",
@@ -697,6 +786,8 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             None,
             Colors::text_secondary(),
             on_stop,
+            None,
+            None,
         ))
         .child(chrome_action_button(
             "transport-record",
@@ -705,6 +796,8 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Some(state.recording),
             record_color,
             on_record,
+            None,
+            None,
         ));
 
     // Count-in split control: the label is a true on/off toggle, the chevron
@@ -808,6 +901,94 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
                 ),
         );
 
+    let metronome_fill = if state.metronome_enabled {
+        Colors::composite(
+            Colors::surface_titlebar(),
+            Colors::with_alpha(Colors::accent_primary(), crate::theme::state::ARMED_WASH),
+        )
+    } else {
+        Colors::with_alpha(Colors::button_bg(), 0.0)
+    };
+    let metronome_hover = Colors::composite(metronome_fill, Colors::state_hover());
+    let on_metronome_menu_icon = on_metronome_menu.clone();
+    let metronome_split = div()
+        .h(px(crate::theme::size::DENSE))
+        .flex()
+        .flex_row()
+        .items_center()
+        .rounded(px(crate::theme::radius::CONTROL_SM))
+        .overflow_hidden()
+        .border(px(1.0))
+        .border_color(if state.metronome_enabled {
+            Colors::with_alpha(Colors::accent_primary(), crate::theme::state::ARMED_BORDER)
+        } else {
+            Colors::button_border()
+        })
+        .child(
+            div()
+                .id("transport-metronome")
+                .role(Role::Button)
+                .aria_label(label_metronome.clone())
+                .aria_toggled(if state.metronome_enabled {
+                    Toggled::True
+                } else {
+                    Toggled::False
+                })
+                .flex()
+                .items_center()
+                .h_full()
+                .px(px(crate::theme::space::SNUG))
+                .bg(metronome_fill)
+                .text_color(metronome_color)
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(metronome_hover))
+                .tooltip(fb_tooltip("Metronome"))
+                .on_click(move |_, window, cx| on_metronome(&(), window, cx))
+                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    on_metronome_menu_icon(&(x, y), window, cx);
+                })
+                .occlude()
+                .child(
+                    svg()
+                        .path(assets::ICON_METRONOME_PATH)
+                        .w(px(13.0))
+                        .h(px(13.0))
+                        .text_color(metronome_color),
+                ),
+        )
+        .child(div().w(px(1.0)).h_full().bg(Colors::border_subtle()))
+        .child(
+            div()
+                .id("transport-metronome-menu")
+                .role(Role::Button)
+                .aria_label("Metronome settings")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h_full()
+                .w(px(14.0))
+                .bg(metronome_fill)
+                .text_color(Colors::text_muted())
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(metronome_hover))
+                .tooltip(fb_tooltip("Metronome volume and settings"))
+                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    on_metronome_menu(&(x, y), window, cx);
+                })
+                .occlude()
+                .child(
+                    svg()
+                        .path(assets::ICON_CHEVRON_DOWN_PATH)
+                        .w(px(9.0))
+                        .h(px(9.0))
+                        .text_color(Colors::text_muted()),
+                ),
+        );
+
     let mode_group = chrome_cluster()
         .child(chrome_action_button(
             "transport-loop",
@@ -816,28 +997,22 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             Some(state.loop_enabled),
             loop_color,
             on_loop,
+            None,
+            None,
         ))
+        .child(metronome_split)
         .child(chrome_action_button(
-            "transport-metronome",
-            assets::ICON_METRONOME_PATH,
-            label_metronome,
-            Some(state.metronome_enabled),
-            metronome_color,
-            on_metronome,
-        ))
-        .child(
-            chrome_action_button(
-                "transport-follow-playhead",
-                assets::TIMELINE_SCROLL_PATH,
-                label_follow,
-                Some(state.follow_playhead),
-                follow_color,
-                on_follow,
-            )
-            .on_mouse_down(gpui::MouseButton::Right, move |_, window, cx| {
+            "transport-follow-playhead",
+            assets::TIMELINE_SCROLL_PATH,
+            label_follow,
+            Some(state.follow_playhead),
+            follow_color,
+            on_follow,
+            None,
+            Some(Arc::new(move |_, window, cx| {
                 on_follow_mode(&(), window, cx);
-            }),
-        );
+            })),
+        ));
 
     // ── Centre track: the readout panel ──────────────────────────────────────
     let position_value = div()
@@ -970,6 +1145,72 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
         })
         .into_any_element();
 
+    // Key: root and scale are separate targets, each opening its own short
+    // picker, the way the meter's two digits are separate fields.
+    let key_part = |id: &'static str, text: String, strong: bool, on_menu: BpmMenuCb| {
+        let hover = Colors::composite(Colors::surface_canvas(), Colors::state_hover());
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .h(px(20.0))
+            .px(px(crate::theme::space::HAIR))
+            .rounded(px(crate::theme::radius::CONTROL_SM))
+            .text_size(px(if strong { 13.0 } else { 11.0 }))
+            .font_weight(if strong {
+                gpui::FontWeight::SEMIBOLD
+            } else {
+                gpui::FontWeight::MEDIUM
+            })
+            .text_color(match (strong, project_key.is_some()) {
+                (_, false) => Colors::text_faint(),
+                (true, true) => Colors::text_primary(),
+                (false, true) => Colors::text_secondary(),
+            })
+            .whitespace_nowrap()
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(move |s| s.bg(hover))
+            .occlude()
+            .on_mouse_down(gpui::MouseButton::Left, {
+                let on_menu = on_menu.clone();
+                move |event: &gpui::MouseDownEvent, window, cx| {
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    on_menu(&(x, y), window, cx);
+                }
+            })
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                move |event: &gpui::MouseDownEvent, window, cx| {
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    on_menu(&(x, y), window, cx);
+                },
+            )
+            .child(text)
+    };
+    let (key_root_text, key_scale_text) = project_key
+        .clone()
+        .unwrap_or_else(|| ("—".to_string(), "No key".to_string()));
+    let key_value = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(crate::theme::space::HAIR))
+        .child(key_part(
+            "lcd-key-root",
+            key_root_text,
+            true,
+            on_key_root_menu,
+        ))
+        .child(key_part(
+            "lcd-key-scale",
+            key_scale_text,
+            false,
+            on_key_scale_menu,
+        ))
+        .into_any_element();
+
     let readout = div()
         .flex()
         .flex_row()
@@ -1024,13 +1265,28 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             None
         })
         .child(lcd_divider())
+        .child(lcd_field(
+            "lcd-key",
+            assets::ICON_KEYBOARD_PATH,
+            "Project key — click the root or the scale to change it",
+            key_value,
+        ))
+        .child(lcd_divider())
         .child(
             div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(crate::theme::space::HAIR))
                 .px(px(crate::theme::space::BASE))
                 .child(tap_tempo_chip(
                     tap_tempo_session_taps,
                     on_tap_tempo,
                     on_tap_tempo_menu,
+                ))
+                .child(find_tempo_key_chip(
+                    find_tempo_key_enabled,
+                    on_find_tempo_key,
                 )),
         );
 
@@ -1098,13 +1354,23 @@ fn panel_toggle_button(
     fallback: impl Into<gpui::SharedString>,
     active: bool,
     on_click: ChromeActionCb,
+    shortcut: Option<String>,
 ) -> impl IntoElement {
     let color = if active {
         Colors::accent_primary()
     } else {
         Colors::text_muted()
     };
-    chrome_action_button(id, icon_path, fallback, Some(active), color, on_click)
+    chrome_action_button(
+        id,
+        icon_path,
+        fallback,
+        Some(active),
+        color,
+        on_click,
+        shortcut,
+        None,
+    )
 }
 
 fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
@@ -1122,6 +1388,7 @@ fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
             i18n.tr("panel.browser"),
             state.browser_visible,
             on_browser,
+            None,
         ))
         .child(panel_toggle_button(
             "panel-bottom-toggle",
@@ -1129,6 +1396,7 @@ fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
             i18n.tr("panel.bottom"),
             state.bottom_panel_visible,
             on_bottom_panel,
+            None,
         ))
         .child(panel_toggle_button(
             "panel-inspector-toggle",
@@ -1136,38 +1404,20 @@ fn panel_toggles(state: PanelChromeState, i18n: I18n) -> impl IntoElement {
             i18n.tr("panel.inspector"),
             state.inspector_visible,
             on_inspector,
+            None,
         ))
 }
 
 #[allow(dead_code)]
-fn utility_buttons(i18n: I18n) -> impl IntoElement {
+fn utility_buttons(_i18n: I18n) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(2.0))
         .px(px(2.0))
-        // Import audio
-        .child(chrome_button(
-            Some(assets::ICON_FOLDER_PATH),
-            i18n.tr("chrome.import"),
-            false,
-            Colors::text_muted(),
-        ))
-        // Save
-        .child(chrome_button(
-            Some(assets::ICON_SAVE_PATH),
-            i18n.tr("chrome.save"),
-            false,
-            Colors::text_muted(),
-        ))
-        // Share
-        .child(chrome_button(
-            Some(assets::ICON_SHARE_PATH),
-            i18n.tr("chrome.share"),
-            false,
-            Colors::text_muted(),
-        ))
+    // Import audio, Save, Share - actions handled by menu commands
+    // Use menu bar or command palette for these instead
 }
 
 #[allow(dead_code)]
@@ -1644,18 +1894,16 @@ pub fn app_chrome(
         // Windows: NCHITTEST callback returns `HTCAPTION` for hitboxes
         // tagged Drag, letting DefWindowProc start the system move.
         .window_control_area(WindowControlArea::Drag)
-        // Linux (Wayland / X11) and macOS: `start_window_move` is the
+        // Linux (Wayland / X11) and macOS: `begin_titlebar_drag` is the
         // implemented drag API there; the WindowControlArea path is a
-        // no-op on those platforms. Safe to attach here because every
-        // interactive child below (menu buttons, transport buttons,
-        // window controls, report-bug) calls `.occlude()`. Occlude is
-        // `HitboxBehavior::BlockMouse`, which breaks the `hit_test`
-        // iteration at that child — the chrome's id is then NOT in
-        // `mouse_hit_test.ids`, so this on_mouse_down does NOT fire
-        // for clicks on those buttons.
-        .on_mouse_down(MouseButton::Left, |_, window, _cx| {
-            window.start_window_move();
-        });
+        // no-op on those platforms. On macOS the second click zooms.
+        // Safe to attach here because every interactive child below
+        // (menu buttons, transport buttons, window controls, report-bug)
+        // calls `.occlude()`. Occlude is `HitboxBehavior::BlockMouse`,
+        // which breaks the `hit_test` iteration at that child — the
+        // chrome's id is then NOT in `mouse_hit_test.ids`, so this
+        // on_mouse_down does NOT fire for clicks on those buttons.
+        .on_mouse_down(MouseButton::Left, begin_titlebar_drag);
 
     // Three tracks, so the project control lands on the true window centre
     // regardless of how wide the menu bar or the right-hand cluster is. Both

@@ -414,6 +414,40 @@ impl Session {
 
         let supported = self.info.supported_transforms;
 
+        // An open editor view is holding the regions it was last shown. Before
+        // any of them is destroyed, show it the set without them, so no view
+        // keeps a reference to a region that no longer exists.
+        {
+            let wanted_clips: HashSet<&AraClipKey> =
+                graph.regions.iter().map(|region| &region.key).collect();
+            if self.clips.keys().any(|key| !wanted_clips.contains(key)) {
+                let wanted_sequences: HashSet<&AraTrackKey> = graph
+                    .sequences
+                    .iter()
+                    .map(|sequence| &sequence.key)
+                    .collect();
+                let remaining: Vec<AraClipKey> = self
+                    .clips
+                    .keys()
+                    .filter(|key| wanted_clips.contains(key))
+                    .cloned()
+                    .collect();
+                let tracks: Vec<AraTrackKey> = self
+                    .sequences
+                    .keys()
+                    .filter(|key| wanted_sequences.contains(key))
+                    .cloned()
+                    .collect();
+                let renderers: Vec<AraRendererId> = self.renderers.keys().copied().collect();
+                for renderer in renderers {
+                    if let Err(error) = self.notify_editor_selection(renderer, &remaining, &tracks)
+                    {
+                        trace(&format!("editor selection before teardown: {error}"));
+                    }
+                }
+            }
+        }
+
         // One destructuring borrow: `document` is mutated through the edit scope
         // while the graph maps below are updated in the same pass, and the
         // borrow checker only allows that on disjoint fields.
@@ -451,10 +485,16 @@ impl Session {
             .collect();
 
         // A playback region may not be destroyed while a renderer still holds
-        // it, so drop those RAII assignments first.
+        // it, so drop those RAII assignments first — in **both** roles. The
+        // editor-renderer assignment used to survive: the region was destroyed
+        // under it, and dropping it afterwards (in `set_renderer_regions`)
+        // handed the plug-in a dangling region in `removePlaybackRegion`.
+        // Cutting or deleting a clip on an ARA track with the ARA panel open
+        // took the app down that way.
         for key in &stale_clips {
             for renderer in renderers.values_mut() {
                 renderer.assignments.remove(key);
+                renderer.editor_assignments.remove(key);
             }
         }
 
@@ -492,6 +532,13 @@ impl Session {
             .collect();
         for key in stale_sources {
             if let Some(entry) = sources.remove(&key) {
+                // Access off before the source goes: the plug-in may be reading
+                // it on an analysis thread, and disabling access is what makes
+                // it close those readers. Destroying a source that is still
+                // readable is an ARA API violation the SDK's controllers assert
+                // on.
+                edit.set_audio_source_samples_access(entry.handle, false)
+                    .map_err(map_error)?;
                 edit.destroy_audio_source(entry.handle).map_err(map_error)?;
                 index.remove_source(entry.address);
             }
@@ -904,32 +951,61 @@ impl Session {
         );
 
         let document = self.document_mut()?;
-        let result = document.store_document_to_archive(token.as_ref());
+        // ARA 2 Final replaced whole-document persistence with object
+        // persistence; store with the call the restore below will read with.
+        let result = if document.generation() >= ApiGeneration::V2Final {
+            document.store_objects_to_archive(token.as_ref(), None)
+        } else {
+            document.store_document_to_archive(token.as_ref())
+        };
         let slot = self.archives.take(address);
         drop(token);
         result.map_err(map_error)?;
         Ok(slot.map(|slot| slot.bytes).unwrap_or_default())
     }
 
-    pub(crate) fn restore_archive(&mut self, bytes: &[u8]) -> AraResult<()> {
+    /// Restores `bytes`, stored under `archive_id`, into the document.
+    ///
+    /// The graph must already exist with the persistent IDs it was saved
+    /// with: both paths match the archive's objects to live ones by ID.
+    ///
+    /// ARA 2 Final and later restore objects inside an ordinary edit cycle.
+    /// Earlier plug-ins get the legacy restore scope, which (in every
+    /// ARA-library controller) is an edit cycle that restores all live
+    /// objects when it ends. The legacy call is refused outright at 2 Final
+    /// and later — which, since this host negotiates the newest generation
+    /// first and Apple Silicon allows nothing older, used to be every
+    /// session: saved ARA edits were silently dropped on every reopen.
+    pub(crate) fn restore_archive(&mut self, archive_id: &str, bytes: &[u8]) -> AraResult<()> {
         let token = Box::new(ArchiveToken {
             _sequence: self.next_archive,
         });
         self.next_archive += 1;
         let address = std::ptr::from_ref(token.as_ref()) as usize;
-        let archive_id = self.info.document_archive_id.clone();
+        // The ID the bytes were written under, not the plug-in's current one:
+        // an archive from an older version must be read as that version.
         self.archives.open(
             address,
             ArchiveSlot {
                 bytes: bytes.to_vec(),
-                archive_id: Some(archive_id),
+                archive_id: Some(archive_id.to_owned()),
             },
         );
 
         let document = self.document_mut()?;
-        let outcome = document
-            .restore_document_from_archive(token.as_ref())
-            .and_then(|edit| edit.finish());
+        let outcome = if document.generation() >= ApiGeneration::V2Final {
+            document.edit().and_then(|mut edit| {
+                let restored = edit.restore_objects_from_archive(token.as_ref(), None);
+                // End the cycle whatever the restore said, so a refused
+                // archive does not leave the document stuck in editing.
+                let finished = edit.finish();
+                restored.and(finished)
+            })
+        } else {
+            document
+                .restore_document_from_archive(token.as_ref())
+                .and_then(|edit| edit.finish())
+        };
         self.archives.take(address);
         drop(token);
         outcome.map_err(map_error)

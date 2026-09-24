@@ -17,11 +17,10 @@
 //! - content child styles: `WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS`.
 //! - the child's parent is the supplied top HWND.
 //!
-//! On non-Windows targets every entry point is a no-op stub returning `None`,
-//! and nothing asks: macOS and Linux use the host-owned-window backend, where
-//! the plug-in's view lives in a top-level window the host process created and
-//! there is no content child in this process at all. See
-//! [`crate::components::plugin_editor_backend::EditorBackendKind`].
+//! VST3 editors on macOS and Linux still use the host-owned-window backend
+//! (see [`crate::components::plugin_editor_backend::EditorBackendKind`]). Built-in
+//! CEF editors on macOS reuse this module's content child as an in-process
+//! AppKit container so Chromium can parent a real NSView into the GPUI shell.
 
 /// Whether this platform can embed a plug-in's own native view inside the
 /// app's window.
@@ -797,7 +796,168 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::{ContentHostKind, ContentRect};
+    use crate::components::plugin_editor_mac_region::{DockedPluginSurface, RegionPx};
+
+    /// Windowed CEF warm-up and the stress harness need a parent that is not
+    /// the studio's Metal-backed view. A borderless window kept off-screen
+    /// satisfies CEF without covering the DAW.
+    pub struct HiddenHostWindow {
+        window: objc2::rc::Retained<objc2::runtime::NSObject>,
+        content: u64,
+    }
+
+    impl HiddenHostWindow {
+        pub fn create() -> Option<Self> {
+            if !appkit_main_thread() {
+                return None;
+            }
+            let cls = objc2::runtime::AnyClass::get(c"NSWindow")?;
+            let rect = objc2_foundation::NSRect {
+                origin: objc2_foundation::NSPoint {
+                    x: -10_000.0,
+                    y: -10_000.0,
+                },
+                size: objc2_foundation::NSSize {
+                    width: 2.0,
+                    height: 2.0,
+                },
+            };
+            // Borderless (0) + buffered backing (2). `defer: true` avoids a
+            // window device until something actually orders the window.
+            let window: *mut objc2::runtime::NSObject = unsafe {
+                let allocated: *mut objc2::runtime::NSObject = objc2::msg_send![cls, alloc];
+                objc2::msg_send![
+                    allocated,
+                    initWithContentRect: rect,
+                    styleMask: 0usize,
+                    backing: 2usize,
+                    defer: true
+                ]
+            };
+            let window = unsafe { objc2::rc::Retained::from_raw(window) }?;
+            let content: *mut objc2::runtime::AnyObject = unsafe {
+                let _: () = objc2::msg_send![&*window, setReleasedWhenClosed: false];
+                let _: () = objc2::msg_send![&*window, setIgnoresMouseEvents: true];
+                let _: () = objc2::msg_send![&*window, setAlphaValue: 0.0f64];
+                let _: () = objc2::msg_send![&*window, orderOut: std::ptr::null::<objc2::runtime::AnyObject>()];
+                objc2::msg_send![&*window, contentView]
+            };
+            if content.is_null() {
+                return None;
+            }
+            Some(Self {
+                window,
+                content: content as u64,
+            })
+        }
+
+        pub fn hwnd(&self) -> u64 {
+            self.content
+        }
+    }
+
+    impl Drop for HiddenHostWindow {
+        fn drop(&mut self) {
+            if !appkit_main_thread() {
+                let leaked = self.window.clone();
+                std::mem::forget(leaked);
+                return;
+            }
+            unsafe {
+                let _: () = objc2::msg_send![&*self.window, orderOut: std::ptr::null::<objc2::runtime::AnyObject>()];
+                let _: () = objc2::msg_send![&*self.window, close];
+            }
+        }
+    }
+
+    fn appkit_main_thread() -> bool {
+        unsafe {
+            let Some(cls) = objc2::runtime::AnyClass::get(c"NSThread") else {
+                return false;
+            };
+            objc2::msg_send![cls, isMainThread]
+        }
+    }
+
+    /// In-process AppKit container for a windowed CEF browser.
+    ///
+    /// VST3 editors on macOS still use the host-owned window backend. Built-in
+    /// editors parent Chromium into this container the same way Windows parents
+    /// a child HWND.
+    pub struct ContentChildHwnd {
+        parent_ns_view: u64,
+        surface: DockedPluginSurface,
+    }
+
+    /// No owned-popup owner on AppKit; popups stay CEF's.
+    pub fn place_owned_popup(
+        _popup_hwnd: u64,
+        _owner_hwnd: u64,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> bool {
+        false
+    }
+
+    impl ContentChildHwnd {
+        pub fn create(top_hwnd: u64, rect: ContentRect) -> Option<Self> {
+            Self::create_for(ContentHostKind::NativeView, top_hwnd, rect)
+        }
+
+        pub fn create_for(
+            _kind: ContentHostKind,
+            top_hwnd: u64,
+            rect: ContentRect,
+        ) -> Option<Self> {
+            if top_hwnd == 0 {
+                return None;
+            }
+            let region = region_px(rect);
+            let surface = if _kind == ContentHostKind::WebView {
+                DockedPluginSurface::create_above_metal(top_hwnd, region)
+            } else {
+                DockedPluginSurface::create(top_hwnd, region)
+            }?;
+            Some(Self {
+                parent_ns_view: top_hwnd,
+                surface,
+            })
+        }
+
+        pub fn hwnd(&self) -> u64 {
+            self.surface.handle()
+        }
+
+        pub fn top_hwnd(&self) -> u64 {
+            self.parent_ns_view
+        }
+
+        pub fn set_bounds(&self, rect: ContentRect) {
+            self.surface
+                .set_bounds(self.parent_ns_view, region_px(rect));
+        }
+
+        pub fn is_valid(&self) -> bool {
+            self.surface.handle() != 0
+        }
+    }
+
+    fn region_px(rect: ContentRect) -> RegionPx {
+        RegionPx {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 mod imp {
     use super::{ContentHostKind, ContentRect};
 
@@ -815,13 +975,13 @@ mod imp {
         }
     }
 
-    /// Non-Windows stub. Host-process editor embedding via NSView/X11 is a later
-    /// slice; this keeps the crate compiling everywhere.
+    /// Linux stub. Host-process editor embedding via X11 is a later slice; this
+    /// keeps the crate compiling everywhere.
     pub struct ContentChildHwnd {
         _private: (),
     }
 
-    /// No native child is ever created off Windows, so nothing occludes an
+    /// No native child is ever created off Windows/macOS, so nothing occludes an
     /// ordinary popup and there is no owner to attach.
     pub fn place_owned_popup(
         _popup_hwnd: u64,

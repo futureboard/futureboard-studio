@@ -252,6 +252,13 @@ struct AraTrackSession {
     /// Archive identifier the plug-in writes under, captured at open.
     archive_id: String,
     plugin_name: String,
+    /// The saved archive the plug-in refused to restore, written back in
+    /// place of the live document until the plug-in changes its state.
+    ///
+    /// Storing the live document instead would overwrite the user's saved
+    /// edits with the empty document the failed restore left behind, and the
+    /// loss would only show the next time the project was opened.
+    unrestored_archive: Option<(String, Vec<u8>)>,
 }
 
 /// Every live ARA session, plus the queues its plug-ins post into.
@@ -332,6 +339,10 @@ impl AraState {
     pub fn store_archives(&mut self) -> Vec<(AraSessionKey, String, Vec<u8>)> {
         let mut stored = Vec::new();
         for (key, session) in self.sessions.iter_mut() {
+            if let Some((archive_id, data)) = session.unrestored_archive.as_ref() {
+                stored.push((key.clone(), archive_id.clone(), data.clone()));
+                continue;
+            }
             match session.session.store_archive() {
                 Ok(data) => stored.push((key.clone(), session.archive_id.clone(), data)),
                 Err(error) => {
@@ -358,6 +369,15 @@ impl AraState {
     /// Drains model updates posted by plug-ins.
     pub fn take_model_updates(&self) -> Vec<AraModelUpdate> {
         self.model_inbox.drain()
+    }
+
+    /// The plug-ins changed their own documents: from here on their live
+    /// state is newer than any archive they failed to restore, so saving
+    /// stores the live state again.
+    pub fn document_data_changed(&mut self) {
+        for session in self.sessions.values_mut() {
+            session.unrestored_archive = None;
+        }
     }
 
     /// Opens a session for `key`, or returns the existing one.
@@ -432,6 +452,7 @@ impl AraState {
                 audio,
                 archive_id,
                 plugin_name: plugin_name.to_owned(),
+                unrestored_archive: None,
             },
         );
         Ok(self
@@ -458,7 +479,14 @@ impl AraState {
         media_paths: HashMap<AraSourceKey, PathBuf>,
     ) -> AraResult<()> {
         let pending = self.pending_archives.remove(key);
-        self.ensure_session(engine, key, plugin_name, plugin_path, class_id)?;
+        if let Err(error) = self.ensure_session(engine, key, plugin_name, plugin_path, class_id) {
+            // The archive waits for the next attempt — and is saved back
+            // untouched meanwhile — instead of going down with this one.
+            if let Some(pending) = pending {
+                self.pending_archives.insert(key.clone(), pending);
+            }
+            return Err(error);
+        }
 
         // The edit below creates and destroys playback regions on an instance
         // the engine may be rendering, and each one calls into the plug-in. ARA
@@ -508,6 +536,8 @@ impl AraState {
         // plug-in's stored edits are in place the first time it renders.
         if let Some((archive_id, data)) = pending {
             if let Err(error) = session.session.restore_archive(&archive_id, &data) {
+                eprintln!("[ARA] {plugin_name} could not restore its saved state: {error}");
+                session.unrestored_archive = Some((archive_id, data));
                 self.last_error = Some(format!(
                     "{plugin_name} could not restore its saved ARA state: {error}"
                 ));

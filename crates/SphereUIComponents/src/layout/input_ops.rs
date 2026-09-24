@@ -266,10 +266,17 @@ impl StudioLayout {
     pub(super) fn handle_bpm_edit_key(
         &mut self,
         event: &KeyDownEvent,
-        _window: &Window,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.tempo_edit.bpm_editing {
+            return false;
+        }
+        // Another text field holds focus: the user has moved on. Close the
+        // editor (as a click away would) and let that field have the key —
+        // this editor sits first in the key chain and used to take it.
+        if self.focused_text_target(window).is_some() {
+            self.commit_bpm_edit(cx);
             return false;
         }
         if event.is_held && !is_repeatable_edit_key(event) {
@@ -308,10 +315,16 @@ impl StudioLayout {
     pub(super) fn handle_ts_edit_key(
         &mut self,
         event: &KeyDownEvent,
-        _window: &Window,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.tempo_edit.ts_editing {
+            return false;
+        }
+        // Same hand-off as the BPM editor: a focused text field elsewhere
+        // wins the key.
+        if self.focused_text_target(window).is_some() {
+            self.commit_ts_edit(cx);
             return false;
         }
         if event.is_held && !is_repeatable_edit_key(event) {
@@ -1699,6 +1712,8 @@ impl StudioLayout {
                 }
                 entries
             }
+            ContextTarget::ProjectKeyRoot => self.project_key_menu_entries(true, cx),
+            ContextTarget::ProjectKeyScale => self.project_key_menu_entries(false, cx),
             ContextTarget::TimeSignature => {
                 let state = &self.timeline.read(cx).state;
                 let pt = state.time_signature_at_playhead();
@@ -1875,6 +1890,24 @@ impl StudioLayout {
                 }
                 entries
             }
+            ContextTarget::Metronome => {
+                let volume = self.settings.read(cx).current.recording.metronome.volume;
+                let mut entries = vec![ContextMenuEntry::Header("Click Volume".to_string())];
+                for percent in [25u32, 50, 75, 100] {
+                    let selected = (volume * 100.0 - percent as f32).abs() < 2.5;
+                    entries.push(ContextMenuEntry::checked_item(
+                        format!("{percent}%"),
+                        format!("metronome:set-volume:{percent}"),
+                        selected,
+                    ));
+                }
+                entries.push(ContextMenuEntry::Separator);
+                entries.push(ContextMenuEntry::item(
+                    "Metronome Settings…",
+                    "settings:open-metronome",
+                ));
+                entries
+            }
             ContextTarget::TempoTrack {
                 beat,
                 bpm,
@@ -1891,13 +1924,14 @@ impl StudioLayout {
                     // Which shape this marker is already on. Three plain items
                     // gave no way to read the current one, which is how a lane
                     // with working curves still feels like it does nothing.
-                    let curve = state
+                    let (curve, tension) = state
                         .tempo_map
                         .points
                         .iter()
                         .find(|p| p.id == id)
-                        .map(|p| p.curve)
+                        .map(|p| (p.curve, p.tension))
                         .unwrap_or_default();
+                    let bent = curve == TempoCurve::Linear && tension.abs() > 1.0e-4;
                     vec![
                         ContextMenuEntry::disabled_item(
                             format!("Tempo point: {bpm_label} BPM at {label}"),
@@ -1916,12 +1950,26 @@ impl StudioLayout {
                         ContextMenuEntry::checked_item(
                             "Linear",
                             "tempo:curve-linear",
-                            curve == TempoCurve::Linear,
+                            curve == TempoCurve::Linear && !bent,
+                        ),
+                        ContextMenuEntry::checked_item(
+                            "Ease In",
+                            "tempo:bend-ease-in",
+                            bent && tension > 0.0,
+                        ),
+                        ContextMenuEntry::checked_item(
+                            "Ease Out",
+                            "tempo:bend-ease-out",
+                            bent && tension < 0.0,
                         ),
                         ContextMenuEntry::checked_item(
                             "Smooth",
                             "tempo:curve-smooth",
                             curve == TempoCurve::Smooth,
+                        ),
+                        ContextMenuEntry::disabled_item(
+                            "Drag the line to bend · ⌥ double-click straightens",
+                            "noop",
                         ),
                     ]
                 } else {
@@ -2045,6 +2093,18 @@ impl StudioLayout {
                     ContextMenuEntry::item("Hide Region Track", "region:hide-track"),
                 ]
             }
+            ContextTarget::ChordTrack { .. } | ContextTarget::ChordLane => {
+                let state = &self.timeline.read(cx).state;
+                let has_chords = !state.chord_events.is_empty();
+                vec![
+                    ContextMenuEntry::Header("Chord Track".to_string()),
+                    ContextMenuEntry::item("Chord Generator…", "chords:open-generator"),
+                    menu_item_enabled("Create MIDI Clip from Chords", "chords:to-midi", has_chords),
+                    ContextMenuEntry::Separator,
+                    danger_menu_item_enabled("Delete All Chords", "chords:clear-all", has_chords),
+                    ContextMenuEntry::item("Hide Chord Track", "chords:hide-track"),
+                ]
+            }
             ContextTarget::TimelineRuler { beat } => {
                 let label = self.timeline.read(cx).state.format_position(*beat as f32);
                 let has_automation = self.timeline.read(cx).state.tempo_has_automation();
@@ -2099,6 +2159,15 @@ impl StudioLayout {
                 } else {
                     ContextMenuEntry::item("Show Region Track", "region:open-track")
                 });
+                entries.push(if st.state.show_chord_track {
+                    ContextMenuEntry::item("Hide Chord Track", "chords:hide-track")
+                } else {
+                    ContextMenuEntry::item("Show Chord Track", "chords:open-track")
+                });
+                entries.push(ContextMenuEntry::item(
+                    "Chord Generator…",
+                    "chords:open-generator",
+                ));
                 entries.push(if st.state.show_song_text_track {
                     ContextMenuEntry::item("Hide Song Text Track", "songtext:hide-track")
                 } else {

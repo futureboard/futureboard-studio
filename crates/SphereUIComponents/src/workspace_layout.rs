@@ -268,8 +268,7 @@ pub fn sanitize_workspace_layout(layout: &mut SavedWorkspaceLayout) {
     if !layout.mixer.send_section_px.is_finite() || layout.mixer.send_section_px < 0.0 {
         layout.mixer.send_section_px = default_mixer_send_section();
     }
-    if !layout.mixer.tree_sidebar_width_px.is_finite()
-        || layout.mixer.tree_sidebar_width_px < 10.0
+    if !layout.mixer.tree_sidebar_width_px.is_finite() || layout.mixer.tree_sidebar_width_px < 10.0
     {
         layout.mixer.tree_sidebar_width_px = default_mixer_tree_sidebar();
     }
@@ -325,7 +324,10 @@ pub fn save_workspace_layout(layout: &SavedWorkspaceLayout) {
     // Atomic write: tmp → rename.
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = fs::write(&tmp, &json) {
-        log_layout(&format!("save: write tmp failed: {e} path={}", tmp.display()));
+        log_layout(&format!(
+            "save: write tmp failed: {e} path={}",
+            tmp.display()
+        ));
         return;
     }
     if let Err(e) = fs::rename(&tmp, &path) {

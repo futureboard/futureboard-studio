@@ -245,3 +245,21 @@ describe("model parameter schema", () => {
     expect(completed.plate!.every((param) => param.val === 3)).toBe(true);
   });
 });
+
+describe("NAM A2 capture", () => {
+  test("exposes a TONE3000-backed engine and a quality dial", () => {
+    const nam = models.amp.find((model) => model.id === "nam_capture");
+    expect(nam?.name).toBe("NAM A2 Capture");
+    expect(nam?.short).toBe("NAM A2");
+    expect(parameterDefaults.nam_capture!.map((param) => param.id)).toEqual([
+      "nam_input_trim",
+      "nam_output_trim",
+      "nam_mix",
+      "nam_slim_size",
+    ]);
+    const quality = parameterDefaults.nam_capture!.find(
+      (param) => param.id === "nam_slim_size",
+    );
+    expect(quality).toMatchObject({ min: 0, max: 100, val: 100, unit: "%" });
+  });
+});

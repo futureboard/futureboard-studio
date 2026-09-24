@@ -245,6 +245,7 @@ describe("snapshotFromRodhareistState", () => {
     expect(param(snap, "softknee", "comp_ratio")).toBe(4);
     expect(param(snap, "parametric", "eq_mid2_gain")).toBe(4);
     expect(param(snap, "nam_capture", "nam_mix")).toBe(90);
+    expect(param(snap, "nam_capture", "nam_slim_size")).toBe(100);
     // Non-selected models keep their defaults.
     expect(param(snap, "screamer", "drive_gain")).toBe(
       defaultValueFor("screamer", "drive_gain"),
@@ -280,6 +281,15 @@ describe("snapshotFromRodhareistState", () => {
     const bypass = structuredClone(FIXTURE);
     bypass.params.tone_engine = "Bypass";
     expect(snapshotFromRodhareistState(bypass)?.stageModels.amp).toBe("bypass");
+  });
+
+  test("restores NAM A2 quality when present", () => {
+    const state = {
+      ...FIXTURE,
+      params: { ...FIXTURE.params, nam_slim_size: 40 },
+    };
+    const snap = snapshotFromRodhareistState(state);
+    expect(param(snap!, "nam_capture", "nam_slim_size")).toBe(40);
   });
 
   test("v3 mod/wah fields map onto the selected models", () => {

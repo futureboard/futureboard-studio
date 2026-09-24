@@ -1,6 +1,7 @@
 use gpui::{
-    div, px, svg, AccessibleAction, App, Div, InteractiveElement, IntoElement, ParentElement, Rgba,
-    Role, SharedString, StatefulInteractiveElement, Styled, Window, WindowControlArea,
+    div, px, svg, AccessibleAction, App, Div, InteractiveElement, IntoElement, MouseDownEvent,
+    ParentElement, Rgba, Role, SharedString, StatefulInteractiveElement, Styled, Window,
+    WindowControlArea,
 };
 
 use crate::assets;
@@ -274,8 +275,9 @@ pub fn window_control_button(
 /// So the title *is* the drag region. It takes the free space, truncates inside
 /// it, and carries both halves of window dragging: `WindowControlArea::Drag`,
 /// which is what the Win32 caption hit-test reads (and what makes double-click
-/// to maximise and the system window menu work), and `start_window_move` for
-/// the platforms that need the move started explicitly.
+/// to maximise and the system window menu work), and [`begin_titlebar_drag`]
+/// for the platforms that need the move started explicitly. On macOS that
+/// helper also turns the second click into the system title-bar action.
 pub fn draggable_title(
     icon_path: Option<&'static str>,
     text: impl Into<SharedString>,
@@ -290,9 +292,7 @@ pub fn draggable_title(
         .min_w(px(0.0))
         .h_full()
         .window_control_area(WindowControlArea::Drag)
-        .on_mouse_down(gpui::MouseButton::Left, |_, window, _cx| {
-            window.start_window_move();
-        });
+        .on_mouse_down(gpui::MouseButton::Left, begin_titlebar_drag);
     if let Some(path) = icon_path {
         row = row.child(
             svg()
@@ -321,9 +321,63 @@ pub fn draggable_spacer() -> Div {
         .flex_1()
         .h_full()
         .window_control_area(WindowControlArea::Drag)
-        .on_mouse_down(gpui::MouseButton::Left, |_, window, _cx| {
+        .on_mouse_down(gpui::MouseButton::Left, begin_titlebar_drag)
+}
+
+/// Left click on a title-bar drag region.
+///
+/// Each platform moves a borderless window differently, and getting one
+/// wrong breaks it silently:
+///
+/// * **Windows** moves and maximises through the caption hit-test: the region
+///   is tagged `WindowControlArea::Drag`, `WM_NCHITTEST` answers `HTCAPTION`,
+///   and `DefWindowProc` runs the system move loop, double-click maximise and
+///   the window menu. The backend forwards the caption press here first and
+///   treats a stopped event as handled — it then returns before
+///   `DefWindowProc` ever sees the press, so the window can neither be dragged
+///   nor maximised. The press must therefore be left alone on Windows
+///   (`start_window_move` is a no-op there anyway).
+/// * **macOS** has no system caption under a transparent title bar:
+///   `performWindowDragWithEvent` consumes every click, including the second
+///   click of a double-click, unless that click is handed to
+///   [`Window::titlebar_double_click`] (zoom, fill, or minimize, following
+///   `AppleActionOnDoubleClick`).
+/// * **Linux** needs the move started explicitly.
+pub fn begin_titlebar_drag(event: &MouseDownEvent, window: &mut Window, cx: &mut App) {
+    match titlebar_press(event.click_count) {
+        TitlebarPress::System => {}
+        TitlebarPress::DoubleClick => {
+            cx.stop_propagation();
+            window.titlebar_double_click();
+        }
+        TitlebarPress::Move => {
+            cx.stop_propagation();
             window.start_window_move();
-        })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitlebarPress {
+    /// The OS handles the press from the caption hit-test (Windows).
+    System,
+    /// Run the system title-bar double-click action (macOS).
+    DoubleClick,
+    /// Start an explicit window move.
+    Move,
+}
+
+/// `click_count` is the platform's click count; on macOS it is AppKit's
+/// `NSEvent.clickCount`, and two or more is the click that should zoom
+/// rather than drag.
+fn titlebar_press(click_count: usize) -> TitlebarPress {
+    if cfg!(target_os = "windows") {
+        TitlebarPress::System
+    } else if cfg!(target_os = "macos") && click_count >= 2 {
+        TitlebarPress::DoubleClick
+    } else {
+        TitlebarPress::Move
+    }
 }
 
 /// Compact title bar for external floating dialogs (Project Wizard, Preferences).
@@ -554,6 +608,39 @@ fn external_window_control_button(
         .occlude()
         .on_click(move |_, window, cx| on_click(window, cx))
         .child(window_control_icon(area, icon_path, "").text_color(Colors::text_faint()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{titlebar_press, TitlebarPress};
+
+    #[test]
+    fn a_second_titlebar_click_zooms_only_on_macos() {
+        for clicks in [2, 3] {
+            let expected = if cfg!(target_os = "macos") {
+                TitlebarPress::DoubleClick
+            } else if cfg!(target_os = "windows") {
+                TitlebarPress::System
+            } else {
+                TitlebarPress::Move
+            };
+            assert_eq!(titlebar_press(clicks), expected);
+        }
+    }
+
+    /// Claiming a Windows caption press stops `DefWindowProc` from moving
+    /// or maximising the window, so Windows must always leave it alone.
+    #[test]
+    fn windows_leaves_every_caption_press_to_the_system() {
+        for clicks in 0..4 {
+            let press = titlebar_press(clicks);
+            if cfg!(target_os = "windows") {
+                assert_eq!(press, TitlebarPress::System);
+            } else {
+                assert_ne!(press, TitlebarPress::System);
+            }
+        }
+    }
 }
 
 pub fn status_item(text: impl Into<String>, strong: bool) -> impl gpui::IntoElement {

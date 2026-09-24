@@ -229,10 +229,12 @@ impl ExportArrangementWindow {
             .with_placeholder("Export name");
         name_input.set_value(&stem);
 
-        let mut range_start_input =
-            TextInputState::new("export-range-start", cx.focus_handle()).with_placeholder("0");
-        let mut range_end_input =
-            TextInputState::new("export-range-end", cx.focus_handle()).with_placeholder("0");
+        let mut range_start_input = TextInputState::new("export-range-start", cx.focus_handle())
+            .with_placeholder("0")
+            .with_ascii_charset("0123456789.");
+        let mut range_end_input = TextInputState::new("export-range-end", cx.focus_handle())
+            .with_placeholder("0")
+            .with_ascii_charset("0123456789.");
         range_start_input.set_value(format_beats(0.0));
         range_end_input.set_value(format_beats(defaults.content_end_beat.max(1.0)));
 

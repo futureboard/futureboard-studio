@@ -1,7 +1,7 @@
 use gpui::{
-    div, px, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
     KeyDownEvent, ParentElement, Render, Role, StatefulInteractiveElement, Styled,
-    UniformListScrollHandle, Window, WindowHandle,
+    UniformListScrollHandle, Window, WindowHandle, div, px,
 };
 
 pub use crate::shutdown::ShutdownState;
@@ -13,22 +13,22 @@ pub use session_load::PreparedWorkspaceFinish;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use crate::components;
+use crate::components::BottomPanelState;
+use crate::components::MixerWindow;
 use crate::components::add_track_dialog::AddTrackKind;
 use crate::components::edit::ClipSnapshot;
 use crate::components::file_browser::FileBrowserState;
 use crate::components::plugin_picker::{
-    compute_filter_result, ensure_default_highlight, plugin_picker_overlay,
     CatalogStatus as PluginCatalogStatus, PickerFilter, PluginPickerCallbacks, PluginPickerPrefs,
-    PluginPickerScrollHandles, PluginPickerState, PluginSearchIndex,
+    PluginPickerScrollHandles, PluginPickerState, PluginSearchIndex, compute_filter_result,
+    ensure_default_highlight, plugin_picker_overlay,
 };
 use crate::components::project_switcher::ProjectSwitcherState;
 use crate::components::text_input::{
-    text_input_context_entries, TextInputCallbacks, TextInputState,
+    TextInputCallbacks, TextInputState, text_input_context_entries,
 };
 use crate::components::timeline::timeline::TimelineContextTarget;
 use crate::components::timeline::timeline_state::{ClipType, TempoCurve};
-use crate::components::BottomPanelState;
-use crate::components::MixerWindow;
 use crate::components::{BackgroundTaskStore, CommandPaletteState};
 use crate::overlay::{project_title_anchor, titlebar_label_anchor};
 use crate::paths::FutureboardPaths;
@@ -41,10 +41,12 @@ mod ara_graph;
 mod ara_menu;
 pub(crate) mod ara_ops;
 mod ara_studio;
+mod audio_editor_ops;
 mod audio_tool_ops;
 mod audio_transport;
 mod bottom_panel_ops;
 mod browser_ops;
+mod chord_ops;
 mod close_ops;
 mod context_menu_ops;
 pub(crate) mod engine_snapshot;
@@ -67,6 +69,7 @@ mod plugin_load_progress;
 mod plugin_ops;
 mod plugin_picker_window;
 mod plugin_restore;
+mod project_key_ops;
 mod project_ops;
 mod project_switch;
 mod recording_ops;
@@ -77,6 +80,8 @@ mod shell_regions;
 mod stretch_tempo_ops;
 mod studio_render;
 mod studio_state;
+mod tempo_key_ops;
+mod tempo_map_ops;
 mod track_clip_ops;
 mod transport_freeze_debug;
 mod transport_ops;
@@ -89,9 +94,10 @@ pub use context_menu_ops::{ContextMenuRequest, ContextMenuTarget};
 use engine_snapshot::volume_norm_to_linear;
 use frame_diagnostics::FrameDiagnostics;
 use helpers::{
-    edit_command_debug, find_clip_summary, is_midi_routable_edit_command, is_supported_audio_ext,
-    is_tap_tempo_command, is_text_input_key, key_debug, normalize_command_id, reveal_path,
-    should_handle_global_transport_shortcut, transport_command_from_id, FocusContext,
+    FocusContext, edit_command_debug, find_clip_summary, is_midi_routable_edit_command,
+    is_supported_audio_ext, is_tap_tempo_command, is_text_input_key, key_debug,
+    normalize_command_id, reveal_path, should_handle_global_transport_shortcut,
+    transport_command_from_id,
 };
 use project_ops::LifecycleAction;
 pub use studio_state::{
@@ -111,7 +117,7 @@ fn use_demo_project() -> bool {
 /// it's safe to call at app launch and again when the studio is built.
 fn apply_renderer_preference(schema: &crate::settings::SettingsSchema) {
     use crate::components::timeline::render::{
-        set_preferred_backend, set_preferred_gpu_device_id, TimelineRendererBackend,
+        TimelineRendererBackend, set_preferred_backend, set_preferred_gpu_device_id,
     };
     use crate::settings::RenderMode;
     let chosen = match schema.performance.render_mode {
@@ -128,7 +134,7 @@ fn apply_renderer_preference(schema: &crate::settings::SettingsSchema) {
     // mixer until the GPU path is visually verified. The backend itself is always
     // GPUI-paint today (offscreen WGPU is parked / falls back).
     {
-        use crate::components::mixer_render::{set_preferred_mixer_backend, MixerRendererBackend};
+        use crate::components::mixer_render::{MixerRendererBackend, set_preferred_mixer_backend};
         use crate::components::mixer_surface::set_mixer_gpu_primitives_enabled;
         let mixer_backend = match schema.performance.render_mode {
             #[cfg(feature = "gpu-renderer")]
@@ -593,7 +599,13 @@ pub struct StudioLayout {
     stretch_tempo: stretch_tempo_ops::StretchTempoState,
     /// Floating audio-editor analysis/processing windows.
     audio_tools: crate::components::AudioToolWindowManager,
-    audio_editor_audition_owned: bool,
+    /// The Chord Generator utility window, when open.
+    chord_generator:
+        Option<gpui::WindowHandle<crate::components::chord_generator::ChordGeneratorWindow>>,
+    chord_generator_bounds: Option<gpui::Bounds<gpui::Pixels>>,
+    /// End beat of a play-selection audition started from the Audio Editor;
+    /// playback stops when the playhead reaches it.
+    audio_editor_audition_end: Option<f32>,
     /// Throttle / sync timestamps for engine ↔ UI bridging (playhead, snapshot
     /// sync, meter push, tempo commit). Grouped into
     /// [`audio_transport::EngineSyncState`] (decomposition slice).
@@ -793,7 +805,12 @@ impl StudioLayout {
         };
         let audio_editor = {
             let timeline = timeline.clone();
-            cx.new(|cx| components::AudioEditorHost::new(timeline, cx))
+            let callbacks = Self::audio_editor_callbacks(&cx.entity());
+            cx.new(|cx| {
+                let mut editor = components::AudioEditorHost::new(timeline, cx);
+                editor.set_callbacks(callbacks);
+                editor
+            })
         };
         let ara_editor = {
             let owner = cx.entity();
@@ -1141,6 +1158,26 @@ impl StudioLayout {
         {
             let target = cx.entity().clone();
             let _ = timeline.update(cx, |timeline, _cx| {
+                timeline.set_plugin_drag_drop_callback(Some(Arc::new(
+                    move |item, drop_target, window, cx| {
+                        let plugin_id = item.plugin_id.clone();
+                        let drop_target = drop_target.clone();
+                        let kind = item.kind;
+                        StudioLayout::defer_update_in_window(
+                            &target,
+                            window,
+                            cx,
+                            move |this, _window, cx| {
+                                this.apply_dropped_plugin_drag(&plugin_id, &drop_target, kind, cx);
+                            },
+                        );
+                    },
+                )));
+            });
+        }
+        {
+            let target = cx.entity().clone();
+            let _ = timeline.update(cx, |timeline, _cx| {
                 timeline.set_midi_import_prompt_callback(Some(Arc::new(
                     move |request, window, cx| {
                         // Deferred for the same nested-update reason as the
@@ -1213,7 +1250,9 @@ impl StudioLayout {
             background_tasks: BackgroundTaskStore::default(),
             stretch_tempo: stretch_tempo_ops::StretchTempoState::default(),
             audio_tools: crate::components::AudioToolWindowManager::default(),
-            audio_editor_audition_owned: false,
+            chord_generator: None,
+            chord_generator_bounds: None,
+            audio_editor_audition_end: None,
             project_switcher: ProjectSwitcherState::default(),
             project_switcher_search_input: TextInputState::new(
                 "project-switcher-search-input",
@@ -1293,7 +1332,11 @@ impl StudioLayout {
             window_hooks: window_ops::StudioWindowHooks::default(),
             lifecycle_guard: close_ops::LifecycleGuardState::default(),
             project_switch: project_switch::ProjectSwitchGuardState::default(),
-            keymap_manager: crate::keymap::KeymapManager::new(app_data),
+            keymap_manager: {
+                let manager = crate::keymap::KeymapManager::new(app_data.clone());
+                crate::keymap::init_global_keymap(app_data);
+                manager
+            },
             project_state: crate::app_state::ProjectState::NoProject,
             last_window_title: None,
             session_install_status: crate::app_state::SessionInstallStatus::Ready,
@@ -1306,7 +1349,8 @@ impl StudioLayout {
             autosave_in_flight: false,
             session_generation: 0,
             last_external_mixer_meter_push: std::time::Instant::now(),
-            pending_secondary_window_restore: crate::workspace_layout::SavedSecondaryWindows::default(),
+            pending_secondary_window_restore:
+                crate::workspace_layout::SavedSecondaryWindows::default(),
         };
 
         layout.ensure_mixer_tree_defaults_once(cx);
@@ -1390,6 +1434,9 @@ impl StudioLayout {
                         this.audio_bridge.last_error = None;
                         this.audio_bridge.engine = Some(engine);
                         this.sync_plugin_bridge_sinks_to_engine(cx, "studio_audio_ready");
+                        // ARA sessions of a project restored before the engine
+                        // existed open now.
+                        this.open_pending_ara_sessions(cx);
                         this.schedule_audio_project_sync(cx, true, "studio_audio_ready");
                         crate::boot::log("audio engine handle ready");
                         cx.notify();
@@ -1740,6 +1787,12 @@ impl StudioLayout {
             eprintln!("[SessionLoad] command blocked during install: {command_id}");
             return;
         }
+        if self.route_edit_command_to_audio_editor(command_id, cx) {
+            return;
+        }
+        if self.handle_project_key_command(command_id, cx) {
+            return;
+        }
         if command_id == "overlay:theme" {
             self.command_palette.open();
             self.command_palette_input.set_value("overlay:theme");
@@ -1771,6 +1824,30 @@ impl StudioLayout {
                 self.overlay.open_popover = None;
                 cx.notify();
             }
+            return;
+        }
+        if let Some(value) = command_id.strip_prefix("metronome:set-volume:") {
+            if let Ok(percent) = value.parse::<u32>() {
+                let volume = (percent as f32 / 100.0).clamp(0.0, 1.0);
+                self.settings.update(cx, |settings, cx| {
+                    settings.update_setting(
+                        move |schema| schema.recording.metronome.volume = volume,
+                        cx,
+                    );
+                });
+                self.overlay.open_popover = None;
+                cx.notify();
+            }
+            return;
+        }
+        if command_id == "settings:open-metronome" {
+            self.open_settings_dialog_on_tab(
+                owner_bounds,
+                Some(crate::components::SettingsTab::Metronome),
+                cx,
+            );
+            self.overlay.open_popover = None;
+            cx.notify();
             return;
         }
         if edit_command_debug() && is_midi_routable_edit_command(command_id) {
@@ -1941,14 +2018,30 @@ impl StudioLayout {
                     self.set_tempo_point_curve(&id, TempoCurve::Hold, cx);
                 }
             }
+            // Linear is a straight ramp: it also clears any bend.
             "tempo:curve-linear" => {
                 if let Some(id) = self.tempo_track_context_point_id() {
-                    self.set_tempo_point_curve(&id, TempoCurve::Linear, cx);
+                    self.set_tempo_point_bend(&id, 0.0, cx);
                 }
             }
             "tempo:curve-smooth" => {
                 if let Some(id) = self.tempo_track_context_point_id() {
                     self.set_tempo_point_curve(&id, TempoCurve::Smooth, cx);
+                }
+            }
+            "tempo:bend-ease-in" => {
+                if let Some(id) = self.tempo_track_context_point_id() {
+                    self.set_tempo_point_bend(&id, 0.5, cx);
+                }
+            }
+            "tempo:bend-ease-out" => {
+                if let Some(id) = self.tempo_track_context_point_id() {
+                    self.set_tempo_point_bend(&id, -0.5, cx);
+                }
+            }
+            "tempo:bend-straight" => {
+                if let Some(id) = self.tempo_track_context_point_id() {
+                    self.set_tempo_point_bend(&id, 0.0, cx);
                 }
             }
             "ruler:create-tempo-here" => {
@@ -2463,6 +2556,9 @@ impl StudioLayout {
             "window:performance" | "view:performance" => {
                 self.open_performance_window(owner_bounds, cx)
             }
+            "midi:sysex-editor" | "window:sysex-editor" => {
+                self.open_sysex_editor_window(owner_bounds, cx)
+            }
 
             "track:add" | "track:show-add-dialog" | "project:add-track" => {
                 self.open_add_track_external_window(AddTrackKind::Audio, owner_bounds, cx)
@@ -2635,6 +2731,16 @@ impl StudioLayout {
                 }
             }
             "clip:split-at-playhead" => self.split_selected_audio_clip_at_playhead(cx),
+            "audio:find-tempo-key" => self.open_tempo_key_finder(cx),
+            "chords:open-track" => self.set_chord_track_visible(true, cx),
+            "chords:hide-track" => self.set_chord_track_visible(false, cx),
+            "chords:toggle-track" => {
+                let visible = self.timeline.read(cx).state.show_chord_track;
+                self.set_chord_track_visible(!visible, cx);
+            }
+            "chords:clear-all" => self.clear_chord_track_command(cx),
+            "chords:to-midi" => self.chord_track_to_midi_command(cx),
+            "chords:open-generator" => self.open_chord_generator(cx),
 
             // ── Tools — switch the active timeline tool. UI-only; never dirties
             // the engine. The piano roll owns its own tool keys when focused.

@@ -860,6 +860,26 @@ impl AudioEngine {
             .plugin_preview_all_notes_off(track_id, plugin_instance_id)
     }
 
+    pub fn midi_preview_pitch_bend(
+        &self,
+        track_id: String,
+        channel: u8,
+        value: u16,
+    ) -> Result<(), SphereAudioError> {
+        self.inner.midi_preview_pitch_bend(track_id, channel, value)
+    }
+
+    pub fn plugin_preview_pitch_bend(
+        &self,
+        track_id: String,
+        plugin_instance_id: String,
+        channel: u8,
+        value: u16,
+    ) -> Result<(), SphereAudioError> {
+        self.inner
+            .plugin_preview_pitch_bend(track_id, plugin_instance_id, channel, value)
+    }
+
     /// Toggle the transport between play and pause. Returns the new playing
     /// state. No-ops cleanly if the stream is not open yet.
     pub fn toggle_transport(&self) -> Result<bool, SphereAudioError> {

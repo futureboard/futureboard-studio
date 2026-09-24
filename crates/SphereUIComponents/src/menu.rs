@@ -203,6 +203,21 @@ mod tests {
         }
     }
 
+    /// The Chord Generator is a standalone window, so it lives in the Window
+    /// menu as well as under MIDI.
+    #[test]
+    fn the_chord_generator_is_in_the_window_menu() {
+        let window = MenuManifest::load()
+            .menus
+            .iter()
+            .find(|menu| menu.id == "window")
+            .expect("window menu");
+        assert!(window
+            .items
+            .iter()
+            .any(|item| item.command.as_deref() == Some("chords:open-generator")));
+    }
+
     /// A malformed manifest degrades to the fallback shell rather than
     /// panicking, so this is worth asserting rather than assuming: if the
     /// embedded JSON ever stops parsing, every menu silently empties.

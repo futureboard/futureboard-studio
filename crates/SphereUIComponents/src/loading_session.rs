@@ -31,7 +31,7 @@ pub use crate::session_shutdown::{
 use crate::theme::{self, Colors};
 
 const LOAD_WINDOW_WIDTH: f32 = 430.0;
-const LOAD_WINDOW_HEIGHT: f32 = 168.0;
+const LOAD_WINDOW_HEIGHT: f32 = 184.0;
 const BODY_PAD_X: f32 = 16.0;
 const BODY_PAD_Y: f32 = 14.0;
 const BODY_GAP: f32 = 10.0;
@@ -688,9 +688,10 @@ impl LoadingSessionWindow {
                     }
                 };
                 if !path.exists() {
+                    let i18n = crate::i18n::I18n::from_app(cx);
                     self.finish_failure(
                         "Open Project Failed",
-                        "The project file could not be found at the saved location.",
+                        &i18n.tr("project.error.file-not-found"),
                         Some(format!("Details: {}", path.display())),
                         cx,
                     );
@@ -730,7 +731,7 @@ impl LoadingSessionWindow {
                 cx.spawn(async move |_entity, cx| {
                     let decoded = cx
                         .background_executor()
-                        .spawn(async move { load_project(&path) })
+                        .spawn(async move { load_project(&path, true) })
                         .await;
                     let _ = this.update(cx, |this, cx| this.on_decode_complete(decoded, cx));
                 })
@@ -742,9 +743,10 @@ impl LoadingSessionWindow {
                 };
                 let Some(project) = transaction.project.take() else {
                     self.transaction = Some(transaction);
+                    let i18n = crate::i18n::I18n::from_app(cx);
                     self.finish_failure(
                         "Open Project Failed",
-                        "The project file could not be restored into the session.",
+                        &i18n.tr("project.error.restore-session-failed"),
                         Some("Decoded project data was missing.".to_string()),
                         cx,
                     );
@@ -1005,9 +1007,10 @@ fn spawn_session_install(
                 }
                 Err(error) => {
                     session_log!("session install failed: {error}");
+                    let i18n = crate::i18n::I18n::from_app(cx);
                     let ctx = LoadFailedContext {
                         title: "Open Project Failed".to_string(),
-                        message: "The project could not be restored into the session.".to_string(),
+                        message: i18n.tr("project.error.restore-session-failed"),
                         detail: Some(format!("Details: {error}")),
                         path: Some(path),
                         open_options,
@@ -1141,6 +1144,39 @@ impl Render for LoadingSessionWindow {
                 }) as crate::components::title_bar::WindowChromeCloseCb
             });
 
+        let title = div()
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(Colors::text_primary())
+            .child(heading);
+        let heading_row = if has_error {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(px(22.0))
+                        .h(px(22.0))
+                        .rounded(px(crate::theme::radius::PILL))
+                        .border(px(1.0))
+                        .border_color(Colors::with_alpha(Colors::status_error(), 0.35))
+                        .bg(Colors::with_alpha(Colors::status_error(), 0.10))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(12.0))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(Colors::status_error())
+                        .child("!"),
+                )
+                .child(title)
+        } else {
+            div().flex().flex_row().items_center().child(title)
+        };
+
         let mut body = div()
             .flex()
             .flex_col()
@@ -1148,22 +1184,16 @@ impl Render for LoadingSessionWindow {
             .px(px(BODY_PAD_X))
             .py(px(BODY_PAD_Y))
             .gap(px(BODY_GAP))
+            .child(heading_row)
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_size(px(11.0))
+                    .line_height(px(16.0))
                     .text_color(if has_error {
-                        Colors::accent_danger()
+                        Colors::text_secondary()
                     } else {
-                        Colors::text_primary()
+                        Colors::text_muted()
                     })
-                    .child(heading),
-            )
-            .child(
-                div()
-                    .text_size(px(10.0))
-                    .line_height(px(15.0))
-                    .text_color(Colors::text_muted())
                     .child(detail),
             );
 
@@ -1216,13 +1246,9 @@ impl Render for LoadingSessionWindow {
             .font(theme::ui_font())
             .bg(Colors::surface_base())
             .overflow_hidden()
-            .rounded(px(crate::theme::radius::CONTROL))
+            .rounded(px(crate::theme::radius::DIALOG))
             .border(px(1.0))
-            .border_color(if has_error {
-                Colors::accent_danger()
-            } else {
-                Colors::border_subtle()
-            })
+            .border_color(Colors::border_subtle())
             .shadow(vec![gpui::BoxShadow {
                 color: Colors::surface_overlay().into(),
                 offset: gpui::point(px(0.0), px(6.0)),
@@ -1284,7 +1310,7 @@ fn run_headless_load(
         return;
     }
     match validate_project_file(&path) {
-        Ok(_) => match load_project(&path) {
+        Ok(_) => match load_project(&path, true) {
             Ok(project) => on_success(
                 LoadedSessionPackage {
                     project,

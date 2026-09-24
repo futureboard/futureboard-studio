@@ -86,19 +86,19 @@ impl MdxModel {
             })?;
 
         let input = session
-            .inputs
+            .inputs()
             .first()
             .ok_or_else(|| backend_err("ONNX model has no inputs"))?;
         let output = session
-            .outputs
+            .outputs()
             .first()
             .ok_or_else(|| backend_err("ONNX model has no outputs"))?;
-        let input_name = input.name.clone();
-        let output_name = output.name.clone();
+        let input_name = input.name().to_owned();
+        let output_name = output.name().to_owned();
 
         // Prefer the model's own static input dims for dim_f/dim_t: input is
         // `[batch, 4, dim_f, dim_t]`. Dynamic (-1) axes keep the table value.
-        if let ValueType::Tensor { shape, .. } = &input.input_type {
+        if let ValueType::Tensor { shape, .. } = input.dtype() {
             if shape.len() == 4 {
                 if shape[2] > 0 {
                     params.dim_f = shape[2] as usize;
@@ -293,7 +293,7 @@ impl MdxModel {
 
     /// Run one inference chunk, returning the flat `[1, 4, dim_f, dim_t]` output.
     fn run(&mut self, spec: Array4<f32>) -> Result<Vec<f32>, StemExtractError> {
-        let input = Tensor::from_array(spec)
+        let input = Tensor::from_array((spec.shape().to_vec(), spec.into_raw_vec_and_offset().0))
             .map_err(|e| backend_err(format!("ONNX input tensor build failed: {e}")))?;
         let outputs = self
             .session

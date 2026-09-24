@@ -230,6 +230,17 @@ export const APP_MENUS: AppMenuGroup[] = [
     label: "View",
     children: [
       {
+        id: "view.chord_track",
+        label: "Chord Track",
+        checked: false,
+        action: "chords:toggle-track",
+        description: "Show or hide the global Chord Track under the ruler",
+      },
+      {
+        type: "separator",
+        id: "view.sep.lanes",
+      },
+      {
         id: "view.developer",
         type: "submenu",
         label: "Developer",
@@ -237,6 +248,7 @@ export const APP_MENUS: AppMenuGroup[] = [
           {
             id: "view.developer.perf_metrics",
             label: "Show Performance Metrics",
+            accelerator: "F3",
             checked: false,
             action: "view:toggle-perf-metrics",
             description: "Compact FPS and frame time in the status bar",
@@ -244,6 +256,7 @@ export const APP_MENUS: AppMenuGroup[] = [
           {
             id: "view.developer.perf_overlay",
             label: "Toggle Performance Overlay",
+            accelerator: "F4",
             checked: false,
             action: "view:toggle-perf-overlay",
             description: "Verbose real-time performance overlay",
@@ -263,6 +276,14 @@ export const APP_MENUS: AppMenuGroup[] = [
         accelerator: "Ctrl+Shift+M",
         icon: "keyboard-music",
         action: "midi:open-editor",
+      },
+      {
+        id: "midi.sysex_editor",
+        label: "SysEx Editor...",
+        icon: "binary",
+        action: "midi:sysex-editor",
+        description:
+          "View, write and fix Roland, Yamaha, Korg and Universal SysEx on a clip or on markers",
       },
       {
         id: "midi.virtual_keyboard",
@@ -303,6 +324,26 @@ export const APP_MENUS: AppMenuGroup[] = [
         icon: "maximize-2",
         accelerator: "Ctrl+Alt+5",
         action: "midi:fit-notes",
+      },
+      {
+        type: "separator",
+        id: "midi.sep.chords",
+      },
+      {
+        id: "midi.chord_generator",
+        label: "Chord Generator...",
+        icon: "music",
+        action: "chords:open-generator",
+        description:
+          "Generate a progression in any key and scale, then drag it onto the Chord Track or a MIDI track",
+      },
+      {
+        id: "midi.chords_to_midi",
+        label: "Create MIDI Clip from Chord Track",
+        icon: "list-music",
+        action: "chords:to-midi",
+        description:
+          "Write every chord on the Chord Track as one voiced MIDI clip on the selected MIDI track",
       },
       {
         type: "separator",
@@ -376,6 +417,7 @@ export const APP_MENUS: AppMenuGroup[] = [
       {
         id: "project.add_plugin_track",
         label: "Add Plugin Track",
+        accelerator: "F5",
         icon: "cpu",
         action: "track:add-plugin",
       },
@@ -550,6 +592,13 @@ export const APP_MENUS: AppMenuGroup[] = [
         accelerator: "Ctrl+Alt+Shift+E",
         action: "audio:stem-extractor",
         description: "Separate a mix into stems with MDX-NET (CPU/GPU)",
+      },
+      {
+        id: "audio.find_tempo_key",
+        label: "Find Tempo & Key...",
+        icon: "scan-search",
+        action: "audio:find-tempo-key",
+        description: "Detect the tempo and key of the selected audio clip",
       },
       {
         type: "separator",
@@ -730,6 +779,14 @@ export const APP_MENUS: AppMenuGroup[] = [
           "Browse and install community themes and extensions from the registry",
       },
       {
+        id: "window.chord_generator",
+        label: "Chord Generator...",
+        icon: "music",
+        action: "chords:open-generator",
+        description:
+          "Generate a progression in any key and scale, then drag it onto the Chord Track or a MIDI track",
+      },
+      {
         type: "separator",
         id: "window.sep.song_text",
       },
@@ -750,6 +807,7 @@ export const APP_MENUS: AppMenuGroup[] = [
       {
         id: "window.lyric_editor_panel",
         label: "Lyric Editor in Right Dock",
+        accelerator: "Ctrl+Alt+Shift+L",
         icon: "pencil",
         action: "panel:show-lyric-editor",
       },
@@ -780,41 +838,49 @@ export const APP_MENUS: AppMenuGroup[] = [
           {
             id: "song_text.commit",
             label: "Commit Song Text Edit",
+            accelerator: "Enter",
             action: "song_text.commit",
           },
           {
             id: "song_text.commit_next_grid",
             label: "Commit and Advance to Next Grid",
+            accelerator: "Shift+Enter",
             action: "song_text.commit_next_grid",
           },
           {
             id: "song_text.commit_next_beat",
             label: "Commit and Advance to Next Beat",
+            accelerator: "Ctrl+Enter",
             action: "song_text.commit_next_beat",
           },
           {
             id: "song_text.commit_next_bar",
             label: "Commit and Advance to Next Bar",
+            accelerator: "Ctrl+Shift+Enter",
             action: "song_text.commit_next_bar",
           },
           {
             id: "song_text.previous_event",
             label: "Previous Song Text Event",
+            accelerator: "Ctrl+Alt+W",
             action: "song_text.previous_event",
           },
           {
             id: "song_text.next_event",
             label: "Next Song Text Event",
+            accelerator: "Ctrl+Alt+Y",
             action: "song_text.next_event",
           },
           {
             id: "song_text.move_to_playhead",
             label: "Move Song Text to Playhead",
+            accelerator: "F6",
             action: "song_text.move_to_playhead",
           },
           {
             id: "song_text.delete_selected",
             label: "Delete Selected Song Text",
+            accelerator: "Shift+Delete",
             action: "song_text.delete_selected",
           },
         ],

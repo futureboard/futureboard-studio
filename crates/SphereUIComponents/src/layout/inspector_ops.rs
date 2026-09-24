@@ -1025,8 +1025,8 @@ impl StudioLayout {
                     cx,
                     move |this, window, cx| {
                         inspector_debug(&format!(
-                        "insert picker track={track_id} slot={slot_index} kind={desired_kind:?}"
-                    ));
+                            "insert picker track={track_id} slot={slot_index} kind={desired_kind:?}"
+                        ));
                         this.open_insert_picker_for(
                             &track_id,
                             Some(slot_index),
@@ -1302,8 +1302,8 @@ impl StudioLayout {
                     cx,
                     move |this, window, cx| {
                         inspector_debug(&format!(
-                        "insert open_editor track={track_id} index={insert_index} insert={insert_id}"
-                    ));
+                            "insert open_editor track={track_id} index={insert_index} insert={insert_id}"
+                        ));
                         this.open_insert_editor(&track_id, insert_index, &insert_id, window, cx);
                     },
                 );

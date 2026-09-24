@@ -192,8 +192,14 @@ pub enum ContextTarget {
     TapTempo,
     /// Record count-in duration dropdown from the transport control.
     CountIn,
+    /// Metronome volume / settings menu from the transport control.
+    Metronome,
     /// The compact time signature menu from the transport display.
     TimeSignature,
+    /// Key root picker from the transport's key readout.
+    ProjectKeyRoot,
+    /// Scale picker from the transport's key readout.
+    ProjectKeyScale,
     /// Right-click on a time signature marker on the ruler or lane.
     TimeSignaturePoint {
         point_id: String,
@@ -219,6 +225,13 @@ pub enum ContextTarget {
     },
     /// Region lane header menu — lane-level actions only.
     RegionLane,
+    /// Right-click on the empty Chord Track (a chord is deleted outright).
+    ChordTrack {
+        beat: f64,
+        event_id: Option<u64>,
+    },
+    /// Chord Track header menu — lane-level actions only.
+    ChordLane,
     /// Right-click on the global Tempo Track lane.
     TempoTrack {
         beat: f64,

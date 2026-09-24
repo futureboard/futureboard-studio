@@ -5,7 +5,7 @@ on:
     branches:
       - main
       - master
-      - develop
+      - dev
     tags:
       - "v*"
   workflow_dispatch:

@@ -131,6 +131,7 @@ pub fn mixer_tree_sidebar(
     let reset_vis = callbacks.on_reset_visibility.clone();
 
     let filter_callbacks = TextInputCallbacks {
+        on_mouse_down_out: None,
         on_context_command: None,
         on_context_menu: Some(on_filter_context_menu),
         on_mouse: None,

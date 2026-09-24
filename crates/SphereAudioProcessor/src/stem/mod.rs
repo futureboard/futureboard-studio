@@ -10,10 +10,12 @@ pub use sphere_stem_extractor::{
     HTDEMUCS_MODEL_BASE, InferBackendKind, InferDevice, STEM_MODELS, StemExtractCancelToken,
     StemExtractError, StemExtractInput, StemExtractOutput, StemExtractParams, StemExtractProgress,
     StemExtractQuality, StemExtractResult, StemExtractStage, StemInferBackend, StemKind, StemModel,
+    StemPlatform, StemPlatformRuntime,
     StemModelDownloadProgress, StemModelFile, StemModelInfo, StemModelPackage, StemSet,
     UVR_MODEL_RELEASE_BASE, create_mdx_net_backend, default_models_dir, download_model,
-    ensure_models_dir, extract_stems, gpu_available, model_installed, resolve_device,
-    resolve_installed_model_files, set_gpu_detected,
+    current_stem_platform, ensure_models_dir, extract_stems, gpu_available, model_installed,
+    resolve_current_platform_runtime, resolve_device, resolve_installed_model_files,
+    resolve_platform_runtime, set_gpu_detected,
 };
 
 /// Convenience constructor matching the Stem Extractor dialog defaults:

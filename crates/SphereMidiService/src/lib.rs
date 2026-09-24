@@ -10,8 +10,10 @@ use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub mod chords;
 pub mod expression;
 pub mod mpe;
+pub mod sysex;
 
 pub use expression::{
     CustomExpressionLane, ExpressionCurve, ExpressionInterpolation, ExpressionPoint,
@@ -1232,18 +1234,22 @@ fn midi_order_key(event: &HardwareMidiEvent) -> (u8, u8, u8, u8) {
     let data1 = event.message.get(1).copied().unwrap_or(0);
     let data2 = event.message.get(2).copied().unwrap_or(0);
     let group = match kind {
-        0x80 => 0,
-        0x90 if data2 == 0 => 0,
-        0xb0 if data1 == 64 && data2 == 0 => 1,
-        0xb0 if data1 == 120 || data1 == 123 => 1,
-        0xc0 => 2,
-        0xb0 if data1 == 0 || data1 == 32 => 3,
-        0xb0 => 4,
-        0xe0 => 5,
-        0xa0 | 0xd0 => 6,
-        0x90 => 7,
-        0xf0 => 8,
-        _ => 9,
+        // SysEx leads its timestamp: a GS/XG/GM reset or a part setup has to
+        // land before the program changes and notes it configures, or the
+        // reset wipes them.
+        0xf0 if status == 0xf0 => 0,
+        0x80 => 1,
+        0x90 if data2 == 0 => 1,
+        0xb0 if data1 == 64 && data2 == 0 => 2,
+        0xb0 if data1 == 120 || data1 == 123 => 2,
+        0xc0 => 3,
+        0xb0 if data1 == 0 || data1 == 32 => 4,
+        0xb0 => 5,
+        0xe0 => 6,
+        0xa0 | 0xd0 => 7,
+        0x90 => 8,
+        0xf0 => 9,
+        _ => 10,
     };
     (group, channel, data1, data2)
 }

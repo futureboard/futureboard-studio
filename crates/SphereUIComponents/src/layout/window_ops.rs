@@ -11,6 +11,7 @@ use crate::components::keymap_window::{open_keymap_window, KeymapChangedCb};
 use crate::components::midi_editor_window::{midi_editor_debug, open_midi_editor_window};
 use crate::components::settings_dialog::{
     open_settings_window, AudioDeviceListsProvider, OnSettingUpdate, SettingsAudioDeviceLists,
+    SettingsTab,
 };
 use crate::components::timeline::timeline_state::{
     self, ClipType, CreateTrackOptions, InsertPluginFormat, TrackAudioFormat,
@@ -268,6 +269,9 @@ pub(crate) struct ExternalWindows {
     /// Performance Monitor — engine latency and PDC, cores, memory and drives.
     pub performance:
         Option<gpui::WindowHandle<crate::components::performance_window::PerformanceWindow>>,
+    /// SysEx Editor — clip and marker System Exclusive messages.
+    pub sysex_editor:
+        Option<gpui::WindowHandle<crate::components::sysex_editor_window::SysExEditorWindow>>,
 }
 
 impl StudioLayout {
@@ -1447,11 +1451,25 @@ impl StudioLayout {
         owner_bounds: Option<Bounds<gpui::Pixels>>,
         cx: &mut Context<Self>,
     ) {
+        self.open_settings_dialog_on_tab(owner_bounds, None, cx);
+    }
+
+    pub(super) fn open_settings_dialog_on_tab(
+        &mut self,
+        owner_bounds: Option<Bounds<gpui::Pixels>>,
+        tab: Option<SettingsTab>,
+        cx: &mut Context<Self>,
+    ) {
         let open_started = std::time::Instant::now();
-        // If window is already open, activate it
+        // If window is already open, activate it — and jump to `tab` when asked.
         if let Some(handle) = self.external_windows.settings.clone() {
             if handle
-                .update(cx, |_settings, window, _cx| window.activate_window())
+                .update(cx, |settings, window, cx| {
+                    if let Some(tab) = tab {
+                        settings.set_active_tab(tab, cx);
+                    }
+                    window.activate_window();
+                })
                 .is_ok()
             {
                 return;
@@ -1630,7 +1648,14 @@ impl StudioLayout {
             on_open_plugin_manager,
             cx,
         ) {
-            Ok(handle) => self.external_windows.settings = Some(handle),
+            Ok(handle) => {
+                if let Some(tab) = tab {
+                    let _ = handle.update(cx, |settings, _window, cx| {
+                        settings.set_active_tab(tab, cx);
+                    });
+                }
+                self.external_windows.settings = Some(handle);
+            }
             Err(err) => eprintln!("[settings] failed to open settings window: {err}"),
         }
 
@@ -2015,6 +2040,38 @@ impl StudioLayout {
         self.reopen_audio_with_sample_rate(rate, cx);
     }
 
+    pub(super) fn open_sysex_editor_window(
+        &mut self,
+        owner_bounds: Option<Bounds<gpui::Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = self.external_windows.sysex_editor.clone() {
+            if handle
+                .update(cx, |_view, window, _cx| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.external_windows.sysex_editor = None;
+        }
+        let owner = cx.entity().downgrade();
+        let on_close: Arc<dyn Fn(&mut App) + Send + Sync> = Arc::new(move |app| {
+            let _ = owner.update(app, |layout, cx| {
+                layout.external_windows.sysex_editor = None;
+                cx.notify();
+            });
+        });
+        match crate::components::sysex_editor_window::open_sysex_editor_window(
+            owner_bounds,
+            self.timeline.clone(),
+            on_close,
+            cx,
+        ) {
+            Ok(handle) => self.external_windows.sysex_editor = Some(handle),
+            Err(err) => eprintln!("[sysex-editor] failed to open window: {err}"),
+        }
+    }
+
     pub(super) fn open_performance_window(
         &mut self,
         owner_bounds: Option<Bounds<gpui::Pixels>>,
@@ -2098,6 +2155,7 @@ impl StudioLayout {
             time_signature: (base_ts.numerator as u32, base_ts.denominator as u32),
             has_tempo_markers: !timeline.state.tempo_map.points.is_empty(),
             has_time_signature_markers: timeline.state.time_signature_has_markers(),
+            project_key: timeline.state.project_key,
             sample_rate: timeline.state.project_sample_rate,
             engine_sample_rate,
             time_display_format: timeline.state.time_display_format,
@@ -2166,6 +2224,14 @@ impl StudioLayout {
                     StudioLayout::defer_update(&owner, cx, move |this, cx| {
                         this.set_project_base_time_signature(numerator, denominator, cx);
                         this.push_project_settings_snapshot_to_window(cx);
+                    });
+                })
+            },
+            on_set_project_key: {
+                let owner = owner.clone();
+                Arc::new(move |key, cx| {
+                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                        this.set_project_key(key, cx);
                     });
                 })
             },

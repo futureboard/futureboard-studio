@@ -30,7 +30,7 @@ use crate::components::controls::{
     fb_badge, fb_button, fb_checkbox, fb_section_header, fb_segment, fb_segmented_track,
     FbButtonKind, FbSegment,
 };
-use crate::components::text_input::{text_field, TextInputState};
+use crate::components::text_input::{bind_mouse_selection, text_field_with_callbacks, TextInputState};
 use crate::components::title_bar::external_window_titlebar;
 use sphere_jam_client::protocol::ParticipantSummary;
 
@@ -146,28 +146,30 @@ impl JamWindow {
     }
 
     fn spawn_refresh(cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(REFRESH).await;
-            let alive = this
-                .update(cx, |this, cx| {
-                    // Read only. The controller's own poll thread advances the
-                    // published state, so closing this window does not stop a
-                    // jam that tracks are still listening to.
-                    let next = jam::snapshot();
-                    let changed = next.state_label != this.state.state_label
-                        || next.streams.len() != this.state.streams.len()
-                        || next.participants.len() != this.state.participants.len()
-                        || next.publishing != this.state.publishing;
-                    this.state = next;
-                    if changed {
-                        this.busy = None;
-                    }
-                    this.busy.take_if(|(_, at)| at.elapsed() >= STATUS_LINGER);
-                    cx.notify();
-                })
-                .is_ok();
-            if !alive {
-                break;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(REFRESH).await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        // Read only. The controller's own poll thread advances the
+                        // published state, so closing this window does not stop a
+                        // jam that tracks are still listening to.
+                        let next = jam::snapshot();
+                        let changed = next.state_label != this.state.state_label
+                            || next.streams.len() != this.state.streams.len()
+                            || next.participants.len() != this.state.participants.len()
+                            || next.publishing != this.state.publishing;
+                        this.state = next;
+                        if changed {
+                            this.busy = None;
+                        }
+                        this.busy.take_if(|(_, at)| at.elapsed() >= STATUS_LINGER);
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
             }
         })
         .detach();
@@ -651,9 +653,10 @@ impl JamWindow {
                     .flex_row()
                     .items_center()
                     .gap(px(space::BASE))
-                    .child(div().flex_1().min_w(px(0.0)).child(text_field(
+                    .child(div().flex_1().min_w(px(0.0)).child(text_field_with_callbacks(
                         &self.link_input,
                         self.link_input.is_focused(window),
+                        bind_mouse_selection(cx.entity().clone(), |this| &mut this.link_input),
                     )))
                     .child(div().flex_none().child(fb_button(
                         "jam-join",

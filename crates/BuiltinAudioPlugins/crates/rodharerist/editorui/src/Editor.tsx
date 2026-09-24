@@ -67,7 +67,7 @@ import {
   type SerializedSnapshotBank,
 } from "./presetFiles";
 import "./Styles/Editor.css";
-import { HashRouter, Routes, Route } from "react-router-dom";
+import { HashRouter, Navigate, Route, Routes } from "react-router-dom";
 import {
   BoundInstanceProvider,
   useBoundInstance,
@@ -862,6 +862,14 @@ export function RodhareistEditor({
     [loadNamCapture],
   );
 
+  const prepareNamEngine = useCallback(() => {
+    setStageModels((prev) => ({ ...prev, amp: "nam_capture" }));
+    if (liveRef.current.activeCat === "amp") setActiveModelId("nam_capture");
+    postModel(categories.amp.node, "nam_capture");
+    flushParamEditsNow();
+    markDirty();
+  }, [markDirty]);
+
   /// A successful IR load switches the Cabinet slot to the convolution
   /// engine — the user clicked an IR to hear it, not to park it. The DSP
   /// keeps the loaded IR either way, so switching back to a modeled voicing
@@ -1291,6 +1299,7 @@ export function RodhareistEditor({
       buildSavePayload={buildSavePayload}
       buildFactorySnapshot={factorySnapshot}
       onLoadNamFile={loadNamFile}
+      onPrepareNamEngine={prepareNamEngine}
       onIrLoaded={onIrLoaded}
       onToggleTest={() => void toggleTest()}
       onSave={saveRig}
@@ -1354,7 +1363,13 @@ function BoundEditor() {
 
 function AppRoot() {
   if (import.meta.env.DEV) {
-    return <RodhareistEditor />;
+    return (
+      <HashRouter>
+        <Routes>
+          <Route path="/*" element={<RodhareistEditor />} />
+        </Routes>
+      </HashRouter>
+    );
   }
 
   return (
@@ -1362,7 +1377,11 @@ function AppRoot() {
       <BoundInstanceProvider>
         <Routes>
           <Route path="/" element={<NoInstanceSelected />} />
-          <Route path="/instance/:instanceId" element={<BoundEditor />} />
+          <Route
+            path="/instance/:instanceId"
+            element={<Navigate to="rig" replace />}
+          />
+          <Route path="/instance/:instanceId/*" element={<BoundEditor />} />
         </Routes>
       </BoundInstanceProvider>
     </HashRouter>

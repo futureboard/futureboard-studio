@@ -37,7 +37,7 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v13 adds timeline markers and regions. v14 adds internal RAUF clip sources.
 /// v15 adds persisted master-bus inserts.
 /// v16 adds a per-clip non-destructive stretch/pitch block (mode, algorithm,
-/// ratio, BPM pair, pitch/formant/transient/fade/gain/pan, warp markers). Pre-v16
+/// ratio, BMP pair, pitch/formant/transient/fade/gain/pan, warp markers). Pre-v16
 /// clips load with [`AudioClipStretchState::default`] (mode Off, ratio 1.0,
 /// preserve_pitch false).
 /// v18 persists enabled VSTi output channels per insert.
@@ -69,7 +69,7 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v30 adds arrangement group membership; v31 persists folder collapse state;
 /// v32 persists each track's volume-automation read/bypass state.
 /// v33 adds the reference Video track (track type tag 7) and the video clip
-/// source (clip source tag 4), which stores only the asset id and source path â
+/// source (clip source tag 4), which stores only the asset id and source path —
 /// frames are always decoded from the file, never persisted. Pre-v33 projects
 /// have no Video track, which is exactly what they had before the type existed.
 /// v34 splits the combined per-track input union into an audio Audio Connection
@@ -81,26 +81,19 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v36 persists each insert's registry-resolved instrument/effect role, so an
 /// effect in slot zero is never mistaken for an instrument after project load.
 /// v37 appends the native Solfege instrument state to each track.
-///
-/// This is a *version bump rather than an extension of v34* on purpose. The body
-/// is positional and a v34 file simply ends after the registry, so appending
-/// fields under the same version number would leave the decoder guessing whether
-/// trailing bytes are absent or truncated. A v34 file must decode as v34, with
-/// no output routing and the bootstrap latch clear â which is exactly what makes
-/// the compatibility bootstrap run once for it.
-/// v39 appends per-note musical accent: five normalised components and a
+/// v38 appends per-note musical accent: five normalised components and a
 /// provenance tag, written as an optional block after the pitch curve. A v38
 /// file loads with no accent on any note, which is exactly the state it was
-/// saved in â and "no accent" is a distinct state from "neutral accent", so
+/// saved in — and "no accent" is a distinct state from "neutral accent", so
 /// re-analysis treats a pre-v39 project as never analysed rather than as
 /// analysed-and-found-flat.
-/// v40 appends the conductor lanes' fold state â four collapse latches and five
-/// dragged heights â after the output routing. A v39 file loads with every lane
+/// v39 appends the conductor lanes' fold state — four collapse latches and five
+/// dragged heights — after the output routing. A v39 file loads with every lane
 /// expanded at its default height, which is the state it was saved in, since
 /// that is what v39 always restored.
 /// v41 appended each clip's ARA binding after its stretch block, and the ARA
 /// document archives after the conductor lanes. A v40 file loads with no ARA at
-/// all â the state it was saved in, since v40 could not express a binding.
+/// all — the state it was saved in, since v40 could not express a binding.
 /// v42 moves the binding from the clip to the track, where it belongs: ARA is a
 /// track processor like an insert, and every audio clip on the track becomes one
 /// of its playback regions. The v41 per-clip byte is still read and discarded so
@@ -119,7 +112,21 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// bypassed.
 /// v49 appends clip channel/DC/de-hum process fields. Pre-v49 clips load as
 /// stereo identity with DC and de-hum bypassed.
-pub const PROJECT_VERSION: u32 = 49;
+/// v50 appends per-marker SysEx messages at the tail of the body, keyed by
+/// marker id. Pre-v50 markers load without SysEx.
+/// v51 appends the Chord Track (chords, lane collapse flag and custom height)
+/// at the tail of the body. Pre-v51 projects load with an empty Chord Track.
+/// v52 appends the project key (root pitch class, 255 = no key, then the
+/// stable scale tag). Pre-v52 projects load with no key.
+/// v53 appends one curve tension (f32) per tempo marker, in marker order.
+/// Pre-v53 ramps load straight.
+pub const PROJECT_VERSION: u32 = 53;
+
+/// Minimum on-disk format version that can be loaded without data loss.
+/// Versions below this will show a warning but can still be loaded.
+/// Currently set to v33 (Video track introduction) since v32 and earlier
+/// lack Video track, modern Audio Connections, and other critical features.
+pub const MIN_SUPPORTED_VERSION: u32 = 33;
 
 /// Minimum on-disk header size: magic (8) + version (4) + reserved (4) + body_len (4).
 pub const PROJECT_HEADER_SIZE: usize = 20;
@@ -129,6 +136,9 @@ pub enum ProjectError {
     Io(io::Error),
     InvalidMagic,
     UnsupportedVersion(u32),
+    /// File is from an older version that can be loaded but may lack features.
+    /// Contains the file's version number.
+    OldVersion(u32),
     /// File is shorter than the header or declared payload.
     IncompleteFile {
         reason: String,
@@ -159,6 +169,9 @@ impl ProjectError {
             ProjectError::UnsupportedVersion(_) => {
                 "This project version is not supported by this build of Futureboard."
             }
+            ProjectError::OldVersion(_) => {
+                "This project was created with an older version of Futureboard. It can be opened, but some features may be missing or behave differently."
+            }
             ProjectError::IncompleteFile { .. }
             | ProjectError::UnexpectedEof { .. }
             | ProjectError::ChecksumMismatch { .. } => {
@@ -179,6 +192,9 @@ impl ProjectError {
             ProjectError::Io(e) => format!("I/O error: {e}"),
             ProjectError::InvalidMagic => "invalid magic bytes".to_string(),
             ProjectError::UnsupportedVersion(v) => format!("unsupported version: {v}"),
+            ProjectError::OldVersion(v) => format!(
+                "old version: {v} (current {PROJECT_VERSION}, minimum {MIN_SUPPORTED_VERSION})"
+            ),
             ProjectError::IncompleteFile { reason } => reason.clone(),
             ProjectError::UnexpectedEof {
                 needed,
@@ -582,8 +598,8 @@ fn encode_midi_note(w: &mut FbWriter, n: &MidiNote) {
     w.write_u8(n.articulation); // v25 (0 = none)
     w.write_u64(n.id); // v26 (0 = mint on load for legacy writers)
     w.write_u8(n.release_velocity); // v26 (0 = unset)
-                                    // v38: continuous pitch performance. Cent deviations keyed by beats from
-                                    // the note start, so the shape survives transposition and moves.
+    // v38: continuous pitch performance. Cent deviations keyed by beats from
+    // the note start, so the shape survives transposition and moves.
     w.write_u32(n.pitch_curve.len() as u32);
     for point in &n.pitch_curve {
         w.write_u64(point.id);
@@ -1024,8 +1040,8 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack) {
     encode_soundfont_player(w, t.soundfont.as_ref()); // v28
     w.write_bool(t.volume_automation_read); // v32
     encode_solfege_engine(w, t.solfege.as_ref()); // v37
-                                                  // v42: the track's ARA plug-in. Identity only â its edits live in the
-                                                  // project-level document archive keyed by (plug-in, track).
+    // v42: the track's ARA plug-in. Identity only â its edits live in the
+    // project-level document archive keyed by (plug-in, track).
     match &t.ara {
         Some(ara) => {
             w.write_u8(1);
@@ -1539,7 +1555,87 @@ fn encode_body(project: &FutureboardProject) -> Vec<u8> {
     w.write_u8(project.settings.time_display_format);
     w.write_u8(project.settings.timecode_rate);
 
+    // Marker SysEx (v50+). Keyed by marker id rather than folded into the v13
+    // marker block, which sits mid-body: the body is positional, so a v49
+    // file simply ends at the timebase.
+    let with_sysex: Vec<_> = project
+        .settings
+        .timeline_markers
+        .iter()
+        .filter(|marker| !marker.sysex.is_empty())
+        .collect();
+    w.write_u32(with_sysex.len() as u32);
+    for marker in with_sysex {
+        w.write_str(&marker.id);
+        w.write_u32(marker.sysex.len() as u32);
+        for message in &marker.sysex {
+            w.write_bytes(message);
+        }
+    }
+
+    // Chord Track (v51+).
+    w.write_u32(project.settings.chord_events.len() as u32);
+    for event in &project.settings.chord_events {
+        w.write_u64(event.id);
+        w.write_f64(event.start_beat);
+        w.write_f64(event.length_beats);
+        encode_chord(&mut w, &event.chord);
+        w.write_bool(event.flats);
+    }
+    w.write_bool(project.settings.chord_track_collapsed);
+    w.write_f32(project.settings.chord_track_height.unwrap_or(0.0));
+
+    // Project key (v52+).
+    match project.settings.project_key {
+        Some((root, scale)) => {
+            w.write_u8(root % 12);
+            w.write_u8(scale);
+        }
+        None => {
+            w.write_u8(NO_PROJECT_KEY);
+            w.write_u8(0);
+        }
+    }
+
+    // Tempo curve tensions (v53+), one per marker in the order written above.
+    w.write_u32(project.settings.tempo_points.len() as u32);
+    for point in &project.settings.tempo_points {
+        w.write_f32(point.tension);
+    }
+
     w.into_bytes()
+}
+
+/// Root byte of a project without a key.
+const NO_PROJECT_KEY: u8 = 255;
+
+/// Chord symbol: root, quality as its stable index in `ChordQuality::ALL`,
+/// and the slash bass (255 = none).
+fn encode_chord(w: &mut FbWriter, chord: &sphere_midi_service::chords::Chord) {
+    use sphere_midi_service::chords::ChordQuality;
+    let quality = ChordQuality::ALL
+        .iter()
+        .position(|q| *q == chord.quality)
+        .unwrap_or(0) as u8;
+    w.write_u8(chord.root % 12);
+    w.write_u8(quality);
+    w.write_u8(chord.bass.map(|b| b % 12).unwrap_or(255));
+}
+
+fn decode_chord(r: &mut FbReader) -> Result<sphere_midi_service::chords::Chord, ProjectError> {
+    use sphere_midi_service::chords::{Chord, ChordQuality};
+    let root = r.read_u8()? % 12;
+    let quality_index = r.read_u8()? as usize;
+    let bass = r.read_u8()?;
+    let quality = ChordQuality::ALL
+        .get(quality_index)
+        .copied()
+        .ok_or_else(|| ProjectError::Corrupted("invalid chord quality".to_string()))?;
+    Ok(Chord {
+        root,
+        quality,
+        bass: (bass < 12).then_some(bass),
+    })
 }
 
 fn encode_audio_connection(w: &mut FbWriter, c: &ProjectAudioConnection) {
@@ -2503,7 +2599,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
     }
 
     // Tempo automation markers (v7+). Pre-v7 files have none. v8+ stores ids.
-    let tempo_points = if version >= 7 {
+    let mut tempo_points = if version >= 7 {
         let count = r.read_u32()? as usize;
         let mut points = Vec::with_capacity(count);
         for _ in 0..count {
@@ -2520,6 +2616,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
                 beat,
                 bpm,
                 curve,
+                tension: 0.0,
             });
         }
         points
@@ -2572,6 +2669,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
                 beat: r.read_f64()?,
                 name: r.read_str()?,
                 color_hex: r.read_str()?,
+                sysex: Vec::new(),
             });
         }
         let region_count = r.read_u32()? as usize;
@@ -2737,6 +2835,95 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
         (defaults.time_display_format, defaults.timecode_rate)
     };
 
+    // Marker SysEx (v50+), matched back to its marker by id.
+    let mut timeline_markers = timeline_markers;
+    if version >= 50 {
+        let count = r.read_u32()? as usize;
+        if count > r.remaining() / 8 {
+            return Err(ProjectError::Corrupted(
+                "invalid marker SysEx count".to_string(),
+            ));
+        }
+        for _ in 0..count {
+            let marker_id = r.read_str()?;
+            let message_count = r.read_u32()? as usize;
+            if message_count > r.remaining() / 4 {
+                return Err(ProjectError::Corrupted(
+                    "invalid marker SysEx message count".to_string(),
+                ));
+            }
+            let mut messages = Vec::with_capacity(message_count);
+            for _ in 0..message_count {
+                messages.push(r.read_bytes()?);
+            }
+            if let Some(marker) = timeline_markers.iter_mut().find(|m| m.id == marker_id) {
+                marker.sysex = messages;
+            }
+        }
+    }
+
+    // Chord Track (v51+).
+    let (chord_events, chord_track_collapsed, chord_track_height) = if version >= 51 {
+        let count = r.read_u32()? as usize;
+        // id + start + length + chord (3) + flats.
+        if count > r.remaining() / 28 {
+            return Err(ProjectError::Corrupted(
+                "invalid chord event count".to_string(),
+            ));
+        }
+        let mut events = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = r.read_u64()?;
+            let start_beat = r.read_f64()?;
+            let length_beats = r.read_f64()?;
+            let chord = decode_chord(&mut r)?;
+            let flats = r.read_bool()?;
+            events.push(super::ProjectChordEvent {
+                id,
+                start_beat,
+                length_beats,
+                chord,
+                flats,
+            });
+        }
+        let collapsed = r.read_bool()?;
+        let height = r.read_f32()?;
+        (events, collapsed, (height > 0.0).then_some(height))
+    } else {
+        (Vec::new(), false, None)
+    };
+
+    // Project key (v52+). A scale tag this build does not know loads as no
+    // key rather than failing the whole project.
+    let project_key = if version >= 52 {
+        let root = r.read_u8()?;
+        let scale = r.read_u8()?;
+        (root != NO_PROJECT_KEY
+            && root < 12
+            && crate::components::timeline::timeline_state::ScaleKind::from_tag(scale).is_some())
+        .then_some((root, scale))
+    } else {
+        None
+    };
+
+    // Tempo curve tensions (v53+).
+    if version >= 53 {
+        let count = r.read_u32()? as usize;
+        if count != tempo_points.len() || count > r.remaining() / 4 {
+            return Err(ProjectError::Corrupted(
+                "tempo tension count does not match the tempo markers".to_string(),
+            ));
+        }
+        for point in &mut tempo_points {
+            let tension = r.read_f32()?;
+            point.tension = if tension.is_finite() {
+                tension.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+        }
+    }
+
     Ok(FutureboardProject {
         audio_connections,
         global_lanes,
@@ -2755,6 +2942,10 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
             timeline_markers,
             timeline_regions,
             song_text_events,
+            chord_events,
+            chord_track_collapsed,
+            chord_track_height,
+            project_key,
             time_sig_num,
             time_sig_den,
             sample_rate,
@@ -2801,7 +2992,19 @@ pub fn peek_project_header(data: &[u8]) -> Result<u32, ProjectError> {
 
 /// Decodes a `.fbproj` binary blob into a `FutureboardProject`.
 pub fn decode_project(data: &[u8]) -> Result<FutureboardProject, ProjectError> {
-    project_load_log(format_args!("file size: {} bytes", data.len()));
+    decode_project_with_options(data, false)
+}
+
+/// Decode a project with an option to allow loading old versions.
+pub fn decode_project_with_options(
+    data: &[u8],
+    allow_old_version: bool,
+) -> Result<FutureboardProject, ProjectError> {
+    project_load_log(format_args!(
+        "file size: {} bytes (allow_old_version={})",
+        data.len(),
+        allow_old_version
+    ));
 
     if data.len() < PROJECT_HEADER_SIZE {
         let err = ProjectError::IncompleteFile {
@@ -2825,6 +3028,14 @@ pub fn decode_project(data: &[u8]) -> Result<FutureboardProject, ProjectError> {
     if version == 0 || version > PROJECT_VERSION {
         let err = ProjectError::UnsupportedVersion(version);
         project_load_log(format_args!("failed: {}", err.technical_detail()));
+        return Err(err);
+    }
+    // Warn but allow loading for old versions that are still above minimum
+    if version < PROJECT_VERSION && version >= MIN_SUPPORTED_VERSION && !allow_old_version {
+        let err = ProjectError::OldVersion(version);
+        project_load_log(format_args!(
+            "warning: old version {version} (current {PROJECT_VERSION})"
+        ));
         return Err(err);
     }
     project_load_log(format_args!("header ok version={version}"));
@@ -3006,10 +3217,12 @@ mod tests {
         encode_midi_note(&mut w, &note(60, false));
         let bytes = w.into_bytes();
         let mut r = FbReader::new(&bytes);
-        assert!(decode_midi_note(&mut r, PROJECT_VERSION)
-            .unwrap()
-            .accent
-            .is_none());
+        assert!(
+            decode_midi_note(&mut r, PROJECT_VERSION)
+                .unwrap()
+                .accent
+                .is_none()
+        );
     }
 
     /// A v38 file has no accent bytes at all. Reading it as v39 would consume
@@ -3121,18 +3334,27 @@ mod tests {
         // Connections count, the v35 output-routing block (two absent optional
         // strings plus the bootstrap latch), the v40 conductor-lane fold block
         // (four collapse latches plus five absent optional heights), the v41
-        // ARA document count, and the v43 timebase pair. A v24-v26 fixture reads
-        // none of them, so drop the whole tail before appending the legacy cue
-        // block in its place.
+        // ARA document count, the v43 timebase pair, the v50 marker SysEx
+        // count, the v51 Chord Track block (event count, collapse latch,
+        // custom height), the v52 project key (root, scale) and the v53 tempo
+        // tension count (no markers, so no values). A v24-v26
+        // fixture reads none of them, so drop the whole tail before appending
+        // the legacy cue block in its place.
         let v35_output_routing_bytes = 1 + 1 + 1;
         let v40_global_lane_bytes = 4 + 5;
         let v43_timebase_bytes = 1 + 1;
+        let v51_chord_track_bytes = 4 + 1 + 4;
+        let v52_project_key_bytes = 1 + 1;
+        let v53_tempo_tension_bytes = 4;
         body.truncate(
             body.len()
-                - 3 * std::mem::size_of::<u32>()
+                - 4 * std::mem::size_of::<u32>()
                 - v35_output_routing_bytes
                 - v40_global_lane_bytes
-                - v43_timebase_bytes,
+                - v43_timebase_bytes
+                - v51_chord_track_bytes
+                - v52_project_key_bytes
+                - v53_tempo_tension_bytes,
         );
 
         let mut tail = FbWriter::new();
@@ -3416,12 +3638,14 @@ mod tests {
                 beat: 0.0,
                 bpm: 120.0,
                 curve: 0,
+                tension: 0.0,
             },
             ProjectTempoPoint {
                 id: "tempo-b".to_string(),
                 beat: 8.0,
                 bpm: 140.0,
                 curve: 1,
+                tension: -0.5,
             },
         ];
         let bytes = encode_project(&project);
@@ -4259,14 +4483,119 @@ mod tests {
     #[test]
     fn an_absurd_connection_count_is_rejected_before_allocating() {
         let mut body = encode_body(&FutureboardProject::new("hostile"));
-        // Overwrite the trailing connection count with a huge value.
+        // Overwrite the v51 Chord Track event count — which sits before its
+        // collapse latch (1), height (4), the v52 project key (2) and the v53
+        // tempo tension count (4) — with a huge value.
         let len = body.len();
-        body[len - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        body[len - 15..len - 11].copy_from_slice(&u32::MAX.to_le_bytes());
         let bytes = project_bytes_with_version(body, PROJECT_VERSION);
         assert!(matches!(
             decode_project(&bytes),
             Err(ProjectError::Corrupted(_))
         ));
+    }
+
+    /// Marker SysEx (v50) survives save/load and stays on its own marker.
+    #[test]
+    fn marker_sysex_roundtrips_v50() {
+        let mut project = FutureboardProject::new("SysEx");
+        let gs_reset = vec![
+            0xF0, 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7,
+        ];
+        let xg_on = vec![0xF0, 0x43, 0x10, 0x4C, 0x00, 0x00, 0x7E, 0x00, 0xF7];
+        project.settings.timeline_markers = vec![
+            ProjectTimelineMarker {
+                id: "plain".into(),
+                beat: 0.0,
+                name: "Intro".into(),
+                color_hex: "#fff".into(),
+                sysex: Vec::new(),
+            },
+            ProjectTimelineMarker {
+                id: "setup".into(),
+                beat: 4.0,
+                name: "Setup".into(),
+                color_hex: "#fff".into(),
+                sysex: vec![gs_reset.clone(), xg_on.clone()],
+            },
+        ];
+        let decoded = decode_project(&encode_project(&project)).expect("decode");
+        assert_eq!(
+            decoded.settings.timeline_markers,
+            project.settings.timeline_markers
+        );
+    }
+
+    #[test]
+    fn project_key_roundtrips_v52() {
+        let mut project = FutureboardProject::new("Key");
+        assert_eq!(
+            decode_project(&encode_project(&project))
+                .unwrap()
+                .settings
+                .project_key,
+            None
+        );
+        // A minor: pitch class 9, Natural Minor's stable tag.
+        project.settings.project_key = Some((9, 2));
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        assert_eq!(decoded.settings.project_key, Some((9, 2)));
+    }
+
+    #[test]
+    fn an_unknown_scale_tag_loads_as_no_key() {
+        let mut body = encode_body(&FutureboardProject::new("future"));
+        // The key sits before the v53 tempo tension count (4).
+        let len = body.len() - 4;
+        body[len - 2] = 4;
+        body[len - 1] = 250;
+        let bytes = project_bytes_with_version(body, PROJECT_VERSION);
+        assert_eq!(decode_project(&bytes).unwrap().settings.project_key, None);
+    }
+
+    #[test]
+    fn chord_track_roundtrips_v51() {
+        use sphere_midi_service::chords::{Chord, ChordQuality};
+        let mut project = FutureboardProject::new("Chords");
+        project.settings.chord_events = vec![
+            super::super::ProjectChordEvent {
+                id: 1,
+                start_beat: 0.0,
+                length_beats: 4.0,
+                chord: Chord::new(9, ChordQuality::Minor7),
+                flats: false,
+            },
+            super::super::ProjectChordEvent {
+                id: 2,
+                start_beat: 4.0,
+                length_beats: 2.5,
+                chord: Chord::black_adder_to(0),
+                flats: true,
+            },
+            super::super::ProjectChordEvent {
+                id: 7,
+                start_beat: 6.5,
+                length_beats: 1.5,
+                chord: Chord {
+                    root: 0,
+                    quality: ChordQuality::Major,
+                    bass: Some(4),
+                },
+                flats: false,
+            },
+        ];
+        project.settings.chord_track_collapsed = true;
+        project.settings.chord_track_height = Some(64.0);
+        let decoded = decode_project(&encode_project(&project)).expect("decode");
+        assert_eq!(decoded.settings.chord_events, project.settings.chord_events);
+        assert!(decoded.settings.chord_track_collapsed);
+        assert_eq!(decoded.settings.chord_track_height, Some(64.0));
+
+        // A project with no custom height stores the default sentinel.
+        let plain =
+            decode_project(&encode_project(&FutureboardProject::new("Plain"))).expect("decode");
+        assert!(plain.settings.chord_events.is_empty());
+        assert_eq!(plain.settings.chord_track_height, None);
     }
 
     /// The conductor lanes' fold state is view state, but it is view state the

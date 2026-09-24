@@ -1221,9 +1221,9 @@ const primaryModels: Record<PrimaryCategoryId, Model[]> = {
     },
     {
       id: "nam_capture",
-      name: "NAM Capture",
-      short: "NAM",
-      sub: "Neural amp/cab capture (.nam)",
+      name: "NAM A2 Capture",
+      short: "NAM A2",
+      sub: "Neural Amp Modeler A2 (.nam / TONE3000)",
     },
     {
       id: "bypass",
@@ -1808,6 +1808,7 @@ const primaryParameterDefaults: Record<string, Param[]> = {
     { id: "nam_input_trim", name: "Input Trim", min: -24, max: 24, val: 0, unit: "dB" },
     { id: "nam_output_trim", name: "Output Trim", min: -24, max: 24, val: 0, unit: "dB" },
     { id: "nam_mix", name: "Mix", min: 0, max: 100, val: 100, unit: "%" },
+    { id: "nam_slim_size", name: "Quality", min: 0, max: 100, val: 100, unit: "%" },
   ],
   bypass: [],
   ir: [],

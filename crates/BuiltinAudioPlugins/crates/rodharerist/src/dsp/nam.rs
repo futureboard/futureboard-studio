@@ -1,6 +1,8 @@
-//! Neural Amp Modeler (NAM) capture engine — a distinct processor from the
-//! classic modeled [`super::amp::Amp`], selectable as an alternative engine for
-//! the same Tone/Amp slot (see [`super::ToneEngineKind`]).
+//! Neural Amp Modeler capture engine — NAM A2 first (SlimmableContainer and
+//! A2 WaveNet), with A1 WaveNet/LSTM still loading so existing `.nam` files
+//! keep working. Distinct from the classic modeled [`super::amp::Amp`],
+//! selectable as an alternative engine for the same Tone/Amp slot (see
+//! [`super::ToneEngineKind`]).
 //!
 //! Loading a `.nam` file parses JSON and builds a neural network — real
 //! allocation, definitely not audio-thread work. [`prepare_nam_runtime`] does
@@ -10,6 +12,10 @@
 //! previous runtime is cross-faded out over a short window, then handed back
 //! to the control thread ([`NamCapture::poll_garbage`]) to actually drop —
 //! never inside [`NamCapture::process`].
+//!
+//! A SlimmableContainer (the usual NAM A2 file) holds every quality tier up
+//! front. Switching the width dial ([`PreparedNamRuntime::set_slim_size`]) is
+//! a single index write — real-time-safe, no rebuild.
 
 use std::sync::Arc;
 
@@ -79,6 +85,18 @@ pub struct NamCaptureInfo {
     pub full_rig: bool,
     pub receptive_field: usize,
     pub sample_rate: f64,
+    /// File-declared architecture (`WaveNet`, `LSTM`, `SlimmableContainer`, …).
+    #[serde(default)]
+    pub architecture: String,
+    /// Coarse family the editor badges: `a2`, `a1`, or `lstm`.
+    #[serde(default)]
+    pub family: String,
+    /// True when the file is a NAM A2 SlimmableContainer (runtime quality dial).
+    #[serde(default)]
+    pub slimmable: bool,
+    /// How many pre-built submodels a slimmable capture holds (0 otherwise).
+    #[serde(default)]
+    pub submodel_count: usize,
 }
 
 /// A fully-built, ready-to-run capture. Boxed and moved into [`NamCapture`]'s
@@ -86,6 +104,10 @@ pub struct NamCaptureInfo {
 /// [`prepare_nam_runtime`].
 pub struct PreparedNamRuntime {
     name: String,
+    architecture: String,
+    family: String,
+    slimmable: bool,
+    submodel_count: usize,
     model_l: Model,
     /// `None` for a mono capture: the single model's output is mirrored to
     /// both channels rather than running two redundant inferences.
@@ -124,6 +146,9 @@ impl std::fmt::Debug for PreparedNamRuntime {
             .field("sample_rate", &self.sample_rate)
             .field("receptive_field", &self.receptive_field)
             .field("full_rig", &self.full_rig)
+            .field("architecture", &self.architecture)
+            .field("family", &self.family)
+            .field("slimmable", &self.slimmable)
             .field("resampled", &self.adapter.is_some())
             .finish_non_exhaustive()
     }
@@ -167,26 +192,45 @@ pub fn prepare_nam_runtime(
     } else {
         None
     };
+
+    // A2 SlimmableContainer: warm every submodel, then park on the full-width
+    // one. Switching later is a single index write and must not allocate.
+    prewarm_model(&mut model_l);
+    if let Some(model_r) = model_r.as_mut() {
+        prewarm_model(model_r);
+    }
+
+    let slimmable = model_l.as_slimmable().is_some();
+    let submodel_count = model_l.as_slimmable().map(|s| s.len()).unwrap_or(0);
+    let family = nam_family(&nam_model, slimmable).to_string();
+    let architecture = nam_model.architecture.clone();
     let receptive_field = model_l.receptive_field();
     let loudness_gain = nam_model
         .loudness()
         .map(|l| 10f32.powf((TARGET_LUFS - l) / 20.0).clamp(0.05, 20.0))
         .unwrap_or(1.0);
-
-    // Warm the receptive field here rather than making the host delay the whole
-    // track by it. A fresh WaveNet's first `receptive_field` outputs are
-    // computed against zero-filled history — a startup transient, not a
-    // latency — so running silence through it now retires the transient on the
-    // control thread and leaves the audio path aligned with the dry signal.
-    prewarm(&mut model_l, receptive_field);
-    if let Some(model_r) = model_r.as_mut() {
-        prewarm(model_r, receptive_field);
-    }
+    let full_rig = full_rig || nam_model.includes_cab() == Some(true);
+    let name = {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            nam_model
+                .metadata_typed()
+                .name
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| "NAM Capture".into())
+        } else {
+            trimmed.to_string()
+        }
+    };
 
     let latency_samples = adapter.as_ref().map_or(0, RateAdapter::latency_samples);
 
     Ok(PreparedNamRuntime {
         name,
+        architecture,
+        family,
+        slimmable,
+        submodel_count,
         model_l,
         model_r,
         sample_rate: expected,
@@ -198,6 +242,42 @@ pub fn prepare_nam_runtime(
         scratch_l: vec![0.0; NAM_BLOCK],
         scratch_r: vec![0.0; NAM_BLOCK],
     })
+}
+
+fn nam_family(nam: &NamModel, slimmable: bool) -> &'static str {
+    let arch = nam.architecture.to_ascii_lowercase();
+    if slimmable || arch.contains("slimmable") || arch.contains("a2") {
+        "a2"
+    } else if arch.contains("lstm") {
+        "lstm"
+    } else {
+        "a1"
+    }
+}
+
+/// Warm a freshly built model (and every slimmable submodel) against silence
+/// so the first real block is not a startup transient. Control thread only.
+fn prewarm_model(model: &mut Model) {
+    let submodels: Vec<usize> = model
+        .as_slimmable()
+        .map(|slim| (0..slim.len()).collect())
+        .unwrap_or_default();
+    if submodels.is_empty() {
+        let samples = model.receptive_field();
+        prewarm(model, samples);
+        return;
+    }
+    for index in submodels {
+        if let Some(slim) = model.as_slimmable_mut() {
+            slim.select(index);
+        }
+        let samples = model.receptive_field();
+        prewarm(model, samples);
+    }
+    if let Some(slim) = model.as_slimmable_mut() {
+        let last = slim.len().saturating_sub(1);
+        slim.select(last);
+    }
 }
 
 /// Run `samples` of silence through a freshly built model so its dilation
@@ -222,6 +302,24 @@ impl PreparedNamRuntime {
             full_rig: self.full_rig,
             receptive_field: self.receptive_field,
             sample_rate: self.sample_rate,
+            architecture: self.architecture.clone(),
+            family: self.family.clone(),
+            slimmable: self.slimmable,
+            submodel_count: self.submodel_count,
+        }
+    }
+
+    /// Audio-thread-safe width dial for a SlimmableContainer. No-op on a
+    /// single WaveNet/LSTM. `size` is 0..1 (0 = smallest submodel, 1 = full).
+    pub fn set_slim_size(&mut self, size: f32) {
+        let size = size.clamp(0.0, 1.0);
+        if let Some(slim) = self.model_l.as_slimmable_mut() {
+            slim.set_slim_size(size);
+        }
+        if let Some(model_r) = self.model_r.as_mut() {
+            if let Some(slim) = model_r.as_slimmable_mut() {
+                slim.set_slim_size(size);
+            }
         }
     }
 
@@ -402,6 +500,8 @@ pub(super) struct NamCapture {
     output_trim: f32,
     loudness_norm_on: bool,
     mix: f32,
+    /// 0..1 width dial for a SlimmableContainer. Ignored by single models.
+    slim_size: f32,
 
     /// 0 = fully `fading_out`, 1 = fully `active`. Sits at 1.0 when no fade
     /// is in progress.
@@ -434,6 +534,7 @@ impl NamCapture {
             output_trim: 1.0,
             loudness_norm_on: true,
             mix: 1.0,
+            slim_size: 1.0,
             fade: 1.0,
             fade_step: 1.0,
         };
@@ -479,18 +580,29 @@ impl NamCapture {
         }
     }
 
-    /// Live knob update (control thread only): trims in dB, mix in 0..100 %.
+    /// Live knob update (control thread only): trims in dB, mix in 0..100 %,
+    /// slim size in 0..1 (NAM A2 quality dial).
     pub(super) fn configure(
         &mut self,
         input_trim_db: f32,
         output_trim_db: f32,
         mix_pct: f32,
         loudness_norm_on: bool,
+        slim_size: f32,
     ) {
         self.input_trim = db_to_linear(input_trim_db);
         self.output_trim = db_to_linear(output_trim_db);
         self.mix = (mix_pct / 100.0).clamp(0.0, 1.0);
         self.loudness_norm_on = loudness_norm_on;
+        self.slim_size = slim_size.clamp(0.0, 1.0);
+        self.apply_slim_size();
+    }
+
+    fn apply_slim_size(&mut self) {
+        let size = self.slim_size;
+        if let Some(rt) = self.active.as_mut() {
+            rt.set_slim_size(size);
+        }
     }
 
     /// Clone out a control-side loader handle for this capture's cells.
@@ -565,6 +677,7 @@ impl NamCapture {
                     self.fade_l.copy_from_slice(&self.out_l);
                     self.fade_r.copy_from_slice(&self.out_r);
                 }
+                self.apply_slim_size();
             }
         }
 
@@ -700,7 +813,7 @@ mod tests {
         );
 
         let mut cap = NamCapture::new(44_100.0);
-        cap.configure(0.0, 0.0, 100.0, false);
+        cap.configure(0.0, 0.0, 100.0, false, 1.0);
         cap.submit(Box::new(adapted));
         cap.begin_block();
         for n in 0..4_000 {
@@ -724,9 +837,11 @@ mod tests {
         let prepared = prepare_nam_runtime(TINY_WAVENET_48K, "t".into(), 48_000.0, false, false)
             .expect("matching rate must load");
         assert_eq!(prepared.model_r.is_some(), false);
+        assert_eq!(prepared.family, "a1");
+        assert!(!prepared.slimmable);
 
         let mut cap = NamCapture::new(48_000.0);
-        cap.configure(0.0, 0.0, 100.0, false);
+        cap.configure(0.0, 0.0, 100.0, false, 1.0);
         cap.submit(Box::new(prepared));
         cap.begin_block();
         for _ in 0..64 {
@@ -747,7 +862,7 @@ mod tests {
     #[test]
     fn swap_crossfades_without_dropping_on_audio_thread() {
         let mut cap = NamCapture::new(48_000.0);
-        cap.configure(0.0, 0.0, 100.0, false);
+        cap.configure(0.0, 0.0, 100.0, false, 1.0);
 
         let first =
             prepare_nam_runtime(TINY_WAVENET_48K, "a".into(), 48_000.0, false, false).unwrap();
@@ -783,7 +898,7 @@ mod tests {
     #[test]
     fn loader_handle_round_trips_submit_and_garbage() {
         let mut cap = NamCapture::new(48_000.0);
-        cap.configure(0.0, 0.0, 100.0, false);
+        cap.configure(0.0, 0.0, 100.0, false, 1.0);
         let loader = cap.loader();
 
         let info = loader
@@ -815,7 +930,7 @@ mod tests {
     #[test]
     fn no_capture_loaded_is_a_delayed_pass_through_at_unity() {
         let mut cap = NamCapture::new(48_000.0);
-        cap.configure(0.0, 0.0, 100.0, false);
+        cap.configure(0.0, 0.0, 100.0, false, 1.0);
         assert_eq!(cap.latency_samples(), NAM_BLOCK);
 
         // A single pulse, so the delay can be read off directly rather than
@@ -856,7 +971,7 @@ mod tests {
     #[test]
     fn the_wet_dry_mix_stays_phase_aligned_through_the_block_delay() {
         let mut cap = NamCapture::new(48_000.0);
-        cap.configure(0.0, 0.0, 50.0, false);
+        cap.configure(0.0, 0.0, 50.0, false, 1.0);
 
         let half_period = std::f32::consts::PI / NAM_BLOCK as f32;
         let input: Vec<f32> = (0..NAM_BLOCK * 32)
@@ -887,7 +1002,7 @@ mod tests {
         assert_eq!(prepared.latency_samples, 0);
 
         let mut cap = NamCapture::new(48_000.0);
-        cap.configure(0.0, 0.0, 100.0, false);
+        cap.configure(0.0, 0.0, 100.0, false, 1.0);
         cap.submit(Box::new(prepared));
         cap.begin_block();
         assert_eq!(

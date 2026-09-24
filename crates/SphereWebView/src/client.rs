@@ -4,22 +4,23 @@
 //! browser/load lifecycle, and exposes thread-safe state to the native host so
 //! registry insertion/removal can follow `OnAfterCreated`/`OnBeforeClose`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use cef::rc::Rc as _;
 use cef::{
-    Browser, BrowserSettings, CefString, CefStringUtf16, Client, DictionaryValue, DisplayHandler,
-    Errorcode, Frame, ImplBrowser, ImplClient, ImplDisplayHandler, ImplFrame, ImplKeyboardHandler,
-    ImplLifeSpanHandler, ImplLoadHandler, ImplRequest, ImplRequestHandler, KeyEvent, KeyEventType,
-    KeyboardHandler, LifeSpanHandler, LoadHandler, LogSeverity, PopupFeatures, RenderHandler,
-    Request, RequestHandler, TerminationStatus, TransitionType, WindowInfo, WindowOpenDisposition,
-    WrapClient, WrapDisplayHandler, WrapKeyboardHandler, WrapLifeSpanHandler, WrapLoadHandler,
-    WrapRequestHandler, wrap_client, wrap_display_handler, wrap_keyboard_handler,
-    wrap_life_span_handler, wrap_load_handler, wrap_request_handler,
+    wrap_client, wrap_display_handler, wrap_keyboard_handler, wrap_life_span_handler,
+    wrap_load_handler, wrap_request_handler, Browser, BrowserSettings, CefString, CefStringUtf16,
+    Client, DictionaryValue, DisplayHandler, Errorcode, Frame, ImplBrowser, ImplClient,
+    ImplDisplayHandler, ImplFrame, ImplKeyboardHandler, ImplLifeSpanHandler, ImplLoadHandler,
+    ImplRequest, ImplRequestHandler, KeyEvent, KeyEventType, KeyboardHandler, LifeSpanHandler,
+    LoadHandler, LogSeverity, PopupFeatures, RenderHandler, Request, RequestHandler,
+    TerminationStatus, TransitionType, WindowInfo, WindowOpenDisposition, WrapClient,
+    WrapDisplayHandler, WrapKeyboardHandler, WrapLifeSpanHandler, WrapLoadHandler,
+    WrapRequestHandler,
 };
 
-use crate::scheme::{PLUGIN_SCHEME, cef_diagnostics_enabled};
+use crate::scheme::{cef_diagnostics_enabled, PLUGIN_SCHEME};
 
 const JAVASCRIPT_PROBE: &str =
     "console.log('[cef-diagnostic] javascript-executed url=' + location.href);";
@@ -200,28 +201,24 @@ wrap_life_span_handler! {
 
         fn do_close(&self, browser: Option<&mut Browser>) -> ::std::os::raw::c_int {
             let id = browser_id(browser);
-            if cef_diagnostics_enabled() {
-                eprintln!(
-                    "[cef-lifecycle] event=DoClose browser_id={id} return=false thread={:?}",
-                    std::thread::current().id()
-                );
-            }
+            eprintln!(
+                "[CEF][Browser {id}] DoClose {}",
+                crate::runtime::thread_label()
+            );
             0
         }
 
         fn on_before_close(&self, browser: Option<&mut Browser>) {
             let id = browser_id(browser);
             self.lifecycle.mark_before_close();
-            if cef_diagnostics_enabled() {
-                eprintln!(
-                    "[cef-lifecycle] event=OnBeforeClose browser_id={id} thread={:?}",
-                    std::thread::current().id()
-                );
-                log::info!(
-                    "event=OnBeforeClose browser_id={id} thread={:?}",
-                    std::thread::current().id()
-                );
-            }
+            eprintln!(
+                "[CEF][Browser {id}] OnBeforeClose {}",
+                crate::runtime::thread_label()
+            );
+            log::info!(
+                "event=OnBeforeClose browser_id={id} thread={}",
+                crate::runtime::thread_label()
+            );
         }
     }
 }

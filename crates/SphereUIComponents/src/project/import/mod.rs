@@ -8,8 +8,8 @@ pub mod cubase_xml;
 
 use std::path::Path;
 
-use super::format::ProjectError;
 use super::FutureboardProject;
+use super::format::ProjectError;
 
 /// Extensions the Open Project dialogs accept in addition to the native
 /// project files.

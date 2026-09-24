@@ -155,6 +155,10 @@ impl Render for StudioLayout {
                             }
                             TimelineContextTarget::MarkerLaneHeader => ContextTarget::MarkerLane,
                             TimelineContextTarget::RegionLaneHeader => ContextTarget::RegionLane,
+                            TimelineContextTarget::ChordTrack { beat, event_id } => {
+                                ContextTarget::ChordTrack { beat, event_id }
+                            }
+                            TimelineContextTarget::ChordLaneHeader => ContextTarget::ChordLane,
                             TimelineContextTarget::TempoLaneHeader => ContextTarget::Tempo,
                             TimelineContextTarget::TimeSignatureLaneHeader => {
                                 ContextTarget::TimeSignature
@@ -191,11 +195,19 @@ impl Render for StudioLayout {
         let on_tempo_point_edit: components::timeline::timeline::TempoPointEditCb = {
             let this = cx.entity().clone();
             std::sync::Arc::new(
-                move |point_id: &str, _window: &mut Window, cx: &mut gpui::App| {
+                move |point_id: &str, window: &mut Window, cx: &mut gpui::App| {
                     let point_id = point_id.to_string();
-                    let _ = this.update(cx, |this, cx| {
-                        this.begin_bpm_edit(Some(point_id), cx);
-                    });
+                    // Double-click on a Tempo Track marker fires from Timeline's
+                    // `cx.listener`. `begin_bpm_edit` reads Timeline for the
+                    // marker BPM, so wait until that lease ends.
+                    StudioLayout::defer_update_in_window(
+                        &this,
+                        window,
+                        cx,
+                        move |this, _window, cx| {
+                            this.begin_bpm_edit(Some(point_id), cx);
+                        },
+                    );
                 },
             )
         };
@@ -308,6 +320,13 @@ impl Render for StudioLayout {
         let viewport_height: f32 = window.bounds().size.height.into();
         let ui_language = self.settings.read(cx).current.general.language.clone();
         let i18n = crate::i18n::I18n::new(&ui_language);
+        // The macOS menu bar is built by AppKit once; follow the language and
+        // the ticks here, where both are known. A no-op until one changes.
+        let native_menu_state = crate::native_macos_menu::NativeMenuState {
+            language: i18n.locale().code().to_string(),
+            checks: self.menu_check_states(cx),
+        };
+        crate::native_macos_menu::refresh_native_macos_menu(cx, native_menu_state);
 
         let chrome_policy = crate::platform_chrome::PlatformChromePolicy::current();
         let dropdown_overlay = if chrome_policy.show_in_window_menubar {
@@ -328,27 +347,9 @@ impl Render for StudioLayout {
                     let manifest = crate::menu::MenuManifest::load();
                     manifest.menus.iter().find(|m| &m.id == id).map(|menu| {
                         let mut runtime_menu = menu.clone();
-                        let perf = self.settings.read(cx).current.performance.clone();
                         crate::menu::patch_checkbox_states(
                             &mut runtime_menu.items,
-                            &[
-                                ("window.show_browser", self.panels.browser),
-                                ("window.show_inspector", self.panels.inspector),
-                                // "Show Mixer" is checked when the mixer is on
-                                // screen, which is what the command now toggles
-                                // — not merely when the dock happens to be open
-                                // on some other tab.
-                                ("window.show_mixer", self.mixer_panel_chrome_visible()),
-                                // The dock itself, not the tab in it: this is
-                                // ticked whenever the bottom panel is docked
-                                // open, whatever it happens to be showing.
-                                ("window.show_bottom_panel", self.panels.bottom_docked),
-                                (
-                                    "view.developer.perf_metrics",
-                                    perf.show_status_performance_metrics,
-                                ),
-                                ("view.developer.perf_overlay", perf.show_performance_overlay),
-                            ],
+                            &self.menu_check_states(cx),
                         );
                         components::menu_dropdown::menu_dropdown(
                             &runtime_menu,
@@ -490,6 +491,7 @@ impl Render for StudioLayout {
                 |layout: &mut StudioLayout| &mut layout.project_switcher_search_input,
             );
             let search_context_callbacks = TextInputCallbacks {
+                on_mouse_down_out: None,
                 on_context_command: None,
                 on_context_menu: Some(Arc::new({
                     let this = cx.entity().clone();
@@ -669,6 +671,7 @@ impl Render for StudioLayout {
                 |layout: &mut StudioLayout| &mut layout.plugin_picker_search_input,
             );
             let search_context_callbacks = TextInputCallbacks {
+                on_mouse_down_out: None,
                 on_context_command: None,
                 on_context_menu: Some(Arc::new({
                     let this = cx.entity().clone();
@@ -796,6 +799,28 @@ impl Render for StudioLayout {
                             this.plugin_catalog.status = PluginCatalogStatus::Loading;
                             this.arm_catalog_load(cx);
                             cx.notify();
+                        });
+                    }
+                }),
+                on_drop_plugin: Arc::new({
+                    let this = cx.entity().clone();
+                    move |item, window, cx| {
+                        let plugin_id = item.plugin_id.clone();
+                        let kind = item.kind;
+                        // Same rule as a drop on the arrangement itself:
+                        // header → that track, timeline → a new track.
+                        let drop_target = {
+                            let timeline = this.read(cx).timeline.read(cx);
+                            let target = timeline
+                                .resolve_context_target_from_window_point(window.mouse_position());
+                            crate::components::timeline::resolve_plugin_drop(
+                                &timeline.state,
+                                &target,
+                                kind == SpherePluginHost::PluginKind::Instrument,
+                            )
+                        };
+                        let _ = this.update(cx, |this, cx| {
+                            this.apply_dropped_plugin_drag(&plugin_id, &drop_target, kind, cx);
                         });
                     }
                 }),
@@ -1596,4 +1621,32 @@ fn publish_studio_main_hwnd(window: &Window) {
 fn debug_active_panel_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("FUTUREBOARD_DEBUG_ACTIVE_PANEL").is_some())
+}
+
+impl StudioLayout {
+    /// State of every checkable menu item, shared by the in-window menu bar
+    /// and the macOS menu bar so both tick the same things.
+    pub(super) fn menu_check_states(&self, cx: &gpui::App) -> Vec<(&'static str, bool)> {
+        let perf = &self.settings.read(cx).current.performance;
+        vec![
+            ("window.show_browser", self.panels.browser),
+            ("window.show_inspector", self.panels.inspector),
+            // "Show Mixer" is checked when the mixer is on screen, which is
+            // what the command toggles — not merely when the dock happens to
+            // be open on some other tab.
+            ("window.show_mixer", self.mixer_panel_chrome_visible()),
+            // The dock itself, not the tab in it: ticked whenever the bottom
+            // panel is docked open, whatever it happens to be showing.
+            ("window.show_bottom_panel", self.panels.bottom_docked),
+            (
+                "view.developer.perf_metrics",
+                perf.show_status_performance_metrics,
+            ),
+            ("view.developer.perf_overlay", perf.show_performance_overlay),
+            (
+                "view.chord_track",
+                self.timeline.read(cx).state.show_chord_track,
+            ),
+        ]
+    }
 }

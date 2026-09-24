@@ -1,14 +1,11 @@
 //! Open/close audio-editor tool windows and apply their commands.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{App, Context, Window};
 use sphere_audio_editor::{AudioToolKind, AudioToolTarget};
 
-use crate::components::timeline::timeline_state::{
-    AudioImportState, ClipType, StretchMode, WarpMarker, MIN_AUDIO_CLIP_BEATS,
-};
+use crate::components::timeline::timeline_state::{WarpMarker, MIN_AUDIO_CLIP_BEATS};
 use crate::components::timeline::{waveform_cache, waveform_detail, waveform_samples};
 use crate::components::{
     apply_previews_to_snapshot, open_audio_tool_window, AudioToolCommand, AudioToolWindowCallbacks,
@@ -19,51 +16,11 @@ use super::StudioLayout;
 impl StudioLayout {
     pub(super) fn flush_pending_audio_tools(
         &mut self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pending = self
-            .audio_editor
-            .update(cx, |editor, _cx| editor.take_pending_open_tool());
-        if let Some((kind, target)) = pending {
-            let owner = cx.entity().clone();
-            let owner_bounds = window.bounds();
-            cx.defer(move |cx| {
-                let _ = owner.update(cx, |layout, cx| {
-                    layout.open_audio_tool(kind, target, Some(owner_bounds), cx);
-                });
-            });
-        }
-
-        let audition = self
-            .audio_editor
-            .update(cx, |editor, _cx| editor.take_pending_audition());
-        if let Some((beat, start)) = audition {
-            let _ = self.timeline.update(cx, |timeline, cx| {
-                timeline.seek_to_exact_beat(beat, crate::layout::SeekReason::TimelineClick, cx);
-            });
-            if start {
-                let playing = self
-                    .audio_bridge
-                    .stats
-                    .as_ref()
-                    .map(|stats| stats.transport_playing)
-                    .unwrap_or(false);
-                if !playing {
-                    self.start_native_playback(cx);
-                    self.audio_editor_audition_owned = true;
-                }
-            } else if self.audio_editor_audition_owned {
-                self.stop_native_playback(cx);
-                self.audio_editor_audition_owned = false;
-            }
-        }
-
         if !self.audio_tools.windows.is_empty() {
-            if let Some(target) = self
-                .audio_editor
-                .update(cx, |editor, cx| editor.current_tool_target(cx))
-            {
+            if let Some(target) = self.audio_editor.read(cx).current_tool_target(cx) {
                 self.audio_tools.follow_selection(&target, cx);
             }
         }
@@ -93,6 +50,14 @@ impl StudioLayout {
         let remembered = self.audio_tools.last_bounds.get(&kind).copied();
         let layout = cx.entity().clone();
         let callbacks = AudioToolWindowCallbacks {
+            project_folder: {
+                let layout = layout.downgrade();
+                Arc::new(move |cx: &App| {
+                    layout
+                        .upgrade()
+                        .and_then(|layout| layout.read(cx).project_folder.clone())
+                })
+            },
             on_command: {
                 let layout = layout.clone();
                 Arc::new(move |command, cx: &mut App| {
@@ -131,7 +96,11 @@ impl StudioLayout {
         }
     }
 
-    fn handle_audio_tool_command(&mut self, command: AudioToolCommand, cx: &mut Context<Self>) {
+    pub(super) fn handle_audio_tool_command(
+        &mut self,
+        command: AudioToolCommand,
+        cx: &mut Context<Self>,
+    ) {
         match command {
             AudioToolCommand::Preview(preview) => {
                 self.audio_tools
@@ -150,15 +119,6 @@ impl StudioLayout {
                 label: _,
                 mutate,
             } => {
-                let source_path =
-                    self.timeline
-                        .read(cx)
-                        .state
-                        .find_clip(&clip_id)
-                        .and_then(|(_, clip)| match &clip.clip_type {
-                            ClipType::Audio { source_path, .. } => source_path.clone(),
-                            _ => None,
-                        });
                 let _ = self.timeline.update(cx, |timeline, cx| {
                     timeline.begin_inspector_clip_gesture(&clip_id);
                     let bpm = timeline.state.bpm.max(1.0) as f64;
@@ -190,7 +150,7 @@ impl StudioLayout {
                     }
                 });
                 self.audio_tools.previews.remove(&clip_id);
-                self.refresh_audio_editor_visuals(source_path.as_deref(), cx);
+                self.refresh_audio_editor_visuals(cx);
             }
             AudioToolCommand::AddMarkers { beats, label } => {
                 let _ = self.timeline.update(cx, |timeline, cx| {
@@ -275,77 +235,57 @@ impl StudioLayout {
                     }
                 });
             }
-            AudioToolCommand::ReplaceSource {
-                clip_id,
-                path,
-                sample_rate,
-            } => {
-                self.replace_clip_source(&clip_id, path, sample_rate, cx);
+            AudioToolCommand::ReplaceSource { clip_id, source } => {
+                self.replace_clip_source(&clip_id, source, cx);
             }
         }
         cx.notify();
     }
 
-    fn replace_clip_source(
+    /// Point a clip at a rendered version of its audio, as one undo step.
+    /// The clip keeps its own settings (see [`crate::audio_edit::apply_new_source`]);
+    /// the previous file is untouched, so undo plays exactly what it did.
+    pub(crate) fn replace_clip_source(
         &mut self,
         clip_id: &str,
-        path: PathBuf,
-        sample_rate: u32,
+        source: crate::audio_edit::NewSource,
         cx: &mut Context<Self>,
     ) {
-        let path_string = path.to_string_lossy().into_owned();
+        let path_string = source.path.to_string_lossy().into_owned();
         let _ = self.timeline.update(cx, |timeline, cx| {
             timeline.begin_inspector_clip_gesture(clip_id);
-            for track in &mut timeline.state.tracks {
-                if let Some(clip) = track.clips.iter_mut().find(|clip| clip.id == clip_id) {
-                    if let ClipType::Audio {
-                        file_id,
-                        source_path,
-                    } = &mut clip.clip_type
-                    {
-                        *file_id = path_string.clone();
-                        *source_path = Some(path_string.clone());
-                    }
-                    clip.audio_import = AudioImportState::Pending;
-                    clip.source_duration_seconds = None;
-                    clip.gain = 1.0;
-                    clip.stretch.original_sample_rate = sample_rate;
-                    clip.stretch.project_sample_rate = sample_rate;
-                    clip.stretch.original_duration_samples = 0;
-                    clip.stretch.source_start_samples = 0;
-                    clip.stretch.source_end_samples = 0;
-                    clip.stretch.mode = StretchMode::Off;
-                    clip.stretch.stretch_ratio = 1.0;
-                    clip.stretch.reset_pitch();
-                    clip.stretch.preserve_pitch = false;
-                    clip.stretch.channel_transform = 0;
-                    clip.stretch.dc_remove = false;
-                    clip.stretch.dehum_hz = 0.0;
-                    clip.stretch.denoise_amount = 0.0;
-                    clip.stretch.dirty = true;
-                    break;
-                }
+            if let Some(clip) = timeline
+                .state
+                .tracks
+                .iter_mut()
+                .flat_map(|track| track.clips.iter_mut())
+                .find(|clip| clip.id == clip_id)
+            {
+                crate::audio_edit::apply_new_source(clip, &source);
             }
             if timeline.commit_inspector_clip_gesture(clip_id, cx) {
                 timeline.mark_media_changed(cx);
             }
         });
-        // Only drop peaks for the file that was just rewritten. Sibling clips
-        // still pointing at the original source must keep drawing it, and undo
-        // must be able to restore that cache instead of an empty waveform.
+        // A new file never has stale peaks, but drop any entry under its key
+        // in case a path is ever reused.
         waveform_cache::invalidate_file(&path_string);
         waveform_detail::forget_asset(&path_string);
         waveform_samples::forget_asset(&path_string);
         self.audio_tools.previews.remove(clip_id);
-        self.spawn_timeline_audio_import_jobs(cx, self.timeline.clone(), path, path_string.clone());
-        self.refresh_audio_editor_visuals(Some(&path_string), cx);
+        self.spawn_timeline_audio_import_jobs(
+            cx,
+            self.timeline.clone(),
+            source.path.clone(),
+            path_string.clone(),
+        );
+        self.refresh_audio_editor_visuals(cx);
     }
 
-    fn refresh_audio_editor_visuals(&mut self, source_path: Option<&str>, cx: &mut Context<Self>) {
-        let path = source_path.map(str::to_string);
-        let _ = self.audio_editor.update(cx, |editor, cx| {
-            editor.refresh_clip_visuals(path.as_deref(), cx);
-        });
+    fn refresh_audio_editor_visuals(&mut self, cx: &mut Context<Self>) {
+        let _ = self
+            .audio_editor
+            .update(cx, |editor, cx| editor.refresh_clip_visuals(cx));
         let _ = self.clip_editor_panel.update(cx, |_, cx| cx.notify());
     }
 

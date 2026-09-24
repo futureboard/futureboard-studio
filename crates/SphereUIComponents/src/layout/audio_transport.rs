@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use crate::components;
 use crate::components::edit::TempoStateSnapshot;
 use crate::components::mixer_panel::{write_vsti_output_meter_key, VstiOutputMeterState};
-use crate::components::timeline::timeline_state::{ClipType, TrackOutputRouting, TrackType};
+use crate::components::timeline::timeline_state::{
+    ClipType, MidiSysExKind, TrackOutputRouting, TrackType,
+};
 use crate::components::timeline::Timeline;
 
 use super::engine_snapshot::{build_engine_project_snapshot, log_engine_sync_snapshot};
@@ -1036,6 +1038,7 @@ impl StudioLayout {
                 crate::components::piano_roll::PianoRoll::publish_playhead(&docked, cx);
                 crate::components::piano_roll::PianoRoll::publish_playhead(&floating, cx);
             }
+            self.tick_audio_editor(true, cx);
         } else {
             let _ = self.timeline.update(cx, |timeline, cx| {
                 if timeline.state.transport.playing {
@@ -1049,6 +1052,7 @@ impl StudioLayout {
             let floating = self.piano_roll_floating.clone();
             crate::components::piano_roll::PianoRoll::publish_playhead(&docked, cx);
             crate::components::piano_roll::PianoRoll::publish_playhead(&floating, cx);
+            self.tick_audio_editor(false, cx);
         }
 
         // Coalesced dropout notice: when the realtime dropout counter advances,
@@ -1353,11 +1357,7 @@ impl StudioLayout {
                     );
                 eprintln!(
                     "[METER PUBLISH]\naudio_callback_seq=0\nplugin_instance_id={}\nbus_index={}\nmixer_channel_id={}\npeak_l={:.6}\npeak_r={:.6}\nrms_l=0.000000\nrms_r=0.000000\nsubscriber_count=1",
-                    meter.insert_id,
-                    bus_index,
-                    mixer_channel_id,
-                    meter.peak,
-                    meter.peak
+                    meter.insert_id, bus_index, mixer_channel_id, meter.peak, meter.peak
                 );
             }
             changed |= smooth_meter_value(&mut entry.level, next, meter_dt);
@@ -1461,6 +1461,7 @@ impl StudioLayout {
                 Some(preferred_input_device.as_str()),
             );
             self.overlay_audio_tool_previews(&mut snapshot);
+            self.sync_engine_ara_rendering(&mut snapshot);
             snapshot
         };
         log_engine_sync_snapshot(
@@ -2063,6 +2064,55 @@ impl StudioLayout {
             .seconds_at_beat(playhead_beats.max(0.0) as f64, base_bpm);
         let has_solo = state.tracks.iter().any(|track| track.solo);
         let mut events = Vec::new();
+        let at_beat = |beat: f64| sphere_midi_service::HardwareMidiEvent {
+            device_id: String::new(),
+            delay_seconds: (state.tempo_map.seconds_at_beat(beat.max(0.0), base_bpm)
+                - playhead_seconds)
+                .max(0.0),
+            beat,
+            absolute_sample: state.tempo_map.samples_at_beat(
+                beat.max(0.0),
+                base_bpm,
+                sample_rate as f64,
+            ),
+            message: Vec::new(),
+        };
+
+        // Marker SysEx is song-level setup (a GS/XG reset, a part map), so it
+        // goes to every hardware output a MIDI track routes to, muted or not —
+        // muting a part must not skip the reset the whole module depends on.
+        // SysEx carries its manufacturer ID, so a Roland message sent to a
+        // Yamaha module is ignored there. Nothing before the playhead is
+        // chased, the same as clip SysEx.
+        let mut marker_outputs: Vec<&String> = Vec::new();
+        for track in &state.tracks {
+            if track.track_type != TrackType::Midi {
+                continue;
+            }
+            if let TrackOutputRouting::HardwareOutput { device_id, .. } = &track.routing.output {
+                if enabled_outputs.contains(device_id) && !marker_outputs.contains(&device_id) {
+                    marker_outputs.push(device_id);
+                }
+            }
+        }
+        for marker in state
+            .markers
+            .iter()
+            .filter(|marker| marker.beat >= playhead_beats.max(0.0) as f64)
+        {
+            for message in marker
+                .sysex
+                .iter()
+                .filter(|m| sphere_midi_service::sysex::validate_frame(m).is_ok())
+            {
+                for device_id in &marker_outputs {
+                    let mut event = at_beat(marker.beat);
+                    event.device_id = (*device_id).clone();
+                    event.message = message.clone();
+                    events.push(event);
+                }
+            }
+        }
 
         for track in &state.tracks {
             if track.track_type != TrackType::Midi || track.muted || (has_solo && !track.solo) {
@@ -2079,9 +2129,38 @@ impl StudioLayout {
                 if clip.muted || clip.start_beat + clip.duration_beats <= playhead_beats {
                     continue;
                 }
-                let ClipType::Midi { notes, .. } = &clip.clip_type else {
+                let ClipType::Midi {
+                    notes,
+                    sysex_events,
+                    ..
+                } = &clip.clip_type
+                else {
                     continue;
                 };
+                let clip_end = clip.start_beat + clip.duration_beats;
+                for sysex in sysex_events {
+                    let beat = clip.start_beat + sysex.beat.max(0.0);
+                    if beat < playhead_beats || beat >= clip_end || sysex.data.is_empty() {
+                        continue;
+                    }
+                    let message = match sysex.kind {
+                        MidiSysExKind::Normal => {
+                            let message = sphere_midi_service::sysex::from_smf_payload(&sysex.data);
+                            // A malformed message could leave a module waiting
+                            // for an EOX that never comes; skip it instead.
+                            if sphere_midi_service::sysex::validate_frame(&message).is_err() {
+                                continue;
+                            }
+                            message
+                        }
+                        // An SMF F7 "escape" is raw bytes to send as they are.
+                        MidiSysExKind::Escaped => sysex.data.clone(),
+                    };
+                    let mut event = at_beat(beat as f64);
+                    event.device_id = device_id.clone();
+                    event.message = message;
+                    events.push(event);
+                }
                 for note in notes.iter().filter(|note| !note.muted) {
                     let note_start = clip.start_beat + note.start.max(0.0);
                     let note_end = (note_start + note.duration.max(0.0))
@@ -2240,6 +2319,7 @@ impl StudioLayout {
                     beat: p.beat,
                     bpm: p.bpm,
                     curve: p.curve.to_tag(),
+                    tension: p.tension as f64,
                 })
                 .collect::<Vec<_>>();
             let ts_points = timeline
@@ -2933,6 +3013,12 @@ impl StudioLayout {
                 self.delete_region_command(&id.clone(), cx);
                 true
             }
+            ContextTarget::ChordTrack {
+                event_id: Some(id), ..
+            } => {
+                self.delete_chord_event_command(*id, cx);
+                true
+            }
             ContextTarget::TempoTrack {
                 point_id: Some(id), ..
             } => {
@@ -3200,6 +3286,26 @@ impl StudioLayout {
         );
     }
 
+    /// Bend a marker's ramp to the next marker: a Linear ramp with `tension`
+    /// (`> 0` eases in, `< 0` eases out, `0` straight).
+    pub(super) fn set_tempo_point_bend(&mut self, id: &str, tension: f32, cx: &mut Context<Self>) {
+        self.edit_tempo_state(
+            if tension == 0.0 {
+                "Straighten Tempo Ramp"
+            } else {
+                "Bend Tempo Ramp"
+            },
+            |timeline| {
+                timeline.state.set_tempo_point_curve(
+                    id,
+                    crate::components::timeline::timeline_state::TempoCurve::Linear,
+                );
+                timeline.state.set_tempo_point_tension(id, tension);
+            },
+            cx,
+        );
+    }
+
     /// Convert fixed-tempo mode into a tempo map by seeding an initial marker at
     /// beat 0 using the current project BPM. No-op if automation already exists.
     pub(super) fn create_tempo_automation(&mut self, cx: &mut Context<Self>) {
@@ -3357,6 +3463,50 @@ impl StudioLayout {
         cx.notify();
     }
 
+    /// A press landed outside one of the transport's inline editor fields.
+    ///
+    /// The editors route keys without a focus grab, so nothing used to end
+    /// them when the user clicked away: the field stayed open, and — being
+    /// first in the key chain — kept taking the keys, Enter included, meant
+    /// for whatever field was clicked next. A press away now commits the
+    /// draft, as Enter would (Escape is still the way to discard it).
+    ///
+    /// Decided after the press has been dispatched, not here: a click from
+    /// the numerator into the denominator is "outside" one field and inside
+    /// the other, and the field's own mouse-down clears the pending flag. A
+    /// press on the fields' Cut/Copy/Paste menu is part of the edit too.
+    pub(super) fn note_inline_edit_outside_press(&mut self, cx: &mut Context<Self>) {
+        if !(self.tempo_edit.bpm_editing || self.tempo_edit.ts_editing) {
+            return;
+        }
+        self.tempo_edit.outside_press_pending = true;
+        let this = cx.entity().downgrade();
+        cx.defer(move |app| {
+            let _ = this.update(app, |layout, cx| {
+                layout.resolve_inline_edit_outside_press(cx)
+            });
+        });
+    }
+
+    fn resolve_inline_edit_outside_press(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.tempo_edit.outside_press_pending) {
+            return;
+        }
+        let menu_on_editor = self.overlay.text_context_menu.as_ref().is_some_and(|menu| {
+            matches!(
+                menu.target,
+                crate::layout::studio_state::TextMenuTarget::TransportBpm
+                    | crate::layout::studio_state::TextMenuTarget::TransportTimeSigNum
+                    | crate::layout::studio_state::TextMenuTarget::TransportTimeSigDen
+            )
+        });
+        if menu_on_editor {
+            return;
+        }
+        self.commit_bpm_edit(cx);
+        self.commit_ts_edit(cx);
+    }
+
     /// Cancel the inline BPM editor without applying.
     pub(super) fn cancel_bpm_edit(&mut self, cx: &mut Context<Self>) {
         if !self.tempo_edit.bpm_editing {
@@ -3383,6 +3533,7 @@ impl StudioLayout {
                         beat: p.beat,
                         bpm: p.bpm,
                         curve: p.curve.to_tag(),
+                        tension: p.tension as f64,
                     })
                     .collect::<Vec<_>>(),
             )
@@ -3592,20 +3743,17 @@ impl StudioLayout {
         if !self.tempo_edit.ts_editing {
             return;
         }
-        let num = self
-            .tempo_edit
-            .ts_num_input
-            .value
-            .trim()
-            .parse::<u16>()
-            .ok();
-        let den = self
-            .tempo_edit
-            .ts_den_input
-            .value
-            .trim()
-            .parse::<u16>()
-            .ok();
+        // Native digits (a Thai ๔ typed or pasted) read as their ASCII value.
+        let parse = |text: &str| -> Option<u16> {
+            text.trim()
+                .chars()
+                .map(|c| crate::components::text_input::ascii_digit_equivalent(c).unwrap_or(c))
+                .collect::<String>()
+                .parse::<u16>()
+                .ok()
+        };
+        let num = parse(&self.tempo_edit.ts_num_input.value);
+        let den = parse(&self.tempo_edit.ts_den_input.value);
         self.tempo_edit.ts_editing = false;
         self.tempo_edit.ts_edit_focus_num = true;
         let Some(num) = num.filter(|n| (1..=64).contains(n)) else {

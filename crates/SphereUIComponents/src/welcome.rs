@@ -46,7 +46,9 @@ use crate::components::text_input::{
     bind_mouse_selection, is_repeatable_edit_key, text_field_with_callbacks_and_ime,
     TextInputCallbacks,
 };
-use crate::components::title_bar::{draggable_spacer, section_separator, window_control_button};
+use crate::components::title_bar::{
+    begin_titlebar_drag, draggable_spacer, section_separator, window_control_button,
+};
 use crate::components::{TextInputAction, TextInputState};
 use crate::embedded_assets::LOGO_TEXT_PATH;
 use crate::i18n::I18n;
@@ -951,9 +953,7 @@ fn welcome_chrome(window: &Window) -> impl IntoElement {
         .border_color(Colors::border_subtle())
         .rounded(px(radius::NONE))
         .window_control_area(WindowControlArea::Drag)
-        .on_mouse_down(MouseButton::Left, |_, window, _cx| {
-            window.start_window_move();
-        })
+        .on_mouse_down(MouseButton::Left, begin_titlebar_drag)
         .child(
             // Shrinks (and clips the wordmark) before the caption controls are
             // pushed off a narrow window: predictable truncation, not reflow.

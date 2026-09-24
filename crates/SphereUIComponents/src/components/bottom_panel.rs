@@ -102,6 +102,11 @@ fn tab_button(
     active_tab: BottomTab,
     on_click: std::sync::Arc<impl Fn(&BottomTab, &mut Window, &mut App) + 'static>,
 ) -> impl IntoElement {
+    let shortcut = match tab {
+        BottomTab::Mixer => Some(crate::keymap::accel_display("Ctrl+3")),
+        BottomTab::Editor => Some(crate::keymap::accel_display("Ctrl+5")),
+        BottomTab::EffectEditor => Some(crate::keymap::accel_display("Ctrl+6")),
+    };
     fb_dock_tab(
         id,
         label,
@@ -109,6 +114,7 @@ fn tab_button(
         tab == active_tab,
         dock_planes(),
         move |_event, window, cx| on_click(&tab, window, cx),
+        shortcut,
     )
 }
 

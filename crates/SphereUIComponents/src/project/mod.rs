@@ -6,13 +6,17 @@ pub mod routing_migration;
 pub mod session;
 pub mod template;
 
-pub use format::{decode_project, encode_project, ProjectError, PROJECT_MAGIC, PROJECT_VERSION};
-pub use import::{is_import_path, IMPORT_PROJECT_FILE_EXTS};
+pub use format::{
+    PROJECT_MAGIC, PROJECT_VERSION, ProjectError, decode_project, decode_project_with_options,
+    encode_project,
+};
+pub use import::{IMPORT_PROJECT_FILE_EXTS, is_import_path};
 pub use io::{
-    create_project_folder, default_projects_dir, import_audio_file_to_project, load_project,
-    project_backup_path, project_temp_path, sanitize_project_name, save_project,
-    validate_project_file, verify_project_file, LEGACY_PROJECT_FILE_EXT, PROJECT_FILE_EXT,
-    SUPPORTED_PROJECT_FILE_EXTS,
+    LEGACY_PROJECT_FILE_EXT, PROJECT_FILE_EXT, SUPPORTED_PROJECT_FILE_EXTS, backup_legacy_project,
+    create_project_folder, default_projects_dir, import_audio_file_to_project,
+    legacy_project_backup_path, load_project, load_project_strict, project_backup_path,
+    project_temp_path, sanitize_project_name, save_project, validate_project_file,
+    verify_project_file,
 };
 pub use recent::{RecentProject, RecentProjectsStore};
 pub use session::ProjectSession;
@@ -22,8 +26,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::solfege::SolfegeTrackState;
-use sphere_midi_service::mpe::MpeTrackConfiguration;
 use sphere_midi_service::NoteExpression;
+use sphere_midi_service::mpe::MpeTrackConfiguration;
 pub use sphere_soundfont_player::{SoundfontEnvelope, SoundfontRenderQuality};
 
 // ── Identifiers ───────────────────────────────────────────────────────────────
@@ -723,6 +727,8 @@ pub struct ProjectTempoPoint {
     pub beat: f64,
     pub bpm: f64,
     pub curve: u8,
+    /// v53+: bend of a Linear ramp, `-1.0..=1.0`. `0.0` for older files.
+    pub tension: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -740,6 +746,8 @@ pub struct ProjectTimelineMarker {
     pub beat: f64,
     pub name: String,
     pub color_hex: String,
+    /// Complete `F0 … F7` messages (v50+).
+    pub sysex: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -802,6 +810,16 @@ pub struct ProjectSongTextEvent {
     pub kind: ProjectSongTextEventKind,
 }
 
+/// One Chord Track chord (v51+).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectChordEvent {
+    pub id: u64,
+    pub start_beat: f64,
+    pub length_beats: f64,
+    pub chord: sphere_midi_service::chords::Chord,
+    pub flats: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectSettings {
     pub bpm: f64,
@@ -812,6 +830,14 @@ pub struct ProjectSettings {
     pub timeline_markers: Vec<ProjectTimelineMarker>,
     pub timeline_regions: Vec<ProjectTimelineRegion>,
     pub song_text_events: Vec<ProjectSongTextEvent>,
+    /// v51+: Chord Track chords, plus the lane's own collapse flag and custom
+    /// height (the v40 lane block is positional and cannot grow a field).
+    pub chord_events: Vec<ProjectChordEvent>,
+    pub chord_track_collapsed: bool,
+    pub chord_track_height: Option<f32>,
+    /// v52+: the project key as (root pitch class, stable `ScaleKind` tag);
+    /// `None` for a project without a key.
+    pub project_key: Option<(u8, u8)>,
     pub time_sig_num: u32,
     pub time_sig_den: u32,
     pub sample_rate: u32,
@@ -832,6 +858,10 @@ impl Default for ProjectSettings {
             timeline_markers: Vec::new(),
             timeline_regions: Vec::new(),
             song_text_events: Vec::new(),
+            chord_events: Vec::new(),
+            chord_track_collapsed: false,
+            chord_track_height: None,
+            project_key: None,
             time_sig_num: 4,
             time_sig_den: 4,
             sample_rate: 48000,
@@ -1403,6 +1433,7 @@ impl From<&TimelineState> for FutureboardProject {
                 beat: p.beat,
                 bpm: p.bpm,
                 curve: p.curve.to_tag(),
+                tension: p.tension,
             })
             .collect();
         project.settings.time_signature_points = tl
@@ -1425,6 +1456,7 @@ impl From<&TimelineState> for FutureboardProject {
                 beat: marker.beat,
                 name: marker.name.clone(),
                 color_hex: marker.color_hex.clone(),
+                sysex: marker.sysex.clone(),
             })
             .collect();
         project.settings.timeline_regions = tl
@@ -1438,6 +1470,24 @@ impl From<&TimelineState> for FutureboardProject {
                 color_hex: region.color_hex.clone(),
             })
             .collect();
+        project.settings.chord_events = tl
+            .chord_events
+            .iter()
+            .map(|event| ProjectChordEvent {
+                id: event.id,
+                start_beat: event.start_beat,
+                length_beats: event.length_beats,
+                chord: event.chord,
+                flats: event.flats,
+            })
+            .collect();
+        project.settings.chord_track_collapsed = tl.chord_track_collapsed;
+        project.settings.project_key = tl
+            .project_key
+            .map(|key| (key.root.pitch_class(), key.kind.to_tag()));
+        project.settings.chord_track_height = tl
+            .global_lane_heights
+            .get(crate::components::timeline::timeline_state::GlobalLaneKind::Chord);
         project.settings.song_text_events = tl
             .song_text_events
             .iter()
@@ -1605,6 +1655,7 @@ pub fn apply_to_timeline(
                     p.bpm,
                     crate::components::timeline::timeline_state::TempoCurve::from_tag(p.curve),
                 )
+                .with_tension(p.tension)
             })
             .collect(),
     );
@@ -1614,16 +1665,50 @@ pub fn apply_to_timeline(
         .timeline_markers
         .iter()
         .map(|marker| {
-            TimelineMarkerState::with_id(
+            let mut state = TimelineMarkerState::with_id(
                 marker.id.clone(),
                 marker.beat,
                 marker.name.clone(),
                 marker.color_hex.clone(),
-            )
+            );
+            state.sysex = marker.sysex.clone();
+            state
         })
         .collect();
     tl.markers
         .sort_by(|a, b| a.beat.total_cmp(&b.beat).then_with(|| a.id.cmp(&b.id)));
+    tl.chord_events = project
+        .settings
+        .chord_events
+        .iter()
+        .map(
+            |event| crate::components::timeline::timeline_state::ChordTrackEvent {
+                id: event.id,
+                start_beat: event.start_beat,
+                length_beats: event.length_beats,
+                chord: event.chord,
+                flats: event.flats,
+            },
+        )
+        .collect();
+    tl.chord_events
+        .sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat).then(a.id.cmp(&b.id)));
+    tl.selected_chord_event_id = None;
+    tl.chord_track_collapsed = project.settings.chord_track_collapsed;
+    tl.project_key = project.settings.project_key.and_then(|(root, scale)| {
+        use crate::components::timeline::timeline_state::{MidiScale, ScaleKind, ScaleRoot};
+        Some(MidiScale::new(
+            ScaleRoot::from_pitch_class(root),
+            ScaleKind::from_tag(scale)?,
+        ))
+    });
+    tl.global_lane_heights.set(
+        crate::components::timeline::timeline_state::GlobalLaneKind::Chord,
+        project.settings.chord_track_height,
+    );
+    // Lane visibility is view state and not saved, but a project that has
+    // chords opens with them on screen — hidden harmony reads as lost work.
+    tl.show_chord_track = !tl.chord_events.is_empty();
     tl.regions = project
         .settings
         .timeline_regions
@@ -2344,7 +2429,7 @@ pub(crate) fn legacy_routing_to_runtime(
     crate::components::timeline::timeline_state::TrackMidiInputRouting,
 ) {
     use crate::project::routing_migration::{
-        migrate_track_routing, LegacyTrackInputRouting, LegacyTrackRouting,
+        LegacyTrackInputRouting, LegacyTrackRouting, migrate_track_routing,
     };
 
     let legacy_input = match legacy {
@@ -3077,10 +3162,12 @@ mod v33_routing_adapter_tests {
         );
         // The persisted forms are exactly the ids — no device, port, or channel
         // is smuggled into them.
-        assert!(project
-            .master_output_connection_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("ac-")));
+        assert!(
+            project
+                .master_output_connection_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("ac-"))
+        );
     }
 
     /// A pre-v35 project has never initialized output routing, so the
@@ -3369,9 +3456,11 @@ mod v33_routing_adapter_tests {
         );
         assert_eq!(warning.track_id.as_deref(), Some(track_id.as_str()));
         assert_eq!(warning.source_project_version, 33);
-        assert!(warning
-            .message
-            .contains("dedicated MIDI input assignment was retained"));
+        assert!(
+            warning
+                .message
+                .contains("dedicated MIDI input assignment was retained")
+        );
 
         // The dedicated assignment wins.
         assert_eq!(
@@ -3541,6 +3630,28 @@ mod project_settings_persistence_tests {
 
         assert_eq!(restored.time_display_format, TimeDisplayFormat::Timecode);
         assert_eq!(restored.timecode_rate, TimecodeRate::Fps25);
+    }
+
+    #[test]
+    fn project_key_survives_save_decode_and_timeline_restore() {
+        use crate::components::timeline::timeline_state::{MidiScale, ScaleKind, ScaleRoot};
+
+        let mut timeline = TimelineState::default();
+        timeline.project_key = Some(MidiScale::new(ScaleRoot::FSharp, ScaleKind::Dorian));
+
+        let encoded = crate::project::format::encode_project(&FutureboardProject::from(&timeline));
+        let decoded = crate::project::format::decode_project(&encoded).expect("decode project");
+        let mut restored = TimelineState::default();
+        restored.project_key = Some(MidiScale::new(ScaleRoot::C, ScaleKind::Major));
+        let _ = apply_to_timeline(&decoded, &mut restored);
+        assert_eq!(restored.project_key, timeline.project_key);
+
+        // Clearing the key is saved too, not left at the previous value.
+        timeline.project_key = None;
+        let encoded = crate::project::format::encode_project(&FutureboardProject::from(&timeline));
+        let decoded = crate::project::format::decode_project(&encoded).expect("decode project");
+        let _ = apply_to_timeline(&decoded, &mut restored);
+        assert_eq!(restored.project_key, None);
     }
 
     #[test]
@@ -3823,11 +3934,13 @@ mod project_settings_persistence_tests {
         // A note that was never analysed comes back un-analysed, not neutral:
         // the two are different states and the re-analysis policy depends on
         // telling them apart.
-        assert!(restored
-            .midi_note(&clip_id, untouched_id)
-            .expect("note restored")
-            .accent
-            .is_none());
+        assert!(
+            restored
+                .midi_note(&clip_id, untouched_id)
+                .expect("note restored")
+                .accent
+                .is_none()
+        );
     }
 }
 
@@ -3878,11 +3991,13 @@ mod group_track_persistence_tests {
         );
         assert!(restored.find_track(&group_id).unwrap().group_collapsed);
         assert!(restored.remove_track_from_group(&child_id));
-        assert!(restored
-            .find_track(&child_id)
-            .unwrap()
-            .parent_group_id
-            .is_none());
+        assert!(
+            restored
+                .find_track(&child_id)
+                .unwrap()
+                .parent_group_id
+                .is_none()
+        );
     }
 }
 
@@ -3990,8 +4105,8 @@ mod articulation_persistence_tests {
 mod vsti_substrip_persistence_tests {
     use super::*;
     use crate::components::timeline::timeline_state::{
-        vsti_output_child_track_id, CreateTrackOptions, InsertPluginFormat, TimelineState,
-        TrackType,
+        CreateTrackOptions, InsertPluginFormat, TimelineState, TrackType,
+        vsti_output_child_track_id,
     };
 
     /// Substrip (VSTi multi-out child strip) mixer state and FX insert chains —
@@ -4326,7 +4441,7 @@ mod vsti_substrip_persistence_tests {
 mod conductor_lane_persistence_tests {
     use super::*;
     use crate::components::timeline::timeline_state::{
-        GlobalLaneKind, TimelineState, GLOBAL_LANE_MAX_HEIGHT,
+        GLOBAL_LANE_MAX_HEIGHT, GlobalLaneKind, TimelineState,
     };
 
     /// Folding the tempo lane away is an arrangement of the workspace, not a

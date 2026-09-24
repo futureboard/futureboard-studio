@@ -168,14 +168,14 @@ impl StemInferBackend for OnnxHtDemucsBackend {
 
         let mut session = Self::load_session(&self.file, self.device)?;
         let input_name = session
-            .inputs
+            .inputs()
             .first()
-            .map(|i| i.name.clone())
+            .map(|i| i.name().to_owned())
             .ok_or_else(|| backend_err("HT-Demucs model has no inputs"))?;
         let output_name = session
-            .outputs
+            .outputs()
             .first()
-            .map(|o| o.name.clone())
+            .map(|o| o.name().to_owned())
             .ok_or_else(|| backend_err("HT-Demucs model has no outputs"))?;
 
         let overlap = N_SAMPLES / 4;
@@ -216,7 +216,7 @@ impl StemInferBackend for OnnxHtDemucsBackend {
                 format!("Separating segment {}/{n_chunks}", chunk_index + 1),
             ));
 
-            let tensor = Tensor::from_array(input)
+            let tensor = Tensor::from_array((input.shape().to_vec(), input.into_raw_vec_and_offset().0))
                 .map_err(|e| backend_err(format!("ONNX input tensor build failed: {e}")))?;
             let outputs = session
                 .run(ort::inputs![input_name.as_str() => tensor])

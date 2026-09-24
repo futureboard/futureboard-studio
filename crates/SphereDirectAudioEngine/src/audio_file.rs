@@ -797,6 +797,38 @@ pub fn load_audio_file(path: &str) -> Result<AudioFileBuffer, String> {
     }
 }
 
+/// Largest file [`load_audio_file_for_edit`] decodes.
+pub const MAX_EDIT_DECODE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Decode a whole file for offline work — a destructive edit, a whole-clip
+/// analysis (tempo/key, spectrogram), stem separation — never on the
+/// realtime path.
+///
+/// [`load_audio_file`] refuses WAVs at or above
+/// [`STREAMING_WAV_THRESHOLD_BYTES`], because playback streams those instead of
+/// holding them. Offline work needs every sample at once, and a few minutes of
+/// 24-bit or 32-bit float stereo is already past that threshold, so this raises
+/// the ceiling to [`MAX_EDIT_DECODE_BYTES`] for WAV and otherwise behaves the
+/// same.
+pub fn load_audio_file_for_edit(path: &str) -> Result<AudioFileBuffer, String> {
+    let p = Path::new(path);
+    let is_wav = matches!(audio_file_format(p), AudioFileFormat::Wav);
+    if !is_wav {
+        return load_audio_file(path);
+    }
+    let file_size = std::fs::metadata(p)
+        .map_err(|e| format!("open failed: {e}"))?
+        .len();
+    if file_size > MAX_EDIT_DECODE_BYTES {
+        return Err(format!(
+            "WAV file too large to edit ({} MB, limit {} MB)",
+            file_size / (1024 * 1024),
+            MAX_EDIT_DECODE_BYTES / (1024 * 1024)
+        ));
+    }
+    decode_wav_file(p)
+}
+
 fn audio_file_format(path: &Path) -> AudioFileFormat {
     match path
         .extension()
@@ -1232,7 +1264,10 @@ fn load_wav(path: &Path) -> Result<AudioFileBuffer, String> {
             "WAV file too large ({file_size} bytes) for in-memory decode — use streaming source"
         ));
     }
+    decode_wav_file(path)
+}
 
+fn decode_wav_file(path: &Path) -> Result<AudioFileBuffer, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read failed: {e}"))?;
     let (fmt, data_start, data_len) = wav_data_layout(&bytes)?;
     if fmt.channels == 0 || fmt.sample_rate == 0 {
@@ -1475,7 +1510,11 @@ pub(crate) fn decode_wav_sample(bytes: &[u8], offset: usize, fmt: &WavFmt) -> Re
             let b = bytes
                 .get(offset..offset + 4)
                 .ok_or_else(|| "unexpected EOF".to_string())?;
-            f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            let value = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            // Float keeps headroom above 0 dBFS — that is the point of
+            // writing edits as float — so it is not clamped. Only values
+            // that are not audio at all are dropped.
+            return Ok(if value.is_finite() { value } else { 0.0 });
         }
         (format, _) => return Err(format!("unsupported WAV format code: {format}")),
     };
@@ -1779,6 +1818,53 @@ mod peak_tests {
         assert_eq!(peaks.total_frames, 512);
         let first = peaks.lods[0].peaks.first().expect("at least one peak");
         assert!((first.max - 0.5).abs() < 1e-3, "max was {}", first.max);
+    }
+
+    #[test]
+    fn float_edit_files_load_with_their_headroom() {
+        let path = temp_path("float-edit").with_extension("wav");
+        let samples = [0.25f32, -0.5, 1.5, -1.25];
+        SphereAudioProcessor::write_wav_f32(&path, &samples, 2, 44_100).unwrap();
+        let loaded = load_audio_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.channels, 2);
+        assert_eq!(loaded.sample_rate, 44_100);
+        assert_eq!(loaded.samples, samples.to_vec());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A WAV at or past the streaming threshold — any few-minute stem — must
+    /// still decode for offline work (tempo/key analysis, the Audio Editor,
+    /// stem separation); only the playback loader refuses it.
+    #[test]
+    fn offline_loads_accept_wavs_past_the_streaming_threshold() {
+        let path = temp_path("large-offline").with_extension("wav");
+        let data_bytes = STREAMING_WAV_THRESHOLD_BYTES as u32 + 4 * 1024;
+        let mut header = Vec::new();
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt ");
+        header.extend_from_slice(&16u32.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        header.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        header.extend_from_slice(&48_000u32.to_le_bytes());
+        header.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+        header.extend_from_slice(&4u16.to_le_bytes());
+        header.extend_from_slice(&16u16.to_le_bytes());
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&data_bytes.to_le_bytes());
+        std::fs::write(&path, &header).unwrap();
+        // Sparse: the silent body costs no disk writes.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(header.len() as u64 + data_bytes as u64)
+            .unwrap();
+        drop(file);
+
+        let path_str = path.to_str().unwrap();
+        assert!(load_audio_file(path_str).is_err());
+        let loaded = load_audio_file_for_edit(path_str).unwrap();
+        assert_eq!(loaded.channels, 2);
+        assert_eq!(loaded.frames, data_bytes as usize / 4);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A crafted WAV whose `fmt ` chunk claims ~4 GiB must be rejected by the

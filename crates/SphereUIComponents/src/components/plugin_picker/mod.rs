@@ -14,9 +14,10 @@ mod search_index;
 mod sidebar;
 mod state;
 
-pub use category::{normalize_category, normalized_category_label, NormalizedCategory};
-pub use filter::{compute_filter_result, picker_perf_debug, FilterCounts, FilterResult};
-pub use insert::{validate_insert, InsertValidation, PluginInsertKind, PluginInsertTarget};
+pub use category::{NormalizedCategory, normalize_category, normalized_category_label};
+pub use filter::{FilterCounts, FilterResult, compute_filter_result, picker_perf_debug};
+pub use insert::{InsertValidation, PluginInsertKind, PluginInsertTarget, validate_insert};
+pub use list_view::PluginDragItem;
 pub use overlay::{
     page_size_for_height, plugin_picker_overlay, plugin_picker_panel, visible_plugin_id_at,
 };
@@ -29,7 +30,7 @@ pub use state::{
 
 use std::sync::Arc;
 
-use gpui::{App, Window};
+use gpui::{App, ParentElement, Styled, Window};
 
 /// Legacy sentinel rejected by current VST3-only insert creation.
 pub const STUB_PLUGIN_ID: &str = "futureboard.stub.gain";
@@ -47,6 +48,27 @@ pub struct PluginPickerCallbacks {
     pub on_retry_load: Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>,
     pub on_open_plugin_manager: Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>,
     pub on_rebuild_database: Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>,
+    pub on_drop_plugin: Arc<dyn Fn(&PluginDragItem, &mut Window, &mut App) + 'static>,
+}
+
+pub struct PluginDragPreview {
+    pub(crate) label: String,
+}
+
+impl gpui::Render for PluginDragPreview {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        gpui::div()
+            .px(gpui::px(crate::theme::space::BASE))
+            .py(gpui::px(crate::theme::space::TIGHT))
+            .rounded(gpui::px(crate::theme::radius::CONTROL))
+            .bg(crate::theme::Colors::surface_raised())
+            .text_color(crate::theme::Colors::text_primary())
+            .child(self.label.clone())
+    }
 }
 
 pub fn move_highlight(state: &mut PluginPickerState, delta: isize, visible_len: usize) {

@@ -13,10 +13,26 @@ use gpui::{
     PathBuilder, PathStyle, Pixels, StrokeOptions, Styled,
 };
 
-/// Tempo Track mouse-down: `(beat, bpm, point_id, additive, click_count)`.
-pub type TempoTrackDownCallback = std::sync::Arc<
-    dyn Fn(&(f64, f64, Option<String>, bool, u32), &mut gpui::Window, &mut gpui::App) + 'static,
->;
+/// A left-button press on the Tempo lane, resolved against the lane.
+#[derive(Debug, Clone)]
+pub struct TempoLaneDown {
+    /// Pointer beat, snapped to the grid (where a new marker would go).
+    pub beat: f64,
+    pub bpm: f64,
+    pub window_y: f32,
+    /// Marker under the pointer.
+    pub point_id: Option<String>,
+    /// Left marker of the ramp whose drawn line is under the pointer, when the
+    /// press is on the line between two markers rather than on a marker.
+    pub segment_left_id: Option<String>,
+    pub additive: bool,
+    pub alt: bool,
+    pub click_count: u32,
+}
+
+/// Tempo Track mouse-down.
+pub type TempoTrackDownCallback =
+    std::sync::Arc<dyn Fn(&TempoLaneDown, &mut gpui::Window, &mut gpui::App) + 'static>;
 
 /// Tempo Track context menu: `(beat, bpm, point_id, screen_x, screen_y)`.
 pub type TempoTrackContextCallback = std::sync::Arc<
@@ -34,16 +50,83 @@ pub type GlobalLaneMenuCallback =
 /// than the pointer that has to hit it.
 const TEMPO_POINT_HIT_PX: f32 = 12.0;
 
-/// [`TEMPO_POINT_HIT_PX`] expressed in the units `tempo_point_at` compares:
-/// beats along the x axis, BPM along the y axis, both at the current zoom and
-/// the lane's current auto-fitted BPM range.
-fn tempo_hit_tolerances(state: &TimelineState, lane_h: f32, min: f64, max: f64) -> (f64, f64) {
-    let ppb = state.viewport.pixels_per_beat.max(1.0) as f64;
-    let usable = (lane_h - 2.0 * TEMPO_LANE_PAD).max(1.0) as f64;
-    (
-        TEMPO_POINT_HIT_PX as f64 / ppb,
-        (max - min) * TEMPO_POINT_HIT_PX as f64 / usable,
-    )
+/// Pointer slop around the drawn tempo line, in lane pixels, for grabbing a
+/// ramp to bend it.
+const TEMPO_CURVE_HIT_PX: f32 = 6.0;
+
+/// What the lane's pointer handlers need, owned. Never a clone of the whole
+/// `TimelineState`: that deep-copied every track, clip and note in the
+/// project twice per render (7 ms per copy at 32 tracks, ~90 ms at 64), which
+/// is what made pressing and dragging on the lane lag.
+struct TempoLaneHit {
+    gesture: crate::components::timeline::timeline_state::TimelineGestureContext,
+    tempo: TempoMap,
+    base_bpm: f64,
+    origin_y: f32,
+    lane_h: f32,
+    min_bpm: f64,
+    max_bpm: f64,
+}
+
+impl TempoLaneHit {
+    fn new(state: &TimelineState, min_bpm: f64, max_bpm: f64) -> Self {
+        Self {
+            gesture: state.gesture_context(),
+            tempo: state.tempo_map.clone(),
+            base_bpm: state.bpm as f64,
+            origin_y: state.tempo_lane_origin_y(),
+            lane_h: state.tempo_track_height(),
+            min_bpm,
+            max_bpm,
+        }
+    }
+
+    /// Same mapping as [`TimelineState::tempo_bpm_at_window_y`].
+    fn bpm_at_window_y(&self, window_y: f32) -> f64 {
+        crate::components::timeline::timeline_state::y_to_bpm(
+            window_y - self.origin_y,
+            self.lane_h,
+            self.min_bpm,
+            self.max_bpm,
+        )
+    }
+
+    /// [`TEMPO_POINT_HIT_PX`] in beats and BPM at the current zoom and range.
+    fn tolerances(&self) -> (f64, f64) {
+        let ppb = self.gesture.viewport.pixels_per_beat.max(1.0) as f64;
+        let usable = (self.lane_h - 2.0 * TEMPO_LANE_PAD).max(1.0) as f64;
+        (
+            TEMPO_POINT_HIT_PX as f64 / ppb,
+            (self.max_bpm - self.min_bpm) * TEMPO_POINT_HIT_PX as f64 / usable,
+        )
+    }
+
+    fn point_at(&self, beat: f64, bpm: f64) -> Option<String> {
+        let (beat_tol, bpm_tol) = self.tolerances();
+        self.tempo
+            .points
+            .iter()
+            .find(|p| (p.beat - beat).abs() <= beat_tol && (p.bpm - bpm).abs() <= bpm_tol)
+            .map(|p| p.id.clone())
+    }
+
+    /// Left marker of the ramp whose drawn line passes within
+    /// [`TEMPO_CURVE_HIT_PX`] of the pointer. Only ramps between two real
+    /// markers qualify: the stretch before the first marker is the base
+    /// tempo, which has no marker to carry a bend.
+    fn segment_at(&self, beat: f64, window_y: f32) -> Option<String> {
+        let points = &self.tempo.points;
+        let index = points.iter().rposition(|p| p.beat <= beat)?;
+        points.get(index + 1)?;
+        let line_y = self.origin_y
+            + bpm_to_y(
+                self.tempo.bpm_at_beat(beat, self.base_bpm),
+                self.lane_h,
+                self.min_bpm,
+                self.max_bpm,
+            );
+        ((window_y - line_y).abs() <= TEMPO_CURVE_HIT_PX).then(|| points[index].id.clone())
+    }
 }
 
 /// Global Tempo Track lane — header + automation curve over the project TempoMap.
@@ -204,11 +287,9 @@ pub fn tempo_track_lane(
 
     let subtitle = state.tempo_lane_header_subtitle();
 
+    let hit = std::rc::Rc::new(TempoLaneHit::new(state, min_bpm, max_bpm));
     let interaction = on_down.map(|cb| {
-        let state_left = state.clone();
-        let lane_h = lane_height;
-        let min = min_bpm;
-        let max = max_bpm;
+        let hit_left = hit.clone();
         let mut layer = div()
             .absolute()
             .inset_0()
@@ -217,41 +298,54 @@ pub fn tempo_track_lane(
                 gpui::MouseButton::Left,
                 move |event: &gpui::MouseDownEvent, window, cx| {
                     cx.stop_propagation();
+                    let hit = &hit_left;
                     let wx: f32 = event.position.x.into();
                     let wy: f32 = event.position.y.into();
-                    let lane_x = state_left.lane_x_from_window_x(wx);
-                    let beat = state_left.x_to_beat(lane_x).max(0.0);
-                    let snapped = state_left.snap_beats(beat as f32) as f64;
-                    let bpm = state_left.tempo_bpm_at_window_y(wy);
-                    let (beat_tol, bpm_tol) = tempo_hit_tolerances(&state_left, lane_h, min, max);
+                    let lane_x = hit.gesture.lane_x_from_window_x(wx);
+                    let beat = hit.gesture.x_to_beat(lane_x).max(0.0);
+                    let snapped = hit.gesture.snap_beats(beat as f32) as f64;
+                    let bpm = hit.bpm_at_window_y(wy);
                     // The *raw* beat, not the snapped one: at high zoom the snap
                     // step is wider than the tolerance, so snapping first made a
                     // marker sitting off the grid impossible to grab.
-                    let point_id = state_left.tempo_point_at(beat, bpm, beat_tol, bpm_tol);
-                    let additive = event.modifiers.shift || event.modifiers.control;
+                    let point_id = hit.point_at(beat, bpm);
+                    let segment_left_id = if point_id.is_none() {
+                        hit.segment_at(beat, wy)
+                    } else {
+                        None
+                    };
                     cb(
-                        &(snapped, bpm, point_id, additive, event.click_count as u32),
+                        &TempoLaneDown {
+                            beat: snapped,
+                            bpm,
+                            window_y: wy,
+                            point_id,
+                            segment_left_id,
+                            additive: event.modifiers.shift || event.modifiers.control,
+                            alt: event.modifiers.alt,
+                            click_count: event.click_count as u32,
+                        },
                         window,
                         cx,
                     );
                 },
             );
         if let Some(ctx_cb) = on_context {
-            let state_right = state.clone();
+            let hit_right = hit.clone();
             layer = layer.on_mouse_down(
                 gpui::MouseButton::Right,
                 move |event: &gpui::MouseDownEvent, window, cx| {
                     cx.stop_propagation();
+                    let hit = &hit_right;
                     let wx: f32 = event.position.x.into();
                     let wy: f32 = event.position.y.into();
-                    let sx: f32 = event.position.x.into();
-                    let sy: f32 = event.position.y.into();
-                    let lane_x = state_right.lane_x_from_window_x(wx);
-                    let beat = state_right.x_to_beat(lane_x).max(0.0);
-                    let bpm = state_right.tempo_bpm_at_window_y(wy);
-                    let (beat_tol, bpm_tol) = tempo_hit_tolerances(&state_right, lane_h, min, max);
-                    let point_id = state_right.tempo_point_at(beat, bpm, beat_tol, bpm_tol);
-                    ctx_cb(&(beat, bpm, point_id, sx, sy), window, cx);
+                    let lane_x = hit.gesture.lane_x_from_window_x(wx);
+                    let beat = hit.gesture.x_to_beat(lane_x).max(0.0);
+                    let bpm = hit.bpm_at_window_y(wy);
+                    // A right-click on a ramp's line targets the marker that
+                    // starts it, so its curve menu is one click away.
+                    let point_id = hit.point_at(beat, bpm).or_else(|| hit.segment_at(beat, wy));
+                    ctx_cb(&(beat, bpm, point_id, wx, wy), window, cx);
                 },
             );
         }

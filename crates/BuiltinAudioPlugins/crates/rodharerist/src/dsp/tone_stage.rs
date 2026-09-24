@@ -91,9 +91,15 @@ impl ToneStage {
         output_trim_db: f32,
         mix_pct: f32,
         loudness_norm_on: bool,
+        slim_size: f32,
     ) {
-        self.nam
-            .configure(input_trim_db, output_trim_db, mix_pct, loudness_norm_on);
+        self.nam.configure(
+            input_trim_db,
+            output_trim_db,
+            mix_pct,
+            loudness_norm_on,
+            slim_size,
+        );
     }
 
     /// Control thread: submit a freshly-built capture for the audio thread to

@@ -832,7 +832,9 @@ fn envelope_hint(panel: &SoundfontPlayerPanelState) -> AnyElement {
             false,
         );
     }
-    let mut hint = String::from("Shapes the instrument's output: attack and decay run from silence, release when the last note ends.");
+    let mut hint = String::from(
+        "Shapes the instrument's output: attack and decay run from silence, release when the last note ends.",
+    );
     if panel.envelope.sanitized().release_ms <= 0.0 {
         hint.push_str(" Release Off keeps the SoundFont tail.");
     }
