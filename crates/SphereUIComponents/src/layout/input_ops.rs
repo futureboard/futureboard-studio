@@ -2076,6 +2076,18 @@ impl StudioLayout {
                     ContextMenuEntry::item("Hide Region Track", "region:hide-track"),
                 ]
             }
+            ContextTarget::ChordTrack { .. } | ContextTarget::ChordLane => {
+                let state = &self.timeline.read(cx).state;
+                let has_chords = !state.chord_events.is_empty();
+                vec![
+                    ContextMenuEntry::Header("Chord Track".to_string()),
+                    ContextMenuEntry::item("Chord Generator…", "chords:open-generator"),
+                    menu_item_enabled("Create MIDI Clip from Chords", "chords:to-midi", has_chords),
+                    ContextMenuEntry::Separator,
+                    danger_menu_item_enabled("Delete All Chords", "chords:clear-all", has_chords),
+                    ContextMenuEntry::item("Hide Chord Track", "chords:hide-track"),
+                ]
+            }
             ContextTarget::TimelineRuler { beat } => {
                 let label = self.timeline.read(cx).state.format_position(*beat as f32);
                 let has_automation = self.timeline.read(cx).state.tempo_has_automation();
@@ -2130,6 +2142,15 @@ impl StudioLayout {
                 } else {
                     ContextMenuEntry::item("Show Region Track", "region:open-track")
                 });
+                entries.push(if st.state.show_chord_track {
+                    ContextMenuEntry::item("Hide Chord Track", "chords:hide-track")
+                } else {
+                    ContextMenuEntry::item("Show Chord Track", "chords:open-track")
+                });
+                entries.push(ContextMenuEntry::item(
+                    "Chord Generator…",
+                    "chords:open-generator",
+                ));
                 entries.push(if st.state.show_song_text_track {
                     ContextMenuEntry::item("Hide Song Text Track", "songtext:hide-track")
                 } else {

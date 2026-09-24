@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-09-23T12:20:00.189Z",
+  "generatedAt": "2026-09-23T20:42:18.805Z",
   "menus": [
     {
       "id": "file",
@@ -382,6 +382,27 @@
       "label": "View",
       "items": [
         {
+          "id": "view.chord_track",
+          "kind": "checkbox",
+          "label": "Chord Track",
+          "icon": null,
+          "shortcut": null,
+          "command": "chords:toggle-track",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": "Show or hide the global Chord Track under the ruler",
+          "children": []
+        },
+        {
+          "id": "view.sep.lanes",
+          "kind": "separator",
+          "enabled": true,
+          "visible": true
+        },
+        {
           "id": "view.developer",
           "kind": "submenu",
           "label": "Developer",
@@ -538,6 +559,42 @@
           "checked": false,
           "danger": false,
           "description": null,
+          "children": []
+        },
+        {
+          "id": "midi.sep.chords",
+          "kind": "separator",
+          "enabled": true,
+          "visible": true
+        },
+        {
+          "id": "midi.chord_generator",
+          "kind": "normal",
+          "label": "Chord Generator...",
+          "icon": "music",
+          "shortcut": null,
+          "command": "chords:open-generator",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": "Generate a progression in any key and scale, then drag it onto the Chord Track or a MIDI track",
+          "children": []
+        },
+        {
+          "id": "midi.chords_to_midi",
+          "kind": "normal",
+          "label": "Create MIDI Clip from Chord Track",
+          "icon": "list-music",
+          "shortcut": null,
+          "command": "chords:to-midi",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": "Write every chord on the Chord Track as one voiced MIDI clip on the selected MIDI track",
           "children": []
         },
         {
@@ -1012,6 +1069,21 @@
           "children": []
         },
         {
+          "id": "audio.find_tempo_key",
+          "kind": "normal",
+          "label": "Find Tempo & Key...",
+          "icon": "scan-search",
+          "shortcut": null,
+          "command": "audio:find-tempo-key",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": "Detect the tempo and key of the selected audio clip",
+          "children": []
+        },
+        {
           "id": "audio.sep.routing",
           "kind": "separator",
           "enabled": true,
@@ -1315,6 +1387,21 @@
           "checked": false,
           "danger": false,
           "description": "Browse and install community themes and extensions from the registry",
+          "children": []
+        },
+        {
+          "id": "window.chord_generator",
+          "kind": "normal",
+          "label": "Chord Generator...",
+          "icon": "music",
+          "shortcut": null,
+          "command": "chords:open-generator",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": "Generate a progression in any key and scale, then drag it onto the Chord Track or a MIDI track",
           "children": []
         },
         {

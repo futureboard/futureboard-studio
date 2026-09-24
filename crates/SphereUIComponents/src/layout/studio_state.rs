@@ -221,6 +221,13 @@ pub enum ContextTarget {
     },
     /// Region lane header menu — lane-level actions only.
     RegionLane,
+    /// Right-click on the empty Chord Track (a chord is deleted outright).
+    ChordTrack {
+        beat: f64,
+        event_id: Option<u64>,
+    },
+    /// Chord Track header menu — lane-level actions only.
+    ChordLane,
     /// Right-click on the global Tempo Track lane.
     TempoTrack {
         beat: f64,

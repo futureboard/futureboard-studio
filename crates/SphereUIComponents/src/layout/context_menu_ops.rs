@@ -159,6 +159,7 @@ impl StudioLayout {
                     state.find_track(track_id).is_some()
                 }
                 ContextTarget::Browser(_) => true,
+                ContextTarget::ChordTrack { .. } | ContextTarget::ChordLane => true,
                 ContextTarget::Mixer(track_id) => state.find_track(track_id).is_some(),
                 ContextTarget::SendPicker { track_id } => state.find_track(track_id).is_some(),
                 ContextTarget::OutputPicker { track_id } => state.find_track(track_id).is_some(),

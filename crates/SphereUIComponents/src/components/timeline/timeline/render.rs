@@ -1086,6 +1086,81 @@ impl Render for Timeline {
         let on_region_drag: std::sync::Arc<
             dyn Fn(&TimelineRegionDragUpdate, &mut gpui::Window, &mut gpui::App) + 'static,
         > = std::sync::Arc::new(on_region_drag);
+
+        // ── Chord Track ─────────────────────────────────────────────────
+        let on_chord_drag = cx.listener(|this, update: &ChordEventDragUpdate, _window, cx| {
+            if this.chord_gesture_origin.is_none() {
+                this.chord_gesture_origin = Some(this.state.chord_events.clone());
+            }
+            // Every move restarts from the gesture's origin, so dragging a
+            // chord across its neighbours trims them only where it finally
+            // lands, not everywhere it passed.
+            if let Some(origin) = this.chord_gesture_origin.clone() {
+                this.state.chord_events = origin;
+            }
+            this.state
+                .set_chord_event_range(update.event_id, update.start_beat, update.end_beat);
+            this.state.select_chord_event(update.event_id);
+            cx.notify();
+        });
+        let on_chord_drag: crate::components::timeline::chord_track::ChordTrackDragCallback =
+            std::sync::Arc::new(on_chord_drag);
+        let on_chord_drag_drop = cx.listener(|this, _drag: &ChordEventDrag, _window, cx| {
+            if let Some(prev) = this.chord_gesture_origin.take() {
+                this.record_chord_edit("Move Chord", prev, cx);
+            }
+            cx.notify();
+        });
+        let on_chord_down = cx.listener(|this, payload: &(f64, Option<u64>, u32), _window, cx| {
+            this.begin_chord_track_interaction(payload.0, payload.1, payload.2, cx);
+        });
+        let on_chord_down: crate::components::timeline::chord_track::ChordTrackDownCallback =
+            std::sync::Arc::new(on_chord_down);
+        let on_chord_context = self.on_context_menu.clone().map(|cb| {
+            std::sync::Arc::new(
+                move |(beat, event_id, x, y): &(f64, Option<u64>, f32, f32),
+                      window: &mut gpui::Window,
+                      cx: &mut gpui::App| {
+                    cb(
+                        &(
+                            TimelineContextTarget::ChordTrack {
+                                beat: *beat,
+                                event_id: *event_id,
+                            },
+                            *x,
+                            *y,
+                        ),
+                        window,
+                        cx,
+                    );
+                },
+            ) as crate::components::timeline::chord_track::ChordTrackContextCallback
+        });
+        let on_chord_open_generator = cx.listener(|this, _: &(), _window, cx| {
+            this.request_command("chords:open-generator", cx);
+        });
+        let on_chord_open_generator: crate::components::timeline::region_track::GlobalLaneVoidCallback =
+            std::sync::Arc::new(on_chord_open_generator);
+        let on_chord_header_menu = self.on_context_menu.clone().map(|cb| {
+            std::sync::Arc::new(
+                move |pos: &(f32, f32), window: &mut gpui::Window, cx: &mut gpui::App| {
+                    cb(&(TimelineContextTarget::ChordLaneHeader, pos.0, pos.1), window, cx);
+                },
+            ) as crate::components::timeline::region_track::GlobalLaneMenuCallback
+        });
+        let on_chord_hide = cx.listener(|this, _: &(), _window, cx| {
+            this.state.hide_chord_track_lane();
+            cx.notify();
+        });
+        let on_chord_hide: crate::components::timeline::region_track::GlobalLaneVoidCallback =
+            std::sync::Arc::new(on_chord_hide);
+        let on_chord_toggle_collapsed = cx.listener(|this, _: &(), _window, cx| {
+            this.state.chord_track_collapsed = !this.state.chord_track_collapsed;
+            this.mark_control_state_changed(cx);
+            cx.notify();
+        });
+        let on_chord_toggle_collapsed: crate::components::timeline::region_track::GlobalLaneVoidCallback =
+            std::sync::Arc::new(on_chord_toggle_collapsed);
         let on_loop_drag = cx.listener(|this, update: &TimelineLoopDragUpdate, _window, cx| {
             let start = update.start_beat.min(update.end_beat).max(0.0);
             let end = update.start_beat.max(update.end_beat).max(start + 1.0e-3);
@@ -1701,6 +1776,7 @@ impl Render for Timeline {
         let ts_h = state.time_signature_track_height();
         let marker_h = state.marker_track_height();
         let region_h = state.region_track_height();
+        let chord_h = state.chord_track_height();
         let content_top = state.arrangement_content_top();
         // Live pen-draw ghost clip (built before the chain to keep the borrow of
         // `self.pen_clip_draw` separate from the render closures).
@@ -1716,6 +1792,8 @@ impl Render for Timeline {
             .clip_clone_hint
             .as_ref()
             .and_then(|hint| clip_clone_hint_overlay(hint, state));
+        let chord_drop_overlay =
+            crate::components::timeline::chord_track::chord_drop_clip_overlay(state);
         let plugin_drop_overlay = self
             .plugin_drop_hint
             .as_ref()
@@ -2446,6 +2524,7 @@ impl Render for Timeline {
             // pointer is released — take it at the surface, like the resize
             // gestures, so the undo entry is always recorded.
             .on_drop::<TimelineRegionDrag>(on_region_drag_drop)
+            .on_drop::<ChordEventDrag>(on_chord_drag_drop)
             .on_drag_move::<TrackDragItem>(on_track_drag_move)
             .on_drop::<TrackDragItem>(on_track_dropped)
             .on_mouse_down(gpui::MouseButton::Middle, on_middle_pan_start)
@@ -2526,6 +2605,23 @@ impl Render for Timeline {
                     on_marker_header_menu.clone(),
                     Some(on_marker_hide.clone()),
                     Some(on_marker_toggle_collapsed.clone()),
+                    Some(on_global_lane_resize_arm.clone()),
+                    Some(on_global_lane_resize_reset.clone()),
+                ))
+            })
+            // Order must match `visible_global_lanes()`: Chord sits between
+            // the structure lanes and the conductor lanes.
+            .when(state.show_chord_track, |this| {
+                this.child(chord_track_lane(
+                    state,
+                    chord_h,
+                    Some(on_chord_down.clone()),
+                    on_chord_context.clone(),
+                    Some(on_chord_drag.clone()),
+                    Some(on_chord_open_generator.clone()),
+                    on_chord_header_menu.clone(),
+                    Some(on_chord_hide.clone()),
+                    Some(on_chord_toggle_collapsed.clone()),
                     Some(on_global_lane_resize_arm.clone()),
                     Some(on_global_lane_resize_reset.clone()),
                 ))
@@ -2652,6 +2748,17 @@ impl Render for Timeline {
             // External/browser file-drop hint. Drawn above lane content and below
             // playhead/tools; it is UI-only and follows the last GPUI drag move.
             .children(file_drop_overlay.map(|overlay| {
+                div()
+                    .absolute()
+                    .left(px(HEADER_WIDTH))
+                    .right_0()
+                    .top(px(content_top))
+                    .bottom_0()
+                    .overflow_hidden()
+                    .child(overlay)
+            }))
+            // Chord Generator drop ghost (a progression becoming a MIDI clip).
+            .children(chord_drop_overlay.map(|overlay| {
                 div()
                     .absolute()
                     .left(px(HEADER_WIDTH))

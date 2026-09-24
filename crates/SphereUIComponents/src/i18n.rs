@@ -96,6 +96,11 @@ impl I18n {
         self.tr_or(&key, fallback)
     }
 
+    /// Whether this locale defines `key` itself, without the en-US fallback.
+    pub fn has_own(self, key: &str) -> bool {
+        locale_messages(self.locale).contains_key(key)
+    }
+
     fn lookup(self, key: &str) -> Option<&'static str> {
         locale_messages(self.locale)
             .get(key)

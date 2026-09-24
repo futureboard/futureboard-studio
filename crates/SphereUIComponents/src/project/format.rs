@@ -114,7 +114,9 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// stereo identity with DC and de-hum bypassed.
 /// v50 appends per-marker SysEx messages at the tail of the body, keyed by
 /// marker id. Pre-v50 markers load without SysEx.
-pub const PROJECT_VERSION: u32 = 50;
+/// v51 appends the Chord Track (chords, lane collapse flag and custom height)
+/// at the tail of the body. Pre-v51 projects load with an empty Chord Track.
+pub const PROJECT_VERSION: u32 = 51;
 
 /// Minimum on-disk format version that can be loaded without data loss.
 /// Versions below this will show a warning but can still be loaded.
@@ -1567,7 +1569,48 @@ fn encode_body(project: &FutureboardProject) -> Vec<u8> {
         }
     }
 
+    // Chord Track (v51+).
+    w.write_u32(project.settings.chord_events.len() as u32);
+    for event in &project.settings.chord_events {
+        w.write_u64(event.id);
+        w.write_f64(event.start_beat);
+        w.write_f64(event.length_beats);
+        encode_chord(&mut w, &event.chord);
+        w.write_bool(event.flats);
+    }
+    w.write_bool(project.settings.chord_track_collapsed);
+    w.write_f32(project.settings.chord_track_height.unwrap_or(0.0));
+
     w.into_bytes()
+}
+
+/// Chord symbol: root, quality as its stable index in `ChordQuality::ALL`,
+/// and the slash bass (255 = none).
+fn encode_chord(w: &mut FbWriter, chord: &sphere_midi_service::chords::Chord) {
+    use sphere_midi_service::chords::ChordQuality;
+    let quality = ChordQuality::ALL
+        .iter()
+        .position(|q| *q == chord.quality)
+        .unwrap_or(0) as u8;
+    w.write_u8(chord.root % 12);
+    w.write_u8(quality);
+    w.write_u8(chord.bass.map(|b| b % 12).unwrap_or(255));
+}
+
+fn decode_chord(r: &mut FbReader) -> Result<sphere_midi_service::chords::Chord, ProjectError> {
+    use sphere_midi_service::chords::{Chord, ChordQuality};
+    let root = r.read_u8()? % 12;
+    let quality_index = r.read_u8()? as usize;
+    let bass = r.read_u8()?;
+    let quality = ChordQuality::ALL
+        .get(quality_index)
+        .copied()
+        .ok_or_else(|| ProjectError::Corrupted("invalid chord quality".to_string()))?;
+    Ok(Chord {
+        root,
+        quality,
+        bass: (bass < 12).then_some(bass),
+    })
 }
 
 fn encode_audio_connection(w: &mut FbWriter, c: &ProjectAudioConnection) {
@@ -2793,6 +2836,37 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
         }
     }
 
+    // Chord Track (v51+).
+    let (chord_events, chord_track_collapsed, chord_track_height) = if version >= 51 {
+        let count = r.read_u32()? as usize;
+        // id + start + length + chord (3) + flats.
+        if count > r.remaining() / 28 {
+            return Err(ProjectError::Corrupted(
+                "invalid chord event count".to_string(),
+            ));
+        }
+        let mut events = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = r.read_u64()?;
+            let start_beat = r.read_f64()?;
+            let length_beats = r.read_f64()?;
+            let chord = decode_chord(&mut r)?;
+            let flats = r.read_bool()?;
+            events.push(super::ProjectChordEvent {
+                id,
+                start_beat,
+                length_beats,
+                chord,
+                flats,
+            });
+        }
+        let collapsed = r.read_bool()?;
+        let height = r.read_f32()?;
+        (events, collapsed, (height > 0.0).then_some(height))
+    } else {
+        (Vec::new(), false, None)
+    };
+
     Ok(FutureboardProject {
         audio_connections,
         global_lanes,
@@ -2811,6 +2885,9 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
             timeline_markers,
             timeline_regions,
             song_text_events,
+            chord_events,
+            chord_track_collapsed,
+            chord_track_height,
             time_sig_num,
             time_sig_den,
             sample_rate,
@@ -3199,18 +3276,21 @@ mod tests {
         // Connections count, the v35 output-routing block (two absent optional
         // strings plus the bootstrap latch), the v40 conductor-lane fold block
         // (four collapse latches plus five absent optional heights), the v41
-        // ARA document count, the v43 timebase pair, and the v50 marker SysEx
-        // count. A v24-v26 fixture reads none of them, so drop the whole tail
-        // before appending the legacy cue block in its place.
+        // ARA document count, the v43 timebase pair, the v50 marker SysEx
+        // count, and the v51 Chord Track block (event count, collapse latch,
+        // custom height). A v24-v26 fixture reads none of them, so drop the
+        // whole tail before appending the legacy cue block in its place.
         let v35_output_routing_bytes = 1 + 1 + 1;
         let v40_global_lane_bytes = 4 + 5;
         let v43_timebase_bytes = 1 + 1;
+        let v51_chord_track_bytes = 4 + 1 + 4;
         body.truncate(
             body.len()
                 - 4 * std::mem::size_of::<u32>()
                 - v35_output_routing_bytes
                 - v40_global_lane_bytes
-                - v43_timebase_bytes,
+                - v43_timebase_bytes
+                - v51_chord_track_bytes,
         );
 
         let mut tail = FbWriter::new();
@@ -4337,9 +4417,11 @@ mod tests {
     #[test]
     fn an_absurd_connection_count_is_rejected_before_allocating() {
         let mut body = encode_body(&FutureboardProject::new("hostile"));
-        // Overwrite the trailing connection count with a huge value.
+        // Overwrite the body's last count — the v51 Chord Track event count,
+        // which sits before its collapse latch (1) and height (4) — with a
+        // huge value.
         let len = body.len();
-        body[len - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        body[len - 9..len - 5].copy_from_slice(&u32::MAX.to_le_bytes());
         let bytes = project_bytes_with_version(body, PROJECT_VERSION);
         assert!(matches!(
             decode_project(&bytes),
@@ -4378,6 +4460,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn chord_track_roundtrips_v51() {
+        use sphere_midi_service::chords::{Chord, ChordQuality};
+        let mut project = FutureboardProject::new("Chords");
+        project.settings.chord_events = vec![
+            super::super::ProjectChordEvent {
+                id: 1,
+                start_beat: 0.0,
+                length_beats: 4.0,
+                chord: Chord::new(9, ChordQuality::Minor7),
+                flats: false,
+            },
+            super::super::ProjectChordEvent {
+                id: 2,
+                start_beat: 4.0,
+                length_beats: 2.5,
+                chord: Chord::black_adder_to(0),
+                flats: true,
+            },
+            super::super::ProjectChordEvent {
+                id: 7,
+                start_beat: 6.5,
+                length_beats: 1.5,
+                chord: Chord {
+                    root: 0,
+                    quality: ChordQuality::Major,
+                    bass: Some(4),
+                },
+                flats: false,
+            },
+        ];
+        project.settings.chord_track_collapsed = true;
+        project.settings.chord_track_height = Some(64.0);
+        let decoded = decode_project(&encode_project(&project)).expect("decode");
+        assert_eq!(decoded.settings.chord_events, project.settings.chord_events);
+        assert!(decoded.settings.chord_track_collapsed);
+        assert_eq!(decoded.settings.chord_track_height, Some(64.0));
+
+        // A project with no custom height stores the default sentinel.
+        let plain =
+            decode_project(&encode_project(&FutureboardProject::new("Plain"))).expect("decode");
+        assert!(plain.settings.chord_events.is_empty());
+        assert_eq!(plain.settings.chord_track_height, None);
+    }
 
     /// The conductor lanes' fold state is view state, but it is view state the
     /// player set by hand, so it has to survive the file like a track height.

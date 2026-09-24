@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub mod chords;
 pub mod expression;
 pub mod mpe;
 pub mod sysex;

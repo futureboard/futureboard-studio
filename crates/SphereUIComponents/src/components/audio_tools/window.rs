@@ -21,11 +21,11 @@ use SphereAudioProcessor::{
     downmix_interleaved, estimate_bpm_candidates, estimate_key_ranked, learn_noise_profile,
     measure_dc_offset, measure_normalize, measure_phase, reduce_noise_stft,
     render_stretch_interleaved, replace_frame_range, resample_interleaved, semitone_to_pitch_ratio,
-    slice_frames, write_wav_f32, AudioClipProcessor, ChannelTransform, DcOffsetProcessor,
-    DeclickParams, DehumParams, DehumProcessor, FftSize, FrequencyFocus, KeyEstimate,
-    LoudnessMeasurement, NormalizeMeasurement, NormalizeMode, NormalizeParams, PhaseMeasurement,
-    SpectralDenoiseParams, SpectralGainParams, SpectrumMode, SpectrumSmoothing, SpectrumSnapshot,
-    SpectrumWindow, StftSettings, StretchAlgorithm, StretchMode, StretchParams, TempoCandidate,
+    slice_frames, write_wav_f32, AudioClipProcessor, ChannelTransform, DeclickParams, DehumParams,
+    DehumProcessor, FftSize, FrequencyFocus, KeyEstimate, LoudnessMeasurement,
+    NormalizeMeasurement, NormalizeMode, NormalizeParams, PhaseMeasurement, SpectralDenoiseParams,
+    SpectralGainParams, SpectrumMode, SpectrumSmoothing, SpectrumSnapshot, SpectrumWindow,
+    StftSettings, StretchAlgorithm, StretchMode, StretchParams, TempoCandidate,
     TransientDetectParams, TransientMarker,
 };
 
@@ -82,16 +82,18 @@ pub enum AudioToolCommand {
         beat: f64,
         bpm: f64,
     },
+    /// Point the clip at a rendered version of its audio.
     ReplaceSource {
         clip_id: String,
-        path: PathBuf,
-        sample_rate: u32,
+        source: crate::audio_edit::NewSource,
     },
 }
 
 #[derive(Clone)]
 pub struct AudioToolWindowCallbacks {
     pub on_command: Arc<dyn Fn(AudioToolCommand, &mut App) + Send + Sync>,
+    /// The open project's folder, where rendered edits are stored.
+    pub project_folder: Arc<dyn Fn(&App) -> Option<PathBuf> + Send + Sync>,
     pub on_close: Arc<dyn Fn(AudioToolKind, Bounds<Pixels>, &mut App) + Send + Sync>,
 }
 
@@ -245,6 +247,8 @@ pub struct AudioToolWindow {
     pub(super) source_pcm: Option<Arc<[f32]>>,
     pub(super) source_channels: usize,
     pub(super) repair: RepairSurface,
+    /// An Apply render is in flight; a second click must not start another.
+    rendering: bool,
 }
 
 impl AudioToolWindow {
@@ -322,6 +326,7 @@ impl AudioToolWindow {
             source_pcm: None,
             source_channels: 1,
             repair: RepairSurface::new(cx),
+            rendering: false,
         };
         if !matches!(kind, AudioToolKind::SpectrogramSettings) {
             window.spawn_analyze(cx);
@@ -427,7 +432,7 @@ impl AudioToolWindow {
                 .background_executor()
                 .spawn(async move {
                     let path = path.ok_or_else(|| "clip has no source file".to_string())?;
-                    let buffer = DirectAudio::load_audio_file(&path)?;
+                    let buffer = DirectAudio::load_audio_file_for_edit(&path)?;
                     let channels = buffer.channels.max(1);
                     let mut samples = buffer.samples;
                     if let Some(sel) = selection {
@@ -763,8 +768,12 @@ impl AudioToolWindow {
                     self.status = "Analyze first".to_string();
                     return;
                 };
-                let gain_db = m.required_gain_db;
-                self.apply_offline_pcm(cx, move |samples, _channels, _sr| {
+                let _ = m;
+                // Measure what is actually being processed, with the mode and
+                // target as they are now — the analysis result can be stale.
+                let params = self.normalize;
+                self.apply_offline_pcm(cx, move |samples, channels, sr| {
+                    let gain_db = measure_normalize(samples, channels, sr, params).required_gain_db;
                     let mut out = samples.to_vec();
                     apply_gain_interleaved(&mut out, gain_db);
                     Ok(out)
@@ -782,11 +791,17 @@ impl AudioToolWindow {
             }
             AudioToolKind::DcOffset => {
                 let dc = self.dc;
-                self.apply_offline_pcm(cx, move |samples, _channels, _sr| {
-                    let mut processor = DcOffsetProcessor::new(dc, true);
-                    let mut out = vec![0.0; samples.len()];
-                    processor.process(samples, &mut out);
-                    Ok(out)
+                self.apply_offline_pcm(cx, move |samples, channels, _sr| {
+                    // Per channel: the processor's interleaved path assumes a
+                    // stereo L/R layout.
+                    Ok(crate::audio_edit::process_channels_independently(
+                        samples,
+                        channels,
+                        |ch, data| {
+                            let offset = if ch == 1 { dc.right } else { dc.left };
+                            data.iter().map(|v| v - offset).collect()
+                        },
+                    ))
                 });
                 return;
             }
@@ -823,12 +838,20 @@ impl AudioToolWindow {
             }
             AudioToolKind::AudioRepair if self.repair.module == AudioRepairModule::DeHum => {
                 let params = self.dehum;
-                self.apply_offline_pcm(cx, move |samples, _channels, sr| {
-                    let mut processor = DehumProcessor::new(sr, params);
-                    processor.reset();
-                    let mut out = vec![0.0; samples.len()];
-                    processor.process(samples, &mut out);
-                    Ok(out)
+                self.apply_offline_pcm(cx, move |samples, channels, sr| {
+                    // One notch bank per channel: the interleaved path assumes
+                    // stereo and runs its filters at half rate on mono files.
+                    Ok(crate::audio_edit::process_channels_independently(
+                        samples,
+                        channels,
+                        |_, data| {
+                            let mut processor = DehumProcessor::new(sr, params);
+                            processor.reset();
+                            data.iter()
+                                .map(|&v| processor.process_stereo(v, 0.0).0)
+                                .collect()
+                        },
+                    ))
                 });
                 return;
             }
@@ -836,15 +859,13 @@ impl AudioToolWindow {
                 if let Some(profile) = self.learned_noise.clone() {
                     let params = self.denoise;
                     self.apply_offline_pcm(cx, move |samples, channels, sr| {
-                        let mono = downmix_interleaved(samples, channels);
-                        let out_mono = reduce_noise_stft(&mono, sr, &profile, params);
-                        let mut out = Vec::with_capacity(out_mono.len() * channels);
-                        for sample in out_mono {
-                            for _ in 0..channels {
-                                out.push(sample);
-                            }
-                        }
-                        Ok(out)
+                        // Each channel denoised on its own; a downmix copied to
+                        // every channel would collapse the stereo image.
+                        Ok(crate::audio_edit::process_channels_independently(
+                            samples,
+                            channels,
+                            |_, data| reduce_noise_stft(data, sr, &profile, params),
+                        ))
                     });
                     return;
                 }
@@ -903,7 +924,6 @@ impl AudioToolWindow {
         let (window_start, _) = self.clip_source_window(cx);
         let window_start = window_start as i64;
         self.apply_offline_pcm(cx, move |samples, channels, sr| {
-            let mono = downmix_interleaved(samples, channels);
             let params = SpectralGainParams {
                 start_frame: (sel.start_frame - window_start).max(0),
                 end_frame: (sel.end_frame - window_start).max(0),
@@ -912,14 +932,12 @@ impl AudioToolWindow {
                 gain,
                 fade_bins: 4,
             };
-            let out_mono = apply_spectral_gain(&mono, sr, params, StftSettings::default());
-            let mut out = Vec::with_capacity(out_mono.len() * channels);
-            for sample in out_mono {
-                for _ in 0..channels {
-                    out.push(sample);
-                }
-            }
-            Ok(out)
+            // Per channel, so a stereo clip stays stereo.
+            Ok(crate::audio_edit::process_channels_independently(
+                samples,
+                channels,
+                |_, data| apply_spectral_gain(data, sr, params, StftSettings::default()),
+            ))
         });
     }
 
@@ -994,26 +1012,40 @@ impl AudioToolWindow {
         process: impl FnOnce(&[f32], usize, u32) -> Result<Vec<f32>, String> + Send + 'static,
     ) {
         let clip_id = self.session.target.clip_id.clone();
-        let path = self.session.target.source_path.clone();
+        // The clip's *current* source: after an earlier Apply it plays a
+        // rendered version, not the file the window was opened on.
+        let path =
+            self.timeline
+                .read(cx)
+                .state
+                .find_clip(&clip_id)
+                .and_then(|(_, clip)| match &clip.clip_type {
+                    crate::components::timeline::timeline_state::ClipType::Audio {
+                        source_path,
+                        ..
+                    } => source_path.clone(),
+                    _ => None,
+                });
         let selection = self.processing_range();
         let tool_kind = self.session.tool_kind;
         let process_whole_clip = self.processes_whole_clip();
         let (source_start, source_end) = self.clip_source_window(cx);
-        let target_rate = if tool_kind == AudioToolKind::Resample {
-            self.resample_target
-        } else {
-            self.session.target.sample_rate
-        };
+        let resample_target =
+            (tool_kind == AudioToolKind::Resample).then_some(self.resample_target);
+        let project_folder = (self.callbacks.project_folder)(cx);
+        if self.rendering {
+            return;
+        }
+        self.rendering = true;
         self.status = "Rendering…".to_string();
         let host = cx.entity().downgrade();
         let on_command = self.callbacks.on_command.clone();
-        let path_clip_id = clip_id.clone();
         cx.spawn(async move |_, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let path = path.ok_or_else(|| "clip has no source file".to_string())?;
-                    let buffer = DirectAudio::load_audio_file(&path)?;
+                    let buffer = DirectAudio::load_audio_file_for_edit(&path)?;
                     let channels = buffer.channels.max(1);
                     let total_frames = (buffer.samples.len() / channels.max(1)) as u64;
                     let window_start = source_start.min(total_frames);
@@ -1023,7 +1055,7 @@ impl AudioToolWindow {
                         total_frames
                     };
                     // Bounce this clip's audible window only. A shared source
-                    // (duplicates, split halves) must keep the original file so
+                    // (duplicates, split halves) keeps the original file so
                     // the other clips do not inherit a crop.
                     let mut clip_samples = slice_frames(
                         &buffer.samples,
@@ -1060,28 +1092,44 @@ impl AudioToolWindow {
                     } else {
                         clip_samples = process(&clip_samples, channels, buffer.sample_rate)?;
                     }
-                    let out_path =
-                        processed_output_path(std::path::Path::new(&path), &path_clip_id);
-                    write_wav_f32(&out_path, &clip_samples, channels as u16, target_rate)
+                    let sample_rate = resample_target.unwrap_or(buffer.sample_rate);
+                    let source = std::path::Path::new(&path);
+                    let dir = crate::audio_edit::edit_output_dir(project_folder.as_deref(), source);
+                    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                    let out_path = crate::audio_edit::next_version_path(&dir, source);
+                    write_wav_f32(&out_path, &clip_samples, channels as u16, sample_rate)
                         .map_err(|e| e.to_string())?;
-                    Ok::<_, String>(out_path)
+                    Ok::<_, String>(crate::audio_edit::NewSource {
+                        path: out_path,
+                        sample_rate,
+                        frames: (clip_samples.len() / channels) as u64,
+                        old_window: (window_start, window_end),
+                        old_sample_rate: buffer.sample_rate,
+                        start_shift_beats: 0.0,
+                    })
                 })
                 .await;
             let _ = host.update(cx, |this, cx| {
+                this.rendering = false;
                 match result {
-                    Ok(path) => {
+                    Ok(source) => {
+                        let name = source
+                            .path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
                         (on_command)(
                             AudioToolCommand::ReplaceSource {
                                 clip_id: clip_id.clone(),
-                                path,
-                                sample_rate: target_rate,
+                                source,
                             },
                             cx,
                         );
-                        this.status = "Applied".to_string();
+                        this.status = format!("Applied — {name}");
+                        this.session.preview_enabled = false;
                         this.dispatch(AudioToolCommand::ClearPreview(clip_id), cx);
                     }
-                    Err(error) => this.status = error,
+                    Err(error) => this.status = format!("Apply failed: {error}"),
                 }
                 cx.notify();
             });
@@ -1097,41 +1145,6 @@ impl AudioToolWindow {
         self.session.preview_enabled = false;
         self.session.dirty = false;
     }
-}
-
-fn sanitized_clip_id(clip_id: &str) -> String {
-    let sanitized: String = clip_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "clip".to_string()
-    } else {
-        sanitized
-    }
-}
-
-/// Derived bounce next to the source, unique per clip so a split sibling or
-/// duplicate cannot be overwritten. Re-applying the same clip replaces its
-/// own file instead of stacking suffixes.
-fn processed_output_path(source: &std::path::Path, clip_id: &str) -> PathBuf {
-    let mut out = source.to_path_buf();
-    let stem = out
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("clip");
-    let clip_tag = sanitized_clip_id(clip_id);
-    let suffix = format!(".{clip_tag}.processed");
-    let stem = stem.strip_suffix(&suffix).unwrap_or(stem);
-    let stem = stem.strip_suffix("-processed").unwrap_or(stem);
-    out.set_file_name(format!("{stem}.{clip_tag}.processed.wav"));
-    out
 }
 
 fn bind_f32(
@@ -2383,29 +2396,4 @@ pub fn open_audio_tool_window(
         cx.new(|cx| AudioToolWindow::new(session, timeline, callbacks, cx))
     })
     .map_err(|e| e.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::processed_output_path;
-    use std::path::PathBuf;
-
-    #[test]
-    fn processed_path_is_unique_per_clip_and_stable_on_reapply() {
-        assert_eq!(
-            processed_output_path(PathBuf::from("/tmp/kick.wav").as_path(), "clip-3"),
-            PathBuf::from("/tmp/kick.clip-3.processed.wav")
-        );
-        assert_eq!(
-            processed_output_path(
-                PathBuf::from("/tmp/kick.clip-3.processed.wav").as_path(),
-                "clip-3"
-            ),
-            PathBuf::from("/tmp/kick.clip-3.processed.wav")
-        );
-        assert_ne!(
-            processed_output_path(PathBuf::from("/tmp/kick.wav").as_path(), "clip-3"),
-            processed_output_path(PathBuf::from("/tmp/kick.wav").as_path(), "clip-4")
-        );
-    }
 }

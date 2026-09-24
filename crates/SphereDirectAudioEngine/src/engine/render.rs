@@ -57,7 +57,6 @@ pub fn render_project_sample(
                     clip.offset_seconds,
                     clip.source_read_rate,
                     clip.reverse,
-                    clip.gain,
                     clip.fade_in_samples,
                     clip.fade_out_samples,
                     clip.fade_in_curve,
@@ -84,7 +83,6 @@ pub fn render_project_sample(
             clip_offset_seconds,
             clip_source_read_rate,
             clip_reverse,
-            clip_gain,
             clip_fade_in,
             clip_fade_out,
             clip_fade_in_curve,
@@ -152,23 +150,6 @@ pub fn render_project_sample(
             effective_time_ratio,
             processor,
         );
-        if rel == 0 {
-            runtime.clips[clip_index].denoise.reset();
-        }
-        (l, r) = runtime.clips[clip_index].denoise.process_stereo(l, r);
-        if !runtime.clips[clip_index].preview_bypass {
-            let clip = &mut runtime.clips[clip_index];
-            (l, r) = SphereAudioProcessor::apply_channel_transform(l, r, clip.channel_transform);
-            if clip.dc_remove {
-                l -= clip.dc_left;
-                r -= clip.dc_right;
-            }
-            (l, r) = clip.dehum.process_stereo(l, r);
-        }
-        if l == 0.0 && r == 0.0 {
-            continue;
-        }
-
         let fade = clip_fade_gain_with_curves(
             rel,
             clip_duration_samples,
@@ -177,23 +158,10 @@ pub fn render_project_sample(
             clip_fade_in_curve,
             clip_fade_out_curve,
         );
-        let extra = if runtime.clips[clip_index].preview_bypass {
-            1.0
-        } else {
-            let env = envelope_linear_gain(
-                &runtime.clips[clip_index].envelope_points,
-                rel as f32 / clip_duration_samples.max(1) as f32,
-            );
-            runtime.clips[clip_index].extra_gain * env
-        };
-        let g = clip_gain * fade * extra;
-        l *= g;
-        r *= g;
-        crate::analysis_tap::analysis_tap().write_if_target(
-            runtime.clips[clip_index].id_hash,
-            l,
-            r,
-        );
+        (l, r) = process_clip_frame(&mut runtime.clips[clip_index], rel, fade, l, r);
+        if l == 0.0 && r == 0.0 {
+            continue;
+        }
 
         // Build-time resolved output index (None for master/missing) — never
         // clone ids or the sends Vec on the audio thread.
@@ -873,7 +841,6 @@ fn render_signalsmith_clip_segment(
         duration_samples,
         output_sample_rate,
         reverse,
-        gain,
         fade_in_samples,
         fade_out_samples,
         fade_in_curve,
@@ -887,7 +854,6 @@ fn render_signalsmith_clip_segment(
             clip.duration_samples,
             runtime.sample_rate,
             clip.reverse,
-            clip.gain,
             clip.fade_in_samples,
             clip.fade_out_samples,
             clip.fade_in_curve,
@@ -999,10 +965,16 @@ fn render_signalsmith_clip_segment(
             fade_in_curve,
             fade_out_curve,
         );
-        let g = gain * fade;
+        let (l, r) = process_clip_frame(
+            clip,
+            rel,
+            fade,
+            clip.stretch_output_l[i],
+            clip.stretch_output_r[i],
+        );
         let frame_idx = frame_idx_start + i;
-        track.block_l[frame_idx] += clip.stretch_output_l[i] * g;
-        track.block_r[frame_idx] += clip.stretch_output_r[i] * g;
+        track.block_l[frame_idx] += l;
+        track.block_r[frame_idx] += r;
     }
 
     true
@@ -1366,7 +1338,6 @@ fn render_project_block_interleaved_core(
             clip_effective_time_ratio,
             clip_processor,
             clip_reverse,
-            clip_gain,
             clip_fade_in,
             clip_fade_out,
             clip_fade_in_curve,
@@ -1385,7 +1356,6 @@ fn render_project_block_interleaved_core(
                 clip.effective_time_ratio,
                 clip.processor,
                 clip.reverse,
-                clip.gain,
                 clip.fade_in_samples,
                 clip.fade_out_samples,
                 clip.fade_in_curve,
@@ -1485,7 +1455,7 @@ fn render_project_block_interleaved_core(
                         } else {
                             clip_processor
                         };
-                        let (mut l, mut r) = sample_clip_processor_stereo(
+                        let (l, r) = sample_clip_processor_stereo(
                             &source,
                             source_pos,
                             dry_source_pos,
@@ -1500,9 +1470,8 @@ fn render_project_block_interleaved_core(
                             clip_fade_in_curve,
                             clip_fade_out_curve,
                         );
-                        let g = clip_gain * fade;
-                        l *= g;
-                        r *= g;
+                        let (l, r) =
+                            process_clip_frame(&mut runtime.clips[clip_index], rel, fade, l, r);
                         runtime.tracks[track_index].block_l[frame_idx] += l;
                         runtime.tracks[track_index].block_r[frame_idx] += r;
                     }
@@ -2819,6 +2788,51 @@ pub(crate) fn scatter_vsti_output_children(
             }
         }
     }
+}
+
+/// Everything a clip does to its signal after the source has been read (and
+/// stretched): de-noise, channel transform, DC removal and de-hum, then the
+/// fade × clip gain × gain envelope × Audio Tools preview gain, and the
+/// analysis tap. Every clip render path — the per-sample path, the resample
+/// block path and the Signalsmith path, i.e. live stereo playback and export —
+/// goes through this one function, so a clip sounds the same everywhere.
+/// (Stereo playback and export used to apply only gain × fade, so the gain
+/// envelope, de-noise, channel, DC and de-hum settings were silent there.)
+///
+/// Realtime: per-sample, allocation-free, no locks; the processors are
+/// fixed-size state prepared when the runtime graph is built.
+#[inline]
+pub(crate) fn process_clip_frame(
+    clip: &mut crate::runtime::RuntimeClip,
+    rel: u64,
+    fade: f32,
+    mut l: f32,
+    mut r: f32,
+) -> (f32, f32) {
+    if rel == 0 {
+        clip.denoise.reset();
+    }
+    (l, r) = clip.denoise.process_stereo(l, r);
+    let extra = if clip.preview_bypass {
+        1.0
+    } else {
+        (l, r) = SphereAudioProcessor::apply_channel_transform(l, r, clip.channel_transform);
+        if clip.dc_remove {
+            l -= clip.dc_left;
+            r -= clip.dc_right;
+        }
+        (l, r) = clip.dehum.process_stereo(l, r);
+        clip.extra_gain
+            * envelope_linear_gain(
+                &clip.envelope_points,
+                rel as f32 / clip.duration_samples.max(1) as f32,
+            )
+    };
+    let g = clip.gain * fade * extra;
+    l *= g;
+    r *= g;
+    crate::analysis_tap::analysis_tap().write_if_target(clip.id_hash, l, r);
+    (l, r)
 }
 
 #[inline]

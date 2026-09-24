@@ -7878,6 +7878,132 @@ mod routing_tests {
         assert_eq!(left, vec![0.3, 0.4, 0.2, 0.3, 0.4]);
     }
 
+    /// The stereo block renderer (live stereo playback and export) must apply
+    /// the clip's own processing — channel transform, DC removal and the gain
+    /// envelope — not just gain × fade. Before, only the mono per-sample path
+    /// did, so these settings were silent on every real output.
+    #[test]
+    fn stereo_block_render_applies_clip_processing() {
+        let frames = 4usize;
+        let channels = 2usize;
+        let render = |configure: &dyn Fn(&mut RuntimeClip)| -> (f32, f32) {
+            let mut audio_track = track("audio", "audio", vec![]);
+            audio_track.pan = 0.0;
+            let tracks = vec![audio_track];
+            let audio_graph = crate::audio_graph::plan_runtime_audio_graph(&tracks).unwrap();
+            let samples: Vec<f32> = (0..8).flat_map(|_| [0.4f32, 0.1]).collect();
+            let source = Arc::new(ClipAudioSource::InMemory(Arc::new(AudioFileBuffer {
+                sample_rate: 48_000,
+                channels: 2,
+                frames: 8,
+                samples,
+            })));
+            let mut clip = RuntimeClip {
+                id: "clip-1".to_string(),
+                track_id: "audio".to_string(),
+                track_index: None,
+                start_beat: 0.0,
+                duration_beats: 8.0,
+                start_sample: 0,
+                duration_samples: 8,
+                offset_seconds: 0.0,
+                gain: 1.0,
+                stretch: SphereAudioProcessor::StretchParams::default(),
+                speed_ratio: 1.0,
+                source_read_rate: 1.0,
+                effective_time_ratio: 1.0,
+                pitch_ratio: 1.0,
+                stretch_backend: SphereAudioProcessor::StretchBackend::InternalRePitch,
+                source_start_samples: 0,
+                source_end_samples: 8,
+                warp_markers: Vec::new(),
+                warp_segments: Vec::new(),
+                processor: ClipDspProcessor::Resample,
+                reverse: false,
+                denoise: SphereAudioProcessor::DenoiseProcessor::new(48_000, 0.0),
+                id_hash: 1,
+                channel_transform: SphereAudioProcessor::ChannelTransform::Stereo,
+                dc_remove: false,
+                dc_left: 0.0,
+                dc_right: 0.0,
+                extra_gain: 1.0,
+                dehum: SphereAudioProcessor::DehumProcessor::new(
+                    48_000,
+                    SphereAudioProcessor::DehumParams {
+                        base_hz: 0.0,
+                        harmonics: 0,
+                        reduction_db: 0.0,
+                    },
+                ),
+                envelope_points: Vec::new(),
+                preview_bypass: false,
+                muted: false,
+                ara_rendered: false,
+                fade_in_samples: 0,
+                fade_out_samples: 0,
+                fade_in_curve: crate::runtime::FadeCurve::EqualPower,
+                fade_out_curve: crate::runtime::FadeCurve::EqualPower,
+                source,
+                stretch_processor: None,
+                stretch_input_l: Vec::new(),
+                stretch_input_r: Vec::new(),
+                stretch_output_l: Vec::new(),
+                stretch_output_r: Vec::new(),
+                stretch_prime_l: Vec::new(),
+                stretch_prime_r: Vec::new(),
+                stretch_next_project_sample: None,
+            };
+            configure(&mut clip);
+            let mut p = RuntimeProject {
+                sample_rate: 48_000,
+                tracks,
+                clips: vec![clip],
+                audio_graph,
+                ..Default::default()
+            };
+            p.resolve_indices();
+            let mut output = vec![0.0f32; frames * channels];
+            render_project_block_interleaved(
+                &mut p,
+                2,
+                1.0,
+                &mut output,
+                channels,
+                true,
+                4,
+                4,
+                None,
+            );
+            (output[0], output[1])
+        };
+        let close = |a: f32, b: f32| (a - b).abs() < 1.0e-3;
+
+        let (l, r) = render(&|_| {});
+        assert!(close(l, 0.4) && close(r, 0.1), "baseline {l} {r}");
+
+        let (l, r) =
+            render(&|c| c.channel_transform = SphereAudioProcessor::ChannelTransform::Swap);
+        assert!(close(l, 0.1) && close(r, 0.4), "channel swap {l} {r}");
+
+        let (l, r) = render(&|c| {
+            c.dc_remove = true;
+            c.dc_left = 0.1;
+            c.dc_right = 0.05;
+        });
+        assert!(close(l, 0.3) && close(r, 0.05), "dc removal {l} {r}");
+
+        let half_db = -6.0206;
+        let (l, r) = render(&|c| c.envelope_points = vec![(0.0, half_db), (1.0, half_db)]);
+        assert!(close(l, 0.2) && close(r, 0.05), "gain envelope {l} {r}");
+
+        // Preview bypass is the A/B "hear the original" switch.
+        let (l, _) = render(&|c| {
+            c.envelope_points = vec![(0.0, half_db), (1.0, half_db)];
+            c.preview_bypass = true;
+        });
+        assert!(close(l, 0.4), "bypass {l}");
+    }
+
     /// End-to-end render check that `reverse` and `speed_ratio` actually change
     /// the audio (not just the snapshot). This is the same block renderer the
     /// offline exporter drives, so it also covers "export uses the clip DSP path".

@@ -808,6 +808,16 @@ pub struct ProjectSongTextEvent {
     pub kind: ProjectSongTextEventKind,
 }
 
+/// One Chord Track chord (v51+).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectChordEvent {
+    pub id: u64,
+    pub start_beat: f64,
+    pub length_beats: f64,
+    pub chord: sphere_midi_service::chords::Chord,
+    pub flats: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectSettings {
     pub bpm: f64,
@@ -818,6 +828,11 @@ pub struct ProjectSettings {
     pub timeline_markers: Vec<ProjectTimelineMarker>,
     pub timeline_regions: Vec<ProjectTimelineRegion>,
     pub song_text_events: Vec<ProjectSongTextEvent>,
+    /// v51+: Chord Track chords, plus the lane's own collapse flag and custom
+    /// height (the v40 lane block is positional and cannot grow a field).
+    pub chord_events: Vec<ProjectChordEvent>,
+    pub chord_track_collapsed: bool,
+    pub chord_track_height: Option<f32>,
     pub time_sig_num: u32,
     pub time_sig_den: u32,
     pub sample_rate: u32,
@@ -838,6 +853,9 @@ impl Default for ProjectSettings {
             timeline_markers: Vec::new(),
             timeline_regions: Vec::new(),
             song_text_events: Vec::new(),
+            chord_events: Vec::new(),
+            chord_track_collapsed: false,
+            chord_track_height: None,
             time_sig_num: 4,
             time_sig_den: 4,
             sample_rate: 48000,
@@ -1445,6 +1463,21 @@ impl From<&TimelineState> for FutureboardProject {
                 color_hex: region.color_hex.clone(),
             })
             .collect();
+        project.settings.chord_events = tl
+            .chord_events
+            .iter()
+            .map(|event| ProjectChordEvent {
+                id: event.id,
+                start_beat: event.start_beat,
+                length_beats: event.length_beats,
+                chord: event.chord,
+                flats: event.flats,
+            })
+            .collect();
+        project.settings.chord_track_collapsed = tl.chord_track_collapsed;
+        project.settings.chord_track_height = tl
+            .global_lane_heights
+            .get(crate::components::timeline::timeline_state::GlobalLaneKind::Chord);
         project.settings.song_text_events = tl
             .song_text_events
             .iter()
@@ -1633,6 +1666,31 @@ pub fn apply_to_timeline(
         .collect();
     tl.markers
         .sort_by(|a, b| a.beat.total_cmp(&b.beat).then_with(|| a.id.cmp(&b.id)));
+    tl.chord_events = project
+        .settings
+        .chord_events
+        .iter()
+        .map(
+            |event| crate::components::timeline::timeline_state::ChordTrackEvent {
+                id: event.id,
+                start_beat: event.start_beat,
+                length_beats: event.length_beats,
+                chord: event.chord,
+                flats: event.flats,
+            },
+        )
+        .collect();
+    tl.chord_events
+        .sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat).then(a.id.cmp(&b.id)));
+    tl.selected_chord_event_id = None;
+    tl.chord_track_collapsed = project.settings.chord_track_collapsed;
+    tl.global_lane_heights.set(
+        crate::components::timeline::timeline_state::GlobalLaneKind::Chord,
+        project.settings.chord_track_height,
+    );
+    // Lane visibility is view state and not saved, but a project that has
+    // chords opens with them on screen — hidden harmony reads as lost work.
+    tl.show_chord_track = !tl.chord_events.is_empty();
     tl.regions = project
         .settings
         .timeline_regions

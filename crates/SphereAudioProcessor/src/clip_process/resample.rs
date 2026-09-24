@@ -100,7 +100,14 @@ pub fn resample_interleaved(
     Ok(interleaved)
 }
 
-/// Write interleaved f32 PCM as a 16-bit WAV. Used to create a derived asset.
+/// Write interleaved PCM as a 32-bit IEEE-float WAV. Used for every derived
+/// (edited/processed) asset.
+///
+/// Float keeps the full resolution of 24-bit and float sources and preserves
+/// peaks above 0 dBFS instead of clipping them — an edit must never cost the
+/// audio quality. The file is written to a sibling temp path and renamed into
+/// place, so a failed or interrupted write never leaves a truncated file where
+/// a clip expects audio.
 pub fn write_wav_f32(
     path: &Path,
     samples: &[f32],
@@ -109,35 +116,67 @@ pub fn write_wav_f32(
 ) -> Result<(), ResampleError> {
     let channels = channels.max(1);
     let frames = samples.len() / channels as usize;
-    let data_bytes = frames * channels as usize * 2;
-    let mut header = Vec::with_capacity(44 + data_bytes);
-    header.extend_from_slice(b"RIFF");
-    header.extend_from_slice(&(36 + data_bytes as u32).to_le_bytes());
-    header.extend_from_slice(b"WAVE");
-    header.extend_from_slice(b"fmt ");
-    header.extend_from_slice(&16u32.to_le_bytes());
-    header.extend_from_slice(&1u16.to_le_bytes());
-    header.extend_from_slice(&channels.to_le_bytes());
-    header.extend_from_slice(&sample_rate.to_le_bytes());
-    let byte_rate = sample_rate * channels as u32 * 2;
-    header.extend_from_slice(&byte_rate.to_le_bytes());
-    header.extend_from_slice(&(channels * 2).to_le_bytes());
-    header.extend_from_slice(&16u16.to_le_bytes());
-    header.extend_from_slice(b"data");
-    header.extend_from_slice(&(data_bytes as u32).to_le_bytes());
+    let block_align = channels as u32 * 4;
+    let data_bytes = frames as u32 * block_align;
+    // fmt (18 bytes, cbSize = 0) + fact chunk, as the spec asks for
+    // non-PCM formats.
+    let mut bytes = Vec::with_capacity(58 + data_bytes as usize);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(50 + data_bytes).to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(b"fmt ");
+    bytes.extend_from_slice(&18u32.to_le_bytes());
+    bytes.extend_from_slice(&3u16.to_le_bytes()); // WAVE_FORMAT_IEEE_FLOAT
+    bytes.extend_from_slice(&channels.to_le_bytes());
+    bytes.extend_from_slice(&sample_rate.to_le_bytes());
+    bytes.extend_from_slice(&(sample_rate * block_align).to_le_bytes());
+    bytes.extend_from_slice(&(block_align as u16).to_le_bytes());
+    bytes.extend_from_slice(&32u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // cbSize
+    bytes.extend_from_slice(b"fact");
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&(frames as u32).to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_bytes.to_le_bytes());
     for sample in samples.iter().take(frames * channels as usize) {
-        let clamped = sample.clamp(-1.0, 1.0);
-        let int = (clamped * 32767.0).round() as i16;
-        header.extend_from_slice(&int.to_le_bytes());
+        let value = if sample.is_finite() { *sample } else { 0.0 };
+        bytes.extend_from_slice(&value.to_le_bytes());
     }
-    let mut file = File::create(path)?;
-    file.write_all(&header)?;
+    let tmp = path.with_extension("wav.tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_wav_keeps_resolution_and_overs() {
+        let dir = std::env::temp_dir().join(format!("fb-wav-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("float.wav");
+        let samples = [0.123_456_78_f32, -0.5, 1.5, -1.25, f32::NAN, 0.0];
+        write_wav_f32(&path, &samples, 2, 48_000).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[20..22], &3u16.to_le_bytes(), "IEEE float format");
+        assert_eq!(&bytes[34..36], &32u16.to_le_bytes(), "32-bit");
+        let data = bytes.windows(4).position(|w| w == b"data").unwrap() + 8;
+        let read: Vec<f32> = bytes[data..]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(read, vec![0.123_456_78, -0.5, 1.5, -1.25, 0.0, 0.0]);
+        assert!(!path.with_extension("wav.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn identity_rate_copies() {

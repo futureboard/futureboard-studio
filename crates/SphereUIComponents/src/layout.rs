@@ -41,10 +41,12 @@ mod ara_graph;
 mod ara_menu;
 pub(crate) mod ara_ops;
 mod ara_studio;
+mod audio_editor_ops;
 mod audio_tool_ops;
 mod audio_transport;
 mod bottom_panel_ops;
 mod browser_ops;
+mod chord_ops;
 mod close_ops;
 mod context_menu_ops;
 pub(crate) mod engine_snapshot;
@@ -595,7 +597,13 @@ pub struct StudioLayout {
     stretch_tempo: stretch_tempo_ops::StretchTempoState,
     /// Floating audio-editor analysis/processing windows.
     audio_tools: crate::components::AudioToolWindowManager,
-    audio_editor_audition_owned: bool,
+    /// The Chord Generator utility window, when open.
+    chord_generator:
+        Option<gpui::WindowHandle<crate::components::chord_generator::ChordGeneratorWindow>>,
+    chord_generator_bounds: Option<gpui::Bounds<gpui::Pixels>>,
+    /// End beat of a play-selection audition started from the Audio Editor;
+    /// playback stops when the playhead reaches it.
+    audio_editor_audition_end: Option<f32>,
     /// Throttle / sync timestamps for engine ↔ UI bridging (playhead, snapshot
     /// sync, meter push, tempo commit). Grouped into
     /// [`audio_transport::EngineSyncState`] (decomposition slice).
@@ -795,7 +803,12 @@ impl StudioLayout {
         };
         let audio_editor = {
             let timeline = timeline.clone();
-            cx.new(|cx| components::AudioEditorHost::new(timeline, cx))
+            let callbacks = Self::audio_editor_callbacks(&cx.entity());
+            cx.new(|cx| {
+                let mut editor = components::AudioEditorHost::new(timeline, cx);
+                editor.set_callbacks(callbacks);
+                editor
+            })
         };
         let ara_editor = {
             let owner = cx.entity();
@@ -1235,7 +1248,9 @@ impl StudioLayout {
             background_tasks: BackgroundTaskStore::default(),
             stretch_tempo: stretch_tempo_ops::StretchTempoState::default(),
             audio_tools: crate::components::AudioToolWindowManager::default(),
-            audio_editor_audition_owned: false,
+            chord_generator: None,
+            chord_generator_bounds: None,
+            audio_editor_audition_end: None,
             project_switcher: ProjectSwitcherState::default(),
             project_switcher_search_input: TextInputState::new(
                 "project-switcher-search-input",
@@ -1768,6 +1783,9 @@ impl StudioLayout {
         // UI cannot mutate a half-loaded workspace.
         if !self.session_install_status.is_ready() {
             eprintln!("[SessionLoad] command blocked during install: {command_id}");
+            return;
+        }
+        if self.route_edit_command_to_audio_editor(command_id, cx) {
             return;
         }
         if command_id == "overlay:theme" {
@@ -2693,6 +2711,15 @@ impl StudioLayout {
             }
             "clip:split-at-playhead" => self.split_selected_audio_clip_at_playhead(cx),
             "audio:find-tempo-key" => self.open_tempo_key_finder(cx),
+            "chords:open-track" => self.set_chord_track_visible(true, cx),
+            "chords:hide-track" => self.set_chord_track_visible(false, cx),
+            "chords:toggle-track" => {
+                let visible = self.timeline.read(cx).state.show_chord_track;
+                self.set_chord_track_visible(!visible, cx);
+            }
+            "chords:clear-all" => self.clear_chord_track_command(cx),
+            "chords:to-midi" => self.chord_track_to_midi_command(cx),
+            "chords:open-generator" => self.open_chord_generator(cx),
 
             // ── Tools — switch the active timeline tool. UI-only; never dirties
             // the engine. The piano roll owns its own tool keys when focused.

@@ -7,8 +7,7 @@ use gpui::{
 use sphere_audio_editor::{editor_kind_for_clip, ClipEditorKind};
 
 use crate::components::ara_editor_host::AraEditorHost;
-use crate::components::audio_editor_adapter::{audio_editor_theme, clip_type_hint_for_selection};
-use crate::components::audio_editor_host::AudioEditorHost;
+use crate::components::audio_editor::{clip_type_hint_for_selection, AudioEditorHost};
 use crate::components::piano_roll::PianoRoll;
 use crate::components::solfege_editor::SolfegeEditorPanel;
 use crate::components::timeline::timeline::Timeline;
@@ -258,6 +257,7 @@ impl Render for ClipEditorPanel {
             let body = match self.active_surface_tab {
                 EditorSurfaceTab::Ara => {
                     self.trace("ara-tab");
+                    self.audio_editor.read(cx).mark_hidden();
                     self.ara_editor.clone().into_any_element()
                 }
                 EditorSurfaceTab::AudioEditor => {
@@ -275,7 +275,11 @@ impl Render for ClipEditorPanel {
                 .into_any_element();
         }
 
-        match self.current_kind(cx) {
+        let kind = self.current_kind(cx);
+        if kind != ClipEditorKind::Audio {
+            self.audio_editor.read(cx).mark_hidden();
+        }
+        match kind {
             ClipEditorKind::Audio => {
                 self.trace("audio");
                 self.audio_editor.clone().into_any_element()
@@ -297,7 +301,6 @@ impl Render for ClipEditorPanel {
 }
 
 fn empty_editor_panel() -> impl IntoElement {
-    let theme = audio_editor_theme();
     div()
         .flex()
         .items_center()
@@ -305,6 +308,6 @@ fn empty_editor_panel() -> impl IntoElement {
         .size_full()
         .bg(Colors::surface_base())
         .text_size(px(11.0))
-        .text_color(theme.text_muted)
+        .text_color(Colors::text_muted())
         .child("Select a clip to edit")
 }

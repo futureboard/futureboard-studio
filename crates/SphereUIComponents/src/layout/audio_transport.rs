@@ -1038,6 +1038,7 @@ impl StudioLayout {
                 crate::components::piano_roll::PianoRoll::publish_playhead(&docked, cx);
                 crate::components::piano_roll::PianoRoll::publish_playhead(&floating, cx);
             }
+            self.tick_audio_editor(true, cx);
         } else {
             let _ = self.timeline.update(cx, |timeline, cx| {
                 if timeline.state.transport.playing {
@@ -1051,6 +1052,7 @@ impl StudioLayout {
             let floating = self.piano_roll_floating.clone();
             crate::components::piano_roll::PianoRoll::publish_playhead(&docked, cx);
             crate::components::piano_roll::PianoRoll::publish_playhead(&floating, cx);
+            self.tick_audio_editor(false, cx);
         }
 
         // Coalesced dropout notice: when the realtime dropout counter advances,
@@ -3008,6 +3010,12 @@ impl StudioLayout {
                 ..
             } => {
                 self.delete_region_command(&id.clone(), cx);
+                true
+            }
+            ContextTarget::ChordTrack {
+                event_id: Some(id), ..
+            } => {
+                self.delete_chord_event_command(*id, cx);
                 true
             }
             ContextTarget::TempoTrack {

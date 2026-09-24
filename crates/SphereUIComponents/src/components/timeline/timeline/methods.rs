@@ -153,6 +153,7 @@ impl Timeline {
         self.ts_gesture_origin = None;
         self.marker_drag = None;
         self.region_gesture_origin = None;
+        self.chord_gesture_origin = None;
         self.marker_gesture_origin = None;
         self.pan_last_position = None;
         self.state.clear_track_drag();
@@ -218,6 +219,8 @@ impl Timeline {
             ts_drag: None,
             ts_gesture_origin: None,
             region_gesture_origin: None,
+            chord_gesture_origin: None,
+            on_command: None,
             marker_gesture_origin: None,
             pan_last_position: None,
             floating_toolbar_position: None,
@@ -292,6 +295,8 @@ impl Timeline {
             ts_drag: None,
             ts_gesture_origin: None,
             region_gesture_origin: None,
+            chord_gesture_origin: None,
+            on_command: None,
             marker_gesture_origin: None,
             pan_last_position: None,
             floating_toolbar_position: None,
@@ -472,6 +477,21 @@ impl Timeline {
         }
         let next = self.state.regions.clone();
         self.record_executed_command(EditCommand::SetRegions { label, prev, next }, cx);
+        true
+    }
+
+    /// One undo entry for a Chord Track change; a no-op when nothing changed.
+    pub(crate) fn record_chord_edit(
+        &mut self,
+        label: &'static str,
+        prev: Vec<crate::components::timeline::timeline_state::ChordTrackEvent>,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        if self.state.chord_events == prev {
+            return false;
+        }
+        let next = self.state.chord_events.clone();
+        self.record_executed_command(EditCommand::SetChordEvents { label, prev, next }, cx);
         true
     }
 
@@ -661,6 +681,18 @@ impl Timeline {
     /// copy-into-project for dropped audio.
     pub fn set_project_root(&mut self, root: Option<std::path::PathBuf>) {
         self.project_root = root;
+    }
+
+    pub fn set_command_callback(&mut self, callback: Option<TimelineCommandCb>) {
+        self.on_command = callback;
+    }
+
+    /// Ask the Studio to run a named command. Deferred by the owner, so it is
+    /// safe from inside a timeline listener.
+    pub(crate) fn request_command(&self, command: &'static str, cx: &mut gpui::App) {
+        if let Some(cb) = self.on_command.as_ref() {
+            cb(command, cx);
+        }
     }
 
     pub fn set_context_menu_callback(&mut self, callback: Option<TimelineContextMenuCb>) {
@@ -1301,6 +1333,39 @@ impl Timeline {
                     let id = self.state.add_region_at_beat(beat);
                     self.state.select_region(&id);
                     self.record_region_edit("Add Region", prev, cx);
+                } else {
+                    self.seek_to_exact_beat(
+                        beat as f32,
+                        crate::layout::SeekReason::TimelineClick,
+                        cx,
+                    );
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Chord Track mouse-down: a chord selects and seeks to it; the empty
+    /// lane seeks, and a double-click there opens the Chord Generator.
+    pub(super) fn begin_chord_track_interaction(
+        &mut self,
+        beat: f64,
+        event_id: Option<u64>,
+        click_count: u32,
+        cx: &mut Context<Self>,
+    ) {
+        match event_id {
+            Some(id) => {
+                self.state.select_chord_event(id);
+                if let Some(event) = self.state.chord_event(id) {
+                    let target = event.start_beat as f32;
+                    self.seek_to_exact_beat(target, crate::layout::SeekReason::TimelineClick, cx);
+                }
+            }
+            None => {
+                self.state.clear_chord_selection();
+                if click_count >= 2 {
+                    self.request_command("chords:open-generator", cx);
                 } else {
                     self.seek_to_exact_beat(
                         beat as f32,

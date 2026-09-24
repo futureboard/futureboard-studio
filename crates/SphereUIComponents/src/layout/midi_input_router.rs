@@ -107,6 +107,36 @@ impl StudioLayout {
         )
     }
 
+    /// Preview notes from a UI surface (the Chord Generator) on the track the
+    /// virtual keyboard would play, without feeding a recording take.
+    /// Returns `false` when no instrument track can play them.
+    pub(super) fn audition_preview_notes(&mut self, notes: &[u8], on: bool, cx: &App) -> bool {
+        let status = self.resolve_virtual_keyboard_target(cx);
+        let Some(target) = status.target else {
+            return false;
+        };
+        for &note in notes {
+            let event = if on {
+                MidiInputEvent::NoteOn {
+                    note,
+                    velocity: 88,
+                    channel: 0,
+                }
+            } else {
+                MidiInputEvent::NoteOff { note, channel: 0 }
+            };
+            self.route_midi_input_event_with_capture(
+                MidiInputSource::PianoRollPreview,
+                target.clone(),
+                event,
+                None,
+                None,
+                cx,
+            );
+        }
+        true
+    }
+
     /// Routes a gesture from the Soundfont Player window's keyboard or Test
     /// button. The built-in player is a track instrument with no plugin
     /// instance, so this always lands on the engine's track MIDI preview.

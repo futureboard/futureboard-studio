@@ -797,6 +797,35 @@ pub fn load_audio_file(path: &str) -> Result<AudioFileBuffer, String> {
     }
 }
 
+/// Largest file [`load_audio_file_for_edit`] decodes.
+pub const MAX_EDIT_DECODE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Decode a whole file for a destructive editor, off the realtime path.
+///
+/// [`load_audio_file`] refuses WAVs at or above
+/// [`STREAMING_WAV_THRESHOLD_BYTES`], because playback streams those instead of
+/// holding them. An editor has to hold the samples it cuts, and a few minutes
+/// of 32-bit float stereo is already past that threshold, so this raises the
+/// ceiling to [`MAX_EDIT_DECODE_BYTES`] for WAV and otherwise behaves the same.
+pub fn load_audio_file_for_edit(path: &str) -> Result<AudioFileBuffer, String> {
+    let p = Path::new(path);
+    let is_wav = matches!(audio_file_format(p), AudioFileFormat::Wav);
+    if !is_wav {
+        return load_audio_file(path);
+    }
+    let file_size = std::fs::metadata(p)
+        .map_err(|e| format!("open failed: {e}"))?
+        .len();
+    if file_size > MAX_EDIT_DECODE_BYTES {
+        return Err(format!(
+            "WAV file too large to edit ({} MB, limit {} MB)",
+            file_size / (1024 * 1024),
+            MAX_EDIT_DECODE_BYTES / (1024 * 1024)
+        ));
+    }
+    decode_wav_file(p)
+}
+
 fn audio_file_format(path: &Path) -> AudioFileFormat {
     match path
         .extension()
@@ -1232,7 +1261,10 @@ fn load_wav(path: &Path) -> Result<AudioFileBuffer, String> {
             "WAV file too large ({file_size} bytes) for in-memory decode — use streaming source"
         ));
     }
+    decode_wav_file(path)
+}
 
+fn decode_wav_file(path: &Path) -> Result<AudioFileBuffer, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read failed: {e}"))?;
     let (fmt, data_start, data_len) = wav_data_layout(&bytes)?;
     if fmt.channels == 0 || fmt.sample_rate == 0 {
@@ -1475,7 +1507,11 @@ pub(crate) fn decode_wav_sample(bytes: &[u8], offset: usize, fmt: &WavFmt) -> Re
             let b = bytes
                 .get(offset..offset + 4)
                 .ok_or_else(|| "unexpected EOF".to_string())?;
-            f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            let value = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            // Float keeps headroom above 0 dBFS — that is the point of
+            // writing edits as float — so it is not clamped. Only values
+            // that are not audio at all are dropped.
+            return Ok(if value.is_finite() { value } else { 0.0 });
         }
         (format, _) => return Err(format!("unsupported WAV format code: {format}")),
     };
@@ -1783,6 +1819,18 @@ mod peak_tests {
 
     /// A crafted WAV whose `fmt ` chunk claims ~4 GiB must be rejected by the
     /// header parser instead of attempting a multi-gigabyte allocation.
+    #[test]
+    fn float_edit_files_load_with_their_headroom() {
+        let path = temp_path("float-edit").with_extension("wav");
+        let samples = [0.25f32, -0.5, 1.5, -1.25];
+        SphereAudioProcessor::write_wav_f32(&path, &samples, 2, 44_100).unwrap();
+        let loaded = load_audio_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.channels, 2);
+        assert_eq!(loaded.sample_rate, 44_100);
+        assert_eq!(loaded.samples, samples.to_vec());
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn wav_header_rejects_absurd_fmt_chunk_length() {
         let mut bytes = Vec::new();

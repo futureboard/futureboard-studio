@@ -4,8 +4,7 @@ pub(crate) mod app_chrome;
 mod ara_editor_host;
 pub mod audio_connections_panel;
 pub mod audio_connections_window;
-mod audio_editor_adapter;
-mod audio_editor_host;
+pub mod audio_editor;
 mod audio_editor_spectrogram;
 mod audio_tools;
 pub mod background_tasks;
@@ -16,6 +15,7 @@ pub mod builtin_plugin_editor;
 pub(crate) mod builtin_plugin_editor_surface;
 pub mod builtin_plugin_editor_window;
 pub mod builtin_plugin_files;
+pub mod chord_generator;
 pub mod clock_window;
 pub mod color_picker;
 pub mod combo_box;
@@ -64,6 +64,7 @@ pub mod panel;
 mod performance_overlay;
 pub mod performance_window;
 pub mod piano_roll;
+pub(crate) mod pitch_wheel;
 pub mod plugin_content_host;
 pub mod plugin_editor_backend;
 pub mod plugin_editor_chrome;
@@ -115,7 +116,7 @@ pub use app_chrome::{
     BPM_MIN,
 };
 pub use ara_editor_host::AraEditorHost;
-pub use audio_editor_host::AudioEditorHost;
+pub use audio_editor::{AudioEditorCallbacks, AudioEditorHost};
 pub use audio_tools::{
     apply_preview_to_clip, apply_previews_to_snapshot, open_audio_tool_window, AudioToolCommand,
     AudioToolWindow, AudioToolWindowCallbacks, AudioToolWindowManager, ClipPreviewOverride,

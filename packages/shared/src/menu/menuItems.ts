@@ -230,6 +230,17 @@ export const APP_MENUS: AppMenuGroup[] = [
     label: "View",
     children: [
       {
+        id: "view.chord_track",
+        label: "Chord Track",
+        checked: false,
+        action: "chords:toggle-track",
+        description: "Show or hide the global Chord Track under the ruler",
+      },
+      {
+        type: "separator",
+        id: "view.sep.lanes",
+      },
+      {
         id: "view.developer",
         type: "submenu",
         label: "Developer",
@@ -313,6 +324,26 @@ export const APP_MENUS: AppMenuGroup[] = [
         icon: "maximize-2",
         accelerator: "Ctrl+Alt+5",
         action: "midi:fit-notes",
+      },
+      {
+        type: "separator",
+        id: "midi.sep.chords",
+      },
+      {
+        id: "midi.chord_generator",
+        label: "Chord Generator...",
+        icon: "music",
+        action: "chords:open-generator",
+        description:
+          "Generate a progression in any key and scale, then drag it onto the Chord Track or a MIDI track",
+      },
+      {
+        id: "midi.chords_to_midi",
+        label: "Create MIDI Clip from Chord Track",
+        icon: "list-music",
+        action: "chords:to-midi",
+        description:
+          "Write every chord on the Chord Track as one voiced MIDI clip on the selected MIDI track",
       },
       {
         type: "separator",
@@ -563,6 +594,13 @@ export const APP_MENUS: AppMenuGroup[] = [
         description: "Separate a mix into stems with MDX-NET (CPU/GPU)",
       },
       {
+        id: "audio.find_tempo_key",
+        label: "Find Tempo & Key...",
+        icon: "scan-search",
+        action: "audio:find-tempo-key",
+        description: "Detect the tempo and key of the selected audio clip",
+      },
+      {
         type: "separator",
         id: "audio.sep.routing",
       },
@@ -739,6 +777,14 @@ export const APP_MENUS: AppMenuGroup[] = [
         action: "window:extensions",
         description:
           "Browse and install community themes and extensions from the registry",
+      },
+      {
+        id: "window.chord_generator",
+        label: "Chord Generator...",
+        icon: "music",
+        action: "chords:open-generator",
+        description:
+          "Generate a progression in any key and scale, then drag it onto the Chord Track or a MIDI track",
       },
       {
         type: "separator",

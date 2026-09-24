@@ -14,8 +14,6 @@
 //! and the beat pulse at the detected tempo — and only while the window is
 //! active, so an idle window costs nothing.
 
-mod visual;
-
 use std::f32::consts::TAU;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,7 +39,7 @@ use crate::components::title_bar::external_window_titlebar;
 use crate::theme::{radius, space, typography, Colors};
 use crate::window_position::{apply_owner_display, centered_window_bounds};
 
-use visual::{fifths_pitch_class, ring, WheelFrame};
+use crate::components::pitch_wheel::{self as visual, fifths_pitch_class, ring, WheelFrame};
 
 pub const TEMPO_KEY_WINDOW_WIDTH: f32 = 640.0;
 pub const TEMPO_KEY_WINDOW_HEIGHT: f32 = 580.0;

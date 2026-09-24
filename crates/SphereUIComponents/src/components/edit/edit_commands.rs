@@ -342,6 +342,13 @@ pub enum EditCommand {
         prev: Vec<TimelineRegionState>,
         next: Vec<TimelineRegionState>,
     },
+    /// Chord Track events (drop, move, resize, delete). Harmony annotation:
+    /// nothing plays from the lane, so it never touches the audio graph.
+    SetChordEvents {
+        label: &'static str,
+        prev: Vec<crate::components::timeline::timeline_state::ChordTrackEvent>,
+        next: Vec<crate::components::timeline::timeline_state::ChordTrackEvent>,
+    },
     /// One global-lane height gesture (drag or reset-to-default). Persisted
     /// with the project since v40, but view state all the same, so it never
     /// invalidates the audio graph.
@@ -370,6 +377,7 @@ impl EditCommand {
             | EditCommand::SetClipSysEx { .. }
             | EditCommand::SplitMidiNote { .. } => EditImpact::Midi,
             EditCommand::SetSongTextEvents { .. } => EditImpact::Metadata,
+            EditCommand::SetChordEvents { .. } => EditImpact::Metadata,
             EditCommand::SetGlobalLaneHeights { .. } => EditImpact::Metadata,
             EditCommand::SetTrackVolume { .. } | EditCommand::SetTrackPan { .. } => {
                 EditImpact::MixerControl
@@ -442,6 +450,7 @@ impl EditCommand {
             EditCommand::SetTimeSignatureState { label, .. } => label,
             EditCommand::SetMarkers { label, .. } => label,
             EditCommand::SetRegions { label, .. } => label,
+            EditCommand::SetChordEvents { label, .. } => label,
             EditCommand::SetGlobalLaneHeights { .. } => "Resize Lane",
         }
     }
@@ -625,6 +634,10 @@ impl EditCommand {
             EditCommand::SetRegions { next, .. } => {
                 state.regions = next.clone();
             }
+            EditCommand::SetChordEvents { next, .. } => {
+                state.chord_events = next.clone();
+                state.selected_chord_event_id = None;
+            }
             EditCommand::SetGlobalLaneHeights { next, .. } => {
                 state.global_lane_heights = next.clone();
             }
@@ -782,6 +795,10 @@ impl EditCommand {
             }
             EditCommand::SetRegions { prev, .. } => {
                 state.regions = prev.clone();
+            }
+            EditCommand::SetChordEvents { prev, .. } => {
+                state.chord_events = prev.clone();
+                state.selected_chord_event_id = None;
             }
             EditCommand::SetGlobalLaneHeights { prev, .. } => {
                 state.global_lane_heights = prev.clone();

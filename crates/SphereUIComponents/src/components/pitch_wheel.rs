@@ -1,4 +1,5 @@
-//! The tempo/key wheel: one draw-only frame description, two painters.
+//! The pitch-class wheel shared by Find Tempo & Key and the Chord Generator:
+//! one draw-only frame description, two painters.
 //!
 //! Twelve pitch-class segments sit on a circle-of-fifths ring, so keys that
 //! share most of their notes sit next to each other and a detected key reads as
@@ -27,18 +28,18 @@ use crate::theme::Colors;
 
 /// Pitch class shown at ring position `i` (0 at twelve o'clock, clockwise):
 /// the circle of fifths starting on C.
-pub(super) fn fifths_pitch_class(position: usize) -> usize {
+pub(crate) fn fifths_pitch_class(position: usize) -> usize {
     (position * 7) % 12
 }
 
 /// Ring position of pitch class `pc` — the inverse of [`fifths_pitch_class`].
-pub(super) fn fifths_position(pc: usize) -> usize {
+pub(crate) fn fifths_position(pc: usize) -> usize {
     (pc * 7) % 12
 }
 
 /// Ring proportions as fractions of the wheel radius. Shared by both painters
 /// and by the label layout in the window, so text and segments cannot drift.
-pub(super) mod ring {
+pub(crate) mod ring {
     /// Inner edge of the pitch-class segments.
     pub const SEGMENT_INNER: f32 = 0.60;
     /// Outer limit a full-energy segment reaches.
@@ -55,7 +56,7 @@ pub(super) mod ring {
 
 /// Everything a painter needs, in logical pixels.
 #[derive(Debug, Clone)]
-pub(super) struct WheelFrame {
+pub(crate) struct WheelFrame {
     pub size: f32,
     /// Device scale, so the GPU painter rasterises at physical resolution.
     pub scale: f32,
@@ -114,7 +115,7 @@ const SEGMENT_GAP_PX: f32 = 1.5;
 // ── GPUI painter (fallback) ──────────────────────────────────────────────────
 
 /// Paint the frame with GPUI paths. Used when WGPU is unavailable.
-pub(super) fn render_gpui(frame: &WheelFrame) -> AnyElement {
+pub(crate) fn render_gpui(frame: &WheelFrame) -> AnyElement {
     let frame = frame.clone();
     canvas(
         |_bounds, _window, _cx| {},
@@ -285,7 +286,7 @@ fn paint_arc(
 /// WGPU is unavailable or the pass failed; the caller then paints with
 /// [`render_gpui`].
 #[cfg(feature = "gpu-renderer")]
-pub(super) fn render_wgpu(frame: &WheelFrame, cx: &mut gpui::App) -> Option<AnyElement> {
+pub(crate) fn render_wgpu(frame: &WheelFrame, cx: &mut gpui::App) -> Option<AnyElement> {
     use gpui::{img, ImageSource, ObjectFit, StyledImage};
     let image = gpu::render(frame, cx)?;
     Some(
@@ -297,7 +298,7 @@ pub(super) fn render_wgpu(frame: &WheelFrame, cx: &mut gpui::App) -> Option<AnyE
 }
 
 #[cfg(not(feature = "gpu-renderer"))]
-pub(super) fn render_wgpu(_frame: &WheelFrame, _cx: &mut gpui::App) -> Option<AnyElement> {
+pub(crate) fn render_wgpu(_frame: &WheelFrame, _cx: &mut gpui::App) -> Option<AnyElement> {
     None
 }
 
@@ -463,7 +464,7 @@ fn fs_wheel(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 }
 "#;
 
-    pub(super) struct WheelGpu {
+    pub(crate) struct WheelGpu {
         device: wgpu::Device,
         queue: wgpu::Queue,
         pipeline: wgpu::RenderPipeline,
@@ -484,7 +485,7 @@ fn fs_wheel(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         std::env::var_os("FUTUREBOARD_GPU_RENDERER_DEBUG").is_some()
     }
 
-    pub(super) fn render(frame: &WheelFrame, cx: &mut gpui::App) -> Option<Arc<RenderImage>> {
+    pub(crate) fn render(frame: &WheelFrame, cx: &mut gpui::App) -> Option<Arc<RenderImage>> {
         WHEEL_GPU.with(|cell| {
             let mut slot = cell.borrow_mut();
             let gpu = slot.get_or_insert_with(|| match WheelGpu::new() {
@@ -525,7 +526,7 @@ fn fs_wheel(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     /// Release the cached frame when the window closes, so its texture does
     /// not outlive the only surface that shows it.
-    pub(super) fn release(cx: &mut gpui::App) {
+    pub(crate) fn release(cx: &mut gpui::App) {
         WHEEL_GPU.with(|cell| {
             if let Some(Some(gpu)) = cell.borrow_mut().as_mut() {
                 if let Some(image) = gpu.last_image.take() {
@@ -546,7 +547,7 @@ fn fs_wheel(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     impl WheelGpu {
-        pub(super) fn new() -> Result<Self, String> {
+        pub(crate) fn new() -> Result<Self, String> {
             let instance = wgpu::Instance::default();
             let adapter =
                 pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -721,7 +722,7 @@ fn fs_wheel(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
 
         /// One pass, read back as tightly packed premultiplied BGRA rows.
-        pub(super) fn render_bgra(&mut self, frame: &WheelFrame) -> Result<Vec<u8>, String> {
+        pub(crate) fn render_bgra(&mut self, frame: &WheelFrame) -> Result<Vec<u8>, String> {
             let edge = (frame.size * frame.scale.max(0.5)).round().max(1.0) as u32;
             if edge > MAX_EDGE {
                 return Err("wheel too large for the GPU pass".to_string());
@@ -808,7 +809,7 @@ fn fs_wheel(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 }
 
 /// Drop the GPU painter's cached frame. Safe to call without the feature.
-pub(super) fn release_gpu_frame(cx: &mut gpui::App) {
+pub(crate) fn release_gpu_frame(cx: &mut gpui::App) {
     #[cfg(feature = "gpu-renderer")]
     gpu::release(cx);
     #[cfg(not(feature = "gpu-renderer"))]

@@ -14,6 +14,9 @@ use crate::components::timeline::floating_tools_bar::floating_tools_bar;
 use crate::components::timeline::global_lane_header::{
     GlobalLaneResizeArmCb, GlobalLaneResizeResetCb,
 };
+use crate::components::timeline::chord_track::{
+    chord_track_lane, ChordEventDrag, ChordEventDragUpdate,
+};
 use crate::components::timeline::marker_track::marker_track_lane;
 use crate::components::timeline::region_track::region_track_lane;
 use crate::components::timeline::song_text_track::{
@@ -246,6 +249,12 @@ pub struct Timeline {
     /// (before any mutation) so the drop records one undo step for the whole
     /// drag instead of one per mouse-move.
     region_gesture_origin: Option<Vec<TimelineRegionState>>,
+    /// Chord Track events at the start of a chord block drag; the drop turns
+    /// the whole gesture into one undo entry.
+    chord_gesture_origin: Option<Vec<crate::components::timeline::timeline_state::ChordTrackEvent>>,
+    /// Named app commands the timeline asks the Studio to run (e.g. opening
+    /// the Chord Generator from the Chord Track header).
+    on_command: Option<TimelineCommandCb>,
     /// Pre-gesture marker snapshot, for the Marker lane's flag drag. Mirrors
     /// `region_gesture_origin`.
     marker_gesture_origin: Option<Vec<TimelineMarkerState>>,
@@ -389,6 +398,14 @@ pub enum TimelineContextTarget {
     MarkerLaneHeader,
     /// Lane header menu button on the Region track.
     RegionLaneHeader,
+    /// Right-click on the global Chord Track. `event_id` is `None` on the
+    /// empty lane.
+    ChordTrack {
+        beat: f64,
+        event_id: Option<u64>,
+    },
+    /// Lane header menu button on the Chord Track.
+    ChordLaneHeader,
     /// Automation target picker opened from the control lane "+ Add" button.
     AutomationTargetPicker {
         track_id: String,
@@ -439,6 +456,9 @@ pub type TimelineMidiImportPromptCb =
     std::sync::Arc<dyn Fn(&TimelineMidiImportPrompt, &mut gpui::Window, &mut gpui::App) + 'static>;
 
 pub type TimelineProjectChangedCb = std::sync::Arc<dyn Fn(&mut gpui::App) + 'static>;
+
+/// A named Studio command requested from inside the timeline.
+pub type TimelineCommandCb = std::sync::Arc<dyn Fn(&'static str, &mut gpui::App) + 'static>;
 
 #[derive(Clone, Debug)]
 struct ScrollbarDrag {
