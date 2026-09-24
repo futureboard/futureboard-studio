@@ -19,8 +19,13 @@ use crate::components::timeline::timeline_state::{
 use super::StudioLayout;
 
 /// Largest drift, in seconds, a merged tempo segment may put any detected
-/// beat off its project beat. Well under what an ear resolves as a flam.
-const MERGE_TOLERANCE_SECONDS: f64 = 0.005;
+/// beat off its project beat. Under what an ear resolves as a flam, and wide
+/// enough that a live band's small push and pull does not become a point on
+/// every bar.
+const MERGE_TOLERANCE_SECONDS: f64 = 0.015;
+/// Tempo resolutions tried in order: a segment gets the coarsest one that
+/// still keeps its beats within tolerance, so a song made at 120 maps as 120.
+const TEMPO_STEPS: [f64; 3] = [1.0, 0.1, 0.01];
 /// A pickup this close to a whole number of beats is rounded to it, with the
 /// pre-roll tempo nudged to match, so the grid starts on a clean beat.
 const PICKUP_SNAP_BEATS: f64 = 0.08;
@@ -34,6 +39,15 @@ pub(crate) struct TempoMapPlan {
     pub meter: Vec<(f64, u16, u16)>,
     /// Project beat of the first detected downbeat.
     pub first_downbeat_beat: f64,
+}
+
+/// The coarsest rounding of `bpm` in [`TEMPO_STEPS`] that `keeps`, else `bpm`.
+fn clean_bpm(bpm: f64, keeps: impl Fn(f64) -> bool) -> f64 {
+    TEMPO_STEPS
+        .iter()
+        .map(|step| (bpm / step).round() * step)
+        .find(|&rounded| rounded > 0.0 && keeps(rounded))
+        .unwrap_or(bpm)
 }
 
 /// Plan a tempo map that puts every detected beat on a project beat.
@@ -72,27 +86,43 @@ pub(crate) fn plan_tempo_map(
     }
 
     // Tempo: grow each segment while one constant tempo keeps every beat in
-    // it within tolerance of where it was heard.
+    // it within tolerance of where it was heard. Segments start where the map
+    // (not the detection) puts their first beat, so rounding a tempo never
+    // lets error build up along the song.
     let mut tempo = Vec::new();
+    let mut at = beats[0];
     if offset > 0.0 {
-        tempo.push((0.0, pre_bpm));
+        let pre = clean_bpm(pre_bpm, |bpm| {
+            (offset * 60.0 / bpm - beats[0]).abs() <= MERGE_TOLERANCE_SECONDS
+        });
+        tempo.push((0.0, pre));
+        at = offset * 60.0 / pre;
     }
     let n = beats.len();
     let mut a = 0usize;
     while a + 1 < n {
+        let fits = |start: f64, period: f64, b: usize| {
+            (a + 1..=b).all(|j| {
+                (start + (j - a) as f64 * period - beats[j]).abs() <= MERGE_TOLERANCE_SECONDS
+            })
+        };
         let mut end = a + 1;
         for b in a + 2..n {
-            let period = (beats[b] - beats[a]) / (b - a) as f64;
-            let fits = (a + 1..b).all(|j| {
-                (beats[a] + (j - a) as f64 * period - beats[j]).abs() <= MERGE_TOLERANCE_SECONDS
-            });
-            if !fits {
+            if !fits(at, (beats[b] - at) / (b - a) as f64, b) {
                 break;
             }
             end = b;
         }
-        let period = (beats[end] - beats[a]) / (end - a) as f64;
-        tempo.push((offset + a as f64, 60.0 / period));
+        let bpm = 60.0 * (end - a) as f64 / (beats[end] - at);
+        let bpm = clean_bpm(bpm, |bpm| fits(at, 60.0 / bpm, end));
+        // The same tempo as the point before just carries on.
+        if tempo
+            .last()
+            .is_none_or(|&(_, last): &(f64, f64)| last != bpm)
+        {
+            tempo.push((offset + a as f64, bpm));
+        }
+        at += (end - a) as f64 * 60.0 / bpm;
         a = end;
     }
 
@@ -416,8 +446,7 @@ mod tests {
         let beats = steady(120.0, 2.0, 64);
         let plan = plan_tempo_map(&beats, &bars(64, 4, 0), 4).unwrap();
         assert_eq!(plan.first_downbeat_beat, 4.0);
-        assert_eq!(plan.tempo.len(), 2, "{:?}", plan.tempo);
-        assert!((plan.tempo[1].1 - 120.0).abs() < 1e-6);
+        assert_eq!(plan.tempo, vec![(0.0, 120.0)]);
         // The downbeat is on a bar line already: no extra meter point.
         assert_eq!(plan.meter, vec![(0.0, 4, 4)]);
     }
@@ -478,6 +507,18 @@ mod tests {
             plan.tempo.len() < beats.len(),
             "merging should reduce points"
         );
+    }
+
+    #[test]
+    fn a_click_track_with_a_few_ms_of_jitter_maps_as_one_whole_tempo() {
+        // 120 BPM with ±6 ms of detection wobble, then a real move to 130.
+        let jitter = |i: usize| 0.006 * ((i * 7919) % 13) as f64 / 6.0 - 0.006;
+        let mut beats: Vec<f64> = (0..96).map(|i| 2.0 + i as f64 * 0.5 + jitter(i)).collect();
+        let last = 2.0 + 95.0 * 0.5;
+        beats.extend((1..=64).map(|i| last + i as f64 * 60.0 / 130.0 + jitter(i)));
+        let plan = plan_tempo_map(&beats, &bars(160, 4, 0), 4).unwrap();
+        let bpms: Vec<f64> = plan.tempo.iter().map(|p| p.1).collect();
+        assert_eq!(bpms, vec![120.0, 130.0], "{:?}", plan.tempo);
     }
 
     #[test]

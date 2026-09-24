@@ -857,14 +857,21 @@ impl TempoKeyFinderWindow {
         let rhythm = self.analysis()?.rhythm.as_ref()?;
         let bars = rhythm.beats.iter().filter(|b| b.position == 1).count();
         let tempo = if rhythm.variable && rhythm.sections.len() > 1 {
-            let first = rhythm.sections.first().map(|s| s.bpm).unwrap_or(rhythm.bpm);
-            let last = rhythm.sections.last().map(|s| s.bpm).unwrap_or(rhythm.bpm);
-            format!(
-                "Tempo changes: {} → {} BPM · {} sections",
-                format_bpm(first),
-                format_bpm(last),
-                rhythm.sections.len()
-            )
+            let sections = &rhythm.sections;
+            let path = if sections.len() <= 5 {
+                sections
+                    .iter()
+                    .map(|s| format_bpm(s.bpm))
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            } else {
+                format!(
+                    "{} → … → {}",
+                    format_bpm(sections[0].bpm),
+                    format_bpm(sections[sections.len() - 1].bpm)
+                )
+            };
+            format!("Tempo changes: {path} BPM · {} sections", sections.len())
         } else if rhythm.variable {
             let (lo, hi) = rhythm
                 .tempo_curve
@@ -1086,19 +1093,34 @@ impl TempoKeyFinderWindow {
         .absolute()
         .inset_0();
 
-        // Labels, positioned by fraction so they need no measured width.
-        let section_labels = rhythm.sections.iter().map(|s| {
-            div()
-                .absolute()
-                .top(px(space::HAIR))
-                .left(gpui::relative(frac(s.start_seconds)))
-                .pl(px(space::TIGHT))
-                .text_size(px(typography::UI_XS))
-                .font_features(tabular_features())
-                .text_color(Colors::text_secondary())
-                .whitespace_nowrap()
-                .child(format!("{} BPM", format_bpm(s.bpm)))
-                .into_any_element()
+        // Labels, positioned by fraction so they need no measured width; each
+        // stays inside its own section, dropping the unit (or itself) when
+        // the section is too narrow to hold it.
+        let section_labels = rhythm.sections.iter().filter_map(|s| {
+            let (a, b) = (frac(s.start_seconds), frac(s.end_seconds));
+            let span = (b - a) * width_px;
+            let text = if span >= 64.0 {
+                format!("{} BPM", format_bpm(s.bpm))
+            } else if span >= 30.0 {
+                format_bpm(s.bpm)
+            } else {
+                return None;
+            };
+            Some(
+                div()
+                    .absolute()
+                    .top(px(space::HAIR))
+                    .left(gpui::relative(a))
+                    .w(gpui::relative(b - a))
+                    .overflow_hidden()
+                    .pl(px(space::TIGHT))
+                    .text_size(px(typography::UI_XS))
+                    .font_features(tabular_features())
+                    .text_color(Colors::text_secondary())
+                    .whitespace_nowrap()
+                    .child(text)
+                    .into_any_element(),
+            )
         });
         let chord_labels = analysis.chords.iter().filter_map(|c| {
             let label = c.chord?;
