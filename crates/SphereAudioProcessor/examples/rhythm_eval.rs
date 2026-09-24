@@ -40,13 +40,7 @@ fn main() {
             (Some(chroma), Some(rhythm)) => {
                 let beats: Vec<f64> = rhythm.beats.iter().map(|b| b.seconds).collect();
                 let down: Vec<bool> = rhythm.beats.iter().map(|b| b.position == 1).collect();
-                let key = key.map(|k| {
-                    (
-                        k.tonic as u8,
-                        matches!(k.mode, SphereAudioProcessor::analysis::KeyMode::Minor),
-                    )
-                });
-                recognize_chords(chroma, &beats, &down, ChordOptions { sevenths: true, key })
+                recognize_chords(chroma, &beats, &down, ChordOptions { sevenths: true })
             }
             _ => Vec::new(),
         };

@@ -5,9 +5,7 @@
 //! Each beat is scored against chord templates — the treble chroma for the
 //! chord's notes, the bass chroma for its root — and a Viterbi pass picks the
 //! chord sequence that explains the whole song with the fewest changes,
-//! letting chords change more easily on a downbeat than inside a bar. An
-//! optional key makes diatonic chords slightly more likely, the way a
-//! listener hears an ambiguous beat.
+//! letting chords change more easily on a downbeat than inside a bar.
 //!
 //! Offline / control-thread only.
 
@@ -91,32 +89,26 @@ pub struct ChordSegment {
 pub struct ChordOptions {
     /// Recognise 7th chords as well as triads.
     pub sevenths: bool,
-    /// `(tonic pitch class, minor)`: nudges toward diatonic chords.
-    pub key: Option<(u8, bool)>,
 }
 
 impl Default for ChordOptions {
     fn default() -> Self {
-        Self {
-            sevenths: true,
-            key: None,
-        }
+        Self { sevenths: true }
     }
 }
 
+// Tuned on GuitarSet players 00–02, checked on 03–05 (held out).
 /// Weight of the bass note matching the chord root.
-const BASS_WEIGHT: f32 = 0.35;
+const BASS_WEIGHT: f32 = 0.1;
 /// Score a beat must beat to count as a chord rather than "no chord".
 const NO_CHORD_SCORE: f32 = 0.55;
 /// Beats quieter than this share of the song's median level are "no chord".
 const SILENCE_RATIO: f32 = 0.08;
 /// Cost of changing chord inside a bar / on a downbeat, in score units.
 const CHANGE_COST: f32 = 0.45;
-const CHANGE_COST_DOWNBEAT: f32 = 0.2;
+const CHANGE_COST_DOWNBEAT: f32 = 0.1;
 /// Extra evidence a 7th chord needs over its triad.
-const SEVENTH_COST: f32 = 0.04;
-/// Bonus for chords diatonic to the given key.
-const DIATONIC_BONUS: f32 = 0.05;
+const SEVENTH_COST: f32 = 0.05;
 
 struct State {
     label: Option<ChordLabel>,
@@ -152,35 +144,6 @@ fn states(options: &ChordOptions) -> Vec<State> {
     out
 }
 
-/// Diatonic chord roots/qualities of a key (triads and 7ths).
-fn diatonic(key: (u8, bool), label: ChordLabel) -> bool {
-    let (tonic, minor) = key;
-    let degree = (label.root + 12 - tonic % 12) % 12;
-    use ChordKind::*;
-    let allowed: &[(u8, &[ChordKind])] = if minor {
-        &[
-            (0, &[Minor, Minor7]),
-            (3, &[Major, Major7]),
-            (5, &[Minor, Minor7]),
-            (7, &[Minor, Major, Minor7, Dominant7]),
-            (8, &[Major, Major7]),
-            (10, &[Major, Dominant7]),
-        ]
-    } else {
-        &[
-            (0, &[Major, Major7]),
-            (2, &[Minor, Minor7]),
-            (4, &[Minor, Minor7]),
-            (5, &[Major, Major7]),
-            (7, &[Major, Dominant7]),
-            (9, &[Minor, Minor7]),
-        ]
-    };
-    allowed
-        .iter()
-        .any(|(d, kinds)| *d == degree && kinds.contains(&label.kind))
-}
-
 /// Recognise chords over `beats` (seconds). `downbeats` marks which beats
 /// start a bar (same length as `beats`), or is empty.
 pub fn recognize_chords(
@@ -193,10 +156,8 @@ pub fn recognize_chords(
         return Vec::new();
     }
     let spans: Vec<(f64, f64)> = beats.windows(2).map(|w| (w[0], w[1])).collect();
-    let summaries: Vec<([f32; 12], [f32; 12], f32)> = spans
-        .iter()
-        .map(|&(a, b)| chroma.span(a, b))
-        .collect();
+    let summaries: Vec<([f32; 12], [f32; 12], f32)> =
+        spans.iter().map(|&(a, b)| chroma.span(a, b)).collect();
     let mut levels: Vec<f32> = summaries.iter().map(|s| s.0.iter().sum::<f32>()).collect();
     levels.sort_by(|a, b| a.total_cmp(b));
     let median_level = levels[levels.len() / 2].max(1e-9);
@@ -219,27 +180,18 @@ pub fn recognize_chords(
                         if silent {
                             1.0
                         } else {
-                            super::rhythm::tune("cnone", NO_CHORD_SCORE)
+                            NO_CHORD_SCORE
                         }
                     }
                     Some(label) => {
                         if silent {
                             return 0.0;
                         }
-                        let dot: f32 = treble
-                            .iter()
-                            .zip(&state.template)
-                            .map(|(a, b)| a * b)
-                            .sum();
+                        let dot: f32 = treble.iter().zip(&state.template).map(|(a, b)| a * b).sum();
                         let mut score = dot / (t_norm * state.norm);
-                        score += super::rhythm::tune("cbass", BASS_WEIGHT) * (bass[label.root as usize] / b_max - 0.5);
+                        score += BASS_WEIGHT * (bass[label.root as usize] / b_max - 0.5);
                         if label.kind.is_seventh() {
-                            score -= super::rhythm::tune("c7", SEVENTH_COST);
-                        }
-                        if let Some(key) = options.key {
-                            if diatonic(key, label) {
-                                score += super::rhythm::tune("cdia", DIATONIC_BONUS);
-                            }
+                            score -= SEVENTH_COST;
                         }
                         score
                     }
@@ -254,16 +206,20 @@ pub fn recognize_chords(
     let mut back = vec![vec![0u16; k]; n];
     for i in 1..n {
         let cost = if downbeats.get(i).copied().unwrap_or(false) {
-            super::rhythm::tune("cdown", CHANGE_COST_DOWNBEAT)
+            CHANGE_COST_DOWNBEAT
         } else {
-            super::rhythm::tune("cchange", CHANGE_COST)
+            CHANGE_COST
         };
-        let (best_prev, best_score) = score
-            .iter()
-            .enumerate()
-            .fold((0, f32::NEG_INFINITY), |acc, (j, &s)| {
-                if s > acc.1 { (j, s) } else { acc }
-            });
+        let (best_prev, best_score) =
+            score
+                .iter()
+                .enumerate()
+                .fold(
+                    (0, f32::NEG_INFINITY),
+                    |acc, (j, &s)| {
+                        if s > acc.1 { (j, s) } else { acc }
+                    },
+                );
         let mut next = vec![0.0_f32; k];
         for j in 0..k {
             let stay = score[j];
@@ -292,7 +248,8 @@ pub fn recognize_chords(
     for i in 1..=n {
         if i == n || path[i] != path[run_start] {
             let s = path[run_start];
-            let conf = (run_start..i).map(|b| emissions[b][s]).sum::<f32>() / (i - run_start) as f32;
+            let conf =
+                (run_start..i).map(|b| emissions[b][s]).sum::<f32>() / (i - run_start) as f32;
             segments.push(ChordSegment {
                 start_seconds: spans[run_start].0,
                 end_seconds: spans[i - 1].1,
@@ -350,7 +307,11 @@ mod tests {
             .filter(|s| s.end_seconds - s.start_seconds >= 1.0)
             .map(|s| s.chord.map(|c| c.harte()).unwrap_or_else(|| "N".into()))
             .collect();
-        assert_eq!(names, vec!["C:maj", "A:min", "F:maj", "G:maj"], "{segments:?}");
+        assert_eq!(
+            names,
+            vec!["C:maj", "A:min", "F:maj", "G:maj"],
+            "{segments:?}"
+        );
         // Changes land on the bar lines.
         for s in &segments[1..] {
             let bar = s.start_seconds / 4.0;

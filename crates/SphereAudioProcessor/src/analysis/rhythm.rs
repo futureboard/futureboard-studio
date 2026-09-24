@@ -64,23 +64,6 @@ const FOUR_BIAS: f32 = 0.04;
 const SECTION_PENALTY: f32 = 0.0032;
 const MIN_BEATS: usize = 8;
 
-// TEMP-TUNING: parameter overrides for dataset tuning; removed once tuned.
-pub(crate) fn tune(name: &str, default: f32) -> f32 {
-    use std::sync::OnceLock;
-    static MAP: OnceLock<Vec<(String, f32)>> = OnceLock::new();
-    let map = MAP.get_or_init(|| {
-        std::env::var("FB_RHYTHM_TUNE")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|kv| {
-                let (k, v) = kv.split_once('=')?;
-                Some((k.trim().to_string(), v.trim().parse().ok()?))
-            })
-            .collect()
-    });
-    map.iter().find(|(k, _)| k == name).map(|(_, v)| *v).unwrap_or(default)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RhythmOptions {
     pub min_bpm: f32,
@@ -159,7 +142,9 @@ pub fn onsets(samples: &[f32], sample_rate: f32) -> Option<Onsets> {
         return None;
     }
     let hop = ((sample_rate / ONSET_FPS).round() as usize).max(1);
-    let size = ((sample_rate * 0.046) as usize).next_power_of_two().max(512);
+    let size = ((sample_rate * 0.046) as usize)
+        .next_power_of_two()
+        .max(512);
     let half = size / 2;
     let fps = sample_rate / hop as f32;
     let frames = samples.len() / hop;
@@ -316,7 +301,7 @@ pub fn analyze_rhythm_from_onsets(
         None => {
             let (score3, pos3) = bar_positions(&evidence, 3);
             let (score4, pos4) = bar_positions(&evidence, 4);
-            if score3 > score4 + tune("four", FOUR_BIAS) * evidence.len() as f32 {
+            if score3 > score4 + FOUR_BIAS * evidence.len() as f32 {
                 (3, pos3)
             } else {
                 (4, pos4)
@@ -351,7 +336,9 @@ pub fn analyze_rhythm_from_onsets(
     };
     let (lo, hi) = tempo_curve
         .iter()
-        .fold((f32::MAX, f32::MIN), |(lo, hi), (_, b)| (lo.min(*b), hi.max(*b)));
+        .fold((f32::MAX, f32::MIN), |(lo, hi), (_, b)| {
+            (lo.min(*b), hi.max(*b))
+        });
     let variable = sections.len() > 1 || (hi - lo) / bpm.max(1.0) > 0.06;
 
     let mean_all = onsets.flux.iter().sum::<f32>() / onsets.flux.len() as f32;
@@ -439,11 +426,13 @@ fn tempo_path(onset: &[f32], fps: f32, min_bpm: f32, max_bpm: f32) -> Option<Tem
     // 90 -> 140 song down to 70, the octave nearer the average.
     let prior: Vec<f32> = states
         .iter()
-        .map(|&b| tune("prior", TEMPO_PRIOR) * log_normal(b, tune("centre", 120.0), tune("spread", 1.0)).ln())
+        .map(|&b| TEMPO_PRIOR * log_normal(b, 120.0, 1.0).ln())
         .collect();
     let emit = |s: &[f32]| -> Vec<f32> {
         let peak = s.iter().copied().fold(0.0_f32, f32::max).max(1e-6);
-        s.iter().map(|v| (v / peak).max(0.0).mul_add(1.0, 0.02).ln()).collect()
+        s.iter()
+            .map(|v| (v / peak).max(0.0).mul_add(1.0, 0.02).ln())
+            .collect()
     };
     let k = states.len();
     let mut score: Vec<f32> = emit(&salience[0])
@@ -464,7 +453,7 @@ fn tempo_path(onset: &[f32], fps: f32, min_bpm: f32, max_bpm: f32) -> Option<Tem
             let mut arg = j;
             for i in lo..=hi {
                 let d = (i as f32 - j as f32) * ln_ratio;
-                let v = score[i] - tune("trans", TEMPO_TRANSITION) * d * d;
+                let v = score[i] - TEMPO_TRANSITION * d * d;
                 if v > best {
                     best = v;
                     arg = i;
@@ -580,7 +569,7 @@ fn track_beats(onset: &[f32], fps: f32, bpm: &[f32]) -> Vec<usize> {
         if hi >= 0 {
             for tau in lo.max(0) as usize..=hi as usize {
                 let ratio = ((t - tau) as f32 / period).ln();
-                let v = cum[tau] - tune("tight", TIGHTNESS) * ratio * ratio;
+                let v = cum[tau] - TIGHTNESS * ratio * ratio;
                 if arg == usize::MAX || v > best {
                     best = v;
                     arg = tau;
@@ -694,9 +683,7 @@ fn downbeat_evidence(
     };
     let (z_onset, z_low, z_harm) = (zscore(&onset), zscore(&low), zscore(&harmonic));
     (0..n)
-        .map(|i| {
-            W_ACCENT * z_onset[i] + W_KICK * z_low[i] + W_HARMONY * z_harm[i]
-        })
+        .map(|i| W_ACCENT * z_onset[i] + W_KICK * z_low[i] + W_HARMONY * z_harm[i])
         .collect()
 }
 
@@ -727,7 +714,7 @@ fn bar_positions(evidence: &[f32], m: u32) -> (f32, Vec<u32>) {
     if m == 1 {
         return (0.0, vec![0; n]);
     }
-    let reset = tune("reset", BAR_RESET);
+    let reset = BAR_RESET;
     let stay = (1.0 - reset).ln();
     let jump = (reset / m as f32).ln();
     let emit = |i: usize, pos: usize| {
@@ -908,7 +895,10 @@ mod tests {
             }
             if pos == 0 {
                 let root = roots[(i / per_bar) % roots.len()];
-                let end = beats.get(i + per_bar).map(|b| (b * SR as f64) as usize).unwrap_or(n);
+                let end = beats
+                    .get(i + per_bar)
+                    .map(|b| (b * SR as f64) as usize)
+                    .unwrap_or(n);
                 for s in start..end.min(n) {
                     let tt = s as f32 / SR;
                     for mult in [1.0_f32, 1.26, 1.5] {
@@ -956,7 +946,11 @@ mod tests {
         assert!(recall(&found, &truth) > 0.95);
         assert_eq!(r.beats_per_bar, 4);
         let downbeats: Vec<f64> = truth.iter().step_by(4).copied().collect();
-        assert!(recall(&r.downbeats(), &downbeats) > 0.9, "{:?}", &r.downbeats()[..4]);
+        assert!(
+            recall(&r.downbeats(), &downbeats) > 0.9,
+            "{:?}",
+            &r.downbeats()[..4]
+        );
     }
 
     #[test]
@@ -1009,7 +1003,9 @@ mod tests {
 
     #[test]
     fn silence_and_a_steady_tone_have_no_rhythm() {
-        assert!(analyze_rhythm(&vec![0.0; 22_050 * 5], SR, None, RhythmOptions::default()).is_none());
+        assert!(
+            analyze_rhythm(&vec![0.0; 22_050 * 5], SR, None, RhythmOptions::default()).is_none()
+        );
         let tone: Vec<f32> = (0..22_050 * 5)
             .map(|i| (i as f32 * 0.05).sin() * 0.3)
             .collect();

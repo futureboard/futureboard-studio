@@ -53,7 +53,9 @@ pub struct ChromaFrames {
 impl ChromaFrames {
     /// Frame index nearest `seconds`.
     pub fn frame_at(&self, seconds: f64) -> usize {
-        (((seconds - self.start_seconds) / self.hop_seconds).round().max(0.0) as usize)
+        (((seconds - self.start_seconds) / self.hop_seconds)
+            .round()
+            .max(0.0) as usize)
             .min(self.treble.len().saturating_sub(1))
     }
 
@@ -83,7 +85,9 @@ pub fn chroma_frames(samples: &[f32], sample_rate: f32) -> Option<ChromaFrames> 
     if sample_rate <= 0.0 || !sample_rate.is_finite() {
         return None;
     }
-    let size = ((sample_rate * WINDOW_SECONDS) as usize).next_power_of_two().max(2048);
+    let size = ((sample_rate * WINDOW_SECONDS) as usize)
+        .next_power_of_two()
+        .max(2048);
     let hop = ((sample_rate * CHROMA_HOP_SECONDS) as usize).max(1);
     if samples.len() < size {
         return None;
@@ -266,7 +270,9 @@ mod tests {
         let frames = chroma_frames(&audio, sr).unwrap();
         let (treble, bass, _) = frames.span(0.5, 1.5);
         assert_eq!(top3(&treble), vec![0, 4, 7]);
-        let bass_pc = (0..12).max_by(|a, b| bass[*a].total_cmp(&bass[*b])).unwrap();
+        let bass_pc = (0..12)
+            .max_by(|a, b| bass[*a].total_cmp(&bass[*b]))
+            .unwrap();
         assert_eq!(bass_pc, 0);
     }
 

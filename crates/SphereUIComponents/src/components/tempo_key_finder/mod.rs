@@ -430,10 +430,9 @@ impl TempoKeyFinderWindow {
 
     fn set_sevenths(&mut self, sevenths: bool, cx: &mut Context<Self>) {
         self.sevenths = sevenths;
-        let key = self.picked_key();
         if let Phase::Ready(analysis) = &mut self.phase {
             if let (Some(frames), Some(rhythm)) = (&analysis.chroma, &analysis.rhythm) {
-                analysis.chords = detect_chords(frames, rhythm, key.as_ref(), sevenths);
+                analysis.chords = detect_chords(frames, rhythm, sevenths);
             }
         }
         cx.notify();
@@ -1362,7 +1361,7 @@ fn run_analysis(path: &str, range: Option<(u64, u64)>) -> Result<Analysis, Strin
         RhythmOptions::default(),
     );
     let chords = match (&frames, &rhythm) {
-        (Some(frames), Some(rhythm)) => detect_chords(frames, rhythm, keys.first(), true),
+        (Some(frames), Some(rhythm)) => detect_chords(frames, rhythm, true),
         _ => Vec::new(),
     };
     let offset_seconds = match range {
@@ -1384,13 +1383,11 @@ fn run_analysis(path: &str, range: Option<(u64, u64)>) -> Result<Analysis, Strin
 fn detect_chords(
     frames: &ChromaFrames,
     rhythm: &RhythmAnalysis,
-    key: Option<&KeyEstimate>,
     sevenths: bool,
 ) -> Vec<ChordSegment> {
     let beats: Vec<f64> = rhythm.beats.iter().map(|b| b.seconds).collect();
     let downbeats: Vec<bool> = rhythm.beats.iter().map(|b| b.position == 1).collect();
-    let key = key.map(|k| (tonic_index(k) as u8, k.mode == KeyMode::Minor));
-    recognize_chords(frames, &beats, &downbeats, ChordOptions { sevenths, key })
+    recognize_chords(frames, &beats, &downbeats, ChordOptions { sevenths })
 }
 
 /// Keys whose signature is written in flats, so chord names match it.
