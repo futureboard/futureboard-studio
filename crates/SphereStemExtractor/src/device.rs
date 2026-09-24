@@ -4,6 +4,74 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::StemExtractError;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StemPlatform {
+    Windows,
+    MacOs,
+    Linux,
+    Other,
+}
+
+impl StemPlatform {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Windows => "Windows",
+            Self::MacOs => "macOS",
+            Self::Linux => "Linux",
+            Self::Other => "this platform",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StemPlatformRuntime {
+    OnnxCpu,
+    CoreMl,
+}
+
+impl StemPlatformRuntime {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OnnxCpu => "ONNX Runtime (CPU)",
+            Self::CoreMl => "Apple Core ML",
+        }
+    }
+
+    pub fn device(self) -> InferDevice {
+        match self {
+            Self::OnnxCpu => InferDevice::Cpu,
+            Self::CoreMl => InferDevice::Gpu,
+        }
+    }
+}
+
+pub fn current_stem_platform() -> StemPlatform {
+    #[cfg(target_os = "windows")]
+    return StemPlatform::Windows;
+    #[cfg(target_os = "macos")]
+    return StemPlatform::MacOs;
+    #[cfg(target_os = "linux")]
+    return StemPlatform::Linux;
+    #[allow(unreachable_code)]
+    StemPlatform::Other
+}
+
+pub fn resolve_platform_runtime(
+    platform: StemPlatform,
+) -> Result<StemPlatformRuntime, StemExtractError> {
+    match platform {
+        StemPlatform::Windows => Ok(StemPlatformRuntime::OnnxCpu),
+        StemPlatform::MacOs => Ok(StemPlatformRuntime::CoreMl),
+        StemPlatform::Linux | StemPlatform::Other => {
+            Err(StemExtractError::UnsupportedPlatform { platform })
+        }
+    }
+}
+
+pub fn resolve_current_platform_runtime() -> Result<StemPlatformRuntime, StemExtractError> {
+    resolve_platform_runtime(current_stem_platform())
+}
+
 /// Application-provided GPU probe result: 0 = not probed, 1 = none, 2 = present.
 static GPU_PROBE: AtomicU8 = AtomicU8::new(0);
 
@@ -94,6 +162,28 @@ pub fn resolve_device(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_runtime_selects_windows_onnx_cpu_and_macos_core_ml() {
+        assert_eq!(
+            resolve_platform_runtime(StemPlatform::Windows).unwrap(),
+            StemPlatformRuntime::OnnxCpu
+        );
+        assert_eq!(
+            resolve_platform_runtime(StemPlatform::MacOs).unwrap(),
+            StemPlatformRuntime::CoreMl
+        );
+    }
+
+    #[test]
+    fn platform_runtime_rejects_linux_until_onnx_cpu_is_supported() {
+        assert_eq!(
+            resolve_platform_runtime(StemPlatform::Linux),
+            Err(StemExtractError::UnsupportedPlatform {
+                platform: StemPlatform::Linux,
+            })
+        );
+    }
 
     #[test]
     fn cpu_always_resolves() {
