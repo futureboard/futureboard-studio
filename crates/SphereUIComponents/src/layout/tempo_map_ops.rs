@@ -23,12 +23,16 @@ use super::StudioLayout;
 /// enough that a live band's small push and pull does not become a point on
 /// every bar.
 const MERGE_TOLERANCE_SECONDS: f64 = 0.015;
+/// The same inside a transition — a short run of off-grid beats next to a
+/// steady section's grid (a ritardando or push into the next section) — so
+/// each of its beats keeps its own tempo.
+const TRANSITION_TOLERANCE_SECONDS: f64 = 0.004;
+/// Off-grid runs up to this many bars long next to grid beats are
+/// transitions; longer ones are a band playing freely.
+const TRANSITION_MAX_BARS: usize = 2;
 /// Tempo resolutions tried in order: a segment gets the coarsest one that
 /// still keeps its beats within tolerance, so a song made at 120 maps as 120.
 const TEMPO_STEPS: [f64; 3] = [1.0, 0.1, 0.01];
-/// A pickup this close to a whole number of beats is rounded to it, with the
-/// pre-roll tempo nudged to match, so the grid starts on a clean beat.
-const PICKUP_SNAP_BEATS: f64 = 0.08;
 
 /// A tempo map laid over detected beats.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,19 +54,49 @@ fn clean_bpm(bpm: f64, keeps: impl Fn(f64) -> bool) -> f64 {
         .unwrap_or(bpm)
 }
 
+/// How far each beat may sit off the map: tight inside a transition, loose
+/// elsewhere.
+fn beat_tolerances(locked: &[bool], beats_per_bar: usize) -> Vec<f64> {
+    let mut out = vec![MERGE_TOLERANCE_SECONDS; locked.len()];
+    let mut i = 0;
+    while i < locked.len() {
+        if locked[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < locked.len() && !locked[i] {
+            i += 1;
+        }
+        let next_to_grid = (start > 0 && locked[start - 1]) || (i < locked.len() && locked[i]);
+        if next_to_grid && i - start <= TRANSITION_MAX_BARS * beats_per_bar.max(1) {
+            out[start..i].fill(TRANSITION_TOLERANCE_SECONDS);
+        }
+    }
+    out
+}
+
 /// Plan a tempo map that puts every detected beat on a project beat.
 ///
 /// `seconds` are the detected beats on the project's clock, `positions` their
-/// 1-based bar positions (1 = downbeat), `beats_per_bar` the detected meter.
+/// 1-based bar positions (1 = downbeat), `locked` whether each sits on a
+/// steady section's grid (may be empty), `beats_per_bar` the detected meter.
 pub(crate) fn plan_tempo_map(
     seconds: &[f64],
     positions: &[u32],
+    locked: &[bool],
     beats_per_bar: u32,
 ) -> Option<TempoMapPlan> {
     let bpb = beats_per_bar.clamp(1, 16) as u16;
     let first = positions.iter().position(|&p| p == 1).unwrap_or(0);
     let beats: Vec<f64> = seconds[first..].to_vec();
     let positions = &positions[first..];
+    let tolerance = beat_tolerances(
+        &(first..seconds.len())
+            .map(|i| locked.get(i).copied().unwrap_or(false))
+            .collect::<Vec<_>>(),
+        bpb as usize,
+    );
     if beats.len() < 2 || beats[0] < 0.0 {
         return None;
     }
@@ -78,7 +112,17 @@ pub(crate) fn plan_tempo_map(
     let mut pre_bpm = 60.0 / first_period;
     let mut offset = beats[0] / first_period;
     let whole = offset.round();
-    if whole >= 1.0 && (offset - whole).abs() <= PICKUP_SNAP_BEATS {
+    // A pickup within tolerance of whole beats is rounded to them; otherwise
+    // the pre-roll keeps the song's tempo and the first bar is a short one,
+    // rather than a tempo change nobody played. A downbeat on a locked grid
+    // is exact, so there only a few ms may go: more would sit on every later
+    // beat, for the first transition to soak up.
+    let pickup_tolerance = if locked.get(first).copied().unwrap_or(false) {
+        TRANSITION_TOLERANCE_SECONDS
+    } else {
+        MERGE_TOLERANCE_SECONDS
+    };
+    if whole >= 1.0 && (offset - whole).abs() * first_period <= pickup_tolerance {
         offset = whole;
         pre_bpm = 60.0 * whole / beats[0];
     } else if beats[0] < 1.0e-3 {
@@ -103,7 +147,8 @@ pub(crate) fn plan_tempo_map(
     while a + 1 < n {
         let fits = |start: f64, period: f64, b: usize| {
             (a + 1..=b).all(|j| {
-                (start + (j - a) as f64 * period - beats[j]).abs() <= MERGE_TOLERANCE_SECONDS
+                let tol = tolerance[j].min(tolerance[j - 1]);
+                (start + (j - a) as f64 * period - beats[j]).abs() <= tol
             })
         };
         let mut end = a + 1;
@@ -300,6 +345,7 @@ impl StudioLayout {
         clip_id: &str,
         source_beats: &[f64],
         positions: &[u32],
+        locked: &[bool],
         beats_per_bar: u32,
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
@@ -340,13 +386,17 @@ impl StudioLayout {
             (start, end)
         };
         // Beats inside the clip, on the project clock.
-        let (seconds, kept_positions): (Vec<f64>, Vec<u32>) = source_beats
+        let kept: Vec<(f64, u32, bool)> = source_beats
             .iter()
             .zip(positions)
-            .filter(|(s, _)| **s >= window_start - 1e-6 && **s < window_end)
-            .map(|(s, p)| (s + shift, *p))
-            .unzip();
-        let plan = plan_tempo_map(&seconds, &kept_positions, beats_per_bar)
+            .enumerate()
+            .filter(|(_, (s, _))| **s >= window_start - 1e-6 && **s < window_end)
+            .map(|(i, (s, p))| (s + shift, *p, locked.get(i).copied().unwrap_or(false)))
+            .collect();
+        let seconds: Vec<f64> = kept.iter().map(|k| k.0).collect();
+        let kept_positions: Vec<u32> = kept.iter().map(|k| k.1).collect();
+        let kept_locked: Vec<bool> = kept.iter().map(|k| k.2).collect();
+        let plan = plan_tempo_map(&seconds, &kept_positions, &kept_locked, beats_per_bar)
             .ok_or_else(|| "Not enough beats inside the clip to map".to_string())?;
 
         let changed = self.timeline.update(cx, |timeline, cx| {
@@ -444,7 +494,7 @@ mod tests {
     fn a_steady_song_is_one_tempo_and_starts_its_bar_on_the_downbeat() {
         // 120 BPM, first downbeat 2.0 s in: exactly 4 beats of pre-roll.
         let beats = steady(120.0, 2.0, 64);
-        let plan = plan_tempo_map(&beats, &bars(64, 4, 0), 4).unwrap();
+        let plan = plan_tempo_map(&beats, &bars(64, 4, 0), &[], 4).unwrap();
         assert_eq!(plan.first_downbeat_beat, 4.0);
         assert_eq!(plan.tempo, vec![(0.0, 120.0)]);
         // The downbeat is on a bar line already: no extra meter point.
@@ -455,7 +505,7 @@ mod tests {
     fn a_pickup_that_is_not_a_whole_bar_starts_a_new_bar_at_the_downbeat() {
         // Downbeat 0.35 s in at 120 BPM: 0.7 beats of pre-roll.
         let beats = steady(120.0, 0.35, 32);
-        let plan = plan_tempo_map(&beats, &bars(32, 4, 0), 4).unwrap();
+        let plan = plan_tempo_map(&beats, &bars(32, 4, 0), &[], 4).unwrap();
         assert!((plan.first_downbeat_beat - 0.7).abs() < 1e-9);
         assert!(plan.meter.contains(&(0.7, 4, 4)), "{:?}", plan.meter);
         // Pre-roll plays at the song's own tempo.
@@ -467,7 +517,7 @@ mod tests {
         let mut beats = steady(90.0, 1.0, 32);
         let last = *beats.last().unwrap();
         beats.extend(steady(140.0, last + 60.0 / 90.0, 32));
-        let plan = plan_tempo_map(&beats, &bars(64, 4, 0), 4).unwrap();
+        let plan = plan_tempo_map(&beats, &bars(64, 4, 0), &[], 4).unwrap();
         let bpms: Vec<f64> = plan.tempo.iter().map(|p| p.1).collect();
         assert!(bpms.iter().any(|b| (b - 90.0).abs() < 0.01), "{bpms:?}");
         assert!(bpms.iter().any(|b| (b - 140.0).abs() < 0.01), "{bpms:?}");
@@ -488,7 +538,7 @@ mod tests {
             beats.push(beats[i - 1] + 60.0 / bpm);
         }
         let positions = bars(96, 4, 0);
-        let plan = plan_tempo_map(&beats, &positions, 4).unwrap();
+        let plan = plan_tempo_map(&beats, &positions, &[], 4).unwrap();
         let points: Vec<TempoPoint> = plan
             .tempo
             .iter()
@@ -516,9 +566,53 @@ mod tests {
         let mut beats: Vec<f64> = (0..96).map(|i| 2.0 + i as f64 * 0.5 + jitter(i)).collect();
         let last = 2.0 + 95.0 * 0.5;
         beats.extend((1..=64).map(|i| last + i as f64 * 60.0 / 130.0 + jitter(i)));
-        let plan = plan_tempo_map(&beats, &bars(160, 4, 0), 4).unwrap();
+        let plan = plan_tempo_map(&beats, &bars(160, 4, 0), &[], 4).unwrap();
         let bpms: Vec<f64> = plan.tempo.iter().map(|p| p.1).collect();
         assert_eq!(bpms, vec![120.0, 130.0], "{:?}", plan.tempo);
+    }
+
+    #[test]
+    fn a_pickup_just_off_a_whole_beat_keeps_the_song_tempo() {
+        // First downbeat 0.536 s in at 120 BPM: 1.072 beats, 36 ms off a
+        // whole beat. One tempo for the whole song, a short first bar.
+        let beats = steady(120.0, 0.536, 64);
+        let plan = plan_tempo_map(&beats, &bars(64, 4, 0), &[], 4).unwrap();
+        assert_eq!(plan.tempo, vec![(0.0, 120.0)]);
+        assert!((plan.first_downbeat_beat - 1.072).abs() < 1e-9);
+        assert!(plan.meter.contains(&(plan.first_downbeat_beat, 4, 4)));
+    }
+
+    #[test]
+    fn a_ritardando_bar_gets_a_tempo_per_beat_then_the_new_sections() {
+        // A bar slowing 108 → 100 → 97 → 85 into 12 bars at 64, then 120.
+        let mut beats = steady(108.0, 2.0, 8);
+        let mut t = beats[7] + 60.0 / 108.0;
+        for bpm in [108.0, 100.0, 97.0, 85.0] {
+            beats.push(t);
+            t += 60.0 / bpm;
+        }
+        beats.extend(steady(64.0, t, 48));
+        let t = beats.last().unwrap() + 60.0 / 64.0;
+        beats.extend(steady(120.0, t, 32));
+        // As the analysis marks them: beats 10 and 11 fit neither grid.
+        let locked: Vec<bool> = (0..beats.len()).map(|i| !(10..=11).contains(&i)).collect();
+        let plan = plan_tempo_map(&beats, &bars(beats.len(), 4, 0), &locked, 4).unwrap();
+        let bpms: Vec<f64> = plan.tempo.iter().map(|p| p.1).collect();
+        assert_eq!(bpms, vec![108.0, 100.0, 97.0, 85.0, 64.0, 120.0]);
+        // The slow section starts on bar 4's downbeat (bar 1 is the pickup).
+        let slow = plan.tempo.iter().find(|p| p.1 == 64.0).unwrap();
+        assert_eq!(slow.0, plan.first_downbeat_beat + 12.0);
+    }
+
+    #[test]
+    fn a_locked_downbeat_10_ms_off_a_whole_beat_is_not_rounded() {
+        // 108 BPM on a locked grid, first downbeat 2.212 s in (3.98 beats):
+        // rounding to 4 beats would put every beat 10 ms late.
+        let beats = steady(108.0, 2.212, 32);
+        let locked = vec![true; beats.len()];
+        let plan = plan_tempo_map(&beats, &bars(32, 4, 0), &locked, 4).unwrap();
+        assert_eq!(plan.tempo, vec![(0.0, 108.0)]);
+        assert!((plan.first_downbeat_beat - 2.212 * 108.0 / 60.0).abs() < 1e-9);
     }
 
     #[test]
@@ -533,7 +627,7 @@ mod tests {
             }
         }
         positions.truncate(30);
-        let plan = plan_tempo_map(&beats, &positions, 4).unwrap();
+        let plan = plan_tempo_map(&beats, &positions, &[], 4).unwrap();
         assert!(plan.meter.contains(&(4.0 + 8.0, 2, 4)), "{:?}", plan.meter);
         assert!(plan.meter.contains(&(4.0 + 10.0, 4, 4)), "{:?}", plan.meter);
     }
@@ -598,7 +692,7 @@ mod tests {
         let beats: Vec<f64> = (0..64)
             .map(|i| clip_seconds + 1.2 + i as f64 * 60.0 / 96.0)
             .collect();
-        let plan = plan_tempo_map(&beats, &bars(64, 4, 0), 4).unwrap();
+        let plan = plan_tempo_map(&beats, &bars(64, 4, 0), &[], 4).unwrap();
         let before = state.clone();
         let command = apply_tempo_plan(&mut state, &plan, "song", false).expect("changed");
 

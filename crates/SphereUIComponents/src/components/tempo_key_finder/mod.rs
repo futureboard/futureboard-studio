@@ -155,6 +155,8 @@ pub enum TempoKeyCommand {
         clip_id: String,
         beats: Vec<f64>,
         positions: Vec<u32>,
+        /// Beats on a steady section's grid (see `Beat::locked`).
+        locked: Vec<bool>,
         beats_per_bar: u32,
     },
     /// Put detected chords on the Chord Track. Seconds on the source file's
@@ -450,6 +452,7 @@ impl TempoKeyFinderWindow {
             clip_id: self.target.clip_id.clone(),
             beats: rhythm.beats.iter().map(|b| b.seconds + offset).collect(),
             positions: rhythm.beats.iter().map(|b| b.position).collect(),
+            locked: rhythm.beats.iter().map(|b| b.locked).collect(),
             beats_per_bar: rhythm.beats_per_bar,
         };
         self.dispatch(command, "Mapping tempo…".to_string(), cx);

@@ -25,7 +25,12 @@
 //!    bars are found again on the locked beats. A tracker that briefly
 //!    follows an off-beat kick, or wobbles by a few ms, then reads as the one
 //!    tempo the song was produced at; sections that really drift keep their
-//!    tracked beats.
+//!    tracked beats. Each grid covers only the beats that sit on it, so a
+//!    ritardando or push into the next section is tracked again beat by
+//!    beat, with the tempo gliding between the two sections' tempos. The
+//!    transition also settles the new section's octave: a ritardando leads
+//!    into a slower tempo, so a slow section whose drums read at double
+//!    speed is taken at half.
 //!
 //! Offline / control-thread only.
 
@@ -84,6 +89,33 @@ const SNAP_SLACK: f32 = 2.0;
 /// Neighbouring steady sections closer than this (tempo ratio) are tried as
 /// one.
 const MERGE_RATIO: f64 = 0.01;
+/// Beat DP tightness inside a transition between two steady sections: loose
+/// enough to follow a ritardando or a push beat by beat.
+const BRIDGE_TIGHTNESS: f32 = 30.0;
+/// Transition intervals stay within these shares of the shorter and longer
+/// neighbouring periods (no reading a fill's 8th notes as the beat).
+const BRIDGE_SHORTEST: f64 = 0.7;
+const BRIDGE_LONGEST: f64 = 1.5;
+/// A transition played at one of its neighbours' tempos is taken as that
+/// tempo when its beats hit onsets at least this well relative to the free
+/// track.
+const BRIDGE_PREFER_CONSTANT: f32 = 0.8;
+/// A transition beat this close (share of a period) to a neighbouring
+/// section's grid is that grid's beat.
+const GRID_SNAP: f64 = 0.03;
+/// A transition "heads somewhere" when its intervals all move one way, each
+/// step allowed this much wobble, by at least [`TREND_MIN`] overall.
+const TREND_WOBBLE: f64 = 0.03;
+const TREND_MIN: f64 = 0.1;
+/// Steps (beyond the wobble) a transition must take its way: one jump is a
+/// tempo change, not a ritardando.
+const TREND_STEPS: usize = 2;
+/// Mean strength of a transition's off-grid beats, relative to the previous
+/// section's typical beat, for its direction to count.
+const TREND_STRENGTH: f32 = 0.7;
+/// Bars before a section change that are tracked again as a possible
+/// transition (a grid can run on past where the tempo starts to move).
+const TRANSITION_LOOKBACK_BARS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RhythmOptions {
@@ -110,6 +142,9 @@ pub struct Beat {
     pub position: u32,
     /// Onset strength at the beat, normalised to the file (`~0..3`).
     pub strength: f32,
+    /// On a steady section's constant grid. Off-grid beats next to grid ones
+    /// are a transition (a ritardando, a push, a fill into a new section).
+    pub locked: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -131,7 +166,9 @@ pub struct RhythmAnalysis {
     pub bpm: f32,
     /// Whether the tempo changes enough to need a tempo map.
     pub variable: bool,
-    /// Smoothed local tempo per beat: `(seconds, bpm)`, for display.
+    /// Local tempo per beat: `(seconds, bpm)`, for display. Beat by beat once
+    /// the song has steady sections (so a transition shows each of its
+    /// tempos); smoothed over 5 beats for a freely played one.
     pub tempo_curve: Vec<(f64, f32)>,
     /// How well the beats sit on onsets, `0..1`.
     pub confidence: f32,
@@ -314,16 +351,23 @@ pub fn analyze_rhythm_from_onsets(
     let (beats_per_bar, positions) = meter(onsets, &tracked, chroma, options);
     let first_pass = make_beats(onsets, &tracked, &positions);
     let rough = tempo_sections(&first_pass, beats_per_bar);
-    let (seconds, fits) = lock_steady_sections(&tracked, &rough);
-    let (beats_per_bar, beats) = if fits.iter().any(|f| f.steady) {
+    let (seconds, fits) = lock_steady_sections(onsets, &tracked, &rough, beats_per_bar);
+    let (beats_per_bar, beats) = if fits.iter().any(|f| f.grid.is_some()) {
         let (beats_per_bar, positions) = meter(onsets, &seconds, chroma, options);
-        (beats_per_bar, make_beats(onsets, &seconds, &positions))
+        let mut beats = make_beats(onsets, &seconds, &positions);
+        mark_locked(&mut beats, &fits);
+        (beats_per_bar, beats)
     } else {
         (beats_per_bar, first_pass)
     };
     let strengths: Vec<f32> = beats.iter().map(|b| b.strength).collect();
 
-    let tempo_curve = smoothed_tempo(&seconds);
+    let smoothed = smoothed_tempo(&seconds);
+    let tempo_curve = if beats.iter().any(|b| b.locked) {
+        per_beat_tempo(&seconds)
+    } else {
+        smoothed.clone()
+    };
     let sections = fits
         .iter()
         .enumerate()
@@ -350,7 +394,7 @@ pub fn analyze_rhythm_from_onsets(
     } else {
         tempo.global_bpm
     };
-    let (lo, hi) = tempo_curve
+    let (lo, hi) = smoothed
         .iter()
         .fold((f32::MAX, f32::MIN), |(lo, hi), (_, b)| {
             (lo.min(*b), hi.max(*b))
@@ -416,17 +460,35 @@ fn make_beats(onsets: &Onsets, seconds: &[f64], positions: &[u32]) -> Vec<Beat> 
             seconds: s,
             position: p + 1,
             strength: window_max(&onsets.flux, f, 3),
+            locked: false,
         })
         .collect()
 }
 
+/// Mark the beats that sit exactly on their section's grid.
+fn mark_locked(beats: &mut [Beat], fits: &[SectionFit]) {
+    for (i, fit) in fits.iter().enumerate() {
+        let Some(g) = fit.grid else {
+            continue;
+        };
+        let end = fits
+            .get(i + 1)
+            .map_or(beats.len(), |f| f.first_beat)
+            .min(beats.len());
+        for beat in &mut beats[fit.first_beat..end] {
+            let k = ((beat.seconds - g.anchor) / g.period).round();
+            beat.locked = (beat.seconds - (g.anchor + k * g.period)).abs() < 1.0e-6;
+        }
+    }
+}
+
 /// One section after locking: where it starts in the final beat list, its
-/// tempo, and whether its beats were locked to a constant grid.
+/// tempo, and the constant grid its beats were locked to, if any.
 #[derive(Clone, Copy, Debug)]
 struct SectionFit {
     first_beat: usize,
     bpm: f32,
-    steady: bool,
+    grid: Option<Grid>,
 }
 
 /// A constant beat grid `anchor + k * period`.
@@ -441,7 +503,12 @@ struct Grid {
 
 /// Replace the beats of every section that one constant grid explains with
 /// that grid. Returns the new beat times and one fit per section.
-fn lock_steady_sections(tracked: &[f64], sections: &[TempoSection]) -> (Vec<f64>, Vec<SectionFit>) {
+fn lock_steady_sections(
+    onsets: &Onsets,
+    tracked: &[f64],
+    sections: &[TempoSection],
+    beats_per_bar: u32,
+) -> (Vec<f64>, Vec<SectionFit>) {
     // Half-open beat ranges per section.
     let mut ranges: Vec<(usize, usize, f32)> = sections
         .iter()
@@ -479,46 +546,425 @@ fn lock_steady_sections(tracked: &[f64], sections: &[TempoSection]) -> (Vec<f64>
         i += 1;
     }
 
+    // Each section's own beats: a steady one's grid over the span of beats
+    // that sit on it, or the tracked beats.
+    let mut pieces: Vec<(Vec<f64>, f32, Option<Grid>)> = fitted
+        .into_iter()
+        .map(|(a, b, bpm, grid)| {
+            let times = &tracked[a..b];
+            match grid.map(|g| snap_grid(times, g)) {
+                Some(g) => {
+                    let on: Vec<i64> = times
+                        .iter()
+                        .filter(|&&t| consistent_with(t, g.period, g.anchor))
+                        .map(|t| ((t - g.anchor) / g.period).round() as i64)
+                        .collect();
+                    let (k0, k1) = (on[0], on[on.len() - 1]);
+                    let beats = (k0..=k1).map(|k| g.anchor + k as f64 * g.period).collect();
+                    (beats, (60.0 / g.period) as f32, Some(g))
+                }
+                None => (times.to_vec(), bpm, None),
+            }
+        })
+        .collect();
+
     let mut out: Vec<f64> = Vec::with_capacity(tracked.len());
-    let mut fits = Vec::with_capacity(fitted.len());
-    for (a, b, bpm, grid) in fitted {
-        let first_beat = out.len();
-        let push = |out: &mut Vec<f64>, t: f64, period: f64| {
+    let mut fits = Vec::with_capacity(pieces.len());
+    for i in 0..pieces.len() {
+        // Entering a steady section from another: re-track the last bar
+        // before it (a ritardando starts inside it), and read the new
+        // section at the octave the transition leads into.
+        let prev_grid = i.checked_sub(1).and_then(|p| pieces[p].2);
+        if let (Some(prev), Some(cur), Some(fit)) = (prev_grid, pieces[i].2, fits.last()) {
+            let fit: &SectionFit = fit;
+            // How hard the previous section's beats hit: a transition has
+            // to be heard at least about as clearly to count.
+            let recent = &out[fit.first_beat.max(out.len().saturating_sub(16))..];
+            let typical = median(
+                beat_frames(onsets, recent)
+                    .iter()
+                    .map(|&f| window_max(&onsets.flux, f, 2) as f64),
+            ) as f32;
+            let lookback = TRANSITION_LOOKBACK_BARS * beats_per_bar.max(1) as usize;
+            let from = out
+                .len()
+                .saturating_sub(1 + lookback)
+                .max(fit.first_beat + 1)
+                .min(out.len().saturating_sub(1));
+            out.truncate(from + 1);
+            let (mut beats, grid, mut transition) =
+                enter_section(onsets, out[from], prev, &pieces[i].0, cur, typical);
+            // Transition beats already on the new grid are the section's own.
+            let settled = transition
+                .iter()
+                .rev()
+                .take_while(|&&t| on_grid(t, grid))
+                .count();
+            let early = transition.split_off(transition.len() - settled);
+            beats.splice(0..0, early);
+            out.extend(transition);
+            pieces[i] = (beats, (60.0 / grid.period) as f32, Some(grid));
+        }
+        let (beats, bpm, grid) = &pieces[i];
+        let Some(&start) = beats.first() else {
+            continue;
+        };
+        let period = grid.map_or_else(
+            || median(beats.windows(2).map(|w| w[1] - w[0])),
+            |g| g.period,
+        );
+        match (
+            out.last().copied(),
+            i.checked_sub(1).and_then(|p| pieces[p].2),
+        ) {
+            // Between two steady sections: bridged above.
+            (Some(_), Some(_)) if grid.is_some() => {}
+            // Otherwise the tracked beats in the gap, if any.
+            (Some(from), _) => {
+                let gap = tracked
+                    .iter()
+                    .copied()
+                    .filter(|&t| t > from + 0.5 * period && t < start - 0.5 * period);
+                out.extend(gap);
+            }
+            // Before a steady first section: its grid carried back to the
+            // first beat heard (a loose start is part of the intro).
+            (None, _) if grid.is_some() => {
+                let k = ((start - tracked[0]) / period).round().max(0.0) as i64;
+                out.extend(
+                    (1..=k)
+                        .rev()
+                        .map(|k| start - k as f64 * period)
+                        .filter(|&t| t >= 0.0),
+                );
+            }
+            (None, _) => {}
+        }
+        let first_beat = if fits.is_empty() { 0 } else { out.len() };
+        for &t in beats {
             if out.last().is_none_or(|&last| t - last > 0.5 * period) {
                 out.push(t);
             }
-        };
-        match grid.map(|g| snap_grid(&tracked[a..b], g)) {
-            Some(g) => {
-                let k0 = ((tracked[a] - g.anchor) / g.period).round() as i64;
-                let k1 = ((tracked[b - 1] - g.anchor) / g.period).round() as i64;
-                for k in k0..=k1 {
-                    push(&mut out, g.anchor + k as f64 * g.period, g.period);
-                }
-                fits.push(SectionFit {
-                    first_beat,
-                    bpm: (60.0 / g.period) as f32,
-                    steady: true,
-                });
-            }
-            None => {
-                let period = median(tracked[a..b].windows(2).map(|w| w[1] - w[0]));
-                for &t in &tracked[a..b] {
-                    push(&mut out, t, period);
-                }
-                fits.push(SectionFit {
-                    first_beat,
-                    bpm,
-                    steady: false,
-                });
-            }
         }
-        // A section whose beats all fell to its neighbour is dropped.
-        if out.len() == first_beat {
-            fits.pop();
+        if out.len() > first_beat {
+            fits.push(SectionFit {
+                first_beat,
+                bpm: *bpm,
+                grid: *grid,
+            });
         }
     }
+    // After a steady last section: tracked beats past its grid.
+    if let (Some(&last), Some((_, _, Some(g)))) = (out.last(), pieces.last()) {
+        out.extend(
+            tracked
+                .iter()
+                .copied()
+                .filter(|&t| t > last + 0.5 * g.period),
+        );
+    }
     (out, fits)
+}
+
+/// Enter steady section `cur` (its grid beats `beats`) from the beat at
+/// `from` on grid `prev`. Returns the section's beats and grid — at its
+/// detected tempo, or at half or double it when the transition says so —
+/// and the transition's beats in between.
+///
+/// Half and double tempo are the same drums read at another beat level, so
+/// the audio of the section alone cannot choose. The transition can: a
+/// ritardando leads into a slower tempo and an accelerando into a faster
+/// one. When the detected tempo contradicts the direction the transition
+/// is heading and the other octave continues it, the other octave wins.
+fn enter_section(
+    onsets: &Onsets,
+    from: f64,
+    prev: Grid,
+    beats: &[f64],
+    cur: Grid,
+    typical: f32,
+) -> (Vec<f64>, Grid, Vec<f64>) {
+    let with_grid = |beats: Vec<f64>, period: f64| {
+        let anchor = beats[0];
+        (
+            beats,
+            Grid {
+                period,
+                anchor,
+                consistent: cur.consistent,
+            },
+        )
+    };
+    let mut candidates = vec![(beats.to_vec(), cur)];
+    for phase in 0..2 {
+        let half: Vec<f64> = beats.iter().copied().skip(phase).step_by(2).collect();
+        if half.len() >= 4 && 60.0 / (2.0 * cur.period) >= 30.0 {
+            candidates.push(with_grid(half, 2.0 * cur.period));
+        }
+    }
+    if 60.0 / (0.5 * cur.period) <= 300.0 {
+        let double: Vec<f64> = beats
+            .windows(2)
+            .flat_map(|w| [w[0], 0.5 * (w[0] + w[1])])
+            .chain(beats.last().copied())
+            .collect();
+        candidates.push(with_grid(double, 0.5 * cur.period));
+    }
+
+    let evaluated: Vec<(Vec<f64>, Grid, Vec<f64>, f64, Trend)> = candidates
+        .into_iter()
+        .map(|(beats, grid)| {
+            let transition = snap_to_grids(
+                bridge(onsets, from, beats[0], prev.period, grid.period),
+                prev,
+                grid,
+            );
+            let mut times = vec![from - prev.period, from];
+            times.extend(&transition);
+            times.extend([beats[0], beats[0] + grid.period]);
+            let intervals: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).collect();
+            let roughness = intervals
+                .windows(2)
+                .map(|w| (w[1] / w[0]).ln().powi(2))
+                .sum::<f64>();
+            // Only a transition played on real hits heads anywhere.
+            let off_grid: Vec<f64> = transition
+                .iter()
+                .copied()
+                .filter(|&t| !on_grid(t, prev) && !on_grid(t, grid))
+                .collect();
+            let heard = beat_frames(onsets, &off_grid)
+                .iter()
+                .map(|&f| window_max(&onsets.flux, f, 2))
+                .sum::<f32>()
+                / off_grid.len().max(1) as f32;
+            let trend = if heard >= TREND_STRENGTH * typical {
+                trend(&intervals[1..intervals.len() - 1])
+            } else {
+                Trend::Steady
+            };
+            (beats, grid, transition, roughness, trend)
+        })
+        .collect();
+    let detected = cur.period;
+    let continues = |grid: &Grid, trend: Trend| match trend {
+        Trend::Slowing => grid.period > prev.period && detected < prev.period,
+        Trend::Quickening => grid.period < prev.period && detected > prev.period,
+        Trend::Steady => false,
+    };
+    let best = (1..evaluated.len())
+        .filter(|&i| continues(&evaluated[i].1, evaluated[i].4))
+        .min_by(|&a, &b| evaluated[a].3.total_cmp(&evaluated[b].3))
+        .unwrap_or(0);
+    let (beats, grid, transition, _, _) = evaluated.into_iter().nth(best).unwrap();
+    (beats, grid, transition)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Trend {
+    Steady,
+    Slowing,
+    Quickening,
+}
+
+/// Direction of a run of beat intervals: every step the same way (allowing
+/// [`TREND_WOBBLE`]), at least [`TREND_STEPS`] real steps, and at least
+/// [`TREND_MIN`] overall.
+fn trend(intervals: &[f64]) -> Trend {
+    let (Some(&first), Some(&last)) = (intervals.first(), intervals.last()) else {
+        return Trend::Steady;
+    };
+    if intervals.len() < 3 {
+        return Trend::Steady;
+    }
+    let slowing = intervals
+        .windows(2)
+        .all(|w| w[1] >= w[0] * (1.0 - TREND_WOBBLE));
+    let quickening = intervals
+        .windows(2)
+        .all(|w| w[1] <= w[0] * (1.0 + TREND_WOBBLE));
+    let steps = |up: bool| {
+        intervals
+            .windows(2)
+            .filter(|w| {
+                if up {
+                    w[1] > w[0] * (1.0 + TREND_WOBBLE)
+                } else {
+                    w[1] < w[0] * (1.0 - TREND_WOBBLE)
+                }
+            })
+            .count()
+    };
+    if slowing && last >= first * (1.0 + TREND_MIN) && steps(true) >= TREND_STEPS {
+        Trend::Slowing
+    } else if quickening && last <= first * (1.0 - TREND_MIN) && steps(false) >= TREND_STEPS {
+        Trend::Quickening
+    } else {
+        Trend::Steady
+    }
+}
+
+fn on_grid(t: f64, g: Grid) -> bool {
+    let on = g.anchor + ((t - g.anchor) / g.period).round() * g.period;
+    (t - on).abs() < 1.0e-9
+}
+
+/// Transition beats that are really the neighbours' grid beats (the tempo
+/// has not moved yet, or already has) are put exactly on those grids.
+fn snap_to_grids(mut beats: Vec<f64>, before: Grid, after: Grid) -> Vec<f64> {
+    let snap = |t: f64, g: Grid| {
+        let on = g.anchor + ((t - g.anchor) / g.period).round() * g.period;
+        ((t - on).abs() <= GRID_SNAP * g.period).then_some(on)
+    };
+    for t in beats.iter_mut() {
+        match snap(*t, before) {
+            Some(on) => *t = on,
+            None => break,
+        }
+    }
+    for t in beats.iter_mut().rev() {
+        match snap(*t, after) {
+            Some(on) => *t = on,
+            None => break,
+        }
+    }
+    beats
+}
+
+/// Beats strictly between `from` and `to` — the last beat of one steady
+/// section and the first of the next. When the gap is a whole number of
+/// either section's periods and those beats land on onsets about as well as
+/// a free track, the tempo simply changed there; otherwise the beats are
+/// tracked with the period gliding from one section's to the other's, so a
+/// ritardando or a push is followed beat by beat.
+fn bridge(onsets: &Onsets, from: f64, to: f64, p_from: f64, p_to: f64) -> Vec<f64> {
+    let gap = to - from;
+    if gap <= 0.0 {
+        return Vec::new();
+    }
+    let strength = |beats: &[f64]| -> f32 {
+        let frames = beat_frames(onsets, beats);
+        if frames.is_empty() {
+            return f32::INFINITY;
+        }
+        frames
+            .iter()
+            .map(|&f| window_max(&onsets.flux, f, 2))
+            .sum::<f32>()
+            / frames.len() as f32
+    };
+    let free = track_between(onsets, from, to, p_from, p_to);
+    let free_strength = strength(&free);
+    let constant = [p_from, p_to].into_iter().filter_map(|p| {
+        let n = (gap / p).round();
+        (n >= 1.0 && (gap - n * p).abs() < GRID_TOLERANCE as f64 * p).then(|| {
+            // Hold the old tempo up to `to`, or start the new one right after
+            // `from`: either way, evenly spaced.
+            let step = gap / n;
+            (1..n as i64)
+                .map(|k| from + k as f64 * step)
+                .collect::<Vec<f64>>()
+        })
+    });
+    constant
+        .filter(|beats| strength(beats) >= BRIDGE_PREFER_CONSTANT * free_strength)
+        .max_by(|a, b| strength(a).total_cmp(&strength(b)))
+        .unwrap_or(free)
+}
+
+/// Beats between the pinned beats at `from` and `to`, tracked so that each
+/// interval changes as little as it can from the one before: the tempo may
+/// hold, glide or fall away in any shape, but not jump without an onset to
+/// show for it. The interval before `from` is `p_from`; the one after `to`
+/// is `p_to`.
+fn track_between(onsets: &Onsets, from: f64, to: f64, p_from: f64, p_to: f64) -> Vec<f64> {
+    let fps = onsets.fps as f64;
+    let last = onsets.flux.len().saturating_sub(1);
+    let fa = ((from * fps).round().max(0.0) as usize).min(last);
+    let fb = ((to * fps).round().max(0.0) as usize).min(last);
+    if fb <= fa + 1 {
+        return Vec::new();
+    }
+    let n = fb - fa + 1;
+    let (short, long) = (p_from.min(p_to) * fps, p_from.max(p_to) * fps);
+    let d_min = ((BRIDGE_SHORTEST * short).floor() as usize).max(1);
+    let d_max = ((BRIDGE_LONGEST * long).ceil() as usize)
+        .min(n - 1)
+        .max(d_min);
+    let width = d_max - d_min + 1;
+    let cost = |a: f64, b: f64| {
+        let r = (b / a).ln() as f32;
+        BRIDGE_TIGHTNESS * r * r
+    };
+    // score[t][d - d_min]: best path with a beat at t whose interval from
+    // the beat before is d frames.
+    let mut score = vec![f32::NEG_INFINITY; n * width];
+    let mut back = vec![u16::MAX; n * width];
+    for t in 1..n {
+        let onset = if t + 1 == n {
+            0.0
+        } else {
+            window_max(&onsets.flux, fa + t, 1)
+        };
+        for d in d_min..=d_max.min(t) {
+            let tau = t - d;
+            let (best, arg) = if tau == 0 {
+                (-cost(p_from * fps, d as f64), u16::MAX)
+            } else {
+                let mut best = f32::NEG_INFINITY;
+                let mut arg = u16::MAX;
+                let lo = ((d as f64 / 1.6).floor() as usize).max(d_min);
+                let hi = ((d as f64 * 1.6).ceil() as usize).min(d_max).min(tau);
+                for e in lo..=hi {
+                    let prev = score[tau * width + (e - d_min)];
+                    if prev == f32::NEG_INFINITY {
+                        continue;
+                    }
+                    let v = prev - cost(e as f64, d as f64);
+                    if v > best {
+                        best = v;
+                        arg = e as u16;
+                    }
+                }
+                (best, arg)
+            };
+            if best > f32::NEG_INFINITY {
+                score[t * width + (d - d_min)] = best + onset;
+                back[t * width + (d - d_min)] = arg;
+            }
+        }
+    }
+    // Close on `to`, whose next interval is `p_to`.
+    let end = n - 1;
+    let Some(d_end) = (d_min..=d_max.min(end))
+        .filter(|&d| score[end * width + (d - d_min)] > f32::NEG_INFINITY)
+        .max_by(|&a, &b| {
+            let va = score[end * width + (a - d_min)] - cost(a as f64, p_to * fps);
+            let vb = score[end * width + (b - d_min)] - cost(b as f64, p_to * fps);
+            va.total_cmp(&vb)
+        })
+    else {
+        return Vec::new();
+    };
+    let mut beats = Vec::new();
+    let (mut t, mut d) = (end, d_end);
+    loop {
+        let e = back[t * width + (d - d_min)];
+        t -= d;
+        if t == 0 || e == u16::MAX {
+            break;
+        }
+        beats.push(refine_peak(&onsets.flux, fa + t) / fps);
+        d = e as usize;
+    }
+    beats.reverse();
+    beats
+}
+
+fn consistent_with(t: f64, period: f64, anchor: f64) -> bool {
+    let tol = GRID_TOLERANCE as f64 * period;
+    let d = t - (anchor + ((t - anchor) / period).round() * period);
+    d.abs() < tol || (d.abs() - 0.5 * period).abs() < tol
 }
 
 /// Robust constant-grid fit: indices from rounded intervals first (so a
@@ -1033,6 +1479,22 @@ fn bar_positions(evidence: &[f32], m: u32) -> (f32, Vec<u32>) {
     (best, path)
 }
 
+/// Tempo of each beat's interval to the next; the last beat repeats its
+/// neighbour's.
+fn per_beat_tempo(seconds: &[f64]) -> Vec<(f64, f32)> {
+    (0..seconds.len())
+        .map(|i| {
+            let (a, b) = if i + 1 < seconds.len() {
+                (i, i + 1)
+            } else {
+                (i.saturating_sub(1), i)
+            };
+            let ibi = (seconds[b] - seconds[a]).max(1e-3);
+            (seconds[i], (60.0 / ibi) as f32)
+        })
+        .collect()
+}
+
 /// Local tempo per beat from a 5-beat median of inter-beat intervals.
 fn smoothed_tempo(seconds: &[f64]) -> Vec<(f64, f32)> {
     let ibis: Vec<f64> = seconds.windows(2).map(|w| w[1] - w[0]).collect();
@@ -1269,14 +1731,132 @@ mod tests {
             bpm: 119.4,
             first_beat: 0,
         };
-        let (locked, fits) = lock_steady_sections(&tracked, &[section]);
+        let onsets = Onsets {
+            fps: ONSET_FPS,
+            flux: vec![0.0; 6_000],
+            low: vec![0.0; 6_000],
+        };
+        let (locked, fits) = lock_steady_sections(&onsets, &tracked, &[section], 4);
         assert_eq!(fits.len(), 1);
-        assert!(fits[0].steady);
+        assert!(fits[0].grid.is_some());
         assert_eq!(fits[0].bpm, 120.0);
         assert_eq!(locked.len(), 108);
         for (i, t) in locked.iter().enumerate() {
             assert!((t - (1.0 + i as f64 * 0.5)).abs() < 1e-9, "beat {i}: {t}");
         }
+    }
+
+    #[test]
+    fn a_ritardando_into_a_new_section_is_followed_beat_by_beat() {
+        // 8 bars at 108, a transition bar slowing 108 → 100 → 97 → 85, 12
+        // bars at 64, then the song at 120 for 40 bars.
+        let run = |bpm: f64, start: f64, count: usize| -> Vec<f64> {
+            (0..count).map(|i| start + i as f64 * 60.0 / bpm).collect()
+        };
+        let mut truth = run(108.0, 0.5, 32);
+        let transition = truth.len();
+        let mut t = truth[transition - 1] + 60.0 / 108.0;
+        for bpm in [108.0, 100.0, 97.0, 85.0] {
+            truth.push(t);
+            t += 60.0 / bpm;
+        }
+        truth.extend(run(64.0, t, 48));
+        let t = truth.last().unwrap() + 60.0 / 64.0;
+        truth.extend(run(120.0, t, 160));
+        let seconds = truth.last().unwrap() + 1.0;
+        let audio = render(&truth, 4, seconds);
+        let r = analyze(&audio, RhythmOptions::default());
+
+        let bpms: Vec<f32> = r.sections.iter().map(|s| s.bpm).collect();
+        assert_eq!(bpms, vec![108.0, 64.0, 120.0], "{:?}", r.sections);
+        // Every beat of the transition is found where it was played, so its
+        // per-beat tempo reads 108, 100, 97, 85.
+        let found: Vec<f64> = r.beats.iter().map(|b| b.seconds).collect();
+        let at = |want: f64| {
+            found
+                .iter()
+                .copied()
+                .min_by(|a, b| (a - want).abs().total_cmp(&(b - want).abs()))
+                .unwrap()
+        };
+        let heard: Vec<f64> = truth[transition..=transition + 4]
+            .iter()
+            .map(|&w| at(w))
+            .collect();
+        for (h, w) in heard.iter().zip(&truth[transition..]) {
+            assert!(
+                (h - w).abs() < 0.02,
+                "transition beat {w:.3} found at {h:.3}"
+            );
+        }
+        let tempos: Vec<f64> = heard.windows(2).map(|w| 60.0 / (w[1] - w[0])).collect();
+        for (got, want) in tempos.iter().zip([108.0, 100.0, 97.0, 85.0]) {
+            assert!((got - want).abs() < 2.0, "{tempos:?}");
+        }
+        // Only the beats that fit neither section's grid are marked off it,
+        // so the tempo map gives them a tempo each.
+        let locked = |want: f64| {
+            r.beats
+                .iter()
+                .min_by(|a, b| {
+                    (a.seconds - want)
+                        .abs()
+                        .total_cmp(&(b.seconds - want).abs())
+                })
+                .unwrap()
+                .locked
+        };
+        let flags: Vec<bool> = truth[transition - 2..=transition + 5]
+            .iter()
+            .map(|&w| locked(w))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![true, true, true, true, false, false, true, true],
+            "{flags:?}"
+        );
+        // And every bar line stays on its downbeat through the change.
+        let downbeats: Vec<f64> = truth.iter().step_by(4).copied().collect();
+        assert!(recall(&r.downbeats(), &downbeats) > 0.95);
+    }
+
+    #[test]
+    fn a_ritardando_into_a_half_time_section_reads_it_at_the_slow_tempo() {
+        // 8 bars at 108, a bar slowing 108 → 100 → 76, then a 65 section
+        // whose drums play 8th notes (kick on the bar, snare on every other
+        // 8th: on its own it reads as 130), then 120.
+        let run = |bpm: f64, start: f64, count: usize| -> Vec<f64> {
+            (0..count).map(|i| start + i as f64 * 60.0 / bpm).collect()
+        };
+        let mut intro = run(108.0, 0.5, 32);
+        let mut t = intro[31] + 60.0 / 108.0;
+        for bpm in [108.0, 100.0, 76.0] {
+            intro.push(t);
+            t += 60.0 / bpm;
+        }
+        intro.push(t); // beat 4 of the transition bar, then the slow bar line
+        t += 60.0 / 76.0;
+        let slow_start = t;
+        let eighths = run(130.0, slow_start, 16 * 8);
+        let song_start = slow_start + 16.0 * 4.0 * 60.0 / 65.0;
+        let song = run(120.0, song_start, 160);
+        let seconds = song.last().unwrap() + 1.0;
+        let mut audio = render(&intro, 4, seconds);
+        for (i, v) in render(&eighths, 8, seconds).into_iter().enumerate() {
+            audio[i] += v;
+        }
+        for (i, v) in render(&song, 4, seconds).into_iter().enumerate() {
+            audio[i] += v;
+        }
+        let r = analyze(&audio, RhythmOptions::default());
+        let bpms: Vec<f32> = r.sections.iter().map(|s| s.bpm).collect();
+        assert_eq!(bpms, vec![108.0, 65.0, 120.0], "{:?}", r.sections);
+        // The slow section starts on its bar line, right after the slowdown.
+        assert!(
+            (r.sections[1].start_seconds - slow_start).abs() < 0.03,
+            "{:?} vs {slow_start}",
+            r.sections[1]
+        );
     }
 
     #[test]

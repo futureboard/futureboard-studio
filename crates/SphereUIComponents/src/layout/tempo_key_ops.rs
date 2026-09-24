@@ -126,10 +126,17 @@ impl StudioLayout {
                 clip_id,
                 beats,
                 positions,
+                locked,
                 beats_per_bar,
             } => {
-                let result =
-                    self.map_tempo_to_clip(&clip_id, &beats, &positions, beats_per_bar, cx);
+                let result = self.map_tempo_to_clip(
+                    &clip_id,
+                    &beats,
+                    &positions,
+                    &locked,
+                    beats_per_bar,
+                    cx,
+                );
                 self.report_to_tempo_key_finder(result, cx);
             }
             TempoKeyCommand::PlaceChords {

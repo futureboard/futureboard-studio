@@ -53,6 +53,7 @@ fn main() {
             "beats_per_bar": rhythm.as_ref().map(|r| r.beats_per_bar),
             "beats": rhythm.as_ref().map(|r| r.beats.iter().map(|b| b.seconds).collect::<Vec<_>>()).unwrap_or_default(),
             "positions": rhythm.as_ref().map(|r| r.beats.iter().map(|b| b.position).collect::<Vec<_>>()).unwrap_or_default(),
+            "locked": rhythm.as_ref().map(|r| r.beats.iter().map(|b| b.locked).collect::<Vec<_>>()).unwrap_or_default(),
             "sections": rhythm.as_ref().map(|r| r.sections.iter().map(|s| (s.start_seconds, s.end_seconds, s.bpm)).collect::<Vec<_>>()).unwrap_or_default(),
             "chords": chords.iter().map(|c| (c.start_seconds, c.end_seconds, c.chord.map(|l| l.harte()).unwrap_or_else(|| "N".into()))).collect::<Vec<_>>(),
             "key": key.map(|k| format!("{:?} {:?}", k.tonic, k.mode)),
