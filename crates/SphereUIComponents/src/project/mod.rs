@@ -727,6 +727,8 @@ pub struct ProjectTempoPoint {
     pub beat: f64,
     pub bpm: f64,
     pub curve: u8,
+    /// v53+: bend of a Linear ramp, `-1.0..=1.0`. `0.0` for older files.
+    pub tension: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -833,6 +835,9 @@ pub struct ProjectSettings {
     pub chord_events: Vec<ProjectChordEvent>,
     pub chord_track_collapsed: bool,
     pub chord_track_height: Option<f32>,
+    /// v52+: the project key as (root pitch class, stable `ScaleKind` tag);
+    /// `None` for a project without a key.
+    pub project_key: Option<(u8, u8)>,
     pub time_sig_num: u32,
     pub time_sig_den: u32,
     pub sample_rate: u32,
@@ -856,6 +861,7 @@ impl Default for ProjectSettings {
             chord_events: Vec::new(),
             chord_track_collapsed: false,
             chord_track_height: None,
+            project_key: None,
             time_sig_num: 4,
             time_sig_den: 4,
             sample_rate: 48000,
@@ -1427,6 +1433,7 @@ impl From<&TimelineState> for FutureboardProject {
                 beat: p.beat,
                 bpm: p.bpm,
                 curve: p.curve.to_tag(),
+                tension: p.tension,
             })
             .collect();
         project.settings.time_signature_points = tl
@@ -1475,6 +1482,9 @@ impl From<&TimelineState> for FutureboardProject {
             })
             .collect();
         project.settings.chord_track_collapsed = tl.chord_track_collapsed;
+        project.settings.project_key = tl
+            .project_key
+            .map(|key| (key.root.pitch_class(), key.kind.to_tag()));
         project.settings.chord_track_height = tl
             .global_lane_heights
             .get(crate::components::timeline::timeline_state::GlobalLaneKind::Chord);
@@ -1645,6 +1655,7 @@ pub fn apply_to_timeline(
                     p.bpm,
                     crate::components::timeline::timeline_state::TempoCurve::from_tag(p.curve),
                 )
+                .with_tension(p.tension)
             })
             .collect(),
     );
@@ -1684,6 +1695,13 @@ pub fn apply_to_timeline(
         .sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat).then(a.id.cmp(&b.id)));
     tl.selected_chord_event_id = None;
     tl.chord_track_collapsed = project.settings.chord_track_collapsed;
+    tl.project_key = project.settings.project_key.and_then(|(root, scale)| {
+        use crate::components::timeline::timeline_state::{MidiScale, ScaleKind, ScaleRoot};
+        Some(MidiScale::new(
+            ScaleRoot::from_pitch_class(root),
+            ScaleKind::from_tag(scale)?,
+        ))
+    });
     tl.global_lane_heights.set(
         crate::components::timeline::timeline_state::GlobalLaneKind::Chord,
         project.settings.chord_track_height,
@@ -3612,6 +3630,28 @@ mod project_settings_persistence_tests {
 
         assert_eq!(restored.time_display_format, TimeDisplayFormat::Timecode);
         assert_eq!(restored.timecode_rate, TimecodeRate::Fps25);
+    }
+
+    #[test]
+    fn project_key_survives_save_decode_and_timeline_restore() {
+        use crate::components::timeline::timeline_state::{MidiScale, ScaleKind, ScaleRoot};
+
+        let mut timeline = TimelineState::default();
+        timeline.project_key = Some(MidiScale::new(ScaleRoot::FSharp, ScaleKind::Dorian));
+
+        let encoded = crate::project::format::encode_project(&FutureboardProject::from(&timeline));
+        let decoded = crate::project::format::decode_project(&encoded).expect("decode project");
+        let mut restored = TimelineState::default();
+        restored.project_key = Some(MidiScale::new(ScaleRoot::C, ScaleKind::Major));
+        let _ = apply_to_timeline(&decoded, &mut restored);
+        assert_eq!(restored.project_key, timeline.project_key);
+
+        // Clearing the key is saved too, not left at the previous value.
+        timeline.project_key = None;
+        let encoded = crate::project::format::encode_project(&FutureboardProject::from(&timeline));
+        let decoded = crate::project::format::decode_project(&encoded).expect("decode project");
+        let _ = apply_to_timeline(&decoded, &mut restored);
+        assert_eq!(restored.project_key, None);
     }
 
     #[test]

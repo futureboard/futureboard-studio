@@ -423,6 +423,7 @@ impl TempoMap {
                 beat: *beat,
                 bpm: *bpm,
                 curve: 0,
+                tension: 0.0,
             })
             .collect()
     }

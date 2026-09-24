@@ -623,6 +623,26 @@ impl StudioLayout {
             )
         };
 
+        let key_menu = |root: bool| -> components::BpmMenuCb {
+            let this = cx.entity().clone();
+            Arc::new(
+                move |pos: &(f32, f32), window: &mut Window, cx: &mut gpui::App| {
+                    let (x, y) = *pos;
+                    let _ = this.update(cx, |this, cx| {
+                        this.open_project_key_menu(window, x, y, root, cx);
+                    });
+                },
+            )
+        };
+        let on_key_root_menu = key_menu(true);
+        let on_key_scale_menu = key_menu(false);
+        let project_key = self.timeline.read(cx).state.project_key.map(|key| {
+            (
+                key.root.label().to_string(),
+                key.kind.short_label().to_string(),
+            )
+        });
+
         let on_ts_edit_start: components::ChromeActionCb = {
             let this = cx.entity().clone();
             Arc::new(move |_: &(), _window: &mut Window, cx: &mut gpui::App| {
@@ -710,6 +730,9 @@ impl StudioLayout {
             ts_edit_focus_num: self.tempo_edit.ts_edit_focus_num,
             on_ts_menu,
             on_ts_edit_start,
+            project_key,
+            on_key_root_menu,
+            on_key_scale_menu,
             on_return_to_start,
             on_play_toggle,
             on_stop,

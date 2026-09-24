@@ -38,6 +38,13 @@ impl Render for Timeline {
         if let Some(measured) = self.lane_origin_probe.get() {
             self.state.viewport.lane_origin_x_measured = Some(measured);
         }
+        // Lay the arrangement out against the current tempo map (real time:
+        // slow bars wide, fast bars narrow). Held still while a tempo marker is
+        // being dragged, so the grid under the pointer cannot move and feed
+        // back into the drag; it re-lays out on release.
+        if self.tempo_drag.is_none() {
+            self.state.sync_time_warp();
+        }
         let mut row_layout = self.state.track_row_layout();
         let (viewport_w, viewport_h, (scroll_max_x, scroll_max_y)) =
             self.scroll_geometry_with_content_height(window, row_layout.total_height);
@@ -683,6 +690,7 @@ impl Render for Timeline {
                     this.update_tempo_track_interaction(
                         event.position.x.into(),
                         event.position.y.into(),
+                        event.modifiers.shift,
                         cx,
                     );
                 } else if this.ts_drag.is_some() {
@@ -1367,26 +1375,19 @@ impl Render for Timeline {
         let on_automation_control = self.on_automation_control.clone();
 
         let on_tempo_down = cx.listener(
-            |this, payload: &(f64, f64, Option<String>, bool, u32), window, cx| {
-                let (beat, bpm, point_id, _additive, click_count) = (
-                    payload.0,
-                    payload.1,
-                    payload.2.clone(),
-                    payload.3,
-                    payload.4,
-                );
+            |this, down: &crate::components::timeline::tempo_track::TempoLaneDown, window, cx| {
                 // Double-click directly on an existing marker opens the
                 // inline BPM editor for that marker instead of the
                 // (previously dead) fallthrough that just re-selected it.
-                if click_count >= 2 {
-                    if let Some(id) = point_id.as_deref() {
+                if down.click_count >= 2 {
+                    if let Some(id) = down.point_id.as_deref() {
                         if let Some(cb) = this.on_tempo_point_edit.clone() {
                             cb(id, window, cx);
                             return;
                         }
                     }
                 }
-                this.begin_tempo_track_interaction(beat, bpm, point_id, click_count, cx);
+                this.begin_tempo_track_interaction(down, cx);
             },
         );
         let on_tempo_down: crate::components::timeline::tempo_track::TempoTrackDownCallback =
@@ -2117,10 +2118,12 @@ impl Render for Timeline {
                     return;
                 }
                 let drag = event.drag(cx).clone();
-                let pointer_beat = this.beat_from_window_x(event.event.position.x.into()) as f64;
-                let pixels_per_beat = this.state.viewport.pixels_per_beat.max(1.0) as f64;
-                let raw_anchor =
-                    (pointer_beat - drag.pointer_offset_x as f64 / pixels_per_beat).max(0.0);
+                // Offset in pixels, resolved through the transform so it holds
+                // under tempo automation.
+                let pointer_x: f32 = event.event.position.x.into();
+                let raw_anchor = this
+                    .beat_from_window_x(pointer_x - drag.pointer_offset_x)
+                    .max(0.0) as f64;
                 let snapped_anchor = this
                     .state
                     .snap_beats_with_bypass(raw_anchor as f32, event.event.modifiers.shift)

@@ -349,6 +349,24 @@ pub enum EditCommand {
         prev: Vec<crate::components::timeline::timeline_state::ChordTrackEvent>,
         next: Vec<crate::components::timeline::timeline_state::ChordTrackEvent>,
     },
+    /// Map the project's tempo and meter onto a recording: the tempo map, the
+    /// meter map and every audio clip kept at its wall-clock position, as one
+    /// step. The maps are applied before the clips in both directions, so the
+    /// maps' own clip re-anchoring cannot move a clip this restores exactly.
+    MapTempo {
+        label: &'static str,
+        tempo_prev: TempoStateSnapshot,
+        tempo_next: TempoStateSnapshot,
+        meter_prev: TimeSignatureStateSnapshot,
+        meter_next: TimeSignatureStateSnapshot,
+        /// `(before, after)` per clip that moved.
+        clips: Vec<(ClipSnapshot, ClipSnapshot)>,
+    },
+    /// Set, change or clear the project key.
+    SetProjectKey {
+        prev: Option<crate::components::timeline::timeline_state::MidiScale>,
+        next: Option<crate::components::timeline::timeline_state::MidiScale>,
+    },
     /// One global-lane height gesture (drag or reset-to-default). Persisted
     /// with the project since v40, but view state all the same, so it never
     /// invalidates the audio graph.
@@ -379,6 +397,8 @@ impl EditCommand {
             EditCommand::SetSongTextEvents { .. } => EditImpact::Metadata,
             EditCommand::SetChordEvents { .. } => EditImpact::Metadata,
             EditCommand::SetGlobalLaneHeights { .. } => EditImpact::Metadata,
+            // Nothing plays differently: the key is read by editors and tools.
+            EditCommand::SetProjectKey { .. } => EditImpact::Metadata,
             EditCommand::SetTrackVolume { .. } | EditCommand::SetTrackPan { .. } => {
                 EditImpact::MixerControl
             }
@@ -452,6 +472,8 @@ impl EditCommand {
             EditCommand::SetRegions { label, .. } => label,
             EditCommand::SetChordEvents { label, .. } => label,
             EditCommand::SetGlobalLaneHeights { .. } => "Resize Lane",
+            EditCommand::SetProjectKey { .. } => "Set Project Key",
+            EditCommand::MapTempo { label, .. } => label,
         }
     }
 
@@ -641,6 +663,21 @@ impl EditCommand {
             EditCommand::SetGlobalLaneHeights { next, .. } => {
                 state.global_lane_heights = next.clone();
             }
+            EditCommand::SetProjectKey { next, .. } => {
+                state.project_key = *next;
+            }
+            EditCommand::MapTempo {
+                tempo_next,
+                meter_next,
+                clips,
+                ..
+            } => {
+                tempo_next.apply(state);
+                meter_next.apply(state);
+                for (_, after) in clips {
+                    replace_clip_snapshot(state, &after.clip.id, after);
+                }
+            }
         }
     }
 
@@ -802,6 +839,21 @@ impl EditCommand {
             }
             EditCommand::SetGlobalLaneHeights { prev, .. } => {
                 state.global_lane_heights = prev.clone();
+            }
+            EditCommand::SetProjectKey { prev, .. } => {
+                state.project_key = *prev;
+            }
+            EditCommand::MapTempo {
+                tempo_prev,
+                meter_prev,
+                clips,
+                ..
+            } => {
+                tempo_prev.apply(state);
+                meter_prev.apply(state);
+                for (before, _) in clips {
+                    replace_clip_snapshot(state, &before.clip.id, before);
+                }
             }
         }
     }

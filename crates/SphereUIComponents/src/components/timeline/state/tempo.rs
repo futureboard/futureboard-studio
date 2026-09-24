@@ -8,6 +8,47 @@ pub struct TempoPointDrag {
     pub moved: bool,
 }
 
+/// In-flight bend of one tempo ramp: vertical travel from the grab point
+/// becomes the left marker's tension; the markers themselves never move.
+#[derive(Debug, Clone)]
+pub struct TempoCurveDrag {
+    /// Marker the ramp starts at (tension lives on the left marker).
+    pub left_id: String,
+    pub start_tension: f32,
+    pub start_window_y: f32,
+    /// Whether the ramp rises to the next marker. Decides which way "up"
+    /// bends it, so dragging up always lifts the line under the pointer.
+    pub rising: bool,
+    /// Set once the tension actually changed, so a pure click never dirties.
+    pub changed: bool,
+}
+
+/// What a press on the Tempo lane is dragging.
+#[derive(Debug, Clone)]
+pub enum TempoLaneDrag {
+    Point(TempoPointDrag),
+    Curve(TempoCurveDrag),
+}
+
+/// Tension change per lane height of vertical drag.
+pub const TEMPO_TENSION_GAIN: f32 = 2.4;
+/// Tension change per lane height with Shift held, for fine shaping.
+pub const TEMPO_TENSION_GAIN_FINE: f32 = 0.6;
+
+/// Tension for a ramp bend dragged from `start_y` to `y` (window px) on a
+/// lane `lane_height` tall. Up lifts the line: on a rising ramp that is an
+/// ease-out (negative tension), on a falling ramp an ease-in.
+pub fn tempo_drag_tension(drag: &TempoCurveDrag, y: f32, lane_height: f32, fine: bool) -> f32 {
+    let gain = if fine {
+        TEMPO_TENSION_GAIN_FINE
+    } else {
+        TEMPO_TENSION_GAIN
+    };
+    let up = (drag.start_window_y - y) / lane_height.max(1.0);
+    let direction = if drag.rising { -1.0 } else { 1.0 };
+    clamp_tempo_tension(drag.start_tension + direction * up * gain)
+}
+
 // ── Tempo map ─────────────────────────────────────────────────────────────────
 
 /// Interpolation shape between a tempo point and the next one.
@@ -65,6 +106,10 @@ pub struct TempoPoint {
     pub beat: f64,
     pub bpm: f64,
     pub curve: TempoCurve,
+    /// Bend of a Linear ramp to the next marker, `-1.0..=1.0`: `> 0` eases in,
+    /// `< 0` eases out. The same power curve automation lanes use, evaluated
+    /// by the engine ([`DirectAudio::TempoCurve::shape`]).
+    pub tension: f32,
 }
 
 impl TempoPoint {
@@ -74,6 +119,7 @@ impl TempoPoint {
             beat: beat.max(0.0),
             bpm: bpm.clamp(TEMPO_BPM_MIN, TEMPO_BPM_MAX),
             curve,
+            tension: 0.0,
         }
     }
 
@@ -83,7 +129,22 @@ impl TempoPoint {
             beat: beat.max(0.0),
             bpm: bpm.clamp(TEMPO_BPM_MIN, TEMPO_BPM_MAX),
             curve,
+            tension: 0.0,
         }
+    }
+
+    pub fn with_tension(mut self, tension: f32) -> Self {
+        self.tension = clamp_tempo_tension(tension);
+        self
+    }
+}
+
+/// Tempo curve tension range, shared with automation lanes.
+pub fn clamp_tempo_tension(tension: f32) -> f32 {
+    if tension.is_finite() {
+        tension.clamp(-1.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -144,7 +205,10 @@ impl TempoMap {
             base_bpm.clamp(TEMPO_BPM_MIN, TEMPO_BPM_MAX),
             self.points
                 .iter()
-                .map(|p| DirectAudio::TempoPoint::new(p.beat, p.bpm, p.curve.to_engine()))
+                .map(|p| {
+                    DirectAudio::TempoPoint::new(p.beat, p.bpm, p.curve.to_engine())
+                        .with_tension(p.tension as f64)
+                })
                 .collect(),
         )
     }
@@ -209,10 +273,8 @@ impl TempoMap {
             (curve, Some(next)) => {
                 let span = (next.beat - cur.beat).max(1e-9);
                 let t = ((beat - cur.beat) / span).clamp(0.0, 1.0);
-                let t = match curve {
-                    TempoCurve::Smooth => t * t * (3.0 - 2.0 * t),
-                    _ => t,
-                };
+                // The engine's shape, so the lane draws the curve that plays.
+                let t = curve.to_engine().shape(cur.tension as f64, t);
                 cur.bpm + (next.bpm - cur.bpm) * t
             }
         }
@@ -338,6 +400,17 @@ impl TempoMap {
         }
     }
 
+    /// Set the bend of a marker's ramp to the next marker.
+    pub fn update_point_tension_by_id(&mut self, id: &str, tension: f32) -> bool {
+        if let Some(point) = self.points.iter_mut().find(|p| p.id == id) {
+            point.tension = clamp_tempo_tension(tension);
+            self.bump_revision();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn update_point_curve_by_id(&mut self, id: &str, curve: TempoCurve) -> bool {
         if let Some(point) = self.points.iter_mut().find(|p| p.id == id) {
             point.curve = curve;
@@ -416,9 +489,9 @@ pub struct ResolvedTempo {
     cell: std::sync::Mutex<Option<(TempoCacheKey, std::sync::Arc<DirectAudio::TempoMap>)>>,
 }
 
-/// What a resolved map was built from: the marker list's revision (which moves
-/// on every edit), the base BPM, and the marker count.
-type TempoCacheKey = (u64, u32, usize);
+/// What a resolved map was built from: a hash of the base BPM and every
+/// marker's beat, BPM, curve and tension.
+type TempoCacheKey = u64;
 
 thread_local! {
     /// Engine tempo maps actually built on this thread.
@@ -453,12 +526,22 @@ impl PartialEq for ResolvedTempo {
 }
 
 impl TimelineState {
-    fn tempo_cache_key(&self) -> TempoCacheKey {
-        (
-            self.tempo_map.revision(),
-            self.bpm.to_bits(),
-            self.tempo_map.points.len(),
-        )
+    /// A hash of everything the resolved map is built from. Content rather
+    /// than the revision counter: `points` is public and a freshly built map
+    /// restarts its revision, so a counter can repeat for a different map
+    /// (open another project with as many markers) and serve a stale one.
+    /// The marker list is small, so hashing it costs far less than a rebuild.
+    pub(crate) fn tempo_cache_key(&self) -> TempoCacheKey {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.bpm.to_bits().hash(&mut hasher);
+        for point in &self.tempo_map.points {
+            point.beat.to_bits().hash(&mut hasher);
+            point.bpm.to_bits().hash(&mut hasher);
+            point.curve.to_tag().hash(&mut hasher);
+            point.tension.to_bits().hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     /// The engine tempo map for the project's current tempo.
@@ -494,6 +577,7 @@ impl TimelineState {
     /// first frame that draws with it.
     pub fn refresh_tempo_cache(&mut self) {
         let _ = self.resolved_tempo_map();
+        self.sync_time_warp();
     }
 }
 
@@ -630,7 +714,15 @@ impl TimelineState {
             let factor = (needed_ppb / current_ppb).clamp(0.05, 1.0);
             self.zoom_by(factor, width * 0.5);
         }
-        let scroll = ((min_beat - pad).max(0.0) as f32 * self.pixels_per_beat()).max(0.0);
+        let scroll = self
+            .viewport
+            .time_warp
+            .content_x(
+                (min_beat - pad).max(0.0),
+                self.viewport.pixels_per_second,
+                self.viewport.pixels_per_beat,
+            )
+            .max(0.0) as f32;
         self.viewport.scroll_x = scroll;
         self.viewport.target_scroll_x = scroll;
     }
@@ -733,6 +825,10 @@ impl TimelineState {
         self.tempo_map.update_point_curve_by_id(id, curve)
     }
 
+    pub fn set_tempo_point_tension(&mut self, id: &str, tension: f32) -> bool {
+        self.tempo_map.update_point_tension_by_id(id, tension)
+    }
+
     pub fn set_fixed_tempo_from_beat(&mut self, beat: f64, bpm: f64) {
         let base = self.bpm as f64;
         self.tempo_map.set_fixed_from_beat(beat, bpm, base);
@@ -758,5 +854,69 @@ impl TimelineState {
                 self.effective_bpm_at_beat(beat)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod curve_tests {
+    use super::*;
+
+    fn drag(rising: bool) -> TempoCurveDrag {
+        TempoCurveDrag {
+            left_id: "a".into(),
+            start_tension: 0.0,
+            start_window_y: 100.0,
+            rising,
+            changed: false,
+        }
+    }
+
+    #[test]
+    fn dragging_up_lifts_the_line_either_way() {
+        // Rising ramp: lifting the line means reaching speed early (ease-out).
+        assert!(tempo_drag_tension(&drag(true), 60.0, 80.0, false) < 0.0);
+        // Falling ramp: lifting the line means staying fast longer (ease-in).
+        assert!(tempo_drag_tension(&drag(false), 60.0, 80.0, false) > 0.0);
+        // Fine drag moves less, and the result stays in range.
+        let coarse = tempo_drag_tension(&drag(true), 90.0, 80.0, false);
+        let fine = tempo_drag_tension(&drag(true), 90.0, 80.0, true);
+        assert!(fine.abs() < coarse.abs());
+        assert_eq!(
+            tempo_drag_tension(&drag(true), -10_000.0, 80.0, false),
+            -1.0
+        );
+    }
+
+    #[test]
+    fn the_lane_draws_the_bend_the_engine_plays() {
+        let map = TempoMap::with_points(vec![
+            TempoPoint::with_id("a", 0.0, 60.0, TempoCurve::Linear).with_tension(0.6),
+            TempoPoint::with_id("b", 8.0, 180.0, TempoCurve::Hold),
+        ]);
+        let engine = map.to_engine_map(120.0);
+        for beat in [1.0, 4.0, 7.0] {
+            let drawn = map.bpm_at_beat(beat, 120.0);
+            let played = engine.bpm_at_beat(beat);
+            assert!(
+                (drawn - played).abs() < 0.05,
+                "beat {beat}: {drawn} vs {played}"
+            );
+        }
+        // Eased in: still well under the straight ramp's 120 at the midpoint.
+        assert!(map.bpm_at_beat(4.0, 120.0) < 110.0);
+    }
+
+    #[test]
+    fn the_resolved_map_never_serves_a_stale_curve() {
+        let mut state = TimelineState::default();
+        state.tempo_map = TempoMap::with_points(vec![
+            TempoPoint::with_id("a", 0.0, 60.0, TempoCurve::Linear),
+            TempoPoint::with_id("b", 8.0, 180.0, TempoCurve::Hold),
+        ]);
+        let straight = state.seconds_at_beat(8.0);
+        // Written straight into the public field: no revision bump.
+        state.tempo_map.points[0].tension = 0.8;
+        let bent = state.seconds_at_beat(8.0);
+        assert!(bent > straight + 0.1, "{straight} → {bent}");
     }
 }

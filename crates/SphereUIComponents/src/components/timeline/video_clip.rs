@@ -63,10 +63,10 @@ pub fn video_clip(
         }
     );
 
-    let pixels_per_second = state.viewport.pixels_per_second;
-    let seconds_per_beat = state.seconds_per_beat();
     let left = state.beats_to_x(clip.start_beat);
-    let width = (clip.duration_beats * seconds_per_beat * pixels_per_second).max(10.0);
+    let width = state
+        .beat_span_px(clip.start_beat, clip.duration_beats)
+        .max(10.0);
 
     let pad = 7.0;
     let clip_h = row_height - pad * 2.0;

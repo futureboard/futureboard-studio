@@ -86,11 +86,11 @@ pub fn track_lane(
             let (clip_left, clip_width) = if matches!(clip.clip_type, ClipType::Audio { .. }) {
                 audio_clip_timeline_geometry(clip, state)
             } else {
-                let seconds_per_beat = state.seconds_per_beat();
-                let pixels_per_second = state.viewport.pixels_per_second;
                 (
                     state.beats_to_x(clip.start_beat),
-                    (clip.duration_beats * seconds_per_beat * pixels_per_second).max(10.0),
+                    state
+                        .beat_span_px(clip.start_beat, clip.duration_beats)
+                        .max(10.0),
                 )
             };
             if clip_left + clip_width < 0.0 || clip_left > viewport_w {

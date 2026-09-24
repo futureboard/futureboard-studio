@@ -25,6 +25,10 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, WindowBackgroundAppearance, WindowBounds,
     WindowHandle, WindowKind,
 };
+use SphereAudioProcessor::analysis::{
+    analyze_rhythm, chroma_frames, recognize_chords, ChordKind, ChordOptions, ChordSegment,
+    ChromaFrames, RhythmAnalysis, RhythmOptions,
+};
 use SphereAudioProcessor::{
     downmix_interleaved, estimate_bpm_candidates, pitch_class_profile, rank_keys, slice_frames,
     KeyEstimate, KeyMode, TempoCandidate,
@@ -41,12 +45,16 @@ use crate::window_position::{apply_owner_display, centered_window_bounds};
 
 use crate::components::pitch_wheel::{self as visual, fifths_pitch_class, ring, WheelFrame};
 
-pub const TEMPO_KEY_WINDOW_WIDTH: f32 = 640.0;
-pub const TEMPO_KEY_WINDOW_HEIGHT: f32 = 580.0;
+pub const TEMPO_KEY_WINDOW_WIDTH: f32 = 780.0;
+pub const TEMPO_KEY_WINDOW_HEIGHT: f32 = 780.0;
 /// Sized so both cards, the wheel and the footer fit without scrolling; the
 /// card column still scrolls rather than clip if the platform chrome is taller.
-const MIN_WIDTH: f32 = 600.0;
-const MIN_HEIGHT: f32 = 560.0;
+const MIN_WIDTH: f32 = 700.0;
+const MIN_HEIGHT: f32 = 700.0;
+/// Height of the tempo / beats / chords strip.
+const STRIP_TEMPO_H: f32 = 84.0;
+const STRIP_BEATS_H: f32 = 18.0;
+const STRIP_CHORDS_H: f32 = 26.0;
 /// Tempo chips shown; the strongest readings, ordered by BPM.
 const TEMPO_CHIPS: usize = 4;
 
@@ -126,9 +134,36 @@ pub fn tempo_key_target(state: &TimelineState) -> Option<TempoKeyTarget> {
 
 /// A project change the window asks the Studio to make.
 pub enum TempoKeyCommand {
-    SetProjectTempo { bpm: f64 },
-    SetClipTempo { clip_id: String, bpm: f64 },
-    ApplyScale { tonic: usize, minor: bool },
+    SetProjectTempo {
+        bpm: f64,
+    },
+    SetClipTempo {
+        clip_id: String,
+        bpm: f64,
+    },
+    ApplyScale {
+        tonic: usize,
+        minor: bool,
+    },
+    SetProjectKey {
+        tonic: usize,
+        minor: bool,
+    },
+    /// Lay the project's tempo and meter over the clip's detected beats.
+    /// `beats` are seconds on the source file's clock.
+    MapTempo {
+        clip_id: String,
+        beats: Vec<f64>,
+        positions: Vec<u32>,
+        beats_per_bar: u32,
+    },
+    /// Put detected chords on the Chord Track. Seconds on the source file's
+    /// clock; `(start, end, root, kind)`.
+    PlaceChords {
+        clip_id: String,
+        chords: Vec<(f64, f64, u8, ChordKind)>,
+        flats: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -152,6 +187,14 @@ struct Analysis {
     /// Pitch-class energy scaled so the strongest class is 1.
     energy: [f32; 12],
     seconds: f32,
+    /// Source-file seconds of the analysed audio's first sample. Every time
+    /// below is relative to it.
+    offset_seconds: f64,
+    /// Beats, bars, meter and tempo sections.
+    rhythm: Option<RhythmAnalysis>,
+    /// Chroma kept so the chord vocabulary can change without re-analysing.
+    chroma: Option<Arc<ChromaFrames>>,
+    chords: Vec<ChordSegment>,
 }
 
 enum Phase {
@@ -170,6 +213,10 @@ pub struct TempoKeyFinderWindow {
     tempo_pick: usize,
     key_pick: usize,
     notice: Option<String>,
+    /// The notice reports a failure.
+    notice_error: bool,
+    /// Recognise 7th chords, not just major/minor.
+    sevenths: bool,
     // Animation state, advanced by the tick loop only while it moves.
     pulse: bool,
     window_active: bool,
@@ -203,6 +250,8 @@ impl TempoKeyFinderWindow {
             tempo_pick: 0,
             key_pick: 0,
             notice: None,
+            notice_error: false,
+            sevenths: true,
             pulse: true,
             window_active: true,
             ticking: false,
@@ -367,7 +416,71 @@ impl TempoKeyFinderWindow {
     fn dispatch(&mut self, command: TempoKeyCommand, notice: String, cx: &mut Context<Self>) {
         (self.callbacks.on_command)(command, cx);
         self.notice = Some(notice);
+        self.notice_error = false;
         cx.notify();
+    }
+
+    /// Report how a command went; the Studio calls this once it has applied
+    /// (or refused) it.
+    pub fn set_notice(&mut self, text: String, error: bool, cx: &mut Context<Self>) {
+        self.notice = Some(text);
+        self.notice_error = error;
+        cx.notify();
+    }
+
+    fn set_sevenths(&mut self, sevenths: bool, cx: &mut Context<Self>) {
+        self.sevenths = sevenths;
+        let key = self.picked_key();
+        if let Phase::Ready(analysis) = &mut self.phase {
+            if let (Some(frames), Some(rhythm)) = (&analysis.chroma, &analysis.rhythm) {
+                analysis.chords = detect_chords(frames, rhythm, key.as_ref(), sevenths);
+            }
+        }
+        cx.notify();
+    }
+
+    fn map_tempo(&mut self, cx: &mut Context<Self>) {
+        let Some(analysis) = self.analysis() else {
+            return;
+        };
+        let Some(rhythm) = &analysis.rhythm else {
+            return;
+        };
+        let offset = analysis.offset_seconds;
+        let command = TempoKeyCommand::MapTempo {
+            clip_id: self.target.clip_id.clone(),
+            beats: rhythm.beats.iter().map(|b| b.seconds + offset).collect(),
+            positions: rhythm.beats.iter().map(|b| b.position).collect(),
+            beats_per_bar: rhythm.beats_per_bar,
+        };
+        self.dispatch(command, "Mapping tempo…".to_string(), cx);
+    }
+
+    fn place_chords(&mut self, cx: &mut Context<Self>) {
+        let Some(analysis) = self.analysis() else {
+            return;
+        };
+        let offset = analysis.offset_seconds;
+        let chords: Vec<(f64, f64, u8, ChordKind)> = analysis
+            .chords
+            .iter()
+            .filter_map(|c| {
+                let label = c.chord?;
+                Some((
+                    c.start_seconds + offset,
+                    c.end_seconds + offset,
+                    label.root,
+                    label.kind,
+                ))
+            })
+            .collect();
+        let flats = key_uses_flats(self.picked_key().as_ref());
+        let command = TempoKeyCommand::PlaceChords {
+            clip_id: self.target.clip_id.clone(),
+            chords,
+            flats,
+        };
+        self.dispatch(command, "Adding chords…".to_string(), cx);
     }
 
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -614,25 +727,39 @@ impl TempoKeyFinderWindow {
             .when(count > 1, |this| {
                 this.child(fb_segmented_track().children(segments))
             })
-            .child(div().flex().flex_row().child(fb_button(
-                "tempo-key-set-clip",
-                "Set Clip Tempo",
-                FbButtonKind::Default,
-                picked.is_some(),
-                cx.listener(move |this, _, _, cx| {
-                    if let Some(tempo) = this.picked_tempo() {
-                        let bpm = round_bpm(tempo.bpm);
-                        this.dispatch(
-                            TempoKeyCommand::SetClipTempo {
-                                clip_id: clip_id.clone(),
-                                bpm,
-                            },
-                            format!("Clip tempo set to {} BPM", format_bpm(bpm as f32)),
-                            cx,
-                        );
-                    }
-                }),
-            )))
+            .children(self.rhythm_summary())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(space::BASE))
+                    .child(fb_button(
+                        "tempo-key-map",
+                        "Map Tempo",
+                        FbButtonKind::Primary,
+                        analysis.is_some_and(|a| a.rhythm.is_some()),
+                        cx.listener(|this, _, _, cx| this.map_tempo(cx)),
+                    ))
+                    .child(fb_button(
+                        "tempo-key-set-clip",
+                        "Set Clip Tempo",
+                        FbButtonKind::Default,
+                        picked.is_some(),
+                        cx.listener(move |this, _, _, cx| {
+                            if let Some(tempo) = this.picked_tempo() {
+                                let bpm = round_bpm(tempo.bpm);
+                                this.dispatch(
+                                    TempoKeyCommand::SetClipTempo {
+                                        clip_id: clip_id.clone(),
+                                        bpm,
+                                    },
+                                    format!("Clip tempo set to {} BPM", format_bpm(bpm as f32)),
+                                    cx,
+                                );
+                            }
+                        }),
+                    )),
+            )
     }
 
     fn key_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -682,24 +809,339 @@ impl TempoKeyFinderWindow {
             .when(count > 1, |this| {
                 this.child(fb_segmented_track().children(segments))
             })
-            .child(div().flex().flex_row().child(fb_button(
-                "tempo-key-apply-scale",
-                "Apply to Piano Roll",
-                FbButtonKind::Default,
-                picked.is_some(),
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(space::BASE))
+                    .child(fb_button(
+                        "tempo-key-set-project-key",
+                        "Set Project Key",
+                        FbButtonKind::Default,
+                        picked.is_some(),
+                        cx.listener(|this, _, _, cx| {
+                            if let Some(key) = this.picked_key() {
+                                this.dispatch(
+                                    TempoKeyCommand::SetProjectKey {
+                                        tonic: tonic_index(&key),
+                                        minor: key.mode == KeyMode::Minor,
+                                    },
+                                    format!("Project key set to {}", key.display_label()),
+                                    cx,
+                                );
+                            }
+                        }),
+                    ))
+                    .child(fb_button(
+                        "tempo-key-apply-scale",
+                        "Apply to Piano Roll",
+                        FbButtonKind::Default,
+                        picked.is_some(),
+                        cx.listener(|this, _, _, cx| {
+                            if let Some(key) = this.picked_key() {
+                                this.dispatch(
+                                    TempoKeyCommand::ApplyScale {
+                                        tonic: tonic_index(&key),
+                                        minor: key.mode == KeyMode::Minor,
+                                    },
+                                    format!("Piano roll scale set to {}", key.display_label()),
+                                    cx,
+                                );
+                            }
+                        }),
+                    )),
+            )
+    }
+
+    /// One line under the tempo: meter, bars and whether it moves.
+    fn rhythm_summary(&self) -> Option<AnyElement> {
+        let rhythm = self.analysis()?.rhythm.as_ref()?;
+        let bars = rhythm.beats.iter().filter(|b| b.position == 1).count();
+        let tempo = if rhythm.variable && rhythm.sections.len() > 1 {
+            let first = rhythm.sections.first().map(|s| s.bpm).unwrap_or(rhythm.bpm);
+            let last = rhythm.sections.last().map(|s| s.bpm).unwrap_or(rhythm.bpm);
+            format!(
+                "Tempo changes: {} → {} BPM · {} sections",
+                format_bpm(first),
+                format_bpm(last),
+                rhythm.sections.len()
+            )
+        } else if rhythm.variable {
+            let (lo, hi) = rhythm
+                .tempo_curve
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(lo, hi), (_, b)| {
+                    (lo.min(*b), hi.max(*b))
+                });
+            format!("Tempo drifts {}–{} BPM", format_bpm(lo), format_bpm(hi))
+        } else {
+            format!("Steady {} BPM", format_bpm(rhythm.bpm))
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::HAIR))
+                .text_size(px(typography::UI_XS))
+                .text_color(Colors::text_secondary())
+                .child(tempo)
+                .child(div().text_color(Colors::text_muted()).child(format!(
+                    "{}/4 · {} bars · {} beats found",
+                    rhythm.beats_per_bar,
+                    bars,
+                    rhythm.beats.len()
+                )))
+                .into_any_element(),
+        )
+    }
+
+    fn chords_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let analysis = self.analysis();
+        let flats = key_uses_flats(self.picked_key().as_ref());
+        let chords: Vec<&ChordSegment> = analysis
+            .map(|a| a.chords.iter().filter(|c| c.chord.is_some()).collect())
+            .unwrap_or_default();
+        let distinct = {
+            let mut seen: Vec<String> = Vec::new();
+            for c in &chords {
+                let label = c.chord.unwrap();
+                let name = chord_name(label.root, label.kind, flats);
+                if !seen.contains(&name) {
+                    seen.push(name);
+                }
+            }
+            seen
+        };
+        let preview = chords
+            .iter()
+            .take(8)
+            .map(|c| {
+                let l = c.chord.unwrap();
+                chord_name(l.root, l.kind, flats)
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        card()
+            .child(card_heading("CHORDS", None))
+            .child(value_line(
+                if chords.is_empty() {
+                    "—".to_string()
+                } else {
+                    chords.len().to_string()
+                },
+                "changes",
+            ))
+            .child(
+                div()
+                    .text_size(px(typography::UI_XS))
+                    .text_color(Colors::text_secondary())
+                    .truncate()
+                    .child(if preview.is_empty() {
+                        "No chords recognised".to_string()
+                    } else {
+                        format!("{preview}{}", if chords.len() > 8 { " …" } else { "" })
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(typography::UI_XS))
+                    .text_color(Colors::text_muted())
+                    .child(format!("{} different chords", distinct.len())),
+            )
+            .child(fb_checkbox(
+                "tempo-key-sevenths",
+                "Include 7th chords",
+                self.sevenths,
+                analysis.is_some(),
                 cx.listener(|this, _, _, cx| {
-                    if let Some(key) = this.picked_key() {
-                        this.dispatch(
-                            TempoKeyCommand::ApplyScale {
-                                tonic: tonic_index(&key),
-                                minor: key.mode == KeyMode::Minor,
-                            },
-                            format!("Piano roll scale set to {}", key.display_label()),
-                            cx,
-                        );
-                    }
+                    let next = !this.sevenths;
+                    this.set_sevenths(next, cx);
                 }),
+            ))
+            .child(div().flex().flex_row().child(fb_button(
+                "tempo-key-place-chords",
+                "Add to Chord Track",
+                FbButtonKind::Default,
+                !chords.is_empty(),
+                cx.listener(|this, _, _, cx| this.place_chords(cx)),
             )))
+    }
+
+    /// Tempo curve with its sections, the beat grid (downbeats tall) and the
+    /// recognised chords, over the analysed audio.
+    fn rhythm_strip(&self, window: &Window) -> Option<AnyElement> {
+        let analysis = self.analysis()?;
+        let rhythm = analysis.rhythm.as_ref()?;
+        let duration = (analysis.seconds as f64).max(1e-3);
+        let flats = key_uses_flats(self.picked_key().as_ref());
+        let width_px: f32 = f32::from(window.viewport_size().width) - 2.0 * space::SECTION;
+        let frac = |t: f64| (t / duration).clamp(0.0, 1.0) as f32;
+
+        let (lo, hi) = rhythm
+            .tempo_curve
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), (_, b)| {
+                (lo.min(*b), hi.max(*b))
+            });
+        let pad = ((hi - lo) * 0.15).max(4.0);
+        let (lo, hi) = (lo - pad, hi + pad);
+        let curve: Vec<(f32, f32)> = rhythm
+            .tempo_curve
+            .iter()
+            .map(|(t, b)| (frac(*t), 1.0 - (b - lo) / (hi - lo).max(1e-3)))
+            .collect();
+        let beats: Vec<(f32, bool)> = rhythm
+            .beats
+            .iter()
+            .map(|b| (frac(b.seconds), b.position == 1))
+            .collect();
+        let sections: Vec<(f32, f32)> = rhythm
+            .sections
+            .iter()
+            .map(|s| (frac(s.start_seconds), frac(s.end_seconds)))
+            .collect();
+        let chord_spans: Vec<(f32, f32, bool)> = analysis
+            .chords
+            .iter()
+            .map(|c| {
+                (
+                    frac(c.start_seconds),
+                    frac(c.end_seconds),
+                    c.chord.is_some(),
+                )
+            })
+            .collect();
+        let line = Colors::accent_primary();
+        let shade = Colors::with_alpha(Colors::text_primary(), 0.04);
+        let tick = Colors::text_muted();
+        let down = Colors::text_primary();
+        let chord_fill = Colors::with_alpha(Colors::accent_primary(), 0.16);
+        let chord_edge = Colors::border_subtle();
+
+        let graphics = gpui::canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let ox: f32 = bounds.origin.x.into();
+                let oy: f32 = bounds.origin.y.into();
+                let w: f32 = bounds.size.width.into();
+                let quad = |x: f32, y: f32, qw: f32, qh: f32| {
+                    gpui::Bounds::new(
+                        gpui::point(px(x), px(y)),
+                        gpui::size(px(qw.max(0.0)), px(qh.max(0.0))),
+                    )
+                };
+                for (i, (a, b)) in sections.iter().enumerate() {
+                    if i % 2 == 1 {
+                        window.paint_quad(gpui::fill(
+                            quad(ox + a * w, oy, (b - a) * w, STRIP_TEMPO_H),
+                            shade,
+                        ));
+                    }
+                }
+                if curve.len() >= 2 {
+                    let mut path = gpui::PathBuilder::stroke(px(1.5));
+                    for (i, (x, y)) in curve.iter().enumerate() {
+                        let p =
+                            gpui::point(px(ox + x * w), px(oy + 6.0 + y * (STRIP_TEMPO_H - 12.0)));
+                        if i == 0 {
+                            path.move_to(p);
+                        } else {
+                            path.line_to(p);
+                        }
+                    }
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, line);
+                    }
+                }
+                let beats_top = oy + STRIP_TEMPO_H;
+                for (x, is_down) in &beats {
+                    let h = if *is_down {
+                        STRIP_BEATS_H
+                    } else {
+                        STRIP_BEATS_H * 0.4
+                    };
+                    window.paint_quad(gpui::fill(
+                        quad(ox + x * w, beats_top + STRIP_BEATS_H - h, 1.0, h),
+                        if *is_down { down } else { tick },
+                    ));
+                }
+                let chords_top = beats_top + STRIP_BEATS_H + 2.0;
+                for (a, b, has) in &chord_spans {
+                    if !has {
+                        continue;
+                    }
+                    let r = quad(
+                        ox + a * w + 0.5,
+                        chords_top,
+                        (b - a) * w - 1.0,
+                        STRIP_CHORDS_H,
+                    );
+                    window.paint_quad(gpui::fill(r, chord_fill));
+                    window.paint_quad(gpui::fill(
+                        quad(ox + a * w, chords_top, 1.0, STRIP_CHORDS_H),
+                        chord_edge,
+                    ));
+                }
+            },
+        )
+        .absolute()
+        .inset_0();
+
+        // Labels, positioned by fraction so they need no measured width.
+        let section_labels = rhythm.sections.iter().map(|s| {
+            div()
+                .absolute()
+                .top(px(space::HAIR))
+                .left(gpui::relative(frac(s.start_seconds)))
+                .pl(px(space::TIGHT))
+                .text_size(px(typography::UI_XS))
+                .font_features(tabular_features())
+                .text_color(Colors::text_secondary())
+                .whitespace_nowrap()
+                .child(format!("{} BPM", format_bpm(s.bpm)))
+                .into_any_element()
+        });
+        let chord_labels = analysis.chords.iter().filter_map(|c| {
+            let label = c.chord?;
+            let (a, b) = (frac(c.start_seconds), frac(c.end_seconds));
+            ((b - a) * width_px >= 26.0).then(|| {
+                div()
+                    .absolute()
+                    .top(px(STRIP_TEMPO_H + STRIP_BEATS_H + 2.0))
+                    .h(px(STRIP_CHORDS_H))
+                    .left(gpui::relative(a))
+                    .w(gpui::relative(b - a))
+                    .flex()
+                    .items_center()
+                    .px(px(space::TIGHT))
+                    .overflow_hidden()
+                    .text_size(px(typography::UI_XS))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .whitespace_nowrap()
+                    .child(chord_name(label.root, label.kind, flats))
+                    .into_any_element()
+            })
+        });
+        Some(
+            div()
+                .flex_none()
+                .px(px(space::SECTION))
+                .pt(px(space::BASE))
+                .child(
+                    div()
+                        .relative()
+                        .h(px(STRIP_TEMPO_H + STRIP_BEATS_H + 2.0 + STRIP_CHORDS_H))
+                        .rounded(px(radius::CONTROL))
+                        .bg(Colors::surface_canvas())
+                        .border(px(1.0))
+                        .border_color(Colors::border_subtle())
+                        .overflow_hidden()
+                        .child(graphics)
+                        .children(section_labels)
+                        .children(chord_labels),
+                )
+                .into_any_element(),
+        )
     }
 
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -707,9 +1149,12 @@ impl TempoKeyFinderWindow {
             (_, Some(notice)) => notice.clone(),
             (Phase::Analyzing, None) => "Analyzing…".to_string(),
             (Phase::Failed(error), None) => error.clone(),
-            (Phase::Ready(_), None) => "Pick a candidate, then apply it".to_string(),
+            (Phase::Ready(_), None) => {
+                "Map Tempo lays the project grid on the detected beats".to_string()
+            }
         };
-        let failed = matches!(self.phase, Phase::Failed(_)) && self.notice.is_none();
+        let failed = (matches!(self.phase, Phase::Failed(_)) && self.notice.is_none())
+            || (self.notice.is_some() && self.notice_error);
         let analyzing = matches!(self.phase, Phase::Analyzing);
         let picked = self.picked_tempo();
         div()
@@ -787,6 +1232,7 @@ impl Render for TempoKeyFinderWindow {
                 },
             ))
             .child(self.header(cx))
+            .children(self.rhythm_strip(window))
             .child(
                 div()
                     .flex_1()
@@ -827,7 +1273,8 @@ impl Render for TempoKeyFinderWindow {
                             .flex_col()
                             .gap(px(space::LOOSE))
                             .child(self.tempo_card(cx))
-                            .child(self.key_card(cx)),
+                            .child(self.key_card(cx))
+                            .child(self.chords_card(cx)),
                     ),
             )
             .child(self.footer(cx))
@@ -871,7 +1318,7 @@ pub fn open_tempo_key_finder_window(
 // ── Analysis (background executor) ───────────────────────────────────────────
 
 fn run_analysis(path: &str, range: Option<(u64, u64)>) -> Result<Analysis, String> {
-    let buffer = DirectAudio::load_audio_file(path)?;
+    let buffer = DirectAudio::load_audio_file_for_edit(path)?;
     let channels = buffer.channels.max(1);
     let sample_rate = buffer.sample_rate as f32;
     let samples = match range {
@@ -906,12 +1353,75 @@ fn run_analysis(path: &str, range: Option<(u64, u64)>) -> Result<Analysis, Strin
             *value /= peak;
         }
     }
+    // Beats, downbeats, meter and tempo sections, then chords on those beats.
+    let frames = chroma_frames(&mono, sample_rate).map(Arc::new);
+    let rhythm = analyze_rhythm(
+        &mono,
+        sample_rate,
+        frames.as_deref(),
+        RhythmOptions::default(),
+    );
+    let chords = match (&frames, &rhythm) {
+        (Some(frames), Some(rhythm)) => detect_chords(frames, rhythm, keys.first(), true),
+        _ => Vec::new(),
+    };
+    let offset_seconds = match range {
+        Some((start, _)) if sample_rate > 0.0 => start as f64 / sample_rate as f64,
+        _ => 0.0,
+    };
     Ok(Analysis {
         tempos,
         keys,
         energy,
         seconds,
+        offset_seconds,
+        rhythm,
+        chroma: frames,
+        chords,
     })
+}
+
+fn detect_chords(
+    frames: &ChromaFrames,
+    rhythm: &RhythmAnalysis,
+    key: Option<&KeyEstimate>,
+    sevenths: bool,
+) -> Vec<ChordSegment> {
+    let beats: Vec<f64> = rhythm.beats.iter().map(|b| b.seconds).collect();
+    let downbeats: Vec<bool> = rhythm.beats.iter().map(|b| b.position == 1).collect();
+    let key = key.map(|k| (tonic_index(k) as u8, k.mode == KeyMode::Minor));
+    recognize_chords(frames, &beats, &downbeats, ChordOptions { sevenths, key })
+}
+
+/// Keys whose signature is written in flats, so chord names match it.
+fn key_uses_flats(key: Option<&KeyEstimate>) -> bool {
+    let Some(key) = key else {
+        return false;
+    };
+    let tonic = tonic_index(key);
+    if key.mode == KeyMode::Minor {
+        matches!(tonic, 0 | 2 | 3 | 5 | 7 | 10)
+    } else {
+        matches!(tonic, 1 | 3 | 5 | 6 | 8 | 10)
+    }
+}
+
+fn chord_name(root: u8, kind: ChordKind, flats: bool) -> String {
+    const SHARPS: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    const FLATS: [&str; 12] = [
+        "C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B",
+    ];
+    let names = if flats { FLATS } else { SHARPS };
+    let suffix = match kind {
+        ChordKind::Major => "",
+        ChordKind::Minor => "m",
+        ChordKind::Dominant7 => "7",
+        ChordKind::Major7 => "maj7",
+        ChordKind::Minor7 => "m7",
+    };
+    format!("{}{}", names[root as usize % 12], suffix)
 }
 
 // ── Small pure helpers ───────────────────────────────────────────────────────

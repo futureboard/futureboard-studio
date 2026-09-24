@@ -326,25 +326,58 @@ pub fn draggable_spacer() -> Div {
 
 /// Left click on a title-bar drag region.
 ///
-/// Windows maximises from the caption hit-test, so this only starts a move
-/// there. macOS has no system caption under a transparent title bar:
-/// `performWindowDragWithEvent` consumes every click, including the second
-/// click of a double-click, unless that click is handed to
-/// [`Window::titlebar_double_click`] (zoom, fill, or minimize, following
-/// `AppleActionOnDoubleClick`).
+/// Each platform moves a borderless window differently, and getting one
+/// wrong breaks it silently:
+///
+/// * **Windows** moves and maximises through the caption hit-test: the region
+///   is tagged `WindowControlArea::Drag`, `WM_NCHITTEST` answers `HTCAPTION`,
+///   and `DefWindowProc` runs the system move loop, double-click maximise and
+///   the window menu. The backend forwards the caption press here first and
+///   treats a stopped event as handled — it then returns before
+///   `DefWindowProc` ever sees the press, so the window can neither be dragged
+///   nor maximised. The press must therefore be left alone on Windows
+///   (`start_window_move` is a no-op there anyway).
+/// * **macOS** has no system caption under a transparent title bar:
+///   `performWindowDragWithEvent` consumes every click, including the second
+///   click of a double-click, unless that click is handed to
+///   [`Window::titlebar_double_click`] (zoom, fill, or minimize, following
+///   `AppleActionOnDoubleClick`).
+/// * **Linux** needs the move started explicitly.
 pub fn begin_titlebar_drag(event: &MouseDownEvent, window: &mut Window, cx: &mut App) {
-    cx.stop_propagation();
-    if macos_titlebar_double_click(event.click_count) {
-        window.titlebar_double_click();
-    } else {
-        window.start_window_move();
+    match titlebar_press(event.click_count) {
+        TitlebarPress::System => {}
+        TitlebarPress::DoubleClick => {
+            cx.stop_propagation();
+            window.titlebar_double_click();
+        }
+        TitlebarPress::Move => {
+            cx.stop_propagation();
+            window.start_window_move();
+        }
     }
 }
 
-/// `click_count` is AppKit's `NSEvent.clickCount`. Two or more is the click
-/// that should zoom rather than drag.
-fn macos_titlebar_double_click(click_count: usize) -> bool {
-    cfg!(target_os = "macos") && click_count >= 2
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitlebarPress {
+    /// The OS handles the press from the caption hit-test (Windows).
+    System,
+    /// Run the system title-bar double-click action (macOS).
+    DoubleClick,
+    /// Start an explicit window move.
+    Move,
+}
+
+/// `click_count` is the platform's click count; on macOS it is AppKit's
+/// `NSEvent.clickCount`, and two or more is the click that should zoom
+/// rather than drag.
+fn titlebar_press(click_count: usize) -> TitlebarPress {
+    if cfg!(target_os = "windows") {
+        TitlebarPress::System
+    } else if cfg!(target_os = "macos") && click_count >= 2 {
+        TitlebarPress::DoubleClick
+    } else {
+        TitlebarPress::Move
+    }
 }
 
 /// Compact title bar for external floating dialogs (Project Wizard, Preferences).
@@ -579,14 +612,34 @@ fn external_window_control_button(
 
 #[cfg(test)]
 mod tests {
-    use super::macos_titlebar_double_click;
+    use super::{titlebar_press, TitlebarPress};
 
     #[test]
     fn a_second_titlebar_click_zooms_only_on_macos() {
-        assert!(!macos_titlebar_double_click(0));
-        assert!(!macos_titlebar_double_click(1));
-        assert_eq!(macos_titlebar_double_click(2), cfg!(target_os = "macos"));
-        assert_eq!(macos_titlebar_double_click(3), cfg!(target_os = "macos"));
+        for clicks in [2, 3] {
+            let expected = if cfg!(target_os = "macos") {
+                TitlebarPress::DoubleClick
+            } else if cfg!(target_os = "windows") {
+                TitlebarPress::System
+            } else {
+                TitlebarPress::Move
+            };
+            assert_eq!(titlebar_press(clicks), expected);
+        }
+    }
+
+    /// Claiming a Windows caption press stops `DefWindowProc` from moving
+    /// or maximising the window, so Windows must always leave it alone.
+    #[test]
+    fn windows_leaves_every_caption_press_to_the_system() {
+        for clicks in 0..4 {
+            let press = titlebar_press(clicks);
+            if cfg!(target_os = "windows") {
+                assert_eq!(press, TitlebarPress::System);
+            } else {
+                assert_ne!(press, TitlebarPress::System);
+            }
+        }
     }
 }
 

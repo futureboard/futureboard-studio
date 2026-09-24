@@ -195,6 +195,12 @@ pub struct TransportChromeState {
     pub ts_edit_focus_num: bool,
     pub on_ts_menu: BpmMenuCb,
     pub on_ts_edit_start: ChromeActionCb,
+    /// The project key as (root, scale) labels; `None` when no key is set.
+    pub project_key: Option<(String, String)>,
+    /// Opens the key-root picker at the pointer.
+    pub on_key_root_menu: BpmMenuCb,
+    /// Opens the scale picker at the pointer.
+    pub on_key_scale_menu: BpmMenuCb,
     pub on_return_to_start: ChromeActionCb,
     pub on_play_toggle: ChromeActionCb,
     pub on_stop: ChromeActionCb,
@@ -739,6 +745,9 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
     let ts_den_input = state.ts_den_input.clone();
     let ts_den_input_callbacks = state.ts_den_input_callbacks.clone();
     let ts_edit_focus_num = state.ts_edit_focus_num;
+    let project_key = state.project_key.clone();
+    let on_key_root_menu = state.on_key_root_menu.clone();
+    let on_key_scale_menu = state.on_key_scale_menu.clone();
 
     let label_skip_back = i18n.tr_or("transport.skip-back", "<<");
     let label_play = i18n.tr_or("transport.play", ">");
@@ -1136,6 +1145,72 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
         })
         .into_any_element();
 
+    // Key: root and scale are separate targets, each opening its own short
+    // picker, the way the meter's two digits are separate fields.
+    let key_part = |id: &'static str, text: String, strong: bool, on_menu: BpmMenuCb| {
+        let hover = Colors::composite(Colors::surface_canvas(), Colors::state_hover());
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .h(px(20.0))
+            .px(px(crate::theme::space::HAIR))
+            .rounded(px(crate::theme::radius::CONTROL_SM))
+            .text_size(px(if strong { 13.0 } else { 11.0 }))
+            .font_weight(if strong {
+                gpui::FontWeight::SEMIBOLD
+            } else {
+                gpui::FontWeight::MEDIUM
+            })
+            .text_color(match (strong, project_key.is_some()) {
+                (_, false) => Colors::text_faint(),
+                (true, true) => Colors::text_primary(),
+                (false, true) => Colors::text_secondary(),
+            })
+            .whitespace_nowrap()
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(move |s| s.bg(hover))
+            .occlude()
+            .on_mouse_down(gpui::MouseButton::Left, {
+                let on_menu = on_menu.clone();
+                move |event: &gpui::MouseDownEvent, window, cx| {
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    on_menu(&(x, y), window, cx);
+                }
+            })
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                move |event: &gpui::MouseDownEvent, window, cx| {
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    on_menu(&(x, y), window, cx);
+                },
+            )
+            .child(text)
+    };
+    let (key_root_text, key_scale_text) = project_key
+        .clone()
+        .unwrap_or_else(|| ("—".to_string(), "No key".to_string()));
+    let key_value = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(crate::theme::space::HAIR))
+        .child(key_part(
+            "lcd-key-root",
+            key_root_text,
+            true,
+            on_key_root_menu,
+        ))
+        .child(key_part(
+            "lcd-key-scale",
+            key_scale_text,
+            false,
+            on_key_scale_menu,
+        ))
+        .into_any_element();
+
     let readout = div()
         .flex()
         .flex_row()
@@ -1189,6 +1264,13 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
         } else {
             None
         })
+        .child(lcd_divider())
+        .child(lcd_field(
+            "lcd-key",
+            assets::ICON_KEYBOARD_PATH,
+            "Project key — click the root or the scale to change it",
+            key_value,
+        ))
         .child(lcd_divider())
         .child(
             div()

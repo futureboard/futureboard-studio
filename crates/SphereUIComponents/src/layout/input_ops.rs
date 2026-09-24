@@ -1712,6 +1712,8 @@ impl StudioLayout {
                 }
                 entries
             }
+            ContextTarget::ProjectKeyRoot => self.project_key_menu_entries(true, cx),
+            ContextTarget::ProjectKeyScale => self.project_key_menu_entries(false, cx),
             ContextTarget::TimeSignature => {
                 let state = &self.timeline.read(cx).state;
                 let pt = state.time_signature_at_playhead();
@@ -1922,13 +1924,14 @@ impl StudioLayout {
                     // Which shape this marker is already on. Three plain items
                     // gave no way to read the current one, which is how a lane
                     // with working curves still feels like it does nothing.
-                    let curve = state
+                    let (curve, tension) = state
                         .tempo_map
                         .points
                         .iter()
                         .find(|p| p.id == id)
-                        .map(|p| p.curve)
+                        .map(|p| (p.curve, p.tension))
                         .unwrap_or_default();
+                    let bent = curve == TempoCurve::Linear && tension.abs() > 1.0e-4;
                     vec![
                         ContextMenuEntry::disabled_item(
                             format!("Tempo point: {bpm_label} BPM at {label}"),
@@ -1947,12 +1950,26 @@ impl StudioLayout {
                         ContextMenuEntry::checked_item(
                             "Linear",
                             "tempo:curve-linear",
-                            curve == TempoCurve::Linear,
+                            curve == TempoCurve::Linear && !bent,
+                        ),
+                        ContextMenuEntry::checked_item(
+                            "Ease In",
+                            "tempo:bend-ease-in",
+                            bent && tension > 0.0,
+                        ),
+                        ContextMenuEntry::checked_item(
+                            "Ease Out",
+                            "tempo:bend-ease-out",
+                            bent && tension < 0.0,
                         ),
                         ContextMenuEntry::checked_item(
                             "Smooth",
                             "tempo:curve-smooth",
                             curve == TempoCurve::Smooth,
+                        ),
+                        ContextMenuEntry::disabled_item(
+                            "Drag the line to bend · ⌥ double-click straightens",
+                            "noop",
                         ),
                     ]
                 } else {

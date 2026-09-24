@@ -478,8 +478,9 @@ impl StemExtractorWindow {
                     if cancel.is_cancelled() {
                         return Err("cancelled".into());
                     }
-                    let buffer = DirectAudio::load_audio_file(&source_path.to_string_lossy())
-                        .map_err(|e| e.to_string())?;
+                    let buffer =
+                        DirectAudio::load_audio_file_for_edit(&source_path.to_string_lossy())
+                            .map_err(|e| e.to_string())?;
                     let channels = buffer.channels.max(1);
                     let input = SphereAudioProcessor::StemExtractInput::new(
                         buffer.sample_rate,

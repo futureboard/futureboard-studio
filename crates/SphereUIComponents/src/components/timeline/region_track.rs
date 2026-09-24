@@ -186,8 +186,30 @@ pub fn region_track_lane(
         })
         .collect();
 
+    // Handlers own only the gesture geometry and the region spans — never a
+    // clone of the whole project (see `TimelineGestureContext`).
+    let gesture = std::rc::Rc::new(state.gesture_context());
+    let region_spans: std::rc::Rc<Vec<(String, f64, f64)>> = std::rc::Rc::new(
+        state
+            .regions
+            .iter()
+            .map(|region| {
+                let (start, end) = region.normalized_range();
+                (region.id.clone(), start, end)
+            })
+            .collect(),
+    );
+    // Same rule as `TimelineState::region_at`: the last region drawn wins.
+    let region_at = |spans: &[(String, f64, f64)], beat: f64| {
+        spans
+            .iter()
+            .rev()
+            .find(|(_, start, end)| beat >= *start && beat <= *end)
+            .map(|(id, _, _)| id.clone())
+    };
     let interaction = on_down.map(|cb| {
-        let state_hit = state.clone();
+        let state_hit = gesture.clone();
+        let spans_hit = region_spans.clone();
         let mut layer = div()
             .absolute()
             .inset_0()
@@ -199,13 +221,14 @@ pub fn region_track_lane(
                     let wx: f32 = event.position.x.into();
                     let lane_x = state_hit.lane_x_from_window_x(wx);
                     let beat = state_hit.x_to_beat(lane_x).max(0.0);
-                    let region_id = state_hit.region_at(beat);
+                    let region_id = region_at(&spans_hit, beat);
                     let snapped = state_hit.snap_beats(beat as f32).max(0.0) as f64;
                     cb(&(snapped, region_id, event.click_count as u32), window, cx);
                 },
             );
         if let Some(ctx_cb) = on_context {
-            let state_ctx = state.clone();
+            let state_ctx = gesture.clone();
+            let spans_ctx = region_spans.clone();
             layer = layer.on_mouse_down(
                 gpui::MouseButton::Right,
                 move |event: &gpui::MouseDownEvent, window, cx| {
@@ -215,7 +238,7 @@ pub fn region_track_lane(
                     let sy: f32 = event.position.y.into();
                     let lane_x = state_ctx.lane_x_from_window_x(wx);
                     let beat = state_ctx.x_to_beat(lane_x).max(0.0);
-                    let region_id = state_ctx.region_at(beat);
+                    let region_id = region_at(&spans_ctx, beat);
                     ctx_cb(&(beat, region_id, sx, sy), window, cx);
                 },
             );

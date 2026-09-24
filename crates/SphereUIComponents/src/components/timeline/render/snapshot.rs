@@ -180,9 +180,12 @@ impl TimelineRenderSnapshot {
         );
 
         let visible_tracks = visible_track_range(state, row_layout, options.track_overscan);
+        // Positions come from the state's transform, which follows the tempo
+        // map (real-time layout); the render viewport only carries zoom/size.
+        let (visible_start, visible_end) = state.visible_beat_range(grid_width);
         let visible_beats = VisibleBeatRange {
-            start_beat: viewport.visible_beat_range().0,
-            end_beat: viewport.visible_beat_range().1,
+            start_beat: visible_start,
+            end_beat: visible_end.max(visible_start),
         };
 
         let lanes = build_lanes(state, row_layout, &visible_tracks);
@@ -200,7 +203,7 @@ impl TimelineRenderSnapshot {
 
         let playhead = PlayheadSnapshot {
             beat: state.transport.playhead_beats,
-            x: viewport.beat_to_x(state.transport.playhead_beats),
+            x: state.beats_to_x(state.transport.playhead_beats),
         };
 
         let selection = SelectionSnapshot {
@@ -317,10 +320,10 @@ fn build_clips(
         }
         let clip_h = row.height - pad * 2.0;
         for clip in &track.clips {
-            let clip_left = viewport.beat_to_x(clip.start_beat);
-            let clip_width =
-                (clip.duration_beats * viewport.seconds_per_beat * viewport.pixels_per_second)
-                    .max(10.0);
+            let clip_left = state.beats_to_x(clip.start_beat);
+            let clip_width = state
+                .beat_span_px(clip.start_beat, clip.duration_beats)
+                .max(10.0);
             if clip_left + clip_width < 0.0 || clip_left > viewport.width {
                 continue;
             }
@@ -450,7 +453,7 @@ fn sample_to_peak_index(sample: f64, samples_per_peak: usize) -> usize {
 }
 
 fn build_bar_shades(state: &TimelineState, viewport: &TimelineViewport) -> Vec<BarShadeSnapshot> {
-    let (visible_start, visible_end) = viewport.visible_beat_range();
+    let (visible_start, visible_end) = state.visible_beat_range(viewport.width);
     let rects = state
         .time_signature_map
         .visible_bar_rects(visible_start as f64, visible_end as f64);
@@ -460,8 +463,8 @@ fn build_bar_shades(state: &TimelineState, viewport: &TimelineViewport) -> Vec<B
         if rect.bar % 2 != 0 {
             continue;
         }
-        let x0 = viewport.beat_to_x(rect.start_beat as f32);
-        let x1 = viewport.beat_to_x(rect.end_beat as f32);
+        let x0 = state.beats_to_x(rect.start_beat as f32);
+        let x1 = state.beats_to_x(rect.end_beat as f32);
         // The bar straddling the left edge starts *before* the viewport, so its
         // unclamped x is negative — and the shade is a translucent wash, so a
         // negative x paints it straight over the track-header column to the

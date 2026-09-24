@@ -1,11 +1,28 @@
 use super::*;
 
+/// Lane x of `beat`. The arrangement's one beat → x transform; it follows
+/// the tempo map through [`TimeWarp`] (real-time layout).
 pub fn beat_to_x(beat: f64, viewport: &TimelineViewport) -> f32 {
-    ((beat.max(0.0) as f32) * viewport.pixels_per_beat - viewport.scroll_x).round()
+    if viewport.time_warp.is_linear() {
+        return ((beat.max(0.0) as f32) * viewport.pixels_per_beat - viewport.scroll_x).round();
+    }
+    (viewport
+        .time_warp
+        .content_x(beat, viewport.pixels_per_second, viewport.pixels_per_beat) as f32
+        - viewport.scroll_x)
+        .round()
 }
 
+/// Beat at lane x. Inverse of [`beat_to_x`].
 pub fn x_to_beat(x: f32, viewport: &TimelineViewport) -> f64 {
-    ((x + viewport.scroll_x) / viewport.pixels_per_beat.max(0.0001)).max(0.0) as f64
+    if viewport.time_warp.is_linear() {
+        return ((x + viewport.scroll_x) / viewport.pixels_per_beat.max(0.0001)).max(0.0) as f64;
+    }
+    viewport.time_warp.beat_at_content_x(
+        (x + viewport.scroll_x) as f64,
+        viewport.pixels_per_second,
+        viewport.pixels_per_beat,
+    )
 }
 
 /// Window-space x of the lane content column's left edge.
@@ -158,8 +175,11 @@ pub fn clip_rect(
     track_id: &str,
 ) -> gpui::Bounds<gpui::Pixels> {
     let x = beat_to_x(clip.start_beat as f64, viewport);
-    let w =
-        ((clip.duration_beats.max(0.0) as f64 * viewport.pixels_per_beat as f64) as f32).max(1.0);
+    let end = beat_to_x(
+        (clip.start_beat + clip.duration_beats.max(0.0)) as f64,
+        viewport,
+    );
+    let w = (end - x).max(1.0);
     let row = layout
         .row_for_track(track_id)
         .map(|row| (row.y, row.height))

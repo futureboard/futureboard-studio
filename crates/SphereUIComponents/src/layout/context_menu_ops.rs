@@ -173,6 +173,8 @@ impl StudioLayout {
                 | ContextTarget::CountIn
                 | ContextTarget::Metronome
                 | ContextTarget::TimeSignature
+                | ContextTarget::ProjectKeyRoot
+                | ContextTarget::ProjectKeyScale
                 | ContextTarget::TimelineRuler { .. } => true,
                 ContextTarget::TimeSignaturePoint { .. }
                 | ContextTarget::TimeSignatureTrack { .. } => true,

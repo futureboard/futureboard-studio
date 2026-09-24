@@ -62,6 +62,22 @@ impl StudioLayout {
         }
     }
 
+    /// Show a command's outcome in the finder window, when it is open.
+    fn report_to_tempo_key_finder(
+        &mut self,
+        result: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = self.audio_tools.tempo_key else {
+            return;
+        };
+        let (text, error) = match result {
+            Ok(text) => (text, false),
+            Err(text) => (text, true),
+        };
+        let _ = handle.update(cx, |finder, _window, cx| finder.set_notice(text, error, cx));
+    }
+
     fn handle_tempo_key_command(&mut self, command: TempoKeyCommand, cx: &mut Context<Self>) {
         match command {
             TempoKeyCommand::SetProjectTempo { bpm } => {
@@ -91,6 +107,61 @@ impl StudioLayout {
                     AudioToolCommand::UseOriginalBpm { clip_id, bpm },
                     cx,
                 );
+            }
+            TempoKeyCommand::SetProjectKey { tonic, minor } => {
+                let kind = if minor {
+                    ScaleKind::NaturalMinor
+                } else {
+                    ScaleKind::Major
+                };
+                self.set_project_key(
+                    Some(crate::components::timeline::timeline_state::MidiScale::new(
+                        ScaleRoot::ALL[tonic % 12],
+                        kind,
+                    )),
+                    cx,
+                );
+            }
+            TempoKeyCommand::MapTempo {
+                clip_id,
+                beats,
+                positions,
+                beats_per_bar,
+            } => {
+                let result =
+                    self.map_tempo_to_clip(&clip_id, &beats, &positions, beats_per_bar, cx);
+                self.report_to_tempo_key_finder(result, cx);
+            }
+            TempoKeyCommand::PlaceChords {
+                clip_id,
+                chords,
+                flats,
+            } => {
+                use sphere_midi_service::chords::{Chord, ChordQuality};
+                use SphereAudioProcessor::analysis::ChordKind;
+                let detected: Vec<super::tempo_map_ops::DetectedChord> = chords
+                    .into_iter()
+                    .map(
+                        |(start, end, root, kind)| super::tempo_map_ops::DetectedChord {
+                            start,
+                            end,
+                            chord: Chord::new(
+                                root,
+                                match kind {
+                                    ChordKind::Major => ChordQuality::Major,
+                                    ChordKind::Minor => ChordQuality::Minor,
+                                    ChordKind::Dominant7 => ChordQuality::Dominant7,
+                                    ChordKind::Major7 => ChordQuality::Major7,
+                                    ChordKind::Minor7 => ChordQuality::Minor7,
+                                },
+                            ),
+                        },
+                    )
+                    .collect();
+                let result = self
+                    .place_detected_chords(&clip_id, &detected, flats, cx)
+                    .map(|count| format!("{count} chords added to the Chord Track"));
+                self.report_to_tempo_key_finder(result, cx);
             }
             TempoKeyCommand::ApplyScale { tonic, minor } => {
                 let root = ScaleRoot::ALL[tonic % 12];

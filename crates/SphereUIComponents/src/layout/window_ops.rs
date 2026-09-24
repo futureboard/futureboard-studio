@@ -2155,6 +2155,7 @@ impl StudioLayout {
             time_signature: (base_ts.numerator as u32, base_ts.denominator as u32),
             has_tempo_markers: !timeline.state.tempo_map.points.is_empty(),
             has_time_signature_markers: timeline.state.time_signature_has_markers(),
+            project_key: timeline.state.project_key,
             sample_rate: timeline.state.project_sample_rate,
             engine_sample_rate,
             time_display_format: timeline.state.time_display_format,
@@ -2223,6 +2224,14 @@ impl StudioLayout {
                     StudioLayout::defer_update(&owner, cx, move |this, cx| {
                         this.set_project_base_time_signature(numerator, denominator, cx);
                         this.push_project_settings_snapshot_to_window(cx);
+                    });
+                })
+            },
+            on_set_project_key: {
+                let owner = owner.clone();
+                Arc::new(move |key, cx| {
+                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                        this.set_project_key(key, cx);
                     });
                 })
             },

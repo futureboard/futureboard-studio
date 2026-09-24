@@ -255,6 +255,9 @@ pub struct EngineTempoPointSnapshot {
     /// before curves existed still loads as the step-hold map it was.
     #[serde(default)]
     pub curve: u8,
+    /// Bend of a Linear ramp, `-1.0..=1.0` ([`crate::tempo_map::TempoPoint::tension`]).
+    #[serde(default)]
+    pub tension: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

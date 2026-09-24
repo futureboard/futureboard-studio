@@ -69,6 +69,7 @@ mod plugin_load_progress;
 mod plugin_ops;
 mod plugin_picker_window;
 mod plugin_restore;
+mod project_key_ops;
 mod project_ops;
 mod project_switch;
 mod recording_ops;
@@ -80,6 +81,7 @@ mod stretch_tempo_ops;
 mod studio_render;
 mod studio_state;
 mod tempo_key_ops;
+mod tempo_map_ops;
 mod track_clip_ops;
 mod transport_freeze_debug;
 mod transport_ops;
@@ -1788,6 +1790,9 @@ impl StudioLayout {
         if self.route_edit_command_to_audio_editor(command_id, cx) {
             return;
         }
+        if self.handle_project_key_command(command_id, cx) {
+            return;
+        }
         if command_id == "overlay:theme" {
             self.command_palette.open();
             self.command_palette_input.set_value("overlay:theme");
@@ -2013,14 +2018,30 @@ impl StudioLayout {
                     self.set_tempo_point_curve(&id, TempoCurve::Hold, cx);
                 }
             }
+            // Linear is a straight ramp: it also clears any bend.
             "tempo:curve-linear" => {
                 if let Some(id) = self.tempo_track_context_point_id() {
-                    self.set_tempo_point_curve(&id, TempoCurve::Linear, cx);
+                    self.set_tempo_point_bend(&id, 0.0, cx);
                 }
             }
             "tempo:curve-smooth" => {
                 if let Some(id) = self.tempo_track_context_point_id() {
                     self.set_tempo_point_curve(&id, TempoCurve::Smooth, cx);
+                }
+            }
+            "tempo:bend-ease-in" => {
+                if let Some(id) = self.tempo_track_context_point_id() {
+                    self.set_tempo_point_bend(&id, 0.5, cx);
+                }
+            }
+            "tempo:bend-ease-out" => {
+                if let Some(id) = self.tempo_track_context_point_id() {
+                    self.set_tempo_point_bend(&id, -0.5, cx);
+                }
+            }
+            "tempo:bend-straight" => {
+                if let Some(id) = self.tempo_track_context_point_id() {
+                    self.set_tempo_point_bend(&id, 0.0, cx);
                 }
             }
             "ruler:create-tempo-here" => {

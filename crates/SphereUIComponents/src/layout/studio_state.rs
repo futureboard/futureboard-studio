@@ -196,6 +196,10 @@ pub enum ContextTarget {
     Metronome,
     /// The compact time signature menu from the transport display.
     TimeSignature,
+    /// Key root picker from the transport's key readout.
+    ProjectKeyRoot,
+    /// Scale picker from the transport's key readout.
+    ProjectKeyScale,
     /// Right-click on a time signature marker on the ruler or lane.
     TimeSignaturePoint {
         point_id: String,

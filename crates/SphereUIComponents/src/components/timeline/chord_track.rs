@@ -226,8 +226,26 @@ pub fn chord_track_lane(
         })
         .unwrap_or_default();
 
+    // Handlers own only the gesture geometry and the chord spans — never a
+    // clone of the whole project (see `TimelineGestureContext`).
+    let gesture = std::rc::Rc::new(state.gesture_context());
+    let chord_spans: std::rc::Rc<Vec<(u64, f64, f64)>> = std::rc::Rc::new(
+        state
+            .chord_events
+            .iter()
+            .map(|e| (e.id, e.start_beat, e.end_beat()))
+            .collect(),
+    );
+    // Same rule as `TimelineState::chord_event_at`.
+    let chord_at = |spans: &[(u64, f64, f64)], beat: f64| {
+        spans
+            .iter()
+            .find(|(_, start, end)| beat >= *start && beat < *end)
+            .map(|(id, _, _)| *id)
+    };
     let interaction = on_down.map(|cb| {
-        let state_hit = state.clone();
+        let state_hit = gesture.clone();
+        let spans_hit = chord_spans.clone();
         let mut layer = div()
             .absolute()
             .inset_0()
@@ -239,13 +257,14 @@ pub fn chord_track_lane(
                     let wx: f32 = event.position.x.into();
                     let lane_x = state_hit.lane_x_from_window_x(wx);
                     let beat = state_hit.x_to_beat(lane_x).max(0.0);
-                    let id = state_hit.chord_event_at(beat);
+                    let id = chord_at(&spans_hit, beat);
                     let snapped = state_hit.snap_beats(beat as f32).max(0.0) as f64;
                     cb(&(snapped, id, event.click_count as u32), window, cx);
                 },
             );
         if let Some(ctx_cb) = on_context {
-            let state_ctx = state.clone();
+            let state_ctx = gesture.clone();
+            let spans_ctx = chord_spans.clone();
             layer = layer.on_mouse_down(
                 gpui::MouseButton::Right,
                 move |event: &gpui::MouseDownEvent, window, cx| {
@@ -254,7 +273,7 @@ pub fn chord_track_lane(
                     let wy: f32 = event.position.y.into();
                     let lane_x = state_ctx.lane_x_from_window_x(wx);
                     let beat = state_ctx.x_to_beat(lane_x).max(0.0);
-                    let id = state_ctx.chord_event_at(beat);
+                    let id = chord_at(&spans_ctx, beat);
                     ctx_cb(&(beat, id, wx, wy), window, cx);
                 },
             );

@@ -37,9 +37,7 @@ pub fn timeline_grid(
         .collect();
     crate::perf::count("grid_lines", lines.len() as u64);
 
-    let ppb = state.viewport.pixels_per_second * state.seconds_per_beat();
     let (visible_start, visible_end) = state.visible_beat_range(grid_width);
-    let scroll_x = state.viewport.scroll_x;
     let shades: Vec<(f32, f32)> = state
         .time_signature_map
         .visible_bar_rects(visible_start as f64, visible_end as f64)
@@ -51,8 +49,8 @@ pub fn timeline_grid(
             // wash would otherwise bleed out of the lane. The lane clips, but
             // relying on the clip to hide wrong geometry is how it escapes the
             // moment a parent stops clipping.
-            let x0 = (rect.start_beat as f32 * ppb - scroll_x).round().max(0.0);
-            let x1 = (rect.end_beat as f32 * ppb - scroll_x).round();
+            let x0 = state.beats_to_x(rect.start_beat as f32).max(0.0);
+            let x1 = state.beats_to_x(rect.end_beat as f32);
             let w = x1 - x0;
             (w >= 2.0).then_some((x0, w))
         })

@@ -96,8 +96,11 @@ pub fn time_signature_track_lane(
     // tolerance. Snapping the pointer beat *before* looking for a marker was
     // the bug: at high zoom the snap step is wider than the tolerance, so a
     // marker off the grid could not be picked at all.
+    // Handlers own only the gesture geometry — never a clone of the whole
+    // project (see `TimelineGestureContext`).
+    let gesture = std::rc::Rc::new(state.gesture_context());
     let interaction = on_down.map(|cb| {
-        let state_hit = state.clone();
+        let state_hit = gesture.clone();
         let spans_hit = hit_spans.clone();
         let ids_hit = hit_ids.clone();
         div()
@@ -122,7 +125,7 @@ pub fn time_signature_track_lane(
                 },
             )
             .when_some(on_context, |layer, ctx_cb| {
-                let state_ctx = state.clone();
+                let state_ctx = gesture.clone();
                 let spans_ctx = hit_spans.clone();
                 let ids_ctx = hit_ids.clone();
                 layer.on_mouse_down(

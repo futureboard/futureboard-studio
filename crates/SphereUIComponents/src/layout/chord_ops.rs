@@ -29,7 +29,7 @@ const UPPER_VELOCITY: u8 = 84;
 const NOTE_GAP_BEATS: f32 = 0.02;
 
 impl StudioLayout {
-    fn edit_chords(
+    pub(super) fn edit_chords(
         &mut self,
         label: &'static str,
         edit: impl FnOnce(&mut Timeline),

@@ -7,12 +7,15 @@
 //! background/analysis thread and apply the result via a command outcome.
 
 mod bpm;
+pub mod chords;
+pub mod chroma;
 mod error;
 mod features;
 mod instrument;
 mod key;
 pub mod loudness;
 pub mod phase;
+pub mod rhythm;
 pub mod spectrum;
 pub mod spectrum_analyzer;
 pub mod transients;
@@ -21,6 +24,9 @@ pub mod transients;
 pub mod onnx;
 
 pub use bpm::{TempoCandidate, TempoEstimate, estimate_bpm_candidates};
+pub use chords::{ChordKind, ChordLabel, ChordOptions, ChordSegment, recognize_chords};
+pub use chroma::{ChromaFrames, chroma_frames};
+pub use rhythm::{Beat, RhythmAnalysis, RhythmOptions, TempoSection, analyze_rhythm};
 pub use error::AnalysisError;
 pub use features::{FEATURE_VECTOR_LEN, SpectralFeatures};
 pub use instrument::{Classifier, HeuristicClassifier, InstrumentCategory, InstrumentEstimate};

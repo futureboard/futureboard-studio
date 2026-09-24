@@ -49,6 +49,113 @@ pub enum TimelineTool {
     Automation,
 }
 
+/// How the arrangement's x axis bends with tempo.
+///
+/// The arrangement is laid out in **real time**: content x is elapsed seconds
+/// × `pixels_per_second`. With a constant tempo that is exactly
+/// `beat × pixels_per_beat`, so nothing moves; with tempo automation a bar
+/// played at 90 BPM is wider than one at 120 and one at 150 narrower, the way
+/// it sounds. The warp is the project's resolved engine tempo map — the same
+/// one the transport plays — or `None` for a constant tempo, which keeps the
+/// old linear arithmetic bit for bit.
+#[derive(Debug, Clone, Default)]
+pub struct TimeWarp {
+    map: Option<std::sync::Arc<DirectAudio::TempoMap>>,
+    /// Hash of what `map` was built from (see `TimelineState::tempo_cache_key`).
+    key: u64,
+}
+
+impl PartialEq for TimeWarp {
+    /// By content key: two warps built from the same tempo state are equal,
+    /// without comparing their segment lists.
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.map.is_some() == other.map.is_some()
+    }
+}
+
+impl TimeWarp {
+    pub fn new(map: std::sync::Arc<DirectAudio::TempoMap>, key: u64) -> Self {
+        Self {
+            map: Some(map),
+            key,
+        }
+    }
+
+    /// `true` for a constant tempo: x is linear in beats.
+    pub fn is_linear(&self) -> bool {
+        self.map.is_none()
+    }
+
+    /// Stable identity for caches keyed on geometry.
+    pub fn key(&self) -> u64 {
+        if self.map.is_some() {
+            self.key
+        } else {
+            0
+        }
+    }
+
+    /// Unscrolled content x of `beat`.
+    #[inline]
+    pub fn content_x(&self, beat: f64, pixels_per_second: f32, pixels_per_beat: f32) -> f64 {
+        match &self.map {
+            Some(map) => map.seconds_at_beat(beat.max(0.0)) * pixels_per_second as f64,
+            None => beat.max(0.0) * pixels_per_beat as f64,
+        }
+    }
+
+    /// Beat at unscrolled content x. Inverse of [`Self::content_x`].
+    #[inline]
+    pub fn beat_at_content_x(&self, x: f64, pixels_per_second: f32, pixels_per_beat: f32) -> f64 {
+        match &self.map {
+            Some(map) => map.beat_at_seconds((x / pixels_per_second.max(0.0001) as f64).max(0.0)),
+            None => (x / pixels_per_beat.max(0.0001) as f64).max(0.0),
+        }
+    }
+
+    /// Clip-local x of a clip-local beat, for content drawn inside a clip
+    /// that starts on `clip_start`. Linear warps reduce to `local × ppb`.
+    #[inline]
+    pub fn local_x(
+        &self,
+        clip_start: f64,
+        local_beat: f64,
+        pixels_per_second: f32,
+        pixels_per_beat: f32,
+    ) -> f32 {
+        match &self.map {
+            Some(_) => {
+                (self.content_x(clip_start + local_beat, pixels_per_second, pixels_per_beat)
+                    - self.content_x(clip_start, pixels_per_second, pixels_per_beat))
+                    as f32
+            }
+            None => local_beat as f32 * pixels_per_beat,
+        }
+    }
+
+    /// Clip-local beat at a clip-local x. Inverse of [`Self::local_x`].
+    #[inline]
+    pub fn local_beat(
+        &self,
+        clip_start: f64,
+        local_x: f32,
+        pixels_per_second: f32,
+        pixels_per_beat: f32,
+    ) -> f32 {
+        match &self.map {
+            Some(_) => {
+                let origin = self.content_x(clip_start, pixels_per_second, pixels_per_beat);
+                (self.beat_at_content_x(
+                    origin + local_x as f64,
+                    pixels_per_second,
+                    pixels_per_beat,
+                ) - clip_start) as f32
+            }
+            None => local_x / pixels_per_beat.max(0.0001),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineViewport {
     pub scroll_x: f32,
@@ -77,6 +184,9 @@ pub struct TimelineViewport {
     /// all. Pointer math reads this instead whenever it is available, so the
     /// transform that resolves a click is the one that drew the pixel.
     pub lane_origin_x_measured: Option<f32>,
+    /// Real-time warp of the x axis; see [`TimeWarp`]. Kept current by
+    /// [`TimelineState::sync_time_warp`].
+    pub time_warp: TimeWarp,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -242,6 +352,36 @@ impl TimelineState {
 
     pub(crate) fn sync_pixels_per_beat(&mut self) {
         self.viewport.pixels_per_beat = self.pixels_per_beat();
+        self.sync_time_warp();
+    }
+
+    /// Bring the x-axis warp in line with the tempo map. Cheap when nothing
+    /// changed (a hash of the marker list); the map itself is the cached
+    /// resolved one the transport reads.
+    pub fn sync_time_warp(&mut self) {
+        if self.tempo_map.points.is_empty() {
+            if !self.viewport.time_warp.is_linear() {
+                self.viewport.time_warp = TimeWarp::default();
+            }
+            return;
+        }
+        let key = self.tempo_cache_key();
+        if self.viewport.time_warp.key() == key && !self.viewport.time_warp.is_linear() {
+            return;
+        }
+        self.viewport.time_warp = TimeWarp::new(self.resolved_tempo_map(), key);
+    }
+
+    /// Width in px of `duration` beats starting at `start`, through the warp.
+    pub fn beat_span_px(&self, start: f32, duration: f32) -> f32 {
+        let v = &self.viewport;
+        (v.time_warp.content_x(
+            (start + duration.max(0.0)) as f64,
+            v.pixels_per_second,
+            v.pixels_per_beat,
+        ) - v
+            .time_warp
+            .content_x(start as f64, v.pixels_per_second, v.pixels_per_beat)) as f32
     }
 
     pub fn update_viewport_size(&mut self, width: f32, height: f32) {
@@ -320,8 +460,11 @@ impl TimelineState {
         if viewport_width <= 1.0 {
             return false;
         }
-        let pps = self.viewport.pixels_per_second.max(0.0001);
-        let playhead_content_x = playhead_beats.max(0.0) * self.seconds_per_beat() * pps;
+        let playhead_content_x = self.viewport.time_warp.content_x(
+            playhead_beats.max(0.0) as f64,
+            self.viewport.pixels_per_second,
+            self.viewport.pixels_per_beat,
+        ) as f32;
         let scroll_x = self.viewport.scroll_x;
 
         // Page mode pages forward once the playhead nears the right edge.
@@ -426,5 +569,95 @@ mod tests {
         assert!(state.update_auto_scroll_for_playhead(0.0));
         assert_eq!(state.viewport.scroll_x, 0.0);
         assert_eq!(state.viewport.target_scroll_x, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod time_warp_tests {
+    use super::*;
+
+    /// 120 BPM for bar 1, 90 for bar 2, 150 from bar 3, 4/4, no ramps.
+    fn warped() -> TimelineState {
+        let mut state = TimelineState::default();
+        state.bpm = 120.0;
+        state.viewport.pixels_per_second = 100.0;
+        state.tempo_map = TempoMap::with_points(vec![
+            TempoPoint::with_id("a", 0.0, 120.0, TempoCurve::Hold),
+            TempoPoint::with_id("b", 4.0, 90.0, TempoCurve::Hold),
+            TempoPoint::with_id("c", 8.0, 150.0, TempoCurve::Hold),
+        ]);
+        state.sync_pixels_per_beat();
+        state
+    }
+
+    #[test]
+    fn a_constant_tempo_keeps_the_linear_layout() {
+        let mut state = TimelineState::default();
+        state.viewport.pixels_per_second = 100.0;
+        state.sync_pixels_per_beat();
+        assert!(state.viewport.time_warp.is_linear());
+        let ppb = state.viewport.pixels_per_beat;
+        assert_eq!(state.beats_to_x(8.0), (8.0 * ppb).round());
+    }
+
+    #[test]
+    fn slow_bars_stretch_and_fast_bars_shrink() {
+        let state = warped();
+        assert!(!state.viewport.time_warp.is_linear());
+        let bar = |n: f32| state.beats_to_x(4.0 * (n + 1.0)) - state.beats_to_x(4.0 * n);
+        let normal = bar(0.0);
+        // 120 BPM at 100 px/s: 2 s per bar.
+        assert!((normal - 200.0).abs() <= 1.0, "{normal}");
+        // 90 BPM: 120/90 as wide.
+        assert!(
+            (bar(1.0) / normal - 120.0 / 90.0).abs() < 0.01,
+            "{}",
+            bar(1.0)
+        );
+        // 150 BPM: 120/150 as wide.
+        assert!(
+            (bar(2.0) / normal - 120.0 / 150.0).abs() < 0.01,
+            "{}",
+            bar(2.0)
+        );
+    }
+
+    #[test]
+    fn x_to_beat_inverts_the_warp() {
+        let state = warped();
+        for beat in [0.0f32, 2.5, 4.0, 6.25, 9.0, 13.5] {
+            let x = state.beats_to_x(beat);
+            let back = state.x_to_beats(x);
+            // One px of rounding in the forward direction.
+            assert!((back - beat).abs() < 0.02, "{beat} -> {x} -> {back}");
+        }
+    }
+
+    #[test]
+    fn a_clip_is_as_wide_as_the_time_it_spans() {
+        let state = warped();
+        // Beats 4..8 play at 90 BPM: 8/3 s = 266.7 px.
+        let width = state.beat_span_px(4.0, 4.0);
+        assert!((width - 800.0 / 3.0).abs() < 1.0, "{width}");
+        assert!(state.densest_pixels_per_beat(0.0, 12.0) < state.pixels_per_beat());
+    }
+
+    #[test]
+    fn notes_inside_a_clip_land_on_the_grid() {
+        use crate::components::timeline::render::clip_geometry::ClipAxis;
+        let state = warped();
+        let clip_start = 2.0f32;
+        let axis = ClipAxis::new(
+            state.viewport.time_warp.clone(),
+            clip_start,
+            state.viewport.pixels_per_second,
+            state.viewport.pixels_per_beat,
+        );
+        let left = state.beats_to_x(clip_start);
+        for local in [0.0f32, 1.5, 2.0, 5.0, 7.75] {
+            let arranged = state.beats_to_x(clip_start + local) - left;
+            assert!((axis.x(local) - arranged).abs() <= 1.0, "{local}");
+            assert!((axis.beat(axis.x(local)) - local).abs() < 1e-3);
+        }
     }
 }

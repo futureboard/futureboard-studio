@@ -26,6 +26,9 @@ pub const BPM_MAX: f64 = 999.0;
 /// swallows one the user drew.
 const RAMP_EPSILON: f64 = 1e-9;
 
+/// Starting pieces of a bent (tensioned) `Linear` segment, before refinement.
+const CURVED_STEPS: usize = 16;
+
 /// Linear pieces a `Smooth` segment is built from.
 ///
 /// Smoothstep has no closed-form time integral, so it is approximated by linear
@@ -65,14 +68,37 @@ impl TempoCurve {
     }
 
     /// Interpolation factor for a normalized position across the segment.
+    ///
+    /// `tension` bends a `Linear` ramp into the same power curve automation
+    /// lanes use: `> 0` eases in (slow start, fast finish), `< 0` eases out,
+    /// and `+k` / `-k` mirror each other. Hold and Smooth ignore it.
     #[inline]
-    fn shape(self, t: f64) -> f64 {
+    pub fn shape(self, tension: f64, t: f64) -> f64 {
         let t = t.clamp(0.0, 1.0);
         match self {
             TempoCurve::Hold => 0.0,
-            TempoCurve::Linear => t,
+            TempoCurve::Linear => {
+                let k = clamp_tension(tension);
+                if k.abs() < TENSION_EPSILON {
+                    t
+                } else {
+                    t.powf(2f64.powf(k * 2.5))
+                }
+            }
             TempoCurve::Smooth => t * t * (3.0 - 2.0 * t),
         }
+    }
+}
+
+/// Below this a tension is a straight ramp.
+const TENSION_EPSILON: f64 = 1e-4;
+
+/// Tension range shared with automation lanes.
+pub fn clamp_tension(tension: f64) -> f64 {
+    if tension.is_finite() {
+        tension.clamp(-1.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -85,11 +111,25 @@ pub struct TempoPoint {
     /// before curves existed load as the step-hold maps they were.
     #[serde(default)]
     pub curve: TempoCurve,
+    /// Bend of a `Linear` ramp to the next marker, `-1.0..=1.0`; see
+    /// [`TempoCurve::shape`]. Defaulted so older maps load as straight ramps.
+    #[serde(default)]
+    pub tension: f64,
 }
 
 impl TempoPoint {
     pub fn new(beat: f64, bpm: f64, curve: TempoCurve) -> Self {
-        Self { beat, bpm, curve }
+        Self {
+            beat,
+            bpm,
+            curve,
+            tension: 0.0,
+        }
+    }
+
+    pub fn with_tension(mut self, tension: f64) -> Self {
+        self.tension = clamp_tension(tension);
+        self
     }
 
     /// A step-hold marker — the shape every marker had before curves.
@@ -352,15 +392,39 @@ impl TempoMap {
             if span <= 0.0 {
                 continue;
             }
-            let pieces = match point.curve {
-                TempoCurve::Hold | TempoCurve::Linear => 1,
-                TempoCurve::Smooth => SMOOTH_STEPS,
+            let bent = point.curve == TempoCurve::Linear
+                && clamp_tension(point.tension).abs() >= TENSION_EPSILON;
+            let bpm_at_t = |t: f64| {
+                clamp_bpm(point.bpm + (next.bpm - point.bpm) * point.curve.shape(point.tension, t))
             };
-            let bpm_at_t =
-                |t: f64| clamp_bpm(point.bpm + (next.bpm - point.bpm) * point.curve.shape(t));
-            for piece in 0..pieces {
-                let t0 = piece as f64 / pieces as f64;
-                let t1 = (piece + 1) as f64 / pieces as f64;
+            // Knots in `t` for the linear pieces this marker contributes.
+            let mut knots: Vec<f64> = Vec::new();
+            match point.curve {
+                TempoCurve::Hold => knots.extend([0.0, 1.0]),
+                TempoCurve::Linear if !bent => knots.extend([0.0, 1.0]),
+                TempoCurve::Linear => {
+                    // A bent ramp: start from pieces of equal tempo change
+                    // (`t = u^(1/e)` makes `t^e` uniform in `u`), then split any
+                    // piece whose straight chord plays measurably differently
+                    // from the curve. The time error of the whole segment then
+                    // stays below a sample whatever the tension.
+                    let exponent = 2f64.powf(clamp_tension(point.tension) * 2.5);
+                    knots.push(0.0);
+                    for piece in 0..CURVED_STEPS {
+                        let a = (piece as f64 / CURVED_STEPS as f64).powf(1.0 / exponent);
+                        let b = ((piece + 1) as f64 / CURVED_STEPS as f64).powf(1.0 / exponent);
+                        refine_curved_piece(&bpm_at_t, span, a, b, 0, &mut knots);
+                    }
+                }
+                TempoCurve::Smooth => {
+                    knots.extend((0..=SMOOTH_STEPS).map(|i| i as f64 / SMOOTH_STEPS as f64))
+                }
+            }
+            for pair in knots.windows(2) {
+                let (t0, t1) = (pair[0], pair[1]);
+                if t1 <= t0 {
+                    continue;
+                }
                 let segment = TempoSegment {
                     start_beat: point.beat + span * t0,
                     end_beat: point.beat + span * t1,
@@ -373,6 +437,55 @@ impl TempoMap {
             }
         }
         self.revision = self.revision.wrapping_add(1);
+    }
+}
+
+/// Seconds one bent piece may drift from the curve it stands in for.
+const CURVED_PIECE_TOLERANCE_SECONDS: f64 = 2e-8;
+/// Halvings allowed per starting piece.
+const CURVED_MAX_DEPTH: u32 = 12;
+
+/// Append the end knots covering `(a, b]` of a bent ramp, halving a piece
+/// while its linear chord's elapsed time differs from the curve's (Simpson's
+/// rule on 60/bpm) by more than [`CURVED_PIECE_TOLERANCE_SECONDS`].
+fn refine_curved_piece(
+    bpm_at_t: &impl Fn(f64) -> f64,
+    span_beats: f64,
+    a: f64,
+    b: f64,
+    depth: u32,
+    knots: &mut Vec<f64>,
+) {
+    let chord = TempoSegment {
+        start_beat: 0.0,
+        end_beat: span_beats * (b - a),
+        start_seconds: 0.0,
+        bpm: bpm_at_t(a),
+        end_bpm: bpm_at_t(b),
+    };
+    let chord_seconds = chord.end_seconds();
+    const N: usize = 8;
+    let h = (b - a) / N as f64;
+    let mut sum = 0.0;
+    for i in 0..=N {
+        let weight = if i == 0 || i == N {
+            1.0
+        } else if i % 2 == 1 {
+            4.0
+        } else {
+            2.0
+        };
+        sum += weight * 60.0 / bpm_at_t(a + h * i as f64);
+    }
+    let curve_seconds = sum * h * span_beats / 3.0;
+    if depth < CURVED_MAX_DEPTH
+        && (chord_seconds - curve_seconds).abs() > CURVED_PIECE_TOLERANCE_SECONDS
+    {
+        let mid = (a + b) * 0.5;
+        refine_curved_piece(bpm_at_t, span_beats, a, mid, depth + 1, knots);
+        refine_curved_piece(bpm_at_t, span_beats, mid, b, depth + 1, knots);
+    } else {
+        knots.push(b);
     }
 }
 
@@ -544,6 +657,67 @@ mod tests {
                 TempoPoint::hold(8.0, 120.0),
             ],
         )
+    }
+
+    /// A bent ramp must play what it draws: elapsed time is the integral of
+    /// 60/bpm over the curve, and seconds → beat inverts it.
+    #[test]
+    fn a_bent_ramp_integrates_its_curve_and_inverts() {
+        for tension in [-0.8, -0.3, 0.3, 0.8] {
+            let map = TempoMap::from_points(
+                60.0,
+                vec![
+                    TempoPoint::new(0.0, 60.0, TempoCurve::Linear).with_tension(tension),
+                    TempoPoint::new(16.0, 180.0, TempoCurve::Hold),
+                ],
+            );
+            // Reference: fine numeric integration of the same curve.
+            let steps = 200_000;
+            let mut expected = 0.0;
+            for i in 0..steps {
+                let t = (i as f64 + 0.5) / steps as f64;
+                let bpm = 60.0 + 120.0 * TempoCurve::Linear.shape(tension, t);
+                expected += 16.0 / steps as f64 * 60.0 / bpm;
+            }
+            // Refinement stays bounded (hundreds of pieces, a few kB).
+            assert!(
+                map.segments().len() < 2_000,
+                "k={tension}: {}",
+                map.segments().len()
+            );
+            let got = map.seconds_at_beat(16.0);
+            // Under one sample at 48 kHz across the whole ramp.
+            assert!(
+                (got - expected).abs() < 1.0 / 48_000.0,
+                "k={tension}: {got} vs {expected}"
+            );
+            // Tension bends the right way: easing in lags a straight ramp.
+            let mid = map.bpm_at_beat(8.0);
+            if tension > 0.0 {
+                assert!(mid < 120.0, "k={tension}: {mid}");
+            } else {
+                assert!(mid > 120.0, "k={tension}: {mid}");
+            }
+            for beat in [0.5, 3.0, 8.0, 12.5, 15.9] {
+                let back = map.beat_at_seconds(map.seconds_at_beat(beat));
+                assert!(
+                    (back - beat).abs() < 1e-9,
+                    "k={tension} beat={beat}: {back}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_tension_keeps_the_exact_single_piece_ramp() {
+        let straight = TempoMap::from_points(
+            60.0,
+            vec![
+                TempoPoint::new(0.0, 60.0, TempoCurve::Linear),
+                TempoPoint::new(16.0, 180.0, TempoCurve::Hold),
+            ],
+        );
+        assert_eq!(straight.segments().len(), 2);
     }
 
     #[test]

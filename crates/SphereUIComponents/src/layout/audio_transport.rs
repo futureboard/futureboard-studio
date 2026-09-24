@@ -2319,6 +2319,7 @@ impl StudioLayout {
                     beat: p.beat,
                     bpm: p.bpm,
                     curve: p.curve.to_tag(),
+                    tension: p.tension as f64,
                 })
                 .collect::<Vec<_>>();
             let ts_points = timeline
@@ -3285,6 +3286,26 @@ impl StudioLayout {
         );
     }
 
+    /// Bend a marker's ramp to the next marker: a Linear ramp with `tension`
+    /// (`> 0` eases in, `< 0` eases out, `0` straight).
+    pub(super) fn set_tempo_point_bend(&mut self, id: &str, tension: f32, cx: &mut Context<Self>) {
+        self.edit_tempo_state(
+            if tension == 0.0 {
+                "Straighten Tempo Ramp"
+            } else {
+                "Bend Tempo Ramp"
+            },
+            |timeline| {
+                timeline.state.set_tempo_point_curve(
+                    id,
+                    crate::components::timeline::timeline_state::TempoCurve::Linear,
+                );
+                timeline.state.set_tempo_point_tension(id, tension);
+            },
+            cx,
+        );
+    }
+
     /// Convert fixed-tempo mode into a tempo map by seeding an initial marker at
     /// beat 0 using the current project BPM. No-op if automation already exists.
     pub(super) fn create_tempo_automation(&mut self, cx: &mut Context<Self>) {
@@ -3512,6 +3533,7 @@ impl StudioLayout {
                         beat: p.beat,
                         bpm: p.bpm,
                         curve: p.curve.to_tag(),
+                        tension: p.tension as f64,
                     })
                     .collect::<Vec<_>>(),
             )

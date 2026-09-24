@@ -49,11 +49,10 @@ pub fn midi_clip(
     let drag_name = clip.name.clone();
     let drag_start_beat = clip.start_beat;
     let selected = state.selection.selected_clip_ids.contains(&clip.id);
-    let pixels_per_second = state.viewport.pixels_per_second;
-    let seconds_per_beat = state.seconds_per_beat();
-
     let left = state.beats_to_x(clip.start_beat);
-    let width = (clip.duration_beats * seconds_per_beat * pixels_per_second).max(10.0);
+    let width = state
+        .beat_span_px(clip.start_beat, clip.duration_beats)
+        .max(10.0);
 
     // Detail by width, for the same reason as an audio clip: the label bar is a
     // measured text node per clip, and a zoomed-out arrangement has the most
@@ -82,7 +81,13 @@ pub fn midi_clip(
         ..
     } = &clip.clip_type
     {
-        let ppb = pixels_per_second * seconds_per_beat;
+        // Notes follow the arrangement's tempo warp, relative to the clip.
+        let axis = crate::components::timeline::render::clip_geometry::ClipAxis::new(
+            state.viewport.time_warp.clone(),
+            clip.start_beat,
+            state.viewport.pixels_per_second,
+            state.viewport.pixels_per_beat,
+        );
         // Only the on-screen slice of the clip needs quads. A clip that spans the
         // whole arrangement is mostly scrolled out of view, and the lane already
         // clips it — building spans for the hidden part was pure waste.
@@ -91,7 +96,7 @@ pub fn midi_clip(
         // rebuilds on every scroll, zoom and selection. See
         // `clip_geometry::note_preview_cached`.
         let preview = visible_px.and_then(|(px_start, px_end)| {
-            note_preview_cached(&clip.id, notes, clip_len, ppb, px_start, px_end)
+            note_preview_cached(&clip.id, notes, clip_len, &axis, px_start, px_end)
         });
         let preview_count = preview.as_ref().map(|p| p.note_count).unwrap_or(0);
         if let Some(preview) = preview {
@@ -104,7 +109,7 @@ pub fn midi_clip(
         }
 
         let controller_preview =
-            controller_preview_cached(&clip.id, controller_lanes, clip_len, ppb, width);
+            controller_preview_cached(&clip.id, controller_lanes, clip_len, &axis, width);
         if let Some(controller_preview) = controller_preview {
             let lane_kinds = controller_preview.lane_kinds.clone();
             let lane_count = lane_kinds.len();

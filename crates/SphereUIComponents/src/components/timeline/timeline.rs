@@ -32,7 +32,7 @@ use crate::components::timeline::timeline_ruler::{
 use crate::components::timeline::timeline_state::{
     ArrangementCoordinateContext, ArrangementHitTarget, ClipDragItem, ClipResizeDrag, ClipState,
     ClipType, DEFAULT_TRACK_HEIGHT, GlobalLaneKind, GlobalLaneResizeDrag, HEADER_WIDTH,
-    RULER_HEIGHT, SnapDivision, TempoPointDrag, TimeSignaturePointDrag, TimelineMarkerDrag,
+    RULER_HEIGHT, SnapDivision, TempoLaneDrag, TimeSignaturePointDrag, TimelineMarkerDrag,
     TimelineMarkerState, TimelineRangeSelection, TimelineRegionState, TimelineState, TimelineTool,
     TrackDragItem, TrackHeightResizeDrag, TrackType, hit_test_arrangement,
 };
@@ -224,7 +224,7 @@ pub struct Timeline {
     on_automation_control:
         Option<crate::components::timeline::automation_control_lane::AutomationControlCallback>,
     /// In-flight tempo-point drag on the global Tempo Track lane.
-    tempo_drag: Option<TempoPointDrag>,
+    tempo_drag: Option<TempoLaneDrag>,
     /// Pre-gesture tempo snapshot for the in-flight Tempo lane drag, plus the
     /// history label the release should use (a double-click *creates* a marker
     /// and then drags it — one gesture, but not an "edit"). Kept here rather

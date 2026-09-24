@@ -1389,14 +1389,60 @@ impl Timeline {
 
     pub(super) fn begin_tempo_track_interaction(
         &mut self,
-        beat: f64,
-        bpm: f64,
-        point_id: Option<String>,
-        click_count: u32,
+        down: &crate::components::timeline::tempo_track::TempoLaneDown,
         cx: &mut Context<Self>,
     ) {
+        use crate::components::timeline::timeline_state::{
+            TempoCurve, TempoCurveDrag, TempoLaneDrag, TempoPointDrag,
+        };
+        let (beat, bpm, click_count) = (down.beat, down.bpm, down.click_count);
+
+        // On the drawn line between two markers: bend that ramp. Alt +
+        // double-click straightens it again.
+        if let (Some(left_id), None) = (down.segment_left_id.clone(), down.point_id.as_ref()) {
+            if click_count >= 2 && down.alt {
+                let origin = self.capture_tempo_state();
+                let anchors = self.state.capture_linear_clip_anchors();
+                if self.state.set_tempo_point_tension(&left_id, 0.0) {
+                    self.state.reconcile_audio_clip_lengths();
+                    self.state.reapply_linear_clip_anchors(&anchors);
+                    self.record_tempo_edit("Straighten Tempo Ramp", origin, cx);
+                }
+                cx.notify();
+                return;
+            }
+            if click_count < 2 {
+                let points = &self.state.tempo_map.points;
+                if let Some(index) = points.iter().position(|p| p.id == left_id) {
+                    if let Some(next) = points.get(index + 1) {
+                        let left = &points[index];
+                        let start_tension = if left.curve == TempoCurve::Linear {
+                            left.tension
+                        } else {
+                            0.0
+                        };
+                        let rising = next.bpm >= left.bpm;
+                        self.state.select_tempo_point(&left_id);
+                        self.tempo_gesture_origin =
+                            Some(("Bend Tempo Ramp", self.capture_tempo_state()));
+                        self.tempo_gesture_linear_anchors =
+                            self.state.capture_linear_clip_anchors();
+                        self.tempo_drag = Some(TempoLaneDrag::Curve(TempoCurveDrag {
+                            left_id,
+                            start_tension,
+                            start_window_y: down.window_y,
+                            rising,
+                            changed: false,
+                        }));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+
         if click_count >= 2 {
-            if point_id.is_none() {
+            if down.point_id.is_none() {
                 let origin = self.capture_tempo_state();
                 self.tempo_gesture_linear_anchors = self.state.capture_linear_clip_anchors();
                 if let Some(id) = self.state.add_tempo_point(beat, bpm) {
@@ -1405,24 +1451,24 @@ impl Timeline {
                     // drag: keep the pre-create snapshot as the gesture origin
                     // so the release records ONE entry covering both.
                     self.tempo_gesture_origin = Some(("Add Tempo Marker", origin));
-                    self.tempo_drag = Some(TempoPointDrag {
+                    self.tempo_drag = Some(TempoLaneDrag::Point(TempoPointDrag {
                         point_id: id,
                         moved: true,
-                    });
+                    }));
                 }
             }
             cx.notify();
             return;
         }
 
-        if let Some(id) = point_id {
+        if let Some(id) = down.point_id.clone() {
             self.state.select_tempo_point(&id);
             self.tempo_gesture_origin = Some(("Move Tempo Marker", self.capture_tempo_state()));
             self.tempo_gesture_linear_anchors = self.state.capture_linear_clip_anchors();
-            self.tempo_drag = Some(TempoPointDrag {
+            self.tempo_drag = Some(TempoLaneDrag::Point(TempoPointDrag {
                 point_id: id,
                 moved: false,
-            });
+            }));
             cx.notify();
             return;
         }
@@ -1435,29 +1481,66 @@ impl Timeline {
         &mut self,
         window_x: f32,
         window_y: f32,
+        fine: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(drag) = self.tempo_drag.clone() else {
-            return false;
+        use crate::components::timeline::timeline_state::{
+            tempo_drag_tension, TempoCurve, TempoLaneDrag,
         };
-        let beat = self.snap_beat(self.beat_from_window_x(window_x)).max(0.0) as f64;
-        let bpm = self.tempo_bpm_from_window_y(window_y);
-        if self.state.move_tempo_point(&drag.point_id, beat, bpm) {
-            if let Some(d) = self.tempo_drag.as_mut() {
-                d.moved = true;
+        match self.tempo_drag.clone() {
+            Some(TempoLaneDrag::Point(drag)) => {
+                let beat = self.snap_beat(self.beat_from_window_x(window_x)).max(0.0) as f64;
+                let bpm = self.tempo_bpm_from_window_y(window_y);
+                if self.state.move_tempo_point(&drag.point_id, beat, bpm) {
+                    if let Some(TempoLaneDrag::Point(d)) = self.tempo_drag.as_mut() {
+                        d.moved = true;
+                    }
+                    cx.notify();
+                    true
+                } else {
+                    false
+                }
             }
-            cx.notify();
-            true
-        } else {
-            false
+            Some(TempoLaneDrag::Curve(drag)) => {
+                let lane_height = self.state.tempo_track_height();
+                let tension = tempo_drag_tension(&drag, window_y, lane_height, fine);
+                // A bend is a ramp: a stepped or eased segment grabbed and
+                // dragged becomes a Linear ramp carrying the bend.
+                let curve_changed = self
+                    .state
+                    .tempo_map
+                    .points
+                    .iter()
+                    .find(|p| p.id == drag.left_id)
+                    .is_some_and(|p| p.curve != TempoCurve::Linear);
+                if curve_changed && (drag.start_window_y - window_y).abs() < 2.0 {
+                    return false;
+                }
+                if curve_changed {
+                    self.state
+                        .set_tempo_point_curve(&drag.left_id, TempoCurve::Linear);
+                }
+                self.state.set_tempo_point_tension(&drag.left_id, tension);
+                if let Some(TempoLaneDrag::Curve(d)) = self.tempo_drag.as_mut() {
+                    d.changed = true;
+                }
+                cx.notify();
+                true
+            }
+            None => false,
         }
     }
 
     pub(super) fn finish_tempo_track_interaction(&mut self, cx: &mut Context<Self>) -> bool {
+        use crate::components::timeline::timeline_state::TempoLaneDrag;
         if let Some(drag) = self.tempo_drag.take() {
             let origin = self.tempo_gesture_origin.take();
             let anchors = std::mem::take(&mut self.tempo_gesture_linear_anchors);
-            if drag.moved {
+            let changed = match drag {
+                TempoLaneDrag::Point(drag) => drag.moved,
+                TempoLaneDrag::Curve(drag) => drag.changed,
+            };
+            if changed {
                 // The map moved under the arrangement, so settle the clips
                 // against it before the edit is recorded: audio clips re-derive
                 // their bar count from the audio they play, and Linear-timebase
@@ -2012,7 +2095,8 @@ impl Timeline {
             .flat_map(|track| track.clips.iter())
             .map(|clip| {
                 self.state
-                    .beats_to_seconds(clip.start_beat + clip.duration_beats)
+                    .seconds_at_beat((clip.start_beat + clip.duration_beats) as f64)
+                    as f32
                     + 4.0
             })
             .fold(16.0_f32, f32::max);
@@ -2020,7 +2104,7 @@ impl Timeline {
             .state
             .song_text_events
             .last()
-            .map(|event| self.state.beats_to_seconds(event.beat as f32) + 4.0)
+            .map(|event| self.state.seconds_at_beat(event.beat) as f32 + 4.0)
             .unwrap_or(0.0);
         let longest_seconds = clip_end_seconds.max(song_text_end_seconds);
         (longest_seconds * self.state.viewport.pixels_per_second).max(1200.0)
@@ -2269,9 +2353,11 @@ impl Timeline {
         position: gpui::Point<gpui::Pixels>,
         bypass_snap: bool,
     ) -> (usize, f32) {
+        // Through the transform, not `dx / ppb`: under tempo automation a
+        // pixel is a different number of beats in different bars.
         let dx: f32 = (position.x - origin.x).into();
-        let ppb = self.state.viewport.pixels_per_second * self.state.seconds_per_beat();
-        let new_start = (drag.start_beat + dx / ppb.max(1.0)).max(0.0);
+        let start_x = self.state.beats_to_x(drag.start_beat);
+        let new_start = self.state.x_to_beats(start_x + dx).max(0.0);
         let snapped = self
             .state
             .snap_beats_with_bypass(new_start, bypass_snap)

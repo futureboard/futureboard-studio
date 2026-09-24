@@ -116,7 +116,11 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// marker id. Pre-v50 markers load without SysEx.
 /// v51 appends the Chord Track (chords, lane collapse flag and custom height)
 /// at the tail of the body. Pre-v51 projects load with an empty Chord Track.
-pub const PROJECT_VERSION: u32 = 51;
+/// v52 appends the project key (root pitch class, 255 = no key, then the
+/// stable scale tag). Pre-v52 projects load with no key.
+/// v53 appends one curve tension (f32) per tempo marker, in marker order.
+/// Pre-v53 ramps load straight.
+pub const PROJECT_VERSION: u32 = 53;
 
 /// Minimum on-disk format version that can be loaded without data loss.
 /// Versions below this will show a warning but can still be loaded.
@@ -1581,8 +1585,29 @@ fn encode_body(project: &FutureboardProject) -> Vec<u8> {
     w.write_bool(project.settings.chord_track_collapsed);
     w.write_f32(project.settings.chord_track_height.unwrap_or(0.0));
 
+    // Project key (v52+).
+    match project.settings.project_key {
+        Some((root, scale)) => {
+            w.write_u8(root % 12);
+            w.write_u8(scale);
+        }
+        None => {
+            w.write_u8(NO_PROJECT_KEY);
+            w.write_u8(0);
+        }
+    }
+
+    // Tempo curve tensions (v53+), one per marker in the order written above.
+    w.write_u32(project.settings.tempo_points.len() as u32);
+    for point in &project.settings.tempo_points {
+        w.write_f32(point.tension);
+    }
+
     w.into_bytes()
 }
+
+/// Root byte of a project without a key.
+const NO_PROJECT_KEY: u8 = 255;
 
 /// Chord symbol: root, quality as its stable index in `ChordQuality::ALL`,
 /// and the slash bass (255 = none).
@@ -2574,7 +2599,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
     }
 
     // Tempo automation markers (v7+). Pre-v7 files have none. v8+ stores ids.
-    let tempo_points = if version >= 7 {
+    let mut tempo_points = if version >= 7 {
         let count = r.read_u32()? as usize;
         let mut points = Vec::with_capacity(count);
         for _ in 0..count {
@@ -2591,6 +2616,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
                 beat,
                 bpm,
                 curve,
+                tension: 0.0,
             });
         }
         points
@@ -2867,6 +2893,37 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
         (Vec::new(), false, None)
     };
 
+    // Project key (v52+). A scale tag this build does not know loads as no
+    // key rather than failing the whole project.
+    let project_key = if version >= 52 {
+        let root = r.read_u8()?;
+        let scale = r.read_u8()?;
+        (root != NO_PROJECT_KEY
+            && root < 12
+            && crate::components::timeline::timeline_state::ScaleKind::from_tag(scale).is_some())
+        .then_some((root, scale))
+    } else {
+        None
+    };
+
+    // Tempo curve tensions (v53+).
+    if version >= 53 {
+        let count = r.read_u32()? as usize;
+        if count != tempo_points.len() || count > r.remaining() / 4 {
+            return Err(ProjectError::Corrupted(
+                "tempo tension count does not match the tempo markers".to_string(),
+            ));
+        }
+        for point in &mut tempo_points {
+            let tension = r.read_f32()?;
+            point.tension = if tension.is_finite() {
+                tension.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+        }
+    }
+
     Ok(FutureboardProject {
         audio_connections,
         global_lanes,
@@ -2888,6 +2945,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
             chord_events,
             chord_track_collapsed,
             chord_track_height,
+            project_key,
             time_sig_num,
             time_sig_den,
             sample_rate,
@@ -3277,20 +3335,26 @@ mod tests {
         // strings plus the bootstrap latch), the v40 conductor-lane fold block
         // (four collapse latches plus five absent optional heights), the v41
         // ARA document count, the v43 timebase pair, the v50 marker SysEx
-        // count, and the v51 Chord Track block (event count, collapse latch,
-        // custom height). A v24-v26 fixture reads none of them, so drop the
-        // whole tail before appending the legacy cue block in its place.
+        // count, the v51 Chord Track block (event count, collapse latch,
+        // custom height), the v52 project key (root, scale) and the v53 tempo
+        // tension count (no markers, so no values). A v24-v26
+        // fixture reads none of them, so drop the whole tail before appending
+        // the legacy cue block in its place.
         let v35_output_routing_bytes = 1 + 1 + 1;
         let v40_global_lane_bytes = 4 + 5;
         let v43_timebase_bytes = 1 + 1;
         let v51_chord_track_bytes = 4 + 1 + 4;
+        let v52_project_key_bytes = 1 + 1;
+        let v53_tempo_tension_bytes = 4;
         body.truncate(
             body.len()
                 - 4 * std::mem::size_of::<u32>()
                 - v35_output_routing_bytes
                 - v40_global_lane_bytes
                 - v43_timebase_bytes
-                - v51_chord_track_bytes,
+                - v51_chord_track_bytes
+                - v52_project_key_bytes
+                - v53_tempo_tension_bytes,
         );
 
         let mut tail = FbWriter::new();
@@ -3574,12 +3638,14 @@ mod tests {
                 beat: 0.0,
                 bpm: 120.0,
                 curve: 0,
+                tension: 0.0,
             },
             ProjectTempoPoint {
                 id: "tempo-b".to_string(),
                 beat: 8.0,
                 bpm: 140.0,
                 curve: 1,
+                tension: -0.5,
             },
         ];
         let bytes = encode_project(&project);
@@ -4417,11 +4483,11 @@ mod tests {
     #[test]
     fn an_absurd_connection_count_is_rejected_before_allocating() {
         let mut body = encode_body(&FutureboardProject::new("hostile"));
-        // Overwrite the body's last count — the v51 Chord Track event count,
-        // which sits before its collapse latch (1) and height (4) — with a
-        // huge value.
+        // Overwrite the v51 Chord Track event count — which sits before its
+        // collapse latch (1), height (4), the v52 project key (2) and the v53
+        // tempo tension count (4) — with a huge value.
         let len = body.len();
-        body[len - 9..len - 5].copy_from_slice(&u32::MAX.to_le_bytes());
+        body[len - 15..len - 11].copy_from_slice(&u32::MAX.to_le_bytes());
         let bytes = project_bytes_with_version(body, PROJECT_VERSION);
         assert!(matches!(
             decode_project(&bytes),
@@ -4458,6 +4524,33 @@ mod tests {
             decoded.settings.timeline_markers,
             project.settings.timeline_markers
         );
+    }
+
+    #[test]
+    fn project_key_roundtrips_v52() {
+        let mut project = FutureboardProject::new("Key");
+        assert_eq!(
+            decode_project(&encode_project(&project))
+                .unwrap()
+                .settings
+                .project_key,
+            None
+        );
+        // A minor: pitch class 9, Natural Minor's stable tag.
+        project.settings.project_key = Some((9, 2));
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        assert_eq!(decoded.settings.project_key, Some((9, 2)));
+    }
+
+    #[test]
+    fn an_unknown_scale_tag_loads_as_no_key() {
+        let mut body = encode_body(&FutureboardProject::new("future"));
+        // The key sits before the v53 tempo tension count (4).
+        let len = body.len() - 4;
+        body[len - 2] = 4;
+        body[len - 1] = 250;
+        let bytes = project_bytes_with_version(body, PROJECT_VERSION);
+        assert_eq!(decode_project(&bytes).unwrap().settings.project_key, None);
     }
 
     #[test]
