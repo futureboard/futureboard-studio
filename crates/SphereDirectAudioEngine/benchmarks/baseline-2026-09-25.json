@@ -1,0 +1,1349 @@
+{
+  "change": {
+    "flagged": 7,
+    "mean_exact_recall": 0.40000003576278687,
+    "mean_recall": 0.75,
+    "n": 7
+  },
+  "chords": {
+    "majmin": 0.0,
+    "n": 0
+  },
+  "key": {
+    "exact": 13,
+    "mirex": 0.84375,
+    "n": 16
+  },
+  "songs": [
+    {
+      "beat_count": 406,
+      "beats_per_bar": 4,
+      "change_exact_recall": 0.25,
+      "change_recall": 0.5,
+      "chord_majmin": null,
+      "file": "Tempo Change/DECO_27 - Hello, Sekai feat.Hatsune Miku.wav",
+      "finder_bpm": 148.0,
+      "key_class": "wrong",
+      "key_ranked": [
+        {
+          "confidence": 0.07,
+          "key": "D major"
+        },
+        {
+          "confidence": 0.07,
+          "key": "D minor"
+        },
+        {
+          "confidence": 0.05,
+          "key": "G minor"
+        },
+        {
+          "confidence": 0.04,
+          "key": "G major"
+        }
+      ],
+      "key_score": 0.0,
+      "key_top": "D major",
+      "key_truth": "G minor",
+      "rhythm_bpm": 154.29,
+      "rhythm_confidence": 0.95,
+      "rhythm_variable": true,
+      "seconds": 166.0,
+      "sections": [
+        {
+          "bpm": 180.0,
+          "end": 22.4,
+          "start": 3.3
+        },
+        {
+          "bpm": 150.75,
+          "end": 160.9,
+          "start": 22.4
+        }
+      ],
+      "sections_collapsed": [
+        180.0,
+        150.75
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 148.0,
+          "confidence": 0.48
+        },
+        {
+          "bpm": 98.68,
+          "confidence": 0.27
+        },
+        {
+          "bpm": 74.0,
+          "confidence": 0.26
+        },
+        {
+          "bpm": 197.36,
+          "confidence": 0.09
+        },
+        {
+          "bpm": 121.57,
+          "confidence": 0.06
+        }
+      ],
+      "tempo_finder_class": null,
+      "tempo_rhythm_class": null,
+      "tempo_top": 148.0,
+      "tempo_top_class": null,
+      "tempo_truth": [
+        90.0,
+        148.0,
+        150.0,
+        152.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 575,
+      "beats_per_bar": 4,
+      "change_exact_recall": 0.3333333432674408,
+      "change_recall": 0.3333333432674408,
+      "chord_majmin": null,
+      "file": "Tempo Change/ ปฐมกาล (Divine) - Zekai.mp3",
+      "finder_bpm": 115.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.15,
+          "key": "A major"
+        },
+        {
+          "confidence": 0.13,
+          "key": "F# minor"
+        },
+        {
+          "confidence": 0.12,
+          "key": "D major"
+        },
+        {
+          "confidence": 0.11,
+          "key": "B minor"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "A major",
+      "key_truth": "A major",
+      "rhythm_bpm": 115.27,
+      "rhythm_confidence": 0.98,
+      "rhythm_variable": true,
+      "seconds": 307.39,
+      "sections": [
+        {
+          "bpm": 115.27,
+          "end": 299.9,
+          "start": 1.1
+        }
+      ],
+      "sections_collapsed": [
+        115.27
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 115.0,
+          "confidence": 0.48
+        },
+        {
+          "bpm": 153.33,
+          "confidence": 0.25
+        },
+        {
+          "bpm": 76.67,
+          "confidence": 0.24
+        },
+        {
+          "bpm": 92.0,
+          "confidence": 0.21
+        },
+        {
+          "bpm": 65.71,
+          "confidence": 0.13
+        }
+      ],
+      "tempo_finder_class": null,
+      "tempo_rhythm_class": null,
+      "tempo_top": 115.0,
+      "tempo_top_class": null,
+      "tempo_truth": [
+        115.0,
+        120.0,
+        115.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 808,
+      "beats_per_bar": 4,
+      "change_exact_recall": 0.0,
+      "change_recall": 1.0,
+      "chord_majmin": null,
+      "file": "Tempo Change/Infinite Chaos - OMINOUS.mp3",
+      "finder_bpm": 184.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.29,
+          "key": "A minor"
+        },
+        {
+          "confidence": 0.21,
+          "key": "D minor"
+        },
+        {
+          "confidence": 0.19,
+          "key": "F major"
+        },
+        {
+          "confidence": 0.19,
+          "key": "D major"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "A minor",
+      "key_truth": "A minor",
+      "rhythm_bpm": 197.55,
+      "rhythm_confidence": 0.97,
+      "rhythm_variable": true,
+      "seconds": 253.68,
+      "sections": [
+        {
+          "bpm": 184.0,
+          "end": 55.0,
+          "start": 4.7
+        },
+        {
+          "bpm": 170.0,
+          "end": 76.6,
+          "start": 55.0
+        },
+        {
+          "bpm": 207.0,
+          "end": 80.3,
+          "start": 76.6
+        },
+        {
+          "bpm": 237.53,
+          "end": 106.6,
+          "start": 80.3
+        },
+        {
+          "bpm": 219.77,
+          "end": 163.4,
+          "start": 106.6
+        },
+        {
+          "bpm": 185.02,
+          "end": 249.0,
+          "start": 163.4
+        }
+      ],
+      "sections_collapsed": [
+        184.0,
+        170.0,
+        207.0,
+        237.53,
+        219.77,
+        185.02
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 184.0,
+          "confidence": 0.29
+        },
+        {
+          "bpm": 92.0,
+          "confidence": 0.27
+        },
+        {
+          "bpm": 73.6,
+          "confidence": 0.24
+        },
+        {
+          "bpm": 122.67,
+          "confidence": 0.22
+        },
+        {
+          "bpm": 147.19,
+          "confidence": 0.16
+        }
+      ],
+      "tempo_finder_class": null,
+      "tempo_rhythm_class": null,
+      "tempo_top": 184.0,
+      "tempo_top_class": null,
+      "tempo_truth": [
+        92.0,
+        82.0,
+        120.0,
+        110.0,
+        92.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 297,
+      "beats_per_bar": 4,
+      "change_exact_recall": 0.0,
+      "change_recall": 1.0,
+      "chord_majmin": null,
+      "file": "Tempo Change/ถ้าเธอยังมีชีวิต ฉันว่ามันก็คงดีขึ้นในซักวัน - Aphaziaa (Rock Ver.).wav",
+      "finder_bpm": 90.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.22,
+          "key": "C major"
+        },
+        {
+          "confidence": 0.17,
+          "key": "F major"
+        },
+        {
+          "confidence": 0.16,
+          "key": "A minor"
+        },
+        {
+          "confidence": 0.16,
+          "key": "G major"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "C major",
+      "key_truth": "C major",
+      "rhythm_bpm": 174.99,
+      "rhythm_confidence": 1.0,
+      "rhythm_variable": true,
+      "seconds": 109.96,
+      "sections": [
+        {
+          "bpm": 170.0,
+          "end": 28.2,
+          "start": 1.4
+        },
+        {
+          "bpm": 180.0,
+          "end": 78.9,
+          "start": 28.2
+        },
+        {
+          "bpm": 170.0,
+          "end": 102.9,
+          "start": 78.9
+        }
+      ],
+      "sections_collapsed": [
+        170.0,
+        180.0,
+        170.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 90.0,
+          "confidence": 0.28
+        },
+        {
+          "bpm": 180.0,
+          "confidence": 0.27
+        },
+        {
+          "bpm": 170.0,
+          "confidence": 0.25
+        },
+        {
+          "bpm": 84.71,
+          "confidence": 0.15
+        },
+        {
+          "bpm": 60.0,
+          "confidence": 0.14
+        }
+      ],
+      "tempo_finder_class": null,
+      "tempo_rhythm_class": null,
+      "tempo_top": 90.0,
+      "tempo_top_class": null,
+      "tempo_truth": [
+        85.0,
+        90.0,
+        85.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 642,
+      "beats_per_bar": 4,
+      "change_exact_recall": 0.800000011920929,
+      "change_recall": 1.0,
+      "chord_majmin": null,
+      "file": "Tempo Change/โย่ยงยก (YoYongYok) - คารุ เอราพี.mp3",
+      "finder_bpm": 162.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.16,
+          "key": "E minor"
+        },
+        {
+          "confidence": 0.14,
+          "key": "B minor"
+        },
+        {
+          "confidence": 0.14,
+          "key": "E major"
+        },
+        {
+          "confidence": 0.12,
+          "key": "D major"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "E minor",
+      "key_truth": "E minor",
+      "rhythm_bpm": 159.09,
+      "rhythm_confidence": 0.99,
+      "rhythm_variable": true,
+      "seconds": 247.85,
+      "sections": [
+        {
+          "bpm": 162.0,
+          "end": 155.8,
+          "start": 1.8
+        },
+        {
+          "bpm": 116.0,
+          "end": 181.1,
+          "start": 155.8
+        },
+        {
+          "bpm": 162.0,
+          "end": 223.0,
+          "start": 181.1
+        },
+        {
+          "bpm": 180.0,
+          "end": 232.5,
+          "start": 223.0
+        },
+        {
+          "bpm": 207.21,
+          "end": 239.1,
+          "start": 232.5
+        }
+      ],
+      "sections_collapsed": [
+        162.0,
+        116.0,
+        162.0,
+        180.0,
+        207.21
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 162.0,
+          "confidence": 0.48
+        },
+        {
+          "bpm": 81.0,
+          "confidence": 0.41
+        },
+        {
+          "bpm": 108.0,
+          "confidence": 0.37
+        },
+        {
+          "bpm": 64.8,
+          "confidence": 0.22
+        },
+        {
+          "bpm": 129.6,
+          "confidence": 0.13
+        }
+      ],
+      "tempo_finder_class": null,
+      "tempo_rhythm_class": null,
+      "tempo_top": 162.0,
+      "tempo_top_class": null,
+      "tempo_truth": [
+        162.0,
+        117.0,
+        162.0,
+        181.0,
+        105.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 632,
+      "beats_per_bar": 4,
+      "change_exact_recall": 0.6666666865348816,
+      "change_recall": 0.6666666865348816,
+      "chord_majmin": null,
+      "file": "Tempo Change/New Genesis _ Royal Pride Cover with 3Cha Loop.wav",
+      "finder_bpm": 165.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.01,
+          "key": "A major"
+        },
+        {
+          "confidence": 0.01,
+          "key": "E major"
+        },
+        {
+          "confidence": 0.01,
+          "key": "C# minor"
+        },
+        {
+          "confidence": 0.01,
+          "key": "F# minor"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "A major",
+      "key_truth": "A major",
+      "rhythm_bpm": 162.62,
+      "rhythm_confidence": 0.99,
+      "rhythm_variable": true,
+      "seconds": 234.22,
+      "sections": [
+        {
+          "bpm": 137.01,
+          "end": 26.4,
+          "start": 0.8
+        },
+        {
+          "bpm": 175.0,
+          "end": 42.8,
+          "start": 26.4
+        },
+        {
+          "bpm": 165.0,
+          "end": 233.3,
+          "start": 42.8
+        }
+      ],
+      "sections_collapsed": [
+        137.01,
+        175.0,
+        165.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 165.0,
+          "confidence": 0.38
+        },
+        {
+          "bpm": 82.5,
+          "confidence": 0.34
+        },
+        {
+          "bpm": 110.0,
+          "confidence": 0.32
+        },
+        {
+          "bpm": 66.0,
+          "confidence": 0.18
+        },
+        {
+          "bpm": 132.0,
+          "confidence": 0.07
+        }
+      ],
+      "tempo_finder_class": null,
+      "tempo_rhythm_class": null,
+      "tempo_top": 165.0,
+      "tempo_top_class": null,
+      "tempo_truth": [
+        175.0,
+        165.0,
+        175.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 573,
+      "beats_per_bar": 4,
+      "change_exact_recall": 0.75,
+      "change_recall": 0.75,
+      "chord_majmin": null,
+      "file": "Tempo Change/Idol - Yoasobi.mp3",
+      "finder_bpm": 166.0,
+      "key_class": "wrong",
+      "key_ranked": [
+        {
+          "confidence": 0.24,
+          "key": "G# minor"
+        },
+        {
+          "confidence": 0.18,
+          "key": "G# major"
+        },
+        {
+          "confidence": 0.18,
+          "key": "E major"
+        },
+        {
+          "confidence": 0.16,
+          "key": "D# major"
+        }
+      ],
+      "key_score": 0.0,
+      "key_top": "G# minor",
+      "key_truth": "A minor",
+      "rhythm_bpm": 163.16,
+      "rhythm_confidence": 0.98,
+      "rhythm_variable": true,
+      "seconds": 225.81,
+      "sections": [
+        {
+          "bpm": 166.0,
+          "end": 121.5,
+          "start": 0.4
+        },
+        {
+          "bpm": 152.21,
+          "end": 164.9,
+          "start": 121.5
+        },
+        {
+          "bpm": 166.0,
+          "end": 210.8,
+          "start": 164.9
+        }
+      ],
+      "sections_collapsed": [
+        166.0,
+        152.21,
+        166.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 166.0,
+          "confidence": 0.47
+        },
+        {
+          "bpm": 83.0,
+          "confidence": 0.41
+        },
+        {
+          "bpm": 110.67,
+          "confidence": 0.36
+        },
+        {
+          "bpm": 66.4,
+          "confidence": 0.23
+        },
+        {
+          "bpm": 94.85,
+          "confidence": 0.14
+        }
+      ],
+      "tempo_finder_class": null,
+      "tempo_rhythm_class": null,
+      "tempo_top": 166.0,
+      "tempo_top_class": null,
+      "tempo_truth": [
+        166.0,
+        150.0,
+        157.0,
+        166.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 521,
+      "beats_per_bar": 4,
+      "change_exact_recall": null,
+      "change_recall": null,
+      "chord_majmin": null,
+      "file": "Static Tempo/BURN IT _ Royal Pride.mp3",
+      "finder_bpm": 140.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.19,
+          "key": "B minor"
+        },
+        {
+          "confidence": 0.16,
+          "key": "F# minor"
+        },
+        {
+          "confidence": 0.15,
+          "key": "B major"
+        },
+        {
+          "confidence": 0.14,
+          "key": "D major"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "B minor",
+      "key_truth": "B minor",
+      "rhythm_bpm": 140.0,
+      "rhythm_confidence": 0.98,
+      "rhythm_variable": true,
+      "seconds": 228.09,
+      "sections": [
+        {
+          "bpm": 140.0,
+          "end": 223.8,
+          "start": 0.9
+        }
+      ],
+      "sections_collapsed": [
+        140.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 140.0,
+          "confidence": 0.4
+        },
+        {
+          "bpm": 93.33,
+          "confidence": 0.33
+        },
+        {
+          "bpm": 70.0,
+          "confidence": 0.25
+        },
+        {
+          "bpm": 186.66,
+          "confidence": 0.17
+        },
+        {
+          "bpm": 112.0,
+          "confidence": 0.16
+        }
+      ],
+      "tempo_finder_class": "exact",
+      "tempo_rhythm_class": "exact",
+      "tempo_top": 140.0,
+      "tempo_top_class": "exact",
+      "tempo_truth": [
+        140.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 324,
+      "beats_per_bar": 4,
+      "change_exact_recall": null,
+      "change_recall": null,
+      "chord_majmin": null,
+      "file": "Static Tempo/Hoshimachi Suisei - BIBIBIDIBA.mp3",
+      "finder_bpm": 120.0,
+      "key_class": "fifth",
+      "key_ranked": [
+        {
+          "confidence": 0.21,
+          "key": "A# minor"
+        },
+        {
+          "confidence": 0.17,
+          "key": "D# minor"
+        },
+        {
+          "confidence": 0.15,
+          "key": "D# major"
+        },
+        {
+          "confidence": 0.14,
+          "key": "A# major"
+        }
+      ],
+      "key_score": 0.5,
+      "key_top": "A# minor",
+      "key_truth": "D# minor",
+      "rhythm_bpm": 120.0,
+      "rhythm_confidence": 0.98,
+      "rhythm_variable": true,
+      "seconds": 171.32,
+      "sections": [
+        {
+          "bpm": 120.0,
+          "end": 167.3,
+          "start": 5.8
+        }
+      ],
+      "sections_collapsed": [
+        120.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 120.0,
+          "confidence": 0.57
+        },
+        {
+          "bpm": 80.0,
+          "confidence": 0.38
+        },
+        {
+          "bpm": 60.0,
+          "confidence": 0.3
+        },
+        {
+          "bpm": 160.0,
+          "confidence": 0.13
+        },
+        {
+          "bpm": 96.0,
+          "confidence": 0.11
+        }
+      ],
+      "tempo_finder_class": "exact",
+      "tempo_rhythm_class": "exact",
+      "tempo_top": 120.0,
+      "tempo_top_class": "exact",
+      "tempo_truth": [
+        120.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 890,
+      "beats_per_bar": 4,
+      "change_exact_recall": null,
+      "change_recall": null,
+      "chord_majmin": null,
+      "file": "Static Tempo/ DAOKO × Kenshi Yonezu “Fireworks”.mp3",
+      "finder_bpm": 96.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.07,
+          "key": "F# major"
+        },
+        {
+          "confidence": 0.06,
+          "key": "C# major"
+        },
+        {
+          "confidence": 0.05,
+          "key": "A# minor"
+        },
+        {
+          "confidence": 0.05,
+          "key": "D# minor"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "F# major",
+      "key_truth": "F# major",
+      "rhythm_bpm": 192.0,
+      "rhythm_confidence": 0.98,
+      "rhythm_variable": true,
+      "seconds": 292.76,
+      "sections": [
+        {
+          "bpm": 192.0,
+          "end": 281.9,
+          "start": 4.1
+        }
+      ],
+      "sections_collapsed": [
+        192.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 96.0,
+          "confidence": 0.41
+        },
+        {
+          "bpm": 192.0,
+          "confidence": 0.36
+        },
+        {
+          "bpm": 128.0,
+          "confidence": 0.29
+        },
+        {
+          "bpm": 64.0,
+          "confidence": 0.27
+        },
+        {
+          "bpm": 76.8,
+          "confidence": 0.15
+        }
+      ],
+      "tempo_finder_class": "exact",
+      "tempo_rhythm_class": "octave",
+      "tempo_top": 96.0,
+      "tempo_top_class": "exact",
+      "tempo_truth": [
+        96.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 355,
+      "beats_per_bar": 4,
+      "change_exact_recall": null,
+      "change_recall": null,
+      "chord_majmin": null,
+      "file": "Static Tempo/Yorushika - Hana ni Bourei.mp3",
+      "finder_bpm": 90.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.27,
+          "key": "E major"
+        },
+        {
+          "confidence": 0.2,
+          "key": "B major"
+        },
+        {
+          "confidence": 0.16,
+          "key": "E minor"
+        },
+        {
+          "confidence": 0.14,
+          "key": "C# minor"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "E major",
+      "key_truth": "E major",
+      "rhythm_bpm": 90.0,
+      "rhythm_confidence": 0.99,
+      "rhythm_variable": false,
+      "seconds": 242.3,
+      "sections": [
+        {
+          "bpm": 90.0,
+          "end": 237.2,
+          "start": 1.2
+        }
+      ],
+      "sections_collapsed": [
+        90.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 90.0,
+          "confidence": 0.57
+        },
+        {
+          "bpm": 180.0,
+          "confidence": 0.44
+        },
+        {
+          "bpm": 120.0,
+          "confidence": 0.26
+        },
+        {
+          "bpm": 60.0,
+          "confidence": 0.23
+        },
+        {
+          "bpm": 72.0,
+          "confidence": 0.13
+        }
+      ],
+      "tempo_finder_class": "exact",
+      "tempo_rhythm_class": "exact",
+      "tempo_top": 90.0,
+      "tempo_top_class": "exact",
+      "tempo_truth": [
+        90.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 745,
+      "beats_per_bar": 4,
+      "change_exact_recall": null,
+      "change_recall": null,
+      "chord_majmin": null,
+      "file": "Static Tempo/余花にみとれて 25時、ナイトコードで。 × MEIKO.mp3",
+      "finder_bpm": 166.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.19,
+          "key": "D major"
+        },
+        {
+          "confidence": 0.15,
+          "key": "A major"
+        },
+        {
+          "confidence": 0.12,
+          "key": "B minor"
+        },
+        {
+          "confidence": 0.12,
+          "key": "G major"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "D major",
+      "key_truth": "D major",
+      "rhythm_bpm": 166.0,
+      "rhythm_confidence": 0.99,
+      "rhythm_variable": false,
+      "seconds": 282.19,
+      "sections": [
+        {
+          "bpm": 166.0,
+          "end": 271.5,
+          "start": 2.6
+        }
+      ],
+      "sections_collapsed": [
+        166.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 166.0,
+          "confidence": 0.6
+        },
+        {
+          "bpm": 83.0,
+          "confidence": 0.53
+        },
+        {
+          "bpm": 110.67,
+          "confidence": 0.34
+        },
+        {
+          "bpm": 66.4,
+          "confidence": 0.17
+        },
+        {
+          "bpm": 177.07,
+          "confidence": 0.01
+        }
+      ],
+      "tempo_finder_class": "octave",
+      "tempo_rhythm_class": "octave",
+      "tempo_top": 166.0,
+      "tempo_top_class": "octave",
+      "tempo_truth": [
+        83.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 898,
+      "beats_per_bar": 4,
+      "change_exact_recall": null,
+      "change_recall": null,
+      "chord_majmin": null,
+      "file": "Static Tempo/命に嫌われている。 初音ミク.mp3",
+      "finder_bpm": 100.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.05,
+          "key": "G major"
+        },
+        {
+          "confidence": 0.05,
+          "key": "C major"
+        },
+        {
+          "confidence": 0.04,
+          "key": "A minor"
+        },
+        {
+          "confidence": 0.03,
+          "key": "D major"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "G major",
+      "key_truth": "G major",
+      "rhythm_bpm": 200.0,
+      "rhythm_confidence": 0.99,
+      "rhythm_variable": false,
+      "seconds": 273.76,
+      "sections": [
+        {
+          "bpm": 200.0,
+          "end": 269.7,
+          "start": 0.6
+        }
+      ],
+      "sections_collapsed": [
+        200.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 100.0,
+          "confidence": 0.58
+        },
+        {
+          "bpm": 200.0,
+          "confidence": 0.52
+        },
+        {
+          "bpm": 66.66,
+          "confidence": 0.38
+        },
+        {
+          "bpm": 133.34,
+          "confidence": 0.37
+        },
+        {
+          "bpm": 80.0,
+          "confidence": 0.27
+        }
+      ],
+      "tempo_finder_class": "octave",
+      "tempo_rhythm_class": "exact",
+      "tempo_top": 100.0,
+      "tempo_top_class": "octave",
+      "tempo_truth": [
+        200.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 231,
+      "beats_per_bar": 4,
+      "change_exact_recall": null,
+      "change_recall": null,
+      "chord_majmin": null,
+      "file": "Static Tempo/BoyWithUke - IDGAF ft. blackbear.mp3",
+      "finder_bpm": 98.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.18,
+          "key": "F major"
+        },
+        {
+          "confidence": 0.14,
+          "key": "D minor"
+        },
+        {
+          "confidence": 0.14,
+          "key": "A minor"
+        },
+        {
+          "confidence": 0.14,
+          "key": "C major"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "F major",
+      "key_truth": "F major",
+      "rhythm_bpm": 98.0,
+      "rhythm_confidence": 0.99,
+      "rhythm_variable": true,
+      "seconds": 146.45,
+      "sections": [
+        {
+          "bpm": 98.0,
+          "end": 141.9,
+          "start": 0.8
+        }
+      ],
+      "sections_collapsed": [
+        98.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 98.0,
+          "confidence": 0.65
+        },
+        {
+          "bpm": 196.0,
+          "confidence": 0.48
+        },
+        {
+          "bpm": 65.33,
+          "confidence": 0.36
+        },
+        {
+          "bpm": 130.65,
+          "confidence": 0.3
+        },
+        {
+          "bpm": 78.4,
+          "confidence": 0.2
+        }
+      ],
+      "tempo_finder_class": "exact",
+      "tempo_rhythm_class": "exact",
+      "tempo_top": 98.0,
+      "tempo_top_class": "exact",
+      "tempo_truth": [
+        97.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 784,
+      "beats_per_bar": 4,
+      "change_exact_recall": null,
+      "change_recall": null,
+      "chord_majmin": null,
+      "file": "Static Tempo/glow _ Leo_need × 初音ミク.mp3",
+      "finder_bpm": 170.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.19,
+          "key": "A# major"
+        },
+        {
+          "confidence": 0.15,
+          "key": "F major"
+        },
+        {
+          "confidence": 0.12,
+          "key": "D minor"
+        },
+        {
+          "confidence": 0.11,
+          "key": "G minor"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "A# major",
+      "key_truth": "A# major",
+      "rhythm_bpm": 170.0,
+      "rhythm_confidence": 0.97,
+      "rhythm_variable": true,
+      "seconds": 282.66,
+      "sections": [
+        {
+          "bpm": 170.0,
+          "end": 276.6,
+          "start": 0.2
+        }
+      ],
+      "sections_collapsed": [
+        170.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 170.0,
+          "confidence": 0.58
+        },
+        {
+          "bpm": 85.0,
+          "confidence": 0.49
+        },
+        {
+          "bpm": 113.34,
+          "confidence": 0.3
+        },
+        {
+          "bpm": 68.0,
+          "confidence": 0.21
+        },
+        {
+          "bpm": 160.0,
+          "confidence": 0.05
+        }
+      ],
+      "tempo_finder_class": "octave",
+      "tempo_rhythm_class": "octave",
+      "tempo_top": 170.0,
+      "tempo_top_class": "octave",
+      "tempo_truth": [
+        85.0
+      ],
+      "timed_tempo": null
+    },
+    {
+      "beat_count": 833,
+      "beats_per_bar": 4,
+      "change_exact_recall": null,
+      "change_recall": null,
+      "chord_majmin": null,
+      "file": "Static Tempo/Kaketa Tsuki (欠けた月) [Shion Miyawaki].mp3",
+      "finder_bpm": 87.0,
+      "key_class": "exact",
+      "key_ranked": [
+        {
+          "confidence": 0.12,
+          "key": "B major"
+        },
+        {
+          "confidence": 0.11,
+          "key": "E major"
+        },
+        {
+          "confidence": 0.1,
+          "key": "G# minor"
+        },
+        {
+          "confidence": 0.09,
+          "key": "F# major"
+        }
+      ],
+      "key_score": 1.0,
+      "key_top": "B major",
+      "key_truth": "B major",
+      "rhythm_bpm": 174.0,
+      "rhythm_confidence": 0.99,
+      "rhythm_variable": false,
+      "seconds": 289.67,
+      "sections": [
+        {
+          "bpm": 174.0,
+          "end": 287.8,
+          "start": 0.9
+        }
+      ],
+      "sections_collapsed": [
+        174.0
+      ],
+      "tempo_candidates": [
+        {
+          "bpm": 87.0,
+          "confidence": 0.58
+        },
+        {
+          "bpm": 174.0,
+          "confidence": 0.57
+        },
+        {
+          "bpm": 116.0,
+          "confidence": 0.35
+        },
+        {
+          "bpm": 69.6,
+          "confidence": 0.22
+        },
+        {
+          "bpm": 139.2,
+          "confidence": 0.08
+        }
+      ],
+      "tempo_finder_class": "exact",
+      "tempo_rhythm_class": "octave",
+      "tempo_top": 87.0,
+      "tempo_top_class": "exact",
+      "tempo_truth": [
+        87.0
+      ],
+      "timed_tempo": null
+    }
+  ],
+  "static": {
+    "finder_exact": 6,
+    "finder_octave": 9,
+    "n": 9,
+    "rhythm_exact": 5,
+    "rhythm_octave": 9,
+    "top_exact": 6,
+    "top_octave": 9
+  },
+  "timed": {
+    "exact": 0.0,
+    "n": 0,
+    "octave": 0.0
+  }
+}

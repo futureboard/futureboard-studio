@@ -1,0 +1,21 @@
+{
+  "description": "Tempo & key reference labels for the Tempo & Key Finder benchmark (examples/tempo_key_benchmark.rs). Audio is NOT in the repo: point the benchmark at the folder holding 'Static Tempo/' and 'Tempo Change/'. Source: 'Key & Tempo.xlsx' (2026-09-24). Per song: file, key (required); tempos (playing order, one value = steady); optional tempo_map [{time, bpm}] and chords [{time, chord}] (timestamps in seconds, each mark holds until the next); meter (informational). Only the OMINOUS map has known positions (see its screenshot), so no song carries a tempo_map yet.",
+  "songs": [
+    { "file": "Tempo Change/DECO_27 - Hello, Sekai feat.Hatsune Miku.wav", "key": "G minor", "tempos": [90, 148, 150, 152], "meter": "4/4" },
+    { "file": "Tempo Change/ ปฐมกาล (Divine) - Zekai.mp3", "key": "A major", "tempos": [115, 120, 115], "meter": "4/4" },
+    { "file": "Tempo Change/Infinite Chaos - OMINOUS.mp3", "key": "A minor", "tempos": [92, 82, 120, 110, 92], "meter": "4/4 > 5/8 > 4/4 > 6/8 > 5/8 > 6/8 > 4/4" },
+    { "file": "Tempo Change/ถ้าเธอยังมีชีวิต ฉันว่ามันก็คงดีขึ้นในซักวัน - Aphaziaa (Rock Ver.).wav", "key": "C major", "tempos": [85, 90, 85], "meter": "4/4" },
+    { "file": "Tempo Change/โย่ยงยก (YoYongYok) - คารุ เอราพี.mp3", "key": "E minor", "tempos": [162, 117, 162, 181, 105], "meter": "4/4" },
+    { "file": "Tempo Change/New Genesis _ Royal Pride Cover with 3Cha Loop.wav", "key": "A major", "tempos": [175, 165, 175], "meter": "4/4 > 4/2 > 4/4" },
+    { "file": "Tempo Change/Idol - Yoasobi.mp3", "key": "A minor", "tempos": [166, 150, 157, 166], "meter": "4/4" },
+    { "file": "Static Tempo/BURN IT _ Royal Pride.mp3", "key": "B minor", "tempos": [140], "meter": "4/4" },
+    { "file": "Static Tempo/Hoshimachi Suisei - BIBIBIDIBA.mp3", "key": "D# minor", "tempos": [120], "meter": "4/4" },
+    { "file": "Static Tempo/ DAOKO × Kenshi Yonezu “Fireworks”.mp3", "key": "F# major", "tempos": [96], "meter": "4/4" },
+    { "file": "Static Tempo/Yorushika - Hana ni Bourei.mp3", "key": "E major", "tempos": [90], "meter": "4/4" },
+    { "file": "Static Tempo/余花にみとれて 25時、ナイトコードで。 × MEIKO.mp3", "key": "D major", "tempos": [83], "meter": "4/4" },
+    { "file": "Static Tempo/命に嫌われている。 初音ミク.mp3", "key": "G major", "tempos": [200], "meter": "4/4" },
+    { "file": "Static Tempo/BoyWithUke - IDGAF ft. blackbear.mp3", "key": "F major", "tempos": [97], "meter": "4/4" },
+    { "file": "Static Tempo/glow _ Leo_need × 初音ミク.mp3", "key": "A# major", "tempos": [85], "meter": "4/4" },
+    { "file": "Static Tempo/Kaketa Tsuki (欠けた月) [Shion Miyawaki].mp3", "key": "B major", "tempos": [87], "meter": "4/4" }
+  ]
+}
