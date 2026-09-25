@@ -143,6 +143,11 @@ x11-dl.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-foundation = { workspace = true, features = ["NSGeometry"] }
+# Performance Monitor readers (`perf.rs`, `system_load.rs`): per-process
+# rusage, per-core Mach load, VM statistics, mounted volumes, and the IOKit
+# block-storage counters behind per-disk throughput.
+libc.workspace = true
+core-foundation-sys.workspace = true
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 midir.workspace = true

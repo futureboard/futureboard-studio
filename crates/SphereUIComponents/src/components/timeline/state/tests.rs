@@ -1904,6 +1904,74 @@ mod audio_clip_split_tests {
     }
 
     #[test]
+    fn split_of_a_stretched_clip_splits_the_source_through_the_ratio() {
+        let mut state = TimelineState::default();
+        state.bpm = 120.0;
+        // Four seconds of source played at 200%: 16 beats at 120 BPM.
+        let mut clip = audio_clip("clip-5", 0.0, 16.0, 0.0);
+        clip.stretch.original_sample_rate = 48_000;
+        clip.stretch.project_sample_rate = 48_000;
+        clip.stretch.original_duration_samples = 192_000;
+        clip.stretch.source_end_samples = 192_000;
+        clip.stretch = clip.stretch.with_timing(StretchTiming::Speed, 120.0);
+        clip.stretch.set_stretch_ratio(2.0);
+        let (left, right) = state
+            .plan_audio_clip_split(&clip, 8.0)
+            .expect("split inside the clip");
+        // Half the timeline is half the source, not the whole take twice.
+        assert_eq!(left.stretch.source_end_samples, 96_000);
+        assert_eq!(right.stretch.source_start_samples, 96_000);
+        assert_eq!(right.stretch.source_end_samples, 192_000);
+    }
+
+    /// A 4 s, 48 kHz clip at 120 BPM (8 beats), decoded and on a track.
+    fn state_with_decoded_clip() -> (TimelineState, String) {
+        let mut state = TimelineState::default();
+        state.bpm = 120.0;
+        let id = state.import_audio_at("C:/a/loop.wav".to_string(), "loop".to_string(), 0.0, 1.0e9);
+        state.update_audio_clip_metadata("C:/a/loop.wav", "wav", 48_000, 2, 192_000, 4.0);
+        (state, id)
+    }
+
+    #[test]
+    fn stretch_tool_drag_changes_the_ratio_and_keeps_the_source_window() {
+        let (mut state, id) = state_with_decoded_clip();
+        assert!(state.stretch_clip_edge(&id, ClipEdge::Right, 16.0));
+        let (_, clip) = state.find_clip(&id).unwrap();
+        assert!((clip.duration_beats - 16.0).abs() < 1e-3);
+        assert_eq!(clip.stretch.timing(), StretchTiming::Speed);
+        assert!(clip.stretch.keeps_pitch());
+        assert!((clip.stretch.stretch_ratio - 2.0).abs() < 1e-6);
+        assert_eq!(clip.stretch.source_start_samples, 0);
+        assert_eq!(clip.stretch.source_end_samples, 192_000);
+        // The model and the drawing agree on the new length.
+        assert!(!state.reconcile_audio_clip_lengths());
+
+        // Left edge: right edge stays put.
+        assert!(state.stretch_clip_edge(&id, ClipEdge::Left, 12.0));
+        let (_, clip) = state.find_clip(&id).unwrap();
+        assert!((clip.start_beat - 12.0).abs() < 1e-3);
+        assert!((clip.start_beat + clip.duration_beats - 16.0).abs() < 1e-3);
+        assert!((clip.stretch.stretch_ratio - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn edge_trim_of_a_stretched_clip_moves_the_window_not_the_speed() {
+        let (mut state, id) = state_with_decoded_clip();
+        assert!(state.stretch_clip_edge(&id, ClipEdge::Right, 16.0));
+        // Trim the 16-beat, 200% clip back to 8 beats: half the source.
+        assert!(state.resize_clip(&id, ClipEdge::Right, 8.0));
+        let (_, clip) = state.find_clip(&id).unwrap();
+        assert!((clip.stretch.stretch_ratio - 2.0).abs() < 1e-6);
+        assert_eq!(clip.stretch.source_end_samples, 96_000);
+        assert!((clip.duration_beats - 8.0).abs() < 1e-3);
+        // And it survives the length re-derivation instead of snapping back.
+        state.reconcile_audio_clip_lengths();
+        let (_, clip) = state.find_clip(&id).unwrap();
+        assert!((clip.duration_beats - 8.0).abs() < 1e-3);
+    }
+
+    #[test]
     fn metadata_update_does_not_resize_trimmed_siblings() {
         let mut state = TimelineState::default();
         state.bpm = 120.0;

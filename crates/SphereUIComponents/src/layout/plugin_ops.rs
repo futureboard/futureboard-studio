@@ -3547,7 +3547,7 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) {
         use crate::components::plugin_picker::{PluginInsertKind, PluginPickerState};
-        use crate::components::timeline::timeline_state::{InputMonitorMode, TrackType};
+        use crate::components::timeline::timeline_state::TrackType;
         use crate::components::timeline::{NewTrackKind, PluginDropTarget};
 
         let Some(plugin) = self
@@ -3575,32 +3575,9 @@ impl StudioLayout {
                     NewTrackKind::Audio => (TrackType::Audio, "Audio"),
                 };
                 let name = format!("{prefix} — {}", plugin.name);
-                let insert_index = *insert_index;
-                self.timeline.update(cx, |timeline, cx| {
-                    let id = timeline.state.create_track(
-                        crate::components::timeline::timeline_state::CreateTrackOptions {
-                            track_type,
-                            name,
-                            color: timeline
-                                .state
-                                .track_color_for_index(timeline.state.tracks.len()),
-                            volume: crate::components::timeline::timeline_state::volume::db_to_norm(
-                                0.0,
-                            ),
-                            pan: 0.0,
-                            armed: false,
-                            input_monitor: InputMonitorMode::Off,
-                        },
-                    );
-                    // Created at the end, then moved to where the drop said —
-                    // below the track the plug-in was released over.
-                    if insert_index < timeline.state.tracks.len() - 1 {
-                        timeline.state.reorder_track(&id, insert_index);
-                    }
-                    timeline.state.select_track(&id);
-                    cx.notify();
-                    id
-                })
+                // Created at the end, then moved to where the drop said —
+                // below the track the plug-in was released over.
+                self.create_track_for_plugin_drop(track_type, name, Some(*insert_index), cx)
             }
             PluginDropTarget::Refused { .. } => return,
         };
@@ -3633,26 +3610,76 @@ impl StudioLayout {
         let _ = self.apply_picked_insert(plugin_id, cx);
     }
 
+    /// A plug-in preset dropped on the arrangement. `track_id` is the track it
+    /// landed on, or `None` for the empty space below the last track.
+    ///
+    /// An instrument always gets its own new MIDI track (a second instrument
+    /// on an existing track would silently replace the first). An effect goes
+    /// onto the track it was dropped on, or onto a new audio track when it
+    /// was dropped on empty space.
     pub(super) fn apply_dropped_plugin_preset(
         &mut self,
-        track_id: &str,
+        track_id: Option<&str>,
         preset_path: &std::path::Path,
         cx: &mut Context<Self>,
     ) -> Option<(String, usize, String)> {
+        use crate::components::timeline::timeline_state::TrackType;
         use SpherePluginHost::PluginKind;
 
         let reg = self.read_dropped_plugin_preset(preset_path)?;
         if reg.kind == PluginKind::Instrument {
             return self.create_instrument_track_from_preset(&reg, cx);
         }
+        let track_id = match track_id {
+            Some(track_id) => track_id.to_string(),
+            None => self.create_track_for_plugin_drop(
+                TrackType::Audio,
+                format!("Audio — {}", reg.name),
+                None,
+                cx,
+            ),
+        };
         let slot_index = self
             .timeline
             .read(cx)
             .state
-            .insert_slots(track_id)
+            .insert_slots(&track_id)
             .map(|slots| slots.len())
             .unwrap_or(0);
-        self.bind_preset_to_insert_slot(track_id, slot_index, &reg, cx, "plugin_preset_drop")
+        self.bind_preset_to_insert_slot(&track_id, slot_index, &reg, cx, "plugin_preset_drop")
+    }
+
+    /// A fresh track for a plug-in dropped where no track was, selected, and
+    /// moved to `insert_index` when one is given (it is created at the end).
+    fn create_track_for_plugin_drop(
+        &mut self,
+        track_type: crate::components::timeline::timeline_state::TrackType,
+        name: String,
+        insert_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> String {
+        use crate::components::timeline::timeline_state::{CreateTrackOptions, InputMonitorMode};
+        self.timeline.update(cx, |timeline, cx| {
+            let id = timeline.state.create_track(CreateTrackOptions {
+                track_type,
+                name,
+                color: timeline
+                    .state
+                    .track_color_for_index(timeline.state.tracks.len()),
+                volume: crate::components::timeline::timeline_state::volume::db_to_norm(0.0),
+                pan: 0.0,
+                armed: false,
+                input_monitor: InputMonitorMode::Off,
+            });
+            if let Some(insert_index) = insert_index {
+                if insert_index < timeline.state.tracks.len() - 1 {
+                    timeline.state.reorder_track(&id, insert_index);
+                }
+            }
+            timeline.state.select_track(&id);
+            cx.notify();
+            id
+        })
     }
 
     pub(super) fn apply_dropped_plugin_preset_to_slot(

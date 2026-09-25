@@ -193,6 +193,13 @@ pub(crate) struct AudioBridgeState {
     pub pending_reason: Option<&'static str>,
     /// Preserves force=true for a pending sync queued behind an in-flight sync.
     pub pending_force: bool,
+    /// A MIDI content edit is waiting to be published. Set by the edit even when
+    /// the throttle defers it, so whichever sync publishes it — the edit's own
+    /// or the engine poll's — knows the graph changed without serializing the
+    /// whole project to find out.
+    pub known_content_change: bool,
+    /// Counter behind the synthetic fingerprint a known content change gets.
+    pub content_change_serial: u64,
     /// Monotonic id of the in-flight sync. A `complete_audio_project_sync` whose
     /// generation no longer matches (the watchdog timeout fired and superseded it)
     /// is ignored — the freshness guard for an orphaned/hung load thread.
@@ -298,6 +305,8 @@ impl Default for AudioBridgeState {
             pending_fingerprint: None,
             pending_reason: None,
             pending_force: false,
+            known_content_change: false,
+            content_change_serial: 0,
             sync_generation: 0,
             sync_started_at: None,
             last_failed_fingerprint: None,
@@ -336,6 +345,13 @@ impl Default for AudioBridgeState {
 /// Cheap, stable fingerprint of a serialized engine snapshot. Identical graphs
 /// hash identically, so a re-sync of an unchanged graph can be skipped without a
 /// full string compare. Control-thread only (never the audio callback).
+/// Sync reason for a committed MIDI note/controller edit. Such an edit always
+/// changes the graph (no-op edits are dropped before they are recorded), so
+/// the sync skips the whole-project JSON signature — 17 MB and ~24 ms on a
+/// 64k-note session, per edit, on the UI thread — that exists only to detect
+/// "nothing changed".
+pub(crate) const MIDI_EDIT_SYNC_REASON: &str = "midi_edit";
+
 pub(crate) fn graph_fingerprint_of(signature: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -792,32 +808,40 @@ impl StudioLayout {
         .detach();
     }
 
-    /// Hardware MIDI gets its own lightweight control poll instead of waiting
-    /// behind meters, bridge reconciliation, waveform work, and frame pacing.
-    /// It idles at 8 ms and accelerates to 2 ms after activity, avoiding a
-    /// permanent high-frequency UI wakeup while keeping live input responsive.
+    /// Hardware MIDI gets its own control task instead of waiting behind
+    /// meters, bridge reconciliation, waveform work, and frame pacing.
+    ///
+    /// Event-driven: the native MIDI callback rings
+    /// [`sphere_midi_service::MidiInputDoorbell`] after queueing a message and
+    /// this task wakes on the ring. It used to sleep 2–8 ms between drains, and
+    /// on Windows a sleep that short lands on the ~15.6 ms OS timer tick
+    /// whenever the frame loop is not holding `timeBeginPeriod(1)` — i.e. with
+    /// the transport stopped, which is exactly when a keyboard is played live.
+    /// That rounding was the input lag, and its randomness the uneven feel.
+    /// An idle Studio now wakes for MIDI and for nothing else.
     pub(super) fn spawn_hardware_midi_input_poll(cx: &mut Context<Self>) {
-        const MIDI_INPUT_ACTIVE_POLL: Duration = Duration::from_millis(2);
-        const MIDI_INPUT_IDLE_POLL: Duration = Duration::from_millis(8);
-        let executor = cx.background_executor().clone();
+        // Spawned from the constructor, so the entity is only readable once
+        // the task first runs.
         cx.spawn(async move |this, cx| {
-            let mut interval = MIDI_INPUT_IDLE_POLL;
+            let Ok(doorbell) = this.update(cx, |this, _| this.hardware_midi_input.doorbell())
+            else {
+                return;
+            };
             loop {
+                doorbell.wait().await;
                 if crate::shutdown::ShutdownState::global().is_shutting_down() {
                     break;
                 }
-                executor.timer(interval).await;
-                if crate::shutdown::ShutdownState::global().is_shutting_down() {
-                    break;
+                // `drain_hardware_midi_input` takes at most a bounded batch;
+                // keep going until the queue is empty so a burst (a chord, a
+                // sustain pedal storm) is delivered in this one wake.
+                loop {
+                    match this.update(cx, |this, cx| this.drain_hardware_midi_input(cx)) {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(_) => return,
+                    }
                 }
-                let active = this
-                    .update(cx, |this, cx| this.drain_hardware_midi_input(cx))
-                    .unwrap_or(false);
-                interval = if active {
-                    MIDI_INPUT_ACTIVE_POLL
-                } else {
-                    MIDI_INPUT_IDLE_POLL
-                };
             }
         })
         .detach();
@@ -1408,6 +1432,9 @@ impl StudioLayout {
             self.audio_bridge.sync_request_count.saturating_add(1);
         crate::perf::count("sync_request_count", self.audio_bridge.sync_request_count);
         self.audio_bridge.last_sync_reason = reason;
+        if reason == MIDI_EDIT_SYNC_REASON {
+            self.audio_bridge.known_content_change = true;
+        }
 
         // Cheap gate plus the burst window; see `sync_should_build_now`. Both
         // leave `project_dirty` / `media_dirty` set, so the 60 Hz engine poll
@@ -1469,8 +1496,24 @@ impl StudioLayout {
             self.audio_bridge.project_dirty || self.audio_bridge.media_dirty,
             reason,
         );
-        let signature = serde_json::to_string(&snapshot).unwrap_or_default();
-        let fingerprint = graph_fingerprint_of(&signature);
+        // A known content change needs no proof that the graph differs: give
+        // it a fingerprint no earlier graph can have and an empty signature,
+        // and skip serializing every note in the project. Everything else
+        // still gets the exact signature the dedup below relies on.
+        let known_content_change = std::mem::take(&mut self.audio_bridge.known_content_change);
+        let (signature, fingerprint) = if known_content_change {
+            self.audio_bridge.content_change_serial =
+                self.audio_bridge.content_change_serial.wrapping_add(1);
+            let token = format!(
+                "known-content-change:{}",
+                self.audio_bridge.content_change_serial
+            );
+            (String::new(), graph_fingerprint_of(&token))
+        } else {
+            let signature = serde_json::to_string(&snapshot).unwrap_or_default();
+            let fingerprint = graph_fingerprint_of(&signature);
+            (signature, fingerprint)
+        };
         // A second, narrower fingerprint over the graph-shaped fields only. It
         // costs another serialize, but of the tracks alone — no clips, no notes
         // — and it buys the difference between "the project changed" and "the
@@ -1498,6 +1541,9 @@ impl StudioLayout {
             if changed {
                 self.audio_bridge.pending_fingerprint = Some(fingerprint);
                 self.audio_bridge.pending_reason = Some(reason);
+                // The queued re-run rebuilds its own snapshot; it must still
+                // know the change is real rather than serialize to find out.
+                self.audio_bridge.known_content_change |= known_content_change;
                 self.audio_bridge.pending_force |= force;
                 self.queue_background_task(
                     "native-sync-pending",

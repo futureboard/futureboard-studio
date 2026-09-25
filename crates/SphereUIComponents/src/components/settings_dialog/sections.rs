@@ -433,9 +433,11 @@ pub(crate) fn performance_section(
 ) -> impl IntoElement {
     let render_mode = schema.performance.render_mode;
     let gpu_pref = schema.performance.gpu_device.clone();
-    // Enumerate once for label/status; the dropdown re-enumerates on open
-    // to stay current with hot-pluggable eGPUs / driver changes.
-    let detected = list_available_gpu_devices();
+    // Read the process-wide adapter list; never enumerate on the render path
+    // (that is what made this page stutter). `None` = still detecting.
+    let cached = cached_gpu_devices();
+    let detecting = cached.is_none();
+    let detected: Vec<_> = cached.map(|list| list.as_ref().clone()).unwrap_or_default();
     let detected_count = detected.len();
     let enumeration_failed_unexpectedly = false; // catch_unwind path inside list_available_gpu_devices already returns Vec::new on panic; treat empty as "no GPU" rather than failure.
 
@@ -450,6 +452,7 @@ pub(crate) fn performance_section(
 
     let gpu_device_label = match &gpu_pref {
         GpuDevicePreference::Auto => "Auto".to_string(),
+        GpuDevicePreference::DeviceId(_) if detecting => "Detecting…".to_string(),
         GpuDevicePreference::DeviceId(id) => detected
             .iter()
             .find(|d| &d.id == id)
@@ -483,6 +486,10 @@ pub(crate) fn performance_section(
         ),
         (RenderMode::CpuRender, _) => (
             "CPU Render active (GPUI paint fallback).".to_string(),
+            Colors::text_secondary(),
+        ),
+        (RenderMode::GpuAcceleration, _) if detecting => (
+            "Detecting GPU adapters…".to_string(),
             Colors::text_secondary(),
         ),
         (RenderMode::GpuAcceleration, 0) => (

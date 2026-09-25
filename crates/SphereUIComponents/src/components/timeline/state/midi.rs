@@ -242,7 +242,7 @@ impl TimelineState {
         // Every mutation of a clip's notes passes through here, which makes it
         // the one place a derived-view cache can be told to refresh. See
         // `midi_edit_revision`.
-        bump_midi_edit_revision();
+        bump_midi_clip_revision(clip_id);
         for track in &mut self.tracks {
             for clip in &mut track.clips {
                 if clip.id == clip_id {

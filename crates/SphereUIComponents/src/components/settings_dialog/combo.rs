@@ -354,16 +354,20 @@ pub(crate) fn hardware_combo_overlay(
             .into_any_element()
         }
         HardwareCombo::GpuDevice => {
-            // Enumerate adapters on open. Cheap on Windows/macOS; the
-            // dropdown shows the actual device names instead of a stale
-            // cached list. Falls back to "Auto" only on enumeration failure.
-            let detected = list_available_gpu_devices();
+            // The process-wide adapter list (see `gpu_devices`). This overlay
+            // is rebuilt on every frame it is open, so it must never
+            // enumerate here.
+            let cached = cached_gpu_devices();
+            let detecting = cached.is_none();
+            let detected: Vec<_> = cached.map(|list| list.as_ref().clone()).unwrap_or_default();
             let mut options: Vec<String> = Vec::with_capacity(detected.len() + 1);
             options.push("Auto".to_string());
             for device in &detected {
                 options.push(device.name.clone());
             }
-            if detected.is_empty() {
+            if detecting {
+                options.push("Detecting GPUs…".to_string());
+            } else if detected.is_empty() {
                 options.push("No GPU device found".to_string());
             }
             let options = crate::components::combo_box::dedupe_preserve_order(&options);
@@ -387,7 +391,7 @@ pub(crate) fn hardware_combo_overlay(
                 &selected,
                 &options,
                 Arc::new(move |value, window, cx| {
-                    if value == "No GPU device found" {
+                    if value == "No GPU device found" || value == "Detecting GPUs…" {
                         return;
                     }
                     let next = if value == "Auto" {

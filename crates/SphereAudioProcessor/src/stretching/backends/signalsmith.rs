@@ -10,6 +10,11 @@ unsafe extern "C" {
     fn fb_signalsmith_create(sample_rate: f32, channels: i32) -> *mut std::ffi::c_void;
     fn fb_signalsmith_destroy(handle: *mut std::ffi::c_void);
     fn fb_signalsmith_reset(handle: *mut std::ffi::c_void);
+    fn fb_signalsmith_configure(
+        handle: *mut std::ffi::c_void,
+        pitch_ratio: f32,
+        quality: f32,
+    ) -> i32;
     fn fb_signalsmith_process_stereo(
         handle: *mut std::ffi::c_void,
         input_l: *const f32,
@@ -73,8 +78,19 @@ impl StretchProcessor for SignalsmithProcessor {
         }
     }
 
+    /// Control-thread only. Applies the preset here so the first
+    /// `output_seek`/`process_stereo` in the audio callback finds the
+    /// stretcher already configured for this quality and does not rebuild
+    /// (and allocate) it on the realtime thread.
     fn set_params(&mut self, params: StretchParams) {
         self.params = params.sanitized();
+        unsafe {
+            fb_signalsmith_configure(
+                self.handle.as_ptr(),
+                self.pitch_ratio(),
+                self.params.quality,
+            );
+        }
     }
 
     fn latency_samples(&self) -> usize {

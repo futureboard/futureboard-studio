@@ -69,6 +69,41 @@ impl StretchMode {
     }
 }
 
+/// What the user chose for a clip's timing, as the Inspector presents it.
+///
+/// [`StretchMode`] is the persisted, engine-facing tag and keeps its five
+/// variants for project compatibility. People think in four answers to "what
+/// decides how long this clip plays?": nothing (`Off`), a speed they set
+/// (`Speed` — stored as `Manual` or `Resample` depending on the pitch choice),
+/// the project tempo (`Tempo`), or warp markers (`Warp`). Whether pitch follows
+/// the speed is a separate, orthogonal choice — see
+/// [`AudioClipStretchState::keeps_pitch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StretchTiming {
+    Off,
+    Speed,
+    Tempo,
+    Warp,
+}
+
+impl StretchTiming {
+    pub const ALL: [StretchTiming; 4] = [
+        StretchTiming::Off,
+        StretchTiming::Speed,
+        StretchTiming::Tempo,
+        StretchTiming::Warp,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StretchTiming::Off => "Off",
+            StretchTiming::Speed => "Speed",
+            StretchTiming::Tempo => "Tempo",
+            StretchTiming::Warp => "Warp",
+        }
+    }
+}
+
 /// Stretch algorithm selection.
 ///
 /// Only some variants are backed by real DSP today; the rest are honest
@@ -1141,6 +1176,22 @@ impl AudioClipStretchState {
 
     // ── Derived getters ────────────────────────────────────────────────────
 
+    /// Rate of the sample positions this state stores (`source_start_samples`,
+    /// `source_end_samples`, warp `source_sample`): the source file's own rate.
+    ///
+    /// `project_sample_rate` is only a fallback for a clip whose file has not
+    /// been decoded yet. Taking the larger of the two, as several call sites
+    /// used to, turns a 44.1 kHz file in a 48 kHz project 8% short everywhere
+    /// the UI converts its window to seconds, while the engine — which reads
+    /// the file at its real rate — plays it at full length. `0` = unknown.
+    pub fn source_sample_rate(&self) -> u32 {
+        if self.original_sample_rate > 0 {
+            self.original_sample_rate
+        } else {
+            self.project_sample_rate
+        }
+    }
+
     /// Current stretch as a percentage (`stretch_ratio * 100`).
     pub fn stretch_percent(&self) -> f64 {
         Self::percent_from_ratio(self.stretch_ratio)
@@ -1190,19 +1241,37 @@ impl AudioClipStretchState {
         &self,
         project_bpm: f64,
     ) -> SphereAudioProcessor::StretchParams {
-        let mode = match self.mode {
-            StretchMode::Off => SphereAudioProcessor::StretchMode::Off,
-            StretchMode::Resample | StretchMode::Manual => {
-                SphereAudioProcessor::StretchMode::Manual
-            }
-            StretchMode::TempoSync => SphereAudioProcessor::StretchMode::TempoSync,
-            StretchMode::Warp => SphereAudioProcessor::StretchMode::Warp,
+        let preserve_pitch = self.keeps_pitch_engine();
+        // A transpose only exists where pitch is decoupled from speed. On a
+        // tape-style clip the read rate already *is* the pitch, and folding a
+        // second factor into it made the engine read past (or stop short of)
+        // the trimmed source window, because the clip length is derived from
+        // the time ratio alone.
+        let transposed = self.pitch_shift_semitones.abs() > 1.0e-4;
+        let pitch_ratio = if preserve_pitch || (self.mode == StretchMode::Off && transposed) {
+            Self::pitch_ratio_from_semitones(self.pitch_shift_semitones) as f32
+        } else {
+            1.0
         };
-        let preserve_pitch = matches!(
-            self.mode,
-            StretchMode::Manual | StretchMode::TempoSync | StretchMode::Warp
-        ) && self.preserve_pitch
-            && !matches!(self.algorithm, StretchAlgorithm::ResampleOnly);
+        let (mode, time_ratio) = match self.mode {
+            // "Off" is about timing. A transposed Off clip still needs the
+            // pitch-preserving processor, at exactly 1:1 time.
+            StretchMode::Off if transposed => (SphereAudioProcessor::StretchMode::Manual, 1.0),
+            StretchMode::Off => (SphereAudioProcessor::StretchMode::Off, 1.0),
+            StretchMode::Resample | StretchMode::Manual => (
+                SphereAudioProcessor::StretchMode::Manual,
+                self.stretch_ratio as f32,
+            ),
+            StretchMode::TempoSync => (
+                SphereAudioProcessor::StretchMode::TempoSync,
+                self.stretch_ratio as f32,
+            ),
+            StretchMode::Warp => (
+                SphereAudioProcessor::StretchMode::Warp,
+                self.stretch_ratio as f32,
+            ),
+        };
+        let preserve_pitch = preserve_pitch || (self.mode == StretchMode::Off && transposed);
         let algorithm = if mode == SphereAudioProcessor::StretchMode::Off {
             SphereAudioProcessor::StretchAlgorithm::Off
         } else if preserve_pitch {
@@ -1210,13 +1279,19 @@ impl AudioClipStretchState {
         } else {
             SphereAudioProcessor::StretchAlgorithm::RePitch
         };
-        let pitch_ratio = Self::pitch_ratio_from_semitones(self.pitch_shift_semitones) as f32;
-        let target_bpm = self.bpm_target.or(Some(project_bpm)).map(|v| v as f32);
+        // Tempo Sync follows the project tempo, always. The stored
+        // `bpm_target` used to win here, which froze a synced clip at whatever
+        // tempo it was fitted under while the Inspector claimed it followed the
+        // project.
+        let target_bpm = match self.mode {
+            StretchMode::TempoSync => Some(project_bpm as f32),
+            _ => self.bpm_target.or(Some(project_bpm)).map(|v| v as f32),
+        };
 
         SphereAudioProcessor::StretchParams {
             mode,
             algorithm,
-            time_ratio: self.stretch_ratio as f32,
+            time_ratio,
             pitch_ratio,
             source_bpm: self.bpm_source.map(|v| v as f32),
             target_bpm,
@@ -1227,6 +1302,124 @@ impl AudioClipStretchState {
                 _ => 0.75,
             },
         }
+    }
+
+    /// Whether the engine renders this clip through the pitch-preserving
+    /// processor because of its timing mode (a transposed `Off` clip is handled
+    /// separately in [`Self::to_sphere_stretch_params`]).
+    fn keeps_pitch_engine(&self) -> bool {
+        matches!(
+            self.mode,
+            StretchMode::Manual | StretchMode::TempoSync | StretchMode::Warp
+        ) && self.preserve_pitch
+            && !matches!(self.algorithm, StretchAlgorithm::ResampleOnly)
+    }
+
+    // ── Inspector intent ───────────────────────────────────────────────────
+
+    /// The timing choice this state represents. See [`StretchTiming`].
+    pub fn timing(&self) -> StretchTiming {
+        match self.mode {
+            StretchMode::Off => StretchTiming::Off,
+            StretchMode::Resample | StretchMode::Manual => StretchTiming::Speed,
+            StretchMode::TempoSync => StretchTiming::Tempo,
+            StretchMode::Warp => StretchTiming::Warp,
+        }
+    }
+
+    /// Whether pitch stays put when the speed changes. `false` is tape-style:
+    /// playing faster plays higher. An `Off` clip does not change speed, so it
+    /// trivially keeps its pitch.
+    pub fn keeps_pitch(&self) -> bool {
+        match self.mode {
+            StretchMode::Off => true,
+            _ => self.keeps_pitch_engine(),
+        }
+    }
+
+    /// Whether the transpose control applies to this clip. It does wherever
+    /// pitch is decoupled from speed; on a tape-style clip the speed *is* the
+    /// pitch.
+    pub fn transpose_available(&self) -> bool {
+        self.keeps_pitch()
+    }
+
+    /// Store `keep` as the pitch choice for the current timing.
+    fn apply_keep_pitch(&mut self, keep: bool) {
+        match self.mode {
+            StretchMode::Off => {}
+            StretchMode::Resample | StretchMode::Manual => {
+                self.mode = if keep {
+                    StretchMode::Manual
+                } else {
+                    StretchMode::Resample
+                };
+            }
+            StretchMode::TempoSync | StretchMode::Warp => {}
+        }
+        if self.mode != StretchMode::Off {
+            self.preserve_pitch = keep;
+            self.algorithm = if keep {
+                StretchAlgorithm::PhaseVocoder
+            } else {
+                StretchAlgorithm::ResampleOnly
+            };
+        }
+    }
+
+    /// Next state for a timing choice. The clip keeps sounding the same length
+    /// across the switch wherever the new timing allows it: Speed and Warp
+    /// start from the ratio the clip was actually playing at, so choosing
+    /// "Speed" on a tempo-synced clip does not make it jump.
+    pub fn with_timing(&self, timing: StretchTiming, project_bpm: f64) -> Self {
+        let mut next = self.clone();
+        if next.timing() == timing {
+            return next;
+        }
+        let keep = self.keeps_pitch();
+        let playing_ratio = self.effective_time_ratio(project_bpm);
+        match timing {
+            StretchTiming::Off => {
+                next.mode = StretchMode::Off;
+                next.algorithm = StretchAlgorithm::Auto;
+            }
+            StretchTiming::Speed => {
+                next.mode = StretchMode::Manual;
+                next.set_stretch_ratio(playing_ratio);
+                next.apply_keep_pitch(keep);
+            }
+            StretchTiming::Tempo => {
+                next.mode = StretchMode::TempoSync;
+                next.apply_keep_pitch(keep);
+            }
+            StretchTiming::Warp => {
+                next.mode = StretchMode::Warp;
+                next.set_stretch_ratio(playing_ratio);
+                next.apply_keep_pitch(keep);
+            }
+        }
+        // A transpose set on a tape clip was inert; it must not suddenly sound
+        // when the clip moves to a pitch-keeping timing.
+        if !keep && next.keeps_pitch() {
+            next.pitch_shift_semitones = 0.0;
+        }
+        next.clip_timeline_duration_beats = 0.0;
+        next.dirty = true;
+        next
+    }
+
+    /// Next state with the pitch choice changed. No-op for `Off`.
+    pub fn with_keep_pitch(&self, keep: bool) -> Self {
+        let mut next = self.clone();
+        if next.mode == StretchMode::Off || next.keeps_pitch() == keep {
+            return next;
+        }
+        next.apply_keep_pitch(keep);
+        if !keep {
+            next.pitch_shift_semitones = 0.0;
+        }
+        next.dirty = true;
+        next
     }
 
     /// Effective playback duration of the source window after stretching, in
@@ -1253,7 +1446,7 @@ impl AudioClipStretchState {
     /// `duration_beats` from it, so the picture and the model cannot disagree
     /// about how long a clip is.
     pub fn played_seconds_for_project_bpm(&self, project_bpm: f64) -> Option<f64> {
-        let rate = self.original_sample_rate.max(self.project_sample_rate);
+        let rate = self.source_sample_rate();
         if rate == 0 || self.source_len_samples() == 0 {
             return None;
         }
@@ -1397,10 +1590,7 @@ impl AudioClipStretchState {
 
     pub fn fit_to_timeline_beats(&mut self, timeline_beats: f64, project_bpm: f64) -> bool {
         let source_len = self.source_len_samples();
-        let sample_rate = self
-            .project_sample_rate
-            .max(self.original_sample_rate)
-            .max(1) as f64;
+        let sample_rate = self.source_sample_rate().max(1) as f64;
         if source_len == 0 || timeline_beats <= 0.0 || project_bpm <= 0.0 {
             return false;
         }
@@ -1435,6 +1625,106 @@ impl AudioClipStretchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decoded(frames: u64, rate: u32) -> AudioClipStretchState {
+        AudioClipStretchState {
+            original_sample_rate: rate,
+            project_sample_rate: rate,
+            original_duration_samples: frames,
+            source_start_samples: 0,
+            source_end_samples: frames,
+            ..AudioClipStretchState::default()
+        }
+    }
+
+    #[test]
+    fn tempo_sync_follows_the_project_tempo_not_the_tempo_it_was_fitted_at() {
+        let mut s = decoded(48_000, 48_000).with_timing(StretchTiming::Tempo, 120.0);
+        s.bpm_source = Some(120.0);
+        // Fitting used to store the target; it must not freeze the clip.
+        assert!(s.fit_to_project_tempo(120.0));
+        approx(s.effective_time_ratio(120.0), 1.0);
+        approx(s.effective_time_ratio(60.0), 2.0);
+        approx(s.effective_time_ratio(240.0), 0.5);
+    }
+
+    #[test]
+    fn tape_clips_never_carry_a_transpose_into_the_engine() {
+        // A transpose on a tape clip used to change the read rate but not the
+        // length, so the engine read past the trimmed window.
+        let mut s = decoded(48_000, 48_000)
+            .with_timing(StretchTiming::Speed, 120.0)
+            .with_keep_pitch(false);
+        s.pitch_shift_semitones = 12.0;
+        let params = s.to_sphere_stretch_params(120.0);
+        assert!(!params.preserve_pitch);
+        assert!((params.pitch_ratio - 1.0).abs() < 1e-6);
+        assert!(!s.transpose_available());
+    }
+
+    #[test]
+    fn an_unstretched_clip_can_be_transposed() {
+        let mut s = decoded(48_000, 48_000);
+        s.set_pitch_semi_and_cents(3.0, 0.0);
+        assert_eq!(s.timing(), StretchTiming::Off);
+        assert!(s.transpose_available());
+        let params = s.to_sphere_stretch_params(120.0);
+        assert!(params.preserve_pitch);
+        assert_eq!(
+            params.algorithm,
+            SphereAudioProcessor::StretchAlgorithm::PreservePitch
+        );
+        approx(s.effective_time_ratio(120.0), 1.0);
+        assert!(params.pitch_ratio > 1.18 && params.pitch_ratio < 1.19);
+    }
+
+    #[test]
+    fn warp_keeps_pitch_through_the_engine_params() {
+        let s = decoded(48_000, 48_000).with_timing(StretchTiming::Warp, 120.0);
+        assert!(s.keeps_pitch());
+        assert!(s.to_sphere_stretch_params(120.0).preserve_pitch);
+        let tape = s.with_keep_pitch(false);
+        assert!(!tape.to_sphere_stretch_params(120.0).preserve_pitch);
+        assert_eq!(tape.timing(), StretchTiming::Warp);
+    }
+
+    #[test]
+    fn played_length_uses_the_file_rate() {
+        // A 44.1 kHz file in a 48 kHz project is still one second long.
+        let s = AudioClipStretchState {
+            project_sample_rate: 48_000,
+            ..decoded(44_100, 44_100)
+        };
+        approx(s.played_seconds_for_project_bpm(120.0).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn switching_timing_keeps_the_playing_length() {
+        let mut s = decoded(48_000, 48_000).with_timing(StretchTiming::Tempo, 120.0);
+        s.bpm_source = Some(90.0);
+        let tempo_ratio = s.effective_time_ratio(120.0);
+        let speed = s.with_timing(StretchTiming::Speed, 120.0);
+        assert_eq!(speed.timing(), StretchTiming::Speed);
+        approx(speed.effective_time_ratio(120.0), tempo_ratio);
+        assert!(speed.keeps_pitch());
+        let off = speed.with_timing(StretchTiming::Off, 120.0);
+        approx(off.effective_time_ratio(120.0), 1.0);
+    }
+
+    #[test]
+    fn speed_pitch_choice_maps_to_the_stored_modes() {
+        let keep = decoded(48_000, 48_000).with_timing(StretchTiming::Speed, 120.0);
+        assert_eq!(keep.mode, StretchMode::Manual);
+        assert!(keep.keeps_pitch());
+        let tape = keep.with_keep_pitch(false);
+        assert_eq!(tape.mode, StretchMode::Resample);
+        assert_eq!(tape.algorithm, StretchAlgorithm::ResampleOnly);
+        assert!(!tape.keeps_pitch());
+        assert_eq!(tape.timing(), StretchTiming::Speed);
+        let back = tape.with_keep_pitch(true);
+        assert_eq!(back.mode, StretchMode::Manual);
+        assert!(back.keeps_pitch());
+    }
 
     fn approx(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-6, "expected {b}, got {a}");
@@ -1686,10 +1976,12 @@ mod tests {
         // ratio 0.5 (half length) → read source twice as fast.
         s.set_stretch_ratio(0.5);
         approx(s.resample_speed_ratio(120.0), 2.0);
-        // +12 semitones with no time stretch → read twice as fast (octave up).
+        // A tape clip's read rate is its speed and nothing else: a stored
+        // transpose must not make it read faster than its length allows (it
+        // would run past the trimmed window). Transpose needs Keep Pitch.
         s.set_stretch_ratio(1.0);
         s.pitch_shift_semitones = 12.0;
-        approx(s.resample_speed_ratio(120.0), 2.0);
+        approx(s.resample_speed_ratio(120.0), 1.0);
         // Off mode ignores the stored ratio for the time component.
         s.mode = StretchMode::Off;
         s.pitch_shift_semitones = 0.0;

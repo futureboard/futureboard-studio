@@ -1,5 +1,5 @@
 use crate::components::timeline::timeline_state::{
-    ClipDragItem, ClipEdge, ClipResizeDrag, ClipState, StretchMode, TimelineState, TimelineTool,
+    ClipDragItem, ClipEdge, ClipResizeDrag, ClipState, StretchTiming, TimelineState, TimelineTool,
 };
 use crate::components::timeline::waveform_canvas::waveform_canvas;
 use crate::theme::Colors;
@@ -393,21 +393,34 @@ struct StretchBadge {
 }
 
 fn stretch_badge(clip: &ClipState, state: &TimelineState) -> Option<StretchBadge> {
-    if clip.stretch.mode == StretchMode::Off {
-        return None;
-    }
-    let locked = clip.stretch.follows_project_tempo();
-    if let Some(source_bpm) = clip.stretch.bpm_source {
-        return Some(StretchBadge {
-            label: format!("{source_bpm:.0}->{:.0}", state.bpm),
-            locked,
+    let stretch = &clip.stretch;
+    let (semi, cents) = stretch.pitch_semi_and_cents();
+    let transpose = (stretch.transpose_available() && stretch.pitch_shift_semitones.abs() > 1.0e-4)
+        .then(|| {
+            if cents.abs() >= 0.5 {
+                format!("{:+.0}st {:+.0}c", semi, cents)
+            } else {
+                format!("{:+.0}st", semi)
+            }
         });
-    }
-    let ratio = clip.stretch.effective_time_ratio(state.bpm as f64);
-    let label = if (ratio - 1.0).abs() > 0.001 {
-        format!("x{ratio:.2}")
-    } else {
-        "Stretch".to_string()
+    let locked = stretch.follows_project_tempo();
+    let timing = match stretch.timing() {
+        StretchTiming::Off => None,
+        StretchTiming::Tempo => Some(match stretch.bpm_source {
+            Some(source_bpm) => format!("{source_bpm:.0}→{:.0}", state.bpm),
+            None => "Tempo ?".to_string(),
+        }),
+        StretchTiming::Speed => {
+            let ratio = stretch.effective_time_ratio(state.bpm as f64);
+            Some(format!("{:.0}%", ratio * 100.0))
+        }
+        StretchTiming::Warp => Some(format!("Warp {}", stretch.warp_markers.len())),
+    };
+    let label = match (timing, transpose) {
+        (None, None) => return None,
+        (Some(timing), None) => timing,
+        (None, Some(transpose)) => transpose,
+        (Some(timing), Some(transpose)) => format!("{timing} {transpose}"),
     };
     Some(StretchBadge { label, locked })
 }

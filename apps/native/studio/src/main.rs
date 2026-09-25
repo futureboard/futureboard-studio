@@ -139,6 +139,11 @@ fn main() {
         boot::log("GPUI_DISABLE_DIRECT_COMPOSITION=1 (plugin editor HWND embedding)");
     }
 
+    // The GPU chosen in Preferences → Performance. GPUI creates its D3D11 /
+    // Metal device while the platform is built below, so the choice has to be
+    // in place before `application()` — the settings model does not exist yet.
+    sphere_ui_components::startup::export_gpu_adapter_preference();
+
     boot::log("process setup done");
     boot::log(
         "Initialize Win32/GPUI platform; Windows D3D11 device creation follows synchronously",

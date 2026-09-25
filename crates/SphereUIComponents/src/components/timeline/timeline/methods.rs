@@ -2742,7 +2742,10 @@ impl Timeline {
             TimelineContextTarget::TrackLane { track_id, .. }
             | TimelineContextTarget::AudioClip { track_id, .. }
             | TimelineContextTarget::MidiClip { track_id, .. }
-            | TimelineContextTarget::TrackHeader(track_id) => track_id,
+            | TimelineContextTarget::TrackHeader(track_id) => Some(track_id),
+            // Empty space below the last track: the preset gets a new track
+            // of its own, the same as an audio file dropped there.
+            TimelineContextTarget::TimelineEmpty => None,
             _ => return false,
         };
         let Some(callback) = self.on_plugin_preset_drop.as_ref() else {

@@ -123,6 +123,63 @@ pub struct GpuProbe {
     pub has_gpu: bool,
 }
 
+/// Environment variable through which the saved GPU choice reaches the
+/// platform renderer (D3D11 adapter selection on Windows, Metal device
+/// selection on macOS). Format: `vendor=0x10de;device=0x2520;name=…`, or
+/// `high-performance` / `low-power`. A value already set in the environment
+/// wins, so the variable doubles as a manual override.
+pub const GPU_ADAPTER_ENV: &str = "FUTUREBOARD_GPU_ADAPTER";
+
+/// Hand the Preferences → Performance → GPU Device choice to the platform
+/// renderer. Must run in `main`, before `application()`: GPUI creates its
+/// D3D11/Metal device while the platform is constructed, long before the
+/// settings model exists.
+///
+/// Reads `settings.json` directly and only the one field — no defaults are
+/// written, no backup is made, nothing is created — because this runs before
+/// logging, the crash reporter and the settings model are up.
+pub fn export_gpu_adapter_preference() {
+    if std::env::var_os(GPU_ADAPTER_ENV).is_some() {
+        return;
+    }
+    let path = FutureboardPaths::resolve().settings_file;
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let Some(device) = json.pointer("/performance/gpu_device").and_then(|value| {
+        serde_json::from_value::<crate::settings::GpuDevicePreference>(value.clone()).ok()
+    }) else {
+        return;
+    };
+    if let Some(value) = gpu_adapter_env_value(&device) {
+        std::env::set_var(GPU_ADAPTER_ENV, &value);
+        crate::boot::log(&format!("GPU adapter preference {GPU_ADAPTER_ENV}={value}"));
+    }
+}
+
+/// The saved preference as the platform renderer reads it. `None` for Auto:
+/// the OS default adapter, exactly as before.
+///
+/// The saved id is wgpu's `"{backend}:{vendor:x}:{device:x}:{name}"`. The PCI
+/// vendor/device pair is what DXGI reports too, so Windows matches on it; the
+/// name is what Metal reports, and wgpu gives Metal devices a zero vendor.
+pub fn gpu_adapter_env_value(preference: &crate::settings::GpuDevicePreference) -> Option<String> {
+    let crate::settings::GpuDevicePreference::DeviceId(id) = preference else {
+        return None;
+    };
+    let mut parts = id.splitn(4, ':');
+    let _backend = parts.next()?;
+    let vendor = u32::from_str_radix(parts.next()?, 16).ok()?;
+    let device = u32::from_str_radix(parts.next()?, 16).ok()?;
+    let name = parts.next().unwrap_or("").replace(';', " ");
+    Some(format!(
+        "vendor=0x{vendor:04x};device=0x{device:04x};name={name}"
+    ))
+}
+
 /// Enumerate GPU adapters (wgpu) and record availability for the audio stack so
 /// stem extraction can automatically prefer GPU inference. Safe to call without
 /// the `gpu-renderer` feature (returns "no GPU"). Never panics — enumeration is
@@ -269,5 +326,35 @@ mod tests {
         assert_eq!(project_path_from_args(Vec::<OsString>::new()), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod gpu_adapter_env_tests {
+    use super::*;
+    use crate::settings::GpuDevicePreference;
+
+    #[test]
+    fn auto_leaves_the_os_default_alone() {
+        assert_eq!(gpu_adapter_env_value(&GpuDevicePreference::Auto), None);
+    }
+
+    #[test]
+    fn a_saved_device_becomes_vendor_device_and_name() {
+        let value = gpu_adapter_env_value(&GpuDevicePreference::DeviceId(
+            "Dx12:10de:2520:NVIDIA GeForce RTX 3060 Laptop GPU".to_string(),
+        ));
+        assert_eq!(
+            value.as_deref(),
+            Some("vendor=0x10de;device=0x2520;name=NVIDIA GeForce RTX 3060 Laptop GPU")
+        );
+    }
+
+    #[test]
+    fn a_malformed_id_is_ignored_rather_than_guessed() {
+        assert_eq!(
+            gpu_adapter_env_value(&GpuDevicePreference::DeviceId("garbage".into())),
+            None
+        );
     }
 }

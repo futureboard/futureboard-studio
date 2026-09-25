@@ -14,8 +14,9 @@ use windows::Win32::{
             D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
         },
         Dxgi::{
-            CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter,
-            IDXGIAdapter1, IDXGIFactory6,
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_DEBUG,
+            DXGI_CREATE_FACTORY_FLAGS, DXGI_GPU_PREFERENCE, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            DXGI_GPU_PREFERENCE_MINIMUM_POWER, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory6,
         },
     },
 };
@@ -136,6 +137,12 @@ fn get_adapter(
     ID3D11DeviceContext,
     D3D_FEATURE_LEVEL,
 )> {
+    if let Some(found) =
+        get_preferred_adapter(dxgi_factory, debug_layer_available, &adapter_preference())
+    {
+        return Ok(found);
+    }
+
     let mut adapter_index = 0;
     loop {
         let adapter: IDXGIAdapter1 = match unsafe { dxgi_factory.EnumAdapters(adapter_index) } {
@@ -175,6 +182,166 @@ fn get_adapter(
     Err(anyhow::anyhow!(
         "No enumerated DXGI adapter created a supported D3D11 device"
     ))
+}
+
+/// Which adapter the user asked for, from `FUTUREBOARD_GPU_ADAPTER`. The app
+/// sets it from Preferences → Performance → GPU Device before the platform is
+/// created; setting it by hand overrides the preference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AdapterPreference {
+    /// The OS default (DXGI enumeration order) — the historical behaviour.
+    Default,
+    HighPerformance,
+    LowPower,
+    /// A specific adapter, by PCI vendor/device id (name as a tiebreak).
+    Device {
+        vendor: u32,
+        device: u32,
+        name: String,
+    },
+}
+
+fn adapter_preference() -> AdapterPreference {
+    std::env::var("FUTUREBOARD_GPU_ADAPTER")
+        .map(|value| parse_adapter_preference(&value))
+        .unwrap_or(AdapterPreference::Default)
+}
+
+fn parse_adapter_preference(value: &str) -> AdapterPreference {
+    let value = value.trim();
+    match value.to_ascii_lowercase().as_str() {
+        "" | "auto" | "default" => return AdapterPreference::Default,
+        "high-performance" | "highperformance" | "high" | "discrete" | "dgpu" => {
+            return AdapterPreference::HighPerformance;
+        }
+        "low-power" | "lowpower" | "low" | "integrated" | "igpu" => {
+            return AdapterPreference::LowPower;
+        }
+        _ => {}
+    }
+    let (mut vendor, mut device, mut name) = (None, None, String::new());
+    for part in value.split(';') {
+        let Some((key, raw)) = part.split_once('=') else {
+            continue;
+        };
+        let number = || {
+            let raw = raw.trim();
+            let hex = raw.trim_start_matches("0x").trim_start_matches("0X");
+            u32::from_str_radix(hex, 16).ok()
+        };
+        match key.trim() {
+            "vendor" => vendor = number(),
+            "device" => device = number(),
+            "name" => name = raw.trim().to_string(),
+            _ => {}
+        }
+    }
+    match (vendor, device) {
+        (Some(vendor), Some(device)) => AdapterPreference::Device {
+            vendor,
+            device,
+            name,
+        },
+        _ => AdapterPreference::Default,
+    }
+}
+
+/// The adapter the preference names, if it exists and creates a usable
+/// device. `None` falls back to the default enumeration, so a stale choice
+/// (GPU removed, driver broken) never stops the app from starting.
+///
+/// Enumerates by GPU preference rather than plain `EnumAdapters`: on a hybrid
+/// laptop index 0 is the integrated GPU the display is wired to, which is why
+/// "use the discrete GPU" used to be impossible to get.
+fn get_preferred_adapter(
+    dxgi_factory: &IDXGIFactory6,
+    debug_layer_available: bool,
+    preference: &AdapterPreference,
+) -> Option<(
+    IDXGIAdapter1,
+    ID3D11Device,
+    ID3D11DeviceContext,
+    D3D_FEATURE_LEVEL,
+)> {
+    let order: DXGI_GPU_PREFERENCE = match preference {
+        AdapterPreference::Default => return None,
+        AdapterPreference::LowPower => DXGI_GPU_PREFERENCE_MINIMUM_POWER,
+        AdapterPreference::HighPerformance | AdapterPreference::Device { .. } => {
+            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE
+        }
+    };
+    log::info!("DXGI adapter preference {preference:?}");
+    let mut index = 0;
+    loop {
+        let adapter: IDXGIAdapter1 =
+            match unsafe { dxgi_factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(index, order) }
+            {
+                Ok(adapter) => adapter,
+                Err(_) => break,
+            };
+        index += 1;
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        // WARP is never what "this GPU" means.
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+            continue;
+        }
+        if let AdapterPreference::Device { vendor, device, .. } = preference {
+            if desc.VendorId != *vendor || desc.DeviceId != *device {
+                continue;
+            }
+        }
+        log_adapter(format!("preferred#{}", index - 1), &adapter);
+        let mut context: Option<ID3D11DeviceContext> = None;
+        let mut feature_level = D3D_FEATURE_LEVEL::default();
+        match get_device(
+            &adapter,
+            Some(&mut context),
+            Some(&mut feature_level),
+            debug_layer_available,
+        ) {
+            Ok(device) => {
+                log::info!(
+                    "DXGI preferred adapter selected adapter={}",
+                    adapter_identity(&adapter)
+                );
+                return Some((adapter, device, context?, feature_level));
+            }
+            Err(error) => log::warn!(
+                "DXGI preferred adapter rejected adapter={} error={error:#}",
+                adapter_identity(&adapter)
+            ),
+        }
+    }
+    log::warn!("DXGI adapter preference {preference:?} not satisfied; using the default adapter");
+    None
+}
+
+#[cfg(test)]
+mod adapter_preference_tests {
+    use super::*;
+
+    #[test]
+    fn parses_what_the_app_writes() {
+        assert_eq!(
+            parse_adapter_preference("vendor=0x10de;device=0x2520;name=NVIDIA GeForce RTX 3060"),
+            AdapterPreference::Device {
+                vendor: 0x10de,
+                device: 0x2520,
+                name: "NVIDIA GeForce RTX 3060".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_adapter_preference("discrete"),
+            AdapterPreference::HighPerformance
+        );
+        assert_eq!(parse_adapter_preference(""), AdapterPreference::Default);
+        assert_eq!(
+            parse_adapter_preference("vendor=zz"),
+            AdapterPreference::Default
+        );
+    }
 }
 
 fn get_warp_adapter(

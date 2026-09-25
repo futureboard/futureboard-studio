@@ -2744,6 +2744,9 @@ impl PianoRoll {
     // ── Mutations through the timeline ────────────────────────────────────
     /// Full snapshots of the given note ids in a clip (undo prev/next state).
     fn snapshot_notes(&self, cx: &Context<Self>, clip_id: &str, ids: &[u64]) -> Vec<MidiNoteState> {
+        // A set, not `ids.contains`: select-all on a dense clip made this
+        // notes × selection on every commit.
+        let ids: std::collections::HashSet<u64> = ids.iter().copied().collect();
         self.timeline
             .read(cx)
             .state
@@ -4472,11 +4475,12 @@ impl PianoRoll {
                 // undoable edit covering every affected note.
                 let ids: Vec<u64> = orig.iter().map(|(id, _)| *id).collect();
                 let next = self.snapshot_notes(cx, &velocity_clip_id, &ids);
+                let original: std::collections::HashMap<u64, _> = orig.iter().copied().collect();
                 let prev: Vec<MidiNoteState> = next
                     .iter()
                     .map(|n| {
                         let mut p = n.clone();
-                        if let Some((_, v)) = orig.iter().find(|(id, _)| *id == n.id) {
+                        if let Some(v) = original.get(&n.id) {
                             p.velocity = *v;
                         }
                         p
@@ -4491,9 +4495,10 @@ impl PianoRoll {
                 ..
             } => {
                 let ids: Vec<u64> = touched.into_iter().collect();
+                let id_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
                 let prev: Vec<MidiNoteState> = original_notes
                     .into_iter()
-                    .filter(|note| ids.contains(&note.id))
+                    .filter(|note| id_set.contains(&note.id))
                     .collect();
                 let next = self.snapshot_notes(cx, &velocity_clip_id, &ids);
                 self.push_note_edit(cx, velocity_clip_id, prev, next);
@@ -4505,9 +4510,10 @@ impl PianoRoll {
                 ..
             } => {
                 let ids: Vec<u64> = affected.into_iter().collect();
+                let id_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
                 let prev: Vec<MidiNoteState> = original_notes
                     .into_iter()
-                    .filter(|note| ids.contains(&note.id))
+                    .filter(|note| id_set.contains(&note.id))
                     .collect();
                 let next = self.snapshot_notes(cx, &velocity_clip_id, &ids);
                 self.push_note_edit(cx, velocity_clip_id, prev, next);

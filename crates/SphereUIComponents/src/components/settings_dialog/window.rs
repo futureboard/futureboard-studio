@@ -75,7 +75,25 @@ impl SettingsWindow {
         };
         // Keep Driver Status live without per-frame polling.
         this.schedule_latency_poll(cx);
+        this.warm_gpu_device_list(cx);
         this
+    }
+
+    /// Make sure the GPU adapter list exists before the Performance page wants
+    /// it. Enumeration can take seconds, so it runs on a background thread and
+    /// the page shows "Detecting…" until this one notify lands. A no-op wait
+    /// when startup already enumerated.
+    fn warm_gpu_device_list(&mut self, cx: &mut Context<Self>) {
+        if crate::components::timeline::render::cached_gpu_devices().is_some() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .spawn(async { crate::components::timeline::render::gpu_devices() })
+                .await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
     }
 
     pub fn set_active_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {

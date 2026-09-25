@@ -1071,7 +1071,11 @@ impl StudioLayout {
                             // `mark_dirty` keeps the graph dirty, so the engine
                             // poll publishes the last state of the burst.
                             this.mark_dirty();
-                            this.schedule_audio_project_sync(cx, false, "midi_edit");
+                            this.schedule_audio_project_sync(
+                                cx,
+                                false,
+                                audio_transport::MIDI_EDIT_SYNC_REASON,
+                            );
                         });
                     });
                 })));
@@ -1148,7 +1152,11 @@ impl StudioLayout {
                             window,
                             cx,
                             move |this, _window, cx| {
-                                this.apply_dropped_plugin_preset(&track_id, &preset_path, cx);
+                                this.apply_dropped_plugin_preset(
+                                    track_id.as_deref(),
+                                    &preset_path,
+                                    cx,
+                                );
                             },
                         );
                     },

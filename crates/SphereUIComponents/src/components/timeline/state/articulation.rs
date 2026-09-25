@@ -377,7 +377,7 @@ impl TimelineState {
         &mut self,
         clip_id: &str,
     ) -> Option<&mut Vec<MidiArticulationEvent>> {
-        bump_midi_edit_revision();
+        bump_midi_clip_revision(clip_id);
         for track in &mut self.tracks {
             for clip in &mut track.clips {
                 if clip.id == clip_id {

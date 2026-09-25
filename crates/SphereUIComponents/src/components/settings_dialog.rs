@@ -39,7 +39,7 @@ use crate::components::slider::slider;
 use crate::components::text_input::{
     text_field_with_callbacks, TextInputAction, TextInputCallbacks, TextInputState,
 };
-use crate::components::timeline::render::list_available_gpu_devices;
+use crate::components::timeline::render::cached_gpu_devices;
 use crate::components::title_bar::external_window_titlebar;
 use crate::device_registry::cached_midi_devices;
 use crate::i18n::{I18n, Locale};

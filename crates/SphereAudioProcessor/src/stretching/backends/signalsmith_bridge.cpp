@@ -106,6 +106,31 @@ void fb_signalsmith_reset(void *handle) {
     state->stretch.reset();
 }
 
+int fb_signalsmith_configure(void *handle, float pitch_ratio, float quality) {
+    if (handle == nullptr) {
+        return kErrorNull;
+    }
+    auto *state = static_cast<FbSignalsmithHandle *>(handle);
+    if (!valid_ratio(pitch_ratio)) {
+        pitch_ratio = 1.0f;
+    }
+    if (!std::isfinite(quality)) {
+        quality = 0.75f;
+    }
+    try {
+        const bool reconfigure = !state->configured || state->quality != quality;
+        state->pitch_ratio = pitch_ratio;
+        state->quality = quality;
+        if (reconfigure) {
+            state->apply_preset();
+        }
+        state->apply_ratios();
+        return 0;
+    } catch (...) {
+        return kErrorProcess;
+    }
+}
+
 int fb_signalsmith_process_stereo(
     void *handle,
     const float *input_l,

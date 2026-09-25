@@ -8,6 +8,13 @@ void *fb_signalsmith_create(float sample_rate, int channels);
 void fb_signalsmith_destroy(void *handle);
 void fb_signalsmith_reset(void *handle);
 
+// Apply the quality preset (and transpose) now. Call from a non-realtime
+// thread whenever the parameters change: `process`/`output_seek` only
+// reconfigure lazily when the quality differs from what is configured, and a
+// preset change allocates, so doing it here keeps the audio callback free of
+// that work.
+int fb_signalsmith_configure(void *handle, float pitch_ratio, float quality);
+
 // Time-stretch is expressed by the input/output sample-count ratio
 // (`output_frames / input_frames`); the caller supplies exactly `input_frames`
 // source samples and requests `output_frames` output samples. This keeps the

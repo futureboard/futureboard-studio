@@ -13,7 +13,6 @@ use std::os::raw::{c_char, c_int, c_ulong};
 use std::ptr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
-use std::sync::mpsc::Sender;
 
 type OSStatus = c_int;
 type MIDIObjectRef = u32;
@@ -613,7 +612,7 @@ pub fn scan_ports() -> Vec<DetectedMidiDevice> {
 }
 
 struct InputCallbackState {
-    tx: Sender<HardwareMidiInputMessage>,
+    tx: crate::MidiInputSender,
     device_id: String,
     device_name: String,
     /// Running status carried across packets (0 = none). Atomic because the box
@@ -802,7 +801,7 @@ fn find_destination_by_name_or_id(device_id_or_name: &str) -> Option<(MIDIEndpoi
 
 pub fn open_inputs(
     enabled: Vec<(String, String)>,
-    tx: Sender<HardwareMidiInputMessage>,
+    tx: crate::MidiInputSender,
 ) -> Vec<(String, MacMidiInputConnection)> {
     let mut connections = Vec::new();
     let client = shared_client();
