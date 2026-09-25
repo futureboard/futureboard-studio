@@ -5,10 +5,34 @@ use crate::components::timeline::midi_clip::midi_clip;
 use crate::components::timeline::timeline_state::{
     ClipState, ClipType, TimelineGestureContext, TimelineState, TimelineTool, TrackState, TrackType,
 };
+use crate::components::edit::{lane_press_intent, LanePressIntent};
 use crate::components::timeline::video_clip::video_clip;
 use crate::theme::Colors;
 use gpui::prelude::FluentBuilder;
 use gpui::{div, px, InteractiveElement, IntoElement, ParentElement, Styled};
+
+/// A left press on arrangement lane space that no clip owns, which starts a
+/// marquee. Positions are raw window pixels: the timeline anchors the
+/// rectangle itself, unsnapped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarqueePress {
+    /// The track pressed — or, below the last track, the last one drawn. The
+    /// marquee's anchor track.
+    pub track_id: String,
+    pub window_x: f32,
+    pub window_y: f32,
+    pub additive: bool,
+    /// The press landed on `track_id`'s own lane, so a click without a drag
+    /// chooses that track the way a lane click always has. `false` below the
+    /// last track, where a click does nothing.
+    pub on_lane: bool,
+    /// A double-click on an empty MIDI / Instrument lane: create a
+    /// default-length clip if it is released without becoming a drag.
+    pub create_clip_on_click: bool,
+}
+
+pub type MarqueePressCb =
+    std::sync::Arc<dyn Fn(&MarqueePress, &mut gpui::Window, &mut gpui::App) + 'static>;
 
 pub fn track_lane(
     track: &TrackState,
@@ -30,9 +54,7 @@ pub fn track_lane(
         std::sync::Arc<dyn Fn(&(String, f32, f32), &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
     on_open_editor: Option<std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>>,
-    on_range_start: Option<
-        std::sync::Arc<dyn Fn(&(String, f32, bool), &mut gpui::Window, &mut gpui::App) + 'static>,
-    >,
+    on_range_start: Option<MarqueePressCb>,
     _on_erase_start: Option<
         std::sync::Arc<dyn Fn(&f32, &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
@@ -63,15 +85,16 @@ pub fn track_lane(
     let on_add = on_add_clip.clone();
     let track_id_add = track_id.clone();
 
-    // Where this track's clips are, for the empty-lane test in the press
-    // handler. Captured here because the handler cannot borrow the track.
+    // Where this track's clips are drawn (lane x, this frame's scroll), for the
+    // create gestures' empty-lane test in the press handler. Captured here
+    // because the handler cannot borrow the track.
     let clips_ref: std::rc::Rc<Vec<(f32, f32)>> = std::rc::Rc::new(
         track
             .clips
             .iter()
             .map(|clip| {
-                let start = clip.start_beat;
-                (start, start + clip.duration_beats.max(0.0))
+                let (left, width) = state.clip_lane_x_span(clip);
+                (left, left + width)
             })
             .collect(),
     );
@@ -167,7 +190,8 @@ pub fn track_lane(
     let active_tool = state.active_tool;
     let track_type = track.track_type;
     let midi_lane = matches!(track_type, TrackType::Midi | TrackType::Instrument);
-    let lane_cursor = if active_tool == TimelineTool::Pen {
+    // Pen and Cut change what a press does, so they say so.
+    let lane_cursor = if matches!(active_tool, TimelineTool::Pen | TimelineTool::Cut) {
         gpui::CursorStyle::Crosshair
     } else {
         gpui::CursorStyle::Arrow
@@ -198,71 +222,66 @@ pub fn track_lane(
             gpui::MouseButton::Left,
             move |event: &gpui::MouseDownEvent, window, cx| {
                 let x: f32 = event.position.x.into();
-                let click_x = state_ref.lane_x_from_window_x(x);
-                let click_beat = state_ref.x_to_beats(click_x);
-                let bypass_snap = event.modifiers.shift;
-                let snapped_beat = state_ref.snap_beats_with_bypass(click_beat, bypass_snap);
+                let lane_x = state_ref.lane_x_from_window_x(x);
                 let click_count = event.click_count as u32;
 
-                // Both branches below create a clip, and both describe
-                // themselves as empty-lane gestures. Neither checked. They
-                // relied on the clip element above stopping the press from
-                // reaching here, which is a contract held by another file and
-                // one that evidently does not always hold — pressing a clip
-                // that was already selected created a new clip beside it.
-                //
-                // The lane decides for itself now. An invariant this cheap to
-                // test should not be an assumption about somebody else's event
-                // handling.
+                // The create gestures describe themselves as empty-lane
+                // gestures, so the lane checks for itself rather than relying
+                // on a clip element above it stopping the press — pressing a
+                // clip that was already selected once created a new clip beside
+                // it. Tested against where the clips are drawn, so the minimum
+                // drawn width counts and the pad bands above and below a clip
+                // do not make a clip there.
                 let over_existing_clip = clips_ref
                     .iter()
-                    .any(|(start, end)| click_beat >= *start && click_beat <= *end);
-                if over_existing_clip {
-                    // Still select the track: pressing a lane is how a track is
-                    // chosen, and a press that lands on a clip is still a press
-                    // on that track.
-                    on_select(&track_id_select, window, cx);
-                    return;
-                }
+                    .any(|(left, right)| lane_x >= *left && lane_x <= *right);
 
-                if active_tool == TimelineTool::Pen {
-                    on_add(
-                        &(track_id_add.clone(), snapped_beat, click_count, bypass_snap),
-                        window,
-                        cx,
-                    );
-                } else if active_tool == TimelineTool::Pointer {
-                    // Ctrl/Cmd is the marquee modifier, and it has to be read
-                    // before the MIDI lane's instant-create gesture. Testing
-                    // `midi_lane` first meant an instrument or MIDI track could
-                    // never rubber-band at all: every Pointer press on its empty
-                    // lane — modifier or not — took the create path, so the drag
-                    // poked a new clip into existence instead of selecting.
-                    let additive = event.modifiers.control || event.modifiers.platform;
-                    if midi_lane && !additive {
-                        // Instant MIDI clip creation without switching tools:
-                        // empty-lane drag / double-click creates a clip; plain
-                        // single-click stays a no-op (see ClipDrawPreview::commit_on_click).
-                        on_select(&track_id_select, window, cx);
+                match lane_press_intent(
+                    active_tool,
+                    Some(track_type),
+                    event.click_count,
+                    &event.modifiers,
+                ) {
+                    LanePressIntent::Marquee {
+                        additive,
+                        create_clip_on_click,
+                    } => match on_range_start.as_ref() {
+                        Some(start_marquee) => start_marquee(
+                            &MarqueePress {
+                                track_id: track_id_select.clone(),
+                                window_x: x,
+                                window_y: event.position.y.into(),
+                                additive,
+                                on_lane: true,
+                                create_clip_on_click: create_clip_on_click
+                                    && midi_lane
+                                    && !over_existing_clip,
+                            },
+                            window,
+                            cx,
+                        ),
+                        None if !additive => on_select(&track_id_select, window, cx),
+                        None => {}
+                    },
+                    LanePressIntent::Pen => {
+                        if over_existing_clip {
+                            // Still a press on this track: pressing a lane is
+                            // how a track is chosen.
+                            on_select(&track_id_select, window, cx);
+                            return;
+                        }
+                        let bypass_snap = event.modifiers.shift;
+                        let snapped_beat = state_ref
+                            .snap_beats_with_bypass(state_ref.x_to_beats(lane_x), bypass_snap);
                         on_add(
                             &(track_id_add.clone(), snapped_beat, click_count, bypass_snap),
                             window,
                             cx,
                         );
-                    } else {
-                        if !additive {
-                            on_select(&track_id_select, window, cx);
-                        }
-                        if let Some(start_range) = on_range_start.as_ref() {
-                            start_range(
-                                &(track_id_select.clone(), snapped_beat, additive),
-                                window,
-                                cx,
-                            );
-                        }
                     }
-                } else {
-                    on_select(&track_id_select, window, cx);
+                    LanePressIntent::SelectTrack | LanePressIntent::Ignore => {
+                        on_select(&track_id_select, window, cx);
+                    }
                 }
             },
         )

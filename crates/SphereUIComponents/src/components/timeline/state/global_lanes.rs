@@ -179,7 +179,7 @@ impl TimelineState {
     /// `APP_CHROME_HEIGHT + RULER_HEIGHT` inline in two files, which silently
     /// became wrong the moment another conductor lane was allowed above it.
     pub fn tempo_lane_origin_y(&self) -> f32 {
-        crate::shell_metrics::APP_CHROME_HEIGHT
+        self.timeline_origin_y()
             + RULER_HEIGHT
             + self.global_lane_top(GlobalLaneKind::Tempo)
     }

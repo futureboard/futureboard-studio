@@ -49,8 +49,7 @@ pub struct LaneFrameContext {
     pub on_clip_context_menu:
         Option<Arc<dyn Fn(&(String, f32, f32), &mut gpui::Window, &mut gpui::App) + 'static>>,
     pub on_open_editor: Option<Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>>,
-    pub on_range_start:
-        Option<Arc<dyn Fn(&(String, f32, bool), &mut gpui::Window, &mut gpui::App) + 'static>>,
+    pub on_range_start: Option<crate::components::timeline::track_lane::MarqueePressCb>,
     pub on_erase_start: Option<Arc<dyn Fn(&f32, &mut gpui::Window, &mut gpui::App) + 'static>>,
     pub on_erase_clip: Option<Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>>,
     pub on_cut_clip: Option<AudioClipCutCb>,

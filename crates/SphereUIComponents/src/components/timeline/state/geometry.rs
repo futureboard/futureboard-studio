@@ -38,6 +38,47 @@ pub fn lane_origin_x(viewport: &TimelineViewport) -> f32 {
         .unwrap_or(viewport.panel_origin_x + HEADER_WIDTH)
 }
 
+/// Window-space y of the timeline's top edge: the ruler's top, which every
+/// arrangement y (conductor lanes, track rows, automation) is measured from.
+///
+/// Prefers the value measured from the rendered timeline root. The fallback,
+/// [`crate::shell_metrics::APP_CHROME_HEIGHT`], is a hand-tuned constant a few
+/// pixels taller than the chrome actually drawn above the timeline; it only
+/// stands in until the first frame has been measured.
+pub fn timeline_origin_y(viewport: &TimelineViewport) -> f32 {
+    viewport
+        .timeline_origin_y_measured
+        .unwrap_or(crate::shell_metrics::APP_CHROME_HEIGHT)
+}
+
+/// Vertical inset of a clip inside its track row, above and below.
+pub const CLIP_LANE_PAD: f32 = 7.0;
+
+/// Narrowest a clip is ever drawn, however short it is, so it stays visible
+/// and grabbable when zoomed out.
+pub const CLIP_MIN_DRAWN_WIDTH: f32 = 10.0;
+
+/// Where a clip is drawn inside its lane row. `left` is lane x (the
+/// arrangement's beat transform, horizontal scroll included); `top` is
+/// row-local.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClipLaneRect {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl ClipLaneRect {
+    pub fn right(&self) -> f32 {
+        self.left + self.width
+    }
+
+    pub fn bottom(&self) -> f32 {
+        self.top + self.height
+    }
+}
+
 pub fn snap_beat(beat: f64, snap: SnapSettings) -> f64 {
     // Arrangement clips historically clamp to ≥ 0; pre-roll-capable callers
     // should use [`super::musical_snap::snap_beat`] directly.
@@ -157,6 +198,16 @@ impl TimelineGestureContext {
     pub fn arrangement_content_top(&self) -> f32 {
         self.content_top
     }
+
+    pub fn timeline_origin_y(&self) -> f32 {
+        timeline_origin_y(&self.viewport)
+    }
+
+    /// Window y -> arrangement content y: 0 at the top of the first track row,
+    /// vertical scroll included. The space track rows are laid out in.
+    pub fn content_y_from_window_y(&self, window_y: f32) -> f32 {
+        window_y - self.timeline_origin_y() - self.content_top + self.viewport.scroll_y
+    }
 }
 
 pub fn track_at_y(y: f32, layout: &TrackLayout) -> Option<TrackId> {
@@ -235,6 +286,61 @@ impl TimelineState {
     /// Convert a window-space x straight to timeline beats.
     pub fn beats_from_window_x(&self, window_x: f32) -> f32 {
         self.x_to_beats(self.lane_x_from_window_x(window_x))
+    }
+
+    /// Window-space y of the timeline's top edge; see [`timeline_origin_y`].
+    /// Every gesture that resolves a window-space pointer y into the
+    /// arrangement goes through this, the vertical twin of
+    /// [`Self::lane_origin_x`].
+    pub fn timeline_origin_y(&self) -> f32 {
+        timeline_origin_y(&self.viewport)
+    }
+
+    /// Window y -> y inside the track area's viewport (0 at the top of the
+    /// visible track area, no scroll). Unclamped.
+    pub fn track_viewport_y_from_window_y(&self, window_y: f32) -> f32 {
+        window_y - self.timeline_origin_y() - self.arrangement_content_top()
+    }
+
+    /// Window y -> arrangement content y: 0 at the top of the first track row,
+    /// vertical scroll included. The space track rows are laid out in.
+    pub fn content_y_from_window_y(&self, window_y: f32) -> f32 {
+        self.track_viewport_y_from_window_y(window_y) + self.viewport.scroll_y
+    }
+
+    /// Horizontal extent a clip is drawn at: `(left, width)` in lane x.
+    ///
+    /// An audio clip's end comes from [`Self::audio_clip_end_beat`], the same
+    /// derivation `reconcile_audio_clip_lengths` writes into the model, so a
+    /// tempo ramp bends the drawn clip exactly as much as the grid under it.
+    pub fn clip_lane_x_span(&self, clip: &ClipState) -> (f32, f32) {
+        let left = self.beats_to_x(clip.start_beat);
+        let width = if matches!(clip.clip_type, ClipType::Audio { .. }) {
+            let end_beat = self
+                .audio_clip_end_beat(clip)
+                // Pending and legacy clips may not have decoded source bounds yet.
+                .unwrap_or_else(|| (clip.start_beat + clip.duration_beats.max(0.0)) as f64);
+            self.beats_to_x(end_beat as f32) - left
+        } else {
+            self.beat_span_px(clip.start_beat, clip.duration_beats)
+        };
+        (left, width.max(CLIP_MIN_DRAWN_WIDTH))
+    }
+
+    /// The rectangle a clip is drawn at inside a lane row `row_height` tall.
+    ///
+    /// The one clip geometry: the audio, MIDI and video clip renderers draw
+    /// through it and the arrangement marquee hit-tests through it, so a clip
+    /// is selected exactly where it is painted — its minimum drawn width
+    /// included, and the pad bands above and below it excluded.
+    pub fn clip_lane_rect(&self, clip: &ClipState, row_height: f32) -> ClipLaneRect {
+        let (left, width) = self.clip_lane_x_span(clip);
+        ClipLaneRect {
+            left,
+            top: CLIP_LANE_PAD,
+            width,
+            height: row_height - CLIP_LANE_PAD * 2.0,
+        }
     }
 
     pub fn arrangement_track_layout(&self) -> TrackLayout {

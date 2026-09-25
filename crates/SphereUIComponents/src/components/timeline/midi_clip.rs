@@ -49,10 +49,10 @@ pub fn midi_clip(
     let drag_name = clip.name.clone();
     let drag_start_beat = clip.start_beat;
     let selected = state.selection.selected_clip_ids.contains(&clip.id);
-    let left = state.beats_to_x(clip.start_beat);
-    let width = state
-        .beat_span_px(clip.start_beat, clip.duration_beats)
-        .max(10.0);
+    // The shared clip rectangle, the one the marquee hit-tests against.
+    let lane_rect = state.clip_lane_rect(clip, row_height);
+    let left = lane_rect.left;
+    let width = lane_rect.width;
 
     // Detail by width, for the same reason as an audio clip: the label bar is a
     // measured text node per clip, and a zoomed-out arrangement has the most
@@ -61,8 +61,8 @@ pub fn midi_clip(
     let show_resize_handles = width >= MIDI_RESIZE_HANDLE_MIN_W;
     let label_h = if show_label { LABEL_H } else { 0.0 };
 
-    let pad = 7.0;
-    let clip_h = row_height - pad * 2.0;
+    let pad = lane_rect.top;
+    let clip_h = lane_rect.height;
     let note_h = clip_h - label_h; // height for notes preview
 
     // Draw notes and controller previews with canvases instead of one GPUI element
@@ -176,7 +176,7 @@ pub fn midi_clip(
         start_beat: clip.start_beat,
         duration_beats: clip.duration_beats,
     };
-    const RESIZE_HANDLE_W: f32 = 6.0;
+    let resize_handle_w = crate::components::timeline::audio_clip::clip_resize_handle_w(width);
 
     div()
         .absolute()
@@ -294,7 +294,7 @@ pub fn midi_clip(
                 .top_0()
                 .left_0()
                 .h_full()
-                .w(px(RESIZE_HANDLE_W))
+                .w(px(resize_handle_w))
                 .cursor(gpui::CursorStyle::ResizeLeft)
                 .id(("midi-clip-resize-l", id_num))
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -308,7 +308,7 @@ pub fn midi_clip(
                 .top_0()
                 .right_0()
                 .h_full()
-                .w(px(RESIZE_HANDLE_W))
+                .w(px(resize_handle_w))
                 .cursor(gpui::CursorStyle::ResizeRight)
                 .id(("midi-clip-resize-r", id_num))
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())

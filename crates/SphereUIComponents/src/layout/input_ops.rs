@@ -1890,6 +1890,38 @@ impl StudioLayout {
                 }
                 entries
             }
+            ContextTarget::SnapGrid => {
+                use crate::components::timeline::timeline_state::{SnapDivision, SnapShape};
+                let (snap_on, division, shape) = {
+                    let state = &self.timeline.read(cx).state;
+                    (state.snap_to_grid, state.grid_division, state.snap_shape)
+                };
+                let mut entries = vec![ContextMenuEntry::Header("Grid".to_string())];
+                for option in SnapDivision::MENU {
+                    entries.push(ContextMenuEntry::checked_item(
+                        option.label(),
+                        format!("timeline:set-grid:{}", option.command_id()),
+                        division == option,
+                    ));
+                }
+                entries.push(ContextMenuEntry::Separator);
+                for option in SnapShape::ALL {
+                    entries.push(ContextMenuEntry::checked_item(
+                        option.label(),
+                        format!("timeline:set-grid-shape:{}", option.command_id()),
+                        shape == option,
+                    ));
+                }
+                entries.push(ContextMenuEntry::Separator);
+                let mut snap =
+                    ContextMenuEntry::checked_item("Snap to Grid", "timeline:toggle-snap", snap_on);
+                if let Some(shortcut) = crate::keymap::shortcut_for_command("timeline:toggle-snap")
+                {
+                    snap = snap.with_shortcut(shortcut);
+                }
+                entries.push(snap);
+                entries
+            }
             ContextTarget::Metronome => {
                 let volume = self.settings.read(cx).current.recording.metronome.volume;
                 let mut entries = vec![ContextMenuEntry::Header("Click Volume".to_string())];

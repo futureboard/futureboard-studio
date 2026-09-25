@@ -102,6 +102,12 @@ impl Render for Timeline {
                 )
             }));
         }
+        if self.cut_guide_overlay.is_none() {
+            let frame = self.cut_guide.clone();
+            self.cut_guide_overlay = Some(
+                cx.new(|_| crate::components::timeline::cut_guide::CutGuideOverlay::new(frame)),
+            );
+        }
         if self.arrangement_surface.is_none() {
             let timeline = cx.entity();
             self.arrangement_surface = Some(cx.new(|cx| {
@@ -147,6 +153,7 @@ impl Render for Timeline {
             );
         }
         let playhead_overlay = self.playhead_overlay.clone();
+        let cut_guide_overlay = self.cut_guide_overlay.clone();
 
         // Diagnostic only, and it walks every track: skip the sum entirely when
         // the perf collector is off.
@@ -544,6 +551,16 @@ impl Render for Timeline {
              _window,
              cx| {
                 use crate::components::timeline::audio_clip::AudioClipProcessUpdate;
+                // First preview of a gesture: remember the clip as it was, for
+                // the one undo entry the release records.
+                if this
+                    .clip_process_origin
+                    .as_ref()
+                    .is_none_or(|origin| origin.id != *clip_id)
+                {
+                    this.clip_process_origin =
+                        this.state.find_clip(clip_id).map(|(_, clip)| clip.clone());
+                }
                 let changed = match *update {
                     AudioClipProcessUpdate::Gain(gain) => this.state.set_clip_gain(clip_id, gain),
                     AudioClipProcessUpdate::FadeInMs(ms) => {
@@ -569,11 +586,21 @@ impl Render for Timeline {
             },
         );
         let on_audio_clip_process_commit = cx.listener(
-            |this, (clip_id, original): &(String, ClipState), _window, cx| {
+            |this, (clip_id, _render_time_clip): &(String, ClipState), _window, cx| {
+                // Every change goes through a preview, and the first preview
+                // captured the "before". No origin means this release changed
+                // nothing — which is also what every *other* selected clip's
+                // handles report, since `on_mouse_up_out` fires for them all.
+                let Some(original) = this
+                    .clip_process_origin
+                    .take_if(|origin| origin.id == *clip_id)
+                else {
+                    return;
+                };
                 if let Some(next) = ClipSnapshot::capture(&this.state, clip_id) {
                     let previous = ClipSnapshot {
                         track_id: next.track_id.clone(),
-                        clip: original.clone(),
+                        clip: original,
                     };
                     if previous.clip != next.clip {
                         this.record_executed_command(
@@ -631,11 +658,49 @@ impl Render for Timeline {
         // never sees the click); resolve + snap it here where the timeline
         // geometry lives, then re-sync media so the split is audible.
         let on_cut_clip = cx.listener(
-            |this, (clip_id, window_x, bypass): &(String, f32, bool), _window, cx| {
-                let beat = this.beat_from_window_x(*window_x);
-                let snapped = this.snap_beat_with_bypass(beat, *bypass);
-                if this.split_audio_clip_at_beat(clip_id, snapped, cx) {
-                    this.mark_media_changed(cx);
+            |this,
+             gesture: &crate::components::timeline::audio_clip::ClipCutGesture,
+             _window,
+             cx| {
+                use crate::components::timeline::audio_clip::ClipCutGesture;
+                match gesture {
+                    ClipCutGesture::Cut {
+                        clip_id,
+                        window_x,
+                        bypass_snap,
+                    } => {
+                        this.hide_cut_guide(cx);
+                        let beat = this.beat_from_window_x(*window_x);
+                        let snapped = this.snap_beat_with_bypass(beat, *bypass_snap);
+                        if this.split_audio_clip_at_beat(clip_id, snapped, cx) {
+                            this.mark_media_changed(cx);
+                        }
+                    }
+                    ClipCutGesture::Hover {
+                        window_x,
+                        bypass_snap,
+                        left,
+                        right,
+                        top,
+                        height,
+                    } => {
+                        // Same transform and snap as the Cut above, so the line
+                        // is where the click will split.
+                        let beat = this.beat_from_window_x(*window_x);
+                        let snapped = this.snap_beat_with_bypass(beat, *bypass_snap);
+                        let x = (*window_x + this.state.beats_to_x(snapped)
+                            - this.state.beats_to_x(beat))
+                        .clamp(*left, (*right).max(*left));
+                        this.show_cut_guide(
+                            crate::components::timeline::cut_guide::CutGuideFrame {
+                                x,
+                                top: *top,
+                                height: *height,
+                            },
+                            cx,
+                        );
+                    }
+                    ClipCutGesture::Leave => this.hide_cut_guide(cx),
                 }
             },
         );
@@ -869,36 +934,12 @@ impl Render for Timeline {
             cx.notify();
         });
 
-        let on_cycle_grid = cx.listener(|this, _: &(), _window, cx| {
-            // Cycle shape (Straight → Dotted → Triplet) before advancing the
-            // base division so arrangement shares the same snap surface as the
-            // piano roll without a separate control.
-            use crate::components::timeline::timeline_state::SnapShape;
-            match this.state.snap_shape {
-                SnapShape::Straight => {
-                    this.state.snap_shape = SnapShape::Dotted;
+        let on_grid_menu =
+            cx.listener(|this, (x, y): &(f32, f32), window: &mut gpui::Window, cx| {
+                if let Some(cb) = this.on_context_menu.clone() {
+                    cb(&(TimelineContextTarget::SnapGrid, *x, *y), window, cx);
                 }
-                SnapShape::Dotted => {
-                    this.state.snap_shape = SnapShape::Triplet;
-                }
-                SnapShape::Triplet => {
-                    this.state.snap_shape = SnapShape::Straight;
-                    this.state.grid_division = match this.state.grid_division {
-                        SnapDivision::Auto => SnapDivision::Off,
-                        SnapDivision::Off => SnapDivision::Bar1,
-                        SnapDivision::Bar1 => SnapDivision::Div1_1,
-                        SnapDivision::Div1_1 => SnapDivision::Div1_2,
-                        SnapDivision::Div1_2 => SnapDivision::Div1_4,
-                        SnapDivision::Div1_4 => SnapDivision::Div1_8,
-                        SnapDivision::Div1_8 => SnapDivision::Div1_16,
-                        SnapDivision::Div1_16 => SnapDivision::Div1_32,
-                        SnapDivision::Div1_32 => SnapDivision::Div1_64,
-                        SnapDivision::Div1_64 => SnapDivision::Auto,
-                    };
-                }
-            }
-            cx.notify();
-        });
+            });
 
         let timeline_seek = cx.entity().clone();
         let on_seek: std::sync::Arc<
@@ -995,9 +1036,9 @@ impl Render for Timeline {
         let on_toggle_snap: std::sync::Arc<
             dyn Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static,
         > = std::sync::Arc::new(on_toggle_snap);
-        let on_cycle_grid: std::sync::Arc<
-            dyn Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static,
-        > = std::sync::Arc::new(on_cycle_grid);
+        let on_grid_menu: std::sync::Arc<
+            dyn Fn(&(f32, f32), &mut gpui::Window, &mut gpui::App) + 'static,
+        > = std::sync::Arc::new(on_grid_menu);
         let on_seek = on_seek.clone();
         let on_playhead_scrub_begin = self.on_playhead_scrub_begin.clone();
         let on_playhead_scrub_end = self.on_playhead_scrub_end.clone();
@@ -2084,8 +2125,24 @@ impl Render for Timeline {
                     .is_none_or(|origin| origin.clip.id != drag.clip_id)
                 {
                     this.clip_resize_origin = ClipSnapshot::capture(&this.state, &drag.clip_id);
+                    // Keep the pointer where it grabbed the handle. Anything
+                    // wider than a handle plus the drag threshold is not a grab
+                    // offset, so it is ignored rather than trusted.
+                    let pointer_x: f32 = event.event.position.x.into();
+                    let edge_beat = match drag.edge {
+                        ClipEdge::Left => drag.start_beat,
+                        ClipEdge::Right => drag.start_beat + drag.duration_beats,
+                    };
+                    let edge_x = this.state.beats_to_x(edge_beat);
+                    let pointer_lane_x = this.state.beats_to_x(this.beat_from_window_x(pointer_x));
+                    this.clip_resize_grab_beats = if (pointer_lane_x - edge_x).abs() <= 16.0 {
+                        edge_beat - this.beat_from_window_x(pointer_x)
+                    } else {
+                        0.0
+                    };
                 }
-                let beat = this.beat_from_window_x(event.event.position.x.into());
+                let beat = this.beat_from_window_x(event.event.position.x.into())
+                    + this.clip_resize_grab_beats;
                 // The Stretch tool turns an audio clip's edge into a time
                 // stretch (same audio, new length); every other tool trims.
                 let stretched = this.state.active_tool == TimelineTool::Time
@@ -2391,7 +2448,7 @@ impl Render for Timeline {
                 ScrollDelta::Lines(p) => (p.x * 36.0, p.y * 36.0),
             };
 
-            if !(event.modifiers.control || event.modifiers.platform) {
+            let Some(zoom_axis) = wheel_zoom_axis(&event.modifiers) else {
                 let (max_x, max_y) = this.max_scroll_offsets(window);
                 let (scroll_x, scroll_y) = if event.modifiers.shift {
                     let horizontal = if delta.1.abs() > 0.01 {
@@ -2432,7 +2489,7 @@ impl Render for Timeline {
                 cx.stop_propagation();
                 cx.notify();
                 return;
-            }
+            };
 
             window.prevent_default();
             cx.stop_propagation();
@@ -2441,9 +2498,37 @@ impl Render for Timeline {
                 return;
             }
 
+            // Both axes share the factor and its sign; zoom ignores the
+            // Natural Scroll preference, which only flips panning.
+            let factor = wheel_zoom_factor(delta.1);
+            if zoom_axis == WheelZoomAxis::Vertical {
+                // A view change like horizontal zoom: no undo entry, and the
+                // project is marked view-dirty once per wheel burst, never
+                // engine-dirty.
+                let (_, track_view_h, _) = this.scroll_geometry(window);
+                let anchor_y = this.track_area_y_from_window(event.position);
+                let tick = this.state.track_zoom_tick(
+                    &mut this.track_zoom_session,
+                    factor,
+                    anchor_y,
+                    track_view_h,
+                    std::time::Instant::now(),
+                );
+                if tick.mark_view_dirty {
+                    this.mark_control_state_changed(cx);
+                }
+                if let Some(scroll_y) = tick.scroll_y {
+                    let (max_x, max_y) = this.max_scroll_offsets(window);
+                    let scroll_x = this.state.viewport.scroll_x;
+                    this.state
+                        .set_scroll_immediate(scroll_x, scroll_y, max_x, max_y);
+                    cx.notify();
+                }
+                return;
+            }
+
             let x: f32 = event.position.x.into();
             let anchor = this.state.lane_x_from_window_x(x).max(0.0);
-            let factor = wheel_zoom_factor(delta.1);
             this.state.zoom_by(factor, anchor);
             let (max_x, max_y) = this.max_scroll_offsets(window);
             this.state.clamp_scroll(max_x, max_y);
@@ -2575,7 +2660,7 @@ impl Render for Timeline {
                 state,
                 on_add_track.clone(),
                 on_toggle_snap.clone(),
-                on_cycle_grid.clone(),
+                on_grid_menu.clone(),
                 on_clear_all_mutes,
                 on_clear_all_solos,
                 on_seek.clone(),
@@ -2807,6 +2892,8 @@ impl Render for Timeline {
             // body are both in there, so the line stays continuous through the
             // conductor lanes rather than restarting below them.
             .children(playhead_overlay)
+            // The Smart Tool's razor line; empty unless hovering a cut zone.
+            .children(cut_guide_overlay)
             // 4. Floating Tools Bar (above playhead)
             .child(
                 div()
@@ -3103,6 +3190,31 @@ const WHEEL_ZOOM_BASE: f32 = 1.0024;
 /// zooming maps it onto a scale, where up simply means more.
 pub(crate) fn wheel_zoom_factor(delta_y: f32) -> f32 {
     WHEEL_ZOOM_BASE.powf(delta_y)
+}
+
+/// What a zooming wheel tick on the arrangement scales.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WheelZoomAxis {
+    /// Time: pixels per second.
+    Horizontal,
+    /// The height of every arrangement track.
+    Vertical,
+}
+
+/// Map wheel modifiers onto a zoom axis, or `None` to pan.
+///
+/// Ctrl and Cmd are one modifier here, as in the keymap. Ctrl/Cmd zooms time;
+/// adding Alt zooms track heights, whatever Shift says. Without Ctrl/Cmd the
+/// wheel pans, so Alt alone still pans.
+pub(crate) fn wheel_zoom_axis(modifiers: &gpui::Modifiers) -> Option<WheelZoomAxis> {
+    if !(modifiers.control || modifiers.platform) {
+        return None;
+    }
+    Some(if modifiers.alt {
+        WheelZoomAxis::Vertical
+    } else {
+        WheelZoomAxis::Horizontal
+    })
 }
 
 /// Map a GPUI [`PinchEvent::delta`] onto a multiplicative zoom factor.
@@ -3715,6 +3827,69 @@ mod midi_clip_draw_tests {
             "wheel down should narrow the timeline: {before} -> {}",
             state.viewport.pixels_per_second
         );
+    }
+
+    #[test]
+    fn wheel_zoom_axis_follows_ctrl_or_cmd_and_alt() {
+        use WheelZoomAxis::{Horizontal, Vertical};
+        // (Ctrl, Cmd, Alt, Shift) -> axis; `None` pans.
+        let cases = [
+            ((true, false, false, false), Some(Horizontal)),
+            ((false, true, false, false), Some(Horizontal)),
+            ((true, false, false, true), Some(Horizontal)),
+            ((true, false, true, false), Some(Vertical)),
+            ((false, true, true, false), Some(Vertical)),
+            ((true, false, true, true), Some(Vertical)),
+            ((true, true, true, true), Some(Vertical)),
+            // Without Ctrl/Cmd the wheel pans, Alt or not.
+            ((false, false, true, false), None),
+            ((false, false, false, true), None),
+            ((false, false, false, false), None),
+        ];
+        for ((control, platform, alt, shift), expected) in cases {
+            let modifiers = gpui::Modifiers {
+                control,
+                platform,
+                alt,
+                shift,
+                ..Default::default()
+            };
+            assert_eq!(wheel_zoom_axis(&modifiers), expected, "{modifiers:?}");
+        }
+    }
+
+    /// Track zoom uses the same factor as time zoom, so wheel up grows both.
+    #[test]
+    fn ctrl_alt_wheel_up_grows_track_heights_and_down_shrinks_them() {
+        use crate::components::timeline::timeline_state::{CreateTrackOptions, InputMonitorMode};
+
+        for (delta, grows) in [(30.0, true), (-30.0, false)] {
+            let mut state = TimelineState::default();
+            let id = state.create_track(CreateTrackOptions {
+                name: "Track".to_string(),
+                track_type: TrackType::Audio,
+                color: crate::theme::Colors::track_color_for_index(0),
+                volume: 1.0,
+                pan: 0.0,
+                armed: false,
+                input_monitor: InputMonitorMode::Off,
+            });
+            let mut session = None;
+            let tick = state.track_zoom_tick(
+                &mut session,
+                wheel_zoom_factor(delta),
+                0.0,
+                600.0,
+                std::time::Instant::now(),
+            );
+            assert!(tick.scroll_y.is_some() && tick.mark_view_dirty);
+            let height = state.track_row_height_for_id(&id);
+            assert_eq!(
+                height > DEFAULT_TRACK_HEIGHT,
+                grows,
+                "delta {delta} -> {height}"
+            );
+        }
     }
 
     #[test]

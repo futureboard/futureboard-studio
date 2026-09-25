@@ -303,7 +303,7 @@ impl StudioLayout {
     }
 
     /// Brings one of a channel's open plug-ins to the front of its window.
-    fn select_plugin_editor_tab(
+    pub(super) fn select_plugin_editor_tab(
         &mut self,
         track_id: &str,
         insert_id: &str,

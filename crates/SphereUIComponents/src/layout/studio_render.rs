@@ -135,6 +135,7 @@ impl Render for StudioLayout {
                             TimelineContextTarget::Ruler(beat) => {
                                 ContextTarget::TimelineRuler { beat }
                             }
+                            TimelineContextTarget::SnapGrid => ContextTarget::SnapGrid,
                             TimelineContextTarget::TempoTrack {
                                 beat,
                                 bpm,

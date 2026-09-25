@@ -1,8 +1,9 @@
-use gpui::{div, px, IntoElement, ParentElement, Styled};
+use gpui::{div, px, InteractiveElement, IntoElement, ParentElement, Styled};
 
 use crate::components::timeline::audio_clip::{
     AudioClipProcessCommitCb, AudioClipProcessPreviewCb,
 };
+use crate::components::edit::{lane_press_intent, LanePressIntent};
 use crate::components::timeline::automation_control_lane::{
     automation_control_lane, AutomationControlCallback,
 };
@@ -15,7 +16,7 @@ use crate::components::timeline::timeline_state::{
     AUTOMATION_CONTROL_LANE_HEIGHT, AUTOMATION_SUBLANE_HEIGHT, DEFAULT_TRACK_HEIGHT, HEADER_WIDTH,
 };
 use crate::components::timeline::track_header::{track_header, TrackHeaderCallbacks};
-use crate::components::timeline::track_lane::track_lane;
+use crate::components::timeline::track_lane::{track_lane, MarqueePress, MarqueePressCb};
 use crate::components::timeline::track_lane_view::{TrackLaneView, TrackLaneViews};
 use crate::components::timeline::track_resize::{
     track_row_resize_handle, visible_track_row_range, TrackHeightResizeArmCb,
@@ -62,9 +63,7 @@ pub fn track_list(
         std::sync::Arc<dyn Fn(&(String, f32, f32), &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
     on_open_editor: Option<std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>>,
-    on_range_start: Option<
-        std::sync::Arc<dyn Fn(&(String, f32, bool), &mut gpui::Window, &mut gpui::App) + 'static>,
-    >,
+    on_range_start: Option<MarqueePressCb>,
     on_erase_start: Option<
         std::sync::Arc<dyn Fn(&f32, &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
@@ -119,6 +118,14 @@ pub fn track_list(
 
     let scroll_y = state.viewport.scroll_y;
     let viewport_height = state.viewport.viewport_height;
+    let active_tool = state.active_tool;
+    let tail_marquee = on_range_start.clone();
+    let tail_anchor_track_id = row_layout
+        .rows
+        .iter()
+        .rev()
+        .find(|row| row.height > 0.0)
+        .map(|row| row.track_id.clone());
     let (visible_start, visible_end, top_spacer_h, bottom_spacer_h) =
         visible_track_row_range(row_layout, scroll_y, viewport_height, OVERSCAN);
 
@@ -327,13 +334,48 @@ pub fn track_list(
                         .bg(Colors::timeline_content_background()),
                 )
                 .children((tail_start_y < grid_height).then(|| {
-                    div()
+                    let tail = div()
                         .absolute()
                         .left_0()
                         .right_0()
                         .top(px(tail_start_y))
                         .bottom_0()
-                        .bg(Colors::timeline_empty_body_background())
+                        .bg(Colors::timeline_empty_body_background());
+                    // The space below the last track starts a marquee too,
+                    // anchored to the last track drawn. A click there without a
+                    // drag still does nothing.
+                    match (tail_anchor_track_id.clone(), tail_marquee.clone()) {
+                        (Some(anchor), Some(start_marquee)) => tail
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                move |event: &gpui::MouseDownEvent, window, cx| {
+                                    let LanePressIntent::Marquee { additive, .. } =
+                                        lane_press_intent(
+                                            active_tool,
+                                            None,
+                                            event.click_count,
+                                            &event.modifiers,
+                                        )
+                                    else {
+                                        return;
+                                    };
+                                    start_marquee(
+                                        &MarqueePress {
+                                            track_id: anchor.clone(),
+                                            window_x: event.position.x.into(),
+                                            window_y: event.position.y.into(),
+                                            additive,
+                                            on_lane: false,
+                                            create_clip_on_click: false,
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            )
+                            .into_any_element(),
+                        _ => tail.into_any_element(),
+                    }
                 }))
                 .child(arrangement_surface),
         )

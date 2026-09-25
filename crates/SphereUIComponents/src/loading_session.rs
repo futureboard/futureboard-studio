@@ -187,6 +187,10 @@ pub struct LoadedSessionPackage {
     /// Populated by pre-studio install; studio adopts this instead of re-restoring.
     pub install_handoff: Option<SessionInstallHandoff>,
     pub restore_warnings: Vec<String>,
+    /// `project` was decoded from the project's newer autosave, which the user
+    /// chose to recover. It is bound to `path` like the saved file, but dirty:
+    /// the recovered work is not in `path` until the user saves.
+    pub recovered_from_autosave: bool,
 }
 
 /// Snapshot captured before replacing an in-flight studio session so a failed
@@ -500,6 +504,8 @@ struct SessionLoadTransaction {
     on_shutdown_complete: Option<SessionShutdownCompleteCb>,
     stage: LoadStage,
     project: Option<FutureboardProject>,
+    /// `project` came from the autosave the user chose to recover.
+    recovered_from_autosave: bool,
     on_success: LoadSuccessCb,
     on_failure: LoadFailedCb,
 }
@@ -758,6 +764,7 @@ impl LoadingSessionWindow {
                     open_options: transaction.open_options,
                     install_handoff: None,
                     restore_warnings: Vec::new(),
+                    recovered_from_autosave: transaction.recovered_from_autosave,
                 };
                 let on_success = transaction.on_success;
                 let on_failure = transaction.on_failure;
@@ -786,8 +793,14 @@ impl LoadingSessionWindow {
                 let track_count = project.tracks.len();
                 let clip_count: usize = project.tracks.iter().map(|t| t.clips.len()).sum();
                 session_log!("decoded: tracks={track_count} clips={clip_count}");
+                let identity = (project.id.clone(), project.modified_at);
                 load.project = Some(project);
-                self.continue_after(LoadStage::Decode, cx);
+                match load.path.clone() {
+                    Some(path) if !load.recovered_from_autosave => {
+                        self.offer_autosave_recovery(path, identity, cx);
+                    }
+                    _ => self.continue_after(LoadStage::Decode, cx),
+                }
             }
             Err(e) => {
                 session_log!("decode failed: {}", e.technical_detail());
@@ -799,6 +812,116 @@ impl LoadingSessionWindow {
                 );
             }
         }
+    }
+
+    /// Before installing a decoded project, look for its autosave. When an
+    /// intact autosave of the same project is newer than the saved file (the
+    /// app crashed or was killed after the last save), ask whether to recover
+    /// it. Recover decodes the autosave in place of the saved file; the session
+    /// is still bound to the project's own path, and dirty. Open Saved (also
+    /// what dismissing the question does) leaves the autosave on disk: nothing
+    /// is lost by answering, and the next successful save removes it.
+    fn offer_autosave_recovery(
+        &mut self,
+        path: PathBuf,
+        (project_id, saved_modified_at): (String, u64),
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity().clone();
+        cx.spawn(async move |_entity, cx| {
+            let check_path = path.clone();
+            let check_id = project_id.clone();
+            let candidate = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::project::io::newer_autosave_for(
+                        &check_path,
+                        &check_id,
+                        saved_modified_at,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |window, cx| match candidate {
+                Some(autosave) => window.ask_to_recover_autosave(autosave, project_id, cx),
+                None => window.continue_after(LoadStage::Decode, cx),
+            });
+        })
+        .detach();
+    }
+
+    fn ask_to_recover_autosave(
+        &mut self,
+        autosave: PathBuf,
+        project_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        session_log!("newer autosave found: {}", autosave.display());
+        let options = crate::components::message_box_dialog::MessageBoxOptions {
+            kind: crate::components::message_box_dialog::MessageBoxKind::Warning,
+            title: "Recover Autosave?".to_string(),
+            message: "This project has an autosave that is newer than the saved \
+                      project. It may hold work that was not saved before \
+                      Futureboard Studio closed."
+                .to_string(),
+            detail: Some(format!("Autosave: {}", autosave.display())),
+            buttons: vec!["Recover".to_string(), "Open Saved".to_string()],
+            default_id: 0,
+            cancel_id: Some(1),
+        };
+        let this = cx.entity().clone();
+        let on_response: crate::components::message_box_dialog::MessageBoxResponseCb =
+            Arc::new(move |result, _window, cx| {
+                let recover = result.response == 0;
+                let autosave = autosave.clone();
+                let project_id = project_id.clone();
+                let _ = this.update(cx, move |window, cx| {
+                    if recover {
+                        window.recover_autosave(autosave, project_id, cx);
+                    } else {
+                        session_log!("autosave declined — opening the saved project");
+                        window.continue_after(LoadStage::Decode, cx);
+                    }
+                });
+            });
+        if let Err(error) = crate::components::message_box_dialog::open_message_box_window(
+            None,
+            options,
+            on_response,
+            cx,
+        ) {
+            session_log!("recovery prompt unavailable: {error} — opening the saved project");
+            self.continue_after(LoadStage::Decode, cx);
+        }
+    }
+
+    fn recover_autosave(&mut self, autosave: PathBuf, project_id: String, cx: &mut Context<Self>) {
+        self.set_detail("Recovering autosave", cx);
+        let this = cx.entity().clone();
+        cx.spawn(async move |_entity, cx| {
+            let decode_path = autosave.clone();
+            let decoded = cx
+                .background_executor()
+                .spawn(async move { load_project(&decode_path, true) })
+                .await;
+            let _ = this.update(cx, |window, cx| {
+                match decoded {
+                    Ok(recovered) if recovered.id == project_id => {
+                        session_log!("recovered autosave: {}", autosave.display());
+                        if let Some(load) = window.transaction.as_mut() {
+                            load.project = Some(recovered);
+                            load.recovered_from_autosave = true;
+                        }
+                    }
+                    Ok(_) => session_log!("autosave changed identity — opening the saved project"),
+                    Err(error) => session_log!(
+                        "autosave could not be decoded ({}) — opening the saved project",
+                        error.technical_detail()
+                    ),
+                }
+                window.continue_after(LoadStage::Decode, cx);
+            });
+        })
+        .detach();
     }
 
     fn finish_failure(
@@ -974,6 +1097,7 @@ fn spawn_session_install(
     let path = package.path.clone();
     let open_options = package.open_options.clone();
     let project = package.project.clone();
+    let recovered_from_autosave = package.recovered_from_autosave;
 
     cx.spawn(async move |cx| {
         let install_result = cx
@@ -998,6 +1122,7 @@ fn spawn_session_install(
                         open_options,
                         install_handoff: Some(handoff),
                         restore_warnings: report.warnings,
+                        recovered_from_autosave,
                     };
                     finish_loading_session_progress(cx, "Opening studio");
                     eprintln!("[SessionLoad] ready");
@@ -1318,6 +1443,7 @@ fn run_headless_load(
                     open_options,
                     install_handoff: None,
                     restore_warnings: Vec::new(),
+                    recovered_from_autosave: false,
                 },
                 cx,
             ),
@@ -1386,9 +1512,84 @@ pub fn begin_pre_studio_workspace_prepare(
         open_options: ProjectOpenOptions::default(),
         install_handoff: None,
         restore_warnings: Vec::new(),
+        recovered_from_autosave: false,
     };
     spawn_session_install(package, on_success, on_failure, cx);
     surface
+}
+
+/// Offer back the newest autosave an untitled session left behind (a crash or
+/// a force-quit before its first save). Untitled autosaves are named by a
+/// per-session id, so no project open can find them: this startup offer is
+/// their way back. Recover hands the file to `on_recover`, which opens it like
+/// a project (it binds as untitled and dirty, never to the autosave's path);
+/// Discard deletes it; Not Now keeps it for the next launch.
+pub fn offer_untitled_autosave_recovery(
+    on_recover: Arc<dyn Fn(PathBuf, &mut App) + Send + Sync>,
+    cx: &mut App,
+) {
+    let dir = crate::project::io::untitled_autosave_dir(
+        &crate::paths::FutureboardPaths::resolve().app_data,
+    );
+    cx.spawn(async move |cx| {
+        let found = cx
+            .background_executor()
+            .spawn(async move { crate::project::io::newest_untitled_autosave(&dir) })
+            .await;
+        let Some((path, identity)) = found else {
+            return;
+        };
+        let _ = cx.update(|cx| {
+            session_log!("untitled autosave found: {}", path.display());
+            let options = crate::components::message_box_dialog::MessageBoxOptions {
+                kind: crate::components::message_box_dialog::MessageBoxKind::Warning,
+                title: "Recover Unsaved Project?".to_string(),
+                message: format!(
+                    "\"{}\" was never saved, but an autosave of it was found. \
+                     Recover it to keep working on it.",
+                    identity.name
+                ),
+                detail: Some(format!("Autosave: {}", path.display())),
+                buttons: vec![
+                    "Recover".to_string(),
+                    "Discard".to_string(),
+                    "Not Now".to_string(),
+                ],
+                default_id: 0,
+                cancel_id: Some(2),
+            };
+            let on_response: crate::components::message_box_dialog::MessageBoxResponseCb =
+                Arc::new(move |result, _window, cx| match result.response {
+                    // Only from the start screen: by the time the user answers,
+                    // a project may already be loading or open.
+                    0 if still_on_welcome(cx) => on_recover(path.clone(), cx),
+                    0 => session_log!("untitled recovery ignored — a session is open or loading"),
+                    1 => {
+                        let path = path.clone();
+                        cx.background_executor()
+                            .spawn(async move { crate::project::io::remove_autosave_files(&path) })
+                            .detach();
+                    }
+                    _ => {}
+                });
+            if let Err(error) = crate::components::message_box_dialog::open_message_box_window(
+                None,
+                options,
+                on_response,
+                cx,
+            ) {
+                session_log!("untitled recovery prompt unavailable: {error}");
+            }
+        });
+    })
+    .detach();
+}
+
+fn still_on_welcome(cx: &App) -> bool {
+    !is_project_lifecycle_busy()
+        && cx
+            .try_global::<AppSessionGate>()
+            .is_some_and(|gate| gate.mode == AppMode::Welcome)
 }
 
 /// Begin a pre-studio project open. Shows the loading window immediately and
@@ -1442,6 +1643,7 @@ pub fn begin_studio_session_shutdown(
         on_shutdown_complete: Some(on_complete.clone()),
         stage: LoadStage::SessionShutdown,
         project: None,
+        recovered_from_autosave: false,
         on_success: Arc::new(|_, _| {}),
         on_failure: Arc::new(|_, _| {}),
     };
@@ -1529,6 +1731,7 @@ fn begin_project_session_load_inner(
         on_shutdown_complete,
         stage: initial_stage,
         project: None,
+        recovered_from_autosave: false,
         on_success: on_success.clone(),
         on_failure: on_failure.clone(),
     };

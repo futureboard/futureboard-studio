@@ -27,7 +27,10 @@ pub use bpm::{
     TempoCandidate, TempoEstimate, TempoFamily, TempoHypothesis, estimate_bpm_candidates,
     octave_ratio, tempo_families,
 };
-pub use chords::{ChordKind, ChordLabel, ChordOptions, ChordSegment, recognize_chords};
+pub use chords::{
+    Certainty, ChordAnalysis, ChordKind, ChordLabel, ChordOptions, ChordSegment, HarmonicSpan,
+    KeyContext, analyze_chords, recognize_chords,
+};
 pub use chroma::{ChromaFrames, chroma_frames};
 pub use error::AnalysisError;
 pub use features::{FEATURE_VECTOR_LEN, SpectralFeatures};

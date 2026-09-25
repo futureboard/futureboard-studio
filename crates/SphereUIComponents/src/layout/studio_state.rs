@@ -210,6 +210,8 @@ pub enum ContextTarget {
     TimelineRuler {
         beat: f64,
     },
+    /// The arrangement grid dropdown opened from the ruler's grid button.
+    SnapGrid,
     /// Right-click on the global Marker lane. `marker_id` is `None` on empty
     /// lane, which is what splits "act on this marker" from "create one here".
     MarkerTrack {

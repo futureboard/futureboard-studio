@@ -2054,52 +2054,17 @@ impl StudioLayout {
                 });
             })
         };
-        // Drag-reorder commit (mirrors the Inspector's `reorder_insert_cb`). The
-        // drop handler supplies the dragged `plugin_instance_id` and the
-        // insertion gap; we snapshot the current id order, compute the new order,
-        // and apply it as a single `EditCommand::ReorderFxSlot` so one drag is one
-        // undo entry. The command only reorders existing slots (never recreates an
-        // instance), so bypass / preset / parameter / editor / automation state
-        // follow each instance. A forced project sync rebuilds the engine's chain
-        // order (DSP order == UI order); editor windows are keyed by instance id,
-        // so they stay attached.
-        let on_reorder_insert: std::sync::Arc<
-            dyn Fn(&(String, String, usize), &mut Window, &mut gpui::App) + 'static,
-        > = {
+        // Drop commit for a dragged insert slot. Every surface (the Inspector,
+        // the docked and the detached mixer) hands its drop to the same
+        // `commit_insert_drop`, which resolves the anchor against the live
+        // chains — so a stale detached-mixer snapshot cannot misplace it.
+        let on_drop_insert: crate::components::reorder::InsertDropCb = {
             let this = owner.clone();
             std::sync::Arc::new(
-                move |(track_id, insert_id, insertion_index): &(String, String, usize), _w, cx| {
-                    let track_id = track_id.clone();
-                    let insert_id = insert_id.clone();
-                    let insertion_index = *insertion_index;
+                move |drop: &crate::components::reorder::InsertDrop, _w, cx| {
+                    let drop = drop.clone();
                     StudioLayout::defer_update(&this, cx, move |this, cx| {
-                        let changed = this.timeline.update(cx, |timeline, cx| {
-                            let before = timeline.state.insert_order(&track_id);
-                            let after = timeline_state::TimelineState::reordered_insert_ids(
-                                &before,
-                                &insert_id,
-                                insertion_index,
-                            );
-                            if before == after {
-                                return false;
-                            }
-                            timeline.run_edit_command(
-                                EditCommand::ReorderFxSlot {
-                                    track_id: track_id.clone(),
-                                    before_order: before,
-                                    after_order: after,
-                                },
-                                cx,
-                            );
-                            true
-                        });
-                        if changed {
-                            this.mark_dirty();
-                            this.audio_bridge.project_dirty = true;
-                            this.schedule_audio_project_sync(cx, true, "mixer_reorder_insert");
-                            this.push_mixer_snapshot_to_window(cx);
-                            cx.notify();
-                        }
+                        this.commit_insert_drop(&drop, cx);
                     });
                 },
             )
@@ -2226,45 +2191,26 @@ impl StudioLayout {
             )
         };
         let on_reorder_send: std::sync::Arc<
-            dyn Fn(&(String, String, usize), &mut Window, &mut gpui::App) + 'static,
+            dyn Fn(
+                    &(String, String, crate::components::reorder::DropAnchor),
+                    &mut Window,
+                    &mut gpui::App,
+                ) + 'static,
         > = {
             let this = owner.clone();
             std::sync::Arc::new(
-                move |(track_id, send_id, insertion_index): &(String, String, usize), _w, cx| {
+                move |(track_id, send_id, anchor): &(
+                    String,
+                    String,
+                    crate::components::reorder::DropAnchor,
+                ),
+                      _w,
+                      cx| {
                     let track_id = track_id.clone();
                     let send_id = send_id.clone();
-                    let insertion_index = *insertion_index;
+                    let anchor = anchor.clone();
                     StudioLayout::defer_update(&this, cx, move |this, cx| {
-                        let changed = this.timeline.update(cx, |timeline, cx| {
-                            let before = timeline.state.send_order(&track_id);
-                            let after = timeline_state::TimelineState::reordered_send_ids(
-                                &before,
-                                &send_id,
-                                insertion_index,
-                            );
-                            if before == after {
-                                return false;
-                            }
-                            timeline.run_edit_command(
-                                EditCommand::ReorderSendSlot {
-                                    track_id: track_id.clone(),
-                                    before_order: before,
-                                    after_order: after,
-                                },
-                                cx,
-                            );
-                            true
-                        });
-                        if changed {
-                            this.mark_dirty();
-                            // Send order is modeled in session routing. The engine
-                            // snapshot dedup guard skips load_project when the graph
-                            // is effectively unchanged.
-                            this.audio_bridge.project_dirty = true;
-                            this.schedule_audio_project_sync(cx, true, "mixer_reorder_send");
-                            this.push_mixer_snapshot_to_window(cx);
-                            cx.notify();
-                        }
+                        this.commit_send_drop(&track_id, &send_id, &anchor, cx);
                     });
                 },
             )
@@ -2298,7 +2244,7 @@ impl StudioLayout {
             on_remove_insert,
             on_toggle_insert_bypass,
             on_toggle_vsti_output_group,
-            on_reorder_insert,
+            on_drop_insert,
             on_drop_plugin_preset,
             on_open_insert_editor,
             on_add_send,
@@ -2307,6 +2253,89 @@ impl StudioLayout {
             on_send_gain_change,
             on_reorder_send,
         }
+    }
+
+    /// The one commit path for a dropped insert slot, from the Inspector and
+    /// every mixer, docked or detached.
+    ///
+    /// The drop names where it lands by a neighbour's id, and that is resolved
+    /// here against the live chains rather than the ones the target rendered
+    /// from. Within one chain it records the existing `ReorderFxSlot`; across
+    /// channels a `MoveInsertSlot`, which moves the same slot (and its plug-in
+    /// parameter lanes) so the running instance keeps playing on its new
+    /// channel. A drop that would change nothing records nothing. Returns
+    /// whether a command ran.
+    pub(crate) fn commit_insert_drop(
+        &mut self,
+        drop: &crate::components::reorder::InsertDrop,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let command = insert_drop_command(&self.timeline.read(cx).state, drop);
+        let Some(command) = command else {
+            return false;
+        };
+        let reason = match &command {
+            EditCommand::MoveInsertSlot { .. } => "move_insert",
+            _ => "reorder_insert",
+        };
+        self.timeline.update(cx, |timeline, cx| {
+            timeline.run_edit_command(command, cx);
+        });
+        self.after_channel_chain_edit(cx, reason);
+        true
+    }
+
+    /// Commit a dropped send: same channel only, resolved against the live
+    /// send order like an insert drop.
+    pub(crate) fn commit_send_drop(
+        &mut self,
+        track_id: &str,
+        send_id: &str,
+        anchor: &crate::components::reorder::DropAnchor,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let command = {
+            let state = &self.timeline.read(cx).state;
+            let before = state.send_order(track_id);
+            crate::components::reorder::reorder_to_anchor(&before, send_id, anchor, 0)
+                .filter(|after| *after != before)
+                .map(|after| EditCommand::ReorderSendSlot {
+                    track_id: track_id.to_string(),
+                    before_order: before,
+                    after_order: after,
+                })
+        };
+        let Some(command) = command else {
+            return false;
+        };
+        self.timeline.update(cx, |timeline, cx| {
+            timeline.run_edit_command(command, cx);
+        });
+        // Send order is modeled in session routing. The engine snapshot dedup
+        // guard skips load_project when the graph is effectively unchanged.
+        self.after_channel_chain_edit(cx, "mixer_reorder_send");
+        true
+    }
+
+    /// What an insert or send chain edit needs beyond the model change —
+    /// after the drop that made it, and after undo or redo of one (which only
+    /// mark the project dirty on their own): the moved insert's editor and
+    /// bridge caches follow it to its channel, a forced engine sync rebuilds the
+    /// graph at once (DSP order == UI order; a moved insert runs on its new
+    /// channel with latency and MIDI destination recomputed, its live instance
+    /// reused by id), and the detached mixer gets a fresh snapshot instead of
+    /// waiting for the poll.
+    pub(crate) fn after_channel_chain_edit(
+        &mut self,
+        cx: &mut Context<Self>,
+        reason: &'static str,
+    ) {
+        self.mark_dirty();
+        self.audio_bridge.project_dirty = true;
+        self.reconcile_insert_ownership(cx);
+        self.schedule_audio_project_sync(cx, true, reason);
+        self.push_mixer_snapshot_to_window(cx);
+        cx.notify();
     }
 
     /// Apply one Master / Monitor Output menu selection.
@@ -2410,6 +2439,34 @@ impl StudioLayout {
             routing.effective_monitor.as_ref().and_then(pair),
         );
     }
+}
+
+/// The command an insert drop records, resolved against `state` as it is now
+/// — `None` when the drop is refused or would change nothing.
+///
+/// Within one chain: the live order with the insert moved next to the anchor,
+/// never in front of the instrument (`fx_chain_floor`). Across channels: a
+/// `MoveInsertSlot` planned from the anchor's gap in the destination chain;
+/// the plan refuses instruments, full or effect-less destinations, and the
+/// master for an insert with plug-in parameter automation.
+pub(crate) fn insert_drop_command(
+    state: &timeline_state::TimelineState,
+    drop: &crate::components::reorder::InsertDrop,
+) -> Option<EditCommand> {
+    use crate::components::reorder::{anchor_gap, reorder_to_anchor};
+    if drop.from_track == drop.to_track {
+        let before = state.insert_order(&drop.to_track);
+        let floor = state.fx_chain_floor(&drop.to_track);
+        let after = reorder_to_anchor(&before, &drop.insert_id, &drop.anchor, floor)?;
+        return (after != before).then(|| EditCommand::ReorderFxSlot {
+            track_id: drop.to_track.clone(),
+            before_order: before,
+            after_order: after,
+        });
+    }
+    let gap = anchor_gap(&state.insert_order(&drop.to_track), &drop.anchor)?;
+    let plan = state.plan_insert_move(&drop.from_track, &drop.insert_id, &drop.to_track, gap)?;
+    Some(EditCommand::MoveInsertSlot { plan })
 }
 
 fn mixer_channel_meter_signature(
@@ -2633,6 +2690,155 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
             Vec::new()
         },
         routing: routing.clone(),
+    }
+}
+
+/// The shared insert-drop commit: anchors resolved against the live chains,
+/// no-ops refused, and a cross-channel move reaching the engine snapshot under
+/// the destination only, as the same instance.
+#[cfg(test)]
+mod insert_drop_tests {
+    use super::insert_drop_command;
+    use crate::components::edit::EditCommand;
+    use crate::components::reorder::{DropAnchor, InsertDrop};
+    use crate::components::timeline::timeline_state::{
+        CreateTrackOptions, InputMonitorMode, InsertPluginFormat, TimelineState, TrackType,
+    };
+    use crate::layout::engine_snapshot::build_engine_project_snapshot;
+
+    fn track(state: &mut TimelineState, track_type: TrackType, name: &str) -> String {
+        state.create_track(CreateTrackOptions {
+            track_type,
+            name: name.to_string(),
+            color: gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        })
+    }
+
+    fn load(state: &mut TimelineState, track_id: &str, index: usize, name: &str) -> String {
+        let slot = state.ensure_insert_slot_at(track_id, index).expect("slot");
+        state.set_insert_plugin(
+            track_id,
+            &slot,
+            name.to_string(),
+            Some(std::path::PathBuf::from(format!("C:/p/{name}.vst3"))),
+            InsertPluginFormat::Vst3,
+            None,
+            name.to_string(),
+        );
+        state.set_insert_plugin_role(track_id, &slot, false);
+        slot
+    }
+
+    fn drop(from: &str, insert: &str, to: &str, anchor: DropAnchor) -> InsertDrop {
+        InsertDrop {
+            from_track: from.to_string(),
+            insert_id: insert.to_string(),
+            to_track: to.to_string(),
+            anchor,
+        }
+    }
+
+    #[test]
+    fn a_same_chain_drop_resolves_its_anchor_against_the_live_order() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let a = track(&mut state, TrackType::Audio, "A");
+        let x = load(&mut state, &a, 0, "x");
+        let y = load(&mut state, &a, 1, "y");
+        let z = load(&mut state, &a, 2, "z");
+        // Rendered as [x, y, z]; the user dragged z up onto y. Meanwhile the
+        // live chain became [y, x, z].
+        assert!(state.set_insert_order(&a, &[y.clone(), x.clone(), z.clone()]));
+        let command = insert_drop_command(&state, &drop(&a, &z, &a, DropAnchor::Before(y.clone())))
+            .expect("a real move");
+        let EditCommand::ReorderFxSlot { after_order, .. } = &command else {
+            panic!("a same-chain drop is a reorder");
+        };
+        assert_eq!(*after_order, vec![z.clone(), y.clone(), x.clone()]);
+
+        // A drop that changes nothing records nothing.
+        assert!(insert_drop_command(&state, &drop(&a, &x, &a, DropAnchor::After(y))).is_none());
+        assert!(insert_drop_command(&state, &drop(&a, &z, &a, DropAnchor::End)).is_none());
+    }
+
+    #[test]
+    fn an_instrument_chain_never_takes_an_effect_in_front_of_its_instrument() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let inst = track(&mut state, TrackType::Instrument, "Inst");
+        let synth = load(&mut state, &inst, 0, "synth");
+        state.set_insert_plugin_role(&inst, &synth, true);
+        let fx1 = load(&mut state, &inst, 1, "fx1");
+        let fx2 = load(&mut state, &inst, 2, "fx2");
+        let command = insert_drop_command(
+            &state,
+            &drop(&inst, &fx2, &inst, DropAnchor::Before(synth.clone())),
+        )
+        .expect("clamped, still a move");
+        let EditCommand::ReorderFxSlot { after_order, .. } = &command else {
+            panic!("a same-chain drop is a reorder");
+        };
+        assert_eq!(*after_order, vec![synth.clone(), fx2, fx1]);
+        assert!(
+            insert_drop_command(&state, &drop(&inst, &synth, &inst, DropAnchor::End)).is_none(),
+            "the instrument never moves"
+        );
+    }
+
+    /// After a cross-channel move the engine sees the insert under the
+    /// destination only, with the same instance id and as an effect.
+    #[test]
+    fn a_moved_insert_reaches_the_engine_under_its_new_track_only() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let a = track(&mut state, TrackType::Audio, "A");
+        let b = track(&mut state, TrackType::Audio, "B");
+        let fx = load(&mut state, &a, 0, "fx");
+        let other = load(&mut state, &b, 0, "other");
+
+        let command =
+            insert_drop_command(&state, &drop(&a, &fx, &b, DropAnchor::End)).expect("movable");
+        assert!(matches!(command, EditCommand::MoveInsertSlot { .. }));
+        command.execute(&mut state);
+
+        let snapshot = build_engine_project_snapshot(&state, 48_000, None, None);
+        let inserts_of = |track_id: &str| {
+            snapshot
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .expect("track in snapshot")
+                .inserts
+                .clone()
+        };
+        assert!(inserts_of(&a).is_empty());
+        let on_b = inserts_of(&b);
+        let ids: Vec<&str> = on_b.iter().map(|insert| insert.id.as_str()).collect();
+        assert_eq!(ids, vec![other.as_str(), fx.as_str()]);
+        let moved = &on_b[1];
+        assert_eq!(
+            moved
+                .params
+                .get("pluginInstanceId")
+                .and_then(serde_json::Value::as_str),
+            Some(fx.as_str()),
+            "the same instance id, so the engine reuses the live instance"
+        );
+        if crate::layout::plugin_bridge_runtime::bridge_enabled() {
+            assert_eq!(
+                moved.params.get("role").and_then(serde_json::Value::as_str),
+                Some("effect")
+            );
+        }
     }
 }
 

@@ -2827,7 +2827,27 @@ impl StudioLayout {
                 .cloned()
                 .collect()
         };
-        for (track_id, insert_id) in stale {
+        if stale.is_empty() {
+            return;
+        }
+        // A stale key whose insert still lives on another channel was moved
+        // there, not removed: `teardown_insert_instance` unloads by instance id
+        // alone and would silence it where it now plays. Its editor caches are
+        // re-filed instead.
+        let removed: Vec<(String, String)> = {
+            let state = &self.timeline.read(cx).state;
+            stale
+                .iter()
+                .filter(|(track_id, insert_id)| {
+                    classify_insert_key(state, track_id, insert_id) == InsertKeyStatus::Removed
+                })
+                .cloned()
+                .collect()
+        };
+        if removed.len() < stale.len() {
+            self.reconcile_insert_ownership(cx);
+        }
+        for (track_id, insert_id) in removed {
             eprintln!(
                 "[PluginUnload] track_id={track_id} insert_id={insert_id} action=teardown_instance reason=stale_reference"
             );
@@ -2837,6 +2857,190 @@ impl StudioLayout {
             // by the same stable instance id used by explicit remove flows.
             self.teardown_insert_instance(&track_id, &insert_id, cx, "stale_reference");
         }
+    }
+
+    /// Re-derive every cache that addresses an insert as `(track_id,
+    /// insert_id)` from where each insert lives now. Runs after an insert
+    /// chain edit and its undo/redo — a moved insert keeps its instance id,
+    /// and the engine drops parameter and enable commands whose track does not
+    /// match the insert's, so every cache still naming the old channel would
+    /// fail silently.
+    ///
+    /// * Editor windows are one per channel, one tab per plug-in. A plug-in
+    ///   that left the channel leaves its tab: the window brings a remaining
+    ///   tab to the front (releasing the moved plug-in's view, which does not
+    ///   unload it), re-files itself under a remaining tab if it was filed
+    ///   under the moved one, or closes when nothing is left. A window is never
+    ///   re-filed under another channel.
+    /// * A bridge editor session is one plug-in's own shell: closed without
+    ///   unloading, or re-filed under the new owner while it is still a
+    ///   loading shell.
+    /// * Preset selection and deferred editor opens follow the insert (a
+    ///   deferred open also takes the insert's current slot index).
+    /// * Bridge descriptors take the new track (MIDI fallback routes by it).
+    /// * Built-in editors rebuild their sidebar; a moved active instance stays
+    ///   selected under its new key.
+    pub(super) fn reconcile_insert_ownership(&mut self, cx: &mut Context<Self>) {
+        use crate::components::timeline::timeline_state::MASTER_TRACK_ID;
+
+        let owners: std::collections::HashMap<String, (String, usize)> = {
+            let state = &self.timeline.read(cx).state;
+            let tracks = state
+                .tracks
+                .iter()
+                .map(|track| (track.id.as_str(), &track.inserts))
+                .chain(std::iter::once((MASTER_TRACK_ID, &state.master.inserts)));
+            let mut owners = std::collections::HashMap::new();
+            for (track_id, inserts) in tracks {
+                for (index, slot) in inserts.iter().enumerate() {
+                    owners.insert(slot.id.clone(), (track_id.to_string(), index));
+                }
+            }
+            owners
+        };
+        let owner_of = |insert_id: &str| owners.get(insert_id).map(|(track, _)| track.as_str());
+        let left = |track_id: &str, insert_id: &str| {
+            owner_of(insert_id).is_some_and(|owner| owner != track_id)
+        };
+
+        // Channel editor windows.
+        let windows: Vec<_> = self
+            .plugin_editors
+            .open
+            .iter()
+            .filter(|((_, key_insert), _)| !is_ara_editor_key(key_insert))
+            .map(|(key, handle)| (key.clone(), *handle))
+            .collect();
+        for ((track_id, key_insert), handle) in windows {
+            let active = handle
+                .update(cx, |editor, _window, _cx| editor.insert_key().1.to_string())
+                .ok();
+            let Some(active) = active else {
+                // The window is gone; only drop a handle that is stale anyway.
+                if left(&track_id, &key_insert) {
+                    self.plugin_editors
+                        .open
+                        .remove(&(track_id.clone(), key_insert.clone()));
+                }
+                continue;
+            };
+            let tabs = self
+                .plugin_editors
+                .editor_tabs
+                .get(&track_id)
+                .cloned()
+                .unwrap_or_default();
+            let Some(plan) =
+                plan_editor_tab_detach(&tabs, &key_insert, &active, |id| left(&track_id, id))
+            else {
+                continue;
+            };
+            eprintln!(
+                "[plugin-editor-window] channel={track_id} lost moved insert(s); \
+                 remaining_tabs={} close={}",
+                plan.remaining.len(),
+                plan.close_window
+            );
+            let key = (track_id.clone(), key_insert.clone());
+            if plan.close_window {
+                self.plugin_editors.editor_tabs.remove(&track_id);
+                self.plugin_editors.open.remove(&key);
+                // The preset list is a window of its own; it goes first. Dropping
+                // the editor releases the view without unloading the plug-in.
+                let _ = handle.update(cx, |editor, window, cx| {
+                    editor.close_preset_menu(cx);
+                    window.remove_window();
+                });
+                continue;
+            }
+            self.plugin_editors
+                .editor_tabs
+                .insert(track_id.clone(), plan.remaining);
+            if let Some(next) = plan.rekey {
+                if let Some(handle) = self.plugin_editors.open.remove(&key) {
+                    self.plugin_editors
+                        .open
+                        .insert((track_id.clone(), next), handle);
+                }
+            }
+            if let Some(next) = plan.activate {
+                self.select_plugin_editor_tab(&track_id, &next, cx);
+            }
+        }
+
+        // Bridge editor sessions. An open shell is the moved plug-in's own
+        // editor: closed through the path that leaves the instance running
+        // (and clears the old track's editor flag in the engine). A shell still
+        // waiting for the plug-in to load is re-filed instead, so the deferred
+        // open — re-filed below as well — replaces it on the new channel.
+        let moved_sessions: Vec<((String, String), bool)> = self
+            .plugin_editors
+            .bridge
+            .iter()
+            .filter(|((track_id, insert_id), _)| left(track_id, insert_id))
+            .map(|(key, session)| (key.clone(), session.state == BridgeEditorState::Loading))
+            .collect();
+        for ((track_id, insert_id), loading) in moved_sessions {
+            if !loading {
+                self.close_bridge_editor(cx, &track_id, &insert_id);
+                continue;
+            }
+            let Some(owner) = owner_of(&insert_id).map(str::to_string) else {
+                continue;
+            };
+            if let Some(mut session) = self
+                .plugin_editors
+                .bridge
+                .remove(&(track_id, insert_id.clone()))
+            {
+                session.track_id = owner.clone();
+                self.plugin_editors
+                    .bridge
+                    .insert((owner, insert_id), session);
+            }
+        }
+
+        // Preset selection.
+        let moved_presets: Vec<(String, String)> = self
+            .plugin_editors
+            .preset_selection
+            .keys()
+            .filter(|(track_id, insert_id)| left(track_id, insert_id))
+            .cloned()
+            .collect();
+        for key in moved_presets {
+            let Some(owner) = owner_of(&key.1).map(str::to_string) else {
+                continue;
+            };
+            if let Some(index) = self.plugin_editors.preset_selection.remove(&key) {
+                self.plugin_editors
+                    .preset_selection
+                    .insert((owner, key.1), index);
+            }
+        }
+
+        // Deferred editor opens.
+        for (track_id, slot_index, insert_id) in &mut self.plugin_editors.deferred_opens {
+            if let Some((owner, index)) = owners.get(insert_id.as_str()) {
+                track_id.clone_from(owner);
+                *slot_index = *index;
+            }
+        }
+
+        // Bridge descriptors.
+        if let Some(runtime) = self.plugin_editors.bridge_runtime.as_ref() {
+            if let Ok(mut runtime) = runtime.lock() {
+                let changed = runtime.retarget_tracks(|insert_id| owner_of(insert_id));
+                if changed > 0 {
+                    eprintln!(
+                        "[plugin-bridge] retargeted {changed} instance(s) to their owning track"
+                    );
+                }
+            }
+        }
+
+        self.refresh_builtin_editor_sidebars(cx);
+        self.refresh_plugin_editor_chrome(cx);
     }
 
     /// Close every open plugin editor and release native embed sessions before
@@ -4890,6 +5094,80 @@ impl StudioLayout {
 }
 
 /// Resize shell/content to preferred size before attach (no `ResizeEditor` yet).
+/// Where an insert a cache addresses as `(track_id, insert_id)` is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum InsertKeyStatus {
+    /// Still on `track_id`.
+    Live,
+    /// On another channel now — moved there, and alive. Never unloaded:
+    /// unloading is by instance id alone and would silence it where it plays.
+    Moved { track_id: String },
+    /// No channel holds it any more.
+    Removed,
+}
+
+/// Classify one `(track_id, insert_id)` key against the project as it is now.
+pub(super) fn classify_insert_key(
+    state: &crate::components::timeline::timeline_state::TimelineState,
+    track_id: &str,
+    insert_id: &str,
+) -> InsertKeyStatus {
+    if state.find_insert_slot(track_id, insert_id).is_some() {
+        return InsertKeyStatus::Live;
+    }
+    match state
+        .insert_owner_ids_containing(insert_id)
+        .into_iter()
+        .next()
+    {
+        Some(owner) => InsertKeyStatus::Moved { track_id: owner },
+        None => InsertKeyStatus::Removed,
+    }
+}
+
+/// What a channel's editor window does when plug-ins on its tabs have left
+/// the channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EditorTabDetach {
+    /// Tabs the window keeps, in their current order.
+    pub remaining: Vec<String>,
+    /// Nothing is left on it: close the window.
+    pub close_window: bool,
+    /// The tab on show left: bring this one to the front.
+    pub activate: Option<String>,
+    /// The insert the window is filed under left: file it under this one.
+    pub rekey: Option<String>,
+}
+
+/// Plan a channel window's response to `left` (whether an insert has left
+/// this channel). `key_insert` is the insert the window is filed under,
+/// `active_insert` the tab on show. `None` when nothing on the window left.
+pub(super) fn plan_editor_tab_detach(
+    tabs: &[String],
+    key_insert: &str,
+    active_insert: &str,
+    left: impl Fn(&str) -> bool,
+) -> Option<EditorTabDetach> {
+    if !tabs.iter().any(|id| left(id)) && !left(key_insert) && !left(active_insert) {
+        return None;
+    }
+    let remaining: Vec<String> = tabs.iter().filter(|id| !left(id)).cloned().collect();
+    let Some(next) = remaining.first().cloned() else {
+        return Some(EditorTabDetach {
+            remaining,
+            close_window: true,
+            activate: None,
+            rekey: None,
+        });
+    };
+    Some(EditorTabDetach {
+        close_window: false,
+        activate: left(active_insert).then(|| next.clone()),
+        rekey: left(key_insert).then_some(next),
+        remaining,
+    })
+}
+
 fn resize_shell_before_attach(session: &mut BridgeEditorSession, width: u32, height: u32) {
     // Host-owned: the host process owns the editor window and sizes it itself
     // (IPlugView::getSize during embed). The main app has no window to resize
@@ -5056,6 +5334,122 @@ fn log_bridge_paint_stats(session: &BridgeEditorSession) {
         stats.shell_paint_count,
         stats.size_count
     );
+}
+
+#[cfg(test)]
+mod insert_ownership_tests {
+    use super::{EditorTabDetach, InsertKeyStatus, classify_insert_key, plan_editor_tab_detach};
+    use crate::components::timeline::timeline_state::{
+        CreateTrackOptions, InputMonitorMode, InsertPluginFormat, TimelineState, TrackType,
+    };
+
+    fn state_with_two_tracks() -> (TimelineState, String, String, String) {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let mut ids = Vec::new();
+        for name in ["A", "B"] {
+            ids.push(state.create_track(CreateTrackOptions {
+                track_type: TrackType::Audio,
+                name: name.to_string(),
+                color: gpui::Rgba {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                },
+                volume: 1.0,
+                pan: 0.0,
+                armed: false,
+                input_monitor: InputMonitorMode::Off,
+            }));
+        }
+        let slot = state.ensure_insert_slot_at(&ids[0], 0).expect("slot");
+        state.set_insert_plugin(
+            &ids[0],
+            &slot,
+            "fx".to_string(),
+            Some(std::path::PathBuf::from("C:/p/fx.vst3")),
+            InsertPluginFormat::Vst3,
+            None,
+            "FX".to_string(),
+        );
+        (state, ids[0].clone(), ids[1].clone(), slot)
+    }
+
+    /// A key whose insert moved is "moved", never "removed" — the reconcile
+    /// sweep unloads only removed instances, so a moved one keeps playing.
+    #[test]
+    fn a_moved_insert_is_never_classified_for_unload() {
+        let (mut state, a, b, slot) = state_with_two_tracks();
+        assert_eq!(
+            classify_insert_key(&state, &a, &slot),
+            InsertKeyStatus::Live
+        );
+
+        let plan = state.plan_insert_move(&a, &slot, &b, 0).expect("movable");
+        assert!(state.apply_insert_move(&plan));
+        assert_eq!(
+            classify_insert_key(&state, &a, &slot),
+            InsertKeyStatus::Moved {
+                track_id: b.clone()
+            }
+        );
+        assert_eq!(
+            classify_insert_key(&state, &b, &slot),
+            InsertKeyStatus::Live
+        );
+
+        state.remove_insert(&b, &slot);
+        assert_eq!(
+            classify_insert_key(&state, &a, &slot),
+            InsertKeyStatus::Removed
+        );
+    }
+
+    fn tabs(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Moving the plug-in a tabbed window is filed under leaves the channel's
+    /// other tabs where they are: the window re-files under one of them and
+    /// stays on the tab it was showing.
+    #[test]
+    fn moving_the_key_insert_keeps_the_other_tabs_on_the_source_channel() {
+        let plan = plan_editor_tab_detach(&tabs(&["x", "y", "z"]), "x", "y", |id| id == "x");
+        assert_eq!(
+            plan,
+            Some(EditorTabDetach {
+                remaining: tabs(&["y", "z"]),
+                close_window: false,
+                activate: None,
+                rekey: Some("y".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn moving_the_tab_on_show_brings_another_to_the_front() {
+        let plan = plan_editor_tab_detach(&tabs(&["x", "y"]), "x", "y", |id| id == "y");
+        assert_eq!(
+            plan,
+            Some(EditorTabDetach {
+                remaining: tabs(&["x"]),
+                close_window: false,
+                activate: Some("x".into()),
+                rekey: None,
+            })
+        );
+    }
+
+    #[test]
+    fn moving_the_only_tab_closes_the_window_and_nothing_moved_does_nothing() {
+        let plan = plan_editor_tab_detach(&tabs(&["x"]), "x", "x", |id| id == "x");
+        assert!(plan.is_some_and(|plan| plan.close_window && plan.remaining.is_empty()));
+        assert_eq!(
+            plan_editor_tab_detach(&tabs(&["x", "y"]), "x", "x", |_| false),
+            None
+        );
+    }
 }
 
 #[cfg(test)]

@@ -233,7 +233,7 @@ impl TimelineState {
             let lane_x = self.lane_x_from_window_x(x);
             (self.snap_beats(self.x_to_beat(lane_x) as f32).max(0.0)) as f64
         };
-        let chrome = crate::shell_metrics::APP_CHROME_HEIGHT;
+        let chrome = self.timeline_origin_y();
         if self.show_chord_track {
             let top = chrome + RULER_HEIGHT + self.global_lane_top(GlobalLaneKind::Chord);
             if y >= top && y < top + self.chord_track_height() {

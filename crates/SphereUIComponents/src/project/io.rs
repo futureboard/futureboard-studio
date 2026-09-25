@@ -1,22 +1,51 @@
 use super::{
     ClipSource, FutureboardProject, ProjectAsset,
-    format::{ProjectError, decode_project, decode_project_with_options, encode_project},
+    format::{
+        ProjectError, ProjectIdentity, decode_project, decode_project_identity,
+        decode_project_with_options, encode_project,
+    },
     now_secs,
 };
+use crate::components::timeline::timeline_state::AudioClipStretchState;
 use crate::paths::{FutureboardPaths, ProjectFolderLayout};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 pub const PROJECT_FILE_EXT: &str = "fbproj";
 pub const LEGACY_PROJECT_FILE_EXT: &str = "fbs";
 pub const SUPPORTED_PROJECT_FILE_EXTS: &[&str] = &[PROJECT_FILE_EXT, LEGACY_PROJECT_FILE_EXT];
 
-/// Temp path used for atomic saves: `<project>.fbproj.tmp`.
+/// Temp path older builds used for every save: `<project>.fbproj.tmp`. Saves
+/// now write a per-job name ([`unique_project_temp_path`]); this one is only
+/// cleaned up.
 pub fn project_temp_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.tmp", path.display()))
 }
+
+/// Temp path for one save job: `<project>.fbproj.<pid>-<n>.tmp`. Unique per
+/// job, so two writers can never truncate or rename each other's temp file.
+fn unique_project_temp_path(path: &Path) -> PathBuf {
+    static NEXT_JOB: AtomicU64 = AtomicU64::new(0);
+    let job = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
+    PathBuf::from(format!(
+        "{}.{}-{job}.tmp",
+        path.display(),
+        std::process::id()
+    ))
+}
+
+/// Serializes every project-file write in this process: the background and
+/// synchronous manual saves, autosave, Save Copy and the shutdown autosave
+/// flush. They share the project's `Assets/Audio` folder (whose
+/// `unique_asset_destination` check-then-copy is not atomic) and, for one
+/// target, its backup, so two interleaved writers could pick the same asset
+/// destination or put an older snapshot over a newer one. Ordering between
+/// requests is the caller's save queue; this lock only keeps writes apart.
+static PROJECT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Backup path written before each successful save: `<project>.fbproj.bak`.
 pub fn project_backup_path(path: &Path) -> PathBuf {
@@ -102,11 +131,39 @@ fn project_save_log(args: std::fmt::Arguments<'_>) {
     eprintln!("[ProjectSave] {args}");
 }
 
+/// What a save found besides writing the file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectSaveReport {
+    /// Media the project references that could not be found while saving,
+    /// resolved to absolute paths. Their clips keep the reference they had:
+    /// relative when it lies under the project folder, otherwise absolute.
+    pub offline_media: Vec<PathBuf>,
+}
+
 /// Atomically writes `project` to `path`:
 /// serialize → temp file → flush/fsync → backup existing → rename.
 pub fn save_project(project: &mut FutureboardProject, path: &Path) -> Result<(), ProjectError> {
+    save_project_with_report(project, path).map(|_| ())
+}
+
+/// [`save_project`], also reporting media that was offline. A missing source
+/// never fails the save: losing every other edit because one file is
+/// unplugged is worse than saving a reference that has to be relinked.
+pub fn save_project_with_report(
+    project: &mut FutureboardProject,
+    path: &Path,
+) -> Result<ProjectSaveReport, ProjectError> {
+    let _write_guard = PROJECT_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     project_save_log(format_args!("serialize start"));
-    prepare_portable_assets(project, path)?;
+    let offline_media = prepare_portable_assets(project, path)?;
+    for missing in &offline_media {
+        project_save_log(format_args!(
+            "offline media kept as a reference: {}",
+            missing.display()
+        ));
+    }
     project.modified_at = now_secs();
     let bytes = encode_project(project);
 
@@ -114,37 +171,58 @@ pub fn save_project(project: &mut FutureboardProject, path: &Path) -> Result<(),
         fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = project_temp_path(path);
+    let tmp_path = unique_project_temp_path(path);
     let backup_path = project_backup_path(path);
 
     project_save_log(format_args!("writing temp: {}", tmp_path.display()));
-    {
+    let written = (|| -> std::io::Result<()> {
         let mut file = File::create(&tmp_path)?;
         file.write_all(&bytes)?;
         file.flush()?;
-        file.sync_all()?;
+        file.sync_all()
+    })();
+    if let Err(error) = written {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ProjectError::Io(error));
     }
     project_save_log(format_args!("temp bytes written: {}", bytes.len()));
     project_save_log(format_args!("fsync complete"));
 
     if path.exists() {
-        fs::copy(path, &backup_path)?;
+        if let Err(error) = fs::copy(path, &backup_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(ProjectError::Io(error));
+        }
         project_save_log(format_args!("backup written: {}", backup_path.display()));
-        // Windows cannot rename over an existing file.
-        let _ = fs::remove_file(path);
     }
 
-    match fs::rename(&tmp_path, path) {
+    match replace_project_file(&tmp_path, path) {
         Ok(()) => {
             project_save_log(format_args!("atomic rename complete: {}", path.display()));
-            let _ = fs::remove_file(&tmp_path);
-            Ok(())
+            Ok(ProjectSaveReport { offline_media })
         }
         Err(error) => {
             let _ = fs::remove_file(&tmp_path);
             project_save_log(format_args!("save failed: {error}"));
             Err(ProjectError::Io(error))
         }
+    }
+}
+
+/// Move a finished temp file over `path`. `rename` replaces the target
+/// atomically on macOS and Linux, so the target is never removed first: a
+/// failed rename leaves the previous project in place instead of no project
+/// at all. Windows can refuse to replace a file that is open elsewhere, so only
+/// there does a failed rename remove the target and try once more.
+fn replace_project_file(tmp_path: &Path, path: &Path) -> std::io::Result<()> {
+    match fs::rename(tmp_path, path) {
+        Ok(()) => Ok(()),
+        #[cfg(windows)]
+        Err(_) if path.exists() => {
+            let _ = fs::remove_file(path);
+            fs::rename(tmp_path, path)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -181,6 +259,128 @@ pub fn load_project_strict(path: &Path) -> Result<FutureboardProject, ProjectErr
 /// Round-trip verify that `path` contains a loadable project file.
 pub fn verify_project_file(path: &Path) -> Result<(), ProjectError> {
     load_project_strict(path).map(|_| ())
+}
+
+/// Suffix of every autosave file: `<name>.autosave.fbproj`.
+pub const AUTOSAVE_FILE_SUFFIX: &str = ".autosave.fbproj";
+
+/// Autosave of a saved project, written next to it: `<stem>.autosave.fbproj`.
+pub fn autosave_path_for_project(project_file: &Path) -> PathBuf {
+    let stem = project_file
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("project");
+    project_file.with_file_name(format!("{stem}{AUTOSAVE_FILE_SUFFIX}"))
+}
+
+/// Folder holding the autosaves of untitled sessions.
+pub fn untitled_autosave_dir(app_data: &Path) -> PathBuf {
+    app_data.join("Autosaves")
+}
+
+/// Autosave of an untitled session, named by its session id.
+pub fn untitled_autosave_path(app_data: &Path, session_id: &str) -> PathBuf {
+    untitled_autosave_dir(app_data).join(format!("{session_id}{AUTOSAVE_FILE_SUFFIX}"))
+}
+
+pub fn is_autosave_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(AUTOSAVE_FILE_SUFFIX))
+}
+
+/// Whether `path` is an untitled session's autosave. Opening one recovers an
+/// untitled session: it must never be bound as the project's own file.
+pub fn is_untitled_autosave_path(path: &Path, app_data: &Path) -> bool {
+    is_autosave_path(path) && path.parent() == Some(untitled_autosave_dir(app_data).as_path())
+}
+
+/// Read and fully validate a project file, returning only its identity.
+pub fn read_project_identity(path: &Path) -> Result<ProjectIdentity, ProjectError> {
+    decode_project_identity(&fs::read(path)?)
+}
+
+/// The autosave to offer when opening `project_file`, whose decoded id and
+/// modification time are given: it must pass the header and checksum checks,
+/// belong to the same project and be strictly newer. `None` otherwise, and
+/// always for a file that is itself an autosave or a foreign import.
+pub fn newer_autosave_for(
+    project_file: &Path,
+    project_id: &str,
+    saved_modified_at: u64,
+) -> Option<PathBuf> {
+    if is_autosave_path(project_file) || super::import::is_import_path(project_file) {
+        return None;
+    }
+    let autosave = autosave_path_for_project(project_file);
+    if !autosave.is_file() {
+        return None;
+    }
+    let identity = read_project_identity(&autosave).ok()?;
+    (identity.id == project_id && identity.modified_at > saved_modified_at).then_some(autosave)
+}
+
+/// Newest intact autosave an untitled session left in `dir`. Untitled
+/// autosaves are named by a per-session id, so no project open can find them
+/// by id; this is how they are offered back.
+pub fn newest_untitled_autosave(dir: &Path) -> Option<(PathBuf, ProjectIdentity)> {
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| is_autosave_path(path) && path.is_file())
+        .filter_map(|path| {
+            let identity = read_project_identity(&path).ok()?;
+            Some((path, identity))
+        })
+        .max_by_key(|(_, identity)| identity.modified_at)
+}
+
+/// Delete an autosave and what its saves leave next to it: the backup, the
+/// shared temp name older builds used, and any per-job temp file a crash
+/// left behind. Best effort; a file that is already gone is not an error.
+/// Waits for a write in progress, so it never pulls a temp file out from under
+/// a running save.
+pub fn remove_autosave_files(autosave: &Path) {
+    let _write_guard = PROJECT_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for path in [
+        autosave.to_path_buf(),
+        project_backup_path(autosave),
+        project_temp_path(autosave),
+    ] {
+        let _ = fs::remove_file(path);
+    }
+    let (Some(dir), Some(name)) = (
+        autosave.parent(),
+        autosave.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{name}.");
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(job) = file_name
+            .to_str()
+            .and_then(|file| file.strip_prefix(&prefix))
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        let is_job_temp = job.split_once('-').is_some_and(|(pid, n)| {
+            !pid.is_empty()
+                && !n.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && n.bytes().all(|b| b.is_ascii_digit())
+        });
+        if is_job_temp {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Cheaply validate a project file on disk by reading only its header.
@@ -258,18 +458,43 @@ pub fn import_audio_file_to_project(
     Ok(dest)
 }
 
+/// Make every clip's media reference portable before a save: copy external
+/// audio into `Assets/Audio`, rewrite each `source_path` to the project-relative
+/// location and rebuild `project.assets` with one record per referenced asset.
+///
+/// Asset ids (`asset_id`, the timeline's `file_id`) are never rewritten. They
+/// are identities, not locations: the ARA audio-source persistentID and the
+/// peak-cache key are both derived from them, so an id that changed on save
+/// orphaned the ARA document and the peaks on the next open.
+///
+/// Media that cannot be found is kept as a reference (relative when it lies
+/// under the project folder, otherwise absolute) with a record that has no
+/// fingerprint, and is returned so the caller can say so. It never fails the
+/// save.
+///
+/// `project.assets` may carry the records of the last load or save. Their
+/// fingerprints spare re-hashing unchanged files, and their format metadata
+/// (for example a DAW import's frame counts) is kept where this save has
+/// nothing newer.
 fn prepare_portable_assets(
     project: &mut FutureboardProject,
     project_file: &Path,
-) -> Result<(), ProjectError> {
+) -> Result<Vec<PathBuf>, ProjectError> {
     let Some(project_root) = project_file.parent() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let layout = ProjectFolderLayout::from_root(project_root.to_path_buf());
     layout.ensure_dirs()?;
 
     let mut copied: Vec<(PathBuf, String)> = Vec::new();
     let mut assets: Vec<ProjectAsset> = Vec::new();
+    let mut offline: Vec<PathBuf> = Vec::new();
+
+    let previous: HashMap<String, ProjectAsset> = project
+        .assets
+        .iter()
+        .map(|asset| (asset.id.clone(), asset.clone()))
+        .collect();
 
     // Fingerprints recorded by previous saves (v11+), keyed by project-relative
     // path. Lets us carry a known fingerprint forward without re-hashing a file
@@ -301,8 +526,8 @@ fn prepare_portable_assets(
 
     for track in &mut project.tracks {
         for clip in &mut track.clips {
+            let known_format = ClipSourceFormat::of(&clip.stretch);
             if let ClipSource::Rauf {
-                asset_id,
                 source_path,
                 metadata_path,
                 ..
@@ -310,15 +535,10 @@ fn prepare_portable_assets(
             {
                 let source_abs = resolve_source_for_save(source_path, project_root);
                 if !source_abs.exists() {
-                    return Err(ProjectError::Corrupted(format!(
-                        "missing RAUF recording: {}",
-                        source_abs.display()
-                    )));
-                }
-                if let Some(relative) = path_relative_to_project(&source_abs, project_root) {
-                    let relative_string = path_to_project_string(&relative);
-                    *source_path = PathBuf::from(&relative_string);
-                    *asset_id = relative_string.clone();
+                    *source_path = offline_reference(&source_abs, project_root);
+                    note_offline(&mut offline, source_abs);
+                } else if let Some(relative) = path_relative_to_project(&source_abs, project_root) {
+                    *source_path = PathBuf::from(path_to_project_string(&relative));
                 }
                 if let Some(metadata_path) = metadata_path {
                     let metadata_abs = resolve_source_for_save(metadata_path, project_root);
@@ -336,22 +556,35 @@ fn prepare_portable_assets(
             else {
                 continue;
             };
+            let asset_id = asset_id.clone();
+            let previous_record = previous.get(&asset_id);
 
             let source_abs = resolve_source_for_save(source_path, project_root);
             if !source_abs.exists() {
-                return Err(ProjectError::Corrupted(format!(
-                    "missing audio asset: {}",
-                    source_abs.display()
-                )));
+                *source_path = offline_reference(&source_abs, project_root);
+                push_asset_record(
+                    &mut assets,
+                    offline_asset_record(
+                        &asset_id,
+                        &source_abs,
+                        project_root,
+                        known_format,
+                        previous_record,
+                    ),
+                );
+                note_offline(&mut offline, source_abs);
+                continue;
             }
 
             if let Some(relative) = path_relative_to_project(&source_abs, project_root) {
                 let relative_string = path_to_project_string(&relative);
-                // Carry a known fingerprint forward; only hash if this file was
-                // never fingerprinted (first save after a pre-v11 upgrade).
+                // Carry a known fingerprint forward while the file still has
+                // the length it was hashed at; only hash files never
+                // fingerprinted (or visibly changed since).
                 let fingerprint = prev_fp_by_rel
                     .get(&relative_string)
                     .copied()
+                    .filter(|fp| file_len_is(&source_abs, fp.len))
                     .or_else(|| audio_fingerprint(&source_abs));
                 if let Some(fp) = fingerprint {
                     content_index
@@ -359,25 +592,30 @@ fn prepare_portable_assets(
                         .or_insert_with(|| relative_string.clone());
                 }
                 *source_path = PathBuf::from(&relative_string);
-                *asset_id = relative_string.clone();
-                assets.push(asset_record(
-                    asset_id.clone(),
-                    &source_abs,
-                    relative_string,
-                    None,
-                    fingerprint,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?);
+                push_asset_record(
+                    &mut assets,
+                    with_known_metadata(
+                        asset_record(
+                            asset_id.clone(),
+                            &source_abs,
+                            relative_string,
+                            None,
+                            fingerprint,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )?,
+                        known_format,
+                        previous_record,
+                    ),
+                );
                 continue;
             }
 
             // External source. Reuse an identical-content copy already in the
             // project before falling back to path-equality dedup within this
-            // save. Mirrors the path-reuse branch: rewrite the reference only,
-            // without emitting a second asset record for the same file.
+            // save. Either way only the reference moves; the clip keeps its id.
             let fingerprint = audio_fingerprint(&source_abs);
             if let Some(fp) = fingerprint {
                 if !content_index.contains_key(&fp) && !folder_scanned {
@@ -396,7 +634,24 @@ fn prepare_portable_assets(
                         source_abs.display()
                     );
                     *source_path = PathBuf::from(existing_rel);
-                    *asset_id = existing_rel.clone();
+                    push_asset_record(
+                        &mut assets,
+                        with_known_metadata(
+                            asset_record(
+                                asset_id.clone(),
+                                &project_root.join(existing_rel),
+                                existing_rel.clone(),
+                                Some(source_abs.clone()),
+                                Some(fp),
+                                None,
+                                None,
+                                None,
+                                None,
+                            )?,
+                            known_format,
+                            previous_record,
+                        ),
+                    );
                     continue;
                 }
             }
@@ -405,8 +660,26 @@ fn prepare_portable_assets(
                 .iter()
                 .find(|(known_source, _)| same_source(known_source, &source_abs))
             {
-                *source_path = PathBuf::from(relative_string);
-                *asset_id = relative_string.clone();
+                let relative_string = relative_string.clone();
+                *source_path = PathBuf::from(&relative_string);
+                push_asset_record(
+                    &mut assets,
+                    with_known_metadata(
+                        asset_record(
+                            asset_id.clone(),
+                            &project_root.join(&relative_string),
+                            relative_string,
+                            Some(source_abs.clone()),
+                            fingerprint,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )?,
+                        known_format,
+                        previous_record,
+                    ),
+                );
                 continue;
             }
 
@@ -426,7 +699,6 @@ fn prepare_portable_assets(
             let relative_string = path_to_project_string(&relative);
 
             *source_path = PathBuf::from(&relative_string);
-            *asset_id = relative_string.clone();
             copied.push((source_abs.clone(), relative_string.clone()));
             // Prefer the fingerprint of the source we just read; fall back to the
             // freshly-written copy.
@@ -434,24 +706,167 @@ fn prepare_portable_assets(
             if let Some(fp) = dest_fingerprint {
                 content_index.insert(fp, relative_string.clone());
             }
-            assets.push(asset_record(
-                asset_id.clone(),
-                &dest,
-                relative_string,
-                Some(source_abs),
-                dest_fingerprint,
-                None,
-                None,
-                None,
-                None,
-            )?);
+            push_asset_record(
+                &mut assets,
+                with_known_metadata(
+                    asset_record(
+                        asset_id.clone(),
+                        &dest,
+                        relative_string,
+                        Some(source_abs),
+                        dest_fingerprint,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?,
+                    known_format,
+                    previous_record,
+                ),
+            );
         }
     }
 
-    if !assets.is_empty() {
-        project.assets = assets;
+    // Exactly the assets this save references: a record for media no clip
+    // uses any more would only schedule a waveform job on the next open.
+    project.assets = assets;
+    Ok(offline)
+}
+
+/// What an audio clip already knows about its file, from a decode in this or
+/// an earlier session. Recorded in the asset so a reopened clip can show its
+/// source duration before (or without) decoding the file again.
+#[derive(Debug, Clone, Copy)]
+struct ClipSourceFormat {
+    sample_rate: u32,
+    frames: u64,
+}
+
+impl ClipSourceFormat {
+    fn of(stretch: &AudioClipStretchState) -> Option<Self> {
+        (stretch.original_sample_rate > 0 && stretch.original_duration_samples > 0).then(|| Self {
+            sample_rate: stretch.original_sample_rate,
+            frames: stretch.original_duration_samples,
+        })
     }
-    Ok(())
+}
+
+/// Fill what this save could not measure from the clip's decoded format and
+/// from the record the last load or save wrote for the same id. A previous
+/// record whose fingerprint no longer matches describes other bytes and is
+/// ignored.
+fn with_known_metadata(
+    mut record: ProjectAsset,
+    format: Option<ClipSourceFormat>,
+    previous: Option<&ProjectAsset>,
+) -> ProjectAsset {
+    if let Some(format) = format {
+        record.sample_rate = record.sample_rate.or(Some(format.sample_rate));
+        record.duration_samples = record.duration_samples.or(Some(format.frames));
+        record.duration_secs = record
+            .duration_secs
+            .or(Some(format.frames as f64 / format.sample_rate as f64));
+    }
+    let same_bytes = |prev: &&ProjectAsset| match (
+        record.source_fingerprint.as_deref(),
+        prev.source_fingerprint.as_deref(),
+    ) {
+        (Some(now), Some(before)) => now == before,
+        _ => true,
+    };
+    if let Some(prev) = previous.filter(same_bytes) {
+        record.duration_secs = record.duration_secs.or(prev.duration_secs);
+        record.sample_rate = record.sample_rate.or(prev.sample_rate);
+        record.channels = record.channels.or(prev.channels);
+        record.duration_samples = record.duration_samples.or(prev.duration_samples);
+    }
+    record
+}
+
+/// Record for media that was offline during the save: no fingerprint (the
+/// bytes could not be read), the reference as the clip keeps it, and any
+/// format known from before.
+fn offline_asset_record(
+    id: &str,
+    source_abs: &Path,
+    project_root: &Path,
+    format: Option<ClipSourceFormat>,
+    previous: Option<&ProjectAsset>,
+) -> ProjectAsset {
+    let relative_path = offline_project_relative(source_abs, project_root);
+    let absolute_path = if relative_path.is_some() {
+        previous.and_then(|prev| prev.absolute_path.clone())
+    } else {
+        Some(source_abs.to_path_buf())
+    };
+    let record = ProjectAsset {
+        id: id.to_string(),
+        original_filename: source_abs
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "audio".to_string()),
+        relative_path,
+        absolute_path,
+        duration_secs: None,
+        sample_rate: None,
+        channels: None,
+        source_fingerprint: None,
+        waveform_peak_relative_path: Some(
+            crate::components::timeline::waveform_peak_file::waveform_peak_relative_path_for_asset(
+                id,
+            ),
+        ),
+        duration_samples: None,
+    };
+    with_known_metadata(record, format, previous)
+}
+
+/// One record per asset id. Clips sharing an asset merge what they know.
+fn push_asset_record(assets: &mut Vec<ProjectAsset>, record: ProjectAsset) {
+    let Some(existing) = assets.iter_mut().find(|asset| asset.id == record.id) else {
+        assets.push(record);
+        return;
+    };
+    existing.duration_secs = existing.duration_secs.or(record.duration_secs);
+    existing.sample_rate = existing.sample_rate.or(record.sample_rate);
+    existing.channels = existing.channels.or(record.channels);
+    existing.duration_samples = existing.duration_samples.or(record.duration_samples);
+    existing.source_fingerprint = existing
+        .source_fingerprint
+        .take()
+        .or(record.source_fingerprint);
+}
+
+fn note_offline(offline: &mut Vec<PathBuf>, path: PathBuf) {
+    if !offline.contains(&path) {
+        offline.push(path);
+    }
+}
+
+/// The reference an offline source keeps: project-relative when it lies under
+/// the project folder, so the project stays portable, otherwise absolute.
+fn offline_reference(source_abs: &Path, project_root: &Path) -> PathBuf {
+    offline_project_relative(source_abs, project_root)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| source_abs.to_path_buf())
+}
+
+/// Project-relative form of a path that may not exist. `path_relative_to_project`
+/// canonicalizes, which a missing file cannot do, so this compares the paths
+/// as written, then against the canonical project root.
+fn offline_project_relative(source_abs: &Path, project_root: &Path) -> Option<String> {
+    if let Ok(relative) = source_abs.strip_prefix(project_root) {
+        return Some(path_to_project_string(relative));
+    }
+    let root = fs::canonicalize(project_root).ok()?;
+    source_abs
+        .strip_prefix(root)
+        .ok()
+        .map(path_to_project_string)
+}
+
+fn file_len_is(path: &Path, len: u64) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.len() == len)
 }
 
 fn resolve_project_relative_assets(project: &mut FutureboardProject, project_file: &Path) {
@@ -603,9 +1018,18 @@ impl AudioFingerprint {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Full-file hashes computed on this thread, so tests can prove a save
+    /// carried a fingerprint forward instead of re-reading the file.
+    static FINGERPRINTS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Stream `path` through CRC32 without loading it fully into memory. Returns
 /// `None` if the file cannot be read (caller falls back to path-equality dedup).
 fn audio_fingerprint(path: &Path) -> Option<AudioFingerprint> {
+    #[cfg(test)]
+    FINGERPRINTS_COMPUTED.with(|count| count.set(count.get() + 1));
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let mut hasher = crc32fast::Hasher::new();
@@ -874,19 +1298,36 @@ mod tests {
         assert!(copied.exists());
         let loaded = load_project_strict(&project_file).unwrap();
         let ClipSource::Audio {
+            asset_id: loaded_id,
             source_path: Some(loaded_path),
-            ..
         } = &loaded.tracks[0].clips[0].source
         else {
             panic!("expected loaded audio clip source");
         };
         assert_eq!(loaded_path, &copied);
+        // Only the location moves into the project; the asset id is an
+        // identity (ARA persistentID, peak-cache key) and stays as it was.
+        let original_id = source.to_string_lossy().into_owned();
+        assert_eq!(loaded_id, &original_id);
+        assert_eq!(loaded.assets.len(), 1);
+        assert_eq!(loaded.assets[0].id, original_id);
+        assert_eq!(
+            loaded.assets[0].relative_path.as_deref(),
+            Some("Assets/Audio/loop.wav")
+        );
+        assert_eq!(loaded.assets[0].absolute_path.as_ref(), Some(&source));
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(external);
     }
 
     fn audio_clip(id: &str, source: &Path) -> ProjectClip {
+        audio_clip_with_asset(id, &source.to_string_lossy(), source)
+    }
+
+    /// A clip whose asset id is not its path, like every clip of a project
+    /// that was saved and reopened (ids are minted once, then kept).
+    fn audio_clip_with_asset(id: &str, asset_id: &str, source: &Path) -> ProjectClip {
         ProjectClip {
             id: id.to_string(),
             name: "loop".to_string(),
@@ -896,7 +1337,7 @@ mod tests {
             gain: 1.0,
             muted: false,
             source: ClipSource::Audio {
-                asset_id: source.to_string_lossy().into_owned(),
+                asset_id: asset_id.to_string(),
                 source_path: Some(source.to_path_buf()),
             },
             stretch: AudioClipStretchState::default(),
@@ -1181,14 +1622,16 @@ mod tests {
         assert!(peak_path.exists());
 
         let mut project = FutureboardProject::new("PeakA");
-        project
-            .tracks
-            .push(audio_track("t1", vec![audio_clip("c1", &dest)]));
+        project.tracks.push(audio_track(
+            "t1",
+            vec![audio_clip_with_asset("c1", asset_id, &dest)],
+        ));
         let project_file = root.join("PeakA.fbproj");
         save_project(&mut project, &project_file).unwrap();
 
         let loaded = load_project_strict(&project_file).unwrap();
         assert_eq!(loaded.assets.len(), 1);
+        assert_eq!(loaded.assets[0].id, asset_id);
         assert_eq!(
             loaded.assets[0].relative_path.as_deref(),
             Some("Assets/Audio/loop.wav")
@@ -1236,13 +1679,18 @@ mod tests {
             waveform_peak_relative_path: Some(peak_rel.clone()),
             duration_samples: Some(48_000),
         });
-        project
-            .tracks
-            .push(audio_track("t1", vec![audio_clip("c1", &audio_path)]));
+        project.tracks.push(audio_track(
+            "t1",
+            vec![audio_clip_with_asset("c1", asset_id, &audio_path)],
+        ));
         let project_file = root.join("PeakB.fbproj");
         save_project(&mut project, &project_file).unwrap();
 
         let loaded = load_project_strict(&project_file).unwrap();
+        // The carried record keeps what the earlier save knew about the file.
+        assert_eq!(loaded.assets[0].id, asset_id);
+        assert_eq!(loaded.assets[0].duration_samples, Some(48_000));
+        assert_eq!(loaded.assets[0].channels, Some(2));
         let peak_path = resolve_project_relative_path(
             &root,
             loaded.assets[0]
@@ -1359,5 +1807,412 @@ mod tests {
             "Could not open this project because the file appears to be incomplete or corrupted."
         );
         assert!(err.technical_detail().contains("u32"));
+    }
+
+    fn clip_source(project: &FutureboardProject, clip: usize) -> (String, PathBuf) {
+        match &project.tracks[0].clips[clip].source {
+            ClipSource::Audio {
+                asset_id,
+                source_path: Some(path),
+            } => (asset_id.clone(), path.clone()),
+            other => panic!("expected an audio clip, got {other:?}"),
+        }
+    }
+
+    /// The asset id is the ARA audio-source persistentID and the peak-cache
+    /// key. A save used to rewrite it to the project-relative path, so the ARA
+    /// document saved alongside no longer matched on reopen.
+    #[test]
+    fn asset_ids_survive_save_reopen_and_a_second_save() {
+        let root = temp_dir("stable-ids");
+        let ext = temp_dir("stable-ids-ext");
+        fs::create_dir_all(&ext).unwrap();
+        let source = ext.join("take.wav");
+        fs::write(&source, b"stable id bytes").unwrap();
+        let live_id = source.to_string_lossy().into_owned();
+
+        let mut project = FutureboardProject::new("Stable");
+        project
+            .tracks
+            .push(audio_track("t1", vec![audio_clip("c1", &source)]));
+        let project_file = root.join("Stable.fbproj");
+        save_project(&mut project, &project_file).unwrap();
+
+        let mut reopened = load_project_strict(&project_file).unwrap();
+        let (id, path) = clip_source(&reopened, 0);
+        assert_eq!(id, live_id);
+        assert_eq!(path, root.join("Assets").join("Audio").join("take.wav"));
+
+        save_project(&mut reopened, &project_file).unwrap();
+        let again = load_project_strict(&project_file).unwrap();
+        assert_eq!(clip_source(&again, 0).0, live_id);
+        assert_eq!(again.assets.len(), 1);
+        assert_eq!(again.assets[0].id, live_id);
+        assert_eq!(audio_files_in(&root), vec!["take.wav".to_string()]);
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(ext);
+    }
+
+    /// One unplugged drive used to fail the whole save (and every autosave),
+    /// so no other edit reached the file. The save now goes through, keeps the
+    /// reference and reports the media as offline.
+    #[test]
+    fn a_missing_source_is_kept_as_a_reference_and_reported() {
+        let root = temp_dir("offline");
+        let ext = temp_dir("offline-ext");
+        fs::create_dir_all(&ext).unwrap();
+        let present = ext.join("present.wav");
+        fs::write(&present, b"present bytes").unwrap();
+        let missing_external = ext.join("unplugged.wav");
+        let missing_inside = root.join("Assets").join("Audio").join("deleted.wav");
+
+        let mut project = FutureboardProject::new("Offline");
+        project.tracks.push(audio_track(
+            "t1",
+            vec![
+                audio_clip("c-present", &present),
+                audio_clip_with_asset("c-external", "asset-external", &missing_external),
+                audio_clip_with_asset("c-inside", "asset-inside", &missing_inside),
+            ],
+        ));
+        let project_file = root.join("Offline.fbproj");
+        let report = save_project_with_report(&mut project, &project_file).unwrap();
+        assert_eq!(
+            report.offline_media,
+            vec![missing_external.clone(), missing_inside.clone()]
+        );
+
+        // The written file is complete: the present clip was still copied in.
+        let loaded = load_project_strict(&project_file).unwrap();
+        assert_eq!(loaded.tracks[0].clips.len(), 3);
+        assert_eq!(
+            clip_source(&loaded, 0).1,
+            root.join("Assets").join("Audio").join("present.wav")
+        );
+        // Outside the project: kept absolute. Inside: kept project-relative,
+        // so it resolves under the (possibly moved) project folder.
+        assert_eq!(
+            clip_source(&loaded, 1),
+            ("asset-external".to_string(), missing_external.clone())
+        );
+        assert_eq!(
+            clip_source(&loaded, 2),
+            ("asset-inside".to_string(), missing_inside.clone())
+        );
+        let external = loaded
+            .assets
+            .iter()
+            .find(|asset| asset.id == "asset-external")
+            .expect("offline asset recorded");
+        assert_eq!(external.source_fingerprint, None);
+        assert_eq!(external.relative_path, None);
+        assert_eq!(external.absolute_path.as_ref(), Some(&missing_external));
+        let inside = loaded
+            .assets
+            .iter()
+            .find(|asset| asset.id == "asset-inside")
+            .expect("offline asset recorded");
+        assert_eq!(
+            inside.relative_path.as_deref(),
+            Some("Assets/Audio/deleted.wav")
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(ext);
+    }
+
+    /// Asset records from the last load or save ride along with the next
+    /// snapshot, so an unchanged file is not hashed on every save — which is
+    /// what made a background save long enough to race edits and other saves.
+    #[test]
+    fn carried_asset_records_spare_rehashing_unchanged_files() {
+        let root = temp_dir("carry-fp");
+        let audio = root.join("Assets").join("Audio").join("loop.wav");
+        fs::create_dir_all(audio.parent().unwrap()).unwrap();
+        fs::write(&audio, b"inside the project already").unwrap();
+        let tracks = vec![audio_track(
+            "t1",
+            vec![audio_clip_with_asset("c1", "Assets/Audio/loop.wav", &audio)],
+        )];
+        let project_file = root.join("Carry.fbproj");
+
+        let hashed = || FINGERPRINTS_COMPUTED.with(|count| count.get());
+        let mut first = FutureboardProject::new("Carry");
+        first.tracks = tracks.clone();
+        let before = hashed();
+        save_project(&mut first, &project_file).unwrap();
+        assert_eq!(hashed() - before, 1, "the first save fingerprints the file");
+
+        // The next snapshot is built fresh from the timeline, plus the records
+        // the last save returned.
+        let mut second = FutureboardProject::new("Carry");
+        second.tracks = tracks.clone();
+        second.assets = first.assets.clone();
+        let before = hashed();
+        save_project(&mut second, &project_file).unwrap();
+        assert_eq!(hashed() - before, 0, "an unchanged file is not re-hashed");
+        assert_eq!(
+            second.assets[0].source_fingerprint,
+            first.assets[0].source_fingerprint
+        );
+
+        // A file whose length changed is hashed again rather than trusted.
+        fs::write(&audio, b"rewritten with different content").unwrap();
+        let mut third = FutureboardProject::new("Carry");
+        third.tracks = tracks;
+        third.assets = second.assets.clone();
+        let before = hashed();
+        save_project(&mut third, &project_file).unwrap();
+        assert_eq!(hashed() - before, 1);
+        assert_ne!(
+            third.assets[0].source_fingerprint,
+            first.assets[0].source_fingerprint
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A DAW import knows each file's format from the archive. That used to be
+    /// dropped by the first save, which wrote every record without it.
+    #[test]
+    fn imported_asset_metadata_survives_a_save() {
+        let root = temp_dir("import-meta");
+        let audio = root.join("Audio").join("kick.wav");
+        fs::create_dir_all(audio.parent().unwrap()).unwrap();
+        fs::write(&audio, b"kick").unwrap();
+
+        let mut project = FutureboardProject::new("Imported");
+        project.assets.push(ProjectAsset {
+            id: "cubase-asset-1".to_string(),
+            original_filename: "kick.wav".to_string(),
+            relative_path: None,
+            absolute_path: Some(audio.clone()),
+            duration_secs: Some(2.0),
+            sample_rate: Some(44_100),
+            channels: Some(2),
+            source_fingerprint: None,
+            waveform_peak_relative_path: None,
+            duration_samples: Some(88_200),
+        });
+        project.tracks.push(audio_track(
+            "t1",
+            vec![audio_clip_with_asset("c1", "cubase-asset-1", &audio)],
+        ));
+        let project_file = root.join("Imported.fbproj");
+        save_project(&mut project, &project_file).unwrap();
+
+        let loaded = load_project_strict(&project_file).unwrap();
+        assert_eq!(loaded.assets.len(), 1);
+        let asset = &loaded.assets[0];
+        assert_eq!(asset.id, "cubase-asset-1");
+        assert_eq!(asset.relative_path.as_deref(), Some("Audio/kick.wav"));
+        assert_eq!(asset.sample_rate, Some(44_100));
+        assert_eq!(asset.channels, Some(2));
+        assert_eq!(asset.duration_samples, Some(88_200));
+        assert_eq!(asset.duration_secs, Some(2.0));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A clip that has been decoded records its format in the asset, so a
+    /// reopened clip knows its source duration without decoding again.
+    #[test]
+    fn a_decoded_clip_records_its_format_in_the_asset() {
+        let root = temp_dir("clip-format");
+        let audio = root.join("Assets").join("Audio").join("vox.wav");
+        fs::create_dir_all(audio.parent().unwrap()).unwrap();
+        fs::write(&audio, b"vox").unwrap();
+        let mut clip = audio_clip_with_asset("c1", "Assets/Audio/vox.wav", &audio);
+        clip.stretch.original_sample_rate = 48_000;
+        clip.stretch.original_duration_samples = 96_000;
+
+        let mut project = FutureboardProject::new("Format");
+        project.tracks.push(audio_track("t1", vec![clip]));
+        let project_file = root.join("Format.fbproj");
+        save_project(&mut project, &project_file).unwrap();
+
+        let loaded = load_project_strict(&project_file).unwrap();
+        assert_eq!(loaded.assets[0].sample_rate, Some(48_000));
+        assert_eq!(loaded.assets[0].duration_samples, Some(96_000));
+        assert_eq!(loaded.assets[0].duration_secs, Some(2.0));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Two saves of one project running at once (a quick double save, or a
+    /// save and a save-on-close) must never leave the project file missing.
+    /// They used to share one temp path and delete the target before renaming,
+    /// so a lost race could remove the `.fbproj` entirely.
+    #[test]
+    fn concurrent_saves_never_leave_the_project_missing() {
+        let root = temp_dir("concurrent-save");
+        fs::create_dir_all(&root).unwrap();
+        let project_file = root.join("Race.fbproj");
+        save_project(&mut FutureboardProject::new("Race 0"), &project_file).unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let stop = stop.clone();
+            let project_file = project_file.clone();
+            std::thread::spawn(move || {
+                let mut missing = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !project_file.exists() {
+                        missing += 1;
+                    }
+                }
+                missing
+            })
+        };
+        let writers: Vec<_> = (0..4)
+            .map(|writer| {
+                let project_file = project_file.clone();
+                std::thread::spawn(move || {
+                    for round in 0..8 {
+                        let mut project =
+                            FutureboardProject::new(&format!("Race {writer}-{round}"));
+                        save_project(&mut project, &project_file).expect("save");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(watcher.join().unwrap(), 0, "the project file went missing");
+
+        let loaded = load_project_strict(&project_file).expect("a complete project");
+        assert!(loaded.name.starts_with("Race "));
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn write_project_file(path: &Path, id: &str, modified_at: u64) {
+        let mut project = FutureboardProject::new("Recoverable");
+        project.id = id.to_string();
+        project.modified_at = modified_at;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, encode_project(&project)).unwrap();
+    }
+
+    #[test]
+    fn project_identity_is_read_without_decoding_and_checks_the_checksum() {
+        let dir = temp_dir("identity");
+        let path = dir.join("Song.fbproj");
+        write_project_file(&path, "id-1", 42);
+        let identity = read_project_identity(&path).unwrap();
+        assert_eq!(identity.id, "id-1");
+        assert_eq!(identity.modified_at, 42);
+
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 5;
+        bytes[last] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            read_project_identity(&path),
+            Err(ProjectError::ChecksumMismatch { .. })
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Only an intact autosave of the same project that is newer than the
+    /// saved file is offered on open.
+    #[test]
+    fn a_newer_autosave_of_the_same_project_is_offered() {
+        let dir = temp_dir("autosave-offer");
+        let project_file = dir.join("Song.fbproj");
+        let autosave = autosave_path_for_project(&project_file);
+        assert_eq!(autosave, dir.join("Song.autosave.fbproj"));
+        write_project_file(&project_file, "song", 100);
+
+        assert_eq!(
+            newer_autosave_for(&project_file, "song", 100),
+            None,
+            "none on disk"
+        );
+
+        write_project_file(&autosave, "song", 160);
+        assert_eq!(
+            newer_autosave_for(&project_file, "song", 100),
+            Some(autosave.clone())
+        );
+        // Older or equally old: the saved file already has everything.
+        assert_eq!(newer_autosave_for(&project_file, "song", 160), None);
+        assert_eq!(newer_autosave_for(&project_file, "song", 200), None);
+        // Another project's autosave under the same name is never offered.
+        assert_eq!(newer_autosave_for(&project_file, "other-song", 100), None);
+        // Nor is a damaged one.
+        fs::write(&autosave, b"not a project").unwrap();
+        assert_eq!(newer_autosave_for(&project_file, "song", 100), None);
+        // An autosave is never checked for an autosave of its own.
+        assert_eq!(newer_autosave_for(&autosave, "song", 0), None);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_newest_intact_untitled_autosave_is_found() {
+        let app_data = temp_dir("untitled-autosaves");
+        let dir = untitled_autosave_dir(&app_data);
+        assert_eq!(newest_untitled_autosave(&dir), None, "no folder yet");
+
+        let older = untitled_autosave_path(&app_data, "session-a");
+        let newer = untitled_autosave_path(&app_data, "session-b");
+        let damaged = untitled_autosave_path(&app_data, "session-c");
+        write_project_file(&older, "session-a", 10);
+        write_project_file(&newer, "session-b", 20);
+        fs::write(&damaged, b"half written").unwrap();
+        fs::write(dir.join("notes.txt"), b"not an autosave").unwrap();
+
+        let (path, identity) = newest_untitled_autosave(&dir).expect("an autosave");
+        assert_eq!(path, newer);
+        assert_eq!(identity.id, "session-b");
+        assert!(is_untitled_autosave_path(&newer, &app_data));
+        assert!(!is_untitled_autosave_path(
+            &autosave_path_for_project(&app_data.join("Song").join("Song.fbproj")),
+            &app_data
+        ));
+
+        let _ = fs::remove_dir_all(app_data);
+    }
+
+    #[test]
+    fn removing_an_autosave_also_removes_its_backup_and_temp_files() {
+        let dir = temp_dir("autosave-cleanup");
+        let project_file = dir.join("Song.fbproj");
+        let autosave = autosave_path_for_project(&project_file);
+        write_project_file(&project_file, "song", 1);
+        write_project_file(&autosave, "song", 2);
+        let backup = project_backup_path(&autosave);
+        let legacy_temp = project_temp_path(&autosave);
+        let job_temp = PathBuf::from(format!("{}.123-4.tmp", autosave.display()));
+        let unrelated = PathBuf::from(format!("{}.notes.tmp", autosave.display()));
+        for path in [&backup, &legacy_temp, &job_temp, &unrelated] {
+            fs::write(path, b"x").unwrap();
+        }
+
+        remove_autosave_files(&autosave);
+
+        for gone in [&autosave, &backup, &legacy_temp, &job_temp] {
+            assert!(!gone.exists(), "{} should be removed", gone.display());
+        }
+        assert!(project_file.exists(), "the project itself is never touched");
+        assert!(unrelated.exists(), "only this autosave's own temp files go");
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

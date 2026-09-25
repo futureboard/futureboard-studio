@@ -117,6 +117,9 @@ impl StudioLayout {
                     "[ProjectSwitch] confirm accepted target={}",
                     request.target_path.display()
                 );
+                if matches!(decision, ProjectSwitchConfirmDecision::SwitchWithoutSaving) {
+                    self.discard_session_recovery();
+                }
                 self.execute_confirmed_project_switch(request, cx);
             }
         }

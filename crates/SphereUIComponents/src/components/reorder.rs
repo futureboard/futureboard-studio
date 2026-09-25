@@ -1,24 +1,41 @@
 //! Shared drag-reorder affordances.
 //!
-//! Two theme-tokened primitives used by any list that supports drag reorder
-//! (FX/insert chains today; reusable for future sortable lists), so the reorder
-//! UX stays consistent and no surface hand-rolls its own drag chrome:
+//! Theme-tokened primitives and the pure drop rules used by every list that
+//! supports drag reorder (FX/insert chains and send lists today), so the
+//! reorder UX stays consistent and no surface hand-rolls its own drag chrome:
 //!
 //! * [`drag_handle`] — a compact grip the user presses to start a drag. The
 //!   caller attaches the GPUI `.id(..).on_drag(payload, ..)` (the drag payload
 //!   is list-specific), so only the handle initiates a reorder; the rest of a
 //!   row's controls (buttons, context menu) keep their own hit-testing.
-//! * [`drop_over_highlight`] — the drop-position indicator: a 1px accent line
-//!   drawn on the top edge of whichever row a compatible drag is hovering,
-//!   applied through GPUI's `.drag_over::<T>(..)` style hook. No transient
-//!   state required.
+//! * [`drop_over_highlight`] — an accent top edge for a control that is a drop
+//!   target as a whole (an add button).
+//! * [`DropAnchor`] / [`DropSlot`] — where a drop lands, named by a
+//!   neighbour's stable id instead of an index. Targets decide the anchor when
+//!   they render; the commit resolves it against the live list, so a stale
+//!   render (a detached window drawing from a pushed snapshot, a cached dock
+//!   frame) can never land an item at the wrong place.
+//! * [`DragRefusal`] — the "not allowed" cursor over a target that refuses.
 //!
 //! GPUI's drag machinery applies its own small click-vs-drag movement threshold
 //! internally, so a press that does not move still registers as a click on the
 //! handle.
 
-use gpui::{div, px, Div, ParentElement, StyleRefinement, Styled};
+use std::any::Any;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
 
+use gpui::{
+    div, px, App, CursorStyle, Div, InteractiveElement, ParentElement, SharedString, Stateful,
+    StyleRefinement, Styled, Window,
+};
+
+use crate::components::panel::FxSlotDrag;
+use crate::components::timeline::timeline_state::{
+    is_insert_parameter_lane, AutomationLaneState, InsertSlotState, MasterBusState, TimelineState,
+    TrackState, MASTER_TRACK_ID, MAX_INSERT_SLOTS,
+};
 use crate::theme::Colors;
 
 /// Compact vertical grip (two columns × three dots) used as a drag handle.
@@ -55,11 +72,587 @@ pub fn drag_handle() -> Div {
         .child(column())
 }
 
-/// Drop-position indicator styling for `.drag_over::<T>(drop_over_highlight)`:
-/// a 1px accent line on the row's top edge marking "drop above this slot".
-/// Shared so every reorderable list shows the same indicator.
+/// Drop-position indicator styling for `.drag_over::<T>(drop_over_highlight)`
+/// on a control that is a drop target as a whole: an accent top edge (on a
+/// control that already has a border, the border turns accent).
 pub fn drop_over_highlight(style: StyleRefinement) -> StyleRefinement {
     style
         .border_t(px(1.0))
         .border_color(Colors::accent_primary())
+}
+
+/// Where a dropped item lands, named by a neighbour's stable id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropAnchor {
+    /// In front of this item.
+    Before(String),
+    /// Right after this item.
+    After(String),
+    /// At the end of the list.
+    End,
+}
+
+impl DropAnchor {
+    /// Whether the drop line belongs on the target's bottom edge: a row
+    /// dragged down onto another lands below it.
+    pub fn marks_bottom_edge(&self) -> bool {
+        matches!(self, DropAnchor::After(_))
+    }
+}
+
+/// A drop target's place in its list, captured when it renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropSlot {
+    /// A row of the list.
+    Row { id: String, index: usize },
+    /// The end of the list. `last_id` is the row currently last, so dragging
+    /// that row onto the end — a drop that changes nothing — is refused.
+    End { last_id: Option<String> },
+}
+
+/// Where a row dragged within its own list lands on `slot`.
+///
+/// Dropping on a row takes that row's place, whichever way the drag went: a
+/// row dragged down lands after its target, one dragged up lands before it.
+/// `None` for a drop that would change nothing — the dragged row itself, or
+/// the end of the list when it is already last — so the target shows no line
+/// and refuses the drop instead of promising a move it does not make.
+pub fn same_list_anchor(
+    dragged_id: &str,
+    dragged_index: usize,
+    slot: &DropSlot,
+) -> Option<DropAnchor> {
+    match slot {
+        DropSlot::Row { id, index } => {
+            if id == dragged_id {
+                None
+            } else if dragged_index < *index {
+                Some(DropAnchor::After(id.clone()))
+            } else {
+                Some(DropAnchor::Before(id.clone()))
+            }
+        }
+        DropSlot::End { last_id } => {
+            (last_id.as_deref() != Some(dragged_id)).then_some(DropAnchor::End)
+        }
+    }
+}
+
+/// Where an item from another list lands on `slot`: in the row's place,
+/// pushing it down, or at the end.
+pub fn foreign_anchor(slot: &DropSlot) -> DropAnchor {
+    match slot {
+        DropSlot::Row { id, .. } => DropAnchor::Before(id.clone()),
+        DropSlot::End { .. } => DropAnchor::End,
+    }
+}
+
+/// The gap (0..=len, between items, counted before the dragged item is taken
+/// out) that `anchor` names in `order`. `None` when the row it names is no
+/// longer in the list.
+pub fn anchor_gap(order: &[String], anchor: &DropAnchor) -> Option<usize> {
+    match anchor {
+        DropAnchor::Before(id) => order.iter().position(|item| item == id),
+        DropAnchor::After(id) => order.iter().position(|item| item == id).map(|i| i + 1),
+        DropAnchor::End => Some(order.len()),
+    }
+}
+
+/// The live `order` after moving `dragged` to `anchor`, never above `floor`
+/// (the first index the list lets a dragged row occupy — see
+/// `TrackState::fx_chain_floor`). `None` when the drop is refused: `dragged`
+/// is not in the list, sits below the floor itself (it is the instrument), or
+/// the anchor's row has gone. A result equal to `order` is a no-op.
+pub fn reorder_to_anchor(
+    order: &[String],
+    dragged: &str,
+    anchor: &DropAnchor,
+    floor: usize,
+) -> Option<Vec<String>> {
+    let from = order.iter().position(|item| item == dragged)?;
+    if from < floor {
+        return None;
+    }
+    let gap = anchor_gap(order, anchor)?.max(floor);
+    Some(TimelineState::reordered_insert_ids(order, dragged, gap))
+}
+
+/// How a drop target shows where a drop would land.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DropIndicator {
+    /// A row that owns `gap` px of spacing below it: a 1px accent line in the
+    /// spacing above the row, or below it for [`DropAnchor::After`]. Drawn in
+    /// the spacing rows already have, so neither the row nor its neighbours
+    /// move while a drag passes over them.
+    Row { gap: f32 },
+    /// A control with a border of its own: the top edge turns accent.
+    Outline,
+    /// Nothing here — a control inside a row that forwards drops to the row.
+    None,
+}
+
+impl DropIndicator {
+    /// The drag-over style for a drop landing at `anchor`.
+    pub fn apply(self, style: StyleRefinement, anchor: &DropAnchor) -> StyleRefinement {
+        match self {
+            DropIndicator::Row { gap } => {
+                let style = style.border_color(Colors::accent_primary());
+                if anchor.marks_bottom_edge() {
+                    style.border_b(px(1.0)).pb(px((gap - 1.0).max(0.0)))
+                } else {
+                    style.border_t(px(1.0)).mt(px(-1.0))
+                }
+            }
+            DropIndicator::Outline => drop_over_highlight(style),
+            DropIndicator::None => style,
+        }
+    }
+}
+
+/// The cursor a slot drag shows wherever it could land. Slot rows use a
+/// pointing hand, and the drag inherits the cursor of the row it started on.
+pub const SLOT_DRAG_CURSOR: CursorStyle = CursorStyle::PointingHand;
+
+/// What one pointer move over a drop target does to the drag cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragCursorChange {
+    Keep,
+    /// Show "not allowed": the pointer is over a target that refuses the drop.
+    Refuse,
+    /// Back to [`SLOT_DRAG_CURSOR`].
+    Restore,
+}
+
+/// Pure rule behind [`DragRefusal::track`]. `current` is the target that last
+/// refused, `target` the one reporting; `inside` is whether the pointer is in
+/// it. Only the target that set "not allowed" puts the cursor back when the
+/// pointer leaves it, so two targets never fight over the cursor.
+pub fn drag_cursor_change(
+    current: Option<&str>,
+    target: &str,
+    inside: bool,
+    refused: bool,
+) -> DragCursorChange {
+    match (inside, refused) {
+        (true, true) if current == Some(target) => DragCursorChange::Keep,
+        (true, true) => DragCursorChange::Refuse,
+        (true, false) if current.is_some() => DragCursorChange::Restore,
+        (false, _) if current == Some(target) => DragCursorChange::Restore,
+        _ => DragCursorChange::Keep,
+    }
+}
+
+/// Which drop target last turned the drag cursor to "not allowed". One per
+/// drag: every clone of the drag payload shares it.
+#[derive(Clone, Default)]
+pub struct DragRefusal(Rc<RefCell<Option<SharedString>>>);
+
+impl DragRefusal {
+    /// Forget any refusal. Called when a drag starts: the payload can outlive
+    /// one drag (a cached frame keeps the element that owns it), and a stale
+    /// entry would stop the next drag's refusal from showing.
+    pub fn reset(&self) {
+        self.0.borrow_mut().take();
+    }
+
+    /// Report the pointer's position against one target. Called from every
+    /// target's `on_drag_move`, which GPUI runs for the whole drag whether or
+    /// not the pointer is over that target.
+    pub fn track(
+        &self,
+        target: &SharedString,
+        inside: bool,
+        refused: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let change = {
+            let current = self.0.borrow();
+            drag_cursor_change(current.as_deref(), target, inside, refused)
+        };
+        match change {
+            DragCursorChange::Keep => {}
+            DragCursorChange::Refuse => {
+                *self.0.borrow_mut() = Some(target.clone());
+                cx.set_active_drag_cursor_style(CursorStyle::OperationNotAllowed, window);
+            }
+            DragCursorChange::Restore => {
+                *self.0.borrow_mut() = None;
+                cx.set_active_drag_cursor_style(SLOT_DRAG_CURSOR, window);
+            }
+        }
+    }
+}
+
+/// One insert drop, as the commit receives it. Resolved against the live
+/// chains by `StudioLayout::commit_insert_drop`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertDrop {
+    pub from_track: String,
+    pub insert_id: String,
+    pub to_track: String,
+    pub anchor: DropAnchor,
+}
+
+/// Commit callback for an insert drop. One completed drag = one undo entry.
+pub type InsertDropCb = Arc<dyn Fn(&InsertDrop, &mut Window, &mut App) + 'static>;
+
+impl FxSlotDrag {
+    /// The drag payload for `slot` at chain index `source_index` on
+    /// `track_id`. `lanes` is the owning track's automation (the master has
+    /// none).
+    pub fn for_slot(
+        track_id: &str,
+        slot: &InsertSlotState,
+        source_index: usize,
+        lanes: &[AutomationLaneState],
+    ) -> Self {
+        Self {
+            track_id: track_id.to_string(),
+            insert_id: slot.id.clone(),
+            display_name: slot.display_name.clone(),
+            source_index,
+            movable: slot.plugin_is_instrument != Some(true),
+            has_param_lanes: lanes
+                .iter()
+                .any(|lane| is_insert_parameter_lane(lane, &slot.id)),
+            refusal: DragRefusal::default(),
+        }
+    }
+}
+
+/// What an insert-chain drop target knows about its own channel, captured when
+/// it renders.
+#[derive(Debug, Clone)]
+pub struct InsertDropTarget {
+    pub track_id: String,
+    pub slot: DropSlot,
+    /// Whether an effect from another channel may land here.
+    pub accepts_foreign: bool,
+    /// The master keeps no automation lanes, so it refuses an insert that
+    /// has any.
+    pub is_master: bool,
+    /// Unique per target on its surface; files the refused cursor.
+    pub key: SharedString,
+}
+
+impl InsertDropTarget {
+    /// A target on `track`'s chain. `surface` keeps keys unique when one
+    /// window shows the same chain twice (the Inspector beside the docked
+    /// mixer).
+    pub fn for_track(track: &TrackState, slot: DropSlot, surface: &str) -> Self {
+        Self::new(&track.id, slot, track.accepts_moved_effect(), surface)
+    }
+
+    /// A target on the master's chain.
+    pub fn for_master(master: &MasterBusState, slot: DropSlot, surface: &str) -> Self {
+        Self::new(
+            MASTER_TRACK_ID,
+            slot,
+            master.inserts.len() < MAX_INSERT_SLOTS,
+            surface,
+        )
+    }
+
+    fn new(track_id: &str, slot: DropSlot, accepts_foreign: bool, surface: &str) -> Self {
+        let place = match &slot {
+            DropSlot::Row { id, .. } => id.as_str(),
+            DropSlot::End { .. } => "<end>",
+        };
+        Self {
+            key: SharedString::from(format!("{surface}/{track_id}/{place}")),
+            track_id: track_id.to_string(),
+            slot,
+            accepts_foreign,
+            is_master: track_id == MASTER_TRACK_ID,
+        }
+    }
+
+    /// The same target filed under another key — for a second drop target
+    /// that stands for this one (an end strip and the add button below it).
+    pub fn with_key_suffix(mut self, suffix: &str) -> Self {
+        self.key = SharedString::from(format!("{}/{suffix}", self.key));
+        self
+    }
+
+    /// Where `drag` lands on this target, or `None` when it is refused.
+    ///
+    /// Within one chain the [`same_list_anchor`] rule applies. From another
+    /// chain the drop takes the row's place, and is refused when this channel
+    /// cannot take an effect, when the insert is an instrument plug-in (its
+    /// identity is positional and it drives MIDI routing), or when this is the
+    /// master and the insert has plug-in parameter automation.
+    pub fn anchor_for(&self, drag: &FxSlotDrag) -> Option<DropAnchor> {
+        if drag.track_id == self.track_id {
+            return same_list_anchor(&drag.insert_id, drag.source_index, &self.slot);
+        }
+        if !self.accepts_foreign || !drag.movable || (self.is_master && drag.has_param_lanes) {
+            return None;
+        }
+        Some(foreign_anchor(&self.slot))
+    }
+}
+
+/// A slot drag payload: its drop targets report refusals through the cursor.
+pub trait RefusableDrag: 'static {
+    fn refusal(&self) -> &DragRefusal;
+}
+
+impl RefusableDrag for FxSlotDrag {
+    fn refusal(&self) -> &DragRefusal {
+        &self.refusal
+    }
+}
+
+/// Make `element` a drop target for `T`: accepts a drag wherever `anchor_for`
+/// finds a landing place, draws `indicator` on the edge that place is on,
+/// shows "not allowed" over it when it refuses, and hands the drop to
+/// `on_drop` as an anchor for the commit to resolve against live state.
+/// `also_accept` answers `can_drop` for other payload types the element has
+/// its own `on_drop` for (GPUI keeps a single predicate per element).
+///
+/// GPUI takes the drag before it asks `can_drop`, so a target that refuses
+/// still eats the drop: rows have to cover their share of the spacing between
+/// them rather than rely on a parent to catch what falls between.
+pub fn slot_drop_target<T: RefusableDrag>(
+    element: Stateful<Div>,
+    key: SharedString,
+    indicator: DropIndicator,
+    anchor_for: impl Fn(&T) -> Option<DropAnchor> + 'static,
+    on_drop: impl Fn(&T, DropAnchor, &mut Window, &mut App) + 'static,
+    also_accept: fn(&dyn Any) -> bool,
+) -> Stateful<Div> {
+    let anchor_for = Rc::new(anchor_for);
+    let can_anchor = anchor_for.clone();
+    let over_anchor = anchor_for.clone();
+    let move_anchor = anchor_for.clone();
+    element
+        .can_drop(
+            move |dragged, _window, _cx| match dragged.downcast_ref::<T>() {
+                Some(drag) => can_anchor(drag).is_some(),
+                None => also_accept(dragged),
+            },
+        )
+        .drag_over::<T>(move |style, drag, _window, _cx| match over_anchor(drag) {
+            Some(anchor) => indicator.apply(style, &anchor),
+            None => style,
+        })
+        .on_drag_move::<T>(move |event, window, cx| {
+            let inside = event.bounds.contains(&event.event.position);
+            let (refusal, refused) = {
+                let drag = event.drag(cx);
+                (drag.refusal().clone(), move_anchor(drag).is_none())
+            };
+            refusal.track(&key, inside, refused, window, cx);
+        })
+        .on_drop::<T>(move |drag, window, cx| {
+            if let Some(anchor) = anchor_for(drag) {
+                on_drop(drag, anchor, window, cx);
+            }
+        })
+}
+
+/// Make `element` an insert drop target — see [`slot_drop_target`] and
+/// [`InsertDropTarget::anchor_for`].
+pub fn insert_drop_target(
+    element: Stateful<Div>,
+    target: InsertDropTarget,
+    indicator: DropIndicator,
+    on_drop: InsertDropCb,
+) -> Stateful<Div> {
+    insert_drop_target_also(element, target, indicator, on_drop, |_| false)
+}
+
+/// [`insert_drop_target`] on an element that also takes other payloads
+/// through its own `on_drop` listeners; `also_accept` answers for those.
+pub fn insert_drop_target_also(
+    element: Stateful<Div>,
+    target: InsertDropTarget,
+    indicator: DropIndicator,
+    on_drop: InsertDropCb,
+    also_accept: fn(&dyn Any) -> bool,
+) -> Stateful<Div> {
+    let target = Rc::new(target);
+    let anchor_target = target.clone();
+    slot_drop_target::<FxSlotDrag>(
+        element,
+        target.key.clone(),
+        indicator,
+        move |drag| anchor_target.anchor_for(drag),
+        move |drag, anchor, window, cx| {
+            on_drop(
+                &InsertDrop {
+                    from_track: drag.track_id.clone(),
+                    insert_id: drag.insert_id.clone(),
+                    to_track: target.track_id.clone(),
+                    anchor,
+                },
+                window,
+                cx,
+            );
+        },
+        also_accept,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn row(id: &str, index: usize) -> DropSlot {
+        DropSlot::Row {
+            id: id.to_string(),
+            index,
+        }
+    }
+
+    fn drag(track: &str, id: &str, index: usize) -> FxSlotDrag {
+        FxSlotDrag {
+            track_id: track.to_string(),
+            insert_id: id.to_string(),
+            display_name: id.to_string(),
+            source_index: index,
+            movable: true,
+            has_param_lanes: false,
+            refusal: DragRefusal::default(),
+        }
+    }
+
+    fn target(track: &str, slot: DropSlot, accepts_foreign: bool) -> InsertDropTarget {
+        InsertDropTarget::new(track, slot, accepts_foreign, "test")
+    }
+
+    /// Dropping a row on the row below it takes that row's place — the move
+    /// that used to need a drop two rows further down.
+    #[test]
+    fn dropping_a_row_on_the_next_one_moves_it_down_one() {
+        let order = ids(&["A", "B", "C"]);
+        let anchor = same_list_anchor("A", 0, &row("B", 1)).expect("a real move");
+        assert_eq!(anchor, DropAnchor::After("B".into()));
+        assert!(
+            anchor.marks_bottom_edge(),
+            "moving down marks the bottom edge"
+        );
+        assert_eq!(
+            reorder_to_anchor(&order, "A", &anchor, 0).unwrap(),
+            ids(&["B", "A", "C"])
+        );
+    }
+
+    #[test]
+    fn dropping_a_row_on_the_previous_one_moves_it_up_one() {
+        let order = ids(&["A", "B", "C"]);
+        let anchor = same_list_anchor("C", 2, &row("B", 1)).expect("a real move");
+        assert_eq!(anchor, DropAnchor::Before("B".into()));
+        assert!(!anchor.marks_bottom_edge(), "moving up marks the top edge");
+        assert_eq!(
+            reorder_to_anchor(&order, "C", &anchor, 0).unwrap(),
+            ids(&["A", "C", "B"])
+        );
+    }
+
+    #[test]
+    fn no_op_targets_are_refused() {
+        // The dragged row itself.
+        assert_eq!(same_list_anchor("A", 0, &row("A", 0)), None);
+        // The end, when the dragged row is already last.
+        let end = DropSlot::End {
+            last_id: Some("C".into()),
+        };
+        assert_eq!(same_list_anchor("C", 2, &end), None);
+        // The end is a real move for any other row.
+        assert_eq!(same_list_anchor("A", 0, &end), Some(DropAnchor::End));
+        assert_eq!(
+            reorder_to_anchor(&ids(&["A", "B", "C"]), "A", &DropAnchor::End, 0).unwrap(),
+            ids(&["B", "C", "A"])
+        );
+    }
+
+    /// The anchor names a row, not an index, so a chain that changed after the
+    /// target rendered (a stale detached-mixer snapshot) still lands the drop
+    /// next to the row the user aimed at.
+    #[test]
+    fn anchors_resolve_against_the_live_order() {
+        // Rendered as [A, B, C]; the user drags C up onto B: before B.
+        let anchor = same_list_anchor("C", 2, &row("B", 1)).unwrap();
+        // Meanwhile the live chain became [B, X, A, C].
+        let live = ids(&["B", "X", "A", "C"]);
+        assert_eq!(
+            reorder_to_anchor(&live, "C", &anchor, 0).unwrap(),
+            ids(&["C", "B", "X", "A"])
+        );
+        // A row that has gone refuses rather than guessing.
+        let gone = DropAnchor::Before("Z".into());
+        assert_eq!(reorder_to_anchor(&live, "C", &gone, 0), None);
+    }
+
+    #[test]
+    fn the_floor_keeps_the_instrument_first() {
+        let order = ids(&["VSTI", "A", "B"]);
+        // Nothing lands in front of the instrument.
+        assert_eq!(
+            reorder_to_anchor(&order, "B", &DropAnchor::Before("VSTI".into()), 1).unwrap(),
+            ids(&["VSTI", "B", "A"])
+        );
+        // And the instrument itself never moves.
+        assert_eq!(reorder_to_anchor(&order, "VSTI", &DropAnchor::End, 1), None);
+    }
+
+    #[test]
+    fn foreign_drops_take_the_rows_place_or_the_end() {
+        let t = target("track-b", row("X", 1), true);
+        assert_eq!(
+            t.anchor_for(&drag("track-a", "A", 0)),
+            Some(DropAnchor::Before("X".into()))
+        );
+        let end = target("track-b", DropSlot::End { last_id: None }, true);
+        assert_eq!(
+            end.anchor_for(&drag("track-a", "A", 3)),
+            Some(DropAnchor::End)
+        );
+        assert_eq!(
+            anchor_gap(&ids(&["W", "X"]), &DropAnchor::Before("X".into())),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn foreign_drops_are_refused_where_the_insert_cannot_go() {
+        let full = target("track-b", row("X", 1), false);
+        assert_eq!(full.anchor_for(&drag("track-a", "A", 0)), None);
+
+        let open = target("track-b", row("X", 1), true);
+        let mut instrument = drag("track-a", "A", 0);
+        instrument.movable = false;
+        assert_eq!(open.anchor_for(&instrument), None);
+
+        let master = target(MASTER_TRACK_ID, DropSlot::End { last_id: None }, true);
+        let mut automated = drag("track-a", "A", 0);
+        assert_eq!(master.anchor_for(&automated), Some(DropAnchor::End));
+        automated.has_param_lanes = true;
+        assert_eq!(master.anchor_for(&automated), None);
+    }
+
+    #[test]
+    fn only_the_refusing_target_restores_the_cursor() {
+        use DragCursorChange::*;
+        // Entering a refusing target.
+        assert_eq!(drag_cursor_change(None, "a", true, true), Refuse);
+        // Staying in it.
+        assert_eq!(drag_cursor_change(Some("a"), "a", true, true), Keep);
+        // Leaving it.
+        assert_eq!(drag_cursor_change(Some("a"), "a", false, true), Restore);
+        // Another target the pointer is not over leaves it alone.
+        assert_eq!(drag_cursor_change(Some("a"), "b", false, false), Keep);
+        // Moving straight onto an accepting target restores it.
+        assert_eq!(drag_cursor_change(Some("a"), "b", true, false), Restore);
+        // Moving straight onto another refusing target takes it over.
+        assert_eq!(drag_cursor_change(Some("a"), "b", true, true), Refuse);
+        // Over an accepting target with nothing refused, nothing changes.
+        assert_eq!(drag_cursor_change(None, "b", true, false), Keep);
+    }
 }

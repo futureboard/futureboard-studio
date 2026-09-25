@@ -697,22 +697,58 @@ pub fn generate(settings: &GeneratorSettings, seed: u64) -> Vec<Chord> {
     };
 
     apply_colors(&mut chords, settings, &scale_pcs, &mut rng);
+    enrich(&mut chords, settings, &scale_pcs);
+    chords
+}
 
+/// Every progression template of the settings' style, spelled in its key and
+/// scale at its richness, one bar per chord by convention. Colours
+/// (borrowed chords, secondary dominants, …) are left to [`generate`], which
+/// draws them at random; these are the plain templates to build from. For a
+/// symmetric scale, a few seeded progressions stand in for templates.
+pub fn progression_patterns(settings: &GeneratorSettings) -> Vec<Vec<Chord>> {
+    let scale_pcs = settings.scale.pitch_classes(settings.tonic);
+    let mut patterns: Vec<Vec<Chord>> = if settings.scale.is_heptatonic() {
+        settings
+            .style
+            .templates(settings.scale.is_minor())
+            .iter()
+            .map(|template| {
+                template
+                    .iter()
+                    .map(|&degree| diatonic_triad(settings.tonic, settings.scale, degree))
+                    .collect()
+            })
+            .collect()
+    } else {
+        (1..=4u64)
+            .map(|seed| symmetric_progression(settings, 4, &mut Rng::new(seed)))
+            .collect()
+    };
+    for chords in &mut patterns {
+        enrich(chords, settings, &scale_pcs);
+    }
+    patterns.dedup();
+    patterns
+}
+
+/// Add sevenths or ninths per the settings' richness (a style that prefers
+/// sevenths gets them even at "triads").
+fn enrich(chords: &mut [Chord], settings: &GeneratorSettings, scale_pcs: &[u8]) {
     let richness = match settings.richness {
         Richness::Triads if settings.style.prefers_sevenths() => Richness::Sevenths,
         other => other,
     };
-    for chord in &mut chords {
+    for chord in chords {
         if chord.quality == ChordQuality::BlackAdder || chord.bass.is_some() {
             continue;
         }
         match richness {
             Richness::Triads => {}
-            Richness::Sevenths => *chord = chord.with_seventh(&scale_pcs),
-            Richness::Ninths => *chord = chord.with_seventh(&scale_pcs).with_ninth(&scale_pcs),
+            Richness::Sevenths => *chord = chord.with_seventh(scale_pcs),
+            Richness::Ninths => *chord = chord.with_seventh(scale_pcs).with_ninth(scale_pcs),
         }
     }
-    chords
 }
 
 /// Symmetric scales have no stacked-thirds harmony. Chords are the ones that
@@ -1053,6 +1089,30 @@ mod tests {
 
     fn names(chords: &[Chord], flats: bool) -> Vec<String> {
         chords.iter().map(|c| c.name(flats)).collect()
+    }
+
+    #[test]
+    fn progression_patterns_are_the_styles_templates_in_key() {
+        let settings = GeneratorSettings {
+            tonic: 2,
+            style: Style::JPop,
+            ..GeneratorSettings::default()
+        };
+        let patterns = progression_patterns(&settings);
+        assert!(patterns.len() >= 3);
+        // The royal road IV–V–iii–vi in D major.
+        assert!(
+            patterns
+                .iter()
+                .any(|p| names(p, false) == vec!["G", "A", "F#m", "Bm"]),
+            "{:?}",
+            patterns.iter().map(|p| names(p, false)).collect::<Vec<_>>()
+        );
+        let sevenths = progression_patterns(&GeneratorSettings {
+            richness: Richness::Sevenths,
+            ..settings
+        });
+        assert!(sevenths[0].iter().all(|c| c.quality.intervals().len() >= 4));
     }
 
     #[test]

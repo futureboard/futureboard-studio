@@ -184,6 +184,11 @@ pub struct TimelineViewport {
     /// all. Pointer math reads this instead whenever it is available, so the
     /// transform that resolves a click is the one that drew the pixel.
     pub lane_origin_x_measured: Option<f32>,
+    /// Measured window y of the timeline's top edge (the ruler's top), published
+    /// by the timeline root's origin probe each frame. The vertical twin of
+    /// [`Self::lane_origin_x_measured`]; `None` until the first frame, when
+    /// [`crate::shell_metrics::APP_CHROME_HEIGHT`] stands in for it.
+    pub timeline_origin_y_measured: Option<f32>,
     /// Real-time warp of the x axis; see [`TimeWarp`]. Kept current by
     /// [`TimelineState::sync_time_warp`].
     pub time_warp: TimeWarp,
@@ -304,6 +309,43 @@ pub enum SnapDivision {
 }
 
 impl SnapDivision {
+    /// The divisions the arrangement's grid menu offers, coarse to fine.
+    /// `Off` is left to the magnet, which is the snap on/off switch.
+    pub const MENU: [SnapDivision; 9] = [
+        SnapDivision::Auto,
+        SnapDivision::Bar1,
+        SnapDivision::Div1_1,
+        SnapDivision::Div1_2,
+        SnapDivision::Div1_4,
+        SnapDivision::Div1_8,
+        SnapDivision::Div1_16,
+        SnapDivision::Div1_32,
+        SnapDivision::Div1_64,
+    ];
+
+    /// Stable id used in the `timeline:set-grid:<id>` command.
+    pub fn command_id(&self) -> &'static str {
+        match self {
+            SnapDivision::Auto => "auto",
+            SnapDivision::Off => "off",
+            SnapDivision::Bar1 => "bar",
+            SnapDivision::Div1_1 => "1",
+            SnapDivision::Div1_2 => "2",
+            SnapDivision::Div1_4 => "4",
+            SnapDivision::Div1_8 => "8",
+            SnapDivision::Div1_16 => "16",
+            SnapDivision::Div1_32 => "32",
+            SnapDivision::Div1_64 => "64",
+        }
+    }
+
+    pub fn from_command_id(id: &str) -> Option<Self> {
+        [SnapDivision::Off]
+            .into_iter()
+            .chain(Self::MENU)
+            .find(|division| division.command_id() == id)
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             SnapDivision::Auto => "Auto",

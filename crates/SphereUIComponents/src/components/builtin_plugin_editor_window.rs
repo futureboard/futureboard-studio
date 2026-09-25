@@ -162,6 +162,20 @@ fn wire_instance_id(key: &PluginInstanceKey) -> String {
     format!("{}::{}", key.track_id, key.insert_id)
 }
 
+/// The key `active` answers to now that its insert sits on another channel:
+/// the listed instance with the same insert id under a different track.
+/// `None` when the insert is gone, or still where it was.
+fn relocated_instance_key(
+    active: &PluginInstanceKey,
+    instances: &[PluginInstanceDescriptor],
+) -> Option<PluginInstanceKey> {
+    instances
+        .iter()
+        .map(|instance| &instance.instance_key)
+        .find(|key| key.insert_id == active.insert_id && key.track_id != active.track_id)
+        .cloned()
+}
+
 /// Decode an insert's persisted state bytes (UTF-8 JSON, see
 /// `PluginInstanceDescriptor::state_bytes`) for the `selectInstance` wire
 /// message. Deliberately generic (`serde_json::Value`, not a specific
@@ -978,6 +992,20 @@ impl BuiltinPluginEditorWindow {
             .active_instance
             .as_ref()
             .is_some_and(|active| instances.iter().any(|i| &i.instance_key == active));
+        // An insert moved to another channel keeps its instance: it is the same
+        // plug-in under a new key, so it stays selected rather than being
+        // reported removed. Its parameter edits then address the new track,
+        // which the engine requires.
+        let relocated = self
+            .active_instance
+            .as_ref()
+            .filter(|_| !active_still_present)
+            .and_then(|active| relocated_instance_key(active, &instances));
+        if let Some(key) = relocated {
+            self.instances = instances;
+            self.select_instance(key, cx);
+            return;
+        }
         let removed_active = self
             .active_instance
             .clone()
@@ -3655,6 +3683,48 @@ mod tests {
         let instances = [descriptor(a.clone())];
         assert!(instances.iter().any(|i| i.instance_key == a));
         assert!(!instances.iter().any(|i| i.instance_key == b));
+    }
+
+    /// A shared editor showing an insert that moved to another channel follows
+    /// it by insert id instead of treating it as removed.
+    #[test]
+    fn a_moved_active_instance_is_found_under_its_new_track() {
+        let descriptor = |track: &str, insert: &str| PluginInstanceDescriptor {
+            instance_key: PluginInstanceKey {
+                track_id: track.into(),
+                insert_id: insert.into(),
+            },
+            plugin_id: "rodharerist".into(),
+            track_name: "Track".into(),
+            insert_name: "Insert".into(),
+            bypassed: false,
+            enabled: true,
+            state_bytes: None,
+        };
+        let active = PluginInstanceKey {
+            track_id: "track-2".into(),
+            insert_id: "insert-4".into(),
+        };
+        let moved = [
+            descriptor("track-1", "insert-1"),
+            descriptor("track-3", "insert-4"),
+        ];
+        assert_eq!(
+            relocated_instance_key(&active, &moved),
+            Some(PluginInstanceKey {
+                track_id: "track-3".into(),
+                insert_id: "insert-4".into(),
+            })
+        );
+        // Gone, or still in place: nothing to follow.
+        assert_eq!(
+            relocated_instance_key(&active, &[descriptor("track-1", "insert-1")]),
+            None
+        );
+        assert_eq!(
+            relocated_instance_key(&active, &[descriptor("track-2", "insert-4")]),
+            None
+        );
     }
 
     #[test]

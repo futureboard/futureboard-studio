@@ -71,13 +71,12 @@ pub struct MixerCallbacks {
     /// Expand/collapse the VSTi output sub-strips for a track/insert group.
     pub on_toggle_vsti_output_group:
         std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
-    /// Drag-reorder commit for an insert slot. `(track_id, dragged_insert_id,
-    /// insertion_index)` where `insertion_index` is the gap (0..=len) the
-    /// dragged slot moves into. Identity is the stable `plugin_instance_id`,
-    /// never the visual index. One completed drag = one undo entry (mirrors the
-    /// Inspector's `on_reorder_insert` / `reorder_insert_cb`).
-    pub on_reorder_insert:
-        std::sync::Arc<dyn Fn(&(String, String, usize), &mut Window, &mut App) + 'static>,
+    /// Drop commit for a dragged insert slot — a reorder within its chain or a
+    /// move from another channel. Identity is the stable `plugin_instance_id`
+    /// and the landing place an anchor next to another slot, never a visual
+    /// index; the layout resolves both against the live chains. One completed
+    /// drag = one undo entry (shared with the Inspector's `on_drop_insert`).
+    pub on_drop_insert: crate::components::reorder::InsertDropCb,
     /// Drop a `.pst` plug-in preset from the browser into a concrete insert slot.
     /// `(preset_path, track_id, insert_index)` uses the full insert-chain index.
     pub on_drop_plugin_preset: std::sync::Arc<
@@ -98,9 +97,12 @@ pub struct MixerCallbacks {
     pub on_send_gain_change:
         std::sync::Arc<dyn Fn(&(String, String, f32), &mut Window, &mut App) + 'static>,
     /// Drag-reorder commit for a send slot. `(track_id, dragged_send_id,
-    /// insertion_index)` where `insertion_index` is the visual gap.
-    pub on_reorder_send:
-        std::sync::Arc<dyn Fn(&(String, String, usize), &mut Window, &mut App) + 'static>,
+    /// anchor)`, the anchor naming the send it lands next to; the layout
+    /// resolves it against the live send order.
+    pub on_reorder_send: std::sync::Arc<
+        dyn Fn(&(String, String, crate::components::reorder::DropAnchor), &mut Window, &mut App)
+            + 'static,
+    >,
 }
 
 /// Inert callbacks for fallback UI when the studio entity is unavailable.
@@ -117,12 +119,16 @@ pub fn noop_mixer_callbacks() -> MixerCallbacks {
     let noop_master_commit = Arc::new(|_: &mut Window, _: &mut App| {});
     let noop_insert_pair = Arc::new(|_: &(String, String), _: &mut Window, _: &mut App| {});
     let noop_insert_open = Arc::new(|_: &(String, usize, String), _: &mut Window, _: &mut App| {});
-    let noop_insert_reorder =
-        Arc::new(|_: &(String, String, usize), _: &mut Window, _: &mut App| {});
+    let noop_insert_drop =
+        Arc::new(|_: &crate::components::reorder::InsertDrop, _: &mut Window, _: &mut App| {});
     let noop_preset_drop =
         Arc::new(|_: &(std::path::PathBuf, String, usize), _: &mut Window, _: &mut App| {});
     let noop_add_send = Arc::new(|_: &(String, f32, f32), _: &mut Window, _: &mut App| {});
-    let noop_send_reorder = Arc::new(|_: &(String, String, usize), _: &mut Window, _: &mut App| {});
+    let noop_send_reorder = Arc::new(
+        |_: &(String, String, crate::components::reorder::DropAnchor),
+         _: &mut Window,
+         _: &mut App| {},
+    );
     let noop_send_gain = Arc::new(|_: &(String, String, f32), _: &mut Window, _: &mut App| {});
     MixerCallbacks {
         on_select_track: noop_select,
@@ -159,7 +165,7 @@ pub fn noop_mixer_callbacks() -> MixerCallbacks {
         on_remove_insert: noop_insert_pair.clone(),
         on_toggle_insert_bypass: noop_insert_pair.clone(),
         on_toggle_vsti_output_group: Arc::new(|_: &String, _: &mut Window, _: &mut App| {}),
-        on_reorder_insert: noop_insert_reorder,
+        on_drop_insert: noop_insert_drop,
         on_drop_plugin_preset: noop_preset_drop,
         on_open_insert_editor: noop_insert_open.clone(),
         on_add_send: noop_add_send,

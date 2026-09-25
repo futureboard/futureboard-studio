@@ -30,11 +30,11 @@ use crate::components::timeline::timeline_ruler::{
     timeline_ruler,
 };
 use crate::components::timeline::timeline_state::{
-    ArrangementCoordinateContext, ArrangementHitTarget, ClipDragItem, ClipResizeDrag, ClipState,
-    ClipType, DEFAULT_TRACK_HEIGHT, GlobalLaneKind, GlobalLaneResizeDrag, HEADER_WIDTH,
-    RULER_HEIGHT, SnapDivision, TempoLaneDrag, TimeSignaturePointDrag, TimelineMarkerDrag,
-    TimelineMarkerState, TimelineRangeSelection, TimelineRegionState, TimelineState, TimelineTool,
-    TrackDragItem, TrackHeightResizeDrag, TrackType, hit_test_arrangement,
+    ArrangementCoordinateContext, ArrangementHitTarget, ClipDragItem, ClipEdge, ClipResizeDrag,
+    ClipState, ClipType, DEFAULT_TRACK_HEIGHT, GlobalLaneKind, GlobalLaneResizeDrag, HEADER_WIDTH,
+    RULER_HEIGHT, TempoLaneDrag, TimeSignaturePointDrag, TimelineMarkerDrag, TimelineMarkerState,
+    TimelineRangeSelection, TimelineRegionState, TimelineState, TimelineTool, TrackDragItem,
+    TrackHeightResizeDrag, TrackType, hit_test_arrangement,
 };
 use crate::components::timeline::track_list::track_list;
 use crate::theme::Colors;
@@ -50,7 +50,6 @@ use std::time::Duration;
 /// the timeline track area. Single definition in `shell_metrics`; this used to
 /// be one of three hand-mirrored copies.
 use crate::shell_metrics::APP_CHROME_HEIGHT;
-const MARQUEE_DRAG_THRESHOLD: f32 = 4.0;
 
 /// Sizes of the surrounding chrome panels that the timeline's scroll/grid
 /// math has to subtract from the window to know the actual timeline body
@@ -85,13 +84,55 @@ struct ClipDrawPreview {
     commit_on_click: bool,
 }
 
+/// The arrangement marquee in flight: a free rectangle of unsnapped pixels.
 #[derive(Clone, Debug)]
 struct RangeSelectDrag {
-    start_beat: f32,
-    current_beat: f32,
+    /// Where the press landed, in arrangement space: an unsnapped beat and a
+    /// content y. Anchored there rather than in window pixels so the rectangle
+    /// stays pinned to the arrangement while it scrolls or zooms under it.
+    anchor_beat: f32,
+    anchor_content_y: f32,
+    /// Window position of the press; the drag threshold is measured from it.
+    press_window: (f32, f32),
+    /// Latest pointer position, in window pixels. Auto-scroll and the wheel
+    /// re-resolve the moving corner from it while the pointer is held still.
+    last_window: (f32, f32),
+    /// The anchor track: the one pressed, or the last one drawn when the press
+    /// was below the tracks.
     start_track_id: String,
     additive: bool,
+    /// The press was on `start_track_id`'s lane (not below the tracks).
+    on_lane: bool,
+    /// A double-click on an empty MIDI / Instrument lane: a release without a
+    /// drag creates a default-length clip.
+    create_clip_on_click: bool,
     dragging: bool,
+    /// The selection before the press: the base an additive marquee adds to,
+    /// and what Escape puts back.
+    selection_before: crate::components::timeline::timeline_state::TimelineSelection,
+    /// What the rectangle enclosed when the selection was last applied, so
+    /// the arrangement is only notified when that changes. `None` until the
+    /// drag starts.
+    hits: Option<crate::components::timeline::timeline_state::MarqueeHits>,
+}
+
+/// A clip move in flight, captured on its first drag move before anything
+/// changes: every moving clip as it was, so each move resolves from the origin
+/// and the drop records one exact undo step.
+#[derive(Clone, Debug)]
+struct ClipMoveOrigin {
+    anchor_clip_id: String,
+    anchor_start: f32,
+    clips: Vec<ClipSnapshot>,
+}
+
+/// A press on a clip that was already selected. Its selection change waits
+/// for the release: a click applies it, a drag drops it, so dragging a
+/// selected clip moves the whole selection.
+#[derive(Clone, Debug)]
+struct PendingClipClick {
+    clip_id: String,
+    op: crate::components::timeline::timeline_state::ClipSelectOp,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +235,10 @@ pub struct Timeline {
     /// undo step. Kept here rather than inside [`ClipResizeDrag`] so the drag
     /// payload — rebuilt for every clip on every repaint — stays identity-only.
     clip_resize_origin: Option<ClipSnapshot>,
+    /// Beats between the grabbed edge and the pointer when the edge-resize
+    /// gesture began. Edge handles are up to 10 px wide; without this the edge
+    /// jumped to the pointer on the first move.
+    clip_resize_grab_beats: f32,
     clip_drag_target_track_index: Option<usize>,
     clip_clone_drag_id: Option<String>,
     /// Pen-tool click-drag MIDI clip preview, live until mouse-up creates the clip.
@@ -259,6 +304,9 @@ pub struct Timeline {
     /// `region_gesture_origin`.
     marker_gesture_origin: Option<Vec<TimelineMarkerState>>,
     pan_last_position: Option<gpui::Point<gpui::Pixels>>,
+    /// The Ctrl/Cmd+Alt+wheel track-zoom burst in flight: the heights it
+    /// scales from. Ends on wheel idle or when anything else changes a height.
+    track_zoom_session: Option<crate::components::timeline::timeline_state::TrackHeightZoomSession>,
     /// View-only floating-toolbar placement. It deliberately never enters the
     /// project snapshot: moving tools must not make a session dirty.
     floating_toolbar_position: Option<(f32, f32)>,
@@ -322,6 +370,43 @@ pub struct Timeline {
     /// dropped audio into the project's `Assets/Audio` folder.
     project_root: Option<std::path::PathBuf>,
     focus_lost_subscription: Option<Subscription>,
+    /// The clip as it was before the clip gain / fade gesture now in flight.
+    ///
+    /// Taken from state on the gesture's first preview. The handles used to
+    /// capture it at render time, but every preview re-renders the lane, so by
+    /// release the "before" was the last preview and the undo entry recorded
+    /// nothing (or a one-pixel step) — undo and redo appeared to do nothing.
+    clip_process_origin: Option<ClipState>,
+    /// The ruler's grid-resolution dropdown is open.
+    snap_menu_open: bool,
+    /// Where the Smart Tool's razor line is, shared with its overlay.
+    cut_guide: crate::components::timeline::cut_guide::CutGuideCell,
+    /// The razor line's own entity, built on first render, so a hover moves
+    /// one line instead of rebuilding the lanes.
+    cut_guide_overlay:
+        Option<gpui::Entity<crate::components::timeline::cut_guide::CutGuideOverlay>>,
+    /// The last Smart Tool cut-zone hover, kept while the pointer is in a zone
+    /// so pressing or releasing Option shows or hides the razor line without
+    /// a mouse move.
+    cut_hover: Option<crate::components::timeline::audio_clip::ClipCutGesture>,
+    /// Window y of the timeline's top edge, measured by the root's probe each
+    /// frame and folded into the viewport at the top of the next render — the
+    /// vertical twin of `lane_origin_probe`.
+    timeline_origin_probe: std::rc::Rc<std::cell::Cell<Option<f32>>>,
+    /// Where the arrangement marquee's rectangle is, shared with its overlay.
+    marquee_frame: crate::components::timeline::marquee_overlay::MarqueeFrameCell,
+    /// The marquee rectangle's own entity, built on first render, so a pointer
+    /// move repaints one rectangle instead of rebuilding the lanes.
+    marquee_overlay:
+        Option<gpui::Entity<crate::components::timeline::marquee_overlay::MarqueeOverlay>>,
+    /// Scrolls the arrangement while a marquee is dragged past the track
+    /// area's edge. Dropped on every way a marquee ends.
+    marquee_autoscroll: Option<gpui::Task<()>>,
+    /// The clip move in flight; see [`ClipMoveOrigin`].
+    clip_move_origin: Option<ClipMoveOrigin>,
+    /// A clip selection change waiting for its release; see
+    /// [`PendingClipClick`].
+    pending_clip_click: Option<PendingClipClick>,
 }
 
 pub type TimelineOpenEditorCb = std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>;
@@ -368,6 +453,8 @@ pub enum TimelineContextTarget {
     },
     /// Right-click on the arrangement ruler. Carries the beat under the cursor.
     Ruler(f64),
+    /// The ruler's grid-resolution dropdown.
+    SnapGrid,
     /// Right-click on the global Tempo Track lane.
     TempoTrack {
         beat: f64,

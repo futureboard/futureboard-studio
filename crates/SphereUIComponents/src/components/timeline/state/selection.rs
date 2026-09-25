@@ -39,7 +39,132 @@ impl TimelineRangeSelection {
     }
 }
 
+/// An arrangement marquee in arrangement space: `left` / `right` in lane x (the
+/// beat transform the clips are drawn with, horizontal scroll included),
+/// `top` / `bottom` in content y (0 at the top of the first track row).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarqueeRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+impl MarqueeRect {
+    /// The rectangle spanned by two corners, in either order.
+    pub fn from_corners(a: (f32, f32), b: (f32, f32)) -> Self {
+        Self {
+            left: a.0.min(b.0),
+            top: a.1.min(b.1),
+            right: a.0.max(b.0),
+            bottom: a.1.max(b.1),
+        }
+    }
+
+    fn as_tuple(&self) -> (f32, f32, f32, f32) {
+        (self.left, self.top, self.right, self.bottom)
+    }
+}
+
+/// What an arrangement marquee encloses: the track rows it crosses and the
+/// clips whose drawn rectangles it touches, both in arrangement order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MarqueeHits {
+    pub track_ids: Vec<String>,
+    pub clip_ids: Vec<String>,
+}
+
+/// How a left press on a clip changes the clip selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipSelectOp {
+    /// Select only this clip.
+    Replace,
+    /// Add the clip, or take it out when it is already selected.
+    Toggle,
+}
+
+/// When a press on a clip applies its selection change: at the press, or only
+/// on a click (a release without a drag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipPressPlan {
+    pub on_press: Option<ClipSelectOp>,
+    pub on_click: Option<ClipSelectOp>,
+}
+
+/// Plan a left press on a clip.
+///
+/// A press on a clip that is already selected leaves the selection alone
+/// until the release: dragging it then moves everything selected with it (a
+/// whole marquee selection), while a click still narrows the selection to that
+/// clip, or with the additive modifier takes it out. A press on a clip that is
+/// not selected selects it at once, so the drag that follows moves it.
+pub fn clip_press_plan(already_selected: bool, additive: bool) -> ClipPressPlan {
+    let op = if additive {
+        ClipSelectOp::Toggle
+    } else {
+        ClipSelectOp::Replace
+    };
+    if already_selected {
+        ClipPressPlan {
+            on_press: None,
+            on_click: Some(op),
+        }
+    } else {
+        ClipPressPlan {
+            on_press: Some(op),
+            on_click: None,
+        }
+    }
+}
+
 impl TimelineState {
+    /// What `rect` encloses, hit-tested against exactly what is drawn.
+    ///
+    /// Tracks are the rows the rectangle crosses (a track's automation lanes
+    /// count as its row). Clips are those whose drawn rectangle
+    /// ([`Self::clip_lane_rect`]) it touches, so a clip narrower than its
+    /// minimum drawn width is hit where it is painted, and the pad bands above
+    /// and below a clip are lane, not clip. Rows that are not drawn — mixer-only
+    /// Bus / Return channels, VSTi multi-out children, children of a collapsed
+    /// group — are never hit, so a later "delete selected tracks" cannot reach
+    /// a track nobody could see.
+    pub fn marquee_hits(&self, rows: &TrackRowLayout, rect: MarqueeRect) -> MarqueeHits {
+        let mut hits = MarqueeHits::default();
+        let first = rows
+            .rows
+            .partition_point(|row| row.y + row.block_height() <= rect.top);
+        for row in &rows.rows[first..] {
+            if row.y >= rect.bottom {
+                break;
+            }
+            if row.height <= 0.0 {
+                continue;
+            }
+            let Some(track) = self.tracks.get(row.index) else {
+                continue;
+            };
+            if is_arrangement_hidden_track(track)
+                || !(rect.top < row.y + row.block_height() && rect.bottom > row.y)
+            {
+                continue;
+            }
+            hits.track_ids.push(track.id.clone());
+            for clip in &track.clips {
+                let drawn = self.clip_lane_rect(clip, row.height);
+                let drawn = (
+                    drawn.left,
+                    row.y + drawn.top,
+                    drawn.right(),
+                    row.y + drawn.bottom(),
+                );
+                if crate::components::edit::rects_intersect(rect.as_tuple(), drawn) {
+                    hits.clip_ids.push(clip.id.clone());
+                }
+            }
+        }
+        hits
+    }
+
     pub fn selected_range_track_ids(&self) -> Vec<String> {
         match self.selection.selected_track_id.as_ref() {
             Some(primary)
@@ -235,8 +360,13 @@ impl TimelineState {
             .iter()
             .find(|t| t.clips.iter().any(|c| c.id == clip_id))
         {
+            // Extend the track selection rather than collapse it: an additive
+            // click inside a cross-track marquee selection must not throw away
+            // the tracks the marquee spanned.
+            if !self.selection.selected_track_ids.contains(&track.id) {
+                self.selection.selected_track_ids.push(track.id.clone());
+            }
             self.selection.selected_track_id = Some(track.id.clone());
-            self.selection.selected_track_ids = vec![track.id.clone()];
             self.selection.track_selection_anchor_id = Some(track.id.clone());
         }
     }
@@ -414,5 +544,210 @@ mod tests {
             state.selection.selected_track_ids,
             vec![first, second, third]
         );
+    }
+
+    /// `count` MIDI tracks, each holding one clip from beat 2 to beat 6.
+    fn stacked_midi_clips(count: usize) -> (TimelineState, Vec<String>, Vec<String>) {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let mut track_ids = Vec::new();
+        let mut clip_ids = Vec::new();
+        for _ in 0..count {
+            let track_id = state.create_midi_track();
+            let clip = state.build_midi_clip(&track_id, 2.0, 4.0).expect("clip");
+            clip_ids.push(clip.id.clone());
+            state
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == track_id)
+                .expect("track")
+                .clips
+                .push(clip);
+            track_ids.push(track_id);
+        }
+        (state, track_ids, clip_ids)
+    }
+
+    fn hits(state: &TimelineState, rect: MarqueeRect) -> MarqueeHits {
+        state.marquee_hits(&state.track_row_layout(), rect)
+    }
+
+    /// A vertical-only drag through a column of clips selects every one of
+    /// them and every track it crossed; the old row-quantized marquee needed
+    /// horizontal travel before it hit anything.
+    #[test]
+    fn a_vertical_marquee_selects_clips_stacked_across_tracks() {
+        let (state, track_ids, clip_ids) = stacked_midi_clips(3);
+        let x = state.beats_to_x(4.0);
+        let found = hits(&state, MarqueeRect::from_corners((x, 30.0), (x, 180.0)));
+        assert_eq!(found.track_ids, track_ids);
+        assert_eq!(found.clip_ids, clip_ids);
+    }
+
+    #[test]
+    fn a_marquee_hits_a_clip_where_it_is_drawn() {
+        let (mut state, track_ids, clip_ids) = stacked_midi_clips(1);
+        // A clip far shorter than its 10 px minimum drawn width.
+        state.tracks[0].clips[0].duration_beats = 0.02;
+        let drawn = state.clip_lane_rect(&state.tracks[0].clips[0], DEFAULT_TRACK_HEIGHT);
+        assert!((drawn.width - CLIP_MIN_DRAWN_WIDTH).abs() < 1.0e-4);
+        let model_right = state.beats_to_x(2.02);
+        assert!(model_right + 3.0 < drawn.right());
+
+        // Touching only the drawn part past the model end still hits it.
+        let past_model_end = MarqueeRect::from_corners(
+            (drawn.right() - 2.0, 20.0),
+            (drawn.right() + 40.0, 40.0),
+        );
+        assert_eq!(hits(&state, past_model_end).clip_ids, clip_ids);
+
+        // The pad bands above and below the clip are lane, not clip: the track
+        // is crossed but the clip is not touched.
+        let pad_above =
+            MarqueeRect::from_corners((drawn.left - 5.0, 1.0), (drawn.right() + 5.0, 6.0));
+        let found = hits(&state, pad_above);
+        assert_eq!(found.track_ids, track_ids);
+        assert!(found.clip_ids.is_empty());
+        let pad_below = MarqueeRect::from_corners(
+            (drawn.left - 5.0, DEFAULT_TRACK_HEIGHT - 6.0),
+            (drawn.right() + 5.0, DEFAULT_TRACK_HEIGHT - 1.0),
+        );
+        assert!(hits(&state, pad_below).clip_ids.is_empty());
+
+        // One pixel into the drawn body is a hit.
+        let edge = MarqueeRect::from_corners(
+            (drawn.left - 20.0, CLIP_LANE_PAD - 3.0),
+            (drawn.left + 1.0, CLIP_LANE_PAD + 1.0),
+        );
+        assert_eq!(hits(&state, edge).clip_ids, clip_ids);
+    }
+
+    /// Dragging below the last row keeps every row down to the last one; it
+    /// used to fall back to the row the drag started on.
+    #[test]
+    fn a_marquee_past_the_last_row_reaches_the_last_row() {
+        let (state, track_ids, _) = stacked_midi_clips(3);
+        let total = state.track_row_layout().total_height;
+        let found = hits(
+            &state,
+            MarqueeRect::from_corners((0.0, DEFAULT_TRACK_HEIGHT + 20.0), (10.0, total + 400.0)),
+        );
+        assert_eq!(found.track_ids, track_ids[1..].to_vec());
+    }
+
+    /// Rows that are not drawn — Bus/Return channels, VSTi multi-out children,
+    /// children of a collapsed group — never enter the selection, however the
+    /// rectangle spans them.
+    #[test]
+    fn a_marquee_never_selects_hidden_rows_or_their_clips() {
+        use crate::components::timeline::timeline_state::{
+            vsti_output_child_track_id, CreateTrackOptions, InputMonitorMode,
+        };
+        let (mut state, track_ids, clip_ids) = stacked_midi_clips(3);
+        let group_id = state.create_track(CreateTrackOptions {
+            name: "Group".to_string(),
+            track_type: TrackType::Group,
+            color: crate::theme::Colors::track_color_for_index(0),
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        });
+        // The middle track goes into the group, which is then collapsed.
+        assert!(state.assign_track_to_group(&track_ids[1], &group_id));
+        assert_eq!(state.toggle_group_collapsed(&group_id), Some(true));
+        let bus_id = state.create_bus_track(&[]);
+        // A VSTi multi-out child row, with a clip that must stay out of reach.
+        let child_index = state.tracks.len();
+        let child_source = state.create_midi_track();
+        let child_clip = state.build_midi_clip(&child_source, 2.0, 4.0).expect("clip");
+        state.tracks[child_index].id = vsti_output_child_track_id("insert-1", 1);
+        state.tracks[child_index].clips.push(child_clip);
+
+        let found = hits(
+            &state,
+            MarqueeRect::from_corners((0.0, 0.0), (2_000.0, 5_000.0)),
+        );
+        assert!(!found.track_ids.contains(&track_ids[1]), "collapsed child");
+        assert!(!found.clip_ids.contains(&clip_ids[1]), "collapsed child's clip");
+        assert!(!found.track_ids.contains(&bus_id), "mixer-only bus");
+        assert!(!found
+            .track_ids
+            .iter()
+            .any(|id| crate::components::timeline::timeline_state::is_vsti_output_child_track_id(id)));
+        assert_eq!(found.clip_ids, vec![clip_ids[0].clone(), clip_ids[2].clone()]);
+        assert!(found.track_ids.contains(&track_ids[0]));
+        assert!(found.track_ids.contains(&track_ids[2]));
+        assert!(found.track_ids.contains(&group_id));
+    }
+
+    /// The rectangle is free pixels: the grid has nothing to say about what
+    /// it encloses.
+    #[test]
+    fn marquee_hits_do_not_depend_on_snap() {
+        let (mut state, _, _) = stacked_midi_clips(2);
+        let rect = MarqueeRect::from_corners(
+            (state.beats_to_x(5.93), 12.0),
+            (state.beats_to_x(9.0), DEFAULT_TRACK_HEIGHT + 30.0),
+        );
+        state.snap_to_grid = true;
+        let snapped = hits(&state, rect);
+        state.snap_to_grid = false;
+        assert_eq!(snapped, hits(&state, rect));
+        assert_eq!(snapped.clip_ids.len(), 2);
+    }
+
+    #[test]
+    fn pressing_a_selected_clip_defers_the_selection_change_to_the_click() {
+        assert_eq!(
+            clip_press_plan(false, false),
+            ClipPressPlan {
+                on_press: Some(ClipSelectOp::Replace),
+                on_click: None
+            }
+        );
+        assert_eq!(
+            clip_press_plan(true, false),
+            ClipPressPlan {
+                on_press: None,
+                on_click: Some(ClipSelectOp::Replace)
+            }
+        );
+        assert_eq!(
+            clip_press_plan(false, true),
+            ClipPressPlan {
+                on_press: Some(ClipSelectOp::Toggle),
+                on_click: None
+            }
+        );
+        assert_eq!(
+            clip_press_plan(true, true),
+            ClipPressPlan {
+                on_press: None,
+                on_click: Some(ClipSelectOp::Toggle)
+            }
+        );
+    }
+
+    /// An additive clip click inside a cross-track selection keeps the tracks.
+    #[test]
+    fn an_additive_clip_click_extends_the_track_selection() {
+        let (mut state, track_ids, clip_ids) = stacked_midi_clips(3);
+        state.apply_marquee_selection(
+            &track_ids[..2],
+            clip_ids[..2].to_vec(),
+            &track_ids[0],
+            false,
+        );
+        state.select_clip_additive(&clip_ids[2]);
+        assert_eq!(state.selection.selected_track_ids, track_ids);
+        assert_eq!(state.selection.selected_clip_ids, clip_ids);
+        assert_eq!(
+            state.selection.selected_track_id.as_deref(),
+            Some(track_ids[2].as_str())
+        );
+        state.select_clip_additive(&clip_ids[0]);
+        assert_eq!(state.selection.selected_clip_ids, clip_ids[1..].to_vec());
+        assert_eq!(state.selection.selected_track_ids, track_ids);
     }
 }

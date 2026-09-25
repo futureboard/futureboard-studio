@@ -20,10 +20,13 @@
 //!
 //! - `tempos`: tempos in playing order — one value for a steady song, the
 //!   sequence for one that changes.
-//! - `tempo_map`: timestamped tempo marks, `[{ "time": 0.0, "bpm": 92 }, …]`,
-//!   each holding until the next. When present it also supplies `tempos`.
-//! - `chords`: timestamped chord labels, `[{ "time": 0.0, "chord": "Am" }, …]`,
-//!   each holding until the next; `"N"` is no chord.
+//! - `tempo_map` (or `tempo`): timestamped tempo marks,
+//!   `[{ "time": 0.0, "bpm": 92 }, …]`, each holding until the next. When
+//!   present it also supplies `tempos`.
+//! - `chords`: timestamped chord labels, `[{ "time": 0.0, "chord": "Am" }, …]`
+//!   or `[{ "start": 0.0, "end": 1.48, "label": "Am" }, …]`, each holding
+//!   until the next; `"N"` is no chord. `examples/chord_benchmark.rs`
+//!   scores chords in full (root, maj/min, sevenths, segmentation).
 //! - `meter`: free text, informational.
 //!
 //! # Scores
@@ -76,7 +79,7 @@ struct Song {
     key: String,
     #[serde(default)]
     tempos: Vec<f32>,
-    #[serde(default)]
+    #[serde(default, alias = "tempo")]
     tempo_map: Vec<TempoMark>,
     #[serde(default)]
     chords: Vec<ChordMark>,
@@ -88,9 +91,13 @@ struct TempoMark {
     bpm: f32,
 }
 
+/// A chord label: `{ "time", "chord" }` or `{ "start", "end", "label" }`
+/// (the chord benchmark's form; `end` is implied by the next label here).
 #[derive(Deserialize, Clone)]
 struct ChordMark {
+    #[serde(alias = "start")]
     time: f64,
+    #[serde(alias = "label")]
     chord: String,
 }
 
@@ -416,6 +423,28 @@ fn key_diagnostics(
     })
 }
 
+/// Beat-grid stability: the beats off every steady grid, and the "wobbles" —
+/// beats where the tempo moves more than 5% one way and then more than 5%
+/// back. A clean tempo step or a ritardando has none; a tracker chasing a
+/// fill has many, and each one lands in the project tempo map.
+fn grid_stability(rhythm: &RhythmAnalysis) -> (usize, usize) {
+    const WOBBLE: f64 = 0.05;
+    let unlocked = rhythm.beats.iter().filter(|b| !b.locked).count();
+    let tempos: Vec<f64> = rhythm
+        .beats
+        .windows(2)
+        .map(|w| 60.0 / (w[1].seconds - w[0].seconds).max(1e-3))
+        .collect();
+    let wobbles = tempos
+        .windows(3)
+        .filter(|w| {
+            let (a, b) = (w[1] / w[0] - 1.0, w[2] / w[1] - 1.0);
+            a.abs() > WOBBLE && b.abs() > WOBBLE && a.signum() != b.signum()
+        })
+        .count();
+    (unlocked, wobbles)
+}
+
 fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
@@ -500,7 +529,7 @@ fn analyze(dataset: &Path, song: &Song) -> Result<Outcome, String> {
             (Some(frames), Some(rhythm)) => {
                 let beats: Vec<f64> = rhythm.beats.iter().map(|b| b.seconds).collect();
                 let downbeats: Vec<bool> = rhythm.beats.iter().map(|b| b.position == 1).collect();
-                recognize_chords(frames, &beats, &downbeats, ChordOptions { sevenths: true })
+                recognize_chords(frames, &beats, &downbeats, ChordOptions::default())
             }
             _ => Vec::new(),
         };
@@ -551,6 +580,8 @@ fn analyze(dataset: &Path, song: &Song) -> Result<Outcome, String> {
             })).collect::<Vec<_>>()),
         })).collect::<Vec<_>>()),
         "tracked_beat_count": rhythm.as_ref().map(|r| r.tracked_beats.len()),
+        "unlocked_beats": rhythm.as_ref().map(|r| grid_stability(r).0),
+        "tempo_wobbles": rhythm.as_ref().map(|r| grid_stability(r).1),
         "sections_collapsed": collapsed.iter().map(|&b| round2(b as f64)).collect::<Vec<_>>(),
         "tempo_top_class": outcome.tempo_top,
         "tempo_finder_class": outcome.tempo_finder,
@@ -581,15 +612,21 @@ fn compare(before_path: &Path, after: &Value) {
         ("change", "flagged"),
         ("change", "mean_recall"),
         ("change", "mean_exact_recall"),
+        ("grid", "unlocked_beats"),
+        ("grid", "tempo_wobbles"),
         ("key", "exact"),
         ("key", "mirex"),
     ];
     for (group, name) in metrics {
         let b = &before[group][name];
         let a = &after[group][name];
+        // Counts of off-grid beats and wobbles are better when lower.
+        let lower_is_better = group == "grid";
         let mark = match (b.as_f64(), a.as_f64()) {
-            (Some(b), Some(a)) if a > b + 1e-9 => "  improved",
-            (Some(b), Some(a)) if a < b - 1e-9 => "  REGRESSED",
+            (Some(b), Some(a)) if (a > b + 1e-9) != lower_is_better && (a - b).abs() > 1e-9 => {
+                "  improved"
+            }
+            (Some(b), Some(a)) if (a - b).abs() > 1e-9 => "  REGRESSED",
             (None, _) | (_, None) => "  (not in both)",
             _ => "",
         };
@@ -618,6 +655,8 @@ fn compare(before_path: &Path, after: &Value) {
         "change_recall",
         "change_exact_recall",
         "rhythm_variable",
+        "unlocked_beats",
+        "tempo_wobbles",
         "beats_per_bar",
         "key_top",
         "key_class",
@@ -709,6 +748,7 @@ fn main() {
     let (mut timed_n, mut timed_exact, mut timed_octave) = (0u32, 0.0f32, 0.0f32);
     let (mut chord_n, mut chord_sum) = (0u32, 0.0f32);
     let (mut key_n, mut key_sum, mut key_exact) = (0u32, 0.0f32, 0u32);
+    let (mut unlocked_total, mut wobble_total) = (0u64, 0u64);
     let mut all_json = Vec::new();
     let hit = |class: &str| (class == "exact") as u32;
     let octave_ok = |class: &str| (class == "exact" || class == "octave") as u32;
@@ -722,6 +762,8 @@ fn main() {
             }
             Ok(o) => o,
         };
+        unlocked_total += o.json["unlocked_beats"].as_u64().unwrap_or(0);
+        wobble_total += o.json["tempo_wobbles"].as_u64().unwrap_or(0);
         key_n += 1;
         key_sum += o.key_score;
         key_exact += (o.key_class == "exact") as u32;
@@ -769,12 +811,14 @@ fn main() {
             exact_recall_sum += exact_recall;
             change_flagged += o.change_flagged.unwrap_or(false) as u32;
             println!(
-                "CHANGE {name}\n  tempo truth {} | sections {} | variable {} | recall {:.0}% (exact level {:.0}%)\n{key_line}",
+                "CHANGE {name}\n  tempo truth {} | sections {} | variable {} | recall {:.0}% (exact level {:.0}%) | off-grid beats {}, wobbles {}\n{key_line}",
                 j["tempo_truth"],
                 j["sections_collapsed"],
                 j["rhythm_variable"],
                 recall * 100.0,
                 exact_recall * 100.0,
+                j["unlocked_beats"],
+                j["tempo_wobbles"],
             );
         }
         if let Some((exact, octave)) = o.timed {
@@ -844,6 +888,9 @@ fn main() {
             mean(exact_recall_sum, change_n) * 100.0,
         );
     }
+    println!(
+        "beat grid     ({key_n}): {unlocked_total} beats off a steady grid, {wobble_total} tempo wobbles"
+    );
     if timed_n > 0 {
         println!(
             "timed tempo   ({timed_n}): exact {:.0}%, octave-ok {:.0}% of labelled time",
@@ -880,6 +927,7 @@ fn main() {
             "mean_recall": mean(recall_sum, change_n),
             "mean_exact_recall": mean(exact_recall_sum, change_n),
         },
+        "grid": { "unlocked_beats": unlocked_total, "tempo_wobbles": wobble_total },
         "timed": { "n": timed_n, "exact": mean(timed_exact, timed_n), "octave": mean(timed_octave, timed_n) },
         "key": { "n": key_n, "exact": key_exact, "mirex": mean(key_sum, key_n) },
         "chords": { "n": chord_n, "majmin": mean(chord_sum, chord_n) },
@@ -927,10 +975,14 @@ mod tests {
         let labels: Labels = serde_json::from_str(
             r#"{ "songs": [ { "file": "a.wav", "key": "A minor",
                 "tempo_map": [ { "time": 0.0, "bpm": 92 }, { "time": 31.4, "bpm": 82 } ],
-                "chords": [ { "time": 0.0, "chord": "Am" }, { "time": 2.667, "chord": "F" } ] } ] }"#,
+                "chords": [ { "time": 0.0, "chord": "Am" }, { "time": 2.667, "chord": "F" } ] },
+              { "file": "b.wav", "key": "E minor", "tempo": [ { "time": 0.0, "bpm": 162 } ],
+                "chords": [ { "start": 0.0, "end": 1.482, "label": "Em" } ] } ] }"#,
         )
         .unwrap();
         assert_eq!(labels.songs[0].tempo_sequence(), vec![92.0, 82.0]);
         assert_eq!(labels.songs[0].chords.len(), 2);
+        assert_eq!(labels.songs[1].tempo_sequence(), vec![162.0]);
+        assert_eq!(labels.songs[1].chords[0].chord, "Em");
     }
 }

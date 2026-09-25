@@ -81,3 +81,129 @@ pub struct TimelineMarkerDrag {
     /// project dirty or writes an undo entry.
     pub moved: bool,
 }
+
+/// Where every clip of a move lands: one delta, from the grabbed clip, added
+/// to every clip's start *at the origin of the gesture*.
+///
+/// `origin_starts` are the moving clips' starts when the drag began,
+/// `anchor_origin` the grabbed clip's, and `anchor_target` where the grabbed
+/// clip should now start (already snapped, or Shift-bypassed). Resolving from
+/// the origin on every move, rather than nudging the current positions, means
+/// a long drag cannot drift and a drop commits exactly what the last preview
+/// showed. The delta is held so the earliest clip stops at beat 0, which
+/// keeps the group's spacing intact instead of piling clips up at the start.
+pub fn group_move_starts(origin_starts: &[f32], anchor_origin: f32, anchor_target: f32) -> Vec<f32> {
+    let earliest = origin_starts
+        .iter()
+        .copied()
+        .fold(anchor_origin, f32::min)
+        .max(0.0);
+    let delta = (anchor_target - anchor_origin).max(-earliest);
+    origin_starts
+        .iter()
+        .map(|start| (start + delta).max(0.0))
+        .collect()
+}
+
+impl TimelineState {
+    /// Move a clip to `start_beat` on its own track, in place: its index in the
+    /// track, the selection and every other field are left alone. The live
+    /// preview of a clip move; the drop records the undo step.
+    pub fn set_clip_start_in_place(&mut self, clip_id: &str, start_beat: f32) -> bool {
+        let Some(clip) = self
+            .tracks
+            .iter_mut()
+            .flat_map(|track| track.clips.iter_mut())
+            .find(|clip| clip.id == clip_id)
+        else {
+            return false;
+        };
+        let start_beat = start_beat.max(0.0);
+        if clip.start_beat == start_beat {
+            return false;
+        }
+        clip.start_beat = start_beat;
+        true
+    }
+
+    /// Move a clip onto another track at `start_beat`, appended to that track's
+    /// clips as a drop always has. No snapping and no selection change: the
+    /// caller resolved the position and restores the selection. Returns
+    /// `false` when the clip or the track is missing.
+    pub fn move_clip_to_track_unsnapped(
+        &mut self,
+        clip_id: &str,
+        target_track_id: &str,
+        start_beat: f32,
+    ) -> bool {
+        if !self.tracks.iter().any(|track| track.id == target_track_id) {
+            return false;
+        }
+        let Some(source) = self
+            .tracks
+            .iter()
+            .position(|track| track.clips.iter().any(|clip| clip.id == clip_id))
+        else {
+            return false;
+        };
+        if self.tracks[source].id == target_track_id {
+            self.set_clip_start_in_place(clip_id, start_beat);
+            return true;
+        }
+        let Some(index) = self.tracks[source]
+            .clips
+            .iter()
+            .position(|clip| clip.id == clip_id)
+        else {
+            return false;
+        };
+        let mut clip = self.tracks[source].clips.remove(index);
+        clip.start_beat = start_beat.max(0.0);
+        if let Some(track) = self
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == target_track_id)
+        {
+            track.clips.push(clip);
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod group_move_tests {
+    use super::group_move_starts;
+
+    #[test]
+    fn every_clip_moves_by_the_anchor_delta_from_the_origin() {
+        let starts = group_move_starts(&[4.0, 6.5, 9.0], 6.5, 8.0);
+        assert_eq!(starts, vec![5.5, 8.0, 10.5]);
+        // Resolving the same target again from the origin gives the same
+        // answer: nothing accumulates between moves.
+        assert_eq!(group_move_starts(&[4.0, 6.5, 9.0], 6.5, 8.0), starts);
+        // Back to where it started is exactly where it started.
+        assert_eq!(
+            group_move_starts(&[4.0, 6.5, 9.0], 6.5, 6.5),
+            vec![4.0, 6.5, 9.0]
+        );
+    }
+
+    /// Dragging a group hard left stops it with its earliest clip at 0 and its
+    /// spacing intact; it used to squash every clip that hit 0 onto the others.
+    #[test]
+    fn a_group_stops_at_beat_zero_with_its_spacing_intact() {
+        let starts = group_move_starts(&[2.0, 5.0, 7.0], 5.0, 0.0);
+        assert_eq!(starts, vec![0.0, 3.0, 5.0]);
+        // A move right after that still resolves from the origin.
+        assert_eq!(
+            group_move_starts(&[2.0, 5.0, 7.0], 5.0, 6.0),
+            vec![3.0, 6.0, 8.0]
+        );
+    }
+
+    #[test]
+    fn a_single_clip_follows_the_target() {
+        assert_eq!(group_move_starts(&[3.0], 3.0, 7.25), vec![7.25]);
+        assert_eq!(group_move_starts(&[3.0], 3.0, -2.0), vec![0.0]);
+    }
+}

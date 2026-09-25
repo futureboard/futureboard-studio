@@ -414,6 +414,99 @@ impl InsertSlotState {
 
 pub const MASTER_TRACK_ID: &str = "master";
 
+/// Most slots one channel's insert chain holds, the instrument slot included.
+pub const MAX_INSERT_SLOTS: usize = 8;
+
+/// A planned move of one effect from one channel's chain to another's — what
+/// [`TimelineState::apply_insert_move`] does and everything
+/// [`TimelineState::revert_insert_move`] needs to undo it exactly. Built by
+/// [`TimelineState::plan_insert_move`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertMove {
+    pub insert_id: String,
+    pub from_track: String,
+    pub from_index: usize,
+    pub to_track: String,
+    /// Index in the destination chain after the move, placeholder included.
+    pub to_index: usize,
+    /// Empty slot 0 created when the destination is an Instrument track with
+    /// no inserts at all, so the effect never lands in the instrument's place.
+    /// Recorded so redo recreates the same id.
+    pub placeholder_id: Option<String>,
+    /// Where the insert's plug-in parameter lanes sat in the source track's
+    /// lane list, ascending. They travel with the insert.
+    pub lane_positions: Vec<usize>,
+    /// The source track's automation focus, when it was on one of the moved
+    /// insert's parameters. Cleared by the move, restored by its undo.
+    pub cleared_selected_target: Option<AutomationTarget>,
+}
+
+fn target_is_insert_param(target: &AutomationTarget, insert_id: &str) -> bool {
+    matches!(target, AutomationTarget::PluginParameter { insert_id: id, .. } if id == insert_id)
+}
+
+/// Whether `lane` automates one of `insert_id`'s parameters.
+pub fn is_insert_parameter_lane(lane: &AutomationLaneState, insert_id: &str) -> bool {
+    target_is_insert_param(&lane.target, insert_id)
+}
+
+impl TrackState {
+    /// First chain index an effect may occupy.
+    ///
+    /// Which slot is the instrument is decided by position in several places
+    /// (`instrument_insert`, MIDI routing, the engine's legacy slot-zero role),
+    /// so slot 0 of a chain that has one is off limits to effects:
+    ///
+    /// * an Instrument track always reserves slot 0, even while it is an empty
+    ///   placeholder or the track plays a built-in instrument;
+    /// * a MIDI track reserves it when a plug-in there is the instrument — by
+    ///   its registry role, or, for a legacy slot with no recorded role, by the
+    ///   same slot-zero rule the engine applies;
+    /// * every other channel carries audio only and reserves nothing.
+    pub fn fx_chain_floor(&self) -> usize {
+        match self.track_type {
+            TrackType::Instrument => 1,
+            TrackType::Midi => {
+                let Some(first) = self.inserts.first() else {
+                    return 0;
+                };
+                let is_instrument = match first.plugin_is_instrument {
+                    Some(role) => role,
+                    None => {
+                        !first.is_empty()
+                            || self.instrument_plugin_instance_id.as_deref()
+                                == Some(first.id.as_str())
+                    }
+                };
+                usize::from(is_instrument)
+            }
+            _ => 0,
+        }
+    }
+
+    /// Whether an effect from another channel may be moved onto this one.
+    ///
+    /// A video track has no effect chain, a full chain has no room (counting
+    /// the placeholder an empty Instrument track needs), and a MIDI track only
+    /// processes audio once an instrument makes some — an effect dropped on a
+    /// bare MIDI track would do nothing, or, with no recorded role, be taken
+    /// for the instrument.
+    pub fn accepts_moved_effect(&self) -> bool {
+        let needed = 1 + usize::from(self.needs_instrument_placeholder());
+        match self.track_type {
+            TrackType::Video => false,
+            TrackType::Midi if self.fx_chain_floor() == 0 => false,
+            _ => self.inserts.len() + needed <= MAX_INSERT_SLOTS,
+        }
+    }
+
+    /// An Instrument track with no inserts must get an empty slot 0 before an
+    /// effect can go in after it.
+    pub fn needs_instrument_placeholder(&self) -> bool {
+        self.track_type == TrackType::Instrument && self.inserts.is_empty()
+    }
+}
+
 impl TimelineState {
     pub fn insert_slots(&self, track_id: &str) -> Option<&Vec<InsertSlotState>> {
         if track_id == MASTER_TRACK_ID {
@@ -465,43 +558,57 @@ impl TimelineState {
     /// Phase 1 — purely UI state; runtime is updated on the next project
     /// sync (the engine ignores unknown plugin descriptors gracefully).
     pub fn add_insert(&mut self, track_id: &str) -> Option<String> {
-        let slots = self.insert_slots_mut(track_id)?;
-        let slot_id = Self::next_insert_slot_id_for(track_id, slots);
+        self.insert_slots(track_id)?;
+        let slot_id = self.next_insert_slot_id_for(track_id);
         let slot = InsertSlotState::empty(&slot_id);
         if plugin_debug_enabled() {
             eprintln!("[plugin] add_insert track={} slot_id={}", track_id, slot_id);
         }
-        slots.push(slot);
+        self.insert_slots_mut(track_id)?.push(slot);
         crate::forensic_trace::log_trace_plugin(track_id, &slot_id);
         Some(slot_id)
     }
 
     pub fn ensure_insert_slot_at(&mut self, track_id: &str, slot_index: usize) -> Option<String> {
-        let slots = self.insert_slots_mut(track_id)?;
-        while slots.len() <= slot_index {
-            let slot_id = Self::next_insert_slot_id_for(track_id, slots);
+        while self.insert_slots(track_id)?.len() <= slot_index {
+            let slot_id = self.next_insert_slot_id_for(track_id);
             if plugin_debug_enabled() {
                 eprintln!("[plugin] add_insert track={} slot_id={}", track_id, slot_id);
             }
-            slots.push(InsertSlotState::empty(&slot_id));
+            self.insert_slots_mut(track_id)?
+                .push(InsertSlotState::empty(&slot_id));
         }
-        slots.get(slot_index).map(|slot| slot.id.clone())
+        self.insert_slot_at(track_id, slot_index)
+            .map(|slot| slot.id.clone())
     }
 
-    fn next_insert_slot_id_for(owner_id: &str, slots: &[InsertSlotState]) -> String {
+    /// Whether any channel — every track and the master — holds `insert_id`.
+    fn insert_id_in_use(&self, insert_id: &str) -> bool {
+        self.master.inserts.iter().any(|slot| slot.id == insert_id)
+            || self
+                .tracks
+                .iter()
+                .any(|track| track.inserts.iter().any(|slot| slot.id == insert_id))
+    }
+
+    fn next_insert_slot_id_for(&self, owner_id: &str) -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_INSERT_SLOT_SEQ: AtomicU64 = AtomicU64::new(1);
         // Session-monotonic so a removed slot's id is NEVER regenerated. The
         // audio engine reconciles live VST3 instances by insert id (plugin
         // path/class_id are only an extra reuse guard), so handing a fresh slot
         // the id of a just-removed one resurrects the old instance — the exact
-        // "old VSTi is still there" bug. The counter is process-global; we still
-        // verify against the track's current ids so a fresh id can never collide
-        // with one loaded from a saved project (whose suffixes are arbitrary).
+        // "old VSTi is still there" bug. The counter is process-global and
+        // restarts with the process, so every candidate is also checked against
+        // every channel, not just the owner: an insert keeps its id when it is
+        // moved to another track, and after a reopen its old owner would
+        // otherwise regenerate an id that now lives somewhere else. The engine
+        // keys processors and bridge sinks by id alone, so two inserts sharing
+        // one would share one instance.
         loop {
             let seq = NEXT_INSERT_SLOT_SEQ.fetch_add(1, Ordering::Relaxed);
             let candidate = format!("insert-{}-{}", owner_id, seq);
-            if slots.iter().all(|slot| slot.id != candidate) {
+            if !self.insert_id_in_use(&candidate) {
                 return candidate;
             }
         }
@@ -736,7 +843,7 @@ impl TimelineState {
                 .inserts
                 .iter()
                 .position(|s| s.id == old_insert_id)?;
-            let fresh_id = Self::next_insert_slot_id_for(track_id, &self.master.inserts);
+            let fresh_id = self.next_insert_slot_id_for(track_id);
             self.master.inserts[idx] = InsertSlotState::empty(&fresh_id);
             eprintln!(
                 "[PluginAdd] replace_insert_with_fresh_slot track={track_id} old={old_insert_id} new={fresh_id}"
@@ -744,9 +851,10 @@ impl TimelineState {
             return Some(fresh_id);
         }
 
+        self.find_insert_slot(track_id, old_insert_id)?;
+        let fresh_id = self.next_insert_slot_id_for(track_id);
         let track = self.tracks.iter_mut().find(|t| t.id == track_id)?;
         let idx = track.inserts.iter().position(|s| s.id == old_insert_id)?;
-        let fresh_id = Self::next_insert_slot_id_for(track_id, &track.inserts);
         track.inserts[idx] = InsertSlotState::empty(&fresh_id);
         // Drop automation lanes bound to the OLD instance so no old state leaks
         // into the fresh instance (which gets a brand-new id below).
@@ -767,35 +875,240 @@ impl TimelineState {
         Some(fresh_id)
     }
 
-    /// Move an insert slot one position earlier (`up = true`) or later within
-    /// the track's chain. Returns `true` if the order changed. Reordering the
-    /// `Vec` is sufficient for the engine — the next project sync carries the
-    /// new chain order down to the runtime.
-    pub fn move_insert(&mut self, track_id: &str, insert_id: &str, up: bool) -> bool {
-        let Some(slots) = self.insert_slots_mut(track_id) else {
-            return false;
-        };
-        let Some(idx) = slots.iter().position(|i| i.id == insert_id) else {
-            return false;
-        };
-        let target = if up {
-            if idx == 0 {
-                return false;
+    /// First chain index an effect may occupy on `track_id`: 1 where slot 0 is
+    /// the instrument, 0 everywhere else (the master included). See
+    /// [`TrackState::fx_chain_floor`].
+    pub fn fx_chain_floor(&self, track_id: &str) -> usize {
+        if track_id == MASTER_TRACK_ID {
+            return 0;
+        }
+        self.tracks
+            .iter()
+            .find(|track| track.id == track_id)
+            .map(TrackState::fx_chain_floor)
+            .unwrap_or(0)
+    }
+
+    /// Plan moving the effect `insert_id` from `from_track` to `to_track`,
+    /// landing in the gap `gap` (0..=len) of the destination chain as it is
+    /// now. `None` when the move is refused:
+    ///
+    /// * the insert is not on `from_track`, or both tracks are the same;
+    /// * the insert sits below its chain's floor (it is the instrument) or is
+    ///   an instrument plug-in — its identity is positional and it drives MIDI
+    ///   routing, so it never changes channels;
+    /// * the destination cannot take an effect (see
+    ///   [`TrackState::accepts_moved_effect`]);
+    /// * the destination is the master and the insert has plug-in parameter
+    ///   automation, which the master has no lanes to hold.
+    ///
+    /// The gap is clamped to the destination's floor, so an effect can never
+    /// land in front of an instrument.
+    pub fn plan_insert_move(
+        &self,
+        from_track: &str,
+        insert_id: &str,
+        to_track: &str,
+        gap: usize,
+    ) -> Option<InsertMove> {
+        if from_track == to_track {
+            return None;
+        }
+        let from_slots = self.insert_slots(from_track)?;
+        let from_index = from_slots.iter().position(|slot| slot.id == insert_id)?;
+        if from_index < self.fx_chain_floor(from_track)
+            || from_slots[from_index].plugin_is_instrument == Some(true)
+        {
+            return None;
+        }
+        let (to_len, placeholder) = if to_track == MASTER_TRACK_ID {
+            if self.master.inserts.len() >= MAX_INSERT_SLOTS {
+                return None;
             }
-            idx - 1
+            (self.master.inserts.len(), false)
         } else {
-            if idx + 1 >= slots.len() {
-                return false;
+            let to = self.tracks.iter().find(|track| track.id == to_track)?;
+            if !to.accepts_moved_effect() {
+                return None;
             }
-            idx + 1
+            (to.inserts.len(), to.needs_instrument_placeholder())
         };
-        slots.swap(idx, target);
+        let (lane_positions, cleared_selected_target) =
+            match self.tracks.iter().find(|track| track.id == from_track) {
+                Some(track) => (
+                    track
+                        .automation_lanes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, lane)| is_insert_parameter_lane(lane, insert_id))
+                        .map(|(position, _)| position)
+                        .collect::<Vec<_>>(),
+                    track
+                        .selected_automation_target
+                        .clone()
+                        .filter(|target| target_is_insert_param(target, insert_id)),
+                ),
+                None => (Vec::new(), None),
+            };
+        if to_track == MASTER_TRACK_ID && !lane_positions.is_empty() {
+            return None;
+        }
+        let to_len = to_len + usize::from(placeholder);
+        let to_index = gap.max(self.fx_chain_floor(to_track)).min(to_len);
+        Some(InsertMove {
+            insert_id: insert_id.to_string(),
+            from_track: from_track.to_string(),
+            from_index,
+            to_track: to_track.to_string(),
+            to_index,
+            placeholder_id: placeholder.then(|| self.next_insert_slot_id_for(to_track)),
+            lane_positions,
+            cleared_selected_target,
+        })
+    }
+
+    /// Carry out a planned [`InsertMove`]: the SAME [`InsertSlotState`] leaves
+    /// the source chain and enters the destination chain — never cloned or
+    /// recreated, so its id, opaque plug-in state, parameters, bypass/enabled
+    /// flags, output layout and runtime state all go with it, and the engine
+    /// reuses the live instance by id on the next sync. Its plug-in parameter
+    /// automation lanes move with it. Removal and insertion happen in this one
+    /// call, so the id is never on two channels at once. Returns `false`, and
+    /// changes nothing, when either side no longer matches the plan.
+    pub fn apply_insert_move(&mut self, plan: &InsertMove) -> bool {
+        self.transfer_insert(
+            &plan.insert_id,
+            &plan.from_track,
+            &plan.to_track,
+            plan.to_index,
+            plan.placeholder_id.as_deref(),
+            None,
+            &[],
+        )
+    }
+
+    /// Exact inverse of [`Self::apply_insert_move`]: the insert goes back to
+    /// `from_index`, its lanes back to their old places in the source lane
+    /// list, the source's cleared automation focus is restored, and the
+    /// placeholder slot 0 is dropped again — unless something was loaded into
+    /// it since, in which case it is no longer a placeholder and stays.
+    pub fn revert_insert_move(&mut self, plan: &InsertMove) -> bool {
+        let moved = self.transfer_insert(
+            &plan.insert_id,
+            &plan.to_track,
+            &plan.from_track,
+            plan.from_index,
+            None,
+            plan.placeholder_id.as_deref(),
+            &plan.lane_positions,
+        );
+        if !moved {
+            return false;
+        }
+        if let Some(target) = plan.cleared_selected_target.clone() {
+            if let Some(track) = self.tracks.iter_mut().find(|t| t.id == plan.from_track) {
+                track.selected_automation_target = Some(target);
+            }
+        }
+        true
+    }
+
+    /// Move `insert_id` from one channel to another at `to_index`. Validates
+    /// both sides before touching anything. `create_placeholder` makes an empty
+    /// slot 0 with that id first when the destination chain is empty;
+    /// `drop_placeholder` removes that slot from the source if it is still
+    /// empty. Lanes land at `lane_positions` (ascending) when given, else at the
+    /// end of the destination's lane list.
+    #[allow(clippy::too_many_arguments)]
+    fn transfer_insert(
+        &mut self,
+        insert_id: &str,
+        from_track: &str,
+        to_track: &str,
+        to_index: usize,
+        create_placeholder: Option<&str>,
+        drop_placeholder: Option<&str>,
+        lane_positions: &[usize],
+    ) -> bool {
+        if from_track == to_track
+            || self.find_insert_slot(from_track, insert_id).is_none()
+            || self.insert_slots(to_track).is_none()
+        {
+            return false;
+        }
+        // The master has no lane list; lanes must never be dropped on the way.
+        if to_track == MASTER_TRACK_ID
+            && self.find_track(from_track).is_some_and(|track| {
+                track
+                    .automation_lanes
+                    .iter()
+                    .any(|lane| is_insert_parameter_lane(lane, insert_id))
+            })
+        {
+            return false;
+        }
+        let Some(slots) = self.insert_slots_mut(from_track) else {
+            return false;
+        };
+        let Some(position) = slots.iter().position(|slot| slot.id == insert_id) else {
+            return false;
+        };
+        let slot = slots.remove(position);
+        if let Some(placeholder) = drop_placeholder {
+            if slots
+                .first()
+                .is_some_and(|s| s.id == placeholder && s.is_empty())
+            {
+                slots.remove(0);
+            }
+        }
+        let mut lanes = Vec::new();
+        if let Some(track) = self.tracks.iter_mut().find(|t| t.id == from_track) {
+            let mut kept = Vec::with_capacity(track.automation_lanes.len());
+            for lane in std::mem::take(&mut track.automation_lanes) {
+                if is_insert_parameter_lane(&lane, insert_id) {
+                    lanes.push(lane);
+                } else {
+                    kept.push(lane);
+                }
+            }
+            track.automation_lanes = kept;
+            if track
+                .selected_automation_target
+                .as_ref()
+                .is_some_and(|target| target_is_insert_param(target, insert_id))
+            {
+                track.selected_automation_target = None;
+            }
+        }
+        let Some(slots) = self.insert_slots_mut(to_track) else {
+            return false;
+        };
+        if let Some(placeholder) = create_placeholder {
+            if slots.is_empty() {
+                slots.push(InsertSlotState::empty(placeholder));
+            }
+        }
+        let index = to_index.min(slots.len());
+        slots.insert(index, slot);
+        if let Some(track) = self.tracks.iter_mut().find(|t| t.id == to_track) {
+            if lane_positions.len() == lanes.len() {
+                for (position, lane) in lane_positions.iter().zip(lanes) {
+                    let at = (*position).min(track.automation_lanes.len());
+                    track.automation_lanes.insert(at, lane);
+                }
+            } else {
+                track.automation_lanes.extend(lanes);
+            }
+        }
+        if let Some(touched) = self.last_touched_plugin_param.as_mut() {
+            if touched.insert_id == insert_id {
+                touched.track_id = to_track.to_string();
+            }
+        }
         if plugin_debug_enabled() {
             eprintln!(
-                "[plugin] move_insert track={} slot={} {}",
-                track_id,
-                insert_id,
-                if up { "up" } else { "down" }
+                "[plugin] move_insert_between_tracks slot={insert_id} {from_track} -> {to_track}[{index}]"
             );
         }
         true
@@ -1506,5 +1819,384 @@ mod vsti_output_bus_layout_tests {
             vsti_output_child_channels_for_bus_layout(&[], 1),
             Some((3, 4))
         );
+    }
+}
+
+/// Cross-channel insert moves: the chain floor, the move itself (the same
+/// slot struct, its lanes, exact undo), and project-wide id uniqueness.
+#[cfg(test)]
+mod insert_move_tests {
+    use super::*;
+    use crate::components::edit::edit_commands::{EditCommand, EditHistory};
+
+    fn track(state: &mut TimelineState, track_type: TrackType, name: &str) -> String {
+        state.create_track(CreateTrackOptions {
+            track_type,
+            name: name.to_string(),
+            color: gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        })
+    }
+
+    /// Load a VST3 into slot `index` of `track_id` with a registry role.
+    fn load(
+        state: &mut TimelineState,
+        track_id: &str,
+        index: usize,
+        name: &str,
+        instrument: bool,
+    ) -> String {
+        let slot = state.ensure_insert_slot_at(track_id, index).expect("slot");
+        state.set_insert_plugin(
+            track_id,
+            &slot,
+            name.to_string(),
+            Some(std::path::PathBuf::from(format!("C:/p/{name}.vst3"))),
+            InsertPluginFormat::Vst3,
+            None,
+            name.to_string(),
+        );
+        state.set_insert_plugin_role(track_id, &slot, instrument);
+        slot
+    }
+
+    fn param_lane(id: &str, insert_id: &str) -> AutomationLaneState {
+        AutomationLaneState::new(
+            id,
+            AutomationTarget::PluginParameter {
+                insert_id: insert_id.to_string(),
+                parameter_id: "7".to_string(),
+                parameter_name: "Cutoff".to_string(),
+            },
+        )
+    }
+
+    fn track_mut<'a>(state: &'a mut TimelineState, track_id: &str) -> &'a mut TrackState {
+        state
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == track_id)
+            .expect("track")
+    }
+
+    fn empty_state() -> TimelineState {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        state
+    }
+
+    #[test]
+    fn fx_chain_floor_reserves_the_instrument_slot_only() {
+        let mut state = empty_state();
+        let inst = track(&mut state, TrackType::Instrument, "Inst");
+        let midi = track(&mut state, TrackType::Midi, "MIDI");
+        let bare_midi = track(&mut state, TrackType::Midi, "Bare MIDI");
+        let legacy_midi = track(&mut state, TrackType::Midi, "Legacy MIDI");
+        let audio = track(&mut state, TrackType::Audio, "Audio");
+        let bus = track(&mut state, TrackType::Bus, "Bus");
+        let ret = track(&mut state, TrackType::Return, "Return");
+
+        // An Instrument track reserves slot 0 even with nothing in it — an
+        // empty placeholder, or a built-in instrument that is no insert at all.
+        assert_eq!(state.fx_chain_floor(&inst), 1);
+        track_mut(&mut state, &inst).builtin_soundfont_player = true;
+        assert_eq!(state.fx_chain_floor(&inst), 1);
+
+        load(&mut state, &midi, 0, "synth", true);
+        assert_eq!(state.fx_chain_floor(&midi), 1, "a MIDI track's VSTi");
+        load(&mut state, &bare_midi, 0, "fx", false);
+        assert_eq!(
+            state.fx_chain_floor(&bare_midi),
+            0,
+            "an effect is no instrument"
+        );
+        // A legacy slot with no recorded role runs as the instrument at slot 0.
+        let legacy = load(&mut state, &legacy_midi, 0, "old", false);
+        state
+            .insert_slots_mut(&legacy_midi)
+            .unwrap()
+            .iter_mut()
+            .find(|slot| slot.id == legacy)
+            .unwrap()
+            .plugin_is_instrument = None;
+        assert_eq!(state.fx_chain_floor(&legacy_midi), 1);
+
+        for id in [&audio, &bus, &ret] {
+            load(&mut state, id, 0, "fx", false);
+            assert_eq!(state.fx_chain_floor(id), 0);
+        }
+        assert_eq!(state.fx_chain_floor(MASTER_TRACK_ID), 0);
+    }
+
+    /// The moved insert is the same struct: nothing is cloned or recreated, so
+    /// its opaque state is the very same allocation, and its lanes go with it.
+    #[test]
+    fn move_insert_between_tracks_keeps_the_same_struct() {
+        let mut state = empty_state();
+        let a = track(&mut state, TrackType::Audio, "A");
+        let b = track(&mut state, TrackType::Audio, "B");
+        let fx1 = load(&mut state, &a, 0, "fx1", false);
+        let fx2 = load(&mut state, &a, 1, "fx2", false);
+        let other = load(&mut state, &b, 0, "other", false);
+
+        let blob = std::sync::Arc::new(vec![1u8, 2, 3, 4]);
+        {
+            let slot = state
+                .insert_slots_mut(&a)
+                .unwrap()
+                .iter_mut()
+                .find(|slot| slot.id == fx2)
+                .unwrap();
+            slot.vst3_state = Some(blob.clone());
+            slot.bypassed = true;
+            slot.enabled = false;
+            slot.output_bus_channel_counts = vec![2, 2];
+            slot.parameters.push(PluginParameterState {
+                id: 7,
+                name: "Cutoff".to_string(),
+                value_normalized: 0.25,
+                automatable: true,
+                hidden: false,
+                read_only: false,
+                unit: String::new(),
+            });
+        }
+        let before = state.find_insert_slot(&a, &fx2).unwrap().clone();
+        {
+            let track_a = track_mut(&mut state, &a);
+            track_a.automation_lanes.push(AutomationLaneState::new(
+                "vol",
+                AutomationTarget::TrackVolume,
+            ));
+            track_a.automation_lanes.push(param_lane("cut", &fx2));
+            track_a.automation_lanes.push(param_lane("fx1", &fx1));
+            track_a.selected_automation_target = Some(param_lane("cut", &fx2).target.clone());
+        }
+        state.last_touched_plugin_param = Some(LastTouchedPluginParam {
+            track_id: a.clone(),
+            insert_id: fx2.clone(),
+            parameter_id: "7".to_string(),
+            parameter_name: "Cutoff".to_string(),
+            plugin_name: "fx2".to_string(),
+            normalized_value: 0.25,
+        });
+
+        // Dropped in front of `other`.
+        let plan = state.plan_insert_move(&a, &fx2, &b, 0).expect("movable");
+        assert!(state.apply_insert_move(&plan));
+
+        assert_eq!(state.insert_order(&a), vec![fx1.clone()]);
+        assert_eq!(state.insert_order(&b), vec![fx2.clone(), other.clone()]);
+        let moved = state.find_insert_slot(&b, &fx2).unwrap();
+        assert_eq!(*moved, before, "every field travels unchanged");
+        assert!(
+            std::sync::Arc::ptr_eq(moved.vst3_state.as_ref().unwrap(), &blob),
+            "the opaque state is the same allocation, not a copy"
+        );
+        let lanes_a: Vec<_> = state
+            .find_track(&a)
+            .unwrap()
+            .automation_lanes
+            .iter()
+            .map(|l| l.id.clone())
+            .collect();
+        let lanes_b: Vec<_> = state
+            .find_track(&b)
+            .unwrap()
+            .automation_lanes
+            .iter()
+            .map(|l| l.id.clone())
+            .collect();
+        assert_eq!(lanes_a, vec!["vol", "fx1"]);
+        assert_eq!(lanes_b, vec!["cut"]);
+        assert_eq!(
+            state.find_track(&a).unwrap().selected_automation_target,
+            None,
+            "the source's focus on a moved lane is cleared"
+        );
+        assert_eq!(
+            state.last_touched_plugin_param.as_ref().unwrap().track_id,
+            b
+        );
+        assert_eq!(state.insert_owner_ids_containing(&fx2), vec![b.clone()]);
+
+        // Undo puts everything back where it was.
+        assert!(state.revert_insert_move(&plan));
+        assert_eq!(state.insert_order(&a), vec![fx1.clone(), fx2.clone()]);
+        assert_eq!(state.insert_order(&b), vec![other]);
+        let lanes_a: Vec<_> = state
+            .find_track(&a)
+            .unwrap()
+            .automation_lanes
+            .iter()
+            .map(|l| l.id.clone())
+            .collect();
+        assert_eq!(lanes_a, vec!["vol", "cut", "fx1"]);
+        assert!(state.find_track(&b).unwrap().automation_lanes.is_empty());
+        assert_eq!(
+            state.find_track(&a).unwrap().selected_automation_target,
+            Some(param_lane("cut", &fx2).target)
+        );
+        assert_eq!(
+            state.last_touched_plugin_param.as_ref().unwrap().track_id,
+            a
+        );
+    }
+
+    #[test]
+    fn moves_the_chain_cannot_take_are_refused() {
+        let mut state = empty_state();
+        let inst = track(&mut state, TrackType::Instrument, "Inst");
+        let audio = track(&mut state, TrackType::Audio, "Audio");
+        let video = track(&mut state, TrackType::Video, "Video");
+        let bare_midi = track(&mut state, TrackType::Midi, "MIDI");
+        let full = track(&mut state, TrackType::Audio, "Full");
+        let synth = load(&mut state, &inst, 0, "synth", true);
+        let fx = load(&mut state, &inst, 1, "fx", false);
+        for index in 0..MAX_INSERT_SLOTS {
+            load(&mut state, &full, index, "filler", false);
+        }
+        // A VSTi used as an effect on an audio track is still an instrument
+        // plug-in: it does not change channels.
+        let loose_synth = load(&mut state, &audio, 0, "synth2", true);
+
+        assert!(
+            state.plan_insert_move(&inst, &synth, &audio, 0).is_none(),
+            "the instrument"
+        );
+        assert!(state
+            .plan_insert_move(&audio, &loose_synth, &inst, 1)
+            .is_none());
+        assert!(
+            state.plan_insert_move(&inst, &fx, &video, 0).is_none(),
+            "no effect chain"
+        );
+        assert!(
+            state.plan_insert_move(&inst, &fx, &full, 0).is_none(),
+            "no room"
+        );
+        assert!(
+            state.plan_insert_move(&inst, &fx, &bare_midi, 0).is_none(),
+            "no instrument"
+        );
+        assert!(
+            state.plan_insert_move(&inst, &fx, &inst, 0).is_none(),
+            "same channel"
+        );
+        assert!(
+            state.plan_insert_move(&inst, "nope", &audio, 0).is_none(),
+            "unknown id"
+        );
+        assert!(
+            state.plan_insert_move(&inst, &fx, "no-track", 0).is_none(),
+            "unknown track"
+        );
+        assert!(state.plan_insert_move(&inst, &fx, &audio, 0).is_some());
+    }
+
+    /// The master keeps no automation lanes, so an insert with parameter
+    /// automation cannot go there — its lanes would be lost.
+    #[test]
+    fn a_move_onto_the_master_is_refused_while_the_insert_has_lanes() {
+        let mut state = empty_state();
+        let a = track(&mut state, TrackType::Audio, "A");
+        let fx = load(&mut state, &a, 0, "fx", false);
+        track_mut(&mut state, &a)
+            .automation_lanes
+            .push(param_lane("cut", &fx));
+        assert!(state
+            .plan_insert_move(&a, &fx, MASTER_TRACK_ID, 0)
+            .is_none());
+
+        track_mut(&mut state, &a).automation_lanes.clear();
+        let plan = state
+            .plan_insert_move(&a, &fx, MASTER_TRACK_ID, 0)
+            .expect("no lanes, no problem");
+        assert!(state.apply_insert_move(&plan));
+        assert_eq!(state.insert_order(MASTER_TRACK_ID), vec![fx]);
+    }
+
+    /// One drop onto an Instrument track with no inserts creates the reserved
+    /// slot 0 first; undo removes it again and puts the effect back where it
+    /// was, redo recreates the same slot id. One history entry throughout.
+    #[test]
+    fn move_insert_slot_undo_redo_is_exact_including_the_placeholder() {
+        let mut state = empty_state();
+        let a = track(&mut state, TrackType::Audio, "A");
+        let inst = track(&mut state, TrackType::Instrument, "Inst");
+        let fx1 = load(&mut state, &a, 0, "fx1", false);
+        let fx2 = load(&mut state, &a, 1, "fx2", false);
+        let fx3 = load(&mut state, &a, 2, "fx3", false);
+
+        // Asked for the very front; the floor puts it after the reserved slot.
+        let plan = state.plan_insert_move(&a, &fx2, &inst, 0).expect("movable");
+        assert_eq!(plan.from_index, 1);
+        assert_eq!(plan.to_index, 1);
+        let placeholder = plan.placeholder_id.clone().expect("empty instrument track");
+
+        let mut history = EditHistory::new(16);
+        let cmd = EditCommand::MoveInsertSlot { plan };
+        assert!(cmd.is_channel_chain_edit());
+        cmd.execute(&mut state);
+        history.push(cmd);
+        assert_eq!(
+            state.insert_order(&inst),
+            vec![placeholder.clone(), fx2.clone()]
+        );
+        assert!(state
+            .find_insert_slot(&inst, &placeholder)
+            .unwrap()
+            .is_empty());
+        assert_eq!(state.insert_order(&a), vec![fx1.clone(), fx3.clone()]);
+
+        assert!(history.undo(&mut state));
+        assert_eq!(
+            state.insert_order(&a),
+            vec![fx1.clone(), fx2.clone(), fx3.clone()]
+        );
+        assert!(
+            state.insert_order(&inst).is_empty(),
+            "the placeholder goes too"
+        );
+
+        assert!(history.redo(&mut state));
+        assert_eq!(state.insert_order(&inst), vec![placeholder, fx2.clone()]);
+        assert_eq!(state.insert_order(&a), vec![fx1, fx3]);
+        assert!(!history.redo(&mut state), "one drop is one entry");
+    }
+
+    /// An insert keeps its id when it moves, so after a reopen its old owner
+    /// could otherwise regenerate an id that now lives on another channel.
+    #[test]
+    fn fresh_insert_ids_are_unique_across_every_channel() {
+        let mut state = empty_state();
+        let a = track(&mut state, TrackType::Audio, "A");
+        let b = track(&mut state, TrackType::Audio, "B");
+        let first = state.add_insert(&a).expect("slot");
+        let seq: u64 = first.rsplit('-').next().unwrap().parse().unwrap();
+        // Track B holds the next ids the counter would hand track A, as if they
+        // had been moved there and the project reopened.
+        {
+            let slots = state.insert_slots_mut(&b).unwrap();
+            for next in seq + 1..seq + 400 {
+                slots.push(InsertSlotState::empty(format!("insert-{a}-{next}")));
+            }
+        }
+        for _ in 0..8 {
+            let fresh = state.add_insert(&a).expect("slot");
+            assert_eq!(
+                state.insert_owner_ids_containing(&fresh),
+                vec![a.clone()],
+                "{fresh} must exist on exactly one channel"
+            );
+        }
     }
 }

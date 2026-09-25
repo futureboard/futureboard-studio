@@ -433,8 +433,8 @@ impl TempoKeyFinderWindow {
     fn set_sevenths(&mut self, sevenths: bool, cx: &mut Context<Self>) {
         self.sevenths = sevenths;
         if let Phase::Ready(analysis) = &mut self.phase {
-            if let (Some(frames), Some(rhythm)) = (&analysis.chroma, &analysis.rhythm) {
-                analysis.chords = detect_chords(frames, rhythm, sevenths);
+            if let Some(frames) = &analysis.chroma {
+                analysis.chords = detect_chords(frames, analysis.rhythm.as_ref(), sevenths);
             }
         }
         cx.notify();
@@ -1386,7 +1386,7 @@ fn run_analysis(path: &str, range: Option<(u64, u64)>) -> Result<Analysis, Strin
         RhythmOptions::default(),
     );
     let chords = match (&frames, &rhythm) {
-        (Some(frames), Some(rhythm)) => detect_chords(frames, rhythm, true),
+        (Some(frames), rhythm) => detect_chords(frames, rhythm.as_ref(), true),
         _ => Vec::new(),
     };
     let offset_seconds = match range {
@@ -1405,14 +1405,27 @@ fn run_analysis(path: &str, range: Option<(u64, u64)>) -> Result<Analysis, Strin
     })
 }
 
+/// Chords over the beat grid, or over fixed spans when no beats were found.
 fn detect_chords(
     frames: &ChromaFrames,
-    rhythm: &RhythmAnalysis,
+    rhythm: Option<&RhythmAnalysis>,
     sevenths: bool,
 ) -> Vec<ChordSegment> {
-    let beats: Vec<f64> = rhythm.beats.iter().map(|b| b.seconds).collect();
-    let downbeats: Vec<bool> = rhythm.beats.iter().map(|b| b.position == 1).collect();
-    recognize_chords(frames, &beats, &downbeats, ChordOptions { sevenths })
+    let beats: Vec<f64> = rhythm
+        .map(|r| r.beats.iter().map(|b| b.seconds).collect())
+        .unwrap_or_default();
+    let downbeats: Vec<bool> = rhythm
+        .map(|r| r.beats.iter().map(|b| b.position == 1).collect())
+        .unwrap_or_default();
+    recognize_chords(
+        frames,
+        &beats,
+        &downbeats,
+        ChordOptions {
+            sevenths,
+            ..ChordOptions::default()
+        },
+    )
 }
 
 /// Keys whose signature is written in flats, so chord names match it.
@@ -1436,13 +1449,7 @@ fn chord_name(root: u8, kind: ChordKind, flats: bool) -> String {
         "C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B",
     ];
     let names = if flats { FLATS } else { SHARPS };
-    let suffix = match kind {
-        ChordKind::Major => "",
-        ChordKind::Minor => "m",
-        ChordKind::Dominant7 => "7",
-        ChordKind::Major7 => "maj7",
-        ChordKind::Minor7 => "m7",
-    };
+    let suffix = kind.suffix();
     format!("{}{}", names[root as usize % 12], suffix)
 }
 

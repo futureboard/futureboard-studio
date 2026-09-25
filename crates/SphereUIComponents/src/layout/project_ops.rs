@@ -1,5 +1,6 @@
 use gpui::Context;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,9 +12,9 @@ use crate::components::timeline::timeline_state::{
     self, CreateTrackOptions, InputMonitorMode, TimelineState, TrackType,
 };
 use crate::project::{
-    io::create_project_folder, io::project_backup_path, io::save_project, io::verify_project_file,
-    now_secs, ClipSource, FutureboardProject, ProjectCreateOptions, ProjectSession,
-    ProjectTemplate,
+    io::create_project_folder, io::project_backup_path, io::save_project_with_report,
+    io::verify_project_file, io::ProjectSaveReport, now_secs, ClipSource, FutureboardProject,
+    ProjectAsset, ProjectCreateOptions, ProjectError, ProjectSession, ProjectTemplate,
 };
 
 use super::StudioLayout;
@@ -39,6 +40,156 @@ enum SaveThenAction {
     PendingClose,
     Lifecycle(LifecycleAction),
     ProjectSwitch(crate::layout::project_switch::ProjectSwitchRequest),
+}
+
+/// Which writer a save job is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveJobKind {
+    /// Save / Save As / save-then-continue: writes the project and binds the
+    /// session to it.
+    Project,
+    /// File → Save Copy: writes a copy and leaves the session alone.
+    Copy,
+    /// The periodic recovery snapshot.
+    Autosave,
+}
+
+impl SaveJobKind {
+    fn task_id(self) -> &'static str {
+        match self {
+            Self::Project => "project-save",
+            Self::Copy => "project-save-copy",
+            Self::Autosave => "project-autosave",
+        }
+    }
+
+    fn task_title(self) -> &'static str {
+        match self {
+            Self::Project => "Save project",
+            Self::Copy => "Save project copy",
+            Self::Autosave => "Autosave project",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SaveRequest {
+    kind: SaveJobKind,
+    path: PathBuf,
+    after_save: Option<SaveThenAction>,
+    /// `StudioLayout::session_generation` when requested. A request whose
+    /// session has been replaced must never run: its fresh snapshot would be
+    /// the new session's content written over the old project's file.
+    session_generation: u64,
+    /// Times this request has already been run again because edits landed
+    /// while it was saving.
+    resaves: u8,
+}
+
+/// What a finished save-then-continue does next.
+enum SaveFollowUp {
+    /// Nothing changed during the save: close / switch / New / Open now.
+    Continue(SaveThenAction),
+    /// Edits landed during the save: save them too before continuing.
+    Resave(SaveRequest),
+    /// Edits keep landing: ask again instead of continuing without them.
+    Reprompt(SaveThenAction),
+}
+
+/// The one queue every project-file writer goes through: manual saves,
+/// save-then-continue, autosave and Save Copy. One job runs at a time; a
+/// request that arrives while one runs waits and then takes a fresh snapshot,
+/// so a newer save can never be overwritten by an older one. The synchronous
+/// save (`do_save_project`) cannot wait in line — its caller needs the result
+/// — and instead waits on the process-wide write lock inside `save_project`.
+#[derive(Debug, Default)]
+pub(crate) struct ProjectSaveState {
+    in_flight: Option<SaveJobKind>,
+    queued: VecDeque<SaveRequest>,
+    /// Asset records from the last load or save of session `assets_session_id`,
+    /// carried into its next snapshot: they spare re-hashing unchanged media
+    /// and keep format metadata only a load knew (a DAW import's frame counts).
+    known_assets: Vec<ProjectAsset>,
+    assets_session_id: Option<String>,
+    /// Session generation whose offline-media warning was already shown.
+    offline_warned_generation: Option<u64>,
+    /// Session generation whose unsaved changes the user chose to discard.
+    discarded_generation: Option<u64>,
+}
+
+impl ProjectSaveState {
+    fn is_busy(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    /// Admit a request. Returns it when nothing is running, to be started now;
+    /// otherwise it waits in line and `None` is returned. A plain save behind
+    /// an identical plain save adds nothing: the waiting one already takes a
+    /// fresh snapshot when it runs.
+    fn admit(&mut self, request: SaveRequest) -> Option<SaveRequest> {
+        if self.in_flight.is_none() {
+            self.in_flight = Some(request.kind);
+            return Some(request);
+        }
+        let duplicate = request.after_save.is_none()
+            && self.queued.iter().any(|queued| {
+                queued.kind == request.kind
+                    && queued.path == request.path
+                    && queued.session_generation == request.session_generation
+            });
+        if !duplicate {
+            self.queued.push_back(request);
+        }
+        None
+    }
+
+    /// Put a request at the head of the line (a save-then-continue that has to
+    /// save again: the user is waiting on its continuation).
+    fn requeue_first(&mut self, request: SaveRequest) {
+        self.queued.push_front(request);
+    }
+
+    /// Drop waiting plain saves of `path` for `generation`: a save of the same
+    /// session just finished with nothing edited since, so they would write
+    /// the same project again while its continuation tears the session down.
+    fn drop_redundant_saves(&mut self, path: &std::path::Path, generation: u64) {
+        self.queued.retain(|queued| {
+            !(queued.kind == SaveJobKind::Project
+                && queued.after_save.is_none()
+                && queued.path == path
+                && queued.session_generation == generation)
+        });
+    }
+
+    /// The running job finished. Returns the next request to start, if any;
+    /// requests whose session has been replaced are discarded and returned in
+    /// the second list.
+    fn finish(&mut self, current_generation: u64) -> (Option<SaveRequest>, Vec<SaveRequest>) {
+        self.in_flight = None;
+        let mut stale = Vec::new();
+        while let Some(next) = self.queued.pop_front() {
+            if next.session_generation != current_generation {
+                stale.push(next);
+                continue;
+            }
+            self.in_flight = Some(next.kind);
+            return (Some(next), stale);
+        }
+        (None, stale)
+    }
+
+    fn remember_assets(&mut self, session_id: &str, assets: Vec<ProjectAsset>) {
+        self.assets_session_id = Some(session_id.to_string());
+        self.known_assets = assets;
+    }
+
+    fn assets_for(&self, session_id: &str) -> Vec<ProjectAsset> {
+        if self.assets_session_id.as_deref() == Some(session_id) {
+            self.known_assets.clone()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -460,7 +611,7 @@ impl StudioLayout {
             now,
             now,
         );
-        self.project_session.is_dirty = true;
+        self.project_session.mark_dirty();
         project_lifecycle_log!(
             "binding current session: name={} path={}",
             final_name,
@@ -755,8 +906,6 @@ impl StudioLayout {
                 .unwrap_or_else(|| self.default_projects_dir(cx));
             let name = self.project_session.name.clone();
             let entity = cx.entity().clone();
-            self.refresh_bridge_plugin_states(cx);
-            let tl_state = self.timeline.read(cx).state.clone();
             cx.spawn(async move |_this, cx| {
                 let result = rfd::AsyncFileDialog::new()
                     .set_title("Save Copy")
@@ -774,14 +923,11 @@ impl StudioLayout {
                     .await;
                 if let Some(handle) = result {
                     let path = handle.path().to_path_buf();
-                    let mut project = FutureboardProject::from(&tl_state);
-                    let _ = entity.update(cx, |this, _cx| {
-                        // A copy carries the ARA edits too; without this the
-                        // copy would silently lose them.
-                        this.attach_ara_archives(&mut project);
-                        if let Err(e) = save_project(&mut project, &path) {
-                            eprintln!("[Project] save copy failed: {e}");
-                        }
+                    // Through the save queue like every writer: the copy is
+                    // snapshotted when its turn comes (plug-in state and ARA
+                    // edits included) and written off the UI thread.
+                    let _ = entity.update(cx, |this, cx| {
+                        this.request_save(SaveJobKind::Copy, path, None, cx);
                     });
                 }
             })
@@ -795,14 +941,24 @@ impl StudioLayout {
         }
     }
 
-    /// Persist the project to `path`. Returns `true` on success so callers
-    /// (notably the unsaved-changes guard) can decide whether to continue.
+    /// Persist the project to `path` now, on this thread. Returns `true` on
+    /// success so callers (creating a project, save-before-record) can decide
+    /// whether to continue. It cannot wait in the save queue: a background
+    /// write already running holds the process-wide write lock inside
+    /// `save_project`, so this waits for it and then writes the newer snapshot;
+    /// anything still queued runs afterwards with a fresher one.
     pub(super) fn do_save_project(&mut self, path: &PathBuf, cx: &mut Context<Self>) -> bool {
         self.refresh_bridge_plugin_states(cx);
+        let saved_generation = self.project_session.dirty_generation;
         let mut project = self.project_snapshot(cx);
-        match save_project(&mut project, path) {
-            Ok(()) => {
-                self.finish_project_save(project, path.clone(), cx);
+        let obsolete_autosaves = self.autosaves_obsoleted_by_saving(path);
+        match save_project_with_report(&mut project, path) {
+            Ok(report) => {
+                for autosave in &obsolete_autosaves {
+                    crate::project::io::remove_autosave_files(autosave);
+                }
+                self.finish_project_save(project, path.clone(), saved_generation, cx);
+                self.warn_offline_media_once(&report, cx);
                 true
             }
             Err(e) => {
@@ -822,73 +978,295 @@ impl StudioLayout {
         after_save: Option<SaveThenAction>,
         cx: &mut Context<Self>,
     ) {
+        self.request_save(SaveJobKind::Project, path, after_save, cx);
+    }
+
+    /// Hand a write to the save queue: it starts now when nothing else is
+    /// writing, otherwise it waits its turn and snapshots the project then.
+    fn request_save(
+        &mut self,
+        kind: SaveJobKind,
+        path: PathBuf,
+        after_save: Option<SaveThenAction>,
+        cx: &mut Context<Self>,
+    ) {
+        let request = SaveRequest {
+            kind,
+            path,
+            after_save,
+            session_generation: self.session_generation(),
+            resaves: 0,
+        };
+        match self.project_saves.admit(request) {
+            Some(request) => self.start_save_job(request, cx),
+            None => {
+                project_lifecycle_log!("save queued behind the running save");
+                if kind == SaveJobKind::Project {
+                    self.project_switcher.current_project.subtitle = "Saving...".to_string();
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Snapshot the live project and write it off the UI thread. The session
+    /// is only rebound when the job completes (`complete_save_job`).
+    fn start_save_job(&mut self, request: SaveRequest, cx: &mut Context<Self>) {
         self.refresh_bridge_plugin_states(cx);
+        // Captured with the snapshot: an edit after this point is not in the
+        // file, and must keep the session dirty when the write completes.
+        let saved_generation = self.project_session.dirty_generation;
         let mut project = self.project_snapshot(cx);
-        // Stamp the session this save belongs to. A plain background save sets no
-        // lifecycle-busy flag, so a project switch/reset can land while the write
-        // is in flight; without this guard the completion below would rebind
-        // `project_session` (name/path/recent, mark saved) — stamping the old
-        // project's identity onto the session that replaced it. See
-        // `advance_session_generation`.
-        let generation = self.session_generation();
-        self.project_switcher.current_project.subtitle = "Saving...".to_string();
+        let obsolete_autosaves = if request.kind == SaveJobKind::Project {
+            self.autosaves_obsoleted_by_saving(&request.path)
+        } else {
+            Vec::new()
+        };
+        match request.kind {
+            SaveJobKind::Project => {
+                self.project_switcher.current_project.subtitle = "Saving...".to_string();
+            }
+            SaveJobKind::Autosave => {
+                self.autosave_in_flight = true;
+                self.last_autosave_at = std::time::Instant::now();
+            }
+            SaveJobKind::Copy => {}
+        }
         self.start_background_task(
-            "project-save",
+            request.kind.task_id(),
             crate::components::BackgroundTaskKind::ProjectSave,
-            "Save project",
-            Some(path.to_string_lossy().to_string()),
+            request.kind.task_title(),
+            Some(request.path.to_string_lossy().to_string()),
             None,
             false,
         );
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let path_for_job = path.clone();
+            let path_for_job = request.path.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { save_project(&mut project, &path_for_job).map(|_| project) })
+                .spawn(async move {
+                    let report = save_project_with_report(&mut project, &path_for_job)?;
+                    // The manual save now holds everything the autosave did.
+                    for autosave in &obsolete_autosaves {
+                        crate::project::io::remove_autosave_files(autosave);
+                    }
+                    Ok((project, report))
+                })
                 .await;
             let _ = this.update(cx, move |this, cx| {
-                // The file is already written to disk regardless of the outcome
-                // below. Only skip the *session-state* mutation when the session
-                // was replaced mid-save.
-                let superseded = this.session_generation() != generation;
-                match result {
-                    Ok(project) => {
-                        if superseded {
-                            this.complete_background_task(
-                                "project-save",
-                                Some("Project saved (session changed)".to_string()),
-                            );
-                            project_lifecycle_log!(
-                                "save completed for superseded session — skipping rebind/after-save"
-                            );
-                            return;
-                        }
-                        this.finish_project_save(project, path, cx);
-                        this.complete_background_task(
-                            "project-save",
-                            Some("Project saved".to_string()),
-                        );
-                        project_lifecycle_log!("save complete");
-                        if let Some(after_save) = after_save {
-                            this.apply_save_then(after_save, cx);
-                        }
-                    }
-                    Err(e) => {
-                        let error = e.to_string();
-                        this.fail_background_task("project-save", error.clone());
-                        if superseded {
-                            project_lifecycle_log!(
-                                "save failed for superseded session — not surfacing on new session"
-                            );
-                            return;
-                        }
-                        this.handle_project_save_error(error, cx);
-                    }
-                }
+                this.complete_save_job(request, saved_generation, result, cx);
             });
         })
         .detach();
+    }
+
+    fn complete_save_job(
+        &mut self,
+        request: SaveRequest,
+        saved_generation: u64,
+        result: Result<(FutureboardProject, ProjectSaveReport), ProjectError>,
+        cx: &mut Context<Self>,
+    ) {
+        let task_id = request.kind.task_id();
+        // The file is on disk (or not) regardless of what follows. A save whose
+        // session was replaced mid-write (a plain background save sets no
+        // lifecycle-busy flag) must not rebind, clear dirty or continue: that
+        // would stamp the old project's identity onto the session that
+        // replaced it. See `advance_session_generation`.
+        let superseded = self.session_generation() != request.session_generation;
+        let mut follow_up = None;
+        match (request.kind, result) {
+            (SaveJobKind::Autosave, Ok((_, report))) => {
+                self.autosave_in_flight = false;
+                self.complete_background_task(task_id, Some("Autosave written".to_string()));
+                eprintln!("[Project] autosave written: {}", request.path.display());
+                if !report.offline_media.is_empty() {
+                    eprintln!(
+                        "[Project] autosave kept {} offline media reference(s)",
+                        report.offline_media.len()
+                    );
+                }
+            }
+            (SaveJobKind::Autosave, Err(e)) => {
+                self.autosave_in_flight = false;
+                let error = e.to_string();
+                self.fail_background_task(task_id, error.clone());
+                eprintln!("[Project] autosave failed: {error}");
+            }
+            (SaveJobKind::Copy, Ok((_, report))) => {
+                self.complete_background_task(task_id, Some("Project copy saved".to_string()));
+                project_lifecycle_log!("save copy complete: {}", request.path.display());
+                if !superseded {
+                    self.warn_offline_media_once(&report, cx);
+                }
+            }
+            (SaveJobKind::Copy, Err(e)) => {
+                let error = e.to_string();
+                self.fail_background_task(task_id, error.clone());
+                eprintln!("[Project] save copy failed: {error}");
+            }
+            (SaveJobKind::Project, Ok((project, report))) => {
+                if superseded {
+                    self.complete_background_task(
+                        task_id,
+                        Some("Project saved (session changed)".to_string()),
+                    );
+                    project_lifecycle_log!(
+                        "save completed for superseded session — skipping rebind/after-save"
+                    );
+                } else {
+                    let clean = self.finish_project_save(
+                        project,
+                        request.path.clone(),
+                        saved_generation,
+                        cx,
+                    );
+                    self.complete_background_task(task_id, Some("Project saved".to_string()));
+                    project_lifecycle_log!("save complete clean={clean}");
+                    self.warn_offline_media_once(&report, cx);
+                    follow_up = request.after_save.clone().map(|after_save| {
+                        if clean {
+                            SaveFollowUp::Continue(after_save)
+                        } else if request.resaves == 0 {
+                            project_lifecycle_log!("edits landed during the save — saving again");
+                            SaveFollowUp::Resave(SaveRequest {
+                                resaves: request.resaves + 1,
+                                ..request.clone()
+                            })
+                        } else {
+                            SaveFollowUp::Reprompt(after_save)
+                        }
+                    });
+                }
+            }
+            (SaveJobKind::Project, Err(e)) => {
+                let error = e.to_string();
+                self.fail_background_task(task_id, error.clone());
+                if superseded {
+                    project_lifecycle_log!(
+                        "save failed for superseded session — not surfacing on new session"
+                    );
+                } else {
+                    self.handle_project_save_error(error, cx);
+                }
+            }
+        }
+
+        // The continuation runs before the next job is picked: it may replace
+        // the session, and a queued save of the replaced session must then be
+        // discarded rather than write the new session over the old file.
+        match follow_up {
+            Some(SaveFollowUp::Continue(after_save)) => {
+                self.project_saves
+                    .drop_redundant_saves(&request.path, request.session_generation);
+                self.apply_save_then(after_save, cx);
+            }
+            Some(SaveFollowUp::Resave(resave)) => self.project_saves.requeue_first(resave),
+            Some(SaveFollowUp::Reprompt(after_save)) => {
+                self.reprompt_after_changed_save(after_save, cx)
+            }
+            None => {}
+        }
+
+        let (next, stale) = self.project_saves.finish(self.session_generation());
+        for dropped in stale {
+            project_lifecycle_log!(
+                "queued {:?} save of {} dropped — its session was replaced",
+                dropped.kind,
+                dropped.path.display()
+            );
+        }
+        if let Some(next) = next {
+            self.start_save_job(next, cx);
+        }
+        cx.notify();
+    }
+
+    /// A save-then-continue saved twice and the project was edited during both
+    /// writes. Continuing would close or switch away from those edits, so ask
+    /// again through the same guard the user answered the first time.
+    fn reprompt_after_changed_save(&mut self, after_save: SaveThenAction, cx: &mut Context<Self>) {
+        project_lifecycle_log!("project still changing after save — asking again");
+        match after_save {
+            SaveThenAction::PendingClose => {
+                if let Some(action) = self.lifecycle_guard.pending_close_action {
+                    self.request_close(action, None, cx);
+                }
+            }
+            SaveThenAction::Lifecycle(action) => self.guard_dirty_then_lifecycle(action, None, cx),
+            SaveThenAction::ProjectSwitch(request) => {
+                self.clear_project_switch_pending();
+                self.request_switch_project(request, None, cx);
+            }
+        }
+    }
+
+    /// Autosaves a successful manual save of `path` makes obsolete: the current
+    /// session's (an untitled session's lives under app data) and the one that
+    /// belongs next to `path`.
+    fn autosaves_obsoleted_by_saving(&self, path: &std::path::Path) -> Vec<PathBuf> {
+        let mut paths = vec![self.autosave_project_path()];
+        let beside = crate::project::io::autosave_path_for_project(path);
+        if !paths.contains(&beside) {
+            paths.push(beside);
+        }
+        paths
+    }
+
+    /// Offline media never fails a save, but the user has to know the saved
+    /// project points at files that are not there. Once per session, without
+    /// blocking anything.
+    fn warn_offline_media_once(&mut self, report: &ProjectSaveReport, cx: &mut Context<Self>) {
+        if report.offline_media.is_empty() {
+            return;
+        }
+        let generation = self.session_generation();
+        if self.project_saves.offline_warned_generation == Some(generation) {
+            return;
+        }
+        self.project_saves.offline_warned_generation = Some(generation);
+        const LISTED: usize = 8;
+        let count = report.offline_media.len();
+        let mut detail = report
+            .offline_media
+            .iter()
+            .take(LISTED)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if count > LISTED {
+            detail.push_str(&format!("\n…and {} more", count - LISTED));
+        }
+        let (noun, pronoun) = if count == 1 {
+            ("file", "Its clip keeps")
+        } else {
+            ("files", "Their clips keep")
+        };
+        let options = MessageBoxOptions {
+            kind: MessageBoxKind::Warning,
+            title: "Media Offline".to_string(),
+            message: format!(
+                "The project was saved, but {count} media {noun} could not be found. \
+                 {pronoun} pointing at the original location; reconnect the drive or \
+                 relink the media to hear it again."
+            ),
+            detail: Some(detail),
+            buttons: vec!["OK".to_string()],
+            default_id: 0,
+            cancel_id: Some(0),
+        };
+        let owner_bounds = crate::window_position::resolve_owner_bounds_with_preferred(
+            self.window_hooks.cached_bounds,
+            self.studio_window_bounds(cx),
+            cx,
+        );
+        let on_response: Arc<
+            dyn Fn(MessageBoxResult, &mut gpui::Window, &mut gpui::App) + Send + Sync,
+        > = Arc::new(|_result, _window, _cx| {});
+        if let Err(error) = open_message_box_window(owner_bounds, options, on_response, cx) {
+            eprintln!("[Project] offline media warning unavailable: {error}");
+        }
     }
 
     pub(super) fn project_snapshot(&mut self, cx: &mut Context<Self>) -> FutureboardProject {
@@ -898,30 +1276,47 @@ impl StudioLayout {
         project.name = self.project_session.name.clone();
         project.created_at = self.project_session.created_at;
         project.modified_at = self.project_session.modified_at;
+        // What the last load or save knew about the media: the save re-hashes
+        // only files that changed, and keeps metadata the timeline never had.
+        project.assets = self.project_saves.assets_for(&self.project_session.id);
         // Ask every live ARA plug-in for its document now: its edits exist only
         // inside the plug-in until it is asked to serialise them.
         self.attach_ara_archives(&mut project);
         project
     }
 
+    /// Remember the asset records of the project just loaded into this
+    /// session, for its next save (see [`ProjectSaveState`]).
+    pub(super) fn remember_loaded_assets(&mut self, assets: Vec<ProjectAsset>) {
+        let session_id = self.project_session.id.clone();
+        self.project_saves.remember_assets(&session_id, assets);
+    }
+
+    /// Bind the session to a finished save of the snapshot taken at
+    /// `saved_generation`. Returns `true` when nothing was edited since, i.e.
+    /// the session is now clean; otherwise it stays "Unsaved changes".
     fn finish_project_save(
         &mut self,
         project: FutureboardProject,
         path: PathBuf,
+        saved_generation: u64,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         self.sync_timeline_audio_paths_after_save(&project, &path, cx);
         let folder = path.parent().map(PathBuf::from);
-        self.project_session.bind_saved(
-            project.id,
+        let clean = self.project_session.bind_saved_snapshot(
+            project.id.clone(),
             project.name.clone(),
             folder.clone(),
             path.clone(),
             project.created_at,
             project.modified_at,
+            saved_generation,
         );
+        self.project_saves
+            .remember_assets(&project.id, project.assets.clone());
         project_lifecycle_log!(
-            "current session updated: name={} path={}",
+            "current session updated: name={} path={} clean={clean}",
             self.project_session.name,
             path.display()
         );
@@ -930,6 +1325,7 @@ impl StudioLayout {
             .push(&project.name, path.clone(), now_secs());
         self.sync_recent_to_switcher();
         cx.notify();
+        clean
     }
 
     fn handle_project_save_error(&mut self, error: String, cx: &mut Context<Self>) {
@@ -944,60 +1340,25 @@ impl StudioLayout {
         if !autosave.enabled || !self.project_session.is_dirty {
             return;
         }
-        if self.autosave_in_flight {
+        // Never queued: while another write runs, the next poll tries again.
+        if self.autosave_in_flight || self.project_saves.is_busy() {
             return;
         }
         let interval_minutes = autosave.interval_minutes.clamp(1, 240) as u64;
         if self.last_autosave_at.elapsed() < std::time::Duration::from_secs(interval_minutes * 60) {
             return;
         }
-
         let path = self.autosave_project_path();
-        self.autosave_in_flight = true;
-        self.last_autosave_at = std::time::Instant::now();
-        self.refresh_bridge_plugin_states(cx);
-        let mut project = self.project_snapshot(cx);
-        self.start_background_task(
-            "project-autosave",
-            crate::components::BackgroundTaskKind::ProjectSave,
-            "Autosave project",
-            Some(path.to_string_lossy().to_string()),
-            None,
-            false,
-        );
-        cx.spawn(async move |this, cx| {
-            let path_for_job = path.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { save_project(&mut project, &path_for_job) })
-                .await;
-            let _ = this.update(cx, move |this, cx| {
-                this.autosave_in_flight = false;
-                match result {
-                    Ok(()) => {
-                        this.complete_background_task(
-                            "project-autosave",
-                            Some("Autosave written".to_string()),
-                        );
-                        eprintln!("[Project] autosave written: {}", path.display());
-                    }
-                    Err(e) => {
-                        let error = e.to_string();
-                        this.fail_background_task("project-autosave", error.clone());
-                        eprintln!("[Project] autosave failed: {error}");
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.request_save(SaveJobKind::Autosave, path, None, cx);
     }
 
     pub(super) fn session_autosave_flush_payload(
         &mut self,
         cx: &mut Context<Self>,
     ) -> (Option<PathBuf>, Option<FutureboardProject>) {
-        if !self.project_session.is_dirty {
+        if !self.project_session.is_dirty
+            || self.project_saves.discarded_generation == Some(self.session_generation())
+        {
             return (None, None);
         }
         // Project-switch shutdown bypasses the normal Save/Autosave entry
@@ -1010,16 +1371,23 @@ impl StudioLayout {
         )
     }
 
+    /// The user chose not to keep this session's unsaved changes (Don't Save,
+    /// Switch Without Saving). Its autosave holds exactly those changes, so it
+    /// is removed and the shutdown flush writes no new one; otherwise the next
+    /// open would offer back what the user just discarded.
+    pub(super) fn discard_session_recovery(&mut self) {
+        self.project_saves.discarded_generation = Some(self.session_generation());
+        crate::project::io::remove_autosave_files(&self.autosave_project_path());
+    }
+
     fn autosave_project_path(&self) -> PathBuf {
-        if let Some(path) = self.project_session.project_file_path.as_ref() {
-            let stem = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("project");
-            return path.with_file_name(format!("{stem}.autosave.fbproj"));
+        match self.project_session.project_file_path.as_ref() {
+            Some(path) => crate::project::io::autosave_path_for_project(path),
+            None => crate::project::io::untitled_autosave_path(
+                &self.paths.app_data,
+                &self.project_session.id,
+            ),
         }
-        let dir = self.paths.app_data.join("Autosaves");
-        dir.join(format!("{}.autosave.fbproj", self.project_session.id))
     }
 
     fn sync_timeline_audio_paths_after_save(
@@ -1225,5 +1593,165 @@ impl StudioLayout {
                 },
             })
             .collect();
+    }
+}
+
+#[cfg(test)]
+mod save_queue_tests {
+    use super::*;
+
+    fn request(kind: SaveJobKind, path: &str, after_save: Option<SaveThenAction>) -> SaveRequest {
+        SaveRequest {
+            kind,
+            path: PathBuf::from(path),
+            after_save,
+            session_generation: 1,
+            resaves: 0,
+        }
+    }
+
+    /// A second save while one is writing waits its turn instead of racing
+    /// it, runs next (taking its snapshot only then), and keeps its
+    /// save-then-close continuation.
+    #[test]
+    fn a_save_during_a_save_is_queued_and_keeps_its_continuation() {
+        let mut queue = ProjectSaveState::default();
+        let first = queue.admit(request(SaveJobKind::Project, "/p/Song.fbproj", None));
+        assert!(first.is_some(), "an idle queue starts the save at once");
+        assert!(queue.is_busy());
+
+        let closing = request(
+            SaveJobKind::Project,
+            "/p/Song.fbproj",
+            Some(SaveThenAction::PendingClose),
+        );
+        assert!(queue.admit(closing).is_none(), "waits for the running save");
+
+        let (next, stale) = queue.finish(1);
+        assert!(stale.is_empty());
+        let next = next.expect("the queued save runs next");
+        assert!(matches!(
+            next.after_save,
+            Some(SaveThenAction::PendingClose)
+        ));
+        assert!(queue.is_busy(), "and is now the running one");
+        let (after, _) = queue.finish(1);
+        assert!(after.is_none());
+        assert!(!queue.is_busy());
+    }
+
+    /// Every writer shares the queue: an autosave or a Save Copy never runs
+    /// alongside a manual save of the same project folder.
+    #[test]
+    fn autosave_and_copies_wait_for_a_running_save() {
+        let mut queue = ProjectSaveState::default();
+        queue.admit(request(
+            SaveJobKind::Autosave,
+            "/p/Song.autosave.fbproj",
+            None,
+        ));
+        assert!(queue
+            .admit(request(SaveJobKind::Project, "/p/Song.fbproj", None))
+            .is_none());
+        assert!(queue
+            .admit(request(SaveJobKind::Copy, "/p/Copy.fbproj", None))
+            .is_none());
+        let (next, _) = queue.finish(1);
+        assert_eq!(next.map(|r| r.kind), Some(SaveJobKind::Project));
+        let (next, _) = queue.finish(1);
+        assert_eq!(next.map(|r| r.kind), Some(SaveJobKind::Copy));
+    }
+
+    /// Mashing Save while a save runs queues one follow-up, not one per press:
+    /// the follow-up snapshots the project when it starts anyway.
+    #[test]
+    fn repeated_plain_saves_collapse_into_one_queued_save() {
+        let mut queue = ProjectSaveState::default();
+        queue.admit(request(SaveJobKind::Project, "/p/Song.fbproj", None));
+        for _ in 0..3 {
+            queue.admit(request(SaveJobKind::Project, "/p/Song.fbproj", None));
+        }
+        assert_eq!(queue.queued.len(), 1);
+    }
+
+    /// A queued save of a session that has since been replaced must never run:
+    /// its fresh snapshot would be the new session written over the old file.
+    #[test]
+    fn a_queued_save_of_a_replaced_session_is_dropped() {
+        let mut queue = ProjectSaveState::default();
+        queue.admit(request(SaveJobKind::Project, "/p/Old.fbproj", None));
+        queue.admit(request(
+            SaveJobKind::Project,
+            "/p/Old.fbproj",
+            Some(SaveThenAction::PendingClose),
+        ));
+        let (next, stale) = queue.finish(2);
+        assert!(next.is_none());
+        assert_eq!(stale.len(), 1);
+        assert!(!queue.is_busy());
+    }
+
+    /// Edits during a save-then-close make it save again, ahead of anything
+    /// else waiting, before the close runs.
+    #[test]
+    fn a_resave_runs_before_other_queued_saves() {
+        let mut queue = ProjectSaveState::default();
+        queue.admit(request(
+            SaveJobKind::Project,
+            "/p/Song.fbproj",
+            Some(SaveThenAction::PendingClose),
+        ));
+        queue.admit(request(SaveJobKind::Copy, "/p/Copy.fbproj", None));
+        let mut resave = request(
+            SaveJobKind::Project,
+            "/p/Song.fbproj",
+            Some(SaveThenAction::PendingClose),
+        );
+        resave.resaves = 1;
+        queue.requeue_first(resave);
+        let (next, _) = queue.finish(1);
+        let next = next.expect("the resave");
+        assert_eq!(next.resaves, 1);
+        assert!(matches!(
+            next.after_save,
+            Some(SaveThenAction::PendingClose)
+        ));
+    }
+
+    /// A clean save-then-close drops plain saves of the same project queued
+    /// behind it: they would write the same content while the session closes.
+    #[test]
+    fn a_clean_continuation_drops_redundant_plain_saves() {
+        let mut queue = ProjectSaveState::default();
+        queue.admit(request(
+            SaveJobKind::Project,
+            "/p/Song.fbproj",
+            Some(SaveThenAction::PendingClose),
+        ));
+        queue.admit(request(SaveJobKind::Project, "/p/Song.fbproj", None));
+        queue.admit(request(SaveJobKind::Copy, "/p/Copy.fbproj", None));
+        queue.drop_redundant_saves(std::path::Path::new("/p/Song.fbproj"), 1);
+        assert_eq!(queue.queued.len(), 1);
+        assert_eq!(queue.queued[0].kind, SaveJobKind::Copy);
+    }
+
+    #[test]
+    fn carried_assets_belong_to_one_session() {
+        let mut queue = ProjectSaveState::default();
+        let asset = ProjectAsset {
+            id: "a".to_string(),
+            original_filename: "a.wav".to_string(),
+            relative_path: Some("Assets/Audio/a.wav".to_string()),
+            absolute_path: None,
+            duration_secs: None,
+            sample_rate: None,
+            channels: None,
+            source_fingerprint: Some("1-00000001".to_string()),
+            waveform_peak_relative_path: None,
+            duration_samples: None,
+        };
+        queue.remember_assets("session-1", vec![asset]);
+        assert_eq!(queue.assets_for("session-1").len(), 1);
+        assert!(queue.assets_for("session-2").is_empty());
     }
 }

@@ -1153,6 +1153,9 @@ impl From<&TimelineState> for FutureboardProject {
                 let clips = t
                     .clips
                     .iter()
+                    // A save while recording must not write the live take's
+                    // UI-only preview clip (audio or MIDI) into the project.
+                    .filter(|c| !c.is_recording_preview_clip())
                     .map(|c| {
                         let source = match &c.clip_type {
                             ClipType::Audio {
@@ -1702,10 +1705,8 @@ pub fn apply_to_timeline(
             ScaleKind::from_tag(scale)?,
         ))
     });
-    tl.global_lane_heights.set(
-        crate::components::timeline::timeline_state::GlobalLaneKind::Chord,
-        project.settings.chord_track_height,
-    );
+    // The Chord Track height is restored with the other lane heights below,
+    // which replace `global_lane_heights` as a whole.
     // Lane visibility is view state and not saved, but a project that has
     // chords opens with them on screen — hidden harmony reads as lost work.
     tl.show_chord_track = !tl.chord_events.is_empty();
@@ -1856,6 +1857,10 @@ pub fn apply_to_timeline(
             GlobalLaneKind::SongText,
             project.global_lanes.song_text_height,
         );
+        // Saved with the project settings, not the conductor lanes. It has to
+        // be set on this fresh struct: setting it on the old one before the
+        // assignment below lost it on every reopen.
+        heights.set(GlobalLaneKind::Chord, project.settings.chord_track_height);
         tl.global_lane_heights = heights;
     }
 
@@ -4497,5 +4502,147 @@ mod conductor_lane_persistence_tests {
             restored.global_lane_heights.get(GlobalLaneKind::Tempo),
             Some(GLOBAL_LANE_MAX_HEIGHT)
         );
+    }
+
+    /// The Chord Track height is stored with the project settings and was set
+    /// on the timeline before the conductor-lane block replaced the whole
+    /// height struct, so every reopen dropped it back to the default.
+    #[test]
+    fn the_chord_track_height_survives_a_project_roundtrip() {
+        let mut state = TimelineState::default();
+        state
+            .global_lane_heights
+            .set(GlobalLaneKind::Chord, Some(64.0));
+        state
+            .global_lane_heights
+            .set(GlobalLaneKind::Tempo, Some(72.0));
+
+        let bytes = encode_project(&FutureboardProject::from(&state));
+        let decoded = decode_project(&bytes).expect("decode");
+        let mut restored = TimelineState::default();
+        let _ = apply_to_timeline(&decoded, &mut restored);
+
+        assert_eq!(
+            restored.global_lane_heights.get(GlobalLaneKind::Chord),
+            Some(64.0)
+        );
+        assert_eq!(
+            restored.global_lane_heights.get(GlobalLaneKind::Tempo),
+            Some(72.0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod save_fidelity_tests {
+    use super::*;
+    use crate::components::timeline::timeline_state::{ClipState, TimelineState};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "futureboard-{label}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    /// A save or autosave while recording wrote the live take's UI-only
+    /// preview clips into the project, audio and MIDI alike.
+    #[test]
+    fn recording_preview_clips_are_never_saved() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let audio_track = state.create_audio_track();
+        let midi_track = state.create_midi_track();
+        let kept = state.insert_audio_clip_with_duration(
+            audio_track.clone(),
+            "/tmp/take.wav".to_string(),
+            "Take".to_string(),
+            0.0,
+            4.0,
+            Some(2.0),
+        );
+        let audio_preview = crate::layout::audio_recording_preview_clip_id(&audio_track);
+        let midi_preview = format!(
+            "{}{midi_track}",
+            ClipState::MIDI_RECORDING_PREVIEW_ID_PREFIX
+        );
+        state.begin_recording_preview_clip(&audio_preview, &audio_track, 4.0);
+        state.begin_midi_recording_preview_clip(&midi_preview, &midi_track, 0.0);
+        assert!(ClipState::is_recording_preview_clip_id(&audio_preview));
+        assert!(ClipState::is_recording_preview_clip_id(&midi_preview));
+        assert!(!ClipState::is_recording_preview_clip_id(&kept));
+
+        let project = FutureboardProject::from(&state);
+        let saved: Vec<&str> = project
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter().map(|clip| clip.id.as_str()))
+            .collect();
+        assert_eq!(saved, vec![kept.as_str()]);
+    }
+
+    /// The clip's asset id is the ARA audio-source persistentID
+    /// (`AraSourceKey(file_id)`) and the peak-cache key. Saving used to
+    /// rewrite it to the project-relative path, so the ARA archive captured
+    /// under the live id matched nothing after reopening.
+    #[test]
+    fn a_live_asset_id_and_source_duration_survive_save_and_reopen() {
+        let root = temp_dir("ara-ids");
+        let external = temp_dir("ara-ids-ext");
+        std::fs::create_dir_all(&external).unwrap();
+        let source = external.join("vocal.wav");
+        std::fs::write(&source, b"vocal bytes").unwrap();
+
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track = state.create_audio_track();
+        let clip_id = state.insert_audio_clip_with_duration(
+            track,
+            source.to_string_lossy().into_owned(),
+            "Vocal".to_string(),
+            0.0,
+            4.0,
+            None,
+        );
+        state.update_audio_clip_metadata(
+            &source.to_string_lossy(),
+            "wav",
+            48_000,
+            2,
+            96_000,
+            2.0,
+        );
+        let live_key = state
+            .find_clip(&clip_id)
+            .and_then(|(_, clip)| clip.audio_asset_key().map(str::to_string))
+            .expect("audio clip key");
+
+        let project_file = root.join("Ara.fbproj");
+        let mut project = FutureboardProject::from(&state);
+        save_project(&mut project, &project_file).unwrap();
+        let loaded = load_project_strict(&project_file).unwrap();
+        let mut restored = TimelineState::default();
+        let _ = apply_to_timeline(&loaded, &mut restored);
+
+        let (_, clip) = restored.find_clip(&clip_id).expect("clip restored");
+        assert_eq!(clip.audio_asset_key(), Some(live_key.as_str()));
+        assert_eq!(clip.source_duration_seconds, Some(2.0));
+        let ClipType::Audio {
+            source_path: Some(path),
+            ..
+        } = &clip.clip_type
+        else {
+            panic!("expected an audio clip");
+        };
+        assert_eq!(
+            PathBuf::from(path),
+            root.join("Assets").join("Audio").join("vocal.wav")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(external);
     }
 }

@@ -15,10 +15,10 @@ use crate::components::edit::EditCommand;
 use crate::components::inspector_debug;
 use crate::components::panel::{InspectorCallbacks, InspectorRoutingCombo};
 use crate::components::plugin_picker::PluginInsertKind;
+use crate::components::reorder::{InsertDrop, InsertDropCb};
 use crate::components::timeline::timeline_state::{
     vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
-    AudioClipStretchState, TimelineState, TrackAudioFormat, TrackMidiInputRouting,
-    TrackOutputRouting,
+    AudioClipStretchState, TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting,
 };
 use crate::overlay::OverlayAnchor;
 use sphere_midi_service::mpe::MpeTrackConfiguration;
@@ -54,8 +54,6 @@ type MpeConfigurationCb =
     Arc<dyn Fn(&(String, MpeTrackConfiguration), &mut Window, &mut App) + 'static>;
 type InsertPairCb = Arc<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>;
 type InsertOpenCb = Arc<dyn Fn(&(String, usize, String), &mut Window, &mut App) + 'static>;
-type InsertMoveCb = Arc<dyn Fn(&(String, String, bool), &mut Window, &mut App) + 'static>;
-type InsertReorderCb = Arc<dyn Fn(&(String, String, usize), &mut Window, &mut App) + 'static>;
 type InsertPickerCb = Arc<dyn Fn(&(String, usize, bool), &mut Window, &mut App) + 'static>;
 type InsertOutputChannelCb =
     Arc<dyn Fn(&(String, String, u8, bool), &mut Window, &mut App) + 'static>;
@@ -396,8 +394,7 @@ impl StudioLayout {
         let on_toggle_insert_bypass = self.toggle_insert_bypass_cb(owner.clone());
         let on_toggle_insert_enabled = self.toggle_insert_enabled_cb(owner.clone());
         let on_toggle_insert_output_channel = self.toggle_insert_output_channel_cb(owner.clone());
-        let on_move_insert = self.move_insert_cb(owner.clone());
-        let on_reorder_insert = self.reorder_insert_cb(owner.clone());
+        let on_drop_insert = self.drop_insert_cb(owner.clone());
         let on_open_insert_editor = self.open_insert_editor_cb(owner.clone());
         let on_set_clip_start = self.set_clip_start_cb(owner.clone());
         let on_set_clip_length = self.set_clip_length_cb(owner.clone());
@@ -508,8 +505,7 @@ impl StudioLayout {
             on_toggle_insert_bypass,
             on_toggle_insert_enabled,
             on_toggle_insert_output_channel,
-            on_move_insert,
-            on_reorder_insert,
+            on_drop_insert,
             on_open_insert_editor,
             on_set_clip_start,
             on_set_clip_length,
@@ -1076,82 +1072,22 @@ impl StudioLayout {
         )
     }
 
-    fn move_insert_cb(&self, owner: Entity<Self>) -> InsertMoveCb {
-        Arc::new(
-            move |(track_id, insert_id, up): &(String, String, bool), _w, cx| {
-                let track_id = track_id.clone();
-                let insert_id = insert_id.clone();
-                let up = *up;
-                StudioLayout::defer_update(&owner, cx, move |this, cx| {
-                    let moved = this.timeline.update(cx, |timeline, cx| {
-                        let moved = timeline.state.move_insert(&track_id, &insert_id, up);
-                        if moved {
-                            cx.notify();
-                        }
-                        moved
-                    });
-                    if moved {
-                        inspector_debug(&format!(
-                            "insert move track={track_id} insert={insert_id} up={up}"
-                        ));
-                        this.mark_dirty();
-                        this.audio_bridge.project_dirty = true;
-                        this.push_mixer_snapshot_to_window(cx);
-                        cx.notify();
-                    }
-                });
-            },
-        )
-    }
-
-    /// Drag-reorder commit. The drop handler supplies the dragged
-    /// `plugin_instance_id` and the insertion gap; we snapshot the current id
-    /// order, compute the new order, and apply it as a single
-    /// [`EditCommand::ReorderFxSlot`] so one drag is one undo entry. The command
-    /// only reorders existing slots (never recreates an instance), so bypass /
-    /// preset / parameter / editor / automation state follow each instance. A
-    /// forced project sync rebuilds the engine's chain order (DSP order == UI
-    /// order); editor windows are keyed by instance id, so they stay attached.
-    fn reorder_insert_cb(&self, owner: Entity<Self>) -> InsertReorderCb {
-        Arc::new(
-            move |(track_id, insert_id, insertion_index): &(String, String, usize), _w, cx| {
-                let track_id = track_id.clone();
-                let insert_id = insert_id.clone();
-                let insertion_index = *insertion_index;
-                StudioLayout::defer_update(&owner, cx, move |this, cx| {
-                    let changed = this.timeline.update(cx, |timeline, cx| {
-                        let before = timeline.state.insert_order(&track_id);
-                        let after = TimelineState::reordered_insert_ids(
-                            &before,
-                            &insert_id,
-                            insertion_index,
-                        );
-                        if before == after {
-                            return false;
-                        }
-                        timeline.run_edit_command(
-                            EditCommand::ReorderFxSlot {
-                                track_id: track_id.clone(),
-                                before_order: before,
-                                after_order: after,
-                            },
-                            cx,
-                        );
-                        true
-                    });
-                    if changed {
-                        inspector_debug(&format!(
-                            "insert reorder track={track_id} insert={insert_id} gap={insertion_index}"
-                        ));
-                        this.mark_dirty();
-                        this.audio_bridge.project_dirty = true;
-                        this.schedule_audio_project_sync(cx, true, "inspector_reorder_insert");
-                        this.push_mixer_snapshot_to_window(cx);
-                        cx.notify();
-                    }
-                });
-            },
-        )
+    /// Drop commit for a dragged slot: a reorder within the chain, or a plug-in
+    /// dragged in from a docked-mixer strip. Shares `commit_insert_drop` with
+    /// every mixer, so one drag is one undo entry wherever it lands and the
+    /// drop is resolved against the live chains.
+    fn drop_insert_cb(&self, owner: Entity<Self>) -> InsertDropCb {
+        Arc::new(move |drop: &InsertDrop, _w, cx| {
+            let drop = drop.clone();
+            StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                if this.commit_insert_drop(&drop, cx) {
+                    inspector_debug(&format!(
+                        "insert drop from={} insert={} to={} anchor={:?}",
+                        drop.from_track, drop.insert_id, drop.to_track, drop.anchor
+                    ));
+                }
+            });
+        })
     }
 
     fn open_insert_editor_cb(&self, owner: Entity<Self>) -> InsertOpenCb {

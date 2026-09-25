@@ -41,7 +41,10 @@ use crate::components::mixer_render::{MixerRenderSnapshot, MixerRenderViewport, 
 use crate::components::mixer_surface::{mixer_gpu_primitives_active, render_mixer_primitives};
 use crate::components::mixer_tree_sidebar_view::MixerTreeSidebar;
 use crate::components::panel::FxSlotDrag;
-use crate::components::reorder::drop_over_highlight;
+use crate::components::reorder::{
+    drop_over_highlight, insert_drop_target, insert_drop_target_also, same_list_anchor,
+    slot_drop_target, DragRefusal, DropIndicator, DropSlot, InsertDropTarget,
+};
 use crate::components::sidebar::BrowserDragItem;
 use crate::components::timeline::timeline_state::{
     is_vsti_output_child_track_id, volume, vsti_output_bus_flat_range,
@@ -73,8 +76,9 @@ fn mixer_strip_is_selected(track_id: &str, primary: Option<&str>, selected_ids: 
 }
 
 /// Maximum insert slots per track. Once reached, the trailing empty "+ Add
-/// Insert" slot and the INSERTS header "+" are hidden/disabled.
-const MAX_INSERT_SLOTS: usize = 8;
+/// Insert" slot and the INSERTS header "+" are hidden/disabled. The same limit
+/// a plug-in dragged in from another channel is held to.
+use crate::components::timeline::timeline_state::MAX_INSERT_SLOTS;
 
 // ─── Mixer sub-header ("Mixer  N ch") ────────────────────────────────────────
 
@@ -462,10 +466,27 @@ fn log_vsti_child_strip_state(track: &TrackState) {
     );
 }
 
+/// Spacing between two slots in a rack. Each slot owns the spacing below it
+/// (as bottom padding) instead of the stack having a flex gap, so there is no
+/// point between two slots that is not a drop target.
+const SLOT_GAP: f32 = 1.0;
+
+/// One insert slot in a rack.
+///
+/// `dnd` is the chip's drag payload and drop target; `None` makes it a
+/// click-only instrument chip (a MIDI track's VSTi), which neither drags nor
+/// takes drops — which slot is the instrument is decided by position.
+///
+/// Every action is a click, never a press: GPUI drops a click once a drag
+/// starts, so picking a slot up never opens its editor, toggles its bypass or
+/// removes it. The chip and its glyphs block clicks from reaching the strip
+/// behind them but not the wheel, so the rack and the strip row still scroll
+/// under the pointer — during a drag as well.
 fn insert_chip(
     track_id: &str,
     insert_index: usize,
     slot: &InsertSlotState,
+    dnd: Option<(FxSlotDrag, InsertDropTarget)>,
     callbacks: &MixerCallbacks,
     base: gpui::Rgba,
 ) -> impl IntoElement {
@@ -494,69 +515,30 @@ fn insert_chip(
     let bypass_pair = (track_id_owned.clone(), slot_id.clone());
     let remove_pair = (track_id_owned.clone(), slot_id.clone());
 
-    // Drag payload carries the stable plugin_instance_id, so reorder identity
-    // follows the instance rather than the visual index.
-    //
-    // The slot itself is the handle. A separate grip column cost six of the
-    // eighty-eight pixels on every row to say what the pointer already says by
-    // picking the row up — and it made the plug-in's name, the thing the user
-    // is actually aiming at, the one part of the row that did not drag.
-    let chip_drag_payload = FxSlotDrag {
-        track_id: track_id_owned.clone(),
-        insert_id: slot_id.clone(),
-        display_name: slot.display_name.clone(),
-    };
-
-    // Drop target: dropping a compatible drag onto this chip moves it into the
-    // gap *above* this slot (`insertion_index == insert_index`, the slot's full
-    // insert-chain index). `can_drop` restricts drops to the same track and
-    // `drag_over` paints the shared accent drop-position line.
-    let drop_track = track_id_owned.clone();
-    let can_drop_track = track_id_owned.clone();
-    let reorder = callbacks.on_reorder_insert.clone();
+    // Dropping a `.pst` preset from the browser onto a chip loads it into
+    // this slot (`insert_index` is the full insert-chain index).
     let drop_plugin_preset = callbacks.on_drop_plugin_preset.clone();
-    let drop_gap = insert_index;
     let preset_track = track_id_owned.clone();
     let preset_slot = insert_index;
 
     let open_target = (track_id_owned, insert_index, slot_id);
 
-    div()
-        .id(gpui::SharedString::from(format!(
-            "insert-chip-{}",
-            id_owned
-        )))
-        .can_drop(move |dragged, _window, _cx| {
-            if dragged
-                .downcast_ref::<FxSlotDrag>()
-                .is_some_and(|d| d.track_id == can_drop_track)
-            {
-                return true;
-            }
-            dragged
-                .downcast_ref::<BrowserDragItem>()
-                .is_some_and(|item| is_plugin_preset_path(&item.path))
-        })
-        .drag_over::<FxSlotDrag>(|style, _drag, _window, _cx| drop_over_highlight(style))
-        .drag_over::<BrowserDragItem>(|style, _drag, _window, _cx| drop_over_highlight(style))
-        .on_drop::<FxSlotDrag>(move |drag, window, cx| {
-            if drag.track_id == drop_track {
-                reorder(
-                    &(drop_track.clone(), drag.insert_id.clone(), drop_gap),
-                    window,
-                    cx,
-                );
-            }
-        })
-        .on_drop::<BrowserDragItem>(move |item, window, cx| {
-            if is_plugin_preset_path(&item.path) {
-                drop_plugin_preset(
-                    &(item.path.clone(), preset_track.clone(), preset_slot),
-                    window,
-                    cx,
-                );
-            }
-        })
+    // The glyphs forward slot drops to the chip, so a drop released over one
+    // still lands where the chip says it would.
+    let on_drop_insert = callbacks.on_drop_insert.clone();
+    let forward_drops = |element: gpui::Stateful<gpui::Div>| match &dnd {
+        Some((_, target)) => insert_drop_target(
+            element,
+            target.clone(),
+            DropIndicator::None,
+            on_drop_insert.clone(),
+        ),
+        None => element,
+    };
+
+    // The chip's look. The interactive element around it is transparent and
+    // also covers the spacing below, where the drop line is drawn.
+    let body = div()
         .flex()
         .flex_none()
         .flex_row()
@@ -571,21 +553,10 @@ fn insert_chip(
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(text)
         .cursor(gpui::CursorStyle::PointingHand)
-        .on_drag(chip_drag_payload, |drag, _offset, _window, cx| {
-            cx.new(|_| drag.clone())
-        })
-        .on_mouse_down(gpui::MouseButton::Left, move |_e, w, cx| {
-            eprintln!(
-                "[mixer] insert row clicked track_id={} insert_index={} plugin={} plugin_instance_id={}",
-                open_target.0, open_target.1, display_for_log, open_target.2
-            );
-            on_open(&open_target, w, cx);
-        })
-        .occlude()
         .child(div().flex_1().min_w(px(0.0)).truncate().child(display))
         // In-circuit pip. A slot is either in the signal path or it is not, and
         // that is the one thing about it readable without stopping to read.
-        .child(
+        .child(forward_drops(
             div()
                 .id(gpui::SharedString::from(format!(
                     "insert-bypass-{}",
@@ -599,13 +570,13 @@ fn insert_chip(
                 } else {
                     Colors::state_monitor()
                 })
-                .on_mouse_down(gpui::MouseButton::Left, move |_e, w, cx| {
+                .on_click(move |_e, w, cx| {
                     on_bypass(&bypass_pair, w, cx);
                 })
-                .occlude(),
-        )
+                .block_mouse_except_scroll(),
+        ))
         // Remove ×.
-        .child(
+        .child(forward_drops(
             div()
                 .id(gpui::SharedString::from(format!(
                     "insert-remove-{}",
@@ -616,58 +587,96 @@ fn insert_chip(
                 .px(px(2.0))
                 .cursor(gpui::CursorStyle::PointingHand)
                 .child("×")
-                .on_mouse_down(gpui::MouseButton::Left, move |_e, w, cx| {
+                .on_click(move |_e, w, cx| {
                     on_remove(&remove_pair, w, cx);
                 })
-                .occlude(),
-        )
-}
+                .block_mouse_except_scroll(),
+        ));
 
-/// Trailing drop zone rendered below the last insert chip so a dragged slot can
-/// land at the very end of the chain (`gap == inserts.len()`); the per-chip drop
-/// targets only cover the gaps *above* each existing slot. Same-track guarded and
-/// shows the shared accent drop-position line while a compatible drag hovers.
-fn insert_drop_end(track_id: &str, gap: usize, callbacks: &MixerCallbacks) -> impl IntoElement {
-    let track_id_owned = track_id.to_string();
-    let can_drop_track = track_id_owned.clone();
-    let reorder = callbacks.on_reorder_insert.clone();
-    div()
+    // The slot itself is the handle. A separate grip column cost six of the
+    // eighty-eight pixels on every row to say what the pointer already says by
+    // picking the row up — and it made the plug-in's name, the thing the user
+    // is actually aiming at, the one part of the row that did not drag.
+    let chip = div()
         .id(gpui::SharedString::from(format!(
-            "mixer-fx-drop-end-{track_id_owned}"
+            "insert-chip-{}",
+            id_owned
         )))
         .flex_none()
-        .h(px(6.0))
-        .mx(px(2.0))
-        .can_drop(move |dragged, _window, _cx| {
-            dragged
-                .downcast_ref::<FxSlotDrag>()
-                .is_some_and(|d| d.track_id == can_drop_track)
-        })
-        .drag_over::<FxSlotDrag>(|style, _drag, _window, _cx| drop_over_highlight(style))
-        .on_drop::<FxSlotDrag>(move |drag, window, cx| {
-            if drag.track_id == track_id_owned {
-                reorder(
-                    &(track_id_owned.clone(), drag.insert_id.clone(), gap),
+        .pb(px(SLOT_GAP))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .drag_over::<BrowserDragItem>(|style, _drag, _window, _cx| drop_over_highlight(style))
+        .on_drop::<BrowserDragItem>(move |item, window, cx| {
+            if is_plugin_preset_path(&item.path) {
+                drop_plugin_preset(
+                    &(item.path.clone(), preset_track.clone(), preset_slot),
                     window,
                     cx,
                 );
             }
         })
+        .on_click(move |_e, w, cx| {
+            eprintln!(
+                "[mixer] insert row clicked track_id={} insert_index={} plugin={} plugin_instance_id={}",
+                open_target.0, open_target.1, display_for_log, open_target.2
+            );
+            on_open(&open_target, w, cx);
+        })
+        .block_mouse_except_scroll()
+        .child(body);
+    match dnd {
+        Some((payload, target)) => insert_drop_target_also(
+            chip.on_drag(payload, |drag, _offset, _window, cx| {
+                drag.refusal.reset();
+                cx.new(|_| drag.clone())
+            }),
+            target,
+            DropIndicator::Row { gap: SLOT_GAP },
+            callbacks.on_drop_insert.clone(),
+            accepts_plugin_preset,
+        ),
+        None => chip.can_drop(|dragged, _window, _cx| accepts_plugin_preset(dragged)),
+    }
+}
+
+/// `can_drop` answer for a browser `.pst` preset.
+fn accepts_plugin_preset(dragged: &dyn std::any::Any) -> bool {
+    dragged
+        .downcast_ref::<BrowserDragItem>()
+        .is_some_and(|item| is_plugin_preset_path(&item.path))
+}
+
+/// Trailing drop zone for the end of a chain, rendered for an empty chain too
+/// so it can take a plug-in dragged from another channel. The chips cover the
+/// places in front of each slot; this covers the one after the last. Its
+/// height plus the last chip's spacing is the gap the rack always had above
+/// "+ Insert".
+fn insert_drop_end(target: InsertDropTarget, callbacks: &MixerCallbacks) -> impl IntoElement {
+    let id = gpui::SharedString::from(format!("mixer-fx-drop-end-{}", target.track_id));
+    insert_drop_target(
+        div().id(id).flex_none().h(px(7.0)).mx(px(2.0)),
+        target,
+        DropIndicator::Row { gap: 0.0 },
+        callbacks.on_drop_insert.clone(),
+    )
 }
 
 /// Trailing empty insert slot. Clicking it opens the plugin picker for the
 /// next available slot (`next_slot`) on this track. `next_slot` is used for
-/// debug logging only — the picker appends to the track's insert chain.
+/// debug logging only — the picker appends to the track's insert chain. It is
+/// also the end of the chain for a dragged slot (`end`), and takes a browser
+/// `.pst` preset.
 fn add_insert_button(
     track_id: &str,
     next_slot: usize,
+    end: InsertDropTarget,
     callbacks: &MixerCallbacks,
 ) -> impl IntoElement {
     let track_id_owned = track_id.to_string();
     let on_add = callbacks.on_add_insert.clone();
     let drop_plugin_preset = callbacks.on_drop_plugin_preset.clone();
     let drop_track = track_id_owned.clone();
-    div()
+    let button = div()
         .id(gpui::SharedString::from(format!(
             "insert-add-{}",
             track_id_owned
@@ -690,11 +699,6 @@ fn add_insert_button(
             s.bg(Colors::state_hover())
                 .border_color(Colors::border_strong())
                 .text_color(Colors::text_secondary())
-        })
-        .can_drop(|dragged, _window, _cx| {
-            dragged
-                .downcast_ref::<BrowserDragItem>()
-                .is_some_and(|item| is_plugin_preset_path(&item.path))
         })
         .drag_over::<BrowserDragItem>(|style, _drag, _window, _cx| drop_over_highlight(style))
         .on_drop::<BrowserDragItem>(move |item, window, cx| {
@@ -720,7 +724,14 @@ fn add_insert_button(
             );
             on_add(&track_id_owned, w, cx);
         })
-        .occlude()
+        .block_mouse_except_scroll();
+    insert_drop_target_also(
+        button,
+        end.with_key_suffix("add"),
+        DropIndicator::Outline,
+        callbacks.on_drop_insert.clone(),
+        accepts_plugin_preset,
+    )
 }
 
 fn is_plugin_preset_path(path: &std::path::Path) -> bool {
@@ -736,31 +747,54 @@ fn inserts_section(
     base: gpui::Rgba,
     i18n: I18n,
 ) -> impl IntoElement {
-    let effect_start = if track.track_type == TrackType::Instrument {
-        1
-    } else {
-        0
-    };
+    // An Instrument track shows its instrument elsewhere; a MIDI track's
+    // instrument sits in the rack as a click-only chip. Either way nothing
+    // drags below the chain's floor, and nothing lands there.
+    let first_shown = usize::from(track.track_type == TrackType::Instrument);
+    let floor = track.fx_chain_floor();
     let used = track.inserts.len();
     let at_max = used >= MAX_INSERT_SLOTS;
 
-    let mut chips = div().flex().flex_col().flex_none().gap(px(1.0)).px(px(3.0));
-    let effects = track.effect_inserts();
-    for (offset, slot) in effects.iter().enumerate() {
-        let insert_index = effect_start + offset;
-        chips = chips.child(insert_chip(&track.id, insert_index, slot, callbacks, base));
+    let mut chips = div().flex().flex_col().flex_none().px(px(3.0));
+    for (insert_index, slot) in track.inserts.iter().enumerate().skip(first_shown) {
+        let dnd = (insert_index >= floor).then(|| {
+            (
+                FxSlotDrag::for_slot(&track.id, slot, insert_index, &track.automation_lanes),
+                InsertDropTarget::for_track(
+                    track,
+                    DropSlot::Row {
+                        id: slot.id.clone(),
+                        index: insert_index,
+                    },
+                    "mixer",
+                ),
+            )
+        });
+        chips = chips.child(insert_chip(
+            &track.id,
+            insert_index,
+            slot,
+            dnd,
+            callbacks,
+            base,
+        ));
     }
-    // Drop-at-end zone below the last chip (gap == full insert-chain length, so
-    // the instrument slot at index 0 is counted). Only meaningful once a slot
-    // exists to drag.
-    if !effects.is_empty() {
-        chips = chips.child(insert_drop_end(&track.id, track.inserts.len(), callbacks));
-    }
-    // Requirement: always render one trailing empty slot after the last insert,
-    // until MAX_INSERT_SLOTS is reached.
-    if !at_max {
-        chips = chips.child(add_insert_button(&track.id, used, callbacks));
-    }
+    let end = InsertDropTarget::for_track(
+        track,
+        DropSlot::End {
+            last_id: track.inserts.last().map(|slot| slot.id.clone()),
+        },
+        "mixer",
+    );
+    let chips = chain_end(
+        chips,
+        &track.id,
+        used,
+        used > first_shown,
+        at_max,
+        end,
+        callbacks,
+    );
 
     // Header "+" adds to the next available slot for *this* track; gone once
     // the rack is full, rather than sitting there greyed and unpressable.
@@ -786,6 +820,29 @@ fn inserts_section(
         base,
         chips,
     )
+}
+
+/// The end of a rack's chain: the drop strip after the last slot, and
+/// "+ Insert" (one trailing empty slot until `MAX_INSERT_SLOTS` is reached).
+/// With no slots, "+ Insert" keeps the top of the rack and the strip goes
+/// under it, so an empty rack looks as it always did.
+fn chain_end(
+    mut chips: gpui::Div,
+    track_id: &str,
+    used: usize,
+    has_slots: bool,
+    at_max: bool,
+    end: InsertDropTarget,
+    callbacks: &MixerCallbacks,
+) -> gpui::Div {
+    let add = (!at_max).then(|| add_insert_button(track_id, used, end.clone(), callbacks));
+    let strip = insert_drop_end(end, callbacks);
+    if has_slots {
+        chips = chips.child(strip).children(add);
+    } else {
+        chips = chips.children(add).child(strip);
+    }
+    chips
 }
 
 /// A rack: caption, then a recessed well the slots scroll inside.
@@ -832,26 +889,45 @@ fn master_inserts_section(
     let used = master.inserts.len();
     let at_max = used >= MAX_INSERT_SLOTS;
 
-    let mut chips = div().flex().flex_col().flex_none().gap(px(1.0)).px(px(3.0));
+    let mut chips = div().flex().flex_col().flex_none().px(px(3.0));
     for (insert_index, slot) in master.inserts.iter().enumerate() {
+        // The master keeps no automation lanes of its own.
+        let dnd = (
+            FxSlotDrag::for_slot(MASTER_TRACK_ID, slot, insert_index, &[]),
+            InsertDropTarget::for_master(
+                master,
+                DropSlot::Row {
+                    id: slot.id.clone(),
+                    index: insert_index,
+                },
+                "mixer",
+            ),
+        );
         chips = chips.child(insert_chip(
             MASTER_TRACK_ID,
             insert_index,
             slot,
+            Some(dnd),
             callbacks,
             base,
         ));
     }
-    if !master.inserts.is_empty() {
-        chips = chips.child(insert_drop_end(
-            MASTER_TRACK_ID,
-            master.inserts.len(),
-            callbacks,
-        ));
-    }
-    if !at_max {
-        chips = chips.child(add_insert_button(MASTER_TRACK_ID, used, callbacks));
-    }
+    let end = InsertDropTarget::for_master(
+        master,
+        DropSlot::End {
+            last_id: master.inserts.last().map(|slot| slot.id.clone()),
+        },
+        "mixer",
+    );
+    let chips = chain_end(
+        chips,
+        MASTER_TRACK_ID,
+        used,
+        used > 0,
+        at_max,
+        end,
+        callbacks,
+    );
 
     let header_plus = if at_max {
         None
@@ -908,10 +984,9 @@ fn send_chip(
         track_id: track_id.to_string(),
         send_id: send.id.clone(),
         target_name: target_name.to_string(),
+        source_index: send_index,
+        refusal: DragRefusal::default(),
     };
-    let can_drop_track = track_id.to_string();
-    let drop_track = track_id.to_string();
-    let reorder = callbacks.on_reorder_send.clone();
     let gain_pair = (track_id.to_string(), send.id.clone());
     let gain_change = callbacks.on_send_gain_change.clone();
     let gain_reset_pair = gain_pair.clone();
@@ -923,23 +998,9 @@ fn send_chip(
         format!("{:+.1} dB", send.gain_db)
     };
     let tooltip = format!("{target_name} · {gain_label}");
-    div()
-        .id(gpui::SharedString::from(format!("send-chip-{}", send.id)))
-        .can_drop(move |dragged, _window, _cx| {
-            dragged
-                .downcast_ref::<SendSlotDrag>()
-                .is_some_and(|d| d.track_id == can_drop_track)
-        })
-        .drag_over::<SendSlotDrag>(|style, _drag, _window, _cx| drop_over_highlight(style))
-        .on_drop::<SendSlotDrag>(move |drag, window, cx| {
-            if drag.track_id == drop_track {
-                reorder(
-                    &(drop_track.clone(), drag.send_id.clone(), send_index),
-                    window,
-                    cx,
-                );
-            }
-        })
+    // The row's look; the interactive element around it is transparent and
+    // owns the spacing below, as an insert chip's does.
+    let body = div()
         .flex()
         .flex_none()
         .flex_col()
@@ -952,10 +1013,6 @@ fn send_chip(
         .bg(bg)
         .hover(move |style| style.bg(hover_bg))
         .cursor(gpui::CursorStyle::PointingHand)
-        .tooltip(strip_tooltip(tooltip))
-        .on_drag(chip_drag_payload, |drag, _offset, _window, cx| {
-            cx.new(|_| drag.clone())
-        })
         .child(
             div()
                 .flex()
@@ -1013,35 +1070,89 @@ fn send_chip(
                     cx,
                 );
             }),
-        ))
+        ));
+    let chip = div()
+        .id(gpui::SharedString::from(format!("send-chip-{}", send.id)))
+        .flex_none()
+        .pb(px(SLOT_GAP))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .tooltip(strip_tooltip(tooltip))
+        .on_drag(chip_drag_payload, |drag, _offset, _window, cx| {
+            drag.refusal.reset();
+            cx.new(|_| drag.clone())
+        })
+        .child(body);
+    send_drop_target(
+        chip,
+        track_id,
+        DropSlot::Row {
+            id: send.id.clone(),
+            index: send_index,
+        },
+        DropIndicator::Row { gap: SLOT_GAP },
+        callbacks,
+    )
 }
 
-fn send_drop_end(track_id: &str, gap: usize, callbacks: &MixerCallbacks) -> impl IntoElement {
-    let track_id_owned = track_id.to_string();
-    let can_drop_track = track_id_owned.clone();
+/// Make `element` a drop target on `track_id`'s send list. A send belongs to
+/// its own channel's routing, so the list takes only its own sends, with the
+/// same take-its-place rule and no-op refusals as an insert chain.
+fn send_drop_target(
+    element: gpui::Stateful<gpui::Div>,
+    track_id: &str,
+    slot: DropSlot,
+    indicator: DropIndicator,
+    callbacks: &MixerCallbacks,
+) -> gpui::Stateful<gpui::Div> {
+    let place = match &slot {
+        DropSlot::Row { id, .. } => id.clone(),
+        DropSlot::End { .. } => "<end>".to_string(),
+    };
+    let key = gpui::SharedString::from(format!("mixer-send/{track_id}/{place}"));
+    let list_track = track_id.to_string();
+    let drop_track = track_id.to_string();
     let reorder = callbacks.on_reorder_send.clone();
-    div()
-        .id(gpui::SharedString::from(format!(
-            "mixer-send-drop-end-{track_id_owned}"
-        )))
-        .flex_none()
-        .h(px(6.0))
-        .mx(px(2.0))
-        .can_drop(move |dragged, _window, _cx| {
-            dragged
-                .downcast_ref::<SendSlotDrag>()
-                .is_some_and(|d| d.track_id == can_drop_track)
-        })
-        .drag_over::<SendSlotDrag>(|style, _drag, _window, _cx| drop_over_highlight(style))
-        .on_drop::<SendSlotDrag>(move |drag, window, cx| {
-            if drag.track_id == track_id_owned {
-                reorder(
-                    &(track_id_owned.clone(), drag.send_id.clone(), gap),
-                    window,
-                    cx,
-                );
+    slot_drop_target::<SendSlotDrag>(
+        element,
+        key,
+        indicator,
+        move |drag| {
+            if drag.track_id != list_track {
+                return None;
             }
-        })
+            same_list_anchor(&drag.send_id, drag.source_index, &slot)
+        },
+        move |drag, anchor, window, cx| {
+            reorder(
+                &(drop_track.clone(), drag.send_id.clone(), anchor),
+                window,
+                cx,
+            );
+        },
+        |_| false,
+    )
+}
+
+/// Trailing drop zone for the end of a send list. Its height plus the last
+/// send's spacing is the gap the rack always had above "+ Send".
+fn send_drop_end(
+    track_id: &str,
+    last_id: Option<String>,
+    callbacks: &MixerCallbacks,
+) -> impl IntoElement {
+    send_drop_target(
+        div()
+            .id(gpui::SharedString::from(format!(
+                "mixer-send-drop-end-{track_id}"
+            )))
+            .flex_none()
+            .h(px(7.0))
+            .mx(px(2.0)),
+        track_id,
+        DropSlot::End { last_id },
+        DropIndicator::Row { gap: 0.0 },
+        callbacks,
+    )
 }
 
 fn add_send_button(track_id: &str, callbacks: &MixerCallbacks) -> impl IntoElement {
@@ -1097,7 +1208,7 @@ fn sends_section(
 ) -> impl IntoElement {
     // Bus/return strips carry an aux-send rack so chained send/return paths
     // (bus → return, return → bus) are available from the mixer.
-    let mut chips = div().flex().flex_col().flex_none().gap(px(1.0)).px(px(3.0));
+    let mut chips = div().flex().flex_col().flex_none().px(px(3.0));
     for (send_index, send) in track.sends.iter().enumerate() {
         // Resolve the live target name (handles renames) with the stored
         // label as a fallback.
@@ -1116,7 +1227,8 @@ fn sends_section(
         ));
     }
     if !track.sends.is_empty() {
-        chips = chips.child(send_drop_end(&track.id, track.sends.len(), callbacks));
+        let last_id = track.sends.last().map(|send| send.id.clone());
+        chips = chips.child(send_drop_end(&track.id, last_id, callbacks));
     }
     chips = chips.child(add_send_button(&track.id, callbacks));
 

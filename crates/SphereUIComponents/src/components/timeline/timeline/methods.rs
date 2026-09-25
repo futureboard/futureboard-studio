@@ -136,11 +136,22 @@ impl Timeline {
         self.song_text_drag_preview = None;
         self.clip_drag_origin = None;
         self.clip_resize_origin = None;
+        // The overlay renders with this view, so clearing the cell is enough
+        // for the caller's notify to take the razor line down.
+        self.cut_guide.set(None);
         self.clip_drag_target_track_index = None;
         self.clip_clone_drag_id = None;
         self.pen_clip_draw = None;
+        // Ends a marquee and keeps the selection it made; Escape goes through
+        // `cancel_marquee` first to put the previous one back. The rectangle's
+        // overlay, like the razor line's, renders with this view.
         self.range_select_drag = None;
+        self.marquee_autoscroll = None;
+        self.marquee_frame.set(None);
         self.state.arrangement_range = None;
+        self.clip_move_origin = None;
+        self.pending_clip_click = None;
+        self.cut_hover = None;
         self.erase_clip_drag = None;
         self.erase_preview_ids.clear();
         self.automation_drag = None;
@@ -167,6 +178,7 @@ impl Timeline {
             eprintln!("[selection] marquee_cancel");
         }
         // Restores before the blanket reset drops the snapshot it needs.
+        self.cancel_marquee(cx);
         self.cancel_marker_track_interaction(cx);
         self.reset_input_state();
         self.song_text_drag_cancelled = true;
@@ -201,6 +213,7 @@ impl Timeline {
             song_text_drag_cancelled: false,
             clip_drag_origin: None,
             clip_resize_origin: None,
+            clip_resize_grab_beats: 0.0,
             clip_drag_target_track_index: None,
             clip_clone_drag_id: None,
             pen_clip_draw: None,
@@ -223,6 +236,7 @@ impl Timeline {
             on_command: None,
             marker_gesture_origin: None,
             pan_last_position: None,
+            track_zoom_session: None,
             floating_toolbar_position: None,
             floating_toolbar_drag_anchor: None,
             on_context_menu: None,
@@ -245,6 +259,17 @@ impl Timeline {
             frame_lane_ctx: None,
             project_root: None,
             focus_lost_subscription: None,
+            clip_process_origin: None,
+            snap_menu_open: false,
+            cut_guide: Default::default(),
+            cut_guide_overlay: None,
+            cut_hover: None,
+            timeline_origin_probe: std::rc::Rc::new(std::cell::Cell::new(None)),
+            marquee_frame: Default::default(),
+            marquee_overlay: None,
+            marquee_autoscroll: None,
+            clip_move_origin: None,
+            pending_clip_click: None,
         }
     }
 
@@ -277,6 +302,7 @@ impl Timeline {
             song_text_drag_cancelled: false,
             clip_drag_origin: None,
             clip_resize_origin: None,
+            clip_resize_grab_beats: 0.0,
             clip_drag_target_track_index: None,
             clip_clone_drag_id: None,
             pen_clip_draw: None,
@@ -299,6 +325,7 @@ impl Timeline {
             on_command: None,
             marker_gesture_origin: None,
             pan_last_position: None,
+            track_zoom_session: None,
             floating_toolbar_position: None,
             floating_toolbar_drag_anchor: None,
             on_context_menu: None,
@@ -321,10 +348,22 @@ impl Timeline {
             frame_lane_ctx: None,
             project_root: None,
             focus_lost_subscription: None,
+            clip_process_origin: None,
+            snap_menu_open: false,
+            cut_guide: Default::default(),
+            cut_guide_overlay: None,
+            cut_hover: None,
+            timeline_origin_probe: std::rc::Rc::new(std::cell::Cell::new(None)),
+            marquee_frame: Default::default(),
+            marquee_overlay: None,
+            marquee_autoscroll: None,
+            clip_move_origin: None,
+            pending_clip_click: None,
         }
     }
 
     pub fn run_edit_command(&mut self, cmd: EditCommand, cx: &mut gpui::Context<Self>) {
+        self.clip_process_origin = None;
         let impact = cmd.impact();
         cmd.execute(&mut self.state);
         self.edit_history.push(cmd);
@@ -385,8 +424,22 @@ impl Timeline {
     /// (e.g. a gesture that mutated `state` live). Pushes it onto the undo
     /// stack without re-executing, then marks the project changed.
     pub fn record_executed_command(&mut self, cmd: EditCommand, cx: &mut gpui::Context<Self>) {
+        // A clip gain/fade gesture whose release never arrived must not lend
+        // its stale "before" to the next one.
+        self.clip_process_origin = None;
         let impact = cmd.impact();
         self.edit_history.push(cmd);
+        self.notify_edit_impact(impact, cx);
+        cx.notify();
+    }
+
+    /// Record a Record pass that has already been applied (see
+    /// [`EditCommand::record_pass`]), merging it with the same pass's earlier
+    /// half so one take is one undo step.
+    pub fn record_pass_command(&mut self, cmd: EditCommand, cx: &mut gpui::Context<Self>) {
+        self.clip_process_origin = None;
+        let impact = cmd.impact();
+        self.edit_history.push_record_pass(cmd);
         self.notify_edit_impact(impact, cx);
         cx.notify();
     }
@@ -610,6 +663,17 @@ impl Timeline {
         } else {
             false
         }
+    }
+
+    /// The command the last [`Self::undo_edit`] reverted, for owners that
+    /// must follow some kinds of undo up with work of their own.
+    pub fn last_undone_edit(&self) -> Option<&EditCommand> {
+        self.edit_history.last_undone()
+    }
+
+    /// The command the last [`Self::redo_edit`] re-applied.
+    pub fn last_redone_edit(&self) -> Option<&EditCommand> {
+        self.edit_history.last_redone()
     }
 
     pub fn delete_clip_command(&mut self, clip_id: &str, cx: &mut gpui::Context<Self>) {
@@ -920,6 +984,34 @@ impl Timeline {
                 ),
             )
             .into_any_element()
+    }
+
+    /// Show the Smart Tool's razor line at `frame`, repainting only the line.
+    pub(super) fn show_cut_guide(
+        &self,
+        frame: crate::components::timeline::cut_guide::CutGuideFrame,
+        cx: &mut gpui::App,
+    ) {
+        let unchanged = self.cut_guide.get().is_some_and(|prev| {
+            (prev.x - frame.x).abs() < 0.5
+                && (prev.top - frame.top).abs() < 0.5
+                && (prev.height - frame.height).abs() < 0.5
+        });
+        if unchanged {
+            return;
+        }
+        self.cut_guide.set(Some(frame));
+        if let Some(overlay) = self.cut_guide_overlay.as_ref() {
+            overlay.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    pub(crate) fn hide_cut_guide(&self, cx: &mut gpui::App) {
+        if self.cut_guide.take().is_some() {
+            if let Some(overlay) = self.cut_guide_overlay.as_ref() {
+                overlay.update(cx, |_, cx| cx.notify());
+            }
+        }
     }
 
     pub(crate) fn publish_playhead(&self, cx: &mut gpui::App) -> bool {

@@ -46,6 +46,10 @@ pub(crate) struct RecordingSessionState {
     /// which is now a state the user can actually see, because the thread that
     /// draws is no longer the thread waiting on the disk.
     pub awaiting_finalize: bool,
+    /// Counts stopped takes. A take's MIDI (committed at Stop) and audio
+    /// (committed when the writer hands the files over) carry the same number,
+    /// which is how they become one undo step.
+    pub pass: u64,
 }
 
 impl Default for RecordingSessionState {
@@ -59,6 +63,7 @@ impl Default for RecordingSessionState {
             midi_preview_updated_at: Instant::now() - Duration::from_secs(1),
             count_in_token: 0,
             awaiting_finalize: false,
+            pass: 0,
         }
     }
 }
@@ -87,7 +92,10 @@ pub(crate) struct MidiRecordingTrack {
 }
 
 fn midi_recording_preview_clip_id(track_id: &str) -> String {
-    format!("__recording_midi_preview__:{track_id}")
+    format!(
+        "{}{track_id}",
+        crate::components::timeline::timeline_state::ClipState::MIDI_RECORDING_PREVIEW_ID_PREFIX
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -703,6 +711,7 @@ impl StudioLayout {
             }
         };
 
+        self.recording.pass = self.recording.pass.wrapping_add(1);
         self.stop_recording_transport_ui(cx);
         self.recording.ui_state = RecordingUiState::Finalizing;
         cx.notify();
@@ -721,6 +730,11 @@ impl StudioLayout {
             }
             self.audio_bridge.stats = Some(engine.stats());
             step("engine pause");
+            // A take ends where it began: back to where Record started the
+            // transport. The MIDI take already read its end off the playhead
+            // above, and the audio take's position comes from the engine.
+            self.return_playhead_to_playback_anchor(cx);
+            step("return playhead");
 
             if engine_recording {
                 // Detach only. The writer closes the files on its own thread,
@@ -961,7 +975,12 @@ impl StudioLayout {
             return;
         }
 
+        let pass = self.recording.pass;
         self.timeline.update(cx, |timeline, cx| {
+            let before = crate::components::edit::TrackTakesState::capture_tracks(
+                &timeline.state,
+                results.iter().map(|result| result.track_id.as_str()),
+            );
             let mut selected_clip_ids = Vec::new();
             let mut selected_track_id = None;
             for result in results {
@@ -996,6 +1015,14 @@ impl StudioLayout {
                 }
             }
             if !selected_clip_ids.is_empty() {
+                if let Some(command) = crate::components::edit::EditCommand::record_pass(
+                    pass,
+                    &timeline.state,
+                    &selected_clip_ids,
+                    before,
+                ) {
+                    timeline.record_pass_command(command, cx);
+                }
                 timeline.state.selection.selected_track_id = selected_track_id;
                 timeline.state.selection.selected_clip_ids = selected_clip_ids;
                 cx.notify();
@@ -1028,7 +1055,16 @@ impl StudioLayout {
         // reads as the same moment — which is what they are.
         let take_stamp = take_timestamp_label();
 
+        let pass = self.recording.pass;
         let _ = self.timeline.update(cx, |timeline, cx| {
+            let before = crate::components::edit::TrackTakesState::capture_tracks(
+                &timeline.state,
+                results
+                    .iter()
+                    .filter(|result| result.success)
+                    .map(|result| result.track_id.as_str()),
+            );
+            let mut created_clip_ids: Vec<String> = Vec::new();
             for result in &results {
                 if !result.success {
                     failed_tracks.push(format!(
@@ -1076,6 +1112,11 @@ impl StudioLayout {
                     result.duration_seconds,
                     bpm,
                 );
+                timeline.state.seed_recorded_clip_source(
+                    &clip_id,
+                    result.sample_rate,
+                    result.duration_seconds,
+                );
                 // Register the pass as a take. A second pass over the same bars
                 // becomes the active take and mutes the one it replaced, which
                 // is what makes Record twice a comp instead of two clips
@@ -1085,6 +1126,7 @@ impl StudioLayout {
                     &clip_id,
                     take_stamp.clone(),
                 );
+                created_clip_ids.push(clip_id.clone());
                 if generate_waveforms {
                     import_paths.push((PathBuf::from(&result.file_path), result.file_path.clone()));
                 }
@@ -1092,6 +1134,16 @@ impl StudioLayout {
                     "[recording] clip created id={clip_id} track={} path={}",
                     result.track_id, result.relative_path
                 );
+            }
+            // One undo step for the pass: undo takes the new clips away *and*
+            // unmutes the takes they replaced.
+            if let Some(command) = crate::components::edit::EditCommand::record_pass(
+                pass,
+                &timeline.state,
+                &created_clip_ids,
+                before,
+            ) {
+                timeline.record_pass_command(command, cx);
             }
             cx.notify();
         });

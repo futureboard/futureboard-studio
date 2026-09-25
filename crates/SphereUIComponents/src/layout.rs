@@ -466,7 +466,10 @@ pub(crate) fn build_and_warm_audio_engine(
 /// with its own growing preview clip). Mirrors
 /// `recording_ops::midi_recording_preview_clip_id`.
 pub(crate) fn audio_recording_preview_clip_id(track_id: &str) -> String {
-    format!("__recording_preview__:{track_id}")
+    format!(
+        "{}{track_id}",
+        crate::components::timeline::timeline_state::ClipState::AUDIO_RECORDING_PREVIEW_ID_PREFIX
+    )
 }
 
 /// UI-side bookkeeping for the realtime recording waveform preview (Part 1).
@@ -715,6 +718,10 @@ pub struct StudioLayout {
     last_autosave_at: std::time::Instant,
     /// Guards the background autosave job so render/poll frames cannot enqueue duplicates.
     autosave_in_flight: bool,
+    /// The one queue every project-file writer goes through (manual save,
+    /// save-then-continue, autosave, Save Copy), plus what the last load or
+    /// save knew about the project's assets. See [`project_ops::ProjectSaveState`].
+    project_saves: project_ops::ProjectSaveState,
     /// Monotonic counter bumped every time the live session is torn down or
     /// replaced (project reset / in-studio switch). Async project-load
     /// completions capture the value at spawn time and self-reject if it has
@@ -1355,6 +1362,7 @@ impl StudioLayout {
             plugin_restore_batch_active: false,
             last_autosave_at: std::time::Instant::now(),
             autosave_in_flight: false,
+            project_saves: project_ops::ProjectSaveState::default(),
             session_generation: 0,
             last_external_mixer_meter_push: std::time::Instant::now(),
             pending_secondary_window_restore:
@@ -1817,6 +1825,29 @@ impl StudioLayout {
                 });
                 self.command_palette.close();
                 cx.notify();
+            }
+            return;
+        }
+        // The ruler's grid dropdown. Choosing a grid is asking to snap to it,
+        // so it also turns the magnet on — as the piano roll's grid menu does.
+        if let Some(id) = command_id.strip_prefix("timeline:set-grid:") {
+            use components::timeline::timeline_state::SnapDivision;
+            if let Some(division) = SnapDivision::from_command_id(id) {
+                let _ = self.timeline.update(cx, |timeline, cx| {
+                    timeline.state.grid_division = division;
+                    timeline.state.snap_to_grid = division != SnapDivision::Off;
+                    cx.notify();
+                });
+            }
+            return;
+        }
+        if let Some(id) = command_id.strip_prefix("timeline:set-grid-shape:") {
+            use components::timeline::timeline_state::SnapShape;
+            if let Some(shape) = SnapShape::from_command_id(id) {
+                let _ = self.timeline.update(cx, |timeline, cx| {
+                    timeline.state.snap_shape = shape;
+                    cx.notify();
+                });
             }
             return;
         }
@@ -2705,14 +2736,30 @@ impl StudioLayout {
             "automation:toggle-mode" => self.toggle_selected_track_automation_mode(cx),
             "automation:cycle-target" => self.cycle_selected_track_automation_target(cx),
             "edit:undo" => {
-                let _ = self
-                    .timeline
-                    .update(cx, |timeline, cx| timeline.undo_edit(cx));
+                // An insert/send chain edit undone has to reach the engine, the
+                // detached mixer and the moved insert's editor caches at once,
+                // like the drop that made it; the project-changed callback
+                // alone only marks the project dirty.
+                let chain_edit = self.timeline.update(cx, |timeline, cx| {
+                    timeline.undo_edit(cx)
+                        && timeline
+                            .last_undone_edit()
+                            .is_some_and(|command| command.is_channel_chain_edit())
+                });
+                if chain_edit {
+                    self.after_channel_chain_edit(cx, "undo_channel_chain");
+                }
             }
             "edit:redo" => {
-                let _ = self
-                    .timeline
-                    .update(cx, |timeline, cx| timeline.redo_edit(cx));
+                let chain_edit = self.timeline.update(cx, |timeline, cx| {
+                    timeline.redo_edit(cx)
+                        && timeline
+                            .last_redone_edit()
+                            .is_some_and(|command| command.is_channel_chain_edit())
+                });
+                if chain_edit {
+                    self.after_channel_chain_edit(cx, "redo_channel_chain");
+                }
             }
             "edit:duplicate" | "clip:duplicate" => self.duplicate_selected_clip(cx),
             "clip:rename" => {
@@ -2749,6 +2796,14 @@ impl StudioLayout {
             "chords:clear-all" => self.clear_chord_track_command(cx),
             "chords:to-midi" => self.chord_track_to_midi_command(cx),
             "chords:open-generator" => self.open_chord_generator(cx),
+
+            // The ruler's magnet. Same switch as clicking it; UI-only.
+            "timeline:toggle-snap" => {
+                let _ = self.timeline.update(cx, |timeline, cx| {
+                    timeline.state.snap_to_grid = !timeline.state.snap_to_grid;
+                    cx.notify();
+                });
+            }
 
             // ── Tools — switch the active timeline tool. UI-only; never dirties
             // the engine. The piano roll owns its own tool keys when focused.

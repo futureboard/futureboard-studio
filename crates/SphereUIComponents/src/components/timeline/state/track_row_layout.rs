@@ -530,6 +530,267 @@ impl TimelineState {
     }
 }
 
+/// Wheel silence that ends a track-zoom burst. The next tick then scales from
+/// the heights as they are, not from the previous burst's snapshot.
+pub const TRACK_ZOOM_BURST_IDLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// One arrangement track's height when a track-zoom burst started.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackZoomBase {
+    pub track_id: TrackId,
+    pub track_type: TrackType,
+    pub height: f32,
+}
+
+/// A burst of Ctrl/Cmd+Alt+wheel ticks zooming every arrangement track's
+/// height. View gesture state held by the `Timeline` view, not by
+/// `TimelineState`, which is cloned and compared as document state.
+///
+/// Heights are always recomputed from `base` × `factor`, never compounded
+/// tick by tick, so zooming into a limit and back within one burst restores
+/// every custom height exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackHeightZoomSession {
+    base: Vec<TrackZoomBase>,
+    /// Zoom accumulated over the burst, relative to `base`.
+    factor: f32,
+    /// `factor` is held inside the range where at least one row can still
+    /// change, so reversing direction after hitting a limit reacts at once.
+    factor_min: f32,
+    factor_max: f32,
+    /// Effective heights the last tick left, in `base` order. Any other writer
+    /// (row drag, reset, undo, project load) makes the live heights differ,
+    /// which restarts the burst instead of overwriting that change.
+    applied: Vec<f32>,
+    last_tick: std::time::Instant,
+    /// This burst already marked the project as having unsaved changes.
+    marked_dirty: bool,
+}
+
+impl TrackHeightZoomSession {
+    fn start(base: Vec<TrackZoomBase>, now: std::time::Instant) -> Option<Self> {
+        if base.is_empty() {
+            return None;
+        }
+        let (mut factor_min, mut factor_max) = (1.0_f32, 1.0_f32);
+        for entry in &base {
+            factor_min = factor_min.min(min_track_row_height(entry.track_type) / entry.height);
+            factor_max = factor_max.max(MAX_TRACK_HEIGHT / entry.height);
+        }
+        let applied = base.iter().map(|entry| entry.height).collect();
+        Some(Self {
+            base,
+            factor: 1.0,
+            factor_min,
+            factor_max,
+            applied,
+            last_tick: now,
+            marked_dirty: false,
+        })
+    }
+}
+
+/// What one track-zoom tick did, so the caller can apply its side effects.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TrackZoomTick {
+    /// Scroll y keeping the anchored track under the pointer, clamped to the
+    /// new content height. `None` when no row height changed.
+    pub scroll_y: Option<f32>,
+    /// First change of this burst: mark the project view-dirty once. Track
+    /// zoom is a view change, so it never records an undo entry and never
+    /// marks the engine dirty.
+    pub mark_view_dirty: bool,
+}
+
+/// Where the zoom anchor sits inside its track's block.
+#[derive(Debug, Clone, Copy)]
+enum TrackZoomAnchorOffset {
+    /// A fraction of the clip row, which scales.
+    ClipRow(f32),
+    /// Pixels below the clip row, inside the automation sub-lanes, which do not.
+    Automation(f32),
+}
+
+/// Height a track takes at `factor` of its burst-start height, or `None` for
+/// the default height, so the override is removed and saves stay byte-stable.
+fn zoomed_track_height(base: &TrackZoomBase, factor: f32) -> Option<f32> {
+    let scaled = base.height * factor;
+    // Within half a pixel of where it started, a row keeps its exact height,
+    // so zooming back to factor 1 restores fractional custom heights.
+    let height = if (scaled - base.height).abs() < 0.5 {
+        base.height
+    } else {
+        clamp_track_row_height(base.track_type, scaled.round())
+    };
+    ((height - DEFAULT_TRACK_HEIGHT).abs() > 0.5).then_some(height)
+}
+
+impl TimelineState {
+    /// Every arrangement track's current height, in track order. Mixer-only
+    /// channels take no arrangement space and are left out; children of a
+    /// collapsed group stay in, so they still match their siblings once the
+    /// group expands.
+    fn track_zoom_base(&self) -> Vec<TrackZoomBase> {
+        self.tracks
+            .iter()
+            .filter(|track| !is_arrangement_hidden_track(track))
+            .map(|track| TrackZoomBase {
+                track_id: track.id.clone(),
+                track_type: track.track_type,
+                height: self.track_row_height(track),
+            })
+            .collect()
+    }
+
+    /// True while `session` still describes the arrangement: its last tick
+    /// was recent, the arrangement tracks are the same, and every height is
+    /// still what that tick wrote.
+    fn track_zoom_session_is_live(
+        &self,
+        session: &TrackHeightZoomSession,
+        now: std::time::Instant,
+    ) -> bool {
+        if now.saturating_duration_since(session.last_tick) > TRACK_ZOOM_BURST_IDLE {
+            return false;
+        }
+        let mut live = self
+            .tracks
+            .iter()
+            .filter(|track| !is_arrangement_hidden_track(track));
+        for (base, applied) in session.base.iter().zip(&session.applied) {
+            let Some(track) = live.next() else {
+                return false;
+            };
+            if track.id != base.track_id || (self.track_row_height(track) - applied).abs() >= 0.01 {
+                return false;
+            }
+        }
+        live.next().is_none()
+    }
+
+    /// One Ctrl/Cmd+Alt+wheel tick: scale every arrangement track's height by
+    /// `tick_factor` and keep the track under `anchor_viewport_y` in place.
+    ///
+    /// `anchor_viewport_y` is in track-area viewport space (the transform the
+    /// arrangement hit-tests with) and `viewport_height` is the visible track
+    /// area height, used to clamp the returned scroll.
+    pub fn track_zoom_tick(
+        &mut self,
+        session: &mut Option<TrackHeightZoomSession>,
+        tick_factor: f32,
+        anchor_viewport_y: f32,
+        viewport_height: f32,
+        now: std::time::Instant,
+    ) -> TrackZoomTick {
+        // A row-resize drag owns the heights until it ends.
+        if self.track_height_resize.is_some() || self.track_height_resize_arm.is_some() {
+            *session = None;
+            return TrackZoomTick::default();
+        }
+        if !tick_factor.is_finite() || tick_factor <= 0.0 {
+            return TrackZoomTick::default();
+        }
+        if !session
+            .as_ref()
+            .is_some_and(|live| self.track_zoom_session_is_live(live, now))
+        {
+            *session = TrackHeightZoomSession::start(self.track_zoom_base(), now);
+        }
+        let Some(active) = session.as_mut() else {
+            return TrackZoomTick::default();
+        };
+        active.last_tick = now;
+        active.factor = (active.factor * tick_factor).clamp(active.factor_min, active.factor_max);
+        let scroll_y = self.zoom_track_heights(
+            &active.base,
+            active.factor,
+            anchor_viewport_y,
+            viewport_height,
+        );
+        let factor = active.factor;
+        active.applied.clear();
+        active.applied.extend(
+            active
+                .base
+                .iter()
+                .map(|entry| zoomed_track_height(entry, factor).unwrap_or(DEFAULT_TRACK_HEIGHT)),
+        );
+        let mark_view_dirty = scroll_y.is_some() && !active.marked_dirty;
+        active.marked_dirty |= mark_view_dirty;
+        TrackZoomTick {
+            scroll_y,
+            mark_view_dirty,
+        }
+    }
+
+    /// Set every track in `base` to its height at `factor`, and return the
+    /// scroll y that keeps the anchored track at `anchor_viewport_y`, clamped
+    /// to `[0, total - viewport_height]`. `None` when no height changed.
+    ///
+    /// Rows are 1:1 with `tracks` by index, so the anchor is a row index plus
+    /// a fraction of its clip row; a pointer in the automation sub-lanes keeps
+    /// its pixel offset, since those rows do not scale. With the pointer below
+    /// the last row, the row at the top of the view anchors instead.
+    pub fn zoom_track_heights(
+        &mut self,
+        base: &[TrackZoomBase],
+        factor: f32,
+        anchor_viewport_y: f32,
+        viewport_height: f32,
+    ) -> Option<f32> {
+        let scroll_y = self.viewport.scroll_y;
+        let before = self.track_row_layout();
+        let anchor = [anchor_viewport_y.max(0.0), 0.0]
+            .into_iter()
+            .find_map(|viewport_y| {
+                let content_y = viewport_y + scroll_y;
+                let row = before.track_at_content_y(content_y)?;
+                let offset = content_y - row.y;
+                let within = if offset < row.height {
+                    TrackZoomAnchorOffset::ClipRow(offset / row.height)
+                } else {
+                    TrackZoomAnchorOffset::Automation(offset - row.height)
+                };
+                Some((viewport_y, row.index, within))
+            });
+
+        let mut changed = false;
+        for entry in base {
+            let old = self
+                .track_view_layout
+                .height_for(&entry.track_id)
+                .map_or(DEFAULT_TRACK_HEIGHT, |h| {
+                    clamp_track_row_height(entry.track_type, h)
+                });
+            let next = zoomed_track_height(entry, factor);
+            match next {
+                Some(height) => self
+                    .track_view_layout
+                    .set_height(entry.track_id.clone(), height),
+                None => self.track_view_layout.remove_track(&entry.track_id),
+            }
+            changed |= (next.unwrap_or(DEFAULT_TRACK_HEIGHT) - old).abs() >= 0.01;
+        }
+        if !changed {
+            return None;
+        }
+
+        let after = self.track_row_layout();
+        let max_scroll_y = (after.total_height - viewport_height).max(0.0);
+        let next_scroll_y = anchor
+            .and_then(|(viewport_y, index, within)| {
+                let row = after.row_for_index(index)?;
+                let content_y = match within {
+                    TrackZoomAnchorOffset::ClipRow(fraction) => row.y + fraction * row.height,
+                    TrackZoomAnchorOffset::Automation(offset) => row.y + row.height + offset,
+                };
+                Some(content_y - viewport_y)
+            })
+            .unwrap_or(scroll_y);
+        Some(next_scroll_y.clamp(0.0, max_scroll_y))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,5 +1086,431 @@ mod tests {
 
         assert_eq!(state.toggle_group_collapsed(&group_id), Some(false));
         assert_eq!(state.total_track_rows_height(), expanded_height);
+    }
+
+    use std::time::{Duration, Instant};
+
+    /// Tall enough that no test below scrolls unless it means to.
+    const ZOOM_VIEWPORT: f32 = 2_000.0;
+
+    fn heights(state: &TimelineState) -> Vec<f32> {
+        state
+            .tracks
+            .iter()
+            .map(|track| state.track_row_height(track))
+            .collect()
+    }
+
+    fn zoom_tick(
+        state: &mut TimelineState,
+        session: &mut Option<TrackHeightZoomSession>,
+        factor: f32,
+        anchor_viewport_y: f32,
+        viewport_height: f32,
+        now: Instant,
+    ) -> TrackZoomTick {
+        state.track_zoom_tick(session, factor, anchor_viewport_y, viewport_height, now)
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 1e-3, "{actual} != {expected}");
+    }
+
+    /// Content y the pointer resolves to, as `(track index, offset into block)`.
+    fn anchor_at(state: &TimelineState, viewport_y: f32) -> (usize, f32) {
+        let layout = state.track_row_layout();
+        let content_y = viewport_y + state.viewport.scroll_y;
+        let row = layout
+            .track_at_content_y(content_y)
+            .expect("pointer over a track");
+        (row.index, content_y - row.y)
+    }
+
+    /// Apply a zoom through the pure state function the way the wheel handler
+    /// does: the returned scroll is written back.
+    fn zoom_and_scroll(
+        state: &mut TimelineState,
+        factor: f32,
+        anchor_viewport_y: f32,
+        viewport_height: f32,
+    ) -> Option<f32> {
+        let base = state.track_zoom_base();
+        let scroll_y = state.zoom_track_heights(&base, factor, anchor_viewport_y, viewport_height);
+        if let Some(scroll_y) = scroll_y {
+            state.viewport.scroll_y = scroll_y;
+        }
+        scroll_y
+    }
+
+    #[test]
+    fn track_zoom_scales_every_arrangement_row_in_proportion() {
+        let mut state = sample_state(&[
+            TrackType::Audio,
+            TrackType::Midi,
+            TrackType::Instrument,
+            TrackType::Bus,
+            TrackType::Return,
+            TrackType::Audio,
+        ]);
+        let ids: Vec<String> = state.tracks.iter().map(|t| t.id.clone()).collect();
+        state.track_view_layout.set_height(ids[0].clone(), 48.0);
+        state.track_view_layout.set_height(ids[2].clone(), 120.0);
+        // A VSTi multi-out child channel is mixer-only, like Bus/Return.
+        state.tracks[5].id = vsti_output_child_track_id("insert-1", 1);
+
+        let mut session = None;
+        let tick = zoom_tick(
+            &mut state,
+            &mut session,
+            1.5,
+            0.0,
+            ZOOM_VIEWPORT,
+            Instant::now(),
+        );
+
+        assert!(tick.scroll_y.is_some());
+        // 48 × 1.5 is the default height, so the override goes away.
+        assert_eq!(state.track_view_layout.height_for(&ids[0]), None);
+        assert_eq!(state.track_row_height(&state.tracks[0]), 72.0);
+        assert_eq!(state.track_row_height(&state.tracks[1]), 108.0);
+        assert_eq!(state.track_row_height(&state.tracks[2]), 180.0);
+        for mixer_only in &state.tracks[3..] {
+            assert_eq!(
+                state.track_view_layout.height_for(&mixer_only.id),
+                None,
+                "mixer-only channel {} must keep no override",
+                mixer_only.id
+            );
+        }
+    }
+
+    #[test]
+    fn track_zoom_clamps_rows_to_the_shared_limits() {
+        let mut state = sample_state(&[TrackType::Audio, TrackType::Midi, TrackType::Instrument]);
+        let id = state.tracks[1].id.clone();
+        state.track_view_layout.set_height(id, 120.0);
+        let now = Instant::now();
+
+        let mut session = None;
+        zoom_tick(&mut state, &mut session, 0.01, 0.0, ZOOM_VIEWPORT, now);
+        assert_eq!(heights(&state), vec![MIN_TRACK_ROW_HEIGHT; 3]);
+
+        let mut session = None;
+        zoom_tick(&mut state, &mut session, 100.0, 0.0, ZOOM_VIEWPORT, now);
+        assert_eq!(heights(&state), vec![MAX_TRACK_HEIGHT; 3]);
+    }
+
+    #[test]
+    fn track_zoom_restores_custom_heights_within_a_burst() {
+        let mut state = sample_state(&[TrackType::Audio, TrackType::Midi, TrackType::Audio]);
+        let ids: Vec<String> = state.tracks.iter().map(|t| t.id.clone()).collect();
+        state.track_view_layout.set_height(ids[0].clone(), 48.0);
+        // A drag-resized row carries a fractional height.
+        state.track_view_layout.set_height(ids[1].clone(), 97.3);
+        let before = state.track_view_layout.clone();
+        let mut now = Instant::now();
+        let mut session = None;
+
+        // Zoom out well past the floor, then back in by exactly as much as
+        // actually applied: the burst factor is clamped at the floor.
+        for _ in 0..40 {
+            now += Duration::from_millis(16);
+            zoom_tick(&mut state, &mut session, 0.9, 0.0, ZOOM_VIEWPORT, now);
+        }
+        assert_eq!(heights(&state), vec![MIN_TRACK_ROW_HEIGHT; 3]);
+        let floor = session.as_ref().unwrap().factor;
+        now += Duration::from_millis(16);
+        zoom_tick(
+            &mut state,
+            &mut session,
+            1.0 / floor,
+            0.0,
+            ZOOM_VIEWPORT,
+            now,
+        );
+
+        assert_eq!(state.track_view_layout, before);
+    }
+
+    #[test]
+    fn track_zoom_reacts_at_once_after_hitting_a_limit() {
+        let mut state = sample_state(&[TrackType::Audio, TrackType::Midi]);
+        let tall = state.tracks[1].id.clone();
+        state.track_view_layout.set_height(tall.clone(), 240.0);
+        let mut now = Instant::now();
+        let mut session = None;
+
+        // Far past the ceiling for both rows.
+        zoom_tick(&mut state, &mut session, 50.0, 0.0, ZOOM_VIEWPORT, now);
+        assert_eq!(heights(&state), vec![MAX_TRACK_HEIGHT; 2]);
+
+        // The first tick back already shrinks the row that had the most room.
+        now += Duration::from_millis(16);
+        let tick = zoom_tick(&mut state, &mut session, 0.9, 0.0, ZOOM_VIEWPORT, now);
+        assert!(tick.scroll_y.is_some());
+        assert_eq!(state.track_row_height(&state.tracks[0]), 288.0);
+        assert_eq!(state.track_row_height(&state.tracks[1]), MAX_TRACK_HEIGHT);
+
+        // Past the floor too: one tick in grows the row that was largest.
+        now += Duration::from_millis(16);
+        zoom_tick(&mut state, &mut session, 0.001, 0.0, ZOOM_VIEWPORT, now);
+        assert_eq!(heights(&state), vec![MIN_TRACK_ROW_HEIGHT; 2]);
+        now += Duration::from_millis(16);
+        let tick = zoom_tick(&mut state, &mut session, 1.1, 0.0, ZOOM_VIEWPORT, now);
+        assert!(tick.scroll_y.is_some());
+        assert!(state.track_row_height(&state.tracks[1]) > MIN_TRACK_ROW_HEIGHT);
+    }
+
+    #[test]
+    fn track_zoom_returning_to_the_default_height_removes_the_override() {
+        let mut state = sample_state(&[TrackType::Audio, TrackType::Midi]);
+        let small = state.tracks[0].id.clone();
+        let default = state.tracks[1].id.clone();
+        state.track_view_layout.set_height(small.clone(), 48.0);
+        let now = Instant::now();
+
+        let mut session = None;
+        zoom_tick(&mut state, &mut session, 1.5, 0.0, ZOOM_VIEWPORT, now);
+        // 48 × 1.5 lands exactly on the default: the project saves no height.
+        assert_eq!(state.track_view_layout.height_for(&small), None);
+        assert_eq!(state.track_view_layout.height_for(&default), Some(108.0));
+
+        let mut session = None;
+        zoom_tick(
+            &mut state,
+            &mut session,
+            72.0 / 108.0,
+            0.0,
+            ZOOM_VIEWPORT,
+            now,
+        );
+        assert_eq!(state.track_view_layout.height_for(&default), None);
+        assert_eq!(state.track_view_layout.height_for(&small), Some(48.0));
+    }
+
+    #[test]
+    fn track_zoom_keeps_the_pointer_on_the_same_point_of_its_track() {
+        let mut state = sample_state(&[TrackType::Audio; 10]);
+        state.viewport.scroll_y = 100.0;
+        let pointer_y = 250.0;
+        let (index, offset) = anchor_at(&state, pointer_y);
+        let fraction = offset / DEFAULT_TRACK_HEIGHT;
+
+        let scroll_y = zoom_and_scroll(&mut state, 1.5, pointer_y, 400.0).unwrap();
+
+        assert_close(scroll_y, 4.0 * 108.0 + fraction * 108.0 - pointer_y);
+        let (after_index, after_offset) = anchor_at(&state, pointer_y);
+        assert_eq!(after_index, index);
+        assert_close(after_offset / 108.0, fraction);
+    }
+
+    #[test]
+    fn track_zoom_at_the_top_edge_anchors_the_first_visible_row() {
+        let mut state = sample_state(&[TrackType::Audio; 10]);
+        state.viewport.scroll_y = 100.0;
+        let (index, offset) = anchor_at(&state, 0.0);
+        assert_eq!((index, offset), (1, 28.0));
+
+        let scroll_y = zoom_and_scroll(&mut state, 2.0, 0.0, 400.0).unwrap();
+
+        assert_close(scroll_y, 144.0 + 56.0);
+        let (after_index, after_offset) = anchor_at(&state, 0.0);
+        assert_eq!(after_index, 1);
+        assert_close(after_offset, 56.0);
+    }
+
+    #[test]
+    fn track_zoom_keeps_an_automation_pointer_at_its_pixel_offset() {
+        let mut state = sample_state(&[TrackType::Audio; 6]);
+        let automated = state.tracks[2].id.clone();
+        state.ensure_automation_lane(&automated, AutomationTarget::TrackVolume);
+        state.tracks[2].lane_mode = TrackLaneMode::Automation;
+        let layout = state.track_row_layout();
+        let row = layout.rows[2].clone();
+        assert!(row.automation_height > 0.0);
+        state.viewport.scroll_y = 50.0;
+        // 20 px below the clip row, inside the automation control row.
+        let pointer_y = row.y + row.height + 20.0 - state.viewport.scroll_y;
+
+        zoom_and_scroll(&mut state, 1.5, pointer_y, 300.0).unwrap();
+
+        let (index, offset) = anchor_at(&state, pointer_y);
+        assert_eq!(index, 2);
+        assert_close(offset, 108.0 + 20.0);
+        assert_eq!(
+            state.track_row_layout().rows[2].automation_height,
+            row.automation_height,
+            "automation rows do not scale"
+        );
+    }
+
+    #[test]
+    fn track_zoom_anchors_past_collapsed_group_children_and_scales_them() {
+        let mut state = sample_state(&[
+            TrackType::Group,
+            TrackType::Audio,
+            TrackType::Audio,
+            TrackType::Midi,
+            TrackType::Audio,
+            TrackType::Audio,
+        ]);
+        let group_id = state.tracks[0].id.clone();
+        let children = [state.tracks[1].id.clone(), state.tracks[2].id.clone()];
+        for child in &children {
+            assert!(state.assign_track_to_group(child, &group_id));
+        }
+        assert_eq!(state.toggle_group_collapsed(&group_id), Some(true));
+        state.viewport.scroll_y = 30.0;
+        let pointer_y = 100.0;
+        let (index, offset) = anchor_at(&state, pointer_y);
+        let anchored_id = state.tracks[index].id.clone();
+        assert!(!children.contains(&anchored_id));
+
+        zoom_and_scroll(&mut state, 1.25, pointer_y, 150.0).unwrap();
+
+        let (after_index, after_offset) = anchor_at(&state, pointer_y);
+        assert_eq!(state.tracks[after_index].id, anchored_id);
+        assert_close(after_offset / 90.0, offset / 72.0);
+        // Hidden children follow the zoom, so they match once expanded.
+        for child in &children {
+            assert_eq!(state.track_view_layout.height_for(child), Some(90.0));
+        }
+    }
+
+    #[test]
+    fn track_zoom_below_the_last_row_anchors_the_top_row() {
+        let mut state = sample_state(&[TrackType::Audio; 3]);
+        // All three rows fit, so there is empty lane below the last one.
+        let scroll_y = zoom_and_scroll(&mut state, 1.5, 500.0, 600.0);
+        assert_eq!(scroll_y, Some(0.0));
+        assert_eq!(heights(&state), vec![108.0; 3]);
+    }
+
+    #[test]
+    fn track_zoom_clamps_scroll_to_the_new_content() {
+        let mut state = sample_state(&[TrackType::Audio; 10]);
+        let viewport = 500.0;
+        state.viewport.scroll_y = 720.0 - viewport;
+
+        // Zoomed out, the content fits the view: nothing left to scroll.
+        let scroll_y = zoom_and_scroll(&mut state, 0.5, 390.0, viewport).unwrap();
+        assert_eq!(state.total_track_rows_height(), 10.0 * MIN_TRACK_ROW_HEIGHT);
+        assert_eq!(scroll_y, 0.0);
+
+        // Zoomed in near the bottom, the scroll stays inside the content.
+        let scroll_y = zoom_and_scroll(&mut state, 5.0, 400.0, viewport).unwrap();
+        let total = state.total_track_rows_height();
+        assert!(total > viewport);
+        assert!(scroll_y > 0.0);
+        assert!(scroll_y <= total - viewport, "{scroll_y} of {total}");
+    }
+
+    #[test]
+    fn track_zoom_marks_the_project_once_per_burst() {
+        let mut state = sample_state(&[TrackType::Audio, TrackType::Midi]);
+        let mut now = Instant::now();
+        let mut session = None;
+
+        // A tick too small to move any row changes nothing and marks nothing.
+        let tick = zoom_tick(&mut state, &mut session, 1.002, 0.0, ZOOM_VIEWPORT, now);
+        assert_eq!(tick, TrackZoomTick::default());
+
+        now += Duration::from_millis(16);
+        let first = zoom_tick(&mut state, &mut session, 1.2, 0.0, ZOOM_VIEWPORT, now);
+        assert!(first.scroll_y.is_some() && first.mark_view_dirty);
+        now += Duration::from_millis(16);
+        let second = zoom_tick(&mut state, &mut session, 1.2, 0.0, ZOOM_VIEWPORT, now);
+        assert!(second.scroll_y.is_some() && !second.mark_view_dirty);
+
+        // After the burst goes idle the next tick starts a new one.
+        now += TRACK_ZOOM_BURST_IDLE + Duration::from_millis(1);
+        let next_burst = zoom_tick(&mut state, &mut session, 1.2, 0.0, ZOOM_VIEWPORT, now);
+        assert!(next_burst.scroll_y.is_some() && next_burst.mark_view_dirty);
+    }
+
+    #[test]
+    fn track_zoom_restarts_when_another_edit_changed_the_heights() {
+        let mut state = sample_state(&[TrackType::Audio, TrackType::Midi]);
+        let edited = state.tracks[0].id.clone();
+        let mut now = Instant::now();
+        let mut session = None;
+        zoom_tick(&mut state, &mut session, 1.5, 0.0, ZOOM_VIEWPORT, now);
+        assert_eq!(heights(&state), vec![108.0, 108.0]);
+
+        // A row drag, reset or undo lands between two ticks of one burst.
+        state.track_view_layout.set_height(edited, 200.0);
+        now += Duration::from_millis(16);
+        zoom_tick(&mut state, &mut session, 1.1, 0.0, ZOOM_VIEWPORT, now);
+
+        // Scaled from what is there now, not from the stale burst start.
+        assert_eq!(heights(&state), vec![220.0, 119.0]);
+    }
+
+    #[test]
+    fn track_zoom_restarts_when_the_tracks_change() {
+        let mut state = sample_state(&[TrackType::Audio]);
+        let mut now = Instant::now();
+        let mut session = None;
+        zoom_tick(&mut state, &mut session, 1.5, 0.0, ZOOM_VIEWPORT, now);
+
+        let added = sample_state(&[TrackType::Audio, TrackType::Midi]).tracks[1].clone();
+        state.tracks.push(added);
+        now += Duration::from_millis(16);
+        zoom_tick(&mut state, &mut session, 1.5, 0.0, ZOOM_VIEWPORT, now);
+
+        // The new track joins at its own height instead of being skipped.
+        assert_eq!(heights(&state), vec![162.0, 108.0]);
+    }
+
+    #[test]
+    fn track_zoom_waits_for_a_row_resize_drag() {
+        let mut state = sample_state(&[TrackType::Audio, TrackType::Midi]);
+        let anchor = state.tracks[0].id.clone();
+        state.arm_track_height_resize(&anchor, 100.0, false, false);
+        let mut session = None;
+
+        let tick = zoom_tick(
+            &mut state,
+            &mut session,
+            2.0,
+            0.0,
+            ZOOM_VIEWPORT,
+            Instant::now(),
+        );
+
+        assert_eq!(tick, TrackZoomTick::default());
+        assert!(session.is_none());
+        assert_eq!(heights(&state), vec![DEFAULT_TRACK_HEIGHT; 2]);
+    }
+
+    /// Track zoom stays out of the undo history, and height edits record
+    /// absolute heights. Undoing a row resize made before a zoom therefore
+    /// restores that edit's own heights and leaves the zoomed rows alone.
+    #[test]
+    fn undoing_a_row_resize_after_a_zoom_restores_that_edits_heights() {
+        use crate::components::edit::EditCommand;
+
+        let mut state = sample_state(&[TrackType::Audio, TrackType::Midi]);
+        let resized = state.tracks[0].id.clone();
+        let resize = EditCommand::SetTrackHeights {
+            prev: vec![(resized.clone(), DEFAULT_TRACK_HEIGHT)],
+            next: vec![(resized.clone(), 120.0)],
+        };
+        resize.execute(&mut state);
+        let mut session = None;
+        zoom_tick(
+            &mut state,
+            &mut session,
+            1.5,
+            0.0,
+            ZOOM_VIEWPORT,
+            Instant::now(),
+        );
+        assert_eq!(heights(&state), vec![180.0, 108.0]);
+
+        resize.undo(&mut state);
+
+        assert_eq!(state.track_view_layout.height_for(&resized), None);
+        assert_eq!(heights(&state), vec![DEFAULT_TRACK_HEIGHT, 108.0]);
     }
 }

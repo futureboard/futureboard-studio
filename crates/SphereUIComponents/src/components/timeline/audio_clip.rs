@@ -5,7 +5,7 @@ use crate::components::timeline::waveform_canvas::waveform_canvas;
 use crate::theme::Colors;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, relative, AppContext, DragMoveEvent, Empty, InteractiveElement, IntoElement,
+    canvas, div, px, relative, AppContext, DragMoveEvent, Empty, InteractiveElement, IntoElement,
     ParentElement, Render, StatefulInteractiveElement, Styled, Window,
 };
 
@@ -22,11 +22,54 @@ pub type AudioClipProcessPreviewCb = std::sync::Arc<
 pub type AudioClipProcessCommitCb =
     std::sync::Arc<dyn Fn(&(String, ClipState), &mut gpui::Window, &mut gpui::App) + 'static>;
 
-/// Cut/razor request: `(clip_id, window_x, bypass_snap)`. The timeline resolves
-/// `window_x` to a snapped beat and splits the clip there. Optional so callers
-/// that never enable the Cut tool can pass `None`.
+/// A razor gesture on an audio clip, from the Cut tool or the Pointer's
+/// Smart Tool cut zone. The timeline resolves every window x to a snapped beat
+/// through one transform, so the line it shows is where the split lands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClipCutGesture {
+    /// Split `clip_id` at `window_x`. Shift bypasses snap, matching the lane
+    /// tools.
+    Cut {
+        clip_id: String,
+        window_x: f32,
+        bypass_snap: bool,
+    },
+    /// The pointer is over a clip's cut zone. `left` / `right` clamp the razor
+    /// line to the clip, `top` / `height` span it; all in window coordinates.
+    /// The line only shows while `alt` is held — the modifier the cut needs —
+    /// and the timeline keeps the position so pressing or releasing Option
+    /// without moving shows or hides it.
+    Hover {
+        window_x: f32,
+        bypass_snap: bool,
+        alt: bool,
+        left: f32,
+        right: f32,
+        top: f32,
+        height: f32,
+    },
+    /// The pointer left the cut zone, or pressed: hide the line.
+    Leave,
+}
+
+/// Cut/razor callback. Optional so callers that never cut can pass `None`.
 pub type AudioClipCutCb =
-    std::sync::Arc<dyn Fn(&(String, f32, bool), &mut gpui::Window, &mut gpui::App) + 'static>;
+    std::sync::Arc<dyn Fn(&ClipCutGesture, &mut gpui::Window, &mut gpui::App) + 'static>;
+
+/// Clips at least this wide get the wider edge handle, so the Smart Tool's
+/// duration zone can be found without hunting for a 6 px strip.
+const CLIP_WIDE_HANDLE_MIN_W: f32 = 64.0;
+
+/// Width of each edge (duration) handle on a clip `clip_width` wide. Shared by
+/// audio and MIDI clips and by the audio cut zone, which starts where the
+/// handles stop.
+pub(crate) fn clip_resize_handle_w(clip_width: f32) -> f32 {
+    if clip_width >= CLIP_WIDE_HANDLE_MIN_W {
+        10.0
+    } else {
+        6.0
+    }
+}
 
 /// Narrowest clip that still gets a processing strip.
 ///
@@ -84,13 +127,8 @@ fn audio_clip_timeline_duration_seconds(clip: &ClipState, state: &TimelineState)
 /// seconds axis and the beat axis are different axes, and the clip drifted off
 /// its own grid position by the difference.
 pub(crate) fn audio_clip_timeline_geometry(clip: &ClipState, state: &TimelineState) -> (f32, f32) {
-    let left = state.beats_to_x(clip.start_beat);
-    let end_beat = state
-        .audio_clip_end_beat(clip)
-        // Pending and legacy clips may not have decoded source bounds yet.
-        .unwrap_or_else(|| (clip.start_beat + clip.duration_beats.max(0.0)) as f64);
-    let right = state.beats_to_x(end_beat as f32);
-    (left, (right - left).max(10.0))
+    // The shared clip geometry; see [`TimelineState::clip_lane_rect`].
+    state.clip_lane_x_span(clip)
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +273,134 @@ fn compact_gain_control(
         })
         .on_mouse_up_out(gpui::MouseButton::Left, move |_, window, cx| {
             on_commit_out(&(commit_out_id.clone(), original_out.clone()), window, cx);
+        })
+}
+
+/// Height of the band along a clip's top edge the Smart Tool's cut zone leaves
+/// free, so the corner fade handles have the corners to themselves.
+const SMART_CUT_TOP_CLEARANCE: f32 = 12.0;
+
+/// Farthest the pointer may travel between press and release for a click in
+/// the cut zone to split: GPUI's own drag threshold, past which it is a drag.
+const SMART_CUT_MAX_TRAVEL_PX: f32 = 2.0;
+
+/// Whether a click in the Smart Tool's cut zone splits the clip.
+///
+/// Only an Option/Alt single click does: Option held at the press *and* the
+/// release (Shift may join it to bypass snap; Cmd or Ctrl may not), the first
+/// click of a sequence, no travel past the drag threshold and no drag in
+/// flight. Every other click is the ordinary select click the clip body has
+/// already handled — including the first click of a double-click meant to open
+/// the editor — and an Option-drag stays a clone.
+pub(crate) fn smart_cut_click_splits(
+    down: &gpui::Modifiers,
+    up: &gpui::Modifiers,
+    click_count: usize,
+    travel_px: f32,
+    drag_active: bool,
+) -> bool {
+    let option_only = |m: &gpui::Modifiers| m.alt && !m.platform && !m.control && !m.function;
+    option_only(down)
+        && option_only(up)
+        && click_count == 1
+        && travel_px <= SMART_CUT_MAX_TRAVEL_PX
+        && !drag_active
+}
+
+/// The Pointer's cut zone: the clip body between its edge handles, below the
+/// top band the fade handles use. With Option/Alt held, hovering shows the
+/// razor line and a single click splits there (see
+/// [`smart_cut_click_splits`]). Without it the zone is inert: a press selects
+/// the clip and a drag moves it — the clip body owns both — and the strip's
+/// inline gain, drawn above the zone, still takes its own presses.
+fn smart_cut_zone(
+    clip_id: &str,
+    id_num: usize,
+    handle_w: f32,
+    on_cut: AudioClipCutCb,
+) -> impl IntoElement {
+    let bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>> =
+        Default::default();
+    let measured = bounds.clone();
+    let on_move = on_cut.clone();
+    let on_hover = on_cut.clone();
+    let on_down = on_cut.clone();
+    let clip_id = clip_id.to_string();
+
+    div()
+        .id(("audio-clip-cut-zone", id_num))
+        .absolute()
+        .left(px(handle_w))
+        .right(px(handle_w))
+        .top(px(SMART_CUT_TOP_CLEARANCE))
+        .bottom_0()
+        .child(
+            canvas(
+                move |zone, _window, _cx| measured.set(Some(zone)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+        .on_mouse_move(move |event: &gpui::MouseMoveEvent, window, cx| {
+            if event.pressed_button.is_some() {
+                on_move(&ClipCutGesture::Leave, window, cx);
+                return;
+            }
+            let Some(zone) = bounds.get() else {
+                return;
+            };
+            let top: f32 = zone.origin.y.into();
+            let height: f32 = zone.size.height.into();
+            on_move(
+                &ClipCutGesture::Hover {
+                    window_x: event.position.x.into(),
+                    bypass_snap: event.modifiers.shift,
+                    alt: event.modifiers.alt,
+                    left: zone.origin.x.into(),
+                    right: (zone.origin.x + zone.size.width).into(),
+                    // The line spans the whole clip, not only the zone.
+                    top: top - SMART_CUT_TOP_CLEARANCE,
+                    height: height + SMART_CUT_TOP_CLEARANCE,
+                },
+                window,
+                cx,
+            );
+        })
+        .on_hover(move |hovered, window, cx| {
+            if !*hovered {
+                on_hover(&ClipCutGesture::Leave, window, cx);
+            }
+        })
+        // No stop_propagation: the clip body still selects on this press.
+        .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+            on_down(&ClipCutGesture::Leave, window, cx);
+        })
+        .on_click(move |event, window, cx| {
+            let gpui::ClickEvent::Mouse(click) = event else {
+                return;
+            };
+            // A drag of the clip that started here also ends here; that was a
+            // move, not a cut. So is every click without Option.
+            let travel = (click.up.position - click.down.position).magnitude() as f32;
+            if !smart_cut_click_splits(
+                &click.down.modifiers,
+                &click.up.modifiers,
+                click.down.click_count,
+                travel,
+                cx.has_active_drag(),
+            ) {
+                return;
+            }
+            on_cut(
+                &ClipCutGesture::Cut {
+                    clip_id: clip_id.clone(),
+                    window_x: click.up.position.x.into(),
+                    bypass_snap: click.up.modifiers.shift,
+                },
+                window,
+                cx,
+            );
         })
 }
 
@@ -499,9 +665,11 @@ pub fn audio_clip(
             };
     let gain_db = gain_to_db(clip.gain);
 
-    // Geometry offsets matching layout
-    let pad = 7.0;
-    let clip_h = row_height - pad * 2.0;
+    // Vertical geometry from the shared clip rectangle, the one the marquee
+    // hit-tests against.
+    let lane_rect = state.clip_lane_rect(clip, row_height);
+    let pad = lane_rect.top;
+    let clip_h = lane_rect.height;
 
     let id_num = {
         use std::hash::{Hash, Hasher};
@@ -529,7 +697,7 @@ pub fn audio_clip(
         start_beat: clip.start_beat,
         duration_beats: clip.duration_beats,
     };
-    const RESIZE_HANDLE_W: f32 = 6.0;
+    let resize_handle_w = clip_resize_handle_w(width);
     const HEADER_H: f32 = 20.0;
     // With no strip the waveform owns the whole clip, and the fade overlays
     // reach the bottom edge instead of stopping above a bar that is not there.
@@ -558,12 +726,9 @@ pub fn audio_clip(
             Colors::timeline_audio_clip_border(track_color, selected)
         })
         .cursor(if active_tool == TimelineTool::Cut {
-            // Cut tool: a click splits (never drags), so drop the move cursor.
-            if active_tool == TimelineTool::Pen {
-                gpui::CursorStyle::Crosshair
-            } else {
-                gpui::CursorStyle::Arrow
-            }
+            // Cut tool: a press splits (never drags), so the cursor says razor,
+            // not move — a stray `C` must not leave a silent split armed.
+            gpui::CursorStyle::Crosshair
         } else {
             gpui::CursorStyle::OpenHand
         })
@@ -577,9 +742,12 @@ pub fn audio_clip(
                 // a snapped beat (Shift bypasses snap, matching the lane tools).
                 if active_tool == TimelineTool::Cut {
                     if let Some(cut) = cut_cb.as_ref() {
-                        let x: f32 = event.position.x.into();
                         cut(
-                            &(clip_for_cut.clone(), x, event.modifiers.shift),
+                            &ClipCutGesture::Cut {
+                                clip_id: clip_for_cut.clone(),
+                                window_x: event.position.x.into(),
+                                bypass_snap: event.modifiers.shift,
+                            },
                             window,
                             cx,
                         );
@@ -632,6 +800,14 @@ pub fn audio_clip(
             left,
             width,
         )))
+        // Smart Tool: the Pointer's lower half cuts. Before the strip, so the
+        // strip's own controls (inline gain) stay on top of it.
+        .children(
+            (active_tool == TimelineTool::Pointer && show_resize_handles)
+                .then(|| on_cut_clip.clone())
+                .flatten()
+                .map(|cut| smart_cut_zone(&clip.id, id_num, resize_handle_w, cut)),
+        )
         // Processing strip: clip identity, inline gain, crossfade, and stretch.
         // Absent on a clip too narrow to show any of it — see
         // [`CLIP_STRIP_MIN_W`].
@@ -807,7 +983,7 @@ pub fn audio_clip(
                 .top_0()
                 .left_0()
                 .h_full()
-                .w(px(RESIZE_HANDLE_W))
+                .w(px(resize_handle_w))
                 .cursor(gpui::CursorStyle::ResizeLeft)
                 .id(("audio-clip-resize-l", id_num))
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -821,7 +997,7 @@ pub fn audio_clip(
                 .top_0()
                 .right_0()
                 .h_full()
-                .w(px(RESIZE_HANDLE_W))
+                .w(px(resize_handle_w))
                 .cursor(gpui::CursorStyle::ResizeRight)
                 .id(("audio-clip-resize-r", id_num))
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -861,11 +1037,67 @@ mod tests {
         );
         // Two 6 px handles need a body between them to leave anything to grab.
         assert!(CLIP_RESIZE_HANDLE_MIN_W >= 2.0 * super::RESIZE_HANDLE_W_FOR_TESTS);
+        assert_eq!(
+            super::clip_resize_handle_w(CLIP_RESIZE_HANDLE_MIN_W),
+            super::RESIZE_HANDLE_W_FOR_TESTS
+        );
+        // The wide handles still leave at least as much body as the narrow
+        // tier does, so the Smart Tool's drag and cut zones never vanish.
+        let wide = super::CLIP_WIDE_HANDLE_MIN_W;
+        assert!(
+            wide - 2.0 * super::clip_resize_handle_w(wide)
+                >= CLIP_RESIZE_HANDLE_MIN_W - 2.0 * super::RESIZE_HANDLE_W_FOR_TESTS
+        );
         // A clip wide enough for a few characters of name keeps its strip.
         assert!(
             CLIP_STRIP_MIN_W <= 64.0,
             "a readable clip lost its name bar"
         );
+    }
+
+    /// The Smart Tool cut zone used to split on any plain click in the lower
+    /// half of a clip, which is where people click to select it.
+    #[test]
+    fn only_an_option_single_click_splits_in_the_cut_zone() {
+        use super::smart_cut_click_splits as splits;
+        let plain = gpui::Modifiers::default();
+        let alt = gpui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let alt_shift = gpui::Modifiers {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        let cmd = gpui::Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        let cmd_alt = gpui::Modifiers {
+            platform: true,
+            alt: true,
+            ..Default::default()
+        };
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+
+        assert!(!splits(&plain, &plain, 1, 0.0, false), "a plain click selects");
+        assert!(!splits(&cmd, &cmd, 1, 0.0, false), "Cmd-click is additive select");
+        assert!(!splits(&shift, &shift, 1, 0.0, false));
+        assert!(!splits(&cmd_alt, &cmd_alt, 1, 0.0, false));
+
+        assert!(splits(&alt, &alt, 1, 0.0, false));
+        assert!(splits(&alt, &alt, 1, 2.0, false), "within the drag threshold");
+        assert!(splits(&alt_shift, &alt_shift, 1, 1.0, false), "Shift bypasses snap");
+
+        assert!(!splits(&alt, &alt, 1, 2.5, false), "past the drag threshold");
+        assert!(!splits(&alt, &alt, 2, 0.0, false), "part of a double-click");
+        assert!(!splits(&alt, &alt, 1, 0.0, true), "a drag is in flight");
+        assert!(!splits(&alt, &plain, 1, 0.0, false), "Option let go first");
+        assert!(!splits(&plain, &alt, 1, 0.0, false), "Option pressed late");
     }
 
     #[test]

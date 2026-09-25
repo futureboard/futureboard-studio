@@ -63,13 +63,13 @@ pub fn video_clip(
         }
     );
 
-    let left = state.beats_to_x(clip.start_beat);
-    let width = state
-        .beat_span_px(clip.start_beat, clip.duration_beats)
-        .max(10.0);
+    // The shared clip rectangle, the one the marquee hit-tests against.
+    let lane_rect = state.clip_lane_rect(clip, row_height);
+    let left = lane_rect.left;
+    let width = lane_rect.width;
 
-    let pad = 7.0;
-    let clip_h = row_height - pad * 2.0;
+    let pad = lane_rect.top;
+    let clip_h = lane_rect.height;
 
     let id_num = {
         use std::hash::{Hash, Hasher};

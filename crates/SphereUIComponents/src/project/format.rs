@@ -2990,6 +2990,56 @@ pub fn peek_project_header(data: &[u8]) -> Result<u32, ProjectError> {
     Ok(version)
 }
 
+/// Who a project file belongs to and when it was written: the fields at the
+/// start of the body, read by [`decode_project_identity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectIdentity {
+    pub version: u32,
+    pub id: String,
+    pub name: String,
+    pub created_at: u64,
+    pub modified_at: u64,
+}
+
+/// Validate a whole project file (magic, a version this build can open, the
+/// declared length and the body checksum) and read only its identity fields,
+/// without decoding tracks or plug-in state. Used to decide whether an
+/// autosave is intact, belongs to a project and is newer than it before
+/// offering it.
+pub fn decode_project_identity(data: &[u8]) -> Result<ProjectIdentity, ProjectError> {
+    let version = peek_project_header(data)?;
+    if version < MIN_SUPPORTED_VERSION {
+        return Err(ProjectError::UnsupportedVersion(version));
+    }
+    let body_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+    let body_end = PROJECT_HEADER_SIZE
+        .checked_add(body_len)
+        .filter(|end| end.checked_add(4).is_some_and(|total| total <= data.len()))
+        .ok_or_else(|| ProjectError::IncompleteFile {
+            reason: format!(
+                "file truncated: declared payload {body_len} bytes, file has {} bytes",
+                data.len()
+            ),
+        })?;
+    let body = &data[PROJECT_HEADER_SIZE..body_end];
+    let stored_crc = u32::from_le_bytes(data[body_end..body_end + 4].try_into().unwrap());
+    let computed_crc = crc32fast::hash(body);
+    if computed_crc != stored_crc {
+        return Err(ProjectError::ChecksumMismatch {
+            expected: stored_crc,
+            got: computed_crc,
+        });
+    }
+    let mut r = FbReader::new(body);
+    Ok(ProjectIdentity {
+        version,
+        id: r.read_str()?,
+        name: r.read_str()?,
+        created_at: r.read_u64()?,
+        modified_at: r.read_u64()?,
+    })
+}
+
 /// Decodes a `.fbproj` binary blob into a `FutureboardProject`.
 pub fn decode_project(data: &[u8]) -> Result<FutureboardProject, ProjectError> {
     decode_project_with_options(data, false)

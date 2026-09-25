@@ -315,6 +315,7 @@ impl Default for TimelineState {
                 track_area_height: 500.0,
                 panel_origin_x: 0.0,
                 lane_origin_x_measured: None,
+                timeline_origin_y_measured: None,
                 time_warp: TimeWarp::default(),
             },
             transport: TransportState {

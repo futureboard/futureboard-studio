@@ -272,6 +272,20 @@ pub fn setup(cx: &mut App) {
             StartupRoute::Welcome => {
                 log_startup_phase(StartupPhase::OpeningWelcome);
                 cx.update(open_welcome_window);
+                // Work from an untitled session that never reached its first
+                // save survives only as an autosave; offer it back once.
+                cx.update(|app| {
+                    sphere_ui_components::loading_session::offer_untitled_autosave_recovery(
+                        Arc::new(|path, app| {
+                            begin_load_project_from_welcome(
+                                path,
+                                ProjectOpenOptions::default(),
+                                app,
+                            );
+                        }),
+                        app,
+                    );
+                });
             }
             StartupRoute::EmptyWorkspace => {
                 log_startup_phase(StartupPhase::OpeningStudio);

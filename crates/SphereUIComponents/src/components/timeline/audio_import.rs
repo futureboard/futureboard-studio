@@ -316,11 +316,15 @@ fn eager_copy_disabled() -> bool {
 
 /// Phase D: if the project is saved and the dropped file lives outside its
 /// folder, copy it into `Assets/Audio` (deduped) on a background thread and
-/// retarget every clip sharing `asset_key` to the project-local copy. The
-/// asset id (`file_id`) is untouched, so the waveform binding — keyed on the
-/// asset id — is unaffected. Returns the path to actually decode (the copy when
-/// copied, otherwise the original). Falls back to the original on any error so a
-/// failed copy never breaks the clip.
+/// retarget every clip sharing `asset_key` to the project-local copy. Only when
+/// a file was actually copied does the asset id (`file_id`) move to the copy's
+/// project-relative path, with the waveform cache migrated to the new key; that
+/// happens right after a drop, before the id was ever saved. A source that
+/// already lives in the project (every reopened clip) keeps its id: it is the
+/// ARA audio-source persistentID and the peak-cache key, and must survive a
+/// reopen. Returns the path to actually decode (the copy when copied, otherwise
+/// the original) and the key to import under. Falls back to the original on any
+/// error so a failed copy never breaks the clip.
 async fn maybe_copy_into_project(
     asset_key: &str,
     path: PathBuf,
@@ -345,10 +349,12 @@ async fn maybe_copy_into_project(
     match copied {
         Ok(dest) => {
             let dest_str = dest.to_string_lossy().to_string();
-            let relative_asset_id =
-                relative_path_in_project(&dest, &root).unwrap_or_else(|| asset_key.to_string());
             let old_key = asset_key.to_string();
-            let new_key = relative_asset_id.clone();
+            let new_key = if dest != path {
+                relative_path_in_project(&dest, &root).unwrap_or_else(|| old_key.clone())
+            } else {
+                old_key.clone()
+            };
             let _ = timeline.update(cx, |timeline, cx| {
                 let mut changed = false;
                 if dest_str != path.to_string_lossy() {
@@ -629,6 +635,7 @@ pub fn schedule_project_waveform_restore(
 
     let mut seen = HashSet::new();
     let mut jobs: Vec<(String, PathBuf)> = Vec::new();
+    let mut engine_resync_needed = false;
     let entries = collect_waveform_restore_entries(project, &project_root);
 
     for (asset_id, audio_path) in entries {
@@ -674,16 +681,36 @@ pub fn schedule_project_waveform_restore(
                     peak_path.display()
                 );
                 let preview = Arc::new(preview);
+                let format = (
+                    preview.sample_rate,
+                    preview.channels,
+                    preview.total_frames,
+                    preview.duration_seconds,
+                );
                 waveform_cache::ingest_preview_as_chunks(&asset_id, preview);
                 waveform_cache::set_import_state(&asset_id, AudioImportState::Ready);
                 let asset_id_for_timeline = asset_id.clone();
-                let _ = timeline.update(cx, |timeline, cx| {
+                let changed = timeline.update(cx, |timeline, cx| {
+                    // No decode runs on a cache hit, so this is the only place
+                    // the reopened clips learn their source's format (the
+                    // Inspector's Source Duration). Metadata only: a saved
+                    // clip's window and length are what the user left.
+                    let (sample_rate, channels, total_frames, duration_seconds) = format;
+                    let changed = timeline.state.apply_cached_audio_source_format(
+                        &asset_id_for_timeline,
+                        sample_rate,
+                        channels,
+                        total_frames,
+                        duration_seconds,
+                    );
                     timeline.state.set_audio_import_for_asset(
                         &asset_id_for_timeline,
                         AudioImportState::Ready,
                     );
                     cx.notify();
+                    changed
                 });
+                engine_resync_needed |= changed;
             }
             Err(PeakFileError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!("[WaveformCache] disk miss asset_id={asset_id}");
@@ -707,6 +734,19 @@ pub fn schedule_project_waveform_restore(
                 }
             }
         }
+    }
+
+    if engine_resync_needed {
+        // A clip decoded for the first time had its window converted to the
+        // file's rate. Re-sync outside this StudioLayout update: updating the
+        // layout entity from inside its own update would double-lease it.
+        let layout_for_sync = layout.clone();
+        cx.defer(move |cx| {
+            let _ = layout_for_sync.update(cx, |this, cx| {
+                this.mark_engine_media_dirty();
+                this.schedule_audio_project_sync(cx, false, "waveform_cache_format");
+            });
+        });
     }
 
     if jobs.is_empty() {

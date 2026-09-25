@@ -1,5 +1,28 @@
 use super::*;
 
+impl ClipState {
+    /// Clip-id prefix of a track's live audio recording preview
+    /// (`layout::audio_recording_preview_clip_id`).
+    pub const AUDIO_RECORDING_PREVIEW_ID_PREFIX: &'static str = "__recording_preview__:";
+    /// Clip-id prefix of a track's live MIDI recording preview
+    /// (`recording_ops::midi_recording_preview_clip_id`).
+    pub const MIDI_RECORDING_PREVIEW_ID_PREFIX: &'static str = "__recording_midi_preview__:";
+
+    /// Whether `clip_id` names a UI-only recording preview clip. Those are
+    /// drawn while a take records and replaced by the committed take at Stop;
+    /// they must never reach the project file, which a save during recording
+    /// would otherwise write as an empty ghost clip.
+    pub fn is_recording_preview_clip_id(clip_id: &str) -> bool {
+        clip_id.starts_with(Self::AUDIO_RECORDING_PREVIEW_ID_PREFIX)
+            || clip_id.starts_with(Self::MIDI_RECORDING_PREVIEW_ID_PREFIX)
+    }
+
+    /// See [`Self::is_recording_preview_clip_id`].
+    pub fn is_recording_preview_clip(&self) -> bool {
+        Self::is_recording_preview_clip_id(&self.id)
+    }
+}
+
 impl TimelineState {
     pub fn insert_recorded_clip(
         &mut self,
@@ -19,6 +42,46 @@ impl TimelineState {
             duration_beats.max(0.01),
             Some(duration_seconds),
         )
+    }
+
+    /// Give a just-recorded clip the format its recorder wrote, so its source
+    /// window is real frames from the start instead of waiting for a waveform
+    /// import that may never run ("Generate waveform after record" off).
+    /// Until then it had no rate, trims before a decode fell back to 1 Hz, and
+    /// a reopen reset its window. Its length follows the tempo map and stretch
+    /// ratio like every decoded clip. Returns `false` if nothing was seeded.
+    pub fn seed_recorded_clip_source(
+        &mut self,
+        clip_id: &str,
+        sample_rate: u32,
+        duration_seconds: f64,
+    ) -> bool {
+        if sample_rate == 0 || !(duration_seconds > 0.0) {
+            return false;
+        }
+        let frames = (duration_seconds * sample_rate as f64).round() as u64;
+        let Some(clip) = self.recorded_clip_mut(clip_id) else {
+            return false;
+        };
+        clip.stretch.original_sample_rate = sample_rate;
+        clip.stretch.project_sample_rate = sample_rate;
+        clip.stretch.original_duration_samples = frames;
+        clip.stretch.source_start_samples = 0;
+        clip.stretch.source_end_samples = frames;
+        let length = self.find_clip(clip_id).and_then(|(_, clip)| {
+            Some((self.audio_clip_end_beat(clip)? - clip.start_beat as f64) as f32)
+        });
+        if let (Some(length), Some(clip)) = (length, self.recorded_clip_mut(clip_id)) {
+            clip.duration_beats = length;
+        }
+        true
+    }
+
+    fn recorded_clip_mut(&mut self, clip_id: &str) -> Option<&mut ClipState> {
+        self.tracks
+            .iter_mut()
+            .flat_map(|track| track.clips.iter_mut())
+            .find(|clip| clip.id == clip_id)
     }
 
     // ── Realtime recording preview clip (Part 1) ─────────────────────────

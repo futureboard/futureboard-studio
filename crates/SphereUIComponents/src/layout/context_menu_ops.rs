@@ -175,7 +175,8 @@ impl StudioLayout {
                 | ContextTarget::TimeSignature
                 | ContextTarget::ProjectKeyRoot
                 | ContextTarget::ProjectKeyScale
-                | ContextTarget::TimelineRuler { .. } => true,
+                | ContextTarget::TimelineRuler { .. }
+                | ContextTarget::SnapGrid => true,
                 ContextTarget::TimeSignaturePoint { .. }
                 | ContextTarget::TimeSignatureTrack { .. } => true,
                 ContextTarget::TempoTrack { .. } => true,

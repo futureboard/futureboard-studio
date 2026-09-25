@@ -33,10 +33,6 @@ fn lane_tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView
     move |_window, cx| cx.new(|_| LaneTooltipText(text)).into()
 }
 
-/// Top chrome height above the timeline ruler, so a window-space click can be
-/// mapped into a sub-lane-local value.
-use crate::shell_metrics::APP_CHROME_HEIGHT;
-
 /// Left inset for automation sub-lane header content. Keeps lane titles visually
 /// nested under the parent track without shifting the timeline grid.
 const AUTOMATION_SUBLANE_HEADER_INDENT: f32 = 28.0;
@@ -523,8 +519,7 @@ pub fn automation_lane(
                     let raw_beat = state_for.x_to_beats(lane_x);
                     let snapped_sec = state_for.snap_time(raw_beat * state_for.seconds_per_beat());
                     let beat = (snapped_sec / state_for.seconds_per_beat()).max(0.0);
-                    let content_y = wy - APP_CHROME_HEIGHT - state_for.arrangement_content_top()
-                        + state_for.viewport.scroll_y;
+                    let content_y = state_for.content_y_from_window_y(wy);
                     let local_y = content_y - lane_y_abs;
                     let value = automation_y_to_value(local_y, lane_height);
                     let additive = event.modifiers.shift || event.modifiers.control;
@@ -567,8 +562,7 @@ pub fn automation_lane(
                     // under the cursor, and snapping would move the probe onto
                     // a grid line the point is not on.
                     let beat = state_for.x_to_beats(lane_x).max(0.0);
-                    let content_y = wy - APP_CHROME_HEIGHT - state_for.arrangement_content_top()
-                        + state_for.viewport.scroll_y;
+                    let content_y = state_for.content_y_from_window_y(wy);
                     let local_y = content_y - lane_y_abs;
                     let value = automation_y_to_value(local_y, lane_height);
                     if delete_cb(&(tid.clone(), lid.clone(), beat, value), window, cx) {
@@ -601,8 +595,7 @@ pub fn automation_lane(
                 let raw_beat = state_for.x_to_beats(lane_x);
                 let snapped_sec = state_for.snap_time(raw_beat * state_for.seconds_per_beat());
                 let beat = (snapped_sec / state_for.seconds_per_beat()).max(0.0);
-                let content_y = wy - APP_CHROME_HEIGHT - state_for.arrangement_content_top()
-                    + state_for.viewport.scroll_y;
+                let content_y = state_for.content_y_from_window_y(wy);
                 let local_y = content_y - lane_y_abs;
                 let value = automation_y_to_value(local_y, lane_height);
                 hover_cb(&(tid.clone(), lid.clone(), beat, value), window, cx);

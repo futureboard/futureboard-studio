@@ -230,36 +230,11 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) -> bool {
         let project = &package.project;
-        let path = &package.path;
         let expected_tracks = expected_persisted_track_count(&project.tracks);
 
-        // A project imported from another DAW's file has no Futureboard file to
-        // save back into: bind it untitled and dirty so the first save is a
-        // Save As and the imported file is never overwritten.
-        if crate::project::is_import_path(path) {
-            self.project_session
-                .bind_untitled(project.name.clone(), true);
-            session_log!("session bound from import: name={}", project.name);
-        } else {
-            let folder = path.parent().map(PathBuf::from);
-            self.project_session.bind_saved(
-                project.id.clone(),
-                project.name.clone(),
-                folder,
-                path.clone(),
-                project.created_at,
-                project.modified_at,
-            );
-            session_log!(
-                "session bound: name={} path={}",
-                self.project_session.name,
-                path.display()
-            );
-        }
+        self.bind_session_to_loaded_project(package);
         self.sync_project_session_to_workspace(cx);
-        self.recent_projects
-            .push(&project.name, path.clone(), now_secs());
-        self.sync_recent_to_switcher();
+        self.push_loaded_project_to_recents(package);
 
         // Count only persisted project tracks. VSTi multi-out child strips
         // (`vsti-out:*`) are runtime-derived from the plugin's output bus layout
@@ -456,6 +431,7 @@ impl StudioLayout {
                         open_options,
                         install_handoff: None,
                         restore_warnings: Vec::new(),
+                        recovered_from_autosave: false,
                     };
                     this.install_loaded_session(package, cx);
                     if this.session_install_status.is_failed() {
@@ -875,7 +851,6 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) -> bool {
         let project = &package.project;
-        let path = &package.path;
         let expected_tracks = expected_persisted_track_count(&project.tracks);
 
         self.teardown_all_plugin_instances(cx, "project_load_replace");
@@ -913,13 +888,47 @@ impl StudioLayout {
             self.reopen_audio_with_sample_rate(project_rate, cx);
         }
 
-        // A project imported from another DAW's file has no Futureboard file to
-        // save back into: bind it untitled and dirty so the first save is a
-        // Save As and the imported file is never overwritten.
+        self.bind_session_to_loaded_project(package);
+        // Compile the loaded project's routing — including Master/Monitor
+        // hardware ownership — before anything can play.
+        self.publish_audio_connection_routing(cx);
+        self.sync_project_session_to_workspace(cx);
+        self.push_loaded_project_to_recents(package);
+        true
+    }
+
+    /// Whether a loaded package must bind as an untitled session: a foreign
+    /// DAW import, or an untitled session's recovered autosave. Neither has a
+    /// Futureboard project file of its own to save back into.
+    fn loaded_package_binds_untitled(&self, path: &std::path::Path) -> bool {
+        crate::project::is_import_path(path)
+            || crate::project::io::is_untitled_autosave_path(path, &self.paths.app_data)
+    }
+
+    /// Bind `project_session` to a freshly loaded package, and remember its
+    /// asset records for the next save.
+    fn bind_session_to_loaded_project(&mut self, package: &LoadedSessionPackage) {
+        let project = &package.project;
+        let path = &package.path;
         if crate::project::is_import_path(path) {
+            // A project imported from another DAW's file has no Futureboard
+            // file to save back into: bind it untitled and dirty so the first
+            // save is a Save As and the imported file is never overwritten.
             self.project_session
                 .bind_untitled(project.name.clone(), true);
             session_log!("session bound from import: name={}", project.name);
+        } else if self.loaded_package_binds_untitled(path) {
+            // Recovered untitled work. Keeping the autosave's id makes later
+            // autosaves overwrite that file, and a Save As removes it.
+            self.project_session.bind_recovered_untitled(
+                project.id.clone(),
+                project.name.clone(),
+                project.created_at,
+            );
+            session_log!(
+                "session recovered from untitled autosave: {}",
+                path.display()
+            );
         } else {
             let folder = path.parent().map(PathBuf::from);
             self.project_session.bind_saved(
@@ -930,20 +939,28 @@ impl StudioLayout {
                 project.created_at,
                 project.modified_at,
             );
+            if package.recovered_from_autosave {
+                // The recovered work is only in the autosave until it is saved.
+                self.project_session.mark_dirty();
+            }
             session_log!(
-                "session bound: name={} path={}",
+                "session bound: name={} path={} recovered_from_autosave={}",
                 self.project_session.name,
-                path.display()
+                path.display(),
+                package.recovered_from_autosave
             );
         }
-        // Compile the loaded project's routing — including Master/Monitor
-        // hardware ownership — before anything can play.
-        self.publish_audio_connection_routing(cx);
-        self.sync_project_session_to_workspace(cx);
+        self.remember_loaded_assets(project.assets.clone());
+    }
+
+    fn push_loaded_project_to_recents(&mut self, package: &LoadedSessionPackage) {
+        // An untitled autosave lives in app data; it is not a project to reopen.
+        if crate::project::io::is_untitled_autosave_path(&package.path, &self.paths.app_data) {
+            return;
+        }
         self.recent_projects
-            .push(&project.name, path.clone(), now_secs());
+            .push(&package.project.name, package.path.clone(), now_secs());
         self.sync_recent_to_switcher();
-        true
     }
 
     pub(super) fn validate_session_references(&mut self, cx: &mut Context<Self>) {
@@ -995,8 +1012,9 @@ impl StudioLayout {
         };
         // Cubase/Nuendo XML (and other foreign imports) bind untitled: never
         // write peak caches or copy media into the archive's folder. Native
-        // `.fbproj` sessions keep peak files under the project tree.
-        let persist_peaks = !crate::project::is_import_path(&package.path);
+        // `.fbproj` sessions keep peak files under the project tree. A
+        // recovered untitled autosave has no project tree either.
+        let persist_peaks = !self.loaded_package_binds_untitled(&package.path);
         let timeline = self.timeline.clone();
         let layout = cx.entity().clone();
         crate::components::timeline::audio_import::schedule_project_waveform_restore(

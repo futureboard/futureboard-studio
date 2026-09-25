@@ -181,6 +181,7 @@ impl StudioLayout {
                         }
                         1 => {
                             shutdown::log("unsaved dialog: Don't Save");
+                            this.discard_session_recovery();
                             this.perform_pending_after_guard(cx);
                         }
                         _ => {

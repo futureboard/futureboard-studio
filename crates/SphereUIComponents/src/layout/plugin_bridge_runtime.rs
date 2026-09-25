@@ -246,6 +246,25 @@ impl PluginBridgeRuntime {
             .cloned()
     }
 
+    /// Re-file every instance (loaded or still loading) under the track that
+    /// now owns it, as `owner_of` reports. An insert moved to another channel
+    /// keeps its instance id, and the host process keeps the instance, but the
+    /// descriptor's track is what the MIDI fallback routes by
+    /// (`loaded_for_track`). Returns how many changed.
+    pub fn retarget_tracks<'a>(&mut self, owner_of: impl Fn(&str) -> Option<&'a str>) -> usize {
+        let mut changed = 0;
+        for (instance, loaded) in self.loaded.iter_mut() {
+            let Some(owner) = owner_of(instance) else {
+                continue;
+            };
+            if loaded.descriptor.track_id != owner {
+                loaded.descriptor.track_id = owner.to_string();
+                changed += 1;
+            }
+        }
+        changed
+    }
+
     pub fn mark_plugin_loaded(&mut self, instance: &str) -> bool {
         let Some(loaded) = self.loaded.get_mut(instance) else {
             eprintln!("[plugin-bridge] confirmed load for unknown instance={instance}");

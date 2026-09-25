@@ -493,8 +493,10 @@ impl TimelineState {
     /// anything changed. UI-mutating only — the caller records undo / marks dirty.
     pub fn set_clip_length_trimming(&mut self, clip_id: &str, duration_beats: f32) -> bool {
         let seconds_per_beat = self.seconds_per_beat();
+        let project_rate = self.project_sample_rate;
         for track in &mut self.tracks {
             if let Some(clip) = track.clips.iter_mut().find(|clip| clip.id == clip_id) {
+                clip.assume_project_rate_until_decoded(project_rate);
                 let min_len = match &clip.clip_type {
                     ClipType::Midi { notes, .. } => {
                         let last_note_end = notes
@@ -875,6 +877,7 @@ impl TimelineState {
                 .max(0.0)
         };
         let seconds_per_beat = self.seconds_per_beat();
+        let project_rate = self.project_sample_rate;
         let Some(track) = self
             .tracks
             .iter_mut()
@@ -885,6 +888,8 @@ impl TimelineState {
         let Some(clip) = track.clips.iter_mut().find(|c| c.id == clip_id) else {
             return false;
         };
+        // No 1 Hz trim math for a clip whose file is not decoded yet.
+        clip.assume_project_rate_until_decoded(project_rate);
 
         let is_midi = matches!(clip.clip_type, ClipType::Midi { .. });
         let min_len = if is_midi {
