@@ -23,7 +23,10 @@ pub mod transients;
 #[cfg(feature = "onnx")]
 pub mod onnx;
 
-pub use bpm::{TempoCandidate, TempoEstimate, estimate_bpm_candidates};
+pub use bpm::{
+    TempoCandidate, TempoEstimate, TempoFamily, TempoHypothesis, estimate_bpm_candidates,
+    octave_ratio, tempo_families,
+};
 pub use chords::{ChordKind, ChordLabel, ChordOptions, ChordSegment, recognize_chords};
 pub use chroma::{ChromaFrames, chroma_frames};
 pub use error::AnalysisError;

@@ -18,10 +18,11 @@ pub use analysis::{
     AnalysisOptions, AudioAnalysis, Classifier, FftSize, FrequencyFocus, HeuristicClassifier,
     InstrumentCategory, InstrumentEstimate, KeyEstimate, KeyMode, LoudnessMeasurement,
     PhaseMeasurement, PitchClass, SpectralFeatures, SpectrumMode, SpectrumSmoothing,
-    SpectrumSnapshot, SpectrumWindow, TempoCandidate, TempoEstimate, TransientDetectParams,
-    TransientMarker, analyze_loudness, analyze_mono, analyze_mono_with, analyze_ring_window,
-    analyze_spectrum, analyze_stereo, detect_transients, estimate_bpm_candidates,
-    estimate_key_ranked, measure_phase, pitch_class_profile, rank_keys,
+    SpectrumSnapshot, SpectrumWindow, TempoCandidate, TempoEstimate, TempoFamily, TempoHypothesis,
+    TransientDetectParams, TransientMarker, analyze_loudness, analyze_mono, analyze_mono_with,
+    analyze_ring_window, analyze_spectrum, analyze_stereo, detect_transients,
+    estimate_bpm_candidates, estimate_key_ranked, measure_phase, octave_ratio, pitch_class_profile,
+    rank_keys, tempo_families,
 };
 
 pub use clip_process::{
