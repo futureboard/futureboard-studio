@@ -33,7 +33,8 @@ pub use error::AnalysisError;
 pub use features::{FEATURE_VECTOR_LEN, SpectralFeatures};
 pub use instrument::{Classifier, HeuristicClassifier, InstrumentCategory, InstrumentEstimate};
 pub use key::{
-    KeyEstimate, KeyMode, PitchClass, estimate_key_ranked, pitch_class_profile, rank_keys,
+    KeyEstimate, KeyMode, PitchClass, estimate_key_ranked, key_correlations, pitch_class_profile,
+    rank_keys,
 };
 pub use loudness::{LoudnessMeasurement, analyze_loudness};
 pub use phase::{PhaseMeasurement, measure_phase};

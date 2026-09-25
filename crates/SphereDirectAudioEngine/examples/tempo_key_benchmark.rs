@@ -51,8 +51,8 @@ use std::time::Instant;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use SphereAudioProcessor::analysis::{
-    analyze_rhythm, chroma_frames, recognize_chords, ChordKind, ChordOptions, ChordSegment,
-    RhythmAnalysis, RhythmOptions,
+    analyze_rhythm, chroma_frames, key_correlations, recognize_chords, tempo_families, ChordKind,
+    ChordOptions, ChordSegment, RhythmAnalysis, RhythmOptions,
 };
 use SphereAudioProcessor::{
     downmix_interleaved, estimate_bpm_candidates, pitch_class_profile, rank_keys, KeyMode,
@@ -350,6 +350,72 @@ fn finder_bpm(candidates: &[TempoCandidate]) -> Option<f32> {
         .map(|c| c.bpm)
 }
 
+/// Key diagnostics. Nothing here feeds the detector; it describes how
+/// decisive the evidence was.
+///
+/// - the raw profile correlations of the best four keys and the top-1/top-2
+///   margin (a small margin is a near tie, whatever the winner);
+/// - the entropy of the pitch-class profile, normalised so 1.0 is perfectly
+///   flat (no tonal centre to find); seven equally weighted scale notes
+///   would read 0.78, and full mixes, which leak energy into every class,
+///   sit around 0.9-0.95 — the flatter end often means a modulation;
+/// - the tuning offset the chroma analysis removed (a recording near ±50
+///   cents sits between two semitones and can read a semitone off);
+/// - the key of every 30 s stretch, by the same profile method, to show
+///   modulations or a key the whole-file profile averaged away.
+fn key_diagnostics(
+    profile: Option<&[f32; 12]>,
+    mono: &[f32],
+    sample_rate: f32,
+    tuning: Option<f32>,
+) -> Value {
+    const SECTION_SECONDS: f64 = 30.0;
+    let top = |profile: &[f32; 12], n: usize| -> Vec<(String, f32)> {
+        key_correlations(profile)
+            .into_iter()
+            .take(n)
+            .map(|(score, tonic, mode)| (key_name((tonic as u8, mode == KeyMode::Minor)), score))
+            .collect()
+    };
+    let Some(profile) = profile else {
+        return json!(null);
+    };
+    let best = top(profile, 4);
+    let margin = best[0].1 - best[1].1;
+    let entropy = -profile
+        .iter()
+        .filter(|&&p| p > 0.0)
+        .map(|&p| p * p.ln())
+        .sum::<f32>()
+        / 12f32.ln();
+    let step = (SECTION_SECONDS * sample_rate as f64) as usize;
+    let sections: Vec<Value> = (0..mono.len())
+        .step_by(step.max(1))
+        .filter_map(|start| {
+            let end = (start + step).min(mono.len());
+            // A short tail holds too little to name a key.
+            if (end - start) < step / 3 {
+                return None;
+            }
+            let profile = pitch_class_profile(&mono[start..end], sample_rate)?;
+            let (key, score) = top(&profile, 1).into_iter().next()?;
+            Some(json!({
+                "start": (start as f64 / sample_rate as f64).round(),
+                "end": (end as f64 / sample_rate as f64).round(),
+                "key": key,
+                "correlation": round2(score as f64),
+            }))
+        })
+        .collect();
+    json!({
+        "top": best.iter().map(|(key, score)| json!({ "key": key, "correlation": round2(*score as f64) })).collect::<Vec<_>>(),
+        "margin": (margin as f64 * 1000.0).round() / 1000.0,
+        "profile_entropy": round2(entropy as f64),
+        "tuning_cents": tuning.map(|t| (t as f64 * 100.0).round()),
+        "sections": sections,
+    })
+}
+
 fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
@@ -379,10 +445,8 @@ fn analyze(dataset: &Path, song: &Song) -> Result<Outcome, String> {
     let seconds = mono.len() as f64 / sample_rate as f64;
 
     let tempos = estimate_bpm_candidates(&mono, sample_rate, MIN_BPM, MAX_BPM);
-    let keys = pitch_class_profile(&mono, sample_rate)
-        .as_ref()
-        .map(rank_keys)
-        .unwrap_or_default();
+    let profile = pitch_class_profile(&mono, sample_rate);
+    let keys = profile.as_ref().map(rank_keys).unwrap_or_default();
     let frames = chroma_frames(&mono, sample_rate);
     let rhythm = analyze_rhythm(
         &mono,
@@ -454,10 +518,20 @@ fn analyze(dataset: &Path, song: &Song) -> Result<Outcome, String> {
         })).collect::<Vec<_>>(),
         "key_class": key_class,
         "key_score": key_points,
+        "key_diagnostics": key_diagnostics(
+            profile.as_ref(),
+            &mono,
+            sample_rate,
+            frames.as_ref().map(|f| f.tuning),
+        ),
         "tempo_truth": sequence,
         "tempo_candidates": tempos.iter().map(|t| json!({
             "bpm": round2(t.bpm as f64),
             "confidence": round2(t.confidence as f64),
+        })).collect::<Vec<_>>(),
+        "candidate_families": tempo_families(&tempos).iter().map(|f| json!({
+            "bpm": round2(f.canonical_bpm as f64),
+            "other_levels": f.alternatives.iter().map(|h| round2(h.bpm as f64)).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "tempo_top": top.map(|b| round2(b as f64)),
         "finder_bpm": finder.map(|b| round2(b as f64)),
@@ -466,11 +540,17 @@ fn analyze(dataset: &Path, song: &Song) -> Result<Outcome, String> {
         "rhythm_confidence": rhythm.as_ref().map(|r| round2(r.confidence as f64)),
         "beats_per_bar": rhythm.as_ref().map(|r| r.beats_per_bar),
         "beat_count": rhythm.as_ref().map(|r| r.beats.len()),
-        "sections": rhythm.as_ref().map(|r| r.sections.iter().map(|s| json!({
+        "sections": rhythm.as_ref().map(|r| r.sections.iter().enumerate().map(|(i, s)| json!({
             "start": (s.start_seconds * 10.0).round() / 10.0,
             "end": (s.end_seconds * 10.0).round() / 10.0,
             "bpm": round2(s.bpm as f64),
+            "other_levels": r.families.get(i).map(|f| f.alternatives.iter().map(|h| json!({
+                "bpm": round2(h.bpm as f64),
+                "evidence": round2(h.evidence as f64),
+                "score": round2(h.score as f64),
+            })).collect::<Vec<_>>()),
         })).collect::<Vec<_>>()),
+        "tracked_beat_count": rhythm.as_ref().map(|r| r.tracked_beats.len()),
         "sections_collapsed": collapsed.iter().map(|&b| round2(b as f64)).collect::<Vec<_>>(),
         "tempo_top_class": outcome.tempo_top,
         "tempo_finder_class": outcome.tempo_finder,
@@ -711,6 +791,43 @@ fn main() {
             chord_n += 1;
             chord_sum += accuracy;
             println!("  chords majmin {:.0}%", accuracy * 100.0);
+        }
+        let diag = &j["key_diagnostics"];
+        if !diag.is_null() {
+            let list = |v: &Value, field: &str| {
+                v.as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|i| format!("{} {}", i["key"].as_str().unwrap_or(""), i[field]))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default()
+            };
+            println!(
+                "  key diag: {} | margin {} | profile entropy {} (1 = flat) | tuning {} cents",
+                list(&diag["top"], "correlation"),
+                diag["margin"],
+                diag["profile_entropy"],
+                diag["tuning_cents"],
+            );
+            let sections: Vec<String> = diag["sections"]
+                .as_array()
+                .map(|s| {
+                    s.iter()
+                        .map(|s| {
+                            format!(
+                                "{}-{}s {}",
+                                s["start"],
+                                s["end"],
+                                s["key"].as_str().unwrap_or("")
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            println!("  key by 30 s: {}", sections.join(" | "));
         }
         all_json.push(o.json.clone());
     }

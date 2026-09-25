@@ -336,17 +336,7 @@ fn estimate_tuning(partials: &[Partial]) -> f32 {
 /// alternates carry the winner's confidence scaled by their own correlation
 /// relative to the winner, so the list reads in one consistent order.
 pub fn rank_keys(chroma: &[f32; 12]) -> Vec<KeyEstimate> {
-    let mut ranked: Vec<(f32, PitchClass, KeyMode)> = Vec::with_capacity(24);
-    for tonic in 0..12 {
-        for (mode, profile) in [
-            (KeyMode::Major, &MAJOR_PROFILE),
-            (KeyMode::Minor, &MINOR_PROFILE),
-        ] {
-            let score = correlation(chroma, profile, tonic);
-            ranked.push((score, PitchClass::from_index(tonic as i32), mode));
-        }
-    }
-    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let ranked = key_correlations(chroma);
     let best = ranked[0].0;
     let margin = if best > 0.0 {
         ((best - ranked[1].0) / best).clamp(0.0, 1.0)
@@ -365,6 +355,23 @@ pub fn rank_keys(chroma: &[f32; 12]) -> Vec<KeyEstimate> {
             },
         })
         .collect()
+}
+
+/// All 24 keys with their raw profile correlation (`-1..1`), best first — the
+/// scores [`rank_keys`] ranks, for diagnostics.
+pub fn key_correlations(chroma: &[f32; 12]) -> Vec<(f32, PitchClass, KeyMode)> {
+    let mut ranked: Vec<(f32, PitchClass, KeyMode)> = Vec::with_capacity(24);
+    for tonic in 0..12 {
+        for (mode, profile) in [
+            (KeyMode::Major, &MAJOR_PROFILE),
+            (KeyMode::Minor, &MINOR_PROFILE),
+        ] {
+            let score = correlation(chroma, profile, tonic);
+            ranked.push((score, PitchClass::from_index(tonic as i32), mode));
+        }
+    }
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    ranked
 }
 
 /// Pearson correlation between the chroma vector and a profile rotated so that
