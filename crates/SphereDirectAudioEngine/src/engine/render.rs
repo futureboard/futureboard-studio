@@ -868,10 +868,38 @@ fn render_signalsmith_clip_segment(
     // or overlap, and the source is never over-read. The stretcher consumes
     // exactly these `input_frames` samples to produce `frames` output (time ratio
     // = frames / input_frames), so it never has to buffer/grow across calls.
-    let (in_start, input_frames) = signalsmith_input_span(rel_start, frames, time_ratio);
-    let total_input = (duration_samples as f64 / time_ratio).floor() as i64;
     let output_sr = output_sample_rate.max(1) as f64;
     let source_sr = source.sample_rate() as f64;
+    // A warped clip's stream is the source itself, resampled to the output
+    // rate: stream index `k` is source frame `k * source_sr / output_sr`, and
+    // the output segment consumes exactly the stream span its warp map covers.
+    // The map is monotonic, so `floor` of it tiles the stream contiguously the
+    // same way `signalsmith_input_span` does for a constant ratio. The local
+    // time ratio (`frames / input_frames`) follows each warp segment's slope,
+    // so pitch stays put while the speed changes between markers.
+    let warp_span = {
+        let clip = &runtime.clips[clip_index];
+        (!clip.warp_segments.is_empty()).then(|| {
+            let to_stream = |rel: u64| -> f64 {
+                crate::runtime::map_warp_source_frame(
+                    rel,
+                    duration_samples,
+                    false,
+                    &clip.warp_segments,
+                )
+                .unwrap_or(0.0)
+                    * output_sr
+                    / source_sr.max(1.0)
+            };
+            let in_start = to_stream(rel_start).floor() as i64;
+            let in_end = to_stream(rel_start + frames as u64).floor() as i64;
+            (in_start, (in_end - in_start).max(1) as usize)
+        })
+    };
+    let warped = warp_span.is_some();
+    let (in_start, input_frames) =
+        warp_span.unwrap_or_else(|| signalsmith_input_span(rel_start, frames, time_ratio));
+    let total_input = (duration_samples as f64 / time_ratio).floor() as i64;
 
     // Source-stream index → source sample position (reverse-aware). Reading the
     // source at the output sample rate lets the seconds map handle the
@@ -879,6 +907,9 @@ fn render_signalsmith_clip_segment(
     // Shared by the pre-roll priming and the per-block feed so both read one
     // contiguous stream.
     let source_pos_at = |stream_index: i64| -> f64 {
+        if warped {
+            return stream_index as f64 * source_sr / output_sr;
+        }
         let effective = if reverse {
             (total_input - 1 - stream_index).max(0)
         } else {
@@ -911,7 +942,11 @@ fn render_signalsmith_clip_segment(
     // (Signalsmith ≈120 ms) does not drift behind the rest of the mix.
     // Zero-latency backends report `seek_input_len == 0` and just reset.
     if clip.stretch_next_project_sample != Some(project_start_sample) {
-        let playback_rate = (1.0 / time_ratio.max(0.05)) as f32;
+        let playback_rate = if warped {
+            (input_frames as f64 / frames.max(1) as f64) as f32
+        } else {
+            (1.0 / time_ratio.max(0.05)) as f32
+        };
         let seek_len = processor.seek_input_len(playback_rate);
         if seek_len > 0 {
             if seek_len > clip.stretch_prime_l.len() || seek_len > clip.stretch_prime_r.len() {
@@ -1399,9 +1434,12 @@ fn render_project_block_interleaved_core(
                 let segment_render_frames = render_end.saturating_sub(render_start);
                 let project_render_start = segment_sample + render_start as u64;
                 let rel_start = project_render_start - clip_start;
+                // Warped clips stream through the stretcher too, so Keep
+                // Pitch and transpose hold on them; only a reversed warp (the
+                // editor refuses to create one) keeps the resample path.
                 let warped = !runtime.clips[clip_index].warp_segments.is_empty();
                 if clip_stretch_backend == StretchBackend::Signalsmith
-                    && !warped
+                    && !(warped && clip_reverse)
                     && render_signalsmith_clip_segment(
                         runtime,
                         clip_index,
@@ -4710,5 +4748,175 @@ mod fade_curve_tests {
         for curve in [FadeCurve::EqualPower, FadeCurve::Linear] {
             assert_eq!(FadeCurve::from_tag(curve.tag()), curve);
         }
+    }
+}
+
+#[cfg(test)]
+mod warp_stretch_render_tests {
+    use super::render_project_block_interleaved;
+    use crate::audio_file::AudioFileBuffer;
+    use crate::audio_source::ClipAudioSource;
+    use crate::runtime::RuntimeProject;
+    use crate::types::{
+        EngineClipSnapshot, EngineProjectSnapshot, EngineRoutingSnapshot, EngineTrackSnapshot,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const SR: u32 = 48_000;
+
+    fn track(id: &str, track_type: &str) -> EngineTrackSnapshot {
+        EngineTrackSnapshot {
+            id: id.to_string(),
+            track_type: track_type.to_string(),
+            volume: 1.0,
+            pan: 0.0,
+            muted: false,
+            solo: false,
+            armed: false,
+            input_monitor: false,
+            input_source: Default::default(),
+            preview_mode: "stereo".to_string(),
+            output_track_id: None,
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            automation_lanes: Vec::new(),
+            builtin_soundfont_player: false,
+            soundfont_path: None,
+            soundfont_preset_bank: None,
+            soundfont_preset_patch: None,
+            soundfont_volume: 1.0,
+            soundfont_reverb_chorus: true,
+            soundfont_polyphony: 64,
+            soundfont_envelope: Default::default(),
+            soundfont_quality: Default::default(),
+            solfege_engine: None,
+        }
+    }
+
+    /// A Keep-Pitch Warp clip — 2 s of a 220 Hz tone over 4 beats at 120 BPM,
+    /// with one marker squeezing the first half-second of audio into the first
+    /// second — used to fall back to plain resampling, so its pitch moved with
+    /// every segment. It must now stream through the pitch-preserving
+    /// stretcher and still produce the whole clip.
+    #[test]
+    fn keep_pitch_warp_clip_renders_through_the_stretcher() {
+        if !SphereAudioProcessor::signalsmith_stretch_available() {
+            return; // C++ backend not built in this environment.
+        }
+        let frames = 96_000usize;
+        let samples: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let v = (i as f32 * 220.0 * std::f32::consts::TAU / SR as f32).sin() * 0.5;
+                [v, v]
+            })
+            .collect();
+        let mut cache: HashMap<String, Arc<ClipAudioSource>> = HashMap::new();
+        cache.insert(
+            "tone.wav".to_string(),
+            Arc::new(ClipAudioSource::InMemory(Arc::new(AudioFileBuffer {
+                sample_rate: SR,
+                channels: 2,
+                frames,
+                samples,
+            }))),
+        );
+        let audio_process = serde_json::from_value(serde_json::json!({
+            "speedRatio": 1.0,
+            "pitchSemitones": 0.0,
+            "preservePitch": true,
+            "mode": "warp",
+            "quality": "Phase Vocoder",
+            "sourceStartSamples": 0,
+            "sourceEndSamples": frames,
+            "warpMarkers": [
+                { "id": 1, "sourceSample": 24_000, "timelineBeat": 2.0, "locked": false }
+            ]
+        }))
+        .expect("audio process");
+        let clip = EngineClipSnapshot {
+            id: "warp".to_string(),
+            track_id: "audio-1".to_string(),
+            asset_id: "tone".to_string(),
+            media_path: Some("tone.wav".to_string()),
+            start_beat: 0.0,
+            duration_beats: 4.0,
+            offset_seconds: 0.0,
+            gain: 1.0,
+            muted: false,
+            ara_rendered: false,
+            fades: None,
+            stretch: SphereAudioProcessor::StretchParams {
+                mode: SphereAudioProcessor::StretchMode::Warp,
+                algorithm: SphereAudioProcessor::StretchAlgorithm::PreservePitch,
+                time_ratio: 1.0,
+                preserve_pitch: true,
+                target_bpm: Some(120.0),
+                ..SphereAudioProcessor::StretchParams::default()
+            },
+            audio_process: Some(audio_process),
+        };
+        let snapshot = EngineProjectSnapshot {
+            project_id: "warp-stretch".to_string(),
+            project_root: None,
+            preferred_input_device: None,
+            bpm: 120.0,
+            tempo_points: Vec::new(),
+            time_signature: [4, 4],
+            sample_rate: SR,
+            tracks: vec![track("audio-1", "audio"), track("master", "master")],
+            clips: vec![clip],
+            midi_clips: Vec::new(),
+            pdc_enabled: true,
+            latency_graph_version: 1,
+            routing: EngineRoutingSnapshot {
+                master_output_device: None,
+                sample_rate: SR,
+                buffer_size: 512,
+            },
+        };
+        let mut runtime =
+            RuntimeProject::build(&snapshot, SR, &mut cache, None, true).expect("runtime");
+        assert_eq!(runtime.clips.len(), 1);
+        assert!(!runtime.clips[0].warp_segments.is_empty());
+        assert!(runtime.clips[0].stretch_processor.is_some());
+
+        let block = 512usize;
+        let mut output = vec![0.0f32; block * 2];
+        let mut energy_by_second = [0.0f64; 2];
+        let mut sample = 0u64;
+        while (sample as usize) < frames {
+            output.iter_mut().for_each(|v| *v = 0.0);
+            render_project_block_interleaved(
+                &mut runtime,
+                sample,
+                1.0,
+                &mut output,
+                2,
+                true,
+                4,
+                4,
+                None,
+            );
+            assert!(output.iter().all(|v| v.is_finite()));
+            // The stretcher path records where its stream continues; the
+            // resample fallback never touches it.
+            assert!(
+                runtime.clips[0].stretch_next_project_sample.is_some(),
+                "block at {sample} fell back to resampling"
+            );
+            let second = (sample as usize / SR as usize).min(1);
+            energy_by_second[second] += output.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+            sample += block as u64;
+        }
+        // Both warp segments are heard — neither half was starved of input.
+        assert!(
+            energy_by_second[0] > 100.0,
+            "first segment {energy_by_second:?}"
+        );
+        assert!(
+            energy_by_second[1] > 100.0,
+            "second segment {energy_by_second:?}"
+        );
     }
 }

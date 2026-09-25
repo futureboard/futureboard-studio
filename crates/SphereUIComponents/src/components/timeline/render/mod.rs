@@ -28,8 +28,9 @@ pub use snapshot::{
 pub use viewport::TimelineViewport;
 #[cfg(feature = "gpu-renderer")]
 pub use wgpu_renderer::{
-    detect_gpu_class, list_available_gpu_devices, set_preferred_gpu_device_id, GpuDeviceInfo,
-    TimelineGpuPreference, WgpuOffscreenFrame, WgpuTimelineRenderer,
+    cached_gpu_devices, detect_gpu_class, gpu_devices, list_available_gpu_devices,
+    set_preferred_gpu_device_id, GpuDeviceInfo, TimelineGpuPreference, WgpuOffscreenFrame,
+    WgpuTimelineRenderer,
 };
 
 #[cfg(not(feature = "gpu-renderer"))]
@@ -59,4 +60,14 @@ pub struct GpuDeviceInfo {
 #[cfg(not(feature = "gpu-renderer"))]
 pub fn list_available_gpu_devices() -> Vec<GpuDeviceInfo> {
     Vec::new()
+}
+
+#[cfg(not(feature = "gpu-renderer"))]
+pub fn gpu_devices() -> std::sync::Arc<Vec<GpuDeviceInfo>> {
+    std::sync::Arc::new(Vec::new())
+}
+
+#[cfg(not(feature = "gpu-renderer"))]
+pub fn cached_gpu_devices() -> Option<std::sync::Arc<Vec<GpuDeviceInfo>>> {
+    Some(gpu_devices())
 }

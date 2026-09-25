@@ -65,7 +65,7 @@ impl TimelineState {
                     continue;
                 }
                 if let ClipType::Midi { sysex_events, .. } = &mut clip.clip_type {
-                    bump_midi_edit_revision();
+                    bump_midi_clip_revision(clip_id);
                     *sysex_events = events;
                     return true;
                 }

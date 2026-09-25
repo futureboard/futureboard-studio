@@ -2086,12 +2086,18 @@ impl Render for Timeline {
                     this.clip_resize_origin = ClipSnapshot::capture(&this.state, &drag.clip_id);
                 }
                 let beat = this.beat_from_window_x(event.event.position.x.into());
-                this.state.resize_clip_with_bypass(
-                    &drag.clip_id,
-                    drag.edge,
-                    beat,
-                    event.event.modifiers.shift,
-                );
+                // The Stretch tool turns an audio clip's edge into a time
+                // stretch (same audio, new length); every other tool trims.
+                let stretched = this.state.active_tool == TimelineTool::Time
+                    && this.state.stretch_clip_edge(&drag.clip_id, drag.edge, beat);
+                if !stretched {
+                    this.state.resize_clip_with_bypass(
+                        &drag.clip_id,
+                        drag.edge,
+                        beat,
+                        event.event.modifiers.shift,
+                    );
+                }
                 cx.notify();
             },
         );
@@ -3190,8 +3196,20 @@ pub(crate) fn format_arrangement_target_debug(target: &ArrangementHitTarget) -> 
     }
 }
 
+/// Label for a Browser plug-in preset drag. Checked by the overlay too, so the
+/// empty-space target says what the drop will actually create.
+const PLUGIN_PRESET_DROP_LABEL: &str = "Drop Plug-in Preset";
+
+fn is_plugin_preset_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pst"))
+}
+
 fn file_drop_hint_label(paths: &[std::path::PathBuf]) -> &'static str {
-    if paths.iter().any(|path| is_supported_audio_ext(path)) {
+    if paths.iter().any(|path| is_plugin_preset_path(path)) {
+        PLUGIN_PRESET_DROP_LABEL
+    } else if paths.iter().any(|path| is_supported_audio_ext(path)) {
         "Drop Audio to import"
     } else if paths.iter().any(|path| is_supported_midi_ext(path)) {
         "Drop MIDI to import"
@@ -3227,7 +3245,11 @@ fn file_drop_hint_overlay(hint: &FileDropHint, state: &TimelineState) -> Option<
         (
             y.max(0.0),
             DEFAULT_TRACK_HEIGHT,
-            "New MIDI/Audio Track".to_string(),
+            if hint.label == PLUGIN_PRESET_DROP_LABEL {
+                "New Track".to_string()
+            } else {
+                "New MIDI/Audio Track".to_string()
+            },
             Colors::accent_primary(),
         )
     };

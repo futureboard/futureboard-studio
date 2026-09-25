@@ -196,3 +196,57 @@ pub(crate) fn bump_midi_edit_revision() {
     use std::sync::atomic::Ordering;
     counter_midi_edit_revision().fetch_add(1, Ordering::Relaxed);
 }
+
+/// Last revision at which each clip's MIDI content was (possibly) mutated.
+fn midi_clip_revisions() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static REVISIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    > = std::sync::OnceLock::new();
+    REVISIONS.get_or_init(Default::default)
+}
+
+/// Record that one clip's MIDI content may have changed: bumps the global
+/// [`midi_edit_revision`] (views that span clips still see it) and stamps
+/// `clip_id` with the new value for [`midi_clip_revision`].
+pub(crate) fn bump_midi_clip_revision(clip_id: &str) {
+    use std::sync::atomic::Ordering;
+    let revision = counter_midi_edit_revision().fetch_add(1, Ordering::Relaxed) + 1;
+    if let Ok(mut revisions) = midi_clip_revisions().lock() {
+        revisions.insert(clip_id.to_string(), revision);
+    }
+}
+
+/// The revision at which `clip_id`'s notes, articulations or SysEx last took a
+/// mutable borrow; `0` for a clip that never has this session.
+///
+/// For caches that belong to one clip — the arrangement's note previews. Keyed
+/// on the global revision they were rebuilt for *every* visible MIDI clip on
+/// every edit to any one of them, including on each mouse move of a velocity
+/// drag.
+pub fn midi_clip_revision(clip_id: &str) -> u64 {
+    midi_clip_revisions()
+        .lock()
+        .ok()
+        .and_then(|revisions| revisions.get(clip_id).copied())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod midi_clip_revision_tests {
+    use super::*;
+
+    /// An edit to one clip moves that clip's revision and the global one, and
+    /// leaves every other clip's cached previews valid.
+    #[test]
+    fn editing_one_clip_does_not_invalidate_another() {
+        let other_before = midi_clip_revision("rev-test-other");
+        let global_before = midi_edit_revision();
+        bump_midi_clip_revision("rev-test-edited");
+        let edited = midi_clip_revision("rev-test-edited");
+        assert!(edited > global_before);
+        assert!(midi_edit_revision() > global_before);
+        assert_eq!(midi_clip_revision("rev-test-other"), other_before);
+        bump_midi_clip_revision("rev-test-edited");
+        assert!(midi_clip_revision("rev-test-edited") > edited);
+    }
+}

@@ -91,12 +91,43 @@ pub struct GpuDeviceInfo {
     pub device_id: Option<u32>,
 }
 
+/// The machine's GPU adapters, enumerated once per process.
+///
+/// Enumeration builds a Vulkan, DX12/Metal and GL instance and can take from
+/// tens of milliseconds to seconds. It used to run on every render of the
+/// Preferences → Performance page (and again for every frame its dropdown was
+/// open), which is what made that page stutter. Adapters do not come and go
+/// during a session in any way the renderer could act on — the choice only
+/// applies at the next launch — so one answer per process is the right amount.
+///
+/// Blocks the caller until the first enumeration finishes; concurrent callers
+/// wait on the same one rather than starting their own. UI code should use
+/// [`cached_gpu_devices`] and never call this on the render path.
+pub fn gpu_devices() -> std::sync::Arc<Vec<GpuDeviceInfo>> {
+    GPU_DEVICES
+        .get_or_init(|| std::sync::Arc::new(enumerate_gpu_devices()))
+        .clone()
+}
+
+/// The enumerated adapters if [`gpu_devices`] has already run, without ever
+/// blocking. `None` means "still detecting", not "no GPU".
+pub fn cached_gpu_devices() -> Option<std::sync::Arc<Vec<GpuDeviceInfo>>> {
+    GPU_DEVICES.get().cloned()
+}
+
+static GPU_DEVICES: std::sync::OnceLock<std::sync::Arc<Vec<GpuDeviceInfo>>> =
+    std::sync::OnceLock::new();
+
 /// Enumerate all GPU adapters visible to wgpu on the current machine.
+/// A clone of the process-wide list — see [`gpu_devices`].
+pub fn list_available_gpu_devices() -> Vec<GpuDeviceInfo> {
+    gpu_devices().as_ref().clone()
+}
+
 /// Never panics — adapter enumeration is wrapped in `catch_unwind` so a
 /// broken driver on one backend can't take down the settings dialog.
-/// Returns an empty Vec when no GPU is detected; the Settings UI shows
-/// "Auto" + "Unavailable" in that case.
-pub fn list_available_gpu_devices() -> Vec<GpuDeviceInfo> {
+/// Returns an empty Vec when no GPU is detected.
+fn enumerate_gpu_devices() -> Vec<GpuDeviceInfo> {
     let result = std::panic::catch_unwind(|| {
         let instance = wgpu::Instance::default();
         // wgpu 29: enumerate_adapters is async (returns Future<Output = Vec<_>>).
@@ -153,35 +184,25 @@ pub fn list_available_gpu_devices() -> Vec<GpuDeviceInfo> {
 /// milliseconds, once, at startup — and a driver that cannot enumerate yields
 /// `Unknown`, which never slows the UI down on a guess.
 pub fn detect_gpu_class() -> crate::perf::GpuClass {
-    let result = std::panic::catch_unwind(|| {
-        let instance = wgpu::Instance::default();
-        let adapters: Vec<wgpu::Adapter> =
-            pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
-        adapters
-            .into_iter()
-            .map(|adapter| {
-                let info = adapter.get_info();
-                (info.device_type, info.name)
-            })
-            .collect::<Vec<_>>()
-    });
-    let Ok(adapters) = result else {
-        return crate::perf::GpuClass::Unknown;
-    };
-    crate::perf::classify_gpu_adapters(
-        adapters
-            .iter()
-            .map(|(kind, name)| (device_type_class(*kind), name.as_str())),
-    )
+    // Shares the one process-wide enumeration with Settings and the startup
+    // probe instead of building its own set of instances.
+    let devices = gpu_devices();
+    crate::perf::classify_gpu_adapters(devices.iter().map(|device| {
+        (
+            device_type_class(device.device_type.as_deref()),
+            device.name.as_str(),
+        )
+    }))
 }
 
-fn device_type_class(kind: wgpu::DeviceType) -> crate::perf::GpuDeviceKind {
+/// `device_type` is stored as wgpu's `Debug` name (`"DiscreteGpu"`, …).
+fn device_type_class(kind: Option<&str>) -> crate::perf::GpuDeviceKind {
     match kind {
-        wgpu::DeviceType::DiscreteGpu => crate::perf::GpuDeviceKind::Discrete,
-        wgpu::DeviceType::IntegratedGpu => crate::perf::GpuDeviceKind::Integrated,
-        wgpu::DeviceType::VirtualGpu => crate::perf::GpuDeviceKind::Virtual,
-        wgpu::DeviceType::Cpu => crate::perf::GpuDeviceKind::Cpu,
-        wgpu::DeviceType::Other => crate::perf::GpuDeviceKind::Other,
+        Some("DiscreteGpu") => crate::perf::GpuDeviceKind::Discrete,
+        Some("IntegratedGpu") => crate::perf::GpuDeviceKind::Integrated,
+        Some("VirtualGpu") => crate::perf::GpuDeviceKind::Virtual,
+        Some("Cpu") => crate::perf::GpuDeviceKind::Cpu,
+        _ => crate::perf::GpuDeviceKind::Other,
     }
 }
 

@@ -325,10 +325,7 @@ fn is_renderable_audio_clip(clip: &ClipState) -> bool {
 fn clip_source_offset_seconds(state: &TimelineState, clip: &ClipState) -> f64 {
     let stretch = &clip.stretch;
     if stretch.source_start_samples > 0 {
-        let source_rate = stretch
-            .original_sample_rate
-            .max(stretch.project_sample_rate)
-            .max(1) as f64;
+        let source_rate = stretch.source_sample_rate().max(1) as f64;
         stretch.source_start_samples as f64 / source_rate
     } else {
         // Keep legacy projects whose trims were stored only as beat offsets
@@ -1048,12 +1045,12 @@ fn build_engine_project_snapshot_inner(
                     &sphere_stretch,
                     Some(project_bpm as f32),
                 ) as f64;
-                let pitch_ratio = timeline_state::AudioClipStretchState::pitch_ratio_from_semitones(
-                    stretch.pitch_shift_semitones,
-                );
-                let preserve_pitch =
-                    matches!(stretch.mode, StretchMode::Manual | StretchMode::TempoSync)
-                        && stretch.preserve_pitch;
+                // Pitch and the preserve flag come from the resolved params —
+                // the same values the engine renders from — so the legacy
+                // `audio_process` mirror and debug output cannot disagree with
+                // what is heard.
+                let pitch_ratio = sphere_stretch.pitch_ratio as f64;
+                let preserve_pitch = sphere_stretch.preserve_pitch;
                 let fades = if stretch.fade_in_ms > 0.0 || stretch.fade_out_ms > 0.0 {
                     Some(EngineFadeSnapshot {
                         in_duration: (stretch.fade_in_ms.max(0.0) as f64) / 1000.0,
@@ -1367,6 +1364,97 @@ pub(super) fn volume_norm_to_linear(norm: f32) -> f32 {
         0.0
     } else {
         10.0_f32.powf(db / 20.0).clamp(0.0, 2.0)
+    }
+}
+
+#[cfg(test)]
+mod sync_cost_measure {
+    //! Measurement only (`--ignored`): where a MIDI edit's engine sync spends
+    //! its UI-thread time on a large session.
+    use super::*;
+    use crate::components::timeline::timeline_state::{
+        AudioClipStretchState, AudioImportState, ClipState, ClipType, CreateTrackOptions,
+        InputMonitorMode, MidiNoteState,
+    };
+
+    #[test]
+    #[ignore]
+    fn midi_edit_sync_cost_breakdown() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        for t in 0..16 {
+            let id = state.create_track(CreateTrackOptions {
+                track_type: TrackType::Midi,
+                name: format!("MIDI {t}"),
+                color: gpui::Rgba {
+                    r: 0.3,
+                    g: 0.6,
+                    b: 0.9,
+                    a: 1.0,
+                },
+                volume: 0.8,
+                pan: 0.0,
+                armed: false,
+                input_monitor: InputMonitorMode::Off,
+            });
+            let track = state.tracks.iter_mut().find(|tr| tr.id == id).unwrap();
+            for c in 0..16 {
+                let notes = (0..250)
+                    .map(|i| MidiNoteState::new(36 + (i % 48) as u8, i as f32 * 0.03, 0.05, 90))
+                    .collect();
+                track.clips.push(ClipState {
+                    id: format!("clip-{t}-{c}"),
+                    name: "m".into(),
+                    start_beat: c as f32 * 8.0,
+                    duration_beats: 8.0,
+                    source_duration_seconds: None,
+                    offset_beats: 0.0,
+                    gain: 1.0,
+                    clip_type: ClipType::Midi {
+                        notes,
+                        controller_lanes: Vec::new(),
+                        sysex_events: Vec::new(),
+                        articulations: Vec::new(),
+                    },
+                    muted: false,
+                    audio_import: AudioImportState::Ready,
+                    stretch: AudioClipStretchState::default(),
+                });
+            }
+        }
+        let time = |label: &str, f: &mut dyn FnMut()| {
+            let started = std::time::Instant::now();
+            for _ in 0..5 {
+                f();
+            }
+            eprintln!(
+                "{label}: {:.2} ms",
+                started.elapsed().as_secs_f64() * 1000.0 / 5.0
+            );
+        };
+        let mut snapshot = None;
+        time("build_engine_project_snapshot", &mut || {
+            snapshot = Some(build_engine_project_snapshot(&state, 48_000, None, None));
+        });
+        let snapshot = snapshot.unwrap();
+        let mut signature = String::new();
+        time("serde_json::to_string(snapshot)", &mut || {
+            signature = serde_json::to_string(&snapshot).unwrap();
+        });
+        time("fingerprint hash", &mut || {
+            std::hint::black_box(crate::layout::audio_transport::graph_fingerprint_of(
+                &signature,
+            ));
+        });
+        time("routing serialize", &mut || {
+            std::hint::black_box(
+                serde_json::to_string(&(&snapshot.tracks, &snapshot.routing)).unwrap(),
+            );
+        });
+        time("TimelineState::clone", &mut || {
+            std::hint::black_box(state.clone());
+        });
+        eprintln!("signature bytes: {}", signature.len());
     }
 }
 

@@ -49,10 +49,7 @@ fn clip_source(clip: &ClipState) -> Option<(&String, &String)> {
 fn source_offset_seconds(state: &TimelineState, clip: &ClipState) -> f64 {
     let stretch = &clip.stretch;
     if stretch.source_start_samples > 0 {
-        let rate = stretch
-            .original_sample_rate
-            .max(stretch.project_sample_rate)
-            .max(1) as f64;
+        let rate = stretch.source_sample_rate().max(1) as f64;
         stretch.source_start_samples as f64 / rate
     } else {
         // Legacy projects stored trims only as beat offsets.

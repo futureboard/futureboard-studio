@@ -605,9 +605,12 @@ impl PluginBridgeRuntime {
         pitch: u8,
         velocity: u8,
     ) -> Result<(), PluginHostClientError> {
-        eprintln!(
-            "[plugin-bridge] sending PreviewNoteOn instance={plugin_instance_id} ch={channel} pitch={pitch} vel={velocity}"
-        );
+        // Per note, on the live-input path: logged only on request.
+        if preview_note_debug() {
+            eprintln!(
+                "[plugin-bridge] sending PreviewNoteOn instance={plugin_instance_id} ch={channel} pitch={pitch} vel={velocity}"
+            );
+        }
         self.client
             .preview_note_on(plugin_instance_id, channel, pitch, velocity)
     }
@@ -618,9 +621,11 @@ impl PluginBridgeRuntime {
         channel: u8,
         pitch: u8,
     ) -> Result<(), PluginHostClientError> {
-        eprintln!(
-            "[plugin-bridge] sending PreviewNoteOff instance={plugin_instance_id} ch={channel} pitch={pitch}"
-        );
+        if preview_note_debug() {
+            eprintln!(
+                "[plugin-bridge] sending PreviewNoteOff instance={plugin_instance_id} ch={channel} pitch={pitch}"
+            );
+        }
         self.client
             .preview_note_off(plugin_instance_id, channel, pitch)
     }
@@ -964,4 +969,12 @@ pub(crate) fn shutdown_bridge_runtime(
 /// Shut down every plugin-host child owned by the studio layout.
 pub(crate) fn shutdown_plugin_bridge(slot: &mut Option<SharedPluginBridgeRuntime>) {
     PluginBridgeRuntime::shutdown_shared(slot);
+}
+
+/// `FUTUREBOARD_PLUGIN_PREVIEW_DEBUG=1` logs every preview note sent over IPC.
+/// Off by default: it runs once per played note, and a console write per note
+/// is jitter on the live-input path.
+fn preview_note_debug() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("FUTUREBOARD_PLUGIN_PREVIEW_DEBUG").is_some())
 }

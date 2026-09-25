@@ -605,11 +605,100 @@ pub struct HardwareMidiInputMessage {
     pub received_at: Instant,
 }
 
+/// Wakes the control thread the moment hardware MIDI arrives.
+///
+/// Live input used to be picked up by a poll that slept 2–8 ms between
+/// drains. On Windows a sleep that short is rounded up to the OS timer tick
+/// (~15.6 ms) unless something holds `timeBeginPeriod(1)`, and the frame loop
+/// only does that while the transport runs — so with the transport stopped,
+/// which is when a keyboard is usually played, every note waited a random
+/// 0–16 ms before it even left the UI thread. That is the lag and the uneven
+/// feel. The native callback now rings this bell after queueing a message, and
+/// the control task wakes on the ring instead of on a timer.
+///
+/// Lock-free on the fast path (one atomic swap); the waker slot is a short
+/// uncontended mutex touched by the MIDI callback thread, never the audio
+/// thread.
+#[derive(Default)]
+pub struct MidiInputDoorbell {
+    rung: std::sync::atomic::AtomicBool,
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+
+impl MidiInputDoorbell {
+    /// Mark that input is waiting and wake whoever is waiting for it.
+    pub fn ring(&self) {
+        self.rung.store(true, std::sync::atomic::Ordering::Release);
+        let waker = self.waker.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Resolve on the next ring, or immediately if one arrived since the last
+    /// wait. A ring can never be lost between the check and the park: the
+    /// flag is re-checked after the waker is stored.
+    pub fn wait(self: &std::sync::Arc<Self>) -> MidiInputDoorbellWait {
+        MidiInputDoorbellWait {
+            bell: std::sync::Arc::clone(self),
+        }
+    }
+}
+
+/// Future returned by [`MidiInputDoorbell::wait`].
+pub struct MidiInputDoorbellWait {
+    bell: std::sync::Arc<MidiInputDoorbell>,
+}
+
+impl std::future::Future for MidiInputDoorbellWait {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        use std::sync::atomic::Ordering;
+        if self.bell.rung.swap(false, Ordering::AcqRel) {
+            return std::task::Poll::Ready(());
+        }
+        if let Ok(mut slot) = self.bell.waker.lock() {
+            *slot = Some(cx.waker().clone());
+        }
+        if self.bell.rung.swap(false, Ordering::AcqRel) {
+            return std::task::Poll::Ready(());
+        }
+        std::task::Poll::Pending
+    }
+}
+
+/// The queue end handed to the native MIDI callbacks: send, then ring.
+#[derive(Clone)]
+pub(crate) struct MidiInputSender {
+    tx: std::sync::mpsc::Sender<HardwareMidiInputMessage>,
+    doorbell: std::sync::Arc<MidiInputDoorbell>,
+}
+
+impl MidiInputSender {
+    pub(crate) fn send(
+        &self,
+        message: HardwareMidiInputMessage,
+    ) -> Result<(), std::sync::mpsc::SendError<HardwareMidiInputMessage>> {
+        let result = self.tx.send(message);
+        if result.is_ok() {
+            self.doorbell.ring();
+        }
+        result
+    }
+}
+
 /// Control-thread hardware MIDI input listener. Opens midir connections for
 /// enabled input / input-output devices and pushes decoded events onto a
 /// bounded queue drained by the UI poll loop.
 pub struct HardwareMidiInput {
     event_rx: Option<std::sync::mpsc::Receiver<HardwareMidiInputMessage>>,
+    /// Rung by every connection's callback; shared across reconnects so a
+    /// waiting control task never has to re-subscribe.
+    doorbell: std::sync::Arc<MidiInputDoorbell>,
     /// Cancel + join handles for the active input connections.
     connections: Vec<HardwareMidiInputConnection>,
     /// Last synced set of enabled device ids (so we can no-op when unchanged).
@@ -636,9 +725,16 @@ impl HardwareMidiInput {
     pub fn new() -> Self {
         Self {
             event_rx: None,
+            doorbell: std::sync::Arc::new(MidiInputDoorbell::default()),
             connections: Vec::new(),
             enabled_ids: Vec::new(),
         }
+    }
+
+    /// Rung whenever a hardware message is queued. Await
+    /// [`MidiInputDoorbell::wait`] and then [`Self::drain`].
+    pub fn doorbell(&self) -> std::sync::Arc<MidiInputDoorbell> {
+        std::sync::Arc::clone(&self.doorbell)
     }
 
     /// Open / refresh connections for every enabled input-capable device.
@@ -669,6 +765,10 @@ impl HardwareMidiInput {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.event_rx = Some(rx);
+        let tx = MidiInputSender {
+            tx,
+            doorbell: std::sync::Arc::clone(&self.doorbell),
+        };
         self.connections = open_hardware_midi_inputs(enabled, tx);
         if self.connections.is_empty() {
             // Nothing opened: the platform backend may still be coming up (on
@@ -964,7 +1064,7 @@ pub fn midi_input_diagnostics() -> MidiInputDiagnostics {
 #[cfg(not(target_os = "macos"))]
 fn open_hardware_midi_inputs(
     enabled: Vec<(String, String)>,
-    tx: std::sync::mpsc::Sender<HardwareMidiInputMessage>,
+    tx: MidiInputSender,
 ) -> Vec<HardwareMidiInputConnection> {
     use midir::MidiInput;
 
@@ -1041,7 +1141,7 @@ fn open_hardware_midi_inputs(
 #[cfg(target_os = "macos")]
 fn open_hardware_midi_inputs(
     enabled: Vec<(String, String)>,
-    tx: std::sync::mpsc::Sender<HardwareMidiInputMessage>,
+    tx: MidiInputSender,
 ) -> Vec<HardwareMidiInputConnection> {
     macos_coremidi::open_inputs(enabled, tx)
         .into_iter()
@@ -2148,5 +2248,54 @@ mod tests {
         assert!(after.ignored - before.ignored >= 1);
         assert!(after.routed > before.routed);
         assert!(after.unrouted > before.unrouted);
+    }
+}
+
+#[cfg(test)]
+mod doorbell_tests {
+    use super::MidiInputDoorbell;
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Flag(AtomicBool);
+    impl Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn poll_once(future: &mut (impl Future<Output = ()> + Unpin), waker: &Waker) -> Poll<()> {
+        std::pin::Pin::new(future).poll(&mut Context::from_waker(waker))
+    }
+
+    /// A message queued before the control task starts waiting must not wait
+    /// for the next one.
+    #[test]
+    fn a_ring_before_the_wait_is_not_lost() {
+        let bell = Arc::new(MidiInputDoorbell::default());
+        bell.ring();
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(flag);
+        let mut wait = bell.wait();
+        assert_eq!(poll_once(&mut wait, &waker), Poll::Ready(()));
+        // Consumed: the next wait parks.
+        let mut next = bell.wait();
+        assert_eq!(poll_once(&mut next, &waker), Poll::Pending);
+    }
+
+    /// A ring from the MIDI callback thread wakes a parked waiter.
+    #[test]
+    fn a_ring_from_another_thread_wakes_the_waiter() {
+        let bell = Arc::new(MidiInputDoorbell::default());
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut wait = bell.wait();
+        assert_eq!(poll_once(&mut wait, &waker), Poll::Pending);
+        let remote = Arc::clone(&bell);
+        std::thread::spawn(move || remote.ring()).join().unwrap();
+        assert!(flag.0.load(Ordering::SeqCst), "waker must be called");
+        assert_eq!(poll_once(&mut wait, &waker), Poll::Ready(()));
     }
 }

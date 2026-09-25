@@ -425,8 +425,10 @@ pub struct TimelineAddTrackRequest {
 pub type TimelineAddTrackCb =
     std::sync::Arc<dyn Fn(&TimelineAddTrackRequest, &mut gpui::Window, &mut gpui::App) + 'static>;
 
+/// A plug-in preset (`.pst`) dropped on the arrangement: the preset path and
+/// the track it landed on, or `None` for empty space below the last track.
 pub type TimelinePluginPresetDropCb = std::sync::Arc<
-    dyn Fn(&(std::path::PathBuf, String), &mut gpui::Window, &mut gpui::App) + 'static,
+    dyn Fn(&(std::path::PathBuf, Option<String>), &mut gpui::Window, &mut gpui::App) + 'static,
 >;
 pub type TimelinePluginDragDropCb = std::sync::Arc<
     dyn Fn(

@@ -1040,7 +1040,9 @@ pub fn disk_io_bytes_per_sec() -> Option<f64> {
 /// What one side of the session (Studio, or the plug-in hosts together) costs.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ProcessLoad {
-    /// Working set — the number Task Manager calls "Memory".
+    /// The process's memory as the OS monitor shows it: working set on Windows
+    /// (Task Manager's "Memory"), physical footprint on macOS (Activity
+    /// Monitor's "Memory").
     pub memory_bytes: u64,
     /// Share of the whole machine's CPU over the last window, 0..100. Scaled by
     /// core count, so 100 means every core, not one of them.
@@ -1231,7 +1233,12 @@ fn read_studio_counters() -> Option<(u64, ProcessCounters)> {
     counters_for_handle(unsafe { GetCurrentProcess() })
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn read_studio_counters() -> Option<(u64, ProcessCounters)> {
+    macos_process::counters(std::process::id())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn read_studio_counters() -> Option<(u64, ProcessCounters)> {
     None
 }
@@ -1258,9 +1265,99 @@ fn read_pid_counters(pid: u32) -> Option<(u64, ProcessCounters)> {
     out
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn read_pid_counters(pid: u32) -> Option<(u64, ProcessCounters)> {
+    macos_process::counters(pid)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn read_pid_counters(_pid: u32) -> Option<(u64, ProcessCounters)> {
     None
+}
+
+/// macOS per-process counters, from `proc_pid_rusage`.
+///
+/// One call answers all three questions for any process this user owns — the
+/// Studio and every plug-in host it spawned — without a task port, so it needs
+/// no entitlement.
+#[cfg(target_os = "macos")]
+mod macos_process {
+    use super::ProcessCounters;
+
+    /// Memory footprint, CPU time and disk I/O totals for `pid`.
+    ///
+    /// Memory is `ri_phys_footprint`: the figure Activity Monitor's Memory
+    /// column shows. Resident size would count shared framework pages against
+    /// every process and read far higher than the number the user compares it
+    /// with.
+    pub(super) fn counters(pid: u32) -> Option<(u64, ProcessCounters)> {
+        let pid = i32::try_from(pid).ok()?;
+        // SAFETY: `rusage_info_v2` is plain data, and the kernel fills exactly
+        // the `RUSAGE_INFO_V2` layout into the buffer we pass.
+        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                pid,
+                libc::RUSAGE_INFO_V2,
+                (&mut info as *mut libc::rusage_info_v2).cast::<libc::rusage_info_t>(),
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let cpu_ns = mach_ticks_to_ns(info.ri_user_time.saturating_add(info.ri_system_time));
+        Some((
+            info.ri_phys_footprint,
+            ProcessCounters {
+                cpu_100ns: cpu_ns / 100,
+                io_bytes: info
+                    .ri_diskio_bytesread
+                    .saturating_add(info.ri_diskio_byteswritten),
+            },
+        ))
+    }
+
+    /// `rusage_info` CPU times are Mach absolute-time ticks, not nanoseconds.
+    /// On Intel the two coincide; on Apple silicon a tick is 125/3 ns, so
+    /// reading them as nanoseconds under-reports CPU roughly forty-fold.
+    // `libc` marks its Mach bindings deprecated in favour of `mach2`; the
+    // system call itself is stable, and one binding crate is enough.
+    #[allow(deprecated)]
+    fn mach_ticks_to_ns(ticks: u64) -> u64 {
+        static TIMEBASE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        let (numer, denom) = *TIMEBASE.get_or_init(|| {
+            let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+            // SAFETY: writes two integers into `info`.
+            let rc = unsafe { libc::mach_timebase_info(&mut info) };
+            if rc != 0 || info.numer == 0 || info.denom == 0 {
+                (1, 1)
+            } else {
+                (info.numer as u64, info.denom as u64)
+            }
+        });
+        ((ticks as u128 * numer as u128) / denom as u128).min(u64::MAX as u128) as u64
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// The Studio's own counters are always readable; a failure here means
+        /// the Session section and the transport memory readout go blank.
+        #[test]
+        fn the_current_process_reports_memory_and_cpu() {
+            let (memory, counters) =
+                super::counters(std::process::id()).expect("own rusage is readable");
+            assert!(memory > 0, "phys footprint should be non-zero");
+            // Burn a little CPU and the counter must move.
+            let before = counters.cpu_100ns;
+            let mut x = 0u64;
+            for i in 0..20_000_000u64 {
+                x = x.wrapping_add(i ^ (x >> 3));
+            }
+            std::hint::black_box(x);
+            let (_, after) = super::counters(std::process::id()).unwrap();
+            assert!(after.cpu_100ns > before, "cpu time should advance");
+        }
+    }
 }
 
 /// Working set, CPU time and I/O totals for one open process handle.
@@ -1360,7 +1457,6 @@ pub fn process_memory_bytes() -> Option<u64> {
 /// memory or disk traffic. A host that exits between the listing and the
 /// `OpenProcess` simply does not contribute; it is not an error worth reporting
 /// on a readout.
-#[cfg(windows)]
 fn running_plugin_host_pids() -> Vec<u32> {
     use SpherePluginHost::plugin_host_lifecycle::{BridgeHostManager, HostLifecycleState};
 
@@ -1370,14 +1466,6 @@ fn running_plugin_host_pids() -> Vec<u32> {
         .filter(|record| record.state == HostLifecycleState::Running)
         .map(|record| record.pid)
         .collect()
-}
-
-// The plugin-host registry is a Windows bridge; there are no host processes to
-// charge anything to elsewhere, and `read_pid_counters` would return `None` for
-// each of them anyway.
-#[cfg(not(windows))]
-fn running_plugin_host_pids() -> Vec<u32> {
-    Vec::new()
 }
 
 #[cfg(test)]

@@ -16,9 +16,9 @@ use crate::components::inspector_debug;
 use crate::components::panel::{InspectorCallbacks, InspectorRoutingCombo};
 use crate::components::plugin_picker::PluginInsertKind;
 use crate::components::timeline::timeline_state::{
-    clip_output_local_to_source_sample, vsti_output_bus_strip_indices,
-    vsti_output_child_channels_for_bus_layout, AudioClipStretchState, TimelineState,
-    TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting, WarpMarker,
+    vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
+    AudioClipStretchState, TimelineState, TrackAudioFormat, TrackMidiInputRouting,
+    TrackOutputRouting,
 };
 use crate::overlay::OverlayAnchor;
 use sphere_midi_service::mpe::MpeTrackConfiguration;
@@ -454,8 +454,6 @@ impl StudioLayout {
             });
         let on_preview_clip_stretch = self.preview_clip_stretch_cb();
         let on_clip_stretch_auto_find_bpm = self.clip_stretch_auto_find_cb(owner.clone());
-        let on_clip_stretch_fit_project = self.clip_stretch_fit_project_cb(owner.clone());
-        let on_clip_warp_add_at_playhead = self.clip_warp_add_at_playhead_cb(owner.clone());
         let on_clip_warp_clear = self.clip_warp_clear_cb(owner.clone());
         let on_open_clip_bottom_editor = self.open_clip_bottom_editor_cb(owner.clone());
         let on_open_clip_external_midi_editor =
@@ -525,8 +523,6 @@ impl StudioLayout {
             on_preview_clip_length,
             on_preview_clip_gain,
             on_clip_stretch_auto_find_bpm,
-            on_clip_stretch_fit_project,
-            on_clip_warp_add_at_playhead,
             on_clip_warp_clear,
             on_open_clip_bottom_editor,
             on_open_clip_external_midi_editor,
@@ -786,138 +782,6 @@ impl StudioLayout {
                 this.stretch_tempo.clear_error(&clip_id);
                 this.spawn_clip_tempo_detection(&clip_id, false, cx);
             });
-        })
-    }
-
-    fn clip_stretch_fit_project_cb(&self, owner: Entity<Self>) -> StrCb {
-        let timeline = self.timeline.clone();
-        Arc::new(move |clip_id: &String, _w, cx| {
-            let clip_id = clip_id.clone();
-            let needs_auto_find = timeline
-                .read(cx)
-                .state
-                .clip_stretch(&clip_id)
-                .and_then(|s| s.bpm_source)
-                .is_none();
-            StudioLayout::defer_update(&owner, cx, move |this, cx| {
-                if needs_auto_find {
-                    this.stretch_tempo.clear_error(&clip_id);
-                    this.spawn_clip_tempo_detection(&clip_id, true, cx);
-                    return;
-                }
-                let project_bpm = this.timeline.read(cx).state.bpm as f64;
-                let changed = this.timeline.update(cx, |t, cx| {
-                    let Some(prev) = t.state.clip_stretch(&clip_id).cloned() else {
-                        return false;
-                    };
-                    let mut next = prev.clone();
-                    if !next.fit_to_project_tempo(project_bpm) {
-                        return false;
-                    }
-                    if prev == next {
-                        return false;
-                    }
-                    let prev_len = t.state.clip_duration_beats(&clip_id).unwrap_or(0.0);
-                    let old_ratio = prev.effective_time_ratio(project_bpm);
-                    let new_ratio = next.effective_time_ratio(project_bpm);
-                    let next_len = if old_ratio > 1e-6 && (old_ratio - new_ratio).abs() > 1e-9 {
-                        (prev_len as f64 * (new_ratio / old_ratio)) as f32
-                    } else {
-                        prev_len
-                    };
-                    t.state.set_clip_stretch(&clip_id, next.clone());
-                    if (next_len - prev_len).abs() > 1e-4 {
-                        t.state.set_clip_length(&clip_id, next_len);
-                    }
-                    t.record_executed_command(
-                        EditCommand::SetClipStretch {
-                            clip_id: clip_id.clone(),
-                            prev,
-                            next,
-                            prev_duration_beats: prev_len,
-                            next_duration_beats: next_len,
-                        },
-                        cx,
-                    );
-                    true
-                });
-                if changed {
-                    this.mark_dirty();
-                    this.mark_engine_media_dirty();
-                    this.schedule_audio_project_sync(cx, false, "inspector_fit_project");
-                    cx.notify();
-                }
-            });
-        })
-    }
-
-    /// Append a warp marker at the current playhead (clamped within the clip),
-    /// mapping the timeline beat to a source-sample position across the active
-    /// source window. Stored only — segment-warp playback is pending.
-    fn clip_warp_add_at_playhead_cb(&self, owner: Entity<Self>) -> StrCb {
-        let timeline = self.timeline.clone();
-        Arc::new(move |clip_id: &String, _w, cx| {
-            let clip_id = clip_id.clone();
-            let changed = timeline.update(cx, |t, cx| {
-                let playhead = t.state.transport.playhead_beats as f64;
-                let Some((prev, start, dur)) = t.state.find_clip(&clip_id).map(|(_, c)| {
-                    (
-                        c.stretch.clone(),
-                        c.start_beat as f64,
-                        c.duration_beats as f64,
-                    )
-                }) else {
-                    return false;
-                };
-                let clip_end = start + dur.max(0.0);
-                if playhead < start || playhead > clip_end || dur <= 0.0 {
-                    return false;
-                }
-                let local_frac = ((playhead - start) / dur.max(f64::EPSILON)).clamp(0.0, 1.0);
-                let output_len = (prev.source_len_samples() as f64)
-                    * prev.effective_time_ratio(t.state.bpm as f64);
-                let source_sample = clip_output_local_to_source_sample(
-                    local_frac * output_len,
-                    prev.source_start_samples,
-                    prev.source_end_samples,
-                    prev.effective_time_ratio(t.state.bpm as f64),
-                    prev.reverse,
-                )
-                .round() as u64;
-                let id = prev.warp_markers.iter().map(|m| m.id).max().unwrap_or(0) + 1;
-                let mut next = prev.clone();
-                next.warp_markers.push(WarpMarker {
-                    id,
-                    source_sample,
-                    timeline_beat: playhead,
-                    locked: false,
-                });
-                next.warp_markers
-                    .sort_by(|a, b| a.timeline_beat.total_cmp(&b.timeline_beat));
-                next.dirty = true;
-                let len = t.state.clip_duration_beats(&clip_id).unwrap_or(0.0);
-                t.state.set_clip_stretch(&clip_id, next.clone());
-                t.record_executed_command(
-                    EditCommand::SetClipStretch {
-                        clip_id: clip_id.clone(),
-                        prev,
-                        next,
-                        prev_duration_beats: len,
-                        next_duration_beats: len,
-                    },
-                    cx,
-                );
-                true
-            });
-            if changed {
-                inspector_debug(&format!("clip warp add clip={clip_id}"));
-                StudioLayout::defer_update(&owner, cx, |this, cx| {
-                    this.mark_dirty();
-                    this.mark_engine_media_dirty();
-                    this.schedule_audio_project_sync(cx, false, "inspector_clip_warp_add");
-                    cx.notify();
-                });
-            }
         })
     }
 

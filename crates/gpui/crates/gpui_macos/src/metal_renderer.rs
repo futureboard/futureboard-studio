@@ -182,10 +182,41 @@ impl MetalRenderer {
     }
 
     fn create_device() -> metal::Device {
+        let devices = metal::Device::all();
+        // Futureboard: the GPU chosen in Preferences → Performance arrives as
+        // `FUTUREBOARD_GPU_ADAPTER` (see `startup::export_gpu_adapter_preference`).
+        // Only Intel Macs with two GPUs have a choice to make.
+        let preference = std::env::var("FUTUREBOARD_GPU_ADAPTER").unwrap_or_default();
+        let preference = preference.trim();
+        let wanted_name = preference
+            .split(';')
+            .find_map(|part| part.trim().strip_prefix("name="))
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let wants_high_performance = matches!(
+            preference.to_ascii_lowercase().as_str(),
+            "high-performance" | "highperformance" | "high" | "discrete" | "dgpu"
+        );
+        if let Some(name) = wanted_name {
+            if let Some(d) = devices.iter().find(|d| d.name().eq_ignore_ascii_case(name)) {
+                log::info!("Metal device selected by preference: {}", d.name());
+                return d.clone();
+            }
+            log::warn!("Preferred Metal device {name:?} not found; using the default");
+        }
+        if wants_high_performance {
+            if let Some(d) = devices
+                .iter()
+                .min_by_key(|d| (d.is_removable(), d.is_low_power()))
+            {
+                log::info!("Metal high-performance device selected: {}", d.name());
+                return d.clone();
+            }
+        }
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
         // Silicon, there is only ever one GPU, so this is equivalent to
         // `metal::Device::system_default()`.
-        if let Some(d) = metal::Device::all()
+        if let Some(d) = devices
             .into_iter()
             .min_by_key(|d| (d.is_removable(), !d.is_low_power()))
         {

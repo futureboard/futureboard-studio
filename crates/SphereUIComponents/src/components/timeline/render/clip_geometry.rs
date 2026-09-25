@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::components::timeline::timeline_state::{
-    midi_edit_revision, MidiControllerKind, MidiControllerLane, MidiNoteState, TimeWarp,
+    midi_clip_revision, MidiControllerKind, MidiControllerLane, MidiNoteState, TimeWarp,
 };
 
 /// Clip-local beat ↔ clip-local px for content drawn inside a clip.
@@ -104,9 +104,11 @@ impl ClipAxis {
 // dense imported parts was measured at 40 ms a frame for 24,000 painted quads.
 //
 // So the pass runs once per (content, geometry) pair and is reused until one of
-// them moves. Validity is a single integer compare against the global MIDI edit
-// revision — see [`midi_edit_revision`], which exists for exactly this and is
-// bumped by the mutable accessors themselves, so no edit path has to remember.
+// them moves. Validity is a single integer compare against the clip's own MIDI
+// edit revision — see [`midi_clip_revision`], bumped by the mutable accessors
+// themselves, so no edit path has to remember. Per clip rather than global: an
+// edit to one clip must not rebuild every other visible clip's preview (which
+// it did, on each mouse move of a velocity drag).
 // The note count is in the key as well, which catches a clip whose payload was
 // replaced wholesale rather than edited in place.
 
@@ -200,7 +202,7 @@ fn preview_key(clip_id: &str, content_len: usize, axis: u64, geometry: &[f32]) -
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     clip_id.hash(&mut hasher);
     axis.hash(&mut hasher);
-    midi_edit_revision().hash(&mut hasher);
+    midi_clip_revision(clip_id).hash(&mut hasher);
     content_len.hash(&mut hasher);
     for value in geometry {
         value.to_bits().hash(&mut hasher);

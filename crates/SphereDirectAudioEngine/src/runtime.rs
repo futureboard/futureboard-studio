@@ -1757,8 +1757,10 @@ impl Clone for RuntimeClip {
                 self.source.sample_rate(),
                 &self.stretch,
             ),
-            stretch_input_l: vec![0.0; stretch_input_capacity(self.effective_time_ratio)],
-            stretch_input_r: vec![0.0; stretch_input_capacity(self.effective_time_ratio)],
+            // Keep the capacity the build sized for this clip (a warped
+            // clip's fastest segment can need more than its global ratio).
+            stretch_input_l: vec![0.0; self.stretch_input_l.len()],
+            stretch_input_r: vec![0.0; self.stretch_input_r.len()],
             stretch_output_l: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
             stretch_output_r: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
             stretch_prime_l: vec![0.0; self.stretch_prime_l.len()],
@@ -1859,6 +1861,26 @@ pub(crate) fn build_warp_segments(
     segments
 }
 
+/// Smallest output-per-input time ratio across a warp map, with the source
+/// measured at the output rate (the rate the stretcher is fed at). `None` for
+/// an unwarped clip. Control-thread only: sizes the stretcher's scratch.
+pub(crate) fn warp_min_time_ratio(
+    segments: &[RuntimeWarpSegment],
+    source_sample_rate: f64,
+    output_sample_rate: f64,
+) -> Option<f32> {
+    let rate = output_sample_rate / source_sample_rate.max(1.0);
+    segments
+        .iter()
+        .filter_map(|seg| {
+            let out = seg.out_end.saturating_sub(seg.out_start) as f64;
+            let input = (seg.src_end - seg.src_start) * rate;
+            (out > 0.0 && input > 0.0).then(|| (out / input) as f32)
+        })
+        .reduce(f32::min)
+        .map(|ratio| ratio.clamp(0.05, 20.0))
+}
+
 /// Map a clip-relative output sample to a source frame through warp segments.
 /// `None` means the caller should use the clip's global read rate.
 #[inline]
@@ -1895,6 +1917,33 @@ pub(crate) fn map_warp_source_frame(
 #[cfg(test)]
 mod warp_map_tests {
     use super::*;
+
+    #[test]
+    fn warp_capacity_ratio_is_the_steepest_segment() {
+        // Output 0..2000 covers source 0..1000 (ratio 2.0), then output
+        // 2000..3000 covers source 1000..3000 (ratio 0.5): the stretcher must be
+        // sized for the 0.5 segment, which consumes four times as much input.
+        let segments = [
+            RuntimeWarpSegment {
+                out_start: 0,
+                out_end: 2_000,
+                src_start: 0.0,
+                src_end: 1_000.0,
+            },
+            RuntimeWarpSegment {
+                out_start: 2_000,
+                out_end: 3_000,
+                src_start: 1_000.0,
+                src_end: 3_000.0,
+            },
+        ];
+        let ratio = warp_min_time_ratio(&segments, 48_000.0, 48_000.0).unwrap();
+        assert!((ratio - 0.5).abs() < 1e-6, "ratio={ratio}");
+        // A 24 kHz source fed at 48 kHz doubles every input span.
+        let ratio = warp_min_time_ratio(&segments, 24_000.0, 48_000.0).unwrap();
+        assert!((ratio - 0.25).abs() < 1e-6, "ratio={ratio}");
+        assert!(warp_min_time_ratio(&[], 48_000.0, 48_000.0).is_none());
+    }
 
     #[test]
     fn empty_markers_do_not_build_segments() {
@@ -5999,15 +6048,6 @@ fn build_clip_runtime(
     let stretch_processor =
         create_runtime_stretch_processor(stretch_backend, source.sample_rate(), &stretch);
 
-    // Preallocate the latency-priming pre-roll buffer on the control thread so
-    // the audio thread never grows it on first use. Sized for this clip's
-    // playback rate (`1 / time_ratio` input-per-output); `0` for zero-latency
-    // backends / no processor.
-    let stretch_prime_len = stretch_processor
-        .as_ref()
-        .map(|p| p.seek_input_len(1.0 / effective_time_ratio.max(0.01)))
-        .unwrap_or(0);
-
     let warp_source_end = if source_end_samples > source_start_samples {
         source_end_samples.min(source.frames() as u64)
     } else {
@@ -6021,6 +6061,23 @@ fn build_clip_runtime(
         source_start_samples.min(source.frames() as u64),
         warp_source_end,
     );
+    // The stretcher's scratch is sized for the fastest rate it will be fed.
+    // For a warped clip that is its steepest segment, not the global ratio.
+    let capacity_time_ratio = warp_min_time_ratio(
+        &warp_segments,
+        source.sample_rate() as f64,
+        output_sample_rate as f64,
+    )
+    .map_or(effective_time_ratio, |warp| warp.min(effective_time_ratio));
+
+    // Preallocate the latency-priming pre-roll buffer on the control thread so
+    // the audio thread never grows it on first use. Sized for this clip's
+    // fastest playback rate (`1 / time_ratio` input-per-output); `0` for
+    // zero-latency backends / no processor.
+    let stretch_prime_len = stretch_processor
+        .as_ref()
+        .map(|p| p.seek_input_len(1.0 / capacity_time_ratio.max(0.01)))
+        .unwrap_or(0);
 
     Some(RuntimeClip {
         id: clip.id.clone(),
@@ -6115,8 +6172,8 @@ fn build_clip_runtime(
             .unwrap_or_default(),
         source,
         stretch_processor,
-        stretch_input_l: vec![0.0; stretch_input_capacity(effective_time_ratio)],
-        stretch_input_r: vec![0.0; stretch_input_capacity(effective_time_ratio)],
+        stretch_input_l: vec![0.0; stretch_input_capacity(capacity_time_ratio)],
+        stretch_input_r: vec![0.0; stretch_input_capacity(capacity_time_ratio)],
         stretch_output_l: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
         stretch_output_r: vec![0.0; DEFAULT_AUDIO_BLOCK_CAPACITY],
         stretch_prime_l: vec![0.0; stretch_prime_len],
