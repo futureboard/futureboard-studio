@@ -130,7 +130,43 @@ impl GraphIndex {
     }
 }
 
-/// Serves random-access reads for every ARA audio source.
+/// How many analysis-progress reports each source has sent.
+///
+/// Read around a restore: a plug-in that reports analysing a source while
+/// its archived state is restored did not simply take the archived analysis.
+/// Written only from model-update callbacks, never from an audio thread.
+#[derive(Default)]
+pub(crate) struct AnalysisLog {
+    reports: Mutex<HashMap<AraSourceKey, u64>>,
+}
+
+impl AnalysisLog {
+    fn record(&self, key: &AraSourceKey) {
+        if let Ok(mut reports) = self.reports.lock() {
+            match reports.get_mut(key) {
+                Some(count) => *count += 1,
+                None => {
+                    reports.insert(key.clone(), 1);
+                }
+            }
+        }
+    }
+
+    /// Progress reports `key` has sent so far.
+    pub(crate) fn reports(&self, key: &AraSourceKey) -> u64 {
+        self.reports
+            .lock()
+            .ok()
+            .and_then(|reports| reports.get(key).copied())
+            .unwrap_or(0)
+    }
+
+    /// Drops the record of a source the document no longer holds.
+    pub(crate) fn forget(&self, key: &AraSourceKey) {
+        let _ = self.reports.lock().map(|mut reports| reports.remove(key));
+    }
+}
+
 /// Gated diagnostic for the ARA host path.
 ///
 /// ARA failures are silent by construction — a plug-in with an empty document
@@ -141,6 +177,7 @@ pub(crate) fn trace(line: &str) {
     }
 }
 
+/// Serves random-access reads for every ARA audio source.
 pub(crate) struct AudioService {
     access: Arc<dyn AraAudioAccess>,
     index: Arc<GraphIndex>,
@@ -381,11 +418,20 @@ impl ArchivingProvider for ArchiveService {
 pub(crate) struct ModelService {
     observer: Arc<dyn AraModelObserver>,
     index: Arc<GraphIndex>,
+    analysis: Arc<AnalysisLog>,
 }
 
 impl ModelService {
-    pub(crate) fn new(observer: Arc<dyn AraModelObserver>, index: Arc<GraphIndex>) -> Self {
-        Self { observer, index }
+    pub(crate) fn new(
+        observer: Arc<dyn AraModelObserver>,
+        index: Arc<GraphIndex>,
+        analysis: Arc<AnalysisLog>,
+    ) -> Self {
+        Self {
+            observer,
+            index,
+            analysis,
+        }
     }
 }
 
@@ -403,8 +449,12 @@ impl ModelUpdateProvider for ModelService {
             "analysis progress: source=0x{:x} state={state} value={value:.3}",
             source.as_usize()
         ));
+        let source = self.index.source_key(source);
+        if let Some(key) = source.as_ref() {
+            self.analysis.record(key);
+        }
         self.observer.notify(AraModelUpdate::AnalysisProgress {
-            source: self.index.source_key(source),
+            source,
             state,
             value,
         });

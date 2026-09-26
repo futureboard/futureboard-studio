@@ -243,6 +243,18 @@ impl AraEditorHost {
         self.attached.as_ref().map(|(key, _)| key)
     }
 
+    /// Whether the view parked over the panel belongs to the plug-in
+    /// instance with this handle (`Vst3RuntimeProcessor::handle_value`).
+    ///
+    /// By instance, not by session key: a project opened in place of another
+    /// reuses track ids, so the key alone cannot tell a retired session's view
+    /// from the new one's.
+    pub fn holds_instance(&self, handle: usize) -> bool {
+        self.attached
+            .as_ref()
+            .is_some_and(|(_, processor)| processor.handle_value() == handle)
+    }
+
     /// Tears the embedded view down.
     ///
     /// Order matters: the plug-in releases its view first, then the child window
@@ -350,12 +362,18 @@ impl AraEditorHost {
         .detach();
     }
 
+    /// The view parked over the panel, as the session key and instance
+    /// handle it was attached for.
+    fn attached_view(&self) -> Option<(&AraSessionKey, usize)> {
+        self.attached
+            .as_ref()
+            .map(|(key, processor)| (key, processor.handle_value()))
+    }
+
     /// Whether the native side is out of step with what the panel wants.
-    fn sync_needed(&self, key: &AraSessionKey, rect: ContentRect) -> bool {
-        match &self.attached {
-            None => true,
-            Some((current, _)) => current != key || self.last_rect != Some(rect),
-        }
+    /// `instance` is the handle of the instance the target session runs now.
+    fn sync_needed(&self, key: &AraSessionKey, instance: Option<usize>, rect: ContentRect) -> bool {
+        !view_is_current(self.attached_view(), key, instance) || self.last_rect != Some(rect)
     }
 
     /// Creates, moves, or tears down the plug-in's view. Never called from
@@ -368,20 +386,23 @@ impl AraEditorHost {
             cx.notify();
             return;
         };
-        // A different session means a different plug-in view; the old one has to
-        // go before the new one is parked in the same place.
-        if self
-            .attached
+        let processor = self.owner.read(cx).ara_processor(&key);
+        // A different session, or the same session key on another instance (a
+        // project reopened in place of another reuses track ids), means a
+        // different plug-in view; the old one has to go before the new one is
+        // parked in the same place. A retired instance's view kept here would
+        // also hold its document open past its project.
+        let instance = processor
             .as_ref()
-            .is_some_and(|(current, _)| current != &key)
-        {
+            .map(DirectAudio::Vst3RuntimeProcessor::handle_value);
+        if self.attached.is_some() && !view_is_current(self.attached_view(), &key, instance) {
             self.detach();
         }
         let Some(rect) = self.pending_rect else {
             Self::trace_event("perform_sync: no measured rect yet");
             return;
         };
-        let Some(processor) = self.owner.read(cx).ara_processor(&key) else {
+        let Some(processor) = processor else {
             self.detach();
             let detail = self
                 .owner
@@ -569,8 +590,9 @@ impl Render for AraEditorHost {
                 self.pending_view_resize = processor.view_take_resize_request();
             }
         }
+        let instance = self.owner.read(cx).ara_instance_handle(&key);
         match self.pending_rect {
-            Some(rect) if self.sync_needed(&key, rect) => self.schedule_sync(cx),
+            Some(rect) if self.sync_needed(&key, instance, rect) => self.schedule_sync(cx),
             Some(_) if self.pending_view_resize.is_some() => self.schedule_sync(cx),
             // A collapsed dock is a state, not a failure; the view comes back
             // when the panel is dragged open again.
@@ -645,6 +667,20 @@ impl Render for AraEditorHost {
         )
         .into_any_element()
     }
+}
+
+/// Whether the view parked over the panel (`attached`: the session key and
+/// instance handle it was attached for) is the one the panel wants: the same
+/// session, on the instance that session runs now (`instance`). A session key
+/// alone is not enough: a project opened in place of another reuses track ids,
+/// so the same key can name a new instance while the retired one's view is
+/// still parked here.
+fn view_is_current(
+    attached: Option<(&AraSessionKey, usize)>,
+    key: &AraSessionKey,
+    instance: Option<usize>,
+) -> bool {
+    attached.is_some_and(|(current, handle)| current == key && instance == Some(handle))
 }
 
 /// The panel body shown when no plug-in view can be embedded.
@@ -784,6 +820,35 @@ mod tests {
             let (width, height) = plugin_size(rect, bad);
             assert_eq!((width, height), (800, 400), "scale {bad} should pin to 1.0");
         }
+    }
+
+    /// Finding (review): the panel matched its view by session key alone, so
+    /// a project reopened in place of another (same track id, same plug-in)
+    /// kept the retired instance's view parked and never attached the new
+    /// session's.
+    #[test]
+    fn a_parked_view_is_current_only_for_the_same_session_on_the_same_instance() {
+        let key = AraSessionKey {
+            plugin_id: "vst3:melodyne".to_string(),
+            track_id: "track-1".to_string(),
+        };
+        let other = AraSessionKey {
+            plugin_id: "vst3:melodyne".to_string(),
+            track_id: "track-2".to_string(),
+        };
+        let retired = 0x9_8acd_8000;
+        let live = 0x9_8ace_0000;
+        assert!(view_is_current(Some((&key, live)), &key, Some(live)));
+        assert!(
+            !view_is_current(Some((&key, retired)), &key, Some(live)),
+            "the same key re-targeted at a new instance"
+        );
+        assert!(
+            !view_is_current(Some((&key, live)), &key, None),
+            "the session is gone"
+        );
+        assert!(!view_is_current(Some((&key, live)), &other, Some(live)));
+        assert!(!view_is_current(None, &key, Some(live)), "nothing parked");
     }
 
     #[test]

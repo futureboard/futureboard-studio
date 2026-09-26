@@ -200,6 +200,9 @@ pub struct SessionRollbackSnapshot {
     pub timeline_state: TimelineState,
     pub session: ProjectSession,
     pub project_state: crate::app_state::ProjectState,
+    /// The project's ARA documents, stored when the snapshot was taken, for a
+    /// switch that closes its sessions and then fails.
+    pub(crate) ara: crate::layout::ara_ops::AraParked,
 }
 
 pub struct LoadFailedContext {

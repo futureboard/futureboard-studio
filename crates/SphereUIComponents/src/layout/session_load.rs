@@ -104,14 +104,18 @@ impl StudioLayout {
     }
 
     /// Capture the live session for rollback before an in-studio project swap.
+    ///
+    /// Asks every live ARA plug-in for its document now: the switch closes
+    /// those sessions, and a switch that fails has nothing else to put back.
     pub fn capture_session_rollback_snapshot(
-        &self,
+        &mut self,
         cx: &mut Context<Self>,
     ) -> SessionRollbackSnapshot {
         SessionRollbackSnapshot {
             timeline_state: self.timeline.read(cx).state.clone(),
             session: self.project_session.clone(),
             project_state: self.project_state.clone(),
+            ara: self.ara.park_for_rollback(),
         }
     }
 
@@ -130,6 +134,9 @@ impl StudioLayout {
         });
         self.project_session = snapshot.session;
         self.project_state = snapshot.project_state;
+        // Its ARA documents come back with its timeline, if the switch had
+        // already closed its sessions or parked the other project's.
+        self.restore_parked_ara(snapshot.ara, cx);
         // Its changes may have been discarded for the switch that failed;
         // they are the live session again and must autosave.
         self.resume_session_recovery();
@@ -1099,10 +1106,6 @@ impl StudioLayout {
         // Per-user preferences from Settings, and the snap defaults for a
         // project saved before v54. The metronome reaches the engine on Play.
         self.seed_session_preferences(project.view.snap.is_none(), cx);
-        // Reopen the ARA sessions this project's clips are bound to, and hand
-        // each plug-in its saved document. Runs after the timeline is populated
-        // so the graph the plug-in sees matches the restored arrangement.
-        self.restore_ara_archives(project, cx);
 
         // Aggregated onto the one project surface. A project whose interface is
         // unplugged reports a single line, not one dialog per track.
@@ -1118,6 +1121,14 @@ impl StudioLayout {
             );
             return false;
         }
+
+        // Reopen the ARA sessions this project's clips are bound to, and hand
+        // each plug-in its saved document. Runs after the timeline is populated
+        // so the graph the plug-in sees matches the restored arrangement, and
+        // only once the project passed the integrity check: before it, a load
+        // that failed and rolled back had already closed the live project's
+        // sessions and parked this project's documents in their place.
+        self.restore_ara_archives(project, cx);
 
         // Project rate is persisted independently of application defaults. The
         // runtime must adopt it before restoring plugins for this session.

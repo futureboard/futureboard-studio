@@ -871,7 +871,49 @@ fn prepare_portable_assets(
     // Exactly the assets this save references: a record for media no clip
     // uses any more would only schedule a waveform job on the next open.
     project.assets = assets;
+    record_ara_source_fingerprints(project);
     Ok(offline)
+}
+
+/// The content part of a fingerprint token (`"<len:x>-<crc:08x>"`), without
+/// the modification time a record may carry: two files hold the same audio
+/// exactly when these are equal. `None` for a malformed token.
+pub(crate) fn content_fingerprint(token: &str) -> Option<String> {
+    let content = AudioFingerprint::parse(token)?;
+    Some(format!("{:x}-{:08x}", content.len, content.crc))
+}
+
+/// Give the archived sources of every ARA document the plug-in stored for
+/// this save the content fingerprint of their asset, joined by asset id
+/// against the records this save just made.
+///
+/// Only here are the two known together: the plug-in stored the document a
+/// moment ago, and the asset records are this save's. Only such documents
+/// ([`ProjectAraDocument::stored_now`]) take one. A document saved back
+/// verbatim (parked, unconfirmed, orphaned) was stored against the audio of
+/// the save that wrote it, which the asset may no longer hold (a file
+/// replaced in place with the same shape, say); a fingerprint from today
+/// would let a later restore map it onto audio it never described. Its
+/// record is kept exactly as it was, fingerprint or none.
+fn record_ara_source_fingerprints(project: &mut FutureboardProject) {
+    let by_id: HashMap<&str, String> = project
+        .assets
+        .iter()
+        .filter_map(|asset| {
+            let token = asset.source_fingerprint.as_deref()?;
+            Some((asset.id.as_str(), content_fingerprint(token)?))
+        })
+        .collect();
+    let documents = project
+        .ara_documents
+        .iter_mut()
+        .chain(project.ara_orphans.iter_mut())
+        .filter(|document| document.stored_now);
+    for identity in documents.filter_map(|document| document.written_with.as_mut()) {
+        for source in &mut identity.sources {
+            source.fingerprint = by_id.get(source.asset_id.as_str()).cloned();
+        }
+    }
 }
 
 /// What an audio clip already knows about its file, from a decode in this or
@@ -1878,6 +1920,117 @@ mod tests {
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(ext);
         let _ = fs::remove_dir_all(ext2);
+    }
+
+    /// A save gives each archived source of a document the plug-in stored for
+    /// it the content fingerprint of its asset. A document saved back
+    /// verbatim keeps its record exactly as it was: with the fingerprint an
+    /// earlier save recorded, or with none (finding: one was back-filled from
+    /// whatever audio the asset held at this save).
+    #[test]
+    fn a_save_records_the_content_of_every_ara_archived_source() {
+        use crate::project::{ProjectAraArchivedSource, ProjectAraDocument, ProjectAraIdentity};
+
+        let root = temp_dir("ara-fp");
+        let ext = temp_dir("ara-fp-ext");
+        fs::create_dir_all(&ext).unwrap();
+        let source = ext.join("vocal.wav");
+        fs::write(&source, b"the vocal take").unwrap();
+        let asset_id = source.to_string_lossy().into_owned();
+
+        let archived = |asset_id: &str, fingerprint: Option<&str>| ProjectAraArchivedSource {
+            persistent_id: asset_id.to_string(),
+            asset_id: asset_id.to_string(),
+            sample_rate: 48_000.0,
+            frames: 7,
+            channels: 1,
+            fingerprint: fingerprint.map(str::to_string),
+        };
+        let document = |sources, stored_now| ProjectAraDocument {
+            plugin_id: "vst3:melodyne".to_string(),
+            track_id: "track-1".to_string(),
+            archive_id: "com.celemony.ara.chunk.13".to_string(),
+            data: vec![1, 2, 3],
+            written_with: Some(ProjectAraIdentity {
+                sources,
+                ..ProjectAraIdentity::default()
+            }),
+            stored_now,
+        };
+        let mut project = FutureboardProject::new("ARA FP");
+        project
+            .tracks
+            .push(audio_track("track-1", vec![audio_clip("clip-1", &source)]));
+        project.ara_documents = vec![
+            document(
+                vec![
+                    archived(&asset_id, None),
+                    // Not in this project any more: nothing to join.
+                    archived("/gone/take.wav", None),
+                ],
+                true,
+            ),
+            // Parked since an earlier save: its record is that save's.
+            document(vec![archived(&asset_id, None)], false),
+        ];
+        project.ara_documents[1].track_id = "track-2".to_string();
+        project.ara_orphans = vec![
+            document(vec![archived(&asset_id, Some("1-00000001"))], false),
+            document(vec![archived(&asset_id, None)], false),
+        ];
+        let project_file = root.join("ARA FP.fbproj");
+        save_project(&mut project, &project_file).unwrap();
+
+        let expected =
+            content_fingerprint(project.assets[0].source_fingerprint.as_deref().unwrap());
+        assert!(expected.is_some());
+        let sources = &project.ara_documents[0]
+            .written_with
+            .as_ref()
+            .unwrap()
+            .sources;
+        assert_eq!(sources[0].fingerprint, expected);
+        assert_eq!(sources[1].fingerprint, None);
+        let kept = &project.ara_orphans[0]
+            .written_with
+            .as_ref()
+            .unwrap()
+            .sources;
+        assert_eq!(kept[0].fingerprint.as_deref(), Some("1-00000001"));
+        let verbatim = |document: &ProjectAraDocument| {
+            document.written_with.as_ref().unwrap().sources[0]
+                .fingerprint
+                .clone()
+        };
+        assert_eq!(verbatim(&project.ara_documents[1]), None);
+        assert_eq!(verbatim(&project.ara_orphans[1]), None);
+
+        // And the record survives the file.
+        let loaded = load_project_strict(&project_file).unwrap();
+        assert_eq!(
+            loaded.ara_documents[0]
+                .written_with
+                .as_ref()
+                .unwrap()
+                .sources[0]
+                .fingerprint,
+            expected
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(ext);
+    }
+
+    #[test]
+    fn the_content_fingerprint_drops_the_modification_time() {
+        assert_eq!(
+            content_fingerprint("498ba4-9e3e795e-18a2b3c4d5e6f708").as_deref(),
+            Some("498ba4-9e3e795e")
+        );
+        assert_eq!(
+            content_fingerprint("498ba4-9e3e795e").as_deref(),
+            Some("498ba4-9e3e795e")
+        );
+        assert_eq!(content_fingerprint("not-a-token"), None);
     }
 
     fn sample_peak_preview() -> crate::components::timeline::waveform_cache::WaveformPreview {

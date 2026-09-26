@@ -545,6 +545,10 @@ impl StudioLayout {
         };
         let ports = crate::audio_connections::current_available_ports();
 
+        // Welcome's Create Project reaches here without `reset_project`, and
+        // the timeline below starts empty: no ARA session or saved document
+        // of an earlier project may outlive it.
+        self.close_all_ara_sessions(cx);
         let _ = self.timeline.update(cx, |timeline, cx| {
             timeline.reset_input_state();
             timeline.state = TimelineState::default();
@@ -717,6 +721,9 @@ impl StudioLayout {
         // otherwise survives a close/switch aimed at a track that is gone.
         self.close_insert_picker_window(cx);
         self.close_audio_tool_windows(cx);
+        // The project's ARA plug-ins and saved documents go with it: left
+        // running, the next save wrote them into whatever project came next.
+        self.close_all_ara_sessions(cx);
         self.project_session = ProjectSession::untitled();
         self.project_path = None;
         self.project_folder = None;

@@ -30,6 +30,10 @@ pub struct AraProjectView {
     pub graph: AraGraph,
     /// Where each ARA audio source reads from on disk.
     pub media_paths: HashMap<AraSourceKey, PathBuf>,
+    /// Clips of this session left out of the graph because their media could
+    /// not be probed (offline, moved, unreadable), with the source each one
+    /// reads. A saved document may hold state for them that cannot land yet.
+    pub offline: Vec<(AraClipKey, AraSourceKey)>,
 }
 
 /// Reads a clip's source id and on-disk path, or `None` when it has neither.
@@ -232,6 +236,7 @@ pub fn project_view(
     let mut media_paths: HashMap<AraSourceKey, PathBuf> = HashMap::new();
     let mut regions: Vec<AraPlaybackRegionDesc> = Vec::new();
     let mut sequences: Vec<AraRegionSequenceDesc> = Vec::new();
+    let mut offline: Vec<(AraClipKey, AraSourceKey)> = Vec::new();
     let base_bpm = state.bpm.max(1.0) as f64;
 
     let Some((order, track)) = state
@@ -265,6 +270,7 @@ pub fn project_view(
                 ..AraGraph::default()
             },
             media_paths,
+            offline,
         };
     }
 
@@ -276,6 +282,7 @@ pub fn project_view(
 
         if !sources.contains_key(&source_key) {
             let Some((sample_rate, frame_count, channel_count)) = shape_of(source_path) else {
+                offline.push((AraClipKey(clip.id.clone()), source_key));
                 continue;
             };
             sources.insert(
@@ -327,6 +334,7 @@ pub fn project_view(
             regions,
         },
         media_paths,
+        offline,
     }
 }
 
@@ -408,6 +416,46 @@ mod tests {
         assert_eq!(view.graph.sequences.len(), 1);
     }
 
+    /// The eager copy into a saved project moves a just-dropped clip to the
+    /// copy's id (`audio_import::retarget_imported_clips`); a clip that
+    /// shares the dropped path and was not part of that drop keeps it. The
+    /// graph then names two sources, each clip on its own, which is what lets
+    /// the host rebuild exactly the moved clip's region and modification on
+    /// the new source instead of updating it in place over the old one.
+    #[test]
+    fn a_clip_moved_to_its_project_copy_reads_a_source_of_its_own() {
+        let mut state = timeline_with_ara_track();
+        let mut moved = state.tracks[0].clips[0].clone();
+        moved.id = "clip-2".to_string();
+        moved.clip_type = ClipType::Audio {
+            file_id: "Assets/Audio/take1-1.wav".to_string(),
+            source_path: Some("/project/Assets/Audio/take1-1.wav".to_string()),
+        };
+        state.tracks[0].clips.push(moved);
+        let mut shape = |_: &str| Some((48_000.0, 192_000, 2));
+        let view = project_view(&state, &key(&state), &mut shape);
+
+        assert!(view.graph.validate().is_ok());
+        assert_eq!(view.graph.sources.len(), 2);
+        let source_of = |clip: &str| {
+            view.graph
+                .regions
+                .iter()
+                .find(|region| region.key.as_str() == clip)
+                .map(|region| region.source.as_str().to_owned())
+        };
+        assert_eq!(source_of("clip-1").as_deref(), Some("asset-1"));
+        assert_eq!(
+            source_of("clip-2").as_deref(),
+            Some("Assets/Audio/take1-1.wav")
+        );
+        assert_eq!(
+            view.media_paths
+                .get(&AraSourceKey::from("Assets/Audio/take1-1.wav")),
+            Some(&PathBuf::from("/project/Assets/Audio/take1-1.wav"))
+        );
+    }
+
     #[test]
     fn an_unprobeable_source_is_skipped_rather_than_guessed() {
         let state = timeline_with_ara_track();
@@ -415,6 +463,43 @@ mod tests {
         let view = project_view(&state, &key(&state), &mut shape);
         assert!(view.graph.regions.is_empty());
         assert!(view.graph.sources.is_empty());
+        // ...and named, so a saved document holding its state waits for it
+        // instead of being restored into a graph without it.
+        assert_eq!(
+            view.offline,
+            vec![(AraClipKey::from("clip-1"), AraSourceKey::from("asset-1"))]
+        );
+    }
+
+    /// Only a clip whose media could not be probed is offline: one that is in
+    /// the graph is not, and neither is one with no media at all.
+    #[test]
+    fn only_clips_whose_media_cannot_be_probed_are_offline() {
+        let mut state = timeline_with_ara_track();
+        let mut gone = state.tracks[0].clips[0].clone();
+        gone.id = "clip-2".to_string();
+        gone.clip_type = ClipType::Audio {
+            file_id: "Assets/Audio/gone.wav".to_string(),
+            source_path: Some("/unmounted/gone.wav".to_string()),
+        };
+        let mut unwritten = state.tracks[0].clips[0].clone();
+        unwritten.id = "clip-3".to_string();
+        unwritten.clip_type = ClipType::Audio {
+            file_id: "take".to_string(),
+            source_path: None,
+        };
+        state.tracks[0].clips.push(gone);
+        state.tracks[0].clips.push(unwritten);
+        let mut shape = |path: &str| (!path.starts_with("/unmounted")).then_some((48_000.0, 10, 1));
+        let view = project_view(&state, &key(&state), &mut shape);
+        assert_eq!(view.graph.regions.len(), 1);
+        assert_eq!(
+            view.offline,
+            vec![(
+                AraClipKey::from("clip-2"),
+                AraSourceKey::from("Assets/Audio/gone.wav")
+            )]
+        );
     }
 
     #[test]

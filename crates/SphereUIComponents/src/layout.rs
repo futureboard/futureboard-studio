@@ -40,6 +40,7 @@ use SpherePluginHost::load_au_cache_state;
 mod ara_graph;
 mod ara_menu;
 pub(crate) mod ara_ops;
+mod ara_restore_plan;
 mod ara_studio;
 mod audio_editor_ops;
 mod audio_tool_ops;
@@ -637,6 +638,10 @@ pub struct StudioLayout {
     /// A short status-bar notice about an edit command that could not run
     /// (e.g. no clips to crossfade), and when it expires.
     edit_notice: Option<(String, std::time::Instant)>,
+    /// A status-bar notice about saved ARA documents (kept because they could
+    /// not be restored, or waiting for offline audio), and when it expires.
+    /// A slot of its own, so a later edit notice cannot erase it.
+    ara_notice: Option<(String, std::time::Instant)>,
     /// Repaint-rate diagnostics. Ticks once per `Render`, smoothed
     /// EMA frame time, exposed in the status bar.
     frame_diag: FrameDiagnostics,
@@ -1345,6 +1350,7 @@ impl StudioLayout {
             clip_clipboard: Vec::new(),
             logged_unsupported_commands: HashSet::new(),
             edit_notice: None,
+            ara_notice: None,
             frame_diag: FrameDiagnostics::new(),
             frame_scheduler: crate::frame_scheduler::FrameScheduler::new(frame_rate_mode),
             shortcut_diagnostics: ShortcutDiagnostics::default(),
@@ -1829,6 +1835,32 @@ impl StudioLayout {
         const EDIT_NOTICE: std::time::Duration = std::time::Duration::from_secs(4);
         self.edit_notice = Some((message, std::time::Instant::now() + EDIT_NOTICE));
         self.notify_status_bar_if_changed(cx);
+    }
+
+    /// Show `message` about saved ARA documents in the status bar for
+    /// [`ara_ops::ARA_NOTICE`]. Non-blocking by design: news the user should
+    /// see but need not answer. It has a slot of its own: an edit notice
+    /// shown meanwhile takes the line for its few seconds, then this one is
+    /// back until it expires.
+    pub(super) fn show_ara_notice(&mut self, message: String, cx: &mut Context<Self>) {
+        self.ara_notice = Some((message, std::time::Instant::now() + ara_ops::ARA_NOTICE));
+        self.notify_status_bar_if_changed(cx);
+    }
+
+    /// Takes the ARA notice off the status bar: the project it was about is
+    /// closed or replaced.
+    pub(super) fn clear_ara_notice(&mut self, cx: &mut Context<Self>) {
+        if self.ara_notice.take().is_some() {
+            self.notify_status_bar_if_changed(cx);
+        }
+    }
+
+    /// The ARA notice still showing, if any.
+    pub(super) fn active_ara_notice(&self) -> Option<&str> {
+        self.ara_notice
+            .as_ref()
+            .filter(|(_, until)| *until > std::time::Instant::now())
+            .map(|(text, _)| text.as_str())
     }
 
     /// The edit notice still showing, if any.

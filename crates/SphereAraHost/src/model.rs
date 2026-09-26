@@ -5,13 +5,15 @@
 //! these records from its own state; [`crate::AraSession`] turns them into ARA
 //! graph objects and keeps the two in sync.
 
+use std::borrow::Cow;
+
 use crate::error::AraResult;
 
 /// Stable identity of one decoded audio asset (Futureboard's clip asset key).
 ///
-/// Becomes the `persistentID` of an `ARAAudioSource`, so it must survive save,
-/// load, and undo — a plug-in restoring an archive matches its stored objects by
-/// this string.
+/// Becomes the `persistentID` of an `ARAAudioSource` (through
+/// [`ara_persistent_id`]), so it must survive save, load, and undo — a plug-in
+/// restoring an archive matches its stored objects by that string.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AraSourceKey(pub String);
 
@@ -53,6 +55,53 @@ macro_rules! key_str {
 key_str!(AraSourceKey);
 key_str!(AraClipKey);
 key_str!(AraTrackKey);
+
+/// Prefix of every persistent ID [`ara_persistent_id`] had to encode.
+///
+/// Reserved: a host key that itself starts with it is encoded too, so an
+/// encoded ID can never equal a key used verbatim.
+pub const ARA_ENCODED_ID_PREFIX: &str = "fbx:";
+
+/// The ARA `persistentID` a host key is published under.
+///
+/// ARA requires persistent IDs to be non-empty seven-bit US-ASCII without NUL,
+/// and the bridge refuses anything else. A key taken from a file path is often
+/// neither: one clip with a Thai file or folder name used to fail the whole
+/// graph of its track, and the saved document went with it.
+///
+/// A key that already qualifies, and does not start with
+/// [`ARA_ENCODED_ID_PREFIX`], is used verbatim, so every archive stored under
+/// it keeps matching. Anything else becomes the prefix followed by its UTF-8
+/// bytes percent-encoded: `%` and every byte outside printable ASCII as `%XX`
+/// in upper-case hex. The mapping is deterministic and injective: verbatim IDs
+/// never start with the prefix, encoded ones always do, and percent-encoding
+/// decodes unambiguously. No archive can hold an ID from the encoded range
+/// under the old rules, since such keys never reached a plug-in.
+///
+/// Host maps stay keyed by the raw key; only what crosses into the plug-in is
+/// encoded, and only here.
+pub fn ara_persistent_id(key: &str) -> Cow<'_, str> {
+    let verbatim = !key.is_empty()
+        && key.is_ascii()
+        && !key.contains('\0')
+        && !key.starts_with(ARA_ENCODED_ID_PREFIX);
+    if verbatim {
+        return Cow::Borrowed(key);
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut id = String::with_capacity(ARA_ENCODED_ID_PREFIX.len() + key.len() * 3);
+    id.push_str(ARA_ENCODED_ID_PREFIX);
+    for &byte in key.as_bytes() {
+        if (0x20..0x7f).contains(&byte) && byte != b'%' {
+            id.push(char::from(byte));
+        } else {
+            id.push('%');
+            id.push(char::from(HEX[usize::from(byte >> 4)]));
+            id.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    Cow::Owned(id)
+}
 
 /// RGB colour in the 0..=1 range, as ARA expresses object colours.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -867,6 +916,108 @@ mod tests {
         let mut swapped = two_clips();
         swapped.regions[1].key = "clip-9".into();
         assert_eq!(swapped.change_from(&held), AraGraphChange::Structure);
+    }
+
+    /// Inverts [`ara_persistent_id`], proving it injective: a mapping with a
+    /// left inverse cannot send two keys to one ID.
+    fn decode_persistent_id(id: &str) -> String {
+        let Some(encoded) = id.strip_prefix(ARA_ENCODED_ID_PREFIX) else {
+            return id.to_owned();
+        };
+        let bytes = encoded.as_bytes();
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).expect("hex");
+                out.push(u8::from_str_radix(hex, 16).expect("two hex digits"));
+                index += 3;
+            } else {
+                out.push(bytes[index]);
+                index += 1;
+            }
+        }
+        String::from_utf8(out).expect("encoded bytes are UTF-8")
+    }
+
+    /// A recording path under this user's default, Thai-named, project folder.
+    const THAI_PATH: &str =
+        "/Users/doppio/Documents/Futureboard Studio/Projects/โปรเจกต์ไม่มีชื่อ-1/Assets/Audio/1.wav";
+
+    /// Keys that exercise every branch of the encoding, including ones built
+    /// to collide with an encoded form.
+    const TRICKY_KEYS: &[&str] = &[
+        "",
+        "clip-1",
+        "Assets/Audio/1.wav",
+        "/Users/doppio/Documents/CodeProject/1.wav",
+        "a b%c",
+        "tab\there",
+        "fbx:",
+        "fbx:a",
+        "fbx:%41",
+        "fbx:%E0%B9%82",
+        "fbx",
+        "%",
+        "%25",
+        "A",
+        "\u{e9}",
+        "e\u{301}",
+        "a\0b",
+        "\0",
+        "\u{7f}",
+        THAI_PATH,
+        "\u{1f3b5}.wav",
+    ];
+
+    #[test]
+    fn ascii_keys_are_published_verbatim() {
+        for key in [
+            "clip-1",
+            "Assets/Audio/1.wav",
+            "/Users/doppio/Documents/CodeProject/1.wav",
+            "a b%c",
+            "fbx",
+        ] {
+            let id = ara_persistent_id(key);
+            assert!(matches!(id, Cow::Borrowed(_)), "'{key}' must not be copied");
+            assert_eq!(id, key);
+        }
+    }
+
+    #[test]
+    fn other_keys_become_prefixed_seven_bit_ascii() {
+        let id = ara_persistent_id(THAI_PATH);
+        assert!(id.starts_with(ARA_ENCODED_ID_PREFIX));
+        assert!(id.is_ascii() && !id.contains('\0'));
+        assert!(
+            id.ends_with("-1/Assets/Audio/1.wav"),
+            "ASCII stays readable: {id}"
+        );
+        assert_eq!(id, ara_persistent_id(THAI_PATH), "deterministic");
+
+        // Keys that are ASCII but unusable, or that look encoded, are encoded.
+        assert_eq!(ara_persistent_id(""), "fbx:");
+        assert_eq!(ara_persistent_id("a\0b"), "fbx:a%00b");
+        assert_eq!(ara_persistent_id("fbx:a"), "fbx:fbx:a");
+        assert_eq!(ara_persistent_id("\u{e9}"), "fbx:%C3%A9");
+        assert_eq!(ara_persistent_id("fbx:%41"), "fbx:fbx:%2541");
+    }
+
+    #[test]
+    fn the_encoding_is_injective() {
+        let mut seen = std::collections::HashMap::new();
+        for key in TRICKY_KEYS {
+            let id = ara_persistent_id(key).into_owned();
+            assert!(
+                !id.is_empty() && id.is_ascii() && !id.contains('\0'),
+                "{id:?}"
+            );
+            assert_eq!(decode_persistent_id(&id), *key, "round trip of {key:?}");
+            if let Some(other) = seen.insert(id.clone(), *key) {
+                panic!("{other:?} and {key:?} share the ID {id:?}");
+            }
+        }
     }
 
     #[test]

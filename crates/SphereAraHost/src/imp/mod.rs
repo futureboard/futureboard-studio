@@ -14,8 +14,8 @@ use ara2_bridge_companion::CompanionRoles;
 use ara2_bridge_companion::vst3::Vst3HostPlugin;
 use ara2_bridge_core::{
     ApiGeneration, AraError, AudioModificationProperties, AudioSourceProperties, Color,
-    ContentUpdateScopes, DocumentProperties, MusicalContextProperties, Notes,
-    PlaybackRegionProperties, PlaybackTransformationFlags, RegionSequenceProperties,
+    ContentKind, ContentUpdateScopes, DocumentProperties, MusicalContextProperties, Notes,
+    PlaybackRegionProperties, PlaybackTransformationFlags, RegionSequenceProperties, RestoreFilter,
 };
 use ara2_bridge_host::{
     AudioModificationHandle, AudioSourceHandle, DocumentSession, ExtensionController,
@@ -24,17 +24,23 @@ use ara2_bridge_host::{
 };
 
 use crate::AraSessionConfig;
+use crate::archive::{
+    AraArchiveIdentity, AraArchivedModification, AraArchivedSource, AraKeyDescriptor,
+    AraRestoreReport, AraRestoreRequest, AraSourceRestore, AraStoredArchive, GRADE_DETECTED,
+    GRADE_INITIAL, PlannedFilter, RestorePlan, classify_source, needs_harmony_resync,
+    overall_outcome, plan_restore,
+};
 use crate::error::{AraHostError, AraResult};
 use crate::info::{AraFactoryInfo, AraRendererId, AraRoles};
 use crate::model::{
     AraAudioSourceDesc, AraClipKey, AraColor, AraGraph, AraGraphChange, AraMusicalTimeline,
     AraPlaybackRegionDesc, AraPlaybackTransform, AraRegionSequenceDesc, AraSourceKey, AraTrackKey,
-    HeldGraph,
+    HeldGraph, ara_persistent_id,
 };
 
 use services::{
-    ArchiveService, ArchiveSlot, ArchiveStore, AudioService, ContentService, GraphIndex,
-    ModelService, SharedContent, TransportService, offers_harmonic_content, trace,
+    AnalysisLog, ArchiveService, ArchiveSlot, ArchiveStore, AudioService, ContentService,
+    GraphIndex, ModelService, SharedContent, TransportService, offers_harmonic_content, trace,
 };
 
 /// Generations tried when initializing a factory, best first.
@@ -306,6 +312,103 @@ struct ArchiveToken {
     _sequence: u64,
 }
 
+/// Serves `bytes`, written under `archive_id`, to the plug-in for the length
+/// of `call`, through a freshly addressed token.
+fn with_archive<T>(
+    archives: &ArchiveStore,
+    sequence: u64,
+    archive_id: &str,
+    bytes: &[u8],
+    call: impl FnOnce(&ArchiveToken) -> T,
+) -> T {
+    let token = Box::new(ArchiveToken {
+        _sequence: sequence,
+    });
+    let address = std::ptr::from_ref(token.as_ref()) as usize;
+    // The ID the bytes were written under, not the plug-in's current one: an
+    // archive from an older version must be read as that version.
+    archives.open(
+        address,
+        ArchiveSlot {
+            bytes: bytes.to_vec(),
+            archive_id: Some(archive_id.to_owned()),
+        },
+    );
+    let out = call(token.as_ref());
+    archives.take(address);
+    out
+}
+
+/// Builds the bridge's restore filter from a planned one.
+///
+/// Document data is selected as planned: always for a whole restore, where
+/// leaving it out would leave the plug-in's private document state behind,
+/// and for a partial one only in the part that brings it (see
+/// [`crate::AraRestoreScope`]).
+fn restore_filter(planned: &PlannedFilter) -> AraResult<RestoreFilter> {
+    let mut builder = RestoreFilter::builder().document_data(planned.document_data);
+    for (archived, current) in &planned.sources {
+        builder = builder.audio_source(archived.clone(), current.clone());
+    }
+    for (archived, current) in &planned.modifications {
+        builder = builder.audio_modification(archived.clone(), current.clone());
+    }
+    builder
+        .build()
+        .map_err(|error| AraHostError::invalid(format!("restore filter: {error}")))
+}
+
+/// Clips whose region and modification must go before the graph is rebuilt:
+/// those no longer wanted, and those that moved to another source or track.
+///
+/// ARA creates a modification on its source for good, and an audio source
+/// cannot be destroyed while a modification still sits on it. A clip whose
+/// audio changed therefore loses its region and modification first and gets
+/// new ones on the new source; updating the region in place left the
+/// modification on the old source and made its teardown fail.
+fn doomed_clips<'a>(
+    held: impl Iterator<Item = (&'a AraClipKey, &'a AraPlaybackRegionDesc)>,
+    wanted: &[AraPlaybackRegionDesc],
+) -> Vec<AraClipKey> {
+    let wanted: HashMap<&AraClipKey, &AraPlaybackRegionDesc> =
+        wanted.iter().map(|desc| (&desc.key, desc)).collect();
+    let mut doomed: Vec<AraClipKey> = held
+        .filter(|(key, held)| {
+            wanted
+                .get(key)
+                .is_none_or(|desc| desc.source != held.source || desc.track != held.track)
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    doomed.sort();
+    doomed
+}
+
+/// A restore settled before the plug-in is touched.
+struct PreparedRestore {
+    plan: RestorePlan,
+    filter: Option<RestoreFilter>,
+}
+
+/// A restore under way: its plan plus what was read before it ran.
+struct RestoreRun {
+    plan: RestorePlan,
+    filter: Option<RestoreFilter>,
+    /// Each target's note grade before the restore.
+    before: Vec<Option<i32>>,
+    /// Each target's analysis-progress report count before the restore.
+    progress: Vec<u64>,
+}
+
+/// A restore that runs inside an edit cycle: the one building the graph, or
+/// one of its own.
+struct InEditRestore<'a, 'b> {
+    request: &'a AraRestoreRequest<'b>,
+    filter: Option<&'a RestoreFilter>,
+    sequence: u64,
+    result: Option<AraResult<()>>,
+}
+
 pub(crate) struct Session {
     /// Leaked so the borrow checker sees `'static`; reclaimed in `Drop` strictly
     /// after `document`, which holds the controller that borrows both.
@@ -319,6 +422,11 @@ pub(crate) struct Session {
     index: Arc<GraphIndex>,
     archives: Arc<ArchiveStore>,
     content: Arc<ContentService>,
+    /// Analysis progress per source, shared with the model-update service.
+    analysis: Arc<AnalysisLog>,
+    /// Whether the plug-in analyses notes, whose content grade is how a
+    /// restore is verified.
+    notes_analysable: bool,
 
     /// Last document name pushed to the plug-in, so an unchanged name performs
     /// no ABI call on re-apply.
@@ -348,15 +456,24 @@ impl Session {
         // SAFETY: the caller forwards the live-factory contract.
         let (loaded, generation) = unsafe { load_factory(factory) }?;
         let info = describe(&loaded, generation);
+        let notes_analysable = loaded
+            .metadata()
+            .analyzable_content_types()
+            .contains(&<Notes as ContentKind>::RAW_TYPE);
 
         let index = Arc::new(GraphIndex::default());
         let archives = Arc::new(ArchiveStore::default());
         let content = Arc::new(ContentService::new(Arc::clone(&index), generation));
+        let analysis = Arc::new(AnalysisLog::default());
 
         let services = HostServicesBuilder::new()
             .audio(AudioService::new(config.audio, Arc::clone(&index)))
             .archiving(ArchiveService::new(Arc::clone(&archives)))
-            .model_updates(ModelService::new(config.observer, Arc::clone(&index)))
+            .model_updates(ModelService::new(
+                config.observer,
+                Arc::clone(&index),
+                Arc::clone(&analysis),
+            ))
             .playback(TransportService::new(config.transport))
             .content(SharedContent(Arc::clone(&content)))
             .build(generation)
@@ -397,6 +514,8 @@ impl Session {
             index,
             archives,
             content,
+            analysis,
+            notes_analysable,
             document_name: config.document_name,
             musical_context: None,
             published: None,
@@ -510,47 +629,169 @@ impl Session {
     }
 
     pub(crate) fn apply_graph(&mut self, graph: &AraGraph) -> AraResult<()> {
+        self.apply_graph_restoring(graph, None).map(|_| ())
+    }
+
+    /// Reconciles the graph and, when asked, restores an archive into it.
+    ///
+    /// From ARA 2 Final on the restore runs inside the edit cycle that builds
+    /// the graph, after every object exists and before the cycle ends: the
+    /// order `ARAInterface.h` documents for `restoreObjectsFromArchive`. A
+    /// plug-in then never starts analysing a source whose analysis the
+    /// archive is about to supply. Note analysis is requested afterwards, and
+    /// only for new sources the restore left without content.
+    ///
+    /// `Err` means the graph was not applied. A restore that is refused or
+    /// fails is reported in [`AraRestoreReport::error`] and never stops the
+    /// graph.
+    pub(crate) fn apply_graph_restoring(
+        &mut self,
+        graph: &AraGraph,
+        restore: Option<AraRestoreRequest<'_>>,
+    ) -> AraResult<Option<AraRestoreReport>> {
+        let requests = restore.as_slice();
+        let mut reports = self.apply_graph_restoring_all(graph, requests)?;
+        Ok(reports.pop())
+    }
+
+    /// [`Self::apply_graph_restoring`] with any number of restores, run one
+    /// after another, in the order given, inside the same edit cycle (ARA
+    /// allows several calls in one cycle). One report per request, in order.
+    ///
+    /// The caller puts the restore that brings the document data last: ARA
+    /// asks for that part to be restored once the graph has its final
+    /// structure and every object's state is in place.
+    pub(crate) fn apply_graph_restoring_all(
+        &mut self,
+        graph: &AraGraph,
+        requests: &[AraRestoreRequest<'_>],
+    ) -> AraResult<Vec<AraRestoreReport>> {
         let context = self.musical_context.ok_or_else(|| {
             AraHostError::invalid("set_musical_timeline must run before apply_graph")
         })?;
         // No edit cycle for a graph that is already in place: `endEditing` is
         // not free for the plug-in even when the edit was empty.
-        if self.graph_change(graph) == AraGraphChange::Unchanged {
-            return Ok(());
+        let unchanged = self.graph_change(graph) == AraGraphChange::Unchanged;
+        if requests.is_empty() {
+            if !unchanged {
+                let created = self.build_graph(context, graph, &mut [])?;
+                if let Ok(document) = self.document_mut() {
+                    notify_after_edit(document);
+                }
+                self.request_note_analysis(&created);
+            }
+            return Ok(Vec::new());
         }
 
+        // Everything about each restore is settled before the graph is
+        // touched, so one that cannot run never gets in the build's way.
+        let prepared: Vec<AraResult<PreparedRestore>> = requests
+            .iter()
+            .map(|request| self.prepare_restore(request, &graph.sources, &graph.regions))
+            .collect();
+        if unchanged {
+            // Nothing to build: the restores get an edit cycle of their own.
+            return Ok(self.restore_all_in_own_cycle(requests, prepared));
+        }
+        if self.generation < ApiGeneration::V2Final {
+            // Before ARA 2 Final a restore is a scope of its own, which cannot
+            // share the build's edit cycle.
+            let created = self.build_graph(context, graph, &mut [])?;
+            // The build's own reports go first, so none of them is taken for
+            // analysis during a restore.
+            if let Ok(document) = self.document_mut() {
+                notify_after_edit(document);
+            }
+            let reports = self.restore_all_in_own_cycle(requests, prepared);
+            self.request_note_analysis(&created);
+            return Ok(reports);
+        }
+
+        let runs: Vec<AraResult<RestoreRun>> = prepared
+            .into_iter()
+            .map(|prepared| prepared.map(|prepared| self.begin_restore(prepared)))
+            .collect();
+        let mut steps: Vec<InEditRestore<'_, '_>> = Vec::with_capacity(runs.len());
+        let mut step_of: Vec<Option<usize>> = Vec::with_capacity(runs.len());
+        for (request, run) in requests.iter().zip(&runs) {
+            match run {
+                Ok(run) => {
+                    step_of.push(Some(steps.len()));
+                    steps.push(InEditRestore {
+                        request,
+                        filter: run.filter.as_ref(),
+                        sequence: self.next_archive,
+                        result: None,
+                    });
+                    self.next_archive += 1;
+                }
+                Err(_) => step_of.push(None),
+            }
+        }
+        let created = self.build_graph(context, graph, &mut steps)?;
+        let mut results: Vec<Option<AraResult<()>>> =
+            steps.into_iter().map(|step| step.result).collect();
+        let concluded: Vec<AraResult<(RestoreRun, AraResult<()>)>> = runs
+            .into_iter()
+            .zip(step_of)
+            .map(|(run, step)| {
+                run.map(|run| {
+                    let result = step
+                        .and_then(|index| results[index].take())
+                        .unwrap_or_else(|| Err(AraHostError::invalid("the restore did not run")));
+                    (run, result)
+                })
+            })
+            .collect();
+        let reports = self.conclude_restores(requests, concluded);
+        self.request_note_analysis(&created);
+        Ok(reports)
+    }
+
+    /// Brings the document's graph in line with `graph` in one edit cycle,
+    /// restoring each of `restores` into it, in order, just before the cycle
+    /// ends, and returns the sources it created.
+    ///
+    /// Leaves delivering the plug-in's model updates to the caller, which may
+    /// have to read content first.
+    fn build_graph(
+        &mut self,
+        context: MusicalContextHandle,
+        graph: &AraGraph,
+        restores: &mut [InEditRestore<'_, '_>],
+    ) -> AraResult<Vec<(AraSourceKey, AudioSourceHandle)>> {
         let supported = self.info.supported_transforms;
+        let doomed_clips = doomed_clips(
+            self.clips.iter().map(|(key, entry)| (key, &entry.desc)),
+            &graph.regions,
+        );
 
         // An open editor view is holding the regions it was last shown. Before
         // any of them is destroyed, show it the set without them, so no view
         // keeps a reference to a region that no longer exists.
-        {
-            let wanted_clips: HashSet<&AraClipKey> =
-                graph.regions.iter().map(|region| &region.key).collect();
-            if self.clips.keys().any(|key| !wanted_clips.contains(key)) {
-                let wanted_sequences: HashSet<&AraTrackKey> = graph
-                    .sequences
-                    .iter()
-                    .map(|sequence| &sequence.key)
-                    .collect();
-                let remaining: Vec<AraClipKey> = self
-                    .clips
-                    .keys()
-                    .filter(|key| wanted_clips.contains(key))
-                    .cloned()
-                    .collect();
-                let tracks: Vec<AraTrackKey> = self
-                    .sequences
-                    .keys()
-                    .filter(|key| wanted_sequences.contains(key))
-                    .cloned()
-                    .collect();
-                let renderers: Vec<AraRendererId> = self.renderers.keys().copied().collect();
-                for renderer in renderers {
-                    if let Err(error) = self.notify_editor_selection(renderer, &remaining, &tracks)
-                    {
-                        trace(&format!("editor selection before teardown: {error}"));
-                    }
+        if !doomed_clips.is_empty() {
+            let doomed: HashSet<&AraClipKey> = doomed_clips.iter().collect();
+            let wanted_sequences: HashSet<&AraTrackKey> = graph
+                .sequences
+                .iter()
+                .map(|sequence| &sequence.key)
+                .collect();
+            let remaining: Vec<AraClipKey> = self
+                .clips
+                .keys()
+                .filter(|key| !doomed.contains(key))
+                .cloned()
+                .collect();
+            let tracks: Vec<AraTrackKey> = self
+                .sequences
+                .keys()
+                .filter(|key| wanted_sequences.contains(key))
+                .cloned()
+                .collect();
+            let renderers: Vec<AraRendererId> = self.renderers.keys().copied().collect();
+            for renderer in renderers {
+                if let Err(error) = self.notify_editor_selection(renderer, &remaining, &tracks) {
+                    trace(&format!("editor selection before teardown: {error}"));
                 }
             }
         }
@@ -562,6 +803,8 @@ impl Session {
             document,
             document_name,
             index,
+            archives,
+            analysis,
             sources,
             sequences,
             clips,
@@ -582,14 +825,6 @@ impl Session {
             .iter()
             .map(|sequence| &sequence.key)
             .collect();
-        let wanted_clips: HashSet<&AraClipKey> =
-            graph.regions.iter().map(|region| &region.key).collect();
-
-        let stale_clips: Vec<AraClipKey> = clips
-            .keys()
-            .filter(|key| !wanted_clips.contains(key))
-            .cloned()
-            .collect();
 
         // A playback region may not be destroyed while a renderer still holds
         // it, so drop those RAII assignments first — in **both** roles. The
@@ -598,7 +833,7 @@ impl Session {
         // handed the plug-in a dangling region in `removePlaybackRegion`.
         // Cutting or deleting a clip on an ARA track with the ARA panel open
         // took the app down that way.
-        for key in &stale_clips {
+        for key in &doomed_clips {
             for renderer in renderers.values_mut() {
                 renderer.assignments.remove(key);
                 renderer.editor_assignments.remove(key);
@@ -620,8 +855,9 @@ impl Session {
         }
 
         // Teardown is leaf-first: regions, then modifications, then the sources
-        // and sequences they referenced.
-        for key in &stale_clips {
+        // and sequences they referenced. A clip that moved to another source or
+        // track goes here too and is created again below.
+        for key in &doomed_clips {
             if let Some(entry) = clips.remove(key) {
                 edit.destroy_playback_region(entry.region)
                     .map_err(map_error)?;
@@ -638,17 +874,26 @@ impl Session {
             .cloned()
             .collect();
         for key in stale_sources {
-            if let Some(entry) = sources.remove(&key) {
-                // Access off before the source goes: the plug-in may be reading
-                // it on an analysis thread, and disabling access is what makes
-                // it close those readers. Destroying a source that is still
-                // readable is an ARA API violation the SDK's controllers assert
-                // on.
-                edit.set_audio_source_samples_access(entry.handle, false)
-                    .map_err(map_error)?;
-                edit.destroy_audio_source(entry.handle).map_err(map_error)?;
-                index.remove_source(entry.address);
+            let Some(entry) = sources.get(&key) else {
+                continue;
+            };
+            let (handle, address) = (entry.handle, entry.address);
+            // Access off before the source goes: the plug-in may be reading it
+            // on an analysis thread, and disabling access is what makes it
+            // close those readers. Destroying a source that is still readable
+            // is an ARA API violation the SDK's controllers assert on.
+            edit.set_audio_source_samples_access(handle, false)
+                .map_err(map_error)?;
+            if let Err(error) = edit.destroy_audio_source(handle) {
+                // The plug-in still has the source, so the host keeps it too,
+                // readable again; forgetting it here left a source the host
+                // could never destroy, holding the clip's modification.
+                let _ = edit.set_audio_source_samples_access(handle, true);
+                return Err(map_error(error));
             }
+            sources.remove(&key);
+            index.remove_source(address);
+            analysis.forget(&key);
         }
 
         let stale_sequences: Vec<AraTrackKey> = sequences
@@ -698,7 +943,7 @@ impl Session {
         for desc in &graph.sources {
             let properties = AudioSourceProperties::new(
                 Some(desc.name.as_str()),
-                desc.key.as_str(),
+                &ara_persistent_id(desc.key.as_str()),
                 desc.frame_count,
                 desc.sample_rate,
                 desc.channel_count,
@@ -708,8 +953,21 @@ impl Session {
             match sources.get_mut(&desc.key) {
                 Some(entry) if entry.desc == *desc => {}
                 Some(entry) => {
+                    // ARA lets a source's length, rate and channel count change
+                    // only while the plug-in cannot read it.
+                    let reshaped = entry.desc.frame_count != desc.frame_count
+                        || entry.desc.sample_rate != desc.sample_rate
+                        || entry.desc.channel_count != desc.channel_count;
+                    if reshaped {
+                        edit.set_audio_source_samples_access(entry.handle, false)
+                            .map_err(map_error)?;
+                    }
                     edit.update_audio_source(entry.handle, properties)
                         .map_err(map_error)?;
+                    if reshaped {
+                        edit.set_audio_source_samples_access(entry.handle, true)
+                            .map_err(map_error)?;
+                    }
                     entry.desc = desc.clone();
                 }
                 None => {
@@ -746,7 +1004,6 @@ impl Session {
             }
         }
 
-        let mut new_clips: Vec<AraClipKey> = Vec::new();
         for desc in &graph.regions {
             let transform = desc.transform.intersect(supported);
             let sequence = sequences
@@ -768,6 +1025,7 @@ impl Session {
 
             match clips.get_mut(&desc.key) {
                 Some(entry) if entry.desc == *desc => {}
+                // Same source and track: `doomed_clips` took every other one.
                 Some(entry) => {
                     edit.update_playback_region(entry.region, region_properties)
                         .map_err(map_error)?;
@@ -782,7 +1040,7 @@ impl Session {
                         .handle;
                     let modification_properties = AudioModificationProperties::new(
                         Some(desc.name.as_str()),
-                        desc.key.as_str(),
+                        &ara_persistent_id(desc.key.as_str()),
                     )
                     .map_err(map_error)?;
                     let modification = edit
@@ -801,7 +1059,6 @@ impl Session {
                         .map_err(map_error)?
                         .as_raw() as usize;
                     index.insert_region(region_address, desc.key.clone());
-                    new_clips.push(desc.key.clone());
                     clips.insert(
                         desc.key.clone(),
                         ClipEntry {
@@ -816,19 +1073,47 @@ impl Session {
             }
         }
 
-        edit.finish().map_err(map_error)?;
-        notify_after_edit(document);
+        // The graph is whole: its archived state goes in now, before the
+        // cycle ends. Whatever the plug-in says, the cycle still ends below,
+        // so a refused archive never leaves the document stuck in editing.
+        for step in restores.iter_mut() {
+            let restored = with_archive(
+                archives,
+                step.sequence,
+                step.request.archive_id,
+                step.request.bytes,
+                |token| edit.restore_objects_from_archive(token, step.filter),
+            );
+            step.result = Some(restored.map_err(map_error));
+        }
 
-        // Identities are indexed as they are created -- they have to be, because
-        // the plug-in calls back during the edit. What is left here is the work
-        // that is only legal once the edit has closed.
-        let _ = new_clips;
-        for (_, handle) in new_sources {
-            // Ask for note analysis on every source the host just published.
-            // A plug-in is entitled to wait for the host to ask before spending
-            // the CPU, and one that does shows an empty editor until then.
-            // `Unsupported` only means this plug-in does not analyse notes.
-            match document.request_audio_source_content_analysis::<Notes>(handle) {
+        edit.finish().map_err(map_error)?;
+        Ok(new_sources)
+    }
+
+    /// Asks for note analysis on sources the host just created, unless they
+    /// already have content (a restore supplied it).
+    ///
+    /// A plug-in is entitled to wait for the host to ask before spending the
+    /// CPU, and one that does shows an empty editor until then. Asking before
+    /// a restore instead left Melodyne reporting the analysis incomplete for
+    /// good. `Unsupported` only means this plug-in does not analyse notes.
+    fn request_note_analysis(&mut self, created: &[(AraSourceKey, AudioSourceHandle)]) {
+        for (key, handle) in created {
+            if self
+                .notes_grade(*handle)
+                .is_some_and(|grade| grade >= GRADE_DETECTED)
+            {
+                trace(&format!(
+                    "'{}' has note content already; no analysis requested",
+                    key.as_str()
+                ));
+                continue;
+            }
+            let Ok(document) = self.document_mut() else {
+                return;
+            };
+            match document.request_audio_source_content_analysis::<Notes>(*handle) {
                 Ok(()) => trace("requested note analysis for a new audio source"),
                 Err(AraError::Unsupported(_)) => {
                     trace("plug-in does not analyse notes; skipping the request")
@@ -836,8 +1121,51 @@ impl Session {
                 Err(error) => trace(&format!("note analysis request failed: {error}")),
             }
         }
+    }
 
-        Ok(())
+    /// The plug-in's note-content grade for one source, or `None` when it
+    /// does not analyse notes or the query fails. Outside editing only.
+    fn notes_grade(&mut self, handle: AudioSourceHandle) -> Option<i32> {
+        if !self.notes_analysable {
+            return None;
+        }
+        let document = self.document_mut().ok()?;
+        document
+            .audio_source_content_grade::<Notes>(handle)
+            .ok()
+            .map(|grade| grade.as_raw())
+    }
+
+    /// Whether the plug-in reports note analysis of one source incomplete,
+    /// or `None` when it does not analyse notes or the query fails.
+    fn notes_incomplete(&mut self, handle: AudioSourceHandle) -> Option<bool> {
+        if !self.notes_analysable {
+            return None;
+        }
+        let document = self.document_mut().ok()?;
+        document
+            .audio_source_content_analysis_incomplete::<Notes>(handle)
+            .ok()
+    }
+
+    /// Whether note analysis of `key` is still incomplete, as the plug-in
+    /// reports it right now; `None` when the source is not in the graph or
+    /// the plug-in does not analyse notes.
+    pub(crate) fn analysis_incomplete(&mut self, key: &AraSourceKey) -> AraResult<Option<bool>> {
+        let Some(handle) = self.sources.get(key).map(|entry| entry.handle) else {
+            return Ok(None);
+        };
+        if !self.notes_analysable {
+            return Ok(None);
+        }
+        match self
+            .document_mut()?
+            .audio_source_content_analysis_incomplete::<Notes>(handle)
+        {
+            Ok(incomplete) => Ok(Some(incomplete)),
+            Err(AraError::Unsupported(_)) => Ok(None),
+            Err(error) => Err(map_error(error)),
+        }
     }
 
     /// # Safety
@@ -1043,7 +1371,7 @@ impl Session {
             .map_err(map_error)
     }
 
-    pub(crate) fn store_archive(&mut self) -> AraResult<Vec<u8>> {
+    pub(crate) fn store_archive(&mut self) -> AraResult<AraStoredArchive> {
         let token = Box::new(ArchiveToken {
             _sequence: self.next_archive,
         });
@@ -1069,82 +1397,394 @@ impl Session {
         let slot = self.archives.take(address);
         drop(token);
         result.map_err(map_error)?;
-        Ok(slot.map(|slot| slot.bytes).unwrap_or_default())
+        // No filter stores every object in the graph, so the identity read
+        // from the same maps in the same call describes exactly these bytes.
+        Ok(AraStoredArchive {
+            bytes: slot.map(|slot| slot.bytes).unwrap_or_default(),
+            identity: self.archive_identity(),
+        })
     }
 
-    /// Restores `bytes`, stored under `archive_id`, into the document.
-    ///
-    /// The graph must already exist with the persistent IDs it was saved
-    /// with: both paths match the archive's objects to live ones by ID.
-    ///
-    /// ARA 2 Final and later restore objects inside an ordinary edit cycle.
-    /// Earlier plug-ins get the legacy restore scope, which (in every
-    /// ARA-library controller) is an edit cycle that restores all live
-    /// objects when it ends. The legacy call is refused outright at 2 Final
-    /// and later — which, since this host negotiates the newest generation
-    /// first and Apple Silicon allows nothing older, used to be every
-    /// session: saved ARA edits were silently dropped on every reopen.
-    pub(crate) fn restore_archive(&mut self, archive_id: &str, bytes: &[u8]) -> AraResult<()> {
-        let token = Box::new(ArchiveToken {
-            _sequence: self.next_archive,
-        });
-        self.next_archive += 1;
-        let address = std::ptr::from_ref(token.as_ref()) as usize;
-        // The ID the bytes were written under, not the plug-in's current one:
-        // an archive from an older version must be read as that version.
-        self.archives.open(
-            address,
-            ArchiveSlot {
-                bytes: bytes.to_vec(),
-                archive_id: Some(archive_id.to_owned()),
-            },
-        );
-
-        let document = self.document_mut()?;
-        let outcome = if document.generation() >= ApiGeneration::V2Final {
-            document.edit().and_then(|mut edit| {
-                let restored = edit.restore_objects_from_archive(token.as_ref(), None);
-                // End the cycle whatever the restore said, so a refused
-                // archive does not leave the document stuck in editing.
-                let finished = edit.finish();
-                restored.and(finished)
+    /// What a store made now holds: every source and modification the host
+    /// published, under the IDs it published them with, and the key the
+    /// plug-in was offered.
+    fn archive_identity(&self) -> AraArchiveIdentity {
+        let mut sources: Vec<AraArchivedSource> = self
+            .sources
+            .values()
+            .map(|entry| AraArchivedSource {
+                persistent_id: ara_persistent_id(entry.desc.key.as_str()).into_owned(),
+                key: entry.desc.key.clone(),
+                sample_rate: entry.desc.sample_rate,
+                frame_count: entry.desc.frame_count,
+                channel_count: entry.desc.channel_count,
             })
-        } else {
-            document
-                .restore_document_from_archive(token.as_ref())
-                .and_then(|edit| edit.finish())
+            .collect();
+        sources.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut modifications: Vec<AraArchivedModification> = self
+            .clips
+            .values()
+            .map(|entry| AraArchivedModification {
+                persistent_id: ara_persistent_id(entry.desc.key.as_str()).into_owned(),
+                clip: entry.desc.key.clone(),
+                source_persistent_id: ara_persistent_id(entry.desc.source.as_str()).into_owned(),
+            })
+            .collect();
+        modifications.sort_by(|a, b| a.clip.cmp(&b.clip));
+        AraArchiveIdentity {
+            sources,
+            modifications,
+            keys: Some(self.published_key_descriptor()),
+        }
+    }
+
+    /// The key signatures the plug-in is offered right now.
+    fn published_key_descriptor(&self) -> AraKeyDescriptor {
+        let keys = match &self.published {
+            Some(timeline) if offers_harmonic_content(self.generation) => timeline.keys.as_slice(),
+            _ => &[],
         };
-        self.archives.take(address);
-        drop(token);
-        outcome.map_err(map_error)?;
-        self.resync_harmony_after_restore();
+        AraKeyDescriptor::of(keys)
+    }
+
+    /// Restores an archive into the graph as it stands, in an edit cycle of
+    /// its own.
+    pub(crate) fn restore(&mut self, request: AraRestoreRequest<'_>) -> AraRestoreReport {
+        let mut sources: Vec<AraAudioSourceDesc> = self
+            .sources
+            .values()
+            .map(|entry| entry.desc.clone())
+            .collect();
+        sources.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut regions: Vec<AraPlaybackRegionDesc> = self
+            .clips
+            .values()
+            .map(|entry| entry.desc.clone())
+            .collect();
+        regions.sort_by(|a, b| a.key.cmp(&b.key));
+        let prepared = self.prepare_restore(&request, &sources, &regions);
+        let requests = [request];
+        self.restore_all_in_own_cycle(&requests, vec![prepared])
+            .pop()
+            .unwrap_or_else(|| {
+                AraRestoreReport::not_run(AraHostError::invalid("the restore did not run"))
+            })
+    }
+
+    /// Settles a restore against the graph `sources` and `regions` describe:
+    /// the archive must be one this plug-in reads, the placement must be
+    /// valid, and a filter (a map, or part of an archive) needs ARA 2 Final.
+    fn prepare_restore(
+        &self,
+        request: &AraRestoreRequest<'_>,
+        sources: &[AraAudioSourceDesc],
+        regions: &[AraPlaybackRegionDesc],
+    ) -> AraResult<PreparedRestore> {
+        if !self.info.can_restore_archive(request.archive_id) {
+            return Err(AraHostError::unsupported(format!(
+                "archive '{}' cannot be restored by '{}'",
+                request.archive_id, self.info.document_archive_id
+            )));
+        }
+        let plan = plan_restore(
+            request.identity,
+            request.map,
+            request.scope,
+            sources,
+            regions,
+        )?;
+        let filter = match &plan.filter {
+            None => None,
+            Some(_) if self.generation < ApiGeneration::V2Final => {
+                return Err(AraHostError::unsupported(
+                    "restoring through a map, or part of an archive, needs ARA 2 Final or later",
+                ));
+            }
+            Some(planned) => Some(restore_filter(planned)?),
+        };
+        Ok(PreparedRestore { plan, filter })
+    }
+
+    /// Reads what judges a restore before it runs: each target's note grade,
+    /// and how much analysis progress it has reported.
+    ///
+    /// A target the host has not created yet is created by the very edit the
+    /// restore runs in, where no analysis has happened: its grade is initial.
+    fn begin_restore(&mut self, prepared: PreparedRestore) -> RestoreRun {
+        let mut before = Vec::with_capacity(prepared.plan.targets.len());
+        let mut progress = Vec::with_capacity(prepared.plan.targets.len());
+        for target in &prepared.plan.targets {
+            let grade = match self.sources.get(&target.key).map(|entry| entry.handle) {
+                Some(handle) => self.notes_grade(handle),
+                None => self.notes_analysable.then_some(GRADE_INITIAL),
+            };
+            before.push(grade);
+            progress.push(self.analysis.reports(&target.key));
+        }
+        RestoreRun {
+            plan: prepared.plan,
+            filter: prepared.filter,
+            before,
+            progress,
+        }
+    }
+
+    /// Runs prepared restores against the graph as it stands and reports
+    /// each, in order.
+    ///
+    /// ARA 2 Final and later restore objects inside an ordinary edit cycle,
+    /// here one cycle for all of them. Earlier plug-ins get the legacy
+    /// restore scope, one per restore, which (in every ARA-library
+    /// controller) is an edit cycle that restores all live objects when it
+    /// ends. The legacy call is refused outright at 2 Final and later —
+    /// which, since this host negotiates the newest generation first and
+    /// Apple Silicon allows nothing older, used to be every session: saved
+    /// ARA edits were silently dropped on every reopen.
+    fn restore_all_in_own_cycle(
+        &mut self,
+        requests: &[AraRestoreRequest<'_>],
+        prepared: Vec<AraResult<PreparedRestore>>,
+    ) -> Vec<AraRestoreReport> {
+        let runs: Vec<AraResult<RestoreRun>> = prepared
+            .into_iter()
+            .map(|prepared| prepared.map(|prepared| self.begin_restore(prepared)))
+            .collect();
+        let archives = Arc::clone(&self.archives);
+        let sequence = self.next_archive;
+        self.next_archive += requests.len() as u64;
+        let mut results: Vec<Option<AraResult<()>>> = Vec::with_capacity(runs.len());
+        match self.document_mut() {
+            Err(error) => {
+                results.extend(runs.iter().map(|_| Some(Err(error.clone()))));
+            }
+            Ok(document) if document.generation() >= ApiGeneration::V2Final => {
+                match document.edit() {
+                    Err(error) => {
+                        let error = map_error(error);
+                        results.extend(runs.iter().map(|_| Some(Err(error.clone()))));
+                    }
+                    Ok(mut edit) => {
+                        for (index, (request, run)) in requests.iter().zip(&runs).enumerate() {
+                            let Ok(run) = run else {
+                                results.push(None);
+                                continue;
+                            };
+                            let restored = with_archive(
+                                &archives,
+                                sequence + index as u64,
+                                request.archive_id,
+                                request.bytes,
+                                |token| {
+                                    edit.restore_objects_from_archive(token, run.filter.as_ref())
+                                },
+                            );
+                            results.push(Some(restored.map_err(map_error)));
+                        }
+                        // End the cycle whatever the restores said, so a
+                        // refused archive does not leave the document stuck
+                        // in editing.
+                        if let Err(error) = edit.finish() {
+                            let error = map_error(error);
+                            for result in results.iter_mut().flatten() {
+                                if result.is_ok() {
+                                    *result = Err(error.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(document) => {
+                for (index, (request, run)) in requests.iter().zip(&runs).enumerate() {
+                    if run.is_err() {
+                        results.push(None);
+                        continue;
+                    }
+                    let restored = with_archive(
+                        &archives,
+                        sequence + index as u64,
+                        request.archive_id,
+                        request.bytes,
+                        |token| {
+                            document
+                                .restore_document_from_archive(token)
+                                .and_then(|edit| edit.finish())
+                        },
+                    );
+                    results.push(Some(restored.map_err(map_error)));
+                }
+            }
+        }
+        let concluded = runs
+            .into_iter()
+            .zip(results)
+            .map(|(run, result)| {
+                run.map(|run| {
+                    let result = result
+                        .unwrap_or_else(|| Err(AraHostError::invalid("the restore did not run")));
+                    (run, result)
+                })
+            })
+            .collect();
+        self.conclude_restores(requests, concluded)
+    }
+
+    /// Judges restores that have run, one report per request, then brings
+    /// the key back in line.
+    ///
+    /// Grades are read first, straight after the edit cycle and before the
+    /// plug-in may deliver anything: a plug-in that found nothing to restore
+    /// starts analysing at the end of the cycle, and its progress reports,
+    /// delivered next, catch an analysis fast enough to finish before the
+    /// read. A restore that could not run is reported as not run. The
+    /// harmony is re-synced once, when the key any of the archives was
+    /// stored with is known and differs from today's.
+    fn conclude_restores(
+        &mut self,
+        requests: &[AraRestoreRequest<'_>],
+        runs: Vec<AraResult<(RestoreRun, AraResult<()>)>>,
+    ) -> Vec<AraRestoreReport> {
+        let handles: Vec<Vec<Option<AudioSourceHandle>>> = runs
+            .iter()
+            .map(|run| match run {
+                Ok((run, _)) => run
+                    .plan
+                    .targets
+                    .iter()
+                    .map(|target| self.sources.get(&target.key).map(|entry| entry.handle))
+                    .collect(),
+                Err(_) => Vec::new(),
+            })
+            .collect();
+        let after: Vec<Vec<Option<i32>>> = handles
+            .iter()
+            .map(|handles| {
+                handles
+                    .iter()
+                    .map(|handle| handle.and_then(|handle| self.notes_grade(handle)))
+                    .collect()
+            })
+            .collect();
         if let Ok(document) = self.document_mut() {
             notify_after_edit(document);
         }
-        Ok(())
+
+        let current_keys = self.published_key_descriptor();
+        let harmonic = offers_harmonic_content(self.generation);
+        let mut reports = Vec::with_capacity(runs.len());
+        let mut resync = Vec::with_capacity(runs.len());
+        for (index, (request, run)) in requests.iter().zip(runs).enumerate() {
+            let (run, result) = match run {
+                Ok(run) => run,
+                Err(error) => {
+                    trace(&format!(
+                        "restore of '{}' ({} bytes) did not run: {error}",
+                        request.archive_id,
+                        request.bytes.len()
+                    ));
+                    reports.push(AraRestoreReport::not_run(error));
+                    resync.push(false);
+                    continue;
+                }
+            };
+            let mut sources = Vec::with_capacity(handles[index].len());
+            for (target_index, target) in run.plan.targets.into_iter().enumerate() {
+                let analysis_seen =
+                    self.analysis.reports(&target.key) != run.progress[target_index];
+                let analysis_incomplete =
+                    handles[index][target_index].and_then(|handle| self.notes_incomplete(handle));
+                sources.push(AraSourceRestore {
+                    outcome: classify_source(
+                        run.before[target_index],
+                        after[index][target_index],
+                        analysis_seen,
+                        target.as_saved,
+                    ),
+                    key: target.key,
+                    persistent_id: target.current_id,
+                    archived_id: target.archived_id,
+                    grade_before: run.before[target_index],
+                    grade_after: after[index][target_index],
+                    analysis_incomplete,
+                });
+            }
+            let unplaced = !run.plan.unplaced_sources.is_empty()
+                || !run.plan.unplaced_modifications.is_empty();
+            let outcomes: Vec<_> = sources.iter().map(|source| source.outcome).collect();
+            let outcome = overall_outcome(&outcomes, run.plan.expects, unplaced);
+            resync.push(
+                result.is_ok()
+                    && needs_harmony_resync(
+                        request.identity.and_then(|identity| identity.keys),
+                        current_keys,
+                        harmonic,
+                    ),
+            );
+            trace(&format!(
+                "restore of '{}' ({} bytes, filter={}, document data={}): {outcome:?}, \
+                 error={:?}, sources={:?}, unplaced sources={:?}, unplaced modifications={:?}",
+                request.archive_id,
+                request.bytes.len(),
+                run.filter.is_some(),
+                run.plan
+                    .filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.document_data),
+                result.as_ref().err(),
+                sources
+                    .iter()
+                    .map(|source| (
+                        source.persistent_id.as_str(),
+                        source.outcome,
+                        source.grade_before,
+                        source.grade_after
+                    ))
+                    .collect::<Vec<_>>(),
+                run.plan.unplaced_sources,
+                run.plan.unplaced_modifications,
+            ));
+            reports.push(AraRestoreReport {
+                error: result.err(),
+                outcome,
+                sources,
+                unplaced_sources: run.plan.unplaced_sources,
+                unplaced_modifications: run.plan.unplaced_modifications,
+                harmony_resynced: false,
+            });
+        }
+        if resync.iter().any(|needed| *needed) && self.resync_harmony() {
+            for (report, needed) in reports.iter_mut().zip(resync) {
+                report.harmony_resynced = needed;
+            }
+        }
+        trace(&format!(
+            "harmony resynced after the restores: {:?}",
+            reports
+                .iter()
+                .map(|report| report.harmony_resynced)
+                .collect::<Vec<_>>()
+        ));
+        reports
     }
 
-    /// Tells the plug-in the harmony changed, after a restore.
+    /// Tells the plug-in the harmony changed, after a restore whose archive
+    /// was stored with a known key that differs from the project's now
+    /// ([`needs_harmony_resync`]).
     ///
     /// The archive brings back each clip's copy of the key it was saved with
     /// (Melodyne keeps scales per audio modification, copied from the musical
     /// context), and the key may have changed since — while the plug-in was
     /// missing, say. The timeline itself is unchanged, so the diff in
-    /// `set_musical_timeline` would never say so. The restore itself has
-    /// succeeded either way, so a failure here is traced, not returned.
-    fn resync_harmony_after_restore(&mut self) {
-        let has_keys = self
-            .published
-            .as_ref()
-            .is_some_and(|timeline| !timeline.keys.is_empty());
+    /// `set_musical_timeline` would never say so. With the same key the
+    /// notification would only replace scales the user set, and with an
+    /// unknown one the host cannot tell, so neither sends it. The restore
+    /// itself stands either way, so a failure here is traced, not returned.
+    fn resync_harmony(&mut self) -> bool {
         let Some(handle) = self.musical_context else {
-            return;
+            return false;
         };
-        if !has_keys || !offers_harmonic_content(self.generation) {
-            return;
-        }
         let Ok(document) = self.document_mut() else {
-            return;
+            return false;
         };
         let outcome = document.edit().and_then(|mut edit| {
             let updated = edit.update_musical_context_content(handle, None, HARMONY_CHANGED);
@@ -1152,8 +1792,15 @@ impl Session {
             let finished = edit.finish();
             updated.and(finished)
         });
-        if let Err(error) = outcome {
-            trace(&format!("harmony re-sync after restore: {error}"));
+        match outcome {
+            Ok(()) => {
+                notify_after_edit(document);
+                true
+            }
+            Err(error) => {
+                trace(&format!("harmony re-sync after restore: {error}"));
+                false
+            }
         }
     }
 
@@ -1329,6 +1976,133 @@ mod tests {
         ));
         assert!(!scopes.contains(ContentUpdateScopes::HARMONIC_REMAINS_UNCHANGED));
         assert_eq!(scopes, CONTEXT_NEVER_CHANGES);
+    }
+
+    const THAI_PATH: &str =
+        "/Users/doppio/Documents/Futureboard Studio/Projects/โปรเจกต์ไม่มีชื่อ-1/Recordings/เสียง.wav";
+
+    #[test]
+    fn published_ids_pass_the_bridge_where_raw_keys_did_not() {
+        // What failed a whole Thai-named project's ARA track.
+        assert!(AudioSourceProperties::new(None, THAI_PATH, 1, 44_100.0, 1, false.into()).is_err());
+
+        for key in [
+            THAI_PATH,
+            "Assets/Audio/1.wav",
+            "clip-1",
+            "",
+            "a\0b",
+            "fbx:x",
+            "🎵",
+        ] {
+            let id = ara_persistent_id(key);
+            AudioSourceProperties::new(Some("n"), &id, 1, 44_100.0, 1, false.into())
+                .unwrap_or_else(|error| panic!("source ID for {key:?}: {error}"));
+            AudioModificationProperties::new(None, &id)
+                .unwrap_or_else(|error| panic!("modification ID for {key:?}: {error}"));
+            RestoreFilter::builder()
+                .audio_source(id.clone().into_owned(), id.clone().into_owned())
+                .build()
+                .unwrap_or_else(|error| panic!("filter ID for {key:?}: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_planned_filter_restores_document_data_and_identity_pairs() {
+        let planned = PlannedFilter {
+            document_data: true,
+            sources: vec![(
+                "/Users/doppio/Documents/CodeProject/1.wav".to_owned(),
+                "Assets/Audio/1.wav".to_owned(),
+            )],
+            modifications: vec![("clip-1".to_owned(), "clip-1".to_owned())],
+        };
+        let filter = restore_filter(&planned).unwrap();
+        assert!(filter.includes_document_data());
+        assert_eq!(filter.audio_sources().len(), 1);
+        assert_eq!(
+            filter.audio_sources()[0].archive_id(),
+            "/Users/doppio/Documents/CodeProject/1.wav"
+        );
+        assert_eq!(filter.audio_sources()[0].current_id(), "Assets/Audio/1.wav");
+        assert_eq!(filter.audio_modifications().len(), 1);
+        assert_eq!(filter.audio_modifications()[0].archive_id(), "clip-1");
+        assert_eq!(filter.audio_modifications()[0].current_id(), "clip-1");
+
+        // A filter the bridge would refuse is refused here, as invalid.
+        let duplicate = PlannedFilter {
+            document_data: true,
+            sources: vec![
+                ("a".to_owned(), "x".to_owned()),
+                ("b".to_owned(), "x".to_owned()),
+            ],
+            modifications: Vec::new(),
+        };
+        assert!(matches!(
+            restore_filter(&duplicate),
+            Err(AraHostError::Invalid(_))
+        ));
+
+        // The later part of a partial restore leaves the document data out.
+        let later = PlannedFilter {
+            document_data: false,
+            sources: vec![("b.wav".to_owned(), "b.wav".to_owned())],
+            modifications: vec![("clip-2".to_owned(), "clip-2".to_owned())],
+        };
+        let filter = restore_filter(&later).unwrap();
+        assert!(!filter.includes_document_data());
+        assert_eq!(filter.audio_sources().len(), 1);
+        // A part with nothing but the document data is a valid filter too.
+        let data_only = PlannedFilter {
+            document_data: true,
+            ..PlannedFilter::default()
+        };
+        let filter = restore_filter(&data_only).unwrap();
+        assert!(filter.includes_document_data());
+        assert!(filter.audio_sources().is_empty() && filter.audio_modifications().is_empty());
+    }
+
+    fn region(key: &str, source: &str, track: &str) -> AraPlaybackRegionDesc {
+        AraPlaybackRegionDesc {
+            key: key.into(),
+            source: source.into(),
+            track: track.into(),
+            name: key.to_owned(),
+            start_in_modification: 0.0,
+            duration_in_modification: 1.0,
+            start_in_playback: 0.0,
+            duration_in_playback: 1.0,
+            transform: AraPlaybackTransform::NONE,
+            color: None,
+        }
+    }
+
+    #[test]
+    fn a_clip_that_moves_to_other_audio_or_another_track_is_rebuilt() {
+        let held = [
+            region("kept", "a.wav", "track-1"),
+            region("moved-later", "a.wav", "track-1"),
+            region("retargeted", "/abs/b.wav", "track-1"),
+            region("rehomed", "a.wav", "track-1"),
+            region("deleted", "a.wav", "track-1"),
+        ];
+        let mut moved = region("moved-later", "a.wav", "track-1");
+        moved.start_in_playback = 4.0;
+        let wanted = [
+            region("kept", "a.wav", "track-1"),
+            moved,
+            region("retargeted", "Assets/Audio/b.wav", "track-1"),
+            region("rehomed", "a.wav", "track-2"),
+        ];
+        let doomed = doomed_clips(held.iter().map(|desc| (&desc.key, desc)), &wanted);
+        assert_eq!(
+            doomed,
+            vec![
+                AraClipKey::from("deleted"),
+                AraClipKey::from("rehomed"),
+                AraClipKey::from("retargeted"),
+            ]
+        );
     }
 
     #[test]

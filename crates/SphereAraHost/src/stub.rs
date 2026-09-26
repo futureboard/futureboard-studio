@@ -9,9 +9,12 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 
 use crate::AraSessionConfig;
+use crate::archive::{AraRestoreReport, AraRestoreRequest, AraStoredArchive};
 use crate::error::{AraHostError, AraResult};
 use crate::info::{AraFactoryInfo, AraRendererId, AraRoles};
-use crate::model::{AraClipKey, AraGraph, AraGraphChange, AraMusicalTimeline, AraTrackKey};
+use crate::model::{
+    AraClipKey, AraGraph, AraGraphChange, AraMusicalTimeline, AraSourceKey, AraTrackKey,
+};
 
 fn unsupported<T>() -> AraResult<T> {
     Err(AraHostError::unsupported(
@@ -67,6 +70,22 @@ impl Session {
         unsupported()
     }
 
+    pub(crate) fn apply_graph_restoring(
+        &mut self,
+        _graph: &AraGraph,
+        _restore: Option<AraRestoreRequest<'_>>,
+    ) -> AraResult<Option<AraRestoreReport>> {
+        unsupported()
+    }
+
+    pub(crate) fn apply_graph_restoring_all(
+        &mut self,
+        _graph: &AraGraph,
+        _restores: &[AraRestoreRequest<'_>],
+    ) -> AraResult<Vec<AraRestoreReport>> {
+        unsupported()
+    }
+
     pub(crate) fn graph_change(&self, _graph: &AraGraph) -> AraGraphChange {
         AraGraphChange::Structure
     }
@@ -115,11 +134,17 @@ impl Session {
         unsupported()
     }
 
-    pub(crate) fn store_archive(&mut self) -> AraResult<Vec<u8>> {
+    pub(crate) fn store_archive(&mut self) -> AraResult<AraStoredArchive> {
         unsupported()
     }
 
-    pub(crate) fn restore_archive(&mut self, _archive_id: &str, _bytes: &[u8]) -> AraResult<()> {
+    pub(crate) fn restore(&mut self, _request: AraRestoreRequest<'_>) -> AraRestoreReport {
+        AraRestoreReport::not_run(AraHostError::unsupported(
+            "ARA hosting is only available on Windows and macOS",
+        ))
+    }
+
+    pub(crate) fn analysis_incomplete(&mut self, _key: &AraSourceKey) -> AraResult<Option<bool>> {
         unsupported()
     }
 

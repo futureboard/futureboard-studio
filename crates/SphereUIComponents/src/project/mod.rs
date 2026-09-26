@@ -922,6 +922,20 @@ pub struct FutureboardProject {
     pub global_lanes: ProjectGlobalLanes,
     /// v41+: one saved ARA document per bound plug-in.
     pub ara_documents: Vec<ProjectAraDocument>,
+    /// v54+ (ARA extension): saved ARA documents a plug-in could not match to
+    /// this project's audio, kept byte for byte, once each, while the live
+    /// document saves in their place (a restore that missed, the plug-in
+    /// removed from the track while its document was still parked or partly
+    /// kept back, or a kept-back document replaced by a newer one). Never
+    /// restored on their own and never dropped by the app: they hold edits no
+    /// restored document has.
+    pub ara_orphans: Vec<ProjectAraDocument>,
+    /// v54+ (ARA extension): per track, at most one saved ARA document that
+    /// was restored in part because some of its audio was offline, kept byte
+    /// for byte with the sources still to be restored from it once that
+    /// audio is back. The track's live document is its `ara_documents` entry
+    /// throughout; this one only feeds the part that is still missing.
+    pub ara_deferred: Vec<ProjectAraDeferred>,
     /// v54+: loop, snap, lane visibility, automation expansion and the mixer
     /// tree latch. Zoom, scroll and the playhead are per user and live in a
     /// [`view::ViewSidecar`] instead.
@@ -948,6 +962,74 @@ pub struct ProjectAraDocument {
     /// Opaque plug-in bytes, stored raw and length-prefixed exactly like
     /// [`PluginStateBlob::state_bytes`]. Never JSON, never base64.
     pub data: Vec<u8>,
+    /// v54+ (ARA extension): which audio sources and modifications `data`
+    /// holds, under the persistent IDs the plug-in stored them with. `None`
+    /// for archives written before it was recorded, or when the record could
+    /// not be read back.
+    pub written_with: Option<ProjectAraIdentity>,
+    /// Runtime only, never written: the plug-in stored this document from its
+    /// live session for the save being made, so `written_with` describes the
+    /// audio the project holds now and may take this save's content
+    /// fingerprints. False for every document read from a file or saved back
+    /// verbatim (parked, unconfirmed, orphaned), whose record describes the
+    /// audio of the save that wrote it.
+    pub stored_now: bool,
+}
+
+/// A saved ARA document restored in part, kept for the rest of it: see
+/// [`FutureboardProject::ara_deferred`].
+#[derive(Debug, Clone)]
+pub struct ProjectAraDeferred {
+    /// The archive, whose plug-in and track, and its record. Never
+    /// `stored_now`: it is always saved back verbatim.
+    pub document: ProjectAraDocument,
+    /// Archived persistent IDs of the audio sources still to be restored
+    /// from it, each with its modifications.
+    pub remaining_sources: Vec<String>,
+}
+
+/// What one saved ARA document holds, recorded in the same call that stored
+/// it.
+///
+/// ARA has no call that lists the IDs inside an archive, and a plug-in
+/// reports success for a restore that matched nothing, so this record is the
+/// only way to tell a restore that can land from one that cannot, and to map
+/// archived IDs that moved onto the current ones.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ProjectAraIdentity {
+    pub sources: Vec<ProjectAraArchivedSource>,
+    pub modifications: Vec<ProjectAraArchivedModification>,
+    /// Stable digest of the key signatures the plug-in was offered
+    /// (`sphere_ara_host::AraKeyDescriptor`), `None` when unknown.
+    pub key_descriptor: Option<u64>,
+}
+
+/// One audio source as a saved ARA document holds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectAraArchivedSource {
+    /// The ARA persistent ID the plug-in stored the source under.
+    pub persistent_id: String,
+    /// The clip asset id (`file_id`) the source was published from.
+    pub asset_id: String,
+    pub sample_rate: f64,
+    /// Frames per channel.
+    pub frames: i64,
+    pub channels: i32,
+    /// Content fingerprint of the audio (`"<len:x>-<crc:08x>"`), from the
+    /// asset record of the save that wrote the document; `None` when that
+    /// save could not read the file.
+    pub fingerprint: Option<String>,
+}
+
+/// One audio modification (a clip's edits) as a saved ARA document holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectAraArchivedModification {
+    /// The ARA persistent ID the plug-in stored the modification under.
+    pub persistent_id: String,
+    /// The clip the modification belonged to.
+    pub clip_id: String,
+    /// Persistent ID of the audio source it was created on.
+    pub source_persistent_id: String,
 }
 
 /// One persisted logical audio bus. Runtime-derived status is deliberately not
@@ -995,6 +1077,8 @@ impl FutureboardProject {
             assets: Vec::new(),
             global_lanes: ProjectGlobalLanes::default(),
             ara_documents: Vec::new(),
+            ara_orphans: Vec::new(),
+            ara_deferred: Vec::new(),
             view: view::ProjectViewState::default(),
         }
     }

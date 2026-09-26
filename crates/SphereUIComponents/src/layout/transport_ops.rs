@@ -917,6 +917,11 @@ impl StudioLayout {
             (None, None, _) if self.active_edit_notice().is_some() => {
                 self.active_edit_notice().unwrap_or_default().to_string()
             }
+            // Saved ARA documents kept or waiting for their audio: news about
+            // the project just opened, until it expires.
+            (None, None, _) if self.active_ara_notice().is_some() => {
+                self.active_ara_notice().unwrap_or_default().to_string()
+            }
             (None, None, _) if routing_notice.is_some() => {
                 routing_notice.clone().unwrap_or_default()
             }

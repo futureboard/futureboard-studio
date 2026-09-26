@@ -11,9 +11,9 @@ use gpui::Context;
 use sphere_ara_host::AraTransportRequest;
 
 use super::ara_graph;
-use super::ara_ops::AraSessionKey;
+use super::ara_ops::{AraParked, AraSavedDocuments, AraSessionKey, DeferredRestore, SavedArchive};
 use super::StudioLayout;
-use crate::project::{FutureboardProject, ProjectAraDocument};
+use crate::project::{FutureboardProject, ProjectAraDeferred, ProjectAraDocument};
 
 /// One ARA-capable plug-in, as the menus present it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -300,10 +300,10 @@ impl StudioLayout {
                 );
             }
             let _ = this.update(cx, |layout, cx| {
-                let Some(engine) = layout.audio_bridge.engine.clone() else {
-                    return;
-                };
-                layout.ara.close(&engine, &key);
+                // Without an engine nothing renders, and the session still has
+                // to go: its document belongs to a track that no longer has it.
+                let engine = layout.audio_bridge.engine.clone();
+                layout.ara.close(engine.as_ref(), &key);
                 cx.notify();
             });
         })
@@ -346,7 +346,7 @@ impl StudioLayout {
             view.media_paths.len()
         ));
 
-        if let Err(error) = self.ara.apply(
+        let applied = self.ara.apply(
             &engine,
             key,
             &choice.name,
@@ -355,7 +355,10 @@ impl StudioLayout {
             &timeline,
             &view.graph,
             view.media_paths,
-        ) {
+            &view.offline,
+        );
+        self.show_ara_notices(cx);
+        if let Err(error) = applied {
             self.ara.last_error = Some(format!("{}: {error}", choice.name));
             eprintln!("[ARA] {} failed: {error}", choice.name);
             return;
@@ -624,17 +627,28 @@ impl StudioLayout {
         }
     }
 
-    /// Writes every live ARA document into the project being saved.
+    /// Writes every ARA document into the project being saved: each live
+    /// session's, every one still parked, every one kept back for audio that
+    /// is offline, and every orphan.
     pub(crate) fn attach_ara_archives(&mut self, project: &mut FutureboardProject) {
-        project.ara_documents = self
-            .ara
-            .store_archives()
+        let saved = self.ara.store_archives();
+        let to_project = |(key, archive): (AraSessionKey, SavedArchive)| ProjectAraDocument {
+            plugin_id: key.plugin_id,
+            track_id: key.track_id,
+            archive_id: archive.archive_id,
+            data: archive.data,
+            written_with: archive.written_with,
+            stored_now: archive.stored_now,
+        };
+        project.ara_documents = saved.documents.into_iter().map(to_project).collect();
+        project.ara_orphans = saved.orphans.into_iter().map(to_project).collect();
+        project.ara_deferred = saved
+            .deferred
             .into_iter()
-            .map(|(key, archive_id, data)| ProjectAraDocument {
-                plugin_id: key.plugin_id,
-                track_id: key.track_id,
-                archive_id,
-                data,
+            .map(|(key, held)| ProjectAraDeferred {
+                // Always saved back verbatim (see `AraState::defer`).
+                document: to_project((key, held.archive)),
+                remaining_sources: held.remaining,
             })
             .collect();
     }
@@ -643,31 +657,184 @@ impl StudioLayout {
     /// are bound to.
     ///
     /// Restoring runs inside the session open, before regions are assigned and
-    /// before playback, which is where ARA requires it.
+    /// before playback, which is where ARA requires it. Everything the previous
+    /// project had open or parked goes first. Callers run this only once the
+    /// loaded project is installed for good (after the integrity check), so a
+    /// load that fails never takes the live project's documents with it.
     pub(crate) fn restore_ara_archives(
         &mut self,
         project: &FutureboardProject,
         cx: &mut Context<Self>,
     ) {
-        if let Some(engine) = self.audio_bridge.engine.clone() {
-            self.ara.close_all(&engine);
-        }
-        self.ara
-            .load_archives(project.ara_documents.iter().map(|document| {
-                (
-                    AraSessionKey {
-                        plugin_id: document.plugin_id.clone(),
-                        track_id: document.track_id.clone(),
-                    },
-                    document.archive_id.clone(),
-                    document.data.clone(),
-                )
-            }));
+        self.close_all_ara_sessions(cx);
+        let key = |document: &ProjectAraDocument| AraSessionKey {
+            plugin_id: document.plugin_id.clone(),
+            track_id: document.track_id.clone(),
+        };
+        let archive = |document: &ProjectAraDocument| SavedArchive {
+            archive_id: document.archive_id.clone(),
+            data: document.data.clone(),
+            written_with: document.written_with.clone(),
+            stored_now: false,
+        };
+        let saved = AraSavedDocuments {
+            documents: project
+                .ara_documents
+                .iter()
+                .map(|document| (key(document), archive(document)))
+                .collect(),
+            orphans: project
+                .ara_orphans
+                .iter()
+                .map(|document| (key(document), archive(document)))
+                .collect(),
+            deferred: project
+                .ara_deferred
+                .iter()
+                .map(|held| {
+                    (
+                        key(&held.document),
+                        DeferredRestore {
+                            archive: archive(&held.document),
+                            remaining: held.remaining_sources.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        // What the plan compares a moved source's audio by: the content the
+        // project's own asset records hold for each asset id.
+        let fingerprints = project
+            .assets
+            .iter()
+            .filter_map(|asset| {
+                let token = asset.source_fingerprint.as_deref()?;
+                Some((
+                    asset.id.clone(),
+                    crate::project::io::content_fingerprint(token)?,
+                ))
+            })
+            .collect();
+        self.ara.load_archives(saved, fingerprints);
 
         self.open_pending_ara_sessions(cx);
         // Until a session is live its clips play from their files (see
         // `sync_engine_ara_rendering`); resync so the engine hears that now.
         self.mark_engine_project_dirty();
+    }
+
+    /// Closes every ARA session with its editors and forgets every saved ARA
+    /// document: the project they belong to is being replaced or closed.
+    ///
+    /// Without this a New, a Close or a template kept the previous project's
+    /// plug-ins running, and the next save wrote their documents into the new
+    /// project; a track of the same id even got the old document back.
+    ///
+    /// The sequence is the one [`Self::unbind_track_from_ara`] follows, for
+    /// every session at once:
+    ///
+    /// 1. The editors are asked to let go: popped-out windows are removed and
+    ///    the docked panel's detach is requested. Neither happens inline (the
+    ///    panel detaches on a deferred tick, a window when GPUI removes it).
+    /// 2. The sessions leave the project synchronously
+    ///    ([`super::ara_ops::AraState::retire_all`]): renderers out of the
+    ///    engine behind the callback barrier, parked documents and orphans
+    ///    forgotten. Callers load the next project right after, and its
+    ///    sessions (on the same track ids, often) must not find these.
+    /// 3. Each document is destroyed only once no view holds it any more (not
+    ///    on the docked panel, not by the plug-in's own account), polled every
+    ///    frame; a view that never lets go is closed anyway after the same
+    ///    wait the unbind path allows, and the log says so. Destroying the
+    ///    document under a live view is what took the app down.
+    ///
+    /// The status bar's ARA notice goes too: it was about that project's
+    /// documents (every path that replaces or closes a project, `reset_project`
+    /// included, comes through here).
+    pub(crate) fn close_all_ara_sessions(&mut self, cx: &mut Context<Self>) {
+        let keys: Vec<AraSessionKey> = self.ara.keys().cloned().collect();
+        self.close_ara_editors(&keys, cx);
+        let engine = self.audio_bridge.engine.clone();
+        self.ara
+            .retire_all(engine.as_ref(), std::time::Instant::now());
+        self.finish_retired_ara_sessions(cx);
+        self.clear_ara_notice(cx);
+    }
+
+    /// Step 1 of [`Self::close_all_ara_sessions`]: asks every editor on
+    /// these sessions to let go.
+    fn close_ara_editors(&mut self, keys: &[AraSessionKey], cx: &mut Context<Self>) {
+        for key in keys {
+            self.close_ara_editor(key, cx);
+        }
+        if !keys.is_empty() {
+            self.ara_editor_popped_out = false;
+            self.ara_editor_open_pending = false;
+            self.ara_editor
+                .update(cx, |host, cx| host.request_detach(cx));
+        }
+    }
+
+    /// Step 3 of [`Self::close_all_ara_sessions`]: destroys each retired
+    /// document once its editor views have let go.
+    fn finish_retired_ara_sessions(&mut self, cx: &mut Context<Self>) {
+        let patience = VIEW_RELEASE_POLL_INTERVAL * VIEW_RELEASE_POLLS;
+        let this_frame = move |layout: &mut Self, cx: &mut Context<Self>| {
+            let docked = layout.ara_editor.read(cx);
+            layout
+                .ara
+                .finish_retired(std::time::Instant::now(), patience, |handle| {
+                    !docked.holds_instance(handle)
+                })
+        };
+        if !this_frame(self, cx) {
+            return;
+        }
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            // One poll past the patience, so the last session retired is
+            // always either released or overdue by the end.
+            for _ in 0..=VIEW_RELEASE_POLLS {
+                executor.timer(VIEW_RELEASE_POLL_INTERVAL).await;
+                let waiting = this
+                    .update(cx, |layout, cx| this_frame(layout, cx))
+                    .unwrap_or(false);
+                if !waiting {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Puts back the ARA documents of a project whose replacement failed,
+    /// when the switch had already closed its sessions or parked the other
+    /// project's documents. A switch that failed before touching them leaves
+    /// the live sessions running.
+    pub(crate) fn restore_parked_ara(&mut self, parked: AraParked, cx: &mut Context<Self>) {
+        if self.ara.holds(&parked) {
+            return;
+        }
+        let keys: Vec<AraSessionKey> = self.ara.keys().cloned().collect();
+        self.close_ara_editors(&keys, cx);
+        let engine = self.audio_bridge.engine.clone();
+        self.ara
+            .roll_back(parked, engine.as_ref(), std::time::Instant::now());
+        self.finish_retired_ara_sessions(cx);
+        self.open_pending_ara_sessions(cx);
+        self.mark_engine_project_dirty();
+    }
+
+    /// Shows what the ARA sessions had to tell the user about saved
+    /// documents, in the status bar: never a dialog, the project is usable.
+    fn show_ara_notices(&mut self, cx: &mut Context<Self>) {
+        // Drained after every session's sync, so several are one track's:
+        // part of its audio offline and the rest not matched, say. Each is
+        // a sentence naming its track.
+        let notices = self.ara.take_notices();
+        if notices.is_empty() {
+            return;
+        }
+        self.show_ara_notice(notices.join(" "), cx);
     }
 
     /// Opens the session of every ARA-bound track that has none yet.
@@ -840,6 +1007,12 @@ impl StudioLayout {
         key: &AraSessionKey,
     ) -> Option<DirectAudio::Vst3RuntimeProcessor> {
         self.ara.processor(key)
+    }
+
+    /// The handle of that instance, for the embedded editor to tell whether
+    /// the view it holds is on it (see `AraState::instance_handle`).
+    pub(crate) fn ara_instance_handle(&self, key: &AraSessionKey) -> Option<usize> {
+        self.ara.instance_handle(key)
     }
 
     /// The last thing an ARA session complained about.
