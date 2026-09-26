@@ -109,27 +109,16 @@ pub fn resolve_plugin_drop(
     }
 }
 
-/// Index just below `track_id` — below its whole group when it is a group or
-/// sits in one, so a new track never lands inside a group it does not belong
-/// to.
+/// Index just below `track_id` — below its whole outermost folder when it is
+/// a folder or sits in one, at any depth, so a new track never lands inside a
+/// folder it does not belong to.
 fn insert_index_below(state: &TimelineState, track_id: &str) -> usize {
     let Some(index) = state.tracks.iter().position(|track| track.id == track_id) else {
         return state.tracks.len();
     };
-    let track = &state.tracks[index];
-    let group = if track.track_type == TrackType::Group {
-        Some(track.id.as_str())
-    } else {
-        track.parent_group_id.as_deref()
-    };
-    match group {
-        Some(group) => state
-            .tracks
-            .iter()
-            .rposition(|t| t.id == group || t.parent_group_id.as_deref() == Some(group))
-            .map_or(index + 1, |last| last + 1),
-        None => index + 1,
-    }
+    let tree = state.group_tree();
+    let outermost = tree.ancestors(index).last().copied().unwrap_or(index);
+    tree.block_end(outermost)
 }
 
 /// The live drag-over state: where the pointer is and what a release there

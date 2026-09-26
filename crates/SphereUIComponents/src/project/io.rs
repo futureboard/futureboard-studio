@@ -227,6 +227,163 @@ pub fn save_project_with_report_from(
     }
 }
 
+/// What an export to a project archive found besides writing it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectArchiveReport {
+    /// Media that could not be found, so is not in the archive.
+    pub offline_media: Vec<PathBuf>,
+    /// Media the archive's project still names outside its own folder: a
+    /// save leaves these where they are rather than copying them in.
+    pub external_media: Vec<PathBuf>,
+}
+
+/// File → Export Project as ZIP: writes `project` as a self-contained project
+/// folder, `<name>/<name>.fbproj` with its `Assets`, into the zip file
+/// `archive`.
+///
+/// The folder is an ordinary save into a scratch folder, so the archive holds
+/// exactly what saving there would: every audio file the project plays is
+/// copied in beside it and referenced relatively, which is what lets it open
+/// on another machine. The scratch folder is removed afterwards, and the zip
+/// is written beside `archive` first and moved over it only once complete.
+/// `records_root` is [`save_project_with_report_from`]'s.
+pub fn export_project_archive(
+    project: &mut FutureboardProject,
+    archive: &Path,
+    records_root: Option<&Path>,
+) -> Result<ProjectArchiveReport, ProjectError> {
+    static NEXT_EXPORT: AtomicU64 = AtomicU64::new(0);
+    let export = NEXT_EXPORT.fetch_add(1, Ordering::Relaxed);
+    let scratch = ScratchFolder(std::env::temp_dir().join(format!(
+        "futureboard-archive-{}-{export}",
+        std::process::id()
+    )));
+    let _ = fs::remove_dir_all(&scratch.0);
+    let name = sanitize_project_name(&project.name);
+    let folder = scratch.0.join(&name);
+    let project_file = folder.join(format!("{name}.{PROJECT_FILE_EXT}"));
+    let saved = save_project_with_report_from(project, &project_file, records_root)?;
+    let external_media = media_outside(project, &folder);
+
+    let partial = PathBuf::from(format!("{}.part", archive.display()));
+    let written = write_folder_zip(&folder, &name, &partial);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&partial);
+        return Err(ProjectError::Io(error));
+    }
+    if let Err(error) = replace_project_file(&partial, archive) {
+        let _ = fs::remove_file(&partial);
+        return Err(ProjectError::Io(error));
+    }
+    project_save_log(format_args!(
+        "project archive written: {}",
+        archive.display()
+    ));
+    Ok(ProjectArchiveReport {
+        offline_media: saved.offline_media,
+        external_media,
+    })
+}
+
+/// A scratch folder removed with everything in it when dropped, on the error
+/// paths too.
+struct ScratchFolder(PathBuf);
+
+impl Drop for ScratchFolder {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Media a saved project still names by an absolute path outside `root`, and
+/// that exists: what a save did not copy into the project folder.
+fn media_outside(project: &FutureboardProject, root: &Path) -> Vec<PathBuf> {
+    let mut outside = Vec::new();
+    for clip in project.tracks.iter().flat_map(|track| &track.clips) {
+        let path = match &clip.source {
+            ClipSource::Audio {
+                source_path: Some(path),
+                ..
+            }
+            | ClipSource::Rauf {
+                source_path: path, ..
+            } => path,
+            _ => continue,
+        };
+        if path.is_absolute() && !path.starts_with(root) && path.exists() && !outside.contains(path)
+        {
+            outside.push(path.clone());
+        }
+    }
+    outside
+}
+
+/// Zips every file under `folder` into `zip_path`, as `<top>/<relative path>`.
+/// Empty folders are left out: opening the project recreates them.
+fn write_folder_zip(folder: &Path, top: &str, zip_path: &Path) -> std::io::Result<()> {
+    use zip::write::SimpleFileOptions;
+    use zip::CompressionMethod;
+
+    let mut files = Vec::new();
+    collect_files(folder, &mut files)?;
+    files.sort();
+
+    let mut writer = zip::ZipWriter::new(std::io::BufWriter::new(File::create(zip_path)?));
+    for path in files {
+        let Ok(relative) = path.strip_prefix(folder) else {
+            continue;
+        };
+        let entry = std::iter::once(top.to_string())
+            .chain(
+                relative
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().into_owned()),
+            )
+            .collect::<Vec<_>>()
+            .join("/");
+        let len = fs::metadata(&path)?.len();
+        let options = SimpleFileOptions::default()
+            .compression_method(if archive_stores_uncompressed(&path) {
+                CompressionMethod::Stored
+            } else {
+                CompressionMethod::Deflated
+            })
+            .large_file(len >= u32::MAX as u64);
+        writer
+            .start_file(entry, options)
+            .map_err(std::io::Error::other)?;
+        std::io::copy(&mut File::open(&path)?, &mut writer)?;
+    }
+    let mut out = writer.finish().map_err(std::io::Error::other)?;
+    out.flush()?;
+    out.get_ref().sync_all()
+}
+
+fn collect_files(folder: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            collect_files(&entry.path(), files)?;
+        } else if kind.is_file() {
+            files.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// Audio is stored as it is: already-compressed formats do not shrink, and
+/// deflating PCM saves little for the time it costs on a large project.
+fn archive_stores_uncompressed(path: &Path) -> bool {
+    const AUDIO: &[&str] = &[
+        "wav", "wave", "aif", "aiff", "flac", "mp3", "ogg", "opus", "m4a", "aac", "caf", "w64",
+        "rauf",
+    ];
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| AUDIO.iter().any(|known| ext.eq_ignore_ascii_case(known)))
+}
+
 /// Move a finished temp file over `path`. `rename` replaces the target
 /// atomically on macOS and Linux, so the target is never removed first: a
 /// failed rename leaves the previous project in place instead of no project
@@ -3022,6 +3179,96 @@ mod tests {
             "and stamped with the file's time"
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The archive is the project folder a save makes, under one top folder:
+    /// the audio it plays is copied in beside it, and it opens from there with
+    /// nothing outside the archive.
+    #[test]
+    fn a_project_archive_holds_the_project_and_the_audio_it_plays() {
+        let root = temp_dir("archive");
+        let external = root.join("elsewhere");
+        fs::create_dir_all(&external).unwrap();
+        let source = external.join("loop.wav");
+        fs::write(&source, b"fake wav bytes").unwrap();
+
+        let mut project = FutureboardProject::new("My Song");
+        project.tracks.push(ProjectTrack {
+            id: "track-1".to_string(),
+            name: "Audio 1".to_string(),
+            track_type: ProjectTrackType::Audio,
+            ara: None,
+            timebase: crate::components::timeline::timeline_state::TrackTimebase::Musical.to_tag(),
+            parent_group_id: None,
+            group_collapsed: false,
+            color_hex: "#56C7C9".to_string(),
+            volume_norm: 1.0,
+            pan: 0.0,
+            muted: false,
+            solo: false,
+            record_arm: false,
+            input_monitor: crate::project::InputMonitorMode::Off,
+            routing: TrackRouting::default(),
+            inserts: Vec::new(),
+            automation_lanes: Vec::new(),
+            clips: vec![ProjectClip {
+                id: "clip-1".to_string(),
+                name: "loop".to_string(),
+                start_beat: 0.0,
+                duration_beats: 4.0,
+                offset_beats: 0.0,
+                gain: 1.0,
+                muted: false,
+                source: ClipSource::Audio {
+                    asset_id: source.to_string_lossy().into_owned(),
+                    source_path: Some(source.clone()),
+                },
+                stretch: AudioClipStretchState::default(),
+            }],
+            row_height_px: None,
+            soundfont: None,
+            volume_automation_read: true,
+            solfege: None,
+            takes: Vec::new(),
+            takes_expanded: false,
+        });
+
+        let archive = root.join("My Song.zip");
+        fs::write(&archive, b"an older archive").unwrap();
+        let report = export_project_archive(&mut project, &archive, None).unwrap();
+        assert!(report.offline_media.is_empty());
+        assert!(report.external_media.is_empty());
+        assert!(!PathBuf::from(format!("{}.part", archive.display())).exists());
+
+        let mut zip = zip::ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+        let mut names: Vec<String> = zip.file_names().map(str::to_string).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["My Song/Assets/Audio/loop.wav", "My Song/My Song.fbproj"]
+        );
+        let mut audio = Vec::new();
+        zip.by_name("My Song/Assets/Audio/loop.wav")
+            .unwrap()
+            .read_to_end(&mut audio)
+            .unwrap();
+        assert_eq!(audio, b"fake wav bytes");
+
+        // Unpacked anywhere, the project finds its audio inside itself.
+        let unpacked = root.join("unpacked");
+        zip.extract(&unpacked).unwrap();
+        let project_file = unpacked.join("My Song").join("My Song.fbproj");
+        let loaded = load_project_strict(&project_file).unwrap();
+        let ClipSource::Audio {
+            source_path: Some(path),
+            ..
+        } = &loaded.tracks[0].clips[0].source
+        else {
+            panic!("expected an audio clip");
+        };
+        let expected = unpacked.join("My Song").join("Assets").join("Audio");
+        assert_eq!(path, &expected.join("loop.wav"));
         let _ = fs::remove_dir_all(root);
     }
 }

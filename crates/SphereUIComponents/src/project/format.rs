@@ -143,7 +143,11 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// from it. A file that ends at the view section, or whose extension cannot
 /// be read, loads with none of them: its ARA documents restore as before, by
 /// ID alone.
-pub const PROJECT_VERSION: u32 = 54;
+/// v55 changes no bytes: from v55 a folder's members play through it, so its
+/// fader, pan, mute and inserts act on them. In a pre-v55 file membership was
+/// only visual, and a member whose output is the main mix loads routed to its
+/// folder instead; a member routed anywhere else keeps its route.
+pub const PROJECT_VERSION: u32 = 55;
 
 /// Minimum on-disk format version that can be loaded without data loss.
 /// Versions below this will show a warning but can still be loaded.
@@ -3149,6 +3153,21 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
             manager_pitch_range: r.read_f32()?,
         }
         .sanitized();
+    }
+
+    // v55: folder members play through their folder (see `PROJECT_VERSION`).
+    if version < 55
+        && !matches!(
+            track_type,
+            ProjectTrackType::Midi | ProjectTrackType::Master
+        )
+        && routing.output == ProjectTrackOutputRouting::Main
+    {
+        if let Some(group_id) = &parent_group_id {
+            routing.output = ProjectTrackOutputRouting::Bus {
+                bus_id: group_id.clone(),
+            };
+        }
     }
 
     Ok(ProjectTrack {

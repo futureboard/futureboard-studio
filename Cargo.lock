@@ -8233,6 +8233,7 @@ dependencies = [
  "x11-dl",
  "zcomp",
  "zed-reqwest",
+ "zip 2.4.2",
 ]
 
 [[package]]

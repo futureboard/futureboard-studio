@@ -2121,6 +2121,17 @@ impl StudioLayout {
                 });
             })
         };
+        let on_toggle_folder: std::sync::Arc<
+            dyn Fn(&String, &mut Window, &mut gpui::App) + 'static,
+        > = {
+            let this = owner.clone();
+            std::sync::Arc::new(move |track_id: &String, _w, cx| {
+                let track_id = track_id.clone();
+                StudioLayout::defer_update(&this, cx, move |this, cx| {
+                    this.toggle_folder(&track_id, cx);
+                });
+            })
+        };
         // Drop commit for a dragged insert slot. Every surface (the Inspector,
         // the docked and the detached mixer) hands its drop to the same
         // `commit_insert_drop`, which resolves the anchor against the live
@@ -2318,6 +2329,7 @@ impl StudioLayout {
             on_remove_insert,
             on_toggle_insert_bypass,
             on_toggle_vsti_output_group,
+            on_toggle_folder,
             on_drop_insert,
             on_drop_plugin_preset,
             on_open_insert_editor,

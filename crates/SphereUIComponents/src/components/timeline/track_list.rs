@@ -15,7 +15,9 @@ use crate::components::timeline::timeline_state::{
     AutomationHover, AutomationMarquee, TimelineGestureContext, TimelineState, TrackRowLayout,
     AUTOMATION_CONTROL_LANE_HEIGHT, AUTOMATION_SUBLANE_HEIGHT, DEFAULT_TRACK_HEIGHT, HEADER_WIDTH,
 };
-use crate::components::timeline::track_header::{track_header, TrackHeaderCallbacks};
+use crate::components::timeline::track_header::{
+    track_header, FolderPlacement, TrackHeaderCallbacks,
+};
 use crate::components::timeline::track_lane::{track_lane, MarqueePress, MarqueePressCb};
 use crate::components::timeline::track_lane_view::{TrackLaneView, TrackLaneViews};
 use crate::components::timeline::track_resize::{
@@ -149,6 +151,8 @@ pub fn track_list(
         );
     }
 
+    // Read once for every row this frame draws.
+    let group_tree = state.group_tree();
     for (offset, track) in state.tracks[visible_start..visible_end].iter().enumerate() {
         // `row_layout.rows` is 1:1 with `state.tracks`, so the row is an index
         // lookup rather than an id scan. The scan was O(track_count) per visible
@@ -238,6 +242,7 @@ pub fn track_list(
                                 index,
                                 state,
                                 row_height,
+                                &FolderPlacement::of(state, &group_tree, index),
                                 header_callbacks.clone(),
                                 meters,
                             ))

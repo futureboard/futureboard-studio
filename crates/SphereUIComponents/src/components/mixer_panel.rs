@@ -49,8 +49,9 @@ use crate::components::sidebar::BrowserDragItem;
 use crate::components::timeline::timeline_state::{
     is_vsti_output_child_track_id, volume, vsti_output_bus_flat_range,
     vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
-    vsti_output_child_insert_id, InsertLoadStatus, InsertSlotState, ListenMode, MasterBusState,
-    MonitorBusState, SendSlotState, TrackOutputRouting, TrackState, TrackType, MASTER_TRACK_ID,
+    vsti_output_child_insert_id, GroupTree, InsertLoadStatus, InsertSlotState, ListenMode,
+    MasterBusState, MonitorBusState, SendSlotState, TrackOutputRouting, TrackState, TrackType,
+    MASTER_TRACK_ID,
 };
 use crate::components::timeline::vu_meter::meter_surface;
 use crate::i18n::I18n;
@@ -291,9 +292,68 @@ fn vsti_output_group_key(track_id: &str, insert_id: &str) -> String {
 fn strip_top_row(
     track: &TrackState,
     vsti_output_group: Option<(&str, bool, usize, &MixerCallbacks)>,
+    folder: Option<(usize, &MixerCallbacks)>,
     i18n: I18n,
 ) -> impl IntoElement {
     let type_label = mixer_track_type_label(track.track_type, i18n);
+    let folder_chip = folder.map(|(members, callbacks)| {
+        let toggle = callbacks.on_toggle_folder.clone();
+        let track_id = track.id.clone();
+        let collapsed = track.group_collapsed;
+        div()
+            .id(gpui::SharedString::from(format!(
+                "mixer-folder-toggle-{}",
+                track.id
+            )))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .h(px(13.0))
+            .px(px(3.0))
+            .rounded(px(crate::theme::radius::MICRO))
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(|s| s.bg(Colors::state_hover()))
+            .tooltip(crate::components::controls::fb_tooltip(if collapsed {
+                "Show the tracks in this folder"
+            } else {
+                "Hide the tracks in this folder"
+            }))
+            .child(
+                svg()
+                    .path(if collapsed {
+                        assets::ICON_FOLDER_PATH
+                    } else {
+                        assets::ICON_FOLDER_OPEN_PATH
+                    })
+                    .w(px(9.0))
+                    .h(px(9.0))
+                    .text_color(track.color),
+            )
+            .child(
+                div()
+                    .text_size(px(type_scale::CAPTION))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(Colors::text_muted())
+                    .child(format!("{members}")),
+            )
+            .child(
+                svg()
+                    .path(if collapsed {
+                        assets::ICON_CHEVRON_RIGHT_PATH
+                    } else {
+                        assets::ICON_CHEVRON_DOWN_PATH
+                    })
+                    .w(px(9.0))
+                    .h(px(9.0))
+                    .text_color(Colors::text_muted()),
+            )
+            .on_mouse_down(gpui::MouseButton::Left, move |_e, w, cx| {
+                cx.stop_propagation();
+                toggle(&track_id, w, cx);
+            })
+            .occlude()
+    });
 
     div()
         .flex()
@@ -316,6 +376,7 @@ fn strip_top_row(
                 .text_color(Colors::text_faint())
                 .child(type_label),
         )
+        .children(folder_chip)
         .children(
             vsti_output_group.map(|(group_key, expanded, count, callbacks)| {
                 let group_key = group_key.to_string();
@@ -1566,6 +1627,44 @@ fn vertical_split_handle(
 
 // ─── Channel strip ──────────────────────────────────────────────────────────
 
+/// Height of one folder band across a strip's top edge.
+const MIXER_FOLDER_BAND_H: f32 = 2.0;
+/// Folder levels a strip shows bands for: the innermost ones. Two fit above
+/// the type label without touching it.
+const MIXER_FOLDER_BANDS: usize = 2;
+
+/// Where a strip sits among folders. Adjacent strips of one folder carry the
+/// same band, so the bands read as one bar across the folder and its members,
+/// starting at the folder's own strip.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct MixerFolderPlacement {
+    /// Band colours, outermost first: the enclosing folders and, for a folder,
+    /// itself; the innermost [`MIXER_FOLDER_BANDS`] of them.
+    pub bands: Vec<gpui::Rgba>,
+    /// For a folder: how many tracks sit directly inside it.
+    pub members: Option<usize>,
+}
+
+impl MixerFolderPlacement {
+    pub(crate) fn of(tracks: &[TrackState], tree: &GroupTree, index: usize) -> Self {
+        let is_folder = tracks[index].track_type == TrackType::Group;
+        let mut bands: Vec<gpui::Rgba> = tree
+            .ancestors(index)
+            .into_iter()
+            .rev()
+            .map(|folder| tracks[folder].color)
+            .collect();
+        if is_folder {
+            bands.push(tracks[index].color);
+        }
+        let skip = bands.len().saturating_sub(MIXER_FOLDER_BANDS);
+        Self {
+            bands: bands.split_off(skip),
+            members: is_folder.then(|| tree.member_count(index)),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn channel_strip(
     track: &TrackState,
@@ -1576,6 +1675,7 @@ fn channel_strip(
     split: &MixerSplit,
     strip_available_px: f32,
     vsti_group_expanded: Option<bool>,
+    folder: &MixerFolderPlacement,
     // When true the GPU primitive layer owns the strip background, the name
     // plate fill, and the right separator — the strip container omits them so
     // the batched canvas behind shows through. Inner sections keep their own
@@ -1638,6 +1738,7 @@ fn channel_strip(
                 .border_color(console::rule())
                 .hover(move |h| h.bg(hover))
         })
+        .relative()
         .id(("mix-strip", id_num))
         // Select during capture so occluding child controls (racks, pan and
         // fader) cannot delay or swallow channel selection. The child still
@@ -1658,8 +1759,20 @@ fn channel_strip(
             vsti_group.as_ref().map(|(group_key, expanded, count)| {
                 (group_key.as_str(), *expanded, *count, callbacks)
             }),
+            folder.members.map(|members| (members, callbacks)),
             i18n,
         ))
+        // The folder bands, over the top edge: GPUI children, so they paint
+        // on both the element and the batched decor paths.
+        .children(folder.bands.iter().enumerate().map(|(level, color)| {
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(level as f32 * MIXER_FOLDER_BAND_H))
+                .h(px(MIXER_FOLDER_BAND_H))
+                .bg(*color)
+        }))
         .child(inserts_section(track, callbacks, insert_h, base, i18n))
         .child(vertical_split_handle(
             id_num,
@@ -1819,7 +1932,7 @@ fn vsti_output_sub_strip(
         // Real callbacks: mute / solo / volume / pan all target the child track
         // id (via button_row / pan_section / fader_area below), so S/M and the
         // fader operate per output bus.
-        .child(strip_top_row(&sub_track, None, i18n))
+        .child(strip_top_row(&sub_track, None, None, i18n))
         // Real per-bus insert rack: the backing child track is a genuine Bus
         // model track, so its FX chain is added/bypassed/reordered by child
         // track id and processed by the engine's pass-2 routing chain for
@@ -2727,8 +2840,14 @@ pub(crate) fn collect_mixer_render_items(
         children.sort_unstable_by_key(|(bus_index, _)| *bus_index);
     }
 
+    // A collapsed folder folds its members' strips away, as it folds their
+    // rows in the arrangement.
+    let folders = GroupTree::of(tracks);
     let mut items = Vec::with_capacity(tracks.len());
     for (track_index, track) in tracks.iter().enumerate() {
+        if folders.hidden[track_index] {
+            continue;
+        }
         // VSTi multi-out child tracks are model/engine route nodes. The visible
         // mixer sub-strips are injected from the parent insert below, so these
         // backing tracks should never render as ordinary BUS channel strips.
@@ -3192,6 +3311,7 @@ pub(crate) fn mixer_strip_scroller(
         visible_end.saturating_sub(visible_start) as u64,
     );
 
+    let folders = GroupTree::of(tracks);
     let visible_strips: Vec<gpui::AnyElement> = render_items[visible_start..visible_end]
         .iter()
         .map(|item| match *item {
@@ -3215,6 +3335,7 @@ pub(crate) fn mixer_strip_scroller(
                     split,
                     strip_available_px,
                     vsti_group_expanded,
+                    &MixerFolderPlacement::of(tracks, &folders, track_index),
                     gpu_decor,
                     i18n,
                 )

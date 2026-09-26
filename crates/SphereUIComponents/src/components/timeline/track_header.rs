@@ -13,8 +13,8 @@ use crate::components::text_input::{
     text_field_with_callbacks_and_ime, TextInputCallbacks, TextInputState,
 };
 use crate::components::timeline::timeline_state::{
-    is_arrangement_hidden_track, volume, TimelineState, TrackDragItem, TrackLaneMode, TrackState,
-    TrackType, HEADER_WIDTH, TRACK_HEADER_CONTROLS_MIN_HEIGHT,
+    volume, GroupTree, TimelineState, TrackDragItem, TrackLaneMode, TrackState, TrackType,
+    HEADER_WIDTH, TRACK_HEADER_CONTROLS_MIN_HEIGHT,
 };
 use crate::components::timeline::vu_meter::{vu_meter_with_levels, TrackMeterViews};
 use crate::theme::{radius, size, space, typography, Colors};
@@ -172,12 +172,121 @@ const TAKE_ROW_H: f32 = 18.0;
 /// Vertical space the two-row header needs before anything else can be shown.
 const TAKE_STRIP_BASE_H: f32 = TRACK_HEADER_CONTROLS_MIN_HEIGHT;
 
-/// How far a grouped child's inset frame sits inside the header column, and how
-/// much room its accent strip and indent need inside that frame. Derived from
-/// the spacing scale rather than hand-tuned per edge, so the folder frame lines
-/// up with everything else in the column.
-const GROUP_FRAME_INSET: f32 = space::SNUG;
-const GROUP_FRAME_CAP: f32 = space::TIGHT;
+/// How far each folder level indents a row, and where the outermost folder's
+/// rail sits: just inside the row's own 3 px colour strip. A row inside
+/// folders draws one rail per level, in that folder's colour, so the tree reads
+/// down the column the way the rows stack, at any depth, with no frame to
+/// break where a member's own folder starts or ends.
+const FOLDER_INDENT: f32 = space::LOOSE;
+const FOLDER_RAIL_X: f32 = 3.0 + space::TIGHT;
+const FOLDER_RAIL_W: f32 = 2.0;
+/// The deepest level that still indents. Deeper rows line up with it, so a
+/// deep tree cannot push the name and controls out of the fixed-width column;
+/// their rails still show every level.
+const FOLDER_MAX_INDENT_LEVELS: usize = 6;
+
+/// Where a row sits among folders. Read once per frame from the
+/// [`GroupTree`], rather than by each header scanning the track list.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FolderPlacement {
+    /// The colours of the folders enclosing the row, outermost first.
+    pub rails: Vec<gpui::Rgba>,
+    /// For a folder: how many tracks sit directly inside it.
+    pub members: usize,
+}
+
+impl FolderPlacement {
+    pub fn of(state: &TimelineState, tree: &GroupTree, index: usize) -> Self {
+        let rails = tree
+            .ancestors(index)
+            .into_iter()
+            .rev()
+            .map(|folder| state.tracks[folder].color)
+            .collect();
+        let is_folder = state
+            .tracks
+            .get(index)
+            .is_some_and(|track| track.track_type == TrackType::Group);
+        Self {
+            rails,
+            members: if is_folder {
+                tree.member_count(index)
+            } else {
+                0
+            },
+        }
+    }
+
+    fn indent(&self) -> f32 {
+        self.rails.len().min(FOLDER_MAX_INDENT_LEVELS) as f32 * FOLDER_INDENT
+    }
+}
+
+/// A collapsed folder's member count, beside its name: what the folded rows
+/// hold, without opening it.
+fn folder_member_badge(members: usize) -> impl IntoElement {
+    div()
+        .flex_none()
+        .px(px(space::TIGHT))
+        .h(px(size::MICRO))
+        .flex()
+        .items_center()
+        .rounded(px(radius::CONTROL_SM))
+        .bg(Colors::surface_badge())
+        .text_size(px(typography::DENSE_CAPTION))
+        .text_color(Colors::text_muted())
+        .child(if members == 1 {
+            "1 track".to_string()
+        } else {
+            format!("{members} tracks")
+        })
+}
+
+/// The folder header's menu button: the track context menu, where the folder
+/// commands live, one click from the row that owns them.
+fn folder_menu_button(
+    id_num: usize,
+    track_id: String,
+    on_open: TrackContextCallback,
+) -> impl IntoElement {
+    let rest = Colors::button_bg();
+    let hover = Colors::composite(rest, Colors::state_hover());
+    div()
+        // Same hit band as the latch strip beside it.
+        .py(px(size::hit_target(size::DENSE)))
+        .flex_none()
+        .child(
+            div()
+                .id(("folder-menu", id_num))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(size::DENSE))
+                .h(px(size::DENSE))
+                .rounded(px(radius::CONTROL_SM))
+                .bg(rest)
+                .border(px(1.0))
+                .border_color(Colors::border_subtle())
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |style| style.bg(hover))
+                .active(|style| style.bg(Colors::composite(rest, Colors::state_recessed())))
+                .tooltip(fb_tooltip("Folder options"))
+                .occlude()
+                .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
+                    cx.stop_propagation();
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    on_open(&(track_id.clone(), x, y), window, cx);
+                })
+                .child(
+                    svg()
+                        .path(assets::ICON_ELLIPSIS_PATH)
+                        .w(px(GLYPH_MD))
+                        .h(px(GLYPH_MD))
+                        .text_color(Colors::text_muted()),
+                ),
+        )
+}
 
 /// One latching track-state toggle inside the M/S/R/I/A strip.
 ///
@@ -294,6 +403,7 @@ where
     I: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
     A: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 {
+    let is_folder = track.track_type == TrackType::Group;
     // Hue when latched, `None` when not — the divider colouring reads this to
     // decide which side of each seam is lit.
     let states: [Option<gpui::Rgba>; 5] = [
@@ -346,24 +456,27 @@ where
                     Some(latch_divider(states[0], states[1])),
                     handlers.on_solo,
                 ))
-                .child(latch_segment(
-                    ("arm-btn", id_num).into(),
-                    "R",
-                    None,
-                    track.armed,
-                    Colors::state_arm(),
-                    Some(latch_divider(states[1], states[2])),
-                    handlers.on_arm,
-                ))
-                .child(latch_segment(
-                    ("input-btn", id_num).into(),
-                    "I",
-                    None,
-                    track.input_monitor.is_active(track.armed),
-                    Colors::state_monitor(),
-                    Some(latch_divider(states[2], states[3])),
-                    handlers.on_input,
-                ))
+                .when(!is_folder, |strip| {
+                    strip
+                        .child(latch_segment(
+                            ("arm-btn", id_num).into(),
+                            "R",
+                            None,
+                            track.armed,
+                            Colors::state_arm(),
+                            Some(latch_divider(states[1], states[2])),
+                            handlers.on_arm,
+                        ))
+                        .child(latch_segment(
+                            ("input-btn", id_num).into(),
+                            "I",
+                            None,
+                            track.input_monitor.is_active(track.armed),
+                            Colors::state_monitor(),
+                            Some(latch_divider(states[2], states[3])),
+                            handlers.on_input,
+                        ))
+                })
                 // Automation mode toggle — switches the lane between Clip and
                 // Automation editing.
                 .child(latch_segment(
@@ -372,7 +485,11 @@ where
                     None,
                     is_automation,
                     Colors::state_automation(),
-                    Some(latch_divider(states[3], states[4])),
+                    Some(if is_folder {
+                        latch_divider(states[1], states[4])
+                    } else {
+                        latch_divider(states[3], states[4])
+                    }),
                     handlers.on_automation,
                 )),
         )
@@ -627,11 +744,13 @@ fn instrument_header_button(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn track_header(
     track: &TrackState,
     index: usize,
     state: &TimelineState,
     row_height: f32,
+    folder: &FolderPlacement,
     callbacks: TrackHeaderCallbacks,
     meters: &TrackMeterViews,
 ) -> impl IntoElement {
@@ -641,25 +760,11 @@ pub fn track_header(
     let is_selected = state.display_selection().is_track_selected(&track.id);
     let is_automation = track.lane_mode == TrackLaneMode::Automation;
     let is_group = track.track_type == TrackType::Group;
-    let is_group_child = track.parent_group_id.is_some();
-    let is_first_group_child = track.parent_group_id.as_deref().is_some_and(|group_id| {
-        state
-            .tracks
-            .get(..index)
-            .into_iter()
-            .flatten()
-            .rev()
-            .find(|candidate| !is_arrangement_hidden_track(candidate))
-            .is_none_or(|previous| previous.parent_group_id.as_deref() != Some(group_id))
-    });
-    let is_last_group_child = track.parent_group_id.as_deref().is_some_and(|group_id| {
-        state
-            .tracks
-            .iter()
-            .skip(index + 1)
-            .find(|candidate| !is_arrangement_hidden_track(candidate))
-            .is_none_or(|next| next.parent_group_id.as_deref() != Some(group_id))
-    });
+    let folder_menu = callbacks
+        .on_context_menu
+        .clone()
+        .filter(|_| is_group)
+        .map(|on_open| (track.id.clone(), on_open));
     // Adaptive header: the volume/pan/meter/dB control row only fits at the
     // default row height or taller. Below that we show the compact single-row
     // header so controls never overlap, clip, or float outside the row.
@@ -667,6 +772,7 @@ pub fn track_header(
     let is_dragging = state.dragging_track_id.as_deref() == Some(track.id.as_str());
     let is_drop_target =
         state.drag_target_index == Some(index) || state.drag_target_index == Some(index + 1);
+    let is_folder_drop_target = state.drag_folder_target_id.as_deref() == Some(track.id.as_str());
     // Selection, drag, and drop-target are *tints*: translucent washes designed
     // to sit on the header's surface, not to be it. Using one as the whole
     // background left a selected header with no opaque pixel of its own, so
@@ -685,11 +791,12 @@ pub fn track_header(
     } else {
         None
     };
-    let header_bg = header_tint.unwrap_or_else(Colors::surface_panel);
-    let group_frame_bg = if is_dragging || is_selected || is_automation {
-        header_bg
+    // A folder's own row sits one plane up from the tracks inside it, so the
+    // row that carries the whole folder's fader reads as its head.
+    let header_base = if is_group {
+        Colors::surface_panel_raised()
     } else {
-        Colors::with_alpha(Colors::surface_canvas(), 0.22)
+        Colors::surface_panel()
     };
     let id_num = {
         use std::hash::{Hash, Hasher};
@@ -802,8 +909,6 @@ pub fn track_header(
     let drag_track_id = track_id.clone();
     let drag_name = track.name.clone();
     let drag_color = track.color;
-    let drop_group_id = track_id.clone();
-    let assign_to_group = callbacks.on_assign_to_group.clone();
     let collapse_group_id = track_id.clone();
     let toggle_group_collapsed = callbacks.on_toggle_group_collapsed.clone();
     // The inline rename draws in place of this track's name only; every other
@@ -828,32 +933,15 @@ pub fn track_header(
         // Always opaque. The header column is the one region the arrangement
         // must never show through, and a state tint cannot carry that on its
         // own — see `header_tint`.
-        .bg(Colors::surface_panel())
+        .bg(header_base)
         .opacity(if is_dragging { 0.62 } else { 1.0 })
         // Stronger right border so the header column reads as a distinct
         // pane rather than blending into the lane area. The inner accent
         // strip on the right keeps the overall feel subtle.
         .border_r(px(1.0))
         .border_color(Colors::border_strong())
-        .when(!is_group_child, |header| header.border_b(px(1.0)))
+        .border_b(px(1.0))
         .id(("track-header", id_num))
-        .when(is_group, |header| {
-            let group_id_for_can_drop = drop_group_id.clone();
-            header
-                .can_drop(move |dragged, _window, _cx| {
-                    dragged.downcast_ref::<TrackDragItem>().is_some_and(|drag| {
-                        !drag.is_group && drag.track_id != group_id_for_can_drop
-                    })
-                })
-                .drag_over::<TrackDragItem>(|style, _drag, _window, _cx| {
-                    style
-                        .bg(Colors::surface_selected())
-                        .border_color(Colors::accent_primary())
-                })
-                .on_drop::<TrackDragItem>(move |drag, window, cx| {
-                    assign_to_group(&(drag.track_id.clone(), drop_group_id.clone()), window, cx);
-                })
-        })
         .on_mouse_down(gpui::MouseButton::Left, on_select_root)
         .when_some(on_context, |this, cb| {
             this.on_mouse_down(gpui::MouseButton::Right, move |event, window, cx| {
@@ -862,64 +950,34 @@ pub fn track_header(
                 cb(&(context_id.clone(), x, y), window, cx);
             })
         })
-        // State tint over the opaque base. Group children get theirs from the
-        // inset frame below instead, so the tint would double up here.
-        .when_some(header_tint.filter(|_| !is_group_child), |header, tint| {
+        // State tint over the opaque base.
+        .when_some(header_tint, |header, tint| {
             header.child(div().absolute().inset_0().bg(tint))
         })
-        // Child rows share one continuous inset surface. The Folder header
-        // itself keeps the standard full-row Track Header geometry.
-        .when(is_group_child, |header| {
+        // The folder a drag in flight would drop into.
+        .when(is_folder_drop_target, |header| {
             header.child(
                 div()
                     .absolute()
-                    .left(px(GROUP_FRAME_INSET))
-                    .right(px(GROUP_FRAME_INSET))
-                    .top(px(if is_first_group_child {
-                        GROUP_FRAME_CAP
-                    } else {
-                        0.0
-                    }))
-                    .bottom(px(if is_last_group_child {
-                        GROUP_FRAME_CAP
-                    } else {
-                        0.0
-                    }))
-                    .bg(group_frame_bg)
-                    .border_l(px(1.0))
-                    .border_r(px(1.0))
-                    .border_color(Colors::border_strong())
-                    .when(is_first_group_child, |frame| {
-                        frame.border_t(px(1.0)).rounded_t(px(radius::CONTROL))
-                    })
-                    .when(is_last_group_child, |frame| {
-                        frame.border_b(px(1.0)).rounded_b(px(radius::CONTROL))
-                    }),
+                    .inset_0()
+                    .bg(Colors::with_alpha(Colors::accent_primary(), 0.10))
+                    .border(px(1.0))
+                    .border_color(Colors::accent_primary()),
             )
         })
-        // Left accent strip — same column as the track lane stripe
-        .when(!is_group_child, |header| {
-            header.child(div().w(px(3.0)).h_full().bg(track.color))
-        })
-        .when(is_group_child, |header| {
-            header.child(
-                div()
-                    .absolute()
-                    .left(px(GROUP_FRAME_INSET + 1.0))
-                    .top(px(if is_first_group_child {
-                        GROUP_FRAME_CAP + 1.0
-                    } else {
-                        0.0
-                    }))
-                    .bottom(px(if is_last_group_child {
-                        GROUP_FRAME_CAP + 1.0
-                    } else {
-                        0.0
-                    }))
-                    .w(px(3.0))
-                    .bg(track.color),
-            )
-        })
+        // Left accent strip — same column as the track lane stripe.
+        .child(div().w(px(3.0)).h_full().flex_none().bg(track.color))
+        // One rail per enclosing folder, in its colour, outermost first.
+        .children(folder.rails.iter().enumerate().map(|(level, color)| {
+            let level = level.min(FOLDER_MAX_INDENT_LEVELS.saturating_sub(1));
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(FOLDER_RAIL_X + level as f32 * FOLDER_INDENT))
+                .w(px(FOLDER_RAIL_W))
+                .bg(*color)
+        }))
         .child(
             div()
                 .flex()
@@ -929,18 +987,10 @@ pub fn track_header(
                 .when(!show_controls, |c| c.justify_center())
                 .flex_1()
                 .min_w_0()
-                // Grouped children indent past their frame's border and accent
-                // strip; the ungrouped case is plain panel padding.
-                .pl(px(if is_group_child {
-                    GROUP_FRAME_INSET + space::BLOCK
-                } else {
-                    space::BASE
-                }))
-                .pr(px(if is_group_child {
-                    GROUP_FRAME_INSET + space::BASE
-                } else {
-                    space::BASE
-                }))
+                // Rows inside folders indent one step per level, past their
+                // folders' rails.
+                .pl(px(space::BASE + folder.indent()))
+                .pr(px(space::BASE))
                 .py(px(space::SNUG))
                 // Row 1: name + type badge + per-track buttons
                 .child(
@@ -1047,12 +1097,19 @@ pub fn track_header(
                                                             .text_color(Colors::text_secondary()),
                                                     ),
                                             )
+                                            // The folder's own colour, not the
+                                            // accent: cyan marks what is
+                                            // active, and a folder is not.
                                             .child(
                                                 svg()
-                                                    .path(assets::ICON_FOLDER_PATH)
+                                                    .path(if track.group_collapsed {
+                                                        assets::ICON_FOLDER_PATH
+                                                    } else {
+                                                        assets::ICON_FOLDER_OPEN_PATH
+                                                    })
                                                     .w(px(GLYPH_MD))
                                                     .h(px(GLYPH_MD))
-                                                    .text_color(Colors::accent_primary()),
+                                                    .text_color(track.color),
                                             )
                                         })
                                         .child(match rename {
@@ -1088,6 +1145,9 @@ pub fn track_header(
                                                     }
                                                 })
                                                 .into_any_element(),
+                                        })
+                                        .when(is_group && track.group_collapsed, |row| {
+                                            row.child(folder_member_badge(folder.members))
                                         }),
                                 ),
                         )
@@ -1111,7 +1171,10 @@ pub fn track_header(
                                 on_input,
                                 on_automation,
                             },
-                        )),
+                        ))
+                        .when_some(folder_menu, |row, (track_id, on_open)| {
+                            row.child(folder_menu_button(id_num, track_id, on_open))
+                        }),
                 )
                 // Row 2: horizontal volume fader + pan pill + meter + dB pill.
                 // Only rendered when the row is tall enough to hold it; the

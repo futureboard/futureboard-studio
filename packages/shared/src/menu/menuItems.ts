@@ -96,6 +96,12 @@ export const APP_MENUS: AppMenuGroup[] = [
         action: "project:save-copy",
       },
       {
+        id: "file.export_project_archive",
+        label: "Export Project as ZIP...",
+        icon: "file-archive",
+        action: "file:export-project-archive",
+      },
+      {
         type: "separator",
         id: "file.sep.export",
       },

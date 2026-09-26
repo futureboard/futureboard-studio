@@ -4067,7 +4067,7 @@ mod project_settings_persistence_tests {
 mod group_track_persistence_tests {
     use super::*;
     use crate::components::timeline::timeline_state::{
-        CreateTrackOptions, InputMonitorMode, TimelineState, TrackType,
+        CreateTrackOptions, InputMonitorMode, TimelineState, TrackOutputRouting, TrackType,
     };
 
     fn add_track(state: &mut TimelineState, track_type: TrackType, name: &str) -> String {
@@ -4116,6 +4116,67 @@ mod group_track_persistence_tests {
                 .unwrap()
                 .parent_group_id
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_folder_inside_a_folder_survives_binary_roundtrip() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let outer = add_track(&mut state, TrackType::Group, "Band");
+        let inner = add_track(&mut state, TrackType::Group, "Drums");
+        let kick = add_track(&mut state, TrackType::Audio, "Kick");
+        assert!(state.assign_track_to_group(&kick, &inner));
+        assert!(state.assign_track_to_group(&inner, &outer));
+
+        let bytes = encode_project(&FutureboardProject::from(&state));
+        let mut restored = TimelineState::default();
+        apply_to_timeline(&decode_project(&bytes).expect("decode"), &mut restored);
+
+        let tree = restored.group_tree();
+        let depth = |id: &str| tree.depth[restored.tracks.iter().position(|t| t.id == id).unwrap()];
+        assert_eq!((depth(&outer), depth(&inner), depth(&kick)), (0, 1, 2));
+        assert_eq!(
+            restored.find_track(&inner).unwrap().routing.output,
+            TrackOutputRouting::Bus { bus_id: outer }
+        );
+        assert_eq!(
+            restored.find_track(&kick).unwrap().routing.output,
+            TrackOutputRouting::Bus { bus_id: inner }
+        );
+    }
+
+    /// Before v55 a folder did not carry its members' audio: one playing to
+    /// the main mix loads playing through its folder, and a v55 member routed
+    /// to the main mix on purpose keeps that.
+    #[test]
+    fn a_pre_v55_folder_member_loads_playing_through_its_folder() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let group = add_track(&mut state, TrackType::Group, "Drums");
+        let kick = add_track(&mut state, TrackType::Audio, "Kick");
+        assert!(state.assign_track_to_group(&kick, &group));
+        state
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == kick)
+            .unwrap()
+            .routing
+            .output = TrackOutputRouting::Main;
+
+        let mut bytes = encode_project(&FutureboardProject::from(&state));
+        let current = decode_project(&bytes).expect("decode");
+        assert_eq!(
+            current.tracks[1].routing.output,
+            ProjectTrackOutputRouting::Main
+        );
+
+        bytes[8..12].copy_from_slice(&54u32.to_le_bytes());
+        let legacy =
+            crate::project::format::decode_project_with_options(&bytes, true).expect("decode v54");
+        assert_eq!(
+            legacy.tracks[1].routing.output,
+            ProjectTrackOutputRouting::Bus { bus_id: group }
         );
     }
 }

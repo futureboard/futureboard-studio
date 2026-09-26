@@ -310,6 +310,7 @@ impl TimelineState {
             drag_origin_index: None,
             drag_current_y: 0.0,
             drag_target_index: None,
+            drag_folder_target_id: None,
             follow_playhead: true,
             follow_playhead_suspended: false,
             auto_scroll_mode: AutoScrollMode::Page,

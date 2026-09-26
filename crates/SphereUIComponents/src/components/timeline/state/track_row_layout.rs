@@ -116,13 +116,13 @@ impl TrackRowLayout {
         let scroll_y = state.viewport.scroll_y;
         let mut y = 0.0_f32;
         let mut rows = Vec::with_capacity(state.tracks.len());
-        let collapsed_groups = CollapsedGroups::of(&state.tracks);
+        let groups = GroupTree::of(&state.tracks);
         for (index, track) in state.tracks.iter().enumerate() {
             // Mixer-only channels (Bus/Return + VSTi multi-out children) live in
             // `state.tracks` for engine/mixer routing, but must NOT occupy
             // arrangement space. Keep them in the rows vector (1:1 with
             // `state.tracks`) but collapse them to zero height.
-            let hidden_by_group = collapsed_groups.hides(track);
+            let hidden_by_group = groups.hidden[index];
             let (height, automation_height) =
                 if is_arrangement_hidden_track(track) || hidden_by_group {
                     (0.0, 0.0)
@@ -183,30 +183,6 @@ impl TrackRowLayout {
     }
 }
 
-/// The arrangement's collapsed groups, and the one rule that hides a row
-/// inside them: its own group is collapsed. The row layout and track zoom
-/// share it, so zoom limits come from exactly the rows on screen.
-struct CollapsedGroups<'a>(std::collections::HashSet<&'a str>);
-
-impl<'a> CollapsedGroups<'a> {
-    fn of(tracks: &'a [TrackState]) -> Self {
-        Self(
-            tracks
-                .iter()
-                .filter(|track| track.track_type == TrackType::Group && track.group_collapsed)
-                .map(|track| track.id.as_str())
-                .collect(),
-        )
-    }
-
-    fn hides(&self, track: &TrackState) -> bool {
-        track
-            .parent_group_id
-            .as_deref()
-            .is_some_and(|group_id| self.0.contains(group_id))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackHeightResizeSession {
     pub anchor_track_id: String,
@@ -244,14 +220,12 @@ pub enum TrackHeightPreset {
 }
 
 impl TimelineState {
+    /// Whether a collapsed folder encloses `track`, at any depth.
     pub fn is_track_hidden_by_collapsed_group(&self, track: &TrackState) -> bool {
-        track.parent_group_id.as_deref().is_some_and(|group_id| {
-            self.tracks.iter().any(|group| {
-                group.id == group_id
-                    && group.track_type == TrackType::Group
-                    && group.group_collapsed
-            })
-        })
+        self.tracks
+            .iter()
+            .position(|candidate| candidate.id == track.id)
+            .is_some_and(|index| self.group_tree().hidden[index])
     }
 
     pub fn track_row_height(&self, track: &TrackState) -> f32 {
@@ -651,15 +625,16 @@ impl TimelineState {
     /// collapsed group stay in, marked not visible, so they still match their
     /// siblings once the group expands.
     fn track_zoom_base(&self) -> Vec<TrackZoomBase> {
-        let collapsed_groups = CollapsedGroups::of(&self.tracks);
+        let groups = GroupTree::of(&self.tracks);
         self.tracks
             .iter()
-            .filter(|track| !is_arrangement_hidden_track(track))
-            .map(|track| TrackZoomBase {
+            .enumerate()
+            .filter(|(_, track)| !is_arrangement_hidden_track(track))
+            .map(|(index, track)| TrackZoomBase {
                 track_id: track.id.clone(),
                 track_type: track.track_type,
                 height: self.track_row_height(track),
-                visible: !collapsed_groups.hides(track),
+                visible: !groups.hidden[index],
             })
             .collect()
     }
@@ -675,17 +650,18 @@ impl TimelineState {
         if now.saturating_duration_since(session.last_tick) > TRACK_ZOOM_BURST_IDLE {
             return false;
         }
-        let collapsed_groups = CollapsedGroups::of(&self.tracks);
+        let groups = GroupTree::of(&self.tracks);
         let mut live = self
             .tracks
             .iter()
-            .filter(|track| !is_arrangement_hidden_track(track));
+            .enumerate()
+            .filter(|(_, track)| !is_arrangement_hidden_track(track));
         for (base, applied) in session.base.iter().zip(&session.applied) {
-            let Some(track) = live.next() else {
+            let Some((index, track)) = live.next() else {
                 return false;
             };
             if track.id != base.track_id
-                || collapsed_groups.hides(track) == base.visible
+                || groups.hidden[index] == base.visible
                 || (self.track_row_height(track) - applied).abs() >= 0.01
             {
                 return false;

@@ -115,6 +115,8 @@ wgpu = { workspace = true, optional = true }
 rfd = { workspace = true, optional = true }
 # CRC-32/ISO-HDLC checksum for .fbproj binary format.
 crc32fast.workspace = true
+# File → Export Project as ZIP.
+zip.workspace = true
 sphere-encoder.workspace = true
 # Grapheme-cluster + word segmentation for the shared IME-safe text input core
 # (cursor movement / deletion must not split emoji, Thai marks, or combining

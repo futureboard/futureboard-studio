@@ -85,6 +85,7 @@ mod studio_state;
 mod tempo_key_ops;
 mod tempo_map_ops;
 mod track_clip_ops;
+mod folder_ops;
 mod track_duplicate_ops;
 mod transport_freeze_debug;
 mod transport_ops;
@@ -2737,6 +2738,7 @@ impl StudioLayout {
                 self.open_export_arrangement_external_window(owner_bounds, cx)
             }
             "file:export-midi" => self.open_export_midi_dialog(owner_bounds, cx),
+            "file:export-project-archive" => self.cmd_export_project_archive(cx),
             // Offered from the MIDI editor status bar and the arrangement's
             // clip context menu. Both mean "the clip in front of me", which is
             // the context clip in the arrangement and the selected clip in the
@@ -2774,6 +2776,10 @@ impl StudioLayout {
             }
             "track:delete" => self.delete_selected_track(cx),
             "track:duplicate" => self.duplicate_context_track(true, cx),
+            "track:group-selected" => self.group_selected_tracks(cx),
+            "track:remove-from-folder" => self.remove_context_track_from_folder(cx),
+            "track:ungroup" => self.ungroup_context_folder(cx),
+            "track:toggle-folder" => self.toggle_context_folder(cx),
             "track:duplicate-no-fx" => self.duplicate_context_track(false, cx),
             "track:copy-fx-chain" => self.copy_context_fx_chain(cx),
             "track:paste-fx-chain" => self.paste_context_fx_chain(cx),

@@ -2337,55 +2337,36 @@ impl Render for Timeline {
         );
 
         let on_track_dropped = cx.listener(|this, drag: &TrackDragItem, _window, cx| {
-            // One drop, one step: the order and the folder it lands in.
+            // One drop, one step: the order and the folder it lands in. Over
+            // the middle of a folder's row it goes into that folder; anywhere
+            // else it lands at the insertion line, in the folder of the row
+            // below the line.
             let edit = this.begin_track_edit(TrackEditScope::tracks([drag.track_id.clone()]));
-            let dragged_parent_group = this
-                .state
-                .find_track(&drag.track_id)
-                .and_then(|track| track.parent_group_id.clone());
-            let hovered_track = this
-                .state
-                .track_index_at_y(this.state.drag_current_y)
-                .and_then(|index| this.state.tracks.get(index))
-                .map(|track| (track.id.clone(), track.parent_group_id.clone()));
-            let hovered_group = (!drag.is_group)
-                .then(|| {
-                    hovered_track.as_ref().and_then(|(hovered_id, _)| {
-                        this.state
-                            .find_track(hovered_id)
-                            .filter(|track| {
-                                track.track_type == TrackType::Group && track.id != drag.track_id
-                            })
-                            .map(|track| track.id.clone())
-                    })
-                })
-                .flatten();
-            if let Some(group_id) = hovered_group {
-                if this.state.assign_track_to_group(&drag.track_id, &group_id) {
-                    this.commit_track_edit("Move to Folder", edit, false, cx);
-                    this.mark_project_changed(cx);
-                    cx.notify();
-                }
-                return;
-            }
+            let into_folder = this.state.drag_folder_target_id.clone();
             let target_index = this
                 .state
                 .drag_target_index
                 .unwrap_or(drag.origin_index)
                 .clamp(0, this.state.tracks.len());
-            let remains_inside_group = dragged_parent_group.as_ref().is_some_and(|group_id| {
-                hovered_track
-                    .as_ref()
-                    .is_some_and(|(hovered_id, parent_id)| {
-                        hovered_id == group_id || parent_id.as_ref() == Some(group_id)
-                    })
-            });
-            if !remains_inside_group {
-                this.state.remove_track_from_group(&drag.track_id);
+            let (moved, label) = match into_folder {
+                Some(group_id) => (
+                    this.state.assign_track_to_group(&drag.track_id, &group_id),
+                    "Move to Folder",
+                ),
+                None => (
+                    this.state
+                        .tracks
+                        .iter()
+                        .position(|track| track.id == drag.track_id)
+                        .is_some_and(|index| this.state.move_track_to(index, target_index)),
+                    "Move Track",
+                ),
+            };
+            this.state.clear_track_drag();
+            this.commit_track_edit(label, edit, false, cx);
+            if moved {
+                this.mark_project_changed(cx);
             }
-            this.state.reorder_track(&drag.track_id, target_index);
-            this.commit_track_edit("Move Track", edit, false, cx);
-            this.mark_project_changed(cx);
             cx.notify();
         });
 

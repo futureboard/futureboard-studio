@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-09-23T20:42:18.805Z",
+  "generatedAt": "2026-09-26T18:26:32.057Z",
   "menus": [
     {
       "id": "file",
@@ -121,6 +121,21 @@
           "icon": "copy",
           "shortcut": "Ctrl+Alt+Shift+S",
           "command": "project:save-copy",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": null,
+          "children": []
+        },
+        {
+          "id": "file.export_project_archive",
+          "kind": "normal",
+          "label": "Export Project as ZIP...",
+          "icon": "file-archive",
+          "shortcut": null,
+          "command": "file:export-project-archive",
           "role": null,
           "enabled": true,
           "visible": true,

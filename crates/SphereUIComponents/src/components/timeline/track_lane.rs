@@ -371,6 +371,14 @@ pub fn track_lane(
         // Clips always render at full strength — automation now lives in its
         // own sub-lanes below the track, so the clip area stays clean.
         .child(div().absolute().inset_0().children(clip_elements))
+        // A collapsed folder owns no clips; it shows the ones folded inside.
+        .children(
+            crate::components::timeline::folder_lane::collapsed_folder_summary(
+                track_index,
+                state,
+                row_height,
+            ),
+        )
         .children(
             (!crossfade_elements.is_empty())
                 .then(|| div().absolute().inset_0().children(crossfade_elements)),

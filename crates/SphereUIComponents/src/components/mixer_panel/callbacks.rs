@@ -71,6 +71,9 @@ pub struct MixerCallbacks {
     /// Expand/collapse the VSTi output sub-strips for a track/insert group.
     pub on_toggle_vsti_output_group:
         std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
+    /// Fold a folder's member strips open or shut (the same fold as the
+    /// arrangement's folder row).
+    pub on_toggle_folder: std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     /// Drop commit for a dragged insert slot — a reorder within its chain or a
     /// move from another channel. Identity is the stable `plugin_instance_id`
     /// and the landing place an anchor next to another slot, never a visual
@@ -165,6 +168,7 @@ pub fn noop_mixer_callbacks() -> MixerCallbacks {
         on_remove_insert: noop_insert_pair.clone(),
         on_toggle_insert_bypass: noop_insert_pair.clone(),
         on_toggle_vsti_output_group: Arc::new(|_: &String, _: &mut Window, _: &mut App| {}),
+        on_toggle_folder: Arc::new(|_: &String, _: &mut Window, _: &mut App| {}),
         on_drop_insert: noop_insert_drop,
         on_drop_plugin_preset: noop_preset_drop,
         on_open_insert_editor: noop_insert_open.clone(),

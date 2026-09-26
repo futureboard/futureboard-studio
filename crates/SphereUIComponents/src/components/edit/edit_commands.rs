@@ -6,7 +6,7 @@ use crate::components::timeline::timeline_state::{
     AudioClipStretchState, AutomationLaneState, ClipState, GlobalLaneHeights,
     MidiArticulationEvent, MidiControllerKind, MidiControllerPoint, MidiNoteState, MidiSysExEvent,
     SongTextEvent, TempoPoint, TimeSignaturePoint, TimelineMarkerState, TimelineRegionState,
-    TimelineState, TrackState, TrackTake,
+    TimelineState, TrackOutputRouting, TrackState, TrackTake,
 };
 use sphere_midi_service::mpe::MpeTrackConfiguration;
 
@@ -119,18 +119,32 @@ impl ClipSnapshot {
 pub struct TrackSnapshot {
     pub index: usize,
     pub track: TrackState,
+    /// For a folder: each direct member's folder and output as they were, so
+    /// an undone delete puts them back inside it (deleting a folder moves its
+    /// members up a level).
+    pub members: Vec<(String, Option<String>, TrackOutputRouting)>,
 }
 
 impl TrackSnapshot {
     pub fn capture(state: &TimelineState, track_id: &str) -> Option<Self> {
-        state
+        let index = state.tracks.iter().position(|track| track.id == track_id)?;
+        let members = state
             .tracks
             .iter()
-            .position(|track| track.id == track_id)
-            .map(|index| Self {
-                index,
-                track: state.tracks[index].clone(),
+            .filter(|track| track.parent_group_id.as_deref() == Some(track_id))
+            .map(|track| {
+                (
+                    track.id.clone(),
+                    track.parent_group_id.clone(),
+                    track.routing.output.clone(),
+                )
             })
+            .collect();
+        Some(Self {
+            index,
+            track: state.tracks[index].clone(),
+            members,
+        })
     }
 }
 
@@ -2209,6 +2223,12 @@ fn restore_track_snapshot(state: &mut TimelineState, snapshot: &TrackSnapshot) {
     }
     let index = snapshot.index.min(state.tracks.len());
     state.tracks.insert(index, snapshot.track.clone());
+    for (id, parent, output) in &snapshot.members {
+        if let Some(member) = state.tracks.iter_mut().find(|track| track.id == *id) {
+            member.parent_group_id = parent.clone();
+            member.routing.output = output.clone();
+        }
+    }
     state.selection.selected_track_id = Some(snapshot.track.id.clone());
     state.selection.selected_clip_ids.clear();
 }

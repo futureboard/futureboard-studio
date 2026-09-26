@@ -395,11 +395,16 @@ impl TimelineState {
         self.drag_origin_index = Some(origin_index);
         self.drag_current_y = y;
         self.drag_target_index = Some(origin_index.min(self.tracks.len()));
+        self.drag_folder_target_id = None;
     }
 
     pub fn update_track_drag(&mut self, y: f32) {
         self.drag_current_y = y;
-        self.drag_target_index = Some(self.track_insert_index_at_y(y));
+        self.drag_folder_target_id = self.folder_drop_target_at_y(y);
+        self.drag_target_index = self
+            .drag_folder_target_id
+            .is_none()
+            .then(|| self.track_insert_index_at_y(y));
     }
 
     pub fn clear_track_drag(&mut self) {
@@ -407,6 +412,7 @@ impl TimelineState {
         self.drag_origin_index = None;
         self.drag_current_y = 0.0;
         self.drag_target_index = None;
+        self.drag_folder_target_id = None;
     }
 
     pub fn reorder_track(&mut self, track_id: &str, target_index: usize) -> bool {
@@ -415,44 +421,11 @@ impl TimelineState {
             return false;
         };
         if self.tracks[origin_index].track_type == TrackType::Group {
-            let before: Vec<_> = self.tracks.iter().map(|track| track.id.clone()).collect();
-            let target_index = target_index.clamp(0, self.tracks.len());
-            let member_indices: Vec<_> = self
-                .tracks
-                .iter()
-                .enumerate()
-                .filter_map(|(index, track)| {
-                    (track.id == track_id || track.parent_group_id.as_deref() == Some(track_id))
-                        .then_some(index)
-                })
-                .collect();
-            let removed_before_target = member_indices
-                .iter()
-                .filter(|index| **index < target_index)
-                .count();
-            let mut block = Vec::with_capacity(member_indices.len());
-            let mut remaining = Vec::with_capacity(self.tracks.len() - member_indices.len());
-            for track in std::mem::take(&mut self.tracks) {
-                let belongs =
-                    track.id == track_id || track.parent_group_id.as_deref() == Some(track_id);
-                if belongs {
-                    block.push(track);
-                } else {
-                    remaining.push(track);
-                }
-            }
-            self.tracks = remaining;
-            let insert_index = target_index
-                .saturating_sub(removed_before_target)
-                .min(self.tracks.len());
-            self.tracks.splice(insert_index..insert_index, block);
+            // A folder moves with everything inside it, at any depth; the
+            // folder it lands in is the one of the position.
+            let changed = self.move_track_to(origin_index, target_index);
             self.clear_track_drag();
-            return before
-                != self
-                    .tracks
-                    .iter()
-                    .map(|track| track.id.clone())
-                    .collect::<Vec<_>>();
+            return changed;
         }
         let target_index = target_index.clamp(0, self.tracks.len());
         let insert_index = if origin_index < target_index {
@@ -561,51 +534,6 @@ impl TimelineState {
         id
     }
 
-    pub fn assign_track_to_group(&mut self, track_id: &str, group_id: &str) -> bool {
-        if track_id == group_id {
-            return false;
-        }
-        let Some(group_index) = self
-            .tracks
-            .iter()
-            .position(|track| track.id == group_id && track.track_type == TrackType::Group)
-        else {
-            return false;
-        };
-        let Some(track_index) = self.tracks.iter().position(|track| track.id == track_id) else {
-            return false;
-        };
-        if self.tracks[track_index].track_type == TrackType::Group {
-            return false;
-        }
-
-        let already_grouped = self.tracks[track_index].parent_group_id.as_deref() == Some(group_id);
-        let mut track = self.tracks.remove(track_index);
-        track.parent_group_id = Some(group_id.to_string());
-
-        let group_index = if track_index < group_index {
-            group_index.saturating_sub(1)
-        } else {
-            group_index
-        };
-        let mut insert_index = group_index + 1;
-        while insert_index < self.tracks.len()
-            && self.tracks[insert_index].parent_group_id.as_deref() == Some(group_id)
-        {
-            insert_index += 1;
-        }
-        self.tracks.insert(insert_index, track);
-        self.clear_track_drag();
-        !already_grouped || track_index != insert_index
-    }
-
-    pub fn remove_track_from_group(&mut self, track_id: &str) -> bool {
-        let Some(track) = self.tracks.iter_mut().find(|track| track.id == track_id) else {
-            return false;
-        };
-        track.parent_group_id.take().is_some()
-    }
-
     pub fn toggle_group_collapsed(&mut self, group_id: &str) -> Option<bool> {
         let group_index = self
             .tracks
@@ -614,11 +542,10 @@ impl TimelineState {
         let collapsed = !self.tracks[group_index].group_collapsed;
         self.tracks[group_index].group_collapsed = collapsed;
         if collapsed {
-            let selected_child_is_hidden = self.selected_range_track_ids().iter().any(|selected| {
-                self.tracks.iter().any(|track| {
-                    track.id == *selected && track.parent_group_id.as_deref() == Some(group_id)
-                })
-            });
+            let tree = self.group_tree();
+            let selected = self.selected_range_track_ids();
+            let selected_child_is_hidden = (group_index + 1..tree.block_end(group_index))
+                .any(|member| selected.contains(&self.tracks[member].id));
             if selected_child_is_hidden {
                 self.select_track(group_id);
             }
@@ -793,11 +720,15 @@ impl TimelineState {
     pub fn delete_track(&mut self, track_id: &str) {
         if let Some(index) = self.tracks.iter().position(|track| track.id == track_id) {
             let deleting_group = self.tracks[index].track_type == TrackType::Group;
+            let outer = self.tracks[index].parent_group_id.clone();
             self.tracks.remove(index);
             if deleting_group {
+                // Its members move up into its own folder, in place, and play
+                // through that one if they played through this.
                 for track in &mut self.tracks {
                     if track.parent_group_id.as_deref() == Some(track_id) {
-                        track.parent_group_id = None;
+                        track.parent_group_id = outer.clone();
+                        follow_folder_output(track, Some(track_id));
                     }
                 }
             }

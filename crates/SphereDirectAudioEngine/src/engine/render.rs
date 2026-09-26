@@ -100,7 +100,7 @@ pub fn render_project_sample(
         if effective_track_muted(&runtime.tracks[track_index], beat)
             || (has_solo
                 && !runtime.tracks[track_index].solo
-                && !has_soloed_vsti_output_child(runtime, track_index))
+                && !solo_keeps_source_audible(runtime, track_index))
         {
             continue;
         }
@@ -264,7 +264,7 @@ fn is_vsti_output_child_track_id(track_id: &str) -> bool {
     track_id.starts_with("vsti-out:")
 }
 
-use crate::runtime::{has_soloed_vsti_output_child, has_soloed_vsti_output_parent};
+use crate::runtime::{has_soloed_vsti_output_parent, solo_keeps_source_audible};
 
 /// Two distinct mutable elements of a slice without allocation. Panics in
 /// debug if `a == b`; callers guarantee distinct indices.
@@ -1410,7 +1410,7 @@ fn render_project_block_interleaved_core(
         if effective_track_muted(&runtime.tracks[track_index], block_beat)
             || (runtime.has_solo
                 && !runtime.tracks[track_index].solo
-                && !has_soloed_vsti_output_child(runtime, track_index))
+                && !solo_keeps_source_audible(runtime, track_index))
         {
             continue;
         }
@@ -1553,7 +1553,7 @@ fn render_project_block_interleaved_core(
         if effective_track_muted(&runtime.tracks[track_index], block_beat)
             || (runtime.has_solo
                 && !runtime.tracks[track_index].solo
-                && !has_soloed_vsti_output_child(runtime, track_index))
+                && !solo_keeps_source_audible(runtime, track_index))
         {
             render_inaudible_instrument_block(runtime, track_index, frames, transport);
             continue;

@@ -13,9 +13,10 @@ use crate::components::timeline::timeline_state::{
     self, CreateTrackOptions, InputMonitorMode, TimelineState, TrackType,
 };
 use crate::project::{
-    io::create_project_folder, io::project_backup_path, io::save_project_with_report_from,
-    io::verify_project_file, io::ProjectSaveReport, now_secs, ClipSource, FutureboardProject,
-    ProjectAsset, ProjectCreateOptions, ProjectError, ProjectSession, ProjectTemplate,
+    io::create_project_folder, io::export_project_archive, io::project_backup_path,
+    io::save_project_with_report_from, io::verify_project_file, io::ProjectSaveReport, now_secs,
+    ClipSource, FutureboardProject, ProjectAsset, ProjectCreateOptions, ProjectError,
+    ProjectSession, ProjectTemplate,
 };
 
 use super::plugin_ops::PluginStateCaptureFor;
@@ -52,6 +53,9 @@ enum SaveJobKind {
     Project,
     /// File → Save Copy: writes a copy and leaves the session alone.
     Copy,
+    /// File → Export Project as ZIP: writes the project with its media into
+    /// a zip file and leaves the session alone.
+    Archive,
     /// The periodic recovery snapshot.
     Autosave,
 }
@@ -61,6 +65,7 @@ impl SaveJobKind {
         match self {
             Self::Project => "project-save",
             Self::Copy => "project-save-copy",
+            Self::Archive => "project-export-archive",
             Self::Autosave => "project-autosave",
         }
     }
@@ -69,9 +74,19 @@ impl SaveJobKind {
         match self {
             Self::Project => "Save project",
             Self::Copy => "Save project copy",
+            Self::Archive => "Export project as ZIP",
             Self::Autosave => "Autosave project",
         }
     }
+}
+
+/// What a finished write hands back to the UI thread.
+struct SavedJob {
+    /// The snapshot as written: its media references are the saved ones.
+    project: FutureboardProject,
+    report: ProjectSaveReport,
+    /// For an export to a zip: media left where it is, outside the archive.
+    external_media: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1203,6 +1218,129 @@ impl StudioLayout {
         }
     }
 
+    /// File → Export Project as ZIP: asks where, then queues the export like
+    /// any other writer, so the live project (plug-in state and ARA edits
+    /// included) is snapshotted when its turn comes and written off the UI
+    /// thread. The session stays bound where it was.
+    pub(super) fn cmd_export_project_archive(&mut self, cx: &mut Context<Self>) {
+        #[cfg(feature = "native-dialogs")]
+        {
+            let default_dir = self
+                .project_session
+                .project_file_path
+                .as_ref()
+                .and_then(|p| p.parent().and_then(|d| d.parent()).map(|d| d.to_path_buf()))
+                .or_else(|| self.project_session.folder_path.clone())
+                .unwrap_or_else(|| self.default_projects_dir(cx));
+            let name = crate::project::io::sanitize_project_name(&self.project_session.name);
+            let entity = cx.entity().clone();
+            cx.spawn(async move |_this, cx| {
+                let result = rfd::AsyncFileDialog::new()
+                    .set_title("Export Project as ZIP")
+                    .set_directory(&default_dir)
+                    .set_file_name(&format!("{name}.zip"))
+                    .add_filter("ZIP Archive", &["zip"])
+                    .save_file()
+                    .await;
+                if let Some(handle) = result {
+                    let path = handle.path().with_extension("zip");
+                    let _ = entity.update(cx, |this, cx| {
+                        this.request_save(SaveJobKind::Archive, path, None, cx);
+                    });
+                }
+            })
+            .detach();
+        }
+
+        #[cfg(not(feature = "native-dialogs"))]
+        {
+            let _ = cx;
+            eprintln!("[Project] Export Project as ZIP unavailable: native file dialogs disabled");
+        }
+    }
+
+    /// Says how an export to a zip went: where it is (with a way to show it),
+    /// and any media it could not take along.
+    fn report_project_archive(
+        &mut self,
+        archive: &std::path::Path,
+        result: Result<&SavedJob, &str>,
+        cx: &mut Context<Self>,
+    ) {
+        let options = match result {
+            Ok(saved) => {
+                let left_out: Vec<&PathBuf> = saved
+                    .report
+                    .offline_media
+                    .iter()
+                    .chain(&saved.external_media)
+                    .collect();
+                const LISTED: usize = 8;
+                let mut detail = archive.display().to_string();
+                if !left_out.is_empty() {
+                    detail.push_str("\n\nNot in the archive:\n");
+                    let listed: Vec<String> = left_out
+                        .iter()
+                        .take(LISTED)
+                        .map(|path| path.display().to_string())
+                        .collect();
+                    detail.push_str(&listed.join("\n"));
+                    if left_out.len() > LISTED {
+                        detail.push_str(&format!("\n…and {} more", left_out.len() - LISTED));
+                    }
+                }
+                MessageBoxOptions {
+                    kind: if left_out.is_empty() {
+                        MessageBoxKind::Info
+                    } else {
+                        MessageBoxKind::Warning
+                    },
+                    title: "Project Exported".to_string(),
+                    message: if left_out.is_empty() {
+                        "The project and all of its audio were exported as a ZIP file.".to_string()
+                    } else {
+                        format!(
+                            "The project was exported as a ZIP file, but {} media file(s) \
+                             could not be included: they are offline or kept outside the \
+                             project folder.",
+                            left_out.len()
+                        )
+                    },
+                    detail: Some(detail),
+                    buttons: vec!["Show in Folder".to_string(), "OK".to_string()],
+                    default_id: 1,
+                    cancel_id: Some(1),
+                }
+            }
+            Err(error) => MessageBoxOptions {
+                kind: MessageBoxKind::Error,
+                title: "Export Failed".to_string(),
+                message: "The project could not be exported as a ZIP file.".to_string(),
+                detail: Some(error.to_string()),
+                buttons: vec!["OK".to_string()],
+                default_id: 0,
+                cancel_id: Some(0),
+            },
+        };
+        let succeeded = result.is_ok();
+        let owner_bounds = crate::window_position::resolve_owner_bounds_with_preferred(
+            self.window_hooks.cached_bounds,
+            self.studio_window_bounds(cx),
+            cx,
+        );
+        let archive = archive.to_path_buf();
+        let on_response: Arc<
+            dyn Fn(MessageBoxResult, &mut gpui::Window, &mut gpui::App) + Send + Sync,
+        > = Arc::new(move |result, _window, _cx| {
+            if succeeded && !result.dismissed && result.response == 0 {
+                super::helpers::reveal_path(&archive);
+            }
+        });
+        if let Err(error) = open_message_box_window(owner_bounds, options, on_response, cx) {
+            eprintln!("[Project] project archive report unavailable: {error}");
+        }
+    }
+
     /// Save the project to `path` for a caller that goes on once it may
     /// (save-before-recording). Returns `true` when the caller may go on.
     ///
@@ -1322,7 +1460,7 @@ impl StudioLayout {
         let capture = match (request.kind, request.after_save.is_some()) {
             (SaveJobKind::Project, false) => PluginStateCaptureFor::Save,
             (SaveJobKind::Project, true) => PluginStateCaptureFor::SaveThenContinue,
-            (SaveJobKind::Copy, _) => PluginStateCaptureFor::SaveCopy,
+            (SaveJobKind::Copy | SaveJobKind::Archive, _) => PluginStateCaptureFor::SaveCopy,
             (SaveJobKind::Autosave, _) => PluginStateCaptureFor::Autosave,
         };
         self.refresh_bridge_plugin_states(capture, cx);
@@ -1344,7 +1482,7 @@ impl StudioLayout {
                 self.autosave_in_flight = true;
                 self.last_autosave_at = std::time::Instant::now();
             }
-            SaveJobKind::Copy => {}
+            SaveJobKind::Copy | SaveJobKind::Archive => {}
         }
         self.start_background_task(
             request.kind.task_id(),
@@ -1368,13 +1506,24 @@ impl StudioLayout {
         // may wait for this write on the UI thread before that task is ever
         // polled.
         let path_for_job = request.path.clone();
+        let kind = request.kind;
         let write = cx.background_executor().spawn(async move {
             let _finished = finished;
-            let report = save_project_with_report_from(
-                &mut project,
-                &path_for_job,
-                records_root.as_deref(),
-            )?;
+            let (report, external_media) = if kind == SaveJobKind::Archive {
+                let archived =
+                    export_project_archive(&mut project, &path_for_job, records_root.as_deref())?;
+                let report = ProjectSaveReport {
+                    offline_media: archived.offline_media,
+                };
+                (report, archived.external_media)
+            } else {
+                let report = save_project_with_report_from(
+                    &mut project,
+                    &path_for_job,
+                    records_root.as_deref(),
+                )?;
+                (report, Vec::new())
+            };
             // The manual save now holds everything the autosave did.
             for autosave in &obsolete_autosaves {
                 crate::project::io::remove_autosave_files(autosave);
@@ -1384,7 +1533,11 @@ impl StudioLayout {
             if discarded.load(Ordering::Acquire) {
                 crate::project::io::remove_autosave_files(&path_for_job);
             }
-            Ok((project, report))
+            Ok(SavedJob {
+                project,
+                report,
+                external_media,
+            })
         });
         cx.spawn(async move |this, cx| {
             let result = write.await;
@@ -1399,7 +1552,7 @@ impl StudioLayout {
         &mut self,
         request: SaveRequest,
         saved_generation: u64,
-        result: Result<(FutureboardProject, ProjectSaveReport), ProjectError>,
+        result: Result<SavedJob, ProjectError>,
         cx: &mut Context<Self>,
     ) {
         let task_id = request.kind.task_id();
@@ -1411,7 +1564,7 @@ impl StudioLayout {
         let superseded = self.session_generation() != request.session_generation;
         let mut follow_up = None;
         match (request.kind, result) {
-            (SaveJobKind::Autosave, Ok((_, report))) => {
+            (SaveJobKind::Autosave, Ok(SavedJob { report, .. })) => {
                 self.autosave_in_flight = false;
                 self.complete_background_task(task_id, Some("Autosave written".to_string()));
                 if self.project_saves.in_flight_autosave_discarded() {
@@ -1435,7 +1588,7 @@ impl StudioLayout {
                 self.fail_background_task(task_id, error.clone());
                 eprintln!("[Project] autosave failed: {error}");
             }
-            (SaveJobKind::Copy, Ok((_, report))) => {
+            (SaveJobKind::Copy, Ok(SavedJob { report, .. })) => {
                 self.complete_background_task(task_id, Some("Project copy saved".to_string()));
                 project_lifecycle_log!("save copy complete: {}", request.path.display());
                 if !superseded {
@@ -1447,7 +1600,27 @@ impl StudioLayout {
                 self.fail_background_task(task_id, error.clone());
                 eprintln!("[Project] save copy failed: {error}");
             }
-            (SaveJobKind::Project, Ok((project, report))) => {
+            (SaveJobKind::Archive, Ok(saved)) => {
+                self.complete_background_task(task_id, Some("Project exported".to_string()));
+                project_lifecycle_log!("project archive complete: {}", request.path.display());
+                if !superseded {
+                    self.report_project_archive(&request.path, Ok(&saved), cx);
+                }
+            }
+            (SaveJobKind::Archive, Err(e)) => {
+                let error = e.to_string();
+                self.fail_background_task(task_id, error.clone());
+                eprintln!("[Project] project archive failed: {error}");
+                if !superseded {
+                    self.report_project_archive(&request.path, Err(&error), cx);
+                }
+            }
+            (
+                SaveJobKind::Project,
+                Ok(SavedJob {
+                    project, report, ..
+                }),
+            ) => {
                 if superseded {
                     self.complete_background_task(
                         task_id,

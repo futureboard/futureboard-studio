@@ -232,6 +232,9 @@ pub struct TimelineState {
     pub drag_origin_index: Option<usize>,
     pub drag_current_y: f32,
     pub drag_target_index: Option<usize>,
+    /// The folder a track drag would drop into, while the pointer is over the
+    /// middle of that folder's row; the insertion line hides meanwhile.
+    pub drag_folder_target_id: Option<TrackId>,
     /// True when the timeline viewport should follow the playhead during
     /// playback. Toggled off temporarily when the user manually scrolls or
     /// drags the viewport; can be re-enabled from the Follow button.
@@ -417,6 +420,7 @@ impl Default for TimelineState {
             drag_origin_index: None,
             drag_current_y: 0.0,
             drag_target_index: None,
+            drag_folder_target_id: None,
             follow_playhead: true,
             follow_playhead_suspended: false,
             auto_scroll_mode: AutoScrollMode::Page,

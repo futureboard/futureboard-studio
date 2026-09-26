@@ -1574,6 +1574,9 @@ impl StudioLayout {
                     ContextMenuEntry::Separator,
                     menu_item_enabled("Track Color", "track:color", exists),
                     menu_item_enabled("Track Settings", "track:settings", exists),
+                ]);
+                entries.extend(self.folder_menu_entries(track_id, cx));
+                entries.extend([
                     ContextMenuEntry::Separator,
                     ContextMenuEntry::Header("Track Height".to_string()),
                     menu_item_enabled("Small", "track:height-small", exists),
