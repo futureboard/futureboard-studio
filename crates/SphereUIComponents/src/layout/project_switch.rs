@@ -118,13 +118,35 @@ impl StudioLayout {
                     request.target_path.display()
                 );
                 if matches!(decision, ProjectSwitchConfirmDecision::SwitchWithoutSaving) {
-                    self.discard_session_recovery();
+                    self.discard_session_recovery(cx);
                 }
                 self.execute_confirmed_project_switch(request, cx);
             }
         }
 
         let _ = owner_bounds;
+    }
+
+    /// Open an untitled session's recovered autosave in this studio: the
+    /// startup offer when the studio, not Welcome, is the first surface. The
+    /// user already chose Recover, so a clean session switches at once; unsaved
+    /// changes still go through the Save / Switch Without Saving / Cancel guard.
+    pub fn recover_untitled_autosave(&mut self, autosave: PathBuf, cx: &mut Context<Self>) {
+        if crate::loading_session::is_project_lifecycle_busy() {
+            eprintln!("[ProjectSwitch] untitled recovery ignored — lifecycle in progress");
+            return;
+        }
+        let request = ProjectSwitchRequest {
+            target_path: autosave,
+            target_name: None,
+            source: ProjectSwitchSource::OpenProjectDialog,
+        };
+        if self.project_session.is_dirty {
+            self.request_switch_project(request, None, cx);
+        } else {
+            self.close_project_switcher_and_overlays(cx);
+            self.execute_confirmed_project_switch(request, cx);
+        }
     }
 
     pub(super) fn handle_project_switch_current_row(&mut self, cx: &mut Context<Self>) {
@@ -142,8 +164,12 @@ impl StudioLayout {
         request: ProjectSwitchRequest,
         cx: &mut Context<Self>,
     ) {
+        // Neither early return replaces the live session. If it was switched
+        // away from without saving, its changes are still being worked on:
+        // they autosave again.
         if self.is_current_project_path(&request.target_path) {
             self.project_switch.pending_request = None;
+            self.resume_session_recovery();
             return;
         }
 
@@ -153,6 +179,7 @@ impl StudioLayout {
                 request.target_path.display()
             );
             self.project_switch.pending_request = None;
+            self.resume_session_recovery();
             return;
         }
 

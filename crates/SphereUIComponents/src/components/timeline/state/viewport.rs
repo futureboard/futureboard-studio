@@ -495,7 +495,10 @@ impl TimelineState {
     /// Returns true when the viewport scrolled (caller should `cx.notify`).
     /// Cheap — no allocation, just a couple of float comparisons.
     pub fn update_auto_scroll_for_playhead(&mut self, playhead_beats: f32) -> bool {
-        if !self.follow_playhead || self.auto_scroll_mode == AutoScrollMode::Off {
+        if !self.follow_playhead
+            || self.follow_playhead_suspended
+            || self.auto_scroll_mode == AutoScrollMode::Off
+        {
             return false;
         }
         let viewport_width = self.viewport.viewport_width;
@@ -611,6 +614,25 @@ mod tests {
         assert!(state.update_auto_scroll_for_playhead(0.0));
         assert_eq!(state.viewport.scroll_x, 0.0);
         assert_eq!(state.viewport.target_scroll_x, 0.0);
+    }
+
+    /// A suspension (a marquee in flight) holds the view still without
+    /// touching the user's Follow choice, which the transport shows and
+    /// Settings saves; lifting it lets the view follow again.
+    #[test]
+    fn a_suspended_follow_holds_the_view_and_keeps_the_users_choice() {
+        let mut state = TimelineState::default();
+        state.update_viewport_size(1000.0, 400.0);
+        state.set_scroll_immediate(1000.0, 0.0, 5000.0, 0.0);
+
+        state.follow_playhead_suspended = true;
+        assert!(!state.update_auto_scroll_for_playhead(0.0));
+        assert_eq!(state.viewport.scroll_x, 1000.0);
+        assert!(state.follow_playhead);
+
+        state.follow_playhead_suspended = false;
+        assert!(state.update_auto_scroll_for_playhead(0.0));
+        assert_eq!(state.viewport.scroll_x, 0.0);
     }
 }
 

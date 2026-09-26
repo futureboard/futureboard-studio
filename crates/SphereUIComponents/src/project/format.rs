@@ -1,3 +1,7 @@
+use super::view::{
+    ProjectAutomationExpansion, ProjectLaneVisibility, ProjectLoopRange, ProjectSnap,
+    ProjectViewState,
+};
 use super::{
     AraTrackBinding, AutomationLane, AutomationPoint, AutomationTargetDesc, ClipSource,
     FutureboardProject, InputMonitorMode, MidiAccent, MidiArticulation, MidiControllerKind,
@@ -120,7 +124,15 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// stable scale tag). Pre-v52 projects load with no key.
 /// v53 appends one curve tension (f32) per tempo marker, in marker order.
 /// Pre-v53 ramps load straight.
-pub const PROJECT_VERSION: u32 = 53;
+/// v54 appends each insert's Active switch after its role tag (pre-v54 inserts
+/// load active), and a length-prefixed view section at the tail of the body:
+/// tagged records (u16 tag, u32 length, payload) for the loop, snap grid, lane
+/// visibility, automation expansion and the mixer tree latch. Unknown tags are
+/// skipped, so later view fields need no version bump, and a record or section
+/// that cannot be read loads its defaults instead of failing the project. A
+/// v53 file loads with the loop off, snap from Settings, the factory lanes
+/// (Chord and Song Text shown when they have content) and no track expanded.
+pub const PROJECT_VERSION: u32 = 54;
 
 /// Minimum on-disk format version that can be loaded without data loss.
 /// Versions below this will show a warning but can still be loaded.
@@ -247,6 +259,10 @@ impl FbWriter {
 
     fn write_u8(&mut self, v: u8) {
         self.buf.push(v);
+    }
+
+    fn write_u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
     fn write_u32(&mut self, v: u32) {
@@ -399,6 +415,12 @@ impl<'a> FbReader<'a> {
         Ok(b[0])
     }
 
+    fn read_u16(&mut self) -> Result<u16, ProjectError> {
+        let mut b = [0u8; 2];
+        self.read_exact_field(&mut b, "u16")?;
+        Ok(u16::from_le_bytes(b))
+    }
+
     fn read_u32(&mut self) -> Result<u32, ProjectError> {
         let mut b = [0u8; 4];
         self.read_exact_field(&mut b, "u32")?;
@@ -496,6 +518,25 @@ impl<'a> FbReader<'a> {
         self.read_exact_field(&mut buf, "byte blob")?;
         Ok(buf)
     }
+
+    /// A blob written by [`FbWriter::write_bytes`], borrowed rather than
+    /// copied. The length is checked against what is left before anything is
+    /// taken, so a damaged length cannot make it allocate.
+    fn read_slice(&mut self) -> Result<&'a [u8], ProjectError> {
+        let len = self.read_u32()? as usize;
+        let remaining = self.remaining();
+        if len > remaining {
+            return Err(ProjectError::UnexpectedEof {
+                needed: len,
+                remaining,
+                field: "byte blob",
+            });
+        }
+        let data: &'a [u8] = self.cur.get_ref();
+        let start = self.cur.position() as usize;
+        self.cur.set_position((start + len) as u64);
+        Ok(&data[start..start + len])
+    }
 }
 
 // ââ Encoding ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -559,6 +600,8 @@ fn encode_insert(w: &mut FbWriter, ins: &ProjectInsert) {
         Some(false) => 1,
         Some(true) => 2,
     });
+    // v54: the Active switch.
+    w.write_bool(ins.enabled);
     match &ins.plugin {
         None => w.write_u8(0),
         Some(inst) => {
@@ -1603,7 +1646,182 @@ fn encode_body(project: &FutureboardProject) -> Vec<u8> {
         w.write_f32(point.tension);
     }
 
+    // View section (v54+). Last, and self-delimiting: see `encode_view_section`.
+    encode_view_section(&mut w, &project.view);
+
     w.into_bytes()
+}
+
+// ── View section (v54+) ──────────────────────────────────────────────────────
+//
+// One length-prefixed blob holding tagged records, each a u16 tag followed by a
+// length-prefixed payload. A reader skips tags it does not know, and ignores
+// payload bytes past the fields it reads, so later view state (and longer
+// versions of these records) needs no format bump. None of it is needed to play
+// the project, so nothing in here may fail a load.
+
+/// Record tags. Stable: a tag is never reused for something else.
+const VIEW_TAG_LOOP: u16 = 1;
+const VIEW_TAG_SNAP: u16 = 2;
+const VIEW_TAG_LANES: u16 = 3;
+const VIEW_TAG_AUTOMATION: u16 = 4;
+const VIEW_TAG_MIXER_TREE: u16 = 5;
+
+fn write_view_record(records: &mut FbWriter, tag: u16, payload: FbWriter) {
+    records.write_u16(tag);
+    records.write_bytes(&payload.into_bytes());
+}
+
+fn encode_view_section(w: &mut FbWriter, view: &ProjectViewState) {
+    let mut records = FbWriter::new();
+
+    let mut payload = FbWriter::new();
+    payload.write_bool(view.loop_range.enabled);
+    payload.write_f64(view.loop_range.start_beat);
+    payload.write_f64(view.loop_range.end_beat);
+    write_view_record(&mut records, VIEW_TAG_LOOP, payload);
+
+    // Grid division and shape as the grid menu's stable command ids.
+    if let Some(snap) = view.snap {
+        let mut payload = FbWriter::new();
+        payload.write_bool(snap.enabled);
+        payload.write_str(snap.division.command_id());
+        payload.write_str(snap.shape.command_id());
+        write_view_record(&mut records, VIEW_TAG_SNAP, payload);
+    }
+
+    if let Some(lanes) = view.lanes {
+        let mut payload = FbWriter::new();
+        payload.write_u8(lanes.to_bits());
+        write_view_record(&mut records, VIEW_TAG_LANES, payload);
+    }
+
+    // Keyed by track id, and the focused lane flattened like a saved
+    // automation lane's target.
+    let mut payload = FbWriter::new();
+    payload.write_u32(view.automation_expanded.len() as u32);
+    for entry in &view.automation_expanded {
+        payload.write_str(&entry.track_id);
+        match &entry.selected_target {
+            None => payload.write_u8(0),
+            Some(target) => {
+                payload.write_u8(1);
+                payload.write_u8(target.tag);
+                payload.write_str(&target.insert_id);
+                payload.write_str(&target.parameter_id);
+                payload.write_str(&target.parameter_name);
+                payload.write_str(&target.send_id);
+            }
+        }
+    }
+    write_view_record(&mut records, VIEW_TAG_AUTOMATION, payload);
+
+    let mut payload = FbWriter::new();
+    payload.write_bool(view.mixer_tree_initialized);
+    write_view_record(&mut records, VIEW_TAG_MIXER_TREE, payload);
+
+    w.write_bytes(&records.into_bytes());
+}
+
+/// Read the view section. Never fails: a record that cannot be read keeps its
+/// default, an unknown tag (a newer build's field) is skipped, and a section
+/// whose framing is damaged keeps whatever records were read before the damage.
+fn decode_view_section(r: &mut FbReader) -> ProjectViewState {
+    let mut view = ProjectViewState::default();
+    let Ok(section) = r.read_slice() else {
+        project_load_log(format_args!(
+            "view section unreadable; loading default view"
+        ));
+        return view;
+    };
+    let mut records = FbReader::new(section);
+    while records.remaining() > 0 {
+        let Ok(tag) = records.read_u16() else {
+            break;
+        };
+        let Ok(payload) = records.read_slice() else {
+            project_load_log(format_args!("view record {tag} truncated; ignored"));
+            break;
+        };
+        let mut p = FbReader::new(payload);
+        let read = match tag {
+            VIEW_TAG_LOOP => decode_view_loop(&mut p).map(|v| view.loop_range = v),
+            VIEW_TAG_SNAP => decode_view_snap(&mut p).map(|v| view.snap = Some(v)),
+            VIEW_TAG_LANES => p
+                .read_u8()
+                .map(|bits| view.lanes = Some(ProjectLaneVisibility::from_bits(bits))),
+            VIEW_TAG_AUTOMATION => {
+                decode_view_automation(&mut p).map(|v| view.automation_expanded = v)
+            }
+            VIEW_TAG_MIXER_TREE => p.read_bool().map(|v| view.mixer_tree_initialized = v),
+            _ => Ok(()),
+        };
+        if let Err(error) = read {
+            project_load_log(format_args!(
+                "view record {tag} unreadable ({}); default kept",
+                error.technical_detail()
+            ));
+        }
+    }
+    view
+}
+
+fn decode_view_loop(r: &mut FbReader) -> Result<ProjectLoopRange, ProjectError> {
+    Ok(ProjectLoopRange {
+        enabled: r.read_bool()?,
+        start_beat: r.read_f64()?,
+        end_beat: r.read_f64()?,
+    })
+}
+
+/// An id this build does not know (a newer grid) falls back to the factory
+/// 1/16, straight, keeping the saved snap switch.
+fn decode_view_snap(r: &mut FbReader) -> Result<ProjectSnap, ProjectError> {
+    use crate::components::timeline::timeline_state::{SnapDivision, SnapShape};
+    let enabled = r.read_bool()?;
+    let division = SnapDivision::from_command_id(&r.read_str()?).unwrap_or(SnapDivision::Div1_16);
+    let shape = SnapShape::from_command_id(&r.read_str()?).unwrap_or_default();
+    Ok(ProjectSnap {
+        enabled,
+        division,
+        shape,
+    })
+}
+
+fn decode_view_automation(
+    r: &mut FbReader,
+) -> Result<Vec<ProjectAutomationExpansion>, ProjectError> {
+    let count = r.read_u32()? as usize;
+    // Track id length + presence byte.
+    if count > r.remaining() / 5 {
+        return Err(ProjectError::Corrupted(
+            "invalid automation expansion count".to_string(),
+        ));
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let track_id = r.read_str()?;
+        let selected_target = match r.read_u8()? {
+            0 => None,
+            1 => Some(AutomationTargetDesc {
+                tag: r.read_u8()?,
+                insert_id: r.read_str()?,
+                parameter_id: r.read_str()?,
+                parameter_name: r.read_str()?,
+                send_id: r.read_str()?,
+            }),
+            tag => {
+                return Err(ProjectError::Corrupted(format!(
+                    "bad automation target option tag {tag}"
+                )));
+            }
+        };
+        entries.push(ProjectAutomationExpansion {
+            track_id,
+            selected_target,
+        });
+    }
+    Ok(entries)
 }
 
 /// Root byte of a project without a key.
@@ -1819,6 +2037,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
     } else {
         None
     };
+    let enabled = if version >= 54 { r.read_bool()? } else { true };
     let plugin = match r.read_u8()? {
         0 => None,
         1 => Some(decode_plugin_instance(r)?),
@@ -1832,6 +2051,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
         id,
         slot_index,
         bypassed,
+        enabled,
         enabled_audio_output_channels,
         plugin_is_instrument,
         multiout_collapsed,
@@ -2924,7 +3144,16 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
         }
     }
 
+    // View section (v54+). A v53 file has none and opens on the defaults
+    // described at `PROJECT_VERSION`.
+    let view = if version >= 54 {
+        decode_view_section(&mut r)
+    } else {
+        ProjectViewState::default()
+    };
+
     Ok(FutureboardProject {
+        view,
         audio_connections,
         global_lanes,
         ara_documents,
@@ -3378,24 +3607,33 @@ mod tests {
         bytes
     }
 
+    /// Encoded size of the v54 view section for `view`, which ends every body.
+    fn view_section_len(view: &ProjectViewState) -> usize {
+        let mut w = FbWriter::new();
+        encode_view_section(&mut w, view);
+        w.into_bytes().len()
+    }
+
     fn encode_legacy_song_text_project(version: u32, cues: &[LegacyProjectSongTextCue]) -> Vec<u8> {
-        let mut body = encode_body(&FutureboardProject::new("Legacy Song Text"));
+        let project = FutureboardProject::new("Legacy Song Text");
+        let mut body = encode_body(&project);
         // `encode_body` ends with the Song Text count, the v34 Audio
         // Connections count, the v35 output-routing block (two absent optional
         // strings plus the bootstrap latch), the v40 conductor-lane fold block
         // (four collapse latches plus five absent optional heights), the v41
         // ARA document count, the v43 timebase pair, the v50 marker SysEx
         // count, the v51 Chord Track block (event count, collapse latch,
-        // custom height), the v52 project key (root, scale) and the v53 tempo
-        // tension count (no markers, so no values). A v24-v26
-        // fixture reads none of them, so drop the whole tail before appending
-        // the legacy cue block in its place.
+        // custom height), the v52 project key (root, scale), the v53 tempo
+        // tension count (no markers, so no values) and the v54 view section.
+        // A v24-v26 fixture reads none of them, so drop the whole tail before
+        // appending the legacy cue block in its place.
         let v35_output_routing_bytes = 1 + 1 + 1;
         let v40_global_lane_bytes = 4 + 5;
         let v43_timebase_bytes = 1 + 1;
         let v51_chord_track_bytes = 4 + 1 + 4;
         let v52_project_key_bytes = 1 + 1;
         let v53_tempo_tension_bytes = 4;
+        let v54_view_bytes = view_section_len(&project.view);
         body.truncate(
             body.len()
                 - 4 * std::mem::size_of::<u32>()
@@ -3404,7 +3642,8 @@ mod tests {
                 - v43_timebase_bytes
                 - v51_chord_track_bytes
                 - v52_project_key_bytes
-                - v53_tempo_tension_bytes,
+                - v53_tempo_tension_bytes
+                - v54_view_bytes,
         );
 
         let mut tail = FbWriter::new();
@@ -3648,6 +3887,7 @@ mod tests {
             id: "insert-1".to_string(),
             slot_index: 0,
             bypassed: false,
+            enabled: true,
             enabled_audio_output_channels: vec![1, 2, 3, 4],
             plugin_is_instrument: Some(false),
             multiout_collapsed: true,
@@ -3933,9 +4173,13 @@ mod tests {
 
     #[test]
     fn truncated_body_reports_unexpected_eof() {
-        let bytes = encode_project(&FutureboardProject::new("Body"));
+        let project = FutureboardProject::new("Body");
+        let bytes = encode_project(&project);
         let body = &bytes[PROJECT_HEADER_SIZE..bytes.len() - 4];
-        let truncated_body = &body[..body.len().saturating_sub(3).max(1)];
+        // Cut into the fields before the v54 view section: a damaged view
+        // section loads the default view by design and is not an error.
+        let cut = view_section_len(&project.view) + 3;
+        let truncated_body = &body[..body.len().saturating_sub(cut).max(1)];
         let err = decode_body(truncated_body, PROJECT_VERSION).unwrap_err();
         assert!(
             matches!(err, ProjectError::UnexpectedEof { .. })
@@ -4532,11 +4776,12 @@ mod tests {
     /// A hostile count must not make the decoder reserve an arbitrary vector.
     #[test]
     fn an_absurd_connection_count_is_rejected_before_allocating() {
-        let mut body = encode_body(&FutureboardProject::new("hostile"));
+        let project = FutureboardProject::new("hostile");
+        let mut body = encode_body(&project);
         // Overwrite the v51 Chord Track event count — which sits before its
-        // collapse latch (1), height (4), the v52 project key (2) and the v53
-        // tempo tension count (4) — with a huge value.
-        let len = body.len();
+        // collapse latch (1), height (4), the v52 project key (2), the v53
+        // tempo tension count (4) and the v54 view section — with a huge value.
+        let len = body.len() - view_section_len(&project.view);
         body[len - 15..len - 11].copy_from_slice(&u32::MAX.to_le_bytes());
         let bytes = project_bytes_with_version(body, PROJECT_VERSION);
         assert!(matches!(
@@ -4594,9 +4839,11 @@ mod tests {
 
     #[test]
     fn an_unknown_scale_tag_loads_as_no_key() {
-        let mut body = encode_body(&FutureboardProject::new("future"));
-        // The key sits before the v53 tempo tension count (4).
-        let len = body.len() - 4;
+        let project = FutureboardProject::new("future");
+        let mut body = encode_body(&project);
+        // The key sits before the v53 tempo tension count (4) and the v54 view
+        // section.
+        let len = body.len() - 4 - view_section_len(&project.view);
         body[len - 2] = 4;
         body[len - 1] = 250;
         let bytes = project_bytes_with_version(body, PROJECT_VERSION);
@@ -4695,5 +4942,195 @@ mod tests {
         // enough to prove the section is version-gated.
         let decoded = decode_project(&bytes).expect("v33 loads");
         assert!(decoded.audio_connections.is_empty());
+    }
+
+    /// v54 saves the insert's Active switch; a switched-off plug-in used to
+    /// come back on after reopening.
+    #[test]
+    fn insert_active_switch_roundtrips_v54() {
+        let mut project = FutureboardProject::new("Active");
+        project.mixer.master_inserts.push(ProjectInsert {
+            id: "off".to_string(),
+            enabled: false,
+            ..ProjectInsert::default()
+        });
+        project.mixer.master_inserts.push(ProjectInsert {
+            id: "on".to_string(),
+            slot_index: 1,
+            ..ProjectInsert::default()
+        });
+        let decoded = decode_project(&encode_project(&project)).expect("decode");
+        assert!(!decoded.mixer.master_inserts[0].enabled);
+        assert!(decoded.mixer.master_inserts[1].enabled);
+    }
+
+    /// A v53 insert has no Active byte and loads active, which is what every
+    /// insert came back as before the field existed.
+    #[test]
+    fn a_v53_insert_loads_active_and_stays_aligned() {
+        let mut w = FbWriter::new();
+        w.write_str("insert-1");
+        w.write_u32(0);
+        w.write_bool(true);
+        w.write_u32(0);
+        w.write_bool(false);
+        w.write_u8(1);
+        w.write_u8(0);
+        w.write_u32(7);
+        let bytes = w.into_bytes();
+        let mut r = FbReader::new(&bytes);
+        let insert = decode_insert(&mut r, 53).expect("v53 insert");
+        assert!(insert.enabled);
+        assert!(insert.bypassed);
+        assert_eq!(insert.plugin_is_instrument, Some(false));
+        assert_eq!(r.read_u32().unwrap(), 7, "reader lands after the insert");
+    }
+
+    fn sample_view() -> ProjectViewState {
+        use crate::components::timeline::timeline_state::{SnapDivision, SnapShape};
+        ProjectViewState {
+            loop_range: ProjectLoopRange {
+                enabled: true,
+                start_beat: 4.0,
+                end_beat: 20.5,
+            },
+            snap: Some(ProjectSnap {
+                enabled: false,
+                division: SnapDivision::Bar1,
+                shape: SnapShape::Dotted,
+            }),
+            lanes: Some(ProjectLaneVisibility {
+                tempo: false,
+                time_signature: true,
+                marker: false,
+                region: true,
+                song_text: true,
+                chord: false,
+            }),
+            automation_expanded: vec![
+                ProjectAutomationExpansion {
+                    track_id: "track-1".to_string(),
+                    selected_target: None,
+                },
+                ProjectAutomationExpansion {
+                    track_id: "track-2".to_string(),
+                    selected_target: Some(AutomationTargetDesc {
+                        tag: 3,
+                        insert_id: "insert-track-2-1".to_string(),
+                        parameter_id: "17".to_string(),
+                        parameter_name: "Cutoff".to_string(),
+                        send_id: String::new(),
+                    }),
+                },
+            ],
+            mixer_tree_initialized: true,
+        }
+    }
+
+    #[test]
+    fn view_section_roundtrips_v54() {
+        let mut project = FutureboardProject::new("View");
+        project.view = sample_view();
+        let decoded = decode_project(&encode_project(&project)).expect("decode");
+        assert_eq!(decoded.view, project.view);
+    }
+
+    /// Records a newer build adds are skipped, and so are payload bytes past
+    /// the fields this build reads.
+    #[test]
+    fn unknown_view_records_and_longer_payloads_are_skipped() {
+        let mut records = FbWriter::new();
+        let mut future = FbWriter::new();
+        future.write_str("piano roll zoom");
+        future.write_f64(3.5);
+        write_view_record(&mut records, 900, future);
+        let mut mixer = FbWriter::new();
+        mixer.write_bool(true);
+        mixer.write_u32(0xDEAD_BEEF);
+        write_view_record(&mut records, VIEW_TAG_MIXER_TREE, mixer);
+        let mut section = FbWriter::new();
+        section.write_bytes(&records.into_bytes());
+        let bytes = section.into_bytes();
+
+        let view = decode_view_section(&mut FbReader::new(&bytes));
+        assert!(view.mixer_tree_initialized);
+        assert_eq!(view.loop_range, ProjectLoopRange::default());
+    }
+
+    /// A record that cannot be read keeps its default; the records around it
+    /// still load, and so does the project.
+    #[test]
+    fn a_malformed_view_record_keeps_its_default() {
+        let mut records = FbWriter::new();
+        let mut snap = FbWriter::new();
+        snap.write_bool(true);
+        snap.write_u32(400); // A string length past the end of the payload.
+        write_view_record(&mut records, VIEW_TAG_SNAP, snap);
+        let mut automation = FbWriter::new();
+        automation.write_u32(u32::MAX); // An impossible count.
+        write_view_record(&mut records, VIEW_TAG_AUTOMATION, automation);
+        let mut lanes = FbWriter::new();
+        lanes.write_u8(0);
+        write_view_record(&mut records, VIEW_TAG_LANES, lanes);
+
+        let mut body = encode_body(&FutureboardProject::new("malformed"));
+        let len = body.len() - view_section_len(&ProjectViewState::default());
+        body.truncate(len);
+        let mut section = FbWriter::new();
+        section.write_bytes(&records.into_bytes());
+        body.extend_from_slice(&section.into_bytes());
+        let bytes = project_bytes_with_version(body, PROJECT_VERSION);
+
+        let decoded = decode_project(&bytes).expect("a bad view record never fails a load");
+        assert_eq!(decoded.view.snap, None);
+        assert!(decoded.view.automation_expanded.is_empty());
+        assert_eq!(
+            decoded.view.lanes,
+            Some(ProjectLaneVisibility::from_bits(0)),
+            "the record after the bad ones is still read"
+        );
+    }
+
+    /// A section whose own length is damaged loads the default view.
+    #[test]
+    fn a_damaged_view_section_loads_the_default_view() {
+        let mut project = FutureboardProject::new("damaged");
+        project.view = sample_view();
+        let mut body = encode_body(&project);
+        let len = body.len() - view_section_len(&project.view);
+        body[len..len + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let bytes = project_bytes_with_version(body, PROJECT_VERSION);
+        let decoded = decode_project(&bytes).expect("still loads");
+        assert_eq!(decoded.view, ProjectViewState::default());
+
+        // A section cut short mid-record keeps the records before the cut.
+        let mut records = FbWriter::new();
+        let mut mixer = FbWriter::new();
+        mixer.write_bool(true);
+        write_view_record(&mut records, VIEW_TAG_MIXER_TREE, mixer);
+        records.write_u16(VIEW_TAG_LOOP);
+        records.write_u32(17); // Longer than what is left.
+        let mut section = FbWriter::new();
+        section.write_bytes(&records.into_bytes());
+        let bytes = section.into_bytes();
+        let view = decode_view_section(&mut FbReader::new(&bytes));
+        assert!(view.mixer_tree_initialized);
+        assert_eq!(view.loop_range, ProjectLoopRange::default());
+    }
+
+    /// A v53 file ends before the view section and opens on the default view.
+    #[test]
+    fn a_v53_project_loads_the_default_view() {
+        let mut project = FutureboardProject::new("v53");
+        project.view = sample_view();
+        let mut body = encode_body(&project);
+        body.truncate(body.len() - view_section_len(&project.view));
+        let bytes = project_bytes_with_version(body, 53);
+        assert!(matches!(
+            decode_project(&bytes),
+            Err(ProjectError::OldVersion(53))
+        ));
+        let decoded = decode_project_with_options(&bytes, true).expect("v53 loads");
+        assert_eq!(decoded.view, ProjectViewState::default());
     }
 }

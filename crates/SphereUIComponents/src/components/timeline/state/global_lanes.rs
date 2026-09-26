@@ -179,9 +179,7 @@ impl TimelineState {
     /// `APP_CHROME_HEIGHT + RULER_HEIGHT` inline in two files, which silently
     /// became wrong the moment another conductor lane was allowed above it.
     pub fn tempo_lane_origin_y(&self) -> f32 {
-        self.timeline_origin_y()
-            + RULER_HEIGHT
-            + self.global_lane_top(GlobalLaneKind::Tempo)
+        self.timeline_origin_y() + RULER_HEIGHT + self.global_lane_top(GlobalLaneKind::Tempo)
     }
 
     /// Window-space y -> BPM for the Tempo lane.
@@ -295,12 +293,14 @@ impl TimelineState {
         Some((prev, self.global_lane_heights.clone()))
     }
 
-    pub fn show_song_text_track_lane(&mut self) {
-        self.show_song_text_track = true;
+    /// Returns whether the lane was hidden, i.e. whether the saved view changed.
+    pub fn show_song_text_track_lane(&mut self) -> bool {
+        !std::mem::replace(&mut self.show_song_text_track, true)
     }
 
-    pub fn hide_song_text_track_lane(&mut self) {
-        self.show_song_text_track = false;
+    /// Returns whether the lane was shown, i.e. whether the saved view changed.
+    pub fn hide_song_text_track_lane(&mut self) -> bool {
+        std::mem::replace(&mut self.show_song_text_track, false)
     }
 
     /// Visible global/system lanes, top to bottom.

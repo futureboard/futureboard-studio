@@ -593,7 +593,7 @@ impl StudioLayout {
                     )
                 })
             })
-            .and_then(|mut states| states.remove(insert_id));
+            .and_then(|mut capture| capture.states.remove(insert_id));
         let bytes = match captured {
             Some(bytes) if !bytes.is_empty() => bytes,
             _ => {

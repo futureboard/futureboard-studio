@@ -9,7 +9,8 @@
 //!
 //! The callers are:
 //! - `new()` — calls `restore_workspace_layout` with the loaded layout.
-//! - Shutdown path — calls `save_workspace_layout`.
+//! - Session end (Close Project, in-studio switch, quit) — calls
+//!   `save_workspace_layout` through `persist_per_user_session_view`.
 
 use crate::layout::studio_state::RightDockTab;
 use crate::workspace_layout::{
@@ -137,7 +138,9 @@ impl StudioLayout {
 
     /// Capture and write the workspace layout to disk.
     ///
-    /// Called at shutdown (project close + app quit). Non-fatal on I/O error.
+    /// Called when a session ends: Close Project, an in-studio project switch
+    /// and app quit (see `persist_per_user_session_view`). Non-fatal on I/O
+    /// error.
     pub fn save_workspace_layout(&self, cx: &mut gpui::App) {
         let layout = self.capture_workspace_layout(cx);
         persist_to_disk(&layout);

@@ -42,8 +42,8 @@ use crate::components::mixer_surface::{mixer_gpu_primitives_active, render_mixer
 use crate::components::mixer_tree_sidebar_view::MixerTreeSidebar;
 use crate::components::panel::FxSlotDrag;
 use crate::components::reorder::{
-    drop_over_highlight, insert_drop_target, insert_drop_target_also, same_list_anchor,
-    slot_drop_target, DragRefusal, DropIndicator, DropSlot, InsertDropTarget,
+    drop_over_highlight, insert_drop_forwarder, insert_drop_target, insert_drop_target_also,
+    same_list_anchor, slot_drop_target, DragRefusal, DropIndicator, DropSlot, InsertDropTarget,
 };
 use crate::components::sidebar::BrowserDragItem;
 use crate::components::timeline::timeline_state::{
@@ -524,15 +524,11 @@ fn insert_chip(
     let open_target = (track_id_owned, insert_index, slot_id);
 
     // The glyphs forward slot drops to the chip, so a drop released over one
-    // still lands where the chip says it would.
+    // still lands where the chip says it would. The chip alone tracks the
+    // refusal cursor: its bounds contain the glyphs.
     let on_drop_insert = callbacks.on_drop_insert.clone();
     let forward_drops = |element: gpui::Stateful<gpui::Div>| match &dnd {
-        Some((_, target)) => insert_drop_target(
-            element,
-            target.clone(),
-            DropIndicator::None,
-            on_drop_insert.clone(),
-        ),
+        Some((_, target)) => insert_drop_forwarder(element, target.clone(), on_drop_insert.clone()),
         None => element,
     };
 

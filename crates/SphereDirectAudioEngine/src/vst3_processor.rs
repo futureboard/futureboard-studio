@@ -363,6 +363,11 @@ pub(crate) mod ffi {
         pub(crate) fn sphere_daux_vst3_embed_take_user_close(
             processor: *mut SphereDauxVst3Processor,
         ) -> i32;
+        /// 1 (and resets) when the plug-in reported a change to its own
+        /// state since the last call. See `take_state_touched`.
+        pub(crate) fn sphere_daux_vst3_take_state_touched(
+            processor: *mut SphereDauxVst3Processor,
+        ) -> i32;
         pub(crate) fn sphere_daux_vst3_embed_set_waiting_stage(
             processor: *mut SphereDauxVst3Processor,
             stage: *const c_char,
@@ -470,6 +475,7 @@ pub(crate) mod ffi {
         sphere_daux_vst3_set_process_context as set_process_context,
         sphere_daux_vst3_set_state as set_state, sphere_daux_vst3_state_free as state_free,
         sphere_daux_vst3_take_pending_shell_resize as take_pending_shell_resize,
+        sphere_daux_vst3_take_state_touched as take_state_touched,
         sphere_daux_vst3_view_attach as view_attach,
         sphere_daux_vst3_view_can_resize as view_can_resize,
         sphere_daux_vst3_view_constrain as view_constrain,
@@ -1654,6 +1660,21 @@ impl Vst3RuntimeProcessor {
             return false;
         }
         unsafe { backend::embed_take_user_close(self.inner.format, self.inner.raw) != 0 }
+    }
+
+    /// `true` (and resets) when the plug-in reported a change to its own state
+    /// since the last call: a VST3 `performEdit` / `endEdit` or a values/reload
+    /// `restartComponent`, a VST2 `audioMasterAutomate` / `audioMasterEndEdit`,
+    /// or a CLAP `mark_dirty`, values rescan or parameter output event.
+    ///
+    /// Only says the saved state *may* be stale — it carries no state. Poll it
+    /// from a control thread; the flag is raised with one atomic store, so the
+    /// plug-in may raise it from any thread, the audio thread included.
+    pub fn take_state_touched(&self) -> bool {
+        if self.inner.raw.is_null() {
+            return false;
+        }
+        unsafe { backend::take_state_touched(self.inner.format, self.inner.raw) != 0 }
     }
 
     pub fn embed_set_waiting_stage(&self, stage: &str) {

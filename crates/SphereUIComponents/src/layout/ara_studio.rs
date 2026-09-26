@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use gpui::Context;
-use sphere_ara_host::{AraModelUpdate, AraTransportRequest};
+use sphere_ara_host::AraTransportRequest;
 
 use super::ara_graph;
 use super::ara_ops::AraSessionKey;
@@ -550,34 +550,77 @@ impl StudioLayout {
                             state.seconds_to_beats((start + duration).max(0.0));
                         cx.notify();
                     });
-                    self.sync_loop_controls(cx);
+                    self.commit_loop_change(cx);
                 }
                 AraTransportRequest::EnableCycle(enabled) => {
                     self.timeline.update(cx, |timeline, cx| {
                         timeline.state.transport.loop_enabled = enabled;
                         cx.notify();
                     });
-                    self.sync_loop_controls(cx);
+                    self.commit_loop_change(cx);
                 }
             }
         }
 
-        let mut dirty = false;
-        for update in self.ara.take_model_updates() {
-            match update {
-                // The plug-in changed its own persistent state, so the project
-                // has unsaved work even though nothing in the timeline moved.
-                AraModelUpdate::DocumentDataChanged => dirty = true,
-                AraModelUpdate::AnalysisProgress { .. }
-                | AraModelUpdate::SourceContentChanged { .. }
-                | AraModelUpdate::ModificationContentChanged { .. }
-                | AraModelUpdate::RegionContentChanged { .. } => {}
-            }
-        }
-        if dirty {
-            self.ara.document_data_changed();
-            self.project_session.mark_dirty();
+        // A plug-in may only report model changes from inside this call, which
+        // the host owes it periodically — without it none of the updates below
+        // would ever arrive. They are recorded synchronously, so the poll right
+        // after sees them, and judges them as this periodic poll's rather than
+        // as the answer to a later host edit.
+        self.ara.notify_model_updates();
+        if self.ara.poll_documents(std::time::Instant::now()) {
+            // The plug-in changed its own persistent state, so the project has
+            // unsaved work even though nothing in the timeline moved. It is
+            // saved with the project, not played by the engine: the same
+            // view-only mark every such writer uses, which keeps the session
+            // the close prompt reads and the switcher's "Unsaved changes" in
+            // step.
+            self.mark_dirty_view_only();
             cx.notify();
+        }
+    }
+
+    /// Publishes the project's musical context — tempo, meter and key — to
+    /// every live ARA session, without touching their graphs.
+    ///
+    /// For edits that change nothing the engine plays (the project key), so
+    /// no engine sync would carry them: each document is told what changed and
+    /// nothing else, with no renderer suspension and no region churn. Every
+    /// per-track document gets the same timeline, built once.
+    pub(crate) fn refresh_ara_musical_contexts(&mut self, cx: &mut Context<Self>) {
+        if !self.ara.is_active() {
+            return;
+        }
+        let (timeline, live) = {
+            let state = &self.timeline.read(cx).state;
+            // A session whose track no longer names it is on its way out, as
+            // in `refresh_ara_sessions`; it is left alone.
+            let live: Vec<AraSessionKey> = self
+                .ara
+                .keys()
+                .filter(|key| {
+                    state.tracks.iter().any(|track| {
+                        track.id == key.track_id
+                            && track
+                                .ara
+                                .as_ref()
+                                .is_some_and(|binding| binding.plugin_id == key.plugin_id)
+                    })
+                })
+                .cloned()
+                .collect();
+            (ara_graph::musical_timeline(state), live)
+        };
+        for key in live {
+            if let Err(error) = self.ara.update_musical_timeline(&key, &timeline) {
+                let name = self
+                    .ara
+                    .plugin_name(&key)
+                    .unwrap_or(key.plugin_id.as_str())
+                    .to_owned();
+                eprintln!("[ARA] {name}: musical context not updated: {error}");
+                self.ara.last_error = Some(format!("{name}: {error}"));
+            }
         }
     }
 

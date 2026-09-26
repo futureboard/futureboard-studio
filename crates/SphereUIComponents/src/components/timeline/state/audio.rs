@@ -452,9 +452,10 @@ impl ClipState {
     ) -> bool {
         let rate = source.sample_rate;
         let first_decode = self.stretch.original_sample_rate == 0;
+        let adopt = adopt_placeholder_length && self.is_untouched_import_placeholder();
         self.source_duration_seconds = Some(source.duration_seconds);
 
-        if first_decode && adopt_placeholder_length && self.is_untouched_import_placeholder() {
+        if adopt {
             self.stretch.original_sample_rate = rate;
             self.stretch.project_sample_rate = rate;
             self.stretch.original_duration_samples = source.total_frames;

@@ -4,11 +4,13 @@
 //! dragged, so it is its own entity for the same reason the playhead and the
 //! razor line are: notifying `Timeline` for it would rebuild every lane on
 //! every mouse move (and on every synthetic drag repeat macOS sends while the
-//! button is held still), while notifying this repaints one rectangle.
-//! `Timeline` itself is notified only when what the rectangle encloses
-//! changes.
+//! button is held still). Notifying this entity still dirties its ancestors —
+//! GPUI re-runs `Timeline::render` and the Studio's render on each move — but
+//! the cached lane views are reused, so no clip, waveform or note preview is
+//! rebuilt. `Timeline` itself is notified, and the lanes rebuilt, only when
+//! what the rectangle encloses changes.
 
-use gpui::{div, px, Context, IntoElement, ParentElement, Render, Styled, Window};
+use gpui::{div, px, Context, IntoElement, Render, Styled, Window};
 
 use crate::theme::Colors;
 

@@ -116,21 +116,13 @@ impl TrackRowLayout {
         let scroll_y = state.viewport.scroll_y;
         let mut y = 0.0_f32;
         let mut rows = Vec::with_capacity(state.tracks.len());
-        let collapsed_group_ids: std::collections::HashSet<&str> = state
-            .tracks
-            .iter()
-            .filter(|track| track.track_type == TrackType::Group && track.group_collapsed)
-            .map(|track| track.id.as_str())
-            .collect();
+        let collapsed_groups = CollapsedGroups::of(&state.tracks);
         for (index, track) in state.tracks.iter().enumerate() {
             // Mixer-only channels (Bus/Return + VSTi multi-out children) live in
             // `state.tracks` for engine/mixer routing, but must NOT occupy
             // arrangement space. Keep them in the rows vector (1:1 with
             // `state.tracks`) but collapse them to zero height.
-            let hidden_by_group = track
-                .parent_group_id
-                .as_deref()
-                .is_some_and(|group_id| collapsed_group_ids.contains(group_id));
+            let hidden_by_group = collapsed_groups.hides(track);
             let (height, automation_height) =
                 if is_arrangement_hidden_track(track) || hidden_by_group {
                     (0.0, 0.0)
@@ -188,6 +180,30 @@ impl TrackRowLayout {
         // midpoint the pointer has not yet passed.
         self.rows
             .partition_point(|row| row.y + row.block_height() * 0.5 <= content_y)
+    }
+}
+
+/// The arrangement's collapsed groups, and the one rule that hides a row
+/// inside them: its own group is collapsed. The row layout and track zoom
+/// share it, so zoom limits come from exactly the rows on screen.
+struct CollapsedGroups<'a>(std::collections::HashSet<&'a str>);
+
+impl<'a> CollapsedGroups<'a> {
+    fn of(tracks: &'a [TrackState]) -> Self {
+        Self(
+            tracks
+                .iter()
+                .filter(|track| track.track_type == TrackType::Group && track.group_collapsed)
+                .map(|track| track.id.as_str())
+                .collect(),
+        )
+    }
+
+    fn hides(&self, track: &TrackState) -> bool {
+        track
+            .parent_group_id
+            .as_deref()
+            .is_some_and(|group_id| self.0.contains(group_id))
     }
 }
 
@@ -289,8 +305,8 @@ impl TimelineState {
     }
 
     /// True when the track's automation section is expanded (sub-lanes shown).
-    /// Reuses [`TrackLaneMode::Automation`] as the expanded flag so the existing
-    /// header toggle and persistence keep working.
+    /// Reuses [`TrackLaneMode::Automation`] as the expanded flag, so the header
+    /// toggle drives it and the project's view section (v54) saves it.
     pub fn track_automation_expanded(&self, track: &TrackState) -> bool {
         track.lane_mode == TrackLaneMode::Automation
     }
@@ -540,6 +556,10 @@ pub struct TrackZoomBase {
     pub track_id: TrackId,
     pub track_type: TrackType,
     pub height: f32,
+    /// The row is on screen: not inside a collapsed group. Only these rows
+    /// set the burst's limits and decide whether a tick changed anything;
+    /// hidden rows follow the zoom, each clamped on its own.
+    pub visible: bool,
 }
 
 /// A burst of Ctrl/Cmd+Alt+wheel ticks zooming every arrangement track's
@@ -554,8 +574,9 @@ pub struct TrackHeightZoomSession {
     base: Vec<TrackZoomBase>,
     /// Zoom accumulated over the burst, relative to `base`.
     factor: f32,
-    /// `factor` is held inside the range where at least one row can still
-    /// change, so reversing direction after hitting a limit reacts at once.
+    /// `factor` is held inside the range where at least one visible row can
+    /// still change, so reversing direction after the rows on screen hit a
+    /// limit reacts at once. A hidden row cannot hold the factor past that.
     factor_min: f32,
     factor_max: f32,
     /// Effective heights the last tick left, in `base` order. Any other writer
@@ -563,8 +584,6 @@ pub struct TrackHeightZoomSession {
     /// which restarts the burst instead of overwriting that change.
     applied: Vec<f32>,
     last_tick: std::time::Instant,
-    /// This burst already marked the project as having unsaved changes.
-    marked_dirty: bool,
 }
 
 impl TrackHeightZoomSession {
@@ -572,8 +591,9 @@ impl TrackHeightZoomSession {
         if base.is_empty() {
             return None;
         }
+        // With no row on screen the range stays [1, 1] and a tick does nothing.
         let (mut factor_min, mut factor_max) = (1.0_f32, 1.0_f32);
-        for entry in &base {
+        for entry in base.iter().filter(|entry| entry.visible) {
             factor_min = factor_min.min(min_track_row_height(entry.track_type) / entry.height);
             factor_max = factor_max.max(MAX_TRACK_HEIGHT / entry.height);
         }
@@ -585,7 +605,6 @@ impl TrackHeightZoomSession {
             factor_max,
             applied,
             last_tick: now,
-            marked_dirty: false,
         })
     }
 }
@@ -594,11 +613,12 @@ impl TrackHeightZoomSession {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TrackZoomTick {
     /// Scroll y keeping the anchored track under the pointer, clamped to the
-    /// new content height. `None` when no row height changed.
+    /// new content height. `None` when no visible row changed height.
     pub scroll_y: Option<f32>,
-    /// First change of this burst: mark the project view-dirty once. Track
-    /// zoom is a view change, so it never records an undo entry and never
-    /// marks the engine dirty.
+    /// A visible row changed: mark the project view-dirty. Every such tick
+    /// marks it, so a save that lands mid-burst leaves the rest of the burst
+    /// unsaved rather than lost. Track zoom is a view change, so it never
+    /// records an undo entry and never marks the engine dirty.
     pub mark_view_dirty: bool,
 }
 
@@ -628,9 +648,10 @@ fn zoomed_track_height(base: &TrackZoomBase, factor: f32) -> Option<f32> {
 impl TimelineState {
     /// Every arrangement track's current height, in track order. Mixer-only
     /// channels take no arrangement space and are left out; children of a
-    /// collapsed group stay in, so they still match their siblings once the
-    /// group expands.
+    /// collapsed group stay in, marked not visible, so they still match their
+    /// siblings once the group expands.
     fn track_zoom_base(&self) -> Vec<TrackZoomBase> {
+        let collapsed_groups = CollapsedGroups::of(&self.tracks);
         self.tracks
             .iter()
             .filter(|track| !is_arrangement_hidden_track(track))
@@ -638,13 +659,14 @@ impl TimelineState {
                 track_id: track.id.clone(),
                 track_type: track.track_type,
                 height: self.track_row_height(track),
+                visible: !collapsed_groups.hides(track),
             })
             .collect()
     }
 
     /// True while `session` still describes the arrangement: its last tick
-    /// was recent, the arrangement tracks are the same, and every height is
-    /// still what that tick wrote.
+    /// was recent, the arrangement tracks and the rows on screen are the same,
+    /// and every height is still what that tick wrote.
     fn track_zoom_session_is_live(
         &self,
         session: &TrackHeightZoomSession,
@@ -653,6 +675,7 @@ impl TimelineState {
         if now.saturating_duration_since(session.last_tick) > TRACK_ZOOM_BURST_IDLE {
             return false;
         }
+        let collapsed_groups = CollapsedGroups::of(&self.tracks);
         let mut live = self
             .tracks
             .iter()
@@ -661,7 +684,10 @@ impl TimelineState {
             let Some(track) = live.next() else {
                 return false;
             };
-            if track.id != base.track_id || (self.track_row_height(track) - applied).abs() >= 0.01 {
+            if track.id != base.track_id
+                || collapsed_groups.hides(track) == base.visible
+                || (self.track_row_height(track) - applied).abs() >= 0.01
+            {
                 return false;
             }
         }
@@ -715,17 +741,16 @@ impl TimelineState {
                 .iter()
                 .map(|entry| zoomed_track_height(entry, factor).unwrap_or(DEFAULT_TRACK_HEIGHT)),
         );
-        let mark_view_dirty = scroll_y.is_some() && !active.marked_dirty;
-        active.marked_dirty |= mark_view_dirty;
         TrackZoomTick {
             scroll_y,
-            mark_view_dirty,
+            mark_view_dirty: scroll_y.is_some(),
         }
     }
 
     /// Set every track in `base` to its height at `factor`, and return the
     /// scroll y that keeps the anchored track at `anchor_viewport_y`, clamped
-    /// to `[0, total - viewport_height]`. `None` when no height changed.
+    /// to `[0, total - viewport_height]`. `None` when no visible row changed:
+    /// a hidden row takes no space, so it moves nothing on screen.
     ///
     /// Rows are 1:1 with `tracks` by index, so the anchor is a row index plus
     /// a fraction of its clip row; a pointer in the automation sub-lanes keeps
@@ -769,7 +794,7 @@ impl TimelineState {
                     .set_height(entry.track_id.clone(), height),
                 None => self.track_view_layout.remove_track(&entry.track_id),
             }
-            changed |= (next.unwrap_or(DEFAULT_TRACK_HEIGHT) - old).abs() >= 0.01;
+            changed |= entry.visible && (next.unwrap_or(DEFAULT_TRACK_HEIGHT) - old).abs() >= 0.01;
         }
         if !changed {
             return None;
@@ -1405,8 +1430,11 @@ mod tests {
         assert!(scroll_y <= total - viewport, "{scroll_y} of {total}");
     }
 
+    /// Every tick that changes a row marks the project, not only a burst's
+    /// first: a save that lands mid-burst must not leave the later ticks
+    /// looking saved.
     #[test]
-    fn track_zoom_marks_the_project_once_per_burst() {
+    fn track_zoom_marks_the_project_on_every_changing_tick() {
         let mut state = sample_state(&[TrackType::Audio, TrackType::Midi]);
         let mut now = Instant::now();
         let mut session = None;
@@ -1420,12 +1448,112 @@ mod tests {
         assert!(first.scroll_y.is_some() && first.mark_view_dirty);
         now += Duration::from_millis(16);
         let second = zoom_tick(&mut state, &mut session, 1.2, 0.0, ZOOM_VIEWPORT, now);
-        assert!(second.scroll_y.is_some() && !second.mark_view_dirty);
+        assert!(second.scroll_y.is_some() && second.mark_view_dirty);
+
+        // Held at the ceiling, a tick changes nothing and marks nothing.
+        now += Duration::from_millis(16);
+        zoom_tick(&mut state, &mut session, 50.0, 0.0, ZOOM_VIEWPORT, now);
+        now += Duration::from_millis(16);
+        let held = zoom_tick(&mut state, &mut session, 1.2, 0.0, ZOOM_VIEWPORT, now);
+        assert_eq!(held, TrackZoomTick::default());
 
         // After the burst goes idle the next tick starts a new one.
         now += TRACK_ZOOM_BURST_IDLE + Duration::from_millis(1);
-        let next_burst = zoom_tick(&mut state, &mut session, 1.2, 0.0, ZOOM_VIEWPORT, now);
+        let next_burst = zoom_tick(&mut state, &mut session, 0.8, 0.0, ZOOM_VIEWPORT, now);
         assert!(next_burst.scroll_y.is_some() && next_burst.mark_view_dirty);
+    }
+
+    /// Group `G` (collapsed) holding one child, then two plain tracks. The
+    /// visible rows stay at the default height; the hidden child is set to
+    /// `child_height`. Returns the state and the child's id.
+    fn collapsed_child_state(child_height: f32) -> (TimelineState, String) {
+        let mut state = sample_state(&[
+            TrackType::Group,
+            TrackType::Audio,
+            TrackType::Audio,
+            TrackType::Midi,
+        ]);
+        let group_id = state.tracks[0].id.clone();
+        let child = state.tracks[1].id.clone();
+        assert!(state.assign_track_to_group(&child, &group_id));
+        assert_eq!(state.toggle_group_collapsed(&group_id), Some(true));
+        state
+            .track_view_layout
+            .set_height(child.clone(), child_height);
+        (state, child)
+    }
+
+    fn visible_heights(state: &TimelineState) -> Vec<f32> {
+        [0, 2, 3]
+            .into_iter()
+            .map(|index| state.track_row_height(&state.tracks[index]))
+            .collect()
+    }
+
+    /// A collapsed group's child with more room to grow than the rows on
+    /// screen must not hold the burst past the visible rows' ceiling: the
+    /// first tick back shrinks a visible row.
+    #[test]
+    fn track_zoom_limits_come_from_the_visible_rows_only_at_the_ceiling() {
+        let (mut state, child) = collapsed_child_state(TRACK_HEIGHT_SMALL);
+        let mut now = Instant::now();
+        let mut session = None;
+
+        zoom_tick(&mut state, &mut session, 50.0, 0.0, ZOOM_VIEWPORT, now);
+        assert_eq!(visible_heights(&state), vec![MAX_TRACK_HEIGHT; 3]);
+        // The hidden child still follows the zoom, clamped on its own.
+        let child_at_ceiling = state.track_row_height_for_id(&child);
+        assert_eq!(child_at_ceiling, (48.0_f32 * 320.0 / 72.0).round());
+
+        now += Duration::from_millis(16);
+        let tick = zoom_tick(&mut state, &mut session, 0.9, 0.0, ZOOM_VIEWPORT, now);
+        assert!(tick.scroll_y.is_some() && tick.mark_view_dirty);
+        assert_eq!(visible_heights(&state), vec![288.0; 3]);
+        assert!(state.track_row_height_for_id(&child) < child_at_ceiling);
+    }
+
+    /// The same at the floor, with a hidden Huge child that could shrink much
+    /// further than the rows on screen.
+    #[test]
+    fn track_zoom_limits_come_from_the_visible_rows_only_at_the_floor() {
+        let (mut state, child) = collapsed_child_state(TRACK_HEIGHT_HUGE);
+        let mut now = Instant::now();
+        let mut session = None;
+
+        zoom_tick(&mut state, &mut session, 0.001, 0.0, ZOOM_VIEWPORT, now);
+        assert_eq!(visible_heights(&state), vec![MIN_TRACK_ROW_HEIGHT; 3]);
+        let child_at_floor = state.track_row_height_for_id(&child);
+        assert_eq!(child_at_floor, (180.0_f32 * 44.0 / 72.0).round());
+
+        now += Duration::from_millis(16);
+        let tick = zoom_tick(&mut state, &mut session, 1.1, 0.0, ZOOM_VIEWPORT, now);
+        assert!(tick.scroll_y.is_some() && tick.mark_view_dirty);
+        assert!(visible_heights(&state)
+            .iter()
+            .all(|height| *height > MIN_TRACK_ROW_HEIGHT));
+    }
+
+    /// A tick that only moves a hidden row still writes it, so the child
+    /// matches its siblings once expanded, but changes nothing on screen: no
+    /// scroll, no repaint and no unsaved-changes mark.
+    #[test]
+    fn track_zoom_of_a_hidden_row_alone_does_not_mark_the_project() {
+        let (mut state, child) = collapsed_child_state(TRACK_HEIGHT_HUGE);
+        let mut session = None;
+
+        // 72 × 1.003 stays within half a pixel; 180 × 1.003 does not.
+        let tick = zoom_tick(
+            &mut state,
+            &mut session,
+            1.003,
+            0.0,
+            ZOOM_VIEWPORT,
+            Instant::now(),
+        );
+
+        assert_eq!(tick, TrackZoomTick::default());
+        assert_eq!(visible_heights(&state), vec![DEFAULT_TRACK_HEIGHT; 3]);
+        assert_eq!(state.track_row_height_for_id(&child), 181.0);
     }
 
     #[test]

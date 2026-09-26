@@ -512,6 +512,68 @@ pub fn inspector_numeric_stepper_with_drag_callbacks(
     on_drag_preview: InspectorNumericChangeCb,
     on_drag_commit: Option<InspectorNumericGestureCb>,
 ) -> impl IntoElement {
+    numeric_stepper(
+        id,
+        value,
+        display,
+        min,
+        max,
+        step,
+        None,
+        disabled,
+        on_drag_start,
+        on_drag_preview,
+        on_drag_commit,
+    )
+}
+
+/// [`inspector_numeric_stepper_with_drag_callbacks`] for a value with a long
+/// range (a fade in ms): holding Shift while scrubbing moves by `coarse_step`
+/// per step instead of `step`, carrying on from the value reached when Shift
+/// went down or came up.
+#[allow(clippy::too_many_arguments)]
+pub fn inspector_numeric_stepper_coarse(
+    id: &'static str,
+    value: f64,
+    display: impl Into<String>,
+    min: f64,
+    max: f64,
+    step: f64,
+    coarse_step: f64,
+    disabled: bool,
+    on_drag_start: Option<InspectorNumericGestureCb>,
+    on_drag_preview: InspectorNumericChangeCb,
+    on_drag_commit: Option<InspectorNumericGestureCb>,
+) -> impl IntoElement {
+    numeric_stepper(
+        id,
+        value,
+        display,
+        min,
+        max,
+        step,
+        Some(coarse_step),
+        disabled,
+        on_drag_start,
+        on_drag_preview,
+        on_drag_commit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn numeric_stepper(
+    id: &'static str,
+    value: f64,
+    display: impl Into<String>,
+    min: f64,
+    max: f64,
+    step: f64,
+    coarse_step: Option<f64>,
+    disabled: bool,
+    on_drag_start: Option<InspectorNumericGestureCb>,
+    on_drag_preview: InspectorNumericChangeCb,
+    on_drag_commit: Option<InspectorNumericGestureCb>,
+) -> impl IntoElement {
     const SCRUB_PIXELS_PER_STEP: f32 = 5.0;
     let drag_id = id.to_string();
     let drag_id_move = drag_id.clone();
@@ -565,13 +627,29 @@ pub fn inspector_numeric_stepper_with_drag_callbacks(
                             return;
                         }
                         let current_y: f32 = event.event.position.y.into();
-                        let next = drag.value_at(
-                            current_y,
-                            step / f64::from(SCRUB_PIXELS_PER_STEP),
-                            min,
-                            max,
-                            Some(step),
-                        );
+                        let next = match coarse_step {
+                            None => drag.value_at(
+                                current_y,
+                                step / f64::from(SCRUB_PIXELS_PER_STEP),
+                                min,
+                                max,
+                                Some(step),
+                            ),
+                            Some(coarse_step) => {
+                                let step = if event.event.modifiers.shift {
+                                    coarse_step
+                                } else {
+                                    step
+                                };
+                                drag.value_at_rescaled(
+                                    current_y,
+                                    step / f64::from(SCRUB_PIXELS_PER_STEP),
+                                    min,
+                                    max,
+                                    Some(step),
+                                )
+                            }
+                        };
                         on_drag_preview(next, window, cx);
                     })
                     .when_some(on_drag_commit, |field, commit| {

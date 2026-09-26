@@ -5,10 +5,14 @@
 //! it is its own entity for the same reason the playhead is: notifying
 //! `Timeline` for it would rebuild every lane on every mouse move, while
 //! notifying this repaints one line.
+//!
+//! The line is not `deferred`, for the same reason the fade squares are not
+//! (`fade_handle_overlay`). It paints in the timeline's own order, after the
+//! lanes. So the studio's command palette, settings and plug-in picker, which
+//! are plain overlays painted after the timeline, cover it, and so does every
+//! deferred menu or popover.
 
-use gpui::{
-    anchored, deferred, div, point, px, Context, IntoElement, ParentElement, Render, Styled, Window,
-};
+use gpui::{anchored, div, point, px, Context, IntoElement, ParentElement, Render, Styled, Window};
 
 use crate::theme::Colors;
 
@@ -40,16 +44,14 @@ impl Render for CutGuideOverlay {
         let Some(frame) = self.frame.get() else {
             return div().into_any_element();
         };
-        deferred(
-            anchored()
-                .position(point(px(frame.x.round() - 0.5), px(frame.top)))
-                .child(
-                    div()
-                        .w(px(1.0))
-                        .h(px(frame.height.max(1.0)))
-                        .bg(Colors::text_primary()),
-                ),
-        )
-        .into_any_element()
+        anchored()
+            .position(point(px(frame.x.round() - 0.5), px(frame.top)))
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h(px(frame.height.max(1.0)))
+                    .bg(Colors::text_primary()),
+            )
+            .into_any_element()
     }
 }

@@ -18,9 +18,13 @@
 //!
 //! [`AraSession`] is the ARA *model thread* and is deliberately `!Send`: create
 //! it, mutate it, and drop it on the application's main thread. Plug-in
-//! callbacks arrive on foreign threads and are serviced by the provider objects,
-//! which resolve their arguments through owned lookup tables and never call back
-//! into the session. Audio reads happen on plug-in worker threads through
+//! callbacks are serviced by the provider objects, which resolve their
+//! arguments through owned lookup tables and never call back into the session.
+//! Most of them arrive re-entrantly on the model thread, from inside one of the
+//! session's own calls: content reads during create/update/`endEditing`, model
+//! updates during [`AraSession::notify_model_updates`], archive I/O during a
+//! store or restore. The session therefore never holds a provider's lock across
+//! a call into the plug-in. Audio reads happen on plug-in worker threads through
 //! [`model::AraSampleReader`], which is resolved once at reader creation so the
 //! read path does no map lookup.
 //!
@@ -40,9 +44,9 @@ pub use error::{AraHostError, AraResult};
 pub use info::{AraFactoryInfo, AraRendererId, AraRoles};
 pub use model::{
     AraAudioAccess, AraAudioSourceDesc, AraBarSignature, AraClipKey, AraColor, AraGraph,
-    AraModelObserver, AraModelUpdate, AraMusicalTimeline, AraPlaybackRegionDesc,
-    AraPlaybackTransform, AraRegionSequenceDesc, AraSampleReader, AraSourceKey, AraTempoEntry,
-    AraTrackKey, AraTransportControl, AraTransportRequest,
+    AraGraphChange, AraKeySignature, AraModelObserver, AraModelUpdate, AraMusicalTimeline,
+    AraPlaybackRegionDesc, AraPlaybackTransform, AraRegionSequenceDesc, AraSampleReader,
+    AraSourceKey, AraTempoEntry, AraTrackKey, AraTransportControl, AraTransportRequest,
 };
 
 use std::sync::Arc;
@@ -89,10 +93,10 @@ pub unsafe fn vst3_ara_factory(
 
 /// One ARA document and the plug-in instances bound to it.
 ///
-/// A session maps one Futureboard project onto one ARA plug-in: the plug-in's
-/// document controller, the graph of audio sources / region sequences /
-/// modifications / playback regions, and the bound companion instances that
-/// render those regions.
+/// Futureboard opens one session per (plug-in, track): the plug-in's document
+/// controller, one musical context, the track's region sequence with its audio
+/// sources, modifications and playback regions, and the bound companion
+/// instances that render those regions.
 pub struct AraSession {
     inner: imp::Session,
 }
@@ -141,11 +145,16 @@ impl AraSession {
         self.inner.factory()
     }
 
-    /// Publishes the project's tempo map and bar signatures.
+    /// Publishes the project's tempo map, bar signatures and key.
     ///
     /// Must be called at least once before [`Self::apply_graph`]: ARA 2 playback
     /// regions live on region sequences, and every region sequence needs a
     /// musical context.
+    ///
+    /// Diffed against the last published timeline: the plug-in is told which
+    /// content changed (timing, harmony, or both), and an unchanged timeline
+    /// makes no plug-in call at all. Keys are published only from ARA 2.0 Final
+    /// on, where key-signature content exists.
     pub fn set_musical_timeline(&mut self, timeline: &AraMusicalTimeline) -> AraResult<()> {
         timeline.validate()?;
         self.inner.set_musical_timeline(timeline)
@@ -159,6 +168,32 @@ impl AraSession {
     pub fn apply_graph(&mut self, graph: &AraGraph) -> AraResult<()> {
         graph.validate()?;
         self.inner.apply_graph(graph)
+    }
+
+    /// How far `graph` departs from what the document already holds.
+    ///
+    /// Lets a caller keep the renderer suspension, the rendering toggle and
+    /// the region re-assignment for applies that create or destroy regions:
+    /// [`AraGraphChange::Unchanged`] makes no plug-in call at all, and
+    /// [`AraGraphChange::Properties`] only updates objects in place, which ARA
+    /// allows while they render. A graph that fails validation reports
+    /// [`AraGraphChange::Structure`], so the full apply runs and returns the
+    /// validation error.
+    pub fn graph_change(&self, graph: &AraGraph) -> AraGraphChange {
+        if graph.validate().is_err() {
+            return AraGraphChange::Structure;
+        }
+        self.inner.graph_change(graph)
+    }
+
+    /// Lets the plug-in deliver its pending model notifications.
+    ///
+    /// ARA plug-ins may report analysis progress, content changes and
+    /// document-data changes only from inside this call, so the host must make
+    /// it periodically whenever it is neither editing nor restoring. The session
+    /// already makes it after each of its own edits.
+    pub fn notify_model_updates(&mut self) -> AraResult<()> {
+        self.inner.notify_model_updates()
     }
 
     /// Binds one companion plug-in instance to this document.
@@ -238,6 +273,10 @@ impl AraSession {
     ///
     /// Call after [`Self::apply_graph`] has recreated the graph with the same
     /// persistent identifiers, and before playback or editor use.
+    ///
+    /// When the published timeline has a key, the plug-in is then told the
+    /// harmonic content changed, so copies of an older key restored with the
+    /// archive are brought back in line with the project key.
     pub fn restore_archive(&mut self, archive_id: &str, bytes: &[u8]) -> AraResult<()> {
         if !self.factory().can_restore_archive(archive_id) {
             return Err(AraHostError::unsupported(format!(

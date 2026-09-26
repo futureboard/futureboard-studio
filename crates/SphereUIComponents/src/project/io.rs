@@ -149,15 +149,33 @@ pub fn save_project(project: &mut FutureboardProject, path: &Path) -> Result<(),
 /// [`save_project`], also reporting media that was offline. A missing source
 /// never fails the save: losing every other edit because one file is
 /// unplugged is worse than saving a reference that has to be relinked.
+///
+/// The asset records `project` carries are taken to have been made for
+/// `path`'s own folder (a project saved back where it was loaded or last
+/// saved, or its autosave beside it). A save into another folder must say
+/// where they were made: [`save_project_with_report_from`].
 pub fn save_project_with_report(
     project: &mut FutureboardProject,
     path: &Path,
+) -> Result<ProjectSaveReport, ProjectError> {
+    save_project_with_report_from(project, path, path.parent())
+}
+
+/// [`save_project_with_report`] for a project whose carried asset records
+/// (`project.assets`, from the last load or save) were made for the project
+/// folder `records_root`, `None` when that is unknown. Their fingerprints
+/// spare re-hashing unchanged files only in that same folder. Saved anywhere
+/// else (Save As, Save Copy), a file they name is hashed before it is reused.
+pub fn save_project_with_report_from(
+    project: &mut FutureboardProject,
+    path: &Path,
+    records_root: Option<&Path>,
 ) -> Result<ProjectSaveReport, ProjectError> {
     let _write_guard = PROJECT_WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     project_save_log(format_args!("serialize start"));
-    let offline_media = prepare_portable_assets(project, path)?;
+    let offline_media = prepare_portable_assets(project, path, records_root)?;
     for missing in &offline_media {
         project_save_log(format_args!(
             "offline media kept as a reference: {}",
@@ -302,8 +320,9 @@ pub fn read_project_identity(path: &Path) -> Result<ProjectIdentity, ProjectErro
 
 /// The autosave to offer when opening `project_file`, whose decoded id and
 /// modification time are given: it must pass the header and checksum checks,
-/// belong to the same project and be strictly newer. `None` otherwise, and
-/// always for a file that is itself an autosave or a foreign import.
+/// belong to the same project, be strictly newer and not be one the user
+/// already declined (see [`remember_declined_autosave`]). `None` otherwise,
+/// and always for a file that is itself an autosave or a foreign import.
 pub fn newer_autosave_for(
     project_file: &Path,
     project_id: &str,
@@ -317,7 +336,40 @@ pub fn newer_autosave_for(
         return None;
     }
     let identity = read_project_identity(&autosave).ok()?;
-    (identity.id == project_id && identity.modified_at > saved_modified_at).then_some(autosave)
+    if identity.id != project_id || identity.modified_at <= saved_modified_at {
+        return None;
+    }
+    let declined = read_declined_autosave(&autosave)
+        .is_some_and(|(id, modified_at)| id == identity.id && identity.modified_at <= modified_at);
+    (!declined).then_some(autosave)
+}
+
+/// Marker left beside an autosave the user chose not to recover:
+/// `<autosave>.declined`, holding that autosave's project id and
+/// `modified_at`. Removed with the autosave's other files.
+fn declined_autosave_marker_path(autosave: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.declined", autosave.display()))
+}
+
+/// Remember that the user opened the saved project instead of recovering
+/// `autosave` as it is now, so it is not offered on every later open. The
+/// autosave itself is kept. A newer autosave (the next one this project
+/// writes) is offered again. Validates the autosave first; best effort.
+pub fn remember_declined_autosave(autosave: &Path) -> Result<(), ProjectError> {
+    let identity = read_project_identity(autosave)?;
+    fs::write(
+        declined_autosave_marker_path(autosave),
+        format!("{}\n{}\n", identity.id, identity.modified_at),
+    )?;
+    Ok(())
+}
+
+fn read_declined_autosave(autosave: &Path) -> Option<(String, u64)> {
+    let text = fs::read_to_string(declined_autosave_marker_path(autosave)).ok()?;
+    let mut lines = text.lines();
+    let id = lines.next()?.to_string();
+    let modified_at = lines.next()?.trim().parse().ok()?;
+    Some((id, modified_at))
 }
 
 /// Newest intact autosave an untitled session left in `dir`. Untitled
@@ -337,21 +389,52 @@ pub fn newest_untitled_autosave(dir: &Path) -> Option<(PathBuf, ProjectIdentity)
 }
 
 /// Delete an autosave and what its saves leave next to it: the backup, the
-/// shared temp name older builds used, and any per-job temp file a crash
-/// left behind. Best effort; a file that is already gone is not an error.
-/// Waits for a write in progress, so it never pulls a temp file out from under
-/// a running save.
+/// shared temp name older builds used, a declined-recovery marker and any
+/// per-job temp file a crash left behind. Best effort; a file that is already
+/// gone is not an error. Waits for a write in progress, so it never pulls a
+/// temp file out from under a running save: call it off the UI thread, or use
+/// [`try_remove_autosave_files`] there.
 pub fn remove_autosave_files(autosave: &Path) {
     let _write_guard = PROJECT_WRITE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    remove_autosave_files_locked(autosave);
+}
+
+/// [`remove_autosave_files`] without waiting. When no write is running, removes
+/// everything and returns `true`. While one runs, removes only the finished
+/// files (the autosave, its backup, the old shared temp and the marker; a
+/// running write's own temp file is left alone) and returns `false`: the
+/// caller must remove the rest once that write is over, since the write may
+/// be the very autosave being discarded.
+pub fn try_remove_autosave_files(autosave: &Path) -> bool {
+    let guard = match PROJECT_WRITE_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            remove_finished_autosave_files(autosave);
+            return false;
+        }
+    };
+    remove_autosave_files_locked(autosave);
+    drop(guard);
+    true
+}
+
+fn remove_finished_autosave_files(autosave: &Path) {
     for path in [
         autosave.to_path_buf(),
         project_backup_path(autosave),
         project_temp_path(autosave),
+        declined_autosave_marker_path(autosave),
     ] {
         let _ = fs::remove_file(path);
     }
+}
+
+/// Caller holds [`PROJECT_WRITE_LOCK`].
+fn remove_autosave_files_locked(autosave: &Path) {
+    remove_finished_autosave_files(autosave);
     let (Some(dir), Some(name)) = (
         autosave.parent(),
         autosave.file_name().and_then(|name| name.to_str()),
@@ -472,17 +555,25 @@ pub fn import_audio_file_to_project(
 /// fingerprint, and is returned so the caller can say so. It never fails the
 /// save.
 ///
-/// `project.assets` may carry the records of the last load or save. Their
-/// fingerprints spare re-hashing unchanged files, and their format metadata
-/// (for example a DAW import's frame counts) is kept where this save has
-/// nothing newer.
+/// `project.assets` may carry the records of the last load or save, made for
+/// the folder `records_root`. Their fingerprints spare re-hashing unchanged
+/// files, and their format metadata (for example a DAW import's frame
+/// counts) is kept where this save has nothing newer. A carried fingerprint
+/// is used without reading the file only when this save is into
+/// `records_root` and the file at its relative path is unchanged (see
+/// [`carried_trust`]). Saved into another folder (Save As, Save Copy), where
+/// the same name can hold other audio of the same length and even the same
+/// modification time (a copy keeps the source's time), a carried record only
+/// points at a candidate that is hashed before any clip is pointed at it.
 fn prepare_portable_assets(
     project: &mut FutureboardProject,
     project_file: &Path,
+    records_root: Option<&Path>,
 ) -> Result<Vec<PathBuf>, ProjectError> {
     let Some(project_root) = project_file.parent() else {
         return Ok(Vec::new());
     };
+    let records_here = records_root == Some(project_root);
     let layout = ProjectFolderLayout::from_root(project_root.to_path_buf());
     layout.ensure_dirs()?;
 
@@ -499,7 +590,7 @@ fn prepare_portable_assets(
     // Fingerprints recorded by previous saves (v11+), keyed by project-relative
     // path. Lets us carry a known fingerprint forward without re-hashing a file
     // that is already inside the project folder.
-    let prev_fp_by_rel: HashMap<String, AudioFingerprint> = project
+    let prev_fp_by_rel: HashMap<String, RecordedFingerprint> = project
         .assets
         .iter()
         .filter_map(|a| {
@@ -507,21 +598,28 @@ fn prepare_portable_assets(
             let fp = a
                 .source_fingerprint
                 .as_deref()
-                .and_then(AudioFingerprint::parse)?;
+                .and_then(RecordedFingerprint::parse)?;
             Some((rel, fp))
         })
         .collect();
 
     // Content fingerprint → existing project-relative path. Seeded cheaply from
     // persisted fingerprints (no hashing) so re-imports of identical content
-    // dedup against bytes copied in an earlier session. The audio folder is only
-    // scanned/hashed lazily as a fallback for files that lack a persisted
-    // fingerprint (e.g. projects last saved by a pre-v11 build).
-    let mut content_index: HashMap<AudioFingerprint, String> = prev_fp_by_rel
-        .iter()
-        .filter(|(rel, _)| project_root.join(rel).exists())
-        .map(|(rel, fp)| (*fp, rel.clone()))
-        .collect();
+    // dedup against bytes copied in an earlier session. A record made for
+    // this folder vouches for an unchanged file; one made for another folder
+    // only names a candidate, hashed on its first hit. The audio folder is
+    // only scanned/hashed lazily as a fallback for files without a usable
+    // fingerprint (a pre-v11 project, an edit, a candidate that did not hold).
+    let mut content_index: HashMap<AudioFingerprint, IndexedCopy> = HashMap::new();
+    for (rel, fp) in &prev_fp_by_rel {
+        let path = resolve_project_relative_path(project_root, rel);
+        let verified = match carried_trust(fp, file_len_and_time(&path), records_here) {
+            CarriedTrust::Trusted => true,
+            CarriedTrust::Candidate => false,
+            CarriedTrust::Stale => continue,
+        };
+        index_copy(&mut content_index, fp.content, rel.clone(), verified);
+    }
     let mut folder_scanned = false;
 
     for track in &mut project.tracks {
@@ -578,18 +676,30 @@ fn prepare_portable_assets(
 
             if let Some(relative) = path_relative_to_project(&source_abs, project_root) {
                 let relative_string = path_to_project_string(&relative);
-                // Carry a known fingerprint forward while the file still has
-                // the length it was hashed at; only hash files never
-                // fingerprinted (or visibly changed since).
-                let fingerprint = prev_fp_by_rel
-                    .get(&relative_string)
-                    .copied()
-                    .filter(|fp| file_len_is(&source_abs, fp.len))
-                    .or_else(|| audio_fingerprint(&source_abs));
+                // Carry a known fingerprint forward for an unchanged file in
+                // the folder it was recorded for; hash files never
+                // fingerprinted, changed since, or recorded for another
+                // folder.
+                let carried = prev_fp_by_rel.get(&relative_string).filter(|fp| {
+                    carried_trust(fp, file_len_and_time(&source_abs), records_here)
+                        == CarriedTrust::Trusted
+                });
+                let fingerprint = match carried {
+                    // A token from before times were recorded gets this
+                    // file's time, so the next save checks it by time too.
+                    Some(fp) if fp.modified_nanos.is_none() => {
+                        Some(RecordedFingerprint::describing(fp.content, &source_abs))
+                    }
+                    Some(fp) => Some(*fp),
+                    None => hash_audio_file(&source_abs),
+                };
                 if let Some(fp) = fingerprint {
-                    content_index
-                        .entry(fp)
-                        .or_insert_with(|| relative_string.clone());
+                    index_copy(
+                        &mut content_index,
+                        fp.content,
+                        relative_string.clone(),
+                        true,
+                    );
                 }
                 *source_path = PathBuf::from(&relative_string);
                 push_asset_record(
@@ -618,31 +728,50 @@ fn prepare_portable_assets(
             // save. Either way only the reference moves; the clip keeps its id.
             let fingerprint = audio_fingerprint(&source_abs);
             if let Some(fp) = fingerprint {
+                // A copy indexed from another folder's records has only its
+                // length (and time) in common with the source so far: read
+                // it before any clip is pointed at it.
+                let candidate = content_index
+                    .get(&fp)
+                    .filter(|copy| !copy.verified)
+                    .map(|copy| copy.relative.clone());
+                if let Some(candidate) = candidate {
+                    let holds =
+                        hash_audio_file(&resolve_project_relative_path(project_root, &candidate))
+                            .is_some_and(|found| found.content == fp);
+                    if holds {
+                        index_copy(&mut content_index, fp, candidate, true);
+                    } else {
+                        content_index.remove(&fp);
+                    }
+                }
                 if !content_index.contains_key(&fp) && !folder_scanned {
                     // Persisted fingerprints missed; hash the folder once to
                     // cover legacy/externally-added files before copying.
                     for (existing_fp, rel) in
                         scan_existing_audio_fingerprints(&layout.media_audio, project_root)
                     {
-                        content_index.entry(existing_fp).or_insert(rel);
+                        index_copy(&mut content_index, existing_fp, rel, true);
                     }
                     folder_scanned = true;
                 }
-                if let Some(existing_rel) = content_index.get(&fp) {
+                if let Some(existing) = content_index.get(&fp).filter(|copy| copy.verified) {
+                    let existing_rel = &existing.relative;
                     eprintln!(
                         "[AudioImport] cache hit (content) reuse={existing_rel} source={}",
                         source_abs.display()
                     );
                     *source_path = PathBuf::from(existing_rel);
+                    let existing_abs = resolve_project_relative_path(project_root, existing_rel);
                     push_asset_record(
                         &mut assets,
                         with_known_metadata(
                             asset_record(
                                 asset_id.clone(),
-                                &project_root.join(existing_rel),
+                                &existing_abs,
                                 existing_rel.clone(),
                                 Some(source_abs.clone()),
-                                Some(fp),
+                                Some(RecordedFingerprint::describing(fp, &existing_abs)),
                                 None,
                                 None,
                                 None,
@@ -662,15 +791,18 @@ fn prepare_portable_assets(
             {
                 let relative_string = relative_string.clone();
                 *source_path = PathBuf::from(&relative_string);
+                let copy_abs = resolve_project_relative_path(project_root, &relative_string);
+                let copy_fingerprint =
+                    fingerprint.map(|fp| RecordedFingerprint::describing(fp, &copy_abs));
                 push_asset_record(
                     &mut assets,
                     with_known_metadata(
                         asset_record(
                             asset_id.clone(),
-                            &project_root.join(&relative_string),
+                            &copy_abs,
                             relative_string,
                             Some(source_abs.clone()),
-                            fingerprint,
+                            copy_fingerprint,
                             None,
                             None,
                             None,
@@ -701,10 +833,19 @@ fn prepare_portable_assets(
             *source_path = PathBuf::from(&relative_string);
             copied.push((source_abs.clone(), relative_string.clone()));
             // Prefer the fingerprint of the source we just read; fall back to the
-            // freshly-written copy.
-            let dest_fingerprint = fingerprint.or_else(|| audio_fingerprint(&dest));
+            // freshly-written copy. Either way it is recorded against the copy,
+            // the file the record's relative path names.
+            let dest_fingerprint = fingerprint
+                .map(|fp| RecordedFingerprint::describing(fp, &dest))
+                .or_else(|| hash_audio_file(&dest));
             if let Some(fp) = dest_fingerprint {
-                content_index.insert(fp, relative_string.clone());
+                content_index.insert(
+                    fp.content,
+                    IndexedCopy {
+                        relative: relative_string.clone(),
+                        verified: true,
+                    },
+                );
             }
             push_asset_record(
                 &mut assets,
@@ -767,11 +908,20 @@ fn with_known_metadata(
             .duration_secs
             .or(Some(format.frames as f64 / format.sample_rate as f64));
     }
+    // Content only: the same bytes touched since keep their metadata.
     let same_bytes = |prev: &&ProjectAsset| match (
         record.source_fingerprint.as_deref(),
         prev.source_fingerprint.as_deref(),
     ) {
-        (Some(now), Some(before)) => now == before,
+        (Some(now), Some(before)) => {
+            match (
+                AudioFingerprint::parse(now),
+                AudioFingerprint::parse(before),
+            ) {
+                (Some(now), Some(before)) => now == before,
+                _ => now == before,
+            }
+        }
         _ => true,
     };
     if let Some(prev) = previous.filter(same_bytes) {
@@ -863,10 +1013,6 @@ fn offline_project_relative(source_abs: &Path, project_root: &Path) -> Option<St
         .strip_prefix(root)
         .ok()
         .map(path_to_project_string)
-}
-
-fn file_len_is(path: &Path, len: u64) -> bool {
-    fs::metadata(path).is_ok_and(|meta| meta.len() == len)
 }
 
 fn resolve_project_relative_assets(project: &mut FutureboardProject, project_file: &Path) {
@@ -963,7 +1109,7 @@ fn asset_record(
     copied_path: &Path,
     relative_path: String,
     original_path: Option<PathBuf>,
-    fingerprint: Option<AudioFingerprint>,
+    fingerprint: Option<RecordedFingerprint>,
     duration_samples: Option<u64>,
     sample_rate: Option<u32>,
     channels: Option<u8>,
@@ -1002,20 +1148,171 @@ struct AudioFingerprint {
 }
 
 impl AudioFingerprint {
-    /// Persisted token form: `"<len:x>-<crc:08x>"`.
+    /// Token form of the content identity alone: `"<len:x>-<crc:08x>"`.
+    #[cfg(test)]
     fn to_token(self) -> String {
         format!("{:x}-{:08x}", self.len, self.crc)
     }
 
-    /// Parse a token written by [`AudioFingerprint::to_token`]. Returns `None`
-    /// for malformed or pre-v11 (absent) values.
+    /// Parse the content identity of a token written by
+    /// [`RecordedFingerprint::to_token`] (or by builds that wrote only
+    /// `"<len:x>-<crc:08x>"`). Returns `None` for malformed or pre-v11
+    /// (absent) values.
     fn parse(token: &str) -> Option<Self> {
-        let (len, crc) = token.split_once('-')?;
+        let mut parts = token.splitn(3, '-');
+        let len = parts.next()?;
+        let crc = parts.next()?;
         Some(Self {
             len: u64::from_str_radix(len, 16).ok()?,
             crc: u32::from_str_radix(crc, 16).ok()?,
         })
     }
+}
+
+/// A fingerprint as an asset record keeps it: the content identity of the file
+/// at the record's path, plus that file's modification time when it was
+/// hashed. Length and modification time are what let a later save into the
+/// same project folder trust the fingerprint without reading the file again
+/// (see [`carried_trust`]); a record made for one project folder never vouches
+/// for a same-named file in another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordedFingerprint {
+    content: AudioFingerprint,
+    /// Nanoseconds since the Unix epoch. `None` when unknown, including every
+    /// token written before modification times were recorded: in the folder
+    /// it was made for, such a fingerprint is checked by length only.
+    modified_nanos: Option<u64>,
+}
+
+impl RecordedFingerprint {
+    /// The fingerprint of `content` for the file at `path` as it is now. The
+    /// modification time is only kept when the file still has the content's
+    /// length.
+    fn describing(content: AudioFingerprint, path: &Path) -> Self {
+        let modified_nanos = fs::metadata(path)
+            .ok()
+            .filter(|meta| meta.len() == content.len)
+            .and_then(|meta| modified_nanos(&meta));
+        Self {
+            content,
+            modified_nanos,
+        }
+    }
+
+    /// Persisted token form: `"<len:x>-<crc:08x>"`, followed by
+    /// `"-<modified_nanos:x>"` when the modification time is known.
+    fn to_token(self) -> String {
+        match self.modified_nanos {
+            Some(modified) => format!(
+                "{:x}-{:08x}-{modified:x}",
+                self.content.len, self.content.crc
+            ),
+            None => format!("{:x}-{:08x}", self.content.len, self.content.crc),
+        }
+    }
+
+    fn parse(token: &str) -> Option<Self> {
+        let content = AudioFingerprint::parse(token)?;
+        let modified_nanos = token
+            .splitn(3, '-')
+            .nth(2)
+            .and_then(|modified| u64::from_str_radix(modified, 16).ok());
+        Some(Self {
+            content,
+            modified_nanos,
+        })
+    }
+}
+
+/// What a fingerprint carried from an earlier load or save is worth for the
+/// file now at its relative path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarriedTrust {
+    /// Reuse it without reading the file.
+    Trusted,
+    /// The file may hold the recorded audio, but only hashing it can say so.
+    Candidate,
+    /// The file is gone or is not what was recorded: hash it.
+    Stale,
+}
+
+/// Decide how far `recorded` can be trusted for a file whose length and
+/// modification time are `file` (`None` when it cannot be read), given
+/// whether the record was made for the folder being saved to.
+///
+/// - Another folder (Save As, Save Copy): at most a [`CarriedTrust::Candidate`],
+///   however well length and time match. A copy keeps its source's time, and
+///   packs extracted from archives share whole-second times, so a same-named
+///   file there can match both and still be other audio.
+/// - The same folder: trusted while the file has the recorded length and
+///   time. A token written before times were recorded keeps the old
+///   same-folder rule, length only, so the first save after an upgrade does
+///   not re-hash every file; that save stamps the time for the next one.
+fn carried_trust(
+    recorded: &RecordedFingerprint,
+    file: Option<(u64, Option<u64>)>,
+    recorded_here: bool,
+) -> CarriedTrust {
+    let Some((len, modified)) = file else {
+        return CarriedTrust::Stale;
+    };
+    if len != recorded.content.len {
+        return CarriedTrust::Stale;
+    }
+    if !recorded_here {
+        return CarriedTrust::Candidate;
+    }
+    match recorded.modified_nanos {
+        None => CarriedTrust::Trusted,
+        Some(at) if modified == Some(at) => CarriedTrust::Trusted,
+        Some(_) => CarriedTrust::Stale,
+    }
+}
+
+/// Length and modification time of the file at `path`, for [`carried_trust`].
+fn file_len_and_time(path: &Path) -> Option<(u64, Option<u64>)> {
+    let meta = fs::metadata(path).ok()?;
+    meta.is_file().then(|| (meta.len(), modified_nanos(&meta)))
+}
+
+/// A project copy that holds some content, for dedup. `verified` once this
+/// save has hashed it or a record made for this folder vouches for it; an
+/// unverified copy (named by another folder's record) is hashed before any
+/// clip is pointed at it.
+#[derive(Debug, Clone)]
+struct IndexedCopy {
+    relative: String,
+    verified: bool,
+}
+
+/// Index `relative` as holding `content`. The first copy found for a content
+/// stays, except that a verified copy replaces an unverified one.
+fn index_copy(
+    index: &mut HashMap<AudioFingerprint, IndexedCopy>,
+    content: AudioFingerprint,
+    relative: String,
+    verified: bool,
+) {
+    use std::collections::hash_map::Entry;
+    match index.entry(content) {
+        Entry::Vacant(entry) => {
+            entry.insert(IndexedCopy { relative, verified });
+        }
+        Entry::Occupied(mut entry) => {
+            if verified && !entry.get().verified {
+                entry.insert(IndexedCopy { relative, verified });
+            }
+        }
+    }
+}
+
+fn modified_nanos(meta: &fs::Metadata) -> Option<u64> {
+    let since_epoch = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    u64::try_from(since_epoch.as_nanos()).ok()
 }
 
 #[cfg(test)]
@@ -1028,10 +1325,19 @@ thread_local! {
 /// Stream `path` through CRC32 without loading it fully into memory. Returns
 /// `None` if the file cannot be read (caller falls back to path-equality dedup).
 fn audio_fingerprint(path: &Path) -> Option<AudioFingerprint> {
+    hash_audio_file(path).map(|recorded| recorded.content)
+}
+
+/// [`audio_fingerprint`], recorded with the file's modification time. The
+/// time is read before the bytes, so an edit during the read leaves a stale
+/// time behind and the next save hashes the file again.
+fn hash_audio_file(path: &Path) -> Option<RecordedFingerprint> {
     #[cfg(test)]
     FINGERPRINTS_COMPUTED.with(|count| count.set(count.get() + 1));
     let mut file = File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
+    let meta = file.metadata().ok()?;
+    let len = meta.len();
+    let modified = modified_nanos(&meta);
     let mut hasher = crc32fast::Hasher::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -1041,9 +1347,12 @@ fn audio_fingerprint(path: &Path) -> Option<AudioFingerprint> {
             Err(_) => return None,
         }
     }
-    Some(AudioFingerprint {
-        len,
-        crc: hasher.finalize(),
+    Some(RecordedFingerprint {
+        content: AudioFingerprint {
+            len,
+            crc: hasher.finalize(),
+        },
+        modified_nanos: modified,
     })
 }
 
@@ -2214,5 +2523,352 @@ mod tests {
         assert!(unrelated.exists(), "only this autosave's own temp files go");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Discarding recovery runs on the UI thread, which must never wait for a
+    /// running save. While one runs, the finished files go at once and the
+    /// running write's temp file is left for the caller's later cleanup.
+    #[test]
+    fn removing_an_autosave_without_waiting_leaves_a_running_write_alone() {
+        let dir = temp_dir("autosave-try-remove");
+        let autosave = autosave_path_for_project(&dir.join("Song.fbproj"));
+        write_project_file(&autosave, "song", 2);
+        let backup = project_backup_path(&autosave);
+        let job_temp = PathBuf::from(format!("{}.123-4.tmp", autosave.display()));
+        for path in [&backup, &job_temp] {
+            fs::write(path, b"x").unwrap();
+        }
+        remember_declined_autosave(&autosave).unwrap();
+        let marker = declined_autosave_marker_path(&autosave);
+        assert!(marker.exists());
+
+        {
+            let _running_write = PROJECT_WRITE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(!try_remove_autosave_files(&autosave), "a write is running");
+        }
+        for gone in [&autosave, &backup, &marker] {
+            assert!(!gone.exists(), "{} should be removed", gone.display());
+        }
+        assert!(job_temp.exists(), "the running write's temp file is kept");
+
+        remove_autosave_files(&autosave);
+        assert!(!job_temp.exists(), "the later cleanup removes it");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Open Saved used to leave the autosave to be offered again on every
+    /// open. The declined one is remembered; only a newer one is offered.
+    #[test]
+    fn a_declined_autosave_is_not_offered_again_until_a_newer_one_exists() {
+        let dir = temp_dir("autosave-declined");
+        let project_file = dir.join("Song.fbproj");
+        let autosave = autosave_path_for_project(&project_file);
+        write_project_file(&project_file, "song", 100);
+        write_project_file(&autosave, "song", 160);
+        assert_eq!(
+            newer_autosave_for(&project_file, "song", 100),
+            Some(autosave.clone())
+        );
+
+        remember_declined_autosave(&autosave).unwrap();
+        assert_eq!(newer_autosave_for(&project_file, "song", 100), None);
+        assert!(autosave.exists(), "declining keeps the autosave on disk");
+
+        // The session autosaves again later: that one is new work.
+        write_project_file(&autosave, "song", 220);
+        assert_eq!(
+            newer_autosave_for(&project_file, "song", 100),
+            Some(autosave.clone())
+        );
+
+        // A marker from another project under the same name is ignored.
+        write_project_file(&autosave, "other", 300);
+        remember_declined_autosave(&autosave).unwrap();
+        write_project_file(&autosave, "song", 250);
+        assert_eq!(
+            newer_autosave_for(&project_file, "song", 100),
+            Some(autosave.clone())
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn set_modified(path: &Path, secs: u64) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// Records carried from the last load or save were made for that
+    /// project's folder. Saving into another folder (Save As, Save Copy) that
+    /// already holds a same-named file with other audio must copy the clip's
+    /// own audio, never point the clip at that file.
+    #[test]
+    fn carried_fingerprints_never_vouch_for_a_same_named_file_in_another_folder() {
+        let base = temp_dir("carry-other-root");
+        let root_a = base.join("A");
+        let backups = base.join("Backups");
+        let kick_a = root_a.join("Assets").join("Audio").join("kick.wav");
+        let kick_b = backups.join("Assets").join("Audio").join("kick.wav");
+        for (path, bytes, secs) in [
+            (&kick_a, b"kick from project A", 1_000_000),
+            (&kick_b, b"kick from project B", 2_000_000),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+            set_modified(path, secs);
+        }
+
+        let mut project = FutureboardProject::new("A");
+        project.tracks.push(audio_track(
+            "t1",
+            vec![audio_clip_with_asset(
+                "c1",
+                "Assets/Audio/kick.wav",
+                &kick_a,
+            )],
+        ));
+        let file_a = root_a.join("A.fbproj");
+        save_project(&mut project, &file_a).unwrap();
+
+        // What the session carries: A's records, and its clip's absolute path
+        // under A (as a load resolves it).
+        let mut reopened = load_project_strict(&file_a).unwrap();
+        assert_eq!(clip_source(&reopened, 0).1, kick_a);
+        save_project_with_report_from(&mut reopened, &backups.join("A.fbproj"), Some(&root_a))
+            .unwrap();
+
+        let (id, source) = clip_source(&reopened, 0);
+        assert_eq!(id, "Assets/Audio/kick.wav", "the asset id never changes");
+        assert_ne!(source, PathBuf::from("Assets/Audio/kick.wav"));
+        assert_eq!(
+            fs::read(backups.join(&source)).unwrap(),
+            b"kick from project A",
+            "the clip must reference A's own audio"
+        );
+        assert_eq!(fs::read(&kick_b).unwrap(), b"kick from project B");
+        assert_eq!(
+            audio_files_in(&backups),
+            vec!["kick-1.wav".to_string(), "kick.wav".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Length alone is not proof: a file replaced in place with other audio of
+    /// the same length is hashed again, not trusted.
+    #[test]
+    fn a_carried_fingerprint_is_not_trusted_for_a_replaced_file_of_the_same_length() {
+        let root = temp_dir("carry-replaced");
+        let audio = root.join("Assets").join("Audio").join("loop.wav");
+        fs::create_dir_all(audio.parent().unwrap()).unwrap();
+        fs::write(&audio, b"original loop bytes").unwrap();
+        set_modified(&audio, 1_000_000);
+        let tracks = vec![audio_track(
+            "t1",
+            vec![audio_clip_with_asset("c1", "Assets/Audio/loop.wav", &audio)],
+        )];
+        let project_file = root.join("Replaced.fbproj");
+        let mut first = FutureboardProject::new("Replaced");
+        first.tracks = tracks.clone();
+        save_project(&mut first, &project_file).unwrap();
+
+        fs::write(&audio, b"replaced loop bytes").unwrap();
+        set_modified(&audio, 1_000_500);
+        let hashed = || FINGERPRINTS_COMPUTED.with(|count| count.get());
+        let mut second = FutureboardProject::new("Replaced");
+        second.tracks = tracks;
+        second.assets = first.assets.clone();
+        let before = hashed();
+        save_project(&mut second, &project_file).unwrap();
+        assert_eq!(hashed() - before, 1, "the replaced file is hashed again");
+        let content = |project: &FutureboardProject| {
+            AudioFingerprint::parse(project.assets[0].source_fingerprint.as_deref().unwrap())
+        };
+        assert_ne!(content(&second), content(&first));
+        assert_eq!(
+            content(&second),
+            Some(AudioFingerprint {
+                len: 19,
+                crc: crc32fast::hash(b"replaced loop bytes"),
+            })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recorded_fingerprint_tokens_roundtrip_and_old_tokens_parse_without_a_time() {
+        let recorded = RecordedFingerprint {
+            content: AudioFingerprint {
+                len: 0x10,
+                crc: 0xABCD_0001,
+            },
+            modified_nanos: Some(0x1234_5678_9ABC),
+        };
+        assert_eq!(recorded.to_token(), "10-abcd0001-123456789abc");
+        assert_eq!(
+            RecordedFingerprint::parse(&recorded.to_token()),
+            Some(recorded)
+        );
+        assert_eq!(
+            AudioFingerprint::parse(&recorded.to_token()),
+            Some(recorded.content)
+        );
+
+        let old = RecordedFingerprint::parse("10-abcd0001").unwrap();
+        assert_eq!(old.content, recorded.content);
+        assert_eq!(old.modified_nanos, None);
+    }
+
+    /// The trust rule for carried fingerprints: only a record made for the
+    /// folder being saved to is reused unread, and only while the file is
+    /// unchanged; one made for another folder at most names a candidate to
+    /// hash, however well length and time match.
+    #[test]
+    fn carried_fingerprints_are_trusted_only_in_the_folder_they_were_made_for() {
+        use CarriedTrust::*;
+        let stamped = RecordedFingerprint {
+            content: AudioFingerprint { len: 16, crc: 1 },
+            modified_nanos: Some(500),
+        };
+        let legacy = RecordedFingerprint {
+            modified_nanos: None,
+            ..stamped
+        };
+        let same = Some((16, Some(500)));
+        let touched = Some((16, Some(900)));
+        let resized = Some((17, Some(500)));
+
+        assert_eq!(carried_trust(&stamped, same, true), Trusted);
+        assert_eq!(carried_trust(&stamped, touched, true), Stale);
+        assert_eq!(carried_trust(&stamped, resized, true), Stale);
+        assert_eq!(carried_trust(&stamped, None, true), Stale);
+        // An old token keeps the old same-folder rule: length only.
+        assert_eq!(carried_trust(&legacy, touched, true), Trusted);
+        assert_eq!(carried_trust(&legacy, resized, true), Stale);
+
+        // Another folder: never trusted unread, even on a perfect match.
+        for record in [&stamped, &legacy] {
+            assert_eq!(carried_trust(record, same, false), Candidate);
+            assert_eq!(carried_trust(record, touched, false), Candidate);
+            assert_eq!(carried_trust(record, resized, false), Stale);
+            assert_eq!(carried_trust(record, None, false), Stale);
+        }
+    }
+
+    /// The reviewer's case: two construction kits each ship a `Drums.wav` of
+    /// the same length and the same archive timestamp, and a copy keeps its
+    /// source's time. Project A (kit 1) saved as a copy into a folder that
+    /// already holds project B's copy of kit 2 must keep A's own drums.
+    #[test]
+    fn same_named_files_of_equal_length_and_time_in_two_folders_never_alias() {
+        let base = temp_dir("carry-same-time");
+        let root_a = base.join("A");
+        let backups = base.join("Backups");
+        let drums_a = root_a.join("Assets").join("Audio").join("Drums.wav");
+        let drums_b = backups.join("Assets").join("Audio").join("Drums.wav");
+        for (path, bytes) in [
+            (&drums_a, b"drums of kit number one"),
+            (&drums_b, b"drums of kit number two"),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+            set_modified(path, 1_600_000_000);
+        }
+        assert_eq!(
+            file_len_and_time(&drums_a),
+            file_len_and_time(&drums_b),
+            "same length, same time"
+        );
+
+        let mut project = FutureboardProject::new("A");
+        project.tracks.push(audio_track(
+            "t1",
+            vec![audio_clip_with_asset(
+                "c1",
+                "Assets/Audio/Drums.wav",
+                &drums_a,
+            )],
+        ));
+        let file_a = root_a.join("A.fbproj");
+        save_project(&mut project, &file_a).unwrap();
+
+        let mut reopened = load_project_strict(&file_a).unwrap();
+        save_project_with_report_from(&mut reopened, &backups.join("A.fbproj"), Some(&root_a))
+            .unwrap();
+
+        let (_, source) = clip_source(&reopened, 0);
+        assert_ne!(source, PathBuf::from("Assets/Audio/Drums.wav"));
+        assert_eq!(
+            fs::read(backups.join(&source)).unwrap(),
+            b"drums of kit number one",
+            "the clip keeps A's drums"
+        );
+        assert_eq!(fs::read(&drums_b).unwrap(), b"drums of kit number two");
+
+        // A candidate that does hold the same audio (an earlier copy of A) is
+        // still reused, after one read of it: the source, then the candidate,
+        // and no scan of the folder.
+        let mirror = base.join("Mirror");
+        let drums_mirror = mirror.join("Assets").join("Audio").join("Drums.wav");
+        fs::create_dir_all(drums_mirror.parent().unwrap()).unwrap();
+        fs::copy(&drums_a, &drums_mirror).unwrap();
+        set_modified(&drums_mirror, 1_600_000_000);
+        let hashed = || FINGERPRINTS_COMPUTED.with(|count| count.get());
+        let mut again = load_project_strict(&file_a).unwrap();
+        let before = hashed();
+        save_project_with_report_from(&mut again, &mirror.join("A.fbproj"), Some(&root_a)).unwrap();
+        assert_eq!(hashed() - before, 2, "the source and the candidate");
+        assert_eq!(
+            clip_source(&again, 0).1,
+            PathBuf::from("Assets/Audio/Drums.wav")
+        );
+        assert_eq!(audio_files_in(&mirror), vec!["Drums.wav".to_string()]);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Records written before modification times were recorded are trusted by
+    /// length in their own folder, so the first save after an upgrade reads
+    /// nothing, and that save stamps the time for the next one.
+    #[test]
+    fn old_tokens_are_not_rehashed_in_their_own_folder_and_get_a_time() {
+        let root = temp_dir("carry-legacy");
+        let audio = root.join("Assets").join("Audio").join("loop.wav");
+        fs::create_dir_all(audio.parent().unwrap()).unwrap();
+        fs::write(&audio, b"loop recorded by an older build").unwrap();
+        let tracks = vec![audio_track(
+            "t1",
+            vec![audio_clip_with_asset("c1", "Assets/Audio/loop.wav", &audio)],
+        )];
+        let project_file = root.join("Legacy.fbproj");
+        let mut first = FutureboardProject::new("Legacy");
+        first.tracks = tracks.clone();
+        save_project(&mut first, &project_file).unwrap();
+        let stamped = first.assets[0].source_fingerprint.clone().unwrap();
+        let legacy_token = AudioFingerprint::parse(&stamped).unwrap().to_token();
+
+        let hashed = || FINGERPRINTS_COMPUTED.with(|count| count.get());
+        let mut upgraded = FutureboardProject::new("Legacy");
+        upgraded.tracks = tracks;
+        upgraded.assets = first.assets.clone();
+        upgraded.assets[0].source_fingerprint = Some(legacy_token);
+        let before = hashed();
+        save_project(&mut upgraded, &project_file).unwrap();
+        assert_eq!(hashed() - before, 0, "trusted by length in its own folder");
+        assert_eq!(
+            upgraded.assets[0].source_fingerprint.as_deref(),
+            Some(stamped.as_str()),
+            "and stamped with the file's time"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

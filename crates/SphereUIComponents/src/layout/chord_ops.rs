@@ -51,15 +51,16 @@ impl StudioLayout {
     }
 
     pub(super) fn set_chord_track_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
-        let _ = self.timeline.update(cx, |timeline, cx| {
-            if visible {
-                timeline.state.show_chord_track_lane();
-            } else {
-                timeline.state.hide_chord_track_lane();
-            }
-            cx.notify();
-        });
-        cx.notify();
+        self.set_conductor_lane_shown(
+            |state| {
+                if visible {
+                    state.show_chord_track_lane()
+                } else {
+                    state.hide_chord_track_lane()
+                }
+            },
+            cx,
+        );
     }
 
     pub(super) fn delete_chord_event_command(&mut self, id: u64, cx: &mut Context<Self>) {

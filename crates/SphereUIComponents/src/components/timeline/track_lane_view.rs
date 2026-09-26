@@ -55,6 +55,7 @@ pub struct LaneFrameContext {
     pub on_cut_clip: Option<AudioClipCutCb>,
     pub on_audio_clip_process_preview: AudioClipProcessPreviewCb,
     pub on_audio_clip_process_commit: AudioClipProcessCommitCb,
+    pub on_crossfade: Option<crate::components::timeline::crossfade_overlay::CrossfadeGestureCb>,
 }
 
 pub struct TrackLaneView {

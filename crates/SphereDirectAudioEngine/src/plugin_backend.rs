@@ -200,6 +200,10 @@ pub(crate) mod backend {
         fn embed_has_visible_ui() -> i32;
         fn embed_host_kind() -> i32;
         fn embed_take_user_close() -> i32;
+        // Whether the plug-in reported a change to its own state (a GUI edit, a
+        // preset it loaded) since the last call, and reset. Each bridge raises
+        // it from its own callbacks with one atomic store.
+        fn take_state_touched() -> i32;
         fn embed_set_waiting_stage(stage: *const c_char);
         fn embed_content_size(out_width: *mut i32, out_height: *mut i32) -> i32;
         fn embed_set_instance_label(instance_id: *const c_char);

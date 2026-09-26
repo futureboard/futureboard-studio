@@ -187,8 +187,6 @@ pub enum DropIndicator {
     Row { gap: f32 },
     /// A control with a border of its own: the top edge turns accent.
     Outline,
-    /// Nothing here — a control inside a row that forwards drops to the row.
-    None,
 }
 
 impl DropIndicator {
@@ -204,7 +202,6 @@ impl DropIndicator {
                 }
             }
             DropIndicator::Outline => drop_over_highlight(style),
-            DropIndicator::None => style,
         }
     }
 }
@@ -422,17 +419,10 @@ pub fn slot_drop_target<T: RefusableDrag>(
     on_drop: impl Fn(&T, DropAnchor, &mut Window, &mut App) + 'static,
     also_accept: fn(&dyn Any) -> bool,
 ) -> Stateful<Div> {
-    let anchor_for = Rc::new(anchor_for);
-    let can_anchor = anchor_for.clone();
+    let anchor_for: Rc<dyn Fn(&T) -> Option<DropAnchor>> = Rc::new(anchor_for);
     let over_anchor = anchor_for.clone();
     let move_anchor = anchor_for.clone();
-    element
-        .can_drop(
-            move |dragged, _window, _cx| match dragged.downcast_ref::<T>() {
-                Some(drag) => can_anchor(drag).is_some(),
-                None => also_accept(dragged),
-            },
-        )
+    accept_slot_drops(element, anchor_for, on_drop, also_accept)
         .drag_over::<T>(move |style, drag, _window, _cx| match over_anchor(drag) {
             Some(anchor) => indicator.apply(style, &anchor),
             None => style,
@@ -445,6 +435,25 @@ pub fn slot_drop_target<T: RefusableDrag>(
             };
             refusal.track(&key, inside, refused, window, cx);
         })
+}
+
+/// The accepting half of a drop target: `can_drop` answers with `anchor_for`
+/// (or `also_accept` for other payloads), and a drop that finds a landing
+/// place goes to `on_drop`. No indicator and no cursor tracking.
+fn accept_slot_drops<T: 'static>(
+    element: Stateful<Div>,
+    anchor_for: Rc<dyn Fn(&T) -> Option<DropAnchor>>,
+    on_drop: impl Fn(&T, DropAnchor, &mut Window, &mut App) + 'static,
+    also_accept: fn(&dyn Any) -> bool,
+) -> Stateful<Div> {
+    let can_anchor = anchor_for.clone();
+    element
+        .can_drop(
+            move |dragged, _window, _cx| match dragged.downcast_ref::<T>() {
+                Some(drag) => can_anchor(drag).is_some(),
+                None => also_accept(dragged),
+            },
+        )
         .on_drop::<T>(move |drag, window, cx| {
             if let Some(anchor) = anchor_for(drag) {
                 on_drop(drag, anchor, window, cx);
@@ -479,20 +488,53 @@ pub fn insert_drop_target_also(
         target.key.clone(),
         indicator,
         move |drag| anchor_target.anchor_for(drag),
-        move |drag, anchor, window, cx| {
-            on_drop(
-                &InsertDrop {
-                    from_track: drag.track_id.clone(),
-                    insert_id: drag.insert_id.clone(),
-                    to_track: target.track_id.clone(),
-                    anchor,
-                },
-                window,
-                cx,
-            );
-        },
+        commit_insert_drop_to(target, on_drop),
         also_accept,
     )
+}
+
+/// Pass insert drops released over `element` to the row it sits on. For a
+/// glyph button inside a row that is an [`insert_drop_target`] for `target`:
+/// the glyph blocks the row's hitbox, so a drop released over it would never
+/// reach the row. It lands exactly where the row says.
+///
+/// It draws no indicator and does not track the refusal cursor. The row's
+/// bounds contain the glyph, so the row's own tracking already covers the
+/// pointer here — one refusal state per row. A second tracker under the row's
+/// key would report "pointer not inside" from every glyph the pointer is not
+/// over, and put the cursor back while the pointer is still in the row.
+pub fn insert_drop_forwarder(
+    element: Stateful<Div>,
+    target: InsertDropTarget,
+    on_drop: InsertDropCb,
+) -> Stateful<Div> {
+    let target = Rc::new(target);
+    let anchor_target = target.clone();
+    accept_slot_drops::<FxSlotDrag>(
+        element,
+        Rc::new(move |drag| anchor_target.anchor_for(drag)),
+        commit_insert_drop_to(target, on_drop),
+        |_| false,
+    )
+}
+
+/// Hand a drop on `target` to `on_drop` as an [`InsertDrop`].
+fn commit_insert_drop_to(
+    target: Rc<InsertDropTarget>,
+    on_drop: InsertDropCb,
+) -> impl Fn(&FxSlotDrag, DropAnchor, &mut Window, &mut App) + 'static {
+    move |drag, anchor, window, cx| {
+        on_drop(
+            &InsertDrop {
+                from_track: drag.track_id.clone(),
+                insert_id: drag.insert_id.clone(),
+                to_track: target.track_id.clone(),
+                anchor,
+            },
+            window,
+            cx,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -654,5 +696,47 @@ mod tests {
         assert_eq!(drag_cursor_change(Some("a"), "b", true, true), Refuse);
         // Over an accepting target with nothing refused, nothing changes.
         assert_eq!(drag_cursor_change(None, "b", true, false), Keep);
+    }
+
+    /// The refused target after one pointer move, given every
+    /// `(key, inside, refused)` report in GPUI's dispatch order (a row before
+    /// the glyphs inside it).
+    fn after_move(current: Option<&str>, reports: &[(&str, bool, bool)]) -> Option<String> {
+        let mut current = current.map(str::to_string);
+        for &(target, inside, refused) in reports {
+            match drag_cursor_change(current.as_deref(), target, inside, refused) {
+                DragCursorChange::Keep => {}
+                DragCursorChange::Refuse => current = Some(target.to_string()),
+                DragCursorChange::Restore => current = None,
+            }
+        }
+        current
+    }
+
+    /// A refusing row keeps "not allowed" while the pointer is anywhere in
+    /// it, over its glyphs too. Only the row reports: the glyphs that forward
+    /// drops to it ([`insert_drop_forwarder`]) track nothing. Were they to
+    /// report under the row's key, the ones the pointer is not over would
+    /// restore the cursor on every move.
+    #[test]
+    fn a_refusing_row_keeps_not_allowed_over_its_glyphs() {
+        let row = "mixer/track-a/fx1";
+        // Pointer over the row's label, then over its bypass glyph: the row's
+        // bounds contain both.
+        let over_label = after_move(None, &[(row, true, true)]);
+        assert_eq!(over_label.as_deref(), Some(row));
+        let over_glyph = after_move(over_label.as_deref(), &[(row, true, true)]);
+        assert_eq!(over_glyph.as_deref(), Some(row));
+        // Leaving the row puts the cursor back.
+        assert_eq!(
+            after_move(over_glyph.as_deref(), &[(row, false, true)]),
+            None
+        );
+
+        // The failure a tracking glyph caused: its own bounds miss the pointer.
+        assert_eq!(
+            after_move(None, &[(row, true, true), (row, false, true)]),
+            None
+        );
     }
 }

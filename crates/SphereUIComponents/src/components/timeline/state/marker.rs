@@ -233,13 +233,15 @@ impl TimelineState {
         self.global_lane_height(GlobalLaneKind::Marker)
     }
 
-    pub fn show_marker_track_lane(&mut self) {
-        self.show_marker_track = true;
+    /// Returns whether the lane was hidden, i.e. whether the saved view changed.
+    pub fn show_marker_track_lane(&mut self) -> bool {
+        !std::mem::replace(&mut self.show_marker_track, true)
     }
 
-    pub fn hide_marker_track_lane(&mut self) {
-        self.show_marker_track = false;
+    /// Returns whether the lane was shown, i.e. whether the saved view changed.
+    pub fn hide_marker_track_lane(&mut self) -> bool {
         self.selected_marker_id = None;
+        std::mem::replace(&mut self.show_marker_track, false)
     }
 
     pub fn select_marker(&mut self, id: &str) {
@@ -342,13 +344,15 @@ impl TimelineState {
         self.global_lane_height(GlobalLaneKind::Arranger)
     }
 
-    pub fn show_region_track_lane(&mut self) {
-        self.show_region_track = true;
+    /// Returns whether the lane was hidden, i.e. whether the saved view changed.
+    pub fn show_region_track_lane(&mut self) -> bool {
+        !std::mem::replace(&mut self.show_region_track, true)
     }
 
-    pub fn hide_region_track_lane(&mut self) {
-        self.show_region_track = false;
+    /// Returns whether the lane was shown, i.e. whether the saved view changed.
+    pub fn hide_region_track_lane(&mut self) -> bool {
         self.selected_region_id = None;
+        std::mem::replace(&mut self.show_region_track, false)
     }
 
     pub fn select_region(&mut self, id: &str) {

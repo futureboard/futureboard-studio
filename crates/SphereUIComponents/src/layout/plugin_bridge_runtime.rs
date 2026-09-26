@@ -52,6 +52,18 @@ pub(crate) struct PluginBridgeRuntime {
 
 pub(crate) type SharedPluginBridgeRuntime = Arc<Mutex<PluginBridgeRuntime>>;
 
+/// What one [`PluginBridgeRuntime::request_plugin_states`] got back.
+#[derive(Debug, Default)]
+pub(crate) struct PluginStateCapture {
+    /// Captured state per instance: the packed VST3 component/controller form,
+    /// or an Audio Unit's raw ClassInfo bytes.
+    pub states: HashMap<String, Vec<u8>>,
+    /// Instances asked for their state that had not answered when the wait ran
+    /// out (or when the host went away), sorted. Their slots keep whatever
+    /// state was captured before, which may be older than the plug-in's.
+    pub unanswered: Vec<String>,
+}
+
 pub(crate) fn bridge_enabled() -> bool {
     plugin_host_bridge_enabled()
 }
@@ -711,12 +723,13 @@ impl PluginBridgeRuntime {
     /// frame). Unrelated events arriving while waiting are queued for the
     /// normal `drain_events` pump. VST3 state is returned in the host's packed
     /// component/controller form; Audio Unit ClassInfo remains opaque raw
-    /// bytes. Instances with no state or that timed out are simply absent.
+    /// bytes. Instances with no state are absent from `states`; instances that
+    /// had not answered when the wait ran out are listed in `unanswered`.
     pub fn request_plugin_states(
         &mut self,
         instance_ids: &[String],
         timeout: std::time::Duration,
-    ) -> HashMap<String, Vec<u8>> {
+    ) -> PluginStateCapture {
         use base64::Engine as _;
         let mut results = HashMap::new();
         let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -790,14 +803,20 @@ impl PluginBridgeRuntime {
                 other => self.queued_events.push_back(other),
             }
         }
-        if !pending.is_empty() {
+        let mut unanswered: Vec<String> = pending.into_iter().collect();
+        unanswered.sort();
+        if !unanswered.is_empty() {
             eprintln!(
-                "[plugin-bridge] GetPluginState timed out pending={} timeout_ms={}",
-                pending.len(),
-                timeout.as_millis()
+                "[plugin-bridge] GetPluginState timed out pending={} timeout_ms={} instances={}",
+                unanswered.len(),
+                timeout.as_millis(),
+                unanswered.join(",")
             );
         }
-        results
+        PluginStateCapture {
+            states: results,
+            unanswered,
+        }
     }
 
     /// Restore state (from the project file) onto a loaded instance. VST3 uses

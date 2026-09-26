@@ -319,14 +319,12 @@ struct ComponentHandlerImpl final : Steinberg::Vst::IComponentHandler {
   Steinberg::tresult PLUGIN_API beginEdit(Steinberg::Vst::ParamID) override {
     return Steinberg::kResultOk;
   }
-  Steinberg::tresult PLUGIN_API endEdit(Steinberg::Vst::ParamID) override {
-    return Steinberg::kResultOk;
-  }
-  Steinberg::tresult PLUGIN_API restartComponent(Steinberg::int32) override {
-    return Steinberg::kResultOk;
-  }
 
-  // Defined below, after SphereDauxVst3Processor is complete.
+  // Defined below, after SphereDauxVst3Processor is complete. `performEdit`,
+  // `endEdit` and a values/reload `restartComponent` also raise the owner's
+  // `state_touched` flag (see there).
+  Steinberg::tresult PLUGIN_API endEdit(Steinberg::Vst::ParamID id) override;
+  Steinberg::tresult PLUGIN_API restartComponent(Steinberg::int32 flags) override;
   Steinberg::tresult PLUGIN_API performEdit(
       Steinberg::Vst::ParamID id, Steinberg::Vst::ParamValue value) override;
 };
@@ -430,6 +428,12 @@ struct SphereDauxVst3Processor {
   SimpleEventList input_events_obj;     // reused per process call
   int event_input_bus_count{0};
   ComponentHandlerImpl component_handler; // installed on IEditController
+  /// Raised when the controller reports an edit (`performEdit`, `endEdit`) or
+  /// that its values changed (`restartComponent` with `kParamValuesChanged` /
+  /// `kReloadComponent`), so the plug-in's saved state may be stale. Cleared
+  /// by `sphere_daux_vst3_take_state_touched`. A plain atomic store: the
+  /// handler can be called from any thread, the audio thread included.
+  std::atomic<bool> state_touched{false};
   /// Owned copy of the loaded module path (survives after create() returns).
   std::string plugin_path;
   /// `PClassInfo::name` of the instantiated audio-module class. ARA pairs a main

@@ -54,7 +54,10 @@ pub fn video_clip(
     let drag_name = clip.name.clone();
     let drag_start_beat = clip.start_beat;
 
-    let selected = state.selection.selected_clip_ids.contains(&clip.id);
+    let selected = state
+        .display_selection()
+        .selected_clip_ids
+        .contains(&clip.id);
     let unresolved = matches!(
         &clip.clip_type,
         ClipType::Video {

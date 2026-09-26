@@ -2554,6 +2554,16 @@ impl StudioLayout {
         self.sync_time_signature_map_to_engine(cx);
     }
 
+    /// Commit a loop change, whoever made it: L and the toolbar, set loop to
+    /// selection, the ruler drag, loop to region, an ARA plug-in's cycle. The
+    /// loop is saved with the project (v54), so the session needs a save, but
+    /// it reaches the engine through its loop atomics — never `mark_dirty`,
+    /// whose graph rebuild per drag move stutters playback.
+    pub(super) fn commit_loop_change(&mut self, cx: &mut Context<Self>) {
+        self.mark_dirty_view_only();
+        self.sync_loop_controls(cx);
+    }
+
     pub(super) fn sync_loop_controls(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.audio_bridge.engine.as_ref() else {
             return;
@@ -3164,8 +3174,7 @@ impl StudioLayout {
     }
 
     /// Set the transport loop to a region's span. Loop range is control state,
-    /// so this marks view-only dirty rather than entering edit history —
-    /// matching the ruler's loop drag.
+    /// committed like every loop change rather than entering edit history.
     pub(super) fn set_loop_to_region_command(&mut self, id: &str, cx: &mut Context<Self>) {
         let range = self
             .timeline
@@ -3183,8 +3192,7 @@ impl StudioLayout {
             transport.loop_enabled = true;
             cx.notify();
         });
-        self.mark_dirty_view_only();
-        self.sync_loop_controls(cx);
+        self.commit_loop_change(cx);
         cx.notify();
     }
 
@@ -3239,20 +3247,33 @@ impl StudioLayout {
         );
     }
 
-    pub(super) fn show_tempo_track(&mut self, cx: &mut Context<Self>) {
-        self.timeline.update(cx, |timeline, cx| {
-            timeline.state.show_tempo_track_lane();
+    /// Show or hide a conductor lane (Tempo, Time Signature, Marker, Region,
+    /// Song Text, Chord) through `toggle`, one of the timeline's
+    /// `show_*_track_lane` / `hide_*_track_lane` helpers. Lane visibility is
+    /// saved with the project (v54), so when the helper reports a change the
+    /// session is marked view-only dirty: a save and autosave pick it up, and
+    /// the engine graph is not rebuilt.
+    pub(super) fn set_conductor_lane_shown(
+        &mut self,
+        toggle: impl FnOnce(&mut crate::components::timeline::timeline_state::TimelineState) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.timeline.update(cx, |timeline, cx| {
             cx.notify();
+            toggle(&mut timeline.state)
         });
+        if changed {
+            self.mark_dirty_view_only();
+        }
         cx.notify();
     }
 
+    pub(super) fn show_tempo_track(&mut self, cx: &mut Context<Self>) {
+        self.set_conductor_lane_shown(|state| state.show_tempo_track_lane(), cx);
+    }
+
     pub(super) fn hide_tempo_track(&mut self, cx: &mut Context<Self>) {
-        self.timeline.update(cx, |timeline, cx| {
-            timeline.state.hide_tempo_track_lane();
-            cx.notify();
-        });
-        cx.notify();
+        self.set_conductor_lane_shown(|state| state.hide_tempo_track_lane(), cx);
     }
 
     pub(super) fn tempo_track_context_position(&self) -> Option<(f64, f64)> {
@@ -3638,19 +3659,11 @@ impl StudioLayout {
     }
 
     pub(super) fn show_time_signature_track(&mut self, cx: &mut Context<Self>) {
-        self.timeline.update(cx, |timeline, cx| {
-            timeline.state.show_time_signature_track_lane();
-            cx.notify();
-        });
-        cx.notify();
+        self.set_conductor_lane_shown(|state| state.show_time_signature_track_lane(), cx);
     }
 
     pub(super) fn hide_time_signature_track(&mut self, cx: &mut Context<Self>) {
-        self.timeline.update(cx, |timeline, cx| {
-            timeline.state.hide_time_signature_track_lane();
-            cx.notify();
-        });
-        cx.notify();
+        self.set_conductor_lane_shown(|state| state.hide_time_signature_track_lane(), cx);
     }
 
     pub(super) fn add_time_signature_marker_at_playhead(&mut self, cx: &mut Context<Self>) {

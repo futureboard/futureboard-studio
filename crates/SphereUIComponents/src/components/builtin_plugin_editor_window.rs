@@ -643,8 +643,10 @@ fn parse_inbound_message(raw: &[u8]) -> Result<InboundMsg, &'static str> {
 /// realtime command path (`AudioEngine::set_insert_param`), which pushes the
 /// per-insert shared param ring from the audio callback thread. Built by
 /// `open_builtin_insert_editor` in `plugin_ops.rs`, which owns the engine
-/// handle this window deliberately does not.
-pub type BuiltinParamForwarder = std::sync::Arc<dyn Fn(&PluginInstanceKey, u32, f32)>;
+/// handle this window deliberately does not. The `App` lets it tell the studio
+/// the project changed (deferred, as this window is mid-update when it runs).
+pub type BuiltinParamForwarder =
+    std::sync::Arc<dyn Fn(&PluginInstanceKey, u32, f32, &mut gpui::App)>;
 
 pub type BuiltinGlobalCommandDispatcher =
     std::sync::Arc<dyn Fn(&'static str, &mut gpui::App) + Send + Sync>;
@@ -1244,7 +1246,7 @@ impl BuiltinPluginEditorWindow {
                 };
                 for edit in &params {
                     match host::builtin_param_index(&self.plugin_id, &edit.id) {
-                        Some(index) => forwarder(&active, index, edit.value),
+                        Some(index) => forwarder(&active, index, edit.value, cx),
                         None => eprintln!(
                             "[plugin-bridge] setParams unknown param plugin={} id={}",
                             self.plugin_id, edit.id

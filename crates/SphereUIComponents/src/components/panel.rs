@@ -31,13 +31,14 @@ use crate::components::controls::{
 };
 use crate::components::inspector::{
     inspector_checkbox as shared_inspector_checkbox, inspector_hint_text, inspector_mini_button,
-    inspector_numeric_stepper, inspector_numeric_stepper_with_drag_callbacks,
-    inspector_row as shared_inspector_row, inspector_section as shared_inspector_section,
-    inspector_select, InspectorSelectOption,
+    inspector_numeric_stepper, inspector_numeric_stepper_coarse,
+    inspector_numeric_stepper_with_drag_callbacks, inspector_row as shared_inspector_row,
+    inspector_section as shared_inspector_section, inspector_select, InspectorSelectOption,
 };
 use crate::components::inspector_kit;
 use crate::components::reorder::{
-    insert_drop_target, DragRefusal, DropIndicator, DropSlot, InsertDropCb, InsertDropTarget,
+    insert_drop_forwarder, insert_drop_target, DragRefusal, DropIndicator, DropSlot, InsertDropCb,
+    InsertDropTarget,
 };
 use crate::components::slider::{bipolar_slider_with_drag_callbacks, slider_with_drag_callbacks};
 use crate::components::solfege_editor::SolfegePitchSummary;
@@ -245,6 +246,9 @@ pub struct SelectedClipSummary<'a> {
     pub project_bpm: f64,
     /// Active arrangement time-selection duration in beats, when available.
     pub selection_duration_beats: Option<f32>,
+    /// The fades the clip plays (a crossfade's on an overlapped edge) and
+    /// whether its track is ARA-rendered. `None` until the owner resolves it.
+    pub fades: Option<crate::components::timeline::timeline_state::ClipFadeSummary>,
 }
 
 /// What the Inspector is currently editing. Resolved fresh from the live
@@ -1571,12 +1575,9 @@ fn plugin_slot_row(
         (payload, target, callbacks.on_drop_insert.clone())
     });
     let forward_drops = |element: gpui::Stateful<gpui::Div>| match &dnd {
-        Some((_, target, on_drop)) => insert_drop_target(
-            element,
-            target.clone(),
-            DropIndicator::None,
-            on_drop.clone(),
-        ),
+        Some((_, target, on_drop)) => {
+            insert_drop_forwarder(element, target.clone(), on_drop.clone())
+        }
         None => element,
     };
 
@@ -2589,9 +2590,13 @@ fn db_to_linear_gain(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
 }
 
+/// The clip's gain in the Inspector. `disabled` on an ARA track, whose
+/// plug-in renders the audio: the engine applies no clip gain there, as the
+/// section's hint says, so the stepper is inert like the clip's inline gain.
 fn gain_stepper(
     clip_id: &str,
     gain: f32,
+    disabled: bool,
     preview_callback: ClipF32Cb,
     callbacks: &InspectorCallbacks,
 ) -> impl IntoElement {
@@ -2609,7 +2614,7 @@ fn gain_stepper(
         -60.0,
         12.0,
         1.0,
-        false,
+        disabled,
         Some(Arc::new(move |w, cx| begin(&start_id, w, cx))),
         Arc::new(move |next, w, cx| {
             preview_callback(&(preview_id.clone(), db_to_linear_gain(next as f32)), w, cx)
@@ -2647,6 +2652,68 @@ fn clip_stretch_stepper(
         disabled,
         Some(Arc::new(move |w, cx| begin(&start_id, w, cx))),
         Arc::new(move |next, w, cx| preview(&(preview_id.clone(), build_next(next)), w, cx)),
+        Some(Arc::new(move |w, cx| commit(&commit_id, w, cx))),
+    )
+}
+
+/// One of a clip's fades in the Inspector, as it plays.
+///
+/// Scrubs the manual fade, clamped so the two fades never overlap (the most
+/// the other edge leaves of the clip); Shift scrubs in 100 ms steps, so a fade
+/// of seconds is in reach. An edge a crossfade covers shows the crossfade's
+/// length read-only — the manual fade does not apply there — and on an ARA
+/// track, whose plug-in renders the audio, neither is applied.
+fn clip_fade_stepper(
+    id: &'static str,
+    edge: crate::components::timeline::timeline_state::FadeEdge,
+    clip: &SelectedClipSummary<'_>,
+    callbacks: &InspectorCallbacks,
+) -> impl IntoElement {
+    use crate::components::timeline::timeline_state::FadeEdge;
+    const MAX_UNRESOLVED_MS: f64 = 60_000.0;
+    let fades = clip.fades.map(|summary| summary.fades);
+    let ara = clip.fades.is_some_and(|summary| summary.ara);
+    let crossfade_ms = fades
+        .filter(|fades| fades.crossfaded(edge))
+        .map(|fades| fades.seconds(edge) * 1000.0);
+    let max_ms = fades.map_or(MAX_UNRESOLVED_MS, |fades| {
+        (fades.max_manual_seconds(edge) * 1000.0).max(0.0)
+    });
+    let manual_ms = match edge {
+        FadeEdge::In => clip.stretch.fade_in_ms,
+        FadeEdge::Out => clip.stretch.fade_out_ms,
+    } as f64;
+    // What plays: a manual fade longer than the clip leaves is heard shorter.
+    let value = fades.map_or(manual_ms, |fades| fades.seconds(edge) * 1000.0);
+    let display = match crossfade_ms {
+        Some(ms) => format!("Xfade {ms:.0} ms"),
+        None => format!("{value:.0} ms"),
+    };
+    let start_id = clip.clip_id.to_string();
+    let preview_id = start_id.clone();
+    let commit_id = start_id.clone();
+    let begin = callbacks.on_begin_clip_property_drag.clone();
+    let preview = callbacks.on_preview_clip_stretch.clone();
+    let commit = callbacks.on_commit_clip_property_drag.clone();
+    let stretch = clip.stretch.clone();
+    inspector_numeric_stepper_coarse(
+        id,
+        value,
+        display,
+        0.0,
+        max_ms,
+        5.0,
+        100.0,
+        crossfade_ms.is_some() || ara,
+        Some(Arc::new(move |w, cx| begin(&start_id, w, cx))),
+        Arc::new(move |ms, w, cx| {
+            let mut next = stretch.clone();
+            match edge {
+                FadeEdge::In => next.fade_in_ms = ms as f32,
+                FadeEdge::Out => next.fade_out_ms = ms as f32,
+            }
+            preview(&(preview_id.clone(), next), w, cx)
+        }),
         Some(Arc::new(move |w, cx| commit(&commit_id, w, cx))),
     )
 }
@@ -3283,6 +3350,7 @@ fn clip_inspector(
                         gain_stepper(
                             clip.clip_id,
                             clip.gain,
+                            clip.fades.is_some_and(|summary| summary.ara),
                             callbacks.on_preview_clip_gain.clone(),
                             callbacks,
                         ),
@@ -3305,50 +3373,28 @@ fn clip_inspector(
                     ))
                     .child(compact_property_row(
                         "Fade In",
-                        clip_stretch_stepper(
+                        clip_fade_stepper(
                             "clip-fade-in",
-                            clip.clip_id,
-                            s.fade_in_ms as f64,
-                            format!("{:.0} ms", s.fade_in_ms),
-                            0.0,
-                            60_000.0,
-                            5.0,
-                            false,
+                            crate::components::timeline::timeline_state::FadeEdge::In,
+                            &clip,
                             callbacks,
-                            {
-                                let s = s.clone();
-                                move |value| {
-                                    let mut next = s.clone();
-                                    next.fade_in_ms = value as f32;
-                                    next.dirty = true;
-                                    next
-                                }
-                            },
                         ),
                     ))
                     .child(compact_property_row(
                         "Fade Out",
-                        clip_stretch_stepper(
+                        clip_fade_stepper(
                             "clip-fade-out",
-                            clip.clip_id,
-                            s.fade_out_ms as f64,
-                            format!("{:.0} ms", s.fade_out_ms),
-                            0.0,
-                            60_000.0,
-                            5.0,
-                            false,
+                            crate::components::timeline::timeline_state::FadeEdge::Out,
+                            &clip,
                             callbacks,
-                            {
-                                let s = s.clone();
-                                move |value| {
-                                    let mut next = s.clone();
-                                    next.fade_out_ms = value as f32;
-                                    next.dirty = true;
-                                    next
-                                }
-                            },
                         ),
-                    )),
+                    ))
+                    .children(clip.fades.is_some_and(|summary| summary.ara).then(|| {
+                        inspector_hint_text(
+                            "ARA track: its plug-in renders the audio, so clip fades, \
+                             crossfades and clip gain are not applied.",
+                        )
+                    })),
             ))
             .child(inspector_section(
                 "Time & Pitch",

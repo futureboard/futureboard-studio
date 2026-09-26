@@ -116,6 +116,9 @@ impl MessageBoxOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageBoxResult {
     pub response: usize,
+    /// The box was dismissed (Escape, or its close button) rather than
+    /// answered with a button; `response` is then the cancel button's index.
+    pub dismissed: bool,
 }
 
 /// What a message box hands back when a button is chosen. Public so callers
@@ -319,7 +322,14 @@ fn message_box_body(
         let on_response = on_response.clone();
         let label = label.clone();
         let on_click = move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
-            on_response(MessageBoxResult { response: index }, window, cx);
+            on_response(
+                MessageBoxResult {
+                    response: index,
+                    dismissed: false,
+                },
+                window,
+                cx,
+            );
         };
         footer = footer.child(message_box_button(index, label, style, on_click));
     }
@@ -353,14 +363,27 @@ impl MessageBoxWindow {
         }
     }
 
-    fn finish(&mut self, response: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn finish(
+        &mut self,
+        response: usize,
+        dismissed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.responded {
             return;
         }
         self.responded = true;
         let cb = self.on_response.clone();
         window.remove_window();
-        cb(MessageBoxResult { response }, window, cx);
+        cb(
+            MessageBoxResult {
+                response,
+                dismissed,
+            },
+            window,
+            cx,
+        );
     }
 
     fn cancel_response_index(&self) -> usize {
@@ -375,11 +398,11 @@ impl MessageBoxWindow {
         match event.keystroke.key.as_str() {
             "escape" => {
                 let response = self.cancel_response_index();
-                self.finish(response, window, cx);
+                self.finish(response, true, window, cx);
             }
             "enter" | "numpad_enter" => {
                 let response = clamp_index(Some(self.options.default_id), len).unwrap_or(0);
-                self.finish(response, window, cx);
+                self.finish(response, false, window, cx);
             }
             _ => {}
         }
@@ -429,7 +452,7 @@ impl Render for MessageBoxWindow {
                     let target = target.clone();
                     move |window, cx| {
                         let _ = target.update(cx, |this, cx| {
-                            this.finish(this.cancel_response_index(), window, cx);
+                            this.finish(this.cancel_response_index(), true, window, cx);
                         });
                     }
                 },
@@ -440,7 +463,7 @@ impl Render for MessageBoxWindow {
                     let target = target.clone();
                     move |result, window, cx| {
                         let _ = target.update(cx, |this, cx| {
-                            this.finish(result.response, window, cx);
+                            this.finish(result.response, false, window, cx);
                         });
                     }
                 }),

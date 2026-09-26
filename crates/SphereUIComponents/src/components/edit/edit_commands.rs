@@ -40,6 +40,9 @@ pub enum EditImpact {
     TempoMap,
     /// Time-signature map — the engine needs a fresh meter map.
     TimeSignatureMap,
+    /// The project key: nothing the engine plays, but part of the musical
+    /// context ARA plug-ins read, so live ARA documents must hear of it.
+    MusicalContext,
 }
 
 /// Snapshot of the project's tempo state for undo/redo.
@@ -395,6 +398,13 @@ pub enum EditCommand {
         prev: MpeTrackConfiguration,
         next: MpeTrackConfiguration,
     },
+    /// Rename one track: one inline header edit, committed once. `prev` is the
+    /// name the track had at commit time, restored exactly on undo.
+    SetTrackName {
+        track_id: String,
+        prev: String,
+        next: String,
+    },
     /// Replace only the affected Song Text events. Empty `previous` creates,
     /// empty `next` deletes, and populated snapshots edit/move atomically.
     SetSongTextEvents {
@@ -488,8 +498,9 @@ impl EditCommand {
             EditCommand::SetSongTextEvents { .. } => EditImpact::Metadata,
             EditCommand::SetChordEvents { .. } => EditImpact::Metadata,
             EditCommand::SetGlobalLaneHeights { .. } => EditImpact::Metadata,
-            // Nothing plays differently: the key is read by editors and tools.
-            EditCommand::SetProjectKey { .. } => EditImpact::Metadata,
+            // Nothing the engine plays differently, but ARA plug-ins read the
+            // key from the musical context, including on undo and redo.
+            EditCommand::SetProjectKey { .. } => EditImpact::MusicalContext,
             EditCommand::SetTrackVolume { .. } | EditCommand::SetTrackPan { .. } => {
                 EditImpact::MixerControl
             }
@@ -535,6 +546,18 @@ impl EditCommand {
         )
     }
 
+    /// Record, right before [`Self::undo`] (`undoing`) or a redo through
+    /// [`Self::execute`], what that step has to set aside for the opposite
+    /// step to put back: state that appeared after the command was planned
+    /// and cannot stay where it is. Today only a plug-in moved to or from the
+    /// master: parameter lanes it gained on its track, which the master cannot
+    /// hold. [`EditHistory`] calls this; nothing else needs to.
+    pub fn record_before_step(&mut self, state: &TimelineState, undoing: bool) {
+        if let EditCommand::MoveInsertSlot { plan } = self {
+            state.record_lanes_left_by_master_step(plan, undoing);
+        }
+    }
+
     /// The record pass that left `before` (captured with
     /// [`TrackTakesState::capture_tracks`]) as `state` now is, having created
     /// `clip_ids`. `None` when it created nothing.
@@ -564,6 +587,22 @@ impl EditCommand {
             })
             .collect();
         Some(EditCommand::RecordPass { pass, clips, takes })
+    }
+
+    /// The rename a committed name `draft` records for `track_id`, or `None`
+    /// when there is nothing to record: the track is gone, or the draft is
+    /// blank or the name the track already has (see
+    /// [`crate::components::timeline::timeline_state::resolve_track_rename`]).
+    /// `prev` is the name the track has *now*, not when editing began.
+    pub fn rename_track(state: &TimelineState, track_id: &str, draft: &str) -> Option<Self> {
+        let current = &state.find_track(track_id)?.name;
+        let next =
+            crate::components::timeline::timeline_state::resolve_track_rename(current, draft)?;
+        Some(EditCommand::SetTrackName {
+            track_id: track_id.to_string(),
+            prev: current.clone(),
+            next,
+        })
     }
 
     pub fn label(&self) -> &'static str {
@@ -603,6 +642,7 @@ impl EditCommand {
             EditCommand::SetTrackPan { .. } => "Set Pan",
             EditCommand::SetTrackVolumeAutomationRead { .. } => "Set Volume Automation Read",
             EditCommand::SetTrackMpeConfiguration { .. } => "Set MPE Configuration",
+            EditCommand::SetTrackName { .. } => "Rename Track",
             EditCommand::SetSongTextEvents { label, .. } => label,
             EditCommand::SetTempoState { label, .. } => label,
             EditCommand::SetTimeSignatureState { label, .. } => label,
@@ -806,6 +846,9 @@ impl EditCommand {
             EditCommand::SetTrackMpeConfiguration { track_id, next, .. } => {
                 state.set_track_mpe_configuration(track_id, *next);
             }
+            EditCommand::SetTrackName { track_id, next, .. } => {
+                state.set_track_name(track_id, next);
+            }
             EditCommand::SetSongTextEvents { previous, next, .. } => {
                 apply_song_text_snapshot(state, previous, next);
             }
@@ -999,6 +1042,9 @@ impl EditCommand {
             EditCommand::SetTrackMpeConfiguration { track_id, prev, .. } => {
                 state.set_track_mpe_configuration(track_id, *prev);
             }
+            EditCommand::SetTrackName { track_id, prev, .. } => {
+                state.set_track_name(track_id, prev);
+            }
             EditCommand::SetSongTextEvents { previous, next, .. } => {
                 apply_song_text_snapshot(state, next, previous);
             }
@@ -1091,10 +1137,12 @@ fn apply_clip_placements(state: &mut TimelineState, snapshots: &[ClipSnapshot]) 
             track.clips.insert(index, snapshot.clip.clone());
         }
     }
-    if let Some(selected) = snapshots
-        .iter()
-        .find(|snapshot| state.selection.selected_clip_ids.contains(&snapshot.clip.id))
-    {
+    if let Some(selected) = snapshots.iter().find(|snapshot| {
+        state
+            .selection
+            .selected_clip_ids
+            .contains(&snapshot.clip.id)
+    }) {
         state.selection.selected_track_id = Some(selected.track_id.clone());
     }
 }
@@ -1820,6 +1868,36 @@ mod conductor_command_tests {
         );
     }
 
+    /// A key change reaches ARA plug-ins on set, undo and redo alike, and is
+    /// never mistaken for an engine-graph edit or plain metadata.
+    #[test]
+    fn a_project_key_edit_is_a_musical_context_change_every_way() {
+        use crate::components::timeline::timeline_state::{MidiScale, ScaleKind, ScaleRoot};
+
+        let mut state = TimelineState::default();
+        let mut history = EditHistory::new(4);
+        let a_minor = Some(MidiScale::new(ScaleRoot::A, ScaleKind::NaturalMinor));
+        let command = EditCommand::SetProjectKey {
+            prev: None,
+            next: a_minor,
+        };
+        assert_eq!(command.impact(), EditImpact::MusicalContext);
+        assert!(!command.is_metadata_only());
+
+        command.execute(&mut state);
+        history.push(command);
+        assert_eq!(
+            history.undo_with_impact(&mut state),
+            Some(EditImpact::MusicalContext)
+        );
+        assert_eq!(state.project_key, None);
+        assert_eq!(
+            history.redo_with_impact(&mut state),
+            Some(EditImpact::MusicalContext)
+        );
+        assert_eq!(state.project_key, a_minor);
+    }
+
     /// Lane heights are persisted view state: undoable like any other resize,
     /// and dirtying the project so the height survives a save — but never an
     /// engine-graph change.
@@ -1944,8 +2022,9 @@ impl EditHistory {
     }
 
     pub fn undo_with_impact(&mut self, state: &mut TimelineState) -> Option<EditImpact> {
-        let cmd = self.undo_stack.pop_back()?;
+        let mut cmd = self.undo_stack.pop_back()?;
         let impact = cmd.impact();
+        cmd.record_before_step(state, true);
         cmd.undo(state);
         self.redo_stack.push_back(cmd);
         Some(impact)
@@ -1985,8 +2064,9 @@ impl EditHistory {
     }
 
     pub fn redo_with_impact(&mut self, state: &mut TimelineState) -> Option<EditImpact> {
-        let cmd = self.redo_stack.pop_back()?;
+        let mut cmd = self.redo_stack.pop_back()?;
         let impact = cmd.impact();
+        cmd.record_before_step(state, false);
         cmd.execute(state);
         self.undo_stack.push_back(cmd);
         Some(impact)
@@ -2278,10 +2358,105 @@ mod update_clips_tests {
         let command = EditCommand::UpdateClips { previous, next };
         command.execute(&mut state);
         assert_eq!(state.selection.selected_clip_ids, vec!["x".to_string()]);
-        assert_eq!(state.selection.selected_track_id.as_deref(), Some(b.as_str()));
+        assert_eq!(
+            state.selection.selected_track_id.as_deref(),
+            Some(b.as_str())
+        );
         command.undo(&mut state);
         assert_eq!(state.selection.selected_clip_ids, vec!["x".to_string()]);
-        assert_eq!(state.selection.selected_track_id.as_deref(), Some(a.as_str()));
+        assert_eq!(
+            state.selection.selected_track_id.as_deref(),
+            Some(a.as_str())
+        );
         assert_eq!(state.find_clip("x").unwrap().1.start_beat, 4.0);
+    }
+}
+
+#[cfg(test)]
+mod track_name_tests {
+    use super::*;
+
+    /// The command the header rename records on commit.
+    fn rename_command(state: &TimelineState, track_id: &str, draft: &str) -> Option<EditCommand> {
+        EditCommand::rename_track(state, track_id, draft)
+    }
+
+    #[test]
+    fn track_rename_is_one_undoable_step() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        let original = state.tracks[0].name.clone();
+        let mut history = EditHistory::new(10);
+
+        let command = rename_command(&state, &id, "  Lead Synth ").expect("a real rename");
+        assert_eq!(command.label(), "Rename Track");
+        assert_eq!(command.impact(), EditImpact::Project);
+        command.execute(&mut state);
+        history.push(command);
+        assert_eq!(state.tracks[0].name, "Lead Synth");
+        assert!(history.can_undo());
+
+        assert!(history.undo(&mut state));
+        assert_eq!(state.tracks[0].name, original);
+        assert!(!history.can_undo(), "the rename was exactly one entry");
+
+        assert!(history.redo(&mut state));
+        assert_eq!(state.tracks[0].name, "Lead Synth");
+        assert!(!history.can_redo());
+    }
+
+    #[test]
+    fn blank_or_unchanged_drafts_record_nothing() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        let name = state.tracks[0].name.clone();
+        assert!(rename_command(&state, &id, "   ").is_none());
+        assert!(rename_command(&state, &id, &format!(" {name} ")).is_none());
+        assert!(rename_command(&state, "no-such-track", "Name").is_none());
+    }
+
+    /// The name changed under the open field (a menu-bound undo on macOS never
+    /// reaches the field): undo must restore what the track was called just
+    /// before the commit.
+    #[test]
+    fn undo_restores_the_name_the_track_had_at_commit_time() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        let mut history = EditHistory::new(10);
+        // The field opened on the original name, then something else renamed it.
+        state.set_track_name(&id, "Renamed Elsewhere");
+
+        let command = rename_command(&state, &id, "Final").expect("a real rename");
+        command.execute(&mut state);
+        history.push(command);
+        assert!(history.undo(&mut state));
+        assert_eq!(state.tracks[0].name, "Renamed Elsewhere");
+    }
+
+    /// An exact restore: a legacy name with surrounding space, or none at all,
+    /// comes back as it was rather than trimmed.
+    #[test]
+    fn undo_restores_a_legacy_name_exactly() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        state.set_track_name(&id, "");
+        let command = rename_command(&state, &id, "Named").expect("a real rename");
+        command.execute(&mut state);
+        command.undo(&mut state);
+        assert_eq!(state.tracks[0].name, "");
+    }
+
+    #[test]
+    fn every_rename_step_advances_the_names_revision() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        let start = state.track_names_revision;
+        let command = rename_command(&state, &id, "Pad").expect("a real rename");
+        command.execute(&mut state);
+        let executed = state.track_names_revision;
+        assert_ne!(executed, start);
+        command.undo(&mut state);
+        assert_ne!(state.track_names_revision, executed);
+        assert_ne!(state.track_names_revision, start);
     }
 }

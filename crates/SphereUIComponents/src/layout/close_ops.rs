@@ -181,7 +181,7 @@ impl StudioLayout {
                         }
                         1 => {
                             shutdown::log("unsaved dialog: Don't Save");
-                            this.discard_session_recovery();
+                            this.discard_session_recovery(cx);
                             this.perform_pending_after_guard(cx);
                         }
                         _ => {
@@ -251,9 +251,10 @@ impl StudioLayout {
         }
         shutdown::log("shutdown_studio begin");
 
-        // Save workspace layout before teardown so nothing is null / stale.
+        // Save the workspace layout and this project's per-user view before
+        // teardown so nothing is null / stale.
         shutdown::log("phase: save workspace layout");
-        self.save_workspace_layout(cx);
+        self.persist_per_user_session_view(cx);
 
         shutdown::log("phase: stop transport");
         self.stop_native_playback(cx);
@@ -274,6 +275,11 @@ impl StudioLayout {
         if let Some(engine) = self.audio_bridge.engine.as_mut() {
             engine.shutdown();
         }
+
+        // "Don't Save" then Quit: the discarded autosave's removal may still
+        // be waiting on a running write, and the process is about to end.
+        shutdown::log("phase: discarded autosave removal");
+        self.finish_discarded_recovery_removal();
 
         shutdown::log("shutdown_studio end");
     }

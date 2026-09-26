@@ -58,6 +58,14 @@ pub const CLIP_LANE_PAD: f32 = 7.0;
 /// and grabbable when zoomed out.
 pub const CLIP_MIN_DRAWN_WIDTH: f32 = 10.0;
 
+/// The band every clip in a lane row `row_height` tall is drawn in, as
+/// `(top, height)` from the row's top: the pad bands above and below are
+/// excluded. [`TimelineState::clip_lane_rect`] places each clip in it, and
+/// the marquee tests it once per row.
+pub fn clip_lane_band(row_height: f32) -> (f32, f32) {
+    (CLIP_LANE_PAD, row_height - CLIP_LANE_PAD * 2.0)
+}
+
 /// Where a clip is drawn inside its lane row. `left` is lane x (the
 /// arrangement's beat transform, horizontal scroll included); `top` is
 /// row-local.
@@ -335,11 +343,12 @@ impl TimelineState {
     /// included, and the pad bands above and below it excluded.
     pub fn clip_lane_rect(&self, clip: &ClipState, row_height: f32) -> ClipLaneRect {
         let (left, width) = self.clip_lane_x_span(clip);
+        let (top, height) = clip_lane_band(row_height);
         ClipLaneRect {
             left,
-            top: CLIP_LANE_PAD,
+            top,
             width,
-            height: row_height - CLIP_LANE_PAD * 2.0,
+            height,
         }
     }
 
@@ -373,5 +382,55 @@ impl TimelineState {
     /// This frame's gesture geometry — see [`TimelineGestureContext`].
     pub fn gesture_context(&self) -> TimelineGestureContext {
         TimelineGestureContext::from_state(self)
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1.0e-3
+    }
+
+    /// Every arrangement pointer y — track rows, automation, the marquee, the
+    /// tempo lane — resolves through the measured timeline top once there is
+    /// one. The chrome constant only stands in before the first frame, and it
+    /// is taller than the chrome actually drawn, which put every row lookup a
+    /// few pixels above the row the pointer was on.
+    #[test]
+    fn pointer_y_resolves_through_the_measured_timeline_top() {
+        let mut state = TimelineState::default();
+        state.viewport.scroll_y = 30.0;
+        let content_top = state.arrangement_content_top();
+
+        let fallback = crate::shell_metrics::APP_CHROME_HEIGHT;
+        assert!(close(state.timeline_origin_y(), fallback));
+        assert!(close(
+            state.content_y_from_window_y(fallback + content_top),
+            30.0
+        ));
+
+        state.viewport.timeline_origin_y_measured = Some(72.0);
+        let first_row_top = 72.0 + content_top;
+        assert!(close(
+            state.track_viewport_y_from_window_y(first_row_top),
+            0.0
+        ));
+        assert!(close(
+            state.content_y_from_window_y(first_row_top + 5.0),
+            35.0
+        ));
+        // The lanes' press handlers resolve through the same origin.
+        let gestures = state.gesture_context();
+        assert!(close(
+            gestures.content_y_from_window_y(first_row_top + 5.0),
+            35.0
+        ));
+        // So does the tempo lane under the ruler.
+        assert!(close(
+            state.tempo_lane_origin_y(),
+            72.0 + RULER_HEIGHT + state.global_lane_top(GlobalLaneKind::Tempo)
+        ));
     }
 }

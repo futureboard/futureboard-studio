@@ -92,7 +92,11 @@ pub struct TimelineMarkerDrag {
 /// a long drag cannot drift and a drop commits exactly what the last preview
 /// showed. The delta is held so the earliest clip stops at beat 0, which
 /// keeps the group's spacing intact instead of piling clips up at the start.
-pub fn group_move_starts(origin_starts: &[f32], anchor_origin: f32, anchor_target: f32) -> Vec<f32> {
+pub fn group_move_starts(
+    origin_starts: &[f32],
+    anchor_origin: f32,
+    anchor_target: f32,
+) -> Vec<f32> {
     let earliest = origin_starts
         .iter()
         .copied()

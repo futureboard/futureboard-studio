@@ -637,14 +637,47 @@ impl StudioLayout {
                         .name_input
                         .set_value(t.name.clone());
                     self.inspector_name_edit.name_bound = Some(t.id.clone());
+                    self.inspector_name_edit.name_synced = Some(t.name.clone());
                 }
                 None => {
                     self.inspector_name_edit.name_input.set_value("");
                     self.inspector_name_edit.name_bound = None;
+                    self.inspector_name_edit.name_synced = None;
                 }
             }
         }
         let inspector_name_focused = self.inspector_name_edit.name_input.is_focused(window);
+        // A rename made elsewhere — a track header, undo, redo, another
+        // project — changed the name under the bound field: reload it, even
+        // while it has focus. A field in step with the track is left alone
+        // while it is typed in, and shows the stored form once it lets go.
+        let names_revision = self.timeline.read(cx).state.track_names_revision;
+        if self.inspector_name_edit.names_revision_seen != names_revision {
+            let bound_name = self
+                .inspector_name_edit
+                .name_bound
+                .as_deref()
+                .and_then(|tid| tracks.iter().find(|t| t.id == tid))
+                .map(|t| t.name.clone());
+            match bound_name {
+                Some(name)
+                    if input_ops::inspector_name_reloads(
+                        self.inspector_name_edit.name_synced.as_deref(),
+                        &name,
+                        inspector_name_focused,
+                    ) =>
+                {
+                    if self.inspector_name_edit.name_input.value != name {
+                        self.inspector_name_edit.name_input.set_value(name.clone());
+                    }
+                    self.inspector_name_edit.name_synced = Some(name);
+                    self.inspector_name_edit.names_revision_seen = names_revision;
+                }
+                // Focused and in step: catch up once it lets go.
+                Some(_) => {}
+                None => self.inspector_name_edit.names_revision_seen = names_revision,
+            }
+        }
         if self.inspector_name_edit.clip_name_bound.as_deref() != selected_clip_id.as_deref() {
             match selected_clip_id.as_deref().and_then(|cid| {
                 tracks
@@ -749,6 +782,10 @@ impl StudioLayout {
                 let stretch_tempo = selected_clip_id
                     .as_deref()
                     .map(|clip_id| self.stretch_tempo_snapshot(clip_id));
+                // The fades the clip plays, crossfades included, for its rows.
+                let clip_fades = selected_clip_id
+                    .as_deref()
+                    .and_then(|clip_id| self.timeline.read(cx).state.clip_fade_summary(clip_id));
                 crate::components::panel::inspector_panel(
                     &tracks,
                     &inspector_audio_connections,
@@ -759,7 +796,11 @@ impl StudioLayout {
                         selected_clip_id.as_deref(),
                         project_bpm,
                         selection_duration_beats,
-                    ),
+                    )
+                    .map(|mut summary| {
+                        summary.fades = clip_fades;
+                        summary
+                    }),
                     stretch_tempo,
                     &self.inspector_name_edit.name_input,
                     inspector_name_focused,

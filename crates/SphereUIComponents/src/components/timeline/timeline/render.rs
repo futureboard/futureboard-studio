@@ -38,6 +38,12 @@ impl Render for Timeline {
         if let Some(measured) = self.lane_origin_probe.get() {
             self.state.viewport.lane_origin_x_measured = Some(measured);
         }
+        // And the timeline's top edge, measured by the root's probe, so every
+        // arrangement y resolves through where the rows were actually drawn
+        // rather than through the hand-tuned chrome constant.
+        if let Some(measured) = self.timeline_origin_probe.get() {
+            self.state.viewport.timeline_origin_y_measured = Some(measured);
+        }
         // Lay the arrangement out against the current tempo map (real time:
         // slow bars wide, fast bars narrow). Held still while a tempo marker is
         // being dragged, so the grid under the pointer cannot move and feed
@@ -49,6 +55,9 @@ impl Render for Timeline {
         let (viewport_w, viewport_h, (scroll_max_x, scroll_max_y)) =
             self.scroll_geometry_with_content_height(window, row_layout.total_height);
         self.state.update_viewport_size(viewport_w, viewport_h);
+        // A reopened project's saved scroll (`pending_view_restore`) lands on
+        // the first frame with a real viewport, before the clamp.
+        self.state.apply_pending_view_restore();
         self.state.clamp_scroll(scroll_max_x, scroll_max_y);
         let scrolling = self.state.smooth_scroll_towards_target();
         if scrolling {
@@ -108,6 +117,13 @@ impl Render for Timeline {
                 cx.new(|_| crate::components::timeline::cut_guide::CutGuideOverlay::new(frame)),
             );
         }
+        if self.marquee_overlay.is_none() {
+            let frame = self.marquee_frame.clone();
+            self.marquee_overlay =
+                Some(cx.new(|_| {
+                    crate::components::timeline::marquee_overlay::MarqueeOverlay::new(frame)
+                }));
+        }
         if self.arrangement_surface.is_none() {
             let timeline = cx.entity();
             self.arrangement_surface = Some(cx.new(|cx| {
@@ -117,7 +133,9 @@ impl Render for Timeline {
             }));
         }
         if self.focus_lost_subscription.is_none() {
-            self.focus_lost_subscription = Some(cx.on_focus_lost(window, |this, _window, cx| {
+            self.focus_lost_subscription = Some(cx.on_focus_lost(window, |this, window, cx| {
+                // A clip gain / fade / crossfade drag puts its clips back.
+                this.cancel_clip_handle_gesture(Some(window), cx);
                 if this.range_select_drag.is_some()
                     || this.pen_clip_draw.is_some()
                     || this.erase_clip_drag.is_some()
@@ -154,6 +172,10 @@ impl Render for Timeline {
         }
         let playhead_overlay = self.playhead_overlay.clone();
         let cut_guide_overlay = self.cut_guide_overlay.clone();
+        // The hovered or dragged clip's fade handles, resolved against this
+        // frame's scroll and zoom.
+        let fade_handle_overlay = self.fade_handle_overlay(cx);
+        self.refresh_fade_handle_frame(&row_layout);
 
         // Diagnostic only, and it walks every track: skip the sum entirely when
         // the perf collector is off.
@@ -204,14 +226,14 @@ impl Render for Timeline {
                 }
                 this.clip_clone_drag_id = clone_drag.then(|| clip_id.clone());
                 this.clip_clone_hint = None;
-                if *additive {
-                    this.state.select_clip_additive(clip_id);
-                } else {
-                    // Plain click is an explicit single-clip selection. Multi-select is
-                    // preserved only with Ctrl/Cmd additive clicks; this keeps imported
-                    // multi-channel MIDI clips from behaving like an inseparable group.
-                    this.state.select_clip(clip_id);
-                }
+                // A press on a clip that is already selected keeps the
+                // selection until the release, so a drag moves everything
+                // selected (a whole marquee selection). The click still makes
+                // a plain press an explicit single-clip selection — which keeps
+                // imported multi-channel MIDI clips from behaving like an
+                // inseparable group — and a Cmd/Ctrl click a toggle. A press on
+                // a fade handle selects by the same rule.
+                this.press_clip_selection(clip_id, *additive);
                 cx.notify();
             },
         );
@@ -360,11 +382,15 @@ impl Render for Timeline {
             cx.notify();
         });
 
-        // Automation mode toggle is UI-only: it selects the track and flips the
-        // lane edit mode but never marks the project/engine dirty on its own.
+        // Automation mode toggle: selects the track and flips the lane edit
+        // mode. The expansion is saved with the project (v54), so it is an
+        // unsaved change, but view-only: the engine graph is never rebuilt
+        // for it, not even when it seeds an empty first lane.
         let on_toggle_automation = cx.listener(|this, track_id: &String, _window, cx| {
             this.state.select_track(track_id);
-            this.state.toggle_track_lane_mode(track_id);
+            if this.state.toggle_track_lane_mode(track_id).is_some() {
+                this.mark_control_state_changed(cx);
+            }
             cx.notify();
         });
 
@@ -476,7 +502,7 @@ impl Render for Timeline {
 
         let on_add_clip = cx.listener(
             |this,
-             (track_id, beat, click_count, bypass_snap): &(String, f32, u32, bool),
+             (track_id, beat, _click_count, bypass_snap): &(String, f32, u32, bool),
              _window,
              cx| {
                 let track_type = this
@@ -509,23 +535,18 @@ impl Render for Timeline {
                         }
                     }
                     Some(TrackType::Midi | TrackType::Instrument) => {
-                        if matches!(
-                            this.state.active_tool,
-                            TimelineTool::Pen | TimelineTool::Pointer
-                        ) {
+                        // Only the Pen draws here. The Pointer's empty-lane
+                        // press is a marquee on every lane, and its
+                        // double-click clip is created by the marquee's release
+                        // (see `Timeline::finish_marquee`).
+                        if this.state.active_tool == TimelineTool::Pen {
                             let start = this.snap_beat_with_bypass(*beat, *bypass_snap);
-                            // Pen tool always commits a default-length clip on a
-                            // plain click; the Pointer tool's empty-lane-creates
-                            // gesture only commits on a drag or a double-click so
-                            // marquee-style single clicks stay a no-op.
-                            let commit_on_click =
-                                this.state.active_tool == TimelineTool::Pen || *click_count >= 2;
                             this.pen_clip_draw = Some(ClipDrawPreview {
                                 track_id: track_id.clone(),
                                 start_beat: start,
                                 current_beat: start,
+                                // A plain Pen click still makes a clip.
                                 dragging: false,
-                                commit_on_click,
                             });
                         }
                     }
@@ -542,6 +563,8 @@ impl Render for Timeline {
             },
         );
 
+        // Clip gain, fade handles and the hovered clip's fade handles; see
+        // `clip_fades`, which resolves and commits them.
         let on_audio_clip_process_preview = cx.listener(
             |this,
              (clip_id, update): &(
@@ -550,39 +573,7 @@ impl Render for Timeline {
             ),
              _window,
              cx| {
-                use crate::components::timeline::audio_clip::AudioClipProcessUpdate;
-                // First preview of a gesture: remember the clip as it was, for
-                // the one undo entry the release records.
-                if this
-                    .clip_process_origin
-                    .as_ref()
-                    .is_none_or(|origin| origin.id != *clip_id)
-                {
-                    this.clip_process_origin =
-                        this.state.find_clip(clip_id).map(|(_, clip)| clip.clone());
-                }
-                let changed = match *update {
-                    AudioClipProcessUpdate::Gain(gain) => this.state.set_clip_gain(clip_id, gain),
-                    AudioClipProcessUpdate::FadeInMs(ms) => {
-                        let Some(mut stretch) = this.state.clip_stretch(clip_id).cloned() else {
-                            return;
-                        };
-                        stretch.fade_in_ms = ms.max(0.0);
-                        stretch.dirty = true;
-                        this.state.set_clip_stretch(clip_id, stretch)
-                    }
-                    AudioClipProcessUpdate::FadeOutMs(ms) => {
-                        let Some(mut stretch) = this.state.clip_stretch(clip_id).cloned() else {
-                            return;
-                        };
-                        stretch.fade_out_ms = ms.max(0.0);
-                        stretch.dirty = true;
-                        this.state.set_clip_stretch(clip_id, stretch)
-                    }
-                };
-                if changed {
-                    cx.notify();
-                }
+                this.apply_clip_process_update(clip_id, *update, cx);
             },
         );
         let on_audio_clip_process_commit = cx.listener(
@@ -590,67 +581,31 @@ impl Render for Timeline {
                 // Every change goes through a preview, and the first preview
                 // captured the "before". No origin means this release changed
                 // nothing — which is also what every *other* selected clip's
-                // handles report, since `on_mouse_up_out` fires for them all.
-                let Some(original) = this
-                    .clip_process_origin
-                    .take_if(|origin| origin.id == *clip_id)
-                else {
-                    return;
-                };
-                if let Some(next) = ClipSnapshot::capture(&this.state, clip_id) {
-                    let previous = ClipSnapshot {
-                        track_id: next.track_id.clone(),
-                        clip: original,
-                    };
-                    if previous.clip != next.clip {
-                        this.record_executed_command(
-                            EditCommand::UpdateClip { previous, next },
-                            cx,
-                        );
-                        this.mark_project_changed(cx);
-                        this.mark_media_changed(cx);
-                    }
-                }
-                cx.notify();
+                // gain control reports, since `on_mouse_up_out` fires for them.
+                this.commit_clip_process_gesture(Some(clip_id), cx);
+            },
+        );
+        let on_crossfade = cx.listener(
+            |this,
+             gesture: &crate::components::timeline::crossfade_overlay::CrossfadeGesture,
+             _window,
+             cx| {
+                this.apply_crossfade_gesture(gesture, cx);
             },
         );
 
         let on_range_start = cx.listener(
-            |this, (track_id, beat, additive): &(String, f32, bool), _window, cx| {
-                if this.state.active_tool == TimelineTool::Pointer {
-                    if Self::input_debug_enabled() {
-                        eprintln!(
-                            "[selection] marquee_start_pending track={} beat={:.3} additive={}",
-                            track_id, beat, additive
-                        );
-                    }
-                    this.range_select_drag = Some(RangeSelectDrag {
-                        start_beat: *beat,
-                        current_beat: *beat,
-                        start_track_id: track_id.clone(),
-                        additive: *additive,
-                        dragging: false,
-                    });
-                    this.state.arrangement_range = None;
-                    cx.notify();
-                }
+            |this, press: &crate::components::timeline::track_lane::MarqueePress, _window, cx| {
+                this.begin_marquee(press, cx);
             },
         );
 
-        let on_erase_start = cx.listener(|this, beat: &f32, _window, cx| {
-            this.begin_erase_at(*beat, None, cx);
+        let on_erase_start = cx.listener(|this, _beat: &f32, _window, cx| {
+            this.begin_erase_at(None, cx);
         });
 
         let on_erase_clip = cx.listener(|this, clip_id: &String, _window, cx| {
-            let beat = this
-                .state
-                .tracks
-                .iter()
-                .flat_map(|t| t.clips.iter())
-                .find(|c| c.id == *clip_id)
-                .map(|c| c.start_beat)
-                .unwrap_or(0.0);
-            this.begin_erase_at(beat, Some(clip_id.clone()), cx);
+            this.begin_erase_at(Some(clip_id.clone()), cx);
         });
 
         // Cut/razor tool: split the clicked audio clip at the cursor. The clip
@@ -670,42 +625,28 @@ impl Render for Timeline {
                         bypass_snap,
                     } => {
                         this.hide_cut_guide(cx);
+                        // Never in the middle of another gesture: a split must
+                        // not land under a marquee, a pen draw, an erase or a
+                        // clip move that happens to end on a cut zone.
+                        if this.pointer_gesture_blocks_cut() {
+                            return;
+                        }
                         let beat = this.beat_from_window_x(*window_x);
                         let snapped = this.snap_beat_with_bypass(beat, *bypass_snap);
                         if this.split_audio_clip_at_beat(clip_id, snapped, cx) {
                             this.mark_media_changed(cx);
                         }
                     }
-                    ClipCutGesture::Hover {
-                        window_x,
-                        bypass_snap,
-                        left,
-                        right,
-                        top,
-                        height,
-                    } => {
-                        // Same transform and snap as the Cut above, so the line
-                        // is where the click will split.
-                        let beat = this.beat_from_window_x(*window_x);
-                        let snapped = this.snap_beat_with_bypass(beat, *bypass_snap);
-                        let x = (*window_x + this.state.beats_to_x(snapped)
-                            - this.state.beats_to_x(beat))
-                        .clamp(*left, (*right).max(*left));
-                        this.show_cut_guide(
-                            crate::components::timeline::cut_guide::CutGuideFrame {
-                                x,
-                                top: *top,
-                                height: *height,
-                            },
-                            cx,
-                        );
+                    ClipCutGesture::Hover { .. } => this.apply_cut_hover(gesture.clone(), cx),
+                    ClipCutGesture::Leave => {
+                        this.cut_hover = None;
+                        this.hide_cut_guide(cx);
                     }
-                    ClipCutGesture::Leave => this.hide_cut_guide(cx),
                 }
             },
         );
 
-        let on_edit_mouse_move = cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
+        let on_edit_mouse_move = cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
             if event.pressed_button == Some(gpui::MouseButton::Left) {
                 if let Some((anchor, start)) = this.floating_toolbar_drag_anchor {
                     let dx: f32 = (event.position.x - anchor.x).into();
@@ -777,65 +718,27 @@ impl Render for Timeline {
             if event.pressed_button == Some(gpui::MouseButton::Right)
                 && this.erase_clip_drag.is_some()
             {
-                let beat = this.snap_beat(this.beat_from_window_x(event.position.x.into()));
-                this.update_erase_clip_drag(beat, cx);
+                this.update_erase_clip_drag(event.position, cx);
             } else if event.pressed_button == Some(gpui::MouseButton::Left)
                 && this.range_select_drag.is_some()
             {
-                let beat = this.snap_beat(this.beat_from_window_x(event.position.x.into()));
-                let lane_y = this.track_area_y_from_window(event.position);
-                let current_track_id = this.state.lane_y_to_track_id(lane_y);
-                let mut overlay: Option<TimelineRangeSelection> = None;
-                if let Some(drag) = this.range_select_drag.as_mut() {
-                    drag.current_beat = beat;
-                    let dx = this.state.beats_to_x(beat) - this.state.beats_to_x(drag.start_beat);
-                    let dy_tracks = current_track_id
-                        .as_ref()
-                        .map(|id| {
-                            let row_layout = this.state.track_row_layout();
-                            let start_row = row_layout.row_for_track(&drag.start_track_id);
-                            let current_row = row_layout.row_for_track(id);
-                            match (start_row, current_row) {
-                                (Some(a), Some(b)) => (b.y - a.y).abs(),
-                                _ => 0.0,
-                            }
-                        })
-                        .unwrap_or(0.0);
-                    if !drag.dragging && (dx * dx + dy_tracks * dy_tracks).sqrt() >= MARQUEE_DRAG_THRESHOLD {
-                        drag.dragging = true;
-                        if Self::input_debug_enabled() {
-                            eprintln!("[selection] marquee_start additive={}", drag.additive);
-                        }
-                    }
-                    if drag.dragging {
-                        let (lo, hi) = normalize_range(drag.start_beat, beat);
-                        let end_track_id = current_track_id.unwrap_or_else(|| drag.start_track_id.clone());
-                        overlay = Some(TimelineRangeSelection::new(
-                            lo as f64,
-                            hi as f64,
-                            this.state.track_ids_between(&drag.start_track_id, &end_track_id),
-                        ));
-                    }
-                }
-                this.state.arrangement_range = overlay;
-                if Self::input_debug_enabled() {
-                    if let Some(drag) = this.range_select_drag.as_ref() {
-                        eprintln!(
-                            "[selection] marquee_update dragging={} beat={:.3}",
-                            drag.dragging, drag.current_beat
-                        );
-                    }
-                }
-                cx.notify();
+                // Usually the window-wide tracker (see the root below) has
+                // already taken this move; it only exists from the frame after
+                // the press, so the first moves come through here. Same
+                // function either way, and a repeated position is a no-op.
+                this.update_marquee(
+                    (event.position.x.into(), event.position.y.into()),
+                    window,
+                    cx,
+                );
             } else if event.pressed_button == Some(gpui::MouseButton::Left)
                 && this.pen_clip_draw.is_some()
             {
                 // Live MIDI clip draw: track the snapped cursor beat so the ghost
                 // preview expands/shrinks in real time. No project mutation —
                 // the real clip is created once on release. `pen_clip_draw` is
-                // only ever populated for the tool/lane combos that should draw
-                // (Pen on any MIDI/Instrument lane, or Pointer on an empty one),
-                // so no extra tool check is needed here.
+                // only ever populated for the Pen on a MIDI/Instrument lane, so
+                // no extra tool check is needed here.
                 let bypass_snap = event.modifiers.shift;
                 let beat = this.snap_beat_with_bypass(
                     this.beat_from_window_x(event.position.x.into()),
@@ -853,12 +756,17 @@ impl Render for Timeline {
             }
         });
 
-        let on_pen_mouse_up = cx.listener(|this, event: &gpui::MouseUpEvent, _window, cx| {
+        let on_pen_mouse_up = cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
             if this.floating_toolbar_drag_anchor.take().is_some() {
                 cx.notify();
                 return;
             }
             this.log_input_state("mouse-up-left");
+            // A clip gain / fade / crossfade drag ends here: one undo step.
+            this.finish_clip_handle_gestures(cx);
+            // A press on a selected clip released without a drag: the click
+            // applies the selection change the press held back.
+            this.apply_pending_clip_click();
             let finished_marker = this.finish_marker_track_interaction(cx);
             let finished_tempo = this.finish_tempo_track_interaction(cx);
             let finished_ts = this.finish_time_signature_track_interaction(cx);
@@ -871,7 +779,11 @@ impl Render for Timeline {
                 if this.pen_clip_draw.is_some() {
                     this.finish_pen_midi_clip(beat, cx);
                 } else if this.range_select_drag.is_some() {
-                    this.finish_range_select(beat, cx);
+                    this.finish_marquee(
+                        Some((event.position.x.into(), event.position.y.into())),
+                        window,
+                        cx,
+                    );
                 } else if this.erase_clip_drag.is_some() {
                     this.finish_erase_clip_drag(cx);
                 }
@@ -880,12 +792,24 @@ impl Render for Timeline {
             debug_assert!(this.range_select_drag.is_none());
             cx.notify();
         });
-        let on_pen_mouse_up_out = cx.listener(|this, event: &gpui::MouseUpEvent, _window, cx| {
+        let on_pen_mouse_up_out = cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
             if this.floating_toolbar_drag_anchor.take().is_some() {
                 cx.notify();
                 return;
             }
             this.log_input_state("mouse-up-left-out");
+            // A clip gain / fade / crossfade drag released outside the
+            // timeline ends here too: one undo step.
+            this.finish_clip_handle_gestures(cx);
+            // A clip move released outside the timeline gets no drop. Commit
+            // what the lanes show before the reset below forgets the origin.
+            if let Some(anchor) = this
+                .clip_move_origin
+                .as_ref()
+                .map(|origin| origin.anchor_clip_id.clone())
+            {
+                this.commit_clip_move(&anchor, None, cx);
+            }
             let finished_marker = this.finish_marker_track_interaction(cx);
             let finished_tempo = this.finish_tempo_track_interaction(cx);
             let finished_ts = this.finish_time_signature_track_interaction(cx);
@@ -898,7 +822,11 @@ impl Render for Timeline {
                 if this.pen_clip_draw.is_some() {
                     this.finish_pen_midi_clip(beat, cx);
                 } else if this.range_select_drag.is_some() {
-                    this.finish_range_select(beat, cx);
+                    this.finish_marquee(
+                        Some((event.position.x.into(), event.position.y.into())),
+                        window,
+                        cx,
+                    );
                 } else if this.erase_clip_drag.is_some() {
                     this.finish_erase_clip_drag(cx);
                 }
@@ -929,8 +857,11 @@ impl Render for Timeline {
             }
         });
 
+        // The ruler magnet. Snap is saved with the project (v54): an unsaved
+        // change, but view-only.
         let on_toggle_snap = cx.listener(|this, _: &(), _window, cx| {
-            this.state.snap_to_grid = !this.state.snap_to_grid;
+            this.state.toggle_snap_to_grid();
+            this.mark_control_state_changed(cx);
             cx.notify();
         });
 
@@ -951,8 +882,12 @@ impl Render for Timeline {
             });
         });
 
-        let on_select_tool = cx.listener(|this, tool: &TimelineTool, _window, cx| {
+        let on_select_tool = cx.listener(|this, tool: &TimelineTool, window, cx| {
             this.log_input_state("tool-change");
+            // A tool change mid-drag cancels a clip gain / fade / crossfade
+            // gesture or a clip move: its clips go back and its drag stops.
+            this.cancel_clip_handle_gesture(Some(window), cx);
+            this.cancel_clip_drag(Some(window), cx);
             this.reset_input_state();
             this.state.active_tool = *tool;
             cx.notify();
@@ -1031,6 +966,8 @@ impl Render for Timeline {
         let on_audio_clip_process_commit:
             crate::components::timeline::audio_clip::AudioClipProcessCommitCb =
             std::sync::Arc::new(on_audio_clip_process_commit);
+        let on_crossfade: crate::components::timeline::crossfade_overlay::CrossfadeGestureCb =
+            std::sync::Arc::new(on_crossfade);
         let on_add_track: std::sync::Arc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static> =
             std::sync::Arc::new(on_add_track);
         let on_toggle_snap: std::sync::Arc<
@@ -1198,7 +1135,10 @@ impl Render for Timeline {
             ) as crate::components::timeline::region_track::GlobalLaneMenuCallback
         });
         let on_chord_hide = cx.listener(|this, _: &(), _window, cx| {
-            this.state.hide_chord_track_lane();
+            // Lane visibility is saved with the project (v54): view-only dirty.
+            if this.state.hide_chord_track_lane() {
+                this.mark_control_state_changed(cx);
+            }
             cx.notify();
         });
         let on_chord_hide: crate::components::timeline::region_track::GlobalLaneVoidCallback =
@@ -1233,9 +1173,8 @@ impl Render for Timeline {
         let on_select_tool: std::sync::Arc<
             dyn Fn(&TimelineTool, &mut gpui::Window, &mut gpui::App) + 'static,
         > = std::sync::Arc::new(on_select_tool);
-        let on_range_start: std::sync::Arc<
-            dyn Fn(&(String, f32, bool), &mut gpui::Window, &mut gpui::App) + 'static,
-        > = std::sync::Arc::new(on_range_start);
+        let on_range_start: crate::components::timeline::track_lane::MarqueePressCb =
+            std::sync::Arc::new(on_range_start);
         let on_erase_start: std::sync::Arc<
             dyn Fn(&f32, &mut gpui::Window, &mut gpui::App) + 'static,
         > = std::sync::Arc::new(on_erase_start);
@@ -1365,7 +1304,7 @@ impl Render for Timeline {
                     AutomationLaneAction::PickTarget => {
                         // The lane name is a parameter selector: the same picker
                         // the control row opens, anchored at the click.
-                        this.state.activate_automation_lane(&track_id, &lane_id);
+                        this.focus_automation_lane(&track_id, &lane_id, cx);
                         if let Some(cb) = this.on_automation_control.clone() {
                             cb(
                                 &(
@@ -1381,7 +1320,7 @@ impl Render for Timeline {
                         cx.notify();
                     }
                     AutomationLaneAction::Activate => {
-                        this.state.activate_automation_lane(&track_id, &lane_id);
+                        this.focus_automation_lane(&track_id, &lane_id, cx);
                         this.state.select_track(&track_id);
                         cx.notify();
                     }
@@ -1474,15 +1413,20 @@ impl Render for Timeline {
             ) as crate::components::timeline::tempo_track::GlobalLaneMenuCallback
         });
 
+        // Lane visibility is saved with the project (v54): view-only dirty.
         let on_tempo_hide = cx.listener(|this, _: &(), _window, cx| {
-            this.state.hide_tempo_track_lane();
+            if this.state.hide_tempo_track_lane() {
+                this.mark_control_state_changed(cx);
+            }
             cx.notify();
         });
         let on_tempo_hide: crate::components::timeline::tempo_track::GlobalLaneVoidCallback =
             std::sync::Arc::new(on_tempo_hide);
 
         let on_song_text_hide = cx.listener(|this, _: &(), _window, cx| {
-            this.state.hide_song_text_track_lane();
+            if this.state.hide_song_text_track_lane() {
+                this.mark_control_state_changed(cx);
+            }
             cx.notify();
         });
         let on_song_text_hide: crate::components::timeline::song_text_track::GlobalLaneVoidCallback =
@@ -1550,7 +1494,9 @@ impl Render for Timeline {
         });
 
         let on_marker_hide = cx.listener(|this, _: &(), _window, cx| {
-            this.state.hide_marker_track_lane();
+            if this.state.hide_marker_track_lane() {
+                this.mark_control_state_changed(cx);
+            }
             cx.notify();
         });
         let on_marker_hide: crate::components::timeline::marker_track::GlobalLaneVoidCallback =
@@ -1615,7 +1561,9 @@ impl Render for Timeline {
         });
 
         let on_region_hide = cx.listener(|this, _: &(), _window, cx| {
-            this.state.hide_region_track_lane();
+            if this.state.hide_region_track_lane() {
+                this.mark_control_state_changed(cx);
+            }
             cx.notify();
         });
         let on_region_hide: crate::components::timeline::region_track::GlobalLaneVoidCallback =
@@ -1682,7 +1630,9 @@ impl Render for Timeline {
         });
 
         let on_ts_hide = cx.listener(|this, _: &(), _window, cx| {
-            this.state.hide_time_signature_track_lane();
+            if this.state.hide_time_signature_track_lane() {
+                this.mark_control_state_changed(cx);
+            }
             cx.notify();
         });
         let on_ts_hide: crate::components::timeline::time_signature_track::GlobalLaneVoidCallback =
@@ -1724,6 +1674,14 @@ impl Render for Timeline {
                 });
             })
         };
+
+        // The rename field lives in its track's header, so a session whose
+        // header is not drawn this frame ends before anything is built.
+        self.end_track_rename_if_unrendered(&row_layout, window, cx);
+        let track_rename = self.track_rename_header(window, cx);
+        let on_begin_rename = cx.listener(|this, track_id: &String, window, cx| {
+            this.begin_track_rename(track_id, window, cx);
+        });
 
         let header_callbacks = crate::components::timeline::track_header::TrackHeaderCallbacks {
             on_select_track: std::sync::Arc::new(on_select_track_header),
@@ -1783,6 +1741,8 @@ impl Render for Timeline {
                 })
             },
             on_open_instrument: self.on_open_track_instrument.clone(),
+            on_begin_rename: std::sync::Arc::new(on_begin_rename),
+            rename: track_rename,
         };
 
         // Shared with the cached lane views, so the row geometry and the
@@ -1810,6 +1770,7 @@ impl Render for Timeline {
                 on_cut_clip: Some(on_cut_clip.clone()),
                 on_audio_clip_process_preview: on_audio_clip_process_preview.clone(),
                 on_audio_clip_process_commit: on_audio_clip_process_commit.clone(),
+                on_crossfade: Some(on_crossfade.clone()),
             },
         ));
 
@@ -1994,6 +1955,12 @@ impl Render for Timeline {
 
         let on_clip_drag_move = cx.listener(
             |this, event: &gpui::DragMoveEvent<ClipDragItem>, window, cx| {
+                if !this.clip_drag_accepted() {
+                    // Cancelled mid-drag with no window at hand (a menu
+                    // command): this is a clip drag, so end it here.
+                    cx.stop_active_drag(window);
+                    return;
+                }
                 let drag = event.drag(cx).clone();
                 let bypass_snap = event.event.modifiers.shift;
                 this.last_drag_position = Some(event.event.position);
@@ -2027,7 +1994,10 @@ impl Render for Timeline {
 
         let on_clip_dropped = cx.listener(|this, drag: &ClipDragItem, _window, cx| {
             let target_index = this.clip_drag_target_track_index;
-            if let Some(target_track_id) = target_index
+            if !this.clip_drag_accepted() {
+                // The move was cancelled: its clips are already back, and the
+                // drop records nothing.
+            } else if let Some(target_track_id) = target_index
                 .and_then(|index| this.state.tracks.get(index))
                 .map(|track| track.id.clone())
             {
@@ -2053,57 +2023,18 @@ impl Render for Timeline {
                         cx,
                     );
                 } else {
-                    let drag_ids = this.clip_drag_selection_ids(&drag.clip_id);
-                    let resolved_target_index = target_index.unwrap_or_else(|| {
-                        this.state
-                            .tracks
-                            .iter()
-                            .position(|track| track.id == target_track_id)
-                            .unwrap_or(0)
-                    });
-                    let source_index = this
-                        .state
-                        .tracks
-                        .iter()
-                        .position(|track| track.id == drag.source_track_id)
-                        .unwrap_or(resolved_target_index);
-                    let track_delta = resolved_target_index as isize - source_index as isize;
-                    let max_index = this.state.tracks.len().saturating_sub(1) as isize;
-
-                    for clip_id in &drag_ids {
-                        let Some((track_index, current_start)) = this
-                            .state
-                            .tracks
-                            .iter()
-                            .enumerate()
-                            .find_map(|(index, track)| {
-                                track
-                                    .clips
-                                    .iter()
-                                    .find(|clip| clip.id == *clip_id)
-                                    .map(|clip| (index, clip.start_beat))
-                            })
-                        else {
-                            continue;
-                        };
-                        let target_track_id = this
-                            .state
-                            .tracks
-                            .get((track_index as isize + track_delta).clamp(0, max_index) as usize)
-                            .map(|track| track.id.clone())
-                            .unwrap_or_else(|| target_track_id.clone());
-                        this.state
-                            .move_clip_to_track(clip_id, &target_track_id, current_start);
-                    }
-                    this.restore_clip_drag_selection(
-                        &drag.clip_id,
-                        drag_ids,
-                        Some(target_track_id),
-                    );
-                    this.mark_project_changed(cx);
+                    // The whole move is one undo step, committed at exactly
+                    // the positions the preview showed.
+                    this.commit_clip_move(&drag.clip_id, target_index, cx);
                 }
+            } else if this.clip_clone_drag_id.as_deref() != Some(drag.clip_id.as_str()) {
+                // No target row (it went away mid-drag): still one undo step
+                // for what the lanes show, each clip on its own track.
+                this.commit_clip_move(&drag.clip_id, None, cx);
             }
             this.clip_drag_origin = None;
+            this.clip_move_origin = None;
+            this.pending_clip_click = None;
             this.clip_drag_target_track_index = None;
             this.clip_clone_drag_id = None;
             this.clip_clone_hint = None;
@@ -2483,8 +2414,19 @@ impl Render for Timeline {
                 this.state
                     .set_scroll_immediate(next_x, next_y, max_x, max_y);
                 if scroll_x.abs() > 0.5 || scroll_y.abs() > 0.5 {
+                    // During a marquee too: the marquee only suspends
+                    // follow-playhead, and this turns it off for after.
                     this.state.note_user_scrolled();
+                    // The clips move under a pointer that does not: a razor
+                    // line kept from the last hover would be in the wrong
+                    // place, so it waits for the next move.
+                    if this.cut_hover.take().is_some() {
+                        this.hide_cut_guide(cx);
+                    }
                 }
+                // A marquee stays pinned to the arrangement: its free corner
+                // follows the pointer over the newly scrolled-in content.
+                this.refresh_marquee(window, cx);
                 window.prevent_default();
                 cx.stop_propagation();
                 cx.notify();
@@ -2494,21 +2436,21 @@ impl Render for Timeline {
             window.prevent_default();
             cx.stop_propagation();
 
-            if delta.1.abs() < 0.01 {
+            let zoom_delta = wheel_zoom_delta(delta, event.modifiers.shift);
+            if zoom_delta.abs() < 0.01 {
                 return;
             }
 
             // Both axes share the factor and its sign; zoom ignores the
             // Natural Scroll preference, which only flips panning.
-            let factor = wheel_zoom_factor(delta.1);
+            let factor = wheel_zoom_factor(zoom_delta);
             if zoom_axis == WheelZoomAxis::Vertical {
-                // A view change like horizontal zoom: no undo entry, and the
-                // project is marked view-dirty once per wheel burst, never
-                // engine-dirty.
+                // A view change like horizontal zoom: no undo entry, and every
+                // tick that changes a row marks the project view-dirty, never
+                // engine-dirty. Skipped while a marquee is in flight.
                 let (_, track_view_h, _) = this.scroll_geometry(window);
                 let anchor_y = this.track_area_y_from_window(event.position);
-                let tick = this.state.track_zoom_tick(
-                    &mut this.track_zoom_session,
+                let tick = this.track_zoom_wheel_tick(
                     factor,
                     anchor_y,
                     track_view_h,
@@ -2522,6 +2464,12 @@ impl Render for Timeline {
                     let scroll_x = this.state.viewport.scroll_x;
                     this.state
                         .set_scroll_immediate(scroll_x, scroll_y, max_x, max_y);
+                    // The clips resized under a pointer that did not move: a
+                    // razor line kept from the last hover spans the old rows,
+                    // so it waits for the next move, as after a pan.
+                    if this.cut_hover.take().is_some() {
+                        this.hide_cut_guide(cx);
+                    }
                     cx.notify();
                 }
                 return;
@@ -2532,6 +2480,7 @@ impl Render for Timeline {
             this.state.zoom_by(factor, anchor);
             let (max_x, max_y) = this.max_scroll_offsets(window);
             this.state.clamp_scroll(max_x, max_y);
+            this.refresh_marquee(window, cx);
             cx.notify();
         });
 
@@ -2550,6 +2499,7 @@ impl Render for Timeline {
             this.state.zoom_by(factor, anchor);
             let (max_x, max_y) = this.max_scroll_offsets(window);
             this.state.clamp_scroll(max_x, max_y);
+            this.refresh_marquee(window, cx);
             cx.notify();
         });
 
@@ -2569,6 +2519,79 @@ impl Render for Timeline {
             crate::perf::PerfScope::enter("Timeline:tree")
         };
 
+        // While a marquee is in flight, follow the pointer window-wide in the
+        // capture phase: over other panels, outside the window, and over
+        // children that occlude or stop propagation — none of which the
+        // root's own hover-gated mouse-move ever sees. Deliberately not a GPUI
+        // drag payload: an active drag makes GPUI refresh the whole window on
+        // every move, which would rebuild every cached lane per pointer event.
+        let marquee_tracker = self.range_select_drag.is_some().then(|| {
+            let on_move = cx.weak_entity();
+            let on_up = on_move.clone();
+            gpui::canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    window.on_mouse_event(
+                        move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+                            if phase != gpui::DispatchPhase::Capture {
+                                return;
+                            }
+                            let position = (event.position.x.into(), event.position.y.into());
+                            let _ = on_move.update(cx, |this, cx| match event.pressed_button {
+                                Some(gpui::MouseButton::Left) => {
+                                    this.update_marquee(position, window, cx)
+                                }
+                                // The release reached somebody else: end the
+                                // marquee where the rectangle is.
+                                None => this.finish_marquee(None, window, cx),
+                                Some(_) => {}
+                            });
+                        },
+                    );
+                    window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, window, cx| {
+                        if phase != gpui::DispatchPhase::Capture
+                            || event.button != gpui::MouseButton::Left
+                        {
+                            return;
+                        }
+                        let position = (event.position.x.into(), event.position.y.into());
+                        let _ = on_up.update(cx, |this, cx| {
+                            this.finish_marquee(Some(position), window, cx)
+                        });
+                    });
+                },
+            )
+            .absolute()
+            .inset_0()
+        });
+        let marquee_overlay = self
+            .range_select_drag
+            .is_some()
+            .then(|| self.marquee_overlay.clone())
+            .flatten();
+        // Records the timeline's top edge each frame; see
+        // `timeline_origin_probe`.
+        let origin_probe = {
+            let sink = self.timeline_origin_probe.clone();
+            gpui::canvas(
+                move |bounds, window, _cx| {
+                    let measured: f32 = bounds.origin.y.into();
+                    if sink.get().is_none_or(|prev| (prev - measured).abs() >= 0.5) {
+                        sink.set(Some(measured));
+                        // Consumed at the top of the next render, so ask for
+                        // one: the first frame after startup or a layout change
+                        // must not keep hit-testing against the stale origin.
+                        // (`window.refresh()` is a no-op while drawing; this
+                        // notifies the timeline on the next frame instead.)
+                        window.request_animation_frame();
+                    }
+                },
+                |_, _: (), _, _| {},
+            )
+            .absolute()
+            .inset_0()
+        };
+
         div()
             .flex()
             .flex_col()
@@ -2579,6 +2602,11 @@ impl Render for Timeline {
             .border_r(px(1.0))
             .border_color(Colors::border_subtle())
             .relative()
+            // Every press starts a new gesture; a cancelled clip drag's
+            // refusal ends here, before any clip sees the press.
+            .capture_any_mouse_down(cx.listener(|this, _event: &gpui::MouseDownEvent, _, _| {
+                this.note_arrangement_press();
+            }))
             .capture_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
                     if event.keystroke.key.as_str() == "escape"
@@ -2655,6 +2683,8 @@ impl Render for Timeline {
             )
             .on_scroll_wheel(on_ctrl_wheel_zoom)
             .on_pinch(on_pinch_zoom)
+            .child(origin_probe)
+            .children(marquee_tracker)
             // 1. Timeline Ruler
             .child(timeline_ruler(
                 state,
@@ -2781,6 +2811,7 @@ impl Render for Timeline {
                 Some(&self.erase_preview_ids),
                 on_audio_clip_process_preview.clone(),
                 on_audio_clip_process_commit.clone(),
+                Some(on_crossfade.clone()),
                 Some(on_automation_down.clone()),
                 Some(on_automation_lane_action.clone()),
                 Some(on_automation_hover.clone()),
@@ -2818,6 +2849,19 @@ impl Render for Timeline {
             // lane content but below the playhead/tools so it never hides the
             // playhead. Follows zoom/scroll via the same lane coordinate space.
             .children(arrangement_range_overlay(state).map(|overlay| {
+                div()
+                    .absolute()
+                    .left(px(HEADER_WIDTH))
+                    .right_0()
+                    .top(px(content_top))
+                    .bottom_0()
+                    .overflow_hidden()
+                    .child(overlay)
+            }))
+            // The marquee's rectangle, drawn by its own entity so a pointer move
+            // rebuilds no lane (see `marquee_overlay`); clipped to the track
+            // area it selects in.
+            .children(marquee_overlay.map(|overlay| {
                 div()
                     .absolute()
                     .left(px(HEADER_WIDTH))
@@ -2894,6 +2938,8 @@ impl Render for Timeline {
             .children(playhead_overlay)
             // The Smart Tool's razor line; empty unless hovering a cut zone.
             .children(cut_guide_overlay)
+            // The hovered clip's fade handles; empty unless over an audio clip.
+            .child(fade_handle_overlay)
             // 4. Floating Tools Bar (above playhead)
             .child(
                 div()
@@ -3192,6 +3238,21 @@ pub(crate) fn wheel_zoom_factor(delta_y: f32) -> f32 {
     WHEEL_ZOOM_BASE.powf(delta_y)
 }
 
+/// The wheel delta a zooming tick scales by, from the event's `(x, y)`.
+///
+/// Zoom reads the vertical wheel, except where Shift has moved it: on macOS,
+/// AppKit reports a mouse wheel turned with Shift held as a horizontal delta.
+/// So with Shift held and no vertical movement, the horizontal delta stands
+/// in, as it does for Shift-panning. Without this, Cmd+Shift and
+/// Cmd+Alt+Shift wheel ticks did nothing there.
+pub(crate) fn wheel_zoom_delta((x, y): (f32, f32), shift: bool) -> f32 {
+    if shift && y.abs() <= 0.01 {
+        x
+    } else {
+        y
+    }
+}
+
 /// What a zooming wheel tick on the arrangement scales.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WheelZoomAxis {
@@ -3215,6 +3276,32 @@ pub(crate) fn wheel_zoom_axis(modifiers: &gpui::Modifiers) -> Option<WheelZoomAx
     } else {
         WheelZoomAxis::Horizontal
     })
+}
+
+impl Timeline {
+    /// One track-zoom wheel tick, or none while a marquee is in flight: the
+    /// marquee is anchored at a content y, which a height change would move
+    /// onto another track, selecting clips the rectangle never enclosed. The
+    /// burst restarts from the live heights once the marquee ends.
+    pub(super) fn track_zoom_wheel_tick(
+        &mut self,
+        tick_factor: f32,
+        anchor_viewport_y: f32,
+        viewport_height: f32,
+        now: std::time::Instant,
+    ) -> crate::components::timeline::timeline_state::TrackZoomTick {
+        if self.range_select_drag.is_some() {
+            self.track_zoom_session = None;
+            return Default::default();
+        }
+        self.state.track_zoom_tick(
+            &mut self.track_zoom_session,
+            tick_factor,
+            anchor_viewport_y,
+            viewport_height,
+            now,
+        )
+    }
 }
 
 /// Map a GPUI [`PinchEvent::delta`] onto a multiplicative zoom factor.
@@ -3339,7 +3426,7 @@ fn file_drop_hint_overlay(hint: &FileDropHint, state: &TimelineState) -> Option<
     let window_x: f32 = hint.position.x.into();
     let window_y: f32 = hint.position.y.into();
     let lane_x = state.lane_x_from_window_x(window_x).max(0.0);
-    let lane_y = (window_y - APP_CHROME_HEIGHT - state.arrangement_content_top()).max(0.0);
+    let lane_y = state.track_viewport_y_from_window_y(window_y).max(0.0);
     let beat = state.snap_beats(state.x_to_beats(lane_x)).max(0.0);
     let track_index = state.track_index_at_y(lane_y);
     let row_layout = state.track_row_layout();
@@ -3858,6 +3945,35 @@ mod midi_clip_draw_tests {
         }
     }
 
+    /// On macOS a mouse wheel turned with Shift held arrives as a horizontal
+    /// delta. Zoom takes it then, keeping its sign, so Cmd+Shift and
+    /// Cmd+Alt+Shift wheel ticks zoom as the unshifted ones do.
+    #[test]
+    fn a_wheel_that_shift_turned_sideways_still_zooms() {
+        use WheelZoomAxis::{Horizontal, Vertical};
+        // Unshifted: the vertical wheel only; a sideways swipe does not zoom.
+        assert_eq!(wheel_zoom_delta((0.0, 30.0), false), 30.0);
+        assert_eq!(wheel_zoom_delta((30.0, 0.0), false), 0.0);
+        // Shift, the wheel moved onto x: x stands in, sign and all.
+        assert_eq!(wheel_zoom_delta((30.0, 0.0), true), 30.0);
+        assert_eq!(wheel_zoom_delta((-30.0, 0.005), true), -30.0);
+        // Shift where the wheel stays vertical: y still decides.
+        assert_eq!(wheel_zoom_delta((5.0, -30.0), true), -30.0);
+        // Cmd+Shift zooms time, Cmd+Alt+Shift track heights; wheel up zooms
+        // in and wheel down zooms out on both.
+        for (alt, axis) in [(false, Horizontal), (true, Vertical)] {
+            let modifiers = gpui::Modifiers {
+                platform: true,
+                alt,
+                shift: true,
+                ..Default::default()
+            };
+            assert_eq!(wheel_zoom_axis(&modifiers), Some(axis));
+            assert!(wheel_zoom_factor(wheel_zoom_delta((30.0, 0.0), modifiers.shift)) > 1.0);
+            assert!(wheel_zoom_factor(wheel_zoom_delta((-30.0, 0.0), modifiers.shift)) < 1.0);
+        }
+    }
+
     /// Track zoom uses the same factor as time zoom, so wheel up grows both.
     #[test]
     fn ctrl_alt_wheel_up_grows_track_heights_and_down_shrinks_them() {
@@ -3910,5 +4026,173 @@ mod midi_clip_draw_tests {
             compute_pen_clip_span(&state, 2.0, 2.01),
             (2.0, MIN_MIDI_CLIP_BEATS)
         );
+    }
+}
+
+#[cfg(test)]
+mod arrangement_gesture_tests {
+    use super::*;
+    use crate::components::timeline::timeline_state::{MarqueeHits, TimelineSelection};
+
+    /// A marquee in flight at the arrangement's top-left, pressed on
+    /// `track_id` with `before` as the selection it started from.
+    fn marquee(track_id: &str, before: TimelineSelection) -> RangeSelectDrag {
+        RangeSelectDrag {
+            anchor_beat: 0.0,
+            anchor_content_y: 10.0,
+            press_window: (0.0, 0.0),
+            last_window: (40.0, 200.0),
+            start_track_id: track_id.to_string(),
+            additive: false,
+            on_lane: true,
+            create_clip_on_click: false,
+            bypass_snap: false,
+            dragging: true,
+            selection_before: before,
+            hits: None,
+        }
+    }
+
+    fn timeline_with_tracks(count: usize) -> (Timeline, Vec<String>) {
+        let mut timeline = Timeline::new();
+        let ids = (0..count)
+            .map(|_| timeline.state.create_audio_track())
+            .collect();
+        (timeline, ids)
+    }
+
+    /// Track zoom waits while a marquee is out: its anchor is a content y,
+    /// which new heights would move onto another track. Once the marquee has
+    /// ended the wheel zooms again.
+    #[test]
+    fn track_zoom_waits_for_a_marquee() {
+        let (mut timeline, ids) = timeline_with_tracks(4);
+        let before = timeline.state.selection.clone();
+        timeline.range_select_drag = Some(marquee(&ids[0], before));
+        let now = std::time::Instant::now();
+
+        let tick = timeline.track_zoom_wheel_tick(1.5, 0.0, 600.0, now);
+
+        assert_eq!(tick, Default::default());
+        assert!(timeline.track_zoom_session.is_none());
+        for id in &ids {
+            assert_eq!(
+                timeline.state.track_row_height_for_id(id),
+                DEFAULT_TRACK_HEIGHT
+            );
+        }
+
+        timeline.end_marquee(true);
+        let tick = timeline.track_zoom_wheel_tick(1.5, 0.0, 600.0, now);
+        assert!(tick.scroll_y.is_some() && tick.mark_view_dirty);
+        assert_eq!(timeline.state.track_row_height_for_id(&ids[0]), 108.0);
+    }
+
+    /// The release commits the marquee's preview as the selection; Escape
+    /// drops it. Either way the follow-playhead suspension is lifted and the
+    /// user's Follow choice was never touched.
+    #[test]
+    fn a_marquee_commits_its_preview_on_release_and_drops_it_on_escape() {
+        for commit in [true, false] {
+            let (mut timeline, ids) = timeline_with_tracks(3);
+            timeline.state.select_track(&ids[0]);
+            let before = timeline.state.selection.clone();
+            let preview = before.after_marquee(
+                &MarqueeHits {
+                    track_ids: ids[1..].to_vec(),
+                    clip_ids: Vec::new(),
+                },
+                &ids[1],
+                false,
+            );
+            timeline.range_select_drag = Some(marquee(&ids[0], before.clone()));
+            timeline.state.marquee_selection_preview = Some(preview.clone());
+            timeline.state.follow_playhead_suspended = true;
+            // What followers see mid-marquee: the selection from before.
+            assert_eq!(timeline.state.selection, before);
+
+            let ended = timeline.end_marquee(commit);
+
+            assert!(ended.is_some());
+            assert!(timeline.range_select_drag.is_none());
+            assert!(timeline.state.marquee_selection_preview.is_none());
+            assert!(!timeline.state.follow_playhead_suspended);
+            assert!(timeline.state.follow_playhead);
+            let expected = if commit { &preview } else { &before };
+            assert_eq!(&timeline.state.selection, expected, "commit={commit}");
+        }
+    }
+
+    /// A marquee that never saw its release (the next press arrives first) is
+    /// ended as a release would end it by the reset every gesture end runs.
+    #[test]
+    fn a_reset_ends_a_marquee_as_a_release_would() {
+        let (mut timeline, ids) = timeline_with_tracks(2);
+        let before = timeline.state.selection.clone();
+        let preview = before.after_marquee(
+            &MarqueeHits {
+                track_ids: ids.clone(),
+                clip_ids: Vec::new(),
+            },
+            &ids[0],
+            false,
+        );
+        timeline.range_select_drag = Some(marquee(&ids[0], before));
+        timeline.state.marquee_selection_preview = Some(preview.clone());
+        timeline.state.follow_playhead_suspended = true;
+
+        timeline.reset_input_state();
+
+        assert_eq!(timeline.state.selection, preview);
+        assert!(!timeline.state.follow_playhead_suspended);
+        assert!(timeline.end_marquee(true).is_none());
+    }
+
+    /// A command pressed while a marquee is out acts on what the arrangement
+    /// shows: the marquee ends first, and its preview becomes the selection.
+    /// A press that is not a drag yet commits only what it shows. An additive
+    /// lane press shows nothing, so the selection stays as it was, and the
+    /// click's release effects are dropped with the release.
+    #[test]
+    fn a_command_mid_marquee_acts_on_the_previewed_selection() {
+        let (mut timeline, ids) = timeline_with_tracks(3);
+        timeline.state.select_track(&ids[0]);
+        let before = timeline.state.selection.clone();
+        let preview = before.after_marquee(
+            &MarqueeHits {
+                track_ids: ids[1..].to_vec(),
+                clip_ids: Vec::new(),
+            },
+            &ids[1],
+            false,
+        );
+        timeline.range_select_drag = Some(marquee(&ids[0], before.clone()));
+        timeline.state.marquee_selection_preview = Some(preview.clone());
+        timeline.state.follow_playhead_suspended = true;
+
+        assert!(timeline.commit_marquee_for_command());
+
+        assert_eq!(timeline.state.selection, preview);
+        assert!(timeline.range_select_drag.is_none());
+        assert!(timeline.state.marquee_selection_preview.is_none());
+        assert!(!timeline.state.follow_playhead_suspended);
+        // Nothing in flight: the next command changes nothing.
+        assert!(!timeline.commit_marquee_for_command());
+        assert_eq!(timeline.state.selection, preview);
+
+        // An additive press on a lane, a double-click that has not moved.
+        let before = timeline.state.selection.clone();
+        let mut press = marquee(&ids[2], before.clone());
+        press.dragging = false;
+        press.additive = true;
+        press.create_clip_on_click = true;
+        timeline.range_select_drag = Some(press);
+        assert!(timeline.commit_marquee_for_command());
+        assert_eq!(timeline.state.selection, before);
+        assert!(timeline
+            .state
+            .tracks
+            .iter()
+            .all(|track| track.clips.is_empty()));
     }
 }

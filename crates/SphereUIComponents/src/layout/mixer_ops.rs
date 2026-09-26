@@ -68,6 +68,10 @@ pub(crate) struct MixerViewState {
     pub tree_cache_filter: String,
     pub tree_cache_output_ch: u32,
     pub tree_cache_tracks_gen: u64,
+    /// The timeline's `track_names_revision` the cached model was built at:
+    /// its nodes copy track names, and a rename never advances the routing
+    /// version.
+    pub tree_cache_names_rev: u64,
     pub tree_cache_show_only: bool,
     pub tree_cache_selected_id: Option<String>,
     /// One-shot fallback when session install did not seed tree defaults.
@@ -108,6 +112,7 @@ impl Default for MixerViewState {
             tree_cache_filter: String::new(),
             tree_cache_output_ch: 0,
             tree_cache_tracks_gen: 0,
+            tree_cache_names_rev: 0,
             tree_cache_show_only: false,
             tree_cache_selected_id: None,
             tree_defaults_applied: false,
@@ -448,6 +453,7 @@ impl StudioLayout {
         let output_channels = self.mixer_tree_output_channels(cx);
         let filter = self.mixer_tree_filter_input.value.clone();
         let tracks_gen = self.audio_bridge.route_graph_version;
+        let names_rev = self.timeline.read(cx).state.track_names_revision;
         let show_only = self.mixer_view.tree_show_only_selected_group;
         let selected_id = self
             .timeline
@@ -461,6 +467,7 @@ impl StudioLayout {
             || self.mixer_view.tree_cache_filter != filter
             || self.mixer_view.tree_cache_output_ch != output_channels
             || self.mixer_view.tree_cache_tracks_gen != tracks_gen
+            || self.mixer_view.tree_cache_names_rev != names_rev
             || self.mixer_view.tree_cache_show_only != show_only
             || (show_only && self.mixer_view.tree_cache_selected_id != selected_id);
 
@@ -480,6 +487,7 @@ impl StudioLayout {
             self.mixer_view.tree_cache_filter = filter;
             self.mixer_view.tree_cache_output_ch = output_channels;
             self.mixer_view.tree_cache_tracks_gen = tracks_gen;
+            self.mixer_view.tree_cache_names_rev = names_rev;
             self.mixer_view.tree_cache_show_only = show_only;
             self.mixer_view.tree_cache_selected_id = selected_id;
         }

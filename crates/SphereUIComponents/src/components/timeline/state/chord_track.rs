@@ -78,13 +78,15 @@ impl TimelineState {
         self.global_lane_height(GlobalLaneKind::Chord)
     }
 
-    pub fn show_chord_track_lane(&mut self) {
-        self.show_chord_track = true;
+    /// Returns whether the lane was hidden, i.e. whether the saved view changed.
+    pub fn show_chord_track_lane(&mut self) -> bool {
+        !std::mem::replace(&mut self.show_chord_track, true)
     }
 
-    pub fn hide_chord_track_lane(&mut self) {
-        self.show_chord_track = false;
+    /// Returns whether the lane was shown, i.e. whether the saved view changed.
+    pub fn hide_chord_track_lane(&mut self) -> bool {
         self.selected_chord_event_id = None;
+        std::mem::replace(&mut self.show_chord_track, false)
     }
 
     fn next_chord_event_id(&self) -> u64 {

@@ -125,10 +125,14 @@ impl StudioLayout {
         let _ = self.timeline.update(cx, |timeline, cx| {
             timeline.reset_input_state();
             timeline.state = snapshot.timeline_state;
+            timeline.end_track_rename_for_project_change(cx);
             cx.notify();
         });
         self.project_session = snapshot.session;
         self.project_state = snapshot.project_state;
+        // Its changes may have been discarded for the switch that failed;
+        // they are the live session again and must autosave.
+        self.resume_session_recovery();
         self.sync_project_session_to_workspace(cx);
         self.session_install_status = crate::app_state::SessionInstallStatus::Ready;
         self.mark_engine_media_dirty();
@@ -180,7 +184,10 @@ impl StudioLayout {
         session_log!("install with pre-studio handoff");
         self.project_state = crate::app_state::ProjectState::Loading;
 
-        self.adopt_session_install_handoff(handoff, cx);
+        // A project saved before v54 has no snap of its own and starts on the
+        // user's Settings defaults.
+        let snap_from_settings = package.project.view.snap.is_none();
+        self.adopt_session_install_handoff(handoff, snap_from_settings, cx);
 
         if !self.bind_loaded_project_session(&package, cx) {
             self.session_install_status = crate::app_state::SessionInstallStatus::Failed;
@@ -198,6 +205,7 @@ impl StudioLayout {
         // save wrote the project without its ARA state.
         self.restore_ara_archives(&package.project, cx);
 
+        self.restore_view_sidecar(&package.project.id, cx);
         self.validate_session_references(cx);
         self.update_virtual_keyboard_target_status(cx);
         self.schedule_loaded_project_waveforms(&package, cx);
@@ -251,16 +259,24 @@ impl StudioLayout {
         true
     }
 
+    /// Install the timeline, engine and plug-in host prepared on the loading
+    /// screen. The timeline arrives built from the project (or empty) and then
+    /// takes the user's per-user preferences from the live Settings; with
+    /// `snap_from_settings` also the snap defaults, for a project without a
+    /// snap of its own.
     pub(super) fn adopt_session_install_handoff(
         &mut self,
         handoff: SessionInstallHandoff,
+        snap_from_settings: bool,
         cx: &mut Context<Self>,
     ) {
         let _ = self.timeline.update(cx, |timeline, cx| {
             timeline.reset_input_state();
             timeline.state = handoff.timeline_state;
+            timeline.end_track_rename_for_project_change(cx);
             cx.notify();
         });
+        self.seed_session_preferences(snap_from_settings, cx);
 
         if let Some(runtime) = handoff.bridge_runtime {
             self.plugin_editors.bridge_runtime = Some(runtime);
@@ -273,6 +289,9 @@ impl StudioLayout {
         self.audio_bridge.engine = Some(handoff.engine);
         self.sync_plugin_bridge_sinks_to_engine(cx, "pre_studio_handoff");
         self.mark_engine_media_dirty();
+        // The engine was warmed with the timeline's factory metronome; the
+        // seeded preference has to reach it before anything plays.
+        self.sync_metronome_controls(cx);
 
         let output_channels = self.mixer_tree_output_channels(cx);
         self.timeline.update(cx, |timeline, _cx| {
@@ -306,10 +325,71 @@ impl StudioLayout {
         self.load_project_from_path_with_options(path, ProjectOpenOptions::default(), cx);
     }
 
+    /// Per-user preferences the timeline takes from the live Settings whenever
+    /// its state is built or replaced. See
+    /// [`crate::project::view::seed_session_preferences`].
+    pub(super) fn seed_session_preferences(
+        &mut self,
+        snap_from_settings: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = self.settings.clone();
+        let _ = self.timeline.update(cx, |timeline, cx| {
+            crate::project::view::seed_session_preferences(
+                &mut timeline.state,
+                &settings.read(cx).current,
+                snap_from_settings,
+            );
+            cx.notify();
+        });
+    }
+
+    /// Restore where this user left the project just installed (zoom, scroll,
+    /// playhead, selected track), if they have been in it before. Never marks
+    /// anything dirty: none of it is project content.
+    fn restore_view_sidecar(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let Some(sidecar) =
+            crate::project::view::read_view_sidecar(&self.paths.app_data, project_id)
+        else {
+            return;
+        };
+        session_log!("view sidecar restored for {project_id}");
+        let _ = self.timeline.update(cx, |timeline, cx| {
+            sidecar.apply(&mut timeline.state);
+            cx.notify();
+        });
+    }
+
+    /// Write where the user left this project to its per-user view sidecar.
+    /// Only for a project with a file: an untitled session has no identity to
+    /// be reopened by. Called when a session ends and after a save.
+    pub(super) fn write_view_sidecar(&self, cx: &gpui::App) {
+        if self.project_session.needs_save_as() {
+            return;
+        }
+        let sidecar = crate::project::view::ViewSidecar::capture(&self.timeline.read(cx).state);
+        if let Err(error) = crate::project::view::write_view_sidecar(
+            &self.paths.app_data,
+            &self.project_session.id,
+            &sidecar,
+        ) {
+            session_log!("view sidecar write failed: {error}");
+        }
+    }
+
+    /// Everything per user a session leaves behind when it ends (Close
+    /// Project, a switch, quit): the workspace layout and this project's view
+    /// sidecar. Small JSON writes on the UI thread, before any teardown.
+    pub(super) fn persist_per_user_session_view(&self, cx: &mut gpui::App) {
+        self.save_workspace_layout(cx);
+        self.write_view_sidecar(cx);
+    }
+
     /// Quiesce the live session for an in-window project switch. Does not close
     /// or unhook the root studio window.
     pub fn prepare_for_in_studio_project_switch(&mut self, cx: &mut Context<Self>) -> usize {
         session_log!("prepare for in-studio project switch");
+        self.persist_per_user_session_view(cx);
         let plugin_editors = self.plugin_editors.open.len() + self.plugin_editors.bridge.len();
         let midi_editor = usize::from(self.midi_editor.window.is_some());
 
@@ -406,9 +486,15 @@ impl StudioLayout {
                     } else {
                         load_project_strict(&path_for_job)
                     };
-                    project
-                        .map_err(LoadSwitchError::Project)
-                        .map(|project| (project, path_for_job))
+                    project.map_err(LoadSwitchError::Project).map(|project| {
+                        // The loading window's recovery offer, for this path too.
+                        let autosave = crate::project::io::newer_autosave_for(
+                            &path_for_job,
+                            &project.id,
+                            project.modified_at,
+                        );
+                        (project, path_for_job, autosave)
+                    })
                 })
                 .await;
 
@@ -421,39 +507,21 @@ impl StudioLayout {
                     return;
                 }
                 match decoded {
-                Ok((project, path)) => {
+                Ok((project, path, None)) => {
                     eprintln!("[ProjectSwitch] loaded target project");
-                    eprintln!("[ProjectSwitch] installing session");
-                    let failed_path = path.clone();
-                    let package = LoadedSessionPackage {
+                    this.install_switched_project(project, path, open_options, rollback, false, cx);
+                }
+                Ok((project, path, Some(autosave))) => {
+                    eprintln!("[ProjectSwitch] loaded target project");
+                    this.offer_switch_autosave_recovery(
                         project,
                         path,
+                        autosave,
                         open_options,
-                        install_handoff: None,
-                        restore_warnings: Vec::new(),
-                        recovered_from_autosave: false,
-                    };
-                    this.install_loaded_session(package, cx);
-                    if this.session_install_status.is_failed() {
-                        eprintln!("[ProjectSwitch] install failed — restoring rollback");
-                        this.restore_session_rollback_snapshot(rollback, cx);
-                        cx.update_global::<AppSessionGate, _>(|gate, _| {
-                            gate.mode = AppMode::Studio
-                        });
-                        let i18n = crate::i18n::I18n::from_app(cx);
-                        this.show_project_open_failed_dialog(
-                            "Open Project Failed",
-                            &i18n.tr("project.error.restore-session-failed"),
-                            Some(i18n.tr("project.error.restore-failed")),
-                            Some(failed_path),
-                            open_options,
-                            cx,
-                        );
-                    } else {
-                        eprintln!(
-                            "[ProjectSwitch] session install started — awaiting plugin restore"
-                        );
-                    }
+                        rollback,
+                        generation,
+                        cx,
+                    );
                 }
                 Err(LoadSwitchError::NotFound(path)) => {
                     eprintln!(
@@ -499,6 +567,170 @@ impl StudioLayout {
                         cx,
                     );
                 }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Install a project the in-studio switch decoded (or the autosave the
+    /// user chose to recover in its place), rolling back on failure.
+    fn install_switched_project(
+        &mut self,
+        project: crate::project::FutureboardProject,
+        path: PathBuf,
+        open_options: ProjectOpenOptions,
+        rollback: SessionRollbackSnapshot,
+        recovered_from_autosave: bool,
+        cx: &mut Context<Self>,
+    ) {
+        eprintln!("[ProjectSwitch] installing session");
+        let failed_path = path.clone();
+        let package = LoadedSessionPackage {
+            project,
+            path,
+            open_options,
+            install_handoff: None,
+            restore_warnings: Vec::new(),
+            recovered_from_autosave,
+        };
+        self.install_loaded_session(package, cx);
+        if self.session_install_status.is_failed() {
+            eprintln!("[ProjectSwitch] install failed — restoring rollback");
+            self.restore_session_rollback_snapshot(rollback, cx);
+            cx.update_global::<AppSessionGate, _>(|gate, _| gate.mode = AppMode::Studio);
+            let i18n = crate::i18n::I18n::from_app(cx);
+            self.show_project_open_failed_dialog(
+                "Open Project Failed",
+                &i18n.tr("project.error.restore-session-failed"),
+                Some(i18n.tr("project.error.restore-failed")),
+                Some(failed_path),
+                open_options,
+                cx,
+            );
+        } else {
+            eprintln!("[ProjectSwitch] session install started — awaiting plugin restore");
+        }
+    }
+
+    /// The switch target has a newer autosave: ask, as the loading window
+    /// does, then install the saved project or the recovered autosave. A
+    /// switch superseded while the question was open installs nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn offer_switch_autosave_recovery(
+        &mut self,
+        saved: crate::project::FutureboardProject,
+        path: PathBuf,
+        autosave: PathBuf,
+        open_options: ProjectOpenOptions,
+        rollback: SessionRollbackSnapshot,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        // Taken once, by the answer or by the fallback below.
+        let pending = Arc::new(std::sync::Mutex::new(Some((saved, rollback))));
+        let take_pending = {
+            let pending = pending.clone();
+            move || {
+                pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+            }
+        };
+        let entity = cx.entity().clone();
+        let on_answer: Arc<dyn Fn(bool, &mut gpui::App) + Send + Sync> = {
+            let take_pending = take_pending.clone();
+            let path = path.clone();
+            let autosave = autosave.clone();
+            Arc::new(move |recover, cx| {
+                let Some((saved, rollback)) = take_pending() else {
+                    return;
+                };
+                let path = path.clone();
+                let autosave = autosave.clone();
+                let _ = entity.update(cx, move |this, cx| {
+                    if this.session_generation() != generation {
+                        eprintln!(
+                            "[ProjectSwitch] recovery answer for a superseded switch ignored"
+                        );
+                        return;
+                    }
+                    if !recover {
+                        this.install_switched_project(
+                            saved,
+                            path,
+                            open_options,
+                            rollback,
+                            false,
+                            cx,
+                        );
+                        return;
+                    }
+                    this.recover_switch_autosave(
+                        saved,
+                        path,
+                        autosave,
+                        open_options,
+                        rollback,
+                        generation,
+                        cx,
+                    );
+                });
+            })
+        };
+        if let Err(error) =
+            crate::loading_session::ask_to_recover_titled_autosave(autosave, on_answer, cx)
+        {
+            eprintln!("[ProjectSwitch] recovery prompt unavailable: {error} — opening saved");
+            if let Some((saved, rollback)) = take_pending() {
+                self.install_switched_project(saved, path, open_options, rollback, false, cx);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recover_switch_autosave(
+        &mut self,
+        saved: crate::project::FutureboardProject,
+        path: PathBuf,
+        autosave: PathBuf,
+        open_options: ProjectOpenOptions,
+        rollback: SessionRollbackSnapshot,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let entity = cx.entity().clone();
+        cx.spawn(async move |_this, cx| {
+            let decode_path = autosave.clone();
+            let decoded = cx
+                .background_executor()
+                .spawn(async move { load_project(&decode_path, true) })
+                .await;
+            let _ = entity.update(cx, move |this, cx| {
+                if this.session_generation() != generation {
+                    return;
+                }
+                let recovered = crate::loading_session::accept_recovered_autosave(
+                    decoded, &saved.id, &autosave,
+                );
+                match recovered {
+                    Some(recovered) => this.install_switched_project(
+                        recovered,
+                        path,
+                        open_options,
+                        rollback,
+                        true,
+                        cx,
+                    ),
+                    None => this.install_switched_project(
+                        saved,
+                        path,
+                        open_options,
+                        rollback,
+                        false,
+                        cx,
+                    ),
                 }
             });
         })
@@ -642,6 +874,7 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) -> (SessionRollbackSnapshot, Option<gpui::Bounds<gpui::Pixels>>) {
         session_log!("prepare for in-studio project switch transaction");
+        self.persist_per_user_session_view(cx);
         eprintln!("[ProjectSwitch] close project switcher popover");
         self.menu_bar.open_menu_id = None;
         self.menu_bar.submenu_path.clear();
@@ -759,6 +992,7 @@ impl StudioLayout {
         SessionShutdownSnapshot,
     ) {
         session_log!("prepare for app-level project reload");
+        self.persist_per_user_session_view(cx);
         self.prepare_immediate_session_shutdown(cx);
         let rollback = self.capture_session_rollback_snapshot(cx);
         let shutdown =
@@ -858,9 +1092,13 @@ impl StudioLayout {
         let (restored_tracks, load_warnings) = self.timeline.update(cx, |timeline, cx| {
             timeline.reset_input_state();
             let warnings = apply_to_timeline(project, &mut timeline.state);
+            timeline.end_track_rename_for_project_change(cx);
             cx.notify();
             (persisted_track_count(&timeline.state.tracks), warnings)
         });
+        // Per-user preferences from Settings, and the snap defaults for a
+        // project saved before v54. The metronome reaches the engine on Play.
+        self.seed_session_preferences(project.view.snap.is_none(), cx);
         // Reopen the ARA sessions this project's clips are bound to, and hand
         // each plug-in its saved document. Runs after the timeline is populated
         // so the graph the plug-in sees matches the restored arrangement.
@@ -889,6 +1127,7 @@ impl StudioLayout {
         }
 
         self.bind_session_to_loaded_project(package);
+        self.restore_view_sidecar(&project.id, cx);
         // Compile the loaded project's routing — including Master/Monitor
         // hardware ownership — before anything can play.
         self.publish_audio_connection_routing(cx);
@@ -906,10 +1145,13 @@ impl StudioLayout {
     }
 
     /// Bind `project_session` to a freshly loaded package, and remember its
-    /// asset records for the next save.
+    /// asset records for the next save. Every project install passes here
+    /// (the app's in-studio switch too, which keeps the session generation),
+    /// so this is where the replaced session's leftovers are dropped.
     fn bind_session_to_loaded_project(&mut self, package: &LoadedSessionPackage) {
         let project = &package.project;
         let path = &package.path;
+        self.forget_replaced_session_state();
         if crate::project::is_import_path(path) {
             // A project imported from another DAW's file has no Futureboard
             // file to save back into: bind it untitled and dirty so the first
@@ -950,7 +1192,7 @@ impl StudioLayout {
                 package.recovered_from_autosave
             );
         }
-        self.remember_loaded_assets(project.assets.clone());
+        self.remember_loaded_assets(path.parent().map(PathBuf::from), project.assets.clone());
     }
 
     fn push_loaded_project_to_recents(&mut self, package: &LoadedSessionPackage) {
@@ -1037,13 +1279,15 @@ impl StudioLayout {
     ) {
         session_log!("install prepared workspace");
         if let Some(handoff) = package.install_handoff.take() {
-            self.adopt_session_install_handoff(handoff, cx);
+            // Every prepared workspace is a new project: snap from Settings.
+            self.adopt_session_install_handoff(handoff, true, cx);
         } else {
             session_log!("prepared workspace missing install handoff — falling back");
         }
         self.session_install_status = SessionInstallStatus::Ready;
         match finish {
             PreparedWorkspaceFinish::EmptyUntitled => {
+                self.forget_replaced_session_state();
                 self.project_session
                     .bind_untitled("Untitled Project", false);
                 self.project_state = ProjectState::UnsavedWorkspace;

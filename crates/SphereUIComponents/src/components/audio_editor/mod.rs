@@ -48,8 +48,8 @@ use crate::audio_edit::{self, apply_edit, clipboard, EditOp, NewSource, Pcm};
 use crate::components::controls::{fb_segment, fb_segmented_track, fb_tooltip, FbSegment};
 use crate::components::timeline::timeline::Timeline;
 use crate::components::timeline::timeline_state::{
-    beats_per_bar_from_sig, AudioClipStretchState, AudioImportState, ClipEdge, ClipState, ClipType,
-    StretchMode, TimeSignatureMap, TimelineState, TrackState, WarpMarker,
+    beats_per_bar_from_sig, clamp_fade_seconds, AudioClipStretchState, AudioImportState, ClipEdge,
+    ClipState, ClipType, StretchMode, TimeSignatureMap, TimelineState, TrackState, WarpMarker,
 };
 use crate::components::timeline::waveform_cache;
 use crate::theme::{radius, size, space, typography, Colors};
@@ -175,6 +175,10 @@ struct ClipView {
     reverse: bool,
     fade_in_end: f64,
     fade_out_start: f64,
+    /// The edge plays a crossfade (or the track is ARA-rendered), so its
+    /// manual fade handle is not offered.
+    fade_in_locked: bool,
+    fade_out_locked: bool,
     envelope: ClipEnvelope,
     warp: Vec<(u64, f64, bool)>,
     import_label: Option<String>,
@@ -463,14 +467,16 @@ impl AudioEditorHost {
         let map = ClipMap::build(clip, total_frames, bpm, |beat| state.seconds_at_beat(beat));
         let abs_start = clip.start_beat.max(0.0) as f64;
         let duration = clip.duration_beats.max(0.0) as f64;
-        let start_seconds = state.seconds_at_beat(abs_start);
-        let end_seconds = state.seconds_at_beat(abs_start + duration);
-        let fade_in_end = (state
-            .beat_at_seconds(start_seconds + clip.stretch.fade_in_ms.max(0.0) as f64 / 1000.0)
-            - abs_start)
+        // The fades the clip plays — a crossfade's on an overlapped edge —
+        // through the arrangement's resolver and clip-time transform, so the
+        // editor, the arrangement and the engine agree.
+        let crossfades = state.audio_crossfades(track);
+        let fades = state.effective_clip_fades(clip, &crossfades);
+        let ara = track.ara.is_some();
+        let fade_in_end = (state.clip_beat_at_local_seconds(clip, fades.in_seconds) - abs_start)
             .clamp(0.0, duration);
         let fade_out_start = (state
-            .beat_at_seconds(end_seconds - clip.stretch.fade_out_ms.max(0.0) as f64 / 1000.0)
+            .clip_beat_at_local_seconds(clip, (fades.played_seconds - fades.out_seconds).max(0.0))
             - abs_start)
             .clamp(0.0, duration);
         let import_label = match &clip.audio_import {
@@ -504,6 +510,8 @@ impl AudioEditorHost {
             reverse: clip.stretch.reverse,
             fade_in_end,
             fade_out_start,
+            fade_in_locked: fades.in_crossfade || ara,
+            fade_out_locked: fades.out_crossfade || ara,
             envelope: clip.stretch.gain_envelope.clone(),
             warp: clip
                 .stretch
@@ -706,9 +714,9 @@ impl AudioEditorHost {
                             left: false,
                             anchor: view.abs_start + self.view.scroll,
                         })
-                    } else if (x - fade_in_x).abs() <= FADE_HANDLE {
+                    } else if (x - fade_in_x).abs() <= FADE_HANDLE && !view.fade_in_locked {
                         Some(Drag::Fade { out: false })
-                    } else if (x - fade_out_x).abs() <= FADE_HANDLE {
+                    } else if (x - fade_out_x).abs() <= FADE_HANDLE && !view.fade_out_locked {
                         Some(Drag::Fade { out: true })
                     } else {
                         None
@@ -901,17 +909,22 @@ impl AudioEditorHost {
             }
             Drag::Fade { out } => {
                 let rel = self.beat_under(&view, x, bypass, cx);
-                let (start_s, end_s, at_s) = {
+                // The arrangement's clamp: the two fades never overlap, the
+                // other edge counted as it plays (a crossfade included).
+                let ms = {
                     let state = &self.timeline.read(cx).state;
-                    (
-                        state.seconds_at_beat(view.abs_start),
-                        state.seconds_at_beat(view.abs_start + view.duration),
-                        state.seconds_at_beat(view.abs_start + rel),
-                    )
+                    let Some((track, clip)) = state.find_clip(&view.id) else {
+                        return;
+                    };
+                    let fades = state.effective_clip_fades(clip, &state.audio_crossfades(track));
+                    let local = state.clip_local_seconds_at_beat(clip, view.abs_start + rel);
+                    let (requested, other) = if out {
+                        (fades.played_seconds - local, fades.in_seconds)
+                    } else {
+                        (local, fades.out_seconds)
+                    };
+                    clamp_fade_seconds(requested, other, fades.played_seconds) * 1000.0
                 };
-                let length = (end_s - start_s).max(0.0);
-                let ms =
-                    if out { end_s - at_s } else { at_s - start_s }.clamp(0.0, length) * 1000.0;
                 self.edit_stretch(&view.id, cx, |s| {
                     if out {
                         s.fade_out_ms = ms as f32;
@@ -1874,6 +1887,7 @@ impl AudioEditorHost {
             cursor: (self.selection.is_none() || self.drag != Drag::None).then_some(self.cursor),
             fade_in_end: view.fade_in_end,
             fade_out_start: view.fade_out_start,
+            fade_handles: [!view.fade_in_locked, !view.fade_out_locked],
             envelope,
             warp: view.warp.clone(),
             warp_emphasized: self.mode == EditMode::Warp,

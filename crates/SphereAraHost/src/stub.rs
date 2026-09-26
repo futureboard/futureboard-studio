@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use crate::AraSessionConfig;
 use crate::error::{AraHostError, AraResult};
 use crate::info::{AraFactoryInfo, AraRendererId, AraRoles};
-use crate::model::{AraClipKey, AraGraph, AraMusicalTimeline, AraTrackKey};
+use crate::model::{AraClipKey, AraGraph, AraGraphChange, AraMusicalTimeline, AraTrackKey};
 
 fn unsupported<T>() -> AraResult<T> {
     Err(AraHostError::unsupported(
@@ -64,6 +64,14 @@ impl Session {
     }
 
     pub(crate) fn apply_graph(&mut self, _graph: &AraGraph) -> AraResult<()> {
+        unsupported()
+    }
+
+    pub(crate) fn graph_change(&self, _graph: &AraGraph) -> AraGraphChange {
+        AraGraphChange::Structure
+    }
+
+    pub(crate) fn notify_model_updates(&mut self) -> AraResult<()> {
         unsupported()
     }
 

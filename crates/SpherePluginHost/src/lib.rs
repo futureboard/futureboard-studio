@@ -54,6 +54,9 @@ pub mod registry;
 pub mod scan;
 mod scanner;
 pub mod spectrum;
+/// Which hosted plug-ins may have changed their own state, and when the host
+/// reports it to the studio (`HostEvent::PluginStateTouched`).
+pub mod state_touch;
 mod types;
 
 pub use builtin::{

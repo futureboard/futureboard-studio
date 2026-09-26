@@ -5,6 +5,7 @@ pub mod recent;
 pub mod routing_migration;
 pub mod session;
 pub mod template;
+pub mod view;
 
 pub use format::{
     PROJECT_MAGIC, PROJECT_VERSION, ProjectError, decode_project, decode_project_with_options,
@@ -305,11 +306,15 @@ pub struct ProjectPluginInstance {
     pub state: PluginStateBlob,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProjectInsert {
     pub id: String,
     pub slot_index: u32,
     pub bypassed: bool,
+    /// v54+: the insert's Active switch (Inspector power button, editor chrome).
+    /// The engine plays `enabled && !bypassed`. Pre-v54 files load `true`,
+    /// which is what every insert came back as before the field existed.
+    pub enabled: bool,
     pub enabled_audio_output_channels: Vec<u8>,
     /// Registry-resolved plug-in role. `None` identifies a pre-v36 insert whose
     /// role must use the legacy track/slot fallback during snapshot construction.
@@ -318,6 +323,21 @@ pub struct ProjectInsert {
     /// multi-out group. Visual state only — never affects routing.
     pub multiout_collapsed: bool,
     pub plugin: Option<ProjectPluginInstance>,
+}
+
+impl Default for ProjectInsert {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            slot_index: 0,
+            bypassed: false,
+            enabled: true,
+            enabled_audio_output_channels: Vec::new(),
+            plugin_is_instrument: None,
+            multiout_collapsed: false,
+            plugin: None,
+        }
+    }
 }
 
 // ── Track routing ─────────────────────────────────────────────────────────────
@@ -453,7 +473,7 @@ pub struct AutomationPoint {
 /// Flattened automation target descriptor for persistence. `tag` matches
 /// `AutomationTarget::to_tag`; the descriptor strings are only meaningful for
 /// the plugin/send variants and are empty otherwise.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AutomationTargetDesc {
     pub tag: u8,
     pub insert_id: String,
@@ -671,8 +691,8 @@ impl Default for ProjectMixer {
 ///
 /// Song Text has a draggable height but no collapse latch (its header offers no
 /// collapse button), so it appears in the heights and not in the flags. Lane
-/// *visibility* is deliberately not here: hiding a lane is a menu command, not
-/// a fold, and it is not what this block promises to restore.
+/// *visibility* is not here: hiding a lane is a menu command, not a fold, and
+/// it is saved with the rest of the view in [`view::ProjectViewState`] (v54).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectGlobalLanes {
     pub arranger_collapsed: bool,
@@ -902,6 +922,10 @@ pub struct FutureboardProject {
     pub global_lanes: ProjectGlobalLanes,
     /// v41+: one saved ARA document per bound plug-in.
     pub ara_documents: Vec<ProjectAraDocument>,
+    /// v54+: loop, snap, lane visibility, automation expansion and the mixer
+    /// tree latch. Zoom, scroll and the playhead are per user and live in a
+    /// [`view::ViewSidecar`] instead.
+    pub view: view::ProjectViewState,
 }
 
 /// One ARA plug-in's saved document state, for one track.
@@ -971,6 +995,7 @@ impl FutureboardProject {
             assets: Vec::new(),
             global_lanes: ProjectGlobalLanes::default(),
             ara_documents: Vec::new(),
+            view: view::ProjectViewState::default(),
         }
     }
 }
@@ -1034,6 +1059,7 @@ fn timeline_insert_to_project(idx: usize, slot: &InsertSlotState) -> ProjectInse
         id: slot.id.clone(),
         slot_index: idx as u32,
         bypassed: slot.bypassed,
+        enabled: slot.enabled,
         enabled_audio_output_channels: slot.enabled_audio_output_channels.clone(),
         plugin_is_instrument: slot.plugin_is_instrument,
         multiout_collapsed: slot.multiout_collapsed,
@@ -1107,7 +1133,7 @@ fn project_insert_to_timeline(pi: &ProjectInsert) -> InsertSlotState {
                     .clone()
                     .filter(|vendor| !vendor.trim().is_empty()),
                 display_name: plugin.display_name.clone(),
-                enabled: true,
+                enabled: pi.enabled,
                 bypassed: pi.bypassed,
                 load_status,
                 runtime_backend,
@@ -1600,6 +1626,7 @@ impl From<&TimelineState> for FutureboardProject {
             time_signature_height: tl.global_lane_heights.time_signature,
             song_text_height: tl.global_lane_heights.song_text,
         };
+        project.view = view::ProjectViewState::capture(tl);
         project
     }
 }
@@ -1706,10 +1733,8 @@ pub fn apply_to_timeline(
         ))
     });
     // The Chord Track height is restored with the other lane heights below,
-    // which replace `global_lane_heights` as a whole.
-    // Lane visibility is view state and not saved, but a project that has
-    // chords opens with them on screen — hidden harmony reads as lost work.
-    tl.show_chord_track = !tl.chord_events.is_empty();
+    // which replace `global_lane_heights` as a whole. Its visibility is
+    // restored with the rest of the view once the tracks are in place.
     tl.regions = project
         .settings
         .timeline_regions
@@ -2300,6 +2325,11 @@ pub fn apply_to_timeline(
         );
         tl.track_view_layout.set_height(pt.id.clone(), clamped);
     }
+
+    // Loop, snap, lane visibility, automation expansion and the mixer tree
+    // latch. After the tracks (expansion names them) and after the chords and
+    // song text (a pre-v54 file shows those lanes only when they have content).
+    project.view.apply(tl);
 
     // Install the Audio Connections generated while converting v33 routing,
     // then validate them against the current hardware. A device that is not
@@ -4607,14 +4637,7 @@ mod save_fidelity_tests {
             4.0,
             None,
         );
-        state.update_audio_clip_metadata(
-            &source.to_string_lossy(),
-            "wav",
-            48_000,
-            2,
-            96_000,
-            2.0,
-        );
+        state.update_audio_clip_metadata(&source.to_string_lossy(), "wav", 48_000, 2, 96_000, 2.0);
         let live_key = state
             .find_clip(&clip_id)
             .and_then(|(_, clip)| clip.audio_asset_key().map(str::to_string))

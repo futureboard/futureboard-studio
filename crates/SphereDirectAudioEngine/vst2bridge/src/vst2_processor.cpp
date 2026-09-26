@@ -266,11 +266,22 @@ intptr_t vst2_audio_master(AEffect *effect, int32_t opcode, int32_t index,
   case audioMasterAutomate:
     // The plug-in's own GUI moved a parameter. VST2 applies the value to the
     // instance itself, so there is nothing to forward to a separate processor
-    // (unlike VST3's split component/controller). Realtime-safe no-op.
+    // (unlike VST3's split component/controller). Only noted, so the host can
+    // tell the studio the saved state may be stale: one atomic store,
+    // realtime-safe.
+    if (p)
+      p->state_touched.store(true, std::memory_order_release);
     return 0;
 
-  case audioMasterBeginEdit:
   case audioMasterEndEdit:
+    if (p)
+      p->state_touched.store(true, std::memory_order_release);
+    return 1;
+
+  // `audioMasterUpdateDisplay` is deliberately not counted: plug-ins send it
+  // for meters and labels as well, and it would leave the project permanently
+  // unsaved.
+  case audioMasterBeginEdit:
   case audioMasterUpdateDisplay:
   case audioMasterIdle:
     return 1;
@@ -1190,6 +1201,12 @@ int sphere_daux_vst2_embed_take_user_close(SphereDauxVst2Processor *p) {
     return 0;
   return p->embed_user_closed.exchange(false, std::memory_order_acq_rel) ? 1
                                                                         : 0;
+}
+
+int sphere_daux_vst2_take_state_touched(SphereDauxVst2Processor *p) {
+  if (!p)
+    return 0;
+  return p->state_touched.exchange(false, std::memory_order_acq_rel) ? 1 : 0;
 }
 
 int sphere_daux_vst2_take_pending_shell_resize(SphereDauxVst2Processor *p,

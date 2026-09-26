@@ -439,6 +439,16 @@ pub struct InsertMove {
     /// The source track's automation focus, when it was on one of the moved
     /// insert's parameters. Cleared by the move, restored by its undo.
     pub cleared_selected_target: Option<AutomationTarget>,
+    /// Plug-in parameter lanes the insert gained on its track while it was
+    /// there, set aside because the step taking it onto the master (undo of a
+    /// move off the master, or redo of a move onto it) cannot bring them: the
+    /// master keeps no lanes. Each with its place in that track's lane list,
+    /// ascending. Recorded by [`TimelineState::record_lanes_left_by_master_step`]
+    /// right before that step, put back by the opposite step. Empty for moves
+    /// between tracks, whose lanes travel with the insert.
+    pub set_aside_lanes: Vec<(usize, AutomationLaneState)>,
+    /// That track's automation focus, when it was on one of those lanes.
+    pub set_aside_selected_target: Option<AutomationTarget>,
 }
 
 fn target_is_insert_param(target: &AutomationTarget, insert_id: &str) -> bool {
@@ -964,6 +974,8 @@ impl TimelineState {
             placeholder_id: placeholder.then(|| self.next_insert_slot_id_for(to_track)),
             lane_positions,
             cleared_selected_target,
+            set_aside_lanes: Vec::new(),
+            set_aside_selected_target: None,
         })
     }
 
@@ -975,8 +987,19 @@ impl TimelineState {
     /// automation lanes move with it. Removal and insertion happen in this one
     /// call, so the id is never on two channels at once. Returns `false`, and
     /// changes nothing, when either side no longer matches the plan.
+    ///
+    /// On redo of a move off the master, the lanes its undo set aside go back
+    /// to the destination; on redo of a move onto the master, the lanes
+    /// recorded right before are set aside (see
+    /// [`Self::record_lanes_left_by_master_step`]).
     pub fn apply_insert_move(&mut self, plan: &InsertMove) -> bool {
-        self.transfer_insert(
+        if !self.can_transfer_insert(&plan.insert_id, &plan.from_track, &plan.to_track) {
+            return false;
+        }
+        if plan.to_track == MASTER_TRACK_ID {
+            self.set_aside_insert_lanes(&plan.from_track, &plan.insert_id, &plan.set_aside_lanes);
+        }
+        let moved = self.transfer_insert(
             &plan.insert_id,
             &plan.from_track,
             &plan.to_track,
@@ -984,15 +1007,31 @@ impl TimelineState {
             plan.placeholder_id.as_deref(),
             None,
             &[],
-        )
+        );
+        if moved && plan.from_track == MASTER_TRACK_ID {
+            self.restore_set_aside_lanes(&plan.to_track, plan);
+        }
+        moved
     }
 
     /// Exact inverse of [`Self::apply_insert_move`]: the insert goes back to
     /// `from_index`, its lanes back to their old places in the source lane
     /// list, the source's cleared automation focus is restored, and the
-    /// placeholder slot 0 is dropped again — unless something was loaded into
-    /// it since, in which case it is no longer a placeholder and stays.
+    /// placeholder slot 0 is dropped again when it is all that is left of the
+    /// chain — still empty, nothing loaded into it or queued behind it since.
+    /// Otherwise it stays, so no effect ever moves up into the instrument's
+    /// slot.
+    ///
+    /// Back onto the master, the lanes recorded right before are set aside
+    /// (see [`Self::record_lanes_left_by_master_step`]); back off it, the
+    /// lanes a redo set aside return to the source.
     pub fn revert_insert_move(&mut self, plan: &InsertMove) -> bool {
+        if !self.can_transfer_insert(&plan.insert_id, &plan.to_track, &plan.from_track) {
+            return false;
+        }
+        if plan.from_track == MASTER_TRACK_ID {
+            self.set_aside_insert_lanes(&plan.to_track, &plan.insert_id, &plan.set_aside_lanes);
+        }
         let moved = self.transfer_insert(
             &plan.insert_id,
             &plan.to_track,
@@ -1010,15 +1049,109 @@ impl TimelineState {
                 track.selected_automation_target = Some(target);
             }
         }
+        if plan.to_track == MASTER_TRACK_ID {
+            self.restore_set_aside_lanes(&plan.from_track, plan);
+        }
         true
+    }
+
+    /// Record, right before the step of `plan` that takes the insert onto the
+    /// master — undo (`undoing`) of a move off it, or redo of a move onto it —
+    /// the insert's plug-in parameter lanes on the track it leaves, with their
+    /// places and that track's focus on one of them. They appeared after the
+    /// move was planned (a lane the user added while the insert sat on that
+    /// track), and the master keeps no lanes, so the step sets them aside in
+    /// the plan and the opposite step puts them back exactly. Any other step
+    /// keeps what is recorded: it is the step that puts them back.
+    pub fn record_lanes_left_by_master_step(&self, plan: &mut InsertMove, undoing: bool) {
+        let (leaving, onto) = if undoing {
+            (&plan.to_track, &plan.from_track)
+        } else {
+            (&plan.from_track, &plan.to_track)
+        };
+        if onto != MASTER_TRACK_ID {
+            return;
+        }
+        let (lanes, focus) = match self.find_track(leaving) {
+            Some(track) => (
+                track
+                    .automation_lanes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, lane)| is_insert_parameter_lane(lane, &plan.insert_id))
+                    .map(|(position, lane)| (position, lane.clone()))
+                    .collect(),
+                track
+                    .selected_automation_target
+                    .clone()
+                    .filter(|target| target_is_insert_param(target, &plan.insert_id)),
+            ),
+            None => (Vec::new(), None),
+        };
+        plan.set_aside_lanes = lanes;
+        plan.set_aside_selected_target = focus;
+    }
+
+    /// Whether [`Self::transfer_insert`] would find both sides of a move.
+    fn can_transfer_insert(&self, insert_id: &str, from_track: &str, to_track: &str) -> bool {
+        from_track != to_track
+            && self.find_insert_slot(from_track, insert_id).is_some()
+            && self.insert_slots(to_track).is_some()
+    }
+
+    /// Take `lanes` off `track_id` — only when they are exactly `insert_id`'s
+    /// lanes there, each still where it was recorded, so nothing else is ever
+    /// removed and the transfer that follows cannot refuse. Otherwise nothing
+    /// is taken, and the transfer to the master refuses rather than lose a
+    /// lane.
+    fn set_aside_insert_lanes(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        lanes: &[(usize, AutomationLaneState)],
+    ) {
+        let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        let insert_lanes = track
+            .automation_lanes
+            .iter()
+            .filter(|lane| is_insert_parameter_lane(lane, insert_id))
+            .count();
+        let recorded = insert_lanes == lanes.len()
+            && lanes
+                .iter()
+                .all(|(position, lane)| track.automation_lanes.get(*position) == Some(lane));
+        if !recorded {
+            return;
+        }
+        for (position, _) in lanes.iter().rev() {
+            track.automation_lanes.remove(*position);
+        }
+    }
+
+    /// Put the lanes a step onto the master set aside back on `track_id`, at
+    /// their recorded places, with the focus it had on one of them.
+    fn restore_set_aside_lanes(&mut self, track_id: &str, plan: &InsertMove) {
+        let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        for (position, lane) in &plan.set_aside_lanes {
+            let at = (*position).min(track.automation_lanes.len());
+            track.automation_lanes.insert(at, lane.clone());
+        }
+        if let Some(target) = plan.set_aside_selected_target.clone() {
+            track.selected_automation_target = Some(target);
+        }
     }
 
     /// Move `insert_id` from one channel to another at `to_index`. Validates
     /// both sides before touching anything. `create_placeholder` makes an empty
     /// slot 0 with that id first when the destination chain is empty;
-    /// `drop_placeholder` removes that slot from the source if it is still
-    /// empty. Lanes land at `lane_positions` (ascending) when given, else at the
-    /// end of the destination's lane list.
+    /// `drop_placeholder` removes that slot from the source when, once the
+    /// insert has left, it is the only slot there, still empty and not the
+    /// track's recorded instrument. Lanes land at `lane_positions` (ascending)
+    /// when given, else at the end of the destination's lane list.
     #[allow(clippy::too_many_arguments)]
     fn transfer_insert(
         &mut self,
@@ -1047,6 +1180,12 @@ impl TimelineState {
         {
             return false;
         }
+        // A placeholder the track names as its instrument is not unused.
+        let placeholder_is_instrument = drop_placeholder.is_some_and(|placeholder| {
+            self.find_track(from_track).is_some_and(|track| {
+                track.instrument_plugin_instance_id.as_deref() == Some(placeholder)
+            })
+        });
         let Some(slots) = self.insert_slots_mut(from_track) else {
             return false;
         };
@@ -1055,11 +1194,14 @@ impl TimelineState {
         };
         let slot = slots.remove(position);
         if let Some(placeholder) = drop_placeholder {
-            if slots
-                .first()
-                .is_some_and(|s| s.id == placeholder && s.is_empty())
-            {
-                slots.remove(0);
+            // Only when it is all that is left: with anything behind it, the
+            // next slot would move up into the instrument's place.
+            let unused = matches!(
+                slots.as_slice(),
+                [only] if only.id == placeholder && only.is_empty()
+            );
+            if unused && !placeholder_is_instrument {
+                slots.clear();
             }
         }
         let mut lanes = Vec::new();
@@ -2171,6 +2313,226 @@ mod insert_move_tests {
         assert_eq!(state.insert_order(&inst), vec![placeholder, fx2.clone()]);
         assert_eq!(state.insert_order(&a), vec![fx1, fx3]);
         assert!(!history.redo(&mut state), "one drop is one entry");
+    }
+
+    /// Loading a plug-in is no edit command, so an effect can go in behind a
+    /// moved one without a history entry. Undoing the move then keeps the
+    /// placeholder: without it, that effect would become slot 0 — the
+    /// instrument — of the Instrument track.
+    #[test]
+    fn undoing_a_move_keeps_the_placeholder_while_another_effect_follows_it() {
+        let mut state = empty_state();
+        let a = track(&mut state, TrackType::Audio, "A");
+        let keys = track(&mut state, TrackType::Instrument, "Keys");
+        let comp = load(&mut state, &a, 0, "comp", false);
+
+        let plan = state
+            .plan_insert_move(&a, &comp, &keys, 0)
+            .expect("movable");
+        let placeholder = plan.placeholder_id.clone().expect("empty instrument track");
+        let mut history = EditHistory::new(16);
+        let cmd = EditCommand::MoveInsertSlot { plan };
+        cmd.execute(&mut state);
+        history.push(cmd);
+        // "+ Insert" on Keys: the picker loads at the end of the chain.
+        let eq = load(&mut state, &keys, 2, "eq", false);
+        assert_eq!(
+            state.insert_order(&keys),
+            vec![placeholder.clone(), comp.clone(), eq.clone()]
+        );
+
+        let instrument_is_the_placeholder = |state: &TimelineState| {
+            let slot = state
+                .find_track(&keys)
+                .and_then(TrackState::instrument_insert)
+                .expect("slot 0");
+            slot.id == placeholder && slot.is_empty()
+        };
+        assert!(history.undo(&mut state));
+        assert_eq!(state.insert_order(&a), vec![comp.clone()]);
+        assert_eq!(
+            state.insert_order(&keys),
+            vec![placeholder.clone(), eq.clone()]
+        );
+        assert!(instrument_is_the_placeholder(&state));
+        assert_eq!(state.fx_chain_floor(&keys), 1);
+
+        // Redo and undo stay exact from there.
+        assert!(history.redo(&mut state));
+        assert_eq!(
+            state.insert_order(&keys),
+            vec![placeholder.clone(), comp.clone(), eq.clone()]
+        );
+        assert!(state.insert_order(&a).is_empty());
+        assert!(history.undo(&mut state));
+        assert_eq!(state.insert_order(&keys), vec![placeholder.clone(), eq]);
+        assert_eq!(state.insert_order(&a), vec![comp]);
+        assert!(instrument_is_the_placeholder(&state));
+    }
+
+    /// A placeholder something was loaded into, or that the track names as
+    /// its instrument, is no longer unused: undo leaves it.
+    #[test]
+    fn undoing_a_move_keeps_a_placeholder_that_became_the_instrument() {
+        for named in [false, true] {
+            let mut state = empty_state();
+            let a = track(&mut state, TrackType::Audio, "A");
+            let keys = track(&mut state, TrackType::Instrument, "Keys");
+            let comp = load(&mut state, &a, 0, "comp", false);
+            let plan = state
+                .plan_insert_move(&a, &comp, &keys, 0)
+                .expect("movable");
+            let placeholder = plan.placeholder_id.clone().expect("placeholder");
+            let mut history = EditHistory::new(16);
+            let cmd = EditCommand::MoveInsertSlot { plan };
+            cmd.execute(&mut state);
+            history.push(cmd);
+            if named {
+                track_mut(&mut state, &keys).instrument_plugin_instance_id =
+                    Some(placeholder.clone());
+            } else {
+                load(&mut state, &keys, 0, "synth", true);
+            }
+
+            assert!(history.undo(&mut state));
+            assert_eq!(
+                state.insert_order(&keys),
+                vec![placeholder],
+                "named={named}"
+            );
+            assert_eq!(state.insert_order(&a), vec![comp]);
+        }
+    }
+
+    /// A plug-in moved off the master can gain parameter lanes on its new
+    /// track (choosing one of its parameters as the automation target is no
+    /// edit command). Undo takes it back to the master, which keeps no lanes:
+    /// the command sets them aside, and redo puts them back exactly.
+    #[test]
+    fn undoing_a_move_off_the_master_sets_lanes_gained_since_aside_for_redo() {
+        let mut state = empty_state();
+        let b = track(&mut state, TrackType::Audio, "B");
+        let x = load(&mut state, MASTER_TRACK_ID, 0, "x", false);
+        let other = load(&mut state, &b, 0, "other", false);
+        track_mut(&mut state, &b)
+            .automation_lanes
+            .push(AutomationLaneState::new(
+                "vol",
+                AutomationTarget::TrackVolume,
+            ));
+
+        let plan = state
+            .plan_insert_move(MASTER_TRACK_ID, &x, &b, 1)
+            .expect("movable");
+        let mut history = EditHistory::new(16);
+        let cmd = EditCommand::MoveInsertSlot { plan };
+        cmd.execute(&mut state);
+        history.push(cmd);
+        assert_eq!(state.insert_order(&b), vec![other.clone(), x.clone()]);
+
+        let res = AutomationTarget::PluginParameter {
+            insert_id: x.clone(),
+            parameter_id: "9".to_string(),
+            parameter_name: "Resonance".to_string(),
+        };
+        {
+            let track_b = track_mut(&mut state, &b);
+            track_b.automation_lanes.insert(0, param_lane("cut", &x));
+            track_b
+                .automation_lanes
+                .push(AutomationLaneState::new("res", res.clone()));
+            track_b.selected_automation_target = Some(res.clone());
+        }
+        let lanes_on_b = state.find_track(&b).unwrap().automation_lanes.clone();
+        let lane_ids = |state: &TimelineState| -> Vec<String> {
+            state
+                .find_track(&b)
+                .unwrap()
+                .automation_lanes
+                .iter()
+                .map(|lane| lane.id.clone())
+                .collect()
+        };
+
+        for _ in 0..2 {
+            assert!(history.undo(&mut state));
+            assert_eq!(state.insert_order(MASTER_TRACK_ID), vec![x.clone()]);
+            assert_eq!(state.insert_order(&b), vec![other.clone()]);
+            assert_eq!(lane_ids(&state), vec!["vol"]);
+            assert_eq!(
+                state.find_track(&b).unwrap().selected_automation_target,
+                None
+            );
+
+            assert!(history.redo(&mut state));
+            assert!(state.insert_order(MASTER_TRACK_ID).is_empty());
+            assert_eq!(state.insert_order(&b), vec![other.clone(), x.clone()]);
+            assert_eq!(state.find_track(&b).unwrap().automation_lanes, lanes_on_b);
+            assert_eq!(
+                state.find_track(&b).unwrap().selected_automation_target,
+                Some(res.clone())
+            );
+        }
+    }
+
+    /// The mirror case: after undoing a move onto the master, the plug-in
+    /// gains lanes back on its track; redoing the move sets them aside and
+    /// undoing it again puts them back.
+    #[test]
+    fn redoing_a_move_onto_the_master_sets_lanes_gained_since_aside() {
+        let mut state = empty_state();
+        let a = track(&mut state, TrackType::Audio, "A");
+        let fx = load(&mut state, &a, 0, "fx", false);
+        track_mut(&mut state, &a)
+            .automation_lanes
+            .push(AutomationLaneState::new(
+                "vol",
+                AutomationTarget::TrackVolume,
+            ));
+        let plan = state
+            .plan_insert_move(&a, &fx, MASTER_TRACK_ID, 0)
+            .expect("no lanes yet");
+        let mut history = EditHistory::new(16);
+        let cmd = EditCommand::MoveInsertSlot { plan };
+        cmd.execute(&mut state);
+        history.push(cmd);
+
+        assert!(history.undo(&mut state));
+        assert_eq!(state.insert_order(&a), vec![fx.clone()]);
+        track_mut(&mut state, &a)
+            .automation_lanes
+            .push(param_lane("cut", &fx));
+        let lanes_on_a = state.find_track(&a).unwrap().automation_lanes.clone();
+
+        assert!(history.redo(&mut state));
+        assert_eq!(state.insert_order(MASTER_TRACK_ID), vec![fx.clone()]);
+        assert!(state.insert_order(&a).is_empty());
+        assert_eq!(state.find_track(&a).unwrap().automation_lanes.len(), 1);
+
+        assert!(history.undo(&mut state));
+        assert_eq!(state.insert_order(&a), vec![fx]);
+        assert!(state.insert_order(MASTER_TRACK_ID).is_empty());
+        assert_eq!(state.find_track(&a).unwrap().automation_lanes, lanes_on_a);
+    }
+
+    /// Called directly, without the history recording them first, a step
+    /// onto the master still refuses rather than drop a lane.
+    #[test]
+    fn a_step_onto_the_master_never_drops_unrecorded_lanes() {
+        let mut state = empty_state();
+        let b = track(&mut state, TrackType::Audio, "B");
+        let x = load(&mut state, MASTER_TRACK_ID, 0, "x", false);
+        let plan = state
+            .plan_insert_move(MASTER_TRACK_ID, &x, &b, 0)
+            .expect("movable");
+        assert!(state.apply_insert_move(&plan));
+        track_mut(&mut state, &b)
+            .automation_lanes
+            .push(param_lane("cut", &x));
+
+        assert!(!state.revert_insert_move(&plan));
+        assert_eq!(state.insert_order(&b), vec![x]);
+        assert_eq!(state.find_track(&b).unwrap().automation_lanes.len(), 1);
     }
 
     /// An insert keeps its id when it moves, so after a reopen its old owner

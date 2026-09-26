@@ -38,10 +38,11 @@ impl Timeline {
         // value would let `panel_x` and `viewport_x` disagree about where the
         // track headers end.
         let lane_origin_x = self.state.lane_origin_x();
-        let panel_origin_px = gpui::point(px(lane_origin_x - HEADER_WIDTH), px(APP_CHROME_HEIGHT));
+        let origin_y = self.state.timeline_origin_y();
+        let panel_origin_px = gpui::point(px(lane_origin_x - HEADER_WIDTH), px(origin_y));
         let viewport_origin_px = gpui::point(
             px(lane_origin_x),
-            px(APP_CHROME_HEIGHT + self.state.arrangement_content_top()),
+            px(origin_y + self.state.arrangement_content_top()),
         );
         ArrangementCoordinateContext {
             panel_origin_px,
@@ -142,14 +143,17 @@ impl Timeline {
         self.clip_drag_target_track_index = None;
         self.clip_clone_drag_id = None;
         self.pen_clip_draw = None;
-        // Ends a marquee and keeps the selection it made; Escape goes through
-        // `cancel_marquee` first to put the previous one back. The rectangle's
-        // overlay, like the razor line's, renders with this view.
-        self.range_select_drag = None;
+        // Ends a marquee and keeps the selection it previewed; Escape goes
+        // through `cancel_marquee` first to put the previous one back. The
+        // rectangle's overlay, like the razor line's, renders with this view.
+        self.end_marquee(true);
         self.marquee_autoscroll = None;
         self.marquee_frame.set(None);
         self.state.arrangement_range = None;
-        self.clip_move_origin = None;
+        // A clip move that ends here was never committed — Escape, a tool
+        // change, a cancelled gesture — so its clips go back where the gesture
+        // found them rather than stay moved with no undo step.
+        self.revert_clip_move();
         self.pending_clip_click = None;
         self.cut_hover = None;
         self.erase_clip_drag = None;
@@ -200,6 +204,7 @@ impl Timeline {
             on_loop_changed: None,
             on_tempo_map_changed: None,
             on_time_signature_map_changed: None,
+            on_musical_context_changed: None,
             on_media_changed: None,
             on_add_track: None,
             on_plugin_preset_drop: None,
@@ -269,7 +274,11 @@ impl Timeline {
             marquee_overlay: None,
             marquee_autoscroll: None,
             clip_move_origin: None,
+            clip_drag_cancelled: false,
             pending_clip_click: None,
+            track_rename: None,
+            focus_return: None,
+            clip_fades: Default::default(),
         }
     }
 
@@ -289,6 +298,7 @@ impl Timeline {
             on_loop_changed: None,
             on_tempo_map_changed: None,
             on_time_signature_map_changed: None,
+            on_musical_context_changed: None,
             on_media_changed: None,
             on_add_track: None,
             on_plugin_preset_drop: None,
@@ -358,7 +368,11 @@ impl Timeline {
             marquee_overlay: None,
             marquee_autoscroll: None,
             clip_move_origin: None,
+            clip_drag_cancelled: false,
             pending_clip_click: None,
+            track_rename: None,
+            focus_return: None,
+            clip_fades: Default::default(),
         }
     }
 
@@ -382,6 +396,7 @@ impl Timeline {
             EditImpact::MixerControl => self.mark_control_state_changed(cx),
             EditImpact::TempoMap => self.mark_tempo_map_changed(cx),
             EditImpact::TimeSignatureMap => self.mark_time_signature_map_changed(cx),
+            EditImpact::MusicalContext => self.mark_musical_context_changed(cx),
         }
     }
 
@@ -566,7 +581,12 @@ impl Timeline {
         let Some(next) = ClipSnapshot::capture(&self.state, clip_id) else {
             return false;
         };
-        if previous.clip == next.clip && previous.track_id == next.track_id {
+        // The transient `dirty` flag alone is no edit.
+        let unchanged = crate::components::timeline::timeline_state::clip_edit_is_noop(
+            &previous.clip,
+            &next.clip,
+        );
+        if unchanged && previous.track_id == next.track_id {
             return false;
         }
         self.record_executed_command(EditCommand::UpdateClip { previous, next }, cx);
@@ -843,6 +863,13 @@ impl Timeline {
         self.on_time_signature_map_changed = callback;
     }
 
+    pub fn set_musical_context_changed_callback(
+        &mut self,
+        callback: Option<TimelineProjectChangedCb>,
+    ) {
+        self.on_musical_context_changed = callback;
+    }
+
     pub fn set_media_changed_callback(&mut self, callback: Option<TimelineProjectChangedCb>) {
         self.on_media_changed = callback;
     }
@@ -860,6 +887,17 @@ impl Timeline {
             callback(cx);
         } else {
             self.mark_project_changed(cx);
+        }
+    }
+
+    /// Project-key edit: persisted, not part of the engine graph, but read by
+    /// ARA plug-ins. Falls back to [`Self::mark_control_state_changed`] (save
+    /// dirty only) when no dedicated callback is wired.
+    pub(crate) fn mark_musical_context_changed(&self, cx: &mut gpui::App) {
+        if let Some(callback) = self.on_musical_context_changed.as_ref() {
+            callback(cx);
+        } else {
+            self.mark_control_state_changed(cx);
         }
     }
 
@@ -953,6 +991,7 @@ impl Timeline {
                 Some(&self.erase_preview_ids),
                 ctx.on_audio_clip_process_preview.clone(),
                 ctx.on_audio_clip_process_commit.clone(),
+                ctx.on_crossfade.clone(),
             ))
             .into_any_element()
     }
@@ -1048,7 +1087,9 @@ impl Timeline {
 
     /// Live mixer-control edit (mute/solo): persisted in the project file but
     /// applied to the engine through the realtime command path, so the owner
-    /// must not treat it as an engine-graph change. Falls back to
+    /// must not treat it as an engine-graph change. Also the path for view
+    /// state the project file saves (snap, lane visibility, automation
+    /// expansion), which never reaches the engine. Falls back to
     /// [`Self::mark_project_changed`] when no dedicated callback is wired.
     pub(crate) fn mark_control_state_changed(&self, cx: &mut gpui::App) {
         if let Some(callback) = self.on_control_state_changed.as_ref() {
@@ -1058,22 +1099,36 @@ impl Timeline {
         }
     }
 
+    /// Focus a track's automation editor on `lane_id`. The focused lane of an
+    /// expanded track is saved with the project (v54), so a move is an unsaved
+    /// change, view-only.
+    pub(crate) fn focus_automation_lane(
+        &mut self,
+        track_id: &str,
+        lane_id: &str,
+        cx: &mut gpui::App,
+    ) {
+        let change = self.state.edit_automation_view(track_id, |state| {
+            state.activate_automation_lane(track_id, lane_id)
+        });
+        if change.is_change() {
+            self.mark_control_state_changed(cx);
+        }
+    }
+
     pub(crate) fn mark_media_changed(&self, cx: &mut gpui::App) {
         if let Some(callback) = self.on_media_changed.as_ref() {
             callback(cx);
         }
     }
 
+    /// The Pen's release: one MIDI clip, default length for a plain click or
+    /// the dragged span. Only the Pen draws clips here.
     pub(super) fn finish_pen_midi_clip(&mut self, end_beat: f32, cx: &mut gpui::Context<Self>) {
         use crate::components::timeline::timeline_state::{MIN_MIDI_CLIP_BEATS, TrackType};
         let Some(preview) = self.pen_clip_draw.take() else {
             return;
         };
-        // Pointer empty-lane: plain single-click (no drag) is a no-op so it
-        // doesn't fight track selection. Drag or double-click still commits.
-        if !preview.dragging && !preview.commit_on_click {
-            return;
-        }
         let track_id = preview.track_id;
         let track_type = self
             .state
@@ -1113,50 +1168,217 @@ impl Timeline {
         }
     }
 
-    pub(super) fn finish_range_select(&mut self, end_beat: f32, cx: &mut gpui::Context<Self>) {
-        let Some(drag) = self.range_select_drag.take() else {
-            return;
-        };
-        let (lo, hi) = normalize_range(drag.start_beat, end_beat);
-        let track_ids = self
-            .state
-            .arrangement_range
-            .as_ref()
-            .map(|range| range.track_ids.clone())
-            .filter(|ids| !ids.is_empty())
-            .unwrap_or_else(|| {
-                self.state
-                    .track_ids_between(&drag.start_track_id, &drag.start_track_id)
-            });
+    // ── Arrangement marquee ──────────────────────────────────────────────
+    // A free rectangle of unsnapped pixels, anchored in arrangement space and
+    // followed by window-wide listeners (see `render`), so it keeps tracking
+    // outside the timeline and over anything that occludes it. While it is
+    // out, the arrangement draws a preview of what it selects; the selection
+    // itself changes once, at the release. Selection is UI state: no undo
+    // step, and Escape puts the previous selection back.
 
-        let mut hit_clip_ids = Vec::new();
-        if drag.dragging && (hi - lo).abs() > f32::EPSILON {
-            for track in &self.state.tracks {
-                if !track_ids.iter().any(|id| id == &track.id) {
-                    continue;
-                }
-                for clip in &track.clips {
-                    let clip_start = clip.start_beat;
-                    let clip_end = clip.start_beat + clip.duration_beats;
-                    if clip_start < hi && clip_end > lo {
-                        hit_clip_ids.push(clip.id.clone());
-                    }
-                }
-            }
+    /// Start a marquee from a press on lane space no clip owns, or below the
+    /// last track.
+    pub(super) fn begin_marquee(
+        &mut self,
+        press: &crate::components::timeline::track_lane::MarqueePress,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        // A marquee whose release never reached the timeline ends here, as a
+        // release would, before this one takes its place: its auto-scroll,
+        // follow-playhead suspension and preview must not outlive it.
+        if self.end_marquee(true).is_some() {
+            self.hide_marquee_frame(cx);
         }
-
-        // Tracks and clips are committed together — see
-        // `TimelineState::apply_marquee_selection` for why the tracks are part
-        // of the result rather than a side effect of the clips.
-        if drag.dragging || drag.additive {
-            self.state.apply_marquee_selection(
-                &track_ids,
-                hit_clip_ids,
-                &drag.start_track_id,
-                drag.additive,
+        if self.state.active_tool != TimelineTool::Pointer {
+            return;
+        }
+        let selection_before = self.state.selection.clone();
+        if press.on_lane && !press.additive {
+            // A lane click chooses its track, as it always has; a drag
+            // replaces that with what the rectangle encloses. Shown at once,
+            // but like the drag's it is a preview until the release commits
+            // it, so what follows the selection sees one change per gesture.
+            let mut chosen = selection_before.clone();
+            chosen.select_track(&press.track_id);
+            self.state.marquee_selection_preview = Some(chosen);
+        }
+        self.state.arrangement_range = None;
+        self.marquee_autoscroll = None;
+        self.range_select_drag = Some(RangeSelectDrag {
+            anchor_beat: self.state.beats_from_window_x(press.window_x),
+            anchor_content_y: self.state.content_y_from_window_y(press.window_y),
+            press_window: (press.window_x, press.window_y),
+            last_window: (press.window_x, press.window_y),
+            start_track_id: press.track_id.clone(),
+            additive: press.additive,
+            on_lane: press.on_lane,
+            create_clip_on_click: press.create_clip_on_click,
+            bypass_snap: press.bypass_snap,
+            dragging: false,
+            selection_before,
+            hits: None,
+        });
+        if Self::input_debug_enabled() {
+            eprintln!(
+                "[selection] marquee_start_pending track={} additive={}",
+                press.track_id, press.additive
             );
         }
+        cx.notify();
+    }
 
+    /// Move the marquee's free corner to the pointer at `window_pos`.
+    ///
+    /// Every pointer update and the release go through here, so what is
+    /// committed is exactly the rectangle that was drawn: no snapping, and no
+    /// Shift difference at the release.
+    pub(super) fn update_marquee(
+        &mut self,
+        window_pos: (f32, f32),
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(drag) = self.range_select_drag.as_mut() else {
+            return;
+        };
+        // Same position (macOS repeats the last drag event every 16 ms while
+        // the button is held still, and the root and the window-wide tracker
+        // both see a move): nothing to do.
+        if drag.dragging && drag.last_window == window_pos {
+            return;
+        }
+        drag.last_window = window_pos;
+        if !drag.dragging {
+            if !crate::components::edit::marquee_drag_started(drag.press_window, window_pos) {
+                return;
+            }
+            drag.dragging = true;
+            // Suspend follow-playhead while the rectangle is out, so a Page or
+            // Continuous scroll cannot move the arrangement from under it. The
+            // user's own Follow choice, shown by the transport and saved in
+            // Settings, is left alone.
+            self.state.follow_playhead_suspended = true;
+            if Self::input_debug_enabled() {
+                eprintln!("[selection] marquee_start additive={}", drag.additive);
+            }
+        }
+        self.refresh_marquee(window, cx);
+    }
+
+    /// A marquee has ended, however it ended: stop auto-scrolling, lift the
+    /// follow-playhead suspension and take the preview down. `commit` makes
+    /// the previewed selection the real one — a release, or a marquee that
+    /// something else ended — and otherwise drops it (Escape). Returns the
+    /// marquee that was in flight.
+    pub(super) fn end_marquee(&mut self, commit: bool) -> Option<RangeSelectDrag> {
+        let drag = self.range_select_drag.take()?;
+        self.marquee_autoscroll = None;
+        self.state.follow_playhead_suspended = false;
+        let preview = self.state.marquee_selection_preview.take();
+        if let Some(selection) = preview.filter(|_| commit) {
+            self.state.selection = selection;
+        }
+        Some(drag)
+    }
+
+    /// Re-resolve the rectangle from the last pointer position against the
+    /// current scroll and time zoom, preview what it encloses and move its
+    /// overlay. Starts auto-scroll when the pointer is at or past the track
+    /// area's edge.
+    ///
+    /// The preview (`TimelineState::marquee_selection_preview`) is what the
+    /// arrangement draws as selected. The selection itself — which the
+    /// Inspector and the editors follow — changes only when the marquee ends.
+    pub(super) fn refresh_marquee(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        use crate::components::timeline::timeline_state::MarqueeRect;
+        let Some(drag) = self.range_select_drag.as_ref().filter(|drag| drag.dragging) else {
+            return;
+        };
+        let (window_x, window_y) = drag.last_window;
+        let rect = MarqueeRect::from_corners(
+            (
+                self.state.beats_to_x(drag.anchor_beat),
+                drag.anchor_content_y,
+            ),
+            (
+                self.state.lane_x_from_window_x(window_x),
+                self.state.content_y_from_window_y(window_y),
+            ),
+        );
+        // This frame's rows: track heights cannot change under a marquee
+        // (track zoom waits for it to end).
+        let rows = match self.frame_lane_ctx.as_ref() {
+            Some(ctx) => ctx.row_layout.clone(),
+            None => std::rc::Rc::new(self.state.track_row_layout()),
+        };
+        let hits = self.state.marquee_hits(&rows, rect);
+        if drag.hits.as_ref() != Some(&hits) {
+            // From the selection before the press, so an additive marquee is
+            // always "before ∪ rectangle" and a replacing one exactly the
+            // rectangle, however the rectangle has moved.
+            self.state.marquee_selection_preview = Some(drag.selection_before.after_marquee(
+                &hits,
+                &drag.start_track_id,
+                drag.additive,
+            ));
+            if let Some(drag) = self.range_select_drag.as_mut() {
+                drag.hits = Some(hits);
+            }
+            // The one Timeline notify a marquee makes: the preview changed.
+            cx.notify();
+        }
+        self.show_marquee_frame(
+            crate::components::timeline::marquee_overlay::MarqueeFrame {
+                left: rect.left,
+                top: rect.top - self.state.viewport.scroll_y,
+                width: rect.right - rect.left,
+                height: rect.bottom - rect.top,
+            },
+            cx,
+        );
+        if self.marquee_autoscroll.is_none()
+            && self.marquee_autoscroll_delta((window_x, window_y)) != (0.0, 0.0)
+        {
+            self.start_marquee_autoscroll(window, cx);
+        }
+    }
+
+    /// End the marquee. A release passes its position, which goes through
+    /// [`Self::update_marquee`] like every move before the marquee ends.
+    ///
+    /// A press that never became a drag is a click: the lane's track, shown
+    /// as chosen since the press, is committed (an additive click adds it
+    /// instead), and a double-click on an empty MIDI / Instrument lane creates
+    /// its clip here.
+    pub(super) fn finish_marquee(
+        &mut self,
+        window_pos: Option<(f32, f32)>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if let Some(position) = window_pos {
+            self.update_marquee(position, window, cx);
+        }
+        // The release commits the preview — the rectangle's, or a click's
+        // track: the one selection change the gesture makes.
+        let Some(drag) = self.end_marquee(true) else {
+            return;
+        };
+        self.hide_marquee_frame(cx);
+        if !drag.dragging {
+            if drag.on_lane && drag.additive {
+                self.state.apply_marquee_selection(
+                    std::slice::from_ref(&drag.start_track_id),
+                    Vec::new(),
+                    &drag.start_track_id,
+                    true,
+                );
+            }
+            if drag.create_clip_on_click {
+                let start = self.snap_beat_with_bypass(drag.anchor_beat, drag.bypass_snap);
+                self.create_default_midi_clip(&drag.start_track_id, start, cx);
+            }
+        }
         if Self::input_debug_enabled() {
             eprintln!(
                 "[selection] marquee_commit additive={} dragging={} clips={} tracks={}",
@@ -1166,11 +1388,251 @@ impl Timeline {
                 self.state.selection.selected_track_ids.len()
             );
         }
-
-        // The marquee rectangle is a transient drag affordance only. Commit the
-        // selected clip ids, then clear the overlay immediately on mouse-up.
-        self.state.arrangement_range = None;
         cx.notify();
+    }
+
+    /// Escape during a marquee: drop its preview, put back the selection from
+    /// before the press and stop auto-scrolling. Escape reaches the
+    /// arrangement only through the Studio's key handler, which calls this
+    /// before resetting the rest of the timeline's input state. Returns
+    /// whether a marquee was in flight.
+    pub fn cancel_marquee(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let Some(drag) = self.end_marquee(false) else {
+            return false;
+        };
+        self.state.selection = drag.selection_before;
+        self.hide_marquee_frame(cx);
+        cx.notify();
+        true
+    }
+
+    /// A command that arrives while a marquee is out (Delete, Copy, a nudge,
+    /// any shortcut or menu item) must act on the selection the arrangement
+    /// shows. So the marquee ends here as a release would, and its preview
+    /// becomes the selection before the command runs. The pointer's later
+    /// moves and its release find no marquee and do nothing. Returns whether
+    /// a marquee was in flight.
+    pub fn finish_marquee_for_command(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        if !self.commit_marquee_for_command() {
+            return false;
+        }
+        self.hide_marquee_frame(cx);
+        cx.notify();
+        true
+    }
+
+    /// The part of [`Self::finish_marquee_for_command`] that needs no
+    /// context: end the marquee and commit its preview. A click's own release
+    /// effects are dropped with the release the command cut off. Those are an
+    /// additive lane click adding its track, which was never previewed, and a
+    /// double-click creating a MIDI clip.
+    pub(super) fn commit_marquee_for_command(&mut self) -> bool {
+        self.end_marquee(true).is_some()
+    }
+
+    /// Auto-scroll step for a marquee pointer at `window_pos`, per tick:
+    /// `(dx, dy)` in pixels, zero while the pointer is well inside the track
+    /// area.
+    fn marquee_autoscroll_delta(&self, (x, y): (f32, f32)) -> (f32, f32) {
+        use crate::components::timeline::timeline_state::marquee_autoscroll_step;
+        let left = self.state.lane_origin_x();
+        let top = self.state.timeline_origin_y() + self.state.arrangement_content_top();
+        (
+            marquee_autoscroll_step(x, left, left + self.state.viewport.viewport_width),
+            marquee_autoscroll_step(y, top, top + self.state.viewport.viewport_height),
+        )
+    }
+
+    /// Scroll on a UI-thread timer while the marquee's pointer is at or past
+    /// the track area's edge. Only the timer scrolls — a pointer move never
+    /// does — so the speed is the same whether or not the platform repeats
+    /// drag events for a pointer held still.
+    fn start_marquee_autoscroll(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) {
+        self.marquee_autoscroll = Some(cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
+            let keep = this
+                .update_in(cx, |this, window, cx| {
+                    this.marquee_autoscroll_tick(window, cx)
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        }));
+    }
+
+    /// One auto-scroll step. `false` once the marquee has ended or the pointer
+    /// is back inside the track area, which ends the timer.
+    fn marquee_autoscroll_tick(
+        &mut self,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let Some(pointer) = self
+            .range_select_drag
+            .as_ref()
+            .filter(|drag| drag.dragging)
+            .map(|drag| drag.last_window)
+        else {
+            self.marquee_autoscroll = None;
+            return false;
+        };
+        let (dx, dy) = self.marquee_autoscroll_delta(pointer);
+        if (dx, dy) == (0.0, 0.0) {
+            self.marquee_autoscroll = None;
+            return false;
+        }
+        let (max_x, max_y) = self.max_scroll_offsets(window);
+        let (x, y) = (self.state.viewport.scroll_x, self.state.viewport.scroll_y);
+        self.state
+            .set_scroll_immediate(x + dx, y + dy, max_x, max_y);
+        if (self.state.viewport.scroll_x - x).abs() < 0.01
+            && (self.state.viewport.scroll_y - y).abs() < 0.01
+        {
+            // At the end of the arrangement: wait for the pointer to move back.
+            return true;
+        }
+        // A user-driven scroll, like the wheel's: it turns follow-playhead
+        // off for after the marquee (the marquee only suspends it).
+        self.state.note_user_scrolled();
+        self.refresh_marquee(window, cx);
+        cx.notify();
+        true
+    }
+
+    /// Show the marquee rectangle at `frame`: notifies the overlay only, so
+    /// the lanes are not rebuilt (see `marquee_overlay`).
+    fn show_marquee_frame(
+        &self,
+        frame: crate::components::timeline::marquee_overlay::MarqueeFrame,
+        cx: &mut gpui::App,
+    ) {
+        let unchanged = self.marquee_frame.get().is_some_and(|prev| {
+            (prev.left - frame.left).abs() < 0.5
+                && (prev.top - frame.top).abs() < 0.5
+                && (prev.width - frame.width).abs() < 0.5
+                && (prev.height - frame.height).abs() < 0.5
+        });
+        if unchanged {
+            return;
+        }
+        self.marquee_frame.set(Some(frame));
+        if let Some(overlay) = self.marquee_overlay.as_ref() {
+            overlay.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    fn hide_marquee_frame(&self, cx: &mut gpui::App) {
+        if self.marquee_frame.take().is_some() {
+            if let Some(overlay) = self.marquee_overlay.as_ref() {
+                overlay.update(cx, |_, cx| cx.notify());
+            }
+        }
+    }
+
+    /// The Pointer's double-click on an empty MIDI / Instrument lane: one
+    /// default-length clip at `start` (the snapped, or Shift-free, press
+    /// beat), as one undo step.
+    fn create_default_midi_clip(
+        &mut self,
+        track_id: &str,
+        start: f32,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let (clip_start, length) = compute_pen_clip_span(&self.state, start, start);
+        if let Some(clip) = self.state.build_midi_clip(track_id, clip_start, length) {
+            self.run_edit_command(
+                EditCommand::CreateClip {
+                    track_id: track_id.to_string(),
+                    clip,
+                },
+                cx,
+            );
+        }
+    }
+
+    /// Whether a pointer gesture is in flight that a Smart Tool cut must not
+    /// interrupt: a marquee, a pen draw, a right-drag erase or a clip move.
+    pub(super) fn pointer_gesture_blocks_cut(&self) -> bool {
+        self.range_select_drag.is_some()
+            || self.pen_clip_draw.is_some()
+            || self.erase_clip_drag.is_some()
+            || self.clip_drag_origin.is_some()
+            || self.clip_move_origin.is_some()
+    }
+
+    /// Show or hide the Smart Tool's razor line for a cut-zone hover. It
+    /// shows only while the cut's modifier is held — Option alone, the same
+    /// test the click makes — at the snapped split position.
+    pub(super) fn apply_cut_hover(
+        &mut self,
+        hover: crate::components::timeline::audio_clip::ClipCutGesture,
+        cx: &mut gpui::App,
+    ) {
+        use crate::components::timeline::audio_clip::ClipCutGesture;
+        let ClipCutGesture::Hover {
+            window_x,
+            bypass_snap,
+            armed,
+            left,
+            right,
+            top,
+            height,
+        } = hover
+        else {
+            return;
+        };
+        self.cut_hover = Some(hover);
+        if !armed || self.pointer_gesture_blocks_cut() {
+            self.hide_cut_guide(cx);
+            return;
+        }
+        // Same transform and snap as the cut, so the line is where the click
+        // will split.
+        let beat = self.beat_from_window_x(window_x);
+        let snapped = self.snap_beat_with_bypass(beat, bypass_snap);
+        let x = (window_x + self.state.beats_to_x(snapped) - self.state.beats_to_x(beat))
+            .clamp(left, right.max(left));
+        self.show_cut_guide(
+            crate::components::timeline::cut_guide::CutGuideFrame { x, top, height },
+            cx,
+        );
+    }
+
+    /// The Studio forwards every modifier change: pressing or releasing Option
+    /// (or Shift, which bypasses snap) while the pointer rests in a cut zone
+    /// shows, hides or re-snaps the razor line without waiting for a move.
+    pub fn smart_cut_modifiers_changed(
+        &mut self,
+        modifiers: &gpui::Modifiers,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        use crate::components::timeline::audio_clip::{smart_cut_modifier_held, ClipCutGesture};
+        let Some(ClipCutGesture::Hover {
+            window_x,
+            left,
+            right,
+            top,
+            height,
+            ..
+        }) = self.cut_hover.clone()
+        else {
+            return;
+        };
+        self.apply_cut_hover(
+            ClipCutGesture::Hover {
+                window_x,
+                bypass_snap: modifiers.shift,
+                armed: smart_cut_modifier_held(modifiers),
+                left,
+                right,
+                top,
+                height,
+            },
+            cx,
+        );
     }
 
     pub(super) fn finish_erase_clip_drag(&mut self, cx: &mut gpui::Context<Self>) {
@@ -1192,39 +1654,43 @@ impl Timeline {
         self.run_edit_command(EditCommand::BatchDeleteClips { snapshots }, cx);
     }
 
-    pub(super) fn update_erase_clip_drag(&mut self, beat: f32, cx: &mut gpui::Context<Self>) {
-        let ids = self.state.clips_intersecting_beats(beat, beat);
+    /// Extend a right-drag erase with the clips under the pointer at
+    /// `window_pos` — on the track under the pointer only, where the clips are
+    /// drawn. It used to take every clip on every track at that beat, so a
+    /// right-drag that began on one clip could delete a whole column of the
+    /// arrangement.
+    pub(super) fn update_erase_clip_drag(
+        &mut self,
+        window_pos: gpui::Point<gpui::Pixels>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let lane_x = self.state.lane_x_from_window_x(window_pos.x.into());
+        let content_y = self.state.content_y_from_window_y(window_pos.y.into());
+        let rows = match self.frame_lane_ctx.as_ref() {
+            Some(ctx) => ctx.row_layout.clone(),
+            None => std::rc::Rc::new(self.state.track_row_layout()),
+        };
+        let ids = self.state.clips_at_lane_point(&rows, lane_x, content_y);
         let set = self.erase_clip_drag.get_or_insert_with(HashSet::new);
-        for id in ids {
+        let before = set.len();
+        set.extend(ids);
+        if set.len() != before {
+            self.erase_preview_ids = set.clone();
+            cx.notify();
+        }
+    }
+
+    pub(super) fn begin_erase_at(&mut self, clip_id: Option<String>, cx: &mut gpui::Context<Self>) {
+        // A known clip (right-click erase) seeds the set with exactly that
+        // clip. The drag that follows extends it only with clips under the
+        // pointer on the track under the pointer.
+        let mut set = HashSet::new();
+        if let Some(id) = clip_id {
             set.insert(id);
         }
         self.erase_preview_ids = set.clone();
+        self.erase_clip_drag = Some(set);
         cx.notify();
-    }
-
-    pub(super) fn begin_erase_at(
-        &mut self,
-        beat: f32,
-        clip_id: Option<String>,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        // A known clip (right-click erase) seeds the set with exactly that
-        // clip. Falling through to `update_erase_clip_drag` here would pull
-        // in every other clip on every track sharing that beat, deleting a
-        // whole stack instead of the one clicked.
-        match clip_id {
-            Some(id) => {
-                let mut set = HashSet::new();
-                set.insert(id);
-                self.erase_preview_ids = set.clone();
-                self.erase_clip_drag = Some(set);
-                cx.notify();
-            }
-            None => {
-                self.erase_clip_drag = Some(HashSet::new());
-                self.update_erase_clip_drag(beat, cx);
-            }
-        }
     }
 
     // ── Automation lane interaction ──────────────────────────────────────────
@@ -1247,9 +1713,7 @@ impl Timeline {
             .state
             .automation_sublane_geometry(track_id, lane_id)
             .unwrap_or((0.0, AUTOMATION_SUBLANE_HEIGHT));
-        let local_y = (window_y - APP_CHROME_HEIGHT - self.state.arrangement_content_top()
-            + self.state.viewport.scroll_y)
-            - lane_y;
+        let local_y = self.state.content_y_from_window_y(window_y) - lane_y;
         automation_y_to_value(local_y, lane_h)
     }
 
@@ -1837,7 +2301,7 @@ impl Timeline {
         // lane, and undo has to remove it again.
         let lanes_before = self.state.capture_automation_lanes(track_id);
         // Focus the editor on the clicked lane and make sure it exists.
-        self.state.activate_automation_lane(track_id, lane_id);
+        self.focus_automation_lane(track_id, lane_id, cx);
         if self.state.automation_lane(track_id, lane_id).is_none() {
             return;
         }
@@ -2299,7 +2763,7 @@ impl Timeline {
         // 220 — the previous constant was stale whenever the bottom
         // panel was resized or hidden, which left the timeline either
         // too short (blank bottom area) or too tall (overflowing).
-        let used_v = APP_CHROME_HEIGHT
+        let used_v = self.state.timeline_origin_y()
             + self.state.arrangement_content_top()
             + m.bottom_panel_height
             + m.status_bar_height;
@@ -2349,42 +2813,180 @@ impl Timeline {
         bypass_snap: bool,
     ) {
         let origin = *self.clip_drag_origin.get_or_insert(position);
+        if self
+            .clip_move_origin
+            .as_ref()
+            .is_none_or(|move_origin| move_origin.anchor_clip_id != drag.clip_id)
+        {
+            // The first move of this drag: nothing has changed yet, so this is
+            // the "before" of the one undo step the drop records — every clip
+            // that moves with the grabbed one, at its index in its track.
+            let clips: Vec<ClipSnapshot> = self
+                .clip_drag_selection_ids(&drag.clip_id)
+                .iter()
+                .filter_map(|id| ClipSnapshot::capture(&self.state, id))
+                .collect();
+            let Some(anchor_start) = clips
+                .iter()
+                .find(|snapshot| snapshot.clip.id == drag.clip_id)
+                .map(|snapshot| snapshot.clip.start_beat)
+            else {
+                return;
+            };
+            self.clip_move_origin = Some(ClipMoveOrigin {
+                anchor_clip_id: drag.clip_id.clone(),
+                anchor_start,
+                clips,
+            });
+            // A drag, not a click: the press's deferred selection change is off.
+            self.pending_clip_click = None;
+        }
         let (target_index, snapped) =
             self.resolve_clip_drag_target_with_bypass(drag, origin, position, bypass_snap);
         self.clip_drag_target_track_index = Some(target_index);
 
-        let Some((current_drag_track_id, current_drag_start)) = self
-            .state
-            .find_clip(&drag.clip_id)
-            .map(|(track, clip)| (track.id.clone(), clip.start_beat))
-        else {
+        let Some(move_origin) = self.clip_move_origin.as_ref() else {
             return;
         };
-        let beat_delta = snapped - current_drag_start;
-        let drag_ids = self.clip_drag_selection_ids(&drag.clip_id);
-
-        for clip_id in &drag_ids {
-            let Some((track_id, start_beat)) = self
-                .state
-                .find_clip(clip_id)
-                .map(|(track, clip)| (track.id.clone(), clip.start_beat))
-            else {
-                continue;
-            };
-            let next_start = if clip_id == &drag.clip_id {
-                snapped
-            } else {
-                (start_beat + beat_delta).max(0.0)
-            };
-            // Anchor already snapped (or Shift-bypassed); peers keep relative spacing.
-            self.state
-                .move_clip_to_track_with_options(clip_id, &track_id, next_start, false);
+        // Every clip from its origin plus one anchor delta: the preview never
+        // drifts, and the drop commits exactly these positions.
+        let origin_starts: Vec<f32> = move_origin
+            .clips
+            .iter()
+            .map(|snapshot| snapshot.clip.start_beat)
+            .collect();
+        let starts = crate::components::timeline::timeline_state::group_move_starts(
+            &origin_starts,
+            move_origin.anchor_start,
+            snapped,
+        );
+        let moves: Vec<(String, f32)> = move_origin
+            .clips
+            .iter()
+            .map(|snapshot| snapshot.clip.id.clone())
+            .zip(starts)
+            .collect();
+        for (clip_id, start) in moves {
+            // In place: the preview must not reorder the track's clips, or the
+            // captured indices would no longer say where each clip was.
+            self.state.set_clip_start_in_place(&clip_id, start);
         }
-        self.restore_clip_drag_selection(&drag.clip_id, drag_ids, Some(current_drag_track_id));
 
         let (max_x, max_y) = self.max_scroll_offsets(window);
         self.state.viewport.scroll_x = self.state.viewport.scroll_x.clamp(0.0, max_x);
         self.state.viewport.scroll_y = self.state.viewport.scroll_y.clamp(0.0, max_y);
+    }
+
+    /// Commit the clip move in flight as one `UpdateClips` undo step.
+    ///
+    /// The drop passes the track the pointer is over, and the group moves
+    /// across tracks by that many rows, exactly at the positions the preview
+    /// showed (nothing is snapped again). A release outside the timeline gets
+    /// no drop, so it commits with `None`: every clip stays on its own track,
+    /// where the lanes are already showing it — without this the moved clips
+    /// stayed moved with no undo entry at all.
+    pub(super) fn commit_clip_move(
+        &mut self,
+        anchor_clip_id: &str,
+        target_track_index: Option<usize>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(origin) = self
+            .clip_move_origin
+            .take()
+            .filter(|origin| origin.anchor_clip_id == anchor_clip_id)
+        else {
+            return;
+        };
+        let clip_ids: Vec<String> = origin
+            .clips
+            .iter()
+            .map(|snapshot| snapshot.clip.id.clone())
+            .collect();
+        let mut target_track_id = None;
+        if let Some(target_index) = target_track_index {
+            let source_index = self
+                .state
+                .tracks
+                .iter()
+                .position(|track| {
+                    origin
+                        .clips
+                        .iter()
+                        .any(|s| s.clip.id == anchor_clip_id && s.track_id == track.id)
+                })
+                .unwrap_or(target_index);
+            let track_delta = target_index as isize - source_index as isize;
+            let max_index = self.state.tracks.len().saturating_sub(1) as isize;
+            for clip_id in &clip_ids {
+                let Some((track_index, start)) =
+                    self.state
+                        .tracks
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, track)| {
+                            track
+                                .clips
+                                .iter()
+                                .find(|clip| clip.id == *clip_id)
+                                .map(|clip| (index, clip.start_beat))
+                        })
+                else {
+                    continue;
+                };
+                let Some(track_id) = self
+                    .state
+                    .tracks
+                    .get((track_index as isize + track_delta).clamp(0, max_index) as usize)
+                    .map(|track| track.id.clone())
+                else {
+                    continue;
+                };
+                self.state
+                    .move_clip_to_track_unsnapped(clip_id, &track_id, start);
+            }
+            target_track_id = self
+                .state
+                .tracks
+                .get(target_index)
+                .map(|track| track.id.clone());
+        }
+        let next: Vec<ClipSnapshot> = clip_ids
+            .iter()
+            .filter_map(|id| ClipSnapshot::capture(&self.state, id))
+            .collect();
+        let previous: Vec<ClipSnapshot> = origin
+            .clips
+            .into_iter()
+            .filter(|before| next.iter().any(|after| after.clip.id == before.clip.id))
+            .collect();
+        self.restore_clip_drag_selection(anchor_clip_id, clip_ids, target_track_id);
+        let changed = previous.iter().zip(&next).any(|(before, after)| {
+            before.track_id != after.track_id
+                || before.index != after.index
+                || before.clip != after.clip
+        });
+        if changed {
+            self.record_executed_command(EditCommand::UpdateClips { previous, next }, cx);
+        }
+    }
+
+    /// The release of a press on a clip that did not become a drag: apply the
+    /// selection change the press deferred. Skipped when the clip is gone —
+    /// an Option-click in the cut zone splits it before this runs.
+    pub(super) fn apply_pending_clip_click(&mut self) -> bool {
+        use crate::components::timeline::timeline_state::ClipSelectOp;
+        let Some(pending) = self.pending_clip_click.take() else {
+            return false;
+        };
+        if self.clip_move_origin.is_some() || self.state.find_clip(&pending.clip_id).is_none() {
+            return false;
+        }
+        match pending.op {
+            ClipSelectOp::Replace => self.state.select_clip(&pending.clip_id),
+            ClipSelectOp::Toggle => self.state.select_clip_additive(&pending.clip_id),
+        }
+        true
     }
 
     pub(super) fn clip_drag_selection_ids(&self, dragged_clip_id: &str) -> Vec<String> {
@@ -2595,7 +3197,7 @@ impl Timeline {
 
     pub(super) fn track_area_y_from_window(&self, position: gpui::Point<gpui::Pixels>) -> f32 {
         let y: f32 = position.y.into();
-        (y - APP_CHROME_HEIGHT - self.state.arrangement_content_top()).max(0.0)
+        self.state.track_viewport_y_from_window_y(y).max(0.0)
     }
 
     pub(super) fn import_audio_path_at_last_drag(
@@ -2618,13 +3220,15 @@ impl Timeline {
 
         let (drop_x, drop_y) = self.drop_position_or_new_track(force_new_track);
 
-        self.state
+        let clip_id = self
+            .state
             .import_audio_at(path_key.clone(), clip_name, drop_x, drop_y);
         self.mark_project_changed(cx);
         self.mark_media_changed(cx);
         super::super::audio_import::spawn_timeline_import(
             path.to_path_buf(),
             self.project_root.clone(),
+            vec![clip_id],
             cx.entity().clone(),
             None,
             cx,
@@ -2853,8 +3457,7 @@ impl Timeline {
                 let x: f32 = p.x.into();
                 let y: f32 = p.y.into();
                 let lane_x = self.state.lane_x_from_window_x(x).max(0.0);
-                let lane_y =
-                    (y - APP_CHROME_HEIGHT - self.state.arrangement_content_top()).max(0.0);
+                let lane_y = self.state.track_viewport_y_from_window_y(y).max(0.0);
                 (lane_x, lane_y)
             }
             _ => (0.0, 1.0e9_f32),

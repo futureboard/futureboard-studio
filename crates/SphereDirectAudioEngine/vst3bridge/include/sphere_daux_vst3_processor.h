@@ -145,6 +145,13 @@ sphere_daux_vst3_embed_host_kind(SphereDauxVst3Processor *processor);
 SPHERE_DAUX_VST3_API int
 sphere_daux_vst3_embed_take_user_close(SphereDauxVst3Processor *processor);
 
+// 1 (and resets) if the controller reported an edit (performEdit / endEdit) or
+// a value change (restartComponent kParamValuesChanged / kReloadComponent)
+// since the last call; 0 otherwise. Any thread may raise it; poll off the
+// audio path.
+SPHERE_DAUX_VST3_API int
+sphere_daux_vst3_take_state_touched(SphereDauxVst3Processor *processor);
+
 /// Claim one bare-Space transport toggle from any editor UI thread. Process-wide.
 SPHERE_DAUX_VST3_API void sphere_daux_vst3_claim_transport_toggle(void);
 

@@ -96,6 +96,88 @@ pub(crate) struct PluginEditorWindows {
     /// is the list the tab strip is built from; `open` holds the window itself,
     /// still keyed by whichever insert opened it first.
     pub editor_tabs: std::collections::HashMap<String, Vec<String>>,
+    /// Plug-in state edits grouped into gestures for the project's dirty flag.
+    /// See [`StudioLayout::note_plugin_state_edited`].
+    pub state_edits: PluginEditGesture,
+}
+
+/// How long a plug-in edit gesture may pause and still be the same gesture.
+///
+/// Longer than the plug-in host's report interval
+/// (`SpherePluginHost::state_touch::REPORT_INTERVAL`), so a knob drag in a
+/// bridged editor stays one gesture, and short enough that the trailing mark
+/// lands soon after the user lets go.
+pub(crate) const PLUGIN_EDIT_GESTURE_GAP: Duration = Duration::from_millis(750);
+
+/// Plug-in state edits grouped into gestures for the project's dirty flag.
+///
+/// Every edit has to leave the project dirty, including one made while a save
+/// writes a snapshot taken before it: the session's `dirty_generation` must move
+/// after that snapshot, or the finished save reports the edit as saved. Moving
+/// it on every frame of a knob drag is wasted work, so a gesture — edits no more
+/// than [`PLUGIN_EDIT_GESTURE_GAP`] apart, in one session — marks the project
+/// when it starts, and once more when it ends if anything arrived after that
+/// first mark. Pure; `StudioLayout` drives it and owns the timer.
+#[derive(Debug, Default)]
+pub(crate) struct PluginEditGesture {
+    /// The latest edit and the session generation it belonged to.
+    last_edit: Option<(Instant, u64)>,
+    /// An edit arrived after the gesture's opening mark.
+    unmarked: bool,
+    /// A settle check is scheduled.
+    settle_armed: bool,
+}
+
+/// What one edit asks of the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PluginEditStep {
+    /// Mark the project dirty now (the edit opened a gesture).
+    pub mark: bool,
+    /// Schedule [`PluginEditGesture::settle`] after [`PLUGIN_EDIT_GESTURE_GAP`].
+    pub arm_settle: bool,
+}
+
+/// The answer of a settle check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PluginEditSettle {
+    /// The gesture is still going: check again after this long.
+    Wait(Duration),
+    /// The gesture ended. When edits followed its opening mark, mark the
+    /// project once more — if it is still this session.
+    Done { mark_session: Option<u64> },
+}
+
+impl PluginEditGesture {
+    pub(crate) fn edit(&mut self, now: Instant, session: u64) -> PluginEditStep {
+        let continues = self.last_edit.is_some_and(|(last, last_session)| {
+            last_session == session
+                && now.saturating_duration_since(last) <= PLUGIN_EDIT_GESTURE_GAP
+        });
+        self.last_edit = Some((now, session));
+        self.unmarked = continues;
+        let arm_settle = !self.settle_armed;
+        self.settle_armed = true;
+        PluginEditStep {
+            mark: !continues,
+            arm_settle,
+        }
+    }
+
+    pub(crate) fn settle(&mut self, now: Instant) -> PluginEditSettle {
+        let Some((last, session)) = self.last_edit else {
+            self.settle_armed = false;
+            return PluginEditSettle::Done { mark_session: None };
+        };
+        let quiet = now.saturating_duration_since(last);
+        if quiet <= PLUGIN_EDIT_GESTURE_GAP {
+            return PluginEditSettle::Wait(
+                PLUGIN_EDIT_GESTURE_GAP - quiet + Duration::from_millis(1),
+            );
+        }
+        self.settle_armed = false;
+        let mark_session = std::mem::take(&mut self.unmarked).then_some(session);
+        PluginEditSettle::Done { mark_session }
+    }
 }
 
 impl PluginEditorWindows {
@@ -291,6 +373,52 @@ fn editor_reopen_action(state: &BridgeEditorState) -> EditorReopenAction {
 }
 
 impl StudioLayout {
+    /// A plug-in's own state changed: a built-in editor forwarded a parameter,
+    /// or the plug-in host reported edits in a bridged plug-in's editor.
+    ///
+    /// Marks the project as needing a save, and nothing else: view-only dirty,
+    /// because no engine graph changed (the edit already reached the DSP), and
+    /// no state is copied, because the next save asks every plug-in for its
+    /// real state. Coalesced per gesture ([`PluginEditGesture`]); the gesture's
+    /// trailing mark runs on a timer so an edit made during a save is not lost.
+    pub(super) fn note_plugin_state_edited(&mut self, cx: &mut Context<Self>) {
+        let session = self.session_generation();
+        let step = self
+            .plugin_editors
+            .state_edits
+            .edit(Instant::now(), session);
+        if step.mark {
+            self.mark_dirty_view_only();
+            cx.notify();
+        }
+        if !step.arm_settle {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let mut wait = PLUGIN_EDIT_GESTURE_GAP;
+            loop {
+                cx.background_executor().timer(wait).await;
+                let next = this.update(cx, |this, cx| {
+                    match this.plugin_editors.state_edits.settle(Instant::now()) {
+                        PluginEditSettle::Wait(remaining) => Some(remaining),
+                        PluginEditSettle::Done { mark_session } => {
+                            if mark_session == Some(this.session_generation()) {
+                                this.mark_dirty_view_only();
+                                cx.notify();
+                            }
+                            None
+                        }
+                    }
+                });
+                match next {
+                    Ok(Some(remaining)) => wait = remaining,
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        })
+        .detach();
+    }
+
     pub(super) fn poll_plugin_bridge_runtime(&mut self, cx: &mut Context<Self>) {
         use crate::components::timeline::timeline_state::{
             PluginRuntimeBackend, PluginRuntimeState,
@@ -642,6 +770,30 @@ impl StudioLayout {
                         eprintln!(
                             "[plugin-bridge] event PluginParameters failed instance={plugin_instance_id}"
                         );
+                    }
+                }
+                // A bridged plug-in's own state may have changed (edits in its
+                // editor, a preset it loaded itself, an AU editor closing).
+                // Routed by the exact instance: it counts only for an insert of
+                // this session that the bridge still has loaded, so a late
+                // report about a closed project's plug-in changes nothing. The
+                // stored blob is left alone; the next save captures the state.
+                ClientEvent::Host(HostEvent::PluginStateTouched { plugin_instance_id }) => {
+                    let loaded = runtime
+                        .lock()
+                        .is_ok_and(|runtime| runtime.is_loaded(&plugin_instance_id));
+                    let owned = !self
+                        .timeline
+                        .read(cx)
+                        .state
+                        .insert_owner_ids_containing(&plugin_instance_id)
+                        .is_empty();
+                    ped_log!(
+                        "plugin state touched instance={plugin_instance_id} loaded={loaded} \
+                         owned={owned}"
+                    );
+                    if loaded && owned {
+                        self.note_plugin_state_edited(cx);
                     }
                 }
                 // Space was pressed while a plug-in editor owned keyboard focus.
@@ -2339,11 +2491,12 @@ impl StudioLayout {
         // path; the callback thread pushes them into this insert's shared
         // param ring (the ring's sole producer). `None` while the engine is
         // still warming up — the focus path re-installs a live one later.
+        let studio = cx.weak_entity();
         let forward_param: Option<BuiltinParamForwarder> =
             self.audio_bridge.engine.clone().map(|engine| {
                 let mirror_plugin_id = plugin_id.to_string();
                 std::sync::Arc::new(
-                    move |key: &PluginInstanceKey, index: u32, value: f32| {
+                    move |key: &PluginInstanceKey, index: u32, value: f32, cx: &mut App| {
                         // UI thread, non-realtime: string alloc + command send.
                         if let Err(error) = engine.set_insert_param(
                             key.track_id.clone(),
@@ -2365,6 +2518,16 @@ impl StudioLayout {
                             index,
                             value,
                         );
+                        // The project now needs saving (view-only: the edit
+                        // already reached the DSP, and the save flushes the
+                        // mirror). Deferred: this runs inside the editor
+                        // window's update, and the studio is its parent.
+                        let studio = studio.clone();
+                        cx.defer(move |cx| {
+                            let _ = studio.update(cx, |layout, cx| {
+                                layout.note_plugin_state_edited(cx);
+                            });
+                        });
                     },
                 ) as BuiltinParamForwarder
             });
@@ -4338,8 +4501,13 @@ impl StudioLayout {
     /// Pull current VST3 states from the plugin host into the timeline slots
     /// (`InsertSlotState::vst3_state`) so the next project snapshot persists
     /// them. Bounded request/response — call on save, not per frame. Slots the
-    /// host did not answer for keep their previously captured state.
-    pub(super) fn refresh_bridge_plugin_states(&mut self, cx: &mut Context<Self>) {
+    /// host did not answer for keep their previously captured state; `capture`
+    /// says what the states are for, which decides how that is reported.
+    pub(super) fn refresh_bridge_plugin_states(
+        &mut self,
+        capture: PluginStateCaptureFor,
+        cx: &mut Context<Self>,
+    ) {
         // Built-in inserts: flush the main-process state mirror into each
         // slot's persisted blob so the imminent save writes real state (the
         // mirror is authoritative; nothing is fetched from the host).
@@ -4372,13 +4540,14 @@ impl StudioLayout {
 
         let slots = self.bridge_hosted_insert_slots(cx);
         if slots.is_empty() {
+            self.report_uncaptured_plugin_states(&[], capture, cx);
             return;
         }
         let Some(runtime) = self.plugin_editors.bridge_runtime.as_ref() else {
             return;
         };
         let instance_ids: Vec<String> = slots.iter().map(|(_, id)| id.clone()).collect();
-        let states = match runtime.lock() {
+        let captured = match runtime.lock() {
             Ok(mut runtime) => {
                 runtime.request_plugin_states(&instance_ids, std::time::Duration::from_millis(1500))
             }
@@ -4387,6 +4556,8 @@ impl StudioLayout {
                 return;
             }
         };
+        self.report_uncaptured_plugin_states(&captured.unanswered, capture, cx);
+        let states = captured.states;
         if states.is_empty() {
             return;
         }
@@ -4408,6 +4579,74 @@ impl StudioLayout {
                     }
                 }
             }
+        });
+    }
+
+    /// Say which plug-ins' state a capture could not get in time, and after a
+    /// plain save keep the project unsaved.
+    ///
+    /// Their slots keep the state captured before, so a file written now may
+    /// hold older settings than the plug-in has. Shown as a failed background
+    /// job naming them, worded for what `capture` is for (the status bar turns
+    /// to an error until a later capture gets everything). After a plain save
+    /// a session that was dirty is marked dirty again — deferred, so the mark
+    /// lands after the snapshot and the finished save cannot clear it. Never
+    /// on a save that goes on to close or switch the project, which would
+    /// then ask "Save changes?" again for as long as the plug-in does not
+    /// answer (see [`PluginStateCaptureFor::keeps_session_dirty`]). A clean
+    /// session stays clean: nothing was edited that the file lacks.
+    fn report_uncaptured_plugin_states(
+        &mut self,
+        unanswered: &[String],
+        capture: PluginStateCaptureFor,
+        cx: &mut Context<Self>,
+    ) {
+        const TASK_ID: &str = PLUGIN_STATE_CAPTURE_TASK_ID;
+        if unanswered.is_empty() {
+            let failed = self
+                .background_tasks
+                .tasks
+                .get(TASK_ID)
+                .is_some_and(|task| task.status == crate::components::BackgroundTaskStatus::Failed);
+            if failed {
+                self.complete_background_task(
+                    TASK_ID,
+                    Some("Every plug-in's state was captured".to_string()),
+                );
+            }
+            return;
+        }
+        let names: Vec<String> = {
+            let state = &self.timeline.read(cx).state;
+            unanswered
+                .iter()
+                .map(|instance_id| plugin_state_label(state, instance_id))
+                .collect()
+        };
+        let message = uncaptured_plugin_states_message(&names, capture);
+        eprintln!("[plugin-bridge] {message}");
+        self.start_background_task(
+            TASK_ID,
+            crate::components::BackgroundTaskKind::ProjectSave,
+            "Plug-in state not captured",
+            None,
+            None,
+            false,
+        );
+        self.fail_background_task(TASK_ID, message);
+        cx.notify();
+        if !capture.keeps_session_dirty(self.project_session.is_dirty) {
+            return;
+        }
+        let session = self.session_generation();
+        let studio = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = studio.update(cx, |layout, cx| {
+                if layout.session_generation() == session {
+                    layout.mark_dirty_view_only();
+                    cx.notify();
+                }
+            });
         });
     }
 
@@ -5093,7 +5332,6 @@ impl StudioLayout {
     }
 }
 
-/// Resize shell/content to preferred size before attach (no `ResizeEditor` yet).
 /// Where an insert a cache addresses as `(track_id, insert_id)` is now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum InsertKeyStatus {
@@ -5104,6 +5342,110 @@ pub(super) enum InsertKeyStatus {
     Moved { track_id: String },
     /// No channel holds it any more.
     Removed,
+}
+
+/// How a plug-in is named to the user when its state could not be captured:
+/// the insert's name and the channel it is on, or the bare instance id when
+/// the insert is gone.
+fn plugin_state_label(
+    state: &crate::components::timeline::timeline_state::TimelineState,
+    instance_id: &str,
+) -> String {
+    if let Some(slot) = state
+        .master
+        .inserts
+        .iter()
+        .find(|slot| slot.id == instance_id)
+    {
+        return format!("{} on Master", slot.display_name);
+    }
+    state
+        .tracks
+        .iter()
+        .find_map(|track| {
+            let slot = track.inserts.iter().find(|slot| slot.id == instance_id)?;
+            Some(format!("{} on {}", slot.display_name, track.name))
+        })
+        .unwrap_or_else(|| instance_id.to_string())
+}
+
+/// What a plug-in state capture is for. Decides whether a plug-in that did
+/// not answer in time keeps the session unsaved, and how the warning reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PluginStateCaptureFor {
+    /// Save / Save As, and the synchronous saves (a new project, save before
+    /// recording): the session is bound to the file written.
+    Save,
+    /// The Save answer to "Save changes?" on the way to closing or switching
+    /// the project: the session is bound to the file, then left.
+    SaveThenContinue,
+    /// File → Save Copy: the session is not bound to the copy.
+    SaveCopy,
+    /// An autosave, or the recovery snapshot written on a project switch.
+    Autosave,
+    /// Audio export: no project file is written.
+    Export,
+}
+
+impl PluginStateCaptureFor {
+    /// Whether a plug-in that missed the capture keeps a dirty session dirty
+    /// past the write it was captured for.
+    ///
+    /// Only after a plain save: the file then lacks what the plug-in holds,
+    /// and saving again can capture it. A save on the way to closing or
+    /// switching must let that go on — a mark after its snapshot would count
+    /// as an edit during the save, and the close or switch would ask
+    /// "Save changes?" again for as long as the plug-in does not answer. The
+    /// other writers never clear the dirty flag, so there is nothing to keep.
+    pub(super) fn keeps_session_dirty(self, session_dirty: bool) -> bool {
+        session_dirty && self == Self::Save
+    }
+}
+
+/// Background task reporting plug-ins whose state a capture missed.
+const PLUGIN_STATE_CAPTURE_TASK_ID: &str = "plugin-state-capture";
+
+/// Drop the missed-capture report when the session it was about is replaced:
+/// it names that session's plug-ins and tracks, and a failed task would
+/// otherwise stay in the next project's status bar. Returns whether one was
+/// dropped.
+pub(super) fn forget_plugin_state_capture_report(
+    tasks: &mut crate::components::BackgroundTaskStore,
+) -> bool {
+    tasks.tasks.remove(PLUGIN_STATE_CAPTURE_TASK_ID).is_some()
+}
+
+/// The warning for plug-ins that did not hand over their state in time,
+/// worded for what the capture was for. It is posted when the snapshot is
+/// taken, before the write runs, so it says what the snapshot holds and
+/// never how the write turned out.
+fn uncaptured_plugin_states_message(names: &[String], capture: PluginStateCaptureFor) -> String {
+    let (noun, subject, object) = if names.len() == 1 {
+        ("plug-in", "Its", "its")
+    } else {
+        ("plug-ins", "Their", "their")
+    };
+    let outcome = match capture {
+        PluginStateCaptureFor::Save => format!(
+            "{subject} last captured state was kept, so the project stays unsaved; \
+             save again to capture it."
+        ),
+        PluginStateCaptureFor::SaveThenContinue => {
+            format!("The save uses {object} last captured state.")
+        }
+        PluginStateCaptureFor::SaveCopy => {
+            format!("The copy uses {object} last captured state.")
+        }
+        PluginStateCaptureFor::Autosave => {
+            format!("The autosave uses {object} last captured state.")
+        }
+        PluginStateCaptureFor::Export => format!("{subject} last captured state was kept."),
+    };
+    format!(
+        "{} {noun} did not answer in time: {}. {outcome}",
+        names.len(),
+        names.join(", ")
+    )
 }
 
 /// Classify one `(track_id, insert_id)` key against the project as it is now.
@@ -5168,6 +5510,7 @@ pub(super) fn plan_editor_tab_detach(
     })
 }
 
+/// Resize shell/content to preferred size before attach (no `ResizeEditor` yet).
 fn resize_shell_before_attach(session: &mut BridgeEditorSession, width: u32, height: u32) {
     // Host-owned: the host process owns the editor window and sizes it itself
     // (IPlugView::getSize during embed). The main app has no window to resize
@@ -5538,5 +5881,260 @@ mod tests {
         assert!(bridge_editor_is_open(&BridgeEditorState::Ready));
         // Intermediate in-flight states are focusable but not "open" yet.
         assert!(!bridge_editor_is_open(&BridgeEditorState::AwaitingAttach));
+    }
+}
+
+#[cfg(test)]
+mod plugin_state_dirty_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{
+        PLUGIN_EDIT_GESTURE_GAP, PLUGIN_STATE_CAPTURE_TASK_ID, PluginEditGesture, PluginEditSettle,
+        PluginEditStep, PluginStateCaptureFor, forget_plugin_state_capture_report,
+        plugin_state_label, uncaptured_plugin_states_message,
+    };
+    use crate::components::timeline::timeline_state::{
+        CreateTrackOptions, InputMonitorMode, InsertPluginFormat, TimelineState, TrackType,
+    };
+    use crate::project::ProjectSession;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    const OPENS: PluginEditStep = PluginEditStep {
+        mark: true,
+        arm_settle: true,
+    };
+    const CONTINUES: PluginEditStep = PluginEditStep {
+        mark: false,
+        arm_settle: false,
+    };
+
+    /// A knob drag marks the project once, not once per frame.
+    #[test]
+    fn a_gesture_marks_the_project_once_when_it_starts() {
+        let t0 = Instant::now();
+        let mut gesture = PluginEditGesture::default();
+        assert_eq!(gesture.edit(t0, 1), OPENS);
+        for frame in 1..=30 {
+            assert_eq!(gesture.edit(t0 + ms(16 * frame), 1), CONTINUES);
+        }
+    }
+
+    /// The trailing mark comes only once the edits stop, and only when edits
+    /// followed the opening mark: a single click needs no second one.
+    #[test]
+    fn the_end_of_a_gesture_marks_again_only_after_later_edits() {
+        let t0 = Instant::now();
+        let mut click = PluginEditGesture::default();
+        click.edit(t0, 1);
+        assert_eq!(
+            click.settle(t0 + PLUGIN_EDIT_GESTURE_GAP + ms(1)),
+            PluginEditSettle::Done { mark_session: None }
+        );
+
+        let mut drag = PluginEditGesture::default();
+        drag.edit(t0, 7);
+        drag.edit(t0 + ms(300), 7);
+        match drag.settle(t0 + ms(500)) {
+            PluginEditSettle::Wait(wait) => {
+                assert!(wait > Duration::ZERO && wait <= PLUGIN_EDIT_GESTURE_GAP)
+            }
+            other => panic!("the drag is still going, got {other:?}"),
+        }
+        assert_eq!(
+            drag.settle(t0 + ms(300) + PLUGIN_EDIT_GESTURE_GAP + ms(1)),
+            PluginEditSettle::Done {
+                mark_session: Some(7)
+            }
+        );
+        // Settled: the next edit opens a new gesture and arms a new check.
+        assert_eq!(drag.edit(t0 + ms(5_000), 7), OPENS);
+    }
+
+    #[test]
+    fn a_pause_or_another_session_starts_a_new_gesture() {
+        let t0 = Instant::now();
+        let mut gesture = PluginEditGesture::default();
+        gesture.edit(t0, 1);
+        // Paused past the gap while its settle check is still armed: marks,
+        // and the armed check serves the new gesture.
+        let step = gesture.edit(t0 + PLUGIN_EDIT_GESTURE_GAP + ms(1), 1);
+        assert_eq!(
+            step,
+            PluginEditStep {
+                mark: true,
+                arm_settle: false
+            }
+        );
+        // The project was switched: its first edit is marked on its own.
+        assert!(gesture.edit(t0 + PLUGIN_EDIT_GESTURE_GAP + ms(2), 2).mark);
+    }
+
+    /// Why the gesture has a trailing mark: a save that snapshots mid-drag
+    /// must not report the rest of the drag as saved.
+    #[test]
+    fn edits_after_a_save_snapshot_keep_the_session_dirty() {
+        let t0 = Instant::now();
+        let mut session = ProjectSession::untitled();
+        let mut gesture = PluginEditGesture::default();
+        if gesture.edit(t0, 1).mark {
+            session.mark_dirty();
+        }
+        let saved_generation = session.dirty_generation;
+        assert!(
+            !gesture.edit(t0 + ms(100), 1).mark,
+            "mid-gesture, after the snapshot"
+        );
+        if let PluginEditSettle::Done {
+            mark_session: Some(_),
+        } = gesture.settle(t0 + ms(100) + PLUGIN_EDIT_GESTURE_GAP + ms(1))
+        {
+            session.mark_dirty();
+        }
+        let clean = session.bind_saved_snapshot(
+            session.id.clone(),
+            "Song".to_string(),
+            None,
+            std::path::PathBuf::from("/tmp/Song/Song.fbproj"),
+            1,
+            2,
+            saved_generation,
+        );
+        assert!(!clean);
+        assert!(session.is_dirty);
+    }
+
+    #[test]
+    fn plug_ins_that_did_not_answer_are_named_by_insert_and_channel() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track = state.create_track(CreateTrackOptions {
+            track_type: TrackType::Audio,
+            name: "Lead Vox".to_string(),
+            color: gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        });
+        let slot = state.ensure_insert_slot_at(&track, 0).expect("slot");
+        state.set_insert_plugin(
+            &track,
+            &slot,
+            "fx".to_string(),
+            Some(std::path::PathBuf::from("/p/Comp.vst3")),
+            InsertPluginFormat::Vst3,
+            None,
+            "Comp".to_string(),
+        );
+        assert_eq!(plugin_state_label(&state, &slot), "Comp on Lead Vox");
+        assert_eq!(plugin_state_label(&state, "gone-7"), "gone-7");
+
+        let save = PluginStateCaptureFor::Save;
+        let one = uncaptured_plugin_states_message(&["Comp on Lead Vox".to_string()], save);
+        assert!(one.starts_with("1 plug-in did not answer in time: Comp on Lead Vox."));
+        assert!(one.contains("Its last captured state was kept"));
+        let two =
+            uncaptured_plugin_states_message(&["A on 1".to_string(), "B on 2".to_string()], save);
+        assert!(two.starts_with("2 plug-ins did not answer in time: A on 1, B on 2."));
+        assert!(two.contains("Their last captured state was kept"));
+    }
+
+    /// Only a plain save keeps the project unsaved when a plug-in missed the
+    /// capture. A save on the way to closing or switching lets that go on:
+    /// re-marking after its snapshot would ask "Save changes?" again for as
+    /// long as the plug-in does not answer.
+    #[test]
+    fn only_a_plain_save_keeps_the_session_dirty_after_a_missed_capture() {
+        use PluginStateCaptureFor::*;
+        assert!(Save.keeps_session_dirty(true));
+        for capture in [SaveThenContinue, SaveCopy, Autosave, Export] {
+            assert!(!capture.keeps_session_dirty(true), "{capture:?}");
+        }
+        for capture in [Save, SaveThenContinue, SaveCopy, Autosave, Export] {
+            assert!(
+                !capture.keeps_session_dirty(false),
+                "a clean session stays clean: {capture:?}"
+            );
+        }
+    }
+
+    /// The warning says what happened for what the capture was for: only a
+    /// plain save says the project stays unsaved, and an export claims no
+    /// save at all.
+    #[test]
+    fn the_missed_capture_warning_matches_what_the_capture_was_for() {
+        use PluginStateCaptureFor::*;
+        let names = ["Comp on Lead Vox".to_string()];
+        let message = |capture| uncaptured_plugin_states_message(&names, capture);
+        for capture in [Save, SaveThenContinue, SaveCopy, Autosave, Export] {
+            assert!(
+                message(capture).starts_with("1 plug-in did not answer in time: Comp on Lead Vox."),
+                "{capture:?}"
+            );
+        }
+        assert!(message(Save).contains("the project stays unsaved; save again"));
+        for capture in [SaveThenContinue, SaveCopy, Autosave, Export] {
+            assert!(!message(capture).contains("unsaved"), "{capture:?}");
+        }
+        // Posted before the write runs: what the snapshot holds, never a
+        // claim that the write succeeded.
+        assert!(message(SaveThenContinue).ends_with("The save uses its last captured state."));
+        assert!(message(SaveCopy).ends_with("The copy uses its last captured state."));
+        assert!(message(Autosave).ends_with("The autosave uses its last captured state."));
+        for capture in [Save, SaveThenContinue, SaveCopy, Autosave, Export] {
+            let message = message(capture);
+            for claim in ["is saved", "was saved", "keeps"] {
+                assert!(!message.contains(claim), "{capture:?}: {message}");
+            }
+        }
+        let export = message(Export);
+        assert!(!export.contains("save"), "{export}");
+        assert!(export.ends_with("Its last captured state was kept."));
+    }
+
+    /// A save-then-switch goes on after a missed capture; the report names
+    /// the old project's plug-ins and must not stay in the next project's
+    /// status bar. Other tasks are left alone.
+    #[test]
+    fn installing_another_project_drops_the_missed_capture_report() {
+        use crate::components::{
+            BackgroundTaskKind, BackgroundTaskStatus, BackgroundTaskStore, BackgroundTaskUpdate,
+        };
+        let task = |title: &str, status| BackgroundTaskUpdate {
+            kind: BackgroundTaskKind::ProjectSave,
+            title: title.to_string(),
+            detail: None,
+            status,
+            progress: None,
+            error: None,
+            cancellable: false,
+            parent_id: None,
+        };
+        let mut tasks = BackgroundTaskStore::default();
+        tasks.add_or_update(
+            PLUGIN_STATE_CAPTURE_TASK_ID,
+            task("Plug-in state not captured", BackgroundTaskStatus::Running),
+        );
+        tasks.fail(
+            PLUGIN_STATE_CAPTURE_TASK_ID,
+            "1 plug-in did not answer in time",
+        );
+        tasks.add_or_update(
+            "project-autosave",
+            task("Autosave project", BackgroundTaskStatus::Running),
+        );
+
+        assert!(forget_plugin_state_capture_report(&mut tasks));
+        assert!(!tasks.tasks.contains_key(PLUGIN_STATE_CAPTURE_TASK_ID));
+        assert!(tasks.tasks.contains_key("project-autosave"));
+        assert!(!forget_plugin_state_capture_report(&mut tasks));
     }
 }

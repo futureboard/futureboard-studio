@@ -405,9 +405,11 @@ impl TimelineState {
             .unwrap_or(TrackLaneMode::Clips)
     }
 
-    /// Toggle a track between Clip and Automation mode. UI-only. Returns the new
-    /// mode. Selecting Automation mode also makes sure a lane exists for the
-    /// active target so the editor has something to draw.
+    /// Toggle a track between Clip and Automation mode. Never reaches the
+    /// engine, but the mode is saved with the project (v54), so callers mark it
+    /// view-only dirty. Returns the new mode. Selecting Automation mode also
+    /// makes sure a lane exists for the active target so the editor has
+    /// something to draw.
     pub fn toggle_track_lane_mode(&mut self, track_id: &str) -> Option<TrackLaneMode> {
         let new_mode = {
             let track = self.tracks.iter_mut().find(|t| t.id == track_id)?;
@@ -990,7 +992,9 @@ impl TimelineState {
     // ── Automation sub-lane actions (lane header controls) ────────────────────
 
     /// Focus the editor on `lane_id` (sets the active automation target to that
-    /// lane's target). UI-only. Called when a sub-lane header is clicked.
+    /// lane's target). UI-only; an expanded track's focus is saved with the
+    /// project, see `Timeline::focus_automation_lane`. Called when a sub-lane
+    /// header is clicked.
     pub fn activate_automation_lane(&mut self, track_id: &str, lane_id: &str) {
         let target = self
             .automation_lane(track_id, lane_id)

@@ -272,20 +272,6 @@ pub fn setup(cx: &mut App) {
             StartupRoute::Welcome => {
                 log_startup_phase(StartupPhase::OpeningWelcome);
                 cx.update(open_welcome_window);
-                // Work from an untitled session that never reached its first
-                // save survives only as an autosave; offer it back once.
-                cx.update(|app| {
-                    sphere_ui_components::loading_session::offer_untitled_autosave_recovery(
-                        Arc::new(|path, app| {
-                            begin_load_project_from_welcome(
-                                path,
-                                ProjectOpenOptions::default(),
-                                app,
-                            );
-                        }),
-                        app,
-                    );
-                });
             }
             StartupRoute::EmptyWorkspace => {
                 log_startup_phase(StartupPhase::OpeningStudio);
@@ -320,6 +306,17 @@ pub fn setup(cx: &mut App) {
             cx.update(|app| splash.close(app));
         }
 
+        // Work from an untitled session that never reached its first save
+        // survives only as an autosave. Offer it back on every startup route,
+        // once the first surface is idle (a project being opened asks about
+        // its own autosave first).
+        cx.update(|app| {
+            sphere_ui_components::loading_session::offer_untitled_autosave_recovery(
+                Arc::new(recover_untitled_autosave),
+                app,
+            );
+        });
+
         // First-run EULA gate (Professional Edition). Opens on top of the first
         // surface; declining quits. No-op once accepted for this version.
         #[cfg(feature = "professional")]
@@ -328,6 +325,31 @@ pub fn setup(cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// Open a recovered untitled autosave into whichever surface is up: from
+/// Welcome like any project, or into the studio through its unsaved-changes
+/// guard.
+fn recover_untitled_autosave(path: PathBuf, cx: &mut App) {
+    let mode = cx.try_global::<AppSessionGate>().map(|gate| gate.mode);
+    match mode {
+        Some(AppMode::Welcome) => {
+            begin_load_project_from_welcome(path, ProjectOpenOptions::default(), cx);
+        }
+        Some(AppMode::Studio) => {
+            let Some(studio) = cx
+                .try_global::<NativeShellWindows>()
+                .and_then(|shell| shell.studio)
+            else {
+                eprintln!("[SessionLoad] untitled recovery ignored — no studio window");
+                return;
+            };
+            let _ = studio.update(cx, |layout, _window, cx| {
+                layout.recover_untitled_autosave(path, cx);
+            });
+        }
+        _ => eprintln!("[SessionLoad] untitled recovery ignored — a session is loading"),
+    }
 }
 
 fn persist_plugin_scan_prompt_answered(cx: &mut App) {

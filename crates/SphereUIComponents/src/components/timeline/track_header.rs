@@ -9,6 +9,9 @@ use crate::components::controls::fb_tooltip;
 use crate::components::fader::{db_value_pill, horizontal_fader_with_drag_callbacks};
 use crate::components::knob::format_pan_label;
 use crate::components::spin_drag::SpinDrag;
+use crate::components::text_input::{
+    text_field_with_callbacks_and_ime, TextInputCallbacks, TextInputState,
+};
 use crate::components::timeline::timeline_state::{
     is_arrangement_hidden_track, volume, TimelineState, TrackDragItem, TrackLaneMode, TrackState,
     TrackType, HEADER_WIDTH, TRACK_HEADER_CONTROLS_MIN_HEIGHT,
@@ -64,6 +67,44 @@ pub struct TrackHeaderCallbacks {
     /// Open the track's instrument plugin editor, or the instrument picker when
     /// the slot is empty. `None` hides the header button.
     pub on_open_instrument: Option<TrackCallback>,
+    /// Open the inline name editor on a plain double-click of the name; see
+    /// [`opens_track_rename`].
+    pub on_begin_rename: TrackCallback,
+    /// The rename in progress, drawn in place of its track's name. `None` when
+    /// no header is being renamed, so the other rows capture nothing of it.
+    pub rename: Option<std::rc::Rc<TrackHeaderRename>>,
+}
+
+/// Height of the inline name field: between the 20 px affordances beside the
+/// name and the 24 px band of the M/S/R/I/A strip, so opening the editor never
+/// changes the height of the name line, on a compact row or a full one.
+pub const TRACK_NAME_FIELD_HEIGHT: f32 = 22.0;
+
+/// What the header needs to draw the name editor the arrangement owns.
+pub struct TrackHeaderRename {
+    pub track_id: String,
+    pub input: TextInputState,
+    pub focused: bool,
+    pub callbacks: TextInputCallbacks,
+    pub ime_target: gpui::Entity<crate::components::timeline::Timeline>,
+}
+
+/// Whether a click on a track name opens the inline rename.
+///
+/// Only a plain, stationary double-click does. The name sits inside the drag
+/// zone, and GPUI still delivers a child's click after the parent dragged, so
+/// the click count alone would open the editor after two quick reorder drags;
+/// [`is_reset_double_click`](crate::components::fader::is_reset_double_click)
+/// requires the pointer to have stayed put. A modified double-click is the
+/// header's Cmd/Shift selection gesture pressed twice, not a request to rename.
+pub fn opens_track_rename(event: &gpui::ClickEvent, drag_active: bool) -> bool {
+    let modified = match event {
+        gpui::ClickEvent::Mouse(click) => {
+            click.down.modifiers.modified() || click.up.modifiers.modified()
+        }
+        gpui::ClickEvent::Keyboard(_) => false,
+    };
+    !drag_active && !modified && crate::components::fader::is_reset_double_click(event)
 }
 
 pub struct TrackDragPreview {
@@ -596,7 +637,8 @@ pub fn track_header(
 ) -> impl IntoElement {
     let _s = crate::perf::PerfScope::enter("TrackHeader");
     let track_id = track.id.clone();
-    let is_selected = state.is_track_selected(&track.id);
+    // The arrangement shows a marquee's preview while one is in flight.
+    let is_selected = state.display_selection().is_track_selected(&track.id);
     let is_automation = track.lane_mode == TrackLaneMode::Automation;
     let is_group = track.track_type == TrackType::Group;
     let is_group_child = track.parent_group_id.is_some();
@@ -764,6 +806,15 @@ pub fn track_header(
     let assign_to_group = callbacks.on_assign_to_group.clone();
     let collapse_group_id = track_id.clone();
     let toggle_group_collapsed = callbacks.on_toggle_group_collapsed.clone();
+    // The inline rename draws in place of this track's name only; every other
+    // row keeps its plain name and the double-click that opens the editor.
+    let rename = callbacks
+        .rename
+        .as_ref()
+        .filter(|rename| rename.track_id == track.id)
+        .cloned();
+    let begin_rename = callbacks.on_begin_rename.clone();
+    let rename_track_id = track_id.clone();
 
     div()
         .flex()
@@ -1004,8 +1055,22 @@ pub fn track_header(
                                                     .text_color(Colors::accent_primary()),
                                             )
                                         })
-                                        .child(
-                                            div()
+                                        .child(match rename {
+                                            // The field stops its own presses,
+                                            // so editing never reselects the
+                                            // track or starts a reorder drag.
+                                            Some(rename) => div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .child(text_field_with_callbacks_and_ime(
+                                                    &rename.input,
+                                                    rename.focused,
+                                                    rename.callbacks.clone(),
+                                                    rename.ime_target.clone(),
+                                                ))
+                                                .into_any_element(),
+                                            None => div()
+                                                .id(("track-name", id_num))
                                                 .flex_1()
                                                 .min_w(px(0.0))
                                                 .overflow_hidden()
@@ -1013,8 +1078,17 @@ pub fn track_header(
                                                 .text_size(px(typography::UI_SM))
                                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                                 .text_color(Colors::text_primary())
-                                                .child(track.name.clone()),
-                                        ),
+                                                .child(track.name.clone())
+                                                .on_click(move |event, window, cx| {
+                                                    if opens_track_rename(
+                                                        event,
+                                                        cx.has_active_drag(),
+                                                    ) {
+                                                        begin_rename(&rename_track_id, window, cx);
+                                                    }
+                                                })
+                                                .into_any_element(),
+                                        }),
                                 ),
                         )
                         .when_some(
@@ -1204,4 +1278,71 @@ pub fn track_header(
                     callbacks.on_delete_take.clone(),
                 )),
         )
+}
+
+#[cfg(test)]
+mod rename_gesture_tests {
+    use super::opens_track_rename;
+    use gpui::{point, px, Modifiers};
+
+    fn click(travel: f32, click_count: usize, down: Modifiers, up: Modifiers) -> gpui::ClickEvent {
+        gpui::ClickEvent::Mouse(gpui::MouseClickEvent {
+            down: gpui::MouseDownEvent {
+                position: point(px(40.0), px(12.0)),
+                modifiers: down,
+                ..Default::default()
+            },
+            up: gpui::MouseUpEvent {
+                position: point(px(40.0 + travel), px(12.0)),
+                modifiers: up,
+                click_count,
+                ..Default::default()
+            },
+        })
+    }
+
+    fn plain() -> Modifiers {
+        Modifiers::default()
+    }
+
+    #[test]
+    fn a_plain_stationary_double_click_opens_the_editor() {
+        assert!(opens_track_rename(&click(0.0, 2, plain(), plain()), false));
+        assert!(opens_track_rename(&click(2.0, 2, plain(), plain()), false));
+    }
+
+    #[test]
+    fn a_single_click_only_selects() {
+        assert!(!opens_track_rename(&click(0.0, 1, plain(), plain()), false));
+    }
+
+    /// Two quick reorder drags started on the name arrive as a double-click.
+    #[test]
+    fn drags_never_open_the_editor() {
+        assert!(!opens_track_rename(
+            &click(40.0, 2, plain(), plain()),
+            false
+        ));
+        assert!(!opens_track_rename(&click(0.0, 2, plain(), plain()), true));
+    }
+
+    /// A modified double-click is the header's selection gesture twice over.
+    #[test]
+    fn a_modified_double_click_does_not_open_the_editor() {
+        let cmd = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert!(!opens_track_rename(&click(0.0, 2, cmd, cmd), false));
+        assert!(!opens_track_rename(&click(0.0, 2, shift, plain()), false));
+        assert!(!opens_track_rename(&click(0.0, 2, plain(), alt), false));
+    }
 }

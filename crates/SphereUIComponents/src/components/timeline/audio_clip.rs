@@ -1,20 +1,55 @@
 use crate::components::timeline::timeline_state::{
-    ClipDragItem, ClipEdge, ClipResizeDrag, ClipState, StretchTiming, TimelineState, TimelineTool,
+    ClipDragItem, ClipEdge, ClipResizeDrag, ClipState, ClipTimeAxis, EffectiveFades, FadeEdge,
+    StretchTiming, TimelineState, TimelineTool,
 };
 use crate::components::timeline::waveform_canvas::waveform_canvas;
 use crate::theme::Colors;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    canvas, div, px, relative, AppContext, DragMoveEvent, Empty, InteractiveElement, IntoElement,
-    ParentElement, Render, StatefulInteractiveElement, Styled, Window,
+    canvas, div, point, px, relative, AppContext, DragMoveEvent, Empty, InteractiveElement,
+    IntoElement, ParentElement, PathBuilder, Render, StatefulInteractiveElement, Styled, Window,
 };
 
+/// A clip-gain or fade gesture on an audio clip, resolved by the timeline.
+///
+/// The fade variants carry raw window x: the timeline maps it through the one
+/// arrangement transform and the grid, the way the Smart Tool's cut does, so a
+/// fade lands where it is drawn.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AudioClipProcessUpdate {
+    /// The inline gain was pressed: a new gain gesture starts.
+    GainPress,
     Gain(f32),
-    FadeInMs(f32),
-    FadeOutMs(f32),
+    /// A fade handle was pressed at `window_x`. The press selects the clip as
+    /// a press on its body does (`additive`: Cmd/Ctrl toggles it); the
+    /// timeline keeps the offset from the fade's end, so the fade does not
+    /// jump to the pointer once a drag starts.
+    FadePress {
+        edge: FadeEdge,
+        window_x: f32,
+        additive: bool,
+    },
+    /// The pressed fade handle moved past the drag threshold. Shift bypasses
+    /// the grid.
+    FadeDrag {
+        edge: FadeEdge,
+        window_x: f32,
+        bypass_snap: bool,
+    },
+    /// A double-click on a fade handle: that fade back to zero. Its press
+    /// selects the clip too.
+    FadeReset {
+        edge: FadeEdge,
+        additive: bool,
+    },
+    /// The pointer entered (`true`) or left the clip. Its fade handles are
+    /// revealed by an overlay, so a hover never rebuilds the lane.
+    Hover(bool),
 }
+
+/// Why the clip-processing controls on an ARA track are disabled.
+pub(crate) const ARA_CLIP_PROCESSING_TOOLTIP: &str =
+    "Not applied on ARA tracks: the ARA plug-in renders this track's audio";
 
 pub type AudioClipProcessPreviewCb = std::sync::Arc<
     dyn Fn(&(String, AudioClipProcessUpdate), &mut gpui::Window, &mut gpui::App) + 'static,
@@ -36,13 +71,14 @@ pub enum ClipCutGesture {
     },
     /// The pointer is over a clip's cut zone. `left` / `right` clamp the razor
     /// line to the clip, `top` / `height` span it; all in window coordinates.
-    /// The line only shows while `alt` is held — the modifier the cut needs —
-    /// and the timeline keeps the position so pressing or releasing Option
+    /// The line only shows while `armed` — the cut's modifier is held, by the
+    /// same test the click makes ([`smart_cut_modifier_held`]) — and the
+    /// timeline keeps the position so pressing or releasing a modifier
     /// without moving shows or hides it.
     Hover {
         window_x: f32,
         bypass_snap: bool,
-        alt: bool,
+        armed: bool,
         left: f32,
         right: f32,
         top: f32,
@@ -77,7 +113,7 @@ pub(crate) fn clip_resize_handle_w(clip_width: f32) -> f32 {
 /// ~38 px level readout before one character of the name can appear. Under
 /// this it is a dark bar with nothing legible in it, and it costs two measured
 /// text nodes per clip — the single largest item in a dense arrangement frame.
-const CLIP_STRIP_MIN_W: f32 = 44.0;
+pub(crate) const CLIP_STRIP_MIN_W: f32 = 44.0;
 
 /// Narrowest clip whose strip carries more than its name.
 ///
@@ -90,26 +126,360 @@ const CLIP_STRIP_DETAIL_MIN_W: f32 = 96.0;
 ///
 /// Two 6 px handles on a 12 px clip cover the whole of it, leaving no body to
 /// grab and no way to move the clip at all. Below this the clip is one target.
-const CLIP_RESIZE_HANDLE_MIN_W: f32 = 20.0;
+pub(crate) const CLIP_RESIZE_HANDLE_MIN_W: f32 = 20.0;
 
 /// Width of one edge handle, exposed for the tier test. The handle itself is a
 /// local constant inside the element builder, where it belongs.
 #[cfg(test)]
 const RESIZE_HANDLE_W_FOR_TESTS: f32 = 6.0;
 
-/// Wall-clock length the clip plays for, in seconds.
-///
-/// Fades are authored in milliseconds, so they are resolved against this rather
-/// than against the beat span the clip happens to cover.
-fn audio_clip_timeline_duration_seconds(clip: &ClipState, state: &TimelineState) -> f32 {
-    if let Some(seconds) = clip
-        .stretch
-        .played_seconds_for_project_bpm(state.bpm.max(1.0) as f64)
-    {
-        return (seconds as f32).max(0.001);
+/// A clip's 1 px border. Its children are laid out inside it, so every handle
+/// position below is in that inner box.
+pub(crate) const CLIP_BORDER: f32 = 1.0;
+
+/// Hit area of a corner fade handle (and of a crossfade handle), square.
+pub(crate) const FADE_HANDLE_HIT: f32 = 12.0;
+
+/// The square a fade handle is drawn as, inside its hit area.
+pub(crate) const FADE_HANDLE_SIZE: f32 = 8.0;
+
+/// A rectangle in a clip's inner box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LocalRect {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl LocalRect {
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.left && x < self.left + self.width && y >= self.top && y < self.top + self.height
     }
-    // Pending and legacy clips may not have decoded source bounds yet.
-    (clip.duration_beats * state.seconds_per_beat()).max(0.001)
+}
+
+/// One fade handle: where it takes presses, and the square drawn in that.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FadeHandleRect {
+    pub hit: LocalRect,
+    pub mark: LocalRect,
+}
+
+/// What a press at a point of an audio clip lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipHitZone {
+    FadeIn,
+    FadeOut,
+    TrimLeft,
+    TrimRight,
+    /// The Smart Tool's cut zone (Option-click splits).
+    CutZone,
+    /// Select, move, double-click to open.
+    Body,
+}
+
+/// Where an audio clip's handles are, in its inner box. The clip element lays
+/// its handles out from this and [`Self::hit`] answers what a press there
+/// reaches, so the two cannot disagree.
+///
+/// Priority, top first: the corner fade handles, the full-height trim columns,
+/// the cut zone, the body. The fade handles live in the top band the cut zone
+/// leaves free ([`SMART_CUT_TOP_CLEARANCE`]), so they never cover it; the trim
+/// columns keep the rest of each edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ClipHandleLayout {
+    pub width: f32,
+    pub height: f32,
+    pub trim_w: Option<f32>,
+    pub fade_in: Option<FadeHandleRect>,
+    pub fade_out: Option<FadeHandleRect>,
+    pub cut_zone: Option<LocalRect>,
+}
+
+impl ClipHandleLayout {
+    /// Handles for a clip drawn `width` × `height` (outer). `fade_in_x` /
+    /// `fade_out_x` are where the fades end and start in the inner box; `None`
+    /// leaves that handle out (another tool, a crossfaded edge).
+    pub fn new(
+        width: f32,
+        height: f32,
+        fade_in_x: Option<f32>,
+        fade_out_x: Option<f32>,
+        cut_zone: bool,
+    ) -> Self {
+        let inner_w = (width - 2.0 * CLIP_BORDER).max(0.0);
+        let inner_h = (height - 2.0 * CLIP_BORDER).max(0.0);
+        let edges = width >= CLIP_RESIZE_HANDLE_MIN_W;
+        let trim_w = edges.then(|| clip_resize_handle_w(width));
+        // Two handles side by side always fit: a zero fade's handle sits in
+        // its corner, and the two never cover each other when the fades meet.
+        let hit_w = FADE_HANDLE_HIT.min(inner_w * 0.5);
+        let hit_h = FADE_HANDLE_HIT.min(SMART_CUT_TOP_CLEARANCE).min(inner_h);
+        let mark_size = FADE_HANDLE_SIZE.min(hit_w).min(hit_h);
+        let handle = |left: f32, fade_x: f32| {
+            let mark_left = (fade_x - mark_size * 0.5)
+                .min(left + hit_w - mark_size)
+                .max(left);
+            FadeHandleRect {
+                hit: LocalRect {
+                    left,
+                    top: 0.0,
+                    width: hit_w,
+                    height: hit_h,
+                },
+                mark: LocalRect {
+                    left: mark_left,
+                    top: ((hit_h - mark_size) * 0.5).max(0.0),
+                    width: mark_size,
+                    height: mark_size,
+                },
+            }
+        };
+        // Room for the fade-out handle to its right, when there is one.
+        let fade_in_max = if fade_out_x.is_some() {
+            inner_w - 2.0 * hit_w
+        } else {
+            inner_w - hit_w
+        };
+        let fade_in = fade_in_x.filter(|_| edges).map(|x| {
+            let left = (x - hit_w * 0.5).min(fade_in_max).max(0.0);
+            handle(left, x)
+        });
+        let fade_out = fade_out_x.filter(|_| edges).map(|x| {
+            let floor = fade_in.map_or(0.0, |rect| rect.hit.left + hit_w);
+            let left = (x - hit_w * 0.5).min(inner_w - hit_w).max(floor);
+            handle(left, x)
+        });
+        let cut_zone = trim_w.filter(|_| cut_zone).map(|trim_w| LocalRect {
+            left: trim_w,
+            top: SMART_CUT_TOP_CLEARANCE,
+            width: (inner_w - 2.0 * trim_w).max(0.0),
+            height: (inner_h - SMART_CUT_TOP_CLEARANCE).max(0.0),
+        });
+        Self {
+            width: inner_w,
+            height: inner_h,
+            trim_w,
+            fade_in,
+            fade_out,
+            cut_zone,
+        }
+    }
+
+    /// What a press at inner-box point `(x, y)` reaches.
+    pub fn hit(&self, x: f32, y: f32) -> ClipHitZone {
+        // Painted last, so tested first; the two never overlap anyway.
+        if self.fade_out.is_some_and(|rect| rect.hit.contains(x, y)) {
+            return ClipHitZone::FadeOut;
+        }
+        if self.fade_in.is_some_and(|rect| rect.hit.contains(x, y)) {
+            return ClipHitZone::FadeIn;
+        }
+        if let Some(trim_w) = self.trim_w {
+            if x < trim_w {
+                return ClipHitZone::TrimLeft;
+            }
+            if x >= self.width - trim_w {
+                return ClipHitZone::TrimRight;
+            }
+        }
+        if self.cut_zone.is_some_and(|rect| rect.contains(x, y)) {
+            return ClipHitZone::CutZone;
+        }
+        ClipHitZone::Body
+    }
+}
+
+/// Where a clip's fade handles go, from the fades it plays: at the end of the
+/// fade-in and the start of the fade-out, through the clip's time map
+/// ([`TimelineState::clip_time_axis`]) the curves are drawn with and a drag is
+/// resolved through. A crossfaded edge gets no handle: the crossfade's own
+/// handle replaces it. `clip_left` / `width` / `height` are the clip's drawn
+/// rectangle.
+pub(crate) fn clip_fade_handle_layout(
+    time: &ClipTimeAxis<'_>,
+    fades: &EffectiveFades,
+    clip_left: f32,
+    width: f32,
+    height: f32,
+    cut_zone: bool,
+) -> ClipHandleLayout {
+    let inner_left = clip_left + CLIP_BORDER;
+    let inner_w = (width - 2.0 * CLIP_BORDER).max(0.0);
+    let local_x =
+        |seconds: f64| (time.lane_x_at_local_seconds(seconds) - inner_left).clamp(0.0, inner_w);
+    let fade_in_x = (!fades.in_crossfade).then(|| local_x(fades.in_seconds));
+    let fade_out_x = (!fades.out_crossfade)
+        .then(|| local_x((fades.played_seconds - fades.out_seconds).max(0.0)));
+    ClipHandleLayout::new(width, height, fade_in_x, fade_out_x, cut_zone)
+}
+
+/// The square a fade or crossfade handle is drawn as. Muted on an ARA track,
+/// whose engine path ignores it.
+pub(crate) fn fade_handle_mark(size: f32, active: bool, disabled: bool) -> gpui::Div {
+    let border = if disabled {
+        Colors::with_alpha(
+            Colors::text_disabled(),
+            crate::theme::state::DISABLED_CONTENT,
+        )
+    } else if active {
+        Colors::text_primary()
+    } else {
+        Colors::accent_primary()
+    };
+    div()
+        .w(px(size))
+        .h(px(size))
+        .rounded(px(crate::theme::radius::CONTROL))
+        .bg(if active {
+            Colors::accent_primary()
+        } else {
+            Colors::surface_input()
+        })
+        .border(px(1.0))
+        .border_color(border)
+}
+
+/// Equal-power gain `t` of the way through a rising fade: the law the engine
+/// plays (`FadeCurve::EqualPower`), so the drawn curve is the heard one.
+pub(crate) fn equal_power_rising(t: f32) -> f32 {
+    (t.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2).sin()
+}
+
+/// One fade to draw: points `(x, gain)` in the clip's inner box.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FadeCurvePoints {
+    pub points: Vec<(f32, f32)>,
+}
+
+/// How many segments a fade `width_px` wide is drawn with. Narrow fades get a
+/// few (a zoomed-out arrangement draws many clips); nothing under 2 px.
+pub(crate) fn fade_curve_segments(width_px: f32) -> usize {
+    if width_px < 2.0 {
+        0
+    } else {
+        ((width_px / 4.0) as usize).clamp(2, 32)
+    }
+}
+
+/// Sample a clip's manual fade on `edge` for drawing; `None` on a crossfaded
+/// edge, which the track's crossfade overlay draws. See [`fade_edge_curve`].
+pub(crate) fn fade_curve_points(
+    time: &ClipTimeAxis<'_>,
+    fades: &EffectiveFades,
+    edge: FadeEdge,
+    inner_left: f32,
+) -> Option<FadeCurvePoints> {
+    if fades.crossfaded(edge) {
+        return None;
+    }
+    fade_edge_curve(time, fades, edge, inner_left, None)
+}
+
+/// Sample the fade a clip plays on `edge` for drawing, stepping through its
+/// own playing time and placing each step through its time map: under a
+/// tempo ramp the curve bends exactly where the audio it fades does. The map
+/// is resolved once per clip, so a sample is arithmetic, not a tempo-map
+/// lookup.
+///
+/// `within` keeps only the part inside that span of the clip's time (a
+/// crossfade overlay draws the part of each fade over its own overlap).
+/// Points are `(x - origin_x, gain)`.
+pub(crate) fn fade_edge_curve(
+    time: &ClipTimeAxis<'_>,
+    fades: &EffectiveFades,
+    edge: FadeEdge,
+    origin_x: f32,
+    within: Option<(f64, f64)>,
+) -> Option<FadeCurvePoints> {
+    let seconds = fades.seconds(edge);
+    if !(seconds > 0.0) {
+        return None;
+    }
+    let (from, rising) = match edge {
+        FadeEdge::In => (0.0, true),
+        FadeEdge::Out => ((fades.played_seconds - seconds).max(0.0), false),
+    };
+    let (mut first, mut last) = (from, from + seconds);
+    if let Some((low, high)) = within {
+        first = first.max(low);
+        last = last.min(high);
+    }
+    if !(last > first) {
+        return None;
+    }
+    let x0 = time.lane_x_at_local_seconds(first);
+    let x1 = time.lane_x_at_local_seconds(last);
+    let segments = fade_curve_segments(x1 - x0);
+    if segments == 0 {
+        return None;
+    }
+    let linear = time.is_linear();
+    let points = (0..=segments)
+        .map(|i| {
+            let u = i as f64 / segments as f64;
+            let at = if i == segments {
+                last
+            } else {
+                first + (last - first) * u
+            };
+            let x = if linear {
+                x0 + (x1 - x0) * u as f32
+            } else {
+                time.lane_x_at_local_seconds(at)
+            };
+            let t = ((at - from) / seconds) as f32;
+            let gain = if rising {
+                equal_power_rising(t)
+            } else {
+                equal_power_rising(1.0 - t)
+            };
+            (x - origin_x, gain)
+        })
+        .collect();
+    Some(FadeCurvePoints { points })
+}
+
+/// Paint fades as the engine plays them: the part each one removes shaded (when
+/// `shade` is given), the gain drawn as a line. `top` / `bottom` bound the
+/// curve in window y.
+pub(crate) fn paint_fade_curves(
+    curves: &[FadeCurvePoints],
+    origin_x: f32,
+    top: f32,
+    bottom: f32,
+    shade: Option<gpui::Rgba>,
+    line_color: gpui::Rgba,
+    window: &mut Window,
+) {
+    for curve in curves {
+        let (Some(first), Some(last)) = (curve.points.first(), curve.points.last()) else {
+            continue;
+        };
+        let y_at = |gain: f32| bottom - (bottom - top) * gain;
+        let mut fill = PathBuilder::fill();
+        let mut line = PathBuilder::stroke(px(1.0));
+        fill.move_to(point(px(origin_x + first.0), px(top)));
+        for (i, &(x, gain)) in curve.points.iter().enumerate() {
+            let p = point(px(origin_x + x), px(y_at(gain)));
+            fill.line_to(p);
+            if i == 0 {
+                line.move_to(p);
+            } else {
+                line.line_to(p);
+            }
+        }
+        fill.line_to(point(px(origin_x + last.0), px(top)));
+        fill.close();
+        if let Some(shade) = shade {
+            if let Ok(path) = fill.build() {
+                window.paint_path(path, shade);
+            }
+        }
+        if let Ok(path) = line.build() {
+            window.paint_path(path, line_color);
+        }
+    }
 }
 
 /// Authoritative horizontal geometry for an audio clip: `(left_x, width_px)` in
@@ -173,11 +543,14 @@ fn norm_to_gain(norm: f32) -> f32 {
     db_to_gain(db)
 }
 
+/// The strip's inline clip gain. `disabled` on an ARA track, where the engine
+/// does not apply clip gain: drawn muted, explained, and inert.
 fn compact_gain_control(
     clip: &ClipState,
+    disabled: bool,
     on_preview: AudioClipProcessPreviewCb,
     on_commit: AudioClipProcessCommitCb,
-) -> impl IntoElement {
+) -> gpui::AnyElement {
     let value = gain_to_norm(clip.gain).clamp(0.0, 1.0);
     let id = format!("audio-clip-gain-{}", clip.id);
     let move_id = id.clone();
@@ -190,13 +563,15 @@ fn compact_gain_control(
     let reset_id = clip.id.clone();
     let reset_preview = on_preview.clone();
 
-    div()
+    let control = div()
         .id(gpui::ElementId::Name(id.into()))
         .w(px(62.0))
         .h(px(16.0))
         .flex_none()
         .relative()
-        .cursor(gpui::CursorStyle::ResizeLeftRight)
+        .when(disabled, |this| {
+            this.opacity(crate::theme::state::DISABLED_CONTENT)
+        })
         .child(
             div()
                 .absolute()
@@ -230,9 +605,21 @@ fn compact_gain_control(
                         .w(px(1.0))
                         .bg(Colors::accent_primary()),
                 ),
-        )
+        );
+    if disabled {
+        return control
+            .tooltip(crate::components::fb_tooltip(ARA_CLIP_PROCESSING_TOOLTIP))
+            .into_any_element();
+    }
+    control
+        .cursor(gpui::CursorStyle::ResizeLeftRight)
         .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
             cx.stop_propagation();
+            reset_preview(
+                &(reset_id.clone(), AudioClipProcessUpdate::GainPress),
+                window,
+                cx,
+            );
             if event.click_count >= 2 {
                 // Clip gain is a bipolar dB control, independent of the track
                 // volume fader. Its neutral/reset value is always 0 dB.
@@ -274,6 +661,7 @@ fn compact_gain_control(
         .on_mouse_up_out(gpui::MouseButton::Left, move |_, window, cx| {
             on_commit_out(&(commit_out_id.clone(), original_out.clone()), window, cx);
         })
+        .into_any_element()
 }
 
 /// Height of the band along a clip's top edge the Smart Tool's cut zone leaves
@@ -299,12 +687,18 @@ pub(crate) fn smart_cut_click_splits(
     travel_px: f32,
     drag_active: bool,
 ) -> bool {
-    let option_only = |m: &gpui::Modifiers| m.alt && !m.platform && !m.control && !m.function;
-    option_only(down)
-        && option_only(up)
+    smart_cut_modifier_held(down)
+        && smart_cut_modifier_held(up)
         && click_count == 1
         && travel_px <= SMART_CUT_MAX_TRAVEL_PX
         && !drag_active
+}
+
+/// The Smart Tool cut's modifier: Option/Alt, with Shift allowed (it only
+/// bypasses snap) and Cmd, Ctrl and Fn not. The razor line shows exactly
+/// while this holds, so it never promises a split the click will not make.
+pub(crate) fn smart_cut_modifier_held(modifiers: &gpui::Modifiers) -> bool {
+    modifiers.alt && !modifiers.platform && !modifiers.control && !modifiers.function
 }
 
 /// The Pointer's cut zone: the clip body between its edge handles, below the
@@ -356,7 +750,7 @@ fn smart_cut_zone(
                 &ClipCutGesture::Hover {
                     window_x: event.position.x.into(),
                     bypass_snap: event.modifiers.shift,
-                    alt: event.modifiers.alt,
+                    armed: smart_cut_modifier_held(&event.modifiers),
                     left: zone.origin.x.into(),
                     right: (zone.origin.x + zone.size.width).into(),
                     // The line spans the whole clip, not only the zone.
@@ -404,52 +798,83 @@ fn smart_cut_zone(
         })
 }
 
-#[derive(Clone, Copy)]
-enum FadeEdge {
-    In,
-    Out,
-}
-
+/// A corner fade handle: a small hit area at the top edge where the fade ends
+/// (fade-in) or starts (fade-out), with a diagonal resize cursor. It stops the
+/// press, so the clip body never moves or cuts from it, but the press still
+/// selects the clip by the body's rule (`Timeline::press_clip_selection`): the
+/// hit areas are there on every clip, shown or not, and a plain click on one
+/// must not be lost. The timeline resolves the drag and commits it when the
+/// button comes up (see `Timeline::finish_clip_handle_gestures`).
+///
+/// The square is drawn here only when `show_mark` (a selected clip); a hovered
+/// clip's squares are painted by the timeline's overlay, so hovering never
+/// rebuilds the lane. On an ARA track the handle only explains why it does
+/// nothing, and its press reaches the body, which selects.
 #[allow(clippy::too_many_arguments)]
-fn fade_drag_zone(
-    clip: &ClipState,
+fn fade_handle(
+    clip_id: &str,
+    id_num: usize,
     edge: FadeEdge,
-    clip_duration_seconds: f32,
-    fade_width: f32,
-    body_height: f32,
+    rect: FadeHandleRect,
+    show_mark: bool,
+    disabled: bool,
     on_preview: AudioClipProcessPreviewCb,
-    on_commit: AudioClipProcessCommitCb,
-) -> impl IntoElement {
-    let edge_name = match edge {
-        FadeEdge::In => "in",
-        FadeEdge::Out => "out",
+) -> gpui::AnyElement {
+    let (name, cursor) = match edge {
+        FadeEdge::In => (
+            "audio-clip-fade-in",
+            gpui::CursorStyle::ResizeUpLeftDownRight,
+        ),
+        FadeEdge::Out => (
+            "audio-clip-fade-out",
+            gpui::CursorStyle::ResizeUpRightDownLeft,
+        ),
     };
-    let id = format!("audio-clip-fade-{edge_name}-{}", clip.id);
-    let move_id = id.clone();
-    let preview_id = clip.id.clone();
-    let commit_id = clip.id.clone();
-    let commit_out_id = clip.id.clone();
-    let original = clip.clone();
-    let original_out = clip.clone();
-    let on_commit_out = on_commit.clone();
-
-    div()
-        .id(gpui::ElementId::Name(id.into()))
+    let handle = div()
+        .id((name, id_num))
         .absolute()
-        .top_0()
-        .when(matches!(edge, FadeEdge::In), |this| this.left_0())
-        .when(matches!(edge, FadeEdge::Out), |this| this.right_0())
-        .w(relative(0.5))
-        .h(px(10.0))
-        .cursor(match edge {
-            FadeEdge::In => gpui::CursorStyle::ResizeLeft,
-            FadeEdge::Out => gpui::CursorStyle::ResizeRight,
-        })
-        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_drag(
-            AudioClipProcessDrag {
-                id: move_id.clone(),
+        .left(px(rect.hit.left))
+        .top(px(rect.hit.top))
+        .w(px(rect.hit.width))
+        .h(px(rect.hit.height))
+        .children(show_mark.then(|| {
+            fade_handle_mark(rect.mark.width, false, disabled)
+                .absolute()
+                .left(px(rect.mark.left - rect.hit.left))
+                .top(px(rect.mark.top - rect.hit.top))
+        }));
+    if disabled {
+        return handle
+            .tooltip(crate::components::fb_tooltip(ARA_CLIP_PROCESSING_TOOLTIP))
+            .into_any_element();
+    }
+    let drag_id = format!("{name}-{clip_id}");
+    let move_id = drag_id.clone();
+    let press_id = clip_id.to_string();
+    let drag_clip_id = clip_id.to_string();
+    let on_drag_preview = on_preview.clone();
+    handle
+        .cursor(cursor)
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            move |event: &gpui::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                // The press selects the clip as a press on its body does.
+                let additive = event.modifiers.control || event.modifiers.platform;
+                let update = if event.click_count >= 2 {
+                    AudioClipProcessUpdate::FadeReset { edge, additive }
+                } else {
+                    AudioClipProcessUpdate::FadePress {
+                        edge,
+                        window_x: event.position.x.into(),
+                        additive,
+                    }
+                };
+                on_preview(&(press_id.clone(), update), window, cx);
             },
+        )
+        .on_drag(
+            AudioClipProcessDrag { id: drag_id },
             |drag, _offset, _window, cx| cx.new(|_| drag.clone()),
         )
         .on_drag_move::<AudioClipProcessDrag>(
@@ -457,56 +882,21 @@ fn fade_drag_zone(
                 if event.drag(cx).id != move_id {
                     return;
                 }
-                let x: f32 = event.event.position.x.into();
-                let ox: f32 = event.bounds.origin.x.into();
-                let width = f32::from(event.bounds.size.width).max(1.0);
-                let ratio = match edge {
-                    FadeEdge::In => ((x - ox) / width).clamp(0.0, 1.0),
-                    FadeEdge::Out => (1.0 - (x - ox) / width).clamp(0.0, 1.0),
-                };
-                let ms = ratio * clip_duration_seconds.max(0.001) * 500.0;
-                let update = match edge {
-                    FadeEdge::In => AudioClipProcessUpdate::FadeInMs(ms),
-                    FadeEdge::Out => AudioClipProcessUpdate::FadeOutMs(ms),
-                };
-                on_preview(&(preview_id.clone(), update), window, cx);
+                on_drag_preview(
+                    &(
+                        drag_clip_id.clone(),
+                        AudioClipProcessUpdate::FadeDrag {
+                            edge,
+                            window_x: event.event.position.x.into(),
+                            bypass_snap: event.event.modifiers.shift,
+                        },
+                    ),
+                    window,
+                    cx,
+                );
             },
         )
-        .on_mouse_up(gpui::MouseButton::Left, move |_, window, cx| {
-            on_commit(&(commit_id.clone(), original.clone()), window, cx);
-        })
-        .on_mouse_up_out(gpui::MouseButton::Left, move |_, window, cx| {
-            on_commit_out(&(commit_out_id.clone(), original_out.clone()), window, cx);
-        })
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .when(matches!(edge, FadeEdge::In), |this| {
-                    this.left(px(fade_width.max(0.0) - 3.0))
-                })
-                .when(matches!(edge, FadeEdge::Out), |this| {
-                    this.right(px(fade_width.max(0.0) - 3.0))
-                })
-                .w(px(6.0))
-                .h(px(6.0))
-                .rounded(px(crate::theme::radius::CONTROL))
-                .bg(Colors::surface_input())
-                .border(px(1.0))
-                .border_color(Colors::accent_primary()),
-        )
-        .child(
-            div()
-                .absolute()
-                .top(px(5.0))
-                .when(matches!(edge, FadeEdge::In), |this| this.left_0())
-                .when(matches!(edge, FadeEdge::Out), |this| this.right_0())
-                .w(px(fade_width.max(0.0)))
-                .h(px((body_height - 5.0).max(1.0)))
-                .border_color(Colors::with_alpha(Colors::accent_primary(), 0.55))
-                .when(matches!(edge, FadeEdge::In), |this| this.border_r(px(1.0)))
-                .when(matches!(edge, FadeEdge::Out), |this| this.border_l(px(1.0))),
-        )
+        .into_any_element()
 }
 
 pub struct ClipDragPreview {
@@ -609,8 +999,9 @@ pub fn audio_clip(
     >,
     on_cut_clip: Option<AudioClipCutCb>,
     erase_target: bool,
-    auto_crossfade_in_beats: f32,
-    auto_crossfade_out_beats: f32,
+    fades: EffectiveFades,
+    time: &ClipTimeAxis<'_>,
+    ara: bool,
     on_process_preview: AudioClipProcessPreviewCb,
     on_process_commit: AudioClipProcessCommitCb,
 ) -> impl IntoElement {
@@ -620,30 +1011,13 @@ pub fn audio_clip(
     let drag_track_id = track_id.to_string();
     let drag_name = clip.name.clone();
     let drag_start_beat = clip.start_beat;
-    let selected = state.selection.selected_clip_ids.contains(&clip.id);
-    let _pixels_per_second = state.viewport.pixels_per_second;
-    let seconds_per_beat = state.seconds_per_beat();
+    let selected = state
+        .display_selection()
+        .selected_clip_ids
+        .contains(&clip.id);
     let stretch_badge = stretch_badge(clip, state);
     let (left, width) = audio_clip_timeline_geometry(clip, state);
-    let clip_duration_seconds = audio_clip_timeline_duration_seconds(clip, state);
-    let fade_in_seconds = (clip.stretch.fade_in_ms.max(0.0) / 1000.0)
-        .max(auto_crossfade_in_beats.max(0.0) * seconds_per_beat)
-        .min(clip_duration_seconds);
-    let fade_out_seconds = (clip.stretch.fade_out_ms.max(0.0) / 1000.0)
-        .max(auto_crossfade_out_beats.max(0.0) * seconds_per_beat)
-        .min((clip_duration_seconds - fade_in_seconds).max(0.0));
-    // Pixels per second *of this clip*, not of the timeline. Under a tempo map
-    // the clip's own seconds-to-pixels scale is its drawn width over the length
-    // it plays for; using the global figure detaches the fade from the audio it
-    // is fading exactly where the tempo moves.
-    let clip_pixels_per_second = width / clip_duration_seconds.max(0.001);
-    let fade_in_w = (fade_in_seconds * clip_pixels_per_second).min(width);
-    let fade_out_w = (fade_out_seconds * clip_pixels_per_second).min((width - fade_in_w).max(0.0));
-    let manual_fade_in_w =
-        ((clip.stretch.fade_in_ms.max(0.0) / 1000.0) * clip_pixels_per_second).min(width * 0.5);
-    let manual_fade_out_w =
-        ((clip.stretch.fade_out_ms.max(0.0) / 1000.0) * clip_pixels_per_second).min(width * 0.5);
-    let has_auto_crossfade = auto_crossfade_in_beats > 0.0 || auto_crossfade_out_beats > 0.0;
+    let has_crossfade = fades.any();
     // Detail by width. Below each threshold the thing being dropped is already
     // illegible, so this is what the clip *should* look like — and it is also
     // where the arrangement's frame goes.
@@ -658,7 +1032,7 @@ pub fn audio_clip(
     let show_resize_handles = width >= CLIP_RESIZE_HANDLE_MIN_W;
     let show_inline_gain = selected
         && width
-            >= if has_auto_crossfade || stretch_badge.is_some() {
+            >= if has_crossfade || stretch_badge.is_some() {
                 220.0
             } else {
                 150.0
@@ -699,16 +1073,40 @@ pub fn audio_clip(
     };
     let resize_handle_w = clip_resize_handle_w(width);
     const HEADER_H: f32 = 20.0;
-    // With no strip the waveform owns the whole clip, and the fade overlays
+    // With no strip the waveform owns the whole clip, and the fade curves
     // reach the bottom edge instead of stopping above a bar that is not there.
     let strip_h = if show_strip { HEADER_H } else { 0.0 };
-    let body_h = (clip_h - strip_h).max(1.0);
+    let pointer = active_tool == TimelineTool::Pointer;
+    // Corner fade handles: Pointer only. Their hit areas are always there —
+    // small and cheap — and a hovered clip's squares are painted by the
+    // timeline's overlay; a selected clip draws its own.
+    let handles =
+        pointer.then(|| clip_fade_handle_layout(time, &fades, left, width, clip_h, false));
+    // The fades as the engine plays them, over the waveform. A crossfaded
+    // edge is drawn by the track's crossfade overlay instead.
+    let curves: Vec<FadeCurvePoints> = [FadeEdge::In, FadeEdge::Out]
+        .into_iter()
+        .filter_map(|edge| fade_curve_points(time, &fades, edge, left + CLIP_BORDER))
+        .collect();
+    let (curve_shade, curve_line) = if ara {
+        (
+            Colors::with_alpha(Colors::surface_canvas(), 0.25),
+            Colors::with_alpha(
+                Colors::text_disabled(),
+                crate::theme::state::DISABLED_CONTENT,
+            ),
+        )
+    } else {
+        (
+            Colors::with_alpha(Colors::surface_canvas(), 0.55),
+            Colors::text_secondary(),
+        )
+    };
     let gain_preview = on_process_preview.clone();
-    let gain_commit = on_process_commit.clone();
-    let fade_in_preview = on_process_preview.clone();
-    let fade_in_commit = on_process_commit.clone();
-    let fade_out_preview = on_process_preview;
-    let fade_out_commit = on_process_commit;
+    let gain_commit = on_process_commit;
+    let hover_preview = on_process_preview.clone();
+    let hover_clip_id = clip.id.clone();
+    let fade_preview = on_process_preview;
 
     div()
         .absolute()
@@ -733,6 +1131,23 @@ pub fn audio_clip(
             gpui::CursorStyle::OpenHand
         })
         .id(("audio-clip", id_num))
+        // Entering or leaving the clip reveals or hides its fade handles
+        // through the timeline's overlay, without rebuilding this lane.
+        .when(
+            handles.is_some_and(|layout| layout.fade_in.is_some() || layout.fade_out.is_some()),
+            move |this| {
+                this.on_hover(move |hovered, window, cx| {
+                    hover_preview(
+                        &(
+                            hover_clip_id.clone(),
+                            AudioClipProcessUpdate::Hover(*hovered),
+                        ),
+                        window,
+                        cx,
+                    );
+                })
+            },
+        )
         .on_mouse_down(
             gpui::MouseButton::Left,
             move |event: &gpui::MouseDownEvent, window, cx| {
@@ -800,8 +1215,9 @@ pub fn audio_clip(
             left,
             width,
         )))
-        // Smart Tool: the Pointer's lower half cuts. Before the strip, so the
-        // strip's own controls (inline gain) stay on top of it.
+        // Smart Tool: an Option-click on the Pointer's clip body cuts (see
+        // `smart_cut_zone`). Before the strip, so the strip's own controls
+        // (inline gain) stay on top of it.
         .children(
             (active_tool == TimelineTool::Pointer && show_resize_handles)
                 .then(|| on_cut_clip.clone())
@@ -849,7 +1265,8 @@ pub fn audio_clip(
                         .child(clip.name.clone()),
                 )
                 .children(
-                    show_inline_gain.then(|| compact_gain_control(clip, gain_preview, gain_commit)),
+                    show_inline_gain
+                        .then(|| compact_gain_control(clip, ara, gain_preview, gain_commit)),
                 )
                 // The level readout is fixed width, so on a narrow clip it does
                 // not shrink — it takes the name's room and is still too small
@@ -866,16 +1283,27 @@ pub fn audio_clip(
                         })
                         .child(format!("{gain_db:+.1} dB"))
                 }))
-                .children((show_strip_detail && has_auto_crossfade).then(|| {
-                    div()
+                .children((show_strip_detail && has_crossfade).then(|| {
+                    let badge = div()
+                        .id(("audio-clip-xfade", id_num))
                         .flex_none()
                         .px(px(4.0))
                         .rounded(px(crate::theme::radius::CONTROL))
-                        .bg(Colors::accent_soft())
                         .text_size(px(7.5))
                         .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(Colors::accent_primary())
-                        .child("XFADE")
+                        .child("XFADE");
+                    if ara {
+                        badge
+                            .bg(Colors::with_alpha(Colors::text_disabled(), 0.14))
+                            .text_color(Colors::text_disabled())
+                            .tooltip(crate::components::fb_tooltip(ARA_CLIP_PROCESSING_TOOLTIP))
+                            .into_any_element()
+                    } else {
+                        badge
+                            .bg(Colors::accent_soft())
+                            .text_color(Colors::accent_primary())
+                            .into_any_element()
+                    }
                 }))
                 .children(stretch_badge.filter(|_| show_strip_detail).map(|badge| {
                     // A tempo-locked clip is marked on two channels: the
@@ -914,66 +1342,29 @@ pub fn audio_clip(
             // name (flex_1) fills the bar, so no gap remains. Duration stays in the
             // model and the inspector; resize/trim handles are unaffected.
         }))
-        .children((fade_in_w > 1.0).then(|| {
-            div()
-                .absolute()
-                .left_0()
-                .top_0()
-                .bottom(px(strip_h))
-                .w(px(fade_in_w))
-                .bg(Colors::with_alpha(Colors::surface_panel_alt(), 0.34))
-                .border_r(px(1.0))
-                .border_color(if auto_crossfade_in_beats > 0.0 {
-                    Colors::accent_primary()
-                } else {
-                    Colors::with_alpha(track_color, 0.55)
-                })
-        }))
-        .children((fade_out_w > 1.0).then(|| {
-            div()
-                .absolute()
-                .right_0()
-                .top_0()
-                .bottom(px(strip_h))
-                .w(px(fade_out_w))
-                .bg(Colors::with_alpha(Colors::surface_panel_alt(), 0.34))
-                .border_l(px(1.0))
-                .border_color(if auto_crossfade_out_beats > 0.0 {
-                    Colors::accent_primary()
-                } else {
-                    Colors::with_alpha(track_color, 0.55)
-                })
-        }))
-        // The fade handles stay on a crossfaded edge.
-        //
-        // They used to be hidden the moment an overlap produced an automatic
-        // crossfade — which is exactly the edge somebody wants to reach for. The
-        // length was then whatever the overlap happened to be and there was no
-        // way to touch it at all, so the only way to change a crossfade was to
-        // drag the clip itself and change the overlap. The manual fade already
-        // wins when it is longer than the automatic one (see `fade_in_seconds`
-        // above), so keeping the handle is what makes that reachable.
-        .children(selected.then(|| {
-            fade_drag_zone(
-                clip,
-                FadeEdge::In,
-                clip_duration_seconds,
-                manual_fade_in_w,
-                body_h,
-                fade_in_preview,
-                fade_in_commit,
+        // The fades as they play: the shaded part is what each one removes.
+        .children((!curves.is_empty()).then(move || {
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let top: f32 = bounds.origin.y.into();
+                    let bottom = top + f32::from(bounds.size.height);
+                    paint_fade_curves(
+                        &curves,
+                        bounds.origin.x.into(),
+                        top,
+                        bottom,
+                        Some(curve_shade),
+                        curve_line,
+                        window,
+                    );
+                },
             )
-        }))
-        .children(selected.then(|| {
-            fade_drag_zone(
-                clip,
-                FadeEdge::Out,
-                clip_duration_seconds,
-                manual_fade_out_w,
-                body_h,
-                fade_out_preview,
-                fade_out_commit,
-            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom(px(strip_h))
         }))
         // Edge handles, on a clip wide enough to have edges *and* a body — see
         // [`CLIP_RESIZE_HANDLE_MIN_W`].
@@ -1004,6 +1395,31 @@ pub fn audio_clip(
                 .on_drag(resize_right, |drag, _offset, _window, cx| {
                     cx.new(|_| drag.clone())
                 })
+        }))
+        // Corner fade handles, after the edge handles so they win the top of
+        // each edge; the edge keeps the rest of its column. See
+        // [`ClipHandleLayout`] for the whole priority order.
+        .children(handles.and_then(|layout| layout.fade_in).map(|rect| {
+            fade_handle(
+                &clip.id,
+                id_num,
+                FadeEdge::In,
+                rect,
+                selected,
+                ara,
+                fade_preview.clone(),
+            )
+        }))
+        .children(handles.and_then(|layout| layout.fade_out).map(|rect| {
+            fade_handle(
+                &clip.id,
+                id_num,
+                FadeEdge::Out,
+                rect,
+                selected,
+                ara,
+                fade_preview.clone(),
+            )
         }))
 }
 
@@ -1084,20 +1500,290 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!splits(&plain, &plain, 1, 0.0, false), "a plain click selects");
-        assert!(!splits(&cmd, &cmd, 1, 0.0, false), "Cmd-click is additive select");
+        assert!(
+            !splits(&plain, &plain, 1, 0.0, false),
+            "a plain click selects"
+        );
+        assert!(
+            !splits(&cmd, &cmd, 1, 0.0, false),
+            "Cmd-click is additive select"
+        );
         assert!(!splits(&shift, &shift, 1, 0.0, false));
         assert!(!splits(&cmd_alt, &cmd_alt, 1, 0.0, false));
 
         assert!(splits(&alt, &alt, 1, 0.0, false));
-        assert!(splits(&alt, &alt, 1, 2.0, false), "within the drag threshold");
-        assert!(splits(&alt_shift, &alt_shift, 1, 1.0, false), "Shift bypasses snap");
+        assert!(
+            splits(&alt, &alt, 1, 2.0, false),
+            "within the drag threshold"
+        );
+        assert!(
+            splits(&alt_shift, &alt_shift, 1, 1.0, false),
+            "Shift bypasses snap"
+        );
 
-        assert!(!splits(&alt, &alt, 1, 2.5, false), "past the drag threshold");
+        assert!(
+            !splits(&alt, &alt, 1, 2.5, false),
+            "past the drag threshold"
+        );
         assert!(!splits(&alt, &alt, 2, 0.0, false), "part of a double-click");
         assert!(!splits(&alt, &alt, 1, 0.0, true), "a drag is in flight");
         assert!(!splits(&alt, &plain, 1, 0.0, false), "Option let go first");
         assert!(!splits(&plain, &alt, 1, 0.0, false), "Option pressed late");
+    }
+
+    /// The razor line shows under exactly the modifiers a click would split
+    /// with. It used to show whenever Option was held, so Cmd+Option drew a
+    /// line where the click only selected.
+    #[test]
+    fn the_razor_line_shows_exactly_when_a_click_would_split() {
+        use super::{smart_cut_click_splits, smart_cut_modifier_held};
+        for bits in 0..32_u8 {
+            let modifiers = gpui::Modifiers {
+                alt: bits & 1 != 0,
+                shift: bits & 2 != 0,
+                platform: bits & 4 != 0,
+                control: bits & 8 != 0,
+                function: bits & 16 != 0,
+            };
+            assert_eq!(
+                smart_cut_modifier_held(&modifiers),
+                smart_cut_click_splits(&modifiers, &modifiers, 1, 0.0, false),
+                "{modifiers:?}"
+            );
+        }
+        let cmd_alt = gpui::Modifiers {
+            platform: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert!(!smart_cut_modifier_held(&cmd_alt));
+    }
+
+    /// Every width tier that has edge handles, from the narrowest up.
+    const HANDLE_TIERS: [f32; 7] = [20.0, 30.0, 44.0, 63.0, 64.0, 96.0, 400.0];
+    const CLIP_H: f32 = 58.0;
+
+    fn center(rect: super::LocalRect) -> (f32, f32) {
+        (rect.left + rect.width * 0.5, rect.top + rect.height * 0.5)
+    }
+
+    fn overlaps(a: super::LocalRect, b: super::LocalRect) -> bool {
+        a.left < b.left + b.width
+            && b.left < a.left + a.width
+            && a.top < b.top + b.height
+            && b.top < a.top + a.height
+    }
+
+    /// Priority: a corner fade handle beats the trim column under it, the trim
+    /// beats the body, and the fade handles never reach into the Smart Tool's
+    /// cut zone.
+    #[test]
+    fn corner_fade_handles_beat_trim_and_trim_beats_the_body() {
+        use super::{ClipHandleLayout, ClipHitZone};
+        for width in HANDLE_TIERS {
+            let inner_w = width - 2.0;
+            let layout = ClipHandleLayout::new(width, CLIP_H, Some(0.0), Some(inner_w), true);
+            let fade_in = layout.fade_in.expect("fade-in handle");
+            let fade_out = layout.fade_out.expect("fade-out handle");
+            let trim_w = layout.trim_w.expect("edge handles");
+            let (x, y) = center(fade_in.hit);
+            assert_eq!(layout.hit(x, y), ClipHitZone::FadeIn, "width {width}");
+            let (x, y) = center(fade_out.hit);
+            assert_eq!(layout.hit(x, y), ClipHitZone::FadeOut, "width {width}");
+            // The trim keeps the rest of its column.
+            assert_eq!(layout.hit(0.5, 20.0), ClipHitZone::TrimLeft);
+            assert_eq!(layout.hit(inner_w - 0.5, 20.0), ClipHitZone::TrimRight);
+            // Under the top band, between the edges, is the cut zone.
+            let cut = layout.cut_zone.expect("cut zone");
+            assert_eq!(layout.hit(trim_w + 0.5, 30.0), ClipHitZone::CutZone);
+            for handle in [fade_in, fade_out] {
+                assert!(
+                    !overlaps(handle.hit, cut),
+                    "width {width}: handle over the cut zone"
+                );
+                assert!(handle.hit.top + handle.hit.height <= super::SMART_CUT_TOP_CLEARANCE);
+                assert!(handle.hit.left >= 0.0 && handle.hit.left + handle.hit.width <= inner_w);
+                // The square drawn is inside the area that takes the press.
+                assert!(handle.mark.left >= handle.hit.left);
+                assert!(handle.mark.left + handle.mark.width <= handle.hit.left + handle.hit.width);
+            }
+            // The top band between the corners still moves the clip.
+            if inner_w > 2.0 * super::FADE_HANDLE_HIT {
+                assert_eq!(layout.hit(inner_w * 0.5, 4.0), ClipHitZone::Body);
+            }
+            // Without the cut zone (another tool) the middle is body.
+            let plain = ClipHandleLayout::new(width, CLIP_H, Some(0.0), Some(inner_w), false);
+            assert_eq!(plain.hit(inner_w * 0.5, 30.0), ClipHitZone::Body);
+        }
+    }
+
+    /// A zero-length fade can always be pulled out of its corner: at every
+    /// width tier both corner handles exist, sit in their corners, and neither
+    /// covers the other.
+    #[test]
+    fn a_zero_fade_handle_is_reachable_at_every_width_tier() {
+        use super::{ClipHandleLayout, ClipHitZone};
+        for width in HANDLE_TIERS {
+            let inner_w = width - 2.0;
+            let layout = ClipHandleLayout::new(width, CLIP_H, Some(0.0), Some(inner_w), true);
+            let (fade_in, fade_out) = (layout.fade_in.unwrap(), layout.fade_out.unwrap());
+            assert!(!overlaps(fade_in.hit, fade_out.hit), "width {width}");
+            assert_eq!(layout.hit(0.5, 0.5), ClipHitZone::FadeIn, "width {width}");
+            assert_eq!(
+                layout.hit(inner_w - 0.5, 0.5),
+                ClipHitZone::FadeOut,
+                "width {width}"
+            );
+            assert_eq!(fade_in.mark.left, 0.0, "the square sits in the corner");
+            assert_eq!(fade_out.mark.left + fade_out.mark.width, inner_w);
+        }
+    }
+
+    /// Fades that meet leave both handles reachable; a crossfaded edge has no
+    /// handle; a clip too narrow for edge handles has none at all.
+    #[test]
+    fn fade_handles_stay_apart_and_only_where_they_belong() {
+        use super::{ClipHandleLayout, ClipHitZone};
+        let layout = ClipHandleLayout::new(200.0, CLIP_H, Some(99.0), Some(99.0), true);
+        let (fade_in, fade_out) = (layout.fade_in.unwrap(), layout.fade_out.unwrap());
+        assert!(!overlaps(fade_in.hit, fade_out.hit));
+        assert_eq!(layout.hit(center(fade_in.hit).0, 4.0), ClipHitZone::FadeIn);
+        assert_eq!(
+            layout.hit(center(fade_out.hit).0, 4.0),
+            ClipHitZone::FadeOut
+        );
+
+        let crossfaded = ClipHandleLayout::new(200.0, CLIP_H, None, Some(198.0), true);
+        assert!(crossfaded.fade_in.is_none());
+        assert_eq!(crossfaded.hit(0.5, 0.5), ClipHitZone::TrimLeft);
+
+        let narrow_w = CLIP_RESIZE_HANDLE_MIN_W - 1.0;
+        let narrow = ClipHandleLayout::new(narrow_w, CLIP_H, Some(0.0), Some(17.0), true);
+        assert!(narrow.fade_in.is_none() && narrow.fade_out.is_none());
+        assert!(narrow.trim_w.is_none() && narrow.cut_zone.is_none());
+        assert_eq!(narrow.hit(1.0, 1.0), ClipHitZone::Body);
+    }
+
+    /// The handle is where the fade is drawn, and dragging it resolves back to
+    /// the same fade: one transform for drawing and hit-testing.
+    #[test]
+    fn a_fade_handle_sits_where_its_curve_ends() {
+        use super::{clip_fade_handle_layout, fade_curve_points, CLIP_BORDER};
+        use crate::components::timeline::timeline_state::FadeEdge;
+
+        let mut clip = two_second_clip("clip-fade");
+        clip.start_beat = 1.0;
+        clip.stretch.fade_in_ms = 500.0;
+        clip.stretch.fade_out_ms = 250.0;
+        let mut state = state_with_clip(clip, 120.0);
+        state.viewport.pixels_per_second = 400.0;
+        state.sync_pixels_per_beat();
+        let clip = state.tracks[0].clips[0].clone();
+        let crossfades = state.audio_crossfades(&state.tracks[0]);
+        let fades = state.effective_clip_fades(&clip, &crossfades);
+        let (left, width) = audio_clip_timeline_geometry(&clip, &state);
+        let inner_left = left + CLIP_BORDER;
+        let time = state.clip_time_axis(&clip);
+        let layout = clip_fade_handle_layout(&time, &fades, left, width, CLIP_H, true);
+
+        let curve_in = fade_curve_points(&time, &fades, FadeEdge::In, inner_left).unwrap();
+        let fade_in_end = curve_in.points.last().unwrap().0;
+        let mark = layout.fade_in.unwrap().mark;
+        assert!((mark.left + mark.width * 0.5 - fade_in_end).abs() < 0.01);
+        let back = state.clip_local_seconds_at_lane_x(&clip, inner_left + fade_in_end);
+        assert!(
+            (back - 0.5).abs() < 0.002,
+            "grabbing the handle reads {back} s"
+        );
+
+        let curve_out = fade_curve_points(&time, &fades, FadeEdge::Out, inner_left).unwrap();
+        let fade_out_start = curve_out.points.first().unwrap().0;
+        let mark = layout.fade_out.unwrap().mark;
+        assert!((mark.left + mark.width * 0.5 - fade_out_start).abs() < 0.01);
+        // The curve is the engine's equal-power law, not a straight ramp.
+        let n = curve_in.points.len() - 1;
+        for (i, &(_, gain)) in curve_in.points.iter().enumerate() {
+            let t = i as f32 / n as f32;
+            assert!((gain - (t * std::f32::consts::FRAC_PI_2).sin()).abs() < 1.0e-6);
+        }
+        let (_, mid) = curve_in.points[n / 2];
+        assert!(
+            mid > (n / 2) as f32 / n as f32 + 0.1,
+            "bowed above a linear ramp"
+        );
+    }
+
+    /// A fade curve drawn through the clip's axis, built once, lands every
+    /// point exactly where the per-call transform (a tempo-map lookup per
+    /// sample, as the curves used to be drawn and as a drag is still
+    /// resolved) puts it: flat and under a tempo ramp, where each point is
+    /// placed through the map.
+    #[test]
+    fn a_fade_curve_through_a_cached_axis_is_the_direct_transform() {
+        use super::{fade_curve_points, fade_curve_segments, CLIP_BORDER};
+        use crate::components::timeline::timeline_state::{FadeEdge, TempoCurve};
+
+        for ramped in [false, true] {
+            let mut clip = two_second_clip("clip-ramp");
+            clip.start_beat = 1.0;
+            clip.stretch.fade_in_ms = 700.0;
+            clip.stretch.fade_out_ms = 900.0;
+            let mut state = state_with_clip(clip, 120.0);
+            state.viewport.pixels_per_second = 400.0;
+            state.sync_pixels_per_beat();
+            if ramped {
+                state
+                    .tempo_map
+                    .add_or_update_point(0.0, 60.0, TempoCurve::Linear);
+                state
+                    .tempo_map
+                    .add_or_update_point(8.0, 180.0, TempoCurve::Hold);
+                state.reconcile_audio_clip_lengths();
+            }
+            state.sync_time_warp();
+            let clip = state.tracks[0].clips[0].clone();
+            let crossfades = state.audio_crossfades(&state.tracks[0]);
+            let fades = state.effective_clip_fades(&clip, &crossfades);
+            let (left, _) = audio_clip_timeline_geometry(&clip, &state);
+            let inner_left = left + CLIP_BORDER;
+            let time = state.clip_time_axis(&clip);
+            for edge in [FadeEdge::In, FadeEdge::Out] {
+                let curve = fade_curve_points(&time, &fades, edge, inner_left).unwrap();
+                let seconds = fades.seconds(edge);
+                let from = match edge {
+                    FadeEdge::In => 0.0,
+                    FadeEdge::Out => fades.played_seconds - seconds,
+                };
+                let direct_x = |at: f64| state.clip_lane_x_at_local_seconds(&clip, at) - inner_left;
+                let segments = fade_curve_segments(direct_x(from + seconds) - direct_x(from));
+                assert_eq!(curve.points.len(), segments + 1);
+                for (i, &(x, _)) in curve.points.iter().enumerate() {
+                    let at = if i == segments {
+                        from + seconds
+                    } else {
+                        from + seconds * (i as f64 / segments as f64)
+                    };
+                    if ramped || i == 0 || i == segments {
+                        // The ends (where the handle sits) always, and every
+                        // point under a ramp: exactly the direct transform.
+                        assert_eq!(x, direct_x(at), "ramped={ramped} {edge:?} point {i}");
+                    } else {
+                        // Flat tempo draws a straight line between the two
+                        // ends; the direct transform rounds each point to a
+                        // whole pixel.
+                        assert!((x - direct_x(at)).abs() <= 0.5, "{edge:?} point {i}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fade_curves_are_drawn_only_when_they_are_visible() {
+        assert_eq!(super::fade_curve_segments(1.5), 0);
+        assert_eq!(super::fade_curve_segments(2.0), 2);
+        assert_eq!(super::fade_curve_segments(40.0), 10);
+        assert_eq!(super::fade_curve_segments(4_000.0), 32);
     }
 
     #[test]

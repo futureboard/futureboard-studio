@@ -48,7 +48,10 @@ pub fn midi_clip(
     let drag_track_id = track_id.to_string();
     let drag_name = clip.name.clone();
     let drag_start_beat = clip.start_beat;
-    let selected = state.selection.selected_clip_ids.contains(&clip.id);
+    let selected = state
+        .display_selection()
+        .selected_clip_ids
+        .contains(&clip.id);
     // The shared clip rectangle, the one the marquee hit-tests against.
     let lane_rect = state.clip_lane_rect(clip, row_height);
     let left = lane_rect.left;

@@ -366,11 +366,12 @@ impl TimelineState {
             // lives. Through the stretch ratio, so a stretched clip's halves
             // keep playing at the same speed instead of each re-deriving the
             // whole take's length.
+            // The split point's time into the clip comes through the tempo map,
+            // the axis the waveform is drawn on, so under tempo automation the
+            // halves meet on the audio under the razor line.
             let frames_per_second = clip.source_frames_per_timeline_second(self.seconds_per_beat());
-            let split_samples = ((left_len as f64 * self.seconds_per_beat() as f64)
-                * frames_per_second)
-                .round()
-                .max(0.0) as u64;
+            let split_seconds = self.clip_local_seconds_at_beat(clip, split_beat as f64);
+            let split_samples = (split_seconds * frames_per_second).round().max(0.0) as u64;
             let source_start = clip.stretch.source_start_samples;
             let source_end = if clip.stretch.source_end_samples > source_start {
                 clip.stretch.source_end_samples
@@ -391,6 +392,10 @@ impl TimelineState {
                     .warp_markers
                     .retain(|marker| marker.timeline_beat > split_at);
             }
+            // The outer fades stay where they were; the cut itself gets none.
+            // Copying them put a fade-out and a fade-in — a dip — on every cut.
+            left.stretch.fade_out_ms = 0.0;
+            right.stretch.fade_in_ms = 0.0;
         }
 
         Some((left, right))

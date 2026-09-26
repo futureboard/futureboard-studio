@@ -128,6 +128,21 @@ impl MonitorBusState {
     }
 }
 
+/// A saved scroll position waiting to be placed.
+///
+/// Scroll cannot be placed when a session is installed: the viewport has no
+/// size yet (so it would be clamped to nothing), and the rows of restored
+/// automation lanes are only measured once the arrangement lays out. The
+/// Timeline consumes it on the first frame with a real viewport, through
+/// [`TimelineState::apply_pending_view_restore`], right before it clamps the
+/// scroll to the content. Set from the per-user view sidecar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PendingViewRestore {
+    /// Beat at the left edge; converted to pixels through the time warp.
+    pub left_edge_beat: f64,
+    pub scroll_y: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineState {
     pub bpm: f32,
@@ -167,6 +182,14 @@ pub struct TimelineState {
     pub song_text_index: SongTextIndex,
     /// Non-persisted mutation revision used by virtualized Song Text views.
     pub song_text_revision: u64,
+    /// Non-persisted revision that takes a fresh value whenever a track's
+    /// name changes (rename, its undo and redo) and for every new arrangement
+    /// ([`TimelineState::touch_track_names`]). Views that copy names out — the
+    /// mixer tree, the pop-out mixer, built-in editor sidebars — key their
+    /// caches on it, since a rename never touches the routing graph they
+    /// otherwise follow. Compare it for equality only: values are unique in
+    /// the process, not consecutive.
+    pub track_names_revision: u64,
     /// Legacy single signature — kept in sync with the marker at beat 0 for
     /// templates and engine fallbacks.
     pub time_signature_num: u32,
@@ -194,6 +217,12 @@ pub struct TimelineState {
     /// state — see [`MonitorBusState`].
     pub monitor: MonitorBusState,
     pub selection: TimelineSelection,
+    /// What an arrangement marquee in flight would select. The arrangement
+    /// draws clips and tracks from it (see [`Self::display_selection`]) while
+    /// the rectangle is out; `selection` — what the Inspector, the editors and
+    /// every command follow — changes once, when the release commits it.
+    /// UI-only, never saved.
+    pub marquee_selection_preview: Option<TimelineSelection>,
     pub active_tool: TimelineTool,
     pub snap_to_grid: bool,
     pub grid_division: SnapDivision,
@@ -207,6 +236,11 @@ pub struct TimelineState {
     /// playback. Toggled off temporarily when the user manually scrolls or
     /// drags the viewport; can be re-enabled from the Follow button.
     pub follow_playhead: bool,
+    /// Follow-playhead is held off for the length of a gesture — a marquee,
+    /// so playback cannot page the arrangement from under the rectangle —
+    /// without touching the user's `follow_playhead`, which the transport
+    /// shows and Settings saves. UI-only, never saved.
+    pub follow_playhead_suspended: bool,
     pub auto_scroll_mode: AutoScrollMode,
     /// Arrangement time-range selection in beats. UI-only; never marks the
     /// project or engine dirty by itself.
@@ -267,6 +301,13 @@ pub struct TimelineState {
     pub last_touched_plugin_param: Option<LastTouchedPluginParam>,
     /// Mixer tree sidebar — expanded nodes, pins, hidden channels (persisted).
     pub mixer_tree: MixerTreeViewState,
+    /// The mixer tree's default groups were expanded once (persisted latch,
+    /// v54), so an empty expanded set is a deliberate collapse-all rather than
+    /// a tree that was never set up. See `ensure_timeline_mixer_tree_defaults`.
+    pub mixer_tree_initialized: bool,
+    /// A reopened project's saved scroll, waiting for the first frame with a
+    /// real viewport. See [`PendingViewRestore`].
+    pub pending_view_restore: Option<PendingViewRestore>,
     /// Transient fader values while the user drags. UI-only: these do not mark the
     /// project dirty, enter undo history, or trigger engine graph sync. Both the
     /// arrangement track headers and mixer strips render from this cache so they
@@ -301,6 +342,7 @@ impl Default for TimelineState {
             song_text_events: Vec::new(),
             song_text_index: SongTextIndex::default(),
             song_text_revision: 0,
+            track_names_revision: fresh_track_names_revision(),
             time_signature_num: 4,
             time_signature_den: 4,
             viewport: TimelineViewport {
@@ -366,6 +408,7 @@ impl Default for TimelineState {
                 selected_clip_ids: Vec::new(),
                 selected_song_text_event_ids: Vec::new(),
             },
+            marquee_selection_preview: None,
             active_tool: TimelineTool::Pointer,
             snap_to_grid: true,
             grid_division: SnapDivision::Div1_16,
@@ -375,6 +418,7 @@ impl Default for TimelineState {
             drag_current_y: 0.0,
             drag_target_index: None,
             follow_playhead: true,
+            follow_playhead_suspended: false,
             auto_scroll_mode: AutoScrollMode::Page,
             arrangement_range: None,
             // Tempo and meter are properties of every project, so both
@@ -416,6 +460,8 @@ impl Default for TimelineState {
             track_height_resize_arm: None,
             last_touched_plugin_param: None,
             mixer_tree: MixerTreeViewState::default(),
+            mixer_tree_initialized: false,
+            pending_view_restore: None,
             track_volume_previews: std::collections::HashMap::new(),
             track_volume_gesture_origin: std::collections::HashMap::new(),
             master_volume_preview: None,
@@ -449,5 +495,31 @@ impl TimelineState {
     /// Y offset from the timeline top to the track-list content area.
     pub fn arrangement_content_top(&self) -> f32 {
         RULER_HEIGHT + self.global_lanes_height()
+    }
+
+    /// Place a [`PendingViewRestore`] once the viewport has a width: the left
+    /// edge beat through the same warp the ruler draws with, and the smooth
+    /// scroll targets with it, or the next frame would animate back to where
+    /// the view was. The caller clamps to the content right after. Returns
+    /// `true` when one was applied.
+    pub fn apply_pending_view_restore(&mut self) -> bool {
+        if self.viewport.viewport_width <= 0.0 {
+            return false;
+        }
+        let Some(pending) = self.pending_view_restore.take() else {
+            return false;
+        };
+        let viewport = &mut self.viewport;
+        let x = viewport.time_warp.content_x(
+            pending.left_edge_beat.max(0.0),
+            viewport.pixels_per_second,
+            viewport.pixels_per_beat,
+        ) as f32;
+        let y = pending.scroll_y.max(0.0);
+        viewport.scroll_x = x;
+        viewport.target_scroll_x = x;
+        viewport.scroll_y = y;
+        viewport.target_scroll_y = y;
+        true
     }
 }

@@ -114,8 +114,9 @@ impl TrackType {
 
 /// Per-track edit/display mode. `Clips` is normal clip editing; `Automation`
 /// switches the lane to automation editing — points/line are drawn inside the
-/// same track lane and clips are dimmed behind. UI-only state: toggling it
-/// never marks the engine or project dirty.
+/// same track lane and clips are dimmed behind. View state: it never reaches
+/// the engine, and toggling it does not mark the project dirty, but a save
+/// keeps it (the v54 view section).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackLaneMode {
     Clips,
@@ -223,8 +224,8 @@ pub struct TrackState {
     /// whenever automation read is off or there is no active volume automation.
     pub volume_effective: f32,
     /// Whether Track Volume automation drives the effective volume / display.
-    /// UI-only, not persisted; defaults to `true` so existing automated projects
-    /// follow their curves on load.
+    /// Persisted with the track (v32); `true` for older projects so automated
+    /// ones follow their curves on load.
     pub volume_automation_read: bool,
     /// Pan position in `-1.0..=1.0`. `-1.0` is hard left, `+1.0` is hard right.
     pub pan: f32,
@@ -251,10 +252,12 @@ pub struct TrackState {
     pub meter_clip: bool,
     pub clips: Vec<ClipState>,
     pub automation_lanes: Vec<AutomationLaneState>,
-    /// Per-track edit mode (Clip vs Automation). UI-only; not persisted.
+    /// Per-track edit mode (Clip vs Automation). View state, saved in the
+    /// project's view section (v54).
     pub lane_mode: TrackLaneMode,
     /// Which automation target the lane editor is currently focused on. Drives
-    /// which lane renders/edits while in [`TrackLaneMode::Automation`]. UI-only.
+    /// which lane renders/edits while in [`TrackLaneMode::Automation`]. Saved
+    /// with the lane mode when it names one of the track's lanes.
     pub selected_automation_target: Option<AutomationTarget>,
     /// Insert (effect) plugin chain — ordered. Audio flows through these
     /// in order before volume/pan/sends in the runtime. The UI stores
@@ -269,8 +272,8 @@ pub struct TrackState {
     /// `true` when this Instrument track's sound source is the in-app built-in
     /// Soundfont Player rather than a hosted VSTi. Not a plugin insert — the
     /// built-in player never goes through the VST3/CLAP/AU/LV2 bridge or plugin
-    /// registry, so this is a plain marker, not `inserts`. Session-only: not
-    /// yet persisted to the project file (reopening a project loses it).
+    /// registry, so this is a plain marker, not `inserts`. Persisted with the
+    /// rest of the player (v28): a track with a saved soundfont reopens with it.
     pub builtin_soundfont_player: bool,
     /// Absolute `.sf2` path loaded into the built-in Soundfont Player.
     pub soundfont_path: Option<String>,
@@ -710,21 +713,48 @@ impl TimelineState {
             .map(|track| track.id.clone())
     }
 
-    /// Rename a track. Trims surrounding whitespace and ignores an
-    /// all-whitespace name (keeps the previous one). Returns `true` if the
-    /// stored name actually changed, so callers only mark dirty on a real edit.
+    /// Rename a track. Line breaks and other control characters become
+    /// spaces and surrounding whitespace is trimmed ([`sanitize_track_name`]);
+    /// an all-whitespace name is ignored (keeps the previous one). Returns
+    /// `true` if the stored name actually changed, so callers only mark dirty
+    /// on a real edit.
     pub fn rename_track(&mut self, track_id: &str, name: &str) -> bool {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
+        let cleaned = sanitize_track_name(name);
+        if cleaned.is_empty() {
             return false;
         }
         if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
-            if t.name != trimmed {
-                t.name = trimmed.to_string();
+            if t.name != cleaned {
+                t.name = cleaned;
+                self.touch_track_names();
                 return true;
             }
         }
         false
+    }
+
+    /// Give [`Self::track_names_revision`] a value no arrangement in this
+    /// process has had. A surface that copies names out of the timeline keeps
+    /// the revision it last copied at, so a fresh value reaches it even when
+    /// the whole arrangement was replaced by one that counted its own renames
+    /// from the same start.
+    pub fn touch_track_names(&mut self) {
+        self.track_names_revision = fresh_track_names_revision();
+    }
+
+    /// Store `name` exactly as given — no trimming, an empty name included —
+    /// so undoing a rename restores whatever the track was called, even a
+    /// legacy name a user could not type today. Returns `true` on a change.
+    pub fn set_track_name(&mut self, track_id: &str, name: &str) -> bool {
+        let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return false;
+        };
+        if track.name == name {
+            return false;
+        }
+        track.name = name.to_string();
+        self.touch_track_names();
+        true
     }
 
     /// Set a track's color. Returns `true` if it changed.
@@ -797,5 +827,166 @@ impl TimelineState {
             }
             self.selection.selected_clip_ids.clear();
         }
+    }
+}
+
+/// A fresh value for [`TimelineState::track_names_revision`]: never 0, never
+/// handed out twice in this process.
+pub(crate) fn fresh_track_names_revision() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A typed or pasted track name made fit to store: every run of line breaks,
+/// tabs and other control characters becomes one space, then surrounding
+/// white space is trimmed. A name pasted from several lines becomes one line;
+/// Thai vowel and tone marks, combining accents and every other character keep
+/// the exact code points typed.
+pub fn sanitize_track_name(name: &str) -> String {
+    let mut cleaned = String::with_capacity(name.len());
+    let mut in_break = false;
+    for c in name.chars() {
+        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            if !in_break {
+                cleaned.push(' ');
+            }
+            in_break = true;
+        } else {
+            cleaned.push(c);
+            in_break = false;
+        }
+    }
+    cleaned.trim().to_string()
+}
+
+/// The name a track rename should store, or `None` when it should leave the
+/// track alone.
+///
+/// The draft is sanitized ([`sanitize_track_name`]); a blank draft, or one
+/// that cleans up to the name the track has `current`ly, is no rename at all,
+/// so it never costs an undo step.
+pub fn resolve_track_rename(current: &str, draft: &str) -> Option<String> {
+    let cleaned = sanitize_track_name(draft);
+    if cleaned.is_empty() || cleaned == current {
+        return None;
+    }
+    Some(cleaned)
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+
+    #[test]
+    fn a_rename_trims_the_draft() {
+        assert_eq!(
+            resolve_track_rename("Audio 1", "  Lead Vox \t"),
+            Some("Lead Vox".to_string())
+        );
+    }
+
+    #[test]
+    fn a_blank_draft_keeps_the_name() {
+        assert_eq!(resolve_track_rename("Audio 1", ""), None);
+        assert_eq!(resolve_track_rename("Audio 1", "   \t "), None);
+    }
+
+    #[test]
+    fn an_unchanged_draft_is_no_rename() {
+        assert_eq!(resolve_track_rename("Bass", "Bass"), None);
+        assert_eq!(resolve_track_rename("Bass", "  Bass  "), None);
+        // A name that only differs in case is a real rename.
+        assert_eq!(
+            resolve_track_rename("Bass", "bass"),
+            Some("bass".to_string())
+        );
+    }
+
+    #[test]
+    fn thai_and_combining_marks_survive_exactly() {
+        // Thai: consonant + above vowel + tone mark, which must stay attached.
+        let thai = "เสียงร้อง";
+        assert_eq!(
+            resolve_track_rename("Audio 1", &format!("  {thai}  ")),
+            Some(thai.to_string())
+        );
+        // A decomposed é (e + U+0301) is not normalised to the precomposed one.
+        let decomposed = "Cafe\u{301}";
+        assert_eq!(
+            resolve_track_rename("Café", decomposed),
+            Some(decomposed.to_string())
+        );
+        // A trailing combining mark is part of the name, not white space.
+        assert_eq!(
+            resolve_track_rename("ก", "ก\u{E34}"),
+            Some("ก\u{E34}".to_string())
+        );
+    }
+
+    #[test]
+    fn renaming_advances_the_names_revision_only_on_a_change() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        let before = state.track_names_revision;
+        assert!(!state.set_track_name(&id, &state.tracks[0].name.clone()));
+        assert_eq!(state.track_names_revision, before);
+        assert!(state.set_track_name(&id, " spaced "));
+        assert_eq!(state.tracks[0].name, " spaced ", "stored exactly");
+        let after_set = state.track_names_revision;
+        assert_ne!(after_set, before);
+        assert!(state.rename_track(&id, "Keys"));
+        let after_rename = state.track_names_revision;
+        assert_ne!(after_rename, after_set);
+        assert!(!state.rename_track(&id, "  "));
+        assert!(!state.rename_track(&id, " Keys\n"));
+        assert_eq!(state.track_names_revision, after_rename);
+    }
+
+    /// A surface remembers the revision it last copied names at. A replaced
+    /// arrangement must never come back with that same value, or the surface
+    /// would keep showing the old project's names.
+    #[test]
+    fn a_fresh_arrangement_never_repeats_a_names_revision() {
+        let mut old = TimelineState::default();
+        let id = old.create_midi_track();
+        assert!(old.rename_track(&id, "Vox"));
+        let seen = old.track_names_revision;
+        let mut replacement = TimelineState::default();
+        assert_ne!(replacement.track_names_revision, seen);
+        assert_ne!(replacement.track_names_revision, 0);
+        let loaded = replacement.track_names_revision;
+        replacement.touch_track_names();
+        assert_ne!(replacement.track_names_revision, loaded);
+        assert_ne!(replacement.track_names_revision, seen);
+    }
+
+    #[test]
+    fn line_breaks_tabs_and_control_characters_become_spaces() {
+        assert_eq!(sanitize_track_name("Lead\nVox"), "Lead Vox");
+        assert_eq!(sanitize_track_name("Lead\r\nVox"), "Lead Vox");
+        assert_eq!(sanitize_track_name("Lead\tVox"), "Lead Vox");
+        assert_eq!(sanitize_track_name("\n\tDrums \r\n"), "Drums");
+        assert_eq!(sanitize_track_name("A\u{7}\u{1b}B"), "A B");
+        assert_eq!(sanitize_track_name("A\u{85}B\u{2028}C\u{2029}D"), "A B C D");
+        // Spaces the user typed stay as typed.
+        assert_eq!(sanitize_track_name("Lead  Vox"), "Lead  Vox");
+        // Format characters are not control characters: a joiner stays.
+        assert_eq!(sanitize_track_name("क्\u{200D}ष"), "क्\u{200D}ष");
+        assert_eq!(sanitize_track_name("\n\r\t"), "");
+    }
+
+    #[test]
+    fn a_pasted_multi_line_name_is_stored_on_one_line() {
+        assert_eq!(
+            resolve_track_rename("Audio 1", "Lead\nVox\n"),
+            Some("Lead Vox".to_string())
+        );
+        assert_eq!(resolve_track_rename("Lead Vox", "Lead\r\nVox"), None);
+        assert_eq!(resolve_track_rename("Audio 1", "\n\t"), None);
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        assert!(state.rename_track(&id, "Bass\tDI\n"));
+        assert_eq!(state.tracks[0].name, "Bass DI");
     }
 }

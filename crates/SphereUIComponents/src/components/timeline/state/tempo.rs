@@ -747,14 +747,21 @@ impl TimelineState {
     }
 
     /// Show the Tempo Track lane and ensure at least one anchor point exists.
-    pub fn show_tempo_track_lane(&mut self) {
+    /// Returns whether the project changed: the lane was hidden (its visibility
+    /// is saved with the project) or the anchor was seeded.
+    pub fn show_tempo_track_lane(&mut self) -> bool {
+        let changed = !self.show_tempo_track || self.tempo_map.points.is_empty();
         self.show_tempo_track = true;
         self.ensure_tempo_anchor_point();
+        changed
     }
 
-    pub fn hide_tempo_track_lane(&mut self) {
+    /// Returns whether the lane was shown, i.e. whether the saved view changed.
+    pub fn hide_tempo_track_lane(&mut self) -> bool {
+        let changed = self.show_tempo_track;
         self.show_tempo_track = false;
         self.selected_tempo_point_id = None;
+        changed
     }
 
     /// Seed beat-0 marker when the map is empty so the lane always has data.

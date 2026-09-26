@@ -337,13 +337,21 @@ impl StudioLayout {
         });
     }
 
+    /// The expansion is saved with the project (v54): an unsaved change, but
+    /// view-only, even when it seeds an empty first lane, which plays nothing.
     pub(super) fn toggle_selected_track_automation_mode(&mut self, cx: &mut Context<Self>) {
-        let _ = self.timeline.update(cx, |timeline, cx| {
-            if let Some(id) = timeline.state.selection.selected_track_id.clone() {
-                timeline.state.toggle_track_lane_mode(&id);
-                cx.notify();
-            }
+        let toggled = self.timeline.update(cx, |timeline, cx| {
+            let Some(id) = timeline.state.selection.selected_track_id.clone() else {
+                return false;
+            };
+            let toggled = timeline.state.toggle_track_lane_mode(&id).is_some();
+            cx.notify();
+            toggled
         });
+        if toggled {
+            self.mark_dirty_view_only();
+            cx.notify();
+        }
     }
 
     pub(super) fn select_all_automation_points(&mut self, cx: &mut Context<Self>) {
@@ -379,15 +387,37 @@ impl StudioLayout {
     }
 
     pub(super) fn cycle_selected_track_automation_target(&mut self, cx: &mut Context<Self>) {
-        let _ = self.timeline.update(cx, |timeline, cx| {
-            if let Some(id) = timeline.state.selection.selected_track_id.clone() {
-                if timeline.state.cycle_automation_target(&id).is_some() {
-                    timeline.mark_project_changed(cx);
-                    cx.notify();
-                }
+        use timeline_state::AutomationViewChange;
+        let change = self.timeline.update(cx, |timeline, cx| {
+            let Some(id) = timeline.state.selection.selected_track_id.clone() else {
+                return AutomationViewChange::Unchanged;
+            };
+            let mut cycled = false;
+            let change = timeline.state.edit_automation_view(&id, |state| {
+                cycled = state.cycle_automation_target(&id).is_some();
+            });
+            if change == AutomationViewChange::Lanes {
+                timeline.mark_project_changed(cx);
             }
+            if cycled {
+                cx.notify();
+            }
+            change
         });
-        self.mark_dirty();
+        self.mark_automation_view_change(change);
+    }
+
+    /// Mark the project for what an automation view command changed. A new
+    /// lane is content that the engine snapshot carries, so it takes the full
+    /// path. A move of the saved expansion or focused lane (v54) is view-only.
+    /// Nothing is marked when nothing changed.
+    fn mark_automation_view_change(&mut self, change: timeline_state::AutomationViewChange) {
+        use timeline_state::AutomationViewChange;
+        match change {
+            AutomationViewChange::Lanes => self.mark_dirty(),
+            AutomationViewChange::View => self.mark_dirty_view_only(),
+            AutomationViewChange::Unchanged => {}
+        }
     }
 
     /// Add (or focus) an automation lane for `target` on `track_id`.
@@ -397,28 +427,27 @@ impl StudioLayout {
         target: crate::components::timeline::timeline_state::AutomationTarget,
         cx: &mut Context<Self>,
     ) {
-        use crate::components::timeline::timeline_state::TrackLaneMode;
+        use crate::components::timeline::timeline_state::{AutomationViewChange, TrackLaneMode};
         let target = self.enrich_automation_target_name(track_id, target, cx);
-        let changed = self.timeline.update(cx, |timeline, cx| {
+        let change = self.timeline.update(cx, |timeline, cx| {
             timeline.state.select_track(track_id);
-            if timeline.state.track_lane_mode(track_id) != TrackLaneMode::Automation {
-                timeline.state.toggle_track_lane_mode(track_id);
-            }
-            if timeline
-                .state
-                .set_track_automation_target(track_id, target)
-                .is_some()
-            {
+            let change = timeline.state.edit_automation_view(track_id, |state| {
+                if state.track_lane_mode(track_id) != TrackLaneMode::Automation {
+                    state.toggle_track_lane_mode(track_id);
+                }
+                state.set_track_automation_target(track_id, target);
+            });
+            if change == AutomationViewChange::Lanes {
                 timeline.mark_project_changed(cx);
-                cx.notify();
-                true
-            } else {
-                false
             }
+            cx.notify();
+            change
         });
         self.overlay.open_popover = None;
-        if changed {
-            self.mark_dirty();
+        // Picking a target whose lane already exists only expands or refocuses
+        // the track, which the engine never sees.
+        self.mark_automation_view_change(change);
+        if change == AutomationViewChange::Lanes {
             self.audio_bridge.project_dirty = true;
             self.schedule_audio_project_sync(cx, false, "automation_add_target");
         }
@@ -513,6 +542,8 @@ impl StudioLayout {
                     }
                 });
                 if collapsed {
+                    // The expansion is saved with the project (v54).
+                    self.mark_dirty_view_only();
                     cx.notify();
                 }
             }

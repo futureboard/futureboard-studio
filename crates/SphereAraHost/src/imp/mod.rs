@@ -27,13 +27,14 @@ use crate::AraSessionConfig;
 use crate::error::{AraHostError, AraResult};
 use crate::info::{AraFactoryInfo, AraRendererId, AraRoles};
 use crate::model::{
-    AraAudioSourceDesc, AraClipKey, AraColor, AraGraph, AraMusicalTimeline, AraPlaybackRegionDesc,
-    AraPlaybackTransform, AraRegionSequenceDesc, AraSourceKey, AraTrackKey,
+    AraAudioSourceDesc, AraClipKey, AraColor, AraGraph, AraGraphChange, AraMusicalTimeline,
+    AraPlaybackRegionDesc, AraPlaybackTransform, AraRegionSequenceDesc, AraSourceKey, AraTrackKey,
+    HeldGraph,
 };
 
 use services::{
     ArchiveService, ArchiveSlot, ArchiveStore, AudioService, ContentService, GraphIndex,
-    ModelService, SharedContent, TransportService, trace,
+    ModelService, SharedContent, TransportService, offers_harmonic_content, trace,
 };
 
 /// Generations tried when initializing a factory, best first.
@@ -51,14 +52,73 @@ const GENERATIONS: [ApiGeneration; 4] = [
 /// Name of the single musical context every region sequence hangs off.
 const MUSICAL_CONTEXT_NAME: &str = "Futureboard timeline";
 
-/// Scopes that stay untouched when only the tempo map or bar signatures move.
+/// Scopes a musical context never touches: it carries timing and harmony, and
+/// neither the signal, the notes nor the tuning of any audio.
 ///
-/// ARA's flags name what is *unchanged*, so listing everything but timing is how
-/// a host says "the timing moved and nothing else did".
-const TIMING_CHANGED: ContentUpdateScopes = ContentUpdateScopes::SIGNAL_REMAINS_UNCHANGED
+/// ARA's flags name what is *unchanged*, so a host says "only X moved" by
+/// listing everything but X.
+const CONTEXT_NEVER_CHANGES: ContentUpdateScopes = ContentUpdateScopes::SIGNAL_REMAINS_UNCHANGED
     .union(ContentUpdateScopes::NOTE_REMAINS_UNCHANGED)
-    .union(ContentUpdateScopes::TUNING_REMAINS_UNCHANGED)
-    .union(ContentUpdateScopes::HARMONIC_REMAINS_UNCHANGED);
+    .union(ContentUpdateScopes::TUNING_REMAINS_UNCHANGED);
+
+/// Scopes that stay untouched when only the key moved.
+const HARMONY_CHANGED: ContentUpdateScopes =
+    CONTEXT_NEVER_CHANGES.union(ContentUpdateScopes::TIMING_REMAINS_UNCHANGED);
+
+/// What publishing a new musical timeline asks of the document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextUpdate {
+    /// No musical context exists yet.
+    Create,
+    /// Content the plug-in can read changed; the flags name what did not.
+    Notify(ContentUpdateScopes),
+    /// Nothing the plug-in can read changed, so no edit cycle at all: even an
+    /// empty one is not free, since a plug-in may re-evaluate its internal
+    /// state at `endEditing` (Melodyne updates its per-clip scale copies there).
+    Nothing,
+}
+
+/// Diffs the last published timeline (`None` before the context exists)
+/// against `next`, as a document negotiated at `generation` sees them.
+///
+/// Keys only count from ARA 2.0 Final on: below that the plug-in is offered no
+/// key content, so a key-only change is invisible to it, and the harmonic
+/// scope flag, itself a 2.0 Final addendum, is never sent.
+fn plan_context_update(
+    prev: Option<&AraMusicalTimeline>,
+    next: &AraMusicalTimeline,
+    generation: ApiGeneration,
+) -> ContextUpdate {
+    let Some(prev) = prev else {
+        return ContextUpdate::Create;
+    };
+    let harmonic = offers_harmonic_content(generation);
+    let timing_same = prev.tempo == next.tempo && prev.bars == next.bars;
+    let harmony_same = !harmonic || prev.keys == next.keys;
+    if timing_same && harmony_same {
+        return ContextUpdate::Nothing;
+    }
+    let mut scopes = CONTEXT_NEVER_CHANGES;
+    if timing_same {
+        scopes |= ContentUpdateScopes::TIMING_REMAINS_UNCHANGED;
+    }
+    if harmonic && harmony_same {
+        scopes |= ContentUpdateScopes::HARMONIC_REMAINS_UNCHANGED;
+    }
+    ContextUpdate::Notify(scopes)
+}
+
+/// Lets the plug-in deliver pending model notifications right after an edit.
+///
+/// ARA asks hosts that read plug-in content to do this within the same undo
+/// frame as `endEditing`. A failure here costs only a delayed notification —
+/// the periodic call from the application retries — so it is traced, not
+/// returned.
+fn notify_after_edit(document: &mut DocumentSession<'static, 'static>) {
+    if let Err(error) = document.notify_model_updates() {
+        trace(&format!("model updates after an edit: {error}"));
+    }
+}
 
 pub(crate) fn is_supported() -> bool {
     true
@@ -253,6 +313,8 @@ pub(crate) struct Session {
     factory_ptr: *mut LoadedFactory<'static>,
     document: Option<DocumentSession<'static, 'static>>,
     info: AraFactoryInfo,
+    /// The negotiated generation, which decides whether keys are published.
+    generation: ApiGeneration,
 
     index: Arc<GraphIndex>,
     archives: Arc<ArchiveStore>,
@@ -262,6 +324,9 @@ pub(crate) struct Session {
     /// no ABI call on re-apply.
     document_name: Option<String>,
     musical_context: Option<MusicalContextHandle>,
+    /// The timeline the plug-in last acknowledged, set together with
+    /// `musical_context`; what the next one is diffed against.
+    published: Option<AraMusicalTimeline>,
     sources: HashMap<AraSourceKey, SourceEntry>,
     sequences: HashMap<AraTrackKey, SequenceEntry>,
     clips: HashMap<AraClipKey, ClipEntry>,
@@ -286,7 +351,7 @@ impl Session {
 
         let index = Arc::new(GraphIndex::default());
         let archives = Arc::new(ArchiveStore::default());
-        let content = Arc::new(ContentService::new(Arc::clone(&index)));
+        let content = Arc::new(ContentService::new(Arc::clone(&index), generation));
 
         let services = HostServicesBuilder::new()
             .audio(AudioService::new(config.audio, Arc::clone(&index)))
@@ -328,11 +393,13 @@ impl Session {
             factory_ptr,
             document: Some(document),
             info,
+            generation,
             index,
             archives,
             content,
             document_name: config.document_name,
             musical_context: None,
+            published: None,
             sources: HashMap::new(),
             sequences: HashMap::new(),
             clips: HashMap::new(),
@@ -365,12 +432,24 @@ impl Session {
     }
 
     pub(crate) fn set_musical_timeline(&mut self, timeline: &AraMusicalTimeline) -> AraResult<()> {
+        let plan = match self.musical_context {
+            Some(_) => plan_context_update(self.published.as_ref(), timeline, self.generation),
+            None => ContextUpdate::Create,
+        };
+        if plan == ContextUpdate::Nothing {
+            return Ok(());
+        }
+
+        // Content goes in before the edit: the plug-in reads it back from
+        // inside the calls below, re-entering `ContentService` on this thread.
+        // `publish` has released its lock by the time any of them runs.
         self.content.publish(timeline);
 
         let Self {
             document,
             index,
             musical_context,
+            published,
             ..
         } = self;
         let document = document
@@ -380,37 +459,65 @@ impl Session {
             return Err(AraHostError::Poisoned);
         }
 
-        // The context object itself carries only a name, order, and colour; the
-        // tempo map reaches the plug-in through the content reader, so updating
-        // an existing context is a content-changed notification, not a rebuild.
-        let properties = MusicalContextProperties::new(Some(MUSICAL_CONTEXT_NAME), 0, None)
-            .map_err(map_error)?;
+        // The context object itself carries only a name, order, and colour, none
+        // of which ever change; the tempo map, meter and key reach the plug-in
+        // through the content reader, so an existing context only ever gets a
+        // content-changed notification.
         let mut edit = document.edit().map_err(map_error)?;
-        let handle = match *musical_context {
-            Some(handle) => {
-                edit.update_musical_context(handle, properties)
-                    .map_err(map_error)?;
-                edit.update_musical_context_content(handle, None, TIMING_CHANGED)
+        let handle = match (plan, *musical_context) {
+            (ContextUpdate::Notify(scopes), Some(handle)) => {
+                edit.update_musical_context_content(handle, None, scopes)
                     .map_err(map_error)?;
                 handle
             }
-            None => edit.create_musical_context(properties).map_err(map_error)?,
+            _ => {
+                let properties = MusicalContextProperties::new(Some(MUSICAL_CONTEXT_NAME), 0, None)
+                    .map_err(map_error)?;
+                let handle = edit.create_musical_context(properties).map_err(map_error)?;
+                // Index before the edit closes: the plug-in reads the context's
+                // content from inside `endEditing`, and an identity registered
+                // afterwards makes every one of those reads come back empty.
+                let address = edit
+                    .musical_context_ref(handle)
+                    .map_err(map_error)?
+                    .as_raw() as usize;
+                index.set_musical_context(Some(address));
+                // Reads made from inside `createMusicalContext` itself could not
+                // be answered — the identity did not exist yet — so the plug-in
+                // is told that everything changed, now that it can re-read.
+                edit.update_musical_context_content(handle, None, ContentUpdateScopes::empty())
+                    .map_err(map_error)?;
+                handle
+            }
         };
         edit.finish().map_err(map_error)?;
 
-        let address = document
-            .musical_context_ref(handle)
-            .map_err(map_error)?
-            .as_raw() as usize;
-        index.set_musical_context(Some(address));
         *musical_context = Some(handle);
+        *published = Some(timeline.clone());
+        notify_after_edit(document);
         Ok(())
+    }
+
+    /// How far `graph` departs from what the document holds.
+    pub(crate) fn graph_change(&self, graph: &AraGraph) -> AraGraphChange {
+        graph.change_from(self)
+    }
+
+    pub(crate) fn notify_model_updates(&mut self) -> AraResult<()> {
+        self.document_mut()?
+            .notify_model_updates()
+            .map_err(map_error)
     }
 
     pub(crate) fn apply_graph(&mut self, graph: &AraGraph) -> AraResult<()> {
         let context = self.musical_context.ok_or_else(|| {
             AraHostError::invalid("set_musical_timeline must run before apply_graph")
         })?;
+        // No edit cycle for a graph that is already in place: `endEditing` is
+        // not free for the plug-in even when the edit was empty.
+        if self.graph_change(graph) == AraGraphChange::Unchanged {
+            return Ok(());
+        }
 
         let supported = self.info.supported_transforms;
 
@@ -710,6 +817,7 @@ impl Session {
         }
 
         edit.finish().map_err(map_error)?;
+        notify_after_edit(document);
 
         // Identities are indexed as they are created -- they have to be, because
         // the plug-in calls back during the edit. What is left here is the work
@@ -1008,7 +1116,45 @@ impl Session {
         };
         self.archives.take(address);
         drop(token);
-        outcome.map_err(map_error)
+        outcome.map_err(map_error)?;
+        self.resync_harmony_after_restore();
+        if let Ok(document) = self.document_mut() {
+            notify_after_edit(document);
+        }
+        Ok(())
+    }
+
+    /// Tells the plug-in the harmony changed, after a restore.
+    ///
+    /// The archive brings back each clip's copy of the key it was saved with
+    /// (Melodyne keeps scales per audio modification, copied from the musical
+    /// context), and the key may have changed since — while the plug-in was
+    /// missing, say. The timeline itself is unchanged, so the diff in
+    /// `set_musical_timeline` would never say so. The restore itself has
+    /// succeeded either way, so a failure here is traced, not returned.
+    fn resync_harmony_after_restore(&mut self) {
+        let has_keys = self
+            .published
+            .as_ref()
+            .is_some_and(|timeline| !timeline.keys.is_empty());
+        let Some(handle) = self.musical_context else {
+            return;
+        };
+        if !has_keys || !offers_harmonic_content(self.generation) {
+            return;
+        }
+        let Ok(document) = self.document_mut() else {
+            return;
+        };
+        let outcome = document.edit().and_then(|mut edit| {
+            let updated = edit.update_musical_context_content(handle, None, HARMONY_CHANGED);
+            // End the cycle whatever the update said.
+            let finished = edit.finish();
+            updated.and(finished)
+        });
+        if let Err(error) = outcome {
+            trace(&format!("harmony re-sync after restore: {error}"));
+        }
     }
 
     pub(crate) fn close(mut self) -> AraResult<()> {
@@ -1021,6 +1167,28 @@ impl Session {
         document
             .close()
             .map_err(|error| AraHostError::Plugin(error.to_string()))
+    }
+}
+
+impl HeldGraph for Session {
+    fn document_name(&self) -> Option<&str> {
+        self.document_name.as_deref()
+    }
+
+    fn counts(&self) -> (usize, usize, usize) {
+        (self.sources.len(), self.sequences.len(), self.clips.len())
+    }
+
+    fn source(&self, key: &AraSourceKey) -> Option<&AraAudioSourceDesc> {
+        self.sources.get(key).map(|entry| &entry.desc)
+    }
+
+    fn sequence(&self, key: &AraTrackKey) -> Option<&AraRegionSequenceDesc> {
+        self.sequences.get(key).map(|entry| &entry.desc)
+    }
+
+    fn region(&self, key: &AraClipKey) -> Option<&AraPlaybackRegionDesc> {
+        self.clips.get(key).map(|entry| &entry.desc)
     }
 }
 
@@ -1037,5 +1205,137 @@ impl Drop for Session {
             drop(Box::from_raw(self.factory_ptr));
             drop(Box::from_raw(self.services_ptr));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AraBarSignature, AraKeySignature, AraTempoEntry};
+
+    fn timeline(bpm: f64, key_root: Option<i32>) -> AraMusicalTimeline {
+        let mut intervals = [false; 12];
+        for interval in [0, 2, 4, 5, 7, 9, 11] {
+            intervals[interval] = true;
+        }
+        AraMusicalTimeline {
+            tempo: vec![
+                AraTempoEntry {
+                    time_seconds: 0.0,
+                    quarter_position: 0.0,
+                },
+                AraTempoEntry {
+                    time_seconds: 60.0 / bpm,
+                    quarter_position: 1.0,
+                },
+            ],
+            bars: vec![AraBarSignature {
+                numerator: 4,
+                denominator: 4,
+                quarter_position: 0.0,
+            }],
+            keys: key_root
+                .map(|root_fifths| AraKeySignature {
+                    root_fifths,
+                    intervals,
+                    name: None,
+                    quarter_position: 0.0,
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn scopes(update: ContextUpdate) -> ContentUpdateScopes {
+        match update {
+            ContextUpdate::Notify(scopes) => scopes,
+            other => panic!("expected a notification, got {other:?}"),
+        }
+    }
+
+    const FINAL: ApiGeneration = ApiGeneration::V23Final;
+
+    #[test]
+    fn the_first_timeline_creates_the_context() {
+        let next = timeline(120.0, Some(0));
+        assert_eq!(
+            plan_context_update(None, &next, FINAL),
+            ContextUpdate::Create
+        );
+    }
+
+    #[test]
+    fn an_unchanged_timeline_needs_no_edit_at_all() {
+        let prev = timeline(120.0, Some(0));
+        assert_eq!(
+            plan_context_update(Some(&prev), &prev.clone(), FINAL),
+            ContextUpdate::Nothing
+        );
+    }
+
+    #[test]
+    fn a_key_change_is_harmonic_only() {
+        let prev = timeline(120.0, Some(0));
+        let next = timeline(120.0, Some(-1));
+        let scopes = scopes(plan_context_update(Some(&prev), &next, FINAL));
+        assert!(scopes.contains(ContentUpdateScopes::TIMING_REMAINS_UNCHANGED));
+        assert!(!scopes.contains(ContentUpdateScopes::HARMONIC_REMAINS_UNCHANGED));
+        assert!(scopes.contains(CONTEXT_NEVER_CHANGES));
+        assert_eq!(scopes, HARMONY_CHANGED);
+    }
+
+    #[test]
+    fn a_tempo_change_is_timing_only() {
+        let prev = timeline(120.0, Some(0));
+        let next = timeline(90.0, Some(0));
+        let scopes = scopes(plan_context_update(Some(&prev), &next, FINAL));
+        assert!(!scopes.contains(ContentUpdateScopes::TIMING_REMAINS_UNCHANGED));
+        assert!(scopes.contains(ContentUpdateScopes::HARMONIC_REMAINS_UNCHANGED));
+        assert!(scopes.contains(CONTEXT_NEVER_CHANGES));
+    }
+
+    #[test]
+    fn clearing_the_key_is_a_harmonic_change() {
+        let prev = timeline(120.0, Some(3));
+        let next = timeline(120.0, None);
+        assert_eq!(
+            scopes(plan_context_update(Some(&prev), &next, FINAL)),
+            HARMONY_CHANGED
+        );
+    }
+
+    #[test]
+    fn tempo_and_key_together_change_both_scopes() {
+        let prev = timeline(120.0, Some(3));
+        let next = timeline(90.0, Some(-2));
+        assert_eq!(
+            scopes(plan_context_update(Some(&prev), &next, FINAL)),
+            CONTEXT_NEVER_CHANGES
+        );
+    }
+
+    #[test]
+    fn a_draft_generation_never_sees_keys_or_the_harmonic_flag() {
+        let draft = ApiGeneration::V2Draft;
+        let prev = timeline(120.0, Some(0));
+        assert_eq!(
+            plan_context_update(Some(&prev), &timeline(120.0, Some(-1)), draft),
+            ContextUpdate::Nothing
+        );
+        let scopes = scopes(plan_context_update(
+            Some(&prev),
+            &timeline(90.0, Some(-1)),
+            draft,
+        ));
+        assert!(!scopes.contains(ContentUpdateScopes::HARMONIC_REMAINS_UNCHANGED));
+        assert_eq!(scopes, CONTEXT_NEVER_CHANGES);
+    }
+
+    #[test]
+    fn harmonic_content_starts_at_ara_2_final() {
+        assert!(!offers_harmonic_content(ApiGeneration::V2Draft));
+        assert!(offers_harmonic_content(ApiGeneration::V2Final));
+        assert!(offers_harmonic_content(ApiGeneration::V2xDraft));
+        assert!(offers_harmonic_content(ApiGeneration::V23Final));
     }
 }

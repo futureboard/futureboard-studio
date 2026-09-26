@@ -56,6 +56,9 @@ impl Render for StudioLayout {
         self.window_hooks.cached_bounds = Some(window.bounds());
         self.flush_deferred_insert_editor_opens(window, cx);
         self.flush_pending_audio_tools(window, cx);
+        // A track was renamed somewhere (a header, the Inspector, undo, redo):
+        // views that copy names out of the timeline catch up once.
+        self.sync_track_name_surfaces(cx);
 
         // Keep the OS window title in sync with the project lifecycle state
         // (Part G/H), e.g. "Untitled Project — Unsaved" / "My Song — Saved".
@@ -954,6 +957,17 @@ impl Render for StudioLayout {
             .capture_any_mouse_down(move |_event, window, cx| {
                 focus_holder_on_pointer.focus(window, cx);
             })
+            // Modifier changes travel the focus path, which the arrangement is
+            // never on. Forward them so pressing or releasing Option over an
+            // audio clip's cut zone shows or hides the razor line at once.
+            .on_modifiers_changed({
+                let timeline = self.timeline.downgrade();
+                move |event: &gpui::ModifiersChangedEvent, _window, cx| {
+                    let _ = timeline.update(cx, |timeline, cx| {
+                        timeline.smart_cut_modifiers_changed(&event.modifiers, cx)
+                    });
+                }
+            })
             .capture_key_down(move |event, window, cx| {
                 let modifiers = event.keystroke.modifiers;
                 if !event.is_held {
@@ -968,10 +982,18 @@ impl Render for StudioLayout {
                     && !modifiers.platform
                     && !modifiers.function
                 {
-                    if modifiers.shift {
-                        window.focus_prev(cx);
-                    } else {
-                        window.focus_next(cx);
+                    // Tab ends a track-name edit the way Enter does, handing
+                    // focus back to the shortcut anchor instead of moving it
+                    // into that header's controls.
+                    let rename_committed = shortcut_keydown_target.update(cx, |this, cx| {
+                        this.commit_track_rename_on_tab(window, cx)
+                    });
+                    if !rename_committed {
+                        if modifiers.shift {
+                            window.focus_prev(cx);
+                        } else {
+                            window.focus_next(cx);
+                        }
                     }
                     window.prevent_default();
                     cx.stop_propagation();
@@ -979,6 +1001,7 @@ impl Render for StudioLayout {
                 }
                 let handled = shortcut_keydown_target.update(cx, |this, cx| {
                     let handled = this.handle_command_palette_key(event, window, cx)
+                        || this.handle_track_rename_key(event, window, cx)
                         || this.handle_bpm_edit_key(event, window, cx)
                         || this.handle_ts_edit_key(event, window, cx)
                         || this.handle_settings_dialog_key(event, window, cx)
@@ -1097,6 +1120,14 @@ impl Render for StudioLayout {
                         // captured at drag start.
                         this.cancel_bpm_drag(cx);
                         let _ = this.timeline.update(cx, |timeline, cx| {
+                            // Escape reaches the arrangement only here: a clip
+                            // gain / fade / crossfade drag or a clip move puts
+                            // its clips back and stops, and a marquee puts the
+                            // previous selection back before the reset forgets
+                            // it.
+                            timeline.cancel_clip_handle_gesture(Some(window), cx);
+                            timeline.cancel_clip_drag(Some(window), cx);
+                            timeline.cancel_marquee(cx);
                             timeline.reset_input_state();
                             cx.notify();
                         });

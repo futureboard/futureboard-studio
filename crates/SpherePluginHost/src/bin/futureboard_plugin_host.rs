@@ -2630,6 +2630,9 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
     // Latest requested editor size per instance (coalesced from ResizeEditor
     // commands), applied below with a bounded preview try-lock.
     let mut pending_resizes: HashMap<String, (u32, u32, u32)> = HashMap::new();
+    // Which open editors reported edits to their plug-in's own state, and
+    // when to tell the studio (throttled `PluginStateTouched`).
+    let mut state_touches = SpherePluginHost::state_touch::StateTouchTracker::default();
     let preview: SharedPluginHostPreview = PluginHostPreviewEngine::shared(48_000, 256);
     let mut preview_output_started = false;
     log_host_audio_mode();
@@ -2868,6 +2871,7 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
         //    this UI thread must NEVER block on it inside the pump path: use
         //    short bounded try-locks and skip the tick when the lock is busy.
         let mut chrome_actions: Vec<(String, i32, i32, String)> = Vec::new();
+        let mut state_touched: Vec<String> = Vec::new();
         let user_closed_editors: Vec<String> = timed_section!("editor_refresh", {
             let mut user_closed: Vec<String> = Vec::new();
             let refresh_targets: Option<
@@ -2886,6 +2890,12 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
                 });
             if let Some(refresh_targets) = refresh_targets {
                 for (instance_id, processor) in refresh_targets {
+                    // The plug-in's own edits since the last tick. Taken before
+                    // the close check, so an edit made just before the user
+                    // closed the window still counts for that session.
+                    if processor.take_state_touched() {
+                        state_touched.push(instance_id.clone());
+                    }
                     // Host-owned (detached) window: the user can close it via its
                     // own titlebar. Detect that here and report EditorClosed so
                     // the main app drops the session and Open works again. The
@@ -2977,6 +2987,32 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
                 },
             );
         }
+        // Tell the studio which plug-ins may have changed their own state, so
+        // the project asks to be saved. Recorded before the open set is synced:
+        // a touch from an editor that closed this tick still belongs to its
+        // session, and one from an editor that only just opened is stale.
+        timed_section!("state_touch", {
+            let now = Instant::now();
+            for instance_id in state_touched.drain(..) {
+                state_touches.record(&instance_id, now);
+            }
+            let closed = state_touches.sync_open_editors(
+                registry.keys().map(String::as_str),
+                now,
+                |instance_id| au_instance(&au_processors, instance_id).is_none(),
+            );
+            let touched = closed
+                .into_iter()
+                .filter(|instance_id| loaded.contains_key(instance_id))
+                .chain(state_touches.take_due(now));
+            for plugin_instance_id in touched {
+                hlog!("[plugin-host-state] state touched instance={plugin_instance_id}");
+                let _ = ipc::write_frame(
+                    &mut out,
+                    &HostEvent::PluginStateTouched { plugin_instance_id },
+                );
+            }
+        });
         timed_section!("resize_poll", {
             let resizes = preview
                 .try_lock_for(Duration::from_millis(2))

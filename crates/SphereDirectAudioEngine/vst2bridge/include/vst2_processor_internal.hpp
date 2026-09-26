@@ -178,6 +178,11 @@ struct SphereDauxVst2Processor {
   bool editor_resizable{false};
   unsigned long long editor_handle{0};
   std::atomic<bool> embed_user_closed{false};
+  /// Raised by `audioMasterAutomate` / `audioMasterEndEdit`: the plug-in's own
+  /// GUI changed a parameter, so its saved state may be stale. Cleared by
+  /// `sphere_daux_vst2_take_state_touched`. Plug-ins may automate from the
+  /// audio thread, hence a plain atomic store.
+  std::atomic<bool> state_touched{false};
   std::atomic<bool> pending_main_shell_resize{false};
   int pending_main_shell_w{0};
   int pending_main_shell_h{0};

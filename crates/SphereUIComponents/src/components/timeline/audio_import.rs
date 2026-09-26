@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 use gpui::{AsyncApp, Context, Entity, WeakEntity};
 
 use super::timeline::Timeline;
-use super::timeline_state::AudioImportState;
+use super::timeline_state::{AudioImportState, ClipType, TimelineState};
 use super::waveform_cache::{self, WaveformFileMeta, WaveformPreview, CHUNK_PEAKS, PEAK_FINE_SPP};
 use super::waveform_peak_file::{
-    read_peak_file, waveform_peak_relative_path_for_asset, write_peak_file, PeakFileError,
-    SourceFingerprint,
+    legacy_waveform_peak_relative_path_for_asset, read_peak_file,
+    waveform_peak_relative_path_for_asset, write_peak_file, PeakFileError, SourceFingerprint,
 };
 use crate::layout::StudioLayout;
 use crate::project::io::relative_path_in_project;
@@ -36,14 +36,89 @@ fn project_peak_path(project_root: &Path, asset_id: &str) -> PathBuf {
     project_root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR))
 }
 
+/// Peak files that may hold `asset_id`'s cache, in lookup order: today's name
+/// (the only one ever written, so the freshest when it exists), the path the
+/// project recorded for it (when that is a portable project-relative path;
+/// an older save may have recorded an older name), then the name an earlier
+/// build wrote.
+fn peak_file_candidates(
+    project_root: &Path,
+    asset_id: &str,
+    recorded: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut relatives: Vec<String> = Vec::with_capacity(3);
+    relatives.push(waveform_peak_relative_path_for_asset(asset_id));
+    if let Some(recorded) = recorded.filter(|recorded| is_portable_peak_relative_path(recorded)) {
+        relatives.push(recorded.to_string());
+    }
+    if let Some(legacy) = legacy_waveform_peak_relative_path_for_asset(asset_id) {
+        relatives.push(legacy);
+    }
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(relatives.len());
+    for relative in relatives {
+        let path = project_root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// A recorded peak path that can be opened here as written: relative, no
+/// `..`, no `:` (a stream name on NTFS), every component within the 255-byte
+/// name limit. Paths recorded from ids before names were bounded can fail
+/// all of these.
+fn is_portable_peak_relative_path(relative: &str) -> bool {
+    !relative.is_empty()
+        && !relative.starts_with(['/', '\\'])
+        && !relative.contains(':')
+        && relative
+            .split(['/', '\\'])
+            .all(|component| component != ".." && component.len() <= 255)
+}
+
+/// Read the first candidate that holds usable peaks for `asset_id`. A
+/// candidate that exists but is stale (its source changed) or damaged never
+/// hides a later one that is current: an old name left behind must not
+/// shadow a fresh cache. When none is usable, the first such error is
+/// returned (the peaks are regenerated), or the first candidate's miss when
+/// none could be opened at all.
+fn read_first_peak_file(
+    candidates: &[PathBuf],
+    asset_id: &str,
+    expected_source: Option<SourceFingerprint>,
+) -> (PathBuf, Result<WaveformPreview, PeakFileError>) {
+    let mut first_miss = None;
+    let mut first_unusable = None;
+    for path in candidates {
+        match read_peak_file(path, Some(asset_id), expected_source) {
+            Ok(preview) => return (path.clone(), Ok(preview)),
+            Err(PeakFileError::Io(err)) => {
+                first_miss.get_or_insert((path.clone(), PeakFileError::Io(err)));
+            }
+            Err(err) => {
+                first_unusable.get_or_insert((path.clone(), err));
+            }
+        }
+    }
+    match first_unusable.or(first_miss) {
+        Some((path, err)) => (path, Err(err)),
+        None => (
+            PathBuf::new(),
+            Err(PeakFileError::Io(std::io::ErrorKind::NotFound.into())),
+        ),
+    }
+}
+
 fn try_load_project_peak_cache(
     project_root: &Path,
     asset_id: &str,
     source_path: &Path,
 ) -> Option<Arc<WaveformPreview>> {
-    let path = project_peak_path(project_root, asset_id);
     let expected_source = SourceFingerprint::for_path(source_path);
-    match read_peak_file(&path, Some(asset_id), expected_source) {
+    let candidates = peak_file_candidates(project_root, asset_id, None);
+    let (path, result) = read_first_peak_file(&candidates, asset_id, expected_source);
+    match result {
         Ok(preview) => {
             let peak_count: usize = preview.lods.iter().map(|l| l.peaks.len()).sum();
             eprintln!(
@@ -314,21 +389,145 @@ fn eager_copy_disabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("FUTUREBOARD_DISABLE_EAGER_AUDIO_COPY").is_some())
 }
 
+/// Which clips an import may point at the project copy it makes of their file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportClips {
+    /// Restoring a saved project: every clip sharing the asset is that saved
+    /// asset. The copy becomes their source, but their ids are saved (the ARA
+    /// audio-source persistentID, the peak-cache key) and never change.
+    Saved,
+    /// The clips this import just created. Only they move to the copy, source
+    /// and id. Any other clip that shares the dropped path keeps both: its id
+    /// may already be saved or bound to an ARA document, and the file at the
+    /// dropped path may no longer hold its audio.
+    Created(Vec<String>),
+}
+
+/// What pointing an import's clips at the project copy changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportRetarget {
+    changed: bool,
+    /// Key the import runs under: the copy's id when this import's clips moved
+    /// to it, otherwise the dropped key.
+    import_key: String,
+    /// Every clip under the old key moved, so its cached peaks go with it.
+    /// When some clip keeps the old key, its peaks stay where they are.
+    move_cache: bool,
+}
+
+/// Point the clips `clips` allows at `copy_source`, and (for clips this import
+/// created) at the copy's id `copy_key`. Clips sharing `old_key` that
+/// `clips` does not name are left exactly as they are.
+fn retarget_imported_clips(
+    state: &mut TimelineState,
+    clips: &ImportClips,
+    old_key: &str,
+    copy_key: &str,
+    copy_source: &str,
+) -> ImportRetarget {
+    let mut changed = false;
+    let mut moved_id = false;
+    let mut kept_old_key = false;
+    for clip in state
+        .tracks
+        .iter_mut()
+        .flat_map(|track| track.clips.iter_mut())
+    {
+        if clip.audio_asset_key() != Some(old_key) {
+            continue;
+        }
+        let may_move = match clips {
+            ImportClips::Saved => true,
+            ImportClips::Created(ids) => ids.contains(&clip.id),
+        };
+        let ClipType::Audio {
+            file_id,
+            source_path,
+        } = &mut clip.clip_type
+        else {
+            continue;
+        };
+        if !may_move {
+            kept_old_key = true;
+            continue;
+        }
+        if source_path.as_deref() != Some(copy_source) {
+            *source_path = Some(copy_source.to_string());
+            changed = true;
+        }
+        if matches!(clips, ImportClips::Created(_)) && file_id.as_str() != copy_key {
+            *file_id = copy_key.to_string();
+            changed = true;
+            moved_id = true;
+        } else {
+            kept_old_key = true;
+        }
+    }
+    ImportRetarget {
+        changed,
+        import_key: if moved_id { copy_key } else { old_key }.to_string(),
+        move_cache: moved_id && !kept_old_key,
+    }
+}
+
+/// The clips a layout-side import just created for `asset_key`. Every such
+/// caller inserts the clip through `insert_audio_clip_with_duration`, which
+/// selects exactly that clip, right before starting its import; a new clip
+/// also still points at the dropped file. A caller that selected nothing
+/// matching moves no clip: ids stay as they are, which is always safe.
+fn clips_just_created(state: &TimelineState, asset_key: &str) -> Vec<String> {
+    state
+        .tracks
+        .iter()
+        .flat_map(|track| track.clips.iter())
+        .filter(|clip| {
+            clip.audio_asset_key() == Some(asset_key)
+                && state.selection.selected_clip_ids.contains(&clip.id)
+                && matches!(
+                    &clip.clip_type,
+                    ClipType::Audio { source_path: Some(source), .. } if source == asset_key
+                )
+        })
+        .map(|clip| clip.id.clone())
+        .collect()
+}
+
+/// Show the clips a layout-side import is about to import as pending. With
+/// clips just created, only those: they alone move to the project copy's key,
+/// and every progress report after that is made under that key, so another
+/// clip sharing the dropped path (a saved clip, maybe long since `Ready`)
+/// would be left pending for good. With none, every clip under the key: the
+/// import then runs under that key and reports to all of them.
+fn mark_import_pending(state: &mut TimelineState, asset_key: &str, created: &[String]) {
+    for clip in state
+        .tracks
+        .iter_mut()
+        .flat_map(|track| track.clips.iter_mut())
+    {
+        if clip.audio_asset_key() == Some(asset_key)
+            && (created.is_empty() || created.contains(&clip.id))
+        {
+            clip.audio_import = AudioImportState::Pending;
+        }
+    }
+}
+
 /// Phase D: if the project is saved and the dropped file lives outside its
 /// folder, copy it into `Assets/Audio` (deduped) on a background thread and
-/// retarget every clip sharing `asset_key` to the project-local copy. Only when
-/// a file was actually copied does the asset id (`file_id`) move to the copy's
-/// project-relative path, with the waveform cache migrated to the new key; that
-/// happens right after a drop, before the id was ever saved. A source that
-/// already lives in the project (every reopened clip) keeps its id: it is the
-/// ARA audio-source persistentID and the peak-cache key, and must survive a
-/// reopen. Returns the path to actually decode (the copy when copied, otherwise
-/// the original) and the key to import under. Falls back to the original on any
-/// error so a failed copy never breaks the clip.
+/// point the clips `clips` allows at the project-local copy. Only clips this
+/// import created take the copy's project-relative path as their asset id
+/// (`file_id`), with the waveform cache migrated when no other clip still
+/// uses the old key; that happens right after a drop, before the id was ever
+/// saved. Every other clip keeps its id: it is the ARA audio-source
+/// persistentID and the peak-cache key, and must survive a reopen. Returns the
+/// path to actually decode (the copy when copied, otherwise the original) and
+/// the key to import under. Falls back to the original on any error so a
+/// failed copy never breaks the clip.
 async fn maybe_copy_into_project(
     asset_key: &str,
     path: PathBuf,
     project_root: Option<PathBuf>,
+    clips: &ImportClips,
     timeline: &WeakEntity<Timeline>,
     cx: &mut AsyncApp,
 ) -> (PathBuf, String) {
@@ -348,36 +547,40 @@ async fn maybe_copy_into_project(
 
     match copied {
         Ok(dest) => {
+            if dest == path {
+                return (dest, asset_key.to_string());
+            }
             let dest_str = dest.to_string_lossy().to_string();
             let old_key = asset_key.to_string();
-            let new_key = if dest != path {
-                relative_path_in_project(&dest, &root).unwrap_or_else(|| old_key.clone())
-            } else {
-                old_key.clone()
-            };
-            let _ = timeline.update(cx, |timeline, cx| {
-                let mut changed = false;
-                if dest_str != path.to_string_lossy() {
-                    changed |= timeline.state.retarget_audio_source(&old_key, &dest_str);
-                }
-                if new_key != old_key {
-                    changed |= timeline.state.retarget_audio_asset_id(&old_key, &new_key);
-                    waveform_cache::migrate_cache_key(&old_key, &new_key);
-                }
-                if changed {
-                    timeline.mark_media_changed(cx);
-                    timeline.mark_project_changed(cx);
-                    cx.notify();
-                }
-            });
-            if dest != path {
-                eprintln!(
-                    "[AudioImport] eager copy retargeted asset_id={new_key} dest={}",
-                    dest.display()
-                );
-                eprintln!("[AudioImport] project asset path={}", dest.display());
-            }
-            (dest, new_key)
+            let copy_key =
+                relative_path_in_project(&dest, &root).unwrap_or_else(|| old_key.clone());
+            let retarget = timeline
+                .update(cx, |timeline, cx| {
+                    let retarget = retarget_imported_clips(
+                        &mut timeline.state,
+                        clips,
+                        &old_key,
+                        &copy_key,
+                        &dest_str,
+                    );
+                    if retarget.move_cache {
+                        waveform_cache::migrate_cache_key(&old_key, &copy_key);
+                    }
+                    if retarget.changed {
+                        timeline.mark_media_changed(cx);
+                        timeline.mark_project_changed(cx);
+                        cx.notify();
+                    }
+                    retarget
+                })
+                .ok();
+            let import_key = retarget.map_or(old_key, |retarget| retarget.import_key);
+            eprintln!(
+                "[AudioImport] eager copy retargeted asset_id={import_key} dest={}",
+                dest.display()
+            );
+            eprintln!("[AudioImport] project asset path={}", dest.display());
+            (dest, import_key)
         }
         Err(error) => {
             eprintln!(
@@ -396,15 +599,16 @@ pub async fn run_import_pipeline(
     asset_key: String,
     path: PathBuf,
     project_root: Option<PathBuf>,
+    clips: ImportClips,
     timeline: WeakEntity<Timeline>,
     layout: Option<WeakEntity<StudioLayout>>,
     cx: &mut AsyncApp,
 ) {
     let mut key = asset_key;
     // Phase D: copy the dropped file into the project folder before importing,
-    // and decode the copy. Retarget asset id to project-relative path when copied.
+    // and decode the copy. Only clips this import created take the copy's id.
     let (path, copied_key) =
-        maybe_copy_into_project(&key, path, project_root.clone(), &timeline, cx).await;
+        maybe_copy_into_project(&key, path, project_root.clone(), &clips, &timeline, cx).await;
     key = copied_key;
     if !waveform_cache::try_begin_import(&key) {
         // Already imported, or an import is still in flight for this source path.
@@ -655,17 +859,12 @@ pub fn schedule_project_waveform_restore(
             continue;
         }
 
-        let peak_rel = project
+        let recorded_peak_rel = project
             .assets
             .iter()
             .find(|a| a.id == asset_id)
-            .and_then(|a| a.waveform_peak_relative_path.clone())
-            .unwrap_or_else(|| waveform_peak_relative_path_for_asset(&asset_id));
-        let peak_path = project_root.join(peak_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-        eprintln!(
-            "[ProjectLoad] peak cache resolved path={}",
-            peak_path.display()
-        );
+            .and_then(|a| a.waveform_peak_relative_path.as_deref());
+        let candidates = peak_file_candidates(&project_root, &asset_id, recorded_peak_rel);
 
         // Validate the cached peaks against the current source file's
         // (size, mtime) when the source is reachable; a missing source stays
@@ -673,7 +872,12 @@ pub fn schedule_project_waveform_restore(
         let expected_source = audio_path
             .as_ref()
             .and_then(|p| SourceFingerprint::for_path(p));
-        match read_peak_file(&peak_path, Some(&asset_id), expected_source) {
+        let (peak_path, peak_read) = read_first_peak_file(&candidates, &asset_id, expected_source);
+        eprintln!(
+            "[ProjectLoad] peak cache resolved path={}",
+            peak_path.display()
+        );
+        match peak_read {
             Ok(preview) => {
                 let peak_count: usize = preview.lods.iter().map(|l| l.peaks.len()).sum();
                 eprintln!(
@@ -763,6 +967,7 @@ pub fn schedule_project_waveform_restore(
                 asset_id,
                 path,
                 persist_root.clone(),
+                ImportClips::Saved,
                 timeline_weak.clone(),
                 Some(layout_weak.clone()),
                 cx,
@@ -778,9 +983,12 @@ pub fn schedule_project_waveform_restore(
 /// Must be called from inside `Timeline`'s own `update` (e.g. file-drop handler).
 /// Do not call `timeline.update` here — the caller already holds the entity lease.
 /// Clip `audio_import` is set to `Pending` in `insert_audio_clip`.
+/// `created_clip_ids` are the clips the drop just inserted: only they may move
+/// to the project copy's asset id.
 pub fn spawn_timeline_import(
     path: PathBuf,
     project_root: Option<PathBuf>,
+    created_clip_ids: Vec<String>,
     _timeline: Entity<Timeline>,
     layout: Option<Entity<StudioLayout>>,
     cx: &mut Context<Timeline>,
@@ -797,6 +1005,7 @@ pub fn spawn_timeline_import(
             asset_key,
             path,
             project_root,
+            ImportClips::Created(created_clip_ids),
             timeline_weak,
             layout_weak,
             cx,
@@ -816,10 +1025,10 @@ pub fn spawn_timeline_import_from_layout(
 ) {
     let asset_key = path.to_string_lossy().to_string();
     let path_key = asset_key.clone();
-    let _ = timeline.update(cx, |timeline, _cx| {
-        timeline
-            .state
-            .set_audio_import_for_asset(&path_key, AudioImportState::Pending);
+    let created_clip_ids = timeline.update(cx, |timeline, _cx| {
+        let created = clips_just_created(&timeline.state, &path_key);
+        mark_import_pending(&mut timeline.state, &path_key, &created);
+        created
     });
     waveform_cache::request_decode_file(path.clone());
 
@@ -830,6 +1039,7 @@ pub fn spawn_timeline_import_from_layout(
             asset_key,
             path,
             project_root,
+            ImportClips::Created(created_clip_ids),
             timeline_weak,
             Some(layout_weak),
             cx,
@@ -999,5 +1209,264 @@ mod tests {
 
         let entries = collect_waveform_restore_entries(&project, Path::new("/tmp"));
         assert_eq!(entries[0].1.as_deref(), Some(media.as_path()));
+    }
+
+    fn clip_audio<'a>(state: &'a TimelineState, clip_id: &str) -> (&'a str, Option<&'a str>) {
+        let clip = state
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .find(|clip| clip.id == clip_id)
+            .expect("clip");
+        match &clip.clip_type {
+            ClipType::Audio {
+                file_id,
+                source_path,
+            } => (file_id.as_str(), source_path.as_deref()),
+            other => panic!("expected an audio clip, got {other:?}"),
+        }
+    }
+
+    /// A saved clip whose id is still its absolute drop path (saved from an
+    /// untitled session, maybe bound to Melodyne) and a fresh drop of the same
+    /// file. The eager copy used to re-identify both, which changed the saved
+    /// clip's ARA persistentID.
+    fn saved_and_redropped() -> (TimelineState, String, String) {
+        let mut state = TimelineState::default();
+        let dropped = "/Samples/vocal.wav".to_string();
+        let saved = state.import_audio_to_selected_or_new_track(dropped.clone(), "vocal".into());
+        // Its save copied the media into the project and pointed it there.
+        let _ = state.retarget_audio_source(&dropped, "/Song/Assets/Audio/vocal.wav");
+        let fresh = state.import_audio_to_selected_or_new_track(dropped, "vocal".into());
+        (state, saved, fresh)
+    }
+
+    #[test]
+    fn a_redrop_moves_only_the_new_clip_to_the_copy() {
+        let (mut state, saved, fresh) = saved_and_redropped();
+        assert_eq!(
+            clips_just_created(&state, "/Samples/vocal.wav"),
+            vec![fresh.clone()]
+        );
+
+        let retarget = retarget_imported_clips(
+            &mut state,
+            &ImportClips::Created(vec![fresh.clone()]),
+            "/Samples/vocal.wav",
+            "Assets/Audio/vocal-1.wav",
+            "/Song/Assets/Audio/vocal-1.wav",
+        );
+        assert_eq!(
+            clip_audio(&state, &saved),
+            ("/Samples/vocal.wav", Some("/Song/Assets/Audio/vocal.wav")),
+            "the saved clip keeps its id and its own media"
+        );
+        assert_eq!(
+            clip_audio(&state, &fresh),
+            (
+                "Assets/Audio/vocal-1.wav",
+                Some("/Song/Assets/Audio/vocal-1.wav")
+            )
+        );
+        assert!(retarget.changed);
+        assert_eq!(retarget.import_key, "Assets/Audio/vocal-1.wav");
+        assert!(
+            !retarget.move_cache,
+            "the saved clip still reads its peaks under the old key"
+        );
+    }
+
+    #[test]
+    fn a_first_drop_moves_its_clip_and_its_cached_peaks() {
+        let mut state = TimelineState::default();
+        let fresh =
+            state.import_audio_to_selected_or_new_track("/Samples/kick.wav".into(), "kick".into());
+        let created = clips_just_created(&state, "/Samples/kick.wav");
+        assert_eq!(created, vec![fresh.clone()]);
+        let retarget = retarget_imported_clips(
+            &mut state,
+            &ImportClips::Created(created),
+            "/Samples/kick.wav",
+            "Assets/Audio/kick.wav",
+            "/Song/Assets/Audio/kick.wav",
+        );
+        assert_eq!(
+            clip_audio(&state, &fresh),
+            ("Assets/Audio/kick.wav", Some("/Song/Assets/Audio/kick.wav"))
+        );
+        assert_eq!(retarget.import_key, "Assets/Audio/kick.wav");
+        assert!(retarget.move_cache);
+    }
+
+    /// Restoring a saved project copies external media in but never changes a
+    /// saved id.
+    #[test]
+    fn restoring_saved_clips_moves_their_media_but_never_their_ids() {
+        let (mut state, saved, fresh) = saved_and_redropped();
+        let retarget = retarget_imported_clips(
+            &mut state,
+            &ImportClips::Saved,
+            "/Samples/vocal.wav",
+            "Assets/Audio/vocal-1.wav",
+            "/Song/Assets/Audio/vocal-1.wav",
+        );
+        for clip in [&saved, &fresh] {
+            assert_eq!(clip_audio(&state, clip).0, "/Samples/vocal.wav");
+            assert_eq!(
+                clip_audio(&state, clip).1,
+                Some("/Song/Assets/Audio/vocal-1.wav")
+            );
+        }
+        assert_eq!(retarget.import_key, "/Samples/vocal.wav");
+        assert!(!retarget.move_cache);
+    }
+
+    /// A layout caller that selected nothing it created moves nothing.
+    #[test]
+    fn without_a_created_clip_nothing_is_re_identified() {
+        let (mut state, saved, _fresh) = saved_and_redropped();
+        state.selection.selected_clip_ids.clear();
+        let created = clips_just_created(&state, "/Samples/vocal.wav");
+        assert!(created.is_empty());
+        let retarget = retarget_imported_clips(
+            &mut state,
+            &ImportClips::Created(created),
+            "/Samples/vocal.wav",
+            "Assets/Audio/vocal-1.wav",
+            "/Song/Assets/Audio/vocal-1.wav",
+        );
+        assert!(!retarget.changed);
+        assert_eq!(retarget.import_key, "/Samples/vocal.wav");
+        assert_eq!(clip_audio(&state, &saved).0, "/Samples/vocal.wav");
+    }
+
+    #[test]
+    fn peak_lookup_tries_todays_name_then_the_recorded_path_then_the_old_one() {
+        let root = Path::new("/p");
+        let id = "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/kick.wav";
+        let candidates = peak_file_candidates(root, id, Some("Cache/Waveforms/recorded.peaks"));
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(
+            candidates[0],
+            root.join(waveform_peak_relative_path_for_asset(id))
+        );
+        assert!(candidates[1].ends_with("recorded.peaks"));
+        assert!(candidates[2]
+            .to_string_lossy()
+            .ends_with("com~apple~CloudDocs__kick.wav.peaks"));
+
+        // An old save recorded the old name: looked up once, after today's.
+        let legacy = legacy_waveform_peak_relative_path_for_asset(id).unwrap();
+        let recorded_legacy = peak_file_candidates(root, id, Some(&legacy));
+        assert_eq!(recorded_legacy.len(), 2);
+        assert_eq!(
+            recorded_legacy[0],
+            root.join(waveform_peak_relative_path_for_asset(id))
+        );
+
+        // A recorded path that cannot be opened as written is skipped.
+        let windows =
+            peak_file_candidates(root, "C:\\a.wav", Some("Cache/Waveforms/C:__a.wav.peaks"));
+        assert_eq!(windows.len(), 1);
+        assert!(!is_portable_peak_relative_path(&format!(
+            "Cache/Waveforms/{}.peaks",
+            "x".repeat(300)
+        )));
+        assert!(!is_portable_peak_relative_path("../outside.peaks"));
+        assert!(is_portable_peak_relative_path(
+            "Cache/Waveforms/Assets__Audio__kick.wav.peaks"
+        ));
+    }
+
+    fn one_peak_preview(max: f32) -> WaveformPreview {
+        WaveformPreview {
+            sample_rate: 48_000,
+            channels: 1,
+            duration_seconds: 1.0,
+            total_frames: 48_000,
+            lods: vec![waveform_cache::WaveformLod {
+                samples_per_peak: 256,
+                peaks: vec![waveform_cache::WaveformPeak { min: -max, max }],
+            }],
+        }
+    }
+
+    /// An old-name cache built for an earlier version of the source (the
+    /// project recorded that name) must not hide the fresh cache under
+    /// today's name, which would re-decode the file on every open.
+    #[test]
+    fn a_stale_old_name_never_shadows_a_fresh_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "fb_peak_lookup_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let id = "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/kick.wav";
+        let legacy = legacy_waveform_peak_relative_path_for_asset(id).unwrap();
+        let source_then = SourceFingerprint {
+            size: 100,
+            modified_nanos: 1,
+        };
+        let source_now = SourceFingerprint {
+            size: 120,
+            modified_nanos: 2,
+        };
+        let at = |relative: &str| root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        write_peak_file(&at(&legacy), id, &one_peak_preview(0.25), Some(source_then)).unwrap();
+        let candidates = peak_file_candidates(&root, id, Some(&legacy));
+
+        // Only the stale old file: reported stale, so the peaks regenerate.
+        let (path, read) = read_first_peak_file(&candidates, id, Some(source_now));
+        assert_eq!(path, at(&legacy));
+        assert!(matches!(read, Err(PeakFileError::SourceChanged { .. })));
+
+        // Regenerated under today's name: found first from then on.
+        let today = waveform_peak_relative_path_for_asset(id);
+        write_peak_file(&at(&today), id, &one_peak_preview(0.75), Some(source_now)).unwrap();
+        let (path, read) = read_first_peak_file(&candidates, id, Some(source_now));
+        assert_eq!(path, at(&today));
+        assert_eq!(read.unwrap().lods[0].peaks[0].max, 0.75);
+
+        // A stale file under today's name still lets a current old one load.
+        write_peak_file(&at(&today), id, &one_peak_preview(0.75), Some(source_then)).unwrap();
+        write_peak_file(&at(&legacy), id, &one_peak_preview(0.25), Some(source_now)).unwrap();
+        let (path, read) = read_first_peak_file(&candidates, id, Some(source_now));
+        assert_eq!(path, at(&legacy));
+        assert!(read.is_ok());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A layout-side re-import used to mark every clip sharing the dropped
+    /// path pending, but only the new clip moves to the copy's key and hears
+    /// about the import after that: the saved clip stayed "Importing…".
+    #[test]
+    fn a_layout_redrop_leaves_the_saved_clip_as_it_was() {
+        let (mut state, saved, fresh) = saved_and_redropped();
+        let import_state = |state: &TimelineState, clip_id: &str| {
+            state
+                .tracks
+                .iter()
+                .flat_map(|track| track.clips.iter())
+                .find(|clip| clip.id == clip_id)
+                .map(|clip| clip.audio_import.clone())
+                .expect("clip")
+        };
+        state.set_audio_import_for_asset("/Samples/vocal.wav", AudioImportState::Ready);
+
+        let created = clips_just_created(&state, "/Samples/vocal.wav");
+        mark_import_pending(&mut state, "/Samples/vocal.wav", &created);
+        assert_eq!(import_state(&state, &saved), AudioImportState::Ready);
+        assert_eq!(import_state(&state, &fresh), AudioImportState::Pending);
+
+        // Nothing known to be new: the import runs under the dropped key and
+        // reports to every clip under it, so all of them wait for it.
+        state.set_audio_import_for_asset("/Samples/vocal.wav", AudioImportState::Ready);
+        mark_import_pending(&mut state, "/Samples/vocal.wav", &[]);
+        assert_eq!(import_state(&state, &saved), AudioImportState::Pending);
+        assert_eq!(import_state(&state, &fresh), AudioImportState::Pending);
     }
 }

@@ -291,7 +291,7 @@ impl StudioLayout {
                     timeline.state.transport.loop_enabled = enabling;
                     cx.notify();
                 });
-                self.sync_loop_controls(cx);
+                self.commit_loop_change(cx);
             }
             TransportCommand::ToggleMetronome => {
                 let enabled = self.timeline.update(cx, |timeline, cx| {
@@ -329,6 +329,15 @@ impl StudioLayout {
                     cx.notify();
                     enabled
                 });
+                // The explicit choice is the user's preference and seeds every
+                // later session. Only this toggle writes it: the pause a manual
+                // scroll causes (`note_user_scrolled`) is runtime state.
+                self.settings.update(cx, |settings, cx| {
+                    settings.update_setting(
+                        move |schema| schema.playback.follow_playhead = enabled,
+                        cx,
+                    );
+                });
                 if std::env::var_os("FUTUREBOARD_AUTOSCROLL_DEBUG").is_some() {
                     eprintln!("[autoscroll] toggled follow_playhead -> {}", enabled);
                 }
@@ -341,6 +350,16 @@ impl StudioLayout {
                     timeline.state.set_follow_playhead(true);
                     cx.notify();
                     mode
+                });
+                let preference = crate::project::view::auto_scroll_preference_from_mode(mode);
+                self.settings.update(cx, |settings, cx| {
+                    settings.update_setting(
+                        move |schema| {
+                            schema.playback.auto_scroll_mode = preference;
+                            schema.playback.follow_playhead = true;
+                        },
+                        cx,
+                    );
                 });
                 if std::env::var_os("FUTUREBOARD_AUTOSCROLL_DEBUG").is_some() {
                     eprintln!("[autoscroll] toggled auto_scroll_mode -> {:?}", mode);
@@ -893,6 +912,11 @@ impl StudioLayout {
         ) {
             (Some(status), _, _) => status,
             (None, Some(error), _) => format!("Audio: {error}"),
+            // Why the edit command just used did nothing (e.g. X with no clips
+            // to crossfade): the answer to the last thing the user did.
+            (None, None, _) if self.active_edit_notice().is_some() => {
+                self.active_edit_notice().unwrap_or_default().to_string()
+            }
             (None, None, _) if routing_notice.is_some() => {
                 routing_notice.clone().unwrap_or_default()
             }

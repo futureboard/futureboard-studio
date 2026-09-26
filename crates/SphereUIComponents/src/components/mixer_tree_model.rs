@@ -482,10 +482,16 @@ pub fn expand_ancestors_for_channel(
 }
 
 /// Seed default expanded groups during session install (not per-frame render).
+///
+/// Once per project: the persisted `mixer_tree_initialized` latch marks the
+/// tree as set up, so a project saved with everything collapsed stays
+/// collapsed instead of looking like one that never had defaults.
 pub fn ensure_timeline_mixer_tree_defaults(state: &mut TimelineState, output_device_channels: u32) {
-    if !state.mixer_tree.expanded_node_ids.is_empty() {
+    if state.mixer_tree_initialized || !state.mixer_tree.expanded_node_ids.is_empty() {
+        state.mixer_tree_initialized = true;
         return;
     }
+    state.mixer_tree_initialized = true;
     let model = MixerTreeModel::build(
         &state.tracks,
         output_device_channels,

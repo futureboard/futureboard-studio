@@ -607,14 +607,21 @@ impl TimelineState {
         }
     }
 
-    pub fn show_time_signature_track_lane(&mut self) {
+    /// Returns whether the project changed: the lane was hidden (its visibility
+    /// is saved with the project) or the default 4/4 point was seeded.
+    pub fn show_time_signature_track_lane(&mut self) -> bool {
+        let changed = !self.show_time_signature_track || self.time_signature_map.points.is_empty();
         self.show_time_signature_track = true;
         self.time_signature_map.ensure_default_point();
+        changed
     }
 
-    pub fn hide_time_signature_track_lane(&mut self) {
+    /// Returns whether the lane was shown, i.e. whether the saved view changed.
+    pub fn hide_time_signature_track_lane(&mut self) -> bool {
+        let changed = self.show_time_signature_track;
         self.show_time_signature_track = false;
         self.selected_time_signature_point_id = None;
+        changed
     }
 
     pub fn select_time_signature_point(&mut self, id: &str) {
