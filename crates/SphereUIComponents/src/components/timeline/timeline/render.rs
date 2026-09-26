@@ -1,6 +1,7 @@
 //! Split out of `timeline.rs`: `impl Render for Timeline` + scrollbar/overlay helpers.
 
 use super::*;
+use crate::components::timeline::timeline_state::TrackEditScope;
 
 /// `FUTUREBOARD_PLAYHEAD_DEBUG=1` — trace the ruler playhead x-position each
 /// frame. Cached so the per-frame render doesn't hit the OS env store while
@@ -239,7 +240,9 @@ impl Render for Timeline {
         );
 
         let on_toggle_mute = cx.listener(|this, track_id: &String, _window, cx| {
+            let edit = this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
             this.state.toggle_track_mute(track_id);
+            this.commit_track_edit("Mute", edit, false, cx);
             // Live control: reaches the engine via `on_track_param_change`
             // below; view-only dirty (no engine graph rebuild).
             this.mark_control_state_changed(cx);
@@ -258,7 +261,9 @@ impl Render for Timeline {
         });
 
         let on_toggle_solo = cx.listener(|this, track_id: &String, _window, cx| {
+            let edit = this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
             this.state.toggle_track_solo(track_id);
+            this.commit_track_edit("Solo", edit, false, cx);
             this.mark_control_state_changed(cx);
             if let Some(track) = this.state.find_track(track_id) {
                 if let Some(cb) = this.on_track_param_change.as_ref() {
@@ -278,10 +283,21 @@ impl Render for Timeline {
         // live param path a single M/S press uses, so the engine never has to
         // be told about a mute it already knows about.
         let on_clear_all_mutes = cx.listener(|this, _: &(), _window, cx| {
+            // The latch clears what cannot be recovered from anywhere else,
+            // which is exactly why it is one undo step.
+            let muted: Vec<String> = this
+                .state
+                .tracks
+                .iter()
+                .filter(|track| track.muted)
+                .map(|track| track.id.clone())
+                .collect();
+            let edit = this.begin_track_edit(TrackEditScope::tracks(muted));
             let cleared = this.state.clear_all_track_mutes();
             if cleared.is_empty() {
                 return;
             }
+            this.commit_track_edit("Clear All Mutes", edit, false, cx);
             if let Some(cb) = this.on_track_param_change.as_ref() {
                 for track_id in &cleared {
                     cb(track_id.clone(), "muted".to_string(), 0.0);
@@ -294,10 +310,19 @@ impl Render for Timeline {
             std::sync::Arc::new(on_clear_all_mutes);
 
         let on_clear_all_solos = cx.listener(|this, _: &(), _window, cx| {
+            let soloed: Vec<String> = this
+                .state
+                .tracks
+                .iter()
+                .filter(|track| track.solo)
+                .map(|track| track.id.clone())
+                .collect();
+            let edit = this.begin_track_edit(TrackEditScope::tracks(soloed));
             let cleared = this.state.clear_all_track_solos();
             if cleared.is_empty() {
                 return;
             }
+            this.commit_track_edit("Clear All Solos", edit, false, cx);
             if let Some(cb) = this.on_track_param_change.as_ref() {
                 for track_id in &cleared {
                     cb(track_id.clone(), "solo".to_string(), 0.0);
@@ -310,6 +335,7 @@ impl Render for Timeline {
             std::sync::Arc::new(on_clear_all_solos);
 
         let on_toggle_arm = cx.listener(|this, track_id: &String, _window, cx| {
+            let edit = this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
             let previous = this
                 .state
                 .find_track(track_id)
@@ -342,11 +368,13 @@ impl Render for Timeline {
                 cx.notify();
                 return;
             }
+            this.commit_track_edit("Record Arm", edit, false, cx);
             this.mark_control_state_changed(cx);
             cx.notify();
         });
 
         let on_toggle_input = cx.listener(|this, track_id: &String, _window, cx| {
+            let edit = this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
             let previous = this
                 .state
                 .find_track(track_id)
@@ -378,6 +406,7 @@ impl Render for Timeline {
                 cx.notify();
                 return;
             }
+            this.commit_track_edit("Input Monitor", edit, false, cx);
             this.mark_control_state_changed(cx);
             cx.notify();
         });
@@ -396,8 +425,19 @@ impl Render for Timeline {
 
         let on_volume_change =
             cx.listener(|this, (track_id, volume): &(String, f32), _window, cx| {
+                let prev = this.state.find_track(track_id).map(|track| track.volume);
                 this.state.set_track_volume(track_id, *volume);
                 this.state.clear_track_volume_preview(track_id);
+                if let Some(prev) = prev {
+                    this.record_mixer_value(
+                        EditCommand::SetTrackVolume {
+                            track_id: track_id.clone(),
+                            prev,
+                            next: *volume,
+                        },
+                        cx,
+                    );
+                }
                 // Double-click reset to 0 dB is the same live control edit a drag
                 // is — the value goes down the realtime path on the next line, so
                 // the engine graph must not be rebuilt for it. `mark_project_changed`
@@ -851,8 +891,10 @@ impl Render for Timeline {
                     cx,
                 );
             } else {
+                let edit = this.begin_track_edit(TrackEditScope::track_list());
                 let id = this.state.create_audio_track();
                 this.state.select_track(&id);
+                this.commit_track_edit("Add Track", edit, false, cx);
                 cx.notify();
             }
         });
@@ -1324,25 +1366,29 @@ impl Render for Timeline {
                         this.state.select_track(&track_id);
                         cx.notify();
                     }
+                    // Each is one undo step on the track's lanes.
                     AutomationLaneAction::ToggleEnable => {
+                        let prev = this.state.capture_automation_lanes(&track_id);
                         if this
                             .state
                             .toggle_automation_lane_enabled(&track_id, &lane_id)
                             .is_some()
                         {
-                            this.mark_project_changed(cx);
+                            this.record_automation_lanes_edit(&track_id, prev, cx);
                             cx.notify();
                         }
                     }
                     AutomationLaneAction::Clear => {
+                        let prev = this.state.capture_automation_lanes(&track_id);
                         if this.state.clear_automation_lane(&track_id, &lane_id) > 0 {
-                            this.mark_project_changed(cx);
+                            this.record_automation_lanes_edit(&track_id, prev, cx);
                             cx.notify();
                         }
                     }
                     AutomationLaneAction::Hide => {
+                        let prev = this.state.capture_automation_lanes(&track_id);
                         if this.state.remove_automation_lane(&track_id, &lane_id) {
-                            this.mark_project_changed(cx);
+                            this.record_automation_lanes_edit(&track_id, prev, cx);
                             cx.notify();
                         }
                     }
@@ -1654,7 +1700,9 @@ impl Render for Timeline {
             let this = cx.entity().clone();
             std::sync::Arc::new(move |(track_id, group_id), _window, cx| {
                 let _ = this.update(cx, |this, cx| {
+                    let edit = this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
                     if this.state.assign_track_to_group(track_id, group_id) {
+                        this.commit_track_edit("Move to Folder", edit, false, cx);
                         this.mark_project_changed(cx);
                         cx.notify();
                     }
@@ -1667,7 +1715,9 @@ impl Render for Timeline {
             let this = cx.entity().clone();
             std::sync::Arc::new(move |group_id, _window, cx| {
                 let _ = this.update(cx, |this, cx| {
+                    let edit = this.begin_track_edit(TrackEditScope::tracks([group_id.clone()]));
                     if this.state.toggle_group_collapsed(group_id).is_some() {
+                        this.commit_track_edit("Collapse Folder", edit, false, cx);
                         this.mark_project_changed(cx);
                         cx.notify();
                     }
@@ -1719,7 +1769,10 @@ impl Render for Timeline {
                 let this = cx.entity().clone();
                 std::sync::Arc::new(move |(track_id, take_id), _window, cx| {
                     let _ = this.update(cx, |this, cx| {
+                        let edit =
+                            this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
                         if this.state.set_active_take(track_id, take_id) {
+                            this.commit_track_edit("Select Take", edit, false, cx);
                             // Muting is what makes a take inactive, so the
                             // engine has to hear about it like any other clip
                             // change.
@@ -1733,7 +1786,10 @@ impl Render for Timeline {
                 let this = cx.entity().clone();
                 std::sync::Arc::new(move |(track_id, take_id), _window, cx| {
                     let _ = this.update(cx, |this, cx| {
+                        let edit =
+                            this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
                         if this.state.delete_take(track_id, take_id) {
+                            this.commit_track_edit("Delete Take", edit, false, cx);
                             this.mark_project_changed(cx);
                             cx.notify();
                         }
@@ -2257,7 +2313,9 @@ impl Render for Timeline {
             let this = cx.entity().clone();
             std::sync::Arc::new(move |track_id: &String, _window, cx| {
                 let _ = this.update(cx, |this, cx| {
+                    let edit = this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
                     if this.state.reset_track_row_height(track_id) {
+                        this.commit_track_edit("Reset Track Height", edit, false, cx);
                         this.mark_project_changed(cx);
                         cx.notify();
                     }
@@ -2279,6 +2337,8 @@ impl Render for Timeline {
         );
 
         let on_track_dropped = cx.listener(|this, drag: &TrackDragItem, _window, cx| {
+            // One drop, one step: the order and the folder it lands in.
+            let edit = this.begin_track_edit(TrackEditScope::tracks([drag.track_id.clone()]));
             let dragged_parent_group = this
                 .state
                 .find_track(&drag.track_id)
@@ -2302,6 +2362,7 @@ impl Render for Timeline {
                 .flatten();
             if let Some(group_id) = hovered_group {
                 if this.state.assign_track_to_group(&drag.track_id, &group_id) {
+                    this.commit_track_edit("Move to Folder", edit, false, cx);
                     this.mark_project_changed(cx);
                     cx.notify();
                 }
@@ -2323,6 +2384,7 @@ impl Render for Timeline {
                 this.state.remove_track_from_group(&drag.track_id);
             }
             this.state.reorder_track(&drag.track_id, target_index);
+            this.commit_track_edit("Move Track", edit, false, cx);
             this.mark_project_changed(cx);
             cx.notify();
         });

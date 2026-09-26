@@ -78,6 +78,38 @@ pub struct MenuItem {
     pub description: Option<String>,
     #[serde(default)]
     pub children: Vec<MenuItem>,
+    /// Runtime-only context drawn after the label ("Undo — Paste FX Chain").
+    /// Never in the manifest: the label is translated by item id, so what an
+    /// item acts on right now goes here instead of into the label.
+    #[serde(skip)]
+    pub detail: Option<String>,
+}
+
+/// Runtime state for one command item: whether it can run now, and what it
+/// would act on. See [`patch_command_states`].
+pub struct CommandMenuState<'a> {
+    pub command: &'a str,
+    pub enabled: bool,
+    pub detail: Option<String>,
+}
+
+/// Apply runtime enabled state and detail to the items running each command
+/// in `states`, through the whole tree. Items for other commands keep their
+/// manifest defaults.
+pub fn patch_command_states(items: &mut [MenuItem], states: &[CommandMenuState<'_>]) {
+    for item in items {
+        if let Some(state) = item
+            .command
+            .as_deref()
+            .and_then(|command| states.iter().find(|state| state.command == command))
+        {
+            item.enabled = state.enabled;
+            item.detail = state.detail.clone();
+        }
+        if !item.children.is_empty() {
+            patch_command_states(&mut item.children, states);
+        }
+    }
 }
 
 fn default_true() -> bool {

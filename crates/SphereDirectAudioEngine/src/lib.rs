@@ -118,7 +118,7 @@ pub use crate::tempo_map::{
 pub use crate::transport::RuntimeTransportSnapshot;
 pub use crate::vst3_processor::{
     AraMainFactory, RuntimeTransportContext, Vst3MidiEvent, Vst3MidiEventKind, Vst3PluginState,
-    Vst3RuntimeProcessor,
+    Vst3RuntimeProcessor, VST3_KEY_COMMAND, VST3_KEY_SHIFT,
 };
 
 #[cfg(feature = "napi")]

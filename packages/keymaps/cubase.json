@@ -4,7 +4,7 @@
   "label": "Cubase",
   "description": "Shortcuts aligned with Steinberg Cubase defaults where commands overlap.",
   "sourceMenuVersion": 1,
-  "generatedAt": "2026-09-20T06:00:01.115Z",
+  "generatedAt": "2026-09-26T12:19:33.389Z",
   "bindings": {
     "project:new": "Ctrl+N",
     "project:open": "Ctrl+O",
@@ -103,6 +103,7 @@
     "help:documentation": "F1",
     "help:keyboard-shortcuts": "Ctrl+/",
     "clip:split-at-playhead": "Alt+X",
+    "tools:select-mute": "7",
     "track:show-add-dialog": "Ctrl+T",
     "audio:bounce-in-place": "Ctrl+Shift+B",
     "audio:render-selection": "Alt+Shift+R",

@@ -1,4 +1,21 @@
-//! Audio Plug-in Manager — GPUI-rendered native dialog (VST3/CLAP scan, Electron layout parity).
+//! Audio Plug-in Manager — the library's maintenance surface.
+//!
+//! Where the Add Insert picker is for *using* plug-ins, this window is for
+//! *keeping the library healthy*: scanning, seeing what failed, registering
+//! what was skipped, and finding a plug-in's files. So the layout leads with
+//! the library's state and its one primary action:
+//!
+//! ```txt
+//! summary · search · Scan · ⋯        ← how the library stands, and Scan
+//! [scan progress]                    ← only while scanning
+//! rail │ table │ details             ← filter │ plug-ins │ the selected one
+//! status bar                         ← last result, database location
+//! ```
+//!
+//! Every action here is real. The details pane used to offer "Insert on
+//! Selected Track" and "Open Plug-in Editor", which only printed "not connected
+//! yet", and the rail offered a permanently disabled "Add Location"; those are
+//! gone rather than dressed up.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,9 +23,10 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, size, svg, App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
-    Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
+    div, px, size, svg, uniform_list, App, AppContext, Bounds, ClipboardItem, Context, Entity,
+    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, Rgba,
+    ScrollHandle, ScrollStrategy, StatefulInteractiveElement, Styled, UniformListScrollHandle,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 use SpherePluginHost::load_au_cache_state;
 use SpherePluginHost::preset::register_plugin;
@@ -16,9 +34,13 @@ use SpherePluginHost::registry::{
     NativeHostStatus, PluginFormat, PluginKind, PluginRegistry, PluginStatus, RegistryPlugin,
     RegistryScanResult, ScanOptions, ScanProgress,
 };
+use SpherePluginHost::PluginScanStatus;
 
 use crate::assets;
-use crate::components::controls::{fb_button, FbButtonKind};
+use crate::components::context_menu::{context_menu_overlay, ContextMenuEntry};
+use crate::components::controls::{
+    fb_button, fb_icon_button, fb_progress, fb_tooltip, FbButtonKind,
+};
 use crate::components::plugin_format_badge::plugin_format_badge;
 use crate::components::progress_dialog::{
     open_progress_dialog_window, open_standalone_progress_dialog_window, ProgressBarValue,
@@ -26,45 +48,43 @@ use crate::components::progress_dialog::{
 };
 use crate::components::scroll_thumb::vertical_scrollbar_thumb;
 use crate::components::text_input::{
-    bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputAction, TextInputCallbacks,
-    TextInputState,
+    bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputCallbacks, TextInputState,
 };
-use crate::components::title_bar::{chrome_cluster, external_window_titlebar};
+use crate::components::title_bar::external_window_titlebar;
 use crate::i18n::I18n;
-use crate::theme::{self, radius, size, space, typography, Colors};
+use crate::theme::{self, radius, size, space, state as state_tokens, typography, Colors};
 
-pub const PLUGIN_MANAGER_WINDOW_WIDTH: f32 = 980.0;
-pub const PLUGIN_MANAGER_WINDOW_HEIGHT: f32 = 640.0;
-pub const PLUGIN_MANAGER_WINDOW_MIN_WIDTH: f32 = 860.0;
+pub const PLUGIN_MANAGER_WINDOW_WIDTH: f32 = 1080.0;
+pub const PLUGIN_MANAGER_WINDOW_HEIGHT: f32 = 680.0;
+pub const PLUGIN_MANAGER_WINDOW_MIN_WIDTH: f32 = 880.0;
 pub const PLUGIN_MANAGER_WINDOW_MIN_HEIGHT: f32 = 520.0;
 
 type VoidCb = Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>;
 type StrCb = Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>;
 
-const SIDEBAR_WIDTH: f32 = 196.0;
+const RAIL_WIDTH: f32 = 196.0;
+const DETAILS_WIDTH: f32 = 300.0;
+const SEARCH_WIDTH: f32 = 260.0;
 
-/// Plug-in list column widths, read by both the header row and the data rows.
-///
-/// They used to be independent literals in the two places *and* the header row
-/// was missing the `gap` the data rows carried, so every header label sat one
-/// accumulated gap-width to the left of the column it named — by the Format
-/// column, three gaps out. One set of numbers, one gap, one padding.
-const COL_VENDOR_W: f32 = 110.0;
-const COL_CATEGORY_W: f32 = 100.0;
-const COL_FORMAT_W: f32 = 72.0;
-const COL_STATUS_W: f32 = 88.0;
+/// Table column metrics, read by both the header and the rows.
+const COL_KIND: f32 = 14.0;
+const COL_NAME_MIN: f32 = 160.0;
+const COL_VENDOR_W: f32 = 150.0;
+const COL_CATEGORY_W: f32 = 110.0;
+const COL_FORMAT_W: f32 = 64.0;
+const COL_STATUS_W: f32 = 120.0;
 const COL_GAP: f32 = space::BASE;
-const LIST_PAD_X: f32 = space::LOOSE;
-/// Toolbar band above the list: one 32 px button plus its breathing room.
-const TOOLBAR_HEIGHT: f32 = size::PROMINENT + space::BASE;
-/// Plug-in list row: tall enough for a status badge plus its padding.
-const LIST_ROW_HEIGHT: f32 = 40.0;
-/// Empty-state block inside the list.
-const LIST_EMPTY_HEIGHT: f32 = 120.0;
-/// Truncation width for the database path in the footer, so a deep install
-/// directory cannot push the scan counters off the end of the window.
+const ROW_PAD_X: f32 = space::LOOSE;
+const ROW_HEIGHT: f32 = size::COMFORTABLE;
+/// Truncation width for the database path in the status bar, so a deep
+/// install directory cannot push the counters off the window.
 const DB_PATH_MAX_W: f32 = 360.0;
-const DETAILS_WIDTH: f32 = 248.0;
+
+// Commands of the "More" menu.
+const CMD_RESCAN_ALL: &str = "plugin-manager:rescan-all";
+const CMD_RESCAN_AU: &str = "plugin-manager:rescan-au";
+const CMD_OPEN_DB: &str = "plugin-manager:open-db-folder";
+const CMD_CLEAR_DB: &str = "plugin-manager:clear-database";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
@@ -72,6 +92,7 @@ pub enum SortKey {
     Vendor,
     Category,
     Format,
+    Status,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +104,9 @@ pub enum SortDir {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarFilter {
     All,
+    /// Plug-ins the user has to do something about: not registered yet,
+    /// failed to scan, or crashed the scanner.
+    Attention,
     Instrument,
     Effect,
     Format(PluginFormat),
@@ -91,6 +115,7 @@ pub enum SidebarFilter {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FilterCounts {
     pub all: usize,
+    pub attention: usize,
     pub instruments: usize,
     pub effects: usize,
     pub vst3: usize,
@@ -107,6 +132,72 @@ pub enum PluginScanMode {
     RescanAll,
     /// Scan AudioUnit plug-ins only (macOS).
     RescanAu,
+}
+
+/// What state a plug-in is in, from the user's side: can it be used, and if
+/// not, what went wrong. Ordered from healthy to worst for sorting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Health {
+    Ready,
+    Unsupported,
+    Disabled,
+    NotRegistered,
+    Failed,
+    Crashed,
+}
+
+impl Health {
+    fn of(plugin: &RegistryPlugin) -> Self {
+        match plugin.scan_status {
+            PluginScanStatus::Crashed => Health::Crashed,
+            PluginScanStatus::Failed | PluginScanStatus::MetadataOnly => Health::Failed,
+            PluginScanStatus::Skipped | PluginScanStatus::Disabled => Health::Disabled,
+            _ if plugin.status == PluginStatus::MissingPreset => Health::NotRegistered,
+            _ if !plugin.supports_insert() => Health::Unsupported,
+            _ => Health::Ready,
+        }
+    }
+
+    /// Something the user can act on. Unsupported and disabled plug-ins are
+    /// states, not problems to fix from here.
+    fn needs_attention(self) -> bool {
+        matches!(
+            self,
+            Health::NotRegistered | Health::Failed | Health::Crashed
+        )
+    }
+
+    fn label(self, i18n: I18n) -> String {
+        i18n.tr(match self {
+            Health::Ready => "plugin-manager.status.ready",
+            Health::Unsupported => "plugin-manager.status.unsupported",
+            Health::Disabled => "plugin-manager.status.disabled",
+            Health::NotRegistered => "plugin-manager.status.not-registered",
+            Health::Failed => "plugin-manager.status.failed",
+            Health::Crashed => "plugin-manager.status.crashed",
+        })
+    }
+
+    fn explanation(self, i18n: I18n) -> Option<String> {
+        let key = match self {
+            Health::Ready => return None,
+            Health::Unsupported => "plugin-manager.health.unsupported",
+            Health::Disabled => "plugin-manager.health.disabled",
+            Health::NotRegistered => "plugin-manager.health.not-registered",
+            Health::Failed => "plugin-manager.health.failed",
+            Health::Crashed => "plugin-manager.health.crashed",
+        };
+        Some(i18n.tr(key))
+    }
+
+    fn tone(self) -> Rgba {
+        match self {
+            Health::Ready => Colors::status_success(),
+            Health::Unsupported | Health::Disabled => Colors::text_faint(),
+            Health::NotRegistered => Colors::status_warning(),
+            Health::Failed | Health::Crashed => Colors::status_error(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -326,9 +417,7 @@ impl PluginManagerDialogState {
                 if *format == PluginFormat::Au {
                     self.au_scan_error = error.clone();
                     if *crashed_count > 0 {
-                        self.status_text = format!(
-                            "AudioUnit scan process crashed. VST3/CLAP results are still available."
-                        );
+                        self.status_text = "AudioUnit scan process crashed. VST3/CLAP results are still available.".to_string();
                     } else if let Some(message) = error {
                         self.status_text = format!(
                             "AudioUnit scan failed ({success_count} ok, {failed_count} failed): {message}"
@@ -347,41 +436,29 @@ impl PluginManagerDialogState {
     }
 
     pub fn counts(&self) -> FilterCounts {
-        FilterCounts {
-            all: self.plugins.len(),
-            instruments: self
-                .plugins
-                .iter()
-                .filter(|p| p.kind == PluginKind::Instrument)
-                .count(),
-            // Matches the Effect rail below: a plug-in that declared no class is
-            // usable as an insert, so it is counted and listed with the effects.
-            effects: self
-                .plugins
-                .iter()
-                .filter(|p| p.kind.usable_as_effect())
-                .count(),
-            vst3: self
-                .plugins
-                .iter()
-                .filter(|p| p.format == PluginFormat::Vst3)
-                .count(),
-            vst2: self
-                .plugins
-                .iter()
-                .filter(|p| p.format == PluginFormat::Vst2)
-                .count(),
-            clap: self
-                .plugins
-                .iter()
-                .filter(|p| p.format == PluginFormat::Clap)
-                .count(),
-            au: self
-                .plugins
-                .iter()
-                .filter(|p| p.format == PluginFormat::Au)
-                .count(),
+        let mut counts = FilterCounts::default();
+        for plugin in &self.plugins {
+            counts.all += 1;
+            if Health::of(plugin).needs_attention() {
+                counts.attention += 1;
+            }
+            if plugin.kind == PluginKind::Instrument {
+                counts.instruments += 1;
+            }
+            // Matches the Effect rail: a plug-in that declared no class is
+            // usable as an insert, so it is counted and listed with effects.
+            if plugin.kind.usable_as_effect() {
+                counts.effects += 1;
+            }
+            match plugin.format {
+                PluginFormat::Vst3 => counts.vst3 += 1,
+                PluginFormat::Vst2 => counts.vst2 += 1,
+                PluginFormat::Clap => counts.clap += 1,
+                PluginFormat::Au => counts.au += 1,
+                _ => {}
+            }
         }
+        counts
     }
 
     pub fn selected_plugin(&self) -> Option<&RegistryPlugin> {
@@ -390,14 +467,17 @@ impl PluginManagerDialogState {
     }
 
     pub fn visible_plugins<'a>(&'a self, query: &str) -> Vec<&'a RegistryPlugin> {
-        let mut result: Vec<&RegistryPlugin> = self.plugins.iter().collect();
-
-        result.retain(|p| match &self.sidebar_filter {
-            SidebarFilter::All => true,
-            SidebarFilter::Instrument => p.kind == PluginKind::Instrument,
-            SidebarFilter::Effect => p.kind.usable_as_effect(),
-            SidebarFilter::Format(fmt) => p.format == *fmt,
-        });
+        let mut result: Vec<&RegistryPlugin> = self
+            .plugins
+            .iter()
+            .filter(|p| match &self.sidebar_filter {
+                SidebarFilter::All => true,
+                SidebarFilter::Attention => Health::of(p).needs_attention(),
+                SidebarFilter::Instrument => p.kind == PluginKind::Instrument,
+                SidebarFilter::Effect => p.kind.usable_as_effect(),
+                SidebarFilter::Format(fmt) => p.format == *fmt,
+            })
+            .collect();
 
         let q = query.trim().to_ascii_lowercase();
         if !q.is_empty() {
@@ -417,11 +497,13 @@ impl PluginManagerDialogState {
 
         result.sort_by(|a, b| {
             let cmp = match self.sort_key {
-                SortKey::Name => a.name.cmp(&b.name),
-                SortKey::Vendor => a.vendor.cmp(&b.vendor),
+                SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortKey::Vendor => a.vendor.to_lowercase().cmp(&b.vendor.to_lowercase()),
                 SortKey::Category => a.display_category().cmp(&b.display_category()),
                 SortKey::Format => a.format.label().cmp(b.format.label()),
-            };
+                SortKey::Status => Health::of(a).cmp(&Health::of(b)),
+            }
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
             match self.sort_dir {
                 SortDir::Asc => cmp,
                 SortDir::Desc => cmp.reverse(),
@@ -442,122 +524,23 @@ fn reveal_path_for_plugin(plugin: &RegistryPlugin) -> &Path {
 
 #[derive(Clone)]
 pub struct PluginManagerCallbacks {
-    pub on_close: VoidCb,
     pub on_rescan: VoidCb,
     pub on_select_id: StrCb,
+    pub on_clear_selection: VoidCb,
     pub on_sidebar_filter: Arc<dyn Fn(&SidebarFilter, &mut Window, &mut App) + 'static>,
     pub on_sort: Arc<dyn Fn(&SortKey, &mut Window, &mut App) + 'static>,
-    pub on_insert: StrCb,
-    pub on_open_editor: StrCb,
+    pub on_reveal_plugin: StrCb,
     pub on_reveal_preset: StrCb,
+    pub on_copy_path: StrCb,
     pub on_register_plugin: StrCb,
-    pub on_rescan_all: VoidCb,
-    pub on_rescan_au: VoidCb,
-    pub on_clear_cache: VoidCb,
+    pub on_open_menu: Arc<dyn Fn(&(f32, f32), &mut Window, &mut App) + 'static>,
     pub on_open_db_folder: VoidCb,
+    pub on_confirm_clear: VoidCb,
+    pub on_cancel_clear: VoidCb,
 }
 
-fn icon(path: &'static str, size: f32, color: gpui::Rgba) -> impl IntoElement {
+fn icon(path: &'static str, size: f32, color: Rgba) -> impl IntoElement {
     svg().path(path).text_color(color).size(px(size))
-}
-
-fn scan_progress_bar(state: &PluginManagerDialogState, i18n: I18n) -> impl IntoElement {
-    let fraction = state.scan_progress_fraction();
-    let pct = (fraction * 100.0).round() as u32;
-    let label = if state.scan_progress_total > 0 {
-        i18n.tr_vars(
-            "plugin-manager.scan.progress",
-            &[
-                (
-                    "current",
-                    state
-                        .scan_progress_current
-                        .min(state.scan_progress_total)
-                        .to_string(),
-                ),
-                ("total", state.scan_progress_total.to_string()),
-                ("name", state.scan_progress_label.clone()),
-            ],
-        )
-    } else {
-        state.scan_progress_label.clone()
-    };
-
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(space::TIGHT))
-        .px(px(space::LOOSE))
-        .py(px(space::BASE))
-        .border_b(px(1.0))
-        .border_color(Colors::divider())
-        .bg(Colors::surface_input())
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(space::BASE))
-                .child(
-                    div()
-                        .text_size(px(typography::UI_XS))
-                        .text_color(Colors::text_secondary())
-                        .truncate()
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .text_size(px(typography::UI_XS))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(Colors::accent_primary())
-                        .child(format!("{pct}%")),
-                ),
-        )
-        .child(
-            div()
-                .h(px(space::TIGHT))
-                // Under `radius::MIN_SIDE`: a 6 px corner on a 4 px rail merges
-                // into a lozenge and the fill stops reading as a level.
-                .rounded(px(radius::MICRO))
-                .bg(Colors::surface_panel_alt())
-                .overflow_hidden()
-                .child(
-                    div()
-                        .h_full()
-                        .w(gpui::relative(fraction.max(0.02)))
-                        .bg(Colors::accent_primary()),
-                ),
-        )
-}
-
-fn status_badge(label: impl Into<String>, ready: bool) -> impl IntoElement {
-    let label = label.into();
-    let (fg, bg) = if ready {
-        (Colors::text_primary(), Colors::surface_input())
-    } else {
-        (Colors::text_faint(), Colors::surface_panel_alt())
-    };
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_center()
-        .min_w(px(COL_FORMAT_W))
-        .px(px(space::BASE))
-        .py(px(space::HAIR))
-        .rounded(px(radius::CONTROL))
-        .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(bg)
-        .text_size(px(typography::UI_XS))
-        .font_weight(if ready {
-            gpui::FontWeight::SEMIBOLD
-        } else {
-            gpui::FontWeight::NORMAL
-        })
-        .text_color(fg)
-        .child(label)
 }
 
 fn format_relative_time(ms: i64) -> String {
@@ -583,166 +566,953 @@ fn format_relative_time(ms: i64) -> String {
     format!("{days}d ago")
 }
 
-fn rgba_warning_soft() -> gpui::Rgba {
-    gpui::rgba(0xE5C07B18)
+/// Paint for full-bleed rows and rail items, resolved once per render:
+/// `Colors::composite` belongs on the control path, not in a row loop.
+#[derive(Clone, Copy)]
+struct Paint {
+    row: Rgba,
+    row_hover: Rgba,
+    row_selected: Rgba,
+    row_selected_hover: Rgba,
+    rail_hover: Rgba,
+    rail_selected: Rgba,
+    rail_selected_hover: Rgba,
 }
 
-fn sidebar_section(label: impl Into<String>, children: Vec<impl IntoElement>) -> impl IntoElement {
-    let label = label.into();
+impl Paint {
+    fn resolve() -> Self {
+        let row = Colors::surface_base();
+        let rail = Colors::surface_sidebar();
+        Self {
+            row,
+            row_hover: Colors::composite(row, Colors::state_hover()),
+            row_selected: Colors::composite(row, Colors::state_selected()),
+            row_selected_hover: Colors::composite(row, Colors::state_selected_hover()),
+            rail_hover: Colors::composite(rail, Colors::state_hover()),
+            rail_selected: Colors::composite(rail, Colors::state_selected()),
+            rail_selected_hover: Colors::composite(rail, Colors::state_selected_hover()),
+        }
+    }
+}
+
+/// Leading-edge selection marker. An overlay, so selecting never reflows.
+fn selection_marker(inset: f32) -> impl IntoElement {
     div()
-        .mb(px(space::TIGHT))
+        .absolute()
+        .left_0()
+        .top(px(inset))
+        .bottom(px(inset))
+        .w(px(2.0))
+        .rounded(px(radius::PILL))
+        .bg(Colors::accent_primary())
+}
+
+/// Status cell: a dot and a word, so the state is not carried by hue alone.
+fn health_chip(health: Health, i18n: I18n) -> impl IntoElement {
+    let tone = health.tone();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::SNUG))
+        .min_w(px(0.0))
         .child(
             div()
-                .px(px(space::LOOSE))
-                .pt(px(space::BASE))
-                .pb(px(space::HAIR))
-                .text_size(px(typography::DENSE_CAPTION))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::text_faint())
-                .child(label),
+                .w(px(6.0))
+                .h(px(6.0))
+                .flex_shrink_0()
+                .rounded(px(radius::PILL))
+                .bg(tone),
         )
-        .child(div().px(px(space::TIGHT)).children(children))
+        .child(
+            div()
+                .truncate()
+                .text_size(px(typography::UI_XS))
+                .text_color(if health == Health::Ready {
+                    Colors::text_muted()
+                } else {
+                    tone
+                })
+                .child(health.label(i18n)),
+        )
 }
 
-fn sidebar_item(
-    id: impl Into<gpui::ElementId>,
-    label: impl Into<String>,
+fn kind_glyph(kind: PluginKind) -> impl IntoElement {
+    let (path, color) = match kind {
+        PluginKind::Instrument => (assets::ICON_MUSIC_PATH, Colors::accent_primary()),
+        PluginKind::Effect => (assets::ICON_SLIDERS_HORIZONTAL_PATH, Colors::text_muted()),
+        PluginKind::Unknown => (assets::ICON_SLIDERS_HORIZONTAL_PATH, Colors::text_faint()),
+    };
+    icon(path, 12.0, color)
+}
+
+// ── Header ──────────────────────────────────────────────────────────────────
+
+fn header(
+    state: &PluginManagerDialogState,
+    counts: FilterCounts,
+    search: gpui::AnyElement,
+    callbacks: &PluginManagerCallbacks,
+    i18n: I18n,
+) -> impl IntoElement {
+    let rescan = callbacks.on_rescan.clone();
+    let open_menu = callbacks.on_open_menu.clone();
+    let stat = |text: String, color: Rgba| {
+        div()
+            .flex_shrink_0()
+            .text_size(px(typography::UI_XS))
+            .text_color(color)
+            .child(text)
+    };
+    let dot = || {
+        div()
+            .flex_shrink_0()
+            .text_size(px(typography::UI_XS))
+            .text_color(Colors::text_faint())
+            .child("·")
+    };
+    let last_scan = if state.last_scan_at_ms > 0 {
+        i18n.tr_vars(
+            "plugin-manager.footer.last-scan",
+            &[("when", format_relative_time(state.last_scan_at_ms))],
+        )
+    } else {
+        i18n.tr("plugin-manager.stat.never-scanned")
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::LOOSE))
+        .flex_shrink_0()
+        .h(px(size::PROMINENT + space::SECTION))
+        .px(px(space::LOOSE))
+        .bg(Colors::surface_panel())
+        .border_b(px(1.0))
+        .border_color(Colors::divider())
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap(px(space::HAIR))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_baseline()
+                        .gap(px(space::SNUG))
+                        .child(
+                            div()
+                                .text_size(px(typography::UI_MD))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Colors::text_primary())
+                                .child(i18n.tr_vars(
+                                    "plugin-manager.stat.plugins",
+                                    &[("count", counts.all.to_string())],
+                                )),
+                        )
+                        .when(counts.attention > 0, |row| {
+                            row.child(dot()).child(stat(
+                                i18n.tr_vars(
+                                    "plugin-manager.stat.attention",
+                                    &[("count", counts.attention.to_string())],
+                                ),
+                                Colors::status_warning(),
+                            ))
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(space::SNUG))
+                        .overflow_hidden()
+                        .child(stat(
+                            i18n.tr_vars(
+                                "plugin-manager.stat.instruments",
+                                &[("count", counts.instruments.to_string())],
+                            ),
+                            Colors::text_muted(),
+                        ))
+                        .child(dot())
+                        .child(stat(
+                            i18n.tr_vars(
+                                "plugin-manager.stat.effects",
+                                &[("count", counts.effects.to_string())],
+                            ),
+                            Colors::text_muted(),
+                        ))
+                        .child(dot())
+                        .child(stat(last_scan, Colors::text_faint())),
+                ),
+        )
+        .child(div().w(px(SEARCH_WIDTH)).flex_shrink_0().child(search))
+        .child(fb_button(
+            "plugin-manager-scan-now",
+            if state.scanning {
+                i18n.tr("plugin-manager.rescan.scanning")
+            } else {
+                i18n.tr("plugin-manager.rescan")
+            },
+            FbButtonKind::Primary,
+            !state.scanning,
+            move |_, window, cx| rescan(&(), window, cx),
+        ))
+        .child(
+            div()
+                .id("plugin-manager-more-anchor")
+                .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
+                    cx.stop_propagation();
+                    let x: f32 = event.position.x.into();
+                    let y: f32 = event.position.y.into();
+                    open_menu(&(x, y), window, cx);
+                })
+                .tooltip(fb_tooltip(i18n.tr("plugin-manager.more")))
+                .child(fb_icon_button(
+                    "plugin-manager-more",
+                    assets::ICON_MENU_PATH,
+                    i18n.tr("plugin-manager.more"),
+                    size::DEFAULT,
+                    None,
+                    |_, _, _| {},
+                )),
+        )
+}
+
+fn scan_progress_strip(state: &PluginManagerDialogState, i18n: I18n) -> impl IntoElement {
+    let fraction = state.scan_progress_fraction();
+    let pct = (fraction * 100.0).round() as u32;
+    let label = if state.scan_progress_total > 0 {
+        i18n.tr_vars(
+            "plugin-manager.scan.progress",
+            &[
+                (
+                    "current",
+                    state
+                        .scan_progress_current
+                        .min(state.scan_progress_total)
+                        .to_string(),
+                ),
+                ("total", state.scan_progress_total.to_string()),
+                ("name", state.scan_progress_label.clone()),
+            ],
+        )
+    } else if state.scan_progress_label.is_empty() {
+        state.status_text.clone()
+    } else {
+        state.scan_progress_label.clone()
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(space::TIGHT))
+        .flex_shrink_0()
+        .px(px(space::LOOSE))
+        .py(px(space::BASE))
+        .border_b(px(1.0))
+        .border_color(Colors::divider())
+        .bg(Colors::surface_panel())
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(space::BASE))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(typography::UI_XS))
+                        .text_color(Colors::text_secondary())
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(typography::UI_XS))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(Colors::text_secondary())
+                        .child(format!("{pct}%")),
+                ),
+        )
+        .child(fb_progress(fraction))
+}
+
+fn banner(message: String, tone: Rgba) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .px(px(space::LOOSE))
+        .py(px(space::SNUG))
+        .border_b(px(1.0))
+        .border_color(Colors::divider())
+        .bg(Colors::with_alpha(tone, 0.08))
+        .text_size(px(typography::DENSE_LABEL))
+        .text_color(tone)
+        .child(message)
+}
+
+/// Clearing the database cannot be undone, so it asks first — in place, with
+/// the destructive action and an explicit Cancel.
+fn clear_confirmation(
+    count: usize,
+    on_confirm: VoidCb,
+    on_cancel: VoidCb,
+    i18n: I18n,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::LOOSE))
+        .flex_shrink_0()
+        .px(px(space::LOOSE))
+        .py(px(space::BASE))
+        .border_b(px(1.0))
+        .border_color(Colors::divider())
+        .bg(Colors::with_alpha(Colors::status_error(), 0.08))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(px(typography::UI_XS))
+                .text_color(Colors::text_primary())
+                .child(i18n.tr_vars(
+                    "plugin-manager.clear.confirm",
+                    &[("count", count.to_string())],
+                )),
+        )
+        .child(fb_button(
+            "plugin-manager-clear-cancel",
+            i18n.tr("plugin-manager.clear.cancel"),
+            FbButtonKind::Default,
+            true,
+            move |_, window, cx| on_cancel(&(), window, cx),
+        ))
+        .child(fb_button(
+            "plugin-manager-clear-confirm",
+            i18n.tr("plugin-manager.clear-database"),
+            FbButtonKind::Danger,
+            true,
+            move |_, window, cx| on_confirm(&(), window, cx),
+        ))
+}
+
+// ── Rail ────────────────────────────────────────────────────────────────────
+
+fn rail(
+    state: &PluginManagerDialogState,
+    counts: FilterCounts,
+    paint: Paint,
+    on_filter: Arc<dyn Fn(&SidebarFilter, &mut Window, &mut App) + 'static>,
+    scroll: &ScrollHandle,
+    i18n: I18n,
+) -> impl IntoElement {
+    let item = |id: &'static str, label: String, count: usize, value: SidebarFilter| {
+        rail_item(
+            id,
+            label,
+            count,
+            state.sidebar_filter == value,
+            paint,
+            on_filter.clone(),
+            value,
+        )
+    };
+
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .px(px(space::TIGHT))
+        .pb(px(space::BASE))
+        .child(rail_heading(i18n.tr("plugin-manager.filter.library")))
+        .child(item(
+            "pm-filter-all",
+            i18n.tr("plugin-manager.filter.all"),
+            counts.all,
+            SidebarFilter::All,
+        ))
+        .child(item(
+            "pm-filter-attention",
+            i18n.tr("plugin-manager.filter.attention"),
+            counts.attention,
+            SidebarFilter::Attention,
+        ))
+        .child(rail_heading(i18n.tr("plugin-manager.filter.kind")))
+        .child(item(
+            "pm-filter-inst",
+            i18n.tr("plugin-manager.filter.instruments"),
+            counts.instruments,
+            SidebarFilter::Instrument,
+        ))
+        .child(item(
+            "pm-filter-fx",
+            i18n.tr("plugin-manager.filter.effects"),
+            counts.effects,
+            SidebarFilter::Effect,
+        ))
+        .child(rail_heading(i18n.tr("plugin-manager.filter.format")));
+
+    for (id, label, count, format) in [
+        ("pm-filter-vst3", "VST3", counts.vst3, PluginFormat::Vst3),
+        ("pm-filter-clap", "CLAP", counts.clap, PluginFormat::Clap),
+        ("pm-filter-vst2", "VST2", counts.vst2, PluginFormat::Vst2),
+        ("pm-filter-au", "Audio Units", counts.au, PluginFormat::Au),
+    ] {
+        let value = SidebarFilter::Format(format);
+        let offered = if format == PluginFormat::Au {
+            state.au_scan_available || count > 0
+        } else {
+            true
+        };
+        if offered && (count > 0 || state.sidebar_filter == value) {
+            col = col.child(item(id, label.to_string(), count, value));
+        }
+    }
+
+    // Where the scanner looks. Read-only: the folders are the platform's
+    // standard plug-in locations.
+    col = col.child(rail_heading(i18n.tr("plugin-manager.scan-locations")));
+    if state.scan_paths.is_empty() {
+        col = col.child(
+            div()
+                .px(px(space::BASE))
+                .py(px(space::TIGHT))
+                .text_size(px(typography::UI_XS))
+                .text_color(Colors::text_faint())
+                .child(i18n.tr("plugin-manager.scan-locations.empty")),
+        );
+    } else {
+        for (i, path) in state.scan_paths.iter().enumerate() {
+            let full = path.display().to_string();
+            col = col.child(
+                div()
+                    .id(("pm-scan-path", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(space::SNUG))
+                    .h(px(size::ROW))
+                    .px(px(space::BASE))
+                    .tooltip(fb_tooltip(full.clone()))
+                    .child(icon(assets::ICON_FOLDER_PATH, 11.0, Colors::text_faint()))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(typography::DENSE_LABEL))
+                            .text_color(Colors::text_faint())
+                            .child(full),
+                    ),
+            );
+        }
+    }
+
+    let thumb = scroll.clone();
+    div()
+        .flex()
+        .flex_col()
+        .w(px(RAIL_WIDTH))
+        .h_full()
+        .flex_shrink_0()
+        .border_r(px(1.0))
+        .border_color(Colors::divider())
+        .bg(Colors::surface_sidebar())
+        .child(
+            div()
+                .flex_1()
+                .min_h(px(0.0))
+                .relative()
+                .child(
+                    div()
+                        .id("plugin-manager-sidebar-scroll")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(scroll)
+                        .child(col),
+                )
+                .child(vertical_scrollbar_thumb(thumb)),
+        )
+}
+
+fn rail_heading(label: String) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .h(px(size::ROW))
+        .px(px(space::BASE))
+        .mt(px(space::SNUG))
+        .text_size(px(typography::DENSE_CAPTION))
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_color(Colors::text_faint())
+        .child(label.to_uppercase())
+}
+
+fn rail_item(
+    id: &'static str,
+    label: String,
     count: usize,
     active: bool,
-    disabled: bool,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    paint: Paint,
+    on_filter: Arc<dyn Fn(&SidebarFilter, &mut Window, &mut App) + 'static>,
+    value: SidebarFilter,
 ) -> impl IntoElement {
-    let label = label.into();
+    let (rest, hover) = if active {
+        (paint.rail_selected, paint.rail_selected_hover)
+    } else {
+        (Colors::with_alpha(paint.rail_hover, 0.0), paint.rail_hover)
+    };
+    let attention = value == SidebarFilter::Attention && count > 0;
     div()
         .id(id)
+        .relative()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(space::BASE))
         .w_full()
+        .h(px(size::ROW))
         .px(px(space::BASE))
-        .py(px(space::SNUG))
         .rounded(px(radius::CONTROL))
-        .when(active, |el| el.bg(Colors::accent_muted()))
-        .when(!disabled, |el| {
-            el.cursor(gpui::CursorStyle::PointingHand)
-                .hover(|s| s.bg(Colors::surface_control_hover()))
-                .on_click(on_click)
-        })
-        .when(disabled, |el| el.opacity(0.35))
+        .bg(rest)
+        .hover(move |s| s.bg(hover))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .on_click(move |_, window, cx| on_filter(&value, window, cx))
+        .when(active, |el| el.child(selection_marker(space::SNUG)))
         .child(
             div()
                 .flex_1()
-                .min_w_0()
+                .min_w(px(0.0))
+                .truncate()
                 .text_size(px(typography::UI_XS))
-                .text_color(if active {
-                    Colors::accent_primary()
+                .font_weight(if active {
+                    gpui::FontWeight::SEMIBOLD
                 } else {
-                    Colors::text_dim()
+                    gpui::FontWeight::NORMAL
+                })
+                .text_color(if active {
+                    Colors::text_primary()
+                } else {
+                    Colors::text_secondary()
                 })
                 .child(label),
         )
         .child(
             div()
-                .text_size(px(typography::UI_XS))
-                .text_color(if active {
-                    Colors::accent_primary()
+                .flex_shrink_0()
+                .text_size(px(typography::DENSE_LABEL))
+                .text_color(if attention {
+                    Colors::status_warning()
+                } else if active {
+                    Colors::text_secondary()
                 } else {
                     Colors::text_faint()
                 })
-                .child(format!("{count}")),
+                .child(count.to_string()),
         )
 }
 
-fn col_header(
-    id: impl Into<gpui::ElementId>,
-    label: impl Into<String>,
-    key: SortKey,
+// ── Table ───────────────────────────────────────────────────────────────────
+
+/// One row's worth of display data. Owned, because the virtualised list
+/// builds rows after this render's borrow of the state has ended.
+#[derive(Clone)]
+struct RowData {
+    id: String,
+    name: String,
+    vendor: String,
+    category: String,
+    format: PluginFormat,
+    kind: PluginKind,
+    health: Health,
+}
+
+fn table_header(
     state: &PluginManagerDialogState,
     on_sort: Arc<dyn Fn(&SortKey, &mut Window, &mut App) + 'static>,
+    i18n: I18n,
 ) -> impl IntoElement {
-    let label = label.into();
-    let active = state.sort_key == key;
-    let on_sort = on_sort.clone();
+    let column = |id: &'static str, label: String, key: SortKey| {
+        let active = state.sort_key == key;
+        let on_sort = on_sort.clone();
+        div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(space::TIGHT))
+            .min_w(px(0.0))
+            .cursor(gpui::CursorStyle::PointingHand)
+            .on_click(move |_, window, cx| on_sort(&key, window, cx))
+            .text_size(px(typography::DENSE_CAPTION))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(if active {
+                Colors::text_secondary()
+            } else {
+                Colors::text_faint()
+            })
+            .child(div().truncate().child(label))
+            .when(active, |el| {
+                el.child(match state.sort_dir {
+                    SortDir::Asc => "▲",
+                    SortDir::Desc => "▼",
+                })
+            })
+    };
     div()
-        .id(id)
+        .w_full()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(space::TIGHT))
+        .flex_shrink_0()
+        .h(px(size::ROW_DENSE))
+        .px(px(ROW_PAD_X))
+        .gap(px(COL_GAP))
+        .border_b(px(1.0))
+        .border_color(Colors::divider())
+        .bg(Colors::surface_base())
+        .child(div().w(px(COL_KIND)).flex_shrink_0())
+        .child(div().flex_1().min_w(px(COL_NAME_MIN)).child(column(
+            "pm-sort-name",
+            i18n.tr("plugin-manager.sort.name"),
+            SortKey::Name,
+        )))
+        .child(div().w(px(COL_VENDOR_W)).flex_shrink_0().child(column(
+            "pm-sort-vendor",
+            i18n.tr("plugin-manager.sort.vendor"),
+            SortKey::Vendor,
+        )))
+        .child(div().w(px(COL_CATEGORY_W)).flex_shrink_0().child(column(
+            "pm-sort-cat",
+            i18n.tr("plugin-manager.sort.category"),
+            SortKey::Category,
+        )))
+        .child(div().w(px(COL_FORMAT_W)).flex_shrink_0().child(column(
+            "pm-sort-fmt",
+            i18n.tr("plugin-manager.sort.format"),
+            SortKey::Format,
+        )))
+        .child(div().w(px(COL_STATUS_W)).flex_shrink_0().child(column(
+            "pm-sort-status",
+            i18n.tr("plugin-manager.column.status"),
+            SortKey::Status,
+        )))
+}
+
+fn table_row(
+    index: usize,
+    row: &RowData,
+    selected: bool,
+    paint: Paint,
+    on_select: StrCb,
+    i18n: I18n,
+) -> impl IntoElement {
+    let (rest, hover) = if selected {
+        (paint.row_selected, paint.row_selected_hover)
+    } else {
+        (paint.row, paint.row_hover)
+    };
+    let id = row.id.clone();
+    div()
+        .id(("plugin-row", index))
+        .relative()
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(COL_GAP))
+        .h(px(ROW_HEIGHT))
+        .px(px(ROW_PAD_X))
+        .bg(rest)
+        .hover(move |s| s.bg(hover))
         .cursor(gpui::CursorStyle::PointingHand)
-        .on_click(move |_, window, cx| on_sort(&key, window, cx))
-        .text_size(px(typography::UI_XS))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(if active {
-            Colors::accent_primary()
-        } else {
-            Colors::text_faint()
-        })
-        .child(label)
+        .on_click(move |_, window, cx| on_select(&id, window, cx))
+        .when(selected, |el| el.child(selection_marker(space::TIGHT)))
         .child(
             div()
-                .text_size(px(typography::DENSE_CAPTION))
-                .child(if active {
-                    match state.sort_dir {
-                        SortDir::Asc => "▲",
-                        SortDir::Desc => "▼",
-                    }
+                .w(px(COL_KIND))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .child(kind_glyph(row.kind)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(COL_NAME_MIN))
+                .truncate()
+                .text_size(px(typography::UI_SM))
+                .font_weight(if selected {
+                    gpui::FontWeight::SEMIBOLD
                 } else {
-                    "⇅"
-                }),
+                    gpui::FontWeight::MEDIUM
+                })
+                .text_color(Colors::text_primary())
+                .child(row.name.clone()),
+        )
+        .child(
+            div()
+                .w(px(COL_VENDOR_W))
+                .flex_shrink_0()
+                .truncate()
+                .text_size(px(typography::UI_XS))
+                .text_color(Colors::text_muted())
+                .child(row.vendor.clone()),
+        )
+        .child(
+            div()
+                .w(px(COL_CATEGORY_W))
+                .flex_shrink_0()
+                .truncate()
+                .text_size(px(typography::UI_XS))
+                .text_color(Colors::text_faint())
+                .child(row.category.clone()),
+        )
+        .child(
+            div()
+                .w(px(COL_FORMAT_W))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .child(plugin_format_badge(row.format)),
+        )
+        .child(
+            div()
+                .w(px(COL_STATUS_W))
+                .flex_shrink_0()
+                .child(health_chip(row.health, i18n)),
         )
 }
+
+fn table(
+    state: &PluginManagerDialogState,
+    rows: Arc<Vec<RowData>>,
+    paint: Paint,
+    callbacks: &PluginManagerCallbacks,
+    list_scroll: &UniformListScrollHandle,
+    i18n: I18n,
+) -> impl IntoElement {
+    let body = if rows.is_empty() {
+        let message = if state.scanning {
+            i18n.tr("plugin-manager.list.scanning")
+        } else if state.plugins.is_empty() {
+            // Nothing registered at all: "empty" is honest either way. Only a
+            // non-empty registry with no visible rows means the filter
+            // excluded everything.
+            i18n.tr("plugin-manager.list.empty")
+        } else {
+            i18n.tr("plugin-manager.list.no-match")
+        };
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(space::SNUG))
+            .size_full()
+            .px(px(space::BLOCK))
+            .child(icon(assets::ICON_PLUG_PATH, 20.0, Colors::text_faint()))
+            .child(
+                div()
+                    .text_size(px(typography::UI_XS))
+                    .text_color(Colors::text_faint())
+                    .child(message),
+            )
+            .into_any_element()
+    } else {
+        let selected = state.selected_id.clone();
+        let on_select = callbacks.on_select_id.clone();
+        let thumb = list_scroll.0.borrow().base_handle.clone();
+        let count = rows.len();
+        let list = uniform_list("plugin-manager-list", count, move |range, _window, _cx| {
+            range
+                .filter_map(|i| {
+                    let row = rows.get(i)?;
+                    Some(
+                        table_row(
+                            i,
+                            row,
+                            selected.as_deref() == Some(row.id.as_str()),
+                            paint,
+                            on_select.clone(),
+                            i18n,
+                        )
+                        .into_any_element(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .track_scroll(list_scroll)
+        .size_full();
+        div()
+            .relative()
+            .size_full()
+            .child(list)
+            .child(vertical_scrollbar_thumb(thumb))
+            .into_any_element()
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w(px(0.0))
+        .bg(Colors::surface_base())
+        .child(table_header(state, callbacks.on_sort.clone(), i18n))
+        .child(div().flex_1().min_h(px(0.0)).child(body))
+}
+
+// ── Details ─────────────────────────────────────────────────────────────────
 
 fn details_panel(
     plugin: &RegistryPlugin,
     callbacks: &PluginManagerCallbacks,
     i18n: I18n,
 ) -> impl IntoElement {
-    let insert_enabled = plugin.supports_insert();
-    let editor_enabled = plugin.supports_editor();
-    let insert_cb = callbacks.on_insert.clone();
-    let editor_cb = callbacks.on_open_editor.clone();
-    let reveal_cb = callbacks.on_reveal_preset.clone();
-    let register_cb = callbacks.on_register_plugin.clone();
-    let id_insert = plugin.id.clone();
-    let id_editor = plugin.id.clone();
-    let id_reveal = plugin.id.clone();
-    let id_register = plugin.id.clone();
-    let can_register = plugin.status == PluginStatus::MissingPreset && plugin.path.exists();
+    let health = Health::of(plugin);
     let kind_label = match plugin.kind {
         PluginKind::Instrument => i18n.tr("plugin-manager.kind.instrument"),
         PluginKind::Effect => i18n.tr("plugin-manager.kind.effect"),
         PluginKind::Unknown => i18n.tr("plugin-manager.kind.unknown"),
     };
-    let status_label = match plugin.status {
-        PluginStatus::PresetReady => i18n.tr("plugin-manager.status.available"),
-        PluginStatus::MissingPreset => i18n.tr("plugin-manager.status.missing-preset"),
+    let byline = match plugin.version.as_deref() {
+        Some(version) if !plugin.vendor.is_empty() => format!("{} · {version}", plugin.vendor),
+        Some(version) => version.to_string(),
+        None => plugin.vendor.clone(),
     };
-    let reveal_label = if plugin.status == PluginStatus::PresetReady {
-        i18n.tr("plugin-manager.action.reveal-preset")
-    } else {
-        i18n.tr("plugin-manager.action.reveal-plugin")
+    let can_register = plugin.status == PluginStatus::MissingPreset && plugin.path.exists();
+    let preset_exists = plugin.preset_path.exists();
+    let plugin_exists = plugin.path.exists();
+    let close = callbacks.on_clear_selection.clone();
+    let register = callbacks.on_register_plugin.clone();
+    let reveal_plugin = callbacks.on_reveal_plugin.clone();
+    let reveal_preset = callbacks.on_reveal_preset.clone();
+    let copy_path = callbacks.on_copy_path.clone();
+    let (id_register, id_plugin, id_preset, id_copy) = (
+        plugin.id.clone(),
+        plugin.id.clone(),
+        plugin.id.clone(),
+        plugin.id.clone(),
+    );
+
+    let field = |label: String, value: String| {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(space::HAIR))
+            .child(
+                div()
+                    .text_size(px(typography::DENSE_CAPTION))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(Colors::text_faint())
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_size(px(typography::DENSE_LABEL))
+                    .text_color(Colors::text_secondary())
+                    .child(value),
+            )
     };
 
     div()
         .flex()
         .flex_col()
         .w(px(DETAILS_WIDTH))
-        .min_w(px(DETAILS_WIDTH))
+        .h_full()
+        .flex_shrink_0()
         .border_l(px(1.0))
         .border_color(Colors::divider())
-        .bg(Colors::surface_panel_alt())
+        .bg(Colors::surface_panel())
+        // Identity.
         .child(
             div()
+                .flex()
+                .flex_col()
+                .gap(px(space::SNUG))
                 .px(px(space::LOOSE))
-                .py(px(space::BASE))
-                .border_b(px(1.0))
-                .border_color(Colors::divider())
-                .text_size(px(typography::UI_XS))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::text_primary())
-                .child(i18n.tr("plugin-manager.details.title")),
+                .pt(px(space::LOOSE))
+                .pb(px(space::BASE))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap(px(space::BASE))
+                        .child(div().pt(px(3.0)).child(kind_glyph(plugin.kind)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_size(px(typography::UI_MD))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Colors::text_primary())
+                                .child(plugin.name.clone()),
+                        )
+                        .child(fb_icon_button(
+                            "plugin-manager-details-close",
+                            assets::ICON_X_PATH,
+                            i18n.tr("plugin-manager.details.close"),
+                            size::DENSE,
+                            None,
+                            move |_, window, cx| close(&(), window, cx),
+                        )),
+                )
+                .when(!byline.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_size(px(typography::UI_XS))
+                            .text_color(Colors::text_muted())
+                            .child(byline),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(space::BASE))
+                        .child(plugin_format_badge(plugin.format))
+                        .child(
+                            div()
+                                .text_size(px(typography::UI_XS))
+                                .text_color(Colors::text_muted())
+                                .child(kind_label),
+                        )
+                        .child(health_chip(health, i18n)),
+                ),
+        )
+        // What is wrong, if anything, in words.
+        .when_some(
+            health
+                .explanation(i18n)
+                .map(|text| match plugin.error_message.as_deref() {
+                    Some(error) if !error.is_empty() => format!("{text}\n{error}"),
+                    _ => text,
+                }),
+            |el, text| {
+                let tone = health.tone();
+                el.child(
+                    div()
+                        .mx(px(space::LOOSE))
+                        .mb(px(space::BASE))
+                        .px(px(space::BASE))
+                        .py(px(space::SNUG))
+                        .rounded(px(radius::CONTROL))
+                        .border(px(1.0))
+                        .border_color(Colors::with_alpha(tone, state_tokens::ARMED_BORDER))
+                        .bg(Colors::with_alpha(tone, 0.08))
+                        .text_size(px(typography::DENSE_LABEL))
+                        .text_color(Colors::text_secondary())
+                        .child(text),
+                )
+            },
         )
         .child(
             div()
@@ -750,56 +1520,37 @@ fn details_panel(
                 .flex_1()
                 .min_h(px(0.0))
                 .overflow_y_scroll()
+                .border_t(px(1.0))
+                .border_color(Colors::divider())
                 .px(px(space::LOOSE))
                 .py(px(space::BASE))
                 .flex()
                 .flex_col()
                 .gap(px(space::BASE))
-                .child(detail_row(
-                    i18n.tr("plugin-manager.field.name"),
-                    &plugin.name,
-                ))
-                .child(detail_row(
-                    i18n.tr("plugin-manager.field.vendor"),
-                    &plugin.vendor,
-                ))
-                .child(detail_row(
+                .child(field(
                     i18n.tr("plugin-manager.field.category"),
-                    &plugin.display_category(),
+                    plugin.display_category(),
                 ))
-                .when_some(plugin.raw_category.as_ref(), |this, raw| {
-                    this.child(detail_row(
-                        i18n.tr("plugin-manager.field.sdk-category"),
-                        raw,
-                    ))
+                .when_some(plugin.raw_category.clone(), |el, raw| {
+                    el.child(field(i18n.tr("plugin-manager.field.sdk-category"), raw))
                 })
-                .child(detail_row(
-                    i18n.tr("plugin-manager.field.format"),
-                    plugin.format.label(),
-                ))
-                .child(detail_row(
-                    i18n.tr("plugin-manager.field.kind"),
-                    &kind_label,
-                ))
-                .child(detail_row(
+                .when_some(plugin.class_id.clone(), |el, class_id| {
+                    el.child(field(i18n.tr("plugin-manager.field.class-id"), class_id))
+                })
+                .child(field(
                     i18n.tr("plugin-manager.field.path"),
-                    &plugin.path.display().to_string(),
+                    plugin.path.display().to_string(),
                 ))
-                .when_some(plugin.class_id.as_ref(), |this, cid| {
-                    this.child(detail_row(i18n.tr("plugin-manager.field.class-id"), cid))
-                })
-                .when_some(plugin.version.as_ref(), |this, ver| {
-                    this.child(detail_row(i18n.tr("plugin-manager.field.version"), ver))
-                })
-                .child(detail_row(
+                .child(field(
                     i18n.tr("plugin-manager.field.preset"),
-                    &plugin.preset_path.display().to_string(),
-                ))
-                .child(detail_row(
-                    i18n.tr("plugin-manager.field.status"),
-                    &status_label,
+                    if preset_exists {
+                        plugin.preset_path.display().to_string()
+                    } else {
+                        "—".to_string()
+                    },
                 )),
         )
+        // Actions — only ones that do something.
         .child(
             div()
                 .flex()
@@ -809,71 +1560,218 @@ fn details_panel(
                 .py(px(space::BASE))
                 .border_t(px(1.0))
                 .border_color(Colors::divider())
+                .when(can_register, |el| {
+                    el.child(fb_button(
+                        "plugin-mgr-register",
+                        i18n.tr("plugin-manager.action.register"),
+                        FbButtonKind::Primary,
+                        true,
+                        move |_, window, cx| register(&id_register, window, cx),
+                    ))
+                })
                 .child(fb_button(
-                    "plugin-mgr-insert",
-                    i18n.tr("plugin-manager.action.insert"),
-                    FbButtonKind::Primary,
-                    insert_enabled,
-                    move |_, window, cx| insert_cb(&id_insert, window, cx),
-                ))
-                .child(fb_button(
-                    "plugin-mgr-editor",
-                    i18n.tr("plugin-manager.action.editor"),
+                    "plugin-mgr-reveal-plugin",
+                    i18n.tr("plugin-manager.action.reveal-plugin"),
                     FbButtonKind::Default,
-                    editor_enabled,
-                    move |_, window, cx| editor_cb(&id_editor, window, cx),
+                    plugin_exists,
+                    move |_, window, cx| reveal_plugin(&id_plugin, window, cx),
                 ))
+                .when(preset_exists, |el| {
+                    el.child(fb_button(
+                        "plugin-mgr-reveal-preset",
+                        i18n.tr("plugin-manager.action.reveal-preset"),
+                        FbButtonKind::Ghost,
+                        true,
+                        move |_, window, cx| reveal_preset(&id_preset, window, cx),
+                    ))
+                })
                 .child(fb_button(
-                    "plugin-mgr-register",
-                    i18n.tr("plugin-manager.action.register"),
-                    FbButtonKind::Primary,
-                    can_register,
-                    move |_, window, cx| register_cb(&id_register, window, cx),
-                ))
-                .child(fb_button(
-                    "plugin-mgr-reveal",
-                    reveal_label,
-                    FbButtonKind::Default,
-                    plugin.path.exists() || plugin.preset_path.exists(),
-                    move |_, window, cx| reveal_cb(&id_reveal, window, cx),
-                ))
-                .when(!editor_enabled, |this| {
-                    this.child(
+                    "plugin-mgr-copy-path",
+                    i18n.tr("plugin-manager.action.copy-path"),
+                    FbButtonKind::Ghost,
+                    true,
+                    move |_, window, cx| copy_path(&id_copy, window, cx),
+                )),
+        )
+}
+
+// ── Status bar ──────────────────────────────────────────────────────────────
+
+fn status_bar(
+    state: &PluginManagerDialogState,
+    on_open_db_folder: VoidCb,
+    i18n: I18n,
+) -> impl IntoElement {
+    let db_path = SpherePluginHost::database_path().display().to_string();
+    let link_hover = Colors::composite(Colors::surface_panel(), Colors::state_hover());
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(space::LOOSE))
+        .flex_shrink_0()
+        .h(px(size::DEFAULT + space::TIGHT))
+        .px(px(space::LOOSE))
+        .border_t(px(1.0))
+        .border_color(Colors::divider())
+        .bg(Colors::surface_panel())
+        .text_size(px(typography::DENSE_LABEL))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::BASE))
+                .min_w(px(0.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_color(Colors::text_muted())
+                        .child(state.status_text.clone()),
+                )
+                .when(state.failed_count > 0, |el| {
+                    el.child(
                         div()
-                            .text_size(px(typography::DENSE_LABEL))
-                            .text_color(Colors::text_faint())
-                            .child(i18n.tr("plugin-manager.editor.hint")),
+                            .flex_shrink_0()
+                            .text_color(Colors::status_warning())
+                            .child(i18n.tr_vars(
+                                "plugin-manager.footer.missing",
+                                &[("count", state.failed_count.to_string())],
+                            )),
                     )
                 }),
         )
+        .child(
+            div()
+                .id("plugin-manager-db-path")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::SNUG))
+                .flex_shrink_0()
+                .px(px(space::SNUG))
+                .h(px(size::DENSE))
+                .rounded(px(radius::CONTROL_SM))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(link_hover))
+                .tooltip(fb_tooltip(i18n.tr("plugin-manager.open-db-folder")))
+                .on_click(move |_, window, cx| on_open_db_folder(&(), window, cx))
+                .child(icon(
+                    assets::ICON_HARD_DRIVE_PATH,
+                    11.0,
+                    Colors::text_faint(),
+                ))
+                .child(
+                    div()
+                        .max_w(px(DB_PATH_MAX_W))
+                        .truncate()
+                        .text_color(Colors::text_faint())
+                        .child(db_path),
+                ),
+        )
 }
 
-fn detail_row(label: impl Into<String>, value: &str) -> impl IntoElement {
-    let label = label.into();
+// ── Composition ─────────────────────────────────────────────────────────────
+
+/// Main plug-in manager body (header, rail, table, details, status bar).
+#[allow(clippy::too_many_arguments)]
+pub fn plugin_manager_panel(
+    state: &PluginManagerDialogState,
+    search_input: &TextInputState,
+    search_focused: bool,
+    search_callbacks: TextInputCallbacks,
+    search_ime_target: Entity<PluginManagerWindow>,
+    callbacks: PluginManagerCallbacks,
+    confirm_clear: bool,
+    sidebar_scroll: &ScrollHandle,
+    list_scroll: &UniformListScrollHandle,
+    i18n: I18n,
+) -> impl IntoElement {
+    let counts = state.counts();
+    let paint = Paint::resolve();
+    let rows: Arc<Vec<RowData>> = Arc::new(
+        state
+            .visible_plugins(&search_input.value)
+            .into_iter()
+            .map(|plugin| RowData {
+                id: plugin.id.clone(),
+                name: plugin.name.clone(),
+                vendor: plugin.vendor.clone(),
+                category: plugin.display_category(),
+                format: plugin.format,
+                kind: plugin.kind,
+                health: Health::of(plugin),
+            })
+            .collect(),
+    );
+    let selected = state.selected_plugin();
+    let search = text_field_with_callbacks_and_ime(
+        search_input,
+        search_focused,
+        search_callbacks,
+        search_ime_target,
+    )
+    .into_any_element();
+
     div()
         .flex()
         .flex_col()
-        .gap(px(space::HAIR))
-        .child(
-            div()
-                .text_size(px(typography::DENSE_CAPTION))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::text_faint())
-                .child(label),
+        .flex_1()
+        .min_h(px(0.0))
+        .bg(Colors::surface_window())
+        .child(header(state, counts, search, &callbacks, i18n))
+        .when(state.scanning, |panel| {
+            panel.child(scan_progress_strip(state, i18n))
+        })
+        .when(confirm_clear, |panel| {
+            panel.child(clear_confirmation(
+                state.plugins.len(),
+                callbacks.on_confirm_clear.clone(),
+                callbacks.on_cancel_clear.clone(),
+                i18n,
+            ))
+        })
+        .when(
+            state.au_auto_scan_disabled && state.au_scan_available,
+            |panel| {
+                panel.child(banner(
+                    i18n.tr("plugin-manager.scan-au.disabled"),
+                    Colors::status_warning(),
+                ))
+            },
+        )
+        .when_some(
+            state
+                .au_scan_error
+                .clone()
+                .filter(|_| !state.scanning && state.au_scan_available),
+            |panel, message| panel.child(banner(message, Colors::status_warning())),
         )
         .child(
             div()
-                .text_size(px(typography::DENSE_LABEL))
-                .text_color(Colors::text_secondary())
-                .child(value.to_string()),
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h(px(0.0))
+                .child(rail(
+                    state,
+                    counts,
+                    paint,
+                    callbacks.on_sidebar_filter.clone(),
+                    sidebar_scroll,
+                    i18n,
+                ))
+                .child(table(state, rows, paint, &callbacks, list_scroll, i18n))
+                .when_some(selected, |panel, plugin| {
+                    panel.child(details_panel(plugin, &callbacks, i18n))
+                }),
         )
+        .child(status_bar(state, callbacks.on_open_db_folder.clone(), i18n))
 }
 
 fn reveal_in_os(path: &Path) {
-    reveal_preset_in_os(path);
-}
-
-fn reveal_preset_in_os(path: &Path) {
     #[cfg(target_os = "windows")]
     {
         if path.is_file() {
@@ -905,680 +1803,7 @@ fn reveal_preset_in_os(path: &Path) {
     }
 }
 
-/// Main plug-in manager body (toolbar, sidebar, list, optional details, status bar).
-pub fn plugin_manager_panel(
-    state: &PluginManagerDialogState,
-    search_input: &TextInputState,
-    search_focused: bool,
-    search_callbacks: TextInputCallbacks,
-    search_ime_target: Entity<PluginManagerWindow>,
-    callbacks: PluginManagerCallbacks,
-    sidebar_scroll: &ScrollHandle,
-    list_scroll: &ScrollHandle,
-    i18n: I18n,
-) -> impl IntoElement {
-    let rescan = callbacks.on_rescan.clone();
-    let rescan_all = callbacks.on_rescan_all.clone();
-    let rescan_au = callbacks.on_rescan_au.clone();
-    let clear_cache = callbacks.on_clear_cache.clone();
-    let open_db_folder = callbacks.on_open_db_folder.clone();
-    let counts = state.counts();
-    let visible = state.visible_plugins(&search_input.value);
-    let visible_len = visible.len();
-    let selected = state.selected_plugin();
-    let filter_cb = callbacks.on_sidebar_filter.clone();
-    let sort_cb = callbacks.on_sort.clone();
-
-    let sidebar_all = filter_cb.clone();
-    let sidebar_inst = filter_cb.clone();
-    let sidebar_fx = filter_cb.clone();
-    let sidebar_vst3 = filter_cb.clone();
-    let sidebar_vst2 = filter_cb.clone();
-    let sidebar_clap = filter_cb.clone();
-    let sidebar_au = filter_cb.clone();
-
-    let sidebar_thumb_scroll = sidebar_scroll.clone();
-    let list_thumb_scroll = list_scroll.clone();
-
-    let mut list_rows: Vec<gpui::AnyElement> = Vec::new();
-    if visible.is_empty() {
-        list_rows.push(
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(LIST_EMPTY_HEIGHT))
-                .text_size(px(typography::UI_XS))
-                .text_color(Colors::text_faint())
-                .child(if state.scanning {
-                    i18n.tr("plugin-manager.list.scanning")
-                } else if state.plugins.is_empty() {
-                    // Nothing registered at all, cache loaded or not: "empty"
-                    // is honest either way. Only a non-empty registry with no
-                    // visible rows means the filter excluded everything.
-                    i18n.tr("plugin-manager.list.empty")
-                } else {
-                    i18n.tr("plugin-manager.list.no-match")
-                })
-                .into_any_element(),
-        );
-    } else {
-        let select_cb = callbacks.on_select_id.clone();
-        for (row_index, plugin) in visible.into_iter().enumerate() {
-            let pid = plugin.id.clone();
-            let selected_row = state.selected_id.as_deref() == Some(pid.as_str());
-            let kind_icon = match plugin.kind {
-                PluginKind::Instrument => assets::ICON_MUSIC_PATH,
-                PluginKind::Effect | PluginKind::Unknown => assets::ICON_SLIDERS_HORIZONTAL_PATH,
-            };
-            let kind_color = match plugin.kind {
-                PluginKind::Instrument => Colors::accent_primary(),
-                PluginKind::Effect => Colors::status_success(),
-                PluginKind::Unknown => Colors::text_faint(),
-            };
-            let reveal = callbacks.on_reveal_preset.clone();
-            let reveal_id = plugin.id.clone();
-            let status_ready = plugin.status == PluginStatus::PresetReady;
-
-            list_rows.push(
-                div()
-                    .id(("plugin-row", row_index))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .min_h(px(LIST_ROW_HEIGHT))
-                    .py(px(space::TIGHT))
-                    .px(px(LIST_PAD_X))
-                    .gap(px(COL_GAP))
-                    .border_b(px(1.0))
-                    .border_color(Colors::divider())
-                    .when(selected_row, |el| el.bg(Colors::accent_muted()))
-                    .when(!selected_row, |el| {
-                        el.hover(|s| s.bg(Colors::surface_control_hover()))
-                    })
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .on_click({
-                        let select_cb = select_cb.clone();
-                        let pid = pid.clone();
-                        move |_, window, cx| select_cb(&pid, window, cx)
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(space::BASE))
-                            .min_w_0()
-                            .flex_1()
-                            .child(icon(kind_icon, 12.0, kind_color))
-                            .child(
-                                div()
-                                    .text_size(px(typography::UI_XS))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(Colors::text_primary())
-                                    .truncate()
-                                    .child(plugin.name.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w(px(COL_VENDOR_W))
-                            .text_size(px(typography::UI_XS))
-                            .text_color(Colors::text_dim())
-                            .truncate()
-                            .child(plugin.vendor.clone()),
-                    )
-                    .child(
-                        div()
-                            .w(px(COL_CATEGORY_W))
-                            .text_size(px(typography::UI_XS))
-                            .text_color(Colors::text_dim())
-                            .truncate()
-                            .child(plugin.display_category()),
-                    )
-                    .child(
-                        div()
-                            .w(px(COL_FORMAT_W))
-                            .flex()
-                            .items_center()
-                            .child(plugin_format_badge(plugin.format)),
-                    )
-                    .child(
-                        div()
-                            .id(("plugin-status", row_index))
-                            .w(px(COL_STATUS_W))
-                            .flex()
-                            .items_center()
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .on_click(move |_, window, cx| {
-                                cx.stop_propagation();
-                                reveal(&reveal_id, window, cx);
-                            })
-                            .child(status_badge(
-                                if status_ready {
-                                    i18n.tr("plugin-manager.status.available")
-                                } else {
-                                    i18n.tr("plugin-manager.status.missing")
-                                },
-                                status_ready,
-                            )),
-                    )
-                    .into_any_element(),
-            );
-        }
-    }
-
-    div()
-        .flex()
-        .flex_col()
-        .flex_1()
-        .min_h_0()
-        .bg(Colors::surface_canvas())
-        .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(space::BASE))
-                        .h(px(TOOLBAR_HEIGHT))
-                        .px(px(space::LOOSE))
-                        .border_b(px(1.0))
-                        .border_color(Colors::divider())
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(text_field_with_callbacks_and_ime(
-                                    search_input,
-                                    search_focused,
-                                    search_callbacks,
-                                    search_ime_target,
-                                )),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(typography::UI_XS))
-                                .text_color(Colors::text_faint())
-                                .child(format!(
-                                    "{visible_len} plug-in{}",
-                                    if visible_len == 1 { "" } else { "s" }
-                                )),
-                        )
-                        // Scan is the toolbar's one primary action and stands
-                        // alone; everything else is registry maintenance and
-                        // sits in its own plate.
-                        .child(fb_button(
-                            "plugin-manager-scan-now",
-                            if state.scanning {
-                                i18n.tr("plugin-manager.rescan.scanning")
-                            } else {
-                                i18n.tr("plugin-manager.rescan")
-                            },
-                            FbButtonKind::Primary,
-                            !state.scanning,
-                            move |_, window, cx| rescan(&(), window, cx),
-                        ))
-                        .child(
-                            chrome_cluster()
-                                .bg(Colors::surface_panel_alt())
-                                .child(fb_button(
-                                    "plugin-manager-full-rescan",
-                                    i18n.tr("plugin-manager.rescan-all"),
-                                    FbButtonKind::Ghost,
-                                    !state.scanning,
-                                    move |_, window, cx| rescan_all(&(), window, cx),
-                                ))
-                                .when(state.au_scan_available, |row| {
-                                    row.child(fb_button(
-                                        "plugin-manager-retry-au",
-                                        if state.au_auto_scan_disabled {
-                                            i18n.tr("plugin-manager.scan-au.retry")
-                                        } else {
-                                            i18n.tr("plugin-manager.scan-au")
-                                        },
-                                        FbButtonKind::Ghost,
-                                        !state.scanning,
-                                        move |_, window, cx| rescan_au(&(), window, cx),
-                                    ))
-                                })
-                                .child(fb_button(
-                                    "plugin-manager-open-db-folder",
-                                    i18n.tr("plugin-manager.open-db-folder"),
-                                    FbButtonKind::Ghost,
-                                    !state.scanning,
-                                    move |_, window, cx| open_db_folder(&(), window, cx),
-                                ))
-                                // Deleting the registry is not recoverable, so
-                                // it takes the destructive fill the contract
-                                // reserves for exactly that — it used to be a
-                                // plain button beside "Open DB Folder".
-                                .child(fb_button(
-                                    "plugin-manager-clear-cache",
-                                    i18n.tr("plugin-manager.clear-database"),
-                                    FbButtonKind::Danger,
-                                    !state.scanning && !state.plugins.is_empty(),
-                                    move |_, window, cx| clear_cache(&(), window, cx),
-                                )),
-                        ),
-                )
-                .when(state.scanning, |panel| {
-                    panel.child(scan_progress_bar(state, i18n))
-                })
-                .when(state.au_auto_scan_disabled && state.au_scan_available, |panel| {
-                    panel.child(
-                        div()
-                            .px(px(space::LOOSE))
-                            .py(px(space::SNUG))
-                            .border_b(px(1.0))
-                            .border_color(Colors::divider())
-                            .bg(rgba_warning_soft())
-                            .text_size(px(typography::DENSE_LABEL))
-                            .text_color(Colors::status_warning())
-                            .child(i18n.tr("plugin-manager.scan-au.disabled")),
-                    )
-                })
-                .when(
-                    state.au_scan_error.is_some() && !state.scanning && state.au_scan_available,
-                    |panel| {
-                        let message = state.au_scan_error.clone().unwrap_or_default();
-                        panel.child(
-                            div()
-                                .px(px(space::LOOSE))
-                                .py(px(space::SNUG))
-                                .border_b(px(1.0))
-                                .border_color(Colors::divider())
-                                .bg(Colors::surface_input())
-                                .text_size(px(typography::DENSE_LABEL))
-                                .text_color(Colors::status_warning())
-                                .child(message),
-                        )
-                    },
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_1()
-                        .min_h_0()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_h(px(0.0))
-                                .w(px(SIDEBAR_WIDTH))
-                                .border_r(px(1.0))
-                                .border_color(Colors::divider())
-                                .bg(Colors::surface_panel_alt())
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_h(px(0.0))
-                                        .relative()
-                                        .child(
-                                            div()
-                                                .id("plugin-manager-sidebar-scroll")
-                                                .size_full()
-                                                .overflow_y_scroll()
-                                                .track_scroll(sidebar_scroll)
-                                                .child(
-                                                    div()
-                                                        .py(px(space::TIGHT))
-                                                        .child(sidebar_section(
-                                                    i18n.tr("plugin-manager.filter.library"),
-                                                    vec![
-                                                        sidebar_item(
-                                                            "pm-filter-all",
-                                                            i18n.tr("plugin-manager.filter.all"),
-                                                            counts.all,
-                                                            state.sidebar_filter == SidebarFilter::All,
-                                                            false,
-                                                            move |_, w, cx| {
-                                                                sidebar_all(
-                                                                    &SidebarFilter::All,
-                                                                    w,
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        )
-                                                        .into_any_element(),
-                                                    ],
-                                                ))
-                                                .child(sidebar_section(
-                                                    i18n.tr("plugin-manager.filter.kind"),
-                                                    vec![
-                                                        sidebar_item(
-                                                            "pm-filter-inst",
-                                                            i18n.tr("plugin-manager.filter.instruments"),
-                                                            counts.instruments,
-                                                            state.sidebar_filter
-                                                                == SidebarFilter::Instrument,
-                                                            false,
-                                                            move |_, w, cx| {
-                                                                sidebar_inst(
-                                                                    &SidebarFilter::Instrument,
-                                                                    w,
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        )
-                                                        .into_any_element(),
-                                                        sidebar_item(
-                                                            "pm-filter-fx",
-                                                            i18n.tr("plugin-manager.filter.effects"),
-                                                            counts.effects,
-                                                            state.sidebar_filter == SidebarFilter::Effect,
-                                                            false,
-                                                            move |_, w, cx| {
-                                                                sidebar_fx(
-                                                                    &SidebarFilter::Effect,
-                                                                    w,
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        )
-                                                        .into_any_element(),
-                                                    ],
-                                                ))
-                                                .child(sidebar_section(
-                                                    i18n.tr("plugin-manager.filter.format"),
-                                                    vec![
-                                                        sidebar_item(
-                                                            "pm-filter-vst3",
-                                                            "VST3",
-                                                            counts.vst3,
-                                                            state.sidebar_filter
-                                                                == SidebarFilter::Format(PluginFormat::Vst3),
-                                                            false,
-                                                            move |_, w, cx| {
-                                                                sidebar_vst3(
-                                                                    &SidebarFilter::Format(PluginFormat::Vst3),
-                                                                    w,
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        )
-                                                        .into_any_element(),
-                                                        sidebar_item(
-                                                            "pm-filter-vst2",
-                                                            "VST2",
-                                                            counts.vst2,
-                                                            state.sidebar_filter
-                                                                == SidebarFilter::Format(PluginFormat::Vst2),
-                                                            false,
-                                                            move |_, w, cx| {
-                                                                sidebar_vst2(
-                                                                    &SidebarFilter::Format(PluginFormat::Vst2),
-                                                                    w,
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        )
-                                                        .into_any_element(),
-                                                        sidebar_item(
-                                                            "pm-filter-clap",
-                                                            "CLAP",
-                                                            counts.clap,
-                                                            state.sidebar_filter
-                                                                == SidebarFilter::Format(PluginFormat::Clap),
-                                                            false,
-                                                            move |_, w, cx| {
-                                                                sidebar_clap(
-                                                                    &SidebarFilter::Format(PluginFormat::Clap),
-                                                                    w,
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        )
-                                                        .into_any_element(),
-                                                        sidebar_item(
-                                                            "pm-filter-au",
-                                                            if state.au_scan_available {
-                                                                "AU"
-                                                            } else {
-                                                                "AU (Unavailable)"
-                                                            },
-                                                            counts.au,
-                                                            state.sidebar_filter
-                                                                == SidebarFilter::Format(PluginFormat::Au),
-                                                            !state.au_scan_available,
-                                                            move |_, w, cx| {
-                                                                sidebar_au(
-                                                                    &SidebarFilter::Format(PluginFormat::Au),
-                                                                    w,
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        )
-                                                        .into_any_element(),
-                                                    ],
-                                                ))
-                                                .child(
-                                                    div()
-                                                        .border_t(px(1.0))
-                                                        .border_color(Colors::divider())
-                                                        .child(
-                                                            sidebar_section(
-                                                                i18n.tr("plugin-manager.scan-locations"),
-                                                                if state.scan_paths.is_empty() {
-                                                                    vec![div()
-                                                                        .px(px(space::BASE))
-                                                                        .py(px(space::TIGHT))
-                                                                        .text_size(px(typography::UI_XS))
-                                                                        .text_color(Colors::text_faint())
-                                                                        .child(i18n.tr("plugin-manager.scan-locations.empty"))
-                                                                        .into_any_element()]
-                                                                } else {
-                                                                    state
-                                                                        .scan_paths
-                                                                        .iter()
-                                                                        .enumerate()
-                                                                        .map(|(i, path)| {
-                                                                            div()
-                                                                                .flex()
-                                                                                .flex_row()
-                                                                                .items_center()
-                                                                                .gap(px(space::SNUG))
-                                                                                .px(px(space::BASE))
-                                                                                .py(px(space::TIGHT))
-                                                                                .id(("scan-path", i))
-                                                                                .child(icon(
-                                                                                    assets::ICON_FOLDER_PATH,
-                                                                                    11.0,
-                                                                                    Colors::text_faint(),
-                                                                                ))
-                                                                                .child(
-                                                                                    div()
-                                                                                        .text_size(px(typography::UI_XS))
-                                                                                        .text_color(Colors::text_faint())
-                                                                                        .truncate()
-                                                                                        .child(path.display().to_string()),
-                                                                                )
-                                                                                .into_any_element()
-                                                                        })
-                                                                        .collect()
-                                                                },
-                                                            ),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .px(px(space::BASE))
-                                                                .pb(px(space::BASE))
-                                                                .child(
-                                                                    fb_button(
-                                                                        "pm-add-location",
-                                                                        i18n.tr("plugin-manager.add-location"),
-                                                                        FbButtonKind::Default,
-                                                                        false,
-                                                                        |_, _, _| {},
-                                                                    ),
-                                                                ),
-                                                        ),
-                                                ),
-                                            ),
-                                        )
-                                        .child(vertical_scrollbar_thumb(sidebar_thumb_scroll)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .h(px(size::PROMINENT))
-                                        .px(px(LIST_PAD_X))
-                                        .gap(px(COL_GAP))
-                                        .border_b(px(1.0))
-                                        .border_color(Colors::divider())
-                                        .bg(Colors::surface_input())
-                                        .child(
-                                            div().flex_1().min_w_0().child(col_header(
-                                                "pm-sort-name",
-                                                i18n.tr("plugin-manager.sort.name"),
-                                                SortKey::Name,
-                                                state,
-                                                sort_cb.clone(),
-                                            )),
-                                        )
-                                        .child(
-                                            div().w(px(COL_VENDOR_W)).child(col_header(
-                                                "pm-sort-vendor",
-                                                i18n.tr("plugin-manager.sort.vendor"),
-                                                SortKey::Vendor,
-                                                state,
-                                                sort_cb.clone(),
-                                            )),
-                                        )
-                                        .child(
-                                            div().w(px(COL_CATEGORY_W)).child(col_header(
-                                                "pm-sort-cat",
-                                                i18n.tr("plugin-manager.sort.category"),
-                                                SortKey::Category,
-                                                state,
-                                                sort_cb.clone(),
-                                            )),
-                                        )
-                                        .child(
-                                            div().w(px(COL_FORMAT_W)).child(col_header(
-                                                "pm-sort-fmt",
-                                                i18n.tr("plugin-manager.sort.format"),
-                                                SortKey::Format,
-                                                state,
-                                                sort_cb,
-                                            )),
-                                        )
-                                        .child(
-                                            div()
-                                                .w(px(COL_STATUS_W))
-                                                .text_size(px(typography::UI_XS))
-                                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                .text_color(Colors::text_faint())
-                                                .child(i18n.tr("plugin-manager.column.status")),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_h(px(0.0))
-                                        .relative()
-                                        .child(
-                                            div()
-                                                .id("plugin-manager-list-scroll")
-                                                .size_full()
-                                                .overflow_y_scroll()
-                                                .track_scroll(list_scroll)
-                                                .children(list_rows),
-                                        )
-                                        .child(vertical_scrollbar_thumb(list_thumb_scroll)),
-                                ),
-                        )
-                        .when_some(selected, |panel, plugin| {
-                            panel.child(details_panel(plugin, &callbacks, i18n))
-                        }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .h(px(size::PROMINENT))
-                        .px(px(space::LOOSE))
-                        .border_t(px(1.0))
-                        .border_color(Colors::divider())
-                        .bg(Colors::surface_input())
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(space::BASE))
-                                .text_size(px(typography::UI_XS))
-                                .text_color(Colors::text_faint())
-                                .child(state.status_text.clone())
-                                .when(state.failed_count > 0, |el| {
-                                    el.child(
-                                        div()
-                                            .text_color(Colors::status_warning())
-                                            .child(format!("• {} failed", state.failed_count)),
-                                    )
-                                })
-                                .when(state.generated_presets > 0, |el| {
-                                    el.child(
-                                        div()
-                                            .text_color(Colors::accent_primary())
-                                            .child(format!(
-                                                "• {} generated",
-                                                state.generated_presets
-                                            )),
-                                    )
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(space::BASE))
-                                .text_size(px(typography::UI_XS))
-                                .text_color(Colors::text_faint())
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .max_w(px(DB_PATH_MAX_W))
-                                        .child(SpherePluginHost::database_path()
-                                            .display()
-                                            .to_string()),
-                                )
-                                .when(state.last_scan_at_ms > 0, |el| {
-                                    el.child(div().child(i18n.tr_vars(
-                                        "plugin-manager.footer.last-scan",
-                                        &[("when", format_relative_time(state.last_scan_at_ms))],
-                                    )))
-                                })
-                                .child(div().child(i18n.tr_vars(
-                                    "plugin-manager.footer.cached",
-                                    &[("count", state.plugins.len().to_string())],
-                                )))
-                                .when(state.failed_count > 0, |el| {
-                                    el.child(
-                                        div().text_color(Colors::status_warning()).child(
-                                            i18n.tr_vars(
-                                                "plugin-manager.footer.missing",
-                                                &[("count", state.failed_count.to_string())],
-                                            ),
-                                        ),
-                                    )
-                                }),
-                        ),
-                )
-}
+// ── Window ──────────────────────────────────────────────────────────────────
 
 pub struct PluginManagerWindow {
     pub state: PluginManagerDialogState,
@@ -1586,7 +1811,11 @@ pub struct PluginManagerWindow {
     focus_handle: FocusHandle,
     initial_cache_loaded: bool,
     sidebar_scroll: ScrollHandle,
-    list_scroll: ScrollHandle,
+    list_scroll: UniformListScrollHandle,
+    /// Where the "More" menu is open, in window coordinates.
+    menu: Option<(f32, f32)>,
+    /// Clear Database was chosen and is waiting for confirmation.
+    confirm_clear: bool,
 }
 
 impl PluginManagerWindow {
@@ -1599,7 +1828,9 @@ impl PluginManagerWindow {
             focus_handle: cx.focus_handle(),
             initial_cache_loaded: false,
             sidebar_scroll: ScrollHandle::new(),
-            list_scroll: ScrollHandle::new(),
+            list_scroll: UniformListScrollHandle::new(),
+            menu: None,
+            confirm_clear: false,
         }
     }
 
@@ -1695,24 +1926,180 @@ impl PluginManagerWindow {
         .detach();
     }
 
-    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_input.is_focused(window) {
-            let action = self.search_input.handle_key_ime(event, Some(cx));
-            if matches!(action, TextInputAction::Cancel) {
-                window.remove_window();
-            }
+    fn start_scan(&mut self, mode: PluginScanMode, cx: &mut Context<Self>) {
+        if self.state.scanning {
+            return;
+        }
+        if mode == PluginScanMode::RescanAu && !self.state.au_scan_available {
+            return;
+        }
+        self.confirm_clear = false;
+        self.state.begin_scan(mode, I18n::from_app(cx));
+        cx.notify();
+        Self::arm_background_scan(cx, mode);
+    }
+
+    fn clear_database(&mut self, cx: &mut Context<Self>) {
+        self.confirm_clear = false;
+        if self.state.scanning {
             cx.notify();
             return;
         }
-        if event.keystroke.key.as_str() == "escape" {
-            window.remove_window();
+        match PluginRegistry::clear_cache() {
+            Ok(removed) => {
+                self.state.plugins.clear();
+                self.state.selected_id = None;
+                self.state.failed_count = 0;
+                self.state.last_scan_at_ms = 0;
+                self.state.cache_loaded = true;
+                self.state.status_text =
+                    format!("Cleared {removed} cached preset(s). Click Rescan to rebuild.");
+            }
+            Err(error) => {
+                self.state.status_text = format!("Clear cache failed: {error}");
+            }
+        }
+        cx.notify();
+    }
+
+    fn run_menu_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        self.menu = None;
+        match command {
+            CMD_RESCAN_ALL => self.start_scan(PluginScanMode::RescanAll, cx),
+            CMD_RESCAN_AU => self.start_scan(PluginScanMode::RescanAu, cx),
+            CMD_OPEN_DB => {
+                let dir = SpherePluginHost::database_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                reveal_in_os(&dir);
+            }
+            CMD_CLEAR_DB => {
+                if !self.state.scanning && !self.state.plugins.is_empty() {
+                    self.confirm_clear = true;
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn menu_entries(&self, i18n: I18n) -> Vec<ContextMenuEntry> {
+        let idle = !self.state.scanning;
+        let item = |label: String, command: &str, enabled: bool| {
+            if enabled {
+                ContextMenuEntry::item(label, command)
+            } else {
+                ContextMenuEntry::disabled_item(label, command)
+            }
+        };
+        let mut entries = vec![item(
+            i18n.tr("plugin-manager.rescan-all"),
+            CMD_RESCAN_ALL,
+            idle,
+        )];
+        if self.state.au_scan_available {
+            entries.push(item(
+                if self.state.au_auto_scan_disabled {
+                    i18n.tr("plugin-manager.scan-au.retry")
+                } else {
+                    i18n.tr("plugin-manager.scan-au")
+                },
+                CMD_RESCAN_AU,
+                idle,
+            ));
+        }
+        entries.push(ContextMenuEntry::Separator);
+        entries.push(ContextMenuEntry::item(
+            i18n.tr("plugin-manager.open-db-folder"),
+            CMD_OPEN_DB,
+        ));
+        entries.push(ContextMenuEntry::Separator);
+        if idle && !self.state.plugins.is_empty() {
+            entries.push(ContextMenuEntry::danger_item(
+                i18n.tr("plugin-manager.clear-database"),
+                CMD_CLEAR_DB,
+            ));
+        } else {
+            entries.push(ContextMenuEntry::disabled_item(
+                i18n.tr("plugin-manager.clear-database"),
+                CMD_CLEAR_DB,
+            ));
+        }
+        entries
+    }
+
+    /// Move the selection through the visible rows, keeping it in view.
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .state
+            .visible_plugins(&self.search_input.value)
+            .into_iter()
+            .map(|plugin| plugin.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let current = self
+            .state
+            .selected_id
+            .as_ref()
+            .and_then(|id| ids.iter().position(|candidate| candidate == id));
+        let next = match current {
+            Some(index) => (index as isize + delta).clamp(0, ids.len() as isize - 1) as usize,
+            None if delta < 0 => ids.len() - 1,
+            None => 0,
+        };
+        self.state.selected_id = Some(ids[next].clone());
+        self.list_scroll
+            .scroll_to_item(next, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    fn handle_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        // The list is browsable from the search field too: arrows are not
+        // text editing there.
+        match key {
+            "up" | "arrowup" => {
+                self.move_selection(-1, cx);
+                cx.stop_propagation();
+                return;
+            }
+            "down" | "arrowdown" => {
+                self.move_selection(1, cx);
+                cx.stop_propagation();
+                return;
+            }
+            _ => {}
+        }
+        if key == "escape" {
+            // Innermost first: the menu, the confirmation, the query, the
+            // selection — and only then the window.
+            if self.menu.take().is_some() || std::mem::take(&mut self.confirm_clear) {
+            } else if !self.search_input.value.is_empty() {
+                self.search_input.set_value("");
+            } else if self.state.selected_id.take().is_none() {
+                window.remove_window();
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if self.search_input.is_focused(window) {
+            let _ = self.search_input.handle_key_ime(event, Some(cx));
+            cx.notify();
+        }
+    }
+
+    fn with_plugin(&self, id: &str, f: impl FnOnce(&RegistryPlugin)) {
+        if let Some(plugin) = self.state.plugins.iter().find(|p| p.id == id) {
+            f(plugin);
         }
     }
 }
 
 // Route platform IME (CJK/Thai composition + candidate-window positioning) to
-// the search field. Coexists with `handle_key_with_clipboard` (handle_key);
-// GPUI suppresses key dispatch for keystrokes the IME consumes.
+// the search field. Coexists with `handle_key_ime` (handle_key); GPUI
+// suppresses key dispatch for keystrokes the IME consumes.
 crate::impl_single_input_window_ime!(PluginManagerWindow, search_input);
 
 impl Render for PluginManagerWindow {
@@ -1723,68 +2110,34 @@ impl Render for PluginManagerWindow {
         if !self.initial_cache_loaded {
             self.initial_cache_loaded = true;
             // Load cached `.pst` index only. Never auto-scan VST3/CLAP binaries
-            // — the user must press Scan Now / Full Rescan explicitly.
+            // — the user must press Rescan explicitly.
             Self::arm_cache_load(cx);
         }
 
         let target = cx.entity().clone();
         let search_focused = self.search_input.is_focused(window);
+        let str_cb = |f: fn(&mut PluginManagerWindow, &str, &mut Context<PluginManagerWindow>)| {
+            let target = target.clone();
+            Arc::new(move |id: &String, _w: &mut Window, cx: &mut App| {
+                let _ = target.update(cx, |this, cx| f(this, id, cx));
+            }) as StrCb
+        };
+        let void_cb = |f: fn(&mut PluginManagerWindow, &mut Context<PluginManagerWindow>)| {
+            let target = target.clone();
+            Arc::new(move |_: &(), _w: &mut Window, cx: &mut App| {
+                let _ = target.update(cx, |this, cx| f(this, cx));
+            }) as VoidCb
+        };
 
         let callbacks = PluginManagerCallbacks {
-            on_close: Arc::new(|_: &(), window: &mut Window, _cx: &mut App| {
-                window.remove_window();
+            on_rescan: void_cb(|this, cx| this.start_scan(PluginScanMode::Rescan, cx)),
+            on_select_id: str_cb(|this, id, cx| {
+                this.state.selected_id = Some(id.to_string());
+                cx.notify();
             }),
-            on_rescan: Arc::new({
-                let target = target.clone();
-                move |_: &(), _w, cx| {
-                    let _ = target.update(cx, |this, cx| {
-                        if this.state.scanning {
-                            return;
-                        }
-                        this.state
-                            .begin_scan(PluginScanMode::Rescan, I18n::from_app(cx));
-                        cx.notify();
-                        PluginManagerWindow::arm_background_scan(cx, PluginScanMode::Rescan);
-                    });
-                }
-            }),
-            on_rescan_all: Arc::new({
-                let target = target.clone();
-                move |_: &(), _w, cx| {
-                    let _ = target.update(cx, |this, cx| {
-                        if this.state.scanning {
-                            return;
-                        }
-                        this.state
-                            .begin_scan(PluginScanMode::RescanAll, I18n::from_app(cx));
-                        cx.notify();
-                        PluginManagerWindow::arm_background_scan(cx, PluginScanMode::RescanAll);
-                    });
-                }
-            }),
-            on_rescan_au: Arc::new({
-                let target = target.clone();
-                move |_: &(), _w, cx| {
-                    let _ = target.update(cx, |this, cx| {
-                        if this.state.scanning || !this.state.au_scan_available {
-                            return;
-                        }
-                        this.state
-                            .begin_scan(PluginScanMode::RescanAu, I18n::from_app(cx));
-                        cx.notify();
-                        PluginManagerWindow::arm_background_scan(cx, PluginScanMode::RescanAu);
-                    });
-                }
-            }),
-            on_select_id: Arc::new({
-                let target = target.clone();
-                move |id: &String, _w, cx| {
-                    let _ = target.update(cx, |this, cx| {
-                        let toggle_off = this.state.selected_id.as_deref() == Some(id.as_str());
-                        this.state.selected_id = if toggle_off { None } else { Some(id.clone()) };
-                        cx.notify();
-                    });
-                }
+            on_clear_selection: void_cb(|this, cx| {
+                this.state.selected_id = None;
+                cx.notify();
             }),
             on_sidebar_filter: Arc::new({
                 let target = target.clone();
@@ -1792,6 +2145,7 @@ impl Render for PluginManagerWindow {
                     let filter = filter.clone();
                     let _ = target.update(cx, |this, cx| {
                         this.state.sidebar_filter = filter;
+                        this.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
                         cx.notify();
                     });
                 }
@@ -1814,104 +2168,92 @@ impl Render for PluginManagerWindow {
                     });
                 }
             }),
-            on_insert: Arc::new({
-                let target = target.clone();
-                move |_id: &String, _w, cx| {
-                    let _ = target.update(cx, |this, cx| {
+            on_reveal_plugin: str_cb(|this, id, _cx| {
+                this.with_plugin(id, |plugin| reveal_in_os(&plugin.path));
+            }),
+            on_reveal_preset: str_cb(|this, id, _cx| {
+                this.with_plugin(id, |plugin| reveal_in_os(reveal_path_for_plugin(plugin)));
+            }),
+            on_copy_path: str_cb(|this, id, cx| {
+                let mut path = None;
+                this.with_plugin(id, |plugin| path = Some(plugin.path.display().to_string()));
+                if let Some(path) = path {
+                    cx.write_to_clipboard(ClipboardItem::new_string(path));
+                    this.state.status_text = I18n::from_app(cx).tr("plugin-manager.copied-path");
+                    cx.notify();
+                }
+            }),
+            on_register_plugin: str_cb(|this, id, cx| {
+                let Some(plugin) = this.state.plugins.iter_mut().find(|p| p.id == id) else {
+                    return;
+                };
+                let name = plugin.name.clone();
+                let i18n = I18n::from_app(cx);
+                match register_plugin(plugin) {
+                    Ok(()) => {
+                        this.state.generated_presets = this
+                            .state
+                            .plugins
+                            .iter()
+                            .filter(|p| p.status == PluginStatus::PresetReady)
+                            .count() as u32;
                         this.state.status_text =
-                            I18n::from_app(cx).tr("plugin-manager.error.insert-not-connected");
-                        cx.notify();
-                    });
+                            i18n.tr_vars("plugin-manager.register.success", &[("name", name)]);
+                    }
+                    Err(error) => {
+                        this.state.status_text = i18n.tr_vars(
+                            "plugin-manager.register.failed",
+                            &[("error", error.to_string())],
+                        );
+                    }
                 }
+                cx.notify();
             }),
-            on_open_editor: Arc::new({
+            on_open_menu: Arc::new({
                 let target = target.clone();
-                move |_id: &String, _w, cx| {
+                move |position: &(f32, f32), _w, cx| {
+                    let position = *position;
                     let _ = target.update(cx, |this, cx| {
-                        this.state.status_text =
-                            I18n::from_app(cx).tr("plugin-manager.error.editor-not-connected");
-                        cx.notify();
-                    });
-                }
-            }),
-            on_reveal_preset: Arc::new({
-                let target = target.clone();
-                move |id: &String, _w, cx| {
-                    let _ = target.update(cx, |this, _cx| {
-                        if let Some(plugin) = this.state.plugins.iter().find(|p| p.id == *id) {
-                            reveal_preset_in_os(reveal_path_for_plugin(plugin));
-                        }
-                    });
-                }
-            }),
-            on_open_db_folder: Arc::new({
-                move |_: &(), _w, _cx| {
-                    let dir = SpherePluginHost::database_dir();
-                    let _ = std::fs::create_dir_all(&dir);
-                    reveal_in_os(&dir);
-                }
-            }),
-            on_clear_cache: Arc::new({
-                let target = target.clone();
-                move |_: &(), _w, cx| {
-                    let _ = target.update(cx, |this, cx| {
-                        if this.state.scanning {
-                            return;
-                        }
-                        match PluginRegistry::clear_cache() {
-                            Ok(removed) => {
-                                this.state.plugins.clear();
-                                this.state.selected_id = None;
-                                this.state.failed_count = 0;
-                                this.state.last_scan_at_ms = 0;
-                                this.state.cache_loaded = true;
-                                this.state.status_text = format!(
-                                    "Cleared {removed} cached preset(s). Click Scan Now to rebuild."
-                                );
-                            }
-                            Err(error) => {
-                                this.state.status_text = format!("Clear cache failed: {error}");
-                            }
-                        }
-                        cx.notify();
-                    });
-                }
-            }),
-            on_register_plugin: Arc::new({
-                let target = target.clone();
-                move |id: &String, _w, cx| {
-                    let _ = target.update(cx, |this, cx| {
-                        let Some(plugin) = this.state.plugins.iter_mut().find(|p| p.id == *id)
-                        else {
-                            return;
+                        this.menu = if this.menu.is_some() {
+                            None
+                        } else {
+                            Some(position)
                         };
-                        let name = plugin.name.clone();
-                        let i18n = I18n::from_app(cx);
-                        match register_plugin(plugin) {
-                            Ok(()) => {
-                                this.state.generated_presets =
-                                    this.state
-                                        .plugins
-                                        .iter()
-                                        .filter(|p| p.status == PluginStatus::PresetReady)
-                                        .count() as u32;
-                                this.state.status_text = i18n
-                                    .tr_vars("plugin-manager.register.success", &[("name", name)]);
-                            }
-                            Err(error) => {
-                                this.state.status_text = i18n.tr_vars(
-                                    "plugin-manager.register.failed",
-                                    &[("error", error.to_string())],
-                                );
-                            }
-                        }
                         cx.notify();
                     });
                 }
+            }),
+            on_open_db_folder: void_cb(|this, cx| this.run_menu_command(CMD_OPEN_DB, cx)),
+            on_confirm_clear: void_cb(|this, cx| this.clear_database(cx)),
+            on_cancel_clear: void_cb(|this, cx| {
+                this.confirm_clear = false;
+                cx.notify();
             }),
         };
 
-        let sw_target = target.clone();
+        let menu = self.menu.map(|(x, y)| {
+            let viewport = window.viewport_size();
+            let command_target = target.clone();
+            let close_target = target.clone();
+            context_menu_overlay(
+                self.menu_entries(i18n),
+                x,
+                y,
+                viewport.width.into(),
+                viewport.height.into(),
+                Arc::new(move |command: &String, _window, cx| {
+                    let command = command.clone();
+                    let _ =
+                        command_target.update(cx, |this, cx| this.run_menu_command(&command, cx));
+                }),
+                Arc::new(move |_: &(), _window, cx| {
+                    let _ = close_target.update(cx, |this, cx| {
+                        this.menu = None;
+                        cx.notify();
+                    });
+                }),
+            )
+        });
 
         div()
             .flex()
@@ -1922,7 +2264,7 @@ impl Render for PluginManagerWindow {
             .bg(Colors::surface_window())
             .overflow_hidden()
             .capture_key_down({
-                let target = sw_target.clone();
+                let target = target.clone();
                 move |event, window, cx| {
                     let _ = target.update(cx, |this, cx| this.handle_key(event, window, cx));
                 }
@@ -1932,7 +2274,7 @@ impl Render for PluginManagerWindow {
                 i18n.tr("plugin-manager.title"),
                 "plugin-manager-window-close",
                 {
-                    let target = sw_target.clone();
+                    let target = target.clone();
                     move |window, cx| {
                         let _ = target.update(cx, |_, cx| cx.notify());
                         window.remove_window();
@@ -1946,10 +2288,12 @@ impl Render for PluginManagerWindow {
                 bind_mouse_selection(cx.entity().clone(), |this| &mut this.search_input),
                 target.clone(),
                 callbacks,
+                self.confirm_clear,
                 &self.sidebar_scroll,
                 &self.list_scroll,
                 i18n,
             ))
+            .children(menu)
     }
 }
 
@@ -2240,5 +2584,99 @@ fn plugin_scan_discovery_text() -> &'static str {
     #[cfg(not(target_os = "macos"))]
     {
         "Discovering VST3 and CLAP plug-ins…"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plugin(id: &str, status: PluginStatus, scan: PluginScanStatus) -> RegistryPlugin {
+        RegistryPlugin {
+            id: id.to_string(),
+            name: id.to_string(),
+            vendor: "Acme".to_string(),
+            format: PluginFormat::Vst3,
+            category: "EQ".to_string(),
+            is_ara: false,
+            raw_category: None,
+            sub_categories: None,
+            kind: PluginKind::Effect,
+            path: PathBuf::from(format!("C:/Plugins/{id}.vst3")),
+            class_id: None,
+            version: None,
+            sdk_metadata_loaded: true,
+            preset_path: PathBuf::from(format!("C:/Cache/{id}.pst")),
+            scanned_at_ms: 0,
+            status,
+            scan_status: scan,
+            error_message: None,
+        }
+    }
+
+    fn state_with(plugins: Vec<RegistryPlugin>) -> PluginManagerDialogState {
+        let mut state = PluginManagerDialogState::new_empty(I18n::new("en"));
+        state.plugins = plugins;
+        state
+    }
+
+    /// "Needs Attention" is what the user can fix from here: unregistered,
+    /// failed, or crashed — not a plug-in that is simply fine.
+    #[test]
+    fn attention_lists_what_the_user_can_fix() {
+        let state = state_with(vec![
+            plugin(
+                "ready",
+                PluginStatus::PresetReady,
+                PluginScanStatus::Success,
+            ),
+            plugin(
+                "unregistered",
+                PluginStatus::MissingPreset,
+                PluginScanStatus::Success,
+            ),
+            plugin(
+                "failed",
+                PluginStatus::PresetReady,
+                PluginScanStatus::Failed,
+            ),
+            plugin(
+                "crashed",
+                PluginStatus::PresetReady,
+                PluginScanStatus::Crashed,
+            ),
+        ]);
+        assert_eq!(state.counts().attention, 3);
+        let mut state = state;
+        state.sidebar_filter = SidebarFilter::Attention;
+        let names: Vec<&str> = state
+            .visible_plugins("")
+            .into_iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["crashed", "failed", "unregistered"]);
+    }
+
+    #[test]
+    fn sorting_by_status_puts_problems_last() {
+        let mut state = state_with(vec![
+            plugin(
+                "b-crashed",
+                PluginStatus::PresetReady,
+                PluginScanStatus::Crashed,
+            ),
+            plugin(
+                "a-ready",
+                PluginStatus::PresetReady,
+                PluginScanStatus::Success,
+            ),
+        ]);
+        state.sort_key = SortKey::Status;
+        let names: Vec<&str> = state
+            .visible_plugins("")
+            .into_iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a-ready", "b-crashed"]);
     }
 }

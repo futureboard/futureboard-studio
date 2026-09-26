@@ -1,33 +1,37 @@
-//! Plugin list row rendering.
+//! Plugin list rows and their column header.
+//!
+//! The list is the picker's main surface, so it stays calm: one line per
+//! plug-in, the name leading, everything else quieter. Rows are full-bleed and
+//! therefore square; selection is a fill plus a leading-edge marker drawn as an
+//! overlay, so selecting a row never reflows it.
 
 use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Div, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, px, svg,
+    div, px, svg, App, AppContext, Div, InteractiveElement, IntoElement, ParentElement, Rgba,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::assets;
 use crate::components::plugin_format_badge::{plugin_format_badge, plugin_format_badge_for};
 use crate::components::plugin_picker::category::normalized_category_label;
 use crate::components::plugin_picker::insert::is_insertable;
-use crate::theme::Colors;
+use crate::theme::{radius, size, space, state, typography, Colors};
 use SpherePluginHost::{PluginFormat, PluginKind, PluginScanStatus, PluginStatus, RegistryPlugin};
 
-pub const ROW_HEIGHT: f32 = 38.0;
+/// One list row. Compact on purpose: a large library is scanned, not read.
+pub const ROW_HEIGHT: f32 = size::COMFORTABLE;
 
 /// Shared column metrics — header and body rows must stay in sync.
-const ROW_GAP: f32 = 8.0;
-const COL_ICON: f32 = 12.0;
-const COL_FAVORITE: f32 = 18.0;
+const ROW_PAD_X: f32 = space::LOOSE;
+const COL_GAP: f32 = space::BASE;
+const COL_STAR: f32 = size::MICRO;
+const COL_KIND: f32 = 14.0;
 const COL_NAME_MIN: f32 = 160.0;
-const COL_VENDOR_MIN: f32 = 100.0;
-const COL_CATEGORY_MIN: f32 = 100.0;
-/// Instrument / Audio Effect / Unknown, straight from `PluginKind`. Fixed width
-/// because the three labels are the only values it ever shows.
-const COL_TYPE: f32 = 86.0;
-const COL_FORMAT: f32 = 80.0;
+const COL_VENDOR_W: f32 = 150.0;
+const COL_CATEGORY_W: f32 = 110.0;
+const COL_FORMAT_W: f32 = 64.0;
 
 type StringCb = Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>;
 
@@ -38,135 +42,87 @@ pub struct PluginDragItem {
     pub kind: PluginKind,
 }
 
-fn col_name_cell(label: impl Into<String>) -> Div {
-    div()
-        .flex_1()
-        .min_w(px(COL_NAME_MIN))
-        .min_w_0()
-        .overflow_hidden()
-        .text_size(px(11.0))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(Colors::text_primary())
-        .truncate()
-        .child(label.into())
+/// Row paint resolved once per render. `Colors::composite` is a control-path
+/// helper, so the list builds this before materialising any row.
+#[derive(Clone, Copy)]
+pub struct RowPaint {
+    rest: Rgba,
+    hover: Rgba,
+    selected: Rgba,
+    selected_hover: Rgba,
 }
 
-fn col_vendor_cell(label: impl Into<String>) -> Div {
-    div()
-        .flex_1()
-        .min_w(px(COL_VENDOR_MIN))
-        .min_w_0()
-        .overflow_hidden()
-        .text_size(px(10.5))
-        .text_color(Colors::text_dim())
-        .truncate()
-        .child(label.into())
+impl RowPaint {
+    pub fn resolve() -> Self {
+        let rest = Colors::surface_base();
+        Self {
+            rest,
+            hover: Colors::composite(rest, Colors::state_hover()),
+            selected: Colors::composite(rest, Colors::state_selected()),
+            selected_hover: Colors::composite(rest, Colors::state_selected_hover()),
+        }
+    }
 }
 
-fn col_category_cell(label: impl Into<String>) -> Div {
-    div()
-        .flex_1()
-        .min_w(px(COL_CATEGORY_MIN))
-        .min_w_0()
-        .overflow_hidden()
-        .text_size(px(10.5))
-        .text_color(Colors::text_dim())
-        .truncate()
-        .child(label.into())
-}
-
-fn col_type_cell(kind: PluginKind) -> Div {
-    div()
-        .w(px(COL_TYPE))
-        .flex_shrink_0()
-        .overflow_hidden()
-        .text_size(px(10.5))
-        .text_color(match kind {
-            PluginKind::Instrument => Colors::accent_primary(),
-            PluginKind::Effect => Colors::text_dim(),
-            PluginKind::Unknown => Colors::text_faint(),
-        })
-        .truncate()
-        .child(kind.label())
-}
-
-fn col_format_cell(plugin: &RegistryPlugin) -> Div {
-    div()
-        .w(px(COL_FORMAT))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .justify_end()
-        .child(plugin_format_badge_for(plugin))
-}
-
-/// Column header row — shares the same flex column layout as [`plugin_row`].
+/// Column header row — shares the column metrics of [`plugin_row`].
 pub fn plugin_table_header() -> impl IntoElement {
+    let caption = |label: &'static str| {
+        div()
+            .text_size(px(typography::DENSE_CAPTION))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(Colors::text_faint())
+            .truncate()
+            .child(label)
+    };
     div()
         .w_full()
         .flex()
         .flex_row()
         .items_center()
-        .h(px(26.0))
-        .px(px(10.0))
+        .flex_shrink_0()
+        .h(px(size::ROW_DENSE))
+        .px(px(ROW_PAD_X))
+        .gap(px(COL_GAP))
         .border_b(px(1.0))
         .border_color(Colors::divider())
-        .bg(Colors::surface_input())
-        .gap(px(ROW_GAP))
-        .text_size(px(9.5))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(Colors::text_faint())
-        .child(div().w(px(COL_ICON)).flex_shrink_0())
-        .child(div().w(px(COL_FAVORITE)).flex_shrink_0())
+        .bg(Colors::surface_base())
+        .child(div().w(px(COL_STAR)).flex_shrink_0())
+        .child(div().w(px(COL_KIND)).flex_shrink_0())
         .child(
             div()
                 .flex_1()
                 .min_w(px(COL_NAME_MIN))
-                .min_w_0()
-                .overflow_hidden()
-                .truncate()
-                .child("Plug-in"),
+                .child(caption("Name")),
         )
         .child(
             div()
-                .flex_1()
-                .min_w(px(COL_VENDOR_MIN))
-                .min_w_0()
-                .overflow_hidden()
-                .truncate()
-                .child("Vendor"),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(COL_CATEGORY_MIN))
-                .min_w_0()
-                .overflow_hidden()
-                .truncate()
-                .child("Category"),
-        )
-        .child(
-            div()
-                .w(px(COL_TYPE))
+                .w(px(COL_VENDOR_W))
                 .flex_shrink_0()
-                .overflow_hidden()
-                .truncate()
-                .child("Type"),
+                .child(caption("Vendor")),
         )
         .child(
             div()
-                .w(px(COL_FORMAT))
+                .w(px(COL_CATEGORY_W))
                 .flex_shrink_0()
-                .text_align(gpui::TextAlign::Right)
-                .child("Format"),
+                .child(caption("Category")),
+        )
+        .child(
+            div()
+                .w(px(COL_FORMAT_W))
+                .flex_shrink_0()
+                .flex()
+                .justify_end()
+                .child(caption("Format")),
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn plugin_row(
     list_index: usize,
     plugin: &RegistryPlugin,
     highlighted: bool,
     favorite: bool,
+    paint: RowPaint,
     on_select: StringCb,
     on_pick: StringCb,
     on_toggle_favorite: StringCb,
@@ -174,38 +130,38 @@ pub fn plugin_row(
     let id_select = plugin.id.clone();
     let id_pick = plugin.id.clone();
     let id_fav = plugin.id.clone();
-    let name = plugin.name.clone();
-    let vendor = plugin.vendor.clone();
-    let category = normalized_category_label(plugin);
     let insertable = is_insertable(plugin);
-    let (kind_icon, kind_color) = kind_icon_for(plugin.kind);
     let status = scan_status_label(plugin);
     let drag_item = PluginDragItem {
         plugin_id: plugin.id.clone(),
         label: plugin.name.clone(),
         kind: plugin.kind,
     };
+    let (rest, hover) = if highlighted {
+        (paint.selected, paint.selected_hover)
+    } else {
+        (paint.rest, paint.hover)
+    };
+    let dim = |color: Rgba| {
+        if insertable {
+            color
+        } else {
+            Colors::with_alpha(color, state::DISABLED_CONTENT + 0.2)
+        }
+    };
 
     div()
         .id(("plugin-picker-row", list_index))
+        .relative()
         .w_full()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(ROW_GAP))
+        .gap(px(COL_GAP))
         .h(px(ROW_HEIGHT))
-        .px(px(10.0))
-        .border_b(px(1.0))
-        .border_color(Colors::divider())
-        .when(highlighted, |el| {
-            el.bg(Colors::accent_muted())
-                .border_l(px(2.0))
-                .border_color(Colors::accent_primary())
-        })
-        .when(!highlighted, |el| {
-            el.hover(|s| s.bg(Colors::surface_hover()))
-        })
-        .when(!insertable, |el| el.opacity(0.55))
+        .px(px(ROW_PAD_X))
+        .bg(rest)
+        .hover(move |s| s.bg(hover))
         .when(insertable, |el| {
             el.on_drag(drag_item, move |drag, _offset, _window, cx| {
                 cx.new(|_| crate::components::plugin_picker::PluginDragPreview {
@@ -227,58 +183,154 @@ pub fn plugin_row(
                 on_select(&id_select, window, cx);
             }
         })
+        .when(highlighted, |el| el.child(selection_marker()))
+        .child(favorite_star(
+            list_index,
+            favorite,
+            paint.hover,
+            id_fav,
+            on_toggle_favorite,
+        ))
         .child(
             div()
-                .w(px(COL_ICON))
-                .flex_shrink_0()
-                .child(icon(kind_icon, 12.0, kind_color)),
-        )
-        .child(
-            div()
-                .w(px(COL_FAVORITE))
+                .w(px(COL_KIND))
                 .flex_shrink_0()
                 .flex()
                 .items_center()
-                .justify_center()
-                .cursor(gpui::CursorStyle::PointingHand)
-                .child(icon(
-                    assets::ICON_STAR_PATH,
-                    11.0,
-                    if favorite {
-                        Colors::status_warning()
-                    } else {
-                        Colors::text_faint()
-                    },
-                ))
-                .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
-                    on_toggle_favorite(&id_fav, window, cx);
+                .child(kind_glyph(plugin.kind, insertable)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(COL_NAME_MIN))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::SNUG))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(typography::UI_SM))
+                        .font_weight(if highlighted {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::MEDIUM
+                        })
+                        .text_color(dim(Colors::text_primary()))
+                        .child(plugin.name.clone()),
+                )
+                .when_some(status, |el, label| {
+                    el.child(
+                        div()
+                            .flex_shrink_0()
+                            .child(crate::components::controls::fb_badge(
+                                label,
+                                Colors::status_warning(),
+                            )),
+                    )
                 }),
         )
-        .child(col_name_cell(name))
-        .child(col_vendor_cell(vendor))
-        .child(col_category_cell(category))
-        .child(col_type_cell(plugin.kind))
-        .child(col_format_cell(plugin))
-        .when_some(status, |el, label| {
-            el.child(div().flex_shrink_0().child(status_badge(label, true)))
+        .child(
+            div()
+                .w(px(COL_VENDOR_W))
+                .flex_shrink_0()
+                .truncate()
+                .text_size(px(typography::UI_XS))
+                .text_color(dim(Colors::text_muted()))
+                .child(plugin.vendor.clone()),
+        )
+        .child(
+            div()
+                .w(px(COL_CATEGORY_W))
+                .flex_shrink_0()
+                .truncate()
+                .text_size(px(typography::UI_XS))
+                .text_color(dim(Colors::text_faint()))
+                .child(normalized_category_label(plugin)),
+        )
+        .child(
+            div()
+                .w(px(COL_FORMAT_W))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_end()
+                .child(plugin_format_badge_for(plugin)),
+        )
+}
+
+/// The selected row's leading-edge marker. An overlay, so the row's content
+/// does not shift when it is selected.
+fn selection_marker() -> impl IntoElement {
+    div()
+        .absolute()
+        .left_0()
+        .top(px(space::TIGHT))
+        .bottom(px(space::TIGHT))
+        .w(px(2.0))
+        .rounded(px(radius::PILL))
+        .bg(Colors::accent_primary())
+}
+
+fn favorite_star(
+    list_index: usize,
+    favorite: bool,
+    hover: Rgba,
+    plugin_id: String,
+    on_toggle: StringCb,
+) -> impl IntoElement {
+    let rest = if favorite {
+        Colors::status_warning()
+    } else {
+        Colors::with_alpha(Colors::text_faint(), 0.5)
+    };
+    div()
+        .id(("plugin-picker-star", list_index))
+        .w(px(COL_STAR))
+        .h(px(COL_STAR))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(radius::CONTROL_SM))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover))
+        .tooltip(crate::components::controls::fb_tooltip(if favorite {
+            "Remove from Favorites"
+        } else {
+            "Add to Favorites"
+        }))
+        // Not a row click: starring a plug-in must neither select nor insert it.
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            on_toggle(&plugin_id, window, cx);
         })
+        .child(
+            svg()
+                .path(assets::ICON_STAR_PATH)
+                .w(px(11.0))
+                .h(px(11.0))
+                .text_color(rest),
+        )
 }
 
-fn kind_icon_for(kind: PluginKind) -> (&'static str, gpui::Rgba) {
-    match kind {
+/// Kind glyph. Instruments and effects differ in shape, not only hue; an
+/// undeclared plug-in shares the effect glyph (it inserts as one) but muted, so
+/// "we do not know" never reads as a confirmed classification.
+pub fn kind_glyph(kind: PluginKind, available: bool) -> impl IntoElement {
+    let (path, color) = match kind {
         PluginKind::Instrument => (assets::ICON_MUSIC_PATH, Colors::accent_primary()),
-        PluginKind::Effect => (
-            assets::ICON_SLIDERS_HORIZONTAL_PATH,
-            Colors::status_success(),
-        ),
-        // Same glyph as an effect — that is how it can be inserted — but muted,
-        // so "we do not know" never reads as a confirmed classification.
+        PluginKind::Effect => (assets::ICON_SLIDERS_HORIZONTAL_PATH, Colors::text_muted()),
         PluginKind::Unknown => (assets::ICON_SLIDERS_HORIZONTAL_PATH, Colors::text_faint()),
-    }
-}
-
-fn icon(path: &'static str, size: f32, color: gpui::Rgba) -> impl IntoElement {
-    svg().path(path).w(px(size)).h(px(size)).text_color(color)
+    };
+    let color = if available {
+        color
+    } else {
+        Colors::with_alpha(color, state::DISABLED_CONTENT)
+    };
+    svg().path(path).w(px(12.0)).h(px(12.0)).text_color(color)
 }
 
 pub fn format_badge(fmt: PluginFormat) -> impl IntoElement {
@@ -287,25 +339,6 @@ pub fn format_badge(fmt: PluginFormat) -> impl IntoElement {
 
 pub fn format_badge_for(plugin: &RegistryPlugin) -> impl IntoElement {
     plugin_format_badge_for(plugin)
-}
-
-fn status_badge(label: &'static str, tone_warn: bool) -> impl IntoElement {
-    let (fg, bg) = if tone_warn {
-        (Colors::status_warning(), gpui::rgba(0xE5C07B14))
-    } else {
-        (Colors::status_success(), gpui::rgba(0x6FCF9714))
-    };
-    div()
-        .px(px(5.0))
-        .py(px(1.0))
-        .rounded(px(crate::theme::radius::CONTROL))
-        .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(bg)
-        .text_size(px(9.0))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(fg)
-        .child(label)
 }
 
 pub fn scan_status_label(plugin: &RegistryPlugin) -> Option<&'static str> {
@@ -326,75 +359,51 @@ pub fn scan_status_label(plugin: &RegistryPlugin) -> Option<&'static str> {
     }
 }
 
-pub fn skeleton_row(index: usize) -> impl IntoElement {
-    let block = |w: f32, alpha: f32| {
+fn skeleton_row(index: usize) -> impl IntoElement {
+    let alpha = 0.05 + ((index % 3) as f32) * 0.015;
+    let block = move |w: f32| {
         div()
-            .h(px(10.0))
+            .h(px(8.0))
             .w(px(w))
-            .rounded(px(crate::theme::radius::CONTROL))
+            .rounded(px(radius::MICRO))
             .bg(Colors::with_alpha(Colors::text_primary(), alpha))
     };
-    let alpha = 0.06 + ((index % 3) as f32) * 0.015;
     div()
         .w_full()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(ROW_GAP))
+        .gap(px(COL_GAP))
         .h(px(ROW_HEIGHT))
-        .px(px(10.0))
-        .border_b(px(1.0))
-        .border_color(Colors::divider())
-        .child(
-            div().w(px(COL_ICON)).flex_shrink_0().child(
-                div()
-                    .w(px(12.0))
-                    .h(px(12.0))
-                    .rounded(px(crate::theme::radius::CONTROL))
-                    .bg(Colors::with_alpha(Colors::text_primary(), alpha)),
-            ),
-        )
-        .child(div().w(px(COL_FAVORITE)).flex_shrink_0())
+        .px(px(ROW_PAD_X))
+        .child(div().w(px(COL_STAR)).flex_shrink_0())
+        .child(div().w(px(COL_KIND)).flex_shrink_0().child(block(12.0)))
         .child(
             div()
                 .flex_1()
                 .min_w(px(COL_NAME_MIN))
-                .min_w_0()
-                .child(block(140.0 + (index % 4) as f32 * 20.0, alpha)),
+                .child(block(120.0 + (index % 4) as f32 * 24.0)),
         )
+        .child(div().w(px(COL_VENDOR_W)).flex_shrink_0().child(block(96.0)))
         .child(
             div()
-                .flex_1()
-                .min_w(px(COL_VENDOR_MIN))
-                .min_w_0()
-                .child(block(110.0, alpha)),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(COL_CATEGORY_MIN))
-                .min_w_0()
-                .child(block(80.0, alpha)),
-        )
-        .child(
-            div()
-                .w(px(COL_TYPE))
+                .w(px(COL_CATEGORY_W))
                 .flex_shrink_0()
-                .child(block(58.0, alpha)),
+                .child(block(64.0)),
         )
         .child(
             div()
-                .w(px(COL_FORMAT))
+                .w(px(COL_FORMAT_W))
                 .flex_shrink_0()
                 .flex()
                 .justify_end()
-                .child(block(36.0, alpha)),
+                .child(block(32.0)),
         )
 }
 
-pub fn skeleton_body() -> impl IntoElement {
+pub fn skeleton_body() -> Div {
     let mut col = div().flex().flex_col().w_full();
-    for i in 0..14 {
+    for i in 0..16 {
         col = col.child(skeleton_row(i));
     }
     col

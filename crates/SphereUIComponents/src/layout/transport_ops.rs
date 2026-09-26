@@ -560,7 +560,10 @@ impl StudioLayout {
             Arc::new(move |bpm: &f32, _window: &mut Window, cx: &mut gpui::App| {
                 let bpm = bpm.clamp(components::BPM_MIN, components::BPM_MAX);
                 let _ = this.update(cx, |this, cx| {
+                    // One step, the way the drag's release records one.
+                    let prev = this.capture_tempo_state(cx);
                     this.set_native_bpm(bpm, cx);
+                    this.record_tempo_edit("Set Tempo", prev, cx);
                 });
             })
         };

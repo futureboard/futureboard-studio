@@ -4,7 +4,7 @@
   "label": "FL Studio",
   "description": "Shortcuts aligned with FL Studio defaults where commands overlap.",
   "sourceMenuVersion": 1,
-  "generatedAt": "2026-09-20T06:00:01.116Z",
+  "generatedAt": "2026-09-26T12:19:33.389Z",
   "bindings": {
     "project:new": "Ctrl+N",
     "project:open": "Ctrl+O",

@@ -634,6 +634,36 @@ mod default_binding_tests {
         );
     }
 
+    /// The arrangement tools sit on the number row in toolbar order, and no
+    /// other command on the default map answers to those keys.
+    #[test]
+    fn default_profile_puts_tools_on_the_number_row() {
+        let manager = KeymapManager::new(std::env::temp_dir());
+        let reverse = manager.dispatch_reverse();
+        for (key, command) in [
+            ("1", "tools:select-pointer"),
+            ("2", "tools:select-pen"),
+            ("3", "tools:select-cut"),
+            ("4", "tools:select-glue"),
+            ("5", "tools:select-mute"),
+            ("6", "tools:select-time"),
+            ("7", "tools:select-automation"),
+        ] {
+            assert_eq!(
+                reverse.get(key).map(String::as_str),
+                Some(command),
+                "{key} selects {command}"
+            );
+            assert!(
+                !manager
+                    .rows()
+                    .iter()
+                    .any(|row| row.action_id == command && row.is_conflict),
+                "{command} on {key} must not conflict"
+            );
+        }
+    }
+
     /// Non-default built-in profiles inherit the default map: a DAW profile only
     /// ships the accelerators it re-maps, so commands it does not mention must
     /// still resolve from the default base. Regression guard for the bug where

@@ -183,6 +183,7 @@ impl Timeline {
         }
         // Restores before the blanket reset drops the snapshot it needs.
         self.cancel_marquee(cx);
+        self.cancel_automation_gesture();
         self.cancel_marker_track_interaction(cx);
         self.reset_input_state();
         self.song_text_drag_cancelled = true;
@@ -380,7 +381,168 @@ impl Timeline {
         self.clip_process_origin = None;
         let impact = cmd.impact();
         cmd.execute(&mut self.state);
+        self.apply_history_limit(cx);
         self.edit_history.push(cmd);
+        self.notify_edit_impact(impact, cx);
+        cx.notify();
+    }
+
+    /// Keep as many steps as Preferences → Editing → Max Undo Steps says.
+    /// Read on every push, so a changed setting applies from the next edit
+    /// without a restart; without a settings model (tests) the history keeps
+    /// the limit it was built with.
+    fn apply_history_limit(&mut self, cx: &gpui::App) {
+        let Some(steps) = cx
+            .try_global::<crate::settings::GlobalSettingsModel>()
+            .map(|g| g.0.read(cx).current.editing.history.max_undo_steps)
+        else {
+            return;
+        };
+        // The range the Preferences stepper offers; a hand-edited settings
+        // file does not get an unbounded history.
+        let steps = steps.clamp(10, 500) as usize;
+        if self.edit_history.max_steps() != steps {
+            self.edit_history.set_max_steps(steps);
+        }
+    }
+
+    /// The command the next undo (`undoing`) or redo will step.
+    pub fn next_history_step(&self, undoing: bool) -> Option<&EditCommand> {
+        self.edit_history.next_step(undoing)
+    }
+
+    /// Mutable access to the command the next undo or redo will step, for an
+    /// owner that has to prepare it (live plug-in state) before it runs.
+    pub fn next_history_step_mut(&mut self, undoing: bool) -> Option<&mut EditCommand> {
+        self.edit_history.next_step_mut(undoing)
+    }
+
+    /// What Undo and Redo would do now, as the Edit menu names them.
+    pub fn history_labels(&self) -> (Option<&'static str>, Option<&'static str>) {
+        (
+            self.edit_history.undo_label(),
+            self.edit_history.redo_label(),
+        )
+    }
+
+    /// Record a fader or pan value the caller has already applied live (see
+    /// `EditHistory::push_mixer_value`). No-op when the value did not move.
+    pub fn record_mixer_value(&mut self, cmd: EditCommand, cx: &mut gpui::Context<Self>) {
+        let moved = match &cmd {
+            EditCommand::SetTrackVolume { prev, next, .. }
+            | EditCommand::SetTrackPan { prev, next, .. } => (prev - next).abs() > 1.0e-5,
+            _ => true,
+        };
+        if !moved {
+            return;
+        }
+        self.clip_process_origin = None;
+        self.apply_history_limit(cx);
+        self.edit_history.push_mixer_value(cmd);
+        cx.notify();
+    }
+
+    /// Import an audio file onto the selected track, or a new one, as one
+    /// undo step (the clip, and the track made for it). Returns the clip id.
+    pub fn import_audio_to_selected_or_new_track_recorded(
+        &mut self,
+        source_path: String,
+        clip_name: String,
+        cx: &mut gpui::Context<Self>,
+    ) -> String {
+        let mut scope = self.state.selection.selected_track_ids.clone();
+        if let Some(primary) = self.state.selection.selected_track_id.clone() {
+            if !scope.contains(&primary) {
+                scope.push(primary);
+            }
+        }
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::tracks(scope),
+        );
+        let clip_id = self
+            .state
+            .import_audio_to_selected_or_new_track(source_path, clip_name);
+        self.commit_track_edit("Import Audio", edit, false, cx);
+        clip_id
+    }
+
+    /// Record an import that has already placed `clip_ids`, opened with
+    /// `edit` (on the track list) before it ran. A track the import created
+    /// comes and goes with its clips as one step; clips that landed on
+    /// tracks that were already there are recorded as created clips.
+    fn record_clip_import(
+        &mut self,
+        label: &'static str,
+        edit: crate::components::timeline::timeline_state::PendingTrackEdit,
+        clip_ids: &[String],
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let existing: Vec<(String, ClipState)> = clip_ids
+            .iter()
+            .filter_map(|id| ClipSnapshot::capture(&self.state, id))
+            .filter(|snapshot| edit.before.order.contains(&snapshot.track_id))
+            .map(|snapshot| (snapshot.track_id, snapshot.clip))
+            .collect();
+        match existing.len() {
+            0 => {}
+            1 => {
+                let (track_id, clip) = existing.into_iter().next().expect("one clip");
+                self.record_executed_command(EditCommand::CreateClip { track_id, clip }, cx);
+            }
+            _ => {
+                self.record_executed_command(EditCommand::BatchCreateClips { clips: existing }, cx)
+            }
+        }
+        self.commit_track_edit(label, edit, false, cx);
+    }
+
+    /// Open a track edit: capture what `scope` covers before the action runs.
+    /// Pair with [`Self::commit_track_edit`].
+    pub fn begin_track_edit(
+        &self,
+        scope: crate::components::timeline::timeline_state::TrackEditScope,
+    ) -> crate::components::timeline::timeline_state::PendingTrackEdit {
+        let before = self.state.capture_track_edit(&scope);
+        crate::components::timeline::timeline_state::PendingTrackEdit { scope, before }
+    }
+
+    /// Record the action since [`Self::begin_track_edit`] as one undo step,
+    /// or nothing when it changed nothing. The action has already applied
+    /// its effect — live, the way it always did — so recording propagates
+    /// nothing; only undo and redo do. `fold` joins it onto the previous step
+    /// when that is the same gesture (see `EditHistory::push_track_edit`).
+    pub fn commit_track_edit(
+        &mut self,
+        label: &'static str,
+        pending: crate::components::timeline::timeline_state::PendingTrackEdit,
+        fold: bool,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let Some((prev, next)) = self.state.finish_track_edit(&pending.scope, pending.before)
+        else {
+            return false;
+        };
+        self.clip_process_origin = None;
+        self.apply_history_limit(cx);
+        self.edit_history.push_track_edit(
+            EditCommand::SetTracks {
+                label,
+                prev: Box::new(prev),
+                next: Box::new(next),
+            },
+            fold,
+        );
+        cx.notify();
+        true
+    }
+
+    /// Record an already-applied [`EditCommand::SetInsertState`], folded into
+    /// the previous step when that was the same change to the same insert.
+    pub fn record_insert_state_command(&mut self, cmd: EditCommand, cx: &mut gpui::Context<Self>) {
+        self.clip_process_origin = None;
+        let impact = cmd.impact();
+        self.apply_history_limit(cx);
+        self.edit_history.push_insert_state(cmd);
         self.notify_edit_impact(impact, cx);
         cx.notify();
     }
@@ -404,6 +566,7 @@ impl Timeline {
     pub fn run_metadata_edit_command(&mut self, cmd: EditCommand, cx: &mut gpui::Context<Self>) {
         debug_assert!(cmd.is_metadata_only());
         cmd.execute(&mut self.state);
+        self.apply_history_limit(cx);
         self.edit_history.push(cmd);
         self.mark_control_state_changed(cx);
         cx.notify();
@@ -443,6 +606,7 @@ impl Timeline {
         // its stale "before" to the next one.
         self.clip_process_origin = None;
         let impact = cmd.impact();
+        self.apply_history_limit(cx);
         self.edit_history.push(cmd);
         self.notify_edit_impact(impact, cx);
         cx.notify();
@@ -454,6 +618,7 @@ impl Timeline {
     pub fn record_pass_command(&mut self, cmd: EditCommand, cx: &mut gpui::Context<Self>) {
         self.clip_process_origin = None;
         let impact = cmd.impact();
+        self.apply_history_limit(cx);
         self.edit_history.push_record_pass(cmd);
         self.notify_edit_impact(impact, cx);
         cx.notify();
@@ -2316,15 +2481,27 @@ impl Timeline {
             .state
             .automation_point_at(track_id, &lane_id, beat, value, beat_tol, value_tol)
         {
-            // Select (UI-only) and begin a move drag.
-            self.state
-                .select_automation_point(track_id, &lane_id, point_id, additive);
+            // A press on a point that is already part of a selection keeps the
+            // selection, so the whole group can be dragged — collapsing it here
+            // threw away every marquee the moment a point was grabbed. A click
+            // that never moves narrows to the point on release instead.
+            let selected = self.state.selected_automation_point_ids(track_id, &lane_id);
+            let in_selection = selected.contains(&point_id);
+            let narrow_on_click = in_selection && !additive && selected.len() > 1;
+            if !(in_selection && !additive) {
+                self.state
+                    .select_automation_point(track_id, &lane_id, point_id, additive);
+            }
+            let group = self.state.selected_automation_points(track_id, &lane_id);
             self.automation_drag = Some(AutomationPointDrag {
                 track_id: track_id.to_string(),
                 lane_id,
                 point_id,
                 moved: false,
                 undo_before: lanes_before,
+                group,
+                press_value: value,
+                narrow_on_click,
             });
             cx.notify();
             return;
@@ -2387,8 +2564,15 @@ impl Timeline {
             }
         }
 
+        // Ctrl/Shift+drag marquees in the drawing tools too: those tools'
+        // plain press draws a point, so the modifier is what asks for a
+        // selection instead.
+        let draws = matches!(
+            self.state.active_tool,
+            TimelineTool::Pen | TimelineTool::Automation
+        );
         match self.state.active_tool {
-            TimelineTool::Pen | TimelineTool::Automation => {
+            TimelineTool::Pen | TimelineTool::Automation if !(draws && additive) => {
                 // Add a point and begin dragging it. The commit happens once on
                 // release (moved=true), so a plain click still persists the add.
                 if !additive {
@@ -2406,15 +2590,20 @@ impl Timeline {
                         point_id,
                         moved: true,
                         undo_before: lanes_before,
+                        group: vec![(point_id, beat, value)],
+                        press_value: value,
+                        narrow_on_click: false,
                     });
                 }
                 cx.notify();
             }
             _ => {
-                // Pointer (and other tools): rubber-band marquee selection.
-                if !additive {
-                    self.state.clear_automation_selection(track_id);
-                }
+                // Pointer (and the drawing tools with a modifier): rubber-band
+                // marquee. Nothing changes until the pointer has moved past the
+                // threshold — a plain click deselects on release instead — so
+                // grabbing the lane to start a marquee never wipes a selection
+                // the user then meant to extend.
+                let before = self.state.selected_automation_point_ids(track_id, &lane_id);
                 self.automation_marquee = Some(AutomationMarquee {
                     track_id: track_id.to_string(),
                     lane_id,
@@ -2423,6 +2612,8 @@ impl Timeline {
                     cur_beat: beat,
                     cur_value: value,
                     additive,
+                    started: false,
+                    before,
                 });
                 cx.notify();
             }
@@ -2442,13 +2633,16 @@ impl Timeline {
             let beat = self.snap_beat(self.beat_from_window_x(window_x)).max(0.0);
             let value =
                 self.automation_value_from_window_y(&drag.track_id, &drag.lane_id, window_y);
-            self.state.move_automation_point(
-                &drag.track_id,
-                &drag.lane_id,
+            // The pressed point follows the snapped cursor in time; the rest of
+            // the group keeps its spacing, and values move by the drag's delta.
+            let moves = crate::components::timeline::timeline_state::automation_group_moves(
+                &drag.group,
                 drag.point_id,
                 beat,
-                value,
+                value - drag.press_value,
             );
+            self.state
+                .move_automation_points(&drag.track_id, &drag.lane_id, &moves);
             if let Some(d) = self.automation_drag.as_mut() {
                 d.moved = true;
             }
@@ -2483,10 +2677,30 @@ impl Timeline {
             return true;
         }
         if let Some(mut m) = self.automation_marquee.clone() {
+            use crate::components::timeline::timeline_state::{
+                AUTOMATION_LANE_PAD, AUTOMATION_MARQUEE_THRESHOLD_PX, AUTOMATION_SUBLANE_HEIGHT,
+            };
             let beat = self.beat_from_window_x(window_x).max(0.0);
             let value = self.automation_value_from_window_y(&m.track_id, &m.lane_id, window_y);
             m.cur_beat = beat;
             m.cur_value = value;
+            if !m.started {
+                let ppb = self.state.viewport.pixels_per_beat.max(1.0);
+                let usable = (AUTOMATION_SUBLANE_HEIGHT - 2.0 * AUTOMATION_LANE_PAD).max(1.0);
+                let dx = (beat - m.start_beat).abs() * ppb;
+                let dy = (value - m.start_value).abs() * usable;
+                if dx.hypot(dy) < AUTOMATION_MARQUEE_THRESHOLD_PX {
+                    self.automation_marquee = Some(m);
+                    return true;
+                }
+                m.started = true;
+                // A fresh (non-additive) marquee replaces the selection on the
+                // whole track, the way a click on empty space would.
+                if !m.additive {
+                    self.state.clear_automation_selection(&m.track_id);
+                }
+            }
+            let keep: &[u64] = if m.additive { &m.before } else { &[] };
             self.state.marquee_select_automation(
                 &m.track_id,
                 &m.lane_id,
@@ -2494,7 +2708,7 @@ impl Timeline {
                 beat,
                 m.start_value,
                 value,
-                m.additive,
+                keep,
             );
             self.automation_marquee = Some(m);
             cx.notify();
@@ -2514,6 +2728,12 @@ impl Timeline {
                 // live, so record the already-applied result rather than
                 // re-executing it.
                 self.record_automation_lanes_edit(&drag.track_id, drag.undo_before, cx);
+            } else if drag.narrow_on_click {
+                self.state.set_automation_selection(
+                    &drag.track_id,
+                    &drag.lane_id,
+                    &[drag.point_id],
+                );
             }
             handled = true;
         }
@@ -2528,13 +2748,51 @@ impl Timeline {
             }
             handled = true;
         }
-        if self.automation_marquee.take().is_some() {
+        if let Some(marquee) = self.automation_marquee.take() {
+            // A press that never became a marquee was a click on empty lane
+            // space, which deselects — unless it was an additive click.
+            if !marquee.started && !marquee.additive {
+                self.state.clear_automation_selection(&marquee.track_id);
+            }
             handled = true;
         }
         if handled {
             cx.notify();
         }
         handled
+    }
+
+    /// Escape during an automation gesture: put back what the gesture changed.
+    ///
+    /// A point or curve drag mutates the lane live, so dropping the gesture
+    /// without this left the points where they were dragged to, with no undo
+    /// step to take them back. A marquee restores the selection it started
+    /// from.
+    pub(super) fn cancel_automation_gesture(&mut self) {
+        if let Some(drag) = self.automation_drag.take() {
+            if drag.moved {
+                self.state
+                    .set_track_automation_lanes(&drag.track_id, drag.undo_before);
+            }
+        }
+        if let Some(drag) = self.automation_curve_drag.take() {
+            if drag.changed {
+                self.state
+                    .set_track_automation_lanes(&drag.track_id, drag.undo_before);
+            }
+        }
+        if let Some(marquee) = self.automation_marquee.take() {
+            if marquee.started {
+                if !marquee.additive {
+                    self.state.clear_automation_selection(&marquee.track_id);
+                }
+                self.state.set_automation_selection(
+                    &marquee.track_id,
+                    &marquee.lane_id,
+                    &marquee.before,
+                );
+            }
+        }
     }
 
     /// Update the hovered automation point / segment for `(track, lane)` from a
@@ -3220,9 +3478,13 @@ impl Timeline {
 
         let (drop_x, drop_y) = self.drop_position_or_new_track(force_new_track);
 
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::track_list(),
+        );
         let clip_id = self
             .state
             .import_audio_at(path_key.clone(), clip_name, drop_x, drop_y);
+        self.record_clip_import("Import Audio", edit, std::slice::from_ref(&clip_id), cx);
         self.mark_project_changed(cx);
         self.mark_media_changed(cx);
         super::super::audio_import::spawn_timeline_import(
@@ -3261,7 +3523,11 @@ impl Timeline {
             .unwrap_or_else(|| "Reference Video".to_string());
 
         let (drop_x, _drop_y) = self.drop_position_or_new_track(false);
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::track_list(),
+        );
         let clip_id = self.state.import_video_at(path_key, clip_name, drop_x);
+        self.record_clip_import("Import Video", edit, std::slice::from_ref(&clip_id), cx);
         self.mark_project_changed(cx);
         self.mark_media_changed(cx);
         self.spawn_video_duration_probe(path.to_path_buf(), clip_id, cx);
@@ -3385,10 +3651,16 @@ impl Timeline {
     ) -> bool {
         super::super::midi_import::apply_import_options(&mut imported_tracks, options);
         let clip_name = midi_import_display_name(path);
+        // The tracks and markers the file brings, and its clips, are one step.
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::track_list()
+                .with_markers(),
+        );
         let clips = self
             .state
             .import_midi_tracks_at(clip_name, imported_tracks, drop_x, drop_y);
         if clips.is_empty() {
+            self.commit_track_edit("Import MIDI", edit, false, cx);
             return false;
         }
         if crate::components::timeline::timeline_state::midi_debug_enabled() {
@@ -3408,12 +3680,24 @@ impl Timeline {
                 note_count,
             );
         }
-        if clips.len() == 1 {
-            let (track_id, clip) = clips.into_iter().next().expect("single imported clip");
-            self.run_edit_command(EditCommand::CreateClip { track_id, clip }, cx);
-        } else {
-            self.run_edit_command(EditCommand::BatchCreateClips { clips }, cx);
+        // Clips on tracks the import made go in with those tracks; clips on
+        // tracks that were already there are a clip step of their own.
+        let (on_new_tracks, on_existing): (Vec<_>, Vec<_>) = clips
+            .into_iter()
+            .partition(|(track_id, _)| !edit.before.order.contains(track_id));
+        for (track_id, clip) in on_new_tracks {
+            EditCommand::CreateClip { track_id, clip }.execute(&mut self.state);
         }
+        match on_existing.len() {
+            0 => self.mark_project_changed(cx),
+            1 => {
+                let (track_id, clip) = on_existing.into_iter().next().expect("one clip");
+                self.run_edit_command(EditCommand::CreateClip { track_id, clip }, cx);
+            }
+            _ => self.run_edit_command(EditCommand::BatchCreateClips { clips: on_existing }, cx),
+        }
+        self.commit_track_edit("Import MIDI", edit, false, cx);
+        cx.notify();
         true
     }
 

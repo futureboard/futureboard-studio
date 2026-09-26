@@ -261,6 +261,11 @@ impl AraEditorHost {
     /// is destroyed — destroying a parent out from under a live `IPlugView` is
     /// exactly what `DESIGN.md` forbids.
     pub fn detach(&mut self) {
+        if let Some(content) = self.content.as_ref() {
+            crate::components::plugin_content_host::unregister_key_sink(dock_surface_handle(
+                content,
+            ));
+        }
         if let Some((_, processor)) = self.attached.take() {
             processor.view_detach();
         }
@@ -445,6 +450,13 @@ impl AraEditorHost {
                 "perform_sync: view attached preferred={}x{} granted={}x{}",
                 preferred.0, preferred.1, granted.0, granted.1
             ));
+            // Keys pressed inside the view reach the plug-in through the host,
+            // the way VST3 expects — see `plugin_content_host::KEY_SINKS`.
+            let sink_processor = processor.clone();
+            crate::components::plugin_content_host::register_key_sink(
+                dock_surface_handle(&content),
+                Rc::new(move |key, modifiers| sink_processor.view_key(key, 0, modifiers)),
+            );
             self.content = Some(content);
             self.last_rect = Some(rect);
             self.pending_view_resize = None;

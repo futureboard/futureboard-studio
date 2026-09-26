@@ -1112,7 +1112,8 @@ fn send_drop_target(
         element,
         key,
         indicator,
-        move |drag| {
+        // Sends have no copy gesture.
+        move |drag, _copy| {
             if drag.track_id != list_track {
                 return None;
             }

@@ -28,7 +28,7 @@ use crate::components::text_input::{
     TextInputCallbacks, TextInputState, text_input_context_entries,
 };
 use crate::components::timeline::timeline::TimelineContextTarget;
-use crate::components::timeline::timeline_state::{ClipType, TempoCurve};
+use crate::components::timeline::timeline_state::{ClipType, TempoCurve, TrackEditScope};
 use crate::components::{BackgroundTaskStore, CommandPaletteState};
 use crate::overlay::{project_title_anchor, titlebar_label_anchor};
 use crate::paths::FutureboardPaths;
@@ -56,6 +56,7 @@ mod engine_snapshot_pitch_tests;
 mod export_ops;
 mod frame_diagnostics;
 mod helpers;
+mod history_ops;
 mod input_ops;
 mod inspector_ops;
 mod midi_export_ops;
@@ -84,6 +85,7 @@ mod studio_state;
 mod tempo_key_ops;
 mod tempo_map_ops;
 mod track_clip_ops;
+mod track_duplicate_ops;
 mod transport_freeze_debug;
 mod transport_ops;
 mod video_ops;
@@ -2001,9 +2003,11 @@ impl StudioLayout {
         }
         if let Some(rest) = command_id.strip_prefix("mixer:add-send-to:") {
             if let Some((track_id, target_track_id)) = rest.rsplit_once(':') {
+                let edit = self.begin_track_edit(TrackEditScope::tracks([track_id]), cx);
                 let added = self.timeline.update(cx, |timeline, _cx| {
                     timeline.state.add_send_to_target(track_id, target_track_id)
                 });
+                self.commit_track_edit("Add Send", edit, cx);
                 self.overlay.open_popover = None;
                 if added.is_some() {
                     self.mark_dirty();
@@ -2030,6 +2034,7 @@ impl StudioLayout {
                 cx.notify();
                 return;
             };
+            let edit = self.begin_track_edit(TrackEditScope::tracks([track_id.clone()]), cx);
             let changed = self.timeline.update(cx, |timeline, cx| {
                 let changed = timeline.state.set_track_output_routing(&track_id, output);
                 if changed {
@@ -2037,6 +2042,7 @@ impl StudioLayout {
                 }
                 changed
             });
+            self.commit_track_edit("Set Output", edit, cx);
             self.overlay.open_popover = None;
             if changed {
                 self.mark_dirty();
@@ -2070,9 +2076,12 @@ impl StudioLayout {
             return;
         }
         if let Some(track_id) = command_id.strip_prefix("mixer:create-return-send:") {
+            // The new return and the send to it are one step.
+            let edit = self.begin_track_edit(TrackEditScope::tracks([track_id]), cx);
             let added = self.timeline.update(cx, |timeline, _cx| {
                 timeline.state.create_return_and_send(track_id)
             });
+            self.commit_track_edit("Add Return", edit, cx);
             self.overlay.open_popover = None;
             if added.is_some() {
                 self.mark_dirty();
@@ -2353,8 +2362,7 @@ impl StudioLayout {
                                 .and_then(|n| n.to_str())
                                 .map(|s| s.to_string())
                                 .unwrap_or_else(|| "Imported Audio".to_string());
-                            t.state
-                                .import_audio_to_selected_or_new_track(path_key, name);
+                            t.import_audio_to_selected_or_new_track_recorded(path_key, name, cx);
                             cx.notify();
                         });
                         let _ = layout.update(cx, |this, cx| {
@@ -2765,6 +2773,10 @@ impl StudioLayout {
                 }
             }
             "track:delete" => self.delete_selected_track(cx),
+            "track:duplicate" => self.duplicate_context_track(true, cx),
+            "track:duplicate-no-fx" => self.duplicate_context_track(false, cx),
+            "track:copy-fx-chain" => self.copy_context_fx_chain(cx),
+            "track:paste-fx-chain" => self.paste_context_fx_chain(cx),
             "track:height-small" => self.set_context_track_height_preset(
                 crate::components::timeline::timeline_state::TrackHeightPreset::Small,
                 cx,
@@ -2813,31 +2825,15 @@ impl StudioLayout {
             }
             "automation:toggle-mode" => self.toggle_selected_track_automation_mode(cx),
             "automation:cycle-target" => self.cycle_selected_track_automation_target(cx),
+            // A chain edit undone has to reach the engine, the detached mixer
+            // and the moved insert's editor caches at once, like the action
+            // that made it, and a step that takes plug-ins away or brings
+            // them back has to unload or load them — see `history_ops`.
             "edit:undo" => {
-                // An insert/send chain edit undone has to reach the engine, the
-                // detached mixer and the moved insert's editor caches at once,
-                // like the drop that made it; the project-changed callback
-                // alone only marks the project dirty.
-                let chain_edit = self.timeline.update(cx, |timeline, cx| {
-                    timeline.undo_edit(cx)
-                        && timeline
-                            .last_undone_edit()
-                            .is_some_and(|command| command.is_channel_chain_edit())
-                });
-                if chain_edit {
-                    self.after_channel_chain_edit(cx, "undo_channel_chain");
-                }
+                self.undo_or_redo(true, cx);
             }
             "edit:redo" => {
-                let chain_edit = self.timeline.update(cx, |timeline, cx| {
-                    timeline.redo_edit(cx)
-                        && timeline
-                            .last_redone_edit()
-                            .is_some_and(|command| command.is_channel_chain_edit())
-                });
-                if chain_edit {
-                    self.after_channel_chain_edit(cx, "redo_channel_chain");
-                }
+                self.undo_or_redo(false, cx);
             }
             "edit:duplicate" | "clip:duplicate" => self.duplicate_selected_clip(cx),
             "clip:rename" => {

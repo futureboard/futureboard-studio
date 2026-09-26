@@ -43,6 +43,8 @@ mod tempo;
 mod time_display;
 mod time_signature;
 mod track;
+mod track_clone;
+mod track_edit;
 mod track_row_layout;
 mod video;
 mod viewport;
@@ -92,6 +94,8 @@ pub use tempo::*;
 pub use time_display::*;
 pub use time_signature::*;
 pub use track::*;
+pub use track_clone::*;
+pub use track_edit::*;
 pub use track_row_layout::*;
 pub use viewport::*;
 

@@ -7,7 +7,7 @@ use gpui::{
 };
 
 use crate::components::plugin_picker::{
-    CatalogStatus, PickerFilter, PluginPickerCallbacks, PluginPickerPrefs,
+    CatalogStatus, KindTab, PickerFilter, PluginPickerCallbacks, PluginPickerPrefs,
     PluginPickerScrollHandles, PluginPickerState, PluginSearchIndex, compute_filter_result,
     ensure_default_highlight, picker_perf_debug, plugin_picker_panel,
 };
@@ -226,6 +226,45 @@ impl Render for InsertPickerWindow {
                                 &layout.plugin_picker_prefs,
                             );
                         }
+                        cx.notify();
+                        layout.insert_picker_snapshot()
+                    });
+                    let _ = target.update(cx, |this, cx| {
+                        this.set_snapshot(snapshot);
+                        cx.notify();
+                    });
+                }
+            }),
+            on_select_kind: Arc::new({
+                let owner = self.owner.clone();
+                let target = target.clone();
+                move |kind: &KindTab, _w, cx| {
+                    let kind = *kind;
+                    let snapshot = owner.update(cx, |layout, cx| {
+                        layout.plugin_picker.set_kind_tab(kind);
+                        if let Some(index) = layout.plugin_search_index.as_ref() {
+                            ensure_default_highlight(
+                                &mut layout.plugin_picker,
+                                index,
+                                &layout.plugin_picker_prefs,
+                            );
+                        }
+                        cx.notify();
+                        layout.insert_picker_snapshot()
+                    });
+                    let _ = target.update(cx, |this, cx| {
+                        this.set_snapshot(snapshot);
+                        cx.notify();
+                    });
+                }
+            }),
+            on_toggle_vendors: Arc::new({
+                let owner = self.owner.clone();
+                let target = target.clone();
+                move |_: &(), _w, cx| {
+                    let snapshot = owner.update(cx, |layout, cx| {
+                        layout.plugin_picker.vendors_expanded =
+                            !layout.plugin_picker.vendors_expanded;
                         cx.notify();
                         layout.insert_picker_snapshot()
                     });

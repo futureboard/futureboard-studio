@@ -15,7 +15,7 @@ use crate::components::timeline::timeline::{
     track_rename_command_policy, TrackRenameChord, TrackRenameCommandPolicy, TrackRenameKeyOutcome,
 };
 use crate::components::timeline::timeline_state::{
-    is_project_routing_track, ClipType, TempoCurve, TrackTimebase, TrackType,
+    is_project_routing_track, ClipType, TempoCurve, TrackEditScope, TrackTimebase, TrackType,
 };
 use crate::i18n::I18n;
 
@@ -671,8 +671,9 @@ impl StudioLayout {
                                     .and_then(|n| n.to_str())
                                     .map(|s| s.to_string())
                                     .unwrap_or_else(|| "Imported Audio".to_string());
-                                t.state
-                                    .import_audio_to_selected_or_new_track(path_key, name);
+                                t.import_audio_to_selected_or_new_track_recorded(
+                                    path_key, name, cx,
+                                );
                                 cx.notify();
                             });
                             let _ = layout.update(cx, |this, cx| {
@@ -1108,9 +1109,12 @@ impl StudioLayout {
         }
         let new_name = self.inspector_name_edit.name_input.value.clone();
         let written = self.timeline.update(cx, |t, cx| {
+            let edit = t.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
             if !t.state.rename_track(&track_id, &new_name) {
                 return None;
             }
+            // The field commits as it is typed in: one rename, one step.
+            t.commit_track_edit("Rename Track", edit, true, cx);
             cx.notify();
             t.state
                 .find_track(&track_id)
@@ -1135,8 +1139,16 @@ impl StudioLayout {
         };
         let new_name = self.inspector_name_edit.clip_name_input.value.clone();
         let changed = self.timeline.update(cx, |t, cx| {
+            let owner = t
+                .state
+                .tracks
+                .iter()
+                .find(|track| track.clips.iter().any(|clip| clip.id == clip_id))
+                .map(|track| track.id.clone());
+            let edit = t.begin_track_edit(TrackEditScope::tracks(owner));
             let changed = t.state.rename_clip(&clip_id, &new_name);
             if changed {
+                t.commit_track_edit("Rename Clip", edit, true, cx);
                 cx.notify();
             }
             changed
@@ -1249,6 +1261,11 @@ impl StudioLayout {
             return;
         };
         let changed = self.timeline.update(cx, |t, cx| {
+            let mut scope = t.state.selection.selected_track_ids.clone();
+            if !scope.contains(&track_id) {
+                scope.push(track_id.clone());
+            }
+            let edit = t.begin_track_edit(TrackEditScope::tracks(scope));
             let mut changed = t.state.set_track_color(&track_id, color);
             if t.state.is_track_selected(&track_id)
                 && t.state.selection.selected_track_ids.len() > 1
@@ -1261,6 +1278,8 @@ impl StudioLayout {
                 }
             }
             if changed {
+                // Every drag sample and hex keystroke lands here: one step.
+                t.commit_track_edit("Track Color", edit, true, cx);
                 cx.notify();
             }
             changed
@@ -1540,9 +1559,13 @@ impl StudioLayout {
             ContextTarget::Track(track_id) => {
                 let track = self.timeline.read(cx).state.find_track(track_id).cloned();
                 let exists = track.is_some();
-                let mut entries = vec![
-                    menu_item_enabled(i18n.tr("context.track.rename"), "track:rename", exists),
-                    menu_item_enabled(i18n.tr("context.track.duplicate"), "track:duplicate", false),
+                let mut entries = vec![menu_item_enabled(
+                    i18n.tr("context.track.rename"),
+                    "track:rename",
+                    exists,
+                )];
+                entries.extend(self.track_copy_menu_entries(track_id, cx));
+                entries.extend([
                     danger_menu_item_enabled(
                         i18n.tr("context.track.delete"),
                         "track:delete",
@@ -1559,7 +1582,7 @@ impl StudioLayout {
                     menu_item_enabled("Huge", "track:height-huge", exists),
                     menu_item_enabled("Reset Track Height", "track:height-reset", exists),
                     menu_item_enabled("Reset All Track Heights", "track:height-reset-all", exists),
-                ];
+                ]);
                 // Timebase — what this track's clips hold onto when the tempo
                 // moves. Only offered where there are clips to hold: a Bus,
                 // Return or Group owns none, so the setting would have nothing
@@ -1737,18 +1760,28 @@ impl StudioLayout {
                 }
                 entries
             }
-            ContextTarget::Mixer(_) => vec![
-                ContextMenuEntry::item("Add Bus", "mixer:create-bus"),
-                ContextMenuEntry::Separator,
-                ContextMenuEntry::item(i18n.tr("context.mixer.reset-volume"), "mixer:reset-volume"),
-                ContextMenuEntry::item(i18n.tr("context.mixer.reset-pan"), "mixer:reset-pan"),
-                ContextMenuEntry::Separator,
-                ContextMenuEntry::item(i18n.tr("context.track.mute"), "track:mute"),
-                ContextMenuEntry::item(i18n.tr("context.track.solo"), "track:solo"),
-                ContextMenuEntry::Separator,
-                ContextMenuEntry::item("Track Color", "track:color"),
-                ContextMenuEntry::danger_item(i18n.tr("context.track.delete"), "track:delete"),
-            ],
+            ContextTarget::Mixer(track_id) => {
+                let mut entries = vec![
+                    ContextMenuEntry::item("Add Bus", "mixer:create-bus"),
+                    ContextMenuEntry::Separator,
+                    ContextMenuEntry::item(
+                        i18n.tr("context.mixer.reset-volume"),
+                        "mixer:reset-volume",
+                    ),
+                    ContextMenuEntry::item(i18n.tr("context.mixer.reset-pan"), "mixer:reset-pan"),
+                    ContextMenuEntry::Separator,
+                    ContextMenuEntry::item(i18n.tr("context.track.mute"), "track:mute"),
+                    ContextMenuEntry::item(i18n.tr("context.track.solo"), "track:solo"),
+                    ContextMenuEntry::Separator,
+                    ContextMenuEntry::item("Track Color", "track:color"),
+                ];
+                entries.extend(self.track_copy_menu_entries(track_id, cx));
+                entries.push(ContextMenuEntry::danger_item(
+                    i18n.tr("context.track.delete"),
+                    "track:delete",
+                ));
+                entries
+            }
             ContextTarget::SendPicker { track_id } => {
                 let state = &self.timeline.read(cx).state;
                 let Some(source) = state.find_track(track_id) else {

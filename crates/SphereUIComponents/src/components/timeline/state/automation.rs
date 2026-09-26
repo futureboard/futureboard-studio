@@ -21,6 +21,16 @@ pub struct AutomationPointDrag {
     /// Lane snapshot taken before the gesture, so the whole drag collapses into
     /// one undo entry rather than one per frame (or none at all).
     pub undo_before: Vec<AutomationLaneState>,
+    /// Every point the drag carries, as `(id, beat, value)` at the press. A
+    /// press on a point of a selection moves the whole selection; the pressed
+    /// point is always among them.
+    pub group: Vec<(u64, f32, f32)>,
+    /// Cursor value at the press. The group moves by the value delta from
+    /// here, so nothing jumps to the cursor when the drag starts.
+    pub press_value: f32,
+    /// The press landed on a point already in a larger selection. A click
+    /// that never moves narrows the selection to that point; a drag keeps it.
+    pub narrow_on_click: bool,
 }
 
 /// In-flight automation curve-tension drag. Shapes one segment by adjusting the
@@ -76,7 +86,53 @@ pub struct AutomationMarquee {
     pub cur_beat: f32,
     pub cur_value: f32,
     pub additive: bool,
+    /// Whether the pointer has moved far enough to be a marquee. Until then
+    /// the press is a click, and neither the selection nor the frame changes.
+    pub started: bool,
+    /// Points of the lane selected when the press began. An additive marquee
+    /// shows these plus the rectangle — so a point the rectangle passes over
+    /// and leaves again goes back to how it was — and Escape restores them.
+    pub before: Vec<u64>,
 }
+
+/// Where a group of automation points goes when one of them is dragged.
+///
+/// `pressed` lands on `target_beat` (already snapped by the caller), and every
+/// other point in `group` keeps its distance from it. Values move by
+/// `value_delta`. Both deltas are clamped so the *group* stays inside the lane:
+/// clamping each point on its own would flatten the shape against the edge
+/// instead of stopping it there.
+pub fn automation_group_moves(
+    group: &[(u64, f32, f32)],
+    pressed: u64,
+    target_beat: f32,
+    value_delta: f32,
+) -> Vec<(u64, f32, f32)> {
+    let Some(&(_, pressed_beat, _)) = group.iter().find(|(id, _, _)| *id == pressed) else {
+        return Vec::new();
+    };
+    let min_beat = group
+        .iter()
+        .map(|&(_, b, _)| b)
+        .fold(f32::INFINITY, f32::min);
+    let min_value = group
+        .iter()
+        .map(|&(_, _, v)| v)
+        .fold(f32::INFINITY, f32::min);
+    let max_value = group
+        .iter()
+        .map(|&(_, _, v)| v)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let beat_delta = (target_beat - pressed_beat).max(-min_beat);
+    let value_delta = value_delta.clamp(-min_value, 1.0 - max_value);
+    group
+        .iter()
+        .map(|&(id, beat, value)| (id, beat + beat_delta, value + value_delta))
+        .collect()
+}
+/// Distance (px) the pointer must travel before an automation press becomes
+/// a marquee, the same threshold the arrangement's own marquee uses.
+pub const AUTOMATION_MARQUEE_THRESHOLD_PX: f32 = 4.0;
 
 /// VST3 parameter the user last moved inside a plugin editor. UI-only runtime
 /// state (not serialized) used by the automation control lane quick-action.
@@ -864,7 +920,11 @@ impl TimelineState {
         lane.points.len()
     }
 
-    /// Select all points inside a beat/value rectangle (marquee). UI-only.
+    /// Marquee selection: the points inside a beat/value rectangle, plus
+    /// `keep` (the selection an additive marquee started from). Everything
+    /// else in the lane is deselected, so the result depends only on where the
+    /// rectangle is now — not on where it has been. UI-only. Returns how many
+    /// points the rectangle covers.
     pub fn marquee_select_automation(
         &mut self,
         track_id: &str,
@@ -873,7 +933,7 @@ impl TimelineState {
         beat_hi: f32,
         value_lo: f32,
         value_hi: f32,
-        additive: bool,
+        keep: &[u64],
     ) -> usize {
         let Some(lane) = self.lane_mut(track_id, lane_id) else {
             return 0;
@@ -892,13 +952,74 @@ impl TimelineState {
         for p in lane.points.iter_mut() {
             let inside = p.beat >= b0 && p.beat <= b1 && p.value >= v0 && p.value <= v1;
             if inside {
-                p.selected = true;
                 count += 1;
-            } else if !additive {
-                p.selected = false;
             }
+            p.selected = inside || keep.contains(&p.id);
         }
         count
+    }
+
+    /// Ids of the selected points in one lane.
+    pub fn selected_automation_point_ids(&self, track_id: &str, lane_id: &str) -> Vec<u64> {
+        self.automation_lane(track_id, lane_id)
+            .map(|lane| {
+                lane.points
+                    .iter()
+                    .filter(|p| p.selected)
+                    .map(|p| p.id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Selected points of one lane as `(id, beat, value)` — what a group drag
+    /// carries.
+    pub fn selected_automation_points(
+        &self,
+        track_id: &str,
+        lane_id: &str,
+    ) -> Vec<(u64, f32, f32)> {
+        self.automation_lane(track_id, lane_id)
+            .map(|lane| {
+                lane.points
+                    .iter()
+                    .filter(|p| p.selected)
+                    .map(|p| (p.id, p.beat, p.value))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Sets exactly `ids` selected in one lane. UI-only.
+    pub fn set_automation_selection(&mut self, track_id: &str, lane_id: &str, ids: &[u64]) {
+        if let Some(lane) = self.lane_mut(track_id, lane_id) {
+            for p in lane.points.iter_mut() {
+                p.selected = ids.contains(&p.id);
+            }
+        }
+    }
+
+    /// Moves several points of one lane at once: `(id, beat, value)` each,
+    /// clamped, then one re-sort and one playback refresh for the lot.
+    /// Committed on release by the caller.
+    pub fn move_automation_points(
+        &mut self,
+        track_id: &str,
+        lane_id: &str,
+        moves: &[(u64, f32, f32)],
+    ) {
+        let Some(lane) = self.lane_mut(track_id, lane_id) else {
+            return;
+        };
+        for p in lane.points.iter_mut() {
+            if let Some(&(_, beat, value)) = moves.iter().find(|(id, _, _)| *id == p.id) {
+                p.beat = beat.max(0.0);
+                p.value = value.clamp(0.0, 1.0);
+            }
+        }
+        lane.sort_points();
+        let playhead = self.transport.playhead_beats;
+        self.recompute_effective_volumes(playhead, "point_edit");
     }
 
     /// Find the closest automation point to `(beat, value)` within the given
@@ -1252,5 +1373,41 @@ mod tests {
         assert!(approx(evaluate_automation(&pts, 2.0, 0.0), 0.5));
         // Second segment [4,8] midpoint: 1.0 + (0.5-1.0)*0.5 = 0.75.
         assert!(approx(evaluate_automation(&pts, 6.0, 0.0), 0.75));
+    }
+}
+
+#[cfg(test)]
+mod marquee_and_group_tests {
+    use super::*;
+
+    #[test]
+    fn a_group_keeps_its_shape_and_stays_in_the_lane() {
+        let group = [(1, 4.0, 0.2), (2, 6.0, 0.8)];
+        // Point 1 dragged to beat 5, up by 0.5: point 2 would go past 1.0, so
+        // the whole group stops where point 2 meets the top.
+        let close = |got: Vec<(u64, f32, f32)>, want: &[(u64, f32, f32)]| {
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(want) {
+                assert_eq!(g.0, w.0);
+                assert!(
+                    (g.1 - w.1).abs() < 1e-5 && (g.2 - w.2).abs() < 1e-5,
+                    "{g:?} vs {w:?}"
+                );
+            }
+        };
+        close(
+            automation_group_moves(&group, 1, 5.0, 0.5),
+            &[(1, 5.0, 0.4), (2, 7.0, 1.0)],
+        );
+        // Dragged before the start of the song: the earliest point stops at 0.
+        close(
+            automation_group_moves(&group, 2, 1.0, 0.0),
+            &[(1, 0.0, 0.2), (2, 2.0, 0.8)],
+        );
+    }
+
+    #[test]
+    fn a_point_outside_the_group_moves_nothing() {
+        assert!(automation_group_moves(&[(1, 0.0, 0.5)], 9, 2.0, 0.1).is_empty());
     }
 }

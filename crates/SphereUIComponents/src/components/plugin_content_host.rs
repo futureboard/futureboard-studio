@@ -174,6 +174,66 @@ mod imp {
         }
     }
 
+    /// Hands Undo/Redo aimed into a view that takes keys from the host to that
+    /// view, and says whether it handled them.
+    ///
+    /// A VST3 view is not supposed to read keys off the platform, so Ctrl+Z
+    /// arriving as `WM_KEYDOWN` does nothing in one that follows the rule
+    /// (Melodyne among them) — the host has to pass it in. Ctrl+Z is Undo;
+    /// Ctrl+Y and Ctrl+Shift+Z are Redo. A key the view does not handle goes
+    /// on as the platform message it was.
+    ///
+    /// # Safety
+    ///
+    /// `msg` must be a message the hook was handed for this thread's queue.
+    unsafe fn delivers_history_key(msg: &MSG) -> bool {
+        const VK_Y: usize = 0x59;
+        const VK_Z: usize = 0x5A;
+        if msg.message != WM_KEYDOWN {
+            return false;
+        }
+        let key = msg.wParam.0;
+        if key != VK_Y && key != VK_Z {
+            return false;
+        }
+        // SAFETY: plain queries of this thread's keyboard state.
+        let held = |vk: i32| unsafe { GetKeyState(vk) } < 0;
+        // VK_CONTROL; and neither Alt (VK_MENU) nor a Windows key.
+        if !held(0x11) || held(0x12) || held(0x5B) || held(0x5C) {
+            return false;
+        }
+        let shift = held(0x10);
+        let redo = key == VK_Y || shift;
+        let debug = transport_key::key_debug();
+        let trace = |verdict: &str| {
+            if debug {
+                // SAFETY: plain queries of window state for the trace.
+                let (target, focus) =
+                    unsafe { (class_name_of(msg.hwnd), class_name_of(GetFocus())) };
+                eprintln!(
+                    "[Keyboard] history key redo={redo} hwnd=0x{:x} class='{target}' \
+                     focus_class='{focus}' verdict={verdict}",
+                    msg.hwnd.0 as u64
+                );
+            }
+        };
+        let Some((host, _)) = (unsafe { owning_host_entry(msg.hwnd) }) else {
+            trace("not inside a plug-in view");
+            return false;
+        };
+        let Some(sink) = super::key_sink(host) else {
+            trace("view takes no host keys");
+            return false;
+        };
+        let handled = super::deliver_history_key(&sink, redo, shift);
+        trace(if handled {
+            "handled by the view"
+        } else {
+            "view declined; passed on as a platform key"
+        });
+        handled
+    }
+
     /// Window classes that own a text caret. Space belongs to them, never to the
     /// transport — typing a note name must not start playback.
     ///
@@ -196,6 +256,11 @@ mod imp {
     /// popups that are *owned* by that window rather than children of it, and a
     /// key pressed in one of those is still a key pressed in the plug-in.
     unsafe fn owning_host(target: HWND) -> Option<ContentHostKind> {
+        unsafe { owning_host_entry(target) }.map(|(_, kind)| kind)
+    }
+
+    /// As [`owning_host`], also naming the host window.
+    unsafe fn owning_host_entry(target: HWND) -> Option<(u64, ContentHostKind)> {
         let Ok(hosts) = HOSTS.lock() else {
             return None;
         };
@@ -211,8 +276,8 @@ mod imp {
             if hwnd.0.is_null() || hwnd == desktop {
                 return None;
             }
-            if let Some(&(_, kind)) = hosts.iter().find(|(host, _)| hwnd_from(*host) == hwnd) {
-                return Some(kind);
+            if let Some(&entry) = hosts.iter().find(|(host, _)| hwnd_from(*host) == hwnd) {
+                return Some(entry);
             }
             // A child's parent, or a top-level window's owner — and which of
             // those to ask has to be decided from the style. `GetAncestor` does
@@ -309,7 +374,13 @@ mod imp {
                 // SAFETY: for `HC_ACTION` the hook is handed a live `MSG` it is
                 // explicitly allowed to modify.
                 let msg = unsafe { &mut *msg };
-                if unsafe { claims_transport(msg) } {
+                if unsafe { delivers_history_key(msg) } {
+                    // The view took it through `onKeyDown`; the platform
+                    // message would only reach it a second time.
+                    msg.message = WM_NULL;
+                    msg.wParam = WPARAM(0);
+                    msg.lParam = LPARAM(0);
+                } else if unsafe { claims_transport(msg) } {
                     // The message time identifies this physical press in every
                     // process that sees it, so the router can recognise the
                     // plug-in host reporting the same one.
@@ -456,8 +527,17 @@ mod imp {
     ///
     /// Both forward focus to the first child; Chromium (and VST3 views)
     /// route it on to their inner widget from there.
+    ///
+    /// Only when focus is not already inside the view. A plug-in puts focus on
+    /// the inner widget that takes its keys — Melodyne's note canvas, say — and
+    /// pulling it back up to the view's outer window on every click left the
+    /// plug-in with no focused widget to deliver its shortcuts to.
     unsafe fn focus_embedded_child(hwnd: HWND) {
         if let Ok(child) = unsafe { GetWindow(hwnd, GW_CHILD) } {
+            let focus = unsafe { GetFocus() };
+            if focus == child || unsafe { IsChild(child, focus) }.as_bool() {
+                return;
+            }
             let _ = unsafe { SetFocus(Some(child)) };
             static LOGGED: AtomicBool = AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::Relaxed) {
@@ -1019,3 +1099,122 @@ mod imp {
 }
 
 pub use imp::{place_owned_popup, ContentChildHwnd, HiddenHostWindow};
+
+/// Delivers a key to a plug-in view through the host, as VST3 requires:
+/// `(character, VST3 modifier mask) -> handled`.
+pub type HostKeySink = std::rc::Rc<dyn Fn(char, i16) -> bool>;
+
+thread_local! {
+    /// Content hosts whose view takes Undo/Redo from the host
+    /// (`IPlugView::onKeyDown`) instead of reading keys off the platform.
+    ///
+    /// UI thread only, like the hook that reads it.
+    static KEY_SINKS: std::cell::RefCell<Vec<(u64, HostKeySink)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Route Undo/Redo pressed inside the view hosted in `host` through `sink`.
+/// Replaces any sink the same host had.
+pub fn register_key_sink(host: u64, sink: HostKeySink) {
+    KEY_SINKS.with(|sinks| {
+        let mut sinks = sinks.borrow_mut();
+        sinks.retain(|(entry, _)| *entry != host);
+        sinks.push((host, sink));
+    });
+}
+
+/// Stop routing keys for `host`; its view is going away.
+pub fn unregister_key_sink(host: u64) {
+    KEY_SINKS.with(|sinks| sinks.borrow_mut().retain(|(entry, _)| *entry != host));
+}
+
+/// The sink registered for `host`, cloned out so it runs with the registry
+/// released — a plug-in handling the key may well re-enter it.
+fn key_sink(host: u64) -> Option<HostKeySink> {
+    KEY_SINKS.with(|sinks| {
+        sinks
+            .borrow()
+            .iter()
+            .find(|(entry, _)| *entry == host)
+            .map(|(_, sink)| sink.clone())
+    })
+}
+
+/// Hand an Undo (`redo == false`) or Redo to a view's sink, trying the chords
+/// a plug-in may answer to. Redo is Ctrl+Y on Windows and Cmd+Shift+Z on
+/// macOS, and plug-ins pick one; the first chord the view handles wins.
+pub fn deliver_history_key(sink: &HostKeySink, redo: bool, shift_held: bool) -> bool {
+    use DirectAudio::{VST3_KEY_COMMAND, VST3_KEY_SHIFT};
+    let chords: &[(char, i16)] = match (redo, shift_held) {
+        (false, _) => &[('z', VST3_KEY_COMMAND)],
+        (true, true) => &[
+            ('z', VST3_KEY_COMMAND | VST3_KEY_SHIFT),
+            ('y', VST3_KEY_COMMAND),
+        ],
+        (true, false) => &[
+            ('y', VST3_KEY_COMMAND),
+            ('z', VST3_KEY_COMMAND | VST3_KEY_SHIFT),
+        ],
+    };
+    // Hosts disagree on the character a Ctrl chord carries: the plain letter,
+    // its capital, or the control character Windows translates it to (Ctrl+Z
+    // is 0x1A). A view answers to one of them; the first it handles wins.
+    chords.iter().any(|&(key, modifiers)| {
+        let control = char::from_u32(u32::from(key) & 0x1F).unwrap_or(key);
+        let handled = sink(key, modifiers)
+            || sink(key.to_ascii_uppercase(), modifiers)
+            || sink(control, modifiers);
+        if crate::components::transport_key::key_debug() {
+            eprintln!(
+                "[Keyboard] history onKeyDown key={key:?} modifiers={modifiers} handled={handled}"
+            );
+        }
+        handled
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use DirectAudio::{VST3_KEY_COMMAND, VST3_KEY_SHIFT};
+
+    /// A view that handles only `accepts` and records every key it was asked.
+    fn view(accepts: (char, i16)) -> (HostKeySink, Rc<RefCell<Vec<(char, i16)>>>) {
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let log = asked.clone();
+        let sink: HostKeySink = Rc::new(move |key, modifiers| {
+            log.borrow_mut().push((key, modifiers));
+            (key, modifiers) == accepts
+        });
+        (sink, asked)
+    }
+
+    #[test]
+    fn undo_is_ctrl_z() {
+        let (sink, asked) = view(('z', VST3_KEY_COMMAND));
+        assert!(deliver_history_key(&sink, false, false));
+        assert_eq!(*asked.borrow(), vec![('z', VST3_KEY_COMMAND)]);
+    }
+
+    /// A plug-in that only knows Ctrl+Shift+Z still gets its Redo from a
+    /// Ctrl+Y press, and nothing is sent once one chord was handled.
+    #[test]
+    fn redo_falls_back_to_the_other_chord() {
+        let redo = ('z', VST3_KEY_COMMAND | VST3_KEY_SHIFT);
+        let (sink, asked) = view(redo);
+        assert!(deliver_history_key(&sink, true, false));
+        assert_eq!(asked.borrow().last(), Some(&redo));
+        let (sink, asked) = view(redo);
+        assert!(deliver_history_key(&sink, true, true));
+        assert_eq!(*asked.borrow(), vec![redo], "the pressed chord goes first");
+    }
+
+    #[test]
+    fn a_view_that_takes_no_keys_reports_it() {
+        let (sink, _) = view(('q', 0));
+        assert!(!deliver_history_key(&sink, false, false));
+        assert!(!deliver_history_key(&sink, true, false));
+    }
+}

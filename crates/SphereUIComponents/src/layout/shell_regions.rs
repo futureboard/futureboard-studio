@@ -236,8 +236,7 @@ impl StudioLayout {
                         .and_then(|n| n.to_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "Imported Audio".to_string());
-                    t.state
-                        .import_audio_to_selected_or_new_track(path_key, name);
+                    t.import_audio_to_selected_or_new_track_recorded(path_key, name, cx);
                     cx.notify();
                 });
                 let _ = layout.update(cx, |this, cx| {

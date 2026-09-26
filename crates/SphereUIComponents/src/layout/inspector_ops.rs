@@ -18,7 +18,8 @@ use crate::components::plugin_picker::PluginInsertKind;
 use crate::components::reorder::{InsertDrop, InsertDropCb};
 use crate::components::timeline::timeline_state::{
     vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
-    AudioClipStretchState, TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting,
+    AudioClipStretchState, TrackAudioFormat, TrackEditScope, TrackMidiInputRouting,
+    TrackOutputRouting,
 };
 use crate::overlay::OverlayAnchor;
 use sphere_midi_service::mpe::MpeTrackConfiguration;
@@ -923,6 +924,7 @@ impl StudioLayout {
             let track_id = track_id.clone();
             let insert_id = insert_id.clone();
             StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                let edit = this.begin_track_edit(TrackEditScope::channel(&track_id), cx);
                 let bypassed = this.timeline.update(cx, |timeline, cx| {
                     let bypassed = timeline
                         .state
@@ -931,6 +933,7 @@ impl StudioLayout {
                     cx.notify();
                     bypassed
                 });
+                this.commit_track_edit("Bypass Plug-in", edit, cx);
                 inspector_debug(&format!(
                     "insert bypass track={track_id} insert={insert_id} bypass={bypassed}"
                 ));
@@ -950,6 +953,7 @@ impl StudioLayout {
             let track_id = track_id.clone();
             let insert_id = insert_id.clone();
             StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                let edit = this.begin_track_edit(TrackEditScope::channel(&track_id), cx);
                 let enabled = this.timeline.update(cx, |timeline, cx| {
                     let enabled = timeline
                         .state
@@ -958,6 +962,7 @@ impl StudioLayout {
                     cx.notify();
                     enabled
                 });
+                this.commit_track_edit("Enable Plug-in", edit, cx);
                 inspector_debug(&format!(
                     "insert enabled track={track_id} insert={insert_id} enabled={enabled}"
                 ));
@@ -978,6 +983,9 @@ impl StudioLayout {
                 let channel = *channel;
                 let enabled = *enabled;
                 StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                    // Unticking an output removes its mixer channel: the scope
+                    // takes the instrument's output channels in with the track.
+                    let edit = this.begin_track_edit(this.channel_with_outputs(&track_id, cx), cx);
                     let changed = this.timeline.update(cx, |timeline, cx| {
                         let ensure_args: Option<(String, u32, bool)> = {
                             let Some(slots) = timeline.state.insert_slots_mut(&track_id) else {
@@ -1053,6 +1061,7 @@ impl StudioLayout {
                         cx.notify();
                         true
                     });
+                    this.commit_track_edit("Instrument Outputs", edit, cx);
                     if changed {
                         inspector_debug(&format!(
                             "insert output channel track={track_id} insert={insert_id} channel={channel} enabled={enabled}"
@@ -1138,6 +1147,9 @@ impl StudioLayout {
                     .state
                     .find_track(&id)
                     .and_then(|track| track.routing.audio_input_connection_id.clone());
+                let edit = timeline
+                    .read(cx)
+                    .begin_track_edit(TrackEditScope::tracks([id.clone()]));
                 let changed = timeline.update(cx, |t, cx| {
                     let changed = t
                         .state
@@ -1172,6 +1184,9 @@ impl StudioLayout {
                     });
                     return;
                 }
+                timeline.update(cx, |t, cx| {
+                    t.commit_track_edit("Set Input", edit, false, cx);
+                });
 
                 StudioLayout::defer_update(&owner, cx, |this, cx| {
                     // A track's input is project data, so this is a real edit.
@@ -1194,8 +1209,10 @@ impl StudioLayout {
                 .find_track(&id)
                 .map(|track| track.routing.output.clone());
             let changed = timeline.update(cx, |t, cx| {
+                let edit = t.begin_track_edit(TrackEditScope::tracks([id.clone()]));
                 let changed = t.state.set_track_output_routing(&id, output.clone());
                 if changed {
+                    t.commit_track_edit("Set Output", edit, false, cx);
                     cx.notify();
                 }
                 changed
@@ -1226,6 +1243,9 @@ impl StudioLayout {
                         track.routing.audio_input_connection_id.clone(),
                     )
                 });
+                let edit = timeline
+                    .read(cx)
+                    .begin_track_edit(TrackEditScope::tracks([id.clone()]));
                 let changed = timeline.update(cx, |t, cx| {
                     let changed = t.state.set_track_audio_format(&id, audio_format);
                     if changed {
@@ -1263,6 +1283,9 @@ impl StudioLayout {
                     });
                     return;
                 }
+                timeline.update(cx, |t, cx| {
+                    t.commit_track_edit("Set Audio Format", edit, false, cx);
+                });
 
                 StudioLayout::defer_update(&owner, cx, |this, cx| {
                     this.mark_dirty();
@@ -1284,8 +1307,10 @@ impl StudioLayout {
                     .find_track(&id)
                     .map(|track| track.routing.midi_input.clone());
                 let changed = timeline.update(cx, |t, cx| {
+                    let edit = t.begin_track_edit(TrackEditScope::tracks([id.clone()]));
                     let changed = t.state.set_track_midi_input(&id, midi_input.clone());
                     if changed {
+                        t.commit_track_edit("Set MIDI Input", edit, false, cx);
                         cx.notify();
                     }
                     changed
@@ -1315,8 +1340,10 @@ impl StudioLayout {
                 .find_track(&id)
                 .map(|track| track.routing.midi_channel);
             let changed = timeline.update(cx, |t, cx| {
+                let edit = t.begin_track_edit(TrackEditScope::tracks([id.clone()]));
                 let changed = t.state.set_track_midi_channel(&id, channel);
                 if changed {
+                    t.commit_track_edit("Set MIDI Channel", edit, false, cx);
                     cx.notify();
                 }
                 changed
@@ -1386,6 +1413,9 @@ impl StudioLayout {
                 .state
                 .find_track(&id)
                 .map(|track| (track.armed, track.input_monitor));
+            let edit = timeline
+                .read(cx)
+                .begin_track_edit(TrackEditScope::tracks([id.clone()]));
             let mut value = false;
             let changed = timeline.update(cx, |t, cx| {
                 let changed = match kind {
@@ -1444,6 +1474,9 @@ impl StudioLayout {
                     return;
                 }
             }
+            timeline.update(cx, |t, cx| {
+                t.commit_track_edit(kind.history_label(), edit, false, cx);
+            });
 
             StudioLayout::defer_update(&owner, cx, move |this, cx| {
                 this.mark_dirty_view_only();
@@ -1478,6 +1511,16 @@ impl TrackToggle {
             TrackToggle::Solo => "solo",
             TrackToggle::Arm => "arm",
             TrackToggle::Input => "input-monitor",
+        }
+    }
+
+    /// The toggle as the Edit menu names its undo step.
+    fn history_label(self) -> &'static str {
+        match self {
+            TrackToggle::Mute => "Mute",
+            TrackToggle::Solo => "Solo",
+            TrackToggle::Arm => "Record Arm",
+            TrackToggle::Input => "Input Monitor",
         }
     }
 }

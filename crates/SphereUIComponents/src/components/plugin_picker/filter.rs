@@ -11,21 +11,30 @@ use crate::components::plugin_picker::state::{PickerFilter, PluginFilterState};
 
 #[derive(Debug, Clone, Default)]
 pub struct FilterCounts {
-    pub all: usize,
-    pub favorites: usize,
-    pub recent: usize,
+    /// Every plug-in in the library, whatever the kind tab — the "All" tab.
+    pub library: usize,
+    /// Library-wide instruments — the "Instruments" tab.
     pub instruments: usize,
-    /// Everything the Effects rail offers — declared effects plus plug-ins that
+    /// Everything the Effects tab offers — declared effects plus plug-ins that
     /// declared no class at all, which are insertable as effects.
     pub effects: usize,
     /// Subset of `effects` that never declared a class.
     pub unknown: usize,
+    // Everything below counts only plug-ins under the active kind tab, so the
+    // rail says what clicking it would show.
+    pub all: usize,
+    pub favorites: usize,
+    pub recent: usize,
     pub vst3: usize,
     pub vst2: usize,
     pub clap: usize,
     pub au: usize,
     pub builtin: usize,
     pub failed: usize,
+    /// Per entry of `FilterResult::vendors`.
+    pub vendors: Vec<usize>,
+    /// Per entry of `FilterResult::categories`.
+    pub categories: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,15 +73,23 @@ pub fn compute_filter_result(
         .as_ref()
         .map(|category| category.to_ascii_lowercase());
 
-    let mut counts = FilterCounts::default();
+    let mut counts = FilterCounts {
+        vendors: vec![0; index.sidebar_vendors().len()],
+        categories: vec![0; index.sidebar_categories().len()],
+        ..FilterCounts::default()
+    };
     let mut indices = Vec::new();
 
-    // Single allocation-free pass: tally library-wide counts and collect the
-    // matching row indices. The sidebar vendor/category facets are NOT rebuilt
-    // here — they are precomputed once on the shared index — so typing only pays
-    // for the cheap substring/enum checks below, never per-keypress String work.
+    // One pass: tally the tab and rail counts and collect the matching rows.
+    // The facet labels themselves are precomputed on the shared index, and
+    // each plug-in's facet position is too, so typing only pays for the cheap
+    // checks below, never per-keypress String work.
     for (idx, plugin) in plugins.iter().enumerate() {
-        update_counts(&mut counts, plugin, prefs, debug_mode);
+        update_tab_counts(&mut counts, plugin);
+        if !filters.kind.matches(plugin) {
+            continue;
+        }
+        update_rail_counts(&mut counts, index, idx, plugin, prefs, debug_mode);
 
         if !matches_sidebar(&filters.sidebar, plugin, prefs, debug_mode) {
             continue;
@@ -123,8 +140,22 @@ pub fn compute_filter_result(
     }
 }
 
-fn update_counts(
+fn update_tab_counts(counts: &mut FilterCounts, plugin: &RegistryPlugin) {
+    counts.library += 1;
+    if plugin.kind == PluginKind::Instrument {
+        counts.instruments += 1;
+    } else {
+        counts.effects += 1;
+        if plugin.kind == PluginKind::Unknown {
+            counts.unknown += 1;
+        }
+    }
+}
+
+fn update_rail_counts(
     counts: &mut FilterCounts,
+    index: &PluginSearchIndex,
+    idx: usize,
     plugin: &RegistryPlugin,
     prefs: &PluginPickerPrefs,
     debug_mode: bool,
@@ -135,14 +166,6 @@ fn update_counts(
     }
     if prefs.recent.contains(&plugin.id) {
         counts.recent += 1;
-    }
-    if plugin.kind == PluginKind::Instrument {
-        counts.instruments += 1;
-    } else {
-        counts.effects += 1;
-        if plugin.kind == PluginKind::Unknown {
-            counts.unknown += 1;
-        }
     }
     if plugin.is_builtin() {
         counts.builtin += 1;
@@ -155,11 +178,16 @@ fn update_counts(
             _ => {}
         }
     }
+    if let Some(slot) = index.vendor_slot(idx) {
+        counts.vendors[slot] += 1;
+    }
+    if let Some(slot) = index.category_slot(idx) {
+        counts.categories[slot] += 1;
+    }
     if debug_mode && is_failed_plugin(plugin) {
         counts.failed += 1;
     }
 }
-
 fn is_failed_plugin(plugin: &RegistryPlugin) -> bool {
     !plugin.scan_status.is_usable()
         || matches!(
@@ -354,5 +382,90 @@ mod perf_tests {
                 t.elapsed().as_micros() / runs
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod kind_tab_tests {
+    use super::*;
+    use crate::components::plugin_picker::search_index::PluginSearchIndex;
+    use crate::components::plugin_picker::state::{KindTab, PickerFilter};
+    use std::path::PathBuf;
+    use SpherePluginHost::PluginStatus;
+
+    fn plugin(id: &str, vendor: &str, kind: PluginKind) -> RegistryPlugin {
+        RegistryPlugin {
+            id: id.to_string(),
+            name: id.to_string(),
+            vendor: vendor.to_string(),
+            format: PluginFormat::Vst3,
+            category: "EQ".to_string(),
+            is_ara: false,
+            raw_category: None,
+            sub_categories: None,
+            kind,
+            path: PathBuf::from(format!("C:/Plugins/{id}.vst3")),
+            class_id: None,
+            version: None,
+            sdk_metadata_loaded: true,
+            preset_path: PathBuf::from(format!("C:/Cache/{id}.pst")),
+            scanned_at_ms: 0,
+            status: PluginStatus::PresetReady,
+            scan_status: PluginScanStatus::Success,
+            error_message: None,
+        }
+    }
+
+    fn library() -> PluginSearchIndex {
+        PluginSearchIndex::from_plugins(vec![
+            plugin("synth", "Acme", PluginKind::Instrument),
+            plugin("eq", "Acme", PluginKind::Effect),
+            plugin("comp", "Zeta", PluginKind::Effect),
+            plugin("mystery", "Zeta", PluginKind::Unknown),
+        ])
+    }
+
+    /// The tab narrows the list and every rail count; the tabs themselves
+    /// always count the whole library, so switching never looks empty.
+    #[test]
+    fn the_kind_tab_scopes_the_list_and_the_rail() {
+        let index = library();
+        let prefs = PluginPickerPrefs::default_with_size();
+        let filters = PluginFilterState {
+            kind: KindTab::Effects,
+            ..Default::default()
+        };
+        let result = compute_filter_result(&index, "", &filters, &prefs, false);
+        // An undeclared plug-in inserts as an effect, so it is listed here.
+        assert_eq!(result.indices.len(), 3);
+        assert_eq!(result.counts.all, 3);
+        assert_eq!(result.counts.library, 4);
+        assert_eq!(result.counts.instruments, 1);
+        assert_eq!(result.counts.effects, 3);
+        let acme = result.vendors.iter().position(|v| v == "Acme").unwrap();
+        let zeta = result.vendors.iter().position(|v| v == "Zeta").unwrap();
+        assert_eq!(
+            result.counts.vendors[acme], 1,
+            "the Acme synth is not an effect"
+        );
+        assert_eq!(result.counts.vendors[zeta], 2);
+    }
+
+    #[test]
+    fn the_rail_composes_with_the_tab() {
+        let index = library();
+        let prefs = PluginPickerPrefs::default_with_size();
+        let filters = PluginFilterState {
+            kind: KindTab::Instruments,
+            sidebar: PickerFilter::Vendor("Acme".to_string()),
+            ..Default::default()
+        };
+        let result = compute_filter_result(&index, "", &filters, &prefs, false);
+        let names: Vec<&str> = result
+            .indices
+            .iter()
+            .map(|&i| index.plugin_at(i).unwrap().name.as_str())
+            .collect();
+        assert_eq!(names, vec!["synth"]);
     }
 }

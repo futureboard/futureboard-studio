@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, svg, App, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
     Styled, Window,
@@ -414,10 +415,25 @@ fn menu_item_row(
             .h(px(menu_style::ROW_HEIGHT))
             .flex()
             .items_center()
-            .truncate()
+            .gap(px(6.0))
             .text_size(px(menu_style::LABEL_TEXT_SIZE))
             .text_color(text_color)
-            .child(label),
+            .child(if item.detail.is_some() {
+                div().flex_none().child(label)
+            } else {
+                div().min_w(px(0.0)).truncate().child(label)
+            })
+            // What the item acts on right now ("Undo  Paste FX Chain"): quieter
+            // than the label, and the part that gives way when space runs out.
+            .when_some(item.detail.clone(), |row, detail| {
+                row.child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_color(shortcut_color)
+                        .child(detail),
+                )
+            }),
     );
 
     // ── Right cluster: shortcut / chevron ────────────────────────────────

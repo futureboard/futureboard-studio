@@ -372,6 +372,35 @@ impl InsertSlotState {
         self.plugin_id.is_none()
     }
 
+    /// A new instance of this slot's plug-in under `id`: the same plug-in,
+    /// flags and output layout, `state` as its opaque state (this slot's
+    /// stored state when `None`), and a runtime that starts over — it is a new
+    /// instance, loaded by the caller like any other added insert. The id has
+    /// to be fresh: the engine and the bridge key instances by id, so a shared
+    /// one would share the instance.
+    pub fn copy_as(&self, id: String, state: Option<std::sync::Arc<Vec<u8>>>) -> Self {
+        Self {
+            id,
+            vst3_state: state.or_else(|| self.vst3_state.clone()),
+            load_status: if self.is_empty() {
+                InsertLoadStatus::Empty
+            } else {
+                InsertLoadStatus::Ready
+            },
+            runtime_backend: PluginRuntimeBackend::InProcess,
+            runtime_state: if self.is_empty() {
+                PluginRuntimeState::Unloaded
+            } else {
+                PluginRuntimeState::Ready
+            },
+            host_pid: None,
+            // Re-detected from the new instance when it prepares.
+            output_bus_channel_counts: Vec::new(),
+            pending_open_editor: false,
+            ..self.clone()
+        }
+    }
+
     /// Whether the plug-in host process can load this insert as an external
     /// module over the shared-audio bridge — the question the engine-sink wiring
     /// and the restore batch both ask before touching a slot.
@@ -601,7 +630,7 @@ impl TimelineState {
                 .any(|track| track.inserts.iter().any(|slot| slot.id == insert_id))
     }
 
-    fn next_insert_slot_id_for(&self, owner_id: &str) -> String {
+    pub(super) fn next_insert_slot_id_for(&self, owner_id: &str) -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_INSERT_SLOT_SEQ: AtomicU64 = AtomicU64::new(1);
         // Session-monotonic so a removed slot's id is NEVER regenerated. The
@@ -1053,6 +1082,61 @@ impl TimelineState {
             self.restore_set_aside_lanes(&plan.from_track, plan);
         }
         true
+    }
+
+    /// Add a copy of the effect `insert_id` on `from_track` to `to_track`, in
+    /// the gap `gap` (0..=len) of that chain as it is now, and return the
+    /// copy's id. `None` when refused, for the reasons a move is refused
+    /// (see [`Self::plan_insert_move`]) except that the source may be the
+    /// destination and the master takes an insert with automation: nothing
+    /// leaves either chain, and the copy starts with no lanes of its own.
+    ///
+    /// The copy is [`InsertSlotState::copy_as`] under a fresh id, with `state`
+    /// as its opaque state (the source's stored state when `None`).
+    pub fn duplicate_insert(
+        &mut self,
+        from_track: &str,
+        insert_id: &str,
+        to_track: &str,
+        gap: usize,
+        state: Option<std::sync::Arc<Vec<u8>>>,
+    ) -> Option<String> {
+        let from_slots = self.insert_slots(from_track)?;
+        let from_index = from_slots.iter().position(|slot| slot.id == insert_id)?;
+        let source = &from_slots[from_index];
+        if source.is_empty()
+            || from_index < self.fx_chain_floor(from_track)
+            || source.plugin_is_instrument == Some(true)
+        {
+            return None;
+        }
+        let source = source.clone();
+        let placeholder = if to_track == MASTER_TRACK_ID {
+            if self.master.inserts.len() >= MAX_INSERT_SLOTS {
+                return None;
+            }
+            false
+        } else {
+            let to = self.tracks.iter().find(|track| track.id == to_track)?;
+            if !to.accepts_moved_effect() {
+                return None;
+            }
+            to.needs_instrument_placeholder()
+        };
+        if placeholder {
+            let placeholder_id = self.next_insert_slot_id_for(to_track);
+            self.insert_slots_mut(to_track)?
+                .push(InsertSlotState::empty(placeholder_id));
+        }
+        let copy_id = self.next_insert_slot_id_for(to_track);
+        let to_index = {
+            let len = self.insert_slots(to_track)?.len();
+            gap.max(self.fx_chain_floor(to_track)).min(len)
+        };
+        let copy = source.copy_as(copy_id.clone(), state);
+        self.insert_slots_mut(to_track)?.insert(to_index, copy);
+        crate::forensic_trace::log_trace_plugin(to_track, &copy_id);
+        Some(copy_id)
     }
 
     /// Record, right before the step of `plan` that takes the insert onto the
@@ -2560,5 +2644,117 @@ mod insert_move_tests {
                 "{fresh} must exist on exactly one channel"
             );
         }
+    }
+
+    /// Alt-drag: the copy is the same plug-in with a fresh id and the given
+    /// state, and the source — its slot, its state, its lanes — is untouched.
+    #[test]
+    fn duplicate_insert_lands_a_fresh_instance_with_the_state() {
+        let mut state = empty_state();
+        let a = track(&mut state, TrackType::Audio, "A");
+        let b = track(&mut state, TrackType::Audio, "B");
+        let fx = load(&mut state, &a, 0, "fx", false);
+        let other = load(&mut state, &b, 0, "other", false);
+        let stored = std::sync::Arc::new(vec![1u8, 2, 3]);
+        {
+            let slot = state
+                .insert_slots_mut(&a)
+                .unwrap()
+                .iter_mut()
+                .find(|slot| slot.id == fx)
+                .unwrap();
+            slot.vst3_state = Some(stored.clone());
+            slot.bypassed = true;
+            slot.output_bus_channel_counts = vec![2];
+            slot.runtime_state = PluginRuntimeState::EditorOpen;
+            slot.host_pid = Some(42);
+        }
+        track_mut(&mut state, &a)
+            .automation_lanes
+            .push(param_lane("cut", &fx));
+        let source_before = state.find_insert_slot(&a, &fx).unwrap().clone();
+
+        let captured = std::sync::Arc::new(vec![9u8, 9]);
+        let copy = state
+            .duplicate_insert(&a, &fx, &b, 1, Some(captured.clone()))
+            .expect("copied");
+
+        assert_ne!(copy, fx);
+        assert_eq!(state.insert_order(&b), vec![other, copy.clone()]);
+        assert_eq!(state.insert_owner_ids_containing(&copy), vec![b.clone()]);
+        let landed = state.find_insert_slot(&b, &copy).unwrap();
+        assert_eq!(landed.plugin_id, source_before.plugin_id);
+        assert_eq!(landed.plugin_path, source_before.plugin_path);
+        assert!(landed.bypassed, "flags come with it");
+        assert!(std::sync::Arc::ptr_eq(
+            landed.vst3_state.as_ref().unwrap(),
+            &captured
+        ));
+        assert_eq!(landed.runtime_state, PluginRuntimeState::Ready);
+        assert_eq!(landed.host_pid, None);
+        assert!(landed.output_bus_channel_counts.is_empty());
+
+        assert_eq!(state.find_insert_slot(&a, &fx).unwrap(), &source_before);
+        assert_eq!(state.find_track(&a).unwrap().automation_lanes.len(), 1);
+        assert!(
+            state.find_track(&b).unwrap().automation_lanes.is_empty(),
+            "the lanes stay with the original"
+        );
+
+        // No fresh capture: the stored state goes with it.
+        let again = state
+            .duplicate_insert(&a, &fx, &a, 1, None)
+            .expect("copied");
+        assert_eq!(state.insert_order(&a), vec![fx.clone(), again.clone()]);
+        assert!(std::sync::Arc::ptr_eq(
+            state
+                .find_insert_slot(&a, &again)
+                .unwrap()
+                .vst3_state
+                .as_ref()
+                .unwrap(),
+            &stored
+        ));
+    }
+
+    #[test]
+    fn duplicates_the_chain_cannot_take_are_refused() {
+        let mut state = empty_state();
+        let midi = track(&mut state, TrackType::Midi, "MIDI");
+        let audio = track(&mut state, TrackType::Audio, "Audio");
+        let synth = load(&mut state, &midi, 0, "synth", true);
+        let fx = load(&mut state, &audio, 0, "fx", false);
+
+        assert_eq!(
+            state.duplicate_insert(&midi, &synth, &audio, 0, None),
+            None,
+            "an instrument is never copied"
+        );
+        for index in 1..MAX_INSERT_SLOTS {
+            load(&mut state, &audio, index, "filler", false);
+        }
+        assert_eq!(
+            state.duplicate_insert(&audio, &fx, &audio, 1, None),
+            None,
+            "a full chain has no room, its own copy included"
+        );
+    }
+
+    /// An empty Instrument track gets its placeholder slot 0 first, so the
+    /// copy never lands in the instrument's place.
+    #[test]
+    fn a_duplicate_onto_an_empty_instrument_track_keeps_slot_zero_free() {
+        let mut state = empty_state();
+        let audio = track(&mut state, TrackType::Audio, "Audio");
+        let inst = track(&mut state, TrackType::Instrument, "Inst");
+        let fx = load(&mut state, &audio, 0, "fx", false);
+
+        let copy = state
+            .duplicate_insert(&audio, &fx, &inst, 0, None)
+            .expect("copied");
+        let order = state.insert_order(&inst);
+        assert_eq!(order.len(), 2);
+        assert!(state.insert_slot_at(&inst, 0).unwrap().is_empty());
+        assert_eq!(order[1], copy);
     }
 }

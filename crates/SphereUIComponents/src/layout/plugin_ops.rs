@@ -99,6 +99,31 @@ pub(crate) struct PluginEditorWindows {
     /// Plug-in state edits grouped into gestures for the project's dirty flag.
     /// See [`StudioLayout::note_plugin_state_edited`].
     pub state_edits: PluginEditGesture,
+    /// State the editor chrome's Copy took, for its Paste. In-app only and
+    /// not persisted: opaque state means nothing outside the plug-in it came
+    /// from, so it is never offered to the system clipboard.
+    pub state_clipboard: Option<PluginStateClipboard>,
+    /// A channel's effects as "Copy FX Chain" took them, for "Paste FX
+    /// Chain". In-app and not persisted, like `state_clipboard`.
+    pub fx_chain_clipboard: Option<FxChainClipboard>,
+}
+
+/// One channel's copied effects, in chain order. Each slot is the original's
+/// with its state as captured at the copy; a paste lands new instances of
+/// them (`TimelineState::replace_fx_chain`), never these ids.
+#[derive(Clone, Debug)]
+pub(crate) struct FxChainClipboard {
+    pub source_name: String,
+    pub effects: Vec<crate::components::timeline::timeline_state::InsertSlotState>,
+}
+
+/// One plug-in's copied state. Pasted only onto an insert of the same
+/// `plugin_id`: state handed to another plug-in is corruption, not a preset.
+#[derive(Clone, Debug)]
+pub(crate) struct PluginStateClipboard {
+    pub plugin_id: String,
+    pub plugin_name: String,
+    pub state: std::sync::Arc<Vec<u8>>,
 }
 
 /// How long a plug-in edit gesture may pause and still be the same gesture.
@@ -2838,11 +2863,15 @@ impl StudioLayout {
         cx: &mut Context<Self>,
         reason: &'static str,
     ) {
+        // One undo step, which brings the plug-in back as it sounds now.
+        self.store_live_plugin_states(track_id, std::slice::from_ref(&insert_id.to_string()), cx);
+        let before = self.capture_insert_chains(&[track_id], cx);
         self.teardown_insert_instance(track_id, insert_id, cx, reason);
         self.timeline.update(cx, |timeline, cx| {
             timeline.state.remove_insert(track_id, insert_id);
             cx.notify();
         });
+        self.record_insert_chains("Remove Plug-in", before, cx);
         self.mark_dirty();
         self.audio_bridge.project_dirty = true;
         // Push the snapshot now instead of waiting for the idle poll: the engine
@@ -3609,6 +3638,16 @@ impl StudioLayout {
             .insert_slot_at(&track_id, target_slot_index)
             .filter(|slot| !slot.is_empty())
             .map(|slot| slot.id.clone());
+        // One undo step. A replaced plug-in comes back as it sounds now.
+        let history_label = if existing_slot_id.is_some() {
+            "Replace Plug-in"
+        } else {
+            "Add Plug-in"
+        };
+        if let Some(old_slot_id) = existing_slot_id.as_ref() {
+            self.store_live_plugin_states(&track_id, std::slice::from_ref(old_slot_id), cx);
+        }
+        let history_before = self.capture_insert_chains(&[track_id.as_str()], cx);
         let new_slot_id = if let Some(old_slot_id) = existing_slot_id {
             self.teardown_insert_instance(&track_id, &old_slot_id, cx, "replace_instrument_plugin");
             self.timeline.update(cx, |timeline, _cx| {
@@ -3852,6 +3891,7 @@ impl StudioLayout {
             if plugin_id != STUB_PLUGIN_ID {
                 self.plugin_picker_prefs.record_recent(plugin_id);
             }
+            self.record_insert_chains(history_label, history_before, cx);
             opened_slot = Some((track_id.clone(), target_slot_index, slot_id));
         }
         self.plugin_picker = PluginPickerState::closed();
@@ -4025,8 +4065,13 @@ impl StudioLayout {
         insert_index: Option<usize>,
         cx: &mut Context<Self>,
     ) -> String {
-        use crate::components::timeline::timeline_state::{CreateTrackOptions, InputMonitorMode};
+        use crate::components::timeline::timeline_state::{
+            CreateTrackOptions, InputMonitorMode, TrackEditScope,
+        };
         self.timeline.update(cx, |timeline, cx| {
+            // Its own step, before the plug-in that goes on it (which records
+            // one of its own): undo takes the plug-in off, then the track.
+            let edit = timeline.begin_track_edit(TrackEditScope::track_list());
             let id = timeline.state.create_track(CreateTrackOptions {
                 track_type,
                 name,
@@ -4044,6 +4089,7 @@ impl StudioLayout {
                 }
             }
             timeline.state.select_track(&id);
+            timeline.commit_track_edit("Add Track", edit, false, cx);
             cx.notify();
             id
         })
@@ -4131,6 +4177,17 @@ impl StudioLayout {
             .insert_slot_at(track_id, slot_index)
             .filter(|slot| !slot.is_empty())
             .map(|slot| slot.id.clone());
+        // One undo step, as with the picker; a replaced plug-in comes back as
+        // it sounds now.
+        let history_label = if existing_slot_id.is_some() {
+            "Replace Plug-in"
+        } else {
+            "Add Plug-in"
+        };
+        if let Some(old_slot_id) = existing_slot_id.as_ref() {
+            self.store_live_plugin_states(track_id, std::slice::from_ref(old_slot_id), cx);
+        }
+        let history_before = self.capture_insert_chains(&[track_id], cx);
         let slot_id = if let Some(old_slot_id) = existing_slot_id {
             self.teardown_insert_instance(track_id, &old_slot_id, cx, source);
             self.timeline.update(cx, |timeline, _cx| {
@@ -4164,6 +4221,7 @@ impl StudioLayout {
             "[PluginDrop] track={track_id} slot={slot_id} index={slot_index} plugin={}",
             display_name
         );
+        self.record_insert_chains(history_label, history_before, cx);
         self.after_preset_insert_bound(track_id, &slot_id, plugin_format, cx, source);
         cx.notify();
         Some((track_id.to_string(), slot_index, slot_id))
@@ -4178,6 +4236,11 @@ impl StudioLayout {
 
         let (plugin_id, plugin_path, plugin_format, vendor, display_name) =
             Self::registry_insert_descriptor(reg);
+        // The track and its instrument are one step.
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::track_list(),
+            cx,
+        );
         let created = self.timeline.update(cx, |timeline, _cx| {
             // A dropped instrument preset must have a MIDI-producing track
             // before the plugin instance is created. Creating an Instrument
@@ -4216,6 +4279,7 @@ impl StudioLayout {
             timeline.state.select_track(&track_id);
             Some((track_id, 0usize, slot_id))
         })?;
+        self.commit_track_edit("Add Instrument Track", edit, cx);
 
         eprintln!(
             "[PluginDrop] midi track created before instrument plugin track={} slot={} plugin={}",
@@ -4496,6 +4560,114 @@ impl StudioLayout {
                 })
         }));
         slots
+    }
+
+    /// One insert's opaque state as the plug-in has it now, for a copy of it.
+    ///
+    /// A built-in's comes from the main-process mirror, which the editor keeps
+    /// current. A bridged plug-in is asked for it, as a preset save does: the
+    /// slot's stored copy is only as new as the last save. The stored copy is
+    /// the answer when neither has anything newer. Bounded by the bridge's
+    /// state request timeout — a user gesture, never per frame.
+    pub(super) fn capture_insert_state(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<std::sync::Arc<Vec<u8>>> {
+        self.capture_insert_states(track_id, std::slice::from_ref(&insert_id.to_string()), cx)
+            .remove(insert_id)
+    }
+
+    /// [`Self::capture_insert_state`] for several of one channel's inserts,
+    /// keyed by insert id; an insert with no state has no entry. Every bridged
+    /// one is asked in a single request, so a whole chain costs one timeout at
+    /// most, not one per plug-in.
+    pub(super) fn capture_insert_states(
+        &mut self,
+        track_id: &str,
+        insert_ids: &[String],
+        cx: &mut Context<Self>,
+    ) -> std::collections::HashMap<String, std::sync::Arc<Vec<u8>>> {
+        let slots: Vec<_> = {
+            let state = &self.timeline.read(cx).state;
+            insert_ids
+                .iter()
+                .filter_map(|id| state.find_insert_slot(track_id, id).cloned())
+                .filter(|slot| !slot.is_empty())
+                .collect()
+        };
+        let mut states = std::collections::HashMap::new();
+        let mut ask_bridge = Vec::new();
+        for slot in &slots {
+            let plugin_id = slot.plugin_id.as_deref().unwrap_or_default();
+            if SpherePluginHost::builtin_audio_bridge_supported(plugin_id) {
+                if let Some(bytes) = crate::components::builtin_plugin_editor::builtin_state_bytes(
+                    plugin_id, &slot.id,
+                ) {
+                    states.insert(slot.id.clone(), std::sync::Arc::new(bytes));
+                }
+            } else if slot.runtime_backend == PluginRuntimeBackend::ExternalBridge {
+                ask_bridge.push(slot.id.clone());
+            }
+        }
+        if !ask_bridge.is_empty() {
+            if let Some(runtime) = self.plugin_editors.bridge_runtime.clone() {
+                if let Ok(mut runtime) = runtime.lock() {
+                    let capture = runtime
+                        .request_plugin_states(&ask_bridge, std::time::Duration::from_millis(1500));
+                    for (id, bytes) in capture.states {
+                        if !bytes.is_empty() {
+                            states.insert(id, std::sync::Arc::new(bytes));
+                        }
+                    }
+                }
+            }
+        }
+        for slot in slots {
+            if states.contains_key(&slot.id) {
+                continue;
+            }
+            eprintln!(
+                "[plugin-state] no live state from insert={}; using the stored copy (present={})",
+                slot.id,
+                slot.vst3_state.is_some()
+            );
+            if let Some(stored) = slot.vst3_state {
+                states.insert(slot.id, stored);
+            }
+        }
+        states
+    }
+
+    /// Load inserts the model just added as copies — a duplicated insert, a
+    /// cloned track's plug-ins, a pasted chain — each already carrying its
+    /// state in `vst3_state`. A built-in's mirror is seeded first, since its
+    /// editor and its replay read that rather than the slot. The caller
+    /// schedules the engine sync that an in-process insert loads through.
+    pub(super) fn load_copied_inserts(
+        &mut self,
+        track_id: &str,
+        insert_ids: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        for insert_id in insert_ids {
+            let seed = self
+                .timeline
+                .read(cx)
+                .state
+                .find_insert_slot(track_id, insert_id)
+                .and_then(|slot| Some((slot.plugin_id.clone()?, slot.vst3_state.clone()?)));
+            let Some((plugin_id, state)) = seed else {
+                // Empty, or nothing captured: it loads at its defaults.
+                self.load_bridge_insert_for_slot(track_id, insert_id, cx);
+                continue;
+            };
+            crate::components::builtin_plugin_editor::builtin_state_seed(
+                &plugin_id, insert_id, &state,
+            );
+            self.load_bridge_insert_for_slot(track_id, insert_id, cx);
+        }
     }
 
     /// Pull current VST3 states from the plugin host into the timeline slots
@@ -4783,7 +4955,7 @@ impl StudioLayout {
     /// channel as live editor edits: engine command → callback thread → SPSC
     /// ring → host producer). No-op for VST3 inserts, missing engine, or an
     /// insert with no mirrored/persisted state (host defaults already match).
-    fn replay_builtin_insert_state(&self, plugin_instance_id: &str, cx: &Context<Self>) {
+    pub(super) fn replay_builtin_insert_state(&self, plugin_instance_id: &str, cx: &Context<Self>) {
         use crate::components::builtin_plugin_editor as host;
         let Some(engine) = self.audio_bridge.engine.as_ref() else {
             return;

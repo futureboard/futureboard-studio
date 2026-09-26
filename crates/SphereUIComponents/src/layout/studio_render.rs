@@ -355,6 +355,10 @@ impl Render for StudioLayout {
                             &mut runtime_menu.items,
                             &self.menu_check_states(cx),
                         );
+                        crate::menu::patch_command_states(
+                            &mut runtime_menu.items,
+                            &self.history_menu_states(cx),
+                        );
                         components::menu_dropdown::menu_dropdown(
                             &runtime_menu,
                             menu_anchor,
@@ -741,6 +745,33 @@ impl Render for StudioLayout {
                                     &this.plugin_picker_prefs,
                                 );
                             }
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_select_kind: Arc::new({
+                    let this = cx.entity().clone();
+                    move |kind: &crate::components::plugin_picker::KindTab, _w, cx| {
+                        let kind = *kind;
+                        let _ = this.update(cx, |this, cx| {
+                            this.plugin_picker.set_kind_tab(kind);
+                            if let Some(index) = this.plugin_search_index.as_ref() {
+                                ensure_default_highlight(
+                                    &mut this.plugin_picker,
+                                    index,
+                                    &this.plugin_picker_prefs,
+                                );
+                            }
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_toggle_vendors: Arc::new({
+                    let this = cx.entity().clone();
+                    move |_: &(), _w, cx| {
+                        let _ = this.update(cx, |this, cx| {
+                            this.plugin_picker.vendors_expanded =
+                                !this.plugin_picker.vendors_expanded;
                             cx.notify();
                         });
                     }

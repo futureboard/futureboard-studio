@@ -289,6 +289,15 @@ pub struct InsertDrop {
     pub insert_id: String,
     pub to_track: String,
     pub anchor: DropAnchor,
+    /// Alt was held on release: land a new instance of the same plug-in with
+    /// the dragged one's state, and leave the dragged one where it is.
+    pub copy: bool,
+}
+
+/// Whether a slot drag is a copy right now: Alt, alone, is held.
+pub fn is_copy_drag(window: &Window) -> bool {
+    let modifiers = window.modifiers();
+    modifiers.alt && !modifiers.control && !modifiers.platform && !modifiers.shift
 }
 
 /// Commit callback for an insert drop. One completed drag = one undo entry.
@@ -379,7 +388,27 @@ impl InsertDropTarget {
     /// cannot take an effect, when the insert is an instrument plug-in (its
     /// identity is positional and it drives MIDI routing), or when this is the
     /// master and the insert has plug-in parameter automation.
-    pub fn anchor_for(&self, drag: &FxSlotDrag) -> Option<DropAnchor> {
+    ///
+    /// A `copy` adds a slot instead of moving one, so it needs room on this
+    /// chain even within the dragged insert's own, and never lands an
+    /// instrument. It carries no automation lanes, so the master takes it
+    /// either way. Dropped on the dragged row itself it lands right after it.
+    pub fn anchor_for(&self, drag: &FxSlotDrag, copy: bool) -> Option<DropAnchor> {
+        if copy {
+            if !self.accepts_foreign || !drag.movable {
+                return None;
+            }
+            if drag.track_id != self.track_id {
+                return Some(foreign_anchor(&self.slot));
+            }
+            return match &self.slot {
+                DropSlot::Row { id, .. } if *id == drag.insert_id => {
+                    Some(DropAnchor::After(id.clone()))
+                }
+                DropSlot::End { .. } => Some(DropAnchor::End),
+                slot => same_list_anchor(&drag.insert_id, drag.source_index, slot),
+            };
+        }
         if drag.track_id == self.track_id {
             return same_list_anchor(&drag.insert_id, drag.source_index, &self.slot);
         }
@@ -408,6 +437,10 @@ impl RefusableDrag for FxSlotDrag {
 /// `also_accept` answers `can_drop` for other payload types the element has
 /// its own `on_drop` for (GPUI keeps a single predicate per element).
 ///
+/// `anchor_for` is told whether the drag is a copy ([`is_copy_drag`]) as of
+/// each question, so the line and the refusal follow Alt as it is pressed and
+/// released mid-drag. A list that has no copy ignores it.
+///
 /// GPUI takes the drag before it asks `can_drop`, so a target that refuses
 /// still eats the drop: rows have to cover their share of the spacing between
 /// them rather than rely on a parent to catch what falls between.
@@ -415,23 +448,26 @@ pub fn slot_drop_target<T: RefusableDrag>(
     element: Stateful<Div>,
     key: SharedString,
     indicator: DropIndicator,
-    anchor_for: impl Fn(&T) -> Option<DropAnchor> + 'static,
+    anchor_for: impl Fn(&T, bool) -> Option<DropAnchor> + 'static,
     on_drop: impl Fn(&T, DropAnchor, &mut Window, &mut App) + 'static,
     also_accept: fn(&dyn Any) -> bool,
 ) -> Stateful<Div> {
-    let anchor_for: Rc<dyn Fn(&T) -> Option<DropAnchor>> = Rc::new(anchor_for);
+    let anchor_for: Rc<dyn Fn(&T, bool) -> Option<DropAnchor>> = Rc::new(anchor_for);
     let over_anchor = anchor_for.clone();
     let move_anchor = anchor_for.clone();
     accept_slot_drops(element, anchor_for, on_drop, also_accept)
-        .drag_over::<T>(move |style, drag, _window, _cx| match over_anchor(drag) {
-            Some(anchor) => indicator.apply(style, &anchor),
-            None => style,
+        .drag_over::<T>(move |style, drag, window, _cx| {
+            match over_anchor(drag, is_copy_drag(window)) {
+                Some(anchor) => indicator.apply(style, &anchor),
+                None => style,
+            }
         })
         .on_drag_move::<T>(move |event, window, cx| {
             let inside = event.bounds.contains(&event.event.position);
+            let copy = is_copy_drag(window);
             let (refusal, refused) = {
                 let drag = event.drag(cx);
-                (drag.refusal().clone(), move_anchor(drag).is_none())
+                (drag.refusal().clone(), move_anchor(drag, copy).is_none())
             };
             refusal.track(&key, inside, refused, window, cx);
         })
@@ -442,20 +478,20 @@ pub fn slot_drop_target<T: RefusableDrag>(
 /// place goes to `on_drop`. No indicator and no cursor tracking.
 fn accept_slot_drops<T: 'static>(
     element: Stateful<Div>,
-    anchor_for: Rc<dyn Fn(&T) -> Option<DropAnchor>>,
+    anchor_for: Rc<dyn Fn(&T, bool) -> Option<DropAnchor>>,
     on_drop: impl Fn(&T, DropAnchor, &mut Window, &mut App) + 'static,
     also_accept: fn(&dyn Any) -> bool,
 ) -> Stateful<Div> {
     let can_anchor = anchor_for.clone();
     element
         .can_drop(
-            move |dragged, _window, _cx| match dragged.downcast_ref::<T>() {
-                Some(drag) => can_anchor(drag).is_some(),
+            move |dragged, window, _cx| match dragged.downcast_ref::<T>() {
+                Some(drag) => can_anchor(drag, is_copy_drag(window)).is_some(),
                 None => also_accept(dragged),
             },
         )
         .on_drop::<T>(move |drag, window, cx| {
-            if let Some(anchor) = anchor_for(drag) {
+            if let Some(anchor) = anchor_for(drag, is_copy_drag(window)) {
                 on_drop(drag, anchor, window, cx);
             }
         })
@@ -487,7 +523,7 @@ pub fn insert_drop_target_also(
         element,
         target.key.clone(),
         indicator,
-        move |drag| anchor_target.anchor_for(drag),
+        move |drag, copy| anchor_target.anchor_for(drag, copy),
         commit_insert_drop_to(target, on_drop),
         also_accept,
     )
@@ -512,7 +548,7 @@ pub fn insert_drop_forwarder(
     let anchor_target = target.clone();
     accept_slot_drops::<FxSlotDrag>(
         element,
-        Rc::new(move |drag| anchor_target.anchor_for(drag)),
+        Rc::new(move |drag, copy| anchor_target.anchor_for(drag, copy)),
         commit_insert_drop_to(target, on_drop),
         |_| false,
     )
@@ -530,6 +566,8 @@ fn commit_insert_drop_to(
                 insert_id: drag.insert_id.clone(),
                 to_track: target.track_id.clone(),
                 anchor,
+                // Read in the same dispatch that found the anchor for it.
+                copy: is_copy_drag(window),
             },
             window,
             cx,
@@ -648,12 +686,12 @@ mod tests {
     fn foreign_drops_take_the_rows_place_or_the_end() {
         let t = target("track-b", row("X", 1), true);
         assert_eq!(
-            t.anchor_for(&drag("track-a", "A", 0)),
+            t.anchor_for(&drag("track-a", "A", 0), false),
             Some(DropAnchor::Before("X".into()))
         );
         let end = target("track-b", DropSlot::End { last_id: None }, true);
         assert_eq!(
-            end.anchor_for(&drag("track-a", "A", 3)),
+            end.anchor_for(&drag("track-a", "A", 3), false),
             Some(DropAnchor::End)
         );
         assert_eq!(
@@ -665,18 +703,66 @@ mod tests {
     #[test]
     fn foreign_drops_are_refused_where_the_insert_cannot_go() {
         let full = target("track-b", row("X", 1), false);
-        assert_eq!(full.anchor_for(&drag("track-a", "A", 0)), None);
+        assert_eq!(full.anchor_for(&drag("track-a", "A", 0), false), None);
 
         let open = target("track-b", row("X", 1), true);
         let mut instrument = drag("track-a", "A", 0);
         instrument.movable = false;
-        assert_eq!(open.anchor_for(&instrument), None);
+        assert_eq!(open.anchor_for(&instrument, false), None);
 
         let master = target(MASTER_TRACK_ID, DropSlot::End { last_id: None }, true);
         let mut automated = drag("track-a", "A", 0);
-        assert_eq!(master.anchor_for(&automated), Some(DropAnchor::End));
+        assert_eq!(master.anchor_for(&automated, false), Some(DropAnchor::End));
         automated.has_param_lanes = true;
-        assert_eq!(master.anchor_for(&automated), None);
+        assert_eq!(master.anchor_for(&automated, false), None);
+    }
+
+    /// Alt-drag lands a copy: on its own row too (right after it), on the end
+    /// even when it is already last, and on the master with automation — the
+    /// lanes stay with the original.
+    #[test]
+    fn a_copy_lands_where_a_move_would_change_nothing() {
+        let own_row = target("track-a", row("A", 0), true);
+        assert_eq!(own_row.anchor_for(&drag("track-a", "A", 0), false), None);
+        assert_eq!(
+            own_row.anchor_for(&drag("track-a", "A", 0), true),
+            Some(DropAnchor::After("A".into()))
+        );
+
+        let end = target(
+            "track-a",
+            DropSlot::End {
+                last_id: Some("A".into()),
+            },
+            true,
+        );
+        assert_eq!(
+            end.anchor_for(&drag("track-a", "A", 0), true),
+            Some(DropAnchor::End)
+        );
+
+        let master = target(MASTER_TRACK_ID, DropSlot::End { last_id: None }, true);
+        let mut automated = drag("track-a", "A", 0);
+        automated.has_param_lanes = true;
+        assert_eq!(master.anchor_for(&automated, true), Some(DropAnchor::End));
+    }
+
+    /// A copy adds a slot, so a full chain refuses it even within the
+    /// insert's own chain, and an instrument is never copied.
+    #[test]
+    fn a_copy_needs_room_and_an_effect() {
+        let full_own = target("track-a", row("B", 1), false);
+        assert_eq!(full_own.anchor_for(&drag("track-a", "A", 0), true), None);
+        assert_eq!(
+            full_own.anchor_for(&drag("track-a", "A", 0), false),
+            Some(DropAnchor::After("B".into())),
+            "a move within a full chain still reorders"
+        );
+
+        let open = target("track-b", row("X", 1), true);
+        let mut instrument = drag("track-a", "A", 0);
+        instrument.movable = false;
+        assert_eq!(open.anchor_for(&instrument, true), None);
     }
 
     #[test]

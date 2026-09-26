@@ -114,7 +114,14 @@ pub struct FxSlotDrag {
 }
 
 impl gpui::Render for FxSlotDrag {
-    fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        // Alt drops a copy (`reorder::is_copy_drag`); the label says so before
+        // the drop does.
+        let label = if crate::components::reorder::is_copy_drag(window) {
+            format!("+ {}", self.display_name)
+        } else {
+            self.display_name.clone()
+        };
         div()
             .px(px(8.0))
             .py(px(3.0))
@@ -125,7 +132,7 @@ impl gpui::Render for FxSlotDrag {
             .text_size(px(11.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(Colors::text_primary())
-            .child(self.display_name.clone())
+            .child(label)
     }
 }
 

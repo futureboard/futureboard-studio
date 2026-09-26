@@ -14,7 +14,7 @@ use crate::components::settings_dialog::{
     SettingsTab,
 };
 use crate::components::timeline::timeline_state::{
-    self, ClipType, CreateTrackOptions, InsertPluginFormat, TrackAudioFormat,
+    self, ClipType, CreateTrackOptions, InsertPluginFormat, TrackAudioFormat, TrackEditScope,
     TrackMidiInputRouting, TrackOutputRouting, TrackType,
 };
 use crate::components::{external_mixer_debug, open_mixer_window};
@@ -389,6 +389,30 @@ impl StudioLayout {
             )
         };
 
+        // One step per edit. A removal clears the input of any track on that
+        // bus, so the tracks that have one come into the scope.
+        let history_scope = {
+            let state = &self.timeline.read(cx).state;
+            TrackEditScope::tracks(
+                state
+                    .tracks
+                    .iter()
+                    .filter(|track| track.routing.audio_input_connection_id.is_some())
+                    .map(|track| track.id.clone()),
+            )
+            .with_routing()
+        };
+        let history_edit = self.begin_track_edit(history_scope, cx);
+        let (history_label, history_fold) = match edit {
+            ConnectionEdit::Add { .. } => ("Add Audio Connection", false),
+            ConnectionEdit::SetEnabled { .. } => ("Enable Audio Connection", false),
+            ConnectionEdit::Rename { .. } => ("Rename Audio Connection", true),
+            ConnectionEdit::Duplicate { .. } => ("Duplicate Audio Connection", false),
+            ConnectionEdit::Remove { .. } => ("Remove Audio Connection", false),
+            ConnectionEdit::ResetDefaults { .. } => ("Reset Audio Connections", false),
+            ConnectionEdit::ApplyPreset { .. } => ("Apply Connection Preset", false),
+            _ => ("Edit Audio Connection", false),
+        };
         let mutation = self.timeline.update(cx, |timeline, cx| {
             let registry = &mut timeline.state.audio_connections;
             let mutation = match edit {
@@ -532,6 +556,11 @@ impl StudioLayout {
             cx.notify();
             mutation
         });
+        if history_fold {
+            self.commit_track_edit_folded(history_label, history_edit, cx);
+        } else {
+            self.commit_track_edit(history_label, history_edit, cx);
+        }
 
         if mutation.needs_routing_rebuild {
             self.publish_audio_connection_routing(cx);
@@ -1182,7 +1211,11 @@ impl StudioLayout {
                 let _ = layout.update(cx, |this, cx| {
                     this.mark_dirty();
                     let mut bridge_inserts = Vec::new();
+                    // Every track this adds — and the selection a new bus
+                    // re-routes — is one undo step.
+                    let scope = TrackEditScope::tracks(this.selected_track_ids(cx));
                     let _ = this.timeline.update(cx, |timeline, cx| {
+                        let edit = timeline.begin_track_edit(scope);
                         let route_selected_to_new_bus = dialog.selected_kind == AddTrackKind::Bus;
                         let selected_for_bus: Vec<String> = if route_selected_to_new_bus {
                             let mut ids = timeline.state.selection.selected_track_ids.clone();
@@ -1413,6 +1446,12 @@ impl StudioLayout {
                             count,
                             created_ids
                         ));
+                        timeline.commit_track_edit(
+                            if count == 1 { "Add Track" } else { "Add Tracks" },
+                            edit,
+                            false,
+                            cx,
+                        );
                         cx.notify();
                     });
                     let mut bridge_loaded = false;
@@ -1892,6 +1931,8 @@ impl StudioLayout {
             ChannelLayout::Mono
         };
 
+        // The bus and the track on it are one step.
+        let edit = self.begin_track_edit(TrackEditScope::track_list().with_routing(), cx);
         let mutation = self.timeline.update(cx, |timeline, cx| {
             let (connection_id, mut mutation) = timeline.state.audio_connections.add_connection(
                 AudioConnectionDirection::Input,
@@ -1949,6 +1990,7 @@ impl StudioLayout {
             cx.notify();
             mutation
         });
+        self.commit_track_edit("Add Jam Track", edit, cx);
 
         self.mark_dirty();
         if mutation.needs_routing_rebuild {
@@ -2440,6 +2482,8 @@ impl StudioLayout {
             let studio = studio.clone();
             Arc::new(move |source_id: String, dest_id: String, _w, cx| {
                 StudioLayout::defer_update(&studio, cx, move |this, cx| {
+                    let edit =
+                        this.begin_track_edit(TrackEditScope::tracks([source_id.clone()]), cx);
                     let changed = this.timeline.update(cx, |timeline, _cx| {
                         let already = timeline
                             .state
@@ -2462,6 +2506,7 @@ impl StudioLayout {
                                 .is_some()
                         }
                     });
+                    this.commit_track_edit("Routing Matrix", edit, cx);
                     if changed {
                         this.mark_dirty();
                         this.audio_bridge.project_dirty = true;
@@ -2556,11 +2601,16 @@ impl StudioLayout {
         > = Arc::new(move |update, app| {
             let _ = studio.update(app, |layout, cx| {
                 let changed = layout.timeline.update(cx, |timeline, cx| {
+                    let edit = timeline
+                        .begin_track_edit(TrackEditScope::tracks([update.track_id.clone()]));
                     let changed = timeline.state.set_track_soundfont_player_state(
                         &update.track_id,
                         update.settings.clone(),
                     );
                     if changed {
+                        // The player's sliders report as they move: one step
+                        // per gesture on the same setting.
+                        timeline.commit_track_edit("Soundfont Player", edit, true, cx);
                         cx.notify();
                     }
                     changed

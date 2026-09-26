@@ -16,7 +16,7 @@ use crate::components::mixer_tree_sidebar::{
     MIXER_TREE_SIDEBAR_DEFAULT_WIDTH,
 };
 use crate::components::timeline::timeline_state::{
-    self, collapsed_vsti_output_group_keys_from_tracks, TrackState,
+    self, collapsed_vsti_output_group_keys_from_tracks, TrackEditScope, TrackState,
 };
 use crate::components::{external_mixer_debug, external_mixer_debug_enabled, MixerSnapshot};
 
@@ -806,12 +806,14 @@ impl StudioLayout {
                 let id = id.clone();
                 StudioLayout::defer_update(&owner_mute, cx, move |layout, cx| {
                     layout.mark_dirty_view_only();
+                    let edit = layout.begin_track_edit(TrackEditScope::tracks([id.clone()]), cx);
                     let muted = layout.timeline.update(cx, |timeline, cx| {
                         timeline.state.toggle_track_mute(&id);
                         let value = timeline.state.find_track(&id).map(|track| track.muted);
                         cx.notify();
                         value
                     });
+                    layout.commit_track_edit("Mute", edit, cx);
                     if let Some(muted) = muted {
                         if let Some(engine) = layout.audio_bridge.engine.as_ref() {
                             let _ = engine.update_track_param(
@@ -833,12 +835,14 @@ impl StudioLayout {
                 let id = id.clone();
                 StudioLayout::defer_update(&owner_solo, cx, move |layout, cx| {
                     layout.mark_dirty_view_only();
+                    let edit = layout.begin_track_edit(TrackEditScope::tracks([id.clone()]), cx);
                     let solo = layout.timeline.update(cx, |timeline, cx| {
                         timeline.state.toggle_track_solo(&id);
                         let value = timeline.state.find_track(&id).map(|track| track.solo);
                         cx.notify();
                         value
                     });
+                    layout.commit_track_edit("Solo", edit, cx);
                     if let Some(solo) = solo {
                         if let Some(engine) = layout.audio_bridge.engine.as_ref() {
                             let _ = engine.update_track_param(
@@ -1084,8 +1088,10 @@ impl StudioLayout {
         > = std::sync::Arc::new(move |v: &f32, _w, cx| {
             let v = *v;
             timeline_master.update(cx, |t, cx| {
+                let edit = t.begin_track_edit(TrackEditScope::master());
                 t.state.set_master_volume(v);
                 t.state.master_volume_preview = None;
+                t.commit_track_edit("Master Volume", edit, false, cx);
                 cx.notify();
             });
             StudioLayout::defer_update(&owner_dirty, cx, |this, cx| {
@@ -1157,8 +1163,11 @@ impl StudioLayout {
             dyn Fn(&mut Window, &mut gpui::App) + 'static,
         > = std::sync::Arc::new(move |_w, cx| {
             let committed = timeline_master_commit.update(cx, |t, cx| {
+                // One drag, one step: the preview never touched the saved level.
+                let edit = t.begin_track_edit(TrackEditScope::master());
                 let committed = t.state.commit_master_volume_preview();
                 if committed.is_some() {
+                    t.commit_track_edit("Master Volume", edit, false, cx);
                     cx.notify();
                 }
                 committed
@@ -1249,8 +1258,19 @@ impl StudioLayout {
             let id = id.clone();
             let v = *v;
             timeline_vol.update(cx, |t, cx| {
+                let prev = t.state.find_track(&id).map(|track| track.volume);
                 t.state.set_track_volume(&id, v);
                 t.state.clear_track_volume_preview(&id);
+                if let Some(prev) = prev {
+                    t.record_mixer_value(
+                        EditCommand::SetTrackVolume {
+                            track_id: id.clone(),
+                            prev,
+                            next: v,
+                        },
+                        cx,
+                    );
+                }
                 cx.notify();
             });
             StudioLayout::defer_update(&owner_dirty, cx, |this, cx| {
@@ -1395,7 +1415,20 @@ impl StudioLayout {
                 ));
             }
             timeline_pan.update(cx, |t, cx| {
+                let prev = t.state.find_track(&id).map(|track| track.pan);
                 t.state.set_track_pan(&id, v);
+                // The knob reports every sample and no release: consecutive
+                // pans of one track fold into one step.
+                if let Some(prev) = prev {
+                    t.record_mixer_value(
+                        EditCommand::SetTrackPan {
+                            track_id: id.clone(),
+                            prev,
+                            next: v,
+                        },
+                        cx,
+                    );
+                }
                 cx.notify();
             });
             StudioLayout::defer_update(&owner_dirty, cx, |this, cx| {
@@ -1423,7 +1456,12 @@ impl StudioLayout {
                 }
                 {
                     let _state_update = crate::perf::PerfScope::enter("MixerMuteStateUpdate");
-                    timeline_mute.update(cx, |t, _cx| {
+                    timeline_mute.update(cx, |t, cx| {
+                        let mut scope = t.state.selection.selected_track_ids.clone();
+                        if !scope.contains(&id) {
+                            scope.push(id.clone());
+                        }
+                        let edit = t.begin_track_edit(TrackEditScope::tracks(scope));
                         before_state = t
                             .state
                             .find_track(&id)
@@ -1448,6 +1486,7 @@ impl StudioLayout {
                                 t.state.set_track_mute(&other, muted);
                             }
                         }
+                        t.commit_track_edit("Mute", edit, false, cx);
                     });
                 }
                 // Dispatch the bounded, non-blocking realtime command before
@@ -1543,7 +1582,12 @@ impl StudioLayout {
                 }
                 {
                     let _state_update = crate::perf::PerfScope::enter("MixerSoloStateUpdate");
-                    timeline_solo.update(cx, |t, _cx| {
+                    timeline_solo.update(cx, |t, cx| {
+                        let mut scope = t.state.selection.selected_track_ids.clone();
+                        if !scope.contains(&id) {
+                            scope.push(id.clone());
+                        }
+                        let edit = t.begin_track_edit(TrackEditScope::tracks(scope));
                         before_state = t
                             .state
                             .find_track(&id)
@@ -1566,6 +1610,7 @@ impl StudioLayout {
                                 t.state.set_track_solo(&other, solo);
                             }
                         }
+                        t.commit_track_edit("Solo", edit, false, cx);
                     });
                 }
                 let mut audio_router_applied = false;
@@ -1644,6 +1689,9 @@ impl StudioLayout {
                     .find_track(&id)
                     .map(|track| track.armed);
                 external_mixer_debug(&format!("mixer command dispatched toggle_arm id={id}"));
+                let edit = timeline_arm
+                    .read(cx)
+                    .begin_track_edit(TrackEditScope::tracks([id.clone()]));
                 let changed = timeline_arm.update(cx, |t, cx| {
                     let changed = t.state.toggle_track_arm(&id);
                     if changed {
@@ -1682,6 +1730,9 @@ impl StudioLayout {
                     });
                     return;
                 }
+                timeline_arm.update(cx, |t, cx| {
+                    t.commit_track_edit("Record Arm", edit, false, cx);
+                });
                 StudioLayout::defer_update(&owner_dirty, cx, |this, cx| {
                     this.mark_dirty_view_only();
                     this.push_mixer_snapshot_to_window(cx);
@@ -1701,6 +1752,9 @@ impl StudioLayout {
                 .find_track(&id)
                 .map(|track| track.input_monitor);
             external_mixer_debug(&format!("mixer command dispatched toggle_input id={id}"));
+            let edit = timeline_input
+                .read(cx)
+                .begin_track_edit(TrackEditScope::tracks([id.clone()]));
             let changed = timeline_input.update(cx, |t, cx| {
                 let changed = t.state.cycle_track_input_monitor(&id);
                 if changed {
@@ -1738,6 +1792,9 @@ impl StudioLayout {
                 });
                 return;
             }
+            timeline_input.update(cx, |t, cx| {
+                t.commit_track_edit("Input Monitor", edit, false, cx);
+            });
             StudioLayout::defer_update(&owner_dirty, cx, |this, cx| {
                 this.mark_dirty_view_only();
                 this.push_mixer_snapshot_to_window(cx);
@@ -2037,9 +2094,11 @@ impl StudioLayout {
                 let track_id = track_id.clone();
                 let insert_id = insert_id.clone();
                 StudioLayout::defer_update(&this, cx, move |this, cx| {
+                    let edit = this.begin_track_edit(TrackEditScope::channel(&track_id), cx);
                     this.timeline.update(cx, |timeline, _cx| {
                         timeline.state.toggle_insert_bypass(&track_id, &insert_id);
                     });
+                    this.commit_track_edit("Bypass Plug-in", edit, cx);
                     // Bypass is applied live per block via the insert's
                     // "enabled" runtime param — the plugin instance stays
                     // loaded and no graph rebuild runs (a full `load_project`
@@ -2151,9 +2210,12 @@ impl StudioLayout {
                 let track_id = track_id.clone();
                 let send_id = send_id.clone();
                 StudioLayout::defer_update(&this, cx, move |this, cx| {
+                    let edit =
+                        this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]), cx);
                     this.timeline.update(cx, |timeline, _cx| {
                         timeline.state.remove_send(&track_id, &send_id);
                     });
+                    this.commit_track_edit("Remove Send", edit, cx);
                     this.mark_dirty();
                     this.audio_bridge.project_dirty = true;
                     cx.notify();
@@ -2170,6 +2232,8 @@ impl StudioLayout {
                     let send_id = send_id.clone();
                     let gain_db = *gain_db;
                     StudioLayout::defer_update(&this, cx, move |this, cx| {
+                        let edit =
+                            this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]), cx);
                         let changed = this.timeline.update(cx, |timeline, cx| {
                             let changed = timeline
                                 .state
@@ -2179,6 +2243,8 @@ impl StudioLayout {
                             }
                             changed
                         });
+                        // A slider drag: its samples fold into one step.
+                        this.commit_track_edit_folded("Send Level", edit, cx);
                         if changed {
                             this.mark_dirty();
                             this.audio_bridge.project_dirty = true;
@@ -2278,6 +2344,9 @@ impl StudioLayout {
         drop: &crate::components::reorder::InsertDrop,
         cx: &mut Context<Self>,
     ) -> bool {
+        if drop.copy {
+            return self.commit_insert_copy(drop, cx);
+        }
         let command = insert_drop_command(&self.timeline.read(cx).state, drop);
         let Some(command) = command else {
             return false;
@@ -2290,6 +2359,52 @@ impl StudioLayout {
             timeline.run_edit_command(command, cx);
         });
         self.after_channel_chain_edit(cx, reason);
+        true
+    }
+
+    /// An Alt-dropped insert: a new instance of the same plug-in, carrying the
+    /// dragged one's state as the plug-in has it now, lands where the drop
+    /// says; the dragged one stays where it was.
+    ///
+    /// Loaded like any other added insert — the state travels with the load
+    /// (`load_bridge_insert_for_slot`, or the engine sync for an in-process
+    /// insert) — but without opening its editor. One undo step. Returns
+    /// whether a copy landed.
+    fn commit_insert_copy(
+        &mut self,
+        drop: &crate::components::reorder::InsertDrop,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let state = self.capture_insert_state(&drop.from_track, &drop.insert_id, cx);
+        let before = self.capture_insert_chains(&[drop.to_track.as_str()], cx);
+        let copy_id = self.timeline.update(cx, |timeline, cx| {
+            let gap = crate::components::reorder::anchor_gap(
+                &timeline.state.insert_order(&drop.to_track),
+                &drop.anchor,
+            )?;
+            let copy_id = timeline.state.duplicate_insert(
+                &drop.from_track,
+                &drop.insert_id,
+                &drop.to_track,
+                gap,
+                state.clone(),
+            )?;
+            cx.notify();
+            Some(copy_id)
+        });
+        let Some(copy_id) = copy_id else {
+            return false;
+        };
+        eprintln!(
+            "[PluginAdd] duplicate insert={} track={} -> insert={copy_id} track={} state_bytes={}",
+            drop.insert_id,
+            drop.from_track,
+            drop.to_track,
+            state.as_ref().map_or(0, |bytes| bytes.len())
+        );
+        self.record_insert_chains("Duplicate Plug-in", before, cx);
+        self.load_copied_inserts(&drop.to_track, std::slice::from_ref(&copy_id), cx);
+        self.after_channel_chain_edit(cx, "duplicate_insert");
         true
     }
 
@@ -2373,6 +2488,7 @@ impl StudioLayout {
             OutputCommand::Assign(id) => Some(id),
         };
 
+        let edit = self.begin_track_edit(TrackEditScope::default().with_routing(), cx);
         let changed = self.timeline.update(cx, |timeline, cx| {
             let changed = if is_master {
                 timeline.state.set_master_output_connection(assignment)
@@ -2389,6 +2505,15 @@ impl StudioLayout {
             cx.notify();
             return;
         }
+        self.commit_track_edit(
+            if is_master {
+                "Master Output"
+            } else {
+                "Monitor Output"
+            },
+            edit,
+            cx,
+        );
 
         self.mark_dirty();
         self.audio_bridge.project_dirty = true;
@@ -2752,6 +2877,7 @@ mod insert_drop_tests {
             insert_id: insert.to_string(),
             to_track: to.to_string(),
             anchor,
+            copy: false,
         }
     }
 

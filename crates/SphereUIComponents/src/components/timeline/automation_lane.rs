@@ -480,12 +480,15 @@ pub fn automation_lane(
     );
 
     // ── Right envelope + interaction area ────────────────────────────────────
+    // The frame only once the press has become a marquee, and only on its own
+    // lane — a lane id alone ("volume") repeats on every track.
+    let lane_marquee = marquee.filter(|m| m.started && m.track_id == track_id);
     let envelope = lane_envelope(
         lane,
         state,
         lane_height,
         is_active,
-        marquee,
+        lane_marquee,
         lane_hover.as_ref(),
     );
 

@@ -3,7 +3,7 @@ use gpui::Context;
 use crate::components::edit::{ClipSnapshot, EditCommand, TrackSnapshot};
 #[cfg(debug_assertions)]
 use crate::components::timeline::timeline_state::TrackType;
-use crate::components::timeline::timeline_state::{self};
+use crate::components::timeline::timeline_state::{self, TrackEditScope};
 
 use super::StudioLayout;
 
@@ -87,6 +87,11 @@ impl StudioLayout {
             plugin_ids.len(),
             insert_ids.len()
         );
+
+        // 0. The delete's undo snapshot is taken after this: keep what the
+        //    plug-ins sound like now, so undo brings them back that way rather
+        //    than as of the last save.
+        self.store_live_plugin_states(track_id, &plugin_ids, cx);
 
         // 1. Silence the track's instrument now (Part 13: delete while sounding).
         //    The engine reload also panics on project_load, but doing it here
@@ -392,12 +397,14 @@ impl StudioLayout {
             let Some(id) = timeline.state.selection.selected_track_id.clone() else {
                 return AutomationViewChange::Unchanged;
             };
+            let lanes_before = timeline.state.capture_automation_lanes(&id);
             let mut cycled = false;
             let change = timeline.state.edit_automation_view(&id, |state| {
                 cycled = state.cycle_automation_target(&id).is_some();
             });
             if change == AutomationViewChange::Lanes {
-                timeline.mark_project_changed(cx);
+                // A lane it created is one undo step.
+                timeline.record_automation_lanes_edit(&id, lanes_before, cx);
             }
             if cycled {
                 cx.notify();
@@ -431,6 +438,7 @@ impl StudioLayout {
         let target = self.enrich_automation_target_name(track_id, target, cx);
         let change = self.timeline.update(cx, |timeline, cx| {
             timeline.state.select_track(track_id);
+            let lanes_before = timeline.state.capture_automation_lanes(track_id);
             let change = timeline.state.edit_automation_view(track_id, |state| {
                 if state.track_lane_mode(track_id) != TrackLaneMode::Automation {
                     state.toggle_track_lane_mode(track_id);
@@ -438,7 +446,8 @@ impl StudioLayout {
                 state.set_track_automation_target(track_id, target);
             });
             if change == AutomationViewChange::Lanes {
-                timeline.mark_project_changed(cx);
+                // A lane it created is one undo step.
+                timeline.record_automation_lanes_edit(track_id, lanes_before, cx);
             }
             cx.notify();
             change
@@ -674,6 +683,7 @@ impl StudioLayout {
         // the render pass), never via a graph rebuild — `mark_dirty()` here
         // used to force a full `load_project` and stutter playback.
         self.mark_dirty_view_only();
+        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
         let toggled = self.timeline.update(cx, |timeline, cx| {
             let id = timeline.state.selection.selected_track_id.clone()?;
             timeline.state.toggle_track_mute(&id);
@@ -693,6 +703,7 @@ impl StudioLayout {
             cx.notify();
             Some((ids, muted))
         });
+        self.commit_track_edit("Mute", edit, cx);
         if let Some((ids, muted)) = toggled {
             if let Some(engine) = self.audio_bridge.engine.as_ref() {
                 for id in &ids {
@@ -706,6 +717,7 @@ impl StudioLayout {
     pub(super) fn toggle_selected_track_solo(&mut self, cx: &mut Context<Self>) {
         // Live control — see `toggle_selected_track_mute`.
         self.mark_dirty_view_only();
+        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
         let toggled = self.timeline.update(cx, |timeline, cx| {
             let id = timeline.state.selection.selected_track_id.clone()?;
             timeline.state.toggle_track_solo(&id);
@@ -725,6 +737,7 @@ impl StudioLayout {
             cx.notify();
             Some((ids, solo))
         });
+        self.commit_track_edit("Solo", edit, cx);
         if let Some((ids, solo)) = toggled {
             if let Some(engine) = self.audio_bridge.engine.as_ref() {
                 for id in &ids {
@@ -737,17 +750,20 @@ impl StudioLayout {
 
     pub(super) fn toggle_selected_track_arm(&mut self, cx: &mut Context<Self>) {
         self.mark_dirty();
+        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
         let _ = self.timeline.update(cx, |timeline, cx| {
             if let Some(id) = timeline.state.selection.selected_track_id.clone() {
                 timeline.state.toggle_track_arm(&id);
                 cx.notify();
             }
         });
+        self.commit_track_edit("Record Arm", edit, cx);
     }
 
     pub(super) fn reset_selected_track_volume(&mut self, cx: &mut Context<Self>) {
         self.mark_dirty_view_only();
         let norm = timeline_state::volume::db_to_norm(0.0);
+        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
         let ids: Vec<String> = self.timeline.update(cx, |timeline, cx| {
             let mut ids = timeline.state.selection.selected_track_ids.clone();
             if ids.is_empty() {
@@ -763,6 +779,7 @@ impl StudioLayout {
             }
             ids
         });
+        self.commit_track_edit("Reset Volume", edit, cx);
         if let Some(engine) = self.audio_bridge.engine.as_ref() {
             let linear = super::engine_snapshot::volume_norm_to_linear(norm) as f64;
             for id in &ids {
@@ -776,6 +793,8 @@ impl StudioLayout {
     /// selected non-routing track(s) into the new bus when present.
     pub(super) fn create_bus_track_immediate(&mut self, cx: &mut Context<Self>) {
         self.overlay.open_popover = None;
+        // The new bus and the selection it re-routes are one step.
+        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
         let bus_id = self.timeline.update(cx, |timeline, cx| {
             let mut route_from = timeline.state.selection.selected_track_ids.clone();
             if route_from.is_empty() {
@@ -787,6 +806,7 @@ impl StudioLayout {
             cx.notify();
             bus_id
         });
+        self.commit_track_edit("Add Bus", edit, cx);
         self.mark_dirty();
         self.audio_bridge.project_dirty = true;
         self.schedule_audio_project_sync(cx, true, "mixer_create_bus");
@@ -798,6 +818,7 @@ impl StudioLayout {
 
     pub(super) fn reset_selected_track_pan(&mut self, cx: &mut Context<Self>) {
         self.mark_dirty_view_only();
+        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
         let ids: Vec<String> = self.timeline.update(cx, |timeline, cx| {
             let mut ids = timeline.state.selection.selected_track_ids.clone();
             if ids.is_empty() {
@@ -813,6 +834,7 @@ impl StudioLayout {
             }
             ids
         });
+        self.commit_track_edit("Reset Pan", edit, cx);
         if let Some(engine) = self.audio_bridge.engine.as_ref() {
             for id in &ids {
                 let _ = engine.update_track_param(id, "pan", 0.0);
@@ -849,6 +871,7 @@ impl StudioLayout {
         else {
             return;
         };
+        let edit = self.begin_track_edit(TrackEditScope::tracks([track_id.clone()]), cx);
         let changed = self.timeline.update(cx, |timeline, cx| {
             let Some(track) = timeline
                 .state
@@ -865,6 +888,7 @@ impl StudioLayout {
             cx.notify();
             true
         });
+        self.commit_track_edit("Set Timebase", edit, cx);
         if changed {
             self.mark_dirty();
             cx.notify();

@@ -66,6 +66,9 @@ pub struct PluginEditorChrome {
     pub presets: Vec<String>,
     /// Which of `presets` is loaded, when the studio knows.
     pub preset_index: Option<usize>,
+    /// State copied from an insert of this same plug-in is waiting to be
+    /// pasted. Paste is offered only then.
+    pub can_paste: bool,
 }
 
 impl PluginEditorChrome {
@@ -119,11 +122,36 @@ impl PluginEditorChrome {
     }
 }
 
-/// Renders the open preset list. It fills its window edge to edge.
+/// Popover state the list renders from: the highlighted row (an index into
+/// `chrome.presets`) and the type-to-filter text.
+#[derive(Clone, Debug, Default)]
+struct PresetPopoverView {
+    highlighted: Option<usize>,
+    filter: String,
+}
+
+/// Presets matching `filter`, as indices into `presets`. Case-insensitive
+/// substring match: preset names are short and the user types part of one.
+fn filtered_presets(presets: &[String], filter: &str) -> Vec<usize> {
+    let needle = filter.trim().to_lowercase();
+    presets
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| needle.is_empty() || name.to_lowercase().contains(&needle))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Renders the preset popover. It fills its window edge to edge.
 ///
-/// `highlighted` is the row the keyboard is on, which is not the same thing as
-/// the loaded preset: arrows move a highlight, Enter commits it, and until then
-/// the loaded preset is still the selected one.
+/// ```txt
+/// PRESETS                      Plug-in name
+/// ⌕ type to filter
+/// ▌Warm Vocal                            ✓
+///  Bright Lead
+/// ──────────────────────────────────────────
+/// Save As…     Import…         Show Folder
+/// ```
 ///
 /// # Why the panel has no corner radius and no shadow
 ///
@@ -132,12 +160,12 @@ impl PluginEditorChrome {
 /// (`gpui_windows/src/directx_renderer.rs:328`). Anything the outermost element
 /// does not cover — the four corners under a radius, the margin a drop shadow
 /// would need — is that white. So the panel is the window: full-bleed fill, one
-/// hairline border, square corners. The floating lift `elevation::OVERLAY`
-/// would give an in-window popover is carried here by the OS instead, because
-/// the list really is a separate surface above the editor.
-pub fn render_preset_menu(
+/// hairline border, square corners. The floating lift an in-window popover
+/// would get is carried here by the OS instead, because the list really is a
+/// separate surface above the editor.
+fn render_preset_popover(
     chrome: &PluginEditorChrome,
-    highlighted: Option<usize>,
+    view: &PresetPopoverView,
     emit: impl Fn(PluginEditorAction, &mut Window, &mut App) + Clone + 'static,
 ) -> gpui::AnyElement {
     // Resolved once, outside the row loop: `Colors::composite` is a
@@ -148,42 +176,124 @@ pub fn render_preset_menu(
     let selected_fill = Colors::composite(rest, Colors::state_selected());
     let selected_hover = Colors::composite(rest, Colors::state_selected_hover());
     let pressed = Colors::composite(rest, Colors::state_recessed());
+    let recessed = Colors::composite(rest, Colors::state_recessed());
+
+    let visible = filtered_presets(&chrome.presets, &view.filter);
+
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::space::BASE))
+        .flex_none()
+        .h(px(PRESET_POPOVER_HEADER_H))
+        .px(px(theme::menu::ROW_PAD_X))
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(theme::typography::DENSE_CAPTION))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(Colors::text_faint())
+                .child("PRESETS"),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(theme::typography::DENSE_LABEL))
+                .text_color(Colors::text_muted())
+                .child(chrome.plugin_name.clone()),
+        );
+
+    // Type-to-filter. Not a text field — the popover owns the keyboard while
+    // it is open, so printable keys go straight to the filter and the arrows
+    // stay on the list.
+    let search = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::SNUG))
+        .flex_none()
+        .h(px(PRESET_POPOVER_SEARCH_H))
+        .mx(px(PRESET_MENU_PAD))
+        .px(px(theme::space::BASE))
+        .rounded(px(theme::radius::CONTROL_SM))
+        .bg(recessed)
+        .border(px(PRESET_MENU_BORDER))
+        .border_color(Colors::border_subtle())
+        .child(
+            svg()
+                .path(assets::ICON_SEARCH_PATH)
+                .w(px(theme::menu::ICON_SIZE))
+                .h(px(theme::menu::ICON_SIZE))
+                .flex_none()
+                .text_color(Colors::text_faint()),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .truncate()
+                .text_size(px(theme::menu::LABEL_TEXT_SIZE))
+                .text_color(if view.filter.is_empty() {
+                    Colors::text_faint()
+                } else {
+                    Colors::text_primary()
+                })
+                .child(if view.filter.is_empty() {
+                    "Type to filter".to_string()
+                } else {
+                    view.filter.clone()
+                }),
+        );
 
     let mut list = div()
         .id("plugin-preset-list")
         .flex()
         .flex_col()
         .gap(px(theme::menu::ITEM_GAP))
-        .size_full()
+        .flex_1()
+        .min_h(px(0.0))
         .p(px(PRESET_MENU_PAD))
-        .bg(rest)
-        .border(px(PRESET_MENU_BORDER))
-        .border_color(Colors::border_subtle())
         // Clamped by `resolve_popup_placement` to what the editor's own client
         // rect can hold, so a long list scrolls here instead of being cut off.
-        .overflow_y_scroll()
-        .occlude();
+        .overflow_y_scroll();
 
-    if chrome.presets.is_empty() {
-        return list
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .h(px(PRESET_MENU_ROW_H))
-                    .px(px(theme::menu::ROW_PAD_X))
-                    .text_size(px(theme::menu::LABEL_TEXT_SIZE))
-                    .font(theme::ui_font())
-                    .text_color(Colors::text_faint())
-                    .truncate()
-                    .child("No presets saved for this plug-in"),
-            )
-            .into_any_element();
+    if visible.is_empty() {
+        list = list.child(
+            div()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .gap(px(theme::space::HAIR))
+                .min_h(px(PRESET_MENU_ROW_H * 2.0))
+                .px(px(theme::menu::ROW_PAD_X))
+                .text_size(px(theme::menu::LABEL_TEXT_SIZE))
+                .child(div().text_color(Colors::text_secondary()).child(
+                    if chrome.presets.is_empty() {
+                        "No presets for this plug-in yet"
+                    } else {
+                        "No preset matches"
+                    },
+                ))
+                .child(
+                    div()
+                        .text_size(px(theme::typography::DENSE_LABEL))
+                        .text_color(Colors::text_faint())
+                        .child(if chrome.presets.is_empty() {
+                            "Save As… keeps the current sound as a .pst file."
+                        } else {
+                            "Backspace clears the filter."
+                        }),
+                ),
+        );
     }
 
-    for (index, name) in chrome.presets.iter().enumerate() {
+    for index in visible {
+        let name = &chrome.presets[index];
         let selected = chrome.preset_index == Some(index);
-        let keyboard = highlighted == Some(index);
+        let keyboard = view.highlighted == Some(index);
         let rest_fill = if selected {
             selected_fill
         } else if keyboard {
@@ -199,14 +309,14 @@ pub fn render_preset_menu(
                 .relative()
                 .flex()
                 .flex_row()
+                .flex_none()
                 .items_center()
                 .gap(px(theme::space::SNUG))
                 .h(px(PRESET_MENU_ROW_H))
                 .px(px(theme::menu::ROW_PAD_X))
-                .rounded(px(theme::radius::CONTROL))
+                .rounded(px(theme::radius::CONTROL_SM))
                 .bg(rest_fill)
                 .text_size(px(theme::menu::LABEL_TEXT_SIZE))
-                .font(theme::ui_font())
                 .text_color(if selected {
                     Colors::text_primary()
                 } else {
@@ -218,11 +328,10 @@ pub fn render_preset_menu(
                 .on_click(move |_, window, cx| {
                     pick(PluginEditorAction::SelectPreset(index), window, cx)
                 })
-                // Selection on two channels, neither of them hue alone: the
+                // Loaded preset on two channels, neither of them hue alone: the
                 // `state.selected` fill above, this leading-edge accent marker,
                 // and the check glyph in the trailing slot. Absolutely
-                // positioned so an unselected row is laid out identically —
-                // a marker that took space would reflow the list.
+                // positioned so an unselected row is laid out identically.
                 .when(selected, |row| {
                     row.child(
                         div()
@@ -236,8 +345,6 @@ pub fn render_preset_menu(
                     )
                 })
                 .child(div().min_w(px(0.0)).flex_1().truncate().child(name.clone()))
-                // Always present, so the label's width does not change when a
-                // preset is loaded.
                 .child(
                     div()
                         .flex_none()
@@ -255,36 +362,114 @@ pub fn render_preset_menu(
                 ),
         );
     }
-    list.into_any_element()
+
+    let footer_button =
+        |id: &'static str, label: &'static str, icon: &'static str, action: PluginEditorAction| {
+            let emit = emit.clone();
+            div()
+                .id(id)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::space::TIGHT))
+                .h(px(theme::size::DENSE))
+                .px(px(theme::space::SNUG))
+                .rounded(px(theme::radius::CONTROL_SM))
+                .text_size(px(theme::menu::LABEL_TEXT_SIZE))
+                .text_color(Colors::text_secondary())
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |style| style.bg(hover).text_color(Colors::text_primary()))
+                .active(move |style| style.bg(pressed))
+                .on_click(move |_, window, cx| emit(action.clone(), window, cx))
+                .child(
+                    svg()
+                        .path(icon)
+                        .w(px(theme::menu::ICON_SIZE))
+                        .h(px(theme::menu::ICON_SIZE))
+                        .text_color(Colors::text_muted()),
+                )
+                .child(label)
+        };
+
+    let footer = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::space::TIGHT))
+        .flex_none()
+        .h(px(PRESET_POPOVER_FOOTER_H))
+        .px(px(PRESET_MENU_PAD))
+        .border_t(px(PRESET_MENU_BORDER))
+        .border_color(Colors::border_subtle())
+        .child(footer_button(
+            "plugin-preset-save-as",
+            "Save As…",
+            assets::ICON_SAVE_PATH,
+            PluginEditorAction::SavePreset,
+        ))
+        .child(footer_button(
+            "plugin-preset-import",
+            "Import…",
+            assets::ICON_FILE_PATH,
+            PluginEditorAction::ImportPreset,
+        ))
+        .child(div().flex_1())
+        .child(footer_button(
+            "plugin-preset-folder",
+            "Show Folder",
+            assets::ICON_FOLDER_OPEN_PATH,
+            PluginEditorAction::RevealPresetFolder,
+        ));
+
+    div()
+        .flex()
+        .flex_col()
+        .size_full()
+        .bg(rest)
+        .border(px(PRESET_MENU_BORDER))
+        .border_color(Colors::border_subtle())
+        .font(theme::ui_font())
+        .occlude()
+        .child(header)
+        .child(search)
+        .child(list)
+        .child(footer)
+        .into_any_element()
 }
 
-/// Geometry of the preset list, taken from the shared menu tokens. The window
-/// has to be sized before it is opened, so the list's size cannot live only
-/// inside its own layout.
-const PRESET_MENU_W: f32 = theme::menu::PANEL_MIN_WIDTH;
-const PRESET_MENU_ROW_H: f32 = theme::menu::ROW_HEIGHT;
+/// Geometry of the preset popover, taken from the shared menu tokens. The
+/// window has to be sized before it is opened, so the popover's size cannot
+/// live only inside its own layout.
+const PRESET_MENU_W: f32 = 280.0;
+const PRESET_MENU_ROW_H: f32 = theme::size::ROW;
 const PRESET_MENU_PAD: f32 = theme::menu::PANEL_PAD;
+const PRESET_POPOVER_HEADER_H: f32 = theme::size::COMFORTABLE;
+const PRESET_POPOVER_SEARCH_H: f32 = theme::size::DEFAULT;
+const PRESET_POPOVER_FOOTER_H: f32 = theme::size::COMFORTABLE + theme::space::TIGHT;
 /// Hairline around the panel. `theme` has no border-width token; every border
 /// in this crate is written as 1 px.
 const PRESET_MENU_BORDER: f32 = 1.0;
 /// Rows the list opens at its tallest. Past this it scrolls, and
 /// `resolve_popup_placement` shortens it further when the editor is short.
-/// `theme::menu` has no panel max-height token yet, so this stays local.
-const PRESET_MENU_MAX_ROWS: f32 = 16.0;
+const PRESET_MENU_MAX_ROWS: f32 = 12.0;
 
-/// Size the preset list window needs for `count` presets.
+/// Size the preset popover needs for `count` presets.
 pub fn preset_menu_size(count: usize) -> gpui::Size<Pixels> {
-    // An empty list still shows one row saying so, which is the whole reason it
-    // opens at all when nothing is saved yet.
-    let rows = (count.max(1) as f32).min(PRESET_MENU_MAX_ROWS);
-    let height = PRESET_MENU_PAD * 2.0
-        + PRESET_MENU_BORDER * 2.0
+    // An empty list still shows its two-line empty state, which is the whole
+    // reason it opens at all when nothing is saved yet.
+    let rows = (count.max(2) as f32).min(PRESET_MENU_MAX_ROWS);
+    let list = PRESET_MENU_PAD * 2.0
         + rows * PRESET_MENU_ROW_H
         + (rows - 1.0).max(0.0) * theme::menu::ITEM_GAP;
+    let height = PRESET_MENU_BORDER * 2.0
+        + PRESET_POPOVER_HEADER_H
+        + PRESET_POPOVER_SEARCH_H
+        + list
+        + PRESET_POPOVER_FOOTER_H;
     size(px(PRESET_MENU_W), px(height))
 }
 
-/// The preset list, in an **owned, topmost** window of its own, anchored and
+/// The preset popover, in an **owned, topmost** window of its own, anchored and
 /// clamped inside the editor's client rect.
 ///
 /// # Why this is a window and not an element
@@ -292,37 +477,30 @@ pub fn preset_menu_size(count: usize) -> gpui::Size<Pixels> {
 /// The app boots with `GPUI_DISABLE_DIRECT_COMPOSITION=1`
 /// (`apps/native/studio/src/main.rs:110`, "Disabling DComp lets child HWNDs
 /// composite above the swap chain"), so gpui creates the editor window with
-/// `WS_CLIPCHILDREN | WS_CLIPSIBLINGS` (`gpui_windows/src/window.rs:502-514`,
-/// whose own comment says clipping "is what keeps this window's own painting
-/// out of those children's rectangles"). Below the header the client area *is*
-/// the plug-in's `ContentChildHwnd`, so that rectangle is removed from the
-/// editor window's visible region and **GPUI cannot paint there at all** while
-/// a view is attached. That is why the in-element dropdown commit `67361c02`
-/// tried "was built and drawn every frame and never once seen"; the clipping
-/// style predates it (`822998f3`), so it was never going to work.
+/// `WS_CLIPCHILDREN | WS_CLIPSIBLINGS` (`gpui_windows/src/window.rs:502-514`).
+/// Below the header the client area *is* the plug-in's `ContentChildHwnd`, so
+/// that rectangle is removed from the editor window's visible region and
+/// **GPUI cannot paint there at all** while a view is attached.
 ///
 /// # Why it is *owned* and *topmost*
 ///
 /// A `WindowKind::PopUp` is created with `(WS_EX_TOOLWINDOW, WINDOW_STYLE(0))`
 /// and no owner (`gpui_windows/src/window.rs:497`), while the editor is
-/// `WindowKind::Floating` and therefore `WS_EX_TOPMOST` (same file, 537-542).
-/// Windows keeps every topmost window above every non-topmost one regardless of
-/// activation, so the previous un-owned popup was created, activated, drawn —
-/// and sat *underneath* the window it drops from. [`place_owned_popup`] gives
-/// it the editor as its owner and puts it in the same z-band, which is what
-/// every Windows application does for a menu over a child control.
+/// `WindowKind::Floating` and therefore `WS_EX_TOPMOST`. Windows keeps every
+/// topmost window above every non-topmost one regardless of activation, so an
+/// un-owned popup sits *underneath* the window it drops from.
+/// [`place_owned_popup`] gives it the editor as its owner and puts it in the
+/// same z-band.
 ///
 /// [`place_owned_popup`]: crate::components::plugin_content_host::place_owned_popup
 pub struct PresetMenuWindow {
     chrome: PluginEditorChrome,
     on_action: Rc<dyn Fn(PluginEditorAction, &mut App)>,
-    /// Row the arrow keys are on, or `None` while the pointer owns the list.
-    ///
-    /// Seeded from the loaded preset so the first Down/Up starts where the user
-    /// is, not at the top.
-    highlighted: Option<usize>,
-    /// Keyboard focus for Escape / arrows / Enter. A window whose root never
-    /// takes focus gets no key events at all in GPUI.
+    /// Highlight and filter. The highlight is seeded from the loaded preset so
+    /// the first Down/Up starts where the user is, not at the top.
+    view: PresetPopoverView,
+    /// Keyboard focus for typing, arrows, Enter and Escape. A window whose
+    /// root never takes focus gets no key events at all in GPUI.
     focus: FocusHandle,
     /// Focus is claimed once, on the first frame — re-claiming it every frame
     /// would fight anything the list itself focuses later.
@@ -332,8 +510,7 @@ pub struct PresetMenuWindow {
     /// Dismiss-on-blur must not fire before the list has been shown. The window
     /// it opens over hosts a plug-in's native child, and a plug-in that takes
     /// keyboard focus back on its own would otherwise deactivate the list on the
-    /// frame it appeared — closing it before anyone saw it, which is the exact
-    /// symptom this window exists to fix.
+    /// frame it appeared — closing it before anyone saw it.
     seen_active: bool,
     /// Dropped with the window; while it lives, losing focus closes the list.
     _activation: Option<Subscription>,
@@ -346,7 +523,10 @@ impl PresetMenuWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
-            highlighted: chrome.preset_index,
+            view: PresetPopoverView {
+                highlighted: chrome.preset_index,
+                filter: String::new(),
+            },
             chrome,
             on_action,
             focus: cx.focus_handle(),
@@ -356,11 +536,11 @@ impl PresetMenuWindow {
         }
     }
 
-    /// Closes the list and tells the editor it is gone.
+    /// Closes the popover and tells the editor it is gone.
     ///
-    /// The list always closes its own window — the editor only forgets the
-    /// handle — so a dismissal never re-enters the menu entity from a callback
-    /// the menu itself is running. Activation returns to the owner, which routes
+    /// The popover always closes its own window — the editor only forgets the
+    /// handle — so a dismissal never re-enters the popover entity from a
+    /// callback it is running. Activation returns to the owner, which routes
     /// keyboard focus back into the plug-in's view through
     /// `plugin_content_host`'s `WM_SETFOCUS` handler.
     fn dismiss(&self, window: &mut Window, cx: &mut App) {
@@ -371,9 +551,14 @@ impl PresetMenuWindow {
 
     /// Loads the highlighted preset and closes.
     fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = filtered_presets(&self.chrome.presets, &self.view.filter);
+        // With a filter typed and nothing highlighted inside it, Enter takes
+        // the first match — typing a name and pressing Enter is the point.
         let Some(index) = self
+            .view
             .highlighted
-            .filter(|index| *index < self.chrome.presets.len())
+            .filter(|index| visible.contains(index))
+            .or_else(|| visible.first().copied())
         else {
             return;
         };
@@ -382,31 +567,53 @@ impl PresetMenuWindow {
         self.dismiss(window, cx);
     }
 
-    /// Moves the keyboard highlight, wrapping at both ends.
+    /// Moves the keyboard highlight through the visible rows, wrapping.
     fn move_highlight(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let count = self.chrome.presets.len();
-        if count == 0 {
+        let visible = filtered_presets(&self.chrome.presets, &self.view.filter);
+        if visible.is_empty() {
             return;
         }
-        let count_i = count as i32;
-        let next = match self.highlighted {
+        let count = visible.len() as i32;
+        let position = self
+            .view
+            .highlighted
+            .and_then(|index| visible.iter().position(|&candidate| candidate == index));
+        let next = match position {
             // Nothing highlighted yet: Down starts at the top, Up at the bottom.
             None if delta > 0 => 0,
-            None => count - 1,
-            Some(current) => (((current as i32 + delta) % count_i + count_i) % count_i) as usize,
+            None => visible.len() - 1,
+            Some(current) => (((current as i32 + delta) % count + count) % count) as usize,
         };
-        if self.highlighted == Some(next) {
-            return;
+        self.view.highlighted = Some(visible[next]);
+        cx.notify();
+    }
+
+    /// Re-aims the highlight after the filter changed: the first match, so
+    /// Enter always has something to load.
+    fn refilter(&mut self, cx: &mut Context<Self>) {
+        let visible = filtered_presets(&self.chrome.presets, &self.view.filter);
+        if !self
+            .view
+            .highlighted
+            .is_some_and(|index| visible.contains(&index))
+        {
+            self.view.highlighted = visible.first().copied();
         }
-        self.highlighted = Some(next);
         cx.notify();
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let modifiers = event.keystroke.modifiers;
         match event.keystroke.key.as_str() {
             "escape" => {
                 cx.stop_propagation();
-                self.dismiss(window, cx);
+                // A typed filter goes first; a second Escape closes.
+                if self.view.filter.is_empty() {
+                    self.dismiss(window, cx);
+                } else {
+                    self.view.filter.clear();
+                    self.refilter(cx);
+                }
             }
             "down" => {
                 cx.stop_propagation();
@@ -420,6 +627,22 @@ impl PresetMenuWindow {
                 cx.stop_propagation();
                 self.commit(window, cx);
             }
+            "backspace" => {
+                cx.stop_propagation();
+                if self.view.filter.pop().is_some() {
+                    self.refilter(cx);
+                }
+            }
+            _ if !modifiers.control && !modifiers.alt && !modifiers.platform => {
+                let Some(typed) = event.keystroke.key_char.as_deref() else {
+                    return;
+                };
+                if typed.chars().all(|c| !c.is_control()) && !typed.is_empty() {
+                    cx.stop_propagation();
+                    self.view.filter.push_str(typed);
+                    self.refilter(cx);
+                }
+            }
             _ => {}
         }
     }
@@ -432,8 +655,8 @@ impl Render for PresetMenuWindow {
             window.focus(&self.focus, cx);
         }
         let on_action = self.on_action.clone();
-        // Every row commits the same way the keyboard does: emit the choice,
-        // tell the editor the list is gone, then close this window.
+        // Every control commits the same way the keyboard does: emit the
+        // choice, tell the editor the popover is gone, then close this window.
         let emit = move |action: PluginEditorAction, window: &mut Window, cx: &mut App| {
             on_action(action, cx);
             on_action(PluginEditorAction::TogglePresetMenu(false), cx);
@@ -445,7 +668,7 @@ impl Render for PresetMenuWindow {
             .key_context("PluginPresetMenu")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
-            .child(render_preset_menu(&self.chrome, self.highlighted, emit))
+            .child(render_preset_popover(&self.chrome, &self.view, emit))
     }
 }
 
@@ -743,8 +966,17 @@ pub enum PluginEditorAction {
     SetActive(bool),
     /// Move `delta` places through the preset list, wrapping.
     StepPreset(i32),
-    /// Store the plug-in's current state as a new preset.
+    /// Store the plug-in's current state as a preset file, through the OS
+    /// Save dialog.
     SavePreset,
+    /// Load a preset file from anywhere, through the OS Open dialog.
+    ImportPreset,
+    /// Show this plug-in's preset folder in the file manager.
+    RevealPresetFolder,
+    /// Take the plug-in's current state, for a Paste into another instance.
+    CopyState,
+    /// Load the copied state into this instance.
+    PasteState,
     /// Load the preset at this index.
     SelectPreset(usize),
     /// Open or close the preset list.
@@ -889,12 +1121,15 @@ pub fn render_chrome_tools(
 ) -> gpui::AnyElement {
     let active = chrome.active;
     let has_presets = !chrome.presets.is_empty();
+    let can_paste = chrome.can_paste;
 
     let emit_active = emit.clone();
     let emit_prev = emit.clone();
     let emit_next = emit.clone();
     let emit_menu = emit.clone();
-    let emit_save = emit;
+    let emit_save = emit.clone();
+    let emit_copy = emit.clone();
+    let emit_paste = emit;
 
     // The trigger's rest / hover / pressed fills, resolved before the element
     // is built: a GPUI div has one background, so `.hover(|s| s.bg(token))`
@@ -1012,10 +1247,27 @@ pub fn render_chrome_tools(
                 ))
                 .child(chrome_button(
                     "plugin-editor-preset-save",
-                    "Save",
+                    // Opens the Save dialog, so it says so.
+                    "Save…",
                     true,
                     false,
                     move |_window, cx| emit_save(PluginEditorAction::SavePreset, cx),
+                ))
+                // Copy / Paste: the plug-in's state from one instance to
+                // another of the same plug-in, without going through a file.
+                .child(chrome_button(
+                    "plugin-editor-state-copy",
+                    "Copy",
+                    true,
+                    false,
+                    move |_window, cx| emit_copy(PluginEditorAction::CopyState, cx),
+                ))
+                .child(chrome_button(
+                    "plugin-editor-state-paste",
+                    "Paste",
+                    can_paste,
+                    false,
+                    move |_window, cx| emit_paste(PluginEditorAction::PasteState, cx),
                 )),
         )
         // Readouts sit at the far end: they are watched, not operated, so they

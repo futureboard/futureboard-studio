@@ -25,7 +25,7 @@
 //! updates) read each frame. No provider touches GPUI state or the audio
 //! thread.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -268,8 +268,9 @@ impl AraTransportControl for TransportBridge {
 /// Not the bounded inbox: that drops its oldest entry when full, and in a large
 /// project a burst of analysis progress could push the one report that matters,
 /// "the document changed", out of it before the UI drained it. Counters cannot
-/// lose it. Region and modification content changes are not kept at all,
-/// because nothing reads them yet. ARA has a plug-in report only from inside
+/// lose it. Modification content changes are counted for the undo history
+/// (see [`AraHistory`]); region content changes are not kept at all, because
+/// nothing reads them yet. ARA has a plug-in report only from inside
 /// `notifyModelUpdates` on the model thread, but one that reports from its own
 /// threads is served too. None of this is on the audio thread.
 #[derive(Debug, Default)]
@@ -285,6 +286,11 @@ struct ModelSignals {
     /// reports the data change a finished analysis makes in the same batch
     /// (see [`DocumentWatch`]).
     analyses_ended: AtomicU64,
+    /// `ModificationContentChanged` reports so far: what the plug-in reports
+    /// when a clip's edit (its notes, their pitch and timing) changes. The
+    /// user's edits in the editor arrive as these even from a plug-in that
+    /// never reports `DocumentDataChanged`, which only ARA 2.3 has.
+    content_edits: AtomicU64,
     /// Analyses reported started and not yet over, per source.
     ///
     /// Per source, so that one start nothing ever completes cannot pin the
@@ -318,6 +324,7 @@ struct ModelReport {
     document_changes: u64,
     analysis_reports: u64,
     analyses_ended: u64,
+    content_edits: u64,
     /// Whether any analysis of the session's sources is still running.
     analysing: bool,
 }
@@ -373,8 +380,10 @@ impl ModelSignals {
                     }
                 }
             }
-            AraModelUpdate::ModificationContentChanged { .. }
-            | AraModelUpdate::RegionContentChanged { .. } => {}
+            AraModelUpdate::ModificationContentChanged { .. } => {
+                self.content_edits.fetch_add(1, Ordering::Relaxed);
+            }
+            AraModelUpdate::RegionContentChanged { .. } => {}
         }
     }
 
@@ -393,6 +402,7 @@ impl ModelSignals {
             document_changes: self.document_changes.load(Ordering::Relaxed),
             analysis_reports: self.analysis_reports.load(Ordering::Relaxed),
             analyses_ended: self.analyses_ended.load(Ordering::Relaxed),
+            content_edits: self.content_edits.load(Ordering::Relaxed),
             analysing: self.running().any(),
         }
     }
@@ -449,6 +459,133 @@ fn finished_analyses(
             .all(|key| incomplete(key) == Some(false));
     }
     finished
+}
+
+/// The undo history's trace, on with the keyboard trace
+/// (`FUTUREBOARD_KEY_DEBUG`): an Undo that finds nothing cannot otherwise say
+/// whether no edit was seen, no document was stored, or storing failed.
+fn history_trace(line: impl FnOnce() -> String) {
+    if crate::components::transport_key::key_debug() {
+        eprintln!("[Keyboard] ara undo: {}", line());
+    }
+}
+
+/// Feeds one session's poll into its undo history, and answers whether a new
+/// undo step was recorded.
+///
+/// The first document is stored once the session has settled, so the first
+/// edit has something to go back to. A user edit waits for the document to go
+/// quiet, then is stored as a step — unless the host or an analysis was busy
+/// with the document in the meantime, in which case the stored document only
+/// becomes the new baseline. Any other change the host or an analysis made is
+/// stored as the baseline once it goes quiet, so that the check an Undo makes
+/// (see [`AraState::step_history`]) never takes it for the user's.
+fn track_history(session: &mut AraTrackSession, user_change: bool, now: Instant) -> bool {
+    if session.plugin.is_poisoned() {
+        return false;
+    }
+    let analysing = session.signals.report().analysing;
+    let history = &mut session.history;
+    if user_change {
+        history.pending_since = Some(now);
+    }
+    if session.watch.last_activity != history.activity_seen {
+        history.activity_seen = session.watch.last_activity;
+        if history.baseline.is_some() {
+            history.rebase_since = Some(now);
+        }
+    }
+    let name = &session.plugin_name;
+    if history.baseline.is_none() {
+        let retry_due = history
+            .baseline_failed_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(2));
+        if !(session.watch.settled && !analysing && retry_due) {
+            return false;
+        }
+        match session.plugin.store_archive() {
+            Ok(first) => {
+                // The same untouched document stored again: equal bytes are
+                // what lets an Undo tell an edit nothing reported from no
+                // edit at all.
+                history.stable = matches!(
+                    session.plugin.store_archive(),
+                    Ok(again) if again.bytes == first.bytes
+                );
+                history_trace(|| {
+                    format!(
+                        "'{name}': first document stored ({} bytes, {})",
+                        first.bytes.len(),
+                        if history.stable {
+                            "stable"
+                        } else {
+                            "differs on every store"
+                        }
+                    )
+                });
+                history.record(first.bytes, false);
+                history.pending_since = None;
+                history.rebase_since = None;
+            }
+            Err(error) => {
+                history.baseline_failed_at = Some(now);
+                history_trace(|| format!("'{name}': could not store the first document: {error}"));
+            }
+        }
+        return false;
+    }
+    if analysing {
+        return false;
+    }
+    let quiet = |at: Instant, wait: Duration| now.saturating_duration_since(at) >= wait;
+    if let Some(since) = history.pending_since {
+        if !quiet(since, ARA_UNDO_SETTLE) {
+            return false;
+        }
+        history.pending_since = None;
+        history.rebase_since = None;
+        let host_busy = session
+            .watch
+            .last_activity
+            .is_some_and(|at| !quiet(at, ARA_UNDO_SETTLE * 2));
+        return match session.plugin.store_archive() {
+            Ok(stored) => {
+                let step = history.record(stored.bytes, !host_busy);
+                history_trace(|| {
+                    format!(
+                        "'{name}': edit settled: {} (steps {:?})",
+                        if step {
+                            "undo step recorded"
+                        } else if host_busy {
+                            "host or analysis busy, taken as the baseline"
+                        } else {
+                            "document unchanged"
+                        },
+                        history.depth()
+                    )
+                });
+                step
+            }
+            Err(error) => {
+                history_trace(|| format!("'{name}': could not store an undo step: {error}"));
+                false
+            }
+        };
+    }
+    if let Some(since) = history.rebase_since {
+        if quiet(since, ARA_UNDO_SETTLE * 2) {
+            history.rebase_since = None;
+            match session.plugin.store_archive() {
+                Ok(stored) => {
+                    history.record(stored.bytes, false);
+                }
+                Err(error) => {
+                    history_trace(|| format!("'{name}': could not store the document: {error}"))
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Records one session's plug-in model updates for the UI to read.
@@ -521,9 +658,30 @@ struct DocumentWatch {
     view_since: Option<Instant>,
     /// Whether the document has gone idle at least once since it opened.
     settled: bool,
+    /// Modification content changes already seen
+    /// ([`ModelSignals::content_edits`]).
+    content_edits: u64,
 }
 
 impl DocumentWatch {
+    /// Everything reported so far is the host's doing (an undo it just
+    /// restored): counted as seen, and marked as activity the user did not
+    /// cause.
+    fn absorb(&mut self, report: ModelReport, now: Instant) {
+        self.counted = report.document_changes;
+        self.analysis_reports = report.analysis_reports;
+        self.content_edits = report.content_edits;
+        self.last_activity = Some(now);
+    }
+
+    /// Whether a clip's edit changed since the last call. Only for the undo
+    /// history: what makes the project dirty is still [`Self::poll`]'s.
+    fn take_content_edits(&mut self, report: ModelReport) -> bool {
+        let edited = report.content_edits != self.content_edits;
+        self.content_edits = report.content_edits;
+        edited
+    }
+
     /// The host has just edited the document: activity the user did not
     /// cause, and the analysis reports that came back inside it are seen.
     fn host_edited(&mut self, report: ModelReport, now: Instant) {
@@ -579,6 +737,108 @@ impl DocumentWatch {
             self.holding = true;
         }
         false
+    }
+}
+
+/// How long a plug-in's document has to stay quiet after a user edit before
+/// the edit is taken as one undo step. A note dragged in the editor reports a
+/// run of changes; the step is the whole drag, not every report in it.
+const ARA_UNDO_SETTLE: Duration = Duration::from_millis(400);
+
+/// Undo steps kept per ARA document. Each is a whole stored document, so the
+/// history is bounded tighter than the project's own.
+const ARA_UNDO_DEPTH: usize = 40;
+
+/// Undo and redo for the edits made inside one ARA plug-in's editor.
+///
+/// ARA gives a host no call to reach a plug-in's own undo, and Melodyne does
+/// not answer Ctrl+Z itself in ARA mode: it hands the key to the host, whose
+/// job undo is there. So the host keeps the history: after each user edit
+/// settles it stores the document, and a step restores the one before or
+/// after it. `baseline` is the document as the plug-in holds it now.
+#[derive(Debug, Default)]
+struct AraHistory {
+    baseline: Option<Arc<Vec<u8>>>,
+    undo: VecDeque<Arc<Vec<u8>>>,
+    redo: Vec<Arc<Vec<u8>>>,
+    /// A user edit was seen and is waiting to settle into a step.
+    pending_since: Option<Instant>,
+    /// The host or an analysis changed the document after `baseline` was
+    /// stored: it becomes the baseline again once quiet.
+    rebase_since: Option<Instant>,
+    /// The session's last host or analysis activity already taken in.
+    activity_seen: Option<Instant>,
+    /// Whether storing the untouched document twice gave the same bytes.
+    stable: bool,
+    /// When storing the first document last failed. Retried, but not on every
+    /// frame: a store is a whole document serialised by the plug-in.
+    baseline_failed_at: Option<Instant>,
+}
+
+impl AraHistory {
+    /// Takes in a freshly stored document. A user edit that changed it
+    /// becomes an undo step; anything else — the first document, or a change
+    /// the plug-in or the host made — only moves the baseline, so undo never
+    /// takes back an analysis or a clip the arrangement moved. Answers
+    /// whether a step was added.
+    fn record(&mut self, stored: Vec<u8>, user_edit: bool) -> bool {
+        let stored = Arc::new(stored);
+        match self.baseline.take() {
+            Some(before) if *before == *stored => {
+                self.baseline = Some(before);
+                false
+            }
+            Some(before) if user_edit => {
+                self.undo.push_back(before);
+                while self.undo.len() > ARA_UNDO_DEPTH {
+                    self.undo.pop_front();
+                }
+                self.redo.clear();
+                self.baseline = Some(stored);
+                true
+            }
+            _ => {
+                self.baseline = Some(stored);
+                false
+            }
+        }
+    }
+
+    /// The document an undo (or redo) would restore, if there is one.
+    fn peek(&self, undoing: bool) -> Option<Arc<Vec<u8>>> {
+        self.baseline.as_ref()?;
+        if undoing {
+            self.undo.back().cloned()
+        } else {
+            self.redo.last().cloned()
+        }
+    }
+
+    /// Commits a step [`Self::peek`] offered, once the plug-in has taken it.
+    fn commit(&mut self, undoing: bool) {
+        let Some(current) = self.baseline.take() else {
+            return;
+        };
+        let target = if undoing {
+            self.undo.pop_back()
+        } else {
+            self.redo.pop()
+        };
+        match target {
+            Some(target) => {
+                if undoing {
+                    self.redo.push(current);
+                } else {
+                    self.undo.push_back(current);
+                }
+                self.baseline = Some(target);
+            }
+            None => self.baseline = Some(current),
+        }
+    }
+
+    fn depth(&self) -> (usize, usize) {
+        (self.undo.len(), self.redo.len())
     }
 }
 
@@ -830,6 +1090,13 @@ trait SessionPlugin {
         tracks: &[AraTrackKey],
     ) -> AraResult<()>;
     fn store_archive(&mut self) -> AraResult<AraStoredArchive>;
+    /// Restores a stored document into the graph as it stands — an undo or
+    /// redo step of the plug-in's own edits.
+    fn restore_document(&mut self, _archive_id: &str, _bytes: &[u8]) -> AraResult<()> {
+        Err(AraHostError::invalid(
+            "this plug-in session cannot restore a document",
+        ))
+    }
     /// The instance the engine renders and editors attach to; a test double
     /// has none.
     fn instance(&self) -> Option<&DirectAudio::Vst3RuntimeProcessor>;
@@ -916,6 +1183,10 @@ impl SessionPlugin for LivePlugin {
 
     fn store_archive(&mut self) -> AraResult<AraStoredArchive> {
         self.session.store_archive()
+    }
+
+    fn restore_document(&mut self, archive_id: &str, bytes: &[u8]) -> AraResult<()> {
+        self.session.restore_archive(archive_id, bytes)
     }
 
     fn instance(&self) -> Option<&DirectAudio::Vst3RuntimeProcessor> {
@@ -1021,6 +1292,8 @@ struct AraTrackSession {
     /// Latency the engine last installed this session's renderer with, so a
     /// sync that changes nothing else still picks up a new plug-in latency.
     installed_latency: Option<u32>,
+    /// Undo and redo of the edits made in the plug-in's own editor.
+    history: AraHistory,
 }
 
 impl AraTrackSession {
@@ -1044,6 +1317,7 @@ impl AraTrackSession {
             watch: DocumentWatch::default(),
             settled: false,
             installed_latency: None,
+            history: AraHistory::default(),
         }
     }
 }
@@ -1465,11 +1739,17 @@ impl AraState {
     pub fn poll_documents(&mut self, now: Instant) -> bool {
         let mut changed = false;
         for (key, session) in self.sessions.iter_mut() {
-            changed |= session.watch.poll(
-                session.signals.report(),
-                session.plugin.view_is_attached(),
-                now,
-            );
+            let report = session.signals.report();
+            let user_change = session
+                .watch
+                .poll(report, session.plugin.view_is_attached(), now);
+            changed |= user_change;
+            // A clip's edit changing is an edit too, from a plug-in that never
+            // reports its document data changing — once the document has
+            // settled, so opening the project is not one.
+            let edited = session.watch.take_content_edits(report) && session.watch.settled;
+            // A recorded step is unsaved work, whatever else reported it.
+            changed |= track_history(session, user_change || edited, now);
 
             let due = analysis_check_due(
                 session.signals.report().analysing,
@@ -1507,6 +1787,105 @@ impl AraState {
             }
         }
         changed
+    }
+
+    /// Undoes (or redoes) the last edit made in one session's plug-in editor.
+    ///
+    /// `Ok(false)` when there is nothing to step to. An edit still settling
+    /// is taken into the history first, so an Undo pressed straight after an
+    /// edit undoes that edit rather than the one before it.
+    pub fn step_history(
+        &mut self,
+        key: &AraSessionKey,
+        undoing: bool,
+        now: Instant,
+    ) -> Result<bool, String> {
+        let Some(session) = self.sessions.get_mut(key) else {
+            return Ok(false);
+        };
+        if session.plugin.is_poisoned() {
+            return Err(format!("{} is not responding", session.plugin_name));
+        }
+        // An edit the plug-in reported and that has not settled yet is the
+        // user's. So is whatever differs from the baseline now, when storing
+        // an untouched document gives the same bytes and neither the host nor
+        // an analysis has changed it since: an edit nothing reported.
+        let reported = session.history.pending_since.take().is_some();
+        let unreported = session.history.stable && session.history.rebase_since.is_none();
+        if session.history.baseline.is_some() && (reported || unreported) {
+            match session.plugin.store_archive() {
+                Ok(stored) => {
+                    if session.history.record(stored.bytes, true) {
+                        history_trace(|| {
+                            format!(
+                                "'{}': {} edit taken as a step on Undo",
+                                session.plugin_name,
+                                if reported {
+                                    "a settling"
+                                } else {
+                                    "an unreported"
+                                }
+                            )
+                        });
+                    }
+                }
+                Err(error) => history_trace(|| {
+                    format!(
+                        "'{}': could not store the document on Undo: {error}",
+                        session.plugin_name
+                    )
+                }),
+            }
+        }
+        let Some(target) = session.history.peek(undoing) else {
+            history_trace(|| {
+                format!(
+                    "'{}': nothing to {}: first document stored={} settled={} analysing={} \
+                     stable={} steps={:?}",
+                    session.plugin_name,
+                    if undoing { "undo" } else { "redo" },
+                    session.history.baseline.is_some(),
+                    session.watch.settled,
+                    session.signals.report().analysing,
+                    session.history.stable,
+                    session.history.depth()
+                )
+            });
+            return Ok(false);
+        };
+        session
+            .plugin
+            .restore_document(&session.archive_id, &target)
+            .map_err(|error| {
+                format!(
+                    "{} could not {}: {error}",
+                    session.plugin_name,
+                    if undoing { "undo" } else { "redo" }
+                )
+            })?;
+        session.history.commit(undoing);
+        // What the plug-in reports about the restore is the host's doing,
+        // not a new edit: counted as seen, so it neither becomes a step nor
+        // throws away the redo that was just made possible.
+        session.watch.absorb(session.signals.report(), now);
+        session.history.pending_since = None;
+        history_trace(|| {
+            format!(
+                "'{}': {} restored (steps {:?})",
+                session.plugin_name,
+                if undoing { "undo" } else { "redo" },
+                session.history.depth()
+            )
+        });
+        Ok(true)
+    }
+
+    /// Undo and redo steps one session's plug-in editor has.
+    pub fn history_depth(&self, key: &AraSessionKey) -> (usize, usize) {
+        self.sessions
+            .get(key)
+            .map(|session| session.history.depth())
+            .unwrap_or_default()
     }
 
     /// Publishes a new musical timeline (tempo, meter, key) to one session
@@ -4827,5 +5206,90 @@ mod tests {
         // frame -1 (before), frames 0..1 (real), frame 2 (past the end)
         assert_eq!(left, [0.0, 0.5, 0.25, 0.0]);
         assert_eq!(right, [0.0, -0.5, -0.25, 0.0]);
+    }
+}
+
+#[cfg(test)]
+mod ara_history_tests {
+    use super::*;
+
+    #[test]
+    fn a_user_edit_is_a_step_and_undo_redo_walk_it() {
+        let mut history = AraHistory::default();
+        history.record(vec![0], false);
+        history.record(vec![1], true);
+        history.record(vec![2], true);
+        assert_eq!(history.depth(), (2, 0));
+
+        assert_eq!(history.peek(true).as_deref(), Some(&vec![1]));
+        history.commit(true);
+        assert_eq!(history.baseline.as_deref(), Some(&vec![1]));
+        assert_eq!(history.depth(), (1, 1));
+
+        assert_eq!(history.peek(false).as_deref(), Some(&vec![2]));
+        history.commit(false);
+        assert_eq!(history.baseline.as_deref(), Some(&vec![2]));
+        assert_eq!(history.depth(), (2, 0));
+    }
+
+    /// The plug-in's own changes (an analysis, a host sync) move the
+    /// baseline without becoming something Undo would take back, and an
+    /// unchanged document records nothing.
+    #[test]
+    fn only_user_edits_that_change_the_document_are_steps() {
+        let mut history = AraHistory::default();
+        history.record(vec![0], false);
+        history.record(vec![0], true);
+        history.record(vec![5], false);
+        assert_eq!(history.depth(), (0, 0));
+        assert_eq!(history.baseline.as_deref(), Some(&vec![5]));
+    }
+
+    #[test]
+    fn a_new_edit_after_undo_drops_the_redo() {
+        let mut history = AraHistory::default();
+        history.record(vec![0], false);
+        history.record(vec![1], true);
+        history.commit(true);
+        assert_eq!(history.depth(), (0, 1));
+        history.record(vec![9], true);
+        assert_eq!(history.depth(), (1, 0));
+    }
+
+    #[test]
+    fn the_history_is_bounded() {
+        let mut history = AraHistory::default();
+        history.record(vec![0], false);
+        for step in 1..=(ARA_UNDO_DEPTH as u8 + 10) {
+            history.record(vec![step], true);
+        }
+        assert_eq!(history.depth().0, ARA_UNDO_DEPTH);
+    }
+
+    #[test]
+    fn record_answers_whether_it_added_a_step() {
+        let mut history = AraHistory::default();
+        assert!(!history.record(vec![0], true));
+        assert!(!history.record(vec![0], true));
+        assert!(!history.record(vec![1], false));
+        assert!(history.record(vec![2], true));
+    }
+
+    /// Melodyne reports a note edit as a modification content change even
+    /// where it never reports its document data changing; an undo the host
+    /// restored is its own and not seen as a new one.
+    #[test]
+    fn a_modification_change_is_an_edit_until_an_undo_absorbs_it() {
+        let signals = ModelSignals::default();
+        let mut watch = DocumentWatch::default();
+        assert!(!watch.take_content_edits(signals.report()));
+
+        signals.record(&AraModelUpdate::ModificationContentChanged { clip: None });
+        assert!(watch.take_content_edits(signals.report()));
+        assert!(!watch.take_content_edits(signals.report()));
+
+        signals.record(&AraModelUpdate::ModificationContentChanged { clip: None });
+        watch.absorb(signals.report(), Instant::now());
+        assert!(!watch.take_content_edits(signals.report()));
     }
 }

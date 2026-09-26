@@ -180,6 +180,8 @@ impl StudioLayout {
         }
         let target = target.clone();
         let track_id = self.timeline.update(cx, |timeline, cx| {
+            // A track made for the clip comes and goes with it: one step.
+            let mut new_track_edit = None;
             let track_id = match &target {
                 ChordDropTarget::Track { track_id }
                     if timeline.state.find_track(track_id).is_some_and(|t| {
@@ -188,7 +190,12 @@ impl StudioLayout {
                 {
                     track_id.clone()
                 }
-                _ => timeline.state.create_midi_track(),
+                _ => {
+                    new_track_edit = Some(timeline.begin_track_edit(
+                        crate::components::timeline::timeline_state::TrackEditScope::track_list(),
+                    ));
+                    timeline.state.create_midi_track()
+                }
             };
             let mut clip = timeline.state.build_midi_clip(
                 &track_id,
@@ -207,13 +214,18 @@ impl StudioLayout {
                 *clip_notes = notes;
             }
             timeline.state.select_track(&track_id);
-            timeline.run_edit_command(
-                EditCommand::CreateClip {
-                    track_id: track_id.clone(),
-                    clip,
-                },
-                cx,
-            );
+            let create = EditCommand::CreateClip {
+                track_id: track_id.clone(),
+                clip,
+            };
+            match new_track_edit {
+                Some(edit) => {
+                    create.execute(&mut timeline.state);
+                    timeline.commit_track_edit("Create Chords", edit, false, cx);
+                    timeline.mark_project_changed(cx);
+                }
+                None => timeline.run_edit_command(create, cx),
+            }
             cx.notify();
             Some(track_id)
         })?;

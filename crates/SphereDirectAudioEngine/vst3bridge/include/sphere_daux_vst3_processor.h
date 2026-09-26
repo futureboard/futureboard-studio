@@ -259,6 +259,12 @@ SPHERE_DAUX_VST3_API int
 sphere_daux_vst3_view_take_resize_request(SphereDauxVst3Processor *processor,
                                           int *out_width, int *out_height);
 
+/// Hands one key press to the view (`IPlugView::onKeyDown`, then `onKeyUp`).
+/// `key` is the character, `key_code` a VST3 virtual key code for keys without
+/// one, `modifiers` a VST3 `KeyModifier` mask. 1 when the view handled it.
+SPHERE_DAUX_VST3_API int sphere_daux_vst3_view_key(
+    SphereDauxVst3Processor *processor, int key, int key_code, int modifiers);
+
 /// Takes the instance out of the processing state without destroying it:
 /// `setProcessing(false)` then `setActive(false)`.
 ///

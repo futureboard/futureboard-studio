@@ -5004,6 +5004,30 @@ sphere_daux_vst3_view_take_resize_request(SphereDauxVst3Processor *, int *,
 }
 #endif
 
+// A view "must not handle keyboard events by the means of platform callbacks,
+// but let the host pass them to the view" (`iplugview.h`), so a key the host
+// wants the plug-in to act on goes through `onKeyDown`, with the matching
+// `onKeyUp` after it. Every platform keeps `editor_view`, so this is one
+// definition for all of them.
+extern "C" int sphere_daux_vst3_view_key(SphereDauxVst3Processor *processor,
+                                         int key, int key_code,
+                                         int modifiers) {
+  if (!processor || !processor->editor_view) {
+    return 0;
+  }
+  const auto character = static_cast<Steinberg::char16>(key);
+  const auto code = static_cast<Steinberg::int16>(key_code);
+  const auto mods = static_cast<Steinberg::int16>(modifiers);
+  // A view that tracks focus itself ignores keys while it believes it does
+  // not have it, and nothing else in this host ever tells it that it does.
+  processor->editor_view->onFocus(true);
+  const bool handled = processor->editor_view->onKeyDown(character, code,
+                                                         mods) ==
+                       Steinberg::kResultTrue;
+  processor->editor_view->onKeyUp(character, code, mods);
+  return handled ? 1 : 0;
+}
+
 // ── Editor chrome strip ─────────────────────────────────────────────────────
 //
 // The strip itself is shared across every format bridge and addressed by the

@@ -13,23 +13,24 @@ use crate::components::plugin_editor_chrome::{
 };
 use crate::layout::StudioLayout;
 
-/// Extension for a stored preset file.
+/// Extension of a user preset file.
 ///
-/// The file itself is the shared FBPST container written by
+/// The file is the shared FBPST container written by
 /// `SpherePluginHost::preset::write_state_preset`: magic, a 24-byte header,
 /// JSON metadata naming the plug-in it belongs to, then that plug-in's own
 /// opaque state. Nothing here parses or edits the state — a preset a plug-in
 /// cannot read back is worse than no preset at all — but the container around
 /// it must be unwrapped before the state is handed over.
 ///
-/// It is deliberately **not** `.pst`, even though the container is the one every
-/// `.pst` uses: `SpherePluginHost::preset::clear_all_presets` and
-/// `load_cached_plugins` walk the whole preset root recursively and treat every
-/// `.pst` under it as a scan-cache row. User presets live inside that root, so
-/// renaming the extension would list them as phantom plug-ins and delete them
-/// with "Clear Plugin Cache".
-const PRESET_EXTENSION: &str = "fbstate";
+/// `.pst` is safe under the preset root: the scan cache also walks that root for
+/// `.pst`, but a user preset carries state and a cache row never does, so the
+/// cache reader skips it and Clear Database keeps it
+/// (`SpherePluginHost::preset::is_state_preset_file`).
+const PRESET_EXTENSION: &str = "pst";
 
+/// Extension user presets were saved with before they became `.pst`. Still
+/// listed and loaded, so nothing saved earlier disappears.
+const LEGACY_PRESET_EXTENSION: &str = "fbstate";
 /// How an ARA editor's window is filed among the insert editors.
 ///
 /// It has no insert slot of its own — it is bound to a clip — so the studio
@@ -84,28 +85,80 @@ fn preset_dir(plugin_id: &str) -> Option<PathBuf> {
     )
 }
 
-/// Preset names for one plug-in, sorted, without extensions.
-fn list_presets(plugin_id: &str) -> Vec<String> {
+/// One plug-in's user presets, sorted by name: `(name, file)`.
+///
+/// `.pst` and the older `.fbstate` both count; where one name exists as both,
+/// the `.pst` wins so the list never shows a preset twice.
+fn list_preset_files(plugin_id: &str) -> Vec<(String, PathBuf)> {
     let Some(dir) = preset_dir(plugin_id) else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some(PRESET_EXTENSION) {
-                return None;
-            }
-            path.file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(str::to_string)
+    let mut presets: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        let modern = ext.eq_ignore_ascii_case(PRESET_EXTENSION);
+        if !modern && !ext.eq_ignore_ascii_case(LEGACY_PRESET_EXTENSION) {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        match presets.iter_mut().find(|(existing, _)| existing == name) {
+            Some(slot) if modern => slot.1 = path,
+            Some(_) => {}
+            None => presets.push((name.to_string(), path)),
+        }
+    }
+    presets.sort_by_key(|(name, _)| name.to_lowercase());
+    presets
+}
+
+/// Preset names for one plug-in, in list order.
+fn list_presets(plugin_id: &str) -> Vec<String> {
+    list_preset_files(plugin_id)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// A file name the OS will take for a preset called `name`.
+fn preset_file_stem(name: &str) -> String {
+    let stem: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
         })
         .collect();
-    names.sort_by_key(|name| name.to_lowercase());
-    names
+    let stem = stem.trim().trim_end_matches('.').to_string();
+    if stem.is_empty() {
+        "Preset".to_string()
+    } else {
+        stem
+    }
+}
+
+/// `path` with a `.pst` extension, whatever the dialog handed back. Appended
+/// rather than `set_extension`, which would eat the "2" of "Lead v1.2".
+fn with_preset_extension(path: PathBuf) -> PathBuf {
+    let has_it = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(PRESET_EXTENSION));
+    if has_it {
+        return path;
+    }
+    let mut raw = path.into_os_string();
+    raw.push(".");
+    raw.push(PRESET_EXTENSION);
+    PathBuf::from(raw)
 }
 
 impl StudioLayout {
@@ -185,6 +238,7 @@ impl StudioLayout {
             cpu_load: None,
             presets: Vec::new(),
             preset_index: None,
+            can_paste: false,
         })
     }
 
@@ -255,7 +309,13 @@ impl StudioLayout {
             .find(|track| track.id == track_id)
             .map(|track| track.name.clone())
             .unwrap_or_default();
+        let can_paste = self
+            .plugin_editors
+            .state_clipboard
+            .as_ref()
+            .is_some_and(|copied| slot.plugin_id.as_deref() == Some(copied.plugin_id.as_str()));
         Some(PluginEditorChrome {
+            can_paste,
             plugin_name: slot.display_name.clone(),
             track_name,
             insert_number: index + 1,
@@ -419,6 +479,10 @@ impl StudioLayout {
             PluginEditorAction::SetActive(active) => {
                 // The same live path the inspector's own toggle uses: the
                 // runtime "enabled" param, no graph rebuild.
+                let edit = self.begin_track_edit(
+                    crate::components::timeline::timeline_state::TrackEditScope::channel(track_id),
+                    cx,
+                );
                 let changed = self.timeline.update(cx, |timeline, cx| {
                     let Some(slots) = timeline.state.insert_slots_mut(track_id) else {
                         return false;
@@ -438,6 +502,15 @@ impl StudioLayout {
                     cx.notify();
                     true
                 });
+                self.commit_track_edit(
+                    if active {
+                        "Activate Plug-in"
+                    } else {
+                        "Deactivate Plug-in"
+                    },
+                    edit,
+                    cx,
+                );
                 if changed {
                     self.push_insert_enabled_to_engine(track_id, insert_id, cx);
                     self.mark_dirty_view_only();
@@ -451,8 +524,26 @@ impl StudioLayout {
             PluginEditorAction::SavePreset => {
                 self.save_plugin_editor_preset(track_id, insert_id, cx);
             }
+            PluginEditorAction::ImportPreset => {
+                self.import_plugin_editor_preset(track_id, insert_id, cx);
+            }
+            PluginEditorAction::RevealPresetFolder => {
+                if let Some(dir) = self
+                    .insert_plugin_id(track_id, insert_id, cx)
+                    .and_then(|plugin_id| preset_dir(&plugin_id))
+                {
+                    let _ = std::fs::create_dir_all(&dir);
+                    super::helpers::reveal_path(&dir);
+                }
+            }
             PluginEditorAction::SelectPreset(index) => {
                 self.load_plugin_editor_preset(track_id, insert_id, index, cx);
+            }
+            PluginEditorAction::CopyState => {
+                self.copy_plugin_editor_state(track_id, insert_id, cx);
+            }
+            PluginEditorAction::PasteState => {
+                self.paste_plugin_editor_state(track_id, insert_id, cx);
             }
             // Window state; it never reaches here.
             PluginEditorAction::TogglePresetMenu(_) => {}
@@ -502,15 +593,11 @@ impl StudioLayout {
         let Some(plugin_id) = self.insert_plugin_id(track_id, insert_id, cx) else {
             return;
         };
-        let presets = list_presets(&plugin_id);
-        if index >= presets.len() {
-            return;
-        }
-        let key = (track_id.to_string(), insert_id.to_string());
-        let Some(dir) = preset_dir(&plugin_id) else {
+        let presets = list_preset_files(&plugin_id);
+        let Some((name, path)) = presets.get(index).cloned() else {
             return;
         };
-        let path = dir.join(format!("{}.{PRESET_EXTENSION}", presets[index]));
+        let key = (track_id.to_string(), insert_id.to_string());
         // Through the container reader, never `fs::read`. The file is an FBPST
         // container and its state starts past the magic, the 24-byte header and
         // the JSON metadata; handing the whole file to `send_plugin_state` gave
@@ -535,36 +622,134 @@ impl StudioLayout {
             );
             return;
         }
-        // Straight back to the plug-in as opaque state, and into the project so
-        // a save keeps what is actually loaded.
+        let state_len = state.len();
+        // Undo goes back to what the plug-in had before, not to the last
+        // saved state; stepping through presets is one step (the history
+        // folds consecutive loads on one insert).
+        let before = self.capture_insert_state(track_id, insert_id, cx);
+        if !self.apply_plugin_state_to_insert(track_id, insert_id, std::sync::Arc::new(state), cx) {
+            return;
+        }
+        self.record_insert_state("Load Preset", track_id, insert_id, before, cx);
+        self.plugin_editors.preset_selection.insert(key, index);
+        eprintln!("[plugin-preset] loaded '{name}' for insert={insert_id} bytes={state_len}");
+        cx.notify();
+    }
+
+    /// Hands `state` to the plug-in as opaque state, and into the project so a
+    /// save keeps what is actually loaded. `false` when the plug-in host
+    /// refused it, in which case the project is left as it was.
+    fn apply_plugin_state_to_insert(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        state: std::sync::Arc<Vec<u8>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if let Some(runtime) = self.plugin_editors.bridge_runtime.as_ref().cloned() {
             if let Ok(mut runtime) = runtime.lock() {
                 if let Err(error) = runtime.send_plugin_state(insert_id, &state) {
-                    eprintln!("[plugin-preset] SetPluginState failed: {error}");
-                    return;
+                    eprintln!("[plugin-state] SetPluginState failed insert={insert_id}: {error}");
+                    return false;
                 }
             }
         }
-        let state_len = state.len();
-        let stored = std::sync::Arc::new(state);
         self.timeline.update(cx, |timeline, cx| {
             if let Some(slots) = timeline.state.insert_slots_mut(track_id) {
                 if let Some(slot) = slots.iter_mut().find(|slot| slot.id == insert_id) {
-                    slot.vst3_state = Some(stored.clone());
+                    slot.vst3_state = Some(state);
                 }
             }
             cx.notify();
         });
-        self.plugin_editors.preset_selection.insert(key, index);
         self.mark_dirty_view_only();
+        true
+    }
+
+    /// Takes this insert's current state for a later Paste.
+    fn copy_plugin_editor_state(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((plugin_id, plugin_name)) = self
+            .timeline
+            .read(cx)
+            .state
+            .find_insert_slot(track_id, insert_id)
+            .and_then(|slot| Some((slot.plugin_id.clone()?, slot.display_name.clone())))
+        else {
+            return;
+        };
+        let Some(state) = self
+            .capture_insert_state(track_id, insert_id, cx)
+            .filter(|state| !state.is_empty())
+        else {
+            eprintln!(
+                "[plugin-state] nothing to copy from insert={insert_id}: the plug-in returned no \
+                 state"
+            );
+            return;
+        };
         eprintln!(
-            "[plugin-preset] loaded '{}' for insert={insert_id} bytes={state_len}",
-            presets[index]
+            "[plugin-state] copied insert={insert_id} plugin={plugin_id} bytes={}",
+            state.len()
         );
+        self.plugin_editors.state_clipboard = Some(super::plugin_ops::PluginStateClipboard {
+            plugin_id,
+            plugin_name,
+            state,
+        });
         cx.notify();
     }
 
-    /// Captures the plug-in's current state and writes it as a new preset.
+    /// Loads the copied state into this insert, when it came from the same
+    /// plug-in. The preset strip then names no preset: what is loaded is no
+    /// longer any one of them.
+    fn paste_plugin_editor_state(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(copied) = self.plugin_editors.state_clipboard.clone() else {
+            return;
+        };
+        let Some(plugin_id) = self.insert_plugin_id(track_id, insert_id, cx) else {
+            return;
+        };
+        // The chrome only offers Paste for a match; this is the same rule for
+        // an action that was queued before the clipboard changed.
+        if plugin_id != copied.plugin_id {
+            eprintln!(
+                "[plugin-state] refusing paste into insert={insert_id}: the copy holds state \
+                 for '{}' ({}), not '{plugin_id}'",
+                copied.plugin_id, copied.plugin_name
+            );
+            return;
+        }
+        let bytes = copied.state.len();
+        let before = self.capture_insert_state(track_id, insert_id, cx);
+        if !self.apply_plugin_state_to_insert(track_id, insert_id, copied.state, cx) {
+            return;
+        }
+        self.record_insert_state("Paste Plug-in State", track_id, insert_id, before, cx);
+        self.plugin_editors
+            .preset_selection
+            .remove(&(track_id.to_string(), insert_id.to_string()));
+        eprintln!("[plugin-state] pasted into insert={insert_id} bytes={bytes}");
+        cx.notify();
+    }
+
+    /// Saves the plug-in's current sound as a `.pst` preset file, wherever the
+    /// user puts it through the OS Save dialog.
+    ///
+    /// The state is captured before the dialog opens: what gets saved is the
+    /// sound the user heard when they clicked Save, not whatever the plug-in
+    /// drifted to while the dialog was up. The dialog starts in this plug-in's
+    /// preset folder, which is what the popover lists; a file saved anywhere
+    /// else is still a preset, it just is not in that list.
     fn save_plugin_editor_preset(
         &mut self,
         track_id: &str,
@@ -577,90 +762,318 @@ impl StudioLayout {
         let Some(dir) = preset_dir(&plugin_id) else {
             return;
         };
-        // Asked for fresh rather than reusing the project's copy: the point of
-        // saving from the editor is to keep what the user just dialled in, and
-        // the project's copy is only as new as the last save.
-        let captured = self
-            .plugin_editors
-            .bridge_runtime
-            .as_ref()
-            .cloned()
-            .and_then(|runtime| {
-                runtime.lock().ok().map(|mut runtime| {
-                    runtime.request_plugin_states(
-                        std::slice::from_ref(&insert_id.to_string()),
-                        std::time::Duration::from_millis(1500),
-                    )
-                })
-            })
-            .and_then(|mut capture| capture.states.remove(insert_id));
-        let bytes = match captured {
-            Some(bytes) if !bytes.is_empty() => bytes,
-            _ => {
-                self.ara.last_error = None;
-                eprintln!(
-                    "[plugin-preset] nothing to save for insert={insert_id}: the plug-in \
-                     returned no state"
-                );
-                return;
-            }
-        };
-
-        // Numbered rather than prompting: the editor has no room for a dialog,
-        // and a preset the user can rename on disk beats one they cannot save.
-        let existing = list_presets(&plugin_id);
-        let mut index = existing.len() + 1;
-        let path = loop {
-            let candidate = dir.join(format!("Preset {index}.{PRESET_EXTENSION}"));
-            if !candidate.exists() {
-                break candidate;
-            }
-            index += 1;
+        let Some(state) = self
+            .capture_insert_state(track_id, insert_id, cx)
+            .filter(|state| !state.is_empty())
+        else {
+            eprintln!(
+                "[plugin-preset] nothing to save for insert={insert_id}: the plug-in returned no \
+                 state"
+            );
+            return;
         };
         let plugin_name = self
             .timeline
             .read(cx)
             .state
-            .insert_slots(track_id)
-            .and_then(|slots| {
-                slots
-                    .iter()
-                    .find(|slot| slot.id == insert_id)
-                    .map(|slot| slot.display_name.clone())
-            })
+            .find_insert_slot(track_id, insert_id)
+            .map(|slot| slot.display_name.clone())
             .unwrap_or_else(|| plugin_id.clone());
-        if let Err(error) = SpherePluginHost::preset::write_state_preset(
-            &path,
-            &SpherePluginHost::preset::StatePreset {
-                plugin_id: plugin_id.clone(),
-                plugin_name,
-                state: bytes.clone(),
-            },
-        ) {
+        // Suggest the loaded preset's name — saving over it is the common case
+        // — or the next free "Preset n".
+        let existing = list_presets(&plugin_id);
+        let suggested = self
+            .plugin_editors
+            .preset_selection
+            .get(&(track_id.to_string(), insert_id.to_string()))
+            .and_then(|&index| existing.get(index).cloned())
+            .unwrap_or_else(|| {
+                (existing.len() + 1..)
+                    .map(|n| format!("Preset {n}"))
+                    .find(|name| !existing.contains(name))
+                    .unwrap_or_else(|| "Preset".to_string())
+            });
+        let _ = std::fs::create_dir_all(&dir);
+        let preset = SpherePluginHost::preset::StatePreset {
+            plugin_id,
+            plugin_name,
+            state: state.as_ref().clone(),
+        };
+        self.save_preset_through_dialog(track_id, insert_id, dir, suggested, preset, cx);
+    }
+
+    #[cfg(feature = "native-dialogs")]
+    fn save_preset_through_dialog(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        dir: PathBuf,
+        suggested: String,
+        preset: SpherePluginHost::preset::StatePreset,
+        cx: &mut Context<Self>,
+    ) {
+        let file_name = format!("{}.{PRESET_EXTENSION}", preset_file_stem(&suggested));
+        let title = format!("Save {} Preset", preset.plugin_name);
+        let base = rfd::AsyncFileDialog::new()
+            .set_title(title)
+            .set_directory(&dir)
+            .set_file_name(file_name)
+            .add_filter("Futureboard Preset", &[PRESET_EXTENSION]);
+        let dialog = self.parent_dialog_to_editor(track_id, base, cx);
+        let key = (track_id.to_string(), insert_id.to_string());
+        cx.spawn(async move |this, cx| {
+            let Some(handle) = dialog.save_file().await else {
+                return; // cancelled
+            };
+            let path = with_preset_extension(handle.path().to_path_buf());
+            if let Err(error) = SpherePluginHost::preset::write_state_preset(&path, &preset) {
+                eprintln!(
+                    "[plugin-preset] could not write {}: {error}",
+                    path.display()
+                );
+                // A save the user asked for that silently does nothing is
+                // worse than an extra dialog.
+                rfd::AsyncMessageDialog::new()
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_title("Save Preset")
+                    .set_description(format!("Could not save {}:\n{error}", path.display()))
+                    .show()
+                    .await;
+                return;
+            }
+            eprintln!(
+                "[plugin-preset] saved {} bytes={}",
+                path.display(),
+                preset.state.len()
+            );
+            let _ = this.update(cx, |layout, cx| {
+                layout.select_saved_preset(key, &preset.plugin_id, &path, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Without native dialogs there is nowhere to ask for a path, so the preset
+    /// goes into the plug-in's folder under the suggested name.
+    #[cfg(not(feature = "native-dialogs"))]
+    fn save_preset_through_dialog(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        dir: PathBuf,
+        suggested: String,
+        preset: SpherePluginHost::preset::StatePreset,
+        cx: &mut Context<Self>,
+    ) {
+        let path = dir.join(format!(
+            "{}.{PRESET_EXTENSION}",
+            preset_file_stem(&suggested)
+        ));
+        if let Err(error) = SpherePluginHost::preset::write_state_preset(&path, &preset) {
             eprintln!(
                 "[plugin-preset] could not write {}: {error}",
                 path.display()
             );
             return;
         }
-        eprintln!(
-            "[plugin-preset] saved {} bytes={}",
-            path.display(),
-            bytes.len()
-        );
-        let names = list_presets(&plugin_id);
-        if let Some(position) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| names.iter().position(|name| name == stem))
-        {
-            self.plugin_editors
-                .preset_selection
-                .insert((track_id.to_string(), insert_id.to_string()), position);
+        let key = (track_id.to_string(), insert_id.to_string());
+        self.select_saved_preset(key, &preset.plugin_id, &path, cx);
+    }
+
+    /// Marks a just-written preset as the loaded one, when it landed in the
+    /// folder the popover lists.
+    fn select_saved_preset(
+        &mut self,
+        key: (String, String),
+        plugin_id: &str,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        let position = list_preset_files(plugin_id)
+            .iter()
+            .position(|(_, listed)| listed == path);
+        match position {
+            Some(position) => {
+                self.plugin_editors.preset_selection.insert(key, position);
+            }
+            None => {
+                self.plugin_editors.preset_selection.remove(&key);
+            }
         }
         cx.notify();
     }
 
+    /// Loads a preset file from anywhere, through the OS Open dialog, and
+    /// files a copy in this plug-in's preset folder so it is in the list from
+    /// then on.
+    #[cfg(feature = "native-dialogs")]
+    fn import_plugin_editor_preset(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(plugin_id) = self.insert_plugin_id(track_id, insert_id, cx) else {
+            return;
+        };
+        let Some(dir) = preset_dir(&plugin_id) else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        let base = rfd::AsyncFileDialog::new()
+            .set_title("Import Preset")
+            .set_directory(&dir)
+            .add_filter(
+                "Futureboard Preset",
+                &[PRESET_EXTENSION, LEGACY_PRESET_EXTENSION],
+            );
+        let dialog = self.parent_dialog_to_editor(track_id, base, cx);
+        let (track_id, insert_id) = (track_id.to_string(), insert_id.to_string());
+        cx.spawn(async move |this, cx| {
+            let Some(handle) = dialog.pick_file().await else {
+                return;
+            };
+            let source = handle.path().to_path_buf();
+            let refusal = match SpherePluginHost::preset::read_state_preset(&source) {
+                Err(error) => Some(format!(
+                    "{} is not a plug-in preset:\n{error}",
+                    source.display()
+                )),
+                Ok((owner, _)) if owner != plugin_id => Some(format!(
+                    "{} was saved from a different plug-in ({owner}). Presets only load into \
+                     the plug-in that made them.",
+                    source.display()
+                )),
+                Ok(_) => None,
+            };
+            if let Some(message) = refusal {
+                rfd::AsyncMessageDialog::new()
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_title("Import Preset")
+                    .set_description(message)
+                    .show()
+                    .await;
+                return;
+            }
+            let _ = this.update(cx, |layout, cx| {
+                layout.import_preset_file(&track_id, &insert_id, &plugin_id, &dir, &source, cx);
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(not(feature = "native-dialogs"))]
+    fn import_plugin_editor_preset(
+        &mut self,
+        _track_id: &str,
+        _insert_id: &str,
+        _cx: &mut Context<Self>,
+    ) {
+        eprintln!("[plugin-preset] native file dialogs are disabled in this build");
+    }
+
+    /// Loads an already-validated preset file into the insert, and keeps a copy
+    /// in the plug-in's folder unless it already lives there.
+    #[cfg(feature = "native-dialogs")]
+    fn import_preset_file(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        plugin_id: &str,
+        dir: &std::path::Path,
+        source: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok((_, state)) = SpherePluginHost::preset::read_state_preset(source) else {
+            return;
+        };
+        let filed = if source.parent() == Some(dir) {
+            source.to_path_buf()
+        } else {
+            let stem = source
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(preset_file_stem)
+                .unwrap_or_else(|| "Imported".to_string());
+            let target = (1..)
+                .map(|n| {
+                    let name = if n == 1 {
+                        stem.clone()
+                    } else {
+                        format!("{stem} {n}")
+                    };
+                    dir.join(format!("{name}.{PRESET_EXTENSION}"))
+                })
+                .find(|candidate| !candidate.exists())
+                .unwrap_or_else(|| dir.join(format!("{stem}.{PRESET_EXTENSION}")));
+            let plugin_name = self
+                .timeline
+                .read(cx)
+                .state
+                .find_insert_slot(track_id, insert_id)
+                .map(|slot| slot.display_name.clone())
+                .unwrap_or_else(|| plugin_id.to_string());
+            match SpherePluginHost::preset::write_state_preset(
+                &target,
+                &SpherePluginHost::preset::StatePreset {
+                    plugin_id: plugin_id.to_string(),
+                    plugin_name,
+                    state: state.clone(),
+                },
+            ) {
+                Ok(()) => target,
+                Err(error) => {
+                    // Loading still goes ahead: the user asked for the sound,
+                    // and only the filing failed.
+                    eprintln!(
+                        "[plugin-preset] could not file {} in {}: {error}",
+                        source.display(),
+                        dir.display()
+                    );
+                    source.to_path_buf()
+                }
+            }
+        };
+        let before = self.capture_insert_state(track_id, insert_id, cx);
+        if !self.apply_plugin_state_to_insert(track_id, insert_id, std::sync::Arc::new(state), cx) {
+            return;
+        }
+        self.record_insert_state("Import Preset", track_id, insert_id, before, cx);
+        self.select_saved_preset(
+            (track_id.to_string(), insert_id.to_string()),
+            plugin_id,
+            &filed,
+            cx,
+        );
+        eprintln!("[plugin-preset] imported {}", source.display());
+    }
+
+    /// Parents a file dialog to this channel's editor window.
+    ///
+    /// The editor is a topmost window, so a dialog without an owner opens
+    /// *behind* the editor the user just clicked Save in — present, modal, and
+    /// invisible.
+    #[cfg(feature = "native-dialogs")]
+    fn parent_dialog_to_editor(
+        &self,
+        track_id: &str,
+        dialog: rfd::AsyncFileDialog,
+        cx: &mut Context<Self>,
+    ) -> rfd::AsyncFileDialog {
+        let Some(handle) = self.plugin_editor_window_for(track_id) else {
+            return dialog;
+        };
+        let mut dialog = Some(dialog);
+        let parented = handle
+            .update(cx, |_editor, window, _cx| {
+                dialog.take().map(|dialog| dialog.set_parent(window))
+            })
+            .ok()
+            .flatten();
+        parented
+            .or(dialog)
+            .unwrap_or_else(rfd::AsyncFileDialog::new)
+    }
     fn insert_plugin_id(
         &self,
         track_id: &str,

@@ -370,6 +370,45 @@ pub enum EditCommand {
     MoveInsertSlot {
         plan: crate::components::timeline::timeline_state::InsertMove,
     },
+    /// Channels' insert chains replaced wholesale: a plug-in added, removed or
+    /// replaced, a duplicate dropped with Alt, an FX chain pasted. Each side
+    /// holds every chain the action changed, as it stood, its slots carrying
+    /// their plug-in state — so a step puts back the instances that were
+    /// there, and the studio loads what the step brings and unloads what it
+    /// takes (see [`EditCommand::instances_arriving`]). One entry per action.
+    SetInsertChains {
+        label: &'static str,
+        prev: Vec<crate::components::timeline::timeline_state::InsertChainSnapshot>,
+        next: Vec<crate::components::timeline::timeline_state::InsertChainSnapshot>,
+    },
+    /// Any edit to tracks, the master bus or the project routing that has no
+    /// command of its own: a track added, tracks reordered or grouped, a
+    /// toggle, a colour, routing, sends, a bypass. Both sides are recorded by
+    /// `TimelineState::finish_track_edit`. The action that made it applied its
+    /// own effect the light way (a live mute, say); its undo and redo rebuild
+    /// the engine project, since a step can touch anything in scope.
+    SetTracks {
+        label: &'static str,
+        prev: Box<crate::components::timeline::timeline_state::TrackEditSnapshot>,
+        next: Box<crate::components::timeline::timeline_state::TrackEditSnapshot>,
+    },
+    /// A track added by Duplicate Track: the inverse of
+    /// [`EditCommand::DeleteTrack`]. `height` is its row height, when it has
+    /// one of its own.
+    DuplicateTrack {
+        snapshot: TrackSnapshot,
+        height: Option<f32>,
+    },
+    /// One insert's opaque plug-in state replaced — a pasted state, a loaded
+    /// preset. The instance stays; the studio hands it the restored state
+    /// after a step (see [`EditCommand::plugin_state_target`]).
+    SetInsertState {
+        label: &'static str,
+        track_id: String,
+        insert_id: String,
+        prev: Option<std::sync::Arc<Vec<u8>>>,
+        next: Option<std::sync::Arc<Vec<u8>>>,
+    },
     /// Batch per-track row height changes (layout/view — one undo entry per gesture).
     SetTrackHeights {
         prev: Vec<(String, f32)>,
@@ -498,6 +537,9 @@ impl EditCommand {
             EditCommand::SetSongTextEvents { .. } => EditImpact::Metadata,
             EditCommand::SetChordEvents { .. } => EditImpact::Metadata,
             EditCommand::SetGlobalLaneHeights { .. } => EditImpact::Metadata,
+            // Saved with the project, but the instance and the graph around
+            // it are unchanged: the studio hands the plug-in its state.
+            EditCommand::SetInsertState { .. } => EditImpact::Metadata,
             // Nothing the engine plays differently, but ARA plug-ins read the
             // key from the musical context, including on undo and redo.
             EditCommand::SetProjectKey { .. } => EditImpact::MusicalContext,
@@ -543,7 +585,129 @@ impl EditCommand {
             EditCommand::ReorderFxSlot { .. }
                 | EditCommand::ReorderSendSlot { .. }
                 | EditCommand::MoveInsertSlot { .. }
+                | EditCommand::SetInsertChains { .. }
+                | EditCommand::DuplicateTrack { .. }
+                | EditCommand::SetTracks { .. }
         )
+    }
+
+    /// `(track, insert)` of every plug-in instance the given step of this
+    /// command — its undo (`undoing`) or its redo — takes out of the project.
+    /// The studio captures their live state into the command first, so the
+    /// opposite step brings them back as they were left, then unloads them.
+    pub fn instances_leaving(&self, undoing: bool) -> Vec<(String, String)> {
+        let (before, after) = self.instance_sides(undoing);
+        before
+            .into_iter()
+            .filter(|(_, id)| !after.iter().any(|(_, kept)| kept == id))
+            .collect()
+    }
+
+    /// `(track, insert)` of every plug-in instance the given step brings into
+    /// the project, for the studio to load after it.
+    pub fn instances_arriving(&self, undoing: bool) -> Vec<(String, String)> {
+        let (before, after) = self.instance_sides(undoing);
+        after
+            .into_iter()
+            .filter(|(_, id)| !before.iter().any(|(_, had)| had == id))
+            .collect()
+    }
+
+    /// The loaded inserts this command's step starts from and ends on.
+    fn instance_sides(&self, undoing: bool) -> (Vec<(String, String)>, Vec<(String, String)>) {
+        use crate::components::timeline::timeline_state::InsertChainSnapshot;
+        let chains = |snapshots: &[InsertChainSnapshot]| {
+            snapshots
+                .iter()
+                .flat_map(|chain| {
+                    chain
+                        .plugin_ids()
+                        .map(|id| (chain.track_id.clone(), id.to_string()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let track = |snapshot: &TrackSnapshot| {
+            snapshot
+                .track
+                .inserts
+                .iter()
+                .filter(|slot| !slot.is_empty())
+                .map(|slot| (snapshot.track.id.clone(), slot.id.clone()))
+                .collect::<Vec<_>>()
+        };
+        // (the side the command's execute leaves, the side it makes)
+        let (executed_from, executed_to) = match self {
+            EditCommand::SetInsertChains { prev, next, .. } => (chains(prev), chains(next)),
+            EditCommand::DuplicateTrack { snapshot, .. } => (Vec::new(), track(snapshot)),
+            EditCommand::SetTracks { prev, next, .. } => {
+                (prev.plugin_instances(), next.plugin_instances())
+            }
+            EditCommand::DeleteTrack { snapshot } => (track(snapshot), Vec::new()),
+            _ => (Vec::new(), Vec::new()),
+        };
+        if undoing {
+            (executed_to, executed_from)
+        } else {
+            (executed_from, executed_to)
+        }
+    }
+
+    /// Replace the stored plug-in state of every slot this command keeps a
+    /// copy of whose insert id is in `states`. Called right before a step
+    /// with the live state of the instances it is about to take away, so the
+    /// opposite step restores what the plug-in had, not what it had when the
+    /// command was first recorded.
+    pub fn refresh_plugin_states(
+        &mut self,
+        states: &std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
+    ) {
+        use crate::components::timeline::timeline_state::InsertSlotState;
+        let refresh = |slots: &mut Vec<InsertSlotState>| {
+            for slot in slots {
+                if let Some(state) = states.get(&slot.id) {
+                    slot.vst3_state = Some(state.clone());
+                }
+            }
+        };
+        match self {
+            EditCommand::SetInsertChains { prev, next, .. } => {
+                for chain in prev.iter_mut().chain(next.iter_mut()) {
+                    refresh(&mut chain.inserts);
+                }
+            }
+            EditCommand::DuplicateTrack { snapshot, .. }
+            | EditCommand::DeleteTrack { snapshot } => {
+                refresh(&mut snapshot.track.inserts);
+            }
+            EditCommand::SetTracks { prev, next, .. } => {
+                for slot in prev.slots_mut().chain(next.slots_mut()) {
+                    if let Some(state) = states.get(&slot.id) {
+                        slot.vst3_state = Some(state.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a step of this command changes the project's audio routing
+    /// (connections, Master / Monitor Output), which the studio has to
+    /// publish to the engine again.
+    pub fn touches_routing(&self) -> bool {
+        matches!(self, EditCommand::SetTracks { prev, .. } if prev.routing.is_some())
+    }
+
+    /// `(track, insert)` whose live plug-in has to be handed its restored
+    /// state after an undo or redo of this command.
+    pub fn plugin_state_target(&self) -> Option<(&str, &str)> {
+        match self {
+            EditCommand::SetInsertState {
+                track_id,
+                insert_id,
+                ..
+            } => Some((track_id.as_str(), insert_id.as_str())),
+            _ => None,
+        }
     }
 
     /// Record, right before [`Self::undo`] (`undoing`) or a redo through
@@ -637,6 +801,10 @@ impl EditCommand {
             EditCommand::ReorderFxSlot { .. } => "Reorder FX",
             EditCommand::ReorderSendSlot { .. } => "Reorder Sends",
             EditCommand::MoveInsertSlot { .. } => "Move Plug-in",
+            EditCommand::SetInsertChains { label, .. } => label,
+            EditCommand::DuplicateTrack { .. } => "Duplicate Track",
+            EditCommand::SetTracks { label, .. } => label,
+            EditCommand::SetInsertState { label, .. } => label,
             EditCommand::SetTrackHeights { .. } => "Resize Track Height",
             EditCommand::SetTrackVolume { .. } => "Set Volume",
             EditCommand::SetTrackPan { .. } => "Set Pan",
@@ -829,6 +997,26 @@ impl EditCommand {
             EditCommand::MoveInsertSlot { plan } => {
                 state.apply_insert_move(plan);
             }
+            EditCommand::SetInsertChains { next, .. } => {
+                for chain in next {
+                    state.restore_insert_chain(chain);
+                }
+            }
+            EditCommand::SetTracks { next, .. } => state.restore_track_edit(next),
+            EditCommand::DuplicateTrack { snapshot, height } => {
+                restore_track_snapshot(state, snapshot);
+                if let Some(height) = height {
+                    state
+                        .track_view_layout
+                        .set_height(snapshot.track.id.clone(), *height);
+                }
+            }
+            EditCommand::SetInsertState {
+                track_id,
+                insert_id,
+                next,
+                ..
+            } => set_insert_state(state, track_id, insert_id, next),
             EditCommand::SetTrackHeights { next, .. } => {
                 apply_track_heights_snapshot(state, next);
             }
@@ -1025,6 +1213,21 @@ impl EditCommand {
             EditCommand::MoveInsertSlot { plan } => {
                 state.revert_insert_move(plan);
             }
+            EditCommand::SetInsertChains { prev, .. } => {
+                for chain in prev {
+                    state.restore_insert_chain(chain);
+                }
+            }
+            EditCommand::SetTracks { prev, .. } => state.restore_track_edit(prev),
+            EditCommand::DuplicateTrack { snapshot, .. } => {
+                state.delete_track(&snapshot.track.id);
+            }
+            EditCommand::SetInsertState {
+                track_id,
+                insert_id,
+                prev,
+                ..
+            } => set_insert_state(state, track_id, insert_id, prev),
             EditCommand::SetTrackHeights { prev, .. } => {
                 apply_track_heights_snapshot(state, prev);
             }
@@ -1982,6 +2185,20 @@ mod conductor_command_tests {
     }
 }
 
+fn set_insert_state(
+    state: &mut TimelineState,
+    track_id: &str,
+    insert_id: &str,
+    value: &Option<std::sync::Arc<Vec<u8>>>,
+) {
+    if let Some(slot) = state
+        .insert_slots_mut(track_id)
+        .and_then(|slots| slots.iter_mut().find(|slot| slot.id == insert_id))
+    {
+        slot.vst3_state = value.clone();
+    }
+}
+
 fn restore_track_snapshot(state: &mut TimelineState, snapshot: &TrackSnapshot) {
     if state
         .tracks
@@ -2120,6 +2337,151 @@ impl EditHistory {
 
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
+    }
+
+    /// Change how many steps are kept. Lowering it drops the oldest steps
+    /// now rather than at the next push, so the setting means what it says
+    /// the moment it is changed.
+    pub fn set_max_steps(&mut self, max_steps: usize) {
+        self.max_steps = max_steps.max(1);
+        while self.undo_stack.len() > self.max_steps {
+            self.undo_stack.pop_front();
+        }
+        while self.redo_stack.len() > self.max_steps {
+            self.redo_stack.pop_front();
+        }
+    }
+
+    pub fn max_steps(&self) -> usize {
+        self.max_steps
+    }
+
+    /// The command the next undo (`undoing`) or redo will step, for a caller
+    /// that has to prepare it first (see [`EditCommand::refresh_plugin_states`]).
+    pub fn next_step_mut(&mut self, undoing: bool) -> Option<&mut EditCommand> {
+        if undoing {
+            self.undo_stack.back_mut()
+        } else {
+            self.redo_stack.back_mut()
+        }
+    }
+
+    pub fn next_step(&self, undoing: bool) -> Option<&EditCommand> {
+        if undoing {
+            self.undo_stack.back()
+        } else {
+            self.redo_stack.back()
+        }
+    }
+
+    /// What Undo would undo, as the Edit menu names it.
+    pub fn undo_label(&self) -> Option<&'static str> {
+        self.undo_stack.back().map(EditCommand::label)
+    }
+
+    /// What Redo would redo.
+    pub fn redo_label(&self) -> Option<&'static str> {
+        self.redo_stack.back().map(EditCommand::label)
+    }
+
+    /// Push a fader or pan value from a control that reports every pointer
+    /// sample and no gesture end (the mixer pan knob): a value for the same
+    /// track and parameter as the newest entry moves that entry's `next`
+    /// instead of stacking a step per sample.
+    pub fn push_mixer_value(&mut self, cmd: EditCommand) {
+        match (&cmd, self.undo_stack.back_mut()) {
+            (
+                EditCommand::SetTrackPan { track_id, next, .. },
+                Some(EditCommand::SetTrackPan {
+                    track_id: top_track,
+                    next: top_next,
+                    ..
+                }),
+            )
+            | (
+                EditCommand::SetTrackVolume { track_id, next, .. },
+                Some(EditCommand::SetTrackVolume {
+                    track_id: top_track,
+                    next: top_next,
+                    ..
+                }),
+            ) if track_id == top_track => {
+                *top_next = *next;
+                self.redo_stack.clear();
+            }
+            _ => self.push(cmd),
+        }
+    }
+
+    /// Push an [`EditCommand::SetTracks`]. With `fold`, a command that
+    /// continues the newest entry — same label, same tracks, master and
+    /// routing in scope — extends it instead of stacking a step per pointer
+    /// sample: dragging through a colour picker, or a send-gain slider, is one
+    /// step back to where it started.
+    pub fn push_track_edit(&mut self, cmd: EditCommand, fold: bool) {
+        if fold {
+            if let (
+                EditCommand::SetTracks { label, next, .. },
+                Some(EditCommand::SetTracks {
+                    label: top_label,
+                    next: top_next,
+                    ..
+                }),
+            ) = (&cmd, self.undo_stack.back_mut())
+            {
+                let same_scope = |a: &crate::components::timeline::timeline_state::TrackEditSnapshot,
+                                  b: &crate::components::timeline::timeline_state::TrackEditSnapshot| {
+                    a.order == b.order
+                        && a.master.is_some() == b.master.is_some()
+                        && a.routing.is_some() == b.routing.is_some()
+                        && a.tracks.len() == b.tracks.len()
+                        && a.tracks.iter().zip(&b.tracks).all(|(x, y)| x.id == y.id)
+                        // A side that left a track's clips out has to be
+                        // folded with one that did the same, or the merged
+                        // step would restore that track with no clips.
+                        && a.kept_clips == b.kept_clips
+                };
+                if top_label == label && same_scope(top_next, next) {
+                    **top_next = (**next).clone();
+                    self.redo_stack.clear();
+                    return;
+                }
+            }
+        }
+        self.push(cmd);
+    }
+
+    /// Push an [`EditCommand::SetInsertState`], folding it into the newest
+    /// entry when that is the same change (`label`) to the same insert:
+    /// stepping through ten presets is one step back to where it started,
+    /// not ten. Anything else pushes normally.
+    pub fn push_insert_state(&mut self, cmd: EditCommand) {
+        let EditCommand::SetInsertState {
+            label,
+            track_id,
+            insert_id,
+            next,
+            ..
+        } = &cmd
+        else {
+            self.push(cmd);
+            return;
+        };
+        if let Some(EditCommand::SetInsertState {
+            label: top_label,
+            track_id: top_track,
+            insert_id: top_insert,
+            next: top_next,
+            ..
+        }) = self.undo_stack.back_mut()
+        {
+            if top_label == label && top_track == track_id && top_insert == insert_id {
+                *top_next = next.clone();
+                self.redo_stack.clear();
+                return;
+            }
+        }
+        self.push(cmd);
     }
 }
 

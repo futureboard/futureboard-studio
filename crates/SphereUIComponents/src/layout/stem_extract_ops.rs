@@ -100,6 +100,11 @@ impl StudioLayout {
         let timeline = self.timeline.clone();
         let mut import_jobs: Vec<(PathBuf, String)> = Vec::new();
         let muted_source = self.timeline.update(cx, |timeline, cx| {
+            // The stem tracks and the muted source are one step.
+            let source_id = request.source_track_id.clone();
+            let edit = timeline.begin_track_edit(
+                crate::components::timeline::timeline_state::TrackEditScope::tracks([source_id]),
+            );
             let source_index = timeline
                 .state
                 .tracks
@@ -154,6 +159,7 @@ impl StudioLayout {
                 request.source_track_id,
                 created_ids
             );
+            timeline.commit_track_edit("Extract Stems", edit, false, cx);
             cx.notify();
             muted.then_some(request.source_track_id.clone())
         });
