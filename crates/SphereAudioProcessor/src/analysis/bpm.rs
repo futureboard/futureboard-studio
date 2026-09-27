@@ -149,6 +149,80 @@ pub fn estimate_bpm_candidates(
     candidates
 }
 
+/// One reading of a pulse at a metrical level.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TempoHypothesis {
+    pub bpm: f32,
+    /// Periodicity evidence for this level: tempogram comb salience for a
+    /// rhythm section, the candidate's confidence for a candidate family.
+    pub evidence: f32,
+    /// Evidence weighted by the tempo prior, relative to the family's
+    /// canonical reading (1.0). Above 1 means this level was more plausible
+    /// on its own and the canonical one was kept for continuity with the
+    /// neighbouring sections.
+    pub score: f32,
+}
+
+/// The same periodicity counted at different metrical levels (…, ½×, 1×,
+/// 2×, …). Every member is physically supported by the audio; they differ
+/// only in which level is called "the beat". `canonical_bpm` is the level
+/// the analysis settled on — for a rhythm section, the level its beats and
+/// tempo map use.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TempoFamily {
+    pub canonical_bpm: f32,
+    /// The other levels, most plausible first.
+    pub alternatives: Vec<TempoHypothesis>,
+}
+
+/// Whether `b` is `a` counted at another metrical level: the power-of-two
+/// ratio `b / a` (1, 2, ½, 4 or ¼) when `b` is within `tolerance`
+/// (relative) of it.
+pub fn octave_ratio(a: f32, b: f32, tolerance: f32) -> Option<f32> {
+    if !(a > 0.0 && b > 0.0) {
+        return None;
+    }
+    [1.0_f32, 2.0, 0.5, 4.0, 0.25]
+        .into_iter()
+        .find(|r| ((b - a * r) / (a * r)).abs() <= tolerance)
+}
+
+/// Candidates grouped into tempo families (members a power of two apart),
+/// the most confident family first. Each family's canonical reading is its
+/// most confident member.
+pub fn tempo_families(candidates: &[TempoCandidate]) -> Vec<TempoFamily> {
+    let mut order: Vec<&TempoCandidate> = candidates.iter().collect();
+    order.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    let mut families: Vec<TempoFamily> = Vec::new();
+    for candidate in order {
+        let family = families
+            .iter_mut()
+            .find(|f| octave_ratio(f.canonical_bpm, candidate.bpm, DISTINCT).is_some());
+        match family {
+            Some(family) => {
+                let best = candidates
+                    .iter()
+                    .find(|c| c.bpm == family.canonical_bpm)
+                    .map_or(1.0, |c| c.confidence);
+                family.alternatives.push(TempoHypothesis {
+                    bpm: candidate.bpm,
+                    evidence: candidate.confidence,
+                    score: if best > 0.0 {
+                        candidate.confidence / best
+                    } else {
+                        0.0
+                    },
+                });
+            }
+            None => families.push(TempoFamily {
+                canonical_bpm: candidate.bpm,
+                alternatives: Vec::new(),
+            }),
+        }
+    }
+    families
+}
+
 /// Onset envelope and its normalised autocorrelation, computed once.
 struct TempoAnalysis {
     /// Envelope frames per second.
@@ -550,6 +624,37 @@ mod tests {
             candidates[0].confidence > 0.5,
             "clear loop should be confident"
         );
+    }
+
+    #[test]
+    fn octave_ratio_names_the_metrical_level() {
+        assert_eq!(octave_ratio(85.0, 170.0, 0.03), Some(2.0));
+        assert_eq!(octave_ratio(170.0, 85.0, 0.03), Some(0.5));
+        assert_eq!(octave_ratio(85.0, 42.5, 0.03), Some(0.5));
+        assert_eq!(octave_ratio(85.0, 340.0, 0.03), Some(4.0));
+        assert_eq!(octave_ratio(96.0, 97.0, 0.03), Some(1.0));
+        // A 3:2 reading is a different pulse, not another level of this one.
+        assert_eq!(octave_ratio(96.0, 144.0, 0.03), None);
+        assert_eq!(octave_ratio(0.0, 120.0, 0.03), None);
+    }
+
+    fn candidate(bpm: f32, confidence: f32) -> TempoCandidate {
+        TempoCandidate { bpm, confidence }
+    }
+
+    #[test]
+    fn families_keep_every_level_of_one_pulse_together() {
+        let families = tempo_families(&[
+            candidate(170.0, 0.58),
+            candidate(85.0, 0.49),
+            candidate(113.34, 0.30),
+            candidate(42.5, 0.1),
+        ]);
+        assert_eq!(families.len(), 2);
+        assert_eq!(families[0].canonical_bpm, 170.0);
+        let levels: Vec<f32> = families[0].alternatives.iter().map(|h| h.bpm).collect();
+        assert_eq!(levels, vec![85.0, 42.5]);
+        assert_eq!(families[1].canonical_bpm, 113.34);
     }
 
     #[test]

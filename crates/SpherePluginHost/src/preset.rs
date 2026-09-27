@@ -92,12 +92,32 @@ fn clear_pst_files_recursive(dir: &Path) -> Result<u32, String> {
         } else if path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("pst"))
+            // A user preset shares the extension but is the user's work, not
+            // cache: clearing the cache must never delete one.
+            && !is_state_preset_file(&path)
         {
             fs::remove_file(&path).map_err(|e| e.to_string())?;
             deleted += 1;
         }
     }
     Ok(deleted)
+}
+
+/// Whether `path` is a user preset — an FBPST file carrying plug-in state —
+/// rather than a scan-cache row, which never carries any.
+///
+/// Both are `.pst` in the same container, so the header's declared state
+/// length is what tells them apart. Only the 16 header bytes are read.
+pub fn is_state_preset_file(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut header = [0u8; 16];
+    if file.read_exact(&mut header).is_err() || &header[..5] != PRESET_MAGIC {
+        return false;
+    }
+    u32::from_le_bytes([header[12], header[13], header[14], header[15]]) > 0
 }
 
 /// Validate that a plug-in binary exists before registration. Formats with no
@@ -182,6 +202,12 @@ pub fn read_preset_file(preset_path: &Path) -> Result<RegistryPlugin, String> {
     let bytes = fs::read(preset_path).map_err(|e| e.to_string())?;
     if bytes.len() < 24 || &bytes[..5] != PRESET_MAGIC {
         return Err("Not an FBPST preset".to_string());
+    }
+    // A user preset carries state; a cache row never does. Reading a user
+    // preset as a row would list it as a phantom plug-in.
+    let state_len = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    if state_len > 0 {
+        return Err("A user preset, not a plug-in cache row".to_string());
     }
     let meta_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
     let meta_start = 24usize;
@@ -472,6 +498,40 @@ mod tests {
         let (plugin_id, restored) = read_state_preset(&path).expect("parse");
         assert_eq!(plugin_id, "vst3:abcdef");
         assert_eq!(restored, state, "state comes back byte for byte");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A user `.pst` under the preset root is neither a plug-in row nor cache
+    /// to clear: the scan cache reader skips it and Clear Database keeps it.
+    #[test]
+    fn a_user_preset_is_not_mistaken_for_the_scan_cache() {
+        let dir = std::env::temp_dir().join("fb-preset-not-cache");
+        let _ = fs::remove_dir_all(&dir);
+        let user = dir.join("User").join("vst3_x").join("Warm Vocal.pst");
+        write_state_preset(
+            &user,
+            &StatePreset {
+                plugin_id: "vst3:x".to_string(),
+                plugin_name: "X".to_string(),
+                state: vec![1, 2, 3],
+            },
+        )
+        .expect("write");
+        let cache = dir.join("VST3").join("Effects").join("x.pst");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        let meta = br#"{"pluginMetadata":{"id":"x","name":"X"}}"#;
+        let mut bytes = preset_header(meta.len(), 0).to_vec();
+        bytes.extend_from_slice(meta);
+        fs::write(&cache, &bytes).unwrap();
+
+        assert!(is_state_preset_file(&user));
+        assert!(!is_state_preset_file(&cache));
+        assert!(read_preset_file(&user).is_err(), "no phantom plug-in row");
+        assert!(read_preset_file(&cache).is_ok());
+        assert_eq!(clear_pst_files_recursive(&dir).unwrap(), 1);
+        assert!(user.exists(), "the user's preset survives Clear Database");
+        assert!(!cache.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

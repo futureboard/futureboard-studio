@@ -260,7 +260,7 @@ pub fn timeline_ruler(
     state: &TimelineState,
     on_add_track: std::sync::Arc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static>,
     on_toggle_snap: std::sync::Arc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static>,
-    on_cycle_grid: std::sync::Arc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static>,
+    on_grid_menu: std::sync::Arc<dyn Fn(&(f32, f32), &mut gpui::Window, &mut gpui::App) + 'static>,
     on_clear_all_mutes: std::sync::Arc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static>,
     on_clear_all_solos: std::sync::Arc<dyn Fn(&(), &mut gpui::Window, &mut gpui::App) + 'static>,
     on_seek: std::sync::Arc<
@@ -286,7 +286,7 @@ pub fn timeline_ruler(
 ) -> impl IntoElement {
     let _s = crate::perf::PerfScope::enter("TimelineRuler");
     let on_toggle_snap_clone = on_toggle_snap.clone();
-    let on_cycle_grid_clone = on_cycle_grid.clone();
+    let on_grid_menu_clone = on_grid_menu.clone();
     let on_add_track_clone = on_add_track.clone();
     let any_muted = state.any_track_muted();
     let any_soloed = state.any_track_soloed();
@@ -472,6 +472,15 @@ pub fn timeline_ruler(
                                 })
                                 .cursor(gpui::CursorStyle::PointingHand)
                                 .id("ruler-snap-toggle-btn")
+                                .tooltip(|window, cx| {
+                                    let text = match crate::keymap::shortcut_for_command(
+                                        "timeline:toggle-snap",
+                                    ) {
+                                        Some(shortcut) => format!("Snap to Grid ({shortcut})"),
+                                        None => "Snap to Grid".to_string(),
+                                    };
+                                    crate::components::controls::fb_tooltip(text)(window, cx)
+                                })
                                 .on_click(move |_, window, cx| {
                                     on_toggle_snap_clone(&(), window, cx);
                                 })
@@ -487,14 +496,17 @@ pub fn timeline_ruler(
                                         }),
                                 ),
                         )
-                        // Grid Resolution Button
+                        // Grid resolution dropdown. Opens on press, like the
+                        // transport's Count-In menu, at the pointer.
                         .child(
                             div()
                                 .flex()
                                 .items_center()
                                 .justify_center()
+                                .gap(px(2.0))
                                 .h(px(20.0))
-                                .px(px(4.0))
+                                .pl(px(4.0))
+                                .pr(px(3.0))
                                 .rounded(px(crate::theme::radius::CONTROL))
                                 .bg(Colors::surface_raised())
                                 .border(px(1.0))
@@ -503,10 +515,24 @@ pub fn timeline_ruler(
                                 .text_color(Colors::text_muted())
                                 .text_size(px(9.0))
                                 .id("ruler-grid-res-btn")
-                                .on_click(move |_, window, cx| {
-                                    on_cycle_grid_clone(&(), window, cx);
+                                .tooltip(crate::components::controls::fb_tooltip("Grid"))
+                                .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
+                                    cx.stop_propagation();
+                                    on_grid_menu_clone(
+                                        &(event.position.x.into(), event.position.y.into()),
+                                        window,
+                                        cx,
+                                    );
                                 })
-                                .child(state.grid_step_label()),
+                                .child(state.grid_step_label())
+                                .child(
+                                    svg()
+                                        .path(assets::ICON_CHEVRON_DOWN_PATH)
+                                        .w(px(8.0))
+                                        .h(px(8.0))
+                                        .flex_none()
+                                        .text_color(Colors::text_faint()),
+                                ),
                         ),
                 ),
         )

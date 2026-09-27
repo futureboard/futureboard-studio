@@ -156,6 +156,11 @@ sphere_daux_vst2_embed_host_kind(SphereDauxVst2Processor *processor);
 SPHERE_DAUX_VST2_API int
 sphere_daux_vst2_embed_take_user_close(SphereDauxVst2Processor *processor);
 
+/// 1 (and resets) if the plug-in reported a GUI edit (`audioMasterAutomate` /
+/// `audioMasterEndEdit`) since the last call; 0 otherwise.
+SPHERE_DAUX_VST2_API int
+sphere_daux_vst2_take_state_touched(SphereDauxVst2Processor *processor);
+
 SPHERE_DAUX_VST2_API void
 sphere_daux_vst2_embed_set_waiting_stage(SphereDauxVst2Processor *processor,
                                          const char *stage);

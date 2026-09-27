@@ -366,11 +366,12 @@ impl TimelineState {
             // lives. Through the stretch ratio, so a stretched clip's halves
             // keep playing at the same speed instead of each re-deriving the
             // whole take's length.
+            // The split point's time into the clip comes through the tempo map,
+            // the axis the waveform is drawn on, so under tempo automation the
+            // halves meet on the audio under the razor line.
             let frames_per_second = clip.source_frames_per_timeline_second(self.seconds_per_beat());
-            let split_samples = ((left_len as f64 * self.seconds_per_beat() as f64)
-                * frames_per_second)
-                .round()
-                .max(0.0) as u64;
+            let split_seconds = self.clip_local_seconds_at_beat(clip, split_beat as f64);
+            let split_samples = (split_seconds * frames_per_second).round().max(0.0) as u64;
             let source_start = clip.stretch.source_start_samples;
             let source_end = if clip.stretch.source_end_samples > source_start {
                 clip.stretch.source_end_samples
@@ -391,6 +392,10 @@ impl TimelineState {
                     .warp_markers
                     .retain(|marker| marker.timeline_beat > split_at);
             }
+            // The outer fades stay where they were; the cut itself gets none.
+            // Copying them put a fade-out and a fade-in — a dip — on every cut.
+            left.stretch.fade_out_ms = 0.0;
+            right.stretch.fade_in_ms = 0.0;
         }
 
         Some((left, right))
@@ -493,8 +498,10 @@ impl TimelineState {
     /// anything changed. UI-mutating only — the caller records undo / marks dirty.
     pub fn set_clip_length_trimming(&mut self, clip_id: &str, duration_beats: f32) -> bool {
         let seconds_per_beat = self.seconds_per_beat();
+        let project_rate = self.project_sample_rate;
         for track in &mut self.tracks {
             if let Some(clip) = track.clips.iter_mut().find(|clip| clip.id == clip_id) {
+                clip.assume_project_rate_until_decoded(project_rate);
                 let min_len = match &clip.clip_type {
                     ClipType::Midi { notes, .. } => {
                         let last_note_end = notes
@@ -758,8 +765,21 @@ impl TimelineState {
         let target_id = if self.tracks.iter().any(|track| track.id == target_track_id) {
             target_track_id.to_string()
         } else {
-            source_track_id.unwrap_or_else(|| target_track_id.to_string())
+            source_track_id
+                .clone()
+                .unwrap_or_else(|| target_track_id.to_string())
         };
+        // Taken to another track, a take's clip is that track's plain clip:
+        // its take stays behind with nothing to point at, and goes.
+        if source_track_id.as_deref() != Some(target_id.as_str()) {
+            if let Some(source) = self
+                .tracks
+                .iter_mut()
+                .find(|track| Some(&track.id) == source_track_id.as_ref())
+            {
+                source.takes.retain(|take| take.clip_id != clip_id);
+            }
+        }
 
         if let Some(track) = self.tracks.iter_mut().find(|track| track.id == target_id) {
             track.clips.push(clip);
@@ -875,6 +895,7 @@ impl TimelineState {
                 .max(0.0)
         };
         let seconds_per_beat = self.seconds_per_beat();
+        let project_rate = self.project_sample_rate;
         let Some(track) = self
             .tracks
             .iter_mut()
@@ -885,6 +906,8 @@ impl TimelineState {
         let Some(clip) = track.clips.iter_mut().find(|c| c.id == clip_id) else {
             return false;
         };
+        // No 1 Hz trim math for a clip whose file is not decoded yet.
+        clip.assume_project_rate_until_decoded(project_rate);
 
         let is_midi = matches!(clip.clip_type, ClipType::Midi { .. });
         let min_len = if is_midi {

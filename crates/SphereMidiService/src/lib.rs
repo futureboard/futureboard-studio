@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 pub mod chords;
 pub mod expression;
 pub mod mpe;
+pub mod performance;
 pub mod sysex;
 
 pub use expression::{

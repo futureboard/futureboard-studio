@@ -4752,7 +4752,17 @@ impl PianoRoll {
             .unwrap_or(false);
         self.cleanup_midi_before_destructive_edit("midi_output_mode_change", cx);
         self.timeline.update(cx, |tl, tcx| {
+            let edit = tl.begin_track_edit(
+                crate::components::timeline::timeline_state::TrackEditScope::tracks([
+                    track_id.clone()
+                ]),
+            );
             tl.state.set_track_midi_output_per_note(&track_id, next);
+            // It is saved with the track and changes what plays, so it is an
+            // edit like any other: one undo step, and the project is changed.
+            if tl.commit_track_edit("MIDI Output Per Note", edit, false, tcx) {
+                tl.mark_project_changed(tcx);
+            }
             tcx.notify();
         });
     }

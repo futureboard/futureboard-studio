@@ -145,6 +145,13 @@ sphere_daux_vst3_embed_host_kind(SphereDauxVst3Processor *processor);
 SPHERE_DAUX_VST3_API int
 sphere_daux_vst3_embed_take_user_close(SphereDauxVst3Processor *processor);
 
+// 1 (and resets) if the controller reported an edit (performEdit / endEdit) or
+// a value change (restartComponent kParamValuesChanged / kReloadComponent)
+// since the last call; 0 otherwise. Any thread may raise it; poll off the
+// audio path.
+SPHERE_DAUX_VST3_API int
+sphere_daux_vst3_take_state_touched(SphereDauxVst3Processor *processor);
+
 /// Claim one bare-Space transport toggle from any editor UI thread. Process-wide.
 SPHERE_DAUX_VST3_API void sphere_daux_vst3_claim_transport_toggle(void);
 
@@ -251,6 +258,12 @@ sphere_daux_vst3_view_constrain(SphereDauxVst3Processor *processor,
 SPHERE_DAUX_VST3_API int
 sphere_daux_vst3_view_take_resize_request(SphereDauxVst3Processor *processor,
                                           int *out_width, int *out_height);
+
+/// Hands one key press to the view (`IPlugView::onKeyDown`, then `onKeyUp`).
+/// `key` is the character, `key_code` a VST3 virtual key code for keys without
+/// one, `modifiers` a VST3 `KeyModifier` mask. 1 when the view handled it.
+SPHERE_DAUX_VST3_API int sphere_daux_vst3_view_key(
+    SphereDauxVst3Processor *processor, int key, int key_code, int modifiers);
 
 /// Takes the instance out of the processing state without destroying it:
 /// `setProcessing(false)` then `setActive(false)`.

@@ -537,20 +537,61 @@ impl TimelineState {
     /// every position readout, ruler label and editor transform re-sort and
     /// re-integrate the whole tempo map.
     pub fn seconds_at_beat(&self, beats: f64) -> f64 {
-        if self.tempo_map.points.is_empty() {
-            return super::time_display::seconds_at_beat(&self.tempo_map, beats, self.bpm as f64);
-        }
-        self.resolved_tempo_map().seconds_at_beat(beats.max(0.0))
+        self.tempo_lookup().seconds_at_beat(beats)
     }
 
     /// Musical beat at a real elapsed time. Inverse of [`Self::seconds_at_beat`].
     pub fn beat_at_seconds(&self, seconds: f64) -> f64 {
-        if self.tempo_map.points.is_empty() {
-            return super::time_display::beat_at_seconds(&self.tempo_map, seconds, self.bpm as f64);
-        }
-        self.resolved_tempo_map().beat_at_seconds(seconds.max(0.0))
+        self.tempo_lookup().beat_at_seconds(seconds)
     }
 
+    /// The tempo map resolved once, for a run of conversions: each
+    /// [`Self::seconds_at_beat`] or [`Self::beat_at_seconds`] call looks the
+    /// cached map up again (hashing every tempo point and taking its lock),
+    /// which a curve sampled per pixel column cannot afford.
+    pub fn tempo_lookup(&self) -> TempoLookup<'_> {
+        TempoLookup {
+            state: self,
+            map: (!self.tempo_map.points.is_empty()).then(|| self.resolved_tempo_map()),
+        }
+    }
+}
+
+/// [`TimelineState::seconds_at_beat`] and [`TimelineState::beat_at_seconds`]
+/// with the tempo map resolved once. They are these methods: both go through
+/// it, so a cached conversion is the direct one. A clone shares the resolved
+/// map.
+#[derive(Clone)]
+pub struct TempoLookup<'a> {
+    state: &'a TimelineState,
+    map: Option<std::sync::Arc<DirectAudio::TempoMap>>,
+}
+
+impl TempoLookup<'_> {
+    pub fn seconds_at_beat(&self, beats: f64) -> f64 {
+        match &self.map {
+            Some(map) => map.seconds_at_beat(beats.max(0.0)),
+            None => super::time_display::seconds_at_beat(
+                &self.state.tempo_map,
+                beats,
+                self.state.bpm as f64,
+            ),
+        }
+    }
+
+    pub fn beat_at_seconds(&self, seconds: f64) -> f64 {
+        match &self.map {
+            Some(map) => map.beat_at_seconds(seconds.max(0.0)),
+            None => super::time_display::beat_at_seconds(
+                &self.state.tempo_map,
+                seconds,
+                self.state.bpm as f64,
+            ),
+        }
+    }
+}
+
+impl TimelineState {
     /// A position rendered in the project's timebase.
     ///
     /// This is what every ruler label, transport readout, and position hint goes

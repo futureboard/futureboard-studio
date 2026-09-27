@@ -119,6 +119,9 @@ pub struct KeymapWindow {
     /// before binding resolution, so an armed recorder sees chords such as
     /// `ctrl-s` instead of losing them to the action they are already bound to.
     recorder_intercept: Option<gpui::Subscription>,
+    /// The row the last plain click landed on, and when, for telling a
+    /// double-click without relying on the platform's click count alone.
+    last_row_click: Option<(String, std::time::Instant)>,
 }
 
 impl KeymapWindow {
@@ -143,6 +146,7 @@ impl KeymapWindow {
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
             recorder_intercept: None,
+            last_row_click: None,
         }
         .with_json_text(json)
     }
@@ -150,6 +154,28 @@ impl KeymapWindow {
     fn with_json_text(mut self, text: String) -> Self {
         self.json_input.set_value(text);
         self
+    }
+
+    /// Whether this press on `row_id` completes a double-click.
+    ///
+    /// The platform's `click_count` is taken from when each press is handled,
+    /// not when it happened, so a slow frame after the first click can push
+    /// the second one out of the double-click window — opening the editor
+    /// took several tries with the mouse while Enter always worked. The same
+    /// row pressed again within the interval counts on its own.
+    fn is_second_click(&mut self, row_id: &str, click_count: usize) -> bool {
+        const DOUBLE_CLICK: Duration = Duration::from_millis(600);
+        let now = std::time::Instant::now();
+        let repeat = self
+            .last_row_click
+            .as_ref()
+            .is_some_and(|(id, at)| id == row_id && now.duration_since(*at) <= DOUBLE_CLICK);
+        if click_count >= 2 || repeat {
+            self.last_row_click = None;
+            return true;
+        }
+        self.last_row_click = Some((row_id.to_string(), now));
+        false
     }
 
     fn visible_rows(&self) -> Vec<KeymapRow> {
@@ -713,19 +739,30 @@ impl Render for KeymapWindow {
                     let selected = selected.as_deref() == Some(row.id.as_str());
                     let entity = list_entity.clone();
                     let row_clone = row.clone();
-                    keymap_row_element(row, selected).on_mouse_down(
+                    let edit_entity = entity.clone();
+                    let edit_row = row.clone();
+                    // The keystroke cell is the thing being changed, so one
+                    // click on it opens the editor. A double-click anywhere
+                    // else on the row does too.
+                    let on_keystrokes =
+                        move |_: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App| {
+                            cx.stop_propagation();
+                            let _ = edit_entity.update(cx, |this, cx| {
+                                this.selected_row_id = Some(edit_row.id.clone());
+                                this.open_edit_for_row(&edit_row, window, cx);
+                            });
+                        };
+                    keymap_row_element(row, selected, on_keystrokes).on_mouse_down(
                         MouseButton::Left,
                         move |event, window, cx| {
-                            if event.click_count >= 2 {
-                                let _ = entity.update(cx, |this, cx| {
+                            let _ = entity.update(cx, |this, cx| {
+                                if this.is_second_click(&row_clone.id, event.click_count) {
                                     this.open_edit_for_row(&row_clone, window, cx);
-                                });
-                            } else {
-                                let _ = entity.update(cx, |this, cx| {
+                                } else {
                                     this.selected_row_id = Some(row_clone.id.clone());
                                     cx.notify();
-                                });
-                            }
+                                }
+                            });
                         },
                     )
                 })
@@ -766,58 +803,63 @@ impl Render for KeymapWindow {
                     .children(empty_state),
             );
 
-        let json_view = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .px(px(12.0))
-            .py(px(8.0))
-            .gap(px(8.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(8.0))
-                    .child(fb_button(
-                        "keymap-json-back",
-                        "Back to Table",
-                        FbButtonKind::Default,
-                        true,
-                        {
-                            let entity = entity.clone();
-                            move |_, _, cx| {
-                                let _ = entity.update(cx, |this, cx| {
-                                    this.view = ViewMode::Table;
-                                    cx.notify();
-                                });
-                            }
-                        },
-                    ))
-                    .child(fb_button(
-                        "keymap-json-apply",
-                        "Apply JSON",
-                        FbButtonKind::Primary,
-                        true,
-                        {
-                            let entity = entity.clone();
-                            move |_, _, cx| {
-                                let _ = entity.update(cx, |this, cx| this.apply_json(cx));
-                            }
-                        },
-                    )),
-            )
-            .child(div().flex_1().min_h_0().child(text_field_with_callbacks(
-                &self.json_input,
-                self.json_input.is_focused(window),
-                json_callbacks,
-            )))
-            .children(self.json_error.as_ref().map(|error| {
-                div()
-                    .text_color(Colors::status_error())
-                    .text_size(px(11.0))
-                    .child(error.clone())
-            }));
+        // Built only while it is shown: the field carries the whole keymap as
+        // text, and rebuilding it on every frame of the table view made each
+        // click on a row pay for it.
+        let json_view = (self.view == ViewMode::Json).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .px(px(12.0))
+                .py(px(8.0))
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .child(fb_button(
+                            "keymap-json-back",
+                            "Back to Table",
+                            FbButtonKind::Default,
+                            true,
+                            {
+                                let entity = entity.clone();
+                                move |_, _, cx| {
+                                    let _ = entity.update(cx, |this, cx| {
+                                        this.view = ViewMode::Table;
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        ))
+                        .child(fb_button(
+                            "keymap-json-apply",
+                            "Apply JSON",
+                            FbButtonKind::Primary,
+                            true,
+                            {
+                                let entity = entity.clone();
+                                move |_, _, cx| {
+                                    let _ = entity.update(cx, |this, cx| this.apply_json(cx));
+                                }
+                            },
+                        )),
+                )
+                .child(div().flex_1().min_h_0().child(text_field_with_callbacks(
+                    &self.json_input,
+                    self.json_input.is_focused(window),
+                    json_callbacks,
+                )))
+                .children(self.json_error.as_ref().map(|error| {
+                    div()
+                        .text_color(Colors::status_error())
+                        .text_size(px(11.0))
+                        .child(error.clone())
+                }))
+        });
 
         let footer = div()
             .flex()
@@ -875,10 +917,9 @@ impl Render for KeymapWindow {
             }))
             .child(top_bar)
             .child(profile_row)
-            .child(if self.view == ViewMode::Table {
-                table_view.into_any_element()
-            } else {
-                json_view.into_any_element()
+            .child(match json_view {
+                Some(json_view) => json_view.into_any_element(),
+                None => table_view.into_any_element(),
             })
             .child(footer)
             .children(edit_overlay)
@@ -920,7 +961,11 @@ fn vsep() -> impl IntoElement {
     div().w(px(1.0)).h_full().bg(Colors::border_subtle())
 }
 
-fn keymap_row_element(row: &KeymapRow, selected: bool) -> gpui::Div {
+fn keymap_row_element(
+    row: &KeymapRow,
+    selected: bool,
+    on_keystrokes: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Div {
     let alt = row.id.len() % 2 == 0;
     let text_color = if row.enabled {
         Colors::text_primary()
@@ -957,11 +1002,14 @@ fn keymap_row_element(row: &KeymapRow, selected: bool) -> gpui::Div {
         .child(body_cell(&args, 140.0))
         .child(vsep())
         .child(
-            body_cell(&keystrokes, 220.0).text_color(if row.keystrokes.is_empty() {
-                Colors::text_muted()
-            } else {
-                Colors::text_secondary()
-            }),
+            body_cell(&keystrokes, 220.0)
+                .text_color(if row.keystrokes.is_empty() {
+                    Colors::text_muted()
+                } else {
+                    Colors::text_secondary()
+                })
+                .hover(|style| style.bg(Colors::state_hover()))
+                .on_mouse_down(MouseButton::Left, on_keystrokes),
         )
         .child(vsep())
         .child(body_cell(&context, 200.0))

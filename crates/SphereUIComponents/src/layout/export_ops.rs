@@ -35,7 +35,7 @@ impl StudioLayout {
 
         // Capture a plain snapshot of project state under a short borrow — the
         // export job receives only this owned data, never a live entity.
-        self.refresh_bridge_plugin_states(cx);
+        self.refresh_bridge_plugin_states(super::plugin_ops::PluginStateCaptureFor::Export, cx);
         let tl_state = self.timeline.read(cx).state.clone();
         let sample_rate = self.current_audio_sample_rate();
         let project_root = self

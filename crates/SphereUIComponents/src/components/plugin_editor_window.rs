@@ -2247,6 +2247,8 @@ impl PluginEditorWindow {
             ClientEvent::Host(HostEvent::PluginState { .. })
             | ClientEvent::Host(HostEvent::PluginStateSet { .. })
             | ClientEvent::Host(HostEvent::PluginParameters { .. })
+            // The project's dirty flag is the studio's (`poll_plugin_bridge_runtime`).
+            | ClientEvent::Host(HostEvent::PluginStateTouched { .. })
             // Built-in NAM results are routed to the built-in editor windows
             // by `poll_plugin_bridge_runtime`, not this VST3 state machine.
             | ClientEvent::Host(HostEvent::BuiltinNamCaptureResult { .. })

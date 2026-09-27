@@ -138,6 +138,7 @@ impl MixerTreeSidebar {
         let selected = timeline.state.selection.selected_track_id.as_deref();
         self.cache.sync_routing_key(
             routing_gen,
+            timeline.state.track_names_revision,
             output_channels,
             &filter,
             self.show_only_selected_group,

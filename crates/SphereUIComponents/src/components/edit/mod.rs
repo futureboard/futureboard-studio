@@ -3,9 +3,9 @@ pub mod edit_interaction;
 
 pub use edit_commands::{
     ClipSnapshot, EditCommand, EditHistory, EditImpact, TempoStateSnapshot,
-    TimeSignatureStateSnapshot, TrackSnapshot,
+    TimeSignatureStateSnapshot, TrackSnapshot, TrackTakesChange, TrackTakesState,
 };
 pub use edit_interaction::{
-    normalize_range, pointer_intent_on_empty, rects_intersect, EditTool, PointerEditIntent,
-    EDIT_DRAG_THRESHOLD_PX,
+    lane_press_intent, marquee_additive, marquee_drag_started, normalize_range, rects_intersect,
+    LanePressIntent, EDIT_DRAG_THRESHOLD_PX,
 };

@@ -56,6 +56,9 @@ impl Render for StudioLayout {
         self.window_hooks.cached_bounds = Some(window.bounds());
         self.flush_deferred_insert_editor_opens(window, cx);
         self.flush_pending_audio_tools(window, cx);
+        // A track was renamed somewhere (a header, the Inspector, undo, redo):
+        // views that copy names out of the timeline catch up once.
+        self.sync_track_name_surfaces(cx);
 
         // Keep the OS window title in sync with the project lifecycle state
         // (Part G/H), e.g. "Untitled Project — Unsaved" / "My Song — Saved".
@@ -87,17 +90,33 @@ impl Render for StudioLayout {
                             TimelineContextTarget::TrackLane { track_id, beat } => {
                                 ContextTarget::TrackLane { track_id, beat }
                             }
+                            // A right-click inside a multi-selection keeps it,
+                            // so the menu acts on all of it (delete, group,
+                            // mute, ...); outside it, it selects what was hit.
                             TimelineContextTarget::TrackHeader(id) => {
                                 this.timeline.update(cx, |timeline, cx| {
-                                    timeline.state.select_track(&id);
+                                    if timeline.state.selection.is_track_selected(&id) {
+                                        timeline.state.selection.selected_track_id =
+                                            Some(id.clone());
+                                    } else {
+                                        timeline.state.select_track(&id);
+                                    }
                                     cx.notify();
                                 });
                                 ContextTarget::Track(id)
                             }
                             TimelineContextTarget::Clip(id) => {
                                 this.timeline.update(cx, |timeline, cx| {
-                                    timeline.state.select_clip(&id);
-                                    cx.notify();
+                                    if !timeline
+                                        .state
+                                        .selection
+                                        .selected_clip_ids
+                                        .iter()
+                                        .any(|selected| selected == &id)
+                                    {
+                                        timeline.state.select_clip(&id);
+                                        cx.notify();
+                                    }
                                 });
                                 ContextTarget::Clip(id)
                             }
@@ -135,6 +154,7 @@ impl Render for StudioLayout {
                             TimelineContextTarget::Ruler(beat) => {
                                 ContextTarget::TimelineRuler { beat }
                             }
+                            TimelineContextTarget::SnapGrid => ContextTarget::SnapGrid,
                             TimelineContextTarget::TempoTrack {
                                 beat,
                                 bpm,
@@ -350,6 +370,10 @@ impl Render for StudioLayout {
                         crate::menu::patch_checkbox_states(
                             &mut runtime_menu.items,
                             &self.menu_check_states(cx),
+                        );
+                        crate::menu::patch_command_states(
+                            &mut runtime_menu.items,
+                            &self.history_menu_states(cx),
                         );
                         components::menu_dropdown::menu_dropdown(
                             &runtime_menu,
@@ -741,6 +765,33 @@ impl Render for StudioLayout {
                         });
                     }
                 }),
+                on_select_kind: Arc::new({
+                    let this = cx.entity().clone();
+                    move |kind: &crate::components::plugin_picker::KindTab, _w, cx| {
+                        let kind = *kind;
+                        let _ = this.update(cx, |this, cx| {
+                            this.plugin_picker.set_kind_tab(kind);
+                            if let Some(index) = this.plugin_search_index.as_ref() {
+                                ensure_default_highlight(
+                                    &mut this.plugin_picker,
+                                    index,
+                                    &this.plugin_picker_prefs,
+                                );
+                            }
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_toggle_vendors: Arc::new({
+                    let this = cx.entity().clone();
+                    move |_: &(), _w, cx| {
+                        let _ = this.update(cx, |this, cx| {
+                            this.plugin_picker.vendors_expanded =
+                                !this.plugin_picker.vendors_expanded;
+                            cx.notify();
+                        });
+                    }
+                }),
                 on_toggle_favorite: Arc::new({
                     let this = cx.entity().clone();
                     move |plugin_id: &String, _w, cx| {
@@ -953,6 +1004,17 @@ impl Render for StudioLayout {
             .capture_any_mouse_down(move |_event, window, cx| {
                 focus_holder_on_pointer.focus(window, cx);
             })
+            // Modifier changes travel the focus path, which the arrangement is
+            // never on. Forward them so pressing or releasing Option over an
+            // audio clip's cut zone shows or hides the razor line at once.
+            .on_modifiers_changed({
+                let timeline = self.timeline.downgrade();
+                move |event: &gpui::ModifiersChangedEvent, _window, cx| {
+                    let _ = timeline.update(cx, |timeline, cx| {
+                        timeline.smart_cut_modifiers_changed(&event.modifiers, cx)
+                    });
+                }
+            })
             .capture_key_down(move |event, window, cx| {
                 let modifiers = event.keystroke.modifiers;
                 if !event.is_held {
@@ -967,10 +1029,18 @@ impl Render for StudioLayout {
                     && !modifiers.platform
                     && !modifiers.function
                 {
-                    if modifiers.shift {
-                        window.focus_prev(cx);
-                    } else {
-                        window.focus_next(cx);
+                    // Tab ends a track-name edit the way Enter does, handing
+                    // focus back to the shortcut anchor instead of moving it
+                    // into that header's controls.
+                    let rename_committed = shortcut_keydown_target.update(cx, |this, cx| {
+                        this.commit_track_rename_on_tab(window, cx)
+                    });
+                    if !rename_committed {
+                        if modifiers.shift {
+                            window.focus_prev(cx);
+                        } else {
+                            window.focus_next(cx);
+                        }
                     }
                     window.prevent_default();
                     cx.stop_propagation();
@@ -978,6 +1048,7 @@ impl Render for StudioLayout {
                 }
                 let handled = shortcut_keydown_target.update(cx, |this, cx| {
                     let handled = this.handle_command_palette_key(event, window, cx)
+                        || this.handle_track_rename_key(event, window, cx)
                         || this.handle_bpm_edit_key(event, window, cx)
                         || this.handle_ts_edit_key(event, window, cx)
                         || this.handle_settings_dialog_key(event, window, cx)
@@ -1096,6 +1167,14 @@ impl Render for StudioLayout {
                         // captured at drag start.
                         this.cancel_bpm_drag(cx);
                         let _ = this.timeline.update(cx, |timeline, cx| {
+                            // Escape reaches the arrangement only here: a clip
+                            // gain / fade / crossfade drag or a clip move puts
+                            // its clips back and stops, and a marquee puts the
+                            // previous selection back before the reset forgets
+                            // it.
+                            timeline.cancel_clip_handle_gesture(Some(window), cx);
+                            timeline.cancel_clip_drag(Some(window), cx);
+                            timeline.cancel_marquee(cx);
                             timeline.reset_input_state();
                             cx.notify();
                         });

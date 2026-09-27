@@ -6,7 +6,7 @@ use crate::components::timeline::timeline_state::{
     AudioClipStretchState, AutomationLaneState, ClipState, GlobalLaneHeights,
     MidiArticulationEvent, MidiControllerKind, MidiControllerPoint, MidiNoteState, MidiSysExEvent,
     SongTextEvent, TempoPoint, TimeSignaturePoint, TimelineMarkerState, TimelineRegionState,
-    TimelineState, TrackState,
+    TimelineState, TrackOutputRouting, TrackState, TrackTake,
 };
 use sphere_midi_service::mpe::MpeTrackConfiguration;
 
@@ -40,6 +40,9 @@ pub enum EditImpact {
     TempoMap,
     /// Time-signature map — the engine needs a fresh meter map.
     TimeSignatureMap,
+    /// The project key: nothing the engine plays, but part of the musical
+    /// context ARA plug-ins read, so live ARA documents must hear of it.
+    MusicalContext,
 }
 
 /// Snapshot of the project's tempo state for undo/redo.
@@ -89,19 +92,45 @@ impl TimeSignatureStateSnapshot {
 pub struct ClipSnapshot {
     pub track_id: String,
     pub clip: ClipState,
+    /// The clip's index in its track's clip list when captured. Clip order is
+    /// the z-order of overlapping clips and the order a project saves in, so
+    /// [`EditCommand::UpdateClips`] puts a clip back at exactly this index;
+    /// the older commands still re-append.
+    pub index: usize,
+    /// The take the clip is, when it is one: a clip put back by undo comes
+    /// back as the take it was, not as a plain clip beside the take list.
+    pub take: Option<TrackTake>,
 }
 
 impl ClipSnapshot {
     pub fn capture(state: &TimelineState, clip_id: &str) -> Option<Self> {
         for track in &state.tracks {
-            if let Some(clip) = track.clips.iter().find(|c| c.id == clip_id) {
+            if let Some(index) = track.clips.iter().position(|c| c.id == clip_id) {
                 return Some(Self {
                     track_id: track.id.clone(),
-                    clip: clip.clone(),
+                    clip: track.clips[index].clone(),
+                    index,
+                    take: track
+                        .takes
+                        .iter()
+                        .find(|take| take.clip_id == clip_id)
+                        .cloned(),
                 });
             }
         }
         None
+    }
+}
+
+/// Puts `take` back on `track_id` unless the track already has it.
+fn restore_take(state: &mut TimelineState, track_id: &str, take: Option<&TrackTake>) {
+    let Some(take) = take else {
+        return;
+    };
+    if let Some(track) = state.tracks.iter_mut().find(|t| t.id == track_id) {
+        if !track.takes.iter().any(|existing| existing.id == take.id) {
+            track.takes.push(take.clone());
+        }
     }
 }
 
@@ -110,25 +139,108 @@ impl ClipSnapshot {
 pub struct TrackSnapshot {
     pub index: usize,
     pub track: TrackState,
+    /// For a folder: each direct member's folder and output as they were, so
+    /// an undone delete puts them back inside it (deleting a folder moves its
+    /// members up a level).
+    pub members: Vec<(String, Option<String>, TrackOutputRouting)>,
 }
 
 impl TrackSnapshot {
     pub fn capture(state: &TimelineState, track_id: &str) -> Option<Self> {
-        state
+        let index = state.tracks.iter().position(|track| track.id == track_id)?;
+        let members = state
             .tracks
             .iter()
-            .position(|track| track.id == track_id)
-            .map(|index| Self {
-                index,
-                track: state.tracks[index].clone(),
+            .filter(|track| track.parent_group_id.as_deref() == Some(track_id))
+            .map(|track| {
+                (
+                    track.id.clone(),
+                    track.parent_group_id.clone(),
+                    track.routing.output.clone(),
+                )
             })
+            .collect();
+        Some(Self {
+            index,
+            track: state.tracks[index].clone(),
+            members,
+        })
     }
+}
+
+/// A track's take state: its take list, whether the take lane is open, and
+/// every clip's mute flag — which is how an inactive take is silenced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackTakesState {
+    pub takes: Vec<TrackTake>,
+    pub expanded: bool,
+    pub muted: Vec<(String, bool)>,
+}
+
+impl TrackTakesState {
+    pub fn capture(track: &TrackState) -> Self {
+        Self {
+            takes: track.takes.clone(),
+            expanded: track.takes_expanded,
+            muted: track
+                .clips
+                .iter()
+                .map(|clip| (clip.id.clone(), clip.muted))
+                .collect(),
+        }
+    }
+
+    /// Capture each of `track_ids` that exists, keyed by id.
+    pub fn capture_tracks<'a>(
+        state: &TimelineState,
+        track_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<(String, Self)> {
+        let mut captured: Vec<(String, Self)> = Vec::new();
+        for track_id in track_ids {
+            if captured.iter().any(|(id, _)| id == track_id) {
+                continue;
+            }
+            if let Some(track) = state.tracks.iter().find(|track| track.id == track_id) {
+                captured.push((track_id.to_string(), Self::capture(track)));
+            }
+        }
+        captured
+    }
+
+    fn apply(&self, track: &mut TrackState) {
+        track.takes = self.takes.clone();
+        track.takes_expanded = self.expanded;
+        for (clip_id, muted) in &self.muted {
+            if let Some(clip) = track.clips.iter_mut().find(|clip| clip.id == *clip_id) {
+                clip.muted = *muted;
+            }
+        }
+    }
+}
+
+/// One track's take state before and after a Record pass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackTakesChange {
+    pub track_id: String,
+    pub prev: TrackTakesState,
+    pub next: TrackTakesState,
 }
 
 /// Editable command with perfect undo.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum EditCommand {
+    /// One Record pass: the clips it created and the take state it changed.
+    ///
+    /// A second pass over the same bars mutes the take it replaces and grows
+    /// the take list, so undo has to put that back as well as delete the new
+    /// clip. `pass` lets the MIDI half (committed at Stop) and the audio half
+    /// (committed when the disk writer hands over the files) share one step.
+    RecordPass {
+        pass: u64,
+        clips: Vec<ClipSnapshot>,
+        takes: Vec<TrackTakesChange>,
+    },
     CreateClip {
         track_id: String,
         clip: ClipState,
@@ -145,6 +257,15 @@ pub enum EditCommand {
     UpdateClip {
         previous: ClipSnapshot,
         next: ClipSnapshot,
+    },
+    /// Replaces several existing clips with exact post-gesture snapshots as one
+    /// history entry: a clip move (the whole selection, across tracks too) and
+    /// gestures that edit neighbouring clips together. Each side names the
+    /// same clips; execute and redo put every clip at its `next` snapshot and
+    /// undo at its `previous` one — content, track *and* index in the track.
+    UpdateClips {
+        previous: Vec<ClipSnapshot>,
+        next: Vec<ClipSnapshot>,
     },
     BatchDeleteClips {
         snapshots: Vec<ClipSnapshot>,
@@ -276,6 +397,52 @@ pub enum EditCommand {
         before_order: Vec<String>,
         after_order: Vec<String>,
     },
+    /// Move one effect to another channel's chain. The SAME slot struct moves
+    /// (never a clone or a fresh instance), with its plug-in parameter lanes;
+    /// the plan records everything undo needs to put it back exactly. One undo
+    /// entry per drop.
+    MoveInsertSlot {
+        plan: crate::components::timeline::timeline_state::InsertMove,
+    },
+    /// Channels' insert chains replaced wholesale: a plug-in added, removed or
+    /// replaced, a duplicate dropped with Alt, an FX chain pasted. Each side
+    /// holds every chain the action changed, as it stood, its slots carrying
+    /// their plug-in state — so a step puts back the instances that were
+    /// there, and the studio loads what the step brings and unloads what it
+    /// takes (see [`EditCommand::instances_arriving`]). One entry per action.
+    SetInsertChains {
+        label: &'static str,
+        prev: Vec<crate::components::timeline::timeline_state::InsertChainSnapshot>,
+        next: Vec<crate::components::timeline::timeline_state::InsertChainSnapshot>,
+    },
+    /// Any edit to tracks, the master bus or the project routing that has no
+    /// command of its own: a track added, tracks reordered or grouped, a
+    /// toggle, a colour, routing, sends, a bypass. Both sides are recorded by
+    /// `TimelineState::finish_track_edit`. The action that made it applied its
+    /// own effect the light way (a live mute, say); its undo and redo rebuild
+    /// the engine project, since a step can touch anything in scope.
+    SetTracks {
+        label: &'static str,
+        prev: Box<crate::components::timeline::timeline_state::TrackEditSnapshot>,
+        next: Box<crate::components::timeline::timeline_state::TrackEditSnapshot>,
+    },
+    /// A track added by Duplicate Track: the inverse of
+    /// [`EditCommand::DeleteTrack`]. `height` is its row height, when it has
+    /// one of its own.
+    DuplicateTrack {
+        snapshot: TrackSnapshot,
+        height: Option<f32>,
+    },
+    /// One insert's opaque plug-in state replaced — a pasted state, a loaded
+    /// preset. The instance stays; the studio hands it the restored state
+    /// after a step (see [`EditCommand::plugin_state_target`]).
+    SetInsertState {
+        label: &'static str,
+        track_id: String,
+        insert_id: String,
+        prev: Option<std::sync::Arc<Vec<u8>>>,
+        next: Option<std::sync::Arc<Vec<u8>>>,
+    },
     /// Batch per-track row height changes (layout/view — one undo entry per gesture).
     SetTrackHeights {
         prev: Vec<(String, f32)>,
@@ -303,6 +470,13 @@ pub enum EditCommand {
         track_id: String,
         prev: MpeTrackConfiguration,
         next: MpeTrackConfiguration,
+    },
+    /// Rename one track: one inline header edit, committed once. `prev` is the
+    /// name the track had at commit time, restored exactly on undo.
+    SetTrackName {
+        track_id: String,
+        prev: String,
+        next: String,
     },
     /// Replace only the affected Song Text events. Empty `previous` creates,
     /// empty `next` deletes, and populated snapshots edit/move atomically.
@@ -397,8 +571,12 @@ impl EditCommand {
             EditCommand::SetSongTextEvents { .. } => EditImpact::Metadata,
             EditCommand::SetChordEvents { .. } => EditImpact::Metadata,
             EditCommand::SetGlobalLaneHeights { .. } => EditImpact::Metadata,
-            // Nothing plays differently: the key is read by editors and tools.
-            EditCommand::SetProjectKey { .. } => EditImpact::Metadata,
+            // Saved with the project, but the instance and the graph around
+            // it are unchanged: the studio hands the plug-in its state.
+            EditCommand::SetInsertState { .. } => EditImpact::Metadata,
+            // Nothing the engine plays differently, but ARA plug-ins read the
+            // key from the musical context, including on undo and redo.
+            EditCommand::SetProjectKey { .. } => EditImpact::MusicalContext,
             EditCommand::SetTrackVolume { .. } | EditCommand::SetTrackPan { .. } => {
                 EditImpact::MixerControl
             }
@@ -431,12 +609,208 @@ impl EditCommand {
         }
     }
 
+    /// Whether this command reorders or moves a channel's insert or send
+    /// chain. Undo/redo of one has to reach the engine and the detached mixer
+    /// at once, like the drop that made it — and a moved insert's editor and
+    /// bridge caches have to follow it to its channel again.
+    pub fn is_channel_chain_edit(&self) -> bool {
+        matches!(
+            self,
+            EditCommand::ReorderFxSlot { .. }
+                | EditCommand::ReorderSendSlot { .. }
+                | EditCommand::MoveInsertSlot { .. }
+                | EditCommand::SetInsertChains { .. }
+                | EditCommand::DuplicateTrack { .. }
+                | EditCommand::SetTracks { .. }
+        )
+    }
+
+    /// `(track, insert)` of every plug-in instance the given step of this
+    /// command — its undo (`undoing`) or its redo — takes out of the project.
+    /// The studio captures their live state into the command first, so the
+    /// opposite step brings them back as they were left, then unloads them.
+    pub fn instances_leaving(&self, undoing: bool) -> Vec<(String, String)> {
+        let (before, after) = self.instance_sides(undoing);
+        before
+            .into_iter()
+            .filter(|(_, id)| !after.iter().any(|(_, kept)| kept == id))
+            .collect()
+    }
+
+    /// `(track, insert)` of every plug-in instance the given step brings into
+    /// the project, for the studio to load after it.
+    pub fn instances_arriving(&self, undoing: bool) -> Vec<(String, String)> {
+        let (before, after) = self.instance_sides(undoing);
+        after
+            .into_iter()
+            .filter(|(_, id)| !before.iter().any(|(_, had)| had == id))
+            .collect()
+    }
+
+    /// The loaded inserts this command's step starts from and ends on.
+    fn instance_sides(&self, undoing: bool) -> (Vec<(String, String)>, Vec<(String, String)>) {
+        use crate::components::timeline::timeline_state::InsertChainSnapshot;
+        let chains = |snapshots: &[InsertChainSnapshot]| {
+            snapshots
+                .iter()
+                .flat_map(|chain| {
+                    chain
+                        .plugin_ids()
+                        .map(|id| (chain.track_id.clone(), id.to_string()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let track = |snapshot: &TrackSnapshot| {
+            snapshot
+                .track
+                .inserts
+                .iter()
+                .filter(|slot| !slot.is_empty())
+                .map(|slot| (snapshot.track.id.clone(), slot.id.clone()))
+                .collect::<Vec<_>>()
+        };
+        // (the side the command's execute leaves, the side it makes)
+        let (executed_from, executed_to) = match self {
+            EditCommand::SetInsertChains { prev, next, .. } => (chains(prev), chains(next)),
+            EditCommand::DuplicateTrack { snapshot, .. } => (Vec::new(), track(snapshot)),
+            EditCommand::SetTracks { prev, next, .. } => {
+                (prev.plugin_instances(), next.plugin_instances())
+            }
+            EditCommand::DeleteTrack { snapshot } => (track(snapshot), Vec::new()),
+            _ => (Vec::new(), Vec::new()),
+        };
+        if undoing {
+            (executed_to, executed_from)
+        } else {
+            (executed_from, executed_to)
+        }
+    }
+
+    /// Replace the stored plug-in state of every slot this command keeps a
+    /// copy of whose insert id is in `states`. Called right before a step
+    /// with the live state of the instances it is about to take away, so the
+    /// opposite step restores what the plug-in had, not what it had when the
+    /// command was first recorded.
+    pub fn refresh_plugin_states(
+        &mut self,
+        states: &std::collections::HashMap<String, std::sync::Arc<Vec<u8>>>,
+    ) {
+        use crate::components::timeline::timeline_state::InsertSlotState;
+        let refresh = |slots: &mut Vec<InsertSlotState>| {
+            for slot in slots {
+                if let Some(state) = states.get(&slot.id) {
+                    slot.vst3_state = Some(state.clone());
+                }
+            }
+        };
+        match self {
+            EditCommand::SetInsertChains { prev, next, .. } => {
+                for chain in prev.iter_mut().chain(next.iter_mut()) {
+                    refresh(&mut chain.inserts);
+                }
+            }
+            EditCommand::DuplicateTrack { snapshot, .. }
+            | EditCommand::DeleteTrack { snapshot } => {
+                refresh(&mut snapshot.track.inserts);
+            }
+            EditCommand::SetTracks { prev, next, .. } => {
+                for slot in prev.slots_mut().chain(next.slots_mut()) {
+                    if let Some(state) = states.get(&slot.id) {
+                        slot.vst3_state = Some(state.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a step of this command changes the project's audio routing
+    /// (connections, Master / Monitor Output), which the studio has to
+    /// publish to the engine again.
+    pub fn touches_routing(&self) -> bool {
+        matches!(self, EditCommand::SetTracks { prev, .. } if prev.routing.is_some())
+    }
+
+    /// `(track, insert)` whose live plug-in has to be handed its restored
+    /// state after an undo or redo of this command.
+    pub fn plugin_state_target(&self) -> Option<(&str, &str)> {
+        match self {
+            EditCommand::SetInsertState {
+                track_id,
+                insert_id,
+                ..
+            } => Some((track_id.as_str(), insert_id.as_str())),
+            _ => None,
+        }
+    }
+
+    /// Record, right before [`Self::undo`] (`undoing`) or a redo through
+    /// [`Self::execute`], what that step has to set aside for the opposite
+    /// step to put back: state that appeared after the command was planned
+    /// and cannot stay where it is. Today only a plug-in moved to or from the
+    /// master: parameter lanes it gained on its track, which the master cannot
+    /// hold. [`EditHistory`] calls this; nothing else needs to.
+    pub fn record_before_step(&mut self, state: &TimelineState, undoing: bool) {
+        if let EditCommand::MoveInsertSlot { plan } = self {
+            state.record_lanes_left_by_master_step(plan, undoing);
+        }
+    }
+
+    /// The record pass that left `before` (captured with
+    /// [`TrackTakesState::capture_tracks`]) as `state` now is, having created
+    /// `clip_ids`. `None` when it created nothing.
+    pub fn record_pass(
+        pass: u64,
+        state: &TimelineState,
+        clip_ids: &[String],
+        before: Vec<(String, TrackTakesState)>,
+    ) -> Option<Self> {
+        let clips: Vec<ClipSnapshot> = clip_ids
+            .iter()
+            .filter_map(|clip_id| ClipSnapshot::capture(state, clip_id))
+            .collect();
+        if clips.is_empty() {
+            return None;
+        }
+        let takes = before
+            .into_iter()
+            .filter_map(|(track_id, prev)| {
+                let track = state.tracks.iter().find(|track| track.id == track_id)?;
+                let next = TrackTakesState::capture(track);
+                (next != prev).then_some(TrackTakesChange {
+                    track_id,
+                    prev,
+                    next,
+                })
+            })
+            .collect();
+        Some(EditCommand::RecordPass { pass, clips, takes })
+    }
+
+    /// The rename a committed name `draft` records for `track_id`, or `None`
+    /// when there is nothing to record: the track is gone, or the draft is
+    /// blank or the name the track already has (see
+    /// [`crate::components::timeline::timeline_state::resolve_track_rename`]).
+    /// `prev` is the name the track has *now*, not when editing began.
+    pub fn rename_track(state: &TimelineState, track_id: &str, draft: &str) -> Option<Self> {
+        let current = &state.find_track(track_id)?.name;
+        let next =
+            crate::components::timeline::timeline_state::resolve_track_rename(current, draft)?;
+        Some(EditCommand::SetTrackName {
+            track_id: track_id.to_string(),
+            prev: current.clone(),
+            next,
+        })
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
+            EditCommand::RecordPass { .. } => "Record",
             EditCommand::CreateClip { .. } => "Create Clip",
             EditCommand::BatchCreateClips { .. } => "Create Clips",
             EditCommand::DeleteClip { .. } => "Delete Clip",
             EditCommand::UpdateClip { .. } => "Edit Clip",
+            EditCommand::UpdateClips { .. } => "Edit Clips",
             EditCommand::BatchDeleteClips { .. } => "Delete Clips",
             EditCommand::ReplaceClipWithClips { .. } => "Split Clip",
             EditCommand::DeleteTrack { .. } => "Delete Track",
@@ -460,11 +834,17 @@ impl EditCommand {
             EditCommand::SetClipStretch { .. } => "Edit Stretch",
             EditCommand::ReorderFxSlot { .. } => "Reorder FX",
             EditCommand::ReorderSendSlot { .. } => "Reorder Sends",
+            EditCommand::MoveInsertSlot { .. } => "Move Plug-in",
+            EditCommand::SetInsertChains { label, .. } => label,
+            EditCommand::DuplicateTrack { .. } => "Duplicate Track",
+            EditCommand::SetTracks { label, .. } => label,
+            EditCommand::SetInsertState { label, .. } => label,
             EditCommand::SetTrackHeights { .. } => "Resize Track Height",
             EditCommand::SetTrackVolume { .. } => "Set Volume",
             EditCommand::SetTrackPan { .. } => "Set Pan",
             EditCommand::SetTrackVolumeAutomationRead { .. } => "Set Volume Automation Read",
             EditCommand::SetTrackMpeConfiguration { .. } => "Set MPE Configuration",
+            EditCommand::SetTrackName { .. } => "Rename Track",
             EditCommand::SetSongTextEvents { label, .. } => label,
             EditCommand::SetTempoState { label, .. } => label,
             EditCommand::SetTimeSignatureState { label, .. } => label,
@@ -479,6 +859,23 @@ impl EditCommand {
 
     pub fn execute(&self, state: &mut TimelineState) {
         match self {
+            EditCommand::RecordPass { clips, takes, .. } => {
+                for snapshot in clips {
+                    restore_clip_snapshot(state, snapshot);
+                }
+                for change in takes {
+                    if let Some(track) = state.tracks.iter_mut().find(|t| t.id == change.track_id) {
+                        change.next.apply(track);
+                    }
+                }
+                if let Some(first) = clips.first() {
+                    state.selection.selected_track_id = Some(first.track_id.clone());
+                    state.selection.selected_clip_ids = clips
+                        .iter()
+                        .map(|snapshot| snapshot.clip.id.clone())
+                        .collect();
+                }
+            }
             EditCommand::CreateClip { track_id, clip } => {
                 if let Some(track) = state.tracks.iter_mut().find(|t| t.id == *track_id) {
                     track.clips.push(clip.clone());
@@ -507,6 +904,9 @@ impl EditCommand {
             EditCommand::UpdateClip { previous, next } => {
                 replace_clip_snapshot(state, &previous.clip.id, next);
             }
+            EditCommand::UpdateClips { next, .. } => {
+                apply_clip_placements(state, next);
+            }
             EditCommand::BatchDeleteClips { snapshots } => {
                 for snap in snapshots {
                     state.delete_clip(&snap.clip.id);
@@ -519,6 +919,22 @@ impl EditCommand {
                         if !track.clips.iter().any(|c| c.id == clip.id) {
                             track.clips.push(clip.clone());
                         }
+                    }
+                }
+                // The pieces of a split take stay that take: each piece is
+                // one, under its name, heard or muted as the whole was.
+                if let Some(take) = &snapshot.take {
+                    for (piece, (track_id, clip)) in clips.iter().enumerate() {
+                        let piece_take = TrackTake {
+                            id: if piece == 0 {
+                                take.id.clone()
+                            } else {
+                                format!("{}-{}", take.id, piece + 1)
+                            },
+                            clip_id: clip.id.clone(),
+                            ..take.clone()
+                        };
+                        restore_take(state, track_id, Some(&piece_take));
                     }
                 }
                 state.selection.selected_track_id = Some(snapshot.track_id.clone());
@@ -628,6 +1044,29 @@ impl EditCommand {
             } => {
                 state.set_send_order(track_id, after_order);
             }
+            EditCommand::MoveInsertSlot { plan } => {
+                state.apply_insert_move(plan);
+            }
+            EditCommand::SetInsertChains { next, .. } => {
+                for chain in next {
+                    state.restore_insert_chain(chain);
+                }
+            }
+            EditCommand::SetTracks { next, .. } => state.restore_track_edit(next),
+            EditCommand::DuplicateTrack { snapshot, height } => {
+                restore_track_snapshot(state, snapshot);
+                if let Some(height) = height {
+                    state
+                        .track_view_layout
+                        .set_height(snapshot.track.id.clone(), *height);
+                }
+            }
+            EditCommand::SetInsertState {
+                track_id,
+                insert_id,
+                next,
+                ..
+            } => set_insert_state(state, track_id, insert_id, next),
             EditCommand::SetTrackHeights { next, .. } => {
                 apply_track_heights_snapshot(state, next);
             }
@@ -644,6 +1083,9 @@ impl EditCommand {
             }
             EditCommand::SetTrackMpeConfiguration { track_id, next, .. } => {
                 state.set_track_mpe_configuration(track_id, *next);
+            }
+            EditCommand::SetTrackName { track_id, next, .. } => {
+                state.set_track_name(track_id, next);
             }
             EditCommand::SetSongTextEvents { previous, next, .. } => {
                 apply_song_text_snapshot(state, previous, next);
@@ -683,6 +1125,16 @@ impl EditCommand {
 
     pub fn undo(&self, state: &mut TimelineState) {
         match self {
+            EditCommand::RecordPass { clips, takes, .. } => {
+                for snapshot in clips {
+                    state.delete_clip(&snapshot.clip.id);
+                }
+                for change in takes {
+                    if let Some(track) = state.tracks.iter_mut().find(|t| t.id == change.track_id) {
+                        change.prev.apply(track);
+                    }
+                }
+            }
             EditCommand::CreateClip { clip, .. } => {
                 state.delete_clip(&clip.id);
             }
@@ -696,6 +1148,9 @@ impl EditCommand {
             }
             EditCommand::UpdateClip { previous, next } => {
                 replace_clip_snapshot(state, &next.clip.id, previous);
+            }
+            EditCommand::UpdateClips { previous, .. } => {
+                apply_clip_placements(state, previous);
             }
             EditCommand::BatchDeleteClips { snapshots } => {
                 for snap in snapshots {
@@ -805,6 +1260,24 @@ impl EditCommand {
             } => {
                 state.set_send_order(track_id, before_order);
             }
+            EditCommand::MoveInsertSlot { plan } => {
+                state.revert_insert_move(plan);
+            }
+            EditCommand::SetInsertChains { prev, .. } => {
+                for chain in prev {
+                    state.restore_insert_chain(chain);
+                }
+            }
+            EditCommand::SetTracks { prev, .. } => state.restore_track_edit(prev),
+            EditCommand::DuplicateTrack { snapshot, .. } => {
+                state.delete_track(&snapshot.track.id);
+            }
+            EditCommand::SetInsertState {
+                track_id,
+                insert_id,
+                prev,
+                ..
+            } => set_insert_state(state, track_id, insert_id, prev),
             EditCommand::SetTrackHeights { prev, .. } => {
                 apply_track_heights_snapshot(state, prev);
             }
@@ -821,6 +1294,9 @@ impl EditCommand {
             }
             EditCommand::SetTrackMpeConfiguration { track_id, prev, .. } => {
                 state.set_track_mpe_configuration(track_id, *prev);
+            }
+            EditCommand::SetTrackName { track_id, prev, .. } => {
+                state.set_track_name(track_id, prev);
             }
             EditCommand::SetSongTextEvents { previous, next, .. } => {
                 apply_song_text_snapshot(state, next, previous);
@@ -887,6 +1363,48 @@ fn restore_clip_snapshot(state: &mut TimelineState, snapshot: &ClipSnapshot) {
             track.clips.push(snapshot.clip.clone());
         }
     }
+    restore_take(state, &snapshot.track_id, snapshot.take.as_ref());
+}
+
+/// Put every clip named in `snapshots` exactly at its snapshot: content, track
+/// and index within the track.
+///
+/// Every named clip is taken out first, then inserted in ascending index
+/// order. The clips not named are left alone and keep their relative order, so
+/// each insert lands at its recorded index — which is what makes a cross-track
+/// move undo back into the exact slot it came from. Selection is kept: the
+/// clips keep their ids, and a selected one pulls the primary track after it.
+fn apply_clip_placements(state: &mut TimelineState, snapshots: &[ClipSnapshot]) {
+    for snapshot in snapshots {
+        for track in &mut state.tracks {
+            if let Some(index) = track.clips.iter().position(|c| c.id == snapshot.clip.id) {
+                track.clips.remove(index);
+                break;
+            }
+        }
+    }
+    let mut ordered: Vec<&ClipSnapshot> = snapshots.iter().collect();
+    ordered.sort_by_key(|snapshot| snapshot.index);
+    for snapshot in ordered {
+        if let Some(track) = state.tracks.iter_mut().find(|t| t.id == snapshot.track_id) {
+            let index = snapshot.index.min(track.clips.len());
+            track.clips.insert(index, snapshot.clip.clone());
+        }
+    }
+    // A take goes where its clip goes back to; a clip moved off its track
+    // leaves its take behind, which is then no take at all.
+    for snapshot in snapshots {
+        restore_take(state, &snapshot.track_id, snapshot.take.as_ref());
+    }
+    state.prune_orphaned_takes();
+    if let Some(selected) = snapshots.iter().find(|snapshot| {
+        state
+            .selection
+            .selected_clip_ids
+            .contains(&snapshot.clip.id)
+    }) {
+        state.selection.selected_track_id = Some(selected.track_id.clone());
+    }
 }
 
 /// Replace a clip snapshot without making an already-selected Audio Editor
@@ -897,8 +1415,17 @@ fn restore_clip_snapshot(state: &mut TimelineState, snapshot: &ClipSnapshot) {
 fn replace_clip_snapshot(state: &mut TimelineState, clip_id: &str, snapshot: &ClipSnapshot) {
     let selected_clip_ids = state.selection.selected_clip_ids.clone();
     let was_selected = selected_clip_ids.iter().any(|id| id == clip_id);
+    // An in-place edit of a take's clip leaves it that take, whatever the
+    // snapshot carries: deleting the clip drops its take.
+    let kept_take = state
+        .tracks
+        .iter()
+        .flat_map(|track| track.takes.iter())
+        .find(|take| take.clip_id == clip_id)
+        .cloned();
     state.delete_clip(clip_id);
     restore_clip_snapshot(state, snapshot);
+    restore_take(state, &snapshot.track_id, kept_take.as_ref());
     if was_selected {
         state.selection.selected_clip_ids = selected_clip_ids;
         state.selection.selected_track_id = Some(snapshot.track_id.clone());
@@ -1091,10 +1618,14 @@ mod inspector_gesture_command_tests {
             previous: ClipSnapshot {
                 track_id: track_id.clone(),
                 clip: previous_clip.clone(),
+                index: 0,
+                take: None,
             },
             next: ClipSnapshot {
                 track_id,
                 clip: next_clip,
+                index: 0,
+                take: None,
             },
         };
         let mut history = EditHistory::new(8);
@@ -1608,6 +2139,36 @@ mod conductor_command_tests {
         );
     }
 
+    /// A key change reaches ARA plug-ins on set, undo and redo alike, and is
+    /// never mistaken for an engine-graph edit or plain metadata.
+    #[test]
+    fn a_project_key_edit_is_a_musical_context_change_every_way() {
+        use crate::components::timeline::timeline_state::{MidiScale, ScaleKind, ScaleRoot};
+
+        let mut state = TimelineState::default();
+        let mut history = EditHistory::new(4);
+        let a_minor = Some(MidiScale::new(ScaleRoot::A, ScaleKind::NaturalMinor));
+        let command = EditCommand::SetProjectKey {
+            prev: None,
+            next: a_minor,
+        };
+        assert_eq!(command.impact(), EditImpact::MusicalContext);
+        assert!(!command.is_metadata_only());
+
+        command.execute(&mut state);
+        history.push(command);
+        assert_eq!(
+            history.undo_with_impact(&mut state),
+            Some(EditImpact::MusicalContext)
+        );
+        assert_eq!(state.project_key, None);
+        assert_eq!(
+            history.redo_with_impact(&mut state),
+            Some(EditImpact::MusicalContext)
+        );
+        assert_eq!(state.project_key, a_minor);
+    }
+
     /// Lane heights are persisted view state: undoable like any other resize,
     /// and dirtying the project so the height survives a save — but never an
     /// engine-graph change.
@@ -1692,6 +2253,20 @@ mod conductor_command_tests {
     }
 }
 
+fn set_insert_state(
+    state: &mut TimelineState,
+    track_id: &str,
+    insert_id: &str,
+    value: &Option<std::sync::Arc<Vec<u8>>>,
+) {
+    if let Some(slot) = state
+        .insert_slots_mut(track_id)
+        .and_then(|slots| slots.iter_mut().find(|slot| slot.id == insert_id))
+    {
+        slot.vst3_state = value.clone();
+    }
+}
+
 fn restore_track_snapshot(state: &mut TimelineState, snapshot: &TrackSnapshot) {
     if state
         .tracks
@@ -1702,6 +2277,12 @@ fn restore_track_snapshot(state: &mut TimelineState, snapshot: &TrackSnapshot) {
     }
     let index = snapshot.index.min(state.tracks.len());
     state.tracks.insert(index, snapshot.track.clone());
+    for (id, parent, output) in &snapshot.members {
+        if let Some(member) = state.tracks.iter_mut().find(|track| track.id == *id) {
+            member.parent_group_id = parent.clone();
+            member.routing.output = output.clone();
+        }
+    }
     state.selection.selected_track_id = Some(snapshot.track.id.clone());
     state.selection.selected_clip_ids.clear();
 }
@@ -1732,8 +2313,9 @@ impl EditHistory {
     }
 
     pub fn undo_with_impact(&mut self, state: &mut TimelineState) -> Option<EditImpact> {
-        let cmd = self.undo_stack.pop_back()?;
+        let mut cmd = self.undo_stack.pop_back()?;
         let impact = cmd.impact();
+        cmd.record_before_step(state, true);
         cmd.undo(state);
         self.redo_stack.push_back(cmd);
         Some(impact)
@@ -1743,9 +2325,39 @@ impl EditHistory {
         self.undo_with_impact(state).is_some()
     }
 
+    /// Push a [`EditCommand::RecordPass`], folding it into the newest entry
+    /// when that is the same pass — the audio half of a take that also
+    /// recorded MIDI arrives after the MIDI half, and one Record is one step.
+    pub fn push_record_pass(&mut self, cmd: EditCommand) {
+        let EditCommand::RecordPass { pass, clips, takes } = cmd else {
+            self.push(cmd);
+            return;
+        };
+        if let Some(EditCommand::RecordPass {
+            pass: top_pass,
+            clips: top_clips,
+            takes: top_takes,
+        }) = self.undo_stack.back_mut()
+        {
+            if *top_pass == pass {
+                top_clips.extend(clips);
+                for change in takes {
+                    match top_takes.iter_mut().find(|t| t.track_id == change.track_id) {
+                        Some(existing) => existing.next = change.next,
+                        None => top_takes.push(change),
+                    }
+                }
+                self.redo_stack.clear();
+                return;
+            }
+        }
+        self.push(EditCommand::RecordPass { pass, clips, takes });
+    }
+
     pub fn redo_with_impact(&mut self, state: &mut TimelineState) -> Option<EditImpact> {
-        let cmd = self.redo_stack.pop_back()?;
+        let mut cmd = self.redo_stack.pop_back()?;
         let impact = cmd.impact();
+        cmd.record_before_step(state, false);
         cmd.execute(state);
         self.undo_stack.push_back(cmd);
         Some(impact)
@@ -1799,5 +2411,489 @@ impl EditHistory {
 
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
+    }
+
+    /// Change how many steps are kept. Lowering it drops the oldest steps
+    /// now rather than at the next push, so the setting means what it says
+    /// the moment it is changed.
+    pub fn set_max_steps(&mut self, max_steps: usize) {
+        self.max_steps = max_steps.max(1);
+        while self.undo_stack.len() > self.max_steps {
+            self.undo_stack.pop_front();
+        }
+        while self.redo_stack.len() > self.max_steps {
+            self.redo_stack.pop_front();
+        }
+    }
+
+    pub fn max_steps(&self) -> usize {
+        self.max_steps
+    }
+
+    /// The command the next undo (`undoing`) or redo will step, for a caller
+    /// that has to prepare it first (see [`EditCommand::refresh_plugin_states`]).
+    pub fn next_step_mut(&mut self, undoing: bool) -> Option<&mut EditCommand> {
+        if undoing {
+            self.undo_stack.back_mut()
+        } else {
+            self.redo_stack.back_mut()
+        }
+    }
+
+    pub fn next_step(&self, undoing: bool) -> Option<&EditCommand> {
+        if undoing {
+            self.undo_stack.back()
+        } else {
+            self.redo_stack.back()
+        }
+    }
+
+    /// What Undo would undo, as the Edit menu names it.
+    pub fn undo_label(&self) -> Option<&'static str> {
+        self.undo_stack.back().map(EditCommand::label)
+    }
+
+    /// What Redo would redo.
+    pub fn redo_label(&self) -> Option<&'static str> {
+        self.redo_stack.back().map(EditCommand::label)
+    }
+
+    /// Push a fader or pan value from a control that reports every pointer
+    /// sample and no gesture end (the mixer pan knob): a value for the same
+    /// track and parameter as the newest entry moves that entry's `next`
+    /// instead of stacking a step per sample.
+    pub fn push_mixer_value(&mut self, cmd: EditCommand) {
+        match (&cmd, self.undo_stack.back_mut()) {
+            (
+                EditCommand::SetTrackPan { track_id, next, .. },
+                Some(EditCommand::SetTrackPan {
+                    track_id: top_track,
+                    next: top_next,
+                    ..
+                }),
+            )
+            | (
+                EditCommand::SetTrackVolume { track_id, next, .. },
+                Some(EditCommand::SetTrackVolume {
+                    track_id: top_track,
+                    next: top_next,
+                    ..
+                }),
+            ) if track_id == top_track => {
+                *top_next = *next;
+                self.redo_stack.clear();
+            }
+            _ => self.push(cmd),
+        }
+    }
+
+    /// Push an [`EditCommand::SetTracks`]. With `fold`, a command that
+    /// continues the newest entry — same label, same tracks, master and
+    /// routing in scope — extends it instead of stacking a step per pointer
+    /// sample: dragging through a colour picker, or a send-gain slider, is one
+    /// step back to where it started.
+    pub fn push_track_edit(&mut self, cmd: EditCommand, fold: bool) {
+        if fold {
+            if let (
+                EditCommand::SetTracks { label, next, .. },
+                Some(EditCommand::SetTracks {
+                    label: top_label,
+                    next: top_next,
+                    ..
+                }),
+            ) = (&cmd, self.undo_stack.back_mut())
+            {
+                let same_scope = |a: &crate::components::timeline::timeline_state::TrackEditSnapshot,
+                                  b: &crate::components::timeline::timeline_state::TrackEditSnapshot| {
+                    a.order == b.order
+                        && a.master.is_some() == b.master.is_some()
+                        && a.routing.is_some() == b.routing.is_some()
+                        && a.tracks.len() == b.tracks.len()
+                        && a.tracks.iter().zip(&b.tracks).all(|(x, y)| x.id == y.id)
+                        // A side that left a track's clips out has to be
+                        // folded with one that did the same, or the merged
+                        // step would restore that track with no clips.
+                        && a.kept_clips == b.kept_clips
+                };
+                if top_label == label && same_scope(top_next, next) {
+                    **top_next = (**next).clone();
+                    self.redo_stack.clear();
+                    return;
+                }
+            }
+        }
+        self.push(cmd);
+    }
+
+    /// Push an [`EditCommand::SetInsertState`], folding it into the newest
+    /// entry when that is the same change (`label`) to the same insert:
+    /// stepping through ten presets is one step back to where it started,
+    /// not ten. Anything else pushes normally.
+    pub fn push_insert_state(&mut self, cmd: EditCommand) {
+        let EditCommand::SetInsertState {
+            label,
+            track_id,
+            insert_id,
+            next,
+            ..
+        } = &cmd
+        else {
+            self.push(cmd);
+            return;
+        };
+        if let Some(EditCommand::SetInsertState {
+            label: top_label,
+            track_id: top_track,
+            insert_id: top_insert,
+            next: top_next,
+            ..
+        }) = self.undo_stack.back_mut()
+        {
+            if top_label == label && top_track == track_id && top_insert == insert_id {
+                *top_next = next.clone();
+                self.redo_stack.clear();
+                return;
+            }
+        }
+        self.push(cmd);
+    }
+}
+
+#[cfg(test)]
+mod record_pass_tests {
+    use super::*;
+
+    /// An audio track with one recorded take covering bars 1–2.
+    fn one_take_state() -> (TimelineState, String, String) {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track_id = state.create_audio_track();
+        let first = state.insert_recorded_clip(
+            &track_id,
+            "/tmp/take-1.wav".to_string(),
+            "Take 1".to_string(),
+            0.0,
+            4.0,
+            120.0,
+        );
+        state.register_recorded_take(&track_id, &first, "first".to_string());
+        (state, track_id, first)
+    }
+
+    fn record_second_take(state: &mut TimelineState, track_id: &str, pass: u64) -> EditCommand {
+        let before = TrackTakesState::capture_tracks(state, [track_id]);
+        let second = state.insert_recorded_clip(
+            track_id,
+            "/tmp/take-2.wav".to_string(),
+            "Take 2".to_string(),
+            0.0,
+            4.0,
+            120.0,
+        );
+        state.register_recorded_take(track_id, &second, "second".to_string());
+        EditCommand::record_pass(pass, state, &[second], before).expect("a pass")
+    }
+
+    fn muted(state: &TimelineState, clip_id: &str) -> bool {
+        state.find_clip(clip_id).expect("clip").1.muted
+    }
+
+    /// Undoing a take used to do nothing at all: recording never reached the
+    /// history. It has to remove the new clip *and* give the replaced take its
+    /// voice back, and redo has to put both back.
+    #[test]
+    fn undo_removes_the_take_and_unmutes_the_one_it_replaced() {
+        let (mut state, track_id, first) = one_take_state();
+        let takes_before = state.tracks[0].takes.clone();
+        let mut history = EditHistory::new(8);
+        let command = record_second_take(&mut state, &track_id, 1);
+        let EditCommand::RecordPass { clips, .. } = &command else {
+            panic!("record pass");
+        };
+        let second = clips[0].clip.id.clone();
+        history.push_record_pass(command);
+        assert!(muted(&state, &first), "the new pass silences the old take");
+
+        assert!(history.undo(&mut state));
+        assert!(state.find_clip(&second).is_none());
+        assert!(!muted(&state, &first));
+        assert_eq!(state.tracks[0].takes, takes_before);
+
+        assert!(history.redo(&mut state));
+        assert!(state.find_clip(&second).is_some());
+        assert!(muted(&state, &first));
+        assert_eq!(state.tracks[0].takes.len(), 2);
+    }
+
+    /// The MIDI half of a take commits at Stop and the audio half when the disk
+    /// writer finishes; the same pass is one undo step.
+    #[test]
+    fn halves_of_one_pass_undo_together() {
+        let (mut state, track_id, _) = one_take_state();
+        let mut history = EditHistory::new(8);
+        history.push_record_pass(record_second_take(&mut state, &track_id, 7));
+        history.push_record_pass(record_second_take(&mut state, &track_id, 7));
+        assert_eq!(state.tracks[0].clips.len(), 3);
+
+        assert!(history.undo(&mut state));
+        assert_eq!(state.tracks[0].clips.len(), 1);
+        assert!(!history.can_undo());
+    }
+
+    #[test]
+    fn different_passes_stay_separate_steps() {
+        let (mut state, track_id, _) = one_take_state();
+        let mut history = EditHistory::new(8);
+        history.push_record_pass(record_second_take(&mut state, &track_id, 1));
+        history.push_record_pass(record_second_take(&mut state, &track_id, 2));
+
+        assert!(history.undo(&mut state));
+        assert_eq!(state.tracks[0].clips.len(), 2);
+        assert!(history.undo(&mut state));
+        assert_eq!(state.tracks[0].clips.len(), 1);
+    }
+
+    #[test]
+    fn a_pass_that_created_nothing_is_not_a_step() {
+        let (state, track_id, _) = one_take_state();
+        let before = TrackTakesState::capture_tracks(&state, [track_id.as_str()]);
+        assert!(EditCommand::record_pass(1, &state, &[], before).is_none());
+    }
+}
+
+#[cfg(test)]
+mod update_clips_tests {
+    use super::*;
+
+    /// Track A holds `a0, x, a1, y`; track B holds `b0`. All MIDI, one beat
+    /// apart, so each clip's start says which one it is.
+    fn two_tracks() -> (TimelineState, String, String) {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let a = state.create_midi_track();
+        let b = state.create_midi_track();
+        for (track, name, start) in [
+            (&a, "a0", 0.0),
+            (&a, "x", 4.0),
+            (&a, "a1", 8.0),
+            (&a, "y", 12.0),
+            (&b, "b0", 0.0),
+        ] {
+            let mut clip = state.build_midi_clip(track, start, 2.0).expect("clip");
+            clip.id = name.to_string();
+            state
+                .tracks
+                .iter_mut()
+                .find(|t| t.id == *track)
+                .expect("track")
+                .clips
+                .push(clip);
+        }
+        (state, a, b)
+    }
+
+    fn layout(state: &TimelineState) -> Vec<Vec<(String, f32)>> {
+        state
+            .tracks
+            .iter()
+            .map(|track| {
+                track
+                    .clips
+                    .iter()
+                    .map(|clip| (clip.id.clone(), clip.start_beat))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn capture(state: &TimelineState, ids: &[&str]) -> Vec<ClipSnapshot> {
+        ids.iter()
+            .map(|id| ClipSnapshot::capture(state, id).expect("clip"))
+            .collect()
+    }
+
+    /// A group move that takes `x` to another track and slides `y` along its
+    /// own is one entry, and undo puts `x` back into the exact slot it left —
+    /// between `a0` and `a1`, not at the end of the track.
+    #[test]
+    fn a_cross_track_group_move_round_trips_exactly() {
+        let (mut state, a, b) = two_tracks();
+        let before = layout(&state);
+        let previous = capture(&state, &["x", "y"]);
+
+        // The gesture: `x` leaves A for B (appended, as a drop does), `y`
+        // moves in place.
+        let a_index = state.tracks.iter().position(|t| t.id == a).unwrap();
+        let b_index = state.tracks.iter().position(|t| t.id == b).unwrap();
+        let x_at = state.tracks[a_index]
+            .clips
+            .iter()
+            .position(|c| c.id == "x")
+            .unwrap();
+        let mut x = state.tracks[a_index].clips.remove(x_at);
+        x.start_beat = 6.0;
+        state.tracks[b_index].clips.push(x);
+        state.tracks[a_index]
+            .clips
+            .iter_mut()
+            .find(|c| c.id == "y")
+            .unwrap()
+            .start_beat = 14.0;
+        let after = layout(&state);
+        let next = capture(&state, &["x", "y"]);
+        assert_eq!(next[0].index, 1, "x was appended after b0");
+        assert_eq!(next[1].index, 2, "y slid up when x left");
+
+        let command = EditCommand::UpdateClips { previous, next };
+        assert_eq!(command.impact(), EditImpact::Project);
+        let mut history = EditHistory::new(8);
+        history.push(command);
+
+        assert!(history.undo(&mut state));
+        assert_eq!(layout(&state), before);
+        assert!(!history.undo(&mut state), "the whole move is one entry");
+        assert!(history.redo(&mut state));
+        assert_eq!(layout(&state), after);
+        assert!(history.undo(&mut state));
+        assert_eq!(layout(&state), before);
+    }
+
+    /// Two clips of one track that swap places keep each other's slots.
+    #[test]
+    fn clips_are_restored_at_their_indices_whatever_order_they_are_named_in() {
+        let (mut state, a, _) = two_tracks();
+        let before = layout(&state);
+        let previous = capture(&state, &["y", "a0"]);
+        let a_index = state.tracks.iter().position(|t| t.id == a).unwrap();
+        state.tracks[a_index].clips.swap(0, 3);
+        state.tracks[a_index].clips[0].start_beat = 20.0;
+        let after = layout(&state);
+        let next = capture(&state, &["y", "a0"]);
+
+        let command = EditCommand::UpdateClips { previous, next };
+        command.undo(&mut state);
+        assert_eq!(layout(&state), before);
+        command.execute(&mut state);
+        assert_eq!(layout(&state), after);
+    }
+
+    /// Selection survives the round trip: the clips keep their ids.
+    #[test]
+    fn undoing_a_move_keeps_the_moved_clips_selected() {
+        let (mut state, a, b) = two_tracks();
+        state.selection.selected_clip_ids = vec!["x".to_string()];
+        state.selection.selected_track_id = Some(a.clone());
+        let previous = capture(&state, &["x"]);
+        let mut x = previous[0].clip.clone();
+        x.start_beat = 1.0;
+        let next = vec![ClipSnapshot {
+            track_id: b.clone(),
+            clip: x,
+            index: 1,
+            take: None,
+        }];
+        let command = EditCommand::UpdateClips { previous, next };
+        command.execute(&mut state);
+        assert_eq!(state.selection.selected_clip_ids, vec!["x".to_string()]);
+        assert_eq!(
+            state.selection.selected_track_id.as_deref(),
+            Some(b.as_str())
+        );
+        command.undo(&mut state);
+        assert_eq!(state.selection.selected_clip_ids, vec!["x".to_string()]);
+        assert_eq!(
+            state.selection.selected_track_id.as_deref(),
+            Some(a.as_str())
+        );
+        assert_eq!(state.find_clip("x").unwrap().1.start_beat, 4.0);
+    }
+}
+
+#[cfg(test)]
+mod track_name_tests {
+    use super::*;
+
+    /// The command the header rename records on commit.
+    fn rename_command(state: &TimelineState, track_id: &str, draft: &str) -> Option<EditCommand> {
+        EditCommand::rename_track(state, track_id, draft)
+    }
+
+    #[test]
+    fn track_rename_is_one_undoable_step() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        let original = state.tracks[0].name.clone();
+        let mut history = EditHistory::new(10);
+
+        let command = rename_command(&state, &id, "  Lead Synth ").expect("a real rename");
+        assert_eq!(command.label(), "Rename Track");
+        assert_eq!(command.impact(), EditImpact::Project);
+        command.execute(&mut state);
+        history.push(command);
+        assert_eq!(state.tracks[0].name, "Lead Synth");
+        assert!(history.can_undo());
+
+        assert!(history.undo(&mut state));
+        assert_eq!(state.tracks[0].name, original);
+        assert!(!history.can_undo(), "the rename was exactly one entry");
+
+        assert!(history.redo(&mut state));
+        assert_eq!(state.tracks[0].name, "Lead Synth");
+        assert!(!history.can_redo());
+    }
+
+    #[test]
+    fn blank_or_unchanged_drafts_record_nothing() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        let name = state.tracks[0].name.clone();
+        assert!(rename_command(&state, &id, "   ").is_none());
+        assert!(rename_command(&state, &id, &format!(" {name} ")).is_none());
+        assert!(rename_command(&state, "no-such-track", "Name").is_none());
+    }
+
+    /// The name changed under the open field (a menu-bound undo on macOS never
+    /// reaches the field): undo must restore what the track was called just
+    /// before the commit.
+    #[test]
+    fn undo_restores_the_name_the_track_had_at_commit_time() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        let mut history = EditHistory::new(10);
+        // The field opened on the original name, then something else renamed it.
+        state.set_track_name(&id, "Renamed Elsewhere");
+
+        let command = rename_command(&state, &id, "Final").expect("a real rename");
+        command.execute(&mut state);
+        history.push(command);
+        assert!(history.undo(&mut state));
+        assert_eq!(state.tracks[0].name, "Renamed Elsewhere");
+    }
+
+    /// An exact restore: a legacy name with surrounding space, or none at all,
+    /// comes back as it was rather than trimmed.
+    #[test]
+    fn undo_restores_a_legacy_name_exactly() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        state.set_track_name(&id, "");
+        let command = rename_command(&state, &id, "Named").expect("a real rename");
+        command.execute(&mut state);
+        command.undo(&mut state);
+        assert_eq!(state.tracks[0].name, "");
+    }
+
+    #[test]
+    fn every_rename_step_advances_the_names_revision() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        let start = state.track_names_revision;
+        let command = rename_command(&state, &id, "Pad").expect("a real rename");
+        command.execute(&mut state);
+        let executed = state.track_names_revision;
+        assert_ne!(executed, start);
+        command.undo(&mut state);
+        assert_ne!(state.track_names_revision, executed);
+        assert_ne!(state.track_names_revision, start);
     }
 }

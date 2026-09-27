@@ -250,6 +250,11 @@ struct SphereDauxClapProcessor {
   bool editor_resizable{false};
   unsigned long long editor_handle{0};
   std::atomic<bool> embed_user_closed{false};
+  /// Raised when the plug-in says its state changed (`clap.state` mark_dirty,
+  /// a values rescan, or a parameter value / gesture end it produced), so the
+  /// saved state may be stale. Cleared by `sphere_daux_clap_take_state_touched`.
+  /// Output events arrive on the audio thread, hence a plain atomic store.
+  std::atomic<bool> state_touched{false};
   std::atomic<bool> pending_main_shell_resize{false};
   std::atomic<int> pending_main_shell_w{0};
   std::atomic<int> pending_main_shell_h{0};

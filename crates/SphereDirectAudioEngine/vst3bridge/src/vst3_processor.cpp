@@ -1156,8 +1156,10 @@ extern "C" void sphere_daux_editor_set_embedded(
 
 Steinberg::tresult PLUGIN_API ComponentHandlerImpl::performEdit(
     Steinberg::Vst::ParamID id, Steinberg::Vst::ParamValue value) {
-  if (owner)
+  if (owner) {
     owner->enqueue_param(id, value);
+    owner->state_touched.store(true, std::memory_order_release);
+  }
   static std::atomic<int> logged{0};
   const int n = logged.fetch_add(1);
   if (n < 16 || n % 50 == 0) {
@@ -1166,6 +1168,27 @@ Steinberg::tresult PLUGIN_API ComponentHandlerImpl::performEdit(
         "[SphereVST3] editor param -> processor param=%u value=%.6f count=%d\n",
         static_cast<unsigned int>(id), static_cast<double>(value), n + 1);
   }
+  return Steinberg::kResultOk;
+}
+
+Steinberg::tresult PLUGIN_API
+ComponentHandlerImpl::endEdit(Steinberg::Vst::ParamID) {
+  // The end of a gesture whose values already arrived through performEdit;
+  // raised again so a gesture is never missed if the flag was taken mid-way.
+  if (owner)
+    owner->state_touched.store(true, std::memory_order_release);
+  return Steinberg::kResultOk;
+}
+
+Steinberg::tresult PLUGIN_API
+ComponentHandlerImpl::restartComponent(Steinberg::int32 flags) {
+  // A controller that loaded a program or preset of its own reports it this
+  // way rather than per parameter. Only the value-changing flags count; a
+  // latency or title change leaves the saved state as it was.
+  constexpr Steinberg::int32 kStateFlags =
+      Steinberg::Vst::kParamValuesChanged | Steinberg::Vst::kReloadComponent;
+  if (owner && (flags & kStateFlags) != 0)
+    owner->state_touched.store(true, std::memory_order_release);
   return Steinberg::kResultOk;
 }
 
@@ -4981,6 +5004,30 @@ sphere_daux_vst3_view_take_resize_request(SphereDauxVst3Processor *, int *,
 }
 #endif
 
+// A view "must not handle keyboard events by the means of platform callbacks,
+// but let the host pass them to the view" (`iplugview.h`), so a key the host
+// wants the plug-in to act on goes through `onKeyDown`, with the matching
+// `onKeyUp` after it. Every platform keeps `editor_view`, so this is one
+// definition for all of them.
+extern "C" int sphere_daux_vst3_view_key(SphereDauxVst3Processor *processor,
+                                         int key, int key_code,
+                                         int modifiers) {
+  if (!processor || !processor->editor_view) {
+    return 0;
+  }
+  const auto character = static_cast<Steinberg::char16>(key);
+  const auto code = static_cast<Steinberg::int16>(key_code);
+  const auto mods = static_cast<Steinberg::int16>(modifiers);
+  // A view that tracks focus itself ignores keys while it believes it does
+  // not have it, and nothing else in this host ever tells it that it does.
+  processor->editor_view->onFocus(true);
+  const bool handled = processor->editor_view->onKeyDown(character, code,
+                                                         mods) ==
+                       Steinberg::kResultTrue;
+  processor->editor_view->onKeyUp(character, code, mods);
+  return handled ? 1 : 0;
+}
+
 // ── Editor chrome strip ─────────────────────────────────────────────────────
 //
 // The strip itself is shared across every format bridge and addressed by the
@@ -5130,6 +5177,18 @@ sphere_daux_vst3_embed_take_user_close(SphereDauxVst3Processor *processor) {
   (void)processor;
   return 0;
 #endif
+}
+
+// Returns 1 (and resets) if the controller reported an edit or a value change
+// since the last call. Polled by the plug-in host's UI thread, which turns it
+// into a throttled HostEvent::PluginStateTouched; never read on the audio path.
+extern "C" int
+sphere_daux_vst3_take_state_touched(SphereDauxVst3Processor *processor) {
+  if (!processor)
+    return 0;
+  return processor->state_touched.exchange(false, std::memory_order_acq_rel)
+             ? 1
+             : 0;
 }
 
 // Process-wide transport-key counter shared by Win32 / AppKit / GTK editors and

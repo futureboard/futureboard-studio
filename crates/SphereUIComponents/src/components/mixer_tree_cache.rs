@@ -59,6 +59,9 @@ pub struct MixerTreeRenderCache {
     pub visible_rows: Vec<MixerTreeVisibleRow>,
     pub dirty: MixerTreeDirty,
     pub routing_gen: u64,
+    /// The timeline's `track_names_revision`. Rows copy track names, and a
+    /// rename never advances the routing version.
+    pub names_revision: u64,
     pub output_channels: u32,
     pub filter: String,
     pub show_only_selected_group: bool,
@@ -101,6 +104,7 @@ impl MixerTreeRenderCache {
     pub fn sync_routing_key(
         &mut self,
         routing_gen: u64,
+        names_revision: u64,
         output_channels: u32,
         filter: &str,
         show_only: bool,
@@ -113,11 +117,13 @@ impl MixerTreeRenderCache {
         // The spec's "if local version is missing or older, schedule one rebuild".
         if self.model.is_none()
             || self.routing_gen != routing_gen
+            || self.names_revision != names_revision
             || self.output_channels != output_channels
             || self.show_only_selected_group != show_only
             || (show_only && self.selected_channel_id != selected)
         {
             self.routing_gen = routing_gen;
+            self.names_revision = names_revision;
             self.output_channels = output_channels;
             self.show_only_selected_group = show_only;
             self.selected_channel_id = selected;
@@ -269,7 +275,7 @@ mod tests {
         // First Studio open: the routing version still matches the cache default
         // (0 == 0), but no model exists yet. This must still build (the first-open
         // bug was that the equal versions skipped the build → blank sidebar).
-        cache.sync_routing_key(0, 2, "", false, None);
+        cache.sync_routing_key(0, 0, 2, "", false, None);
         assert!(cache.dirty.routing, "first sync must mark routing dirty");
         cache.recompute(&tracks, &view);
         assert!(cache.model.is_some(), "tree model must build on first sync");
@@ -277,7 +283,7 @@ mod tests {
 
         // A no-op re-sync (the shape of a meter / fader repaint): nothing changed,
         // so the tree must NOT rebuild.
-        cache.sync_routing_key(0, 2, "", false, None);
+        cache.sync_routing_key(0, 0, 2, "", false, None);
         cache.recompute(&tracks, &view);
         assert_eq!(
             cache.model_rebuild_count, 1,
@@ -285,8 +291,46 @@ mod tests {
         );
 
         // Routing graph advances (tracks ready / added / renamed): rebuild once.
-        cache.sync_routing_key(1, 2, "", false, None);
+        cache.sync_routing_key(1, 0, 2, "", false, None);
         cache.recompute(&tracks, &view);
         assert_eq!(cache.model_rebuild_count, 2);
+    }
+
+    /// A rename changes no routing, so only the names revision can tell the
+    /// cache that the rows it copied a track name into are stale.
+    #[test]
+    fn a_rename_rebuilds_the_rows_on_the_same_routing_version() {
+        use crate::components::mixer_tree_model::ensure_timeline_mixer_tree_defaults;
+        use crate::components::timeline::timeline_state::TimelineState;
+
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        assert!(state.rename_track(&id, "Before"));
+        ensure_timeline_mixer_tree_defaults(&mut state, 2);
+        let labels = |cache: &MixerTreeRenderCache| -> Vec<String> {
+            cache
+                .visible_rows
+                .iter()
+                .filter(|row| row.channel_id.as_deref() == Some(id.as_str()))
+                .map(|row| row.label.clone())
+                .collect()
+        };
+
+        let mut cache = MixerTreeRenderCache::default();
+        cache.sync_routing_key(3, state.track_names_revision, 2, "", false, None);
+        cache.recompute(&state.tracks, &state.mixer_tree);
+        assert_eq!(labels(&cache), vec!["Before".to_string()]);
+        let builds = cache.model_rebuild_count;
+
+        assert!(state.rename_track(&id, "After"));
+        cache.sync_routing_key(3, state.track_names_revision, 2, "", false, None);
+        cache.recompute(&state.tracks, &state.mixer_tree);
+        assert_eq!(cache.model_rebuild_count, builds + 1);
+        assert_eq!(labels(&cache), vec!["After".to_string()]);
+
+        // Nothing renamed since: the next sync is a no-op again.
+        cache.sync_routing_key(3, state.track_names_revision, 2, "", false, None);
+        cache.recompute(&state.tracks, &state.mixer_tree);
+        assert_eq!(cache.model_rebuild_count, builds + 1);
     }
 }

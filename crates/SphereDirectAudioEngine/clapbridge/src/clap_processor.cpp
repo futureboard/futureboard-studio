@@ -195,17 +195,28 @@ void CLAP_ABI host_latency_changed(const clap_host_t *host) {
 }
 
 // clap.params
-void CLAP_ABI host_params_rescan(const clap_host_t *, clap_param_rescan_flags) {
+void CLAP_ABI host_params_rescan(const clap_host_t *host,
+                                 clap_param_rescan_flags flags) {
+  // A values rescan is how a plug-in reports that it changed its own
+  // parameters wholesale (a preset it loaded, say).
+  if ((flags & CLAP_PARAM_RESCAN_VALUES) != 0) {
+    if (auto *p = processor_for(host)) {
+      p->state_touched.store(true, std::memory_order_release);
+    }
+  }
 }
 void CLAP_ABI host_params_clear(const clap_host_t *, clap_id,
                                 clap_param_clear_flags) {}
 void CLAP_ABI host_params_request_flush(const clap_host_t *) {}
 
 // clap.state
-void CLAP_ABI host_state_mark_dirty(const clap_host_t *) {
-  // Project dirtiness is tracked by the app from user gestures, not by the
-  // plug-in; nothing to do, but the extension has to exist or plug-ins that
-  // require it refuse to load.
+void CLAP_ABI host_state_mark_dirty(const clap_host_t *host) {
+  // The plug-in's state changed and should be saved again. Only noted: the
+  // plug-in host turns it into a PluginStateTouched report for the studio,
+  // which owns the project's dirty state.
+  if (auto *p = processor_for(host)) {
+    p->state_touched.store(true, std::memory_order_release);
+  }
 }
 
 // clap.gui
@@ -309,8 +320,20 @@ const clap_event_header_t *CLAP_ABI in_events_get(
   return &p->event_storage[index].header;
 }
 
-bool CLAP_ABI out_events_try_push(const clap_output_events_t *,
-                                  const clap_event_header_t *) {
+bool CLAP_ABI out_events_try_push(const clap_output_events_t *list,
+                                  const clap_event_header_t *event) {
+  // A parameter value or the end of a gesture coming *out* of the plug-in is
+  // its GUI (or a preset it loaded) changing its own state. Noted with one
+  // atomic store — this runs on the audio thread — so the host can report
+  // the saved state as possibly stale.
+  if (event && event->space_id == CLAP_CORE_EVENT_SPACE_ID &&
+      (event->type == CLAP_EVENT_PARAM_VALUE ||
+       event->type == CLAP_EVENT_PARAM_GESTURE_END)) {
+    if (auto *p = static_cast<SphereDauxClapProcessor *>(list ? list->ctx
+                                                              : nullptr)) {
+      p->state_touched.store(true, std::memory_order_release);
+    }
+  }
   // Plug-in-produced events (parameter gestures, note output) are not routed
   // anywhere yet. Reporting failure is honest: accepting them would claim the
   // host delivered something it dropped.
@@ -1405,6 +1428,13 @@ int sphere_daux_clap_embed_take_user_close(SphereDauxClapProcessor *p) {
     return 0;
   }
   return p->embed_user_closed.exchange(false, std::memory_order_acq_rel) ? 1 : 0;
+}
+
+int sphere_daux_clap_take_state_touched(SphereDauxClapProcessor *p) {
+  if (!p) {
+    return 0;
+  }
+  return p->state_touched.exchange(false, std::memory_order_acq_rel) ? 1 : 0;
 }
 
 int sphere_daux_clap_take_pending_shell_resize(SphereDauxClapProcessor *p,

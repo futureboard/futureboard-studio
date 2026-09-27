@@ -93,6 +93,9 @@ pub struct LaneFrame {
     pub cursor: Option<f64>,
     pub fade_in_end: f64,
     pub fade_out_start: f64,
+    /// Whether each fade (in, out) offers its manual handle. An edge a
+    /// crossfade covers draws its curve but no handle.
+    pub fade_handles: [bool; 2],
     pub envelope: Option<(ClipEnvelope, bool)>,
     pub warp: Vec<(u64, f64, bool)>,
     pub warp_emphasized: bool,
@@ -401,9 +404,10 @@ fn paint_fades(
     }
     let _ = (clip_x0, clip_x1);
 
-    // Handles always show, so a fade of zero length can still be pulled out.
-    for x in [fade_in_x, fade_out_x] {
-        if (-FADE_HANDLE..=w + FADE_HANDLE).contains(&x) {
+    // Handles always show, so a fade of zero length can still be pulled out —
+    // except on an edge a crossfade covers, which no manual fade changes.
+    for (x, shown) in [fade_in_x, fade_out_x].into_iter().zip(frame.fade_handles) {
+        if shown && (-FADE_HANDLE..=w + FADE_HANDLE).contains(&x) {
             let r = rect(
                 ox + x - FADE_HANDLE * 0.5,
                 oy + (HANDLE_BAND - FADE_HANDLE) * 0.5,

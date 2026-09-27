@@ -9,7 +9,9 @@
 # joining the two trees here:
 #
 #   * Mach-O files (app, sidecars, CEF framework, plugin dylibs) are `lipo`d
-#     into one binary carrying both slices.
+#     into one binary carrying both slices: the x86_64 slice from the x86_64
+#     package and the arm64 slice from the arm64 package. An input that is
+#     already fat (ONNX Runtime downloads as universal2) is thinned first.
 #   * Files whose name carries an architecture — Chromium's
 #     `v8_context_snapshot.arm64.bin` / `.x86_64.bin` — are taken from whichever
 #     package has them. A universal framework is expected to hold both, and the
@@ -59,6 +61,26 @@ fi
 is_macho() {
   lipo -archs "$1" >/dev/null 2>&1
 }
+
+# Write the `$2` slice of Mach-O `$1` to `$3`. A single-architecture input is
+# copied; a fat one (ONNX Runtime ships as universal2 in *both* packages) is
+# thinned, so the merge never hands lipo two files that both carry a slice —
+# which it refuses. Fails when the file has no such slice at all.
+extract_slice() {
+  local file="$1" arch="$2" out="$3" archs
+  archs="$(lipo -archs "$file")"
+  if [[ "$archs" == "$arch" ]]; then
+    cp "$file" "$out"
+  elif [[ " $archs " == *" $arch "* ]]; then
+    lipo "$file" -thin "$arch" -output "$out"
+  else
+    echo "error: ${file} has no $arch slice (has: $archs)" >&2
+    return 1
+  fi
+}
+
+SLICE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fb-universal-slices.XXXXXX")"
+trap 'rm -rf "$SLICE_DIR"' EXIT
 
 # Chromium names its per-architecture resources `<name>.<arch>.<ext>`, so a
 # single-architecture package legitimately holds only its own. These are
@@ -112,7 +134,11 @@ while IFS= read -r -d '' source; do
   fi
 
   if is_macho "$source" && is_macho "$counterpart"; then
-    lipo -create "$counterpart" "$source" -output "$destination"
+    # Each package contributes its own architecture's slice, whatever it
+    # happened to contain.
+    extract_slice "$counterpart" x86_64 "$SLICE_DIR/x86_64"
+    extract_slice "$source" arm64 "$SLICE_DIR/arm64"
+    lipo -create "$SLICE_DIR/x86_64" "$SLICE_DIR/arm64" -output "$destination"
     # lipo does not carry the mode across.
     if [[ -x "$source" ]]; then
       chmod +x "$destination"

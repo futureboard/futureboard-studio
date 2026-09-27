@@ -233,6 +233,7 @@ pub(super) fn find_clip_summary<'a>(
                 stretch: &c.stretch,
                 project_bpm,
                 selection_duration_beats,
+                fades: None,
             });
         }
     }

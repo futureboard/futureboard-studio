@@ -13,6 +13,11 @@ pub struct ProjectSession {
     pub project_file_path: Option<PathBuf>,
     pub is_untitled: bool,
     pub is_dirty: bool,
+    /// Bumped by every [`Self::mark_dirty`]. A save captures it with its
+    /// snapshot and only marks the session clean when it is unchanged on
+    /// completion, so an edit made while a background save runs is never
+    /// reported as saved.
+    pub dirty_generation: u64,
     pub created_at: u64,
     pub modified_at: u64,
 }
@@ -37,6 +42,7 @@ impl ProjectSession {
             project_file_path: None,
             is_untitled: true,
             is_dirty: false,
+            dirty_generation: 0,
             created_at: now,
             modified_at: now,
         }
@@ -61,6 +67,34 @@ impl ProjectSession {
         self.modified_at = modified_at;
     }
 
+    /// Bind the file a save just wrote, where the save's snapshot was taken at
+    /// `saved_generation`. The session only becomes clean when nothing was
+    /// edited since that snapshot; otherwise it stays dirty so the later edits
+    /// still prompt and still autosave. Returns `true` when the session is clean.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_saved_snapshot(
+        &mut self,
+        id: String,
+        name: String,
+        folder_path: Option<PathBuf>,
+        project_file_path: PathBuf,
+        created_at: u64,
+        modified_at: u64,
+        saved_generation: u64,
+    ) -> bool {
+        let edited_since_snapshot = self.dirty_generation != saved_generation;
+        self.bind_saved(
+            id,
+            name,
+            folder_path,
+            project_file_path,
+            created_at,
+            modified_at,
+        );
+        self.is_dirty = edited_since_snapshot;
+        !edited_since_snapshot
+    }
+
     pub fn bind_untitled(&mut self, name: impl Into<String>, dirty: bool) {
         let now = now_secs();
         self.id = new_id();
@@ -68,9 +102,27 @@ impl ProjectSession {
         self.folder_path = None;
         self.project_file_path = None;
         self.is_untitled = true;
-        self.is_dirty = dirty;
+        self.is_dirty = false;
+        if dirty {
+            self.mark_dirty();
+        }
         self.created_at = now;
         self.modified_at = now;
+    }
+
+    /// Bind an untitled session recovered from its autosave. It keeps the
+    /// autosave's id, so later autosaves overwrite that same recovery file
+    /// instead of leaving it behind to be offered again, and it is dirty: the
+    /// recovered work exists nowhere but in the autosave.
+    pub fn bind_recovered_untitled(
+        &mut self,
+        id: String,
+        name: impl Into<String>,
+        created_at: u64,
+    ) {
+        self.bind_untitled(name, true);
+        self.id = id;
+        self.created_at = created_at;
     }
 
     /// Titlebar / window chrome display name.
@@ -88,6 +140,7 @@ impl ProjectSession {
 
     pub fn mark_dirty(&mut self) {
         self.is_dirty = true;
+        self.dirty_generation = self.dirty_generation.wrapping_add(1);
         self.modified_at = now_secs();
     }
 
@@ -173,5 +226,65 @@ mod tests {
         session.mark_clean(Some(99));
         assert!(!session.is_dirty);
         assert_eq!(session.modified_at, 99);
+    }
+
+    fn bind_snapshot(session: &mut ProjectSession, generation: u64) -> bool {
+        session.bind_saved_snapshot(
+            "id-4".to_string(),
+            "Race".to_string(),
+            Some(PathBuf::from("/tmp/Race")),
+            PathBuf::from("/tmp/Race/Race.fbproj"),
+            1,
+            2,
+            generation,
+        )
+    }
+
+    /// A background save snapshots the project, writes it off the UI thread,
+    /// then binds the result. An edit that lands in between is not in the file,
+    /// so the session must stay dirty instead of reporting it as saved.
+    #[test]
+    fn an_edit_during_a_save_keeps_the_session_dirty() {
+        let mut session = ProjectSession::untitled();
+        session.mark_dirty();
+        let snapshot_generation = session.dirty_generation;
+        session.mark_dirty();
+        assert!(!bind_snapshot(&mut session, snapshot_generation));
+        assert!(session.is_dirty);
+        assert_eq!(session.subtitle(), "Unsaved changes");
+        assert!(!session.needs_save_as(), "the file is still bound");
+    }
+
+    #[test]
+    fn a_save_with_no_later_edits_marks_the_session_clean() {
+        let mut session = ProjectSession::untitled();
+        session.mark_dirty();
+        let snapshot_generation = session.dirty_generation;
+        assert!(bind_snapshot(&mut session, snapshot_generation));
+        assert!(!session.is_dirty);
+        assert_eq!(session.subtitle(), "Saved");
+    }
+
+    #[test]
+    fn binding_a_dirty_untitled_session_counts_as_an_edit() {
+        let mut session = ProjectSession::untitled();
+        let before = session.dirty_generation;
+        session.bind_untitled("Imported", true);
+        assert!(session.is_dirty);
+        assert_ne!(session.dirty_generation, before);
+        let generation = session.dirty_generation;
+        session.bind_untitled("Clean", false);
+        assert!(!session.is_dirty);
+        assert_eq!(session.dirty_generation, generation);
+    }
+
+    #[test]
+    fn a_recovered_untitled_session_keeps_its_autosave_id_and_is_dirty() {
+        let mut session = ProjectSession::untitled();
+        session.bind_recovered_untitled("autosave-id".to_string(), "Untitled Project", 7);
+        assert_eq!(session.id, "autosave-id");
+        assert_eq!(session.created_at, 7);
+        assert!(session.is_dirty);
+        assert!(session.needs_save_as());
     }
 }

@@ -1,5 +1,6 @@
-use gpui::{div, px, IntoElement, ParentElement, Styled};
+use gpui::{div, px, InteractiveElement, IntoElement, ParentElement, Styled};
 
+use crate::components::edit::{lane_press_intent, LanePressIntent};
 use crate::components::timeline::audio_clip::{
     AudioClipProcessCommitCb, AudioClipProcessPreviewCb,
 };
@@ -10,12 +11,15 @@ use crate::components::timeline::automation_lane::{
     automation_lane, AutomationDeleteCallback, AutomationDownCallback, AutomationHoverCallback,
     AutomationLaneActionCallback,
 };
+use crate::components::timeline::take_lane::take_lane;
 use crate::components::timeline::timeline_state::{
     AutomationHover, AutomationMarquee, TimelineGestureContext, TimelineState, TrackRowLayout,
     AUTOMATION_CONTROL_LANE_HEIGHT, AUTOMATION_SUBLANE_HEIGHT, DEFAULT_TRACK_HEIGHT, HEADER_WIDTH,
 };
-use crate::components::timeline::track_header::{track_header, TrackHeaderCallbacks};
-use crate::components::timeline::track_lane::track_lane;
+use crate::components::timeline::track_header::{
+    track_header, FolderPlacement, TrackHeaderCallbacks,
+};
+use crate::components::timeline::track_lane::{track_lane, MarqueePress, MarqueePressCb};
 use crate::components::timeline::track_lane_view::{TrackLaneView, TrackLaneViews};
 use crate::components::timeline::track_resize::{
     track_row_resize_handle, visible_track_row_range, TrackHeightResizeArmCb,
@@ -25,8 +29,9 @@ use crate::components::timeline::vu_meter::TrackMeterViews;
 use crate::theme::Colors;
 
 /// Rows above/below the visible viewport that are kept rendered to prevent
-/// pop-in during fast scrolling. Measured in track rows.
-const OVERSCAN: usize = 2;
+/// pop-in during fast scrolling. Measured in track rows. The inline track
+/// rename reads it too, to know whether its header is drawn this frame.
+pub(crate) const OVERSCAN: usize = 2;
 
 /// `FUTUREBOARD_TIMELINE_BG_DEBUG=1` — trace the timeline background metrics.
 /// Cached: `track_list` runs on every timeline repaint, so re-reading the OS
@@ -62,9 +67,7 @@ pub fn track_list(
         std::sync::Arc<dyn Fn(&(String, f32, f32), &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
     on_open_editor: Option<std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>>,
-    on_range_start: Option<
-        std::sync::Arc<dyn Fn(&(String, f32, bool), &mut gpui::Window, &mut gpui::App) + 'static>,
-    >,
+    on_range_start: Option<MarqueePressCb>,
     on_erase_start: Option<
         std::sync::Arc<dyn Fn(&f32, &mut gpui::Window, &mut gpui::App) + 'static>,
     >,
@@ -75,6 +78,7 @@ pub fn track_list(
     erase_preview_ids: Option<&std::collections::HashSet<String>>,
     on_audio_clip_process_preview: AudioClipProcessPreviewCb,
     on_audio_clip_process_commit: AudioClipProcessCommitCb,
+    on_crossfade: Option<crate::components::timeline::crossfade_overlay::CrossfadeGestureCb>,
     on_automation_down: Option<AutomationDownCallback>,
     on_automation_lane_action: Option<AutomationLaneActionCallback>,
     on_automation_hover: Option<AutomationHoverCallback>,
@@ -119,6 +123,14 @@ pub fn track_list(
 
     let scroll_y = state.viewport.scroll_y;
     let viewport_height = state.viewport.viewport_height;
+    let active_tool = state.active_tool;
+    let tail_marquee = on_range_start.clone();
+    let tail_anchor_track_id = row_layout
+        .rows
+        .iter()
+        .rev()
+        .find(|row| row.height > 0.0)
+        .map(|row| row.track_id.clone());
     let (visible_start, visible_end, top_spacer_h, bottom_spacer_h) =
         visible_track_row_range(row_layout, scroll_y, viewport_height, OVERSCAN);
 
@@ -140,6 +152,8 @@ pub fn track_list(
         );
     }
 
+    // Read once for every row this frame draws.
+    let group_tree = state.group_tree();
     for (offset, track) in state.tracks[visible_start..visible_end].iter().enumerate() {
         // `row_layout.rows` is 1:1 with `state.tracks`, so the row is an index
         // lookup rather than an id scan. The scan was O(track_count) per visible
@@ -159,7 +173,7 @@ pub fn track_list(
         let row_height = row_entry.height;
         let row_y = row_entry.y;
         let automation_height = row_entry.automation_height;
-        let total_row_height = row_height + automation_height;
+        let total_row_height = row_height + automation_height + row_entry.take_height;
 
         // Build the expandable automation sub-lane rows that stack directly
         // below the parent track. Each one owns its full row bounds so point
@@ -229,6 +243,7 @@ pub fn track_list(
                                 index,
                                 state,
                                 row_height,
+                                &FolderPlacement::of(state, &group_tree, index),
                                 header_callbacks.clone(),
                                 meters,
                             ))
@@ -257,6 +272,7 @@ pub fn track_list(
                                     erase_preview_ids,
                                     on_audio_clip_process_preview.clone(),
                                     on_audio_clip_process_commit.clone(),
+                                    on_crossfade.clone(),
                                 )
                                 .into_any_element(),
                             }),
@@ -267,7 +283,22 @@ pub fn track_list(
                         on_resize_reset.clone(),
                     )),
             )
-            .children(sub_lanes);
+            .children(sub_lanes)
+            .children((row_entry.take_height > 0.0).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .children(track.takes.iter().map(|take| {
+                        take_lane(
+                            track,
+                            take,
+                            state,
+                            header_callbacks.on_select_take.clone(),
+                            header_callbacks.on_delete_take.clone(),
+                        )
+                    }))
+            }));
         rows.push(row.into_any_element());
     }
 
@@ -327,13 +358,49 @@ pub fn track_list(
                         .bg(Colors::timeline_content_background()),
                 )
                 .children((tail_start_y < grid_height).then(|| {
-                    div()
+                    let tail = div()
                         .absolute()
                         .left_0()
                         .right_0()
                         .top(px(tail_start_y))
                         .bottom_0()
-                        .bg(Colors::timeline_empty_body_background())
+                        .bg(Colors::timeline_empty_body_background());
+                    // The space below the last track starts a marquee too,
+                    // anchored to the last track drawn. A click there without a
+                    // drag still does nothing.
+                    match (tail_anchor_track_id.clone(), tail_marquee.clone()) {
+                        (Some(anchor), Some(start_marquee)) => tail
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                move |event: &gpui::MouseDownEvent, window, cx| {
+                                    let LanePressIntent::Marquee { additive, .. } =
+                                        lane_press_intent(
+                                            active_tool,
+                                            None,
+                                            event.click_count,
+                                            &event.modifiers,
+                                        )
+                                    else {
+                                        return;
+                                    };
+                                    start_marquee(
+                                        &MarqueePress {
+                                            track_id: anchor.clone(),
+                                            window_x: event.position.x.into(),
+                                            window_y: event.position.y.into(),
+                                            additive,
+                                            on_lane: false,
+                                            create_clip_on_click: false,
+                                            bypass_snap: false,
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            )
+                            .into_any_element(),
+                        _ => tail.into_any_element(),
+                    }
                 }))
                 .child(arrangement_surface),
         )

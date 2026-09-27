@@ -522,9 +522,14 @@ impl Default for MouseEditingSettings {
     }
 }
 
+/// The snap a session starts on when its project has none of its own: a new
+/// project, or one saved before v54. A v54 project restores the snap it was
+/// saved with. See `project::view::seed_session_preferences`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SnapEditingSettings {
     pub snap_to_grid: bool,
+    /// A fraction as offered in Settings ("1/16"), mapped by
+    /// `project::view::snap_division_from_setting`.
     pub default_snap_value: String,
 }
 
@@ -943,6 +948,19 @@ pub enum SpacebarAction {
     PlayStop,
 }
 
+/// How the arrangement follows the playhead while playing (the transport's
+/// auto-scroll toggle).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoScrollPreference {
+    /// Page forward when the playhead nears the right edge.
+    #[default]
+    Page,
+    /// Keep the playhead pinned while the arrangement scrolls under it.
+    Continuous,
+    Off,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlaybackSettings {
     /// Align parallel track paths at the master bus (Phase W PDC).
@@ -957,6 +975,14 @@ pub struct PlaybackSettings {
     /// When true, the Stop button returns the playhead to where Play began.
     #[serde(default)]
     pub return_playhead_on_stop: bool,
+    /// Follow the playhead while playing: the choice last made with the
+    /// transport's Follow toggle. The pause a manual scroll causes is a
+    /// runtime state and is never written here.
+    #[serde(default = "default_true")]
+    pub follow_playhead: bool,
+    /// How following scrolls, as last chosen with the auto-scroll toggle.
+    #[serde(default)]
+    pub auto_scroll_mode: AutoScrollPreference,
 }
 
 impl Default for PlaybackSettings {
@@ -966,6 +992,8 @@ impl Default for PlaybackSettings {
             dropout_protection: DropoutProtectionMode::default(),
             spacebar_action: SpacebarAction::default(),
             return_playhead_on_stop: false,
+            follow_playhead: default_true(),
+            auto_scroll_mode: AutoScrollPreference::default(),
         }
     }
 }

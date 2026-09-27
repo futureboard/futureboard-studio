@@ -49,7 +49,10 @@ impl StudioLayout {
             true
         });
         if changed {
-            self.mark_dirty();
+            // Saved with the project but not part of the engine graph. The
+            // recorded command's musical-context callback carries the key to
+            // live ARA documents, exactly as it does on undo and redo.
+            self.mark_dirty_view_only();
             self.push_project_settings_snapshot_to_window(cx);
             cx.notify();
         }

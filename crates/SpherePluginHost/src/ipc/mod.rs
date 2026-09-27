@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 /// [`HostEvent`]. The client sends it in [`HostCommand::Hello`] and the host
 /// echoes its own in [`HostEvent::Ready`]; a mismatch should be surfaced, not
 /// silently tolerated.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// 7: [`HostEvent::PluginStateTouched`] (an older client cannot parse it).
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Commands sent **client → host** (written to the host's stdin).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,6 +543,17 @@ pub enum HostEvent {
         ok: bool,
         parameters: Vec<HostPluginParameter>,
     },
+    /// The plug-in's own state may have changed since the studio last heard:
+    /// its editor reported parameter edits (VST3 `performEdit` / `endEdit`,
+    /// VST2 `audioMasterAutomate`, CLAP parameter output), it reloaded its
+    /// values (a preset or program it loaded itself), or its editor closed
+    /// without a way to tell (Audio Units).
+    ///
+    /// Carries no state: the studio only marks the project as needing a save,
+    /// and the save captures the real state with [`HostCommand::GetPluginState`].
+    /// Counted only while the instance's editor is open, polled on the host UI
+    /// thread (never from `process()`), and throttled per instance.
+    PluginStateTouched { plugin_instance_id: String },
     /// Reply to [`HostCommand::LoadBuiltinNamCapture`]. On success the capture
     /// has been submitted and will be adopted at the next audio block; on
     /// failure `error` carries the human-readable reason (parse failure,
@@ -841,6 +854,21 @@ mod tests {
         let mut reader = Cursor::new(buf);
         let decoded: HostEvent = read_frame(&mut reader).unwrap().unwrap();
         assert_eq!(decoded, ev);
+    }
+
+    #[test]
+    fn state_touched_event_round_trips_by_exact_instance() {
+        let ev = HostEvent::PluginStateTouched {
+            plugin_instance_id: "track1:insert2".into(),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &ev).unwrap();
+        assert_eq!(
+            String::from_utf8(buf.clone()).unwrap().trim_end(),
+            r#"{"event":"PluginStateTouched","plugin_instance_id":"track1:insert2"}"#
+        );
+        let mut reader = Cursor::new(buf);
+        assert_eq!(read_frame::<HostEvent, _>(&mut reader).unwrap(), Some(ev));
     }
 
     #[test]

@@ -1,9 +1,14 @@
+use super::view::{
+    ProjectAutomationExpansion, ProjectLaneVisibility, ProjectLoopRange, ProjectSnap,
+    ProjectViewState,
+};
 use super::{
     AraTrackBinding, AutomationLane, AutomationPoint, AutomationTargetDesc, ClipSource,
     FutureboardProject, InputMonitorMode, MidiAccent, MidiArticulation, MidiControllerKind,
     MidiControllerLane, MidiControllerPoint, MidiNote, MidiPitchPoint, MidiSysExEvent,
-    MidiSysExKind, PluginFormat, PluginStateBlob, ProjectAraDocument, ProjectAsset,
-    ProjectAudioConnection, ProjectAudioPortBinding, ProjectClip, ProjectInsert,
+    MidiSysExKind, PluginFormat, PluginStateBlob, ProjectAraArchivedModification,
+    ProjectAraArchivedSource, ProjectAraDeferred, ProjectAraDocument, ProjectAraIdentity,
+    ProjectAsset, ProjectAudioConnection, ProjectAudioPortBinding, ProjectClip, ProjectInsert,
     ProjectLyricSyllable, ProjectLyricSyllableMode, ProjectMixer, ProjectPluginInstance,
     ProjectSend, ProjectSolfegeEngine, ProjectSolfegeLane, ProjectSongSectionType,
     ProjectSongTextEvent, ProjectSongTextEventKind, ProjectSoundfontPlayer, ProjectTake,
@@ -120,7 +125,29 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// stable scale tag). Pre-v52 projects load with no key.
 /// v53 appends one curve tension (f32) per tempo marker, in marker order.
 /// Pre-v53 ramps load straight.
-pub const PROJECT_VERSION: u32 = 53;
+/// v54 appends each insert's Active switch after its role tag (pre-v54 inserts
+/// load active), and a length-prefixed view section at the tail of the body:
+/// tagged records (u16 tag, u32 length, payload) for the loop, snap grid, lane
+/// visibility, automation expansion and the mixer tree latch. Unknown tags are
+/// skipped, so later view fields need no version bump, and a record or section
+/// that cannot be read loads its defaults instead of failing the project. A
+/// v53 file loads with the loop off, snap from Settings, the factory lanes
+/// (Chord and Song Text shown when they have content) and no track expanded.
+/// After the view section come self-identifying sections, each a u32 magic
+/// and a length-prefixed payload; a reader skips a magic it does not know.
+/// The one v54 defines is the ARA extension (`FARA`): per ARA document, the
+/// persistent IDs, shapes and fingerprints of the audio sources and
+/// modifications it holds, the saved ARA documents a plug-in could not match
+/// (kept verbatim), and, per track, the one saved document restored in part
+/// because some of its audio was offline, with the sources still to restore
+/// from it. A file that ends at the view section, or whose extension cannot
+/// be read, loads with none of them: its ARA documents restore as before, by
+/// ID alone.
+/// v55 changes no bytes: from v55 a folder's members play through it, so its
+/// fader, pan, mute and inserts act on them. In a pre-v55 file membership was
+/// only visual, and a member whose output is the main mix loads routed to its
+/// folder instead; a member routed anywhere else keeps its route.
+pub const PROJECT_VERSION: u32 = 55;
 
 /// Minimum on-disk format version that can be loaded without data loss.
 /// Versions below this will show a warning but can still be loaded.
@@ -247,6 +274,10 @@ impl FbWriter {
 
     fn write_u8(&mut self, v: u8) {
         self.buf.push(v);
+    }
+
+    fn write_u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
     fn write_u32(&mut self, v: u32) {
@@ -399,6 +430,12 @@ impl<'a> FbReader<'a> {
         Ok(b[0])
     }
 
+    fn read_u16(&mut self) -> Result<u16, ProjectError> {
+        let mut b = [0u8; 2];
+        self.read_exact_field(&mut b, "u16")?;
+        Ok(u16::from_le_bytes(b))
+    }
+
     fn read_u32(&mut self) -> Result<u32, ProjectError> {
         let mut b = [0u8; 4];
         self.read_exact_field(&mut b, "u32")?;
@@ -496,6 +533,25 @@ impl<'a> FbReader<'a> {
         self.read_exact_field(&mut buf, "byte blob")?;
         Ok(buf)
     }
+
+    /// A blob written by [`FbWriter::write_bytes`], borrowed rather than
+    /// copied. The length is checked against what is left before anything is
+    /// taken, so a damaged length cannot make it allocate.
+    fn read_slice(&mut self) -> Result<&'a [u8], ProjectError> {
+        let len = self.read_u32()? as usize;
+        let remaining = self.remaining();
+        if len > remaining {
+            return Err(ProjectError::UnexpectedEof {
+                needed: len,
+                remaining,
+                field: "byte blob",
+            });
+        }
+        let data: &'a [u8] = self.cur.get_ref();
+        let start = self.cur.position() as usize;
+        self.cur.set_position((start + len) as u64);
+        Ok(&data[start..start + len])
+    }
 }
 
 // ââ Encoding ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
@@ -559,6 +615,8 @@ fn encode_insert(w: &mut FbWriter, ins: &ProjectInsert) {
         Some(false) => 1,
         Some(true) => 2,
     });
+    // v54: the Active switch.
+    w.write_bool(ins.enabled);
     match &ins.plugin {
         None => w.write_u8(0),
         Some(inst) => {
@@ -1603,7 +1661,598 @@ fn encode_body(project: &FutureboardProject) -> Vec<u8> {
         w.write_f32(point.tension);
     }
 
+    // View section (v54+). Self-delimiting: see `encode_view_section`.
+    encode_view_section(&mut w, &project.view);
+
+    // Trailing sections (v54+), each named by its magic: see
+    // `decode_trailing_sections`. The ARA extension is written only when there
+    // is something to say.
+    encode_ara_extension(&mut w, project);
+
     w.into_bytes()
+}
+
+// ── Trailing sections (v54+) ─────────────────────────────────────────────────
+//
+// Everything after the view section is a sequence of sections that name
+// themselves: a u32 magic, then a length-prefixed payload. A reader takes the
+// sections it knows by their magic and skips every other one whole, so a later
+// build can add a section after these without any build misreading it, and a
+// file with none of them simply ends at the view section. Nothing in here may
+// fail a load.
+
+/// Magic of the ARA extension section, "FARA" in file order. Stable: a magic
+/// is never reused for something else.
+const SECTION_ARA: u32 = u32::from_le_bytes(*b"FARA");
+
+// ── ARA extension (v54+) ─────────────────────────────────────────────────────
+//
+// The payload of the `FARA` section, readable on its own: tagged records, each
+// a u16 tag and a length-prefixed payload. The positional v41 ARA block stays
+// as it is; this only adds to it. Unknown tags are skipped, and an unreadable
+// record is dropped, which leaves its documents to restore by ID alone,
+// exactly as a file without the extension.
+
+/// Record tags. Stable: a tag is never reused for something else.
+const ARA_TAG_IDENTITIES: u16 = 1;
+const ARA_TAG_ORPHANS: u16 = 2;
+const ARA_TAG_DEFERRED: u16 = 3;
+
+/// How a kept-back document's bytes are written: in full, or as the index of
+/// an orphan written in the same section with the same archive id and bytes
+/// (the same archive is often kept both ways, and is large).
+const ARA_DEFERRED_BYTES_INLINE: u8 = 0;
+const ARA_DEFERRED_BYTES_OF_ORPHAN: u8 = 1;
+
+/// Upper bound on the entries of one ARA identity list, far above any real
+/// document; a count past it is damage, not data.
+const MAX_ARA_IDENTITY_ENTRIES: usize = 1 << 16;
+
+fn encode_ara_identity(w: &mut FbWriter, identity: &ProjectAraIdentity) {
+    w.write_u32(identity.sources.len() as u32);
+    for source in &identity.sources {
+        w.write_str(&source.persistent_id);
+        w.write_str(&source.asset_id);
+        w.write_f64(source.sample_rate);
+        w.write_u64(source.frames as u64);
+        w.write_u32(source.channels as u32);
+        w.write_opt_str(&source.fingerprint);
+    }
+    w.write_u32(identity.modifications.len() as u32);
+    for modification in &identity.modifications {
+        w.write_str(&modification.persistent_id);
+        w.write_str(&modification.clip_id);
+        w.write_str(&modification.source_persistent_id);
+    }
+    w.write_opt_u64(&identity.key_descriptor);
+}
+
+fn encode_ara_extension(w: &mut FbWriter, project: &FutureboardProject) {
+    let identified: Vec<&ProjectAraDocument> = project
+        .ara_documents
+        .iter()
+        .filter(|document| document.written_with.is_some())
+        .collect();
+    if identified.is_empty() && project.ara_orphans.is_empty() && project.ara_deferred.is_empty() {
+        return;
+    }
+    let mut records = FbWriter::new();
+
+    // Joined back to the positional documents by (plug-in, track), which
+    // identifies one document per project.
+    if !identified.is_empty() {
+        let mut payload = FbWriter::new();
+        payload.write_u32(identified.len() as u32);
+        for document in identified {
+            payload.write_str(&document.plugin_id);
+            payload.write_str(&document.track_id);
+            if let Some(identity) = &document.written_with {
+                encode_ara_identity(&mut payload, identity);
+            }
+        }
+        write_view_record(&mut records, ARA_TAG_IDENTITIES, payload);
+    }
+
+    if !project.ara_orphans.is_empty() {
+        let mut payload = FbWriter::new();
+        payload.write_u32(project.ara_orphans.len() as u32);
+        for orphan in &project.ara_orphans {
+            payload.write_str(&orphan.plugin_id);
+            payload.write_str(&orphan.track_id);
+            payload.write_str(&orphan.archive_id);
+            payload.write_bytes(&orphan.data);
+            match &orphan.written_with {
+                None => payload.write_u8(0),
+                Some(identity) => {
+                    payload.write_u8(1);
+                    encode_ara_identity(&mut payload, identity);
+                }
+            }
+        }
+        write_view_record(&mut records, ARA_TAG_ORPHANS, payload);
+    }
+
+    // After the orphans, whose indices it may refer to.
+    if !project.ara_deferred.is_empty() {
+        let mut payload = FbWriter::new();
+        payload.write_u32(project.ara_deferred.len() as u32);
+        for held in &project.ara_deferred {
+            let document = &held.document;
+            payload.write_str(&document.plugin_id);
+            payload.write_str(&document.track_id);
+            payload.write_str(&document.archive_id);
+            match project.ara_orphans.iter().position(|orphan| {
+                orphan.archive_id == document.archive_id && orphan.data == document.data
+            }) {
+                Some(index) => {
+                    payload.write_u8(ARA_DEFERRED_BYTES_OF_ORPHAN);
+                    payload.write_u32(index as u32);
+                }
+                None => {
+                    payload.write_u8(ARA_DEFERRED_BYTES_INLINE);
+                    payload.write_bytes(&document.data);
+                }
+            }
+            match &document.written_with {
+                None => payload.write_u8(0),
+                Some(identity) => {
+                    payload.write_u8(1);
+                    encode_ara_identity(&mut payload, identity);
+                }
+            }
+            payload.write_u32(held.remaining_sources.len() as u32);
+            for source in &held.remaining_sources {
+                payload.write_str(source);
+            }
+        }
+        write_view_record(&mut records, ARA_TAG_DEFERRED, payload);
+    }
+
+    w.write_u32(SECTION_ARA);
+    w.write_bytes(&records.into_bytes());
+}
+
+/// A string whose length is checked against what is left before anything is
+/// allocated, so a damaged length cannot make the reader allocate.
+fn read_bounded_str(r: &mut FbReader) -> Result<String, ProjectError> {
+    let bytes = r.read_slice()?;
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| ProjectError::Corrupted("invalid UTF-8 string".into()))
+}
+
+fn read_ara_count(r: &mut FbReader, min_entry_bytes: usize) -> Result<usize, ProjectError> {
+    let count = r.read_u32()? as usize;
+    if count > MAX_ARA_IDENTITY_ENTRIES || count > r.remaining() / min_entry_bytes {
+        return Err(ProjectError::Corrupted(
+            "invalid ARA identity count".to_string(),
+        ));
+    }
+    Ok(count)
+}
+
+fn decode_ara_identity(r: &mut FbReader) -> Result<ProjectAraIdentity, ProjectError> {
+    // Two empty strings, rate, frames, channels, option tag.
+    let count = read_ara_count(r, 4 + 4 + 8 + 8 + 4 + 1)?;
+    let mut sources = Vec::with_capacity(count);
+    for _ in 0..count {
+        sources.push(ProjectAraArchivedSource {
+            persistent_id: read_bounded_str(r)?,
+            asset_id: read_bounded_str(r)?,
+            sample_rate: r.read_f64()?,
+            frames: r.read_u64()? as i64,
+            channels: r.read_u32()? as i32,
+            fingerprint: match r.read_u8()? {
+                0 => None,
+                1 => Some(read_bounded_str(r)?),
+                tag => return Err(ProjectError::Corrupted(format!("bad option tag {tag}"))),
+            },
+        });
+    }
+    // Three empty strings.
+    let count = read_ara_count(r, 4 * 3)?;
+    let mut modifications = Vec::with_capacity(count);
+    for _ in 0..count {
+        modifications.push(ProjectAraArchivedModification {
+            persistent_id: read_bounded_str(r)?,
+            clip_id: read_bounded_str(r)?,
+            source_persistent_id: read_bounded_str(r)?,
+        });
+    }
+    Ok(ProjectAraIdentity {
+        sources,
+        modifications,
+        key_descriptor: r.read_opt_u64()?,
+    })
+}
+
+type AraIdentityEntries = Vec<(String, String, ProjectAraIdentity)>;
+
+fn decode_ara_identities(r: &mut FbReader) -> Result<AraIdentityEntries, ProjectError> {
+    // Two empty strings and an identity with two empty lists and no key.
+    let count = read_ara_count(r, 4 + 4 + 4 + 4 + 1)?;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let plugin_id = read_bounded_str(r)?;
+        let track_id = read_bounded_str(r)?;
+        entries.push((plugin_id, track_id, decode_ara_identity(r)?));
+    }
+    Ok(entries)
+}
+
+fn decode_ara_orphans(r: &mut FbReader) -> Result<Vec<ProjectAraDocument>, ProjectError> {
+    let count = r.read_u32()? as usize;
+    if count > MAX_ARA_DOCUMENTS || count > r.remaining() / MIN_ARA_DOCUMENT_BYTES {
+        return Err(ProjectError::Corrupted(
+            "invalid ARA orphan count".to_string(),
+        ));
+    }
+    let mut orphans = Vec::with_capacity(count);
+    for _ in 0..count {
+        let plugin_id = read_bounded_str(r)?;
+        let track_id = read_bounded_str(r)?;
+        let archive_id = read_bounded_str(r)?;
+        let data = r.read_slice()?.to_vec();
+        let written_with = match r.read_u8()? {
+            0 => None,
+            1 => Some(decode_ara_identity(r)?),
+            tag => return Err(ProjectError::Corrupted(format!("bad option tag {tag}"))),
+        };
+        orphans.push(ProjectAraDocument {
+            plugin_id,
+            track_id,
+            archive_id,
+            data,
+            written_with,
+            stored_now: false,
+        });
+    }
+    Ok(orphans)
+}
+
+/// A kept-back document as read, before its bytes are found.
+#[derive(Debug)]
+struct DeferredEntry {
+    plugin_id: String,
+    track_id: String,
+    archive_id: String,
+    /// The bytes, or the index of the orphan that holds them.
+    data: Result<Vec<u8>, usize>,
+    written_with: Option<ProjectAraIdentity>,
+    remaining_sources: Vec<String>,
+}
+
+fn decode_ara_deferred(r: &mut FbReader) -> Result<Vec<DeferredEntry>, ProjectError> {
+    // Three empty strings, a kind and an index, an option tag, a count.
+    let count = r.read_u32()? as usize;
+    if count > MAX_ARA_DOCUMENTS || count > r.remaining() / (4 * 3 + 1 + 4 + 1 + 4) {
+        return Err(ProjectError::Corrupted(
+            "invalid ARA kept-back count".to_string(),
+        ));
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let plugin_id = read_bounded_str(r)?;
+        let track_id = read_bounded_str(r)?;
+        let archive_id = read_bounded_str(r)?;
+        let data = match r.read_u8()? {
+            ARA_DEFERRED_BYTES_INLINE => Ok(r.read_slice()?.to_vec()),
+            ARA_DEFERRED_BYTES_OF_ORPHAN => Err(r.read_u32()? as usize),
+            kind => {
+                return Err(ProjectError::Corrupted(format!(
+                    "bad ARA kept-back bytes kind {kind}"
+                )))
+            }
+        };
+        let written_with = match r.read_u8()? {
+            0 => None,
+            1 => Some(decode_ara_identity(r)?),
+            tag => return Err(ProjectError::Corrupted(format!("bad option tag {tag}"))),
+        };
+        let remaining = read_ara_count(r, 4)?;
+        let mut remaining_sources = Vec::with_capacity(remaining);
+        for _ in 0..remaining {
+            remaining_sources.push(read_bounded_str(r)?);
+        }
+        entries.push(DeferredEntry {
+            plugin_id,
+            track_id,
+            archive_id,
+            data,
+            written_with,
+            remaining_sources,
+        });
+    }
+    Ok(entries)
+}
+
+/// What the ARA extension held. Empty for a file without one.
+#[derive(Debug, Default)]
+struct AraExtension {
+    identities: AraIdentityEntries,
+    orphans: Vec<ProjectAraDocument>,
+    deferred: Vec<ProjectAraDeferred>,
+}
+
+/// Read the sections after the view section. Never fails: a section whose
+/// magic is unknown (a newer build's) is skipped whole, and damaged framing
+/// ends the read, keeping what was read before it.
+fn decode_trailing_sections(r: &mut FbReader) -> AraExtension {
+    let mut ara: Option<AraExtension> = None;
+    while r.remaining() > 0 {
+        let Ok(magic) = r.read_u32() else {
+            project_load_log(format_args!("trailing section header truncated; ignored"));
+            break;
+        };
+        let Ok(payload) = r.read_slice() else {
+            project_load_log(format_args!(
+                "trailing section {magic:#010x} truncated; ignored"
+            ));
+            break;
+        };
+        match magic {
+            // One ARA extension per file; a second is damage, not data.
+            SECTION_ARA if ara.is_none() => ara = Some(decode_ara_extension(payload)),
+            _ => {}
+        }
+    }
+    ara.unwrap_or_default()
+}
+
+/// Read an ARA extension section's payload. Never fails: an unreadable record
+/// is dropped (its documents then restore by ID alone, as from a file written
+/// without it), an unknown tag is skipped, and damaged framing keeps what was
+/// read before it.
+fn decode_ara_extension(section: &[u8]) -> AraExtension {
+    let mut extension = AraExtension::default();
+    let mut deferred: Vec<DeferredEntry> = Vec::new();
+    let mut records = FbReader::new(section);
+    while records.remaining() > 0 {
+        let Ok(tag) = records.read_u16() else {
+            break;
+        };
+        let Ok(payload) = records.read_slice() else {
+            project_load_log(format_args!(
+                "ARA extension record {tag} truncated; ignored"
+            ));
+            break;
+        };
+        let mut p = FbReader::new(payload);
+        let read = match tag {
+            ARA_TAG_IDENTITIES => {
+                decode_ara_identities(&mut p).map(|entries| extension.identities = entries)
+            }
+            ARA_TAG_ORPHANS => {
+                decode_ara_orphans(&mut p).map(|orphans| extension.orphans = orphans)
+            }
+            ARA_TAG_DEFERRED => decode_ara_deferred(&mut p).map(|entries| deferred = entries),
+            _ => Ok(()),
+        };
+        if let Err(error) = read {
+            project_load_log(format_args!(
+                "ARA extension record {tag} unreadable ({}); ignored",
+                error.technical_detail()
+            ));
+        }
+    }
+    // Kept-back documents whose bytes are an orphan's take them now, whatever
+    // order the records came in; one whose orphan is not there is dropped.
+    for entry in deferred {
+        let data = match entry.data {
+            Ok(data) => data,
+            Err(index) => match extension
+                .orphans
+                .get(index)
+                .filter(|orphan| orphan.archive_id == entry.archive_id)
+            {
+                Some(orphan) => orphan.data.clone(),
+                None => {
+                    project_load_log(format_args!(
+                        "ARA kept-back document for {} names a missing orphan; ignored",
+                        entry.track_id
+                    ));
+                    continue;
+                }
+            },
+        };
+        extension.deferred.push(ProjectAraDeferred {
+            document: ProjectAraDocument {
+                plugin_id: entry.plugin_id,
+                track_id: entry.track_id,
+                archive_id: entry.archive_id,
+                data,
+                written_with: entry.written_with,
+                stored_now: false,
+            },
+            remaining_sources: entry.remaining_sources,
+        });
+    }
+    extension
+}
+
+/// Hand each positional ARA document the identity recorded for it, matched
+/// by (plug-in, track). A document with no record keeps `None`.
+fn join_ara_identities(documents: &mut [ProjectAraDocument], identities: AraIdentityEntries) {
+    for (plugin_id, track_id, identity) in identities {
+        if let Some(document) = documents.iter_mut().find(|document| {
+            document.written_with.is_none()
+                && document.plugin_id == plugin_id
+                && document.track_id == track_id
+        }) {
+            document.written_with = Some(identity);
+        }
+    }
+}
+
+// ── View section (v54+) ──────────────────────────────────────────────────────
+//
+// One length-prefixed blob holding tagged records, each a u16 tag followed by a
+// length-prefixed payload. A reader skips tags it does not know, and ignores
+// payload bytes past the fields it reads, so later view state (and longer
+// versions of these records) needs no format bump. None of it is needed to play
+// the project, so nothing in here may fail a load.
+
+/// Record tags. Stable: a tag is never reused for something else.
+const VIEW_TAG_LOOP: u16 = 1;
+const VIEW_TAG_SNAP: u16 = 2;
+const VIEW_TAG_LANES: u16 = 3;
+const VIEW_TAG_AUTOMATION: u16 = 4;
+const VIEW_TAG_MIXER_TREE: u16 = 5;
+
+fn write_view_record(records: &mut FbWriter, tag: u16, payload: FbWriter) {
+    records.write_u16(tag);
+    records.write_bytes(&payload.into_bytes());
+}
+
+fn encode_view_section(w: &mut FbWriter, view: &ProjectViewState) {
+    let mut records = FbWriter::new();
+
+    let mut payload = FbWriter::new();
+    payload.write_bool(view.loop_range.enabled);
+    payload.write_f64(view.loop_range.start_beat);
+    payload.write_f64(view.loop_range.end_beat);
+    write_view_record(&mut records, VIEW_TAG_LOOP, payload);
+
+    // Grid division and shape as the grid menu's stable command ids.
+    if let Some(snap) = view.snap {
+        let mut payload = FbWriter::new();
+        payload.write_bool(snap.enabled);
+        payload.write_str(snap.division.command_id());
+        payload.write_str(snap.shape.command_id());
+        write_view_record(&mut records, VIEW_TAG_SNAP, payload);
+    }
+
+    if let Some(lanes) = view.lanes {
+        let mut payload = FbWriter::new();
+        payload.write_u8(lanes.to_bits());
+        write_view_record(&mut records, VIEW_TAG_LANES, payload);
+    }
+
+    // Keyed by track id, and the focused lane flattened like a saved
+    // automation lane's target.
+    let mut payload = FbWriter::new();
+    payload.write_u32(view.automation_expanded.len() as u32);
+    for entry in &view.automation_expanded {
+        payload.write_str(&entry.track_id);
+        match &entry.selected_target {
+            None => payload.write_u8(0),
+            Some(target) => {
+                payload.write_u8(1);
+                payload.write_u8(target.tag);
+                payload.write_str(&target.insert_id);
+                payload.write_str(&target.parameter_id);
+                payload.write_str(&target.parameter_name);
+                payload.write_str(&target.send_id);
+            }
+        }
+    }
+    write_view_record(&mut records, VIEW_TAG_AUTOMATION, payload);
+
+    let mut payload = FbWriter::new();
+    payload.write_bool(view.mixer_tree_initialized);
+    write_view_record(&mut records, VIEW_TAG_MIXER_TREE, payload);
+
+    w.write_bytes(&records.into_bytes());
+}
+
+/// Read the view section. Never fails: a record that cannot be read keeps its
+/// default, an unknown tag (a newer build's field) is skipped, and a section
+/// whose framing is damaged keeps whatever records were read before the damage.
+fn decode_view_section(r: &mut FbReader) -> ProjectViewState {
+    let mut view = ProjectViewState::default();
+    let Ok(section) = r.read_slice() else {
+        project_load_log(format_args!(
+            "view section unreadable; loading default view"
+        ));
+        return view;
+    };
+    let mut records = FbReader::new(section);
+    while records.remaining() > 0 {
+        let Ok(tag) = records.read_u16() else {
+            break;
+        };
+        let Ok(payload) = records.read_slice() else {
+            project_load_log(format_args!("view record {tag} truncated; ignored"));
+            break;
+        };
+        let mut p = FbReader::new(payload);
+        let read = match tag {
+            VIEW_TAG_LOOP => decode_view_loop(&mut p).map(|v| view.loop_range = v),
+            VIEW_TAG_SNAP => decode_view_snap(&mut p).map(|v| view.snap = Some(v)),
+            VIEW_TAG_LANES => p
+                .read_u8()
+                .map(|bits| view.lanes = Some(ProjectLaneVisibility::from_bits(bits))),
+            VIEW_TAG_AUTOMATION => {
+                decode_view_automation(&mut p).map(|v| view.automation_expanded = v)
+            }
+            VIEW_TAG_MIXER_TREE => p.read_bool().map(|v| view.mixer_tree_initialized = v),
+            _ => Ok(()),
+        };
+        if let Err(error) = read {
+            project_load_log(format_args!(
+                "view record {tag} unreadable ({}); default kept",
+                error.technical_detail()
+            ));
+        }
+    }
+    view
+}
+
+fn decode_view_loop(r: &mut FbReader) -> Result<ProjectLoopRange, ProjectError> {
+    Ok(ProjectLoopRange {
+        enabled: r.read_bool()?,
+        start_beat: r.read_f64()?,
+        end_beat: r.read_f64()?,
+    })
+}
+
+/// An id this build does not know (a newer grid) falls back to the factory
+/// 1/16, straight, keeping the saved snap switch.
+fn decode_view_snap(r: &mut FbReader) -> Result<ProjectSnap, ProjectError> {
+    use crate::components::timeline::timeline_state::{SnapDivision, SnapShape};
+    let enabled = r.read_bool()?;
+    let division = SnapDivision::from_command_id(&r.read_str()?).unwrap_or(SnapDivision::Div1_16);
+    let shape = SnapShape::from_command_id(&r.read_str()?).unwrap_or_default();
+    Ok(ProjectSnap {
+        enabled,
+        division,
+        shape,
+    })
+}
+
+fn decode_view_automation(
+    r: &mut FbReader,
+) -> Result<Vec<ProjectAutomationExpansion>, ProjectError> {
+    let count = r.read_u32()? as usize;
+    // Track id length + presence byte.
+    if count > r.remaining() / 5 {
+        return Err(ProjectError::Corrupted(
+            "invalid automation expansion count".to_string(),
+        ));
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let track_id = r.read_str()?;
+        let selected_target = match r.read_u8()? {
+            0 => None,
+            1 => Some(AutomationTargetDesc {
+                tag: r.read_u8()?,
+                insert_id: r.read_str()?,
+                parameter_id: r.read_str()?,
+                parameter_name: r.read_str()?,
+                send_id: r.read_str()?,
+            }),
+            tag => {
+                return Err(ProjectError::Corrupted(format!(
+                    "bad automation target option tag {tag}"
+                )));
+            }
+        };
+        entries.push(ProjectAutomationExpansion {
+            track_id,
+            selected_target,
+        });
+    }
+    Ok(entries)
 }
 
 /// Root byte of a project without a key.
@@ -1819,6 +2468,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
     } else {
         None
     };
+    let enabled = if version >= 54 { r.read_bool()? } else { true };
     let plugin = match r.read_u8()? {
         0 => None,
         1 => Some(decode_plugin_instance(r)?),
@@ -1832,6 +2482,7 @@ fn decode_insert(r: &mut FbReader, version: u32) -> Result<ProjectInsert, Projec
         id,
         slot_index,
         bypassed,
+        enabled,
         enabled_audio_output_channels,
         plugin_is_instrument,
         multiout_collapsed,
@@ -2504,6 +3155,21 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
         .sanitized();
     }
 
+    // v55: folder members play through their folder (see `PROJECT_VERSION`).
+    if version < 55
+        && !matches!(
+            track_type,
+            ProjectTrackType::Midi | ProjectTrackType::Master
+        )
+        && routing.output == ProjectTrackOutputRouting::Main
+    {
+        if let Some(group_id) = &parent_group_id {
+            routing.output = ProjectTrackOutputRouting::Bus {
+                bus_id: group_id.clone(),
+            };
+        }
+    }
+
     Ok(ProjectTrack {
         id,
         name,
@@ -2819,6 +3485,9 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
                 track_id: r.read_str()?,
                 archive_id: r.read_str()?,
                 data: r.read_bytes()?,
+                // Read from the ARA extension at the tail, when there is one.
+                written_with: None,
+                stored_now: false,
             });
         }
         documents
@@ -2924,10 +3593,33 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
         }
     }
 
+    // View section (v54+). A v53 file has none and opens on the defaults
+    // described at `PROJECT_VERSION`.
+    let view = if version >= 54 {
+        decode_view_section(&mut r)
+    } else {
+        ProjectViewState::default()
+    };
+
+    // Trailing sections (v54+), after the view section. A file that ends at
+    // the view section has no ARA extension: its documents restore by ID
+    // alone.
+    let mut ara_documents = ara_documents;
+    let (ara_orphans, ara_deferred) = if version >= 54 {
+        let extension = decode_trailing_sections(&mut r);
+        join_ara_identities(&mut ara_documents, extension.identities);
+        (extension.orphans, extension.deferred)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     Ok(FutureboardProject {
+        view,
         audio_connections,
         global_lanes,
         ara_documents,
+        ara_orphans,
+        ara_deferred,
         master_output_connection_id,
         monitor_output_connection_id,
         output_routing_initialized,
@@ -2988,6 +3680,56 @@ pub fn peek_project_header(data: &[u8]) -> Result<u32, ProjectError> {
         return Err(ProjectError::UnsupportedVersion(version));
     }
     Ok(version)
+}
+
+/// Who a project file belongs to and when it was written: the fields at the
+/// start of the body, read by [`decode_project_identity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectIdentity {
+    pub version: u32,
+    pub id: String,
+    pub name: String,
+    pub created_at: u64,
+    pub modified_at: u64,
+}
+
+/// Validate a whole project file (magic, a version this build can open, the
+/// declared length and the body checksum) and read only its identity fields,
+/// without decoding tracks or plug-in state. Used to decide whether an
+/// autosave is intact, belongs to a project and is newer than it before
+/// offering it.
+pub fn decode_project_identity(data: &[u8]) -> Result<ProjectIdentity, ProjectError> {
+    let version = peek_project_header(data)?;
+    if version < MIN_SUPPORTED_VERSION {
+        return Err(ProjectError::UnsupportedVersion(version));
+    }
+    let body_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+    let body_end = PROJECT_HEADER_SIZE
+        .checked_add(body_len)
+        .filter(|end| end.checked_add(4).is_some_and(|total| total <= data.len()))
+        .ok_or_else(|| ProjectError::IncompleteFile {
+            reason: format!(
+                "file truncated: declared payload {body_len} bytes, file has {} bytes",
+                data.len()
+            ),
+        })?;
+    let body = &data[PROJECT_HEADER_SIZE..body_end];
+    let stored_crc = u32::from_le_bytes(data[body_end..body_end + 4].try_into().unwrap());
+    let computed_crc = crc32fast::hash(body);
+    if computed_crc != stored_crc {
+        return Err(ProjectError::ChecksumMismatch {
+            expected: stored_crc,
+            got: computed_crc,
+        });
+    }
+    let mut r = FbReader::new(body);
+    Ok(ProjectIdentity {
+        version,
+        id: r.read_str()?,
+        name: r.read_str()?,
+        created_at: r.read_u64()?,
+        modified_at: r.read_u64()?,
+    })
 }
 
 /// Decodes a `.fbproj` binary blob into a `FutureboardProject`.
@@ -3328,24 +4070,33 @@ mod tests {
         bytes
     }
 
+    /// Encoded size of the v54 view section for `view`, which ends every body.
+    fn view_section_len(view: &ProjectViewState) -> usize {
+        let mut w = FbWriter::new();
+        encode_view_section(&mut w, view);
+        w.into_bytes().len()
+    }
+
     fn encode_legacy_song_text_project(version: u32, cues: &[LegacyProjectSongTextCue]) -> Vec<u8> {
-        let mut body = encode_body(&FutureboardProject::new("Legacy Song Text"));
+        let project = FutureboardProject::new("Legacy Song Text");
+        let mut body = encode_body(&project);
         // `encode_body` ends with the Song Text count, the v34 Audio
         // Connections count, the v35 output-routing block (two absent optional
         // strings plus the bootstrap latch), the v40 conductor-lane fold block
         // (four collapse latches plus five absent optional heights), the v41
         // ARA document count, the v43 timebase pair, the v50 marker SysEx
         // count, the v51 Chord Track block (event count, collapse latch,
-        // custom height), the v52 project key (root, scale) and the v53 tempo
-        // tension count (no markers, so no values). A v24-v26
-        // fixture reads none of them, so drop the whole tail before appending
-        // the legacy cue block in its place.
+        // custom height), the v52 project key (root, scale), the v53 tempo
+        // tension count (no markers, so no values) and the v54 view section.
+        // A v24-v26 fixture reads none of them, so drop the whole tail before
+        // appending the legacy cue block in its place.
         let v35_output_routing_bytes = 1 + 1 + 1;
         let v40_global_lane_bytes = 4 + 5;
         let v43_timebase_bytes = 1 + 1;
         let v51_chord_track_bytes = 4 + 1 + 4;
         let v52_project_key_bytes = 1 + 1;
         let v53_tempo_tension_bytes = 4;
+        let v54_view_bytes = view_section_len(&project.view);
         body.truncate(
             body.len()
                 - 4 * std::mem::size_of::<u32>()
@@ -3354,7 +4105,8 @@ mod tests {
                 - v43_timebase_bytes
                 - v51_chord_track_bytes
                 - v52_project_key_bytes
-                - v53_tempo_tension_bytes,
+                - v53_tempo_tension_bytes
+                - v54_view_bytes,
         );
 
         let mut tail = FbWriter::new();
@@ -3598,6 +4350,7 @@ mod tests {
             id: "insert-1".to_string(),
             slot_index: 0,
             bypassed: false,
+            enabled: true,
             enabled_audio_output_channels: vec![1, 2, 3, 4],
             plugin_is_instrument: Some(false),
             multiout_collapsed: true,
@@ -3883,9 +4636,13 @@ mod tests {
 
     #[test]
     fn truncated_body_reports_unexpected_eof() {
-        let bytes = encode_project(&FutureboardProject::new("Body"));
+        let project = FutureboardProject::new("Body");
+        let bytes = encode_project(&project);
         let body = &bytes[PROJECT_HEADER_SIZE..bytes.len() - 4];
-        let truncated_body = &body[..body.len().saturating_sub(3).max(1)];
+        // Cut into the fields before the v54 view section: a damaged view
+        // section loads the default view by design and is not an error.
+        let cut = view_section_len(&project.view) + 3;
+        let truncated_body = &body[..body.len().saturating_sub(cut).max(1)];
         let err = decode_body(truncated_body, PROJECT_VERSION).unwrap_err();
         assert!(
             matches!(err, ProjectError::UnexpectedEof { .. })
@@ -4073,6 +4830,8 @@ mod tests {
             // Opaque bytes, including a NUL and a high byte, to prove the blob
             // survives as raw data rather than as text.
             data: vec![0x00, 0xFF, 0x10, b'M', b'D'],
+            written_with: None,
+            stored_now: false,
         });
         let bytes = encode_project(&project);
         let decoded = decode_project(&bytes).unwrap();
@@ -4482,11 +5241,12 @@ mod tests {
     /// A hostile count must not make the decoder reserve an arbitrary vector.
     #[test]
     fn an_absurd_connection_count_is_rejected_before_allocating() {
-        let mut body = encode_body(&FutureboardProject::new("hostile"));
+        let project = FutureboardProject::new("hostile");
+        let mut body = encode_body(&project);
         // Overwrite the v51 Chord Track event count — which sits before its
-        // collapse latch (1), height (4), the v52 project key (2) and the v53
-        // tempo tension count (4) — with a huge value.
-        let len = body.len();
+        // collapse latch (1), height (4), the v52 project key (2), the v53
+        // tempo tension count (4) and the v54 view section — with a huge value.
+        let len = body.len() - view_section_len(&project.view);
         body[len - 15..len - 11].copy_from_slice(&u32::MAX.to_le_bytes());
         let bytes = project_bytes_with_version(body, PROJECT_VERSION);
         assert!(matches!(
@@ -4544,9 +5304,11 @@ mod tests {
 
     #[test]
     fn an_unknown_scale_tag_loads_as_no_key() {
-        let mut body = encode_body(&FutureboardProject::new("future"));
-        // The key sits before the v53 tempo tension count (4).
-        let len = body.len() - 4;
+        let project = FutureboardProject::new("future");
+        let mut body = encode_body(&project);
+        // The key sits before the v53 tempo tension count (4) and the v54 view
+        // section.
+        let len = body.len() - 4 - view_section_len(&project.view);
         body[len - 2] = 4;
         body[len - 1] = 250;
         let bytes = project_bytes_with_version(body, PROJECT_VERSION);
@@ -4645,5 +5407,598 @@ mod tests {
         // enough to prove the section is version-gated.
         let decoded = decode_project(&bytes).expect("v33 loads");
         assert!(decoded.audio_connections.is_empty());
+    }
+
+    /// v54 saves the insert's Active switch; a switched-off plug-in used to
+    /// come back on after reopening.
+    #[test]
+    fn insert_active_switch_roundtrips_v54() {
+        let mut project = FutureboardProject::new("Active");
+        project.mixer.master_inserts.push(ProjectInsert {
+            id: "off".to_string(),
+            enabled: false,
+            ..ProjectInsert::default()
+        });
+        project.mixer.master_inserts.push(ProjectInsert {
+            id: "on".to_string(),
+            slot_index: 1,
+            ..ProjectInsert::default()
+        });
+        let decoded = decode_project(&encode_project(&project)).expect("decode");
+        assert!(!decoded.mixer.master_inserts[0].enabled);
+        assert!(decoded.mixer.master_inserts[1].enabled);
+    }
+
+    /// A v53 insert has no Active byte and loads active, which is what every
+    /// insert came back as before the field existed.
+    #[test]
+    fn a_v53_insert_loads_active_and_stays_aligned() {
+        let mut w = FbWriter::new();
+        w.write_str("insert-1");
+        w.write_u32(0);
+        w.write_bool(true);
+        w.write_u32(0);
+        w.write_bool(false);
+        w.write_u8(1);
+        w.write_u8(0);
+        w.write_u32(7);
+        let bytes = w.into_bytes();
+        let mut r = FbReader::new(&bytes);
+        let insert = decode_insert(&mut r, 53).expect("v53 insert");
+        assert!(insert.enabled);
+        assert!(insert.bypassed);
+        assert_eq!(insert.plugin_is_instrument, Some(false));
+        assert_eq!(r.read_u32().unwrap(), 7, "reader lands after the insert");
+    }
+
+    fn sample_view() -> ProjectViewState {
+        use crate::components::timeline::timeline_state::{SnapDivision, SnapShape};
+        ProjectViewState {
+            loop_range: ProjectLoopRange {
+                enabled: true,
+                start_beat: 4.0,
+                end_beat: 20.5,
+            },
+            snap: Some(ProjectSnap {
+                enabled: false,
+                division: SnapDivision::Bar1,
+                shape: SnapShape::Dotted,
+            }),
+            lanes: Some(ProjectLaneVisibility {
+                tempo: false,
+                time_signature: true,
+                marker: false,
+                region: true,
+                song_text: true,
+                chord: false,
+            }),
+            automation_expanded: vec![
+                ProjectAutomationExpansion {
+                    track_id: "track-1".to_string(),
+                    selected_target: None,
+                },
+                ProjectAutomationExpansion {
+                    track_id: "track-2".to_string(),
+                    selected_target: Some(AutomationTargetDesc {
+                        tag: 3,
+                        insert_id: "insert-track-2-1".to_string(),
+                        parameter_id: "17".to_string(),
+                        parameter_name: "Cutoff".to_string(),
+                        send_id: String::new(),
+                    }),
+                },
+            ],
+            mixer_tree_initialized: true,
+        }
+    }
+
+    #[test]
+    fn view_section_roundtrips_v54() {
+        let mut project = FutureboardProject::new("View");
+        project.view = sample_view();
+        let decoded = decode_project(&encode_project(&project)).expect("decode");
+        assert_eq!(decoded.view, project.view);
+    }
+
+    /// Records a newer build adds are skipped, and so are payload bytes past
+    /// the fields this build reads.
+    #[test]
+    fn unknown_view_records_and_longer_payloads_are_skipped() {
+        let mut records = FbWriter::new();
+        let mut future = FbWriter::new();
+        future.write_str("piano roll zoom");
+        future.write_f64(3.5);
+        write_view_record(&mut records, 900, future);
+        let mut mixer = FbWriter::new();
+        mixer.write_bool(true);
+        mixer.write_u32(0xDEAD_BEEF);
+        write_view_record(&mut records, VIEW_TAG_MIXER_TREE, mixer);
+        let mut section = FbWriter::new();
+        section.write_bytes(&records.into_bytes());
+        let bytes = section.into_bytes();
+
+        let view = decode_view_section(&mut FbReader::new(&bytes));
+        assert!(view.mixer_tree_initialized);
+        assert_eq!(view.loop_range, ProjectLoopRange::default());
+    }
+
+    /// A record that cannot be read keeps its default; the records around it
+    /// still load, and so does the project.
+    #[test]
+    fn a_malformed_view_record_keeps_its_default() {
+        let mut records = FbWriter::new();
+        let mut snap = FbWriter::new();
+        snap.write_bool(true);
+        snap.write_u32(400); // A string length past the end of the payload.
+        write_view_record(&mut records, VIEW_TAG_SNAP, snap);
+        let mut automation = FbWriter::new();
+        automation.write_u32(u32::MAX); // An impossible count.
+        write_view_record(&mut records, VIEW_TAG_AUTOMATION, automation);
+        let mut lanes = FbWriter::new();
+        lanes.write_u8(0);
+        write_view_record(&mut records, VIEW_TAG_LANES, lanes);
+
+        let mut body = encode_body(&FutureboardProject::new("malformed"));
+        let len = body.len() - view_section_len(&ProjectViewState::default());
+        body.truncate(len);
+        let mut section = FbWriter::new();
+        section.write_bytes(&records.into_bytes());
+        body.extend_from_slice(&section.into_bytes());
+        let bytes = project_bytes_with_version(body, PROJECT_VERSION);
+
+        let decoded = decode_project(&bytes).expect("a bad view record never fails a load");
+        assert_eq!(decoded.view.snap, None);
+        assert!(decoded.view.automation_expanded.is_empty());
+        assert_eq!(
+            decoded.view.lanes,
+            Some(ProjectLaneVisibility::from_bits(0)),
+            "the record after the bad ones is still read"
+        );
+    }
+
+    /// A section whose own length is damaged loads the default view.
+    #[test]
+    fn a_damaged_view_section_loads_the_default_view() {
+        let mut project = FutureboardProject::new("damaged");
+        project.view = sample_view();
+        let mut body = encode_body(&project);
+        let len = body.len() - view_section_len(&project.view);
+        body[len..len + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let bytes = project_bytes_with_version(body, PROJECT_VERSION);
+        let decoded = decode_project(&bytes).expect("still loads");
+        assert_eq!(decoded.view, ProjectViewState::default());
+
+        // A section cut short mid-record keeps the records before the cut.
+        let mut records = FbWriter::new();
+        let mut mixer = FbWriter::new();
+        mixer.write_bool(true);
+        write_view_record(&mut records, VIEW_TAG_MIXER_TREE, mixer);
+        records.write_u16(VIEW_TAG_LOOP);
+        records.write_u32(17); // Longer than what is left.
+        let mut section = FbWriter::new();
+        section.write_bytes(&records.into_bytes());
+        let bytes = section.into_bytes();
+        let view = decode_view_section(&mut FbReader::new(&bytes));
+        assert!(view.mixer_tree_initialized);
+        assert_eq!(view.loop_range, ProjectLoopRange::default());
+    }
+
+    /// A v53 file ends before the view section and opens on the default view.
+    #[test]
+    fn a_v53_project_loads_the_default_view() {
+        let mut project = FutureboardProject::new("v53");
+        project.view = sample_view();
+        let mut body = encode_body(&project);
+        body.truncate(body.len() - view_section_len(&project.view));
+        let bytes = project_bytes_with_version(body, 53);
+        assert!(matches!(
+            decode_project(&bytes),
+            Err(ProjectError::OldVersion(53))
+        ));
+        let decoded = decode_project_with_options(&bytes, true).expect("v53 loads");
+        assert_eq!(decoded.view, ProjectViewState::default());
+    }
+
+    // ── ARA extension (v54+) ────────────────────────────────────────────────
+
+    /// The evidence project's shape: an absolute drop path archived for a clip
+    /// that now reads its project copy, and a Thai-named recording published
+    /// under an encoded ID.
+    fn sample_ara_identity() -> ProjectAraIdentity {
+        ProjectAraIdentity {
+            sources: vec![
+                ProjectAraArchivedSource {
+                    persistent_id: "/Users/doppio/Documents/CodeProject/1.wav".to_string(),
+                    asset_id: "/Users/doppio/Documents/CodeProject/1.wav".to_string(),
+                    sample_rate: 44_100.0,
+                    frames: 1_205_470,
+                    channels: 2,
+                    fingerprint: Some("498ba4-9e3e795e".to_string()),
+                },
+                ProjectAraArchivedSource {
+                    persistent_id: "fbx:%E0%B9%82.rauf".to_string(),
+                    asset_id: "\u{0e42}.rauf".to_string(),
+                    sample_rate: 48_000.0,
+                    frames: 96_000,
+                    channels: 1,
+                    fingerprint: None,
+                },
+            ],
+            modifications: vec![ProjectAraArchivedModification {
+                persistent_id: "clip-1".to_string(),
+                clip_id: "clip-1".to_string(),
+                source_persistent_id: "/Users/doppio/Documents/CodeProject/1.wav".to_string(),
+            }],
+            key_descriptor: Some(0x529a_2cdc_8ff5_33ac),
+        }
+    }
+
+    fn ara_document(track_id: &str, identity: Option<ProjectAraIdentity>) -> ProjectAraDocument {
+        ProjectAraDocument {
+            plugin_id: "vst3:fd5c205bb907b3ca".to_string(),
+            track_id: track_id.to_string(),
+            archive_id: "com.celemony.ara.chunk.13".to_string(),
+            data: vec![b'G', b'N', b'B', b'K', 0x00, 0xFF],
+            written_with: identity,
+            stored_now: false,
+        }
+    }
+
+    #[test]
+    fn ara_identity_and_orphans_roundtrip_in_the_v54_tail() {
+        let mut project = FutureboardProject::new("ara identity");
+        project.ara_documents = vec![
+            ara_document("track-1", Some(sample_ara_identity())),
+            // A legacy document keeps no record, and must not take another's.
+            ara_document("track-2", None),
+        ];
+        project.ara_orphans = vec![
+            ara_document("track-1", None),
+            ara_document("track-3", Some(ProjectAraIdentity::default())),
+        ];
+        let decoded = decode_project(&encode_project(&project)).expect("v54 loads");
+
+        assert_eq!(decoded.ara_documents.len(), 2);
+        assert_eq!(
+            decoded.ara_documents[0].written_with,
+            Some(sample_ara_identity())
+        );
+        assert_eq!(decoded.ara_documents[1].written_with, None);
+        assert_eq!(decoded.ara_orphans.len(), 2);
+        assert_eq!(decoded.ara_orphans[0].track_id, "track-1");
+        assert_eq!(decoded.ara_orphans[0].data, project.ara_orphans[0].data);
+        assert_eq!(decoded.ara_orphans[0].written_with, None);
+        assert_eq!(
+            decoded.ara_orphans[1].written_with,
+            Some(ProjectAraIdentity::default())
+        );
+        assert_eq!(
+            decoded.ara_orphans[1].archive_id,
+            "com.celemony.ara.chunk.13"
+        );
+    }
+
+    fn deferred_record(track_id: &str, data: &[u8], remaining: &[&str]) -> ProjectAraDeferred {
+        let mut document = ara_document(track_id, Some(sample_ara_identity()));
+        document.data = data.to_vec();
+        ProjectAraDeferred {
+            document,
+            remaining_sources: remaining.iter().map(|id| (*id).to_owned()).collect(),
+        }
+    }
+
+    /// The archive a track's document was restored in part from round-trips
+    /// with its record and the sources still to restore, alone or beside
+    /// every other ARA record. Its bytes are written once: when an orphan in
+    /// the same file holds the same archive, it names that orphan instead.
+    #[test]
+    fn a_kept_back_archive_roundtrips_and_is_written_once() {
+        let big = vec![0x5Au8; 4096];
+        let mut project = FutureboardProject::new("kept back");
+        project.ara_deferred = vec![deferred_record("track-1", &big, &["b.wav", "fbx:%E0"])];
+        let alone = decode_project(&encode_project(&project)).expect("v54 loads");
+        assert_eq!(alone.ara_deferred.len(), 1);
+        let held = &alone.ara_deferred[0];
+        assert_eq!(held.document.track_id, "track-1");
+        assert_eq!(held.document.data, big);
+        assert_eq!(held.document.written_with, Some(sample_ara_identity()));
+        assert!(!held.document.stored_now);
+        assert_eq!(
+            held.remaining_sources,
+            vec!["b.wav".to_owned(), "fbx:%E0".to_owned()]
+        );
+        let inline_len = encode_body(&project).len();
+
+        // The same archive also kept as an orphan: the bytes go in once.
+        let mut orphan = ara_document("track-1", None);
+        orphan.data = big.clone();
+        project.ara_orphans = vec![ara_document("track-2", None), orphan];
+        project.ara_documents = vec![ara_document("track-1", Some(sample_ara_identity()))];
+        let both = encode_body(&project);
+        assert!(
+            both.len() < inline_len + big.len(),
+            "not written twice: {} vs {}",
+            both.len(),
+            inline_len + big.len()
+        );
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        assert_eq!(decoded.ara_orphans.len(), 2);
+        assert_eq!(decoded.ara_deferred.len(), 1);
+        assert_eq!(decoded.ara_deferred[0].document.data, big);
+        assert_eq!(
+            decoded.ara_documents[0].written_with,
+            Some(sample_ara_identity())
+        );
+    }
+
+    /// A kept-back record that names an orphan the file does not hold (its
+    /// orphans record damaged, say) is dropped, and nothing else is.
+    #[test]
+    fn a_kept_back_archive_whose_orphan_is_missing_is_dropped() {
+        let mut payload = FbWriter::new();
+        payload.write_u32(1);
+        payload.write_str("vst3:x");
+        payload.write_str("track-1");
+        payload.write_str("com.celemony.ara.chunk.13");
+        payload.write_u8(ARA_DEFERRED_BYTES_OF_ORPHAN);
+        payload.write_u32(3);
+        payload.write_u8(0);
+        payload.write_u32(1);
+        payload.write_str("b.wav");
+        let mut records = FbWriter::new();
+        write_view_record(&mut records, ARA_TAG_DEFERRED, payload);
+        let extension = decode_ara_extension(&records.into_bytes());
+        assert!(extension.deferred.is_empty());
+        assert!(extension.orphans.is_empty());
+    }
+
+    /// Nothing to record writes nothing: the body ends at the view section,
+    /// exactly as before the extension existed.
+    #[test]
+    fn a_project_without_ara_records_writes_no_extension() {
+        let mut project = FutureboardProject::new("plain");
+        project.ara_documents = vec![ara_document("track-1", None)];
+        let with_legacy = encode_body(&project);
+        let decoded = decode_project(&encode_project(&project)).unwrap();
+        assert_eq!(decoded.ara_documents[0].written_with, None);
+        assert!(decoded.ara_orphans.is_empty());
+
+        project.ara_documents[0].written_with = Some(sample_ara_identity());
+        let with_record = encode_body(&project);
+        assert!(with_record.len() > with_legacy.len());
+        // The extension starts right after the view section, and names
+        // itself.
+        assert_eq!(
+            &with_record[with_legacy.len()..with_legacy.len() + 4],
+            b"FARA"
+        );
+    }
+
+    /// A v54 file written before the extension existed, or cut at the view
+    /// section, loads its documents without a record.
+    #[test]
+    fn a_v54_file_that_ends_at_the_view_section_loads_as_legacy() {
+        let mut project = FutureboardProject::new("cut");
+        project.ara_documents = vec![ara_document("track-1", Some(sample_ara_identity()))];
+        project.ara_orphans = vec![ara_document("track-1", None)];
+        let mut body = encode_body(&project);
+        let bare = {
+            let mut without = FutureboardProject::new("cut");
+            without.ara_documents = vec![ara_document("track-1", None)];
+            encode_body(&without).len()
+        };
+        body.truncate(bare);
+        let decoded = decode_project(&project_bytes_with_version(body, PROJECT_VERSION)).unwrap();
+        assert_eq!(decoded.ara_documents.len(), 1);
+        assert_eq!(decoded.ara_documents[0].written_with, None);
+        assert!(decoded.ara_orphans.is_empty());
+    }
+
+    /// A v53 file has no extension; its ARA document loads without a record.
+    #[test]
+    fn a_v53_ara_document_loads_without_a_record() {
+        let mut project = FutureboardProject::new("v53 ara");
+        project.ara_documents = vec![ara_document("track-1", None)];
+        let mut body = encode_body(&project);
+        body.truncate(body.len() - view_section_len(&project.view));
+        let decoded =
+            decode_project_with_options(&project_bytes_with_version(body, 53), true).unwrap();
+        assert_eq!(decoded.ara_documents.len(), 1);
+        assert_eq!(decoded.ara_documents[0].data, project.ara_documents[0].data);
+        assert_eq!(decoded.ara_documents[0].written_with, None);
+        assert!(decoded.ara_orphans.is_empty());
+    }
+
+    /// Damage anywhere in the extension never fails the load: the project and
+    /// its positional ARA documents come back, without the damaged records.
+    #[test]
+    fn a_damaged_ara_extension_never_fails_the_load() {
+        let mut project = FutureboardProject::new("damaged");
+        project.ara_documents = vec![ara_document("track-1", Some(sample_ara_identity()))];
+        project.ara_orphans = vec![ara_document("track-1", Some(sample_ara_identity()))];
+        project.ara_deferred = vec![
+            deferred_record("track-1", &project.ara_orphans[0].data.clone(), &["b.wav"]),
+            deferred_record("track-2", &[7, 7, 7], &["c.wav"]),
+        ];
+        let body = encode_body(&project);
+        let bare = {
+            let mut without = FutureboardProject::new("damaged");
+            without.ara_documents = vec![ara_document("track-1", None)];
+            encode_body(&without).len()
+        };
+        assert!(body.len() > bare);
+        // Every truncation point and a flipped byte at every offset of the tail.
+        for cut in bare..body.len() {
+            let decoded = decode_project(&project_bytes_with_version(
+                body[..cut].to_vec(),
+                PROJECT_VERSION,
+            ))
+            .expect("a cut extension still loads");
+            assert_eq!(decoded.ara_documents.len(), 1);
+            assert_eq!(decoded.ara_documents[0].data, project.ara_documents[0].data);
+        }
+        for offset in bare..body.len() {
+            let mut damaged = body.clone();
+            damaged[offset] ^= 0xA5;
+            let decoded = decode_project(&project_bytes_with_version(damaged, PROJECT_VERSION))
+                .expect("a damaged extension still loads");
+            assert_eq!(decoded.ara_documents.len(), 1);
+        }
+        // A length that claims more than the file holds is refused before
+        // anything is allocated.
+        let mut hostile = body[..bare].to_vec();
+        hostile.extend_from_slice(&u32::MAX.to_le_bytes());
+        let decoded =
+            decode_project(&project_bytes_with_version(hostile, PROJECT_VERSION)).unwrap();
+        assert_eq!(decoded.ara_documents[0].written_with, None);
+    }
+
+    /// A later build's record is skipped and the known ones still read.
+    #[test]
+    fn unknown_ara_extension_tags_are_skipped() {
+        let mut project = FutureboardProject::new("future");
+        project.ara_documents = vec![ara_document("track-1", None)];
+        let mut body = encode_body(&project);
+
+        let mut records = FbWriter::new();
+        let mut future = FbWriter::new();
+        future.write_str("a record from a newer build");
+        write_view_record(&mut records, 0x7777, future);
+        let mut identities = FbWriter::new();
+        identities.write_u32(1);
+        identities.write_str("vst3:fd5c205bb907b3ca");
+        identities.write_str("track-1");
+        encode_ara_identity(&mut identities, &sample_ara_identity());
+        write_view_record(&mut records, ARA_TAG_IDENTITIES, identities);
+        let mut section = FbWriter::new();
+        section.write_u32(SECTION_ARA);
+        section.write_bytes(&records.into_bytes());
+        body.extend_from_slice(&section.into_bytes());
+
+        let decoded = decode_project(&project_bytes_with_version(body, PROJECT_VERSION)).unwrap();
+        assert_eq!(
+            decoded.ara_documents[0].written_with,
+            Some(sample_ara_identity())
+        );
+    }
+
+    /// A section tagged `magic` holding `payload`, as it follows the view
+    /// section.
+    fn trailing_section(magic: u32, payload: &[u8]) -> Vec<u8> {
+        let mut section = FbWriter::new();
+        section.write_u32(magic);
+        section.write_bytes(payload);
+        section.into_bytes()
+    }
+
+    /// An ARA records payload identifying track-1's document, as the `FARA`
+    /// section carries it.
+    fn ara_records_payload() -> Vec<u8> {
+        let mut records = FbWriter::new();
+        let mut identities = FbWriter::new();
+        identities.write_u32(1);
+        identities.write_str("vst3:fd5c205bb907b3ca");
+        identities.write_str("track-1");
+        encode_ara_identity(&mut identities, &sample_ara_identity());
+        write_view_record(&mut records, ARA_TAG_IDENTITIES, identities);
+        records.into_bytes()
+    }
+
+    /// Finding (review): the extension was the untagged rest of the file, so
+    /// a later section after the view section would have been read as ARA
+    /// records. Every trailing section now names itself: one this build does
+    /// not know is skipped whole, before or after the ARA one, even when its
+    /// payload would parse as ARA records.
+    #[test]
+    fn an_unknown_trailing_section_is_never_read_as_ara_records() {
+        let mut project = FutureboardProject::new("later section");
+        project.ara_documents = vec![ara_document("track-1", None)];
+        let bare = encode_body(&project);
+        let lookalike = trailing_section(u32::from_le_bytes(*b"ZZZZ"), &ara_records_payload());
+        let ara = trailing_section(SECTION_ARA, &ara_records_payload());
+        let load = |tail: &[&[u8]]| {
+            let mut body = bare.clone();
+            for section in tail {
+                body.extend_from_slice(section);
+            }
+            decode_project(&project_bytes_with_version(body, PROJECT_VERSION))
+                .expect("trailing sections never fail a load")
+        };
+
+        // Only the unknown section: no ARA data at all.
+        let decoded = load(&[&lookalike]);
+        assert_eq!(decoded.ara_documents[0].written_with, None);
+        assert!(decoded.ara_orphans.is_empty());
+        // Before and after the ARA section, it changes nothing.
+        for tail in [[&lookalike[..], &ara[..]], [&ara[..], &lookalike[..]]] {
+            let decoded = load(&tail);
+            assert_eq!(
+                decoded.ara_documents[0].written_with,
+                Some(sample_ara_identity())
+            );
+        }
+        // An encoded project reads the same with a later section appended.
+        let mut identified = project.clone();
+        identified.ara_documents[0].written_with = Some(sample_ara_identity());
+        identified.ara_orphans = vec![ara_document("track-3", None)];
+        let mut body = encode_body(&identified);
+        body.extend_from_slice(&trailing_section(u32::from_le_bytes(*b"NEXT"), b"view v2"));
+        let decoded = decode_project(&project_bytes_with_version(body, PROJECT_VERSION)).unwrap();
+        assert_eq!(
+            decoded.ara_documents[0].written_with,
+            Some(sample_ara_identity())
+        );
+        assert_eq!(decoded.ara_orphans.len(), 1);
+    }
+
+    /// The untagged form an unreleased build wrote is not read as ARA data,
+    /// and never fails the load.
+    #[test]
+    fn the_untagged_ara_form_is_ignored_without_failing_the_load() {
+        let mut project = FutureboardProject::new("untagged");
+        project.ara_documents = vec![ara_document("track-1", None)];
+        let mut body = encode_body(&project);
+        let mut untagged = FbWriter::new();
+        untagged.write_bytes(&ara_records_payload());
+        body.extend_from_slice(&untagged.into_bytes());
+        let decoded = decode_project(&project_bytes_with_version(body, PROJECT_VERSION)).unwrap();
+        assert_eq!(decoded.ara_documents.len(), 1);
+        assert_eq!(decoded.ara_documents[0].written_with, None);
+        assert!(decoded.ara_orphans.is_empty());
+    }
+
+    /// The extension's payload parses on its own, with nothing around it.
+    #[test]
+    fn the_ara_section_payload_parses_in_isolation() {
+        let extension = decode_ara_extension(&ara_records_payload());
+        assert_eq!(extension.identities.len(), 1);
+        assert_eq!(extension.identities[0].2, sample_ara_identity());
+        assert!(extension.orphans.is_empty());
+        let empty = decode_ara_extension(&[]);
+        assert!(empty.identities.is_empty() && empty.orphans.is_empty());
+    }
+
+    /// A record for a document the file does not hold is dropped rather than
+    /// attached to another track's document.
+    #[test]
+    fn an_identity_joins_only_its_own_document() {
+        let mut documents = vec![ara_document("track-1", None), ara_document("track-2", None)];
+        join_ara_identities(
+            &mut documents,
+            vec![
+                (
+                    "vst3:fd5c205bb907b3ca".to_string(),
+                    "track-2".to_string(),
+                    sample_ara_identity(),
+                ),
+                (
+                    "vst3:other".to_string(),
+                    "track-1".to_string(),
+                    ProjectAraIdentity::default(),
+                ),
+            ],
+        );
+        assert_eq!(documents[0].written_with, None);
+        assert_eq!(documents[1].written_with, Some(sample_ara_identity()));
     }
 }

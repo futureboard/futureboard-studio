@@ -157,6 +157,11 @@ pub(crate) mod ffi {
         pub(crate) fn sphere_daux_vst2_embed_take_user_close(
             processor: *mut SphereDauxVst2Processor,
         ) -> i32;
+        /// 1 (and resets) when the plug-in reported a change to its own
+        /// state since the last call. See `take_state_touched`.
+        pub(crate) fn sphere_daux_vst2_take_state_touched(
+            processor: *mut SphereDauxVst2Processor,
+        ) -> i32;
         pub(crate) fn sphere_daux_vst2_embed_set_waiting_stage(
             processor: *mut SphereDauxVst2Processor,
             stage: *const c_char,
@@ -298,6 +303,7 @@ pub(crate) mod ffi {
         sphere_daux_vst2_set_process_context as set_process_context,
         sphere_daux_vst2_set_state as set_state, sphere_daux_vst2_state_free as state_free,
         sphere_daux_vst2_take_pending_shell_resize as take_pending_shell_resize,
+        sphere_daux_vst2_take_state_touched as take_state_touched,
         sphere_daux_vst2_view_attach as view_attach,
         sphere_daux_vst2_view_can_resize as view_can_resize,
         sphere_daux_vst2_view_constrain as view_constrain,

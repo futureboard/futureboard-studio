@@ -16,7 +16,7 @@ use crate::components::mixer_tree_sidebar::{
     MIXER_TREE_SIDEBAR_DEFAULT_WIDTH,
 };
 use crate::components::timeline::timeline_state::{
-    self, collapsed_vsti_output_group_keys_from_tracks, TrackState,
+    self, collapsed_vsti_output_group_keys_from_tracks, TrackEditScope, TrackState,
 };
 use crate::components::{external_mixer_debug, external_mixer_debug_enabled, MixerSnapshot};
 
@@ -68,6 +68,10 @@ pub(crate) struct MixerViewState {
     pub tree_cache_filter: String,
     pub tree_cache_output_ch: u32,
     pub tree_cache_tracks_gen: u64,
+    /// The timeline's `track_names_revision` the cached model was built at:
+    /// its nodes copy track names, and a rename never advances the routing
+    /// version.
+    pub tree_cache_names_rev: u64,
     pub tree_cache_show_only: bool,
     pub tree_cache_selected_id: Option<String>,
     /// One-shot fallback when session install did not seed tree defaults.
@@ -108,6 +112,7 @@ impl Default for MixerViewState {
             tree_cache_filter: String::new(),
             tree_cache_output_ch: 0,
             tree_cache_tracks_gen: 0,
+            tree_cache_names_rev: 0,
             tree_cache_show_only: false,
             tree_cache_selected_id: None,
             tree_defaults_applied: false,
@@ -448,6 +453,7 @@ impl StudioLayout {
         let output_channels = self.mixer_tree_output_channels(cx);
         let filter = self.mixer_tree_filter_input.value.clone();
         let tracks_gen = self.audio_bridge.route_graph_version;
+        let names_rev = self.timeline.read(cx).state.track_names_revision;
         let show_only = self.mixer_view.tree_show_only_selected_group;
         let selected_id = self
             .timeline
@@ -461,6 +467,7 @@ impl StudioLayout {
             || self.mixer_view.tree_cache_filter != filter
             || self.mixer_view.tree_cache_output_ch != output_channels
             || self.mixer_view.tree_cache_tracks_gen != tracks_gen
+            || self.mixer_view.tree_cache_names_rev != names_rev
             || self.mixer_view.tree_cache_show_only != show_only
             || (show_only && self.mixer_view.tree_cache_selected_id != selected_id);
 
@@ -480,6 +487,7 @@ impl StudioLayout {
             self.mixer_view.tree_cache_filter = filter;
             self.mixer_view.tree_cache_output_ch = output_channels;
             self.mixer_view.tree_cache_tracks_gen = tracks_gen;
+            self.mixer_view.tree_cache_names_rev = names_rev;
             self.mixer_view.tree_cache_show_only = show_only;
             self.mixer_view.tree_cache_selected_id = selected_id;
         }
@@ -798,12 +806,14 @@ impl StudioLayout {
                 let id = id.clone();
                 StudioLayout::defer_update(&owner_mute, cx, move |layout, cx| {
                     layout.mark_dirty_view_only();
+                    let edit = layout.begin_track_edit(TrackEditScope::tracks([id.clone()]), cx);
                     let muted = layout.timeline.update(cx, |timeline, cx| {
                         timeline.state.toggle_track_mute(&id);
                         let value = timeline.state.find_track(&id).map(|track| track.muted);
                         cx.notify();
                         value
                     });
+                    layout.commit_track_edit("Mute", edit, cx);
                     if let Some(muted) = muted {
                         if let Some(engine) = layout.audio_bridge.engine.as_ref() {
                             let _ = engine.update_track_param(
@@ -825,12 +835,14 @@ impl StudioLayout {
                 let id = id.clone();
                 StudioLayout::defer_update(&owner_solo, cx, move |layout, cx| {
                     layout.mark_dirty_view_only();
+                    let edit = layout.begin_track_edit(TrackEditScope::tracks([id.clone()]), cx);
                     let solo = layout.timeline.update(cx, |timeline, cx| {
                         timeline.state.toggle_track_solo(&id);
                         let value = timeline.state.find_track(&id).map(|track| track.solo);
                         cx.notify();
                         value
                     });
+                    layout.commit_track_edit("Solo", edit, cx);
                     if let Some(solo) = solo {
                         if let Some(engine) = layout.audio_bridge.engine.as_ref() {
                             let _ = engine.update_track_param(
@@ -1076,8 +1088,10 @@ impl StudioLayout {
         > = std::sync::Arc::new(move |v: &f32, _w, cx| {
             let v = *v;
             timeline_master.update(cx, |t, cx| {
+                let edit = t.begin_track_edit(TrackEditScope::master());
                 t.state.set_master_volume(v);
                 t.state.master_volume_preview = None;
+                t.commit_track_edit("Master Volume", edit, false, cx);
                 cx.notify();
             });
             StudioLayout::defer_update(&owner_dirty, cx, |this, cx| {
@@ -1149,8 +1163,11 @@ impl StudioLayout {
             dyn Fn(&mut Window, &mut gpui::App) + 'static,
         > = std::sync::Arc::new(move |_w, cx| {
             let committed = timeline_master_commit.update(cx, |t, cx| {
+                // One drag, one step: the preview never touched the saved level.
+                let edit = t.begin_track_edit(TrackEditScope::master());
                 let committed = t.state.commit_master_volume_preview();
                 if committed.is_some() {
+                    t.commit_track_edit("Master Volume", edit, false, cx);
                     cx.notify();
                 }
                 committed
@@ -1204,7 +1221,7 @@ impl StudioLayout {
             // invalidation was deferred behind it, the strip highlight visibly
             // lagged even though the model had already changed.
             timeline_select.update(cx, |t, _cx| {
-                t.state.select_track_with_modifiers(&id, additive, range);
+                t.state.press_track_selection(&id, additive, range);
             });
             // Queue the lightweight mixer repaint first so selection feedback is
             // not blocked by Timeline/Inspector/tree work.
@@ -1240,18 +1257,21 @@ impl StudioLayout {
         > = std::sync::Arc::new(move |(id, v): &(String, f32), _w, cx| {
             let id = id.clone();
             let v = *v;
-            timeline_vol.update(cx, |t, cx| {
-                t.state.set_track_volume(&id, v);
-                t.state.clear_track_volume_preview(&id);
-                cx.notify();
-            });
+            // A reset on one of several selected strips resets them all.
+            let targets = timeline_vol.update(cx, |t, cx| t.set_volume_gang(&id, v, cx));
             StudioLayout::defer_update(&owner_dirty, cx, |this, cx| {
                 this.mark_dirty_view_only();
                 this.push_mixer_snapshot_to_window(cx);
                 let _ = this.mixer_panel.update(cx, |_, cx| cx.notify());
             });
             if let Some(engine) = audio_engine_volume_commit.as_ref() {
-                let _ = engine.update_track_param(&id, "volume", volume_norm_to_linear(v) as f64);
+                for target in &targets {
+                    let _ = engine.update_track_param(
+                        target,
+                        "volume",
+                        volume_norm_to_linear(v) as f64,
+                    );
+                }
             }
         });
 
@@ -1261,8 +1281,9 @@ impl StudioLayout {
         > = std::sync::Arc::new(move |(id, v): &(String, f32), _w, cx| {
             let id = id.clone();
             let v = *v;
+            // One of several selected strips drags them all (`begin_volume_gang`).
             timeline_vol_start.update(cx, |t, cx| {
-                t.state.begin_track_volume_preview(&id, v);
+                t.state.begin_volume_gang(&id, v);
                 cx.notify();
             });
         });
@@ -1276,13 +1297,13 @@ impl StudioLayout {
             let id = id.clone();
             let v = *v;
             let changed = timeline_vol_preview.update(cx, |t, cx| {
-                let changed = t.state.set_track_volume_preview(&id, v);
-                if changed {
+                let changed = t.state.set_volume_gang_preview(&id, v);
+                if !changed.is_empty() {
                     cx.notify();
                 }
                 changed
             });
-            if !changed {
+            if changed.is_empty() {
                 return;
             }
             crate::perf::count("fader_drag_preview_count", 1);
@@ -1315,15 +1336,22 @@ impl StudioLayout {
                 let _ = this.mixer_panel.update(cx, |_, cx| cx.notify());
             });
             if let Some(engine) = audio_engine_volume_preview.as_ref() {
-                crate::perf::count("mixer_fader_audio_control_update_count", 1);
-                let result =
-                    engine.update_track_param(&id, "volume", volume_norm_to_linear(v) as f64);
-                if let Err(error) = result {
-                    // Silent until now: the dispatch result was discarded, so a
-                    // rejected command (no stream open, unknown track) was
-                    // indistinguishable from one the engine applied.
-                    if fader_debug {
-                        eprintln!("[fader] preview source=mixer track={id} dispatch_error={error}");
+                for (target, level) in &changed {
+                    crate::perf::count("mixer_fader_audio_control_update_count", 1);
+                    let result = engine.update_track_param(
+                        target,
+                        "volume",
+                        volume_norm_to_linear(*level) as f64,
+                    );
+                    if let Err(error) = result {
+                        // Silent until now: the dispatch result was discarded, so
+                        // a rejected command (no stream open, unknown track) was
+                        // indistinguishable from one the engine applied.
+                        if fader_debug {
+                            eprintln!(
+                                "[fader] preview source=mixer track={target} dispatch_error={error}"
+                            );
+                        }
                     }
                 }
             }
@@ -1336,28 +1364,10 @@ impl StudioLayout {
             dyn Fn(&String, &mut Window, &mut gpui::App) + 'static,
         > = std::sync::Arc::new(move |id: &String, _w, cx| {
             let id = id.clone();
-            let committed = timeline_vol_commit.update(cx, |t, cx| {
-                let committed = t.state.commit_track_volume_preview(&id);
-                if let Some((prev, next)) = committed {
-                    if (prev - next).abs() > 1.0e-5 {
-                        // Volume already applied by commit; record one undo entry.
-                        t.record_executed_command(
-                            EditCommand::SetTrackVolume {
-                                track_id: id.clone(),
-                                prev,
-                                next,
-                            },
-                            cx,
-                        );
-                    } else {
-                        cx.notify();
-                    }
-                }
-                committed
-            });
-            let Some((_prev, v)) = committed else {
+            let committed = timeline_vol_commit.update(cx, |t, cx| t.finish_volume_gang(&id, cx));
+            if committed.is_empty() {
                 return;
-            };
+            }
             crate::perf::count("fader_drag_commit_count", 1);
             StudioLayout::defer_update(&owner_commit, cx, |this, cx| {
                 this.mark_dirty_view_only();
@@ -1365,7 +1375,13 @@ impl StudioLayout {
                 let _ = this.mixer_panel.update(cx, |_, cx| cx.notify());
             });
             if let Some(engine) = audio_engine_volume_final.as_ref() {
-                let _ = engine.update_track_param(&id, "volume", volume_norm_to_linear(v) as f64);
+                for (target, _, v) in &committed {
+                    let _ = engine.update_track_param(
+                        target,
+                        "volume",
+                        volume_norm_to_linear(*v) as f64,
+                    );
+                }
             }
         });
 
@@ -1386,17 +1402,19 @@ impl StudioLayout {
                     "mixer command dispatched set_pan id={id} v={v:.3}"
                 ));
             }
-            timeline_pan.update(cx, |t, cx| {
-                t.state.set_track_pan(&id, v);
-                cx.notify();
-            });
+            // The knob reports every sample and no release: consecutive pans
+            // fold into one step, and one of several selected strips moves
+            // them all by the same amount.
+            let moved = timeline_pan.update(cx, |t, cx| t.nudge_pan_gang(&id, v, cx));
             StudioLayout::defer_update(&owner_dirty, cx, |this, cx| {
                 this.mark_dirty_view_only();
                 this.push_mixer_snapshot_to_window(cx);
             });
             if let Some(engine) = audio_engine.as_ref() {
-                crate::perf::count("mixer_fader_audio_control_update_count", 1);
-                let _ = engine.update_track_param(&id, "pan", v as f64);
+                for (target, pan) in &moved {
+                    crate::perf::count("mixer_fader_audio_control_update_count", 1);
+                    let _ = engine.update_track_param(target, "pan", *pan as f64);
+                }
             }
         });
 
@@ -1415,7 +1433,12 @@ impl StudioLayout {
                 }
                 {
                     let _state_update = crate::perf::PerfScope::enter("MixerMuteStateUpdate");
-                    timeline_mute.update(cx, |t, _cx| {
+                    timeline_mute.update(cx, |t, cx| {
+                        let mut scope = t.state.selection.selected_track_ids.clone();
+                        if !scope.contains(&id) {
+                            scope.push(id.clone());
+                        }
+                        let edit = t.begin_track_edit(TrackEditScope::tracks(scope));
                         before_state = t
                             .state
                             .find_track(&id)
@@ -1440,6 +1463,7 @@ impl StudioLayout {
                                 t.state.set_track_mute(&other, muted);
                             }
                         }
+                        t.commit_track_edit("Mute", edit, false, cx);
                     });
                 }
                 // Dispatch the bounded, non-blocking realtime command before
@@ -1535,7 +1559,12 @@ impl StudioLayout {
                 }
                 {
                     let _state_update = crate::perf::PerfScope::enter("MixerSoloStateUpdate");
-                    timeline_solo.update(cx, |t, _cx| {
+                    timeline_solo.update(cx, |t, cx| {
+                        let mut scope = t.state.selection.selected_track_ids.clone();
+                        if !scope.contains(&id) {
+                            scope.push(id.clone());
+                        }
+                        let edit = t.begin_track_edit(TrackEditScope::tracks(scope));
                         before_state = t
                             .state
                             .find_track(&id)
@@ -1558,6 +1587,7 @@ impl StudioLayout {
                                 t.state.set_track_solo(&other, solo);
                             }
                         }
+                        t.commit_track_edit("Solo", edit, false, cx);
                     });
                 }
                 let mut audio_router_applied = false;
@@ -1629,55 +1659,24 @@ impl StudioLayout {
         let owner_dirty = owner.clone();
         let on_toggle_arm: std::sync::Arc<dyn Fn(&String, &mut Window, &mut gpui::App) + 'static> =
             std::sync::Arc::new(move |id: &String, _w, cx| {
-                let id = id.clone();
-                let previous = timeline_arm
+                external_mixer_debug(&format!("mixer command dispatched toggle_arm id={id}"));
+                let Some(armed) = timeline_arm
                     .read(cx)
                     .state
-                    .find_track(&id)
-                    .map(|track| track.armed);
-                external_mixer_debug(&format!("mixer command dispatched toggle_arm id={id}"));
-                let changed = timeline_arm.update(cx, |t, cx| {
-                    let changed = t.state.toggle_track_arm(&id);
-                    if changed {
-                        cx.notify();
-                    }
-                    changed
-                });
-                if !changed {
+                    .find_track(id)
+                    .map(|track| !track.armed)
+                else {
                     return;
-                }
-                let connections = timeline_arm.read(cx).state.audio_connections.clone();
-                let apply_error = audio_engine_arm.as_ref().and_then(|engine| {
-                    timeline_arm
-                        .read(cx)
-                        .state
-                        .find_track(&id)
-                        .and_then(|track| {
-                            apply_engine_track_input_state(engine, track, &connections).err()
-                        })
-                });
-                if let Some(error) = apply_error {
-                    if let Some(previous) = previous {
-                        timeline_arm.update(cx, |t, cx| {
-                            if let Some(track) =
-                                t.state.tracks.iter_mut().find(|track| track.id == id)
-                            {
-                                track.armed = previous;
-                            }
-                            cx.notify();
-                        });
-                    }
-                    StudioLayout::defer_update(&owner_dirty, cx, move |this, cx| {
-                        this.audio_bridge.last_error =
-                            Some(format!("Track input update failed: {error}"));
-                        this.push_mixer_snapshot_to_window(cx);
-                    });
-                    return;
-                }
-                StudioLayout::defer_update(&owner_dirty, cx, |this, cx| {
-                    this.mark_dirty_view_only();
-                    this.push_mixer_snapshot_to_window(cx);
-                });
+                };
+                apply_mixer_input_gang(
+                    &timeline_arm,
+                    audio_engine_arm.as_ref(),
+                    &owner_dirty,
+                    id,
+                    "Record Arm",
+                    move |state, target| state.set_track_armed(target, armed),
+                    cx,
+                );
             });
 
         let audio_engine_input = self.audio_bridge.engine.clone();
@@ -1686,54 +1685,24 @@ impl StudioLayout {
         let on_toggle_input: std::sync::Arc<
             dyn Fn(&String, &mut Window, &mut gpui::App) + 'static,
         > = std::sync::Arc::new(move |id: &String, _w, cx| {
-            let id = id.clone();
-            let previous = timeline_input
+            external_mixer_debug(&format!("mixer command dispatched toggle_input id={id}"));
+            let Some(mode) = timeline_input
                 .read(cx)
                 .state
-                .find_track(&id)
-                .map(|track| track.input_monitor);
-            external_mixer_debug(&format!("mixer command dispatched toggle_input id={id}"));
-            let changed = timeline_input.update(cx, |t, cx| {
-                let changed = t.state.cycle_track_input_monitor(&id);
-                if changed {
-                    cx.notify();
-                }
-                changed
-            });
-            if !changed {
+                .find_track(id)
+                .map(|track| track.input_monitor.cycle())
+            else {
                 return;
-            }
-            let connections = timeline_input.read(cx).state.audio_connections.clone();
-            let apply_error = audio_engine_input.as_ref().and_then(|engine| {
-                timeline_input
-                    .read(cx)
-                    .state
-                    .find_track(&id)
-                    .and_then(|track| {
-                        apply_engine_track_input_state(engine, track, &connections).err()
-                    })
-            });
-            if let Some(error) = apply_error {
-                if let Some(previous) = previous {
-                    timeline_input.update(cx, |t, cx| {
-                        if let Some(track) = t.state.tracks.iter_mut().find(|track| track.id == id)
-                        {
-                            track.input_monitor = previous;
-                        }
-                        cx.notify();
-                    });
-                }
-                StudioLayout::defer_update(&owner_dirty, cx, move |this, cx| {
-                    this.audio_bridge.last_error =
-                        Some(format!("Track input update failed: {error}"));
-                    this.push_mixer_snapshot_to_window(cx);
-                });
-                return;
-            }
-            StudioLayout::defer_update(&owner_dirty, cx, |this, cx| {
-                this.mark_dirty_view_only();
-                this.push_mixer_snapshot_to_window(cx);
-            });
+            };
+            apply_mixer_input_gang(
+                &timeline_input,
+                audio_engine_input.as_ref(),
+                &owner_dirty,
+                id,
+                "Input Monitor",
+                move |state, target| state.set_track_input_monitor(target, mode),
+                cx,
+            );
         });
 
         // Re-bound: the first `audio_engine` was moved into the select closure
@@ -2029,9 +1998,11 @@ impl StudioLayout {
                 let track_id = track_id.clone();
                 let insert_id = insert_id.clone();
                 StudioLayout::defer_update(&this, cx, move |this, cx| {
+                    let edit = this.begin_track_edit(TrackEditScope::channel(&track_id), cx);
                     this.timeline.update(cx, |timeline, _cx| {
                         timeline.state.toggle_insert_bypass(&track_id, &insert_id);
                     });
+                    this.commit_track_edit("Bypass Plug-in", edit, cx);
                     // Bypass is applied live per block via the insert's
                     // "enabled" runtime param — the plugin instance stays
                     // loaded and no graph rebuild runs (a full `load_project`
@@ -2054,52 +2025,28 @@ impl StudioLayout {
                 });
             })
         };
-        // Drag-reorder commit (mirrors the Inspector's `reorder_insert_cb`). The
-        // drop handler supplies the dragged `plugin_instance_id` and the
-        // insertion gap; we snapshot the current id order, compute the new order,
-        // and apply it as a single `EditCommand::ReorderFxSlot` so one drag is one
-        // undo entry. The command only reorders existing slots (never recreates an
-        // instance), so bypass / preset / parameter / editor / automation state
-        // follow each instance. A forced project sync rebuilds the engine's chain
-        // order (DSP order == UI order); editor windows are keyed by instance id,
-        // so they stay attached.
-        let on_reorder_insert: std::sync::Arc<
-            dyn Fn(&(String, String, usize), &mut Window, &mut gpui::App) + 'static,
+        let on_toggle_folder: std::sync::Arc<
+            dyn Fn(&String, &mut Window, &mut gpui::App) + 'static,
         > = {
             let this = owner.clone();
+            std::sync::Arc::new(move |track_id: &String, _w, cx| {
+                let track_id = track_id.clone();
+                StudioLayout::defer_update(&this, cx, move |this, cx| {
+                    this.toggle_folder(&track_id, cx);
+                });
+            })
+        };
+        // Drop commit for a dragged insert slot. Every surface (the Inspector,
+        // the docked and the detached mixer) hands its drop to the same
+        // `commit_insert_drop`, which resolves the anchor against the live
+        // chains — so a stale detached-mixer snapshot cannot misplace it.
+        let on_drop_insert: crate::components::reorder::InsertDropCb = {
+            let this = owner.clone();
             std::sync::Arc::new(
-                move |(track_id, insert_id, insertion_index): &(String, String, usize), _w, cx| {
-                    let track_id = track_id.clone();
-                    let insert_id = insert_id.clone();
-                    let insertion_index = *insertion_index;
+                move |drop: &crate::components::reorder::InsertDrop, _w, cx| {
+                    let drop = drop.clone();
                     StudioLayout::defer_update(&this, cx, move |this, cx| {
-                        let changed = this.timeline.update(cx, |timeline, cx| {
-                            let before = timeline.state.insert_order(&track_id);
-                            let after = timeline_state::TimelineState::reordered_insert_ids(
-                                &before,
-                                &insert_id,
-                                insertion_index,
-                            );
-                            if before == after {
-                                return false;
-                            }
-                            timeline.run_edit_command(
-                                EditCommand::ReorderFxSlot {
-                                    track_id: track_id.clone(),
-                                    before_order: before,
-                                    after_order: after,
-                                },
-                                cx,
-                            );
-                            true
-                        });
-                        if changed {
-                            this.mark_dirty();
-                            this.audio_bridge.project_dirty = true;
-                            this.schedule_audio_project_sync(cx, true, "mixer_reorder_insert");
-                            this.push_mixer_snapshot_to_window(cx);
-                            cx.notify();
-                        }
+                        this.commit_insert_drop(&drop, cx);
                     });
                 },
             )
@@ -2178,9 +2125,12 @@ impl StudioLayout {
                 let track_id = track_id.clone();
                 let send_id = send_id.clone();
                 StudioLayout::defer_update(&this, cx, move |this, cx| {
+                    let edit =
+                        this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]), cx);
                     this.timeline.update(cx, |timeline, _cx| {
                         timeline.state.remove_send(&track_id, &send_id);
                     });
+                    this.commit_track_edit("Remove Send", edit, cx);
                     this.mark_dirty();
                     this.audio_bridge.project_dirty = true;
                     cx.notify();
@@ -2197,6 +2147,8 @@ impl StudioLayout {
                     let send_id = send_id.clone();
                     let gain_db = *gain_db;
                     StudioLayout::defer_update(&this, cx, move |this, cx| {
+                        let edit =
+                            this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]), cx);
                         let changed = this.timeline.update(cx, |timeline, cx| {
                             let changed = timeline
                                 .state
@@ -2206,6 +2158,8 @@ impl StudioLayout {
                             }
                             changed
                         });
+                        // A slider drag: its samples fold into one step.
+                        this.commit_track_edit_folded("Send Level", edit, cx);
                         if changed {
                             this.mark_dirty();
                             this.audio_bridge.project_dirty = true;
@@ -2226,45 +2180,26 @@ impl StudioLayout {
             )
         };
         let on_reorder_send: std::sync::Arc<
-            dyn Fn(&(String, String, usize), &mut Window, &mut gpui::App) + 'static,
+            dyn Fn(
+                    &(String, String, crate::components::reorder::DropAnchor),
+                    &mut Window,
+                    &mut gpui::App,
+                ) + 'static,
         > = {
             let this = owner.clone();
             std::sync::Arc::new(
-                move |(track_id, send_id, insertion_index): &(String, String, usize), _w, cx| {
+                move |(track_id, send_id, anchor): &(
+                    String,
+                    String,
+                    crate::components::reorder::DropAnchor,
+                ),
+                      _w,
+                      cx| {
                     let track_id = track_id.clone();
                     let send_id = send_id.clone();
-                    let insertion_index = *insertion_index;
+                    let anchor = anchor.clone();
                     StudioLayout::defer_update(&this, cx, move |this, cx| {
-                        let changed = this.timeline.update(cx, |timeline, cx| {
-                            let before = timeline.state.send_order(&track_id);
-                            let after = timeline_state::TimelineState::reordered_send_ids(
-                                &before,
-                                &send_id,
-                                insertion_index,
-                            );
-                            if before == after {
-                                return false;
-                            }
-                            timeline.run_edit_command(
-                                EditCommand::ReorderSendSlot {
-                                    track_id: track_id.clone(),
-                                    before_order: before,
-                                    after_order: after,
-                                },
-                                cx,
-                            );
-                            true
-                        });
-                        if changed {
-                            this.mark_dirty();
-                            // Send order is modeled in session routing. The engine
-                            // snapshot dedup guard skips load_project when the graph
-                            // is effectively unchanged.
-                            this.audio_bridge.project_dirty = true;
-                            this.schedule_audio_project_sync(cx, true, "mixer_reorder_send");
-                            this.push_mixer_snapshot_to_window(cx);
-                            cx.notify();
-                        }
+                        this.commit_send_drop(&track_id, &send_id, &anchor, cx);
                     });
                 },
             )
@@ -2298,7 +2233,8 @@ impl StudioLayout {
             on_remove_insert,
             on_toggle_insert_bypass,
             on_toggle_vsti_output_group,
-            on_reorder_insert,
+            on_toggle_folder,
+            on_drop_insert,
             on_drop_plugin_preset,
             on_open_insert_editor,
             on_add_send,
@@ -2307,6 +2243,138 @@ impl StudioLayout {
             on_send_gain_change,
             on_reorder_send,
         }
+    }
+
+    /// The one commit path for a dropped insert slot, from the Inspector and
+    /// every mixer, docked or detached.
+    ///
+    /// The drop names where it lands by a neighbour's id, and that is resolved
+    /// here against the live chains rather than the ones the target rendered
+    /// from. Within one chain it records the existing `ReorderFxSlot`; across
+    /// channels a `MoveInsertSlot`, which moves the same slot (and its plug-in
+    /// parameter lanes) so the running instance keeps playing on its new
+    /// channel. A drop that would change nothing records nothing. Returns
+    /// whether a command ran.
+    pub(crate) fn commit_insert_drop(
+        &mut self,
+        drop: &crate::components::reorder::InsertDrop,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if drop.copy {
+            return self.commit_insert_copy(drop, cx);
+        }
+        let command = insert_drop_command(&self.timeline.read(cx).state, drop);
+        let Some(command) = command else {
+            return false;
+        };
+        let reason = match &command {
+            EditCommand::MoveInsertSlot { .. } => "move_insert",
+            _ => "reorder_insert",
+        };
+        self.timeline.update(cx, |timeline, cx| {
+            timeline.run_edit_command(command, cx);
+        });
+        self.after_channel_chain_edit(cx, reason);
+        true
+    }
+
+    /// An Alt-dropped insert: a new instance of the same plug-in, carrying the
+    /// dragged one's state as the plug-in has it now, lands where the drop
+    /// says; the dragged one stays where it was.
+    ///
+    /// Loaded like any other added insert — the state travels with the load
+    /// (`load_bridge_insert_for_slot`, or the engine sync for an in-process
+    /// insert) — but without opening its editor. One undo step. Returns
+    /// whether a copy landed.
+    fn commit_insert_copy(
+        &mut self,
+        drop: &crate::components::reorder::InsertDrop,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let state = self.capture_insert_state(&drop.from_track, &drop.insert_id, cx);
+        let before = self.capture_insert_chains(&[drop.to_track.as_str()], cx);
+        let copy_id = self.timeline.update(cx, |timeline, cx| {
+            let gap = crate::components::reorder::anchor_gap(
+                &timeline.state.insert_order(&drop.to_track),
+                &drop.anchor,
+            )?;
+            let copy_id = timeline.state.duplicate_insert(
+                &drop.from_track,
+                &drop.insert_id,
+                &drop.to_track,
+                gap,
+                state.clone(),
+            )?;
+            cx.notify();
+            Some(copy_id)
+        });
+        let Some(copy_id) = copy_id else {
+            return false;
+        };
+        eprintln!(
+            "[PluginAdd] duplicate insert={} track={} -> insert={copy_id} track={} state_bytes={}",
+            drop.insert_id,
+            drop.from_track,
+            drop.to_track,
+            state.as_ref().map_or(0, |bytes| bytes.len())
+        );
+        self.record_insert_chains("Duplicate Plug-in", before, cx);
+        self.load_copied_inserts(&drop.to_track, std::slice::from_ref(&copy_id), cx);
+        self.after_channel_chain_edit(cx, "duplicate_insert");
+        true
+    }
+
+    /// Commit a dropped send: same channel only, resolved against the live
+    /// send order like an insert drop.
+    pub(crate) fn commit_send_drop(
+        &mut self,
+        track_id: &str,
+        send_id: &str,
+        anchor: &crate::components::reorder::DropAnchor,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let command = {
+            let state = &self.timeline.read(cx).state;
+            let before = state.send_order(track_id);
+            crate::components::reorder::reorder_to_anchor(&before, send_id, anchor, 0)
+                .filter(|after| *after != before)
+                .map(|after| EditCommand::ReorderSendSlot {
+                    track_id: track_id.to_string(),
+                    before_order: before,
+                    after_order: after,
+                })
+        };
+        let Some(command) = command else {
+            return false;
+        };
+        self.timeline.update(cx, |timeline, cx| {
+            timeline.run_edit_command(command, cx);
+        });
+        // Send order is modeled in session routing. The engine snapshot dedup
+        // guard skips load_project when the graph is effectively unchanged.
+        self.after_channel_chain_edit(cx, "mixer_reorder_send");
+        true
+    }
+
+    /// What an insert or send chain edit needs beyond the model change —
+    /// after the drop that made it, and after undo or redo of one (which only
+    /// mark the project dirty on their own): the moved insert's editor and
+    /// bridge caches follow it to its channel, a forced engine sync rebuilds the
+    /// graph at once (DSP order == UI order; a moved insert runs on its new
+    /// channel with latency and MIDI destination recomputed, its live instance
+    /// reused by id), and the detached mixer gets a fresh snapshot instead of
+    /// waiting for the poll.
+    pub(crate) fn after_channel_chain_edit(
+        &mut self,
+        cx: &mut Context<Self>,
+        reason: &'static str,
+    ) {
+        self.mark_dirty();
+        self.audio_bridge.project_dirty = true;
+        self.reconcile_insert_ownership(cx);
+        self.schedule_audio_project_sync(cx, true, reason);
+        self.push_mixer_snapshot_to_window(cx);
+        cx.notify();
     }
 
     /// Apply one Master / Monitor Output menu selection.
@@ -2336,6 +2404,7 @@ impl StudioLayout {
             OutputCommand::Assign(id) => Some(id),
         };
 
+        let edit = self.begin_track_edit(TrackEditScope::default().with_routing(), cx);
         let changed = self.timeline.update(cx, |timeline, cx| {
             let changed = if is_master {
                 timeline.state.set_master_output_connection(assignment)
@@ -2352,6 +2421,15 @@ impl StudioLayout {
             cx.notify();
             return;
         }
+        self.commit_track_edit(
+            if is_master {
+                "Master Output"
+            } else {
+                "Monitor Output"
+            },
+            edit,
+            cx,
+        );
 
         self.mark_dirty();
         self.audio_bridge.project_dirty = true;
@@ -2410,6 +2488,34 @@ impl StudioLayout {
             routing.effective_monitor.as_ref().and_then(pair),
         );
     }
+}
+
+/// The command an insert drop records, resolved against `state` as it is now
+/// — `None` when the drop is refused or would change nothing.
+///
+/// Within one chain: the live order with the insert moved next to the anchor,
+/// never in front of the instrument (`fx_chain_floor`). Across channels: a
+/// `MoveInsertSlot` planned from the anchor's gap in the destination chain;
+/// the plan refuses instruments, full or effect-less destinations, and the
+/// master for an insert with plug-in parameter automation.
+pub(crate) fn insert_drop_command(
+    state: &timeline_state::TimelineState,
+    drop: &crate::components::reorder::InsertDrop,
+) -> Option<EditCommand> {
+    use crate::components::reorder::{anchor_gap, reorder_to_anchor};
+    if drop.from_track == drop.to_track {
+        let before = state.insert_order(&drop.to_track);
+        let floor = state.fx_chain_floor(&drop.to_track);
+        let after = reorder_to_anchor(&before, &drop.insert_id, &drop.anchor, floor)?;
+        return (after != before).then(|| EditCommand::ReorderFxSlot {
+            track_id: drop.to_track.clone(),
+            before_order: before,
+            after_order: after,
+        });
+    }
+    let gap = anchor_gap(&state.insert_order(&drop.to_track), &drop.anchor)?;
+    let plan = state.plan_insert_move(&drop.from_track, &drop.insert_id, &drop.to_track, gap)?;
+    Some(EditCommand::MoveInsertSlot { plan })
 }
 
 fn mixer_channel_meter_signature(
@@ -2633,6 +2739,226 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
             Vec::new()
         },
         routing: routing.clone(),
+    }
+}
+
+/// The shared insert-drop commit: anchors resolved against the live chains,
+/// no-ops refused, and a cross-channel move reaching the engine snapshot under
+/// the destination only, as the same instance.
+
+/// An input change (record arm, input monitor) pressed on the mixer strip of
+/// `id`: applied to every track ganged with it and handed to the engine one
+/// track at a time. A track the engine refuses is put back and the error
+/// shown; the rest keep the change, recorded as one undo step.
+pub(super) fn apply_mixer_input_gang(
+    timeline: &gpui::Entity<crate::components::timeline::Timeline>,
+    engine: Option<&DirectAudio::native::AudioEngine>,
+    owner: &Entity<StudioLayout>,
+    id: &str,
+    label: &'static str,
+    apply: impl Fn(&mut crate::components::timeline::timeline_state::TimelineState, &str) -> bool,
+    cx: &mut gpui::App,
+) {
+    let targets = timeline.read(cx).state.gang_targets(id);
+    let edit = timeline
+        .read(cx)
+        .begin_track_edit(TrackEditScope::tracks(targets.clone()));
+    let mut changed = false;
+    let mut refused = None;
+    for target in &targets {
+        let Some(previous) = timeline
+            .read(cx)
+            .state
+            .find_track(target)
+            .map(|track| (track.armed, track.input_monitor))
+        else {
+            continue;
+        };
+        if !timeline.update(cx, |t, _| apply(&mut t.state, target)) {
+            continue;
+        }
+        let connections = timeline.read(cx).state.audio_connections.clone();
+        let error = engine.and_then(|engine| {
+            timeline
+                .read(cx)
+                .state
+                .find_track(target)
+                .and_then(|track| apply_engine_track_input_state(engine, track, &connections).err())
+        });
+        match error {
+            Some(error) => {
+                timeline.update(cx, |t, _| {
+                    if let Some(track) = t.state.tracks.iter_mut().find(|t| t.id == *target) {
+                        track.armed = previous.0;
+                        track.input_monitor = previous.1;
+                    }
+                });
+                refused = Some(error);
+            }
+            None => changed = true,
+        }
+    }
+    timeline.update(cx, |t, cx| {
+        if changed {
+            t.commit_track_edit(label, edit, false, cx);
+        }
+        cx.notify();
+    });
+    StudioLayout::defer_update(owner, cx, move |this, cx| {
+        if let Some(error) = refused {
+            this.audio_bridge.last_error = Some(format!("Track input update failed: {error}"));
+        }
+        if changed {
+            this.mark_dirty_view_only();
+        }
+        this.push_mixer_snapshot_to_window(cx);
+    });
+}
+
+#[cfg(test)]
+mod insert_drop_tests {
+    use super::insert_drop_command;
+    use crate::components::edit::EditCommand;
+    use crate::components::reorder::{DropAnchor, InsertDrop};
+    use crate::components::timeline::timeline_state::{
+        CreateTrackOptions, InputMonitorMode, InsertPluginFormat, TimelineState, TrackType,
+    };
+    use crate::layout::engine_snapshot::build_engine_project_snapshot;
+
+    fn track(state: &mut TimelineState, track_type: TrackType, name: &str) -> String {
+        state.create_track(CreateTrackOptions {
+            track_type,
+            name: name.to_string(),
+            color: gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        })
+    }
+
+    fn load(state: &mut TimelineState, track_id: &str, index: usize, name: &str) -> String {
+        let slot = state.ensure_insert_slot_at(track_id, index).expect("slot");
+        state.set_insert_plugin(
+            track_id,
+            &slot,
+            name.to_string(),
+            Some(std::path::PathBuf::from(format!("C:/p/{name}.vst3"))),
+            InsertPluginFormat::Vst3,
+            None,
+            name.to_string(),
+        );
+        state.set_insert_plugin_role(track_id, &slot, false);
+        slot
+    }
+
+    fn drop(from: &str, insert: &str, to: &str, anchor: DropAnchor) -> InsertDrop {
+        InsertDrop {
+            from_track: from.to_string(),
+            insert_id: insert.to_string(),
+            to_track: to.to_string(),
+            anchor,
+            copy: false,
+        }
+    }
+
+    #[test]
+    fn a_same_chain_drop_resolves_its_anchor_against_the_live_order() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let a = track(&mut state, TrackType::Audio, "A");
+        let x = load(&mut state, &a, 0, "x");
+        let y = load(&mut state, &a, 1, "y");
+        let z = load(&mut state, &a, 2, "z");
+        // Rendered as [x, y, z]; the user dragged z up onto y. Meanwhile the
+        // live chain became [y, x, z].
+        assert!(state.set_insert_order(&a, &[y.clone(), x.clone(), z.clone()]));
+        let command = insert_drop_command(&state, &drop(&a, &z, &a, DropAnchor::Before(y.clone())))
+            .expect("a real move");
+        let EditCommand::ReorderFxSlot { after_order, .. } = &command else {
+            panic!("a same-chain drop is a reorder");
+        };
+        assert_eq!(*after_order, vec![z.clone(), y.clone(), x.clone()]);
+
+        // A drop that changes nothing records nothing.
+        assert!(insert_drop_command(&state, &drop(&a, &x, &a, DropAnchor::After(y))).is_none());
+        assert!(insert_drop_command(&state, &drop(&a, &z, &a, DropAnchor::End)).is_none());
+    }
+
+    #[test]
+    fn an_instrument_chain_never_takes_an_effect_in_front_of_its_instrument() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let inst = track(&mut state, TrackType::Instrument, "Inst");
+        let synth = load(&mut state, &inst, 0, "synth");
+        state.set_insert_plugin_role(&inst, &synth, true);
+        let fx1 = load(&mut state, &inst, 1, "fx1");
+        let fx2 = load(&mut state, &inst, 2, "fx2");
+        let command = insert_drop_command(
+            &state,
+            &drop(&inst, &fx2, &inst, DropAnchor::Before(synth.clone())),
+        )
+        .expect("clamped, still a move");
+        let EditCommand::ReorderFxSlot { after_order, .. } = &command else {
+            panic!("a same-chain drop is a reorder");
+        };
+        assert_eq!(*after_order, vec![synth.clone(), fx2, fx1]);
+        assert!(
+            insert_drop_command(&state, &drop(&inst, &synth, &inst, DropAnchor::End)).is_none(),
+            "the instrument never moves"
+        );
+    }
+
+    /// After a cross-channel move the engine sees the insert under the
+    /// destination only, with the same instance id and as an effect.
+    #[test]
+    fn a_moved_insert_reaches_the_engine_under_its_new_track_only() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let a = track(&mut state, TrackType::Audio, "A");
+        let b = track(&mut state, TrackType::Audio, "B");
+        let fx = load(&mut state, &a, 0, "fx");
+        let other = load(&mut state, &b, 0, "other");
+
+        let command =
+            insert_drop_command(&state, &drop(&a, &fx, &b, DropAnchor::End)).expect("movable");
+        assert!(matches!(command, EditCommand::MoveInsertSlot { .. }));
+        command.execute(&mut state);
+
+        let snapshot = build_engine_project_snapshot(&state, 48_000, None, None);
+        let inserts_of = |track_id: &str| {
+            snapshot
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .expect("track in snapshot")
+                .inserts
+                .clone()
+        };
+        assert!(inserts_of(&a).is_empty());
+        let on_b = inserts_of(&b);
+        let ids: Vec<&str> = on_b.iter().map(|insert| insert.id.as_str()).collect();
+        assert_eq!(ids, vec![other.as_str(), fx.as_str()]);
+        let moved = &on_b[1];
+        assert_eq!(
+            moved
+                .params
+                .get("pluginInstanceId")
+                .and_then(serde_json::Value::as_str),
+            Some(fx.as_str()),
+            "the same instance id, so the engine reuses the live instance"
+        );
+        if crate::layout::plugin_bridge_runtime::bridge_enabled() {
+            assert_eq!(
+                moved.params.get("role").and_then(serde_json::Value::as_str),
+                Some("effect")
+            );
+        }
     }
 }
 

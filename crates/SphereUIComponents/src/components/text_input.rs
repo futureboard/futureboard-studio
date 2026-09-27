@@ -310,6 +310,9 @@ pub struct TextInputState {
     /// their field focused; the always-visible main-window fields opt in.
     pub blur_on_click_outside: bool,
     mouse_selecting: bool,
+    /// Outer height of the drawn field; `None` is the standard 30 px. See
+    /// [`Self::with_field_height`].
+    field_height: Option<f32>,
 }
 
 impl std::ops::Deref for TextInputState {
@@ -335,7 +338,16 @@ impl TextInputState {
             buffer: TextEditBuffer::default(),
             blur_on_click_outside: false,
             mouse_selecting: false,
+            field_height: None,
         }
+    }
+
+    /// Draw the field `height` px tall instead of the standard 30, for a field
+    /// that edits in place inside a denser row (a track header's name line).
+    /// Padding, text size and pointer hit-testing are unchanged.
+    pub fn with_field_height(mut self, height: f32) -> Self {
+        self.field_height = Some(height);
+        self
     }
 
     /// Restrict typing to `charset`, independent of the keyboard layout.
@@ -1480,6 +1492,7 @@ fn text_field_inner(
     let blur_outside = state.blur_on_click_outside;
     let accessible_label = state.accessible_label();
     let accessible_value = state.value.clone();
+    let field_height = state.field_height.unwrap_or(30.0);
     let read_only = state.read_only;
     let is_password = state.is_password;
     let value = state.display_value();
@@ -1616,7 +1629,7 @@ fn text_field_inner(
         .flex_row()
         .items_center()
         .w_full()
-        .h(px(30.0))
+        .h(px(field_height))
         .px(px(9.0))
         .rounded(px(crate::theme::radius::CONTROL))
         .overflow_hidden()

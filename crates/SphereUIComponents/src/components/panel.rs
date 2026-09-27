@@ -31,12 +31,15 @@ use crate::components::controls::{
 };
 use crate::components::inspector::{
     inspector_checkbox as shared_inspector_checkbox, inspector_hint_text, inspector_mini_button,
-    inspector_numeric_stepper, inspector_numeric_stepper_with_drag_callbacks,
-    inspector_row as shared_inspector_row, inspector_section as shared_inspector_section,
-    inspector_select, InspectorSelectOption,
+    inspector_numeric_stepper, inspector_numeric_stepper_coarse,
+    inspector_numeric_stepper_with_drag_callbacks, inspector_row as shared_inspector_row,
+    inspector_section as shared_inspector_section, inspector_select, InspectorSelectOption,
 };
 use crate::components::inspector_kit;
-use crate::components::reorder::drop_over_highlight;
+use crate::components::reorder::{
+    insert_drop_forwarder, insert_drop_target, DragRefusal, DropIndicator, DropSlot, InsertDropCb,
+    InsertDropTarget,
+};
 use crate::components::slider::{bipolar_slider_with_drag_callbacks, slider_with_drag_callbacks};
 use crate::components::solfege_editor::SolfegePitchSummary;
 use crate::components::text_input::{
@@ -69,7 +72,6 @@ type MpeConfigurationCb =
     Arc<dyn Fn(&(String, MpeTrackConfiguration), &mut Window, &mut App) + 'static>;
 type InsertPairCb = Arc<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>;
 type InsertOpenCb = Arc<dyn Fn(&(String, usize, String), &mut Window, &mut App) + 'static>;
-type InsertMoveCb = Arc<dyn Fn(&(String, String, bool), &mut Window, &mut App) + 'static>;
 type InsertPickerCb = Arc<dyn Fn(&(String, usize, bool), &mut Window, &mut App) + 'static>;
 type InsertOutputChannelCb =
     Arc<dyn Fn(&(String, String, u8, bool), &mut Window, &mut App) + 'static>;
@@ -90,24 +92,36 @@ pub struct StretchTempoUiSnapshot {
     pub low_confidence: bool,
     pub suggested_bpm: Option<f32>,
 }
-/// Reorder an FX/insert slot via drag. `(track_id, dragged_insert_id,
-/// insertion_index)` where `insertion_index` is the gap (0..=len) the dragged
-/// slot should move into. Identity is the stable `plugin_instance_id`, never
-/// the visual index. One completed drag = one undo entry (see
-/// `reorder_insert_cb`).
-type InsertReorderCb = Arc<dyn Fn(&(String, String, usize), &mut Window, &mut App) + 'static>;
-
-/// Drag payload for FX/insert reorder. Carries the stable instance identity
-/// plus a label rendered in the drag preview. Cloned into the GPUI drag view.
+/// Drag payload for FX/insert reorder and cross-channel moves. Carries the
+/// stable instance identity plus a label rendered in the drag preview. Cloned
+/// into the GPUI drag view. Built by `FxSlotDrag::for_slot` (reorder.rs).
 #[derive(Clone)]
 pub struct FxSlotDrag {
     pub track_id: String,
     pub insert_id: String,
     pub display_name: String,
+    /// Chain index the drag started from, as rendered. Only picks which edge
+    /// of a same-chain target the drop line is drawn on; the commit resolves
+    /// the drop against the live chain.
+    pub source_index: usize,
+    /// Whether the insert may leave its channel. Instrument plug-ins may not.
+    pub movable: bool,
+    /// The insert has plug-in parameter automation lanes, which travel with it
+    /// — so the master, which keeps no lanes, refuses it.
+    pub has_param_lanes: bool,
+    /// The target currently showing "not allowed" for this drag.
+    pub refusal: DragRefusal,
 }
 
 impl gpui::Render for FxSlotDrag {
-    fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        // Alt drops a copy (`reorder::is_copy_drag`); the label says so before
+        // the drop does.
+        let label = if crate::components::reorder::is_copy_drag(window) {
+            format!("+ {}", self.display_name)
+        } else {
+            self.display_name.clone()
+        };
         div()
             .px(px(8.0))
             .py(px(3.0))
@@ -118,7 +132,7 @@ impl gpui::Render for FxSlotDrag {
             .text_size(px(11.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(Colors::text_primary())
-            .child(self.display_name.clone())
+            .child(label)
     }
 }
 
@@ -166,9 +180,9 @@ pub struct InspectorCallbacks {
     pub on_toggle_insert_bypass: InsertPairCb,
     pub on_toggle_insert_enabled: InsertPairCb,
     pub on_toggle_insert_output_channel: InsertOutputChannelCb,
-    pub on_move_insert: InsertMoveCb,
-    /// Drag-reorder commit for an FX/insert slot (one undo entry per drag).
-    pub on_reorder_insert: InsertReorderCb,
+    /// Drop commit for a dragged FX/insert slot — a reorder within its chain or
+    /// a move from another channel (one undo entry per drag).
+    pub on_drop_insert: InsertDropCb,
     pub on_open_insert_editor: InsertOpenCb,
     pub on_set_clip_start: ClipF32Cb,
     pub on_set_clip_length: ClipF32Cb,
@@ -239,6 +253,9 @@ pub struct SelectedClipSummary<'a> {
     pub project_bpm: f64,
     /// Active arrangement time-selection duration in beats, when available.
     pub selection_duration_beats: Option<f32>,
+    /// The fades the clip plays (a crossfade's on an overlapped edge) and
+    /// whether its track is ARA-rendered. `None` until the owner resolves it.
+    pub fades: Option<crate::components::timeline::timeline_state::ClipFadeSummary>,
 }
 
 /// What the Inspector is currently editing. Resolved fresh from the live
@@ -1522,18 +1539,23 @@ fn plugin_state_label(slot: &InsertSlotState) -> String {
 ///
 /// Everything a slot can say that is not one of those four lives in the
 /// tooltip: the format, the load state, and why it failed if it did.
-#[allow(clippy::too_many_arguments)]
+///
+/// # The instrument row does not drag
+///
+/// Which slot is the instrument is decided by position (slot 0), so the
+/// instrument row is click-only: it is neither a drag source nor a drop
+/// target, and nothing can be dropped in front of it. An effect row owns
+/// `row_gap` px of spacing below it, so a drop between two rows always lands
+/// on one of them.
 fn plugin_slot_row(
     track: &TrackState,
     slot: &InsertSlotState,
     slot_index: usize,
     display_index: usize,
     callbacks: &InspectorCallbacks,
-    _can_move_up: bool,
-    _can_move_down: bool,
     is_instrument: bool,
+    row_gap: f32,
 ) -> impl IntoElement {
-    let _ = is_instrument;
     let name = plugin_slot_name(Some(slot), "Empty Slot");
     let bypassed = slot.bypassed || !slot.enabled;
     let failed = matches!(
@@ -1541,18 +1563,30 @@ fn plugin_slot_row(
         InsertLoadStatus::Missing(_) | InsertLoadStatus::Failed(_)
     );
 
-    // Drag source: the whole row, carrying the stable plugin_instance_id so
-    // reorder identity follows the instance and never the visual index.
-    let drag_payload = FxSlotDrag {
-        track_id: track.id.clone(),
-        insert_id: slot.id.clone(),
-        display_name: name.clone(),
+    // Drag source and drop target: the whole row, carrying the stable
+    // plugin_instance_id so reorder identity follows the instance and never
+    // the visual index. The glyph buttons forward drops to the row, so a drop
+    // released over one still lands.
+    let dnd = (!is_instrument).then(|| {
+        let mut payload =
+            FxSlotDrag::for_slot(&track.id, slot, slot_index, &track.automation_lanes);
+        payload.display_name = name.clone();
+        let target = InsertDropTarget::for_track(
+            track,
+            DropSlot::Row {
+                id: slot.id.clone(),
+                index: slot_index,
+            },
+            "inspector",
+        );
+        (payload, target, callbacks.on_drop_insert.clone())
+    });
+    let forward_drops = |element: gpui::Stateful<gpui::Div>| match &dnd {
+        Some((_, target, on_drop)) => {
+            insert_drop_forwarder(element, target.clone(), on_drop.clone())
+        }
+        None => element,
     };
-    // Drop target: a drop on this row moves the dragged slot into the gap
-    // *above* it. Same-track guarded, and the shared accent line shows where.
-    let drop_track = track.id.clone();
-    let can_drop_track = track.id.clone();
-    let reorder = callbacks.on_reorder_insert.clone();
 
     let open = callbacks.on_open_insert_editor.clone();
     let open_target = (track.id.clone(), slot_index, slot.id.clone());
@@ -1572,8 +1606,10 @@ fn plugin_slot_row(
     let rest = Colors::composite(Colors::surface_card(), Colors::state_recessed());
     let hover = Colors::composite(rest, Colors::state_hover());
 
-    div()
-        .id(("fx-slot", slot_index))
+    // The row's look. The interactive element around it is transparent and
+    // also covers the spacing below, so the drop line can be drawn in that
+    // spacing without moving anything.
+    let body = div()
         .flex()
         .flex_row()
         .items_center()
@@ -1584,30 +1620,11 @@ fn plugin_slot_row(
         .bg(rest)
         .hover(move |style| style.bg(hover))
         .cursor(gpui::CursorStyle::PointingHand)
-        .tooltip(crate::components::controls::fb_tooltip(tooltip))
-        .can_drop(move |dragged, _window, _cx| {
-            dragged
-                .downcast_ref::<FxSlotDrag>()
-                .is_some_and(|d| d.track_id == can_drop_track)
-        })
-        .drag_over::<FxSlotDrag>(|style, _drag, _window, _cx| drop_over_highlight(style))
-        .on_drop::<FxSlotDrag>(move |drag, window, cx| {
-            if drag.track_id == drop_track {
-                reorder(
-                    &(drop_track.clone(), drag.insert_id.clone(), slot_index),
-                    window,
-                    cx,
-                );
-            }
-        })
-        .on_drag(drag_payload, |drag, _offset, _window, cx| {
-            cx.new(|_| drag.clone())
-        })
         // Bypass. A power symbol, not a word: it is the one control on the row
         // whose state has to be readable without reading.
-        .child(
+        .child(forward_drops(
             div()
-                .id(("fx-slot-bypass", slot_index))
+                .id("fx-slot-bypass")
                 .flex()
                 .flex_none()
                 .items_center()
@@ -1631,8 +1648,8 @@ fn plugin_slot_row(
                         }),
                 )
                 .on_click(move |_, w, cx| bypass(&bypass_target, w, cx))
-                .occlude(),
-        )
+                .block_mouse_except_scroll(),
+        ))
         .child(
             div()
                 .flex_none()
@@ -1658,30 +1675,53 @@ fn plugin_slot_row(
                 })
                 .child(name),
         )
-        .child(slot_icon_button(
-            ("fx-slot-open", slot_index),
+        .child(forward_drops(slot_icon_button(
+            "fx-slot-open",
             assets::ICON_SLIDERS_HORIZONTAL_PATH,
             Colors::text_secondary(),
             move |w, cx| open_editor(&editor_target, w, cx),
-        ))
-        .child(slot_icon_button(
-            ("fx-slot-remove", slot_index),
+        )))
+        .child(forward_drops(slot_icon_button(
+            "fx-slot-remove",
             assets::ICON_TRASH_PATH,
             Colors::text_faint(),
             move |w, cx| remove(&remove_target, w, cx),
-        ))
+        )));
+
+    // Keyed by instance, not position, so press / hover / click state follows
+    // the plug-in across a reorder.
+    let row = div()
+        .id(gpui::SharedString::from(format!("fx-slot-{}", slot.id)))
+        .pb(px(row_gap))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .tooltip(crate::components::controls::fb_tooltip(tooltip))
+        .child(body)
         // Pressing anywhere else on the row opens the editor, so the name is a
-        // target and not just a label.
-        .on_click(move |_, w, cx| open(&open_target, w, cx))
+        // target and not just a label. A click, not a press: GPUI drops the
+        // click once a drag starts, so dragging never opens the editor.
+        .on_click(move |_, w, cx| open(&open_target, w, cx));
+    match dnd {
+        Some((payload, target, on_drop)) => insert_drop_target(
+            row.on_drag(payload, |drag, _offset, _window, cx| {
+                drag.refusal.reset();
+                cx.new(|_| drag.clone())
+            }),
+            target,
+            DropIndicator::Row { gap: row_gap },
+            on_drop,
+        ),
+        None => row,
+    }
 }
 
-/// One glyph button on a plug-in slot.
+/// One glyph button on a plug-in slot. Blocks clicks from reaching the row
+/// behind it, but not the wheel, so the Inspector still scrolls under it.
 fn slot_icon_button(
     id: impl Into<gpui::ElementId>,
     icon: &'static str,
     tone: gpui::Rgba,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
@@ -1695,7 +1735,7 @@ fn slot_icon_button(
         .hover(|style| style.bg(Colors::state_hover()))
         .child(svg().path(icon).w(px(13.0)).h(px(13.0)).text_color(tone))
         .on_click(move |_, w, cx| on_click(w, cx))
-        .occlude()
+        .block_mouse_except_scroll()
 }
 
 fn instrument_section(track: &TrackState, callbacks: &InspectorCallbacks) -> gpui::AnyElement {
@@ -1737,9 +1777,7 @@ fn instrument_section(track: &TrackState, callbacks: &InspectorCallbacks) -> gpu
             ))
             // The instrument is a chain of one, so it gets the same row every
             // effect gets: power, name, editor, bin.
-            .child(plugin_slot_row(
-                track, slot, 0, 1, callbacks, false, false, true,
-            ));
+            .child(plugin_slot_row(track, slot, 0, 1, callbacks, true, 0.0));
     } else if track.solfege.is_some() {
         section = section.child(kv_row("Details", "Open the Solfege tab"));
     } else if track.builtin_soundfont_player {
@@ -2162,67 +2200,62 @@ fn insert_effects_section(track: &TrackState, callbacks: &InspectorCallbacks) ->
     } else {
         0
     };
-    let mut rows = section_rows();
+    // The chain's own stack has no flex gap: each row owns the spacing below
+    // it, so every point between two rows is a drop target.
+    let row_gap = inspector_kit::CARD_ROW_GAP;
+    let mut chain = div().flex().flex_col();
 
     let effects = track.effect_inserts();
-    if effects.is_empty() {
-        rows = rows.child(inspector_kit::ins_value_muted("No effects"));
-    } else {
-        for (offset, slot) in effects.iter().enumerate() {
-            let slot_index = effect_start + offset;
-            rows = rows.child(plugin_slot_row(
-                track,
-                slot,
-                slot_index,
-                offset + 1,
-                callbacks,
-                slot_index > effect_start,
-                slot_index + 1 < track.inserts.len(),
-                false,
-            ));
-        }
-        // Trailing drop zone so a dragged slot can land at the very end of the
-        // chain (insertion gap == inserts.len()); rows above only cover the
-        // gaps before each slot. Same-track guarded; shows the accent line.
-        let end_track = track.id.clone();
-        let end_can_track = track.id.clone();
-        let end_reorder = callbacks.on_reorder_insert.clone();
-        let end_gap = track.inserts.len();
-        rows = rows.child(
-            div()
-                .id("fx-drop-end")
-                .h(px(8.0))
-                .can_drop(move |dragged, _window, _cx| {
-                    dragged
-                        .downcast_ref::<FxSlotDrag>()
-                        .is_some_and(|d| d.track_id == end_can_track)
-                })
-                .drag_over::<FxSlotDrag>(|style, _drag, _window, _cx| drop_over_highlight(style))
-                .on_drop::<FxSlotDrag>(move |drag, window, cx| {
-                    if drag.track_id == end_track {
-                        end_reorder(
-                            &(end_track.clone(), drag.insert_id.clone(), end_gap),
-                            window,
-                            cx,
-                        );
-                    }
-                }),
-        );
+    for (offset, slot) in effects.iter().enumerate() {
+        chain = chain.child(plugin_slot_row(
+            track,
+            slot,
+            effect_start + offset,
+            offset + 1,
+            callbacks,
+            false,
+            row_gap,
+        ));
     }
+    // End of the chain — rendered for an empty chain too, so it can take a
+    // plug-in dragged from another channel. Rows cover the places in front of
+    // each slot; this covers the one after the last.
+    let end = DropSlot::End {
+        last_id: track.inserts.last().map(|slot| slot.id.clone()),
+    };
+    let end_zone = div().id("fx-drop-end");
+    let end_zone = if effects.is_empty() {
+        end_zone.child(inspector_kit::ins_value_muted("No effects"))
+    } else {
+        end_zone.h(px(8.0))
+    };
+    chain = chain.child(insert_drop_target(
+        end_zone,
+        InsertDropTarget::for_track(track, end.clone(), "inspector"),
+        DropIndicator::Row { gap: 0.0 },
+        callbacks.on_drop_insert.clone(),
+    ));
 
     let track_id = track.id.clone();
     let next_slot = track.inserts.len().max(effect_start);
     let picker = callbacks.on_open_insert_picker.clone();
-    section_card(
-        "inserts",
-        "Insert Effects",
-        callbacks,
-        rows.child(compact_action_button(
+    // Add Effect is the end of the chain as well.
+    let add = insert_drop_target(
+        div().id("effect-add-drop").child(compact_action_button(
             "effect-add",
             "Add Effect",
             true,
             move |_, w, cx| picker(&(track_id.clone(), next_slot, false), w, cx),
         )),
+        InsertDropTarget::for_track(track, end, "inspector").with_key_suffix("add"),
+        DropIndicator::Row { gap: 0.0 },
+        callbacks.on_drop_insert.clone(),
+    );
+    section_card(
+        "inserts",
+        "Insert Effects",
+        callbacks,
+        section_rows().child(chain).child(add),
     )
 }
 
@@ -2564,9 +2597,13 @@ fn db_to_linear_gain(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
 }
 
+/// The clip's gain in the Inspector. `disabled` on an ARA track, whose
+/// plug-in renders the audio: the engine applies no clip gain there, as the
+/// section's hint says, so the stepper is inert like the clip's inline gain.
 fn gain_stepper(
     clip_id: &str,
     gain: f32,
+    disabled: bool,
     preview_callback: ClipF32Cb,
     callbacks: &InspectorCallbacks,
 ) -> impl IntoElement {
@@ -2584,7 +2621,7 @@ fn gain_stepper(
         -60.0,
         12.0,
         1.0,
-        false,
+        disabled,
         Some(Arc::new(move |w, cx| begin(&start_id, w, cx))),
         Arc::new(move |next, w, cx| {
             preview_callback(&(preview_id.clone(), db_to_linear_gain(next as f32)), w, cx)
@@ -2622,6 +2659,68 @@ fn clip_stretch_stepper(
         disabled,
         Some(Arc::new(move |w, cx| begin(&start_id, w, cx))),
         Arc::new(move |next, w, cx| preview(&(preview_id.clone(), build_next(next)), w, cx)),
+        Some(Arc::new(move |w, cx| commit(&commit_id, w, cx))),
+    )
+}
+
+/// One of a clip's fades in the Inspector, as it plays.
+///
+/// Scrubs the manual fade, clamped so the two fades never overlap (the most
+/// the other edge leaves of the clip); Shift scrubs in 100 ms steps, so a fade
+/// of seconds is in reach. An edge a crossfade covers shows the crossfade's
+/// length read-only — the manual fade does not apply there — and on an ARA
+/// track, whose plug-in renders the audio, neither is applied.
+fn clip_fade_stepper(
+    id: &'static str,
+    edge: crate::components::timeline::timeline_state::FadeEdge,
+    clip: &SelectedClipSummary<'_>,
+    callbacks: &InspectorCallbacks,
+) -> impl IntoElement {
+    use crate::components::timeline::timeline_state::FadeEdge;
+    const MAX_UNRESOLVED_MS: f64 = 60_000.0;
+    let fades = clip.fades.map(|summary| summary.fades);
+    let ara = clip.fades.is_some_and(|summary| summary.ara);
+    let crossfade_ms = fades
+        .filter(|fades| fades.crossfaded(edge))
+        .map(|fades| fades.seconds(edge) * 1000.0);
+    let max_ms = fades.map_or(MAX_UNRESOLVED_MS, |fades| {
+        (fades.max_manual_seconds(edge) * 1000.0).max(0.0)
+    });
+    let manual_ms = match edge {
+        FadeEdge::In => clip.stretch.fade_in_ms,
+        FadeEdge::Out => clip.stretch.fade_out_ms,
+    } as f64;
+    // What plays: a manual fade longer than the clip leaves is heard shorter.
+    let value = fades.map_or(manual_ms, |fades| fades.seconds(edge) * 1000.0);
+    let display = match crossfade_ms {
+        Some(ms) => format!("Xfade {ms:.0} ms"),
+        None => format!("{value:.0} ms"),
+    };
+    let start_id = clip.clip_id.to_string();
+    let preview_id = start_id.clone();
+    let commit_id = start_id.clone();
+    let begin = callbacks.on_begin_clip_property_drag.clone();
+    let preview = callbacks.on_preview_clip_stretch.clone();
+    let commit = callbacks.on_commit_clip_property_drag.clone();
+    let stretch = clip.stretch.clone();
+    inspector_numeric_stepper_coarse(
+        id,
+        value,
+        display,
+        0.0,
+        max_ms,
+        5.0,
+        100.0,
+        crossfade_ms.is_some() || ara,
+        Some(Arc::new(move |w, cx| begin(&start_id, w, cx))),
+        Arc::new(move |ms, w, cx| {
+            let mut next = stretch.clone();
+            match edge {
+                FadeEdge::In => next.fade_in_ms = ms as f32,
+                FadeEdge::Out => next.fade_out_ms = ms as f32,
+            }
+            preview(&(preview_id.clone(), next), w, cx)
+        }),
         Some(Arc::new(move |w, cx| commit(&commit_id, w, cx))),
     )
 }
@@ -3258,6 +3357,7 @@ fn clip_inspector(
                         gain_stepper(
                             clip.clip_id,
                             clip.gain,
+                            clip.fades.is_some_and(|summary| summary.ara),
                             callbacks.on_preview_clip_gain.clone(),
                             callbacks,
                         ),
@@ -3280,50 +3380,28 @@ fn clip_inspector(
                     ))
                     .child(compact_property_row(
                         "Fade In",
-                        clip_stretch_stepper(
+                        clip_fade_stepper(
                             "clip-fade-in",
-                            clip.clip_id,
-                            s.fade_in_ms as f64,
-                            format!("{:.0} ms", s.fade_in_ms),
-                            0.0,
-                            60_000.0,
-                            5.0,
-                            false,
+                            crate::components::timeline::timeline_state::FadeEdge::In,
+                            &clip,
                             callbacks,
-                            {
-                                let s = s.clone();
-                                move |value| {
-                                    let mut next = s.clone();
-                                    next.fade_in_ms = value as f32;
-                                    next.dirty = true;
-                                    next
-                                }
-                            },
                         ),
                     ))
                     .child(compact_property_row(
                         "Fade Out",
-                        clip_stretch_stepper(
+                        clip_fade_stepper(
                             "clip-fade-out",
-                            clip.clip_id,
-                            s.fade_out_ms as f64,
-                            format!("{:.0} ms", s.fade_out_ms),
-                            0.0,
-                            60_000.0,
-                            5.0,
-                            false,
+                            crate::components::timeline::timeline_state::FadeEdge::Out,
+                            &clip,
                             callbacks,
-                            {
-                                let s = s.clone();
-                                move |value| {
-                                    let mut next = s.clone();
-                                    next.fade_out_ms = value as f32;
-                                    next.dirty = true;
-                                    next
-                                }
-                            },
                         ),
-                    )),
+                    ))
+                    .children(clip.fades.is_some_and(|summary| summary.ara).then(|| {
+                        inspector_hint_text(
+                            "ARA track: its plug-in renders the audio, so clip fades, \
+                             crossfades and clip gain are not applied.",
+                        )
+                    })),
             ))
             .child(inspector_section(
                 "Time & Pitch",

@@ -11,12 +11,15 @@ use crate::components::plugin_picker::{
     sync_selection_from_highlight, visible_plugin_id_at, PluginPickerState,
 };
 use crate::components::text_input::{is_repeatable_edit_key, TextInputAction, TextInputState};
+use crate::components::timeline::timeline::{
+    track_rename_command_policy, TrackRenameChord, TrackRenameCommandPolicy, TrackRenameKeyOutcome,
+};
 use crate::components::timeline::timeline_state::{
-    is_project_routing_track, ClipType, TempoCurve, TrackTimebase, TrackType,
+    is_project_routing_track, ClipType, TempoCurve, TrackEditScope, TrackTimebase, TrackType,
 };
 use crate::i18n::I18n;
 
-use super::helpers::{is_supported_audio_ext, is_text_input_key};
+use super::helpers::{is_supported_audio_ext, is_text_input_key, normalize_command_id};
 use super::{
     ContextMenuTarget, ContextTarget, OpenPopover, RightDockTab, StudioLayout, TextMenuTarget,
 };
@@ -40,6 +43,15 @@ pub(crate) struct InspectorNameEditState {
     /// Track id the open picker is editing, so a selection change while the
     /// popover is open cannot recolour the wrong track.
     pub color_bound: Option<String>,
+    /// The timeline's `track_names_revision` the name field last caught up
+    /// with. See [`inspector_name_reloads`].
+    pub names_revision_seen: u64,
+    /// The bound track's name as the field last loaded it or wrote it. A
+    /// stored name that differs was put there by something else — a header
+    /// rename, undo, redo — so the field reloads, and a keystroke never
+    /// writes text based on a name the track no longer has. See
+    /// [`inspector_name_commit_allowed`].
+    pub name_synced: Option<String>,
 }
 
 impl InspectorNameEditState {
@@ -61,8 +73,67 @@ impl InspectorNameEditState {
                 crate::color::load_recent_colors(),
             ),
             color_bound: None,
+            names_revision_seen: 0,
+            name_synced: None,
         }
     }
+}
+
+/// Whether the Inspector's track-name field takes the bound track's `stored`
+/// name, on a render where the names revision moved.
+///
+/// `synced` is the name the field last loaded or wrote. A stored name that
+/// differs was put there by something else — a header rename, undo, redo,
+/// another project — so the field reloads at once, even while it has focus:
+/// its own text reached the track on its last keystroke, so nothing typed is
+/// lost, and keeping it would write over the other rename on the next one.
+/// Otherwise a focused field is left alone (the track holds the trimmed form
+/// of what is being typed, and reloading would eat a space before the next
+/// word); once it lets go it shows the stored form.
+pub(super) fn inspector_name_reloads(synced: Option<&str>, stored: &str, focused: bool) -> bool {
+    !focused || synced != Some(stored)
+}
+
+/// Whether an edit in the Inspector's track-name field may write its text to
+/// the bound track: only while the track still has the name the field last
+/// loaded or wrote. Otherwise the text is an edit of a name the track no
+/// longer has — an undo landed before the field could reload — and writing it
+/// would silently take the undo back with no history entry.
+pub(super) fn inspector_name_commit_allowed(synced: Option<&str>, stored: &str) -> bool {
+    synced == Some(stored)
+}
+
+/// Every accelerator that can run `command_id` (normalised) without its
+/// keystroke passing the rename field: its bindings in the active keymap
+/// (`rows`), plus the menu manifest's accelerator when it is one the macOS
+/// menubar turns into a key equivalent — Cmd or Option held, whatever keymap
+/// profile is active.
+pub(super) fn command_accelerators(
+    rows: &[crate::keymap::KeymapRow],
+    menus: &[crate::menu::Menu],
+    command_id: &str,
+) -> Vec<String> {
+    fn walk(items: &[crate::menu::MenuItem], command_id: &str, out: &mut Vec<String>) {
+        for item in items {
+            if let (Some(command), Some(shortcut)) = (&item.command, &item.shortcut) {
+                let key_equivalent = crate::keymap::canonical_accel(shortcut)
+                    .is_some_and(|token| token.starts_with("alt+") || token.contains("ctrl+"));
+                if key_equivalent && normalize_command_id(command) == command_id {
+                    out.push(shortcut.clone());
+                }
+            }
+            walk(&item.children, command_id, out);
+        }
+    }
+    let mut accelerators: Vec<String> = rows
+        .iter()
+        .filter(|row| normalize_command_id(&row.command) == command_id)
+        .flat_map(|row| row.keystrokes.iter().cloned())
+        .collect();
+    for menu in menus {
+        walk(&menu.items, command_id, &mut accelerators);
+    }
+    accelerators
 }
 
 fn menu_item_enabled(
@@ -151,6 +222,153 @@ impl StudioLayout {
                 false
             }
         }
+    }
+
+    /// Route a key to a track header's inline rename while its field has
+    /// focus. Runs right after the command palette, so the transport's inline
+    /// editors, the dialogs and the global Enter / Escape / Space bindings
+    /// never see what is typed into a track name. A chord the field has no use
+    /// for runs its command through [`track_rename_command_policy`] with the
+    /// chord itself, which is known here; it never reaches the shortcuts.
+    pub(super) fn handle_track_rename_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.timeline.read(cx).track_rename_focused(window) {
+            return false;
+        }
+        if event.is_held && !is_repeatable_edit_key(event) {
+            return true;
+        }
+        let outcome = self.timeline.update(cx, |timeline, cx| {
+            timeline.handle_track_rename_key(event, window, cx)
+        });
+        if matches!(outcome, TrackRenameKeyOutcome::PassCommand) {
+            if let Some(command) = self.shortcut_command_id(event) {
+                let command = normalize_command_id(&command);
+                let chord = TrackRenameChord::of_keystroke(&event.keystroke);
+                let policy = track_rename_command_policy(&command, Some(chord));
+                let bounds = Some(window.bounds());
+                self.apply_track_rename_command(policy, &command, bounds, Some(window), cx);
+            }
+        }
+        true
+    }
+
+    /// The command gate while a track rename is open in the studio window.
+    ///
+    /// On macOS the menu key equivalents (Cmd+Z, Cmd+S, Cmd+Shift+Delete,
+    /// Option+Left, …) reach [`Self::dispatch_command_id_from_bounds`] without
+    /// passing any key listener, and a menubar click arrives the same way, so
+    /// the command's accelerators decide what it most likely was
+    /// ([`TrackRenameChord::likeliest`]). A click anywhere in the window has
+    /// already committed the name on its press. Returns `true` when the
+    /// command must not run now; one that commits the name first runs again
+    /// right after.
+    pub(super) fn track_rename_blocks_command(
+        &mut self,
+        command_id: &str,
+        owner_bounds: Option<Bounds<Pixels>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.timeline.read(cx).track_rename_open() {
+            return false;
+        }
+        // A command from another window — the pop-out mixer, a plug-in editor
+        // — is not aimed at a field in the window the user has left. The
+        // rename stays open; installing another project ends it
+        // (`Timeline::end_track_rename_for_project_change`).
+        let studio_window_active = self
+            .window_hooks
+            .self_window
+            .is_none_or(|studio| cx.active_window() == Some(studio.into()));
+        if !studio_window_active {
+            return false;
+        }
+        let accelerators = command_accelerators(
+            self.keymap_manager.rows(),
+            &crate::menu::MenuManifest::load().menus,
+            command_id,
+        );
+        let chord = TrackRenameChord::likeliest(accelerators.iter().map(String::as_str));
+        let policy = track_rename_command_policy(command_id, chord);
+        self.apply_track_rename_command(policy, command_id, owner_bounds, None, cx);
+        true
+    }
+
+    /// Carry out `policy` for `command_id` while a track rename is open.
+    /// `window` is `None` on the menu path, which runs while the window is busy
+    /// dispatching.
+    fn apply_track_rename_command(
+        &mut self,
+        policy: TrackRenameCommandPolicy,
+        command_id: &str,
+        owner_bounds: Option<Bounds<Pixels>>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        match policy {
+            TrackRenameCommandPolicy::CommitThenRun => {
+                self.timeline
+                    .update(cx, |timeline, cx| timeline.commit_track_rename(window, cx));
+                // Run the command once the commit's own deferred work — the
+                // dirty mark, handing focus back — has landed. Run now, a save
+                // would finish first and the late dirty mark would call the
+                // project it just saved unsaved.
+                let command = command_id.to_string();
+                let this = cx.entity().downgrade();
+                cx.defer(move |cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.dispatch_command_id_from_bounds(&command, owner_bounds, cx);
+                        cx.notify();
+                    });
+                });
+            }
+            TrackRenameCommandPolicy::Edit(edit) => {
+                self.timeline.update(cx, |timeline, cx| {
+                    timeline.apply_track_rename_edit(edit, cx)
+                });
+            }
+            TrackRenameCommandPolicy::Swallow => {}
+        }
+    }
+
+    /// Tab while a track name is being edited commits it, as Enter does,
+    /// rather than walking focus into the header's controls. Returns `true`
+    /// when it did.
+    pub(super) fn commit_track_rename_on_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.timeline.read(cx).track_rename_focused(window) {
+            return false;
+        }
+        self.timeline.update(cx, |timeline, cx| {
+            timeline.commit_track_rename(Some(window), cx)
+        })
+    }
+
+    /// Surfaces that copy track names out of the timeline — the pop-out mixer,
+    /// built-in editor sidebars, the mixer tree — catch up once after any
+    /// rename: the header, the Inspector, undo, redo. Checked once per frame;
+    /// the refresh runs after the frame because it updates other views.
+    pub(super) fn sync_track_name_surfaces(&mut self, cx: &mut Context<Self>) {
+        let revision = self.timeline.read(cx).state.track_names_revision;
+        if revision == self.track_names_revision_seen {
+            return;
+        }
+        self.track_names_revision_seen = revision;
+        let this = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.push_mixer_snapshot_to_window(cx);
+                this.refresh_builtin_editor_sidebars(cx);
+                this.refresh_mixer_tree_sidebar_entity(cx);
+            });
+        });
     }
 
     pub(super) fn project_switcher_visible_entries(
@@ -453,8 +671,9 @@ impl StudioLayout {
                                     .and_then(|n| n.to_str())
                                     .map(|s| s.to_string())
                                     .unwrap_or_else(|| "Imported Audio".to_string());
-                                t.state
-                                    .import_audio_to_selected_or_new_track(path_key, name);
+                                t.import_audio_to_selected_or_new_track_recorded(
+                                    path_key, name, cx,
+                                );
                                 cx.notify();
                             });
                             let _ = layout.update(cx, |this, cx| {
@@ -862,25 +1081,56 @@ impl StudioLayout {
     /// Marks the project dirty only on a real change (rename_track returns
     /// whether the stored name changed). Never marks the engine dirty — a name
     /// is project metadata only.
+    ///
+    /// When the track's name moved under the field since it last loaded it
+    /// (an undo that landed before a render could reload the field), the
+    /// field reloads instead of writing its stale text back.
     pub(super) fn commit_inspector_name(&mut self, cx: &mut Context<Self>) {
         let Some(track_id) = self.inspector_name_edit.name_bound.clone() else {
             return;
         };
-        let new_name = self.inspector_name_edit.name_input.value.clone();
-        let changed = self.timeline.update(cx, |t, cx| {
-            let changed = t.state.rename_track(&track_id, &new_name);
-            if changed {
-                cx.notify();
-            }
-            changed
-        });
-        if changed {
-            crate::components::inspector_debug(&format!(
-                "edit track name track={track_id} new={new_name}"
-            ));
-            self.mark_dirty();
-            self.push_mixer_snapshot_to_window(cx);
+        let Some(stored) = self
+            .timeline
+            .read(cx)
+            .state
+            .find_track(&track_id)
+            .map(|track| track.name.clone())
+        else {
+            return;
+        };
+        let synced = self.inspector_name_edit.name_synced.as_deref();
+        if !inspector_name_commit_allowed(synced, &stored) {
+            self.inspector_name_edit
+                .name_input
+                .set_value(stored.clone());
+            self.inspector_name_edit.name_synced = Some(stored);
+            cx.notify();
+            return;
         }
+        let new_name = self.inspector_name_edit.name_input.value.clone();
+        let written = self.timeline.update(cx, |t, cx| {
+            let edit = t.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
+            if !t.state.rename_track(&track_id, &new_name) {
+                return None;
+            }
+            // The field commits as it is typed in: one rename, one step.
+            t.commit_track_edit("Rename Track", edit, true, cx);
+            cx.notify();
+            t.state
+                .find_track(&track_id)
+                .map(|track| track.name.clone())
+        });
+        let Some(written) = written else {
+            return;
+        };
+        // The track now holds what this field wrote (cleaned up), so the field
+        // is still in step with it.
+        self.inspector_name_edit.name_synced = Some(written);
+        crate::components::inspector_debug(&format!(
+            "edit track name track={track_id} new={new_name}"
+        ));
+        self.mark_dirty();
+        self.push_mixer_snapshot_to_window(cx);
     }
 
     pub(super) fn commit_inspector_clip_name(&mut self, cx: &mut Context<Self>) {
@@ -889,8 +1139,16 @@ impl StudioLayout {
         };
         let new_name = self.inspector_name_edit.clip_name_input.value.clone();
         let changed = self.timeline.update(cx, |t, cx| {
+            let owner = t
+                .state
+                .tracks
+                .iter()
+                .find(|track| track.clips.iter().any(|clip| clip.id == clip_id))
+                .map(|track| track.id.clone());
+            let edit = t.begin_track_edit(TrackEditScope::tracks(owner));
             let changed = t.state.rename_clip(&clip_id, &new_name);
             if changed {
+                t.commit_track_edit("Rename Clip", edit, true, cx);
                 cx.notify();
             }
             changed
@@ -1003,6 +1261,11 @@ impl StudioLayout {
             return;
         };
         let changed = self.timeline.update(cx, |t, cx| {
+            let mut scope = t.state.selection.selected_track_ids.clone();
+            if !scope.contains(&track_id) {
+                scope.push(track_id.clone());
+            }
+            let edit = t.begin_track_edit(TrackEditScope::tracks(scope));
             let mut changed = t.state.set_track_color(&track_id, color);
             if t.state.is_track_selected(&track_id)
                 && t.state.selection.selected_track_ids.len() > 1
@@ -1015,6 +1278,8 @@ impl StudioLayout {
                 }
             }
             if changed {
+                // Every drag sample and hex keystroke lands here: one step.
+                t.commit_track_edit("Track Color", edit, true, cx);
                 cx.notify();
             }
             changed
@@ -1294,9 +1559,13 @@ impl StudioLayout {
             ContextTarget::Track(track_id) => {
                 let track = self.timeline.read(cx).state.find_track(track_id).cloned();
                 let exists = track.is_some();
-                let mut entries = vec![
-                    menu_item_enabled(i18n.tr("context.track.rename"), "track:rename", exists),
-                    menu_item_enabled(i18n.tr("context.track.duplicate"), "track:duplicate", false),
+                let mut entries = vec![menu_item_enabled(
+                    i18n.tr("context.track.rename"),
+                    "track:rename",
+                    exists,
+                )];
+                entries.extend(self.track_copy_menu_entries(track_id, cx));
+                entries.extend([
                     danger_menu_item_enabled(
                         i18n.tr("context.track.delete"),
                         "track:delete",
@@ -1305,6 +1574,22 @@ impl StudioLayout {
                     ContextMenuEntry::Separator,
                     menu_item_enabled("Track Color", "track:color", exists),
                     menu_item_enabled("Track Settings", "track:settings", exists),
+                ]);
+                entries.extend(self.folder_menu_entries(track_id, cx));
+                if let Some(track) = track.as_ref().filter(|track| !track.takes.is_empty()) {
+                    entries.extend([
+                        ContextMenuEntry::Separator,
+                        ContextMenuEntry::item(
+                            if track.takes_expanded {
+                                "Hide Take Lanes"
+                            } else {
+                                "Show Take Lanes"
+                            },
+                            "track:toggle-takes",
+                        ),
+                    ]);
+                }
+                entries.extend([
                     ContextMenuEntry::Separator,
                     ContextMenuEntry::Header("Track Height".to_string()),
                     menu_item_enabled("Small", "track:height-small", exists),
@@ -1313,7 +1598,7 @@ impl StudioLayout {
                     menu_item_enabled("Huge", "track:height-huge", exists),
                     menu_item_enabled("Reset Track Height", "track:height-reset", exists),
                     menu_item_enabled("Reset All Track Heights", "track:height-reset-all", exists),
-                ];
+                ]);
                 // Timebase — what this track's clips hold onto when the tempo
                 // moves. Only offered where there are clips to hold: a Bus,
                 // Return or Group owns none, so the setting would have nothing
@@ -1491,18 +1776,28 @@ impl StudioLayout {
                 }
                 entries
             }
-            ContextTarget::Mixer(_) => vec![
-                ContextMenuEntry::item("Add Bus", "mixer:create-bus"),
-                ContextMenuEntry::Separator,
-                ContextMenuEntry::item(i18n.tr("context.mixer.reset-volume"), "mixer:reset-volume"),
-                ContextMenuEntry::item(i18n.tr("context.mixer.reset-pan"), "mixer:reset-pan"),
-                ContextMenuEntry::Separator,
-                ContextMenuEntry::item(i18n.tr("context.track.mute"), "track:mute"),
-                ContextMenuEntry::item(i18n.tr("context.track.solo"), "track:solo"),
-                ContextMenuEntry::Separator,
-                ContextMenuEntry::item("Track Color", "track:color"),
-                ContextMenuEntry::danger_item(i18n.tr("context.track.delete"), "track:delete"),
-            ],
+            ContextTarget::Mixer(track_id) => {
+                let mut entries = vec![
+                    ContextMenuEntry::item("Add Bus", "mixer:create-bus"),
+                    ContextMenuEntry::Separator,
+                    ContextMenuEntry::item(
+                        i18n.tr("context.mixer.reset-volume"),
+                        "mixer:reset-volume",
+                    ),
+                    ContextMenuEntry::item(i18n.tr("context.mixer.reset-pan"), "mixer:reset-pan"),
+                    ContextMenuEntry::Separator,
+                    ContextMenuEntry::item(i18n.tr("context.track.mute"), "track:mute"),
+                    ContextMenuEntry::item(i18n.tr("context.track.solo"), "track:solo"),
+                    ContextMenuEntry::Separator,
+                    ContextMenuEntry::item("Track Color", "track:color"),
+                ];
+                entries.extend(self.track_copy_menu_entries(track_id, cx));
+                entries.push(ContextMenuEntry::danger_item(
+                    i18n.tr("context.track.delete"),
+                    "track:delete",
+                ));
+                entries
+            }
             ContextTarget::SendPicker { track_id } => {
                 let state = &self.timeline.read(cx).state;
                 let Some(source) = state.find_track(track_id) else {
@@ -1888,6 +2183,38 @@ impl StudioLayout {
                         bars == value,
                     ));
                 }
+                entries
+            }
+            ContextTarget::SnapGrid => {
+                use crate::components::timeline::timeline_state::{SnapDivision, SnapShape};
+                let (snap_on, division, shape) = {
+                    let state = &self.timeline.read(cx).state;
+                    (state.snap_to_grid, state.grid_division, state.snap_shape)
+                };
+                let mut entries = vec![ContextMenuEntry::Header("Grid".to_string())];
+                for option in SnapDivision::MENU {
+                    entries.push(ContextMenuEntry::checked_item(
+                        option.label(),
+                        format!("timeline:set-grid:{}", option.command_id()),
+                        division == option,
+                    ));
+                }
+                entries.push(ContextMenuEntry::Separator);
+                for option in SnapShape::ALL {
+                    entries.push(ContextMenuEntry::checked_item(
+                        option.label(),
+                        format!("timeline:set-grid-shape:{}", option.command_id()),
+                        shape == option,
+                    ));
+                }
+                entries.push(ContextMenuEntry::Separator);
+                let mut snap =
+                    ContextMenuEntry::checked_item("Snap to Grid", "timeline:toggle-snap", snap_on);
+                if let Some(shortcut) = crate::keymap::shortcut_for_command("timeline:toggle-snap")
+                {
+                    snap = snap.with_shortcut(shortcut);
+                }
+                entries.push(snap);
                 entries
             }
             ContextTarget::Metronome => {
@@ -2388,5 +2715,202 @@ impl EntityInputHandler for StudioLayout {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod track_rename_command_tests {
+    use super::*;
+    use crate::components::edit::{EditCommand, EditHistory};
+    use crate::components::timeline::timeline_state::TimelineState;
+    use crate::keymap::KeymapManager;
+    use crate::menu::MenuManifest;
+
+    /// The chord a command arriving from the macOS menubar — a click or its
+    /// key equivalent, which look the same — is judged by.
+    fn menubar_chord(manager: &KeymapManager, command: &str) -> Option<TrackRenameChord> {
+        let accelerators =
+            command_accelerators(manager.rows(), &MenuManifest::load().menus, command);
+        TrackRenameChord::likeliest(accelerators.iter().map(String::as_str))
+    }
+
+    fn menubar_policy(manager: &KeymapManager, command: &str) -> TrackRenameCommandPolicy {
+        track_rename_command_policy(command, menubar_chord(manager, command))
+    }
+
+    #[test]
+    fn menubar_commands_follow_their_accelerators() {
+        use TrackRenameChord::{Command, Typing, WordLeft, WordRight};
+        use TrackRenameCommandPolicy::{CommitThenRun, Swallow};
+        let mut manager = KeymapManager::new(std::env::temp_dir());
+        manager
+            .set_active_profile("default")
+            .expect("the default profile ships");
+        let cases = [
+            // Cmd/Ctrl accelerators: the name is kept, then the command runs.
+            ("edit:duplicate", Some(Command), CommitThenRun),
+            ("panel:toggle-mixer", Some(Command), CommitThenRun),
+            ("track:add-midi", Some(Command), CommitThenRun),
+            ("app:preferences", Some(Command), CommitThenRun),
+            ("view:zoom-in", Some(Command), CommitThenRun),
+            ("track:delete", Some(Command), CommitThenRun),
+            ("project:save", Some(Command), CommitThenRun),
+            ("edit:undo", Some(Command), CommitThenRun),
+            // No accelerator at all: only a click runs it.
+            ("track:rename", None, CommitThenRun),
+            // Option+K types a character; bare keys are typing.
+            ("view:toggle-virtual-keyboard", Some(Typing), Swallow),
+            ("transport:play-pause", Some(Typing), Swallow),
+            ("tools:select-cut", Some(Typing), Swallow),
+        ];
+        for (command, chord, expected) in cases {
+            assert_eq!(menubar_chord(&manager, command), chord, "command {command}");
+            assert_eq!(
+                menubar_policy(&manager, command),
+                expected,
+                "command {command}"
+            );
+        }
+        // Option+arrows are word moves in the field; select-all and the
+        // clipboard act on it.
+        assert_eq!(menubar_chord(&manager, "transport:rewind"), Some(WordLeft));
+        assert_eq!(
+            menubar_chord(&manager, "transport:fast-forward"),
+            Some(WordRight)
+        );
+        for command in [
+            "transport:rewind",
+            "transport:fast-forward",
+            "midi:select-all",
+            "edit:copy",
+        ] {
+            assert!(
+                matches!(
+                    menubar_policy(&manager, command),
+                    TrackRenameCommandPolicy::Edit(_)
+                ),
+                "command {command}"
+            );
+        }
+        // Quit is Alt+F4 in the keymaps and still commits first.
+        assert_eq!(menubar_policy(&manager, "app:quit"), CommitThenRun);
+    }
+
+    #[test]
+    fn the_menubar_key_equivalent_counts_whatever_profile_is_active() {
+        let mut manager = KeymapManager::new(std::env::temp_dir());
+        manager
+            .set_active_profile("fl-studio")
+            .expect("the FL Studio profile ships");
+        // FL Studio binds rewind to a numpad key, but the macOS menubar still
+        // turns Option+Left into `transport:rewind` from the manifest.
+        let accelerators = command_accelerators(
+            manager.rows(),
+            &MenuManifest::load().menus,
+            "transport:rewind",
+        );
+        assert!(accelerators.iter().any(|a| a == "Numpad/"));
+        assert!(accelerators.iter().any(|a| a == "Alt+Left"));
+        assert_eq!(
+            menubar_chord(&manager, "transport:rewind"),
+            Some(TrackRenameChord::WordLeft)
+        );
+        // From the manifest alone: a bare shortcut never becomes a key
+        // equivalent, an Option or Cmd/Ctrl one does.
+        let menus = &MenuManifest::load().menus;
+        assert!(command_accelerators(&[], menus, "transport:record").is_empty());
+        assert_eq!(
+            command_accelerators(&[], menus, "transport:rewind"),
+            vec!["Alt+Left".to_string()]
+        );
+        assert_eq!(
+            command_accelerators(&[], menus, "edit:duplicate"),
+            vec!["Ctrl+D".to_string()]
+        );
+    }
+
+    fn name(state: &TimelineState) -> String {
+        state.tracks[0].name.clone()
+    }
+
+    /// The review's case: a header rename, the Inspector field focused on it,
+    /// then Cmd+Z from the menu, which never passes the field.
+    #[test]
+    fn an_undo_under_the_focused_inspector_field_reloads_it_and_is_kept() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        state.set_track_name(&id, "Bass");
+        let mut history = EditHistory::new(10);
+        let rename = EditCommand::rename_track(&state, &id, "Lead").expect("a rename");
+        rename.execute(&mut state);
+        history.push(rename);
+
+        // The field loads "Lead" and has focus.
+        let mut synced = Some(name(&state));
+        let mut field = name(&state);
+
+        assert!(history.undo(&mut state));
+        assert_eq!(name(&state), "Bass");
+
+        // A keystroke that lands before any render must not write "Leads".
+        field.push('s');
+        assert!(!inspector_name_commit_allowed(
+            synced.as_deref(),
+            &name(&state)
+        ));
+
+        // The next render reloads the field even though it has focus.
+        assert!(inspector_name_reloads(
+            synced.as_deref(),
+            &name(&state),
+            true
+        ));
+        field = name(&state);
+        synced = Some(name(&state));
+
+        // Typing on from there writes on top of the undone name.
+        field.push('s');
+        assert!(inspector_name_commit_allowed(
+            synced.as_deref(),
+            &name(&state)
+        ));
+        assert!(state.rename_track(&id, &field));
+        assert_eq!(name(&state), "Basss");
+
+        // Redo still restores exactly what the header committed.
+        assert!(history.redo(&mut state));
+        assert_eq!(name(&state), "Lead");
+    }
+
+    /// Typing in the focused field is never clobbered by its own commits: the
+    /// track stores the trimmed text, the field keeps the space the user is
+    /// about to type the next word after.
+    #[test]
+    fn the_focused_inspector_field_keeps_what_is_being_typed() {
+        let mut state = TimelineState::default();
+        let id = state.create_midi_track();
+        state.set_track_name(&id, "Lead Vox");
+        let mut synced = Some(name(&state));
+        let field = "Lead ".to_string();
+
+        assert!(inspector_name_commit_allowed(
+            synced.as_deref(),
+            &name(&state)
+        ));
+        assert!(state.rename_track(&id, &field));
+        assert_eq!(name(&state), "Lead");
+        synced = Some(name(&state));
+
+        assert!(!inspector_name_reloads(
+            synced.as_deref(),
+            &name(&state),
+            true
+        ));
+        // Once it lets go it shows the stored form.
+        assert!(inspector_name_reloads(
+            synced.as_deref(),
+            &name(&state),
+            false
+        ));
     }
 }

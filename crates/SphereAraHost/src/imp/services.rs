@@ -1,8 +1,13 @@
 //! ARA host services: the callbacks a plug-in makes back into Futureboard.
 //!
-//! Every provider here is called from plug-in threads, never from the session's
-//! model thread. They therefore own everything they need and never call back
-//! into [`crate::imp::Session`].
+//! Most of these run re-entrantly on the session's model thread, from inside
+//! one of its own calls into the plug-in: content reads during
+//! create/update/`endEditing`, model updates during `notifyModelUpdates`,
+//! archive I/O during a store or restore. Sample reads run on plug-in worker
+//! threads. Either way a provider owns everything it needs and never calls back
+//! into [`crate::imp::Session`], and the session never holds a provider's lock
+//! across a call into the plug-in: `std::sync::Mutex` is not re-entrant, so a
+//! callback taking the same lock on the same thread would deadlock.
 //!
 //! ARA names graph objects in callbacks by the *address* of the host record that
 //! created them. [`GraphIndex`] is the reverse map from those addresses to
@@ -13,7 +18,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ara2_bridge_core::{
-    AraError, BarSignatureEvent, BarSignatures, ContentGrade, ContentKind, ContentTimeRange, Tempo,
+    ApiGeneration, AraError, BarSignatureEvent, BarSignatures, ContentGrade, ContentKind,
+    ContentTimeRange, KeySignatureEvent, KeySignatureIntervalUsage, KeySignatures, Tempo,
     TempoEvent,
 };
 use ara2_bridge_host::{
@@ -124,7 +130,43 @@ impl GraphIndex {
     }
 }
 
-/// Serves random-access reads for every ARA audio source.
+/// How many analysis-progress reports each source has sent.
+///
+/// Read around a restore: a plug-in that reports analysing a source while
+/// its archived state is restored did not simply take the archived analysis.
+/// Written only from model-update callbacks, never from an audio thread.
+#[derive(Default)]
+pub(crate) struct AnalysisLog {
+    reports: Mutex<HashMap<AraSourceKey, u64>>,
+}
+
+impl AnalysisLog {
+    fn record(&self, key: &AraSourceKey) {
+        if let Ok(mut reports) = self.reports.lock() {
+            match reports.get_mut(key) {
+                Some(count) => *count += 1,
+                None => {
+                    reports.insert(key.clone(), 1);
+                }
+            }
+        }
+    }
+
+    /// Progress reports `key` has sent so far.
+    pub(crate) fn reports(&self, key: &AraSourceKey) -> u64 {
+        self.reports
+            .lock()
+            .ok()
+            .and_then(|reports| reports.get(key).copied())
+            .unwrap_or(0)
+    }
+
+    /// Drops the record of a source the document no longer holds.
+    pub(crate) fn forget(&self, key: &AraSourceKey) {
+        let _ = self.reports.lock().map(|mut reports| reports.remove(key));
+    }
+}
+
 /// Gated diagnostic for the ARA host path.
 ///
 /// ARA failures are silent by construction — a plug-in with an empty document
@@ -135,6 +177,7 @@ pub(crate) fn trace(line: &str) {
     }
 }
 
+/// Serves random-access reads for every ARA audio source.
 pub(crate) struct AudioService {
     access: Arc<dyn AraAudioAccess>,
     index: Arc<GraphIndex>,
@@ -375,11 +418,20 @@ impl ArchivingProvider for ArchiveService {
 pub(crate) struct ModelService {
     observer: Arc<dyn AraModelObserver>,
     index: Arc<GraphIndex>,
+    analysis: Arc<AnalysisLog>,
 }
 
 impl ModelService {
-    pub(crate) fn new(observer: Arc<dyn AraModelObserver>, index: Arc<GraphIndex>) -> Self {
-        Self { observer, index }
+    pub(crate) fn new(
+        observer: Arc<dyn AraModelObserver>,
+        index: Arc<GraphIndex>,
+        analysis: Arc<AnalysisLog>,
+    ) -> Self {
+        Self {
+            observer,
+            index,
+            analysis,
+        }
     }
 }
 
@@ -397,8 +449,12 @@ impl ModelUpdateProvider for ModelService {
             "analysis progress: source=0x{:x} state={state} value={value:.3}",
             source.as_usize()
         ));
+        let source = self.index.source_key(source);
+        if let Some(key) = source.as_ref() {
+            self.analysis.record(key);
+        }
         self.observer.notify(AraModelUpdate::AnalysisProgress {
-            source: self.index.source_key(source),
+            source,
             state,
             value,
         });
@@ -502,37 +558,42 @@ impl PlaybackProvider for TransportService {
     }
 }
 
-/// Publishes the project's tempo map and bar signatures to the plug-in.
+/// Whether a document negotiated at `generation` knows harmonic content.
 ///
-/// Futureboard has no key-signature or chord track, and analysis of audio
-/// sources is the plug-in's job, not the host's — every other content type
-/// reports unavailable rather than inventing data.
+/// Key signatures, sheet chords and the harmonic update scope are ARA 2.0
+/// Final addenda: a 2.0 Draft plug-in is offered none of them and is never sent
+/// the scope's flag.
+pub(crate) fn offers_harmonic_content(generation: ApiGeneration) -> bool {
+    generation >= ApiGeneration::V2Final
+}
+
+/// Publishes the project's tempo map, bar signatures and key to the plug-in.
+///
+/// All three are authored by the user, so they are graded approved. With no
+/// project key, key signatures report unavailable rather than inventing one.
+/// Chords are not published, and analysing audio sources is the plug-in's job,
+/// not the host's, so every other content type reports unavailable too.
 pub(crate) struct ContentService {
     index: Arc<GraphIndex>,
+    generation: ApiGeneration,
     timeline: Mutex<AraMusicalTimeline>,
 }
 
 impl ContentService {
-    pub(crate) fn new(index: Arc<GraphIndex>) -> Self {
+    pub(crate) fn new(index: Arc<GraphIndex>, generation: ApiGeneration) -> Self {
         Self {
             index,
+            generation,
             timeline: Mutex::new(AraMusicalTimeline::default()),
         }
     }
 
-    /// Replaces the published timeline. Called on the model thread.
+    /// Replaces the published timeline. Called on the model thread, never from
+    /// inside a call into the plug-in.
     pub(crate) fn publish(&self, timeline: &AraMusicalTimeline) {
         if let Ok(mut slot) = self.timeline.lock() {
             slot.clone_from(timeline);
         }
-    }
-
-    /// Whether a timeline has been published yet.
-    pub(crate) fn has_timeline(&self) -> bool {
-        self.timeline
-            .lock()
-            .map(|timeline| !timeline.tempo.is_empty())
-            .unwrap_or(false)
     }
 }
 
@@ -542,17 +603,24 @@ impl ContentAccessProvider for ContentService {
         context: MusicalContextId,
         content_type: i32,
     ) -> Result<Option<ContentGrade>, AraError> {
-        if !self.index.is_musical_context(context) || !self.has_timeline() {
+        if !self.index.is_musical_context(context) {
             return Ok(None);
         }
-        if content_type == <Tempo as ContentKind>::RAW_TYPE
-            || content_type == <BarSignatures as ContentKind>::RAW_TYPE
-        {
-            // The user authored this tempo map, so it is approved, not detected.
-            Ok(Some(ContentGrade::APPROVED))
-        } else {
-            Ok(None)
+        let timeline = self
+            .timeline
+            .lock()
+            .map_err(|_| AraError::Peer("ARA musical timeline is poisoned"))?;
+        if timeline.tempo.is_empty() {
+            return Ok(None);
         }
+        let available = content_type == <Tempo as ContentKind>::RAW_TYPE
+            || content_type == <BarSignatures as ContentKind>::RAW_TYPE
+            || (content_type == <KeySignatures as ContentKind>::RAW_TYPE
+                && offers_harmonic_content(self.generation)
+                && !timeline.keys.is_empty());
+        // The user authored the tempo map, the meter and the key, so they are
+        // approved, not detected.
+        Ok(available.then_some(ContentGrade::APPROVED))
     }
 
     fn musical_context_reader(
@@ -594,6 +662,30 @@ impl ContentAccessProvider for ContentService {
                 )?);
             }
             let snapshot = HostContentSnapshot::<BarSignatures>::new(events)?;
+            return Ok(Some(snapshot.into_reader(ContentGrade::APPROVED)));
+        }
+
+        if content_type == <KeySignatures as ContentKind>::RAW_TYPE {
+            if !offers_harmonic_content(self.generation) || timeline.keys.is_empty() {
+                return Ok(None);
+            }
+            let mut events = Vec::with_capacity(timeline.keys.len());
+            for key in &timeline.keys {
+                let intervals = key.intervals.map(|used| {
+                    if used {
+                        KeySignatureIntervalUsage::USED
+                    } else {
+                        KeySignatureIntervalUsage::UNUSED
+                    }
+                });
+                events.push(KeySignatureEvent::new(
+                    key.root_fifths,
+                    intervals,
+                    key.name.clone(),
+                    key.quarter_position,
+                )?);
+            }
+            let snapshot = HostContentSnapshot::<KeySignatures>::new(events)?;
             return Ok(Some(snapshot.into_reader(ContentGrade::APPROVED)));
         }
 
@@ -661,5 +753,136 @@ impl ContentAccessProvider for SharedContent {
         range: Option<ContentTimeRange>,
     ) -> Result<Option<HostContentReaderSnapshot>, AraError> {
         self.0.audio_source_reader(source, content_type, range)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AraBarSignature, AraKeySignature, AraTempoEntry};
+
+    const CONTEXT: usize = 0x1000;
+
+    fn timeline(keys: Vec<AraKeySignature>) -> AraMusicalTimeline {
+        AraMusicalTimeline {
+            tempo: vec![
+                AraTempoEntry {
+                    time_seconds: 0.0,
+                    quarter_position: 0.0,
+                },
+                AraTempoEntry {
+                    time_seconds: 0.5,
+                    quarter_position: 1.0,
+                },
+            ],
+            bars: vec![AraBarSignature {
+                numerator: 4,
+                denominator: 4,
+                quarter_position: 0.0,
+            }],
+            keys,
+        }
+    }
+
+    fn a_minor() -> AraKeySignature {
+        let mut intervals = [false; 12];
+        for interval in [0, 2, 3, 5, 7, 8, 10] {
+            intervals[interval] = true;
+        }
+        AraKeySignature {
+            root_fifths: 3,
+            intervals,
+            name: Some("A Natural Minor".to_owned()),
+            quarter_position: 0.0,
+        }
+    }
+
+    fn service(generation: ApiGeneration, keys: Vec<AraKeySignature>) -> ContentService {
+        let index = Arc::new(GraphIndex::default());
+        index.set_musical_context(Some(CONTEXT));
+        let service = ContentService::new(index, generation);
+        service.publish(&timeline(keys));
+        service
+    }
+
+    fn grade(service: &ContentService, content_type: i32) -> Option<ContentGrade> {
+        service
+            .musical_context_grade(MusicalContextId::from_address(CONTEXT), content_type)
+            .expect("grade query")
+    }
+
+    fn reader(service: &ContentService, content_type: i32) -> Option<HostContentReaderSnapshot> {
+        service
+            .musical_context_reader(MusicalContextId::from_address(CONTEXT), content_type, None)
+            .expect("reader query")
+    }
+
+    #[test]
+    fn a_project_key_is_offered_as_approved_key_signatures() {
+        let service = service(ApiGeneration::V23Final, vec![a_minor()]);
+        let keys = KeySignatures::RAW_TYPE;
+        assert_eq!(grade(&service, keys), Some(ContentGrade::APPROVED));
+
+        let snapshot = reader(&service, keys).expect("key signatures are readable");
+        assert_eq!(snapshot.content_type(), keys);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.grade(), ContentGrade::APPROVED);
+    }
+
+    #[test]
+    fn no_project_key_means_no_key_content() {
+        let service = service(ApiGeneration::V23Final, Vec::new());
+        assert_eq!(grade(&service, KeySignatures::RAW_TYPE), None);
+        assert!(reader(&service, KeySignatures::RAW_TYPE).is_none());
+    }
+
+    #[test]
+    fn tempo_and_bars_stay_approved_with_or_without_a_key() {
+        for keys in [Vec::new(), vec![a_minor()]] {
+            let service = service(ApiGeneration::V23Final, keys);
+            for content_type in [Tempo::RAW_TYPE, BarSignatures::RAW_TYPE] {
+                assert_eq!(grade(&service, content_type), Some(ContentGrade::APPROVED));
+                assert!(reader(&service, content_type).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn a_draft_generation_is_offered_no_key_content() {
+        let service = service(ApiGeneration::V2Draft, vec![a_minor()]);
+        assert_eq!(grade(&service, KeySignatures::RAW_TYPE), None);
+        assert!(reader(&service, KeySignatures::RAW_TYPE).is_none());
+        // Timing is not an addendum and stays available.
+        assert_eq!(
+            grade(&service, Tempo::RAW_TYPE),
+            Some(ContentGrade::APPROVED)
+        );
+    }
+
+    #[test]
+    fn an_unindexed_context_is_offered_nothing() {
+        let service = service(ApiGeneration::V23Final, vec![a_minor()]);
+        let other = MusicalContextId::from_address(CONTEXT + 8);
+        assert_eq!(
+            service
+                .musical_context_grade(other, KeySignatures::RAW_TYPE)
+                .unwrap(),
+            None
+        );
+        assert!(
+            service
+                .musical_context_reader(other, KeySignatures::RAW_TYPE, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn chords_are_not_published() {
+        use ara2_bridge_core::SheetChords;
+
+        let service = service(ApiGeneration::V23Final, vec![a_minor()]);
+        assert_eq!(grade(&service, SheetChords::RAW_TYPE), None);
+        assert!(reader(&service, SheetChords::RAW_TYPE).is_none());
     }
 }

@@ -4,7 +4,6 @@
 //! binaries from the picker UI thread.
 
 mod category;
-mod details;
 mod filter;
 mod insert;
 mod list_view;
@@ -24,7 +23,7 @@ pub use overlay::{
 pub use prefs::PluginPickerPrefs;
 pub use search_index::PluginSearchIndex;
 pub use state::{
-    CatalogStatus, PickerFilter, PluginFilterState, PluginPickerLoadState,
+    CatalogStatus, KindTab, PickerFilter, PluginFilterState, PluginPickerLoadState,
     PluginPickerScrollHandles, PluginPickerState,
 };
 
@@ -44,6 +43,9 @@ pub struct PluginPickerCallbacks {
     pub on_select: Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     pub on_pick: Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     pub on_select_filter: Arc<dyn Fn(&PickerFilter, &mut Window, &mut App) + 'static>,
+    pub on_select_kind: Arc<dyn Fn(&KindTab, &mut Window, &mut App) + 'static>,
+    /// Folds or unfolds the rail's vendor list.
+    pub on_toggle_vendors: Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>,
     pub on_toggle_favorite: Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     pub on_retry_load: Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>,
     pub on_open_plugin_manager: Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>,

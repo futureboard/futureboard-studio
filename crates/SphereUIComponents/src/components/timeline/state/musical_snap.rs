@@ -22,6 +22,31 @@ pub enum SnapShape {
     Triplet,
 }
 
+impl SnapShape {
+    pub const ALL: [SnapShape; 3] = [SnapShape::Straight, SnapShape::Dotted, SnapShape::Triplet];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SnapShape::Straight => "Straight",
+            SnapShape::Dotted => "Dotted",
+            SnapShape::Triplet => "Triplet",
+        }
+    }
+
+    /// Stable id used in the `timeline:set-grid-shape:<id>` command.
+    pub fn command_id(&self) -> &'static str {
+        match self {
+            SnapShape::Straight => "straight",
+            SnapShape::Dotted => "dotted",
+            SnapShape::Triplet => "triplet",
+        }
+    }
+
+    pub fn from_command_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|shape| shape.command_id() == id)
+    }
+}
+
 /// Complete snap configuration for one editor gesture.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MusicalSnap {
@@ -249,5 +274,30 @@ mod tests {
         let s = snap(SnapDivision::Div1_16, SnapShape::Straight);
         assert_eq!(snap_relative_delta(0.3, s, false), 0.25);
         assert_eq!(snap_relative_delta(0.3, s, true), 0.3);
+    }
+}
+
+#[cfg(test)]
+mod grid_menu_id_tests {
+    use super::*;
+
+    /// The grid dropdown sends `timeline:set-grid:<id>` / `-shape:<id>`; every
+    /// entry it offers has to parse back to itself.
+    #[test]
+    fn grid_menu_ids_round_trip() {
+        for division in SnapDivision::MENU {
+            assert_eq!(
+                SnapDivision::from_command_id(division.command_id()),
+                Some(division)
+            );
+        }
+        assert_eq!(
+            SnapDivision::from_command_id("off"),
+            Some(SnapDivision::Off)
+        );
+        for shape in SnapShape::ALL {
+            assert_eq!(SnapShape::from_command_id(shape.command_id()), Some(shape));
+        }
+        assert_eq!(SnapDivision::from_command_id("3"), None);
     }
 }

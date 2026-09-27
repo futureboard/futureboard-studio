@@ -10,7 +10,9 @@ use SpherePluginHost::RegistryPlugin;
 
 use crate::components::plugin_picker::category::normalized_category_label;
 
-/// Cap on distinct vendors / categories surfaced in the sidebar rail.
+/// Cap on distinct categories surfaced in the sidebar rail. Vendors are not
+/// capped: the rail folds them away, and a cap silently dropped every vendor
+/// past the 48th from a large library.
 const SIDEBAR_FACET_CAP: usize = 48;
 
 #[derive(Debug, Clone)]
@@ -25,6 +27,10 @@ pub struct PluginSearchIndex {
     sidebar_vendors: Vec<String>,
     /// Distinct normalized category labels, sorted + capped. Static like above.
     sidebar_categories: Vec<String>,
+    /// Each plug-in's position in `sidebar_vendors` / `sidebar_categories`, so
+    /// the rail's per-facet counts are one array increment per plug-in.
+    vendor_slot: Vec<Option<usize>>,
+    category_slot: Vec<Option<usize>>,
 }
 
 impl PluginSearchIndex {
@@ -51,9 +57,18 @@ impl PluginSearchIndex {
                 vendor_set.insert(plugin.vendor.clone());
             }
         }
-        let sidebar_vendors = vendor_set.into_iter().take(SIDEBAR_FACET_CAP).collect();
+        let sidebar_vendors: Vec<String> = vendor_set.into_iter().collect();
         let category_set: BTreeSet<String> = categories.iter().cloned().collect();
-        let sidebar_categories = category_set.into_iter().take(SIDEBAR_FACET_CAP).collect();
+        let sidebar_categories: Vec<String> =
+            category_set.into_iter().take(SIDEBAR_FACET_CAP).collect();
+        let vendor_slot = plugins
+            .iter()
+            .map(|plugin| sidebar_vendors.binary_search(&plugin.vendor).ok())
+            .collect();
+        let category_slot = categories
+            .iter()
+            .map(|category| sidebar_categories.binary_search(category).ok())
+            .collect();
         Self {
             plugins,
             search_text,
@@ -62,6 +77,8 @@ impl PluginSearchIndex {
             categories_lower,
             sidebar_vendors,
             sidebar_categories,
+            vendor_slot,
+            category_slot,
         }
     }
 
@@ -77,6 +94,16 @@ impl PluginSearchIndex {
     /// Library-wide distinct category labels for the sidebar (precomputed).
     pub fn sidebar_categories(&self) -> &[String] {
         &self.sidebar_categories
+    }
+
+    /// Position of plug-in `index`'s vendor in [`Self::sidebar_vendors`].
+    pub fn vendor_slot(&self, index: usize) -> Option<usize> {
+        self.vendor_slot.get(index).copied().flatten()
+    }
+
+    /// Position of plug-in `index`'s category in [`Self::sidebar_categories`].
+    pub fn category_slot(&self, index: usize) -> Option<usize> {
+        self.category_slot.get(index).copied().flatten()
     }
 
     pub fn plugin_at(&self, index: usize) -> Option<&RegistryPlugin> {

@@ -149,6 +149,12 @@ sphere_daux_clap_embed_host_kind(SphereDauxClapProcessor *processor);
 SPHERE_DAUX_CLAP_API int
 sphere_daux_clap_embed_take_user_close(SphereDauxClapProcessor *processor);
 
+/// 1 (and resets) if the plug-in reported a state change (`clap.state`
+/// mark_dirty, a values rescan, or a parameter value / gesture end it output)
+/// since the last call; 0 otherwise.
+SPHERE_DAUX_CLAP_API int
+sphere_daux_clap_take_state_touched(SphereDauxClapProcessor *processor);
+
 SPHERE_DAUX_CLAP_API void
 sphere_daux_clap_embed_set_waiting_stage(SphereDauxClapProcessor *processor,
                                          const char *stage);

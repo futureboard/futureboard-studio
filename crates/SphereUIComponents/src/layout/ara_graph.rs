@@ -8,13 +8,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use sphere_ara_host::{
-    AraAudioSourceDesc, AraBarSignature, AraClipKey, AraGraph, AraMusicalTimeline,
+    AraAudioSourceDesc, AraBarSignature, AraClipKey, AraGraph, AraKeySignature, AraMusicalTimeline,
     AraPlaybackRegionDesc, AraPlaybackTransform, AraRegionSequenceDesc, AraSourceKey,
     AraTempoEntry, AraTrackKey,
 };
 
 use super::ara_ops::AraSessionKey;
-use crate::components::timeline::timeline_state::{ClipState, ClipType, TimelineState};
+use crate::components::timeline::timeline_state::{
+    ClipState, ClipType, MidiScale, ScaleKind, TimelineState,
+};
 
 /// Native shape of one audio file: sample rate, frames per channel, channels.
 ///
@@ -28,6 +30,10 @@ pub struct AraProjectView {
     pub graph: AraGraph,
     /// Where each ARA audio source reads from on disk.
     pub media_paths: HashMap<AraSourceKey, PathBuf>,
+    /// Clips of this session left out of the graph because their media could
+    /// not be probed (offline, moved, unreadable), with the source each one
+    /// reads. A saved document may hold state for them that cannot land yet.
+    pub offline: Vec<(AraClipKey, AraSourceKey)>,
 }
 
 /// Reads a clip's source id and on-disk path, or `None` when it has neither.
@@ -57,7 +63,89 @@ fn source_offset_seconds(state: &TimelineState, clip: &ClipState) -> f64 {
     }
 }
 
-/// The project's tempo map and bar signatures, as ARA content.
+/// How far a mode's key signature sits from its tonic on the circle of fifths.
+///
+/// A key's accidental count is its tonic's fifths index plus this offset: A
+/// minor is 3 − 3 = 0, D Dorian 2 − 2 = 0, F Lydian −1 + 1 = 0. Pentatonic
+/// and the minor variants count as their parent major or natural minor.
+fn mode_fifths_offset(kind: ScaleKind) -> i32 {
+    match kind {
+        ScaleKind::Chromatic | ScaleKind::Major | ScaleKind::MajorPentatonic => 0,
+        ScaleKind::Lydian => 1,
+        ScaleKind::Mixolydian => -1,
+        ScaleKind::Dorian => -2,
+        ScaleKind::NaturalMinor
+        | ScaleKind::HarmonicMinor
+        | ScaleKind::MelodicMinor
+        | ScaleKind::MinorPentatonic => -3,
+        ScaleKind::Phrygian => -4,
+        ScaleKind::Locrian => -5,
+    }
+}
+
+/// The tonic's circle-of-fifths index (C = 0, G = 1, F = −1), spelled with the
+/// fewest accidentals `kind` allows: D♭ major (−5) but C♯ minor (7).
+///
+/// A pitch class has one sharp-side and one flat-side index, twelve apart. A
+/// tie — six accidentals either way, as in F♯/G♭ major or D♯/E♭ minor — keeps
+/// the sharp spelling Futureboard's own key readout uses.
+fn root_fifths(pitch_class: u8, kind: ScaleKind) -> i32 {
+    let sharp_side = (i32::from(pitch_class) * 7).rem_euclid(12);
+    let flat_side = sharp_side - 12;
+    let offset = mode_fifths_offset(kind);
+    if (flat_side + offset).abs() < (sharp_side + offset).abs() {
+        flat_side
+    } else {
+        sharp_side
+    }
+}
+
+/// Note name for a circle-of-fifths index, with the U+266F / U+266D signs ARA
+/// requires in content names.
+fn fifths_note_name(fifths: i32) -> String {
+    const LETTERS: [char; 7] = ['F', 'C', 'G', 'D', 'A', 'E', 'B'];
+    let letter = LETTERS[(fifths + 1).rem_euclid(7) as usize];
+    let accidentals = (fifths + 1).div_euclid(7);
+    let sign = if accidentals < 0 {
+        '\u{266D}'
+    } else {
+        '\u{266F}'
+    };
+    let mut name = String::from(letter);
+    name.extend(std::iter::repeat_n(
+        sign,
+        accidentals.unsigned_abs() as usize,
+    ));
+    name
+}
+
+/// The project key as one ARA key signature, valid from the start of the
+/// timeline (and, per ARA, before it). `None` when there is no key.
+///
+/// The name is the key's label ("D♭ Major"), spelled like `root_fifths` so the
+/// two never disagree.
+fn key_signature(key: MidiScale) -> Option<AraKeySignature> {
+    if key.kind == ScaleKind::Chromatic {
+        return None;
+    }
+    let root_fifths = root_fifths(key.root.pitch_class(), key.kind);
+    let mut intervals = [false; 12];
+    for &interval in key.kind.intervals() {
+        intervals[usize::from(interval) % 12] = true;
+    }
+    Some(AraKeySignature {
+        root_fifths,
+        intervals,
+        name: Some(format!(
+            "{} {}",
+            fifths_note_name(root_fifths),
+            key.kind.label()
+        )),
+        quarter_position: 0.0,
+    })
+}
+
+/// The project's tempo map, bar signatures and key, as ARA content.
 ///
 /// ARA requires at least two strictly increasing tempo entries, so a project
 /// with no tempo automation is expressed as two implicit endpoints rather than
@@ -119,7 +207,15 @@ pub fn musical_timeline(state: &TimelineState) -> AraMusicalTimeline {
         );
     }
 
-    AraMusicalTimeline { tempo, bars }
+    AraMusicalTimeline {
+        tempo,
+        bars,
+        keys: state
+            .project_key
+            .and_then(key_signature)
+            .into_iter()
+            .collect(),
+    }
 }
 
 /// Builds the ARA graph for one (plug-in, track) session.
@@ -140,6 +236,7 @@ pub fn project_view(
     let mut media_paths: HashMap<AraSourceKey, PathBuf> = HashMap::new();
     let mut regions: Vec<AraPlaybackRegionDesc> = Vec::new();
     let mut sequences: Vec<AraRegionSequenceDesc> = Vec::new();
+    let mut offline: Vec<(AraClipKey, AraSourceKey)> = Vec::new();
     let base_bpm = state.bpm.max(1.0) as f64;
 
     let Some((order, track)) = state
@@ -173,6 +270,7 @@ pub fn project_view(
                 ..AraGraph::default()
             },
             media_paths,
+            offline,
         };
     }
 
@@ -184,6 +282,7 @@ pub fn project_view(
 
         if !sources.contains_key(&source_key) {
             let Some((sample_rate, frame_count, channel_count)) = shape_of(source_path) else {
+                offline.push((AraClipKey(clip.id.clone()), source_key));
                 continue;
             };
             sources.insert(
@@ -235,13 +334,14 @@ pub fn project_view(
             regions,
         },
         media_paths,
+        offline,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::timeline::timeline_state::AraTrackBinding;
+    use crate::components::timeline::timeline_state::{AraTrackBinding, ScaleRoot};
 
     fn timeline_with_ara_track() -> TimelineState {
         let mut state = TimelineState::default();
@@ -316,6 +416,46 @@ mod tests {
         assert_eq!(view.graph.sequences.len(), 1);
     }
 
+    /// The eager copy into a saved project moves a just-dropped clip to the
+    /// copy's id (`audio_import::retarget_imported_clips`); a clip that
+    /// shares the dropped path and was not part of that drop keeps it. The
+    /// graph then names two sources, each clip on its own, which is what lets
+    /// the host rebuild exactly the moved clip's region and modification on
+    /// the new source instead of updating it in place over the old one.
+    #[test]
+    fn a_clip_moved_to_its_project_copy_reads_a_source_of_its_own() {
+        let mut state = timeline_with_ara_track();
+        let mut moved = state.tracks[0].clips[0].clone();
+        moved.id = "clip-2".to_string();
+        moved.clip_type = ClipType::Audio {
+            file_id: "Assets/Audio/take1-1.wav".to_string(),
+            source_path: Some("/project/Assets/Audio/take1-1.wav".to_string()),
+        };
+        state.tracks[0].clips.push(moved);
+        let mut shape = |_: &str| Some((48_000.0, 192_000, 2));
+        let view = project_view(&state, &key(&state), &mut shape);
+
+        assert!(view.graph.validate().is_ok());
+        assert_eq!(view.graph.sources.len(), 2);
+        let source_of = |clip: &str| {
+            view.graph
+                .regions
+                .iter()
+                .find(|region| region.key.as_str() == clip)
+                .map(|region| region.source.as_str().to_owned())
+        };
+        assert_eq!(source_of("clip-1").as_deref(), Some("asset-1"));
+        assert_eq!(
+            source_of("clip-2").as_deref(),
+            Some("Assets/Audio/take1-1.wav")
+        );
+        assert_eq!(
+            view.media_paths
+                .get(&AraSourceKey::from("Assets/Audio/take1-1.wav")),
+            Some(&PathBuf::from("/project/Assets/Audio/take1-1.wav"))
+        );
+    }
+
     #[test]
     fn an_unprobeable_source_is_skipped_rather_than_guessed() {
         let state = timeline_with_ara_track();
@@ -323,6 +463,43 @@ mod tests {
         let view = project_view(&state, &key(&state), &mut shape);
         assert!(view.graph.regions.is_empty());
         assert!(view.graph.sources.is_empty());
+        // ...and named, so a saved document holding its state waits for it
+        // instead of being restored into a graph without it.
+        assert_eq!(
+            view.offline,
+            vec![(AraClipKey::from("clip-1"), AraSourceKey::from("asset-1"))]
+        );
+    }
+
+    /// Only a clip whose media could not be probed is offline: one that is in
+    /// the graph is not, and neither is one with no media at all.
+    #[test]
+    fn only_clips_whose_media_cannot_be_probed_are_offline() {
+        let mut state = timeline_with_ara_track();
+        let mut gone = state.tracks[0].clips[0].clone();
+        gone.id = "clip-2".to_string();
+        gone.clip_type = ClipType::Audio {
+            file_id: "Assets/Audio/gone.wav".to_string(),
+            source_path: Some("/unmounted/gone.wav".to_string()),
+        };
+        let mut unwritten = state.tracks[0].clips[0].clone();
+        unwritten.id = "clip-3".to_string();
+        unwritten.clip_type = ClipType::Audio {
+            file_id: "take".to_string(),
+            source_path: None,
+        };
+        state.tracks[0].clips.push(gone);
+        state.tracks[0].clips.push(unwritten);
+        let mut shape = |path: &str| (!path.starts_with("/unmounted")).then_some((48_000.0, 10, 1));
+        let view = project_view(&state, &key(&state), &mut shape);
+        assert_eq!(view.graph.regions.len(), 1);
+        assert_eq!(
+            view.offline,
+            vec![(
+                AraClipKey::from("clip-2"),
+                AraSourceKey::from("Assets/Audio/gone.wav")
+            )]
+        );
     }
 
     #[test]
@@ -338,5 +515,127 @@ mod tests {
             timeline.bars.first().map(|bar| bar.quarter_position),
             Some(0.0)
         );
+    }
+
+    fn timeline_in(key: Option<MidiScale>) -> AraMusicalTimeline {
+        let mut state = timeline_with_ara_track();
+        state.project_key = key;
+        musical_timeline(&state)
+    }
+
+    #[test]
+    fn no_project_key_publishes_no_key() {
+        let timeline = timeline_in(None);
+        assert!(timeline.keys.is_empty());
+        assert!(timeline.validate().is_ok());
+    }
+
+    #[test]
+    fn the_key_changes_only_the_keys_of_the_timeline() {
+        let without = timeline_in(None);
+        let with = timeline_in(Some(MidiScale::new(ScaleRoot::A, ScaleKind::NaturalMinor)));
+        assert_eq!(with.tempo, without.tempo);
+        assert_eq!(with.bars, without.bars);
+        assert_eq!(with.keys.len(), 1);
+    }
+
+    #[test]
+    fn a_minor_is_one_key_at_the_start_with_no_accidentals() {
+        let timeline = timeline_in(Some(MidiScale::new(ScaleRoot::A, ScaleKind::NaturalMinor)));
+        assert!(timeline.validate().is_ok());
+        let key = &timeline.keys[0];
+        assert_eq!(key.root_fifths, 3);
+        assert_eq!(key.quarter_position, 0.0);
+        assert_eq!(
+            key.intervals,
+            [true, false, true, true, false, true, false, true, true, false, true, false]
+        );
+        assert_eq!(key.name.as_deref(), Some("A Natural Minor"));
+    }
+
+    #[test]
+    fn black_key_roots_take_the_spelling_with_fewer_accidentals() {
+        let key = |root, kind| key_signature(MidiScale::new(root, kind)).expect("a real key");
+        assert_eq!(key(ScaleRoot::F, ScaleKind::Major).root_fifths, -1);
+        let d_flat = key(ScaleRoot::CSharp, ScaleKind::Major);
+        assert_eq!(d_flat.root_fifths, -5);
+        assert_eq!(d_flat.name.as_deref(), Some("D\u{266D} Major"));
+        let c_sharp_minor = key(ScaleRoot::CSharp, ScaleKind::NaturalMinor);
+        assert_eq!(c_sharp_minor.root_fifths, 7);
+        assert_eq!(
+            c_sharp_minor.name.as_deref(),
+            Some("C\u{266F} Natural Minor")
+        );
+        // D♯/E♭ Dorian: E♭ has five flats, D♯ would need seven sharps.
+        assert_eq!(key(ScaleRoot::DSharp, ScaleKind::Dorian).root_fifths, -3);
+        // Six either way keeps the sharp spelling of the key readout.
+        assert_eq!(key(ScaleRoot::FSharp, ScaleKind::Major).root_fifths, 6);
+    }
+
+    /// Every root in every scale a project key can have.
+    #[test]
+    fn every_project_key_maps_to_a_valid_ara_key_signature() {
+        // Tonic fifths index per pitch class, C upwards.
+        const MAJOR: [i32; 12] = [0, -5, 2, -3, 4, -1, 6, 1, -4, 3, -2, 5];
+        const MINOR: [i32; 12] = [0, 7, 2, 9, 4, -1, 6, 1, 8, 3, -2, 5];
+
+        for root in ScaleRoot::ALL {
+            for kind in MidiScale::KEY_KINDS {
+                let timeline = timeline_in(Some(MidiScale::new(root, kind)));
+                assert!(timeline.validate().is_ok(), "{root:?} {kind:?}");
+                assert_eq!(timeline.keys.len(), 1);
+                let key = &timeline.keys[0];
+                let pitch_class = root.pitch_class();
+
+                // The index names this pitch class: seven semitones per fifth.
+                assert_eq!(
+                    (key.root_fifths * 7).rem_euclid(12),
+                    i32::from(pitch_class),
+                    "{root:?} {kind:?}"
+                );
+                // No other spelling of the tonic needs fewer accidentals.
+                let accidentals = (key.root_fifths + mode_fifths_offset(kind)).abs();
+                assert!(accidentals <= 6, "{root:?} {kind:?}: {accidentals}");
+                if accidentals == 6 {
+                    assert!(key.root_fifths >= 0, "ties keep the sharp spelling");
+                }
+
+                let expected: Vec<usize> = kind.intervals().iter().map(|&i| i as usize).collect();
+                let used: Vec<usize> = (0..12).filter(|&i| key.intervals[i]).collect();
+                assert_eq!(used, expected, "{root:?} {kind:?}");
+
+                let name = key.name.as_deref().expect("every key is named");
+                assert!(name.ends_with(kind.label()), "{name}");
+                assert!(!name.contains('#'), "ARA wants U+266F, got {name}");
+                assert!(name.starts_with(&fifths_note_name(key.root_fifths)));
+                assert_eq!(key.quarter_position, 0.0);
+
+                let table = match kind {
+                    ScaleKind::Major | ScaleKind::MajorPentatonic => Some(MAJOR),
+                    ScaleKind::NaturalMinor
+                    | ScaleKind::HarmonicMinor
+                    | ScaleKind::MelodicMinor
+                    | ScaleKind::MinorPentatonic => Some(MINOR),
+                    _ => None,
+                };
+                if let Some(table) = table {
+                    assert_eq!(
+                        key.root_fifths, table[pitch_class as usize],
+                        "{root:?} {kind:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fifths_indices_are_named_with_ara_accidentals() {
+        assert_eq!(fifths_note_name(0), "C");
+        assert_eq!(fifths_note_name(-1), "F");
+        assert_eq!(fifths_note_name(-2), "B\u{266D}");
+        assert_eq!(fifths_note_name(6), "F\u{266F}");
+        assert_eq!(fifths_note_name(-6), "G\u{266D}");
+        assert_eq!(fifths_note_name(-8), "F\u{266D}");
+        assert_eq!(fifths_note_name(13), "F\u{266F}\u{266F}");
     }
 }

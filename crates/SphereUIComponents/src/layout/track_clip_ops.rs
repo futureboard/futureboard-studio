@@ -3,7 +3,7 @@ use gpui::Context;
 use crate::components::edit::{ClipSnapshot, EditCommand, TrackSnapshot};
 #[cfg(debug_assertions)]
 use crate::components::timeline::timeline_state::TrackType;
-use crate::components::timeline::timeline_state::{self};
+use crate::components::timeline::timeline_state::{self, TrackEditScope};
 
 use super::StudioLayout;
 
@@ -87,6 +87,11 @@ impl StudioLayout {
             plugin_ids.len(),
             insert_ids.len()
         );
+
+        // 0. The delete's undo snapshot is taken after this: keep what the
+        //    plug-ins sound like now, so undo brings them back that way rather
+        //    than as of the last save.
+        self.store_live_plugin_states(track_id, &plugin_ids, cx);
 
         // 1. Silence the track's instrument now (Part 13: delete while sounding).
         //    The engine reload also panics on project_load, but doing it here
@@ -301,6 +306,12 @@ impl StudioLayout {
                 0.0
             };
             let mut pasted_ids = Vec::new();
+            let mut pasted = Vec::new();
+            // Ids are taken up front: nothing is inserted until the one step
+            // that pastes them all.
+            let first_id = crate::components::timeline::timeline_state::next_clip_id_number(
+                &timeline.state.tracks,
+            );
             for snapshot in snapshots {
                 let track_id = if timeline
                     .state
@@ -322,12 +333,21 @@ impl StudioLayout {
                 };
                 let clip = timeline.state.clone_clip_for_insert(
                     &snapshot.clip,
-                    timeline.state.next_clip_id(),
+                    format!("clip-{}", first_id + pasted.len() as u32),
                     snapshot.clip.name.clone(),
                     (snapshot.clip.start_beat + offset).max(0.0),
                 );
                 pasted_ids.push(clip.id.clone());
-                timeline.run_edit_command(EditCommand::CreateClip { track_id, clip }, cx);
+                pasted.push((track_id, clip));
+            }
+            // One paste, one undo step, however many clips it brings.
+            match pasted.len() {
+                0 => {}
+                1 => {
+                    let (track_id, clip) = pasted.remove(0);
+                    timeline.run_edit_command(EditCommand::CreateClip { track_id, clip }, cx);
+                }
+                _ => timeline.run_edit_command(EditCommand::BatchCreateClips { clips: pasted }, cx),
             }
             if !pasted_ids.is_empty() {
                 timeline.state.selection.selected_clip_ids = pasted_ids;
@@ -337,13 +357,21 @@ impl StudioLayout {
         });
     }
 
+    /// The expansion is saved with the project (v54): an unsaved change, but
+    /// view-only, even when it seeds an empty first lane, which plays nothing.
     pub(super) fn toggle_selected_track_automation_mode(&mut self, cx: &mut Context<Self>) {
-        let _ = self.timeline.update(cx, |timeline, cx| {
-            if let Some(id) = timeline.state.selection.selected_track_id.clone() {
-                timeline.state.toggle_track_lane_mode(&id);
-                cx.notify();
-            }
+        let toggled = self.timeline.update(cx, |timeline, cx| {
+            let Some(id) = timeline.state.selection.selected_track_id.clone() else {
+                return false;
+            };
+            let toggled = timeline.state.toggle_track_lane_mode(&id).is_some();
+            cx.notify();
+            toggled
         });
+        if toggled {
+            self.mark_dirty_view_only();
+            cx.notify();
+        }
     }
 
     pub(super) fn select_all_automation_points(&mut self, cx: &mut Context<Self>) {
@@ -379,15 +407,39 @@ impl StudioLayout {
     }
 
     pub(super) fn cycle_selected_track_automation_target(&mut self, cx: &mut Context<Self>) {
-        let _ = self.timeline.update(cx, |timeline, cx| {
-            if let Some(id) = timeline.state.selection.selected_track_id.clone() {
-                if timeline.state.cycle_automation_target(&id).is_some() {
-                    timeline.mark_project_changed(cx);
-                    cx.notify();
-                }
+        use timeline_state::AutomationViewChange;
+        let change = self.timeline.update(cx, |timeline, cx| {
+            let Some(id) = timeline.state.selection.selected_track_id.clone() else {
+                return AutomationViewChange::Unchanged;
+            };
+            let lanes_before = timeline.state.capture_automation_lanes(&id);
+            let mut cycled = false;
+            let change = timeline.state.edit_automation_view(&id, |state| {
+                cycled = state.cycle_automation_target(&id).is_some();
+            });
+            if change == AutomationViewChange::Lanes {
+                // A lane it created is one undo step.
+                timeline.record_automation_lanes_edit(&id, lanes_before, cx);
             }
+            if cycled {
+                cx.notify();
+            }
+            change
         });
-        self.mark_dirty();
+        self.mark_automation_view_change(change);
+    }
+
+    /// Mark the project for what an automation view command changed. A new
+    /// lane is content that the engine snapshot carries, so it takes the full
+    /// path. A move of the saved expansion or focused lane (v54) is view-only.
+    /// Nothing is marked when nothing changed.
+    fn mark_automation_view_change(&mut self, change: timeline_state::AutomationViewChange) {
+        use timeline_state::AutomationViewChange;
+        match change {
+            AutomationViewChange::Lanes => self.mark_dirty(),
+            AutomationViewChange::View => self.mark_dirty_view_only(),
+            AutomationViewChange::Unchanged => {}
+        }
     }
 
     /// Add (or focus) an automation lane for `target` on `track_id`.
@@ -397,28 +449,29 @@ impl StudioLayout {
         target: crate::components::timeline::timeline_state::AutomationTarget,
         cx: &mut Context<Self>,
     ) {
-        use crate::components::timeline::timeline_state::TrackLaneMode;
+        use crate::components::timeline::timeline_state::{AutomationViewChange, TrackLaneMode};
         let target = self.enrich_automation_target_name(track_id, target, cx);
-        let changed = self.timeline.update(cx, |timeline, cx| {
+        let change = self.timeline.update(cx, |timeline, cx| {
             timeline.state.select_track(track_id);
-            if timeline.state.track_lane_mode(track_id) != TrackLaneMode::Automation {
-                timeline.state.toggle_track_lane_mode(track_id);
+            let lanes_before = timeline.state.capture_automation_lanes(track_id);
+            let change = timeline.state.edit_automation_view(track_id, |state| {
+                if state.track_lane_mode(track_id) != TrackLaneMode::Automation {
+                    state.toggle_track_lane_mode(track_id);
+                }
+                state.set_track_automation_target(track_id, target);
+            });
+            if change == AutomationViewChange::Lanes {
+                // A lane it created is one undo step.
+                timeline.record_automation_lanes_edit(track_id, lanes_before, cx);
             }
-            if timeline
-                .state
-                .set_track_automation_target(track_id, target)
-                .is_some()
-            {
-                timeline.mark_project_changed(cx);
-                cx.notify();
-                true
-            } else {
-                false
-            }
+            cx.notify();
+            change
         });
         self.overlay.open_popover = None;
-        if changed {
-            self.mark_dirty();
+        // Picking a target whose lane already exists only expands or refocuses
+        // the track, which the engine never sees.
+        self.mark_automation_view_change(change);
+        if change == AutomationViewChange::Lanes {
             self.audio_bridge.project_dirty = true;
             self.schedule_audio_project_sync(cx, false, "automation_add_target");
         }
@@ -513,6 +566,8 @@ impl StudioLayout {
                     }
                 });
                 if collapsed {
+                    // The expansion is saved with the project (v54).
+                    self.mark_dirty_view_only();
                     cx.notify();
                 }
             }
@@ -627,11 +682,8 @@ impl StudioLayout {
 
     pub(super) fn split_selected_audio_clip_at_playhead(&mut self, cx: &mut Context<Self>) {
         let did_split = self.timeline.update(cx, |timeline, cx| {
-            let Some(clip_id) = timeline.state.selection.selected_clip_ids.first().cloned() else {
-                return false;
-            };
             let split_beat = timeline.state.transport.playhead_beats;
-            timeline.split_audio_clip_at_beat(&clip_id, split_beat, cx)
+            timeline.split_selected_clips_at_beat(split_beat, cx)
         });
         if did_split {
             self.mark_dirty();
@@ -643,6 +695,7 @@ impl StudioLayout {
         // the render pass), never via a graph rebuild — `mark_dirty()` here
         // used to force a full `load_project` and stutter playback.
         self.mark_dirty_view_only();
+        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
         let toggled = self.timeline.update(cx, |timeline, cx| {
             let id = timeline.state.selection.selected_track_id.clone()?;
             timeline.state.toggle_track_mute(&id);
@@ -662,6 +715,7 @@ impl StudioLayout {
             cx.notify();
             Some((ids, muted))
         });
+        self.commit_track_edit("Mute", edit, cx);
         if let Some((ids, muted)) = toggled {
             if let Some(engine) = self.audio_bridge.engine.as_ref() {
                 for id in &ids {
@@ -675,6 +729,7 @@ impl StudioLayout {
     pub(super) fn toggle_selected_track_solo(&mut self, cx: &mut Context<Self>) {
         // Live control — see `toggle_selected_track_mute`.
         self.mark_dirty_view_only();
+        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
         let toggled = self.timeline.update(cx, |timeline, cx| {
             let id = timeline.state.selection.selected_track_id.clone()?;
             timeline.state.toggle_track_solo(&id);
@@ -694,6 +749,7 @@ impl StudioLayout {
             cx.notify();
             Some((ids, solo))
         });
+        self.commit_track_edit("Solo", edit, cx);
         if let Some((ids, solo)) = toggled {
             if let Some(engine) = self.audio_bridge.engine.as_ref() {
                 for id in &ids {
@@ -704,19 +760,36 @@ impl StudioLayout {
         }
     }
 
+    /// Record arm from the menu or keyboard: every selected track follows the
+    /// primary one, and each goes to the engine the way a header press does.
     pub(super) fn toggle_selected_track_arm(&mut self, cx: &mut Context<Self>) {
-        self.mark_dirty();
-        let _ = self.timeline.update(cx, |timeline, cx| {
-            if let Some(id) = timeline.state.selection.selected_track_id.clone() {
-                timeline.state.toggle_track_arm(&id);
-                cx.notify();
-            }
-        });
+        let state = &self.timeline.read(cx).state;
+        let Some((id, armed)) = state
+            .selection
+            .selected_track_id
+            .as_ref()
+            .and_then(|id| state.find_track(id))
+            .map(|track| (track.id.clone(), !track.armed))
+        else {
+            return;
+        };
+        let engine = self.audio_bridge.engine.clone();
+        let owner = cx.entity().clone();
+        super::mixer_ops::apply_mixer_input_gang(
+            &self.timeline,
+            engine.as_ref(),
+            &owner,
+            &id,
+            "Record Arm",
+            move |state, target| state.set_track_armed(target, armed),
+            cx,
+        );
     }
 
     pub(super) fn reset_selected_track_volume(&mut self, cx: &mut Context<Self>) {
         self.mark_dirty_view_only();
         let norm = timeline_state::volume::db_to_norm(0.0);
+        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
         let ids: Vec<String> = self.timeline.update(cx, |timeline, cx| {
             let mut ids = timeline.state.selection.selected_track_ids.clone();
             if ids.is_empty() {
@@ -732,6 +805,7 @@ impl StudioLayout {
             }
             ids
         });
+        self.commit_track_edit("Reset Volume", edit, cx);
         if let Some(engine) = self.audio_bridge.engine.as_ref() {
             let linear = super::engine_snapshot::volume_norm_to_linear(norm) as f64;
             for id in &ids {
@@ -745,6 +819,8 @@ impl StudioLayout {
     /// selected non-routing track(s) into the new bus when present.
     pub(super) fn create_bus_track_immediate(&mut self, cx: &mut Context<Self>) {
         self.overlay.open_popover = None;
+        // The new bus and the selection it re-routes are one step.
+        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
         let bus_id = self.timeline.update(cx, |timeline, cx| {
             let mut route_from = timeline.state.selection.selected_track_ids.clone();
             if route_from.is_empty() {
@@ -756,6 +832,7 @@ impl StudioLayout {
             cx.notify();
             bus_id
         });
+        self.commit_track_edit("Add Bus", edit, cx);
         self.mark_dirty();
         self.audio_bridge.project_dirty = true;
         self.schedule_audio_project_sync(cx, true, "mixer_create_bus");
@@ -767,6 +844,7 @@ impl StudioLayout {
 
     pub(super) fn reset_selected_track_pan(&mut self, cx: &mut Context<Self>) {
         self.mark_dirty_view_only();
+        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
         let ids: Vec<String> = self.timeline.update(cx, |timeline, cx| {
             let mut ids = timeline.state.selection.selected_track_ids.clone();
             if ids.is_empty() {
@@ -782,6 +860,7 @@ impl StudioLayout {
             }
             ids
         });
+        self.commit_track_edit("Reset Pan", edit, cx);
         if let Some(engine) = self.audio_bridge.engine.as_ref() {
             for id in &ids {
                 let _ = engine.update_track_param(id, "pan", 0.0);
@@ -800,7 +879,9 @@ impl StudioLayout {
             return;
         };
         let height = timeline_state::preset_track_row_height(preset);
-        self.set_track_heights_with_undo(vec![(track_id, height)], cx);
+        // Every selected track, when the menu was opened on one of them.
+        let targets = self.timeline.read(cx).state.gang_targets(&track_id);
+        self.set_track_heights_with_undo(targets.into_iter().map(|id| (id, height)).collect(), cx);
     }
 
     /// Set the context track's timebase — what its clips hold onto when the
@@ -818,22 +899,28 @@ impl StudioLayout {
         else {
             return;
         };
+        let targets = self.timeline.read(cx).state.gang_targets(&track_id);
+        let edit = self.begin_track_edit(TrackEditScope::tracks(targets.clone()), cx);
         let changed = self.timeline.update(cx, |timeline, cx| {
-            let Some(track) = timeline
+            let mut changed = false;
+            for track in timeline
                 .state
                 .tracks
                 .iter_mut()
-                .find(|track| track.id == track_id)
-            else {
-                return false;
-            };
-            if track.timebase == timebase {
-                return false;
+                .filter(|track| targets.contains(&track.id))
+            {
+                // A routing track owns no clips to hold on to anything.
+                if track.timebase != timebase && !track.track_type.is_routing() {
+                    track.timebase = timebase;
+                    changed = true;
+                }
             }
-            track.timebase = timebase;
-            cx.notify();
-            true
+            if changed {
+                cx.notify();
+            }
+            changed
         });
+        self.commit_track_edit("Set Timebase", edit, cx);
         if changed {
             self.mark_dirty();
             cx.notify();
@@ -845,18 +932,20 @@ impl StudioLayout {
         else {
             return;
         };
-        let prev = self
-            .timeline
-            .read(cx)
-            .state
-            .track_row_height_for_id(&track_id);
-        if (prev - timeline_state::DEFAULT_TRACK_HEIGHT).abs() < 0.01 {
+        let state = &self.timeline.read(cx).state;
+        let changes: Vec<(String, f32)> = state
+            .gang_targets(&track_id)
+            .into_iter()
+            .filter(|id| {
+                (state.track_row_height_for_id(id) - timeline_state::DEFAULT_TRACK_HEIGHT).abs()
+                    >= 0.01
+            })
+            .map(|id| (id, timeline_state::DEFAULT_TRACK_HEIGHT))
+            .collect();
+        if changes.is_empty() {
             return;
         }
-        self.set_track_heights_with_undo(
-            vec![(track_id, timeline_state::DEFAULT_TRACK_HEIGHT)],
-            cx,
-        );
+        self.set_track_heights_with_undo(changes, cx);
     }
 
     pub(super) fn reset_all_track_heights(&mut self, cx: &mut Context<Self>) {

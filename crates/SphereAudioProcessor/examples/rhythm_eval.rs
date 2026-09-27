@@ -40,7 +40,7 @@ fn main() {
             (Some(chroma), Some(rhythm)) => {
                 let beats: Vec<f64> = rhythm.beats.iter().map(|b| b.seconds).collect();
                 let down: Vec<bool> = rhythm.beats.iter().map(|b| b.position == 1).collect();
-                recognize_chords(chroma, &beats, &down, ChordOptions { sevenths: true })
+                recognize_chords(chroma, &beats, &down, ChordOptions::default())
             }
             _ => Vec::new(),
         };

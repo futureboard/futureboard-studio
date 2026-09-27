@@ -6,7 +6,7 @@ use gpui::{
 };
 
 use crate::components::timeline::timeline_state::{
-    TrackHeightResizeDrag, TrackRowLayoutEntry, TRACK_RESIZE_HANDLE_HITBOX,
+    TrackHeightResizeDrag, TrackRowLayoutEntry, HEADER_WIDTH, TRACK_RESIZE_HANDLE_HITBOX,
 };
 use crate::theme::Colors;
 
@@ -26,10 +26,13 @@ pub fn track_row_resize_handle(
     let arm_cb = on_resize_arm.clone();
     let reset_cb = on_double_click_reset.clone();
 
+    // Header column only. Across the lane it swallowed the bottom 5 px of
+    // every row, where a marquee should be able to start; the lane draws its
+    // own bottom border.
     div()
         .absolute()
         .left_0()
-        .right_0()
+        .w(px(HEADER_WIDTH))
         .bottom(px(0.0))
         .h(px(TRACK_RESIZE_HANDLE_HITBOX))
         .id(("track-row-resize", row.index))

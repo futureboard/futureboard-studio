@@ -22,6 +22,11 @@ pub fn take_transport_toggle_requests() -> u32 {
     unsafe { ffi::sphere_daux_vst3_take_transport_toggle_requests() }
 }
 
+/// VST3 `KeyModifier::kShiftKey`, for [`Vst3RuntimeProcessor::view_key`].
+pub const VST3_KEY_SHIFT: i16 = 1 << 0;
+/// VST3 `KeyModifier::kCommandKey`: Ctrl on Windows, Cmd on macOS.
+pub const VST3_KEY_COMMAND: i16 = 1 << 2;
+
 /// `FUTUREBOARD_VST3_MIDI_DEBUG=1` enables VST3 MIDI bridge traces.
 pub fn vst3_midi_debug_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -309,6 +314,12 @@ pub(crate) mod ffi {
             out_width: *mut i32,
             out_height: *mut i32,
         ) -> i32;
+        pub(crate) fn sphere_daux_vst3_view_key(
+            processor: *mut SphereDauxVst3Processor,
+            key: i32,
+            key_code: i32,
+            modifiers: i32,
+        ) -> i32;
         pub(crate) fn sphere_daux_vst3_ara_is_supported(
             processor: *mut SphereDauxVst3Processor,
         ) -> i32;
@@ -361,6 +372,11 @@ pub(crate) mod ffi {
             processor: *mut SphereDauxVst3Processor,
         ) -> i32;
         pub(crate) fn sphere_daux_vst3_embed_take_user_close(
+            processor: *mut SphereDauxVst3Processor,
+        ) -> i32;
+        /// 1 (and resets) when the plug-in reported a change to its own
+        /// state since the last call. See `take_state_touched`.
+        pub(crate) fn sphere_daux_vst3_take_state_touched(
             processor: *mut SphereDauxVst3Processor,
         ) -> i32;
         pub(crate) fn sphere_daux_vst3_embed_set_waiting_stage(
@@ -470,6 +486,7 @@ pub(crate) mod ffi {
         sphere_daux_vst3_set_process_context as set_process_context,
         sphere_daux_vst3_set_state as set_state, sphere_daux_vst3_state_free as state_free,
         sphere_daux_vst3_take_pending_shell_resize as take_pending_shell_resize,
+        sphere_daux_vst3_take_state_touched as take_state_touched,
         sphere_daux_vst3_view_attach as view_attach,
         sphere_daux_vst3_view_can_resize as view_can_resize,
         sphere_daux_vst3_view_constrain as view_constrain,
@@ -1334,6 +1351,33 @@ impl Vst3RuntimeProcessor {
         unsafe { backend::view_idle(self.inner.format, self.inner.raw) };
     }
 
+    /// Hands one key press to the VST3 view (`IPlugView::onKeyDown`, then
+    /// `onKeyUp`). Returns whether the view handled it.
+    ///
+    /// A VST3 view is not supposed to read keys from the platform; the host
+    /// passes them in, so this is how a shortcut the host routes to the
+    /// plug-in (its own Undo, say) reaches it. `key` is the character,
+    /// `key_code` a VST3 virtual key code for keys without one, `modifiers` a
+    /// VST3 `KeyModifier` mask — see [`VST3_KEY_COMMAND`] and
+    /// [`VST3_KEY_SHIFT`]. VST3 only; UI thread only, with a view attached.
+    pub fn view_key(&self, key: char, key_code: i16, modifiers: i16) -> bool {
+        if self.inner.raw.is_null() || self.inner.format != PluginModuleFormat::Vst3 {
+            return false;
+        }
+        let Ok(key) = u16::try_from(u32::from(key)) else {
+            return false;
+        };
+        // SAFETY: `raw` is a live VST3 processor for as long as this handle is.
+        unsafe {
+            ffi::sphere_daux_vst3_view_key(
+                self.inner.raw,
+                i32::from(key),
+                i32::from(key_code),
+                i32::from(modifiers),
+            ) != 0
+        }
+    }
+
     /// Whether this instance's module registers an ARA main factory for the
     /// exact class that was instantiated.
     ///
@@ -1654,6 +1698,21 @@ impl Vst3RuntimeProcessor {
             return false;
         }
         unsafe { backend::embed_take_user_close(self.inner.format, self.inner.raw) != 0 }
+    }
+
+    /// `true` (and resets) when the plug-in reported a change to its own state
+    /// since the last call: a VST3 `performEdit` / `endEdit` or a values/reload
+    /// `restartComponent`, a VST2 `audioMasterAutomate` / `audioMasterEndEdit`,
+    /// or a CLAP `mark_dirty`, values rescan or parameter output event.
+    ///
+    /// Only says the saved state *may* be stale — it carries no state. Poll it
+    /// from a control thread; the flag is raised with one atomic store, so the
+    /// plug-in may raise it from any thread, the audio thread included.
+    pub fn take_state_touched(&self) -> bool {
+        if self.inner.raw.is_null() {
+            return false;
+        }
+        unsafe { backend::take_state_touched(self.inner.format, self.inner.raw) != 0 }
     }
 
     pub fn embed_set_waiting_stage(&self, stage: &str) {

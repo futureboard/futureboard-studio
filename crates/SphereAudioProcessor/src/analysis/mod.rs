@@ -23,14 +23,21 @@ pub mod transients;
 #[cfg(feature = "onnx")]
 pub mod onnx;
 
-pub use bpm::{TempoCandidate, TempoEstimate, estimate_bpm_candidates};
-pub use chords::{ChordKind, ChordLabel, ChordOptions, ChordSegment, recognize_chords};
+pub use bpm::{
+    TempoCandidate, TempoEstimate, TempoFamily, TempoHypothesis, estimate_bpm_candidates,
+    octave_ratio, tempo_families,
+};
+pub use chords::{
+    Certainty, ChordAnalysis, ChordKind, ChordLabel, ChordOptions, ChordSegment, HarmonicSpan,
+    KeyContext, analyze_chords, recognize_chords,
+};
 pub use chroma::{ChromaFrames, chroma_frames};
 pub use error::AnalysisError;
 pub use features::{FEATURE_VECTOR_LEN, SpectralFeatures};
 pub use instrument::{Classifier, HeuristicClassifier, InstrumentCategory, InstrumentEstimate};
 pub use key::{
-    KeyEstimate, KeyMode, PitchClass, estimate_key_ranked, pitch_class_profile, rank_keys,
+    KeyEstimate, KeyMode, PitchClass, estimate_key_ranked, key_correlations, pitch_class_profile,
+    rank_keys,
 };
 pub use loudness::{LoudnessMeasurement, analyze_loudness};
 pub use phase::{PhaseMeasurement, measure_phase};

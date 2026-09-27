@@ -25,6 +25,7 @@ pub mod icons {
     pub const FOLDER: &str = include_str!("../../../packages/shared/lucide/icons/folder.svg");
     pub const FOLDER_OPEN: &str =
         include_str!("../../../packages/shared/lucide/icons/folder-open.svg");
+    pub const ELLIPSIS: &str = include_str!("../../../packages/shared/lucide/icons/ellipsis.svg");
     pub const SHARE: &str = include_str!("../../../packages/shared/lucide/icons/share.svg");
     pub const PANEL_BOTTOM: &str =
         include_str!("../../../packages/shared/lucide/icons/panel-bottom.svg");
@@ -134,6 +135,7 @@ pub const ICON_METRONOME_PATH: &str = "icons/metronome.svg";
 pub const ICON_SAVE_PATH: &str = "icons/save.svg";
 pub const ICON_FOLDER_PATH: &str = "icons/folder.svg";
 pub const ICON_FOLDER_OPEN_PATH: &str = "icons/folder-open.svg";
+pub const ICON_ELLIPSIS_PATH: &str = "icons/ellipsis.svg";
 pub const ICON_SHARE_PATH: &str = "icons/share.svg";
 pub const ICON_PANEL_BOTTOM_PATH: &str = "icons/panel-bottom.svg";
 pub const ICON_PANEL_RIGHT_PATH: &str = "icons/panel-right.svg";

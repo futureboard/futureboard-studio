@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use gpui::{App, Context, Pixels, Point};
 use sphere_midi_service::chords::{voice_progression, VoicingOptions};
+use sphere_midi_service::performance::GeneratedNote;
 
 use crate::components::chord_generator::{
     open_chord_generator_window, ChordGeneratorCallbacks, ChordGeneratorCommand,
@@ -50,15 +51,16 @@ impl StudioLayout {
     }
 
     pub(super) fn set_chord_track_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
-        let _ = self.timeline.update(cx, |timeline, cx| {
-            if visible {
-                timeline.state.show_chord_track_lane();
-            } else {
-                timeline.state.hide_chord_track_lane();
-            }
-            cx.notify();
-        });
-        cx.notify();
+        self.set_conductor_lane_shown(
+            |state| {
+                if visible {
+                    state.show_chord_track_lane()
+                } else {
+                    state.hide_chord_track_lane()
+                }
+            },
+            cx,
+        );
     }
 
     pub(super) fn delete_chord_event_command(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -123,8 +125,8 @@ impl StudioLayout {
             .unwrap_or(ChordDropTarget::NewTrack)
     }
 
-    /// Write `chords` as one voiced MIDI clip at `start_beat` on `target`.
-    /// Returns the track the clip landed on.
+    /// Write `chords` as one voiced MIDI clip (block chords) at `start_beat`
+    /// on `target`. Returns the track the clip landed on.
     pub(crate) fn create_progression_midi_clip(
         &mut self,
         target: &ChordDropTarget,
@@ -139,8 +141,47 @@ impl StudioLayout {
         let voiced =
             voice_progression(&chords.iter().map(|c| c.chord).collect::<Vec<_>>(), voicing);
         let total: f64 = chords.iter().map(|c| c.length_beats).sum();
+        let mut notes = Vec::new();
+        let mut offset = 0.0_f64;
+        for (placement, pitches) in chords.iter().zip(&voiced) {
+            let length = (placement.length_beats - NOTE_GAP_BEATS as f64).max(0.05);
+            for (index, &pitch) in pitches.iter().enumerate() {
+                let velocity = if index == 0 && voicing.bass {
+                    BASS_VELOCITY
+                } else {
+                    UPPER_VELOCITY
+                };
+                notes.push(GeneratedNote {
+                    pitch,
+                    start: offset,
+                    length,
+                    velocity,
+                });
+            }
+            offset += placement.length_beats;
+        }
+        self.create_notes_midi_clip(target, start_beat, total, &notes, cx)
+    }
+
+    /// Write `notes` (beats from the clip start) as one MIDI clip of
+    /// `length_beats` at `start_beat` on `target` — the given MIDI or
+    /// instrument track, else a new MIDI track. One undo step. Returns the
+    /// track the clip landed on.
+    pub(crate) fn create_notes_midi_clip(
+        &mut self,
+        target: &ChordDropTarget,
+        start_beat: f64,
+        length_beats: f64,
+        notes: &[GeneratedNote],
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        if notes.is_empty() || length_beats <= 0.0 {
+            return None;
+        }
         let target = target.clone();
         let track_id = self.timeline.update(cx, |timeline, cx| {
+            // A track made for the clip comes and goes with it: one step.
+            let mut new_track_edit = None;
             let track_id = match &target {
                 ChordDropTarget::Track { track_id }
                     if timeline.state.find_track(track_id).is_some_and(|t| {
@@ -149,28 +190,23 @@ impl StudioLayout {
                 {
                     track_id.clone()
                 }
-                _ => timeline.state.create_midi_track(),
+                _ => {
+                    new_track_edit = Some(timeline.begin_track_edit(
+                        crate::components::timeline::timeline_state::TrackEditScope::track_list(),
+                    ));
+                    timeline.state.create_midi_track()
+                }
             };
             let mut clip = timeline.state.build_midi_clip(
                 &track_id,
                 start_beat.max(0.0) as f32,
-                total as f32,
+                length_beats as f32,
             )?;
             clip.name = "Chords".to_string();
-            let mut notes = Vec::new();
-            let mut offset = 0.0_f32;
-            for (placement, pitches) in chords.iter().zip(&voiced) {
-                let length = (placement.length_beats as f32 - NOTE_GAP_BEATS).max(0.05);
-                for (index, &pitch) in pitches.iter().enumerate() {
-                    let velocity = if index == 0 && voicing.bass {
-                        BASS_VELOCITY
-                    } else {
-                        UPPER_VELOCITY
-                    };
-                    notes.push(MidiNoteState::new(pitch, offset, length, velocity));
-                }
-                offset += placement.length_beats as f32;
-            }
+            let notes: Vec<MidiNoteState> = notes
+                .iter()
+                .map(|n| MidiNoteState::new(n.pitch, n.start as f32, n.length as f32, n.velocity))
+                .collect();
             if let ClipType::Midi {
                 notes: clip_notes, ..
             } = &mut clip.clip_type
@@ -178,13 +214,18 @@ impl StudioLayout {
                 *clip_notes = notes;
             }
             timeline.state.select_track(&track_id);
-            timeline.run_edit_command(
-                EditCommand::CreateClip {
-                    track_id: track_id.clone(),
-                    clip,
-                },
-                cx,
-            );
+            let create = EditCommand::CreateClip {
+                track_id: track_id.clone(),
+                clip,
+            };
+            match new_track_edit {
+                Some(edit) => {
+                    create.execute(&mut timeline.state);
+                    timeline.commit_track_edit("Create Chords", edit, false, cx);
+                    timeline.mark_project_changed(cx);
+                }
+                None => timeline.run_edit_command(create, cx),
+            }
             cx.notify();
             Some(track_id)
         })?;
@@ -360,17 +401,23 @@ impl StudioLayout {
             .playhead_beats
             .max(0.0) as f64;
         match command {
-            ChordGeneratorCommand::PlaceOnChordTrack { chords } => {
+            ChordGeneratorCommand::PlaceOnChordTrack {
+                chords,
+                offset_beats,
+            } => {
                 let count = chords.len();
-                self.place_progression_on_chord_track(playhead, &chords, cx);
+                self.place_progression_on_chord_track(playhead + offset_beats, &chords, cx);
                 Some(format!(
                     "Added {count} chords to the Chord Track at the playhead"
                 ))
             }
-            ChordGeneratorCommand::CreateMidiClip { chords, voicing } => {
+            ChordGeneratorCommand::CreateMidiClip {
+                notes,
+                length_beats,
+            } => {
                 let target = self.chord_midi_target_for_selection(cx);
                 let track_id =
-                    self.create_progression_midi_clip(&target, playhead, &chords, voicing, cx)?;
+                    self.create_notes_midi_clip(&target, playhead, length_beats, &notes, cx)?;
                 let name = self
                     .timeline
                     .read(cx)
@@ -380,29 +427,35 @@ impl StudioLayout {
                     .unwrap_or_default();
                 Some(format!("Wrote a MIDI clip on {name} at the playhead"))
             }
-            ChordGeneratorCommand::DragMove { chords } => {
-                match self.resolve_chord_pointer(pointer, cx) {
-                    Some((target, beat)) => {
-                        let message = self.describe_chord_target(&target, beat, cx);
-                        self.set_chord_drop_preview(
-                            Some(
-                                crate::components::timeline::timeline_state::ChordDropPreview {
-                                    target,
-                                    start_beat: beat,
-                                    chords,
-                                },
-                            ),
-                            cx,
-                        );
-                        Some(message)
-                    }
-                    None => {
-                        self.set_chord_drop_preview(None, cx);
-                        Some("Drop on the Chord Track or a MIDI track".to_string())
-                    }
+            ChordGeneratorCommand::DragMove {
+                chords,
+                offset_beats,
+            } => match self.resolve_chord_pointer(pointer, cx) {
+                Some((target, beat)) => {
+                    let message = self.describe_chord_target(&target, beat, cx);
+                    self.set_chord_drop_preview(
+                        Some(
+                            crate::components::timeline::timeline_state::ChordDropPreview {
+                                target,
+                                start_beat: beat + offset_beats,
+                                chords,
+                            },
+                        ),
+                        cx,
+                    );
+                    Some(message)
                 }
-            }
-            ChordGeneratorCommand::DragEnd { chords, voicing } => {
+                None => {
+                    self.set_chord_drop_preview(None, cx);
+                    Some("Drop on the Chord Track or a MIDI track".to_string())
+                }
+            },
+            ChordGeneratorCommand::DragEnd {
+                chords,
+                offset_beats,
+                notes,
+                length_beats,
+            } => {
                 self.set_chord_drop_preview(None, cx);
                 let Some((target, beat)) = self.resolve_chord_pointer(pointer, cx) else {
                     return Some("Dropped outside the arrangement — nothing changed".to_string());
@@ -410,12 +463,14 @@ impl StudioLayout {
                 match target {
                     ChordDropTarget::ChordTrack => {
                         let count = chords.len();
-                        self.place_progression_on_chord_track(beat, &chords, cx);
+                        self.place_progression_on_chord_track(beat + offset_beats, &chords, cx);
                         Some(format!("Added {count} chords to the Chord Track"))
                     }
                     other => {
+                        // The clip holds the whole timeline, leading rest
+                        // included, so it starts where the drop was.
                         let track_id =
-                            self.create_progression_midi_clip(&other, beat, &chords, voicing, cx)?;
+                            self.create_notes_midi_clip(&other, beat, length_beats, &notes, cx)?;
                         let name = self
                             .timeline
                             .read(cx)

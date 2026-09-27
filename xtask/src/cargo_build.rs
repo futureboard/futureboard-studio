@@ -128,6 +128,20 @@ pub fn build(
         );
     }
 
+    if let Some(shim_dir) = macos_cross_cxx_shim(&target_dir, &target_triple)? {
+        reset_stale_crashpad_wrapper(&cargo, &workspace, &target_dir, &target_triple, profile)?;
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let joined = std::env::join_paths(
+            std::iter::once(shim_dir.clone()).chain(std::env::split_paths(&path)),
+        )
+        .context("failed to prepend the macOS cross c++ shim to PATH")?;
+        command.env("PATH", joined);
+        eprintln!(
+            "[xtask] cross-building {target_triple}: bare `c++` gets the target arch via {}",
+            shim_dir.display()
+        );
+    }
+
     for bin in SIDECAR_BINARIES {
         command.args(["--bin", bin]);
     }
@@ -247,6 +261,137 @@ pub fn build(
 /// has the static MSVC CRT selected or GNU-style compiler/archiver tools cached.
 /// This keeps both the Crashpad/CEF runtime and the MSVC command-line tools
 /// aligned after developers update the wrapper toolchain.
+/// Mach-O architecture name for a macOS target triple.
+fn macos_arch(triple: &str) -> Option<&'static str> {
+    if !triple.ends_with("apple-darwin") {
+        return None;
+    }
+    if triple.starts_with("x86_64") {
+        Some("x86_64")
+    } else if triple.starts_with("aarch64") || triple.starts_with("arm64") {
+        Some("arm64")
+    } else {
+        None
+    }
+}
+
+/// The `c++` wrapper written for a macOS cross build. It adds `-arch <arch>`
+/// unless the caller already chose an architecture (`cc` and GN always do).
+fn cross_cxx_shim_script(arch: &str) -> String {
+    format!(
+        "#!/bin/bash\n\
+         # Written by xtask. crashpad-rs-sys builds crashpad_wrapper.cc with bare\n\
+         # `c++` and no architecture flag, so a cross build gets a host-arch\n\
+         # wrapper next to target-arch Crashpad libraries and fails to link.\n\
+         for arg in \"$@\"; do\n\
+         \x20 case \"$arg\" in -arch|-target|--target=*) exec /usr/bin/c++ \"$@\" ;; esac\n\
+         done\n\
+         exec /usr/bin/c++ -arch {arch} \"$@\"\n"
+    )
+}
+
+/// On a macOS host building for the *other* macOS architecture, write a `c++`
+/// shim that adds the target `-arch` and return its directory for `PATH`.
+///
+/// Crashpad publishes a prebuilt archive for arm64 only, so the Intel slice of
+/// a universal build compiles Crashpad from source. crashpad-rs-sys (v0.2.7)
+/// builds the Crashpad libraries for the right CPU through GN, but compiles its
+/// own `crashpad_wrapper.cc` with plain `c++` and no `-arch`, i.e. for the host.
+/// The x86_64 link then fails on `_crashpad_client_new`. The shim leaves every
+/// compile that names an architecture alone.
+fn macos_cross_cxx_shim(target_dir: &Path, target_triple: &str) -> Result<Option<PathBuf>> {
+    let Some(target_arch) = macos_arch(target_triple) else {
+        return Ok(None);
+    };
+    let host = host_target()?;
+    let Some(host_arch) = macos_arch(&host) else {
+        return Ok(None);
+    };
+    if host_arch == target_arch {
+        return Ok(None);
+    }
+    let dir = target_dir.join("xtask-cxx-shim").join(target_triple);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create c++ shim directory {}", dir.display()))?;
+    let shim = dir.join("c++");
+    let script = cross_cxx_shim_script(target_arch);
+    if fs::read_to_string(&shim).ok().as_deref() != Some(script.as_str()) {
+        fs::write(&shim, &script)
+            .with_context(|| format!("failed to write c++ shim {}", shim.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("failed to mark c++ shim executable {}", shim.display()))?;
+    }
+    Ok(Some(dir))
+}
+
+/// A Crashpad wrapper cached by a cross build that predates the shim holds
+/// the host architecture, and Cargo will not rerun the build script for a
+/// `PATH` change. Clean the crate when the cached object is the wrong arch.
+fn reset_stale_crashpad_wrapper(
+    cargo: &str,
+    workspace: &Path,
+    target_dir: &Path,
+    target_triple: &str,
+    profile: &str,
+) -> Result<()> {
+    let Some(arch) = macos_arch(target_triple) else {
+        return Ok(());
+    };
+    let profile_dir = if profile == "dev" { "debug" } else { profile };
+    let build_dir = target_dir
+        .join(target_triple)
+        .join(profile_dir)
+        .join("build");
+    let Ok(entries) = fs::read_dir(&build_dir) else {
+        return Ok(());
+    };
+    let stale = entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("crashpad-rs-sys-")
+            && {
+                let object = entry.path().join("out").join("crashpad_wrapper.o");
+                object.is_file()
+                    && Command::new("lipo")
+                        .arg("-archs")
+                        .arg(&object)
+                        .output()
+                        .ok()
+                        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                        .is_some_and(|archs| !archs.split_whitespace().any(|a| a == arch))
+            }
+    });
+    if !stale {
+        return Ok(());
+    }
+    eprintln!(
+        "[xtask] cached crashpad_wrapper.o in {} is not {arch}; rebuilding crashpad-rs-sys",
+        build_dir.display()
+    );
+    let status = Command::new(cargo)
+        .current_dir(workspace)
+        .args([
+            "clean",
+            "--package",
+            "crashpad-rs-sys",
+            "--target",
+            target_triple,
+        ])
+        .args(["--profile", profile, "--target-dir"])
+        .arg(target_dir)
+        .status()
+        .context("failed to reset the stale Crashpad wrapper build")?;
+    if !status.success() {
+        bail!("cargo clean for the stale Crashpad wrapper failed with {status}");
+    }
+    Ok(())
+}
+
 fn reset_stale_cef_wrapper(
     cargo: &str,
     workspace: &Path,
@@ -442,6 +587,72 @@ fn wanted_executable(artifact: &Artifact) -> Option<(String, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_arch_names_match_lipo() {
+        assert_eq!(macos_arch("x86_64-apple-darwin"), Some("x86_64"));
+        assert_eq!(macos_arch("aarch64-apple-darwin"), Some("arm64"));
+        assert_eq!(macos_arch("x86_64-pc-windows-msvc"), None);
+    }
+
+    #[test]
+    fn cross_cxx_shim_adds_arch_only_when_unset() {
+        let script = cross_cxx_shim_script("x86_64");
+        assert!(script.starts_with("#!/bin/bash\n"));
+        assert!(script.contains("exec /usr/bin/c++ -arch x86_64 \"$@\""));
+        assert!(script.contains("-arch|-target|--target=*) exec /usr/bin/c++ \"$@\""));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cross_cxx_shim_compiles_for_the_target_arch() {
+        let dir = std::env::temp_dir().join(format!("xtask-shim-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("c++");
+        fs::write(&shim, cross_cxx_shim_script("x86_64")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let source = dir.join("t.cc");
+        fs::write(&source, "int f() { return 1; }\n").unwrap();
+        let plain = dir.join("plain.o");
+        let explicit = dir.join("explicit.o");
+        assert!(
+            Command::new(&shim)
+                .args(["-c", "-o"])
+                .arg(&plain)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new(&shim)
+                .args(["--target=arm64-apple-macosx", "-c", "-o"])
+                .arg(&explicit)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let archs = |path: &Path| {
+            String::from_utf8(
+                Command::new("lipo")
+                    .arg("-archs")
+                    .arg(path)
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string()
+        };
+        assert_eq!(archs(&plain), "x86_64");
+        assert_eq!(archs(&explicit), "arm64");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn community_features_are_sidecar_only() {

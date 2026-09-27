@@ -318,10 +318,6 @@ fn clip_media_source(clip: &ClipState) -> Option<(&String, &String)> {
     (!source_path.trim().is_empty()).then_some((file_id, source_path))
 }
 
-fn is_renderable_audio_clip(clip: &ClipState) -> bool {
-    !clip.muted && clip_media_source(clip).is_some()
-}
-
 fn clip_source_offset_seconds(state: &TimelineState, clip: &ClipState) -> f64 {
     let stretch = &clip.stretch;
     if stretch.source_start_samples > 0 {
@@ -334,56 +330,46 @@ fn clip_source_offset_seconds(state: &TimelineState, clip: &ClipState) -> f64 {
     }
 }
 
+/// Publish every audio and video clip's effective fades: its manual fades,
+/// except on an edge where a staggered overlap crossfades, which fades over
+/// exactly the overlap.
+///
+/// Resolved by the same code the arrangement draws with
+/// ([`TimelineState::engine_crossfades`] and
+/// [`TimelineState::effective_clip_fades`]): every overlap, not only
+/// neighbours in start order, timed through the tempo map, and clamped the
+/// way the engine clamps (the two fades never overlap). What is drawn is what
+/// plays. Overlapping reference videos, whose sound the engine plays, keep
+/// crossfading it as they always have; the arrangement draws no crossfade for
+/// them.
 fn apply_auto_crossfades(state: &TimelineState, clips: &mut [EngineClipSnapshot]) {
+    let slots: std::collections::HashMap<String, usize> = clips
+        .iter()
+        .enumerate()
+        .map(|(slot, clip)| (clip.id.clone(), slot))
+        .collect();
     for track in &state.tracks {
-        let mut track_audio: Vec<&ClipState> = track
-            .clips
-            .iter()
-            .filter(|clip| is_renderable_audio_clip(clip))
-            .collect();
-        track_audio.sort_by(|a, b| a.start_beat.total_cmp(&b.start_beat));
-
-        for pair in track_audio.windows(2) {
-            let a = pair[0];
-            let b = pair[1];
-            let a_end = a.start_beat + a.duration_beats;
-            let b_end = b.start_beat + b.duration_beats;
-            let overlap_start = a.start_beat.max(b.start_beat);
-            let overlap_end = a_end.min(b_end);
-            if overlap_end <= overlap_start {
+        let crossfades = state.engine_crossfades(track);
+        for clip in &track.clips {
+            if !matches!(
+                clip.clip_type,
+                ClipType::Audio { .. } | ClipType::Video { .. }
+            ) {
                 continue;
             }
-
-            let overlap_beats = overlap_end - overlap_start;
-            let overlap_seconds = state.beats_to_seconds(overlap_beats).max(0.0) as f64;
-            if overlap_seconds <= 0.0 {
+            let Some(&slot) = slots.get(&clip.id) else {
                 continue;
-            }
-            extend_engine_fade(clips, &a.id, 0.0, overlap_seconds);
-            extend_engine_fade(clips, &b.id, overlap_seconds, 0.0);
+            };
+            let fades = state.effective_clip_fades(clip, &crossfades);
+            clips[slot].fades =
+                (fades.in_seconds > 0.0 || fades.out_seconds > 0.0).then(|| EngineFadeSnapshot {
+                    in_duration: fades.in_seconds,
+                    out_duration: fades.out_seconds,
+                    in_curve: "equal_power".to_string(),
+                    out_curve: "equal_power".to_string(),
+                });
         }
     }
-}
-
-fn extend_engine_fade(
-    clips: &mut [EngineClipSnapshot],
-    clip_id: &str,
-    fade_in_seconds: f64,
-    fade_out_seconds: f64,
-) {
-    let Some(clip) = clips.iter_mut().find(|clip| clip.id == clip_id) else {
-        return;
-    };
-    let fades = clip.fades.get_or_insert_with(|| EngineFadeSnapshot {
-        in_duration: 0.0,
-        out_duration: 0.0,
-        in_curve: "equal_power".to_string(),
-        out_curve: "equal_power".to_string(),
-    });
-    fades.in_duration = fades.in_duration.max(fade_in_seconds);
-    fades.out_duration = fades.out_duration.max(fade_out_seconds);
-    fades.in_curve = "equal_power".to_string();
-    fades.out_curve = "equal_power".to_string();
 }
 
 /// Map a controller lane kind to its VST3 controller number, or `None` for
@@ -1627,6 +1613,153 @@ mod tests {
         assert!((second_fades.in_duration - 0.5).abs() < 1.0e-9);
         assert_eq!(first_fades.out_curve, "equal_power");
         assert_eq!(second_fades.in_curve, "equal_power");
+    }
+
+    fn engine_fades(snapshot: &EngineProjectSnapshot, clip_id: &str) -> Option<(f64, f64)> {
+        snapshot
+            .clips
+            .iter()
+            .find(|clip| clip.id == clip_id)
+            .expect("clip in snapshot")
+            .fades
+            .as_ref()
+            .map(|fades| (fades.in_duration, fades.out_duration))
+    }
+
+    /// The engine pairs every staggered overlap the arrangement draws, not
+    /// only neighbours in start order: A[0,8) B[2,4) C[3,10). B sits inside
+    /// A and makes no crossfade; C's fade-in is the longest overlap on it.
+    #[test]
+    fn every_staggered_overlap_publishes_the_crossfade_the_arrangement_draws() {
+        let (mut state, a) = audio_state_with_clip();
+        state.tracks[0].clips[0].duration_beats = 8.0;
+        let track_id = state.tracks[0].id.clone();
+        let b = state.insert_audio_clip_with_duration(
+            track_id.clone(),
+            "C:/audio/b.wav".to_string(),
+            "b".to_string(),
+            2.0,
+            2.0,
+            Some(1.0),
+        );
+        let c = state.insert_audio_clip_with_duration(
+            track_id,
+            "C:/audio/c.wav".to_string(),
+            "c".to_string(),
+            3.0,
+            7.0,
+            Some(3.5),
+        );
+
+        let snapshot = build_engine_project_snapshot(&state, 48_000, None, None);
+        let close = |a: f64, b: f64| (a - b).abs() < 1.0e-6;
+        let (a_in, a_out) = engine_fades(&snapshot, &a).expect("A fades out into C");
+        assert!(close(a_in, 0.0) && close(a_out, 2.5), "A: {a_in} / {a_out}");
+        let (b_in, b_out) = engine_fades(&snapshot, &b).expect("B fades out into C");
+        assert!(close(b_in, 0.0) && close(b_out, 0.5), "B: {b_in} / {b_out}");
+        let (c_in, c_out) = engine_fades(&snapshot, &c).expect("C fades in");
+        assert!(close(c_in, 2.5) && close(c_out, 0.0), "C: {c_in} / {c_out}");
+
+        // The arrangement resolves the same edges.
+        let crossfades = state.audio_crossfades(&state.tracks[0]);
+        assert!(close(crossfades.fade_out_override(&a).unwrap(), a_out));
+        assert!(close(crossfades.fade_in_override(&c).unwrap(), c_in));
+    }
+
+    /// On an overlapped edge the engine plays exactly the overlap: a longer
+    /// manual fade no longer stretches the crossfade into a dip, and the
+    /// manual fade on the other edge still plays.
+    #[test]
+    fn a_crossfaded_edge_publishes_exactly_the_overlap() {
+        let (mut state, first_id) = audio_state_with_clip();
+        let track_id = state.tracks[0].id.clone();
+        let second_id = state.insert_audio_clip_with_duration(
+            track_id,
+            "C:/audio/second.wav".to_string(),
+            "second".to_string(),
+            3.0,
+            4.0,
+            Some(2.0),
+        );
+        let mut stretch = state.clip_stretch(&first_id).unwrap().clone();
+        stretch.fade_out_ms = 1_500.0;
+        stretch.fade_in_ms = 250.0;
+        assert!(state.set_clip_stretch(&first_id, stretch));
+
+        let snapshot = build_engine_project_snapshot(&state, 48_000, None, None);
+        let (first_in, first_out) = engine_fades(&snapshot, &first_id).unwrap();
+        assert!((first_out - 0.5).abs() < 1.0e-9, "the overlap, not 1.5 s");
+        assert!((first_in - 0.25).abs() < 1.0e-9);
+        let (second_in, _) = engine_fades(&snapshot, &second_id).unwrap();
+        assert!((second_in - 0.5).abs() < 1.0e-9);
+    }
+
+    /// Two overlapping reference videos crossfade their sound over the
+    /// overlap, as the engine always did for them (the pre-resolver pairing
+    /// published `beats_to_seconds(overlap)` on both edges), while the
+    /// arrangement draws no crossfade on the Video track.
+    #[test]
+    fn overlapping_video_clips_keep_crossfading_their_sound() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let first_id = state.insert_video_clip("C:/video/a.mp4".into(), "a".into(), 0.0);
+        let second_id = state.insert_video_clip("C:/video/b.mp4".into(), "b".into(), 12.0);
+        let video_track = state
+            .tracks
+            .iter()
+            .find(|track| track.track_type == TrackType::Video)
+            .expect("video track");
+        assert!(state.audio_crossfades(video_track).is_empty());
+
+        // The overlap is beats 12..16 of two 16-beat placeholder clips.
+        let expected = state.beats_to_seconds(4.0) as f64;
+        let snapshot = build_engine_project_snapshot(&state, 48_000, None, None);
+        let (first_in, first_out) = engine_fades(&snapshot, &first_id).expect("fades out");
+        let (second_in, second_out) = engine_fades(&snapshot, &second_id).expect("fades in");
+        assert!((first_out - expected).abs() < 1.0e-6, "{first_out}");
+        assert!((second_in - expected).abs() < 1.0e-6, "{second_in}");
+        assert_eq!((first_in, second_out), (0.0, 0.0));
+        let second = snapshot
+            .clips
+            .iter()
+            .find(|clip| clip.id == second_id)
+            .unwrap();
+        assert_eq!(second.fades.as_ref().unwrap().in_curve, "equal_power");
+    }
+
+    /// Crossfade lengths are real time through the tempo map, not beats at
+    /// the project BPM.
+    #[test]
+    fn crossfade_durations_follow_the_tempo_map() {
+        use crate::components::timeline::timeline_state::TempoCurve;
+
+        let (mut state, first_id) = audio_state_with_clip();
+        let track_id = state.tracks[0].id.clone();
+        let second_id = state.insert_audio_clip_with_duration(
+            track_id,
+            "C:/audio/second.wav".to_string(),
+            "second".to_string(),
+            3.0,
+            4.0,
+            Some(2.0),
+        );
+        state
+            .tempo_map
+            .add_or_update_point(0.0, 60.0, TempoCurve::Linear);
+        state
+            .tempo_map
+            .add_or_update_point(4.0, 240.0, TempoCurve::Hold);
+
+        let expected = state.seconds_at_beat(4.0) - state.seconds_at_beat(3.0);
+        assert!((expected - 0.5).abs() > 0.05, "the ramp changes the length");
+        let snapshot = build_engine_project_snapshot(&state, 48_000, None, None);
+        let (_, first_out) = engine_fades(&snapshot, &first_id).unwrap();
+        let (second_in, _) = engine_fades(&snapshot, &second_id).unwrap();
+        assert!(
+            (first_out - expected).abs() < 1.0e-9,
+            "{first_out} vs {expected}"
+        );
+        assert!((second_in - expected).abs() < 1.0e-9);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use crate::components::text_input::{
     TextInputCallbacks, TextInputState, text_input_context_entries,
 };
 use crate::components::timeline::timeline::TimelineContextTarget;
-use crate::components::timeline::timeline_state::{ClipType, TempoCurve};
+use crate::components::timeline::timeline_state::{ClipType, TempoCurve, TrackEditScope};
 use crate::components::{BackgroundTaskStore, CommandPaletteState};
 use crate::overlay::{project_title_anchor, titlebar_label_anchor};
 use crate::paths::FutureboardPaths;
@@ -40,6 +40,7 @@ use SpherePluginHost::load_au_cache_state;
 mod ara_graph;
 mod ara_menu;
 pub(crate) mod ara_ops;
+mod ara_restore_plan;
 mod ara_studio;
 mod audio_editor_ops;
 mod audio_tool_ops;
@@ -55,6 +56,7 @@ mod engine_snapshot_pitch_tests;
 mod export_ops;
 mod frame_diagnostics;
 mod helpers;
+mod history_ops;
 mod input_ops;
 mod inspector_ops;
 mod midi_export_ops;
@@ -83,6 +85,8 @@ mod studio_state;
 mod tempo_key_ops;
 mod tempo_map_ops;
 mod track_clip_ops;
+mod folder_ops;
+mod track_duplicate_ops;
 mod transport_freeze_debug;
 mod transport_ops;
 mod video_ops;
@@ -466,7 +470,10 @@ pub(crate) fn build_and_warm_audio_engine(
 /// with its own growing preview clip). Mirrors
 /// `recording_ops::midi_recording_preview_clip_id`.
 pub(crate) fn audio_recording_preview_clip_id(track_id: &str) -> String {
-    format!("__recording_preview__:{track_id}")
+    format!(
+        "{}{track_id}",
+        crate::components::timeline::timeline_state::ClipState::AUDIO_RECORDING_PREVIEW_ID_PREFIX
+    )
 }
 
 /// UI-side bookkeeping for the realtime recording waveform preview (Part 1).
@@ -631,6 +638,13 @@ pub struct StudioLayout {
     /// Menu/key command IDs we've already logged as unsupported. Keeps
     /// the unified dispatcher quiet after the first miss per command.
     logged_unsupported_commands: HashSet<String>,
+    /// A short status-bar notice about an edit command that could not run
+    /// (e.g. no clips to crossfade), and when it expires.
+    edit_notice: Option<(String, std::time::Instant)>,
+    /// A status-bar notice about saved ARA documents (kept because they could
+    /// not be restored, or waiting for offline audio), and when it expires.
+    /// A slot of its own, so a later edit notice cannot erase it.
+    ara_notice: Option<(String, std::time::Instant)>,
     /// Repaint-rate diagnostics. Ticks once per `Render`, smoothed
     /// EMA frame time, exposed in the status bar.
     frame_diag: FrameDiagnostics,
@@ -715,6 +729,10 @@ pub struct StudioLayout {
     last_autosave_at: std::time::Instant,
     /// Guards the background autosave job so render/poll frames cannot enqueue duplicates.
     autosave_in_flight: bool,
+    /// The one queue every project-file writer goes through (manual save,
+    /// save-then-continue, autosave, Save Copy), plus what the last load or
+    /// save knew about the project's assets. See [`project_ops::ProjectSaveState`].
+    project_saves: project_ops::ProjectSaveState,
     /// Monotonic counter bumped every time the live session is torn down or
     /// replaced (project reset / in-studio switch). Async project-load
     /// completions capture the value at spawn time and self-reject if it has
@@ -729,6 +747,9 @@ pub struct StudioLayout {
     /// immediately via [`Self::push_mixer_snapshot_to_window`] and are never
     /// throttled. See [`Self::push_mixer_meter_snapshot_throttled`].
     last_external_mixer_meter_push: std::time::Instant,
+    /// The timeline's `track_names_revision` the name-copying surfaces were
+    /// last refreshed for. See [`Self::sync_track_name_surfaces`].
+    track_names_revision_seen: u64,
     /// Secondary window bounds loaded from the layout file, waiting to be
     /// opened during the first deferred tick after `new()`. Cleared immediately
     /// after `restore_secondary_windows_from_layout` runs.
@@ -789,9 +810,10 @@ impl StudioLayout {
                 components::timeline::Timeline::new()
             }
         });
-        let metronome_enabled = schema.recording.metronome.enabled;
+        // The startup workspace takes the user's metronome, Follow and snap
+        // preferences like every later session (see `seed_session_preferences`).
         let _ = timeline.update(cx, |t, _cx| {
-            t.state.transport.metronome_enabled = metronome_enabled;
+            crate::project::view::seed_session_preferences(&mut t.state, &schema, true);
         });
 
         let piano_roll = {
@@ -967,16 +989,15 @@ impl StudioLayout {
                             // Loop region is transport/control state, NOT audio
                             // graph structure. It reaches the engine live through
                             // `sync_loop_controls` (`engine.set_loop` → atomics)
-                            // and is persisted in timeline transport state for
-                            // save. Dragging the loop handles fires this per
+                            // and is saved with the project's view (v54).
+                            // Dragging the loop handles fires this per
                             // mouse-move, so it must NOT call `mark_dirty()` —
                             // that sets `audio_bridge.project_dirty`, which the
                             // ~16ms poll turns into a full `load_project` engine
                             // sync (route-graph rebuild) per move and stutters
-                            // playback. Use view-only dirty (session-dirty for
-                            // save, no engine sync). Mirrors the mixer fader fix.
-                            this.mark_dirty_view_only();
-                            this.sync_loop_controls(cx);
+                            // playback. `commit_loop_change` marks view-only
+                            // dirty (session-dirty for save, no engine sync).
+                            this.commit_loop_change(cx);
                         });
                     });
                 })));
@@ -1005,6 +1026,24 @@ impl StudioLayout {
                         let _ = target.update(cx, |this, cx| {
                             this.mark_dirty();
                             this.sync_time_signature_map_to_engine(cx);
+                        });
+                    });
+                })));
+            });
+        }
+        {
+            let target = cx.entity().clone();
+            let _ = timeline.update(cx, |timeline, _cx| {
+                timeline.set_musical_context_changed_callback(Some(Arc::new(move |cx| {
+                    // The project key, on set, undo and redo: saved with the
+                    // project and read by ARA plug-ins, but nothing the engine
+                    // plays, so no graph rebuild. Deferred for the same
+                    // nested-update reason as the project-changed callback.
+                    let target = target.clone();
+                    cx.defer(move |cx| {
+                        let _ = target.update(cx, |this, cx| {
+                            this.mark_dirty_view_only();
+                            this.refresh_ara_musical_contexts(cx);
                         });
                     });
                 })));
@@ -1313,6 +1352,8 @@ impl StudioLayout {
             focus_handle: cx.focus_handle(),
             clip_clipboard: Vec::new(),
             logged_unsupported_commands: HashSet::new(),
+            edit_notice: None,
+            ara_notice: None,
             frame_diag: FrameDiagnostics::new(),
             frame_scheduler: crate::frame_scheduler::FrameScheduler::new(frame_rate_mode),
             shortcut_diagnostics: ShortcutDiagnostics::default(),
@@ -1355,8 +1396,10 @@ impl StudioLayout {
             plugin_restore_batch_active: false,
             last_autosave_at: std::time::Instant::now(),
             autosave_in_flight: false,
+            project_saves: project_ops::ProjectSaveState::default(),
             session_generation: 0,
             last_external_mixer_meter_push: std::time::Instant::now(),
+            track_names_revision_seen: 0,
             pending_secondary_window_restore:
                 crate::workspace_layout::SavedSecondaryWindows::default(),
         };
@@ -1412,6 +1455,14 @@ impl StudioLayout {
             });
         });
         layout.sync_timeline_chrome_metrics(cx);
+        // Editors the arrangement owns (the track header rename) hand the
+        // keyboard back to the shortcut anchor when they close.
+        {
+            let anchor = layout.focus_handle.clone();
+            layout
+                .timeline
+                .update(cx, |timeline, _cx| timeline.set_focus_return(anchor));
+        }
 
         layout
     }
@@ -1781,6 +1832,48 @@ impl StudioLayout {
         false
     }
 
+    /// Show `message` in the status bar for a few seconds: an edit command
+    /// that finds nothing to act on says why instead of silently doing nothing.
+    pub(super) fn show_edit_notice(&mut self, message: String, cx: &mut Context<Self>) {
+        const EDIT_NOTICE: std::time::Duration = std::time::Duration::from_secs(4);
+        self.edit_notice = Some((message, std::time::Instant::now() + EDIT_NOTICE));
+        self.notify_status_bar_if_changed(cx);
+    }
+
+    /// Show `message` about saved ARA documents in the status bar for
+    /// [`ara_ops::ARA_NOTICE`]. Non-blocking by design: news the user should
+    /// see but need not answer. It has a slot of its own: an edit notice
+    /// shown meanwhile takes the line for its few seconds, then this one is
+    /// back until it expires.
+    pub(super) fn show_ara_notice(&mut self, message: String, cx: &mut Context<Self>) {
+        self.ara_notice = Some((message, std::time::Instant::now() + ara_ops::ARA_NOTICE));
+        self.notify_status_bar_if_changed(cx);
+    }
+
+    /// Takes the ARA notice off the status bar: the project it was about is
+    /// closed or replaced.
+    pub(super) fn clear_ara_notice(&mut self, cx: &mut Context<Self>) {
+        if self.ara_notice.take().is_some() {
+            self.notify_status_bar_if_changed(cx);
+        }
+    }
+
+    /// The ARA notice still showing, if any.
+    pub(super) fn active_ara_notice(&self) -> Option<&str> {
+        self.ara_notice
+            .as_ref()
+            .filter(|(_, until)| *until > std::time::Instant::now())
+            .map(|(text, _)| text.as_str())
+    }
+
+    /// The edit notice still showing, if any.
+    pub(super) fn active_edit_notice(&self) -> Option<&str> {
+        self.edit_notice
+            .as_ref()
+            .filter(|(_, until)| *until > std::time::Instant::now())
+            .map(|(text, _)| text.as_str())
+    }
+
     pub(super) fn dispatch_command_id_from_bounds(
         &mut self,
         command_id: &str,
@@ -1795,6 +1888,18 @@ impl StudioLayout {
             eprintln!("[SessionLoad] command blocked during install: {command_id}");
             return;
         }
+        // A track name is being typed in a header: saves and undo commit it
+        // first, a few commands edit the field, the rest wait.
+        if self.track_rename_blocks_command(command_id, owner_bounds, cx) {
+            return;
+        }
+        // A marquee still out ends as its release would before the command
+        // runs, so Delete, Copy or a nudge acts on the selection the
+        // arrangement shows, not the one from before the press. Every
+        // shortcut and menu item arrives here; a command held back above
+        // leaves the marquee alone.
+        self.timeline
+            .update(cx, |timeline, cx| timeline.finish_marquee_for_command(cx));
         if self.route_edit_command_to_audio_editor(command_id, cx) {
             return;
         }
@@ -1817,6 +1922,38 @@ impl StudioLayout {
                 });
                 self.command_palette.close();
                 cx.notify();
+            }
+            return;
+        }
+        // The ruler's grid dropdown. Choosing a grid is asking to snap to it,
+        // so it also turns the magnet on — as the piano roll's grid menu does.
+        // Snap is saved with the project (v54): a real change is an unsaved
+        // change, view-only.
+        if let Some(id) = command_id.strip_prefix("timeline:set-grid:") {
+            use components::timeline::timeline_state::SnapDivision;
+            if let Some(division) = SnapDivision::from_command_id(id) {
+                let changed = self.timeline.update(cx, |timeline, cx| {
+                    cx.notify();
+                    timeline.state.choose_grid_division(division)
+                });
+                if changed {
+                    self.mark_dirty_view_only();
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        if let Some(id) = command_id.strip_prefix("timeline:set-grid-shape:") {
+            use components::timeline::timeline_state::SnapShape;
+            if let Some(shape) = SnapShape::from_command_id(id) {
+                let changed = self.timeline.update(cx, |timeline, cx| {
+                    cx.notify();
+                    timeline.state.choose_snap_shape(shape)
+                });
+                if changed {
+                    self.mark_dirty_view_only();
+                    cx.notify();
+                }
             }
             return;
         }
@@ -1867,9 +2004,11 @@ impl StudioLayout {
         }
         if let Some(rest) = command_id.strip_prefix("mixer:add-send-to:") {
             if let Some((track_id, target_track_id)) = rest.rsplit_once(':') {
+                let edit = self.begin_track_edit(TrackEditScope::tracks([track_id]), cx);
                 let added = self.timeline.update(cx, |timeline, _cx| {
                     timeline.state.add_send_to_target(track_id, target_track_id)
                 });
+                self.commit_track_edit("Add Send", edit, cx);
                 self.overlay.open_popover = None;
                 if added.is_some() {
                     self.mark_dirty();
@@ -1896,6 +2035,7 @@ impl StudioLayout {
                 cx.notify();
                 return;
             };
+            let edit = self.begin_track_edit(TrackEditScope::tracks([track_id.clone()]), cx);
             let changed = self.timeline.update(cx, |timeline, cx| {
                 let changed = timeline.state.set_track_output_routing(&track_id, output);
                 if changed {
@@ -1903,6 +2043,7 @@ impl StudioLayout {
                 }
                 changed
             });
+            self.commit_track_edit("Set Output", edit, cx);
             self.overlay.open_popover = None;
             if changed {
                 self.mark_dirty();
@@ -1936,9 +2077,12 @@ impl StudioLayout {
             return;
         }
         if let Some(track_id) = command_id.strip_prefix("mixer:create-return-send:") {
+            // The new return and the send to it are one step.
+            let edit = self.begin_track_edit(TrackEditScope::tracks([track_id]), cx);
             let added = self.timeline.update(cx, |timeline, _cx| {
                 timeline.state.create_return_and_send(track_id)
             });
+            self.commit_track_edit("Add Return", edit, cx);
             self.overlay.open_popover = None;
             if added.is_some() {
                 self.mark_dirty();
@@ -2096,18 +2240,10 @@ impl StudioLayout {
             }
             "marker:clear-all" => self.clear_markers_command(cx),
             "marker:open-track" => {
-                self.timeline.update(cx, |timeline, cx| {
-                    timeline.state.show_marker_track_lane();
-                    cx.notify();
-                });
-                cx.notify();
+                self.set_conductor_lane_shown(|state| state.show_marker_track_lane(), cx);
             }
             "marker:hide-track" => {
-                self.timeline.update(cx, |timeline, cx| {
-                    timeline.state.hide_marker_track_lane();
-                    cx.notify();
-                });
-                cx.notify();
+                self.set_conductor_lane_shown(|state| state.hide_marker_track_lane(), cx);
             }
 
             "region:add-here" => {
@@ -2133,18 +2269,10 @@ impl StudioLayout {
             }
             "region:clear-all" => self.clear_regions_command(cx),
             "region:open-track" => {
-                self.timeline.update(cx, |timeline, cx| {
-                    timeline.state.show_region_track_lane();
-                    cx.notify();
-                });
-                cx.notify();
+                self.set_conductor_lane_shown(|state| state.show_region_track_lane(), cx);
             }
             "region:hide-track" => {
-                self.timeline.update(cx, |timeline, cx| {
-                    timeline.state.hide_region_track_lane();
-                    cx.notify();
-                });
-                cx.notify();
+                self.set_conductor_lane_shown(|state| state.hide_region_track_lane(), cx);
             }
             "ruler:set-loop-selection" => {
                 let applied = self.timeline.update(cx, |timeline, cx| {
@@ -2162,8 +2290,7 @@ impl StudioLayout {
                     true
                 });
                 if applied {
-                    self.sync_loop_controls(cx);
-                    self.mark_dirty();
+                    self.commit_loop_change(cx);
                     cx.notify();
                 }
             }
@@ -2184,18 +2311,10 @@ impl StudioLayout {
                 self.hide_time_signature_track(cx);
             }
             "songtext:open-track" => {
-                self.timeline.update(cx, |timeline, cx| {
-                    timeline.state.show_song_text_track_lane();
-                    cx.notify();
-                });
-                cx.notify();
+                self.set_conductor_lane_shown(|state| state.show_song_text_track_lane(), cx);
             }
             "songtext:hide-track" => {
-                self.timeline.update(cx, |timeline, cx| {
-                    timeline.state.hide_song_text_track_lane();
-                    cx.notify();
-                });
-                cx.notify();
+                self.set_conductor_lane_shown(|state| state.hide_song_text_track_lane(), cx);
             }
             "ts:add-point-here" => {
                 if let Some(beat) = self.ts_track_context_position() {
@@ -2244,8 +2363,7 @@ impl StudioLayout {
                                 .and_then(|n| n.to_str())
                                 .map(|s| s.to_string())
                                 .unwrap_or_else(|| "Imported Audio".to_string());
-                            t.state
-                                .import_audio_to_selected_or_new_track(path_key, name);
+                            t.import_audio_to_selected_or_new_track_recorded(path_key, name, cx);
                             cx.notify();
                         });
                         let _ = layout.update(cx, |this, cx| {
@@ -2620,6 +2738,7 @@ impl StudioLayout {
                 self.open_export_arrangement_external_window(owner_bounds, cx)
             }
             "file:export-midi" => self.open_export_midi_dialog(owner_bounds, cx),
+            "file:export-project-archive" => self.cmd_export_project_archive(cx),
             // Offered from the MIDI editor status bar and the arrangement's
             // clip context menu. Both mean "the clip in front of me", which is
             // the context clip in the arrangement and the selected clip in the
@@ -2656,6 +2775,25 @@ impl StudioLayout {
                 }
             }
             "track:delete" => self.delete_selected_track(cx),
+            "track:duplicate" => self.duplicate_context_track(true, cx),
+            "track:group-selected" => self.group_selected_tracks(cx),
+            "track:remove-from-folder" => self.remove_context_track_from_folder(cx),
+            "track:ungroup" => self.ungroup_context_folder(cx),
+            "track:toggle-folder" => self.toggle_context_folder(cx),
+            "track:toggle-takes" => {
+                if let Some(track_id) = self.context_track_id_or_selected(cx) {
+                    self.timeline.update(cx, |timeline, cx| {
+                        if timeline.state.toggle_takes_expanded(&track_id) {
+                            cx.notify();
+                        }
+                    });
+                    self.mark_dirty_view_only();
+                    cx.notify();
+                }
+            }
+            "track:duplicate-no-fx" => self.duplicate_context_track(false, cx),
+            "track:copy-fx-chain" => self.copy_context_fx_chain(cx),
+            "track:paste-fx-chain" => self.paste_context_fx_chain(cx),
             "track:height-small" => self.set_context_track_height_preset(
                 crate::components::timeline::timeline_state::TrackHeightPreset::Small,
                 cx,
@@ -2704,15 +2842,15 @@ impl StudioLayout {
             }
             "automation:toggle-mode" => self.toggle_selected_track_automation_mode(cx),
             "automation:cycle-target" => self.cycle_selected_track_automation_target(cx),
+            // A chain edit undone has to reach the engine, the detached mixer
+            // and the moved insert's editor caches at once, like the action
+            // that made it, and a step that takes plug-ins away or brings
+            // them back has to unload or load them — see `history_ops`.
             "edit:undo" => {
-                let _ = self
-                    .timeline
-                    .update(cx, |timeline, cx| timeline.undo_edit(cx));
+                self.undo_or_redo(true, cx);
             }
             "edit:redo" => {
-                let _ = self
-                    .timeline
-                    .update(cx, |timeline, cx| timeline.redo_edit(cx));
+                self.undo_or_redo(false, cx);
             }
             "edit:duplicate" | "clip:duplicate" => self.duplicate_selected_clip(cx),
             "clip:rename" => {
@@ -2750,6 +2888,28 @@ impl StudioLayout {
             "chords:to-midi" => self.chord_track_to_midi_command(cx),
             "chords:open-generator" => self.open_chord_generator(cx),
 
+            // X: crossfade the two selected touching audio clips, as one
+            // undo step. Nothing to crossfade says why in the status bar.
+            "audio:create-crossfade" => {
+                let result = self.timeline.update(cx, |timeline, cx| {
+                    timeline.create_crossfade_at_selection(cx)
+                });
+                if let Err(message) = result {
+                    self.show_edit_notice(message, cx);
+                }
+            }
+
+            // The ruler's magnet. Same switch as clicking it. Saved with the
+            // project (v54), so an unsaved change, but view-only.
+            "timeline:toggle-snap" => {
+                let _ = self.timeline.update(cx, |timeline, cx| {
+                    timeline.state.toggle_snap_to_grid();
+                    cx.notify();
+                });
+                self.mark_dirty_view_only();
+                cx.notify();
+            }
+
             // ── Tools — switch the active timeline tool. UI-only; never dirties
             // the engine. The piano roll owns its own tool keys when focused.
             "tools:select-pointer"
@@ -2771,6 +2931,11 @@ impl StudioLayout {
                 };
                 let _ = self.timeline.update(cx, |timeline, cx| {
                     if timeline.state.active_tool != tool {
+                        // A clip gain / fade / crossfade drag or a clip move
+                        // puts its clips back; with no window here its drag
+                        // goes inert.
+                        timeline.cancel_clip_handle_gesture(None, cx);
+                        timeline.cancel_clip_drag(None, cx);
                         timeline.reset_input_state();
                         timeline.state.active_tool = tool;
                         cx.notify();

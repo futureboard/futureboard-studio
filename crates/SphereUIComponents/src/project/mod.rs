@@ -5,6 +5,7 @@ pub mod recent;
 pub mod routing_migration;
 pub mod session;
 pub mod template;
+pub mod view;
 
 pub use format::{
     PROJECT_MAGIC, PROJECT_VERSION, ProjectError, decode_project, decode_project_with_options,
@@ -305,11 +306,15 @@ pub struct ProjectPluginInstance {
     pub state: PluginStateBlob,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProjectInsert {
     pub id: String,
     pub slot_index: u32,
     pub bypassed: bool,
+    /// v54+: the insert's Active switch (Inspector power button, editor chrome).
+    /// The engine plays `enabled && !bypassed`. Pre-v54 files load `true`,
+    /// which is what every insert came back as before the field existed.
+    pub enabled: bool,
     pub enabled_audio_output_channels: Vec<u8>,
     /// Registry-resolved plug-in role. `None` identifies a pre-v36 insert whose
     /// role must use the legacy track/slot fallback during snapshot construction.
@@ -318,6 +323,21 @@ pub struct ProjectInsert {
     /// multi-out group. Visual state only — never affects routing.
     pub multiout_collapsed: bool,
     pub plugin: Option<ProjectPluginInstance>,
+}
+
+impl Default for ProjectInsert {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            slot_index: 0,
+            bypassed: false,
+            enabled: true,
+            enabled_audio_output_channels: Vec::new(),
+            plugin_is_instrument: None,
+            multiout_collapsed: false,
+            plugin: None,
+        }
+    }
 }
 
 // ── Track routing ─────────────────────────────────────────────────────────────
@@ -453,7 +473,7 @@ pub struct AutomationPoint {
 /// Flattened automation target descriptor for persistence. `tag` matches
 /// `AutomationTarget::to_tag`; the descriptor strings are only meaningful for
 /// the plugin/send variants and are empty otherwise.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AutomationTargetDesc {
     pub tag: u8,
     pub insert_id: String,
@@ -671,8 +691,8 @@ impl Default for ProjectMixer {
 ///
 /// Song Text has a draggable height but no collapse latch (its header offers no
 /// collapse button), so it appears in the heights and not in the flags. Lane
-/// *visibility* is deliberately not here: hiding a lane is a menu command, not
-/// a fold, and it is not what this block promises to restore.
+/// *visibility* is not here: hiding a lane is a menu command, not a fold, and
+/// it is saved with the rest of the view in [`view::ProjectViewState`] (v54).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectGlobalLanes {
     pub arranger_collapsed: bool,
@@ -902,6 +922,24 @@ pub struct FutureboardProject {
     pub global_lanes: ProjectGlobalLanes,
     /// v41+: one saved ARA document per bound plug-in.
     pub ara_documents: Vec<ProjectAraDocument>,
+    /// v54+ (ARA extension): saved ARA documents a plug-in could not match to
+    /// this project's audio, kept byte for byte, once each, while the live
+    /// document saves in their place (a restore that missed, the plug-in
+    /// removed from the track while its document was still parked or partly
+    /// kept back, or a kept-back document replaced by a newer one). Never
+    /// restored on their own and never dropped by the app: they hold edits no
+    /// restored document has.
+    pub ara_orphans: Vec<ProjectAraDocument>,
+    /// v54+ (ARA extension): per track, at most one saved ARA document that
+    /// was restored in part because some of its audio was offline, kept byte
+    /// for byte with the sources still to be restored from it once that
+    /// audio is back. The track's live document is its `ara_documents` entry
+    /// throughout; this one only feeds the part that is still missing.
+    pub ara_deferred: Vec<ProjectAraDeferred>,
+    /// v54+: loop, snap, lane visibility, automation expansion and the mixer
+    /// tree latch. Zoom, scroll and the playhead are per user and live in a
+    /// [`view::ViewSidecar`] instead.
+    pub view: view::ProjectViewState,
 }
 
 /// One ARA plug-in's saved document state, for one track.
@@ -924,6 +962,74 @@ pub struct ProjectAraDocument {
     /// Opaque plug-in bytes, stored raw and length-prefixed exactly like
     /// [`PluginStateBlob::state_bytes`]. Never JSON, never base64.
     pub data: Vec<u8>,
+    /// v54+ (ARA extension): which audio sources and modifications `data`
+    /// holds, under the persistent IDs the plug-in stored them with. `None`
+    /// for archives written before it was recorded, or when the record could
+    /// not be read back.
+    pub written_with: Option<ProjectAraIdentity>,
+    /// Runtime only, never written: the plug-in stored this document from its
+    /// live session for the save being made, so `written_with` describes the
+    /// audio the project holds now and may take this save's content
+    /// fingerprints. False for every document read from a file or saved back
+    /// verbatim (parked, unconfirmed, orphaned), whose record describes the
+    /// audio of the save that wrote it.
+    pub stored_now: bool,
+}
+
+/// A saved ARA document restored in part, kept for the rest of it: see
+/// [`FutureboardProject::ara_deferred`].
+#[derive(Debug, Clone)]
+pub struct ProjectAraDeferred {
+    /// The archive, whose plug-in and track, and its record. Never
+    /// `stored_now`: it is always saved back verbatim.
+    pub document: ProjectAraDocument,
+    /// Archived persistent IDs of the audio sources still to be restored
+    /// from it, each with its modifications.
+    pub remaining_sources: Vec<String>,
+}
+
+/// What one saved ARA document holds, recorded in the same call that stored
+/// it.
+///
+/// ARA has no call that lists the IDs inside an archive, and a plug-in
+/// reports success for a restore that matched nothing, so this record is the
+/// only way to tell a restore that can land from one that cannot, and to map
+/// archived IDs that moved onto the current ones.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ProjectAraIdentity {
+    pub sources: Vec<ProjectAraArchivedSource>,
+    pub modifications: Vec<ProjectAraArchivedModification>,
+    /// Stable digest of the key signatures the plug-in was offered
+    /// (`sphere_ara_host::AraKeyDescriptor`), `None` when unknown.
+    pub key_descriptor: Option<u64>,
+}
+
+/// One audio source as a saved ARA document holds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectAraArchivedSource {
+    /// The ARA persistent ID the plug-in stored the source under.
+    pub persistent_id: String,
+    /// The clip asset id (`file_id`) the source was published from.
+    pub asset_id: String,
+    pub sample_rate: f64,
+    /// Frames per channel.
+    pub frames: i64,
+    pub channels: i32,
+    /// Content fingerprint of the audio (`"<len:x>-<crc:08x>"`), from the
+    /// asset record of the save that wrote the document; `None` when that
+    /// save could not read the file.
+    pub fingerprint: Option<String>,
+}
+
+/// One audio modification (a clip's edits) as a saved ARA document holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectAraArchivedModification {
+    /// The ARA persistent ID the plug-in stored the modification under.
+    pub persistent_id: String,
+    /// The clip the modification belonged to.
+    pub clip_id: String,
+    /// Persistent ID of the audio source it was created on.
+    pub source_persistent_id: String,
 }
 
 /// One persisted logical audio bus. Runtime-derived status is deliberately not
@@ -971,6 +1077,9 @@ impl FutureboardProject {
             assets: Vec::new(),
             global_lanes: ProjectGlobalLanes::default(),
             ara_documents: Vec::new(),
+            ara_orphans: Vec::new(),
+            ara_deferred: Vec::new(),
+            view: view::ProjectViewState::default(),
         }
     }
 }
@@ -1034,6 +1143,7 @@ fn timeline_insert_to_project(idx: usize, slot: &InsertSlotState) -> ProjectInse
         id: slot.id.clone(),
         slot_index: idx as u32,
         bypassed: slot.bypassed,
+        enabled: slot.enabled,
         enabled_audio_output_channels: slot.enabled_audio_output_channels.clone(),
         plugin_is_instrument: slot.plugin_is_instrument,
         multiout_collapsed: slot.multiout_collapsed,
@@ -1107,7 +1217,7 @@ fn project_insert_to_timeline(pi: &ProjectInsert) -> InsertSlotState {
                     .clone()
                     .filter(|vendor| !vendor.trim().is_empty()),
                 display_name: plugin.display_name.clone(),
-                enabled: true,
+                enabled: pi.enabled,
                 bypassed: pi.bypassed,
                 load_status,
                 runtime_backend,
@@ -1153,6 +1263,9 @@ impl From<&TimelineState> for FutureboardProject {
                 let clips = t
                     .clips
                     .iter()
+                    // A save while recording must not write the live take's
+                    // UI-only preview clip (audio or MIDI) into the project.
+                    .filter(|c| !c.is_recording_preview_clip())
                     .map(|c| {
                         let source = match &c.clip_type {
                             ClipType::Audio {
@@ -1597,6 +1710,7 @@ impl From<&TimelineState> for FutureboardProject {
             time_signature_height: tl.global_lane_heights.time_signature,
             song_text_height: tl.global_lane_heights.song_text,
         };
+        project.view = view::ProjectViewState::capture(tl);
         project
     }
 }
@@ -1702,13 +1816,9 @@ pub fn apply_to_timeline(
             ScaleKind::from_tag(scale)?,
         ))
     });
-    tl.global_lane_heights.set(
-        crate::components::timeline::timeline_state::GlobalLaneKind::Chord,
-        project.settings.chord_track_height,
-    );
-    // Lane visibility is view state and not saved, but a project that has
-    // chords opens with them on screen — hidden harmony reads as lost work.
-    tl.show_chord_track = !tl.chord_events.is_empty();
+    // The Chord Track height is restored with the other lane heights below,
+    // which replace `global_lane_heights` as a whole. Its visibility is
+    // restored with the rest of the view once the tracks are in place.
     tl.regions = project
         .settings
         .timeline_regions
@@ -1856,6 +1966,10 @@ pub fn apply_to_timeline(
             GlobalLaneKind::SongText,
             project.global_lanes.song_text_height,
         );
+        // Saved with the project settings, not the conductor lanes. It has to
+        // be set on this fresh struct: setting it on the old one before the
+        // assignment below lost it on every reopen.
+        heights.set(GlobalLaneKind::Chord, project.settings.chord_track_height);
         tl.global_lane_heights = heights;
     }
 
@@ -2263,6 +2377,9 @@ pub fn apply_to_timeline(
         })
         .collect();
 
+    // A take whose clip did not load points at nothing.
+    tl.prune_orphaned_takes();
+
     let valid_group_ids: std::collections::HashSet<String> = tl
         .tracks
         .iter()
@@ -2295,6 +2412,11 @@ pub fn apply_to_timeline(
         );
         tl.track_view_layout.set_height(pt.id.clone(), clamped);
     }
+
+    // Loop, snap, lane visibility, automation expansion and the mixer tree
+    // latch. After the tracks (expansion names them) and after the chords and
+    // song text (a pre-v54 file shows those lanes only when they have content).
+    project.view.apply(tl);
 
     // Install the Audio Connections generated while converting v33 routing,
     // then validate them against the current hardware. A device that is not
@@ -3948,7 +4070,7 @@ mod project_settings_persistence_tests {
 mod group_track_persistence_tests {
     use super::*;
     use crate::components::timeline::timeline_state::{
-        CreateTrackOptions, InputMonitorMode, TimelineState, TrackType,
+        CreateTrackOptions, InputMonitorMode, TimelineState, TrackOutputRouting, TrackType,
     };
 
     fn add_track(state: &mut TimelineState, track_type: TrackType, name: &str) -> String {
@@ -3997,6 +4119,67 @@ mod group_track_persistence_tests {
                 .unwrap()
                 .parent_group_id
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_folder_inside_a_folder_survives_binary_roundtrip() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let outer = add_track(&mut state, TrackType::Group, "Band");
+        let inner = add_track(&mut state, TrackType::Group, "Drums");
+        let kick = add_track(&mut state, TrackType::Audio, "Kick");
+        assert!(state.assign_track_to_group(&kick, &inner));
+        assert!(state.assign_track_to_group(&inner, &outer));
+
+        let bytes = encode_project(&FutureboardProject::from(&state));
+        let mut restored = TimelineState::default();
+        apply_to_timeline(&decode_project(&bytes).expect("decode"), &mut restored);
+
+        let tree = restored.group_tree();
+        let depth = |id: &str| tree.depth[restored.tracks.iter().position(|t| t.id == id).unwrap()];
+        assert_eq!((depth(&outer), depth(&inner), depth(&kick)), (0, 1, 2));
+        assert_eq!(
+            restored.find_track(&inner).unwrap().routing.output,
+            TrackOutputRouting::Bus { bus_id: outer }
+        );
+        assert_eq!(
+            restored.find_track(&kick).unwrap().routing.output,
+            TrackOutputRouting::Bus { bus_id: inner }
+        );
+    }
+
+    /// Before v55 a folder did not carry its members' audio: one playing to
+    /// the main mix loads playing through its folder, and a v55 member routed
+    /// to the main mix on purpose keeps that.
+    #[test]
+    fn a_pre_v55_folder_member_loads_playing_through_its_folder() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let group = add_track(&mut state, TrackType::Group, "Drums");
+        let kick = add_track(&mut state, TrackType::Audio, "Kick");
+        assert!(state.assign_track_to_group(&kick, &group));
+        state
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == kick)
+            .unwrap()
+            .routing
+            .output = TrackOutputRouting::Main;
+
+        let mut bytes = encode_project(&FutureboardProject::from(&state));
+        let current = decode_project(&bytes).expect("decode");
+        assert_eq!(
+            current.tracks[1].routing.output,
+            ProjectTrackOutputRouting::Main
+        );
+
+        bytes[8..12].copy_from_slice(&54u32.to_le_bytes());
+        let legacy =
+            crate::project::format::decode_project_with_options(&bytes, true).expect("decode v54");
+        assert_eq!(
+            legacy.tracks[1].routing.output,
+            ProjectTrackOutputRouting::Bus { bus_id: group }
         );
     }
 }
@@ -4497,5 +4680,140 @@ mod conductor_lane_persistence_tests {
             restored.global_lane_heights.get(GlobalLaneKind::Tempo),
             Some(GLOBAL_LANE_MAX_HEIGHT)
         );
+    }
+
+    /// The Chord Track height is stored with the project settings and was set
+    /// on the timeline before the conductor-lane block replaced the whole
+    /// height struct, so every reopen dropped it back to the default.
+    #[test]
+    fn the_chord_track_height_survives_a_project_roundtrip() {
+        let mut state = TimelineState::default();
+        state
+            .global_lane_heights
+            .set(GlobalLaneKind::Chord, Some(64.0));
+        state
+            .global_lane_heights
+            .set(GlobalLaneKind::Tempo, Some(72.0));
+
+        let bytes = encode_project(&FutureboardProject::from(&state));
+        let decoded = decode_project(&bytes).expect("decode");
+        let mut restored = TimelineState::default();
+        let _ = apply_to_timeline(&decoded, &mut restored);
+
+        assert_eq!(
+            restored.global_lane_heights.get(GlobalLaneKind::Chord),
+            Some(64.0)
+        );
+        assert_eq!(
+            restored.global_lane_heights.get(GlobalLaneKind::Tempo),
+            Some(72.0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod save_fidelity_tests {
+    use super::*;
+    use crate::components::timeline::timeline_state::{ClipState, TimelineState};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "futureboard-{label}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    /// A save or autosave while recording wrote the live take's UI-only
+    /// preview clips into the project, audio and MIDI alike.
+    #[test]
+    fn recording_preview_clips_are_never_saved() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let audio_track = state.create_audio_track();
+        let midi_track = state.create_midi_track();
+        let kept = state.insert_audio_clip_with_duration(
+            audio_track.clone(),
+            "/tmp/take.wav".to_string(),
+            "Take".to_string(),
+            0.0,
+            4.0,
+            Some(2.0),
+        );
+        let audio_preview = crate::layout::audio_recording_preview_clip_id(&audio_track);
+        let midi_preview = format!(
+            "{}{midi_track}",
+            ClipState::MIDI_RECORDING_PREVIEW_ID_PREFIX
+        );
+        state.begin_recording_preview_clip(&audio_preview, &audio_track, 4.0);
+        state.begin_midi_recording_preview_clip(&midi_preview, &midi_track, 0.0);
+        assert!(ClipState::is_recording_preview_clip_id(&audio_preview));
+        assert!(ClipState::is_recording_preview_clip_id(&midi_preview));
+        assert!(!ClipState::is_recording_preview_clip_id(&kept));
+
+        let project = FutureboardProject::from(&state);
+        let saved: Vec<&str> = project
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter().map(|clip| clip.id.as_str()))
+            .collect();
+        assert_eq!(saved, vec![kept.as_str()]);
+    }
+
+    /// The clip's asset id is the ARA audio-source persistentID
+    /// (`AraSourceKey(file_id)`) and the peak-cache key. Saving used to
+    /// rewrite it to the project-relative path, so the ARA archive captured
+    /// under the live id matched nothing after reopening.
+    #[test]
+    fn a_live_asset_id_and_source_duration_survive_save_and_reopen() {
+        let root = temp_dir("ara-ids");
+        let external = temp_dir("ara-ids-ext");
+        std::fs::create_dir_all(&external).unwrap();
+        let source = external.join("vocal.wav");
+        std::fs::write(&source, b"vocal bytes").unwrap();
+
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let track = state.create_audio_track();
+        let clip_id = state.insert_audio_clip_with_duration(
+            track,
+            source.to_string_lossy().into_owned(),
+            "Vocal".to_string(),
+            0.0,
+            4.0,
+            None,
+        );
+        state.update_audio_clip_metadata(&source.to_string_lossy(), "wav", 48_000, 2, 96_000, 2.0);
+        let live_key = state
+            .find_clip(&clip_id)
+            .and_then(|(_, clip)| clip.audio_asset_key().map(str::to_string))
+            .expect("audio clip key");
+
+        let project_file = root.join("Ara.fbproj");
+        let mut project = FutureboardProject::from(&state);
+        save_project(&mut project, &project_file).unwrap();
+        let loaded = load_project_strict(&project_file).unwrap();
+        let mut restored = TimelineState::default();
+        let _ = apply_to_timeline(&loaded, &mut restored);
+
+        let (_, clip) = restored.find_clip(&clip_id).expect("clip restored");
+        assert_eq!(clip.audio_asset_key(), Some(live_key.as_str()));
+        assert_eq!(clip.source_duration_seconds, Some(2.0));
+        let ClipType::Audio {
+            source_path: Some(path),
+            ..
+        } = &clip.clip_type
+        else {
+            panic!("expected an audio clip");
+        };
+        assert_eq!(
+            PathBuf::from(path),
+            root.join("Assets").join("Audio").join("vocal.wav")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(external);
     }
 }

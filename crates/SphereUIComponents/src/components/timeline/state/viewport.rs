@@ -184,6 +184,11 @@ pub struct TimelineViewport {
     /// all. Pointer math reads this instead whenever it is available, so the
     /// transform that resolves a click is the one that drew the pixel.
     pub lane_origin_x_measured: Option<f32>,
+    /// Measured window y of the timeline's top edge (the ruler's top), published
+    /// by the timeline root's origin probe each frame. The vertical twin of
+    /// [`Self::lane_origin_x_measured`]; `None` until the first frame, when
+    /// [`crate::shell_metrics::APP_CHROME_HEIGHT`] stands in for it.
+    pub timeline_origin_y_measured: Option<f32>,
     /// Real-time warp of the x axis; see [`TimeWarp`]. Kept current by
     /// [`TimelineState::sync_time_warp`].
     pub time_warp: TimeWarp,
@@ -226,6 +231,7 @@ impl TrackLayout {
                         y: *y,
                         height: DEFAULT_TRACK_HEIGHT,
                         automation_height: 0.0,
+                        take_height: 0.0,
                     };
                     *y += DEFAULT_TRACK_HEIGHT;
                     Some(entry)
@@ -304,6 +310,43 @@ pub enum SnapDivision {
 }
 
 impl SnapDivision {
+    /// The divisions the arrangement's grid menu offers, coarse to fine.
+    /// `Off` is left to the magnet, which is the snap on/off switch.
+    pub const MENU: [SnapDivision; 9] = [
+        SnapDivision::Auto,
+        SnapDivision::Bar1,
+        SnapDivision::Div1_1,
+        SnapDivision::Div1_2,
+        SnapDivision::Div1_4,
+        SnapDivision::Div1_8,
+        SnapDivision::Div1_16,
+        SnapDivision::Div1_32,
+        SnapDivision::Div1_64,
+    ];
+
+    /// Stable id used in the `timeline:set-grid:<id>` command.
+    pub fn command_id(&self) -> &'static str {
+        match self {
+            SnapDivision::Auto => "auto",
+            SnapDivision::Off => "off",
+            SnapDivision::Bar1 => "bar",
+            SnapDivision::Div1_1 => "1",
+            SnapDivision::Div1_2 => "2",
+            SnapDivision::Div1_4 => "4",
+            SnapDivision::Div1_8 => "8",
+            SnapDivision::Div1_16 => "16",
+            SnapDivision::Div1_32 => "32",
+            SnapDivision::Div1_64 => "64",
+        }
+    }
+
+    pub fn from_command_id(id: &str) -> Option<Self> {
+        [SnapDivision::Off]
+            .into_iter()
+            .chain(Self::MENU)
+            .find(|division| division.command_id() == id)
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             SnapDivision::Auto => "Auto",
@@ -453,7 +496,10 @@ impl TimelineState {
     /// Returns true when the viewport scrolled (caller should `cx.notify`).
     /// Cheap — no allocation, just a couple of float comparisons.
     pub fn update_auto_scroll_for_playhead(&mut self, playhead_beats: f32) -> bool {
-        if !self.follow_playhead || self.auto_scroll_mode == AutoScrollMode::Off {
+        if !self.follow_playhead
+            || self.follow_playhead_suspended
+            || self.auto_scroll_mode == AutoScrollMode::Off
+        {
             return false;
         }
         let viewport_width = self.viewport.viewport_width;
@@ -569,6 +615,25 @@ mod tests {
         assert!(state.update_auto_scroll_for_playhead(0.0));
         assert_eq!(state.viewport.scroll_x, 0.0);
         assert_eq!(state.viewport.target_scroll_x, 0.0);
+    }
+
+    /// A suspension (a marquee in flight) holds the view still without
+    /// touching the user's Follow choice, which the transport shows and
+    /// Settings saves; lifting it lets the view follow again.
+    #[test]
+    fn a_suspended_follow_holds_the_view_and_keeps_the_users_choice() {
+        let mut state = TimelineState::default();
+        state.update_viewport_size(1000.0, 400.0);
+        state.set_scroll_immediate(1000.0, 0.0, 5000.0, 0.0);
+
+        state.follow_playhead_suspended = true;
+        assert!(!state.update_auto_scroll_for_playhead(0.0));
+        assert_eq!(state.viewport.scroll_x, 1000.0);
+        assert!(state.follow_playhead);
+
+        state.follow_playhead_suspended = false;
+        assert!(state.update_auto_scroll_for_playhead(0.0));
+        assert_eq!(state.viewport.scroll_x, 0.0);
     }
 }
 

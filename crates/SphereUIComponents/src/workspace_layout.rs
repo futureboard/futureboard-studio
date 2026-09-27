@@ -1,7 +1,7 @@
 //! Workspace layout persistence — panel visibility, sizes, and active tabs.
 //!
-//! Persisted to `<app_data>/workspace_layout.json` on clean shutdown and
-//! restored at startup. Designed to be forward-compatible: unknown fields
+//! Persisted to `<app_data>/workspace_layout.json` when a session ends (Close
+//! Project, an in-studio project switch, app quit) and restored at startup. Designed to be forward-compatible: unknown fields
 //! are silently ignored by `serde(default)`, so older files load without error
 //! in a newer build.
 //!
@@ -12,7 +12,8 @@
 //! - `active_bottom_tab` — Mixer / Editor / EffectEditor selection
 //! - `right_dock_tab` — Inspector / Chords / Lyrics / Solfege selection
 //! - `mixer_*` — mixer section heights and tree sidebar width
-//! - `secondary_windows` — bounds of detached windows (mixer, settings, clock)
+//! - `secondary_windows` — bounds of detached windows (mixer, big clock,
+//!   timecode)
 //!
 //! # What is NOT saved
 //!

@@ -4668,6 +4668,47 @@ pub(crate) fn has_soloed_vsti_output_child(
     })
 }
 
+/// True when the output of `source_track_index` flows, through any number of
+/// routing tracks, into one that is soloed. Soloing a group or bus is a solo
+/// of what plays through it: a folder's members stay audible under their
+/// soloed folder, and a folder inside a soloed folder passes its members on.
+/// Follows the indices resolved by [`RuntimeProject::resolve_indices`], at
+/// most once around the track list, so a routing loop cannot hang the audio
+/// thread; no search, no allocation.
+#[inline]
+pub(crate) fn has_soloed_route_target(runtime: &RuntimeProject, source_track_index: usize) -> bool {
+    let mut current = source_track_index;
+    for _ in 0..runtime.tracks.len() {
+        let Some(next) = runtime
+            .tracks
+            .get(current)
+            .and_then(|track| track.output_track_index)
+        else {
+            return false;
+        };
+        let Some(target) = runtime.tracks.get(next) else {
+            return false;
+        };
+        if next == current || !crate::audio_graph::is_routing_track_type(&target.track_type) {
+            return false;
+        }
+        if target.solo {
+            return true;
+        }
+        current = next;
+    }
+    false
+}
+
+/// True when solo, though the track itself is not soloed, still lets it play:
+/// one of its VSTi channels is soloed ([`has_soloed_vsti_output_child`]), or
+/// a group or bus it plays through is ([`has_soloed_route_target`]).
+#[inline]
+pub(crate) fn solo_keeps_source_audible(runtime: &RuntimeProject, track_index: usize) -> bool {
+    has_soloed_vsti_output_child(runtime, track_index)
+        || has_soloed_route_target(runtime, track_index)
+}
+
 /// True when `child_track_index` is a VSTi multi-out child ("Out Ch") strip
 /// whose parent instrument track is soloed. Soloing the main VSTi track is a
 /// solo of that instrument as a whole, so every separate-output channel it
@@ -5728,6 +5769,34 @@ mod pdc_reset_tests {
                 buffer_size: 512,
             },
         }
+    }
+
+    /// A soloed folder is a solo of what plays through it, through a folder
+    /// inside it too; a track outside it stays silenced.
+    #[test]
+    fn a_soloed_folder_keeps_the_tracks_playing_through_it_audible() {
+        let routed = |id: &str, kind: &str, to: Option<&str>| EngineTrackSnapshot {
+            output_track_id: to.map(str::to_string),
+            ..track_snapshot(id, kind)
+        };
+        let mut snapshot = two_track_snapshot(48_000);
+        snapshot.tracks = vec![
+            routed("outer", "group", None),
+            routed("inner", "group", Some("outer")),
+            routed("kick", "audio", Some("inner")),
+            routed("bass", "audio", Some("outer")),
+            routed("keys", "audio", None),
+            track_snapshot("master", "master"),
+        ];
+        snapshot.tracks[0].solo = true;
+        let mut cache = HashMap::new();
+        let runtime =
+            RuntimeProject::build(&snapshot, 48_000, &mut cache, None, true).expect("build");
+        assert!(runtime.has_solo);
+        let index = |id: &str| runtime.tracks.iter().position(|t| t.id == id).unwrap();
+        assert!(solo_keeps_source_audible(&runtime, index("kick")));
+        assert!(solo_keeps_source_audible(&runtime, index("bass")));
+        assert!(!solo_keeps_source_audible(&runtime, index("keys")));
     }
 
     #[test]

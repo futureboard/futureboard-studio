@@ -11,6 +11,11 @@ use SpherePluginHost::PluginFormat;
 pub struct PluginPickerScrollHandles {
     pub sidebar: ScrollHandle,
     pub list: UniformListScrollHandle,
+    /// The row the list was last scrolled to reveal, and how long the list was
+    /// then. The list follows the keyboard highlight only when either moves,
+    /// so the wheel stays free to scroll away from it — and a new filter, which
+    /// resets the highlight to the top, still brings the list back up.
+    pub revealed_row: std::rc::Rc<std::cell::Cell<Option<(usize, usize)>>>,
 }
 
 /// Sidebar filter rail — composes with search query and optional secondary filters.
@@ -35,9 +40,33 @@ impl Default for PickerFilter {
     }
 }
 
+/// The kind tabs across the top of the picker. They compose with the rail, so
+/// "Favorites" under "Instruments" is the favourite instruments.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KindTab {
+    #[default]
+    All,
+    Effects,
+    Instruments,
+}
+
+impl KindTab {
+    pub fn matches(self, plugin: &SpherePluginHost::RegistryPlugin) -> bool {
+        match self {
+            KindTab::All => true,
+            // A plug-in that declared no class is insertable as an effect, so
+            // it is listed with them rather than hidden from the slot that
+            // needs it.
+            KindTab::Effects => plugin.kind.usable_as_effect(),
+            KindTab::Instruments => plugin.kind == SpherePluginHost::PluginKind::Instrument,
+        }
+    }
+}
+
 /// Multi-dimensional filter state applied together with the search query.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PluginFilterState {
+    pub kind: KindTab,
     pub sidebar: PickerFilter,
     pub format: Option<PluginFormat>,
     pub vendor: Option<String>,
@@ -53,6 +82,9 @@ pub struct PluginPickerState {
     pub selected_id: Option<String>,
     pub highlighted_index: usize,
     pub show_details: bool,
+    /// Whether the rail's vendor list is unfolded. Folded by default: a
+    /// library with a few hundred vendors buried the rest of the rail.
+    pub vendors_expanded: bool,
 }
 
 impl PluginPickerState {
@@ -71,6 +103,7 @@ impl PluginPickerState {
             selected_id: None,
             highlighted_index: 0,
             show_details: true,
+            vendors_expanded: false,
         }
     }
 
@@ -101,6 +134,14 @@ impl PluginPickerState {
         sidebar_filter: PickerFilter,
         desired_kind: PluginInsertKind,
     ) -> Self {
+        // Kind is a tab now, not a rail entry: a caller asking for the
+        // instrument or effect rail gets that tab with the whole library under
+        // it.
+        let (kind, sidebar) = match sidebar_filter {
+            PickerFilter::Instruments => (KindTab::Instruments, PickerFilter::All),
+            PickerFilter::Effects => (KindTab::Effects, PickerFilter::All),
+            other => (KindTab::All, other),
+        };
         Self {
             is_open: true,
             insert_target: PluginInsertTarget {
@@ -111,14 +152,21 @@ impl PluginPickerState {
                 desired_kind,
             },
             filters: PluginFilterState {
-                sidebar: sidebar_filter,
+                kind,
+                sidebar,
                 ..PluginFilterState::default()
             },
             query: String::new(),
             selected_id: None,
             highlighted_index: 0,
             show_details,
+            vendors_expanded: false,
         }
+    }
+
+    pub fn set_kind_tab(&mut self, kind: KindTab) {
+        self.filters.kind = kind;
+        self.reset_selection_for_filter_change();
     }
 
     pub fn reset_selection_for_filter_change(&mut self) {
@@ -156,3 +204,26 @@ pub enum CatalogStatus {
 }
 
 pub type PluginPickerLoadState = CatalogStatus;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Callers still ask for the effect or instrument rail; they now get the
+    /// matching tab with the whole library on the rail.
+    #[test]
+    fn a_kind_rail_request_opens_on_that_tab() {
+        let state = PluginPickerState::open_for_with_filter(
+            "t1",
+            "Bass",
+            TrackType::Instrument,
+            0,
+            true,
+            PickerFilter::Instruments,
+            PluginInsertKind::Instrument,
+        );
+        assert_eq!(state.filters.kind, KindTab::Instruments);
+        assert_eq!(state.filters.sidebar, PickerFilter::All);
+        assert!(!state.vendors_expanded);
+    }
+}

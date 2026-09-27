@@ -86,6 +86,7 @@ impl AssetSource for EmbeddedAssets {
             assets::ICON_SAVE_PATH => Some(assets::icons::SAVE.as_bytes()),
             assets::ICON_FOLDER_PATH => Some(assets::icons::FOLDER.as_bytes()),
             assets::ICON_FOLDER_OPEN_PATH => Some(assets::icons::FOLDER_OPEN.as_bytes()),
+            assets::ICON_ELLIPSIS_PATH => Some(assets::icons::ELLIPSIS.as_bytes()),
             assets::ICON_SHARE_PATH => Some(assets::icons::SHARE.as_bytes()),
             assets::ICON_PANEL_BOTTOM_PATH => Some(assets::icons::PANEL_BOTTOM.as_bytes()),
             assets::ICON_PANEL_RIGHT_PATH => Some(assets::icons::PANEL_RIGHT.as_bytes()),

@@ -1,5 +1,6 @@
 //! On-disk waveform peak cache (`FBPEAKS1`) stored under
-//! `<project>/Cache/Waveforms/<asset_id>.peaks`.
+//! `<project>/Cache/Waveforms/`, one file per asset id (named by
+//! [`waveform_peak_relative_path_for_asset`]).
 //!
 //! The cache key is the stored `(asset_id, algorithm version, source file
 //! size, source mtime)`. A peak file is only reused when all four match the
@@ -108,10 +109,83 @@ impl From<std::io::Error> for PeakFileError {
     }
 }
 
+/// Longest peak file name written, in bytes. Leaves room under the common
+/// 255-byte name limit for the `.tmp` suffix of the atomic write.
+const MAX_PEAK_FILE_NAME_BYTES: usize = 200;
+/// Bytes of the readable prefix kept in a hashed peak file name.
+const HASHED_NAME_PREFIX_BYTES: usize = 48;
+
 /// Project-relative path for an asset's peak cache file.
+///
+/// Asset ids are stable identities and can be absolute paths from any
+/// platform (`/Users/…/very/deep/take.wav`, `C:\Samples\kick.wav`). The file
+/// name is the id with its separators flattened when that is short and safe
+/// on every file system; this is the name earlier builds wrote, so existing
+/// caches keep working. Otherwise it is a sanitized, length-bounded prefix of
+/// the id's last component plus a stable hash of the whole id
+/// (`kick.wav~0123456789abcdef.peaks`). `~` never appears in a kept name, so
+/// the two forms cannot collide. The peak file also stores the full id, and
+/// reading checks it.
 pub fn waveform_peak_relative_path_for_asset(asset_id: &str) -> String {
-    let safe = asset_id.replace(['/', '\\'], "__");
-    format!("Cache/Waveforms/{safe}.peaks")
+    format!("Cache/Waveforms/{}", peak_file_name_for_asset(asset_id))
+}
+
+/// The name earlier builds used for `asset_id`, when it differs from today's
+/// and could exist on disk (short enough, no `:`), so an existing cache is
+/// still found. `None` when there is nothing different to look for.
+pub fn legacy_waveform_peak_relative_path_for_asset(asset_id: &str) -> Option<String> {
+    let legacy = legacy_peak_file_name(asset_id);
+    let current = peak_file_name_for_asset(asset_id);
+    (legacy != current && legacy.len() <= 255 && !legacy.contains(':'))
+        .then(|| format!("Cache/Waveforms/{legacy}"))
+}
+
+fn legacy_peak_file_name(asset_id: &str) -> String {
+    format!("{}.peaks", asset_id.replace(['/', '\\'], "__"))
+}
+
+fn peak_file_name_for_asset(asset_id: &str) -> String {
+    let legacy = legacy_peak_file_name(asset_id);
+    if legacy.len() <= MAX_PEAK_FILE_NAME_BYTES && legacy.chars().all(is_kept_name_char) {
+        return legacy;
+    }
+    let last_component = asset_id
+        .rsplit(['/', '\\'])
+        .find(|component| !component.is_empty())
+        .unwrap_or("audio");
+    let mut prefix = String::new();
+    for c in last_component.chars() {
+        let c = if is_kept_name_char(c) { c } else { '_' };
+        if prefix.len() + c.len_utf8() > HASHED_NAME_PREFIX_BYTES {
+            break;
+        }
+        prefix.push(c);
+    }
+    // No leading dot (a hidden file) and no empty prefix.
+    let prefix = prefix.trim_start_matches('.');
+    let prefix = if prefix.is_empty() { "audio" } else { prefix };
+    format!("{prefix}~{:016x}.peaks", fnv1a_64(asset_id.as_bytes()))
+}
+
+/// Characters a kept (unhashed) peak file name may contain: portable on
+/// Windows, macOS and Linux file systems. Excludes `~`, the hashed-name marker.
+fn is_kept_name_char(c: char) -> bool {
+    !c.is_control()
+        && !matches!(
+            c,
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '~'
+        )
+}
+
+/// FNV-1a, 64-bit: small and stable across builds and platforms (unlike the
+/// std hasher), which a file name derived from it must be.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Write peaks to `path` atomically (temp file + rename), creating parent
@@ -417,6 +491,82 @@ mod tests {
         assert_eq!(
             waveform_peak_relative_path_for_asset("Assets/Audio/kick.wav"),
             "Cache/Waveforms/Assets__Audio__kick.wav.peaks"
+        );
+        // Short safe ids keep the name earlier builds wrote: nothing to migrate.
+        assert_eq!(
+            legacy_waveform_peak_relative_path_for_asset("Assets/Audio/kick.wav"),
+            None
+        );
+    }
+
+    fn file_name(relative: &str) -> &str {
+        relative
+            .strip_prefix("Cache/Waveforms/")
+            .expect("under the cache folder")
+    }
+
+    /// A Windows id used to become `C:__Samples__kick.wav.peaks`, which NTFS
+    /// reads as a stream of a file named `C` and FAT rejects.
+    #[test]
+    fn a_windows_id_gets_a_name_without_a_colon() {
+        let relative = waveform_peak_relative_path_for_asset("C:\\Samples\\Drums\\kick.wav");
+        let name = file_name(&relative);
+        assert!(!name.contains(':'), "{name}");
+        assert!(name.starts_with("kick.wav~"), "{name}");
+        assert!(name.ends_with(".peaks"));
+        assert_eq!(
+            legacy_waveform_peak_relative_path_for_asset("C:\\Samples\\Drums\\kick.wav"),
+            None,
+            "a name with ':' is never looked up"
+        );
+    }
+
+    /// Stable ids of media dropped from deep folders are long absolute paths;
+    /// flattening them exceeded the 255-byte file name limit, so the cache
+    /// was never written and every reopen decoded the file again.
+    #[test]
+    fn a_long_id_gets_a_bounded_name_that_can_be_written() {
+        let deep = format!(
+            "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/Sample Packs/{}/Kicks/{} kick.wav",
+            "Vendor Name/Pack Name/Drums".repeat(8),
+            "long ".repeat(30)
+        );
+        assert!(deep.len() > 255);
+        let relative = waveform_peak_relative_path_for_asset(&deep);
+        let name = file_name(&relative);
+        assert!(
+            name.len() <= MAX_PEAK_FILE_NAME_BYTES,
+            "{} bytes",
+            name.len()
+        );
+        assert!(name.ends_with(".peaks"));
+
+        // Same prefix, different id: different file.
+        let sibling = deep.replace("Kicks", "Snares");
+        assert_ne!(waveform_peak_relative_path_for_asset(&sibling), relative);
+        // Stable: the same id always names the same file.
+        assert_eq!(waveform_peak_relative_path_for_asset(&deep), relative);
+
+        let dir = temp_dir("long_id");
+        let path = dir.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        write_peak_file(&path, &deep, &sample_preview(), None).unwrap();
+        let loaded = read_peak_file(&path, Some(&deep), None).unwrap();
+        assert_eq!(loaded.total_frames, sample_preview().total_frames);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An id whose old name was writable but is now hashed (a `~` in it, as
+    /// in iCloud paths) still finds the cache an earlier build wrote.
+    #[test]
+    fn a_renamed_cache_file_is_still_found_under_its_old_name() {
+        let id = "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/kick.wav";
+        let relative = waveform_peak_relative_path_for_asset(id);
+        assert!(file_name(&relative).starts_with("kick.wav~"));
+        assert_eq!(
+            legacy_waveform_peak_relative_path_for_asset(id).as_deref(),
+            Some(
+                "Cache/Waveforms/__Users__me__Library__Mobile Documents__com~apple~CloudDocs__kick.wav.peaks"
+            )
         );
     }
 }
