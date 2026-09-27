@@ -171,40 +171,29 @@ impl StudioLayout {
         let audio_engine = self.audio_bridge.engine.clone();
         let timeline_vol = self.timeline.clone();
         let owner_vol = owner.clone();
+        // The inspector edits a multi-selection the way the header and the
+        // mixer do: a value on one selected track reaches every selected one.
         let on_volume: StrF32Cb = Arc::new(move |(id, v): &(String, f32), _w, cx| {
-            let id = id.clone();
             let v = *v;
-            let changed = timeline_vol.update(cx, |timeline, cx| {
-                let Some(prev) = timeline.state.find_track(&id).map(|track| track.volume) else {
-                    return false;
-                };
-                if (prev - v).abs() <= 1.0e-5 {
-                    return false;
-                }
-                timeline.run_edit_command(
-                    EditCommand::SetTrackVolume {
-                        track_id: id.clone(),
-                        prev,
-                        next: v,
-                    },
-                    cx,
-                );
-                true
+            let targets =
+                timeline_vol.update(cx, |timeline, cx| timeline.set_volume_gang(id, v, cx));
+            StudioLayout::defer_update(&owner_vol, cx, |this, cx| {
+                this.push_mixer_snapshot_to_window(cx);
             });
-            if changed {
-                StudioLayout::defer_update(&owner_vol, cx, |this, cx| {
-                    this.push_mixer_snapshot_to_window(cx);
-                });
-                if let Some(engine) = audio_engine.as_ref() {
-                    let _ =
-                        engine.update_track_param(&id, "volume", volume_norm_to_linear(v) as f64);
+            if let Some(engine) = audio_engine.as_ref() {
+                for target in &targets {
+                    let _ = engine.update_track_param(
+                        target,
+                        "volume",
+                        volume_norm_to_linear(v) as f64,
+                    );
                 }
             }
         });
         let timeline_volume_start = self.timeline.clone();
         let on_volume_drag_start: StrF32Cb = Arc::new(move |(id, v): &(String, f32), _w, cx| {
             timeline_volume_start.update(cx, |timeline, cx| {
-                timeline.state.begin_track_volume_preview(id, *v);
+                timeline.state.begin_volume_gang(id, *v);
                 cx.notify();
             });
         });
@@ -212,16 +201,19 @@ impl StudioLayout {
         let audio_engine_volume_preview = self.audio_bridge.engine.clone();
         let on_volume_drag_preview: StrF32Cb = Arc::new(move |(id, v): &(String, f32), _w, cx| {
             let changed = timeline_volume_preview.update(cx, |timeline, cx| {
-                let changed = timeline.state.set_track_volume_preview(id, *v);
-                if changed {
+                let changed = timeline.state.set_volume_gang_preview(id, *v);
+                if !changed.is_empty() {
                     cx.notify();
                 }
                 changed
             });
-            if changed {
-                if let Some(engine) = audio_engine_volume_preview.as_ref() {
-                    let _ =
-                        engine.update_track_param(id, "volume", volume_norm_to_linear(*v) as f64);
+            if let Some(engine) = audio_engine_volume_preview.as_ref() {
+                for (target, level) in &changed {
+                    let _ = engine.update_track_param(
+                        target,
+                        "volume",
+                        volume_norm_to_linear(*level) as f64,
+                    );
                 }
             }
         });
@@ -229,73 +221,47 @@ impl StudioLayout {
         let owner_volume_commit = owner.clone();
         let audio_engine_volume_commit = self.audio_bridge.engine.clone();
         let on_volume_drag_commit: StrCb = Arc::new(move |id: &String, _w, cx| {
-            let id = id.clone();
-            let committed = timeline_volume_commit.update(cx, |timeline, cx| {
-                let committed = timeline.state.commit_track_volume_preview(&id);
-                if let Some((prev, next)) = committed {
-                    if (prev - next).abs() > 1.0e-5 {
-                        timeline.record_executed_command(
-                            EditCommand::SetTrackVolume {
-                                track_id: id.clone(),
-                                prev,
-                                next,
-                            },
-                            cx,
-                        );
-                    }
-                }
-                committed
-            });
-            if let Some((_prev, next)) = committed {
-                if let Some(engine) = audio_engine_volume_commit.as_ref() {
+            let committed = timeline_volume_commit
+                .update(cx, |timeline, cx| timeline.finish_volume_gang(id, cx));
+            if committed.is_empty() {
+                return;
+            }
+            if let Some(engine) = audio_engine_volume_commit.as_ref() {
+                for (target, _, next) in &committed {
                     let _ = engine.update_track_param(
-                        &id,
+                        target,
                         "volume",
-                        volume_norm_to_linear(next) as f64,
+                        volume_norm_to_linear(*next) as f64,
                     );
                 }
-                StudioLayout::defer_update(&owner_volume_commit, cx, |this, cx| {
-                    this.push_mixer_snapshot_to_window(cx);
-                });
             }
+            StudioLayout::defer_update(&owner_volume_commit, cx, |this, cx| {
+                this.push_mixer_snapshot_to_window(cx);
+            });
         });
 
         let audio_engine = self.audio_bridge.engine.clone();
         let timeline_pan = self.timeline.clone();
         let owner_pan = owner.clone();
         let on_pan: StrF32Cb = Arc::new(move |(id, v): &(String, f32), _w, cx| {
-            let id = id.clone();
             let v = *v;
-            let changed = timeline_pan.update(cx, |timeline, cx| {
-                let Some(prev) = timeline.state.find_track(&id).map(|track| track.pan) else {
-                    return false;
-                };
-                if (prev - v).abs() <= 1.0e-5 {
-                    return false;
-                }
-                timeline.run_edit_command(
-                    EditCommand::SetTrackPan {
-                        track_id: id.clone(),
-                        prev,
-                        next: v,
-                    },
-                    cx,
-                );
-                true
+            let targets = timeline_pan.update(cx, |timeline, cx| timeline.set_pan_gang(id, v, cx));
+            if targets.is_empty() {
+                return;
+            }
+            StudioLayout::defer_update(&owner_pan, cx, |this, cx| {
+                this.push_mixer_snapshot_to_window(cx);
             });
-            if changed {
-                StudioLayout::defer_update(&owner_pan, cx, |this, cx| {
-                    this.push_mixer_snapshot_to_window(cx);
-                });
-                if let Some(engine) = audio_engine.as_ref() {
-                    let _ = engine.update_track_param(&id, "pan", v as f64);
+            if let Some(engine) = audio_engine.as_ref() {
+                for target in &targets {
+                    let _ = engine.update_track_param(target, "pan", v as f64);
                 }
             }
         });
         let timeline_pan_start = self.timeline.clone();
         let on_pan_drag_start: StrCb = Arc::new(move |id: &String, _w, cx| {
             timeline_pan_start.update(cx, |timeline, cx| {
-                timeline.state.begin_track_pan_preview(id);
+                timeline.state.begin_pan_gang(id);
                 cx.notify();
             });
         });
@@ -303,15 +269,15 @@ impl StudioLayout {
         let audio_engine_pan_preview = self.audio_bridge.engine.clone();
         let on_pan_drag_preview: StrF32Cb = Arc::new(move |(id, v): &(String, f32), _w, cx| {
             let changed = timeline_pan_preview.update(cx, |timeline, cx| {
-                let changed = timeline.state.set_track_pan_preview(id, *v);
-                if changed {
+                let changed = timeline.state.set_pan_gang_preview(id, *v);
+                if !changed.is_empty() {
                     cx.notify();
                 }
                 changed
             });
-            if changed {
-                if let Some(engine) = audio_engine_pan_preview.as_ref() {
-                    let _ = engine.update_track_param(id, "pan", *v as f64);
+            if let Some(engine) = audio_engine_pan_preview.as_ref() {
+                for (target, pan) in &changed {
+                    let _ = engine.update_track_param(target, "pan", *pan as f64);
                 }
             }
         });
@@ -319,31 +285,22 @@ impl StudioLayout {
         let owner_pan_commit = owner.clone();
         let audio_engine_pan_commit = self.audio_bridge.engine.clone();
         let on_pan_drag_commit: StrCb = Arc::new(move |id: &String, _w, cx| {
-            let id = id.clone();
             let committed = timeline_pan_commit.update(cx, |timeline, cx| {
-                let committed = timeline.state.commit_track_pan_preview(&id);
-                if let Some((prev, next)) = committed {
-                    if (prev - next).abs() > 1.0e-5 {
-                        timeline.record_executed_command(
-                            EditCommand::SetTrackPan {
-                                track_id: id.clone(),
-                                prev,
-                                next,
-                            },
-                            cx,
-                        );
-                    }
-                }
+                let committed = timeline.state.commit_pan_gang(id);
+                timeline.record_pan_gang(&committed, cx);
                 committed
             });
-            if let Some((_prev, next)) = committed {
-                if let Some(engine) = audio_engine_pan_commit.as_ref() {
-                    let _ = engine.update_track_param(&id, "pan", next as f64);
-                }
-                StudioLayout::defer_update(&owner_pan_commit, cx, |this, cx| {
-                    this.push_mixer_snapshot_to_window(cx);
-                });
+            if committed.is_empty() {
+                return;
             }
+            if let Some(engine) = audio_engine_pan_commit.as_ref() {
+                for (target, _, next) in &committed {
+                    let _ = engine.update_track_param(target, "pan", *next as f64);
+                }
+            }
+            StudioLayout::defer_update(&owner_pan_commit, cx, |this, cx| {
+                this.push_mixer_snapshot_to_window(cx);
+            });
         });
 
         let timeline_auto = self.timeline.clone();
@@ -598,21 +555,27 @@ impl StudioLayout {
         Arc::new(move |(clip_id, gain): &(String, f32), _w, cx| {
             let clip_id = clip_id.clone();
             let gain = *gain;
+            // On one of several selected clips, every one takes the same
+            // change, as a ratio, so each keeps its level against the others.
             let changed = timeline.update(cx, |t, cx| {
-                let Some(previous) =
-                    crate::components::edit::ClipSnapshot::capture(&t.state, &clip_id)
-                else {
+                let Some(origin) = t.state.find_clip(&clip_id).map(|(_, clip)| clip.gain) else {
                     return false;
                 };
-                if !t.state.set_clip_gain(&clip_id, gain) {
-                    return false;
-                }
-                let Some(next) = crate::components::edit::ClipSnapshot::capture(&t.state, &clip_id)
-                else {
-                    return false;
-                };
-                t.record_executed_command(EditCommand::UpdateClip { previous, next }, cx);
-                true
+                t.edit_clip_selection(
+                    &clip_id,
+                    |state, id| {
+                        let next = if id == clip_id || origin <= 1.0e-6 {
+                            gain
+                        } else {
+                            state
+                                .find_clip(id)
+                                .map(|(_, clip)| clip.gain * gain / origin)
+                                .unwrap_or(gain)
+                        };
+                        state.set_clip_gain(id, next)
+                    },
+                    cx,
+                )
             });
             if changed {
                 StudioLayout::defer_update(&owner, cx, |this, cx| {
@@ -630,20 +593,7 @@ impl StudioLayout {
             let clip_id = clip_id.clone();
             let muted = *muted;
             let changed = timeline.update(cx, |t, cx| {
-                let Some(previous) =
-                    crate::components::edit::ClipSnapshot::capture(&t.state, &clip_id)
-                else {
-                    return false;
-                };
-                if !t.state.set_clip_muted(&clip_id, muted) {
-                    return false;
-                }
-                let Some(next) = crate::components::edit::ClipSnapshot::capture(&t.state, &clip_id)
-                else {
-                    return false;
-                };
-                t.record_executed_command(EditCommand::UpdateClip { previous, next }, cx);
-                true
+                t.edit_clip_selection(&clip_id, |state, id| state.set_clip_muted(id, muted), cx)
             });
             if changed {
                 StudioLayout::defer_update(&owner, cx, |this, cx| {
@@ -1407,75 +1357,73 @@ impl StudioLayout {
         let audio_engine = self.audio_bridge.engine.clone();
         let timeline = self.timeline.clone();
         Arc::new(move |id: &String, _w, cx: &mut App| {
-            let id = id.clone();
-            let previous_input_state = timeline
+            // Like the header and the mixer: on one of several selected
+            // tracks, the toggle sets them all to this track's new state.
+            let Some(value) = timeline
                 .read(cx)
                 .state
-                .find_track(&id)
-                .map(|track| (track.armed, track.input_monitor));
-            let edit = timeline
-                .read(cx)
-                .begin_track_edit(TrackEditScope::tracks([id.clone()]));
-            let mut value = false;
-            let changed = timeline.update(cx, |t, cx| {
-                let changed = match kind {
-                    TrackToggle::Mute => t.state.toggle_track_mute(&id),
-                    TrackToggle::Solo => t.state.toggle_track_solo(&id),
-                    TrackToggle::Arm => t.state.toggle_track_arm(&id),
-                    TrackToggle::Input => t.state.cycle_track_input_monitor(&id),
-                };
-                value = t
-                    .state
-                    .find_track(&id)
-                    .map(|track| match kind {
-                        TrackToggle::Mute => track.muted,
-                        TrackToggle::Solo => track.solo,
-                        TrackToggle::Arm => track.armed,
-                        TrackToggle::Input => track.input_monitor.is_active(track.armed),
-                    })
-                    .unwrap_or(false);
-                if changed {
-                    cx.notify();
-                }
-                changed
-            });
-            if !changed {
+                .find_track(id)
+                .map(|track| match kind {
+                    TrackToggle::Mute => !track.muted,
+                    TrackToggle::Solo => !track.solo,
+                    TrackToggle::Arm => !track.armed,
+                    TrackToggle::Input => false,
+                })
+            else {
                 return;
-            }
+            };
             inspector_debug(&format!(
                 "edit track {} track={id} new={value}",
                 kind.label()
             ));
-
-            if matches!(kind, TrackToggle::Arm | TrackToggle::Input) {
-                let connections = timeline.read(cx).state.audio_connections.clone();
-                let apply_error = audio_engine.as_ref().and_then(|engine| {
-                    timeline.read(cx).state.find_track(&id).and_then(|track| {
-                        apply_engine_track_input_state(engine, track, &connections).err()
-                    })
-                });
-                if let Some(error) = apply_error {
-                    if let Some((armed, input_monitor)) = previous_input_state {
-                        timeline.update(cx, |t, cx| {
-                            if let Some(track) =
-                                t.state.tracks.iter_mut().find(|track| track.id == id)
-                            {
-                                track.armed = armed;
-                                track.input_monitor = input_monitor;
-                            }
-                            cx.notify();
-                        });
-                    }
-                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
-                        this.audio_bridge.last_error =
-                            Some(format!("Track input update failed: {error}"));
-                        this.push_mixer_snapshot_to_window(cx);
-                    });
+            match kind {
+                TrackToggle::Arm => {
+                    super::mixer_ops::apply_mixer_input_gang(
+                        &timeline,
+                        audio_engine.as_ref(),
+                        &owner,
+                        id,
+                        kind.history_label(),
+                        move |state, target| state.set_track_armed(target, value),
+                        cx,
+                    );
                     return;
                 }
+                TrackToggle::Input => {
+                    let Some(mode) = timeline
+                        .read(cx)
+                        .state
+                        .find_track(id)
+                        .map(|track| track.input_monitor.cycle())
+                    else {
+                        return;
+                    };
+                    super::mixer_ops::apply_mixer_input_gang(
+                        &timeline,
+                        audio_engine.as_ref(),
+                        &owner,
+                        id,
+                        kind.history_label(),
+                        move |state, target| state.set_track_input_monitor(target, mode),
+                        cx,
+                    );
+                    return;
+                }
+                TrackToggle::Mute | TrackToggle::Solo => {}
             }
+            let targets = timeline.read(cx).state.gang_targets(id);
+            let edit = timeline
+                .read(cx)
+                .begin_track_edit(TrackEditScope::tracks(targets.clone()));
             timeline.update(cx, |t, cx| {
+                for target in &targets {
+                    match kind {
+                        TrackToggle::Mute => t.state.set_track_mute(target, value),
+                        _ => t.state.set_track_solo(target, value),
+                    };
+                }
                 t.commit_track_edit(kind.history_label(), edit, false, cx);
+                cx.notify();
             });
 
             StudioLayout::defer_update(&owner, cx, move |this, cx| {
@@ -1484,12 +1432,11 @@ impl StudioLayout {
             });
             if let Some(engine) = audio_engine.as_ref() {
                 let param = match kind {
-                    TrackToggle::Mute => Some("muted"),
-                    TrackToggle::Solo => Some("solo"),
-                    TrackToggle::Arm | TrackToggle::Input => None,
+                    TrackToggle::Mute => "muted",
+                    _ => "solo",
                 };
-                if let Some(param) = param {
-                    let _ = engine.update_track_param(&id, param, if value { 1.0 } else { 0.0 });
+                for target in &targets {
+                    let _ = engine.update_track_param(target, param, if value { 1.0 } else { 0.0 });
                 }
             }
         })

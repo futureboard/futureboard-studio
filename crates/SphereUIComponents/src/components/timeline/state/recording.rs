@@ -56,18 +56,42 @@ impl TimelineState {
         sample_rate: u32,
         duration_seconds: f64,
     ) -> bool {
-        if sample_rate == 0 || !(duration_seconds > 0.0) {
+        self.seed_recorded_clip_window(
+            clip_id,
+            sample_rate,
+            duration_seconds,
+            0.0,
+            duration_seconds,
+        )
+    }
+
+    /// [`Self::seed_recorded_clip_source`] for a clip that plays only part
+    /// of its file, `window_start..window_end` seconds into it: one pass of
+    /// a loop recording, whose passes all share the file the recorder wrote
+    /// straight through.
+    pub fn seed_recorded_clip_window(
+        &mut self,
+        clip_id: &str,
+        sample_rate: u32,
+        duration_seconds: f64,
+        window_start: f64,
+        window_end: f64,
+    ) -> bool {
+        if sample_rate == 0 || !(duration_seconds > 0.0) || !(window_end > window_start) {
             return false;
         }
-        let frames = (duration_seconds * sample_rate as f64).round() as u64;
+        let rate = sample_rate as f64;
+        let frames = (duration_seconds * rate).round() as u64;
+        let start = ((window_start.max(0.0) * rate).round() as u64).min(frames);
+        let end = ((window_end * rate).round() as u64).clamp(start, frames);
         let Some(clip) = self.recorded_clip_mut(clip_id) else {
             return false;
         };
         clip.stretch.original_sample_rate = sample_rate;
         clip.stretch.project_sample_rate = sample_rate;
         clip.stretch.original_duration_samples = frames;
-        clip.stretch.source_start_samples = 0;
-        clip.stretch.source_end_samples = frames;
+        clip.stretch.source_start_samples = start;
+        clip.stretch.source_end_samples = end;
         let length = self.find_clip(clip_id).and_then(|(_, clip)| {
             Some((self.audio_clip_end_beat(clip)? - clip.start_beat as f64) as f32)
         });

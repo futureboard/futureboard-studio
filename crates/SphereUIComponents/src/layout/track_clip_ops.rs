@@ -306,6 +306,12 @@ impl StudioLayout {
                 0.0
             };
             let mut pasted_ids = Vec::new();
+            let mut pasted = Vec::new();
+            // Ids are taken up front: nothing is inserted until the one step
+            // that pastes them all.
+            let first_id = crate::components::timeline::timeline_state::next_clip_id_number(
+                &timeline.state.tracks,
+            );
             for snapshot in snapshots {
                 let track_id = if timeline
                     .state
@@ -327,12 +333,21 @@ impl StudioLayout {
                 };
                 let clip = timeline.state.clone_clip_for_insert(
                     &snapshot.clip,
-                    timeline.state.next_clip_id(),
+                    format!("clip-{}", first_id + pasted.len() as u32),
                     snapshot.clip.name.clone(),
                     (snapshot.clip.start_beat + offset).max(0.0),
                 );
                 pasted_ids.push(clip.id.clone());
-                timeline.run_edit_command(EditCommand::CreateClip { track_id, clip }, cx);
+                pasted.push((track_id, clip));
+            }
+            // One paste, one undo step, however many clips it brings.
+            match pasted.len() {
+                0 => {}
+                1 => {
+                    let (track_id, clip) = pasted.remove(0);
+                    timeline.run_edit_command(EditCommand::CreateClip { track_id, clip }, cx);
+                }
+                _ => timeline.run_edit_command(EditCommand::BatchCreateClips { clips: pasted }, cx),
             }
             if !pasted_ids.is_empty() {
                 timeline.state.selection.selected_clip_ids = pasted_ids;
@@ -667,11 +682,8 @@ impl StudioLayout {
 
     pub(super) fn split_selected_audio_clip_at_playhead(&mut self, cx: &mut Context<Self>) {
         let did_split = self.timeline.update(cx, |timeline, cx| {
-            let Some(clip_id) = timeline.state.selection.selected_clip_ids.first().cloned() else {
-                return false;
-            };
             let split_beat = timeline.state.transport.playhead_beats;
-            timeline.split_audio_clip_at_beat(&clip_id, split_beat, cx)
+            timeline.split_selected_clips_at_beat(split_beat, cx)
         });
         if did_split {
             self.mark_dirty();
@@ -748,16 +760,30 @@ impl StudioLayout {
         }
     }
 
+    /// Record arm from the menu or keyboard: every selected track follows the
+    /// primary one, and each goes to the engine the way a header press does.
     pub(super) fn toggle_selected_track_arm(&mut self, cx: &mut Context<Self>) {
-        self.mark_dirty();
-        let edit = self.begin_track_edit(TrackEditScope::tracks(self.selected_track_ids(cx)), cx);
-        let _ = self.timeline.update(cx, |timeline, cx| {
-            if let Some(id) = timeline.state.selection.selected_track_id.clone() {
-                timeline.state.toggle_track_arm(&id);
-                cx.notify();
-            }
-        });
-        self.commit_track_edit("Record Arm", edit, cx);
+        let state = &self.timeline.read(cx).state;
+        let Some((id, armed)) = state
+            .selection
+            .selected_track_id
+            .as_ref()
+            .and_then(|id| state.find_track(id))
+            .map(|track| (track.id.clone(), !track.armed))
+        else {
+            return;
+        };
+        let engine = self.audio_bridge.engine.clone();
+        let owner = cx.entity().clone();
+        super::mixer_ops::apply_mixer_input_gang(
+            &self.timeline,
+            engine.as_ref(),
+            &owner,
+            &id,
+            "Record Arm",
+            move |state, target| state.set_track_armed(target, armed),
+            cx,
+        );
     }
 
     pub(super) fn reset_selected_track_volume(&mut self, cx: &mut Context<Self>) {
@@ -853,7 +879,9 @@ impl StudioLayout {
             return;
         };
         let height = timeline_state::preset_track_row_height(preset);
-        self.set_track_heights_with_undo(vec![(track_id, height)], cx);
+        // Every selected track, when the menu was opened on one of them.
+        let targets = self.timeline.read(cx).state.gang_targets(&track_id);
+        self.set_track_heights_with_undo(targets.into_iter().map(|id| (id, height)).collect(), cx);
     }
 
     /// Set the context track's timebase — what its clips hold onto when the
@@ -871,22 +899,26 @@ impl StudioLayout {
         else {
             return;
         };
-        let edit = self.begin_track_edit(TrackEditScope::tracks([track_id.clone()]), cx);
+        let targets = self.timeline.read(cx).state.gang_targets(&track_id);
+        let edit = self.begin_track_edit(TrackEditScope::tracks(targets.clone()), cx);
         let changed = self.timeline.update(cx, |timeline, cx| {
-            let Some(track) = timeline
+            let mut changed = false;
+            for track in timeline
                 .state
                 .tracks
                 .iter_mut()
-                .find(|track| track.id == track_id)
-            else {
-                return false;
-            };
-            if track.timebase == timebase {
-                return false;
+                .filter(|track| targets.contains(&track.id))
+            {
+                // A routing track owns no clips to hold on to anything.
+                if track.timebase != timebase && !track.track_type.is_routing() {
+                    track.timebase = timebase;
+                    changed = true;
+                }
             }
-            track.timebase = timebase;
-            cx.notify();
-            true
+            if changed {
+                cx.notify();
+            }
+            changed
         });
         self.commit_track_edit("Set Timebase", edit, cx);
         if changed {
@@ -900,18 +932,20 @@ impl StudioLayout {
         else {
             return;
         };
-        let prev = self
-            .timeline
-            .read(cx)
-            .state
-            .track_row_height_for_id(&track_id);
-        if (prev - timeline_state::DEFAULT_TRACK_HEIGHT).abs() < 0.01 {
+        let state = &self.timeline.read(cx).state;
+        let changes: Vec<(String, f32)> = state
+            .gang_targets(&track_id)
+            .into_iter()
+            .filter(|id| {
+                (state.track_row_height_for_id(id) - timeline_state::DEFAULT_TRACK_HEIGHT).abs()
+                    >= 0.01
+            })
+            .map(|id| (id, timeline_state::DEFAULT_TRACK_HEIGHT))
+            .collect();
+        if changes.is_empty() {
             return;
         }
-        self.set_track_heights_with_undo(
-            vec![(track_id, timeline_state::DEFAULT_TRACK_HEIGHT)],
-            cx,
-        );
+        self.set_track_heights_with_undo(changes, cx);
     }
 
     pub(super) fn reset_all_track_heights(&mut self, cx: &mut Context<Self>) {

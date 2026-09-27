@@ -90,17 +90,33 @@ impl Render for StudioLayout {
                             TimelineContextTarget::TrackLane { track_id, beat } => {
                                 ContextTarget::TrackLane { track_id, beat }
                             }
+                            // A right-click inside a multi-selection keeps it,
+                            // so the menu acts on all of it (delete, group,
+                            // mute, ...); outside it, it selects what was hit.
                             TimelineContextTarget::TrackHeader(id) => {
                                 this.timeline.update(cx, |timeline, cx| {
-                                    timeline.state.select_track(&id);
+                                    if timeline.state.selection.is_track_selected(&id) {
+                                        timeline.state.selection.selected_track_id =
+                                            Some(id.clone());
+                                    } else {
+                                        timeline.state.select_track(&id);
+                                    }
                                     cx.notify();
                                 });
                                 ContextTarget::Track(id)
                             }
                             TimelineContextTarget::Clip(id) => {
                                 this.timeline.update(cx, |timeline, cx| {
-                                    timeline.state.select_clip(&id);
-                                    cx.notify();
+                                    if !timeline
+                                        .state
+                                        .selection
+                                        .selected_clip_ids
+                                        .iter()
+                                        .any(|selected| selected == &id)
+                                    {
+                                        timeline.state.select_clip(&id);
+                                        cx.notify();
+                                    }
                                 });
                                 ContextTarget::Clip(id)
                             }

@@ -15,6 +15,7 @@ mod crossfade;
 mod debug;
 mod demo;
 mod drag;
+mod gang;
 mod geometry;
 mod global_lanes;
 mod grid;

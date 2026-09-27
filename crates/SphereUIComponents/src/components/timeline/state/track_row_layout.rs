@@ -85,15 +85,20 @@ pub struct TrackRowLayoutEntry {
     /// Combined height (px) of the track's expanded automation sub-lanes,
     /// stacked directly below the parent row. `0.0` when the track's automation
     /// section is collapsed. The full block a track occupies vertically is
-    /// `height + automation_height`.
+    /// `height + automation_height + take_height`.
     pub automation_height: f32,
+    /// Combined height (px) of the track's open take lanes, below its
+    /// automation lanes, so automation geometry never moves for them. `0.0`
+    /// when its takes are closed.
+    pub take_height: f32,
 }
 
 impl TrackRowLayoutEntry {
-    /// Total vertical space the track occupies: parent row + automation lanes.
+    /// Total vertical space the track occupies: parent row, automation lanes
+    /// and take lanes.
     #[inline]
     pub fn block_height(&self) -> f32 {
-        self.height + self.automation_height
+        self.height + self.automation_height + self.take_height
     }
 }
 
@@ -123,13 +128,14 @@ impl TrackRowLayout {
             // arrangement space. Keep them in the rows vector (1:1 with
             // `state.tracks`) but collapse them to zero height.
             let hidden_by_group = groups.hidden[index];
-            let (height, automation_height) =
+            let (height, automation_height, take_height) =
                 if is_arrangement_hidden_track(track) || hidden_by_group {
-                    (0.0, 0.0)
+                    (0.0, 0.0, 0.0)
                 } else {
                     (
                         state.track_row_height(track),
                         state.track_automation_height(track),
+                        state.track_take_lanes_height(track),
                     )
                 };
             rows.push(TrackRowLayoutEntry {
@@ -138,8 +144,9 @@ impl TrackRowLayout {
                 y,
                 height,
                 automation_height,
+                take_height,
             });
-            y += height + automation_height;
+            y += height + automation_height + take_height;
         }
         Self {
             rows,

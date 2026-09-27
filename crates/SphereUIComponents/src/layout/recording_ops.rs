@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::components::timeline::timeline_state::{
-    AudioClipStretchState, AudioImportState, ClipState, ClipType, MidiControllerLane,
-    MidiNoteState, TrackAudioFormat, TrackState, TrackType, MIN_NOTE_BEATS,
+    midi_record_passes, unwrap_record_beat, AudioClipStretchState, AudioImportState, ClipState,
+    ClipType, MidiControllerLane, MidiNoteState, RecordLoop, TrackAudioFormat, TrackState,
+    TrackType, MIN_NOTE_BEATS,
 };
 use crate::components::timeline::waveform_cache::{self, WaveformPeak};
 use sphere_midi_service::mpe::{MpeDecoder, MpeRecordingSession, RecordedNote};
@@ -50,6 +51,10 @@ pub(crate) struct RecordingSessionState {
     /// (committed when the writer hands the files over) carry the same number,
     /// which is how they become one undo step.
     pub pass: u64,
+    /// The loop the session records under, taken when it starts: each wrap
+    /// of the transport is a new take (see `RecordLoop`). `None` records
+    /// straight through.
+    pub record_loop: Option<RecordLoop>,
 }
 
 impl Default for RecordingSessionState {
@@ -64,6 +69,7 @@ impl Default for RecordingSessionState {
             count_in_token: 0,
             awaiting_finalize: false,
             pass: 0,
+            record_loop: None,
         }
     }
 }
@@ -72,6 +78,21 @@ impl Default for RecordingSessionState {
 pub(crate) struct MidiRecordingTake {
     pub start_beat: f32,
     pub tracks: HashMap<String, MidiRecordingTrack>,
+    /// The session's loop, and the running state that unrolls the wrapping
+    /// transport into one clock (`unwrap_record_beat`), so each pass's notes
+    /// stay its own instead of landing on the pass before.
+    pub record_loop: Option<RecordLoop>,
+    pub last_beat: f32,
+    pub wraps: u32,
+}
+
+impl MidiRecordingTake {
+    /// `beat` on the recording's unrolled clock, relative to its start.
+    fn relative_beat(&mut self, beat: f32) -> f32 {
+        let unrolled =
+            unwrap_record_beat(beat, self.record_loop, &mut self.last_beat, &mut self.wraps);
+        (unrolled - self.start_beat).max(0.0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +133,8 @@ pub(crate) struct MidiRecordingResult {
     pub start_beat: f32,
     pub duration_beats: f32,
     pub notes: Vec<MidiNoteState>,
+    /// The pass ran the whole loop (always, for a straight recording).
+    pub complete: bool,
 }
 
 impl StudioLayout {
@@ -591,6 +614,15 @@ impl StudioLayout {
         };
         let project_name = self.project_session.name.clone();
 
+        let record_loop = {
+            let transport = &self.timeline.read(cx).state.transport;
+            RecordLoop::of(
+                transport.loop_enabled,
+                transport.loop_start_beats,
+                transport.loop_end_beats,
+            )
+        };
+        self.recording.record_loop = record_loop;
         if !midi_tracks.is_empty() {
             self.recording.midi = Some(MidiRecordingTake {
                 start_beat: start_beat.max(0.0),
@@ -598,6 +630,9 @@ impl StudioLayout {
                     .into_iter()
                     .map(|track| (track.track_id.clone(), track))
                     .collect(),
+                record_loop,
+                last_beat: start_beat.max(0.0),
+                wraps: 0,
             });
             self.recording.midi_preview_dirty = true;
             self.recording.midi_preview_updated_at = Instant::now() - Duration::from_secs(1);
@@ -855,7 +890,7 @@ impl StudioLayout {
         let Some(take) = self.recording.midi.as_mut() else {
             return;
         };
-        let relative_beat = (current_beat - take.start_beat).max(0.0);
+        let relative_beat = take.relative_beat(current_beat);
         let Some(track) = take.tracks.get_mut(track_id) else {
             return;
         };
@@ -934,7 +969,7 @@ impl StudioLayout {
         let Some(mut take) = self.recording.midi.take() else {
             return Vec::new();
         };
-        let relative_end = (end_beat - take.start_beat).max(0.0);
+        let relative_end = take.relative_beat(end_beat);
         let mut results = Vec::new();
         for (_, mut track) in take.tracks.drain() {
             close_all_recorded_midi_notes(&mut track, relative_end);
@@ -951,17 +986,17 @@ impl StudioLayout {
             if notes.is_empty() {
                 continue;
             }
-            let note_end = notes
-                .iter()
-                .map(|note| note.start + note.duration)
-                .fold(0.0_f32, f32::max);
-            results.push(MidiRecordingResult {
-                track_id: track.track_id,
-                track_name: track.track_name,
-                start_beat: take.start_beat,
-                duration_beats: relative_end.max(note_end).max(MIN_NOTE_BEATS),
-                notes,
-            });
+            // One result per pass of a loop recording, each its own take.
+            for pass in midi_record_passes(take.start_beat, notes, relative_end, take.record_loop) {
+                results.push(MidiRecordingResult {
+                    track_id: track.track_id.clone(),
+                    track_name: track.track_name.clone(),
+                    start_beat: pass.start_beat,
+                    duration_beats: pass.duration_beats,
+                    notes: pass.notes,
+                    complete: pass.complete,
+                });
+            }
         }
         results
     }
@@ -983,6 +1018,9 @@ impl StudioLayout {
             );
             let mut selected_clip_ids = Vec::new();
             let mut selected_track_id = None;
+            let take_stamp = take_timestamp_label();
+            // Each track's clips in pass order, to register as its takes.
+            let mut passes_by_track: Vec<(String, Vec<(String, bool)>)> = Vec::new();
             for result in results {
                 let clip_id = timeline.state.next_clip_id();
                 let clip = ClipState {
@@ -1011,8 +1049,25 @@ impl StudioLayout {
                 {
                     track.clips.push(clip);
                     selected_track_id = Some(track.id.clone());
+                    match passes_by_track
+                        .iter_mut()
+                        .find(|(track_id, _)| *track_id == result.track_id)
+                    {
+                        Some((_, passes)) => passes.push((clip_id.clone(), result.complete)),
+                        None => passes_by_track.push((
+                            result.track_id.clone(),
+                            vec![(clip_id.clone(), result.complete)],
+                        )),
+                    }
                     selected_clip_ids.push(clip_id);
                 }
+            }
+            // A MIDI pass is a take like an audio one: a second pass over the
+            // same bars is an alternate, not a layer.
+            for (track_id, passes) in &passes_by_track {
+                timeline
+                    .state
+                    .register_recorded_passes(track_id, passes, &take_stamp);
             }
             if !selected_clip_ids.is_empty() {
                 if let Some(command) = crate::components::edit::EditCommand::record_pass(
@@ -1056,6 +1111,7 @@ impl StudioLayout {
         let take_stamp = take_timestamp_label();
 
         let pass = self.recording.pass;
+        let record_loop = self.recording.record_loop;
         let _ = self.timeline.update(cx, |timeline, cx| {
             let before = crate::components::edit::TrackTakesState::capture_tracks(
                 &timeline.state,
@@ -1104,36 +1160,50 @@ impl StudioLayout {
                         placed_beat
                     );
                 }
-                let clip_id = timeline.state.insert_recorded_clip(
-                    &result.track_id,
-                    result.file_path.clone(),
-                    clip_name,
+                // One clip per pass: a loop recording's file holds every pass
+                // end to end, and each pass's clip plays its own part of it.
+                let passes = timeline.state.audio_record_passes(
                     placed_beat,
                     result.duration_seconds,
-                    bpm,
+                    record_loop,
                 );
-                timeline.state.seed_recorded_clip_source(
-                    &clip_id,
-                    result.sample_rate,
-                    result.duration_seconds,
-                );
-                // Register the pass as a take. A second pass over the same bars
-                // becomes the active take and mutes the one it replaced, which
-                // is what makes Record twice a comp instead of two clips
-                // playing over each other.
-                timeline.state.register_recorded_take(
-                    &result.track_id,
-                    &clip_id,
-                    take_stamp.clone(),
-                );
-                created_clip_ids.push(clip_id.clone());
+                let mut pass_clips = Vec::with_capacity(passes.len());
+                for pass in &passes {
+                    let clip_id = timeline.state.insert_recorded_clip(
+                        &result.track_id,
+                        result.file_path.clone(),
+                        clip_name.clone(),
+                        pass.start_beat,
+                        pass.source_end_seconds - pass.source_start_seconds,
+                        bpm,
+                    );
+                    timeline.state.seed_recorded_clip_window(
+                        &clip_id,
+                        result.sample_rate,
+                        result.duration_seconds,
+                        pass.source_start_seconds,
+                        pass.source_end_seconds,
+                    );
+                    eprintln!(
+                        "[recording] clip created id={clip_id} track={} path={} window={:.3}..{:.3}s",
+                        result.track_id,
+                        result.relative_path,
+                        pass.source_start_seconds,
+                        pass.source_end_seconds
+                    );
+                    created_clip_ids.push(clip_id.clone());
+                    pass_clips.push((clip_id, pass.complete));
+                }
+                // Register the passes as takes. A pass over bars an earlier
+                // take covers becomes the active take and mutes the one it
+                // replaced, which is what makes Record twice a comp instead of
+                // two clips playing over each other.
+                timeline
+                    .state
+                    .register_recorded_passes(&result.track_id, &pass_clips, &take_stamp);
                 if generate_waveforms {
                     import_paths.push((PathBuf::from(&result.file_path), result.file_path.clone()));
                 }
-                eprintln!(
-                    "[recording] clip created id={clip_id} track={} path={}",
-                    result.track_id, result.relative_path
-                );
             }
             // One undo step for the pass: undo takes the new clips away *and*
             // unmutes the takes they replaced.

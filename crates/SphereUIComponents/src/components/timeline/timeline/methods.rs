@@ -136,7 +136,7 @@ impl Timeline {
         self.clip_clone_hint = None;
         self.song_text_drag_preview = None;
         self.clip_drag_origin = None;
-        self.clip_resize_origin = None;
+        self.clip_resize_origin.clear();
         // The overlay renders with this view, so clearing the cell is enough
         // for the caller's notify to take the razor line down.
         self.cut_guide.set(None);
@@ -218,7 +218,7 @@ impl Timeline {
             song_text_drag_preview: None,
             song_text_drag_cancelled: false,
             clip_drag_origin: None,
-            clip_resize_origin: None,
+            clip_resize_origin: Vec::new(),
             clip_resize_grab_beats: 0.0,
             clip_drag_target_track_index: None,
             clip_clone_drag_id: None,
@@ -266,6 +266,7 @@ impl Timeline {
             project_root: None,
             focus_lost_subscription: None,
             clip_process_origin: None,
+            clip_process_peers: Vec::new(),
             snap_menu_open: false,
             cut_guide: Default::default(),
             cut_guide_overlay: None,
@@ -312,7 +313,7 @@ impl Timeline {
             song_text_drag_preview: None,
             song_text_drag_cancelled: false,
             clip_drag_origin: None,
-            clip_resize_origin: None,
+            clip_resize_origin: Vec::new(),
             clip_resize_grab_beats: 0.0,
             clip_drag_target_track_index: None,
             clip_clone_drag_id: None,
@@ -360,6 +361,7 @@ impl Timeline {
             project_root: None,
             focus_lost_subscription: None,
             clip_process_origin: None,
+            clip_process_peers: Vec::new(),
             snap_menu_open: false,
             cut_guide: Default::default(),
             cut_guide_overlay: None,
@@ -494,6 +496,263 @@ impl Timeline {
             }
         }
         self.commit_track_edit(label, edit, false, cx);
+    }
+
+    /// Applies an input change (record arm, input monitor) to each of
+    /// `targets` and hands it to the engine, putting back any track the engine
+    /// refuses. Returns whether any track changed.
+    pub(crate) fn apply_track_input_gang(
+        &mut self,
+        targets: &[String],
+        mut apply: impl FnMut(
+            &mut crate::components::timeline::timeline_state::TimelineState,
+            &str,
+        ) -> bool,
+    ) -> bool {
+        let mut changed = false;
+        for target in targets {
+            let Some(previous) = self
+                .state
+                .find_track(target)
+                .map(|track| (track.armed, track.input_monitor))
+            else {
+                continue;
+            };
+            if !apply(&mut self.state, target) {
+                continue;
+            }
+            let next = self
+                .state
+                .find_track(target)
+                .map(|track| (track.armed, track.input_monitor.is_active(track.armed)));
+            let refused = next.and_then(|(armed, monitor)| {
+                self.on_track_input_state_change
+                    .as_ref()
+                    .and_then(|cb| cb(target.clone(), armed, monitor).err())
+            });
+            match refused {
+                Some(error) => {
+                    if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == *target) {
+                        track.armed = previous.0;
+                        track.input_monitor = previous.1;
+                    }
+                    eprintln!("[audio] track input update rejected: {error}");
+                }
+                None => changed = true,
+            }
+        }
+        changed
+    }
+
+    /// Sets `track_id` — and every track ganged with it — to `volume`, as one
+    /// undo step (a fader reset). Returns the tracks set.
+    pub(crate) fn set_volume_gang(
+        &mut self,
+        track_id: &str,
+        volume: f32,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<String> {
+        let targets = self.state.gang_targets(track_id);
+        if targets.len() > 1 {
+            let edit = self.begin_track_edit(
+                crate::components::timeline::timeline_state::TrackEditScope::tracks(
+                    targets.clone(),
+                ),
+            );
+            for target in &targets {
+                self.state.set_track_volume(target, volume);
+                self.state.clear_track_volume_preview(target);
+            }
+            self.commit_track_edit("Volume", edit, false, cx);
+        } else {
+            let prev = self.state.find_track(track_id).map(|track| track.volume);
+            self.state.set_track_volume(track_id, volume);
+            self.state.clear_track_volume_preview(track_id);
+            if let Some(prev) = prev {
+                self.record_mixer_value(
+                    EditCommand::SetTrackVolume {
+                        track_id: track_id.to_string(),
+                        prev,
+                        next: volume,
+                    },
+                    cx,
+                );
+            }
+        }
+        cx.notify();
+        targets
+    }
+
+    /// Ends a fader drag on `track_id`: every ganged track takes its preview
+    /// as its level, recorded as one step. Returns `(track, before, after)`.
+    pub(crate) fn finish_volume_gang(
+        &mut self,
+        track_id: &str,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<(String, f32, f32)> {
+        let targets = self.state.gang_targets(track_id);
+        // Levels only change on release, so the step's "before" is taken
+        // here, over every track the drag moved.
+        let edit = (targets.len() > 1).then(|| {
+            self.begin_track_edit(
+                crate::components::timeline::timeline_state::TrackEditScope::tracks(targets),
+            )
+        });
+        let committed = self.state.commit_volume_gang(track_id);
+        let moved = committed
+            .iter()
+            .any(|(_, prev, next)| (prev - next).abs() > 1.0e-5);
+        match (edit, committed.as_slice()) {
+            (Some(edit), _) if moved => {
+                self.commit_track_edit("Volume", edit, false, cx);
+            }
+            (None, [(target, prev, next)]) if moved => {
+                self.record_executed_command(
+                    EditCommand::SetTrackVolume {
+                        track_id: target.clone(),
+                        prev: *prev,
+                        next: *next,
+                    },
+                    cx,
+                );
+            }
+            _ => {}
+        }
+        cx.notify();
+        committed
+    }
+
+    /// Sets `track_id` — and every track ganged with it — to `pan`, as one
+    /// undo step (a pan reset or a typed value). Returns the tracks set.
+    pub(crate) fn set_pan_gang(
+        &mut self,
+        track_id: &str,
+        pan: f32,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<String> {
+        let pan = pan.clamp(-1.0, 1.0);
+        let targets = self.state.gang_targets(track_id);
+        if targets.len() > 1 {
+            let edit = self.begin_track_edit(
+                crate::components::timeline::timeline_state::TrackEditScope::tracks(
+                    targets.clone(),
+                ),
+            );
+            for target in &targets {
+                self.state.set_track_pan(target, pan);
+            }
+            if !self.commit_track_edit("Pan", edit, false, cx) {
+                return Vec::new();
+            }
+        } else {
+            let Some(prev) = self.state.find_track(track_id).map(|track| track.pan) else {
+                return Vec::new();
+            };
+            if (prev - pan).abs() <= 1.0e-5 {
+                return Vec::new();
+            }
+            self.run_edit_command(
+                EditCommand::SetTrackPan {
+                    track_id: track_id.to_string(),
+                    prev,
+                    next: pan,
+                },
+                cx,
+            );
+        }
+        cx.notify();
+        targets
+    }
+
+    /// A pan control that reports absolute values and no release (the mixer
+    /// knob): `track_id` goes to `pan` and every ganged track moves by the
+    /// same change, each sample folding into one undo step. Returns the new
+    /// pan of every track moved.
+    pub(crate) fn nudge_pan_gang(
+        &mut self,
+        track_id: &str,
+        pan: f32,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<(String, f32)> {
+        let pan = pan.clamp(-1.0, 1.0);
+        let targets = self.state.gang_targets(track_id);
+        let Some(prev) = self.state.find_track(track_id).map(|track| track.pan) else {
+            return Vec::new();
+        };
+        if targets.len() == 1 {
+            self.state.set_track_pan(track_id, pan);
+            self.record_mixer_value(
+                EditCommand::SetTrackPan {
+                    track_id: track_id.to_string(),
+                    prev,
+                    next: pan,
+                },
+                cx,
+            );
+            cx.notify();
+            return vec![(track_id.to_string(), pan)];
+        }
+        let delta = pan - prev;
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::tracks(targets.clone()),
+        );
+        let mut moved = Vec::with_capacity(targets.len());
+        for target in targets {
+            let Some(current) = self.state.find_track(&target).map(|track| track.pan) else {
+                continue;
+            };
+            let next = if target == track_id {
+                pan
+            } else {
+                (current + delta).clamp(-1.0, 1.0)
+            };
+            self.state.set_track_pan(&target, next);
+            moved.push((target, next));
+        }
+        self.commit_track_edit("Pan", edit, true, cx);
+        cx.notify();
+        moved
+    }
+
+    /// Records a finished pan drag, `(track, before, after)` per track moved:
+    /// one `SetTrackPan` for one track, one step over all of them for a gang.
+    /// Pan moves live during the drag, so the gang's "before" is rebuilt from
+    /// the recorded starting pans.
+    pub(crate) fn record_pan_gang(
+        &mut self,
+        committed: &[(String, f32, f32)],
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if !committed
+            .iter()
+            .any(|(_, prev, next)| (prev - next).abs() > 1.0e-5)
+        {
+            return;
+        }
+        if let [(track_id, prev, next)] = committed {
+            self.record_executed_command(
+                EditCommand::SetTrackPan {
+                    track_id: track_id.clone(),
+                    prev: *prev,
+                    next: *next,
+                },
+                cx,
+            );
+            return;
+        }
+        for (track_id, prev, _) in committed {
+            self.state.set_track_pan(track_id, *prev);
+        }
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::tracks(
+                committed.iter().map(|(track_id, _, _)| track_id.clone()),
+            ),
+        );
+        for (track_id, _, next) in committed {
+            self.state.set_track_pan(track_id, *next);
+        }
+        self.commit_track_edit("Pan", edit, false, cx);
+        self.mark_control_state_changed(cx);
     }
 
     /// Open a track edit: capture what `scope` covers before the action runs.
@@ -728,6 +987,51 @@ impl Timeline {
         true
     }
 
+    /// Applies one clip edit to `clip_id` — and to every other selected clip
+    /// when it is one of several — as one undo step. `apply` edits one clip
+    /// and says whether it changed. Returns whether any clip changed.
+    pub(crate) fn edit_clip_selection(
+        &mut self,
+        clip_id: &str,
+        mut apply: impl FnMut(
+            &mut crate::components::timeline::timeline_state::TimelineState,
+            &str,
+        ) -> bool,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let ids = self.clip_drag_selection_ids(clip_id);
+        let before: Vec<ClipSnapshot> = ids
+            .iter()
+            .filter_map(|id| ClipSnapshot::capture(&self.state, id))
+            .collect();
+        let mut changed = false;
+        for id in &ids {
+            changed |= apply(&mut self.state, id);
+        }
+        if !changed {
+            return false;
+        }
+        let mut changes: Vec<(ClipSnapshot, ClipSnapshot)> = before
+            .into_iter()
+            .filter_map(|previous| {
+                let next = ClipSnapshot::capture(&self.state, &previous.clip.id)?;
+                (previous.clip != next.clip).then_some((previous, next))
+            })
+            .collect();
+        match changes.len() {
+            0 => return false,
+            1 => {
+                let (previous, next) = changes.remove(0);
+                self.record_executed_command(EditCommand::UpdateClip { previous, next }, cx);
+            }
+            _ => {
+                let (previous, next) = changes.into_iter().unzip();
+                self.record_executed_command(EditCommand::UpdateClips { previous, next }, cx);
+            }
+        }
+        true
+    }
+
     pub fn begin_inspector_clip_gesture(&mut self, clip_id: &str) {
         self.inspector_clip_gesture_origin = ClipSnapshot::capture(&self.state, clip_id);
     }
@@ -876,6 +1180,68 @@ impl Timeline {
     /// A no-op when the clip is missing, is not audio, or `split_beat` lands
     /// within `MIN_SPLIT_LEN_BEATS` of either edge (a hair-thin fragment is
     /// never useful and would round to a zero-length clip).
+    /// Split every selected audio clip the playhead (`split_beat`) runs
+    /// through, as one undo step. One clip goes the single-clip way.
+    pub fn split_selected_clips_at_beat(
+        &mut self,
+        split_beat: f32,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let mut splits: Vec<EditCommand> = self
+            .state
+            .selection
+            .selected_clip_ids
+            .clone()
+            .iter()
+            .filter_map(|clip_id| {
+                let snapshot = ClipSnapshot::capture(&self.state, clip_id)?;
+                let (left, right) = self
+                    .state
+                    .plan_audio_clip_split(&snapshot.clip, split_beat)?;
+                let track_id = snapshot.track_id.clone();
+                Some(EditCommand::ReplaceClipWithClips {
+                    clips: vec![(track_id.clone(), left), (track_id, right)],
+                    snapshot,
+                })
+            })
+            .collect();
+        match splits.len() {
+            0 => false,
+            1 => {
+                self.run_edit_command(splits.remove(0), cx);
+                true
+            }
+            _ => {
+                // One step over the tracks the splits touch: their clips (and
+                // takes) come back whole on undo.
+                let mut tracks: Vec<String> = Vec::new();
+                let mut pieces: Vec<String> = Vec::new();
+                for split in &splits {
+                    if let EditCommand::ReplaceClipWithClips { clips, .. } = split {
+                        for (track_id, clip) in clips {
+                            if !tracks.contains(track_id) {
+                                tracks.push(track_id.clone());
+                            }
+                            pieces.push(clip.id.clone());
+                        }
+                    }
+                }
+                let edit = self.begin_track_edit(
+                    crate::components::timeline::timeline_state::TrackEditScope::tracks(tracks),
+                );
+                for split in &splits {
+                    split.execute(&mut self.state);
+                }
+                self.state.selection.selected_clip_ids = pieces;
+                self.commit_track_edit("Split Clips", edit, false, cx);
+                self.mark_project_changed(cx);
+                self.mark_media_changed(cx);
+                cx.notify();
+                true
+            }
+        }
+    }
+
     pub fn split_audio_clip_at_beat(
         &mut self,
         clip_id: &str,

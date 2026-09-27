@@ -105,7 +105,6 @@ pub fn collapsed_folder_summary(
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

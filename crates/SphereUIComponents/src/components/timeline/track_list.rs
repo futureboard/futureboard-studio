@@ -11,6 +11,7 @@ use crate::components::timeline::automation_lane::{
     automation_lane, AutomationDeleteCallback, AutomationDownCallback, AutomationHoverCallback,
     AutomationLaneActionCallback,
 };
+use crate::components::timeline::take_lane::take_lane;
 use crate::components::timeline::timeline_state::{
     AutomationHover, AutomationMarquee, TimelineGestureContext, TimelineState, TrackRowLayout,
     AUTOMATION_CONTROL_LANE_HEIGHT, AUTOMATION_SUBLANE_HEIGHT, DEFAULT_TRACK_HEIGHT, HEADER_WIDTH,
@@ -172,7 +173,7 @@ pub fn track_list(
         let row_height = row_entry.height;
         let row_y = row_entry.y;
         let automation_height = row_entry.automation_height;
-        let total_row_height = row_height + automation_height;
+        let total_row_height = row_height + automation_height + row_entry.take_height;
 
         // Build the expandable automation sub-lane rows that stack directly
         // below the parent track. Each one owns its full row bounds so point
@@ -282,7 +283,22 @@ pub fn track_list(
                         on_resize_reset.clone(),
                     )),
             )
-            .children(sub_lanes);
+            .children(sub_lanes)
+            .children((row_entry.take_height > 0.0).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .children(track.takes.iter().map(|take| {
+                        take_lane(
+                            track,
+                            take,
+                            state,
+                            header_callbacks.on_select_take.clone(),
+                            header_callbacks.on_delete_take.clone(),
+                        )
+                    }))
+            }));
         rows.push(row.into_any_element());
     }
 

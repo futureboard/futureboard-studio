@@ -125,11 +125,15 @@ pub fn track_lane(
         .map(|clip| state.clip_time_axis_in(tempo.clone(), clip))
         .collect();
 
+    // Muted clips first, so a clip that plays is drawn — and hit — above the
+    // muted ones it overlaps: the active take over the takes it replaced.
+    let mut draw_order: Vec<usize> = (0..track.clips.len()).collect();
+    draw_order.sort_by_key(|&index| !track.clips[index].muted);
+
     // Map clips — skip lanes outside the horizontal viewport.
-    let clip_elements: Vec<_> = track
-        .clips
+    let clip_elements: Vec<_> = draw_order
         .iter()
-        .zip(&time_axes)
+        .map(|&index| (&track.clips[index], &time_axes[index]))
         .filter_map(|(clip, time)| {
             let (clip_left, clip_width) = if matches!(clip.clip_type, ClipType::Audio { .. }) {
                 audio_clip_timeline_geometry(clip, state)

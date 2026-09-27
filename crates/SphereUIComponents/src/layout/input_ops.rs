@@ -1576,6 +1576,19 @@ impl StudioLayout {
                     menu_item_enabled("Track Settings", "track:settings", exists),
                 ]);
                 entries.extend(self.folder_menu_entries(track_id, cx));
+                if let Some(track) = track.as_ref().filter(|track| !track.takes.is_empty()) {
+                    entries.extend([
+                        ContextMenuEntry::Separator,
+                        ContextMenuEntry::item(
+                            if track.takes_expanded {
+                                "Hide Take Lanes"
+                            } else {
+                                "Show Take Lanes"
+                            },
+                            "track:toggle-takes",
+                        ),
+                    ]);
+                }
                 entries.extend([
                     ContextMenuEntry::Separator,
                     ContextMenuEntry::Header("Track Height".to_string()),

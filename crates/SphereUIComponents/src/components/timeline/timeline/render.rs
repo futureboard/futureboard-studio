@@ -239,21 +239,30 @@ impl Render for Timeline {
             },
         );
 
+        // A toggle pressed on one of several selected tracks sets every one
+        // of them to the pressed track's new state (`gang_targets`): one undo
+        // step, one live engine update per track.
         let on_toggle_mute = cx.listener(|this, track_id: &String, _window, cx| {
-            let edit = this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
-            this.state.toggle_track_mute(track_id);
+            let Some(muted) = this.state.find_track(track_id).map(|track| !track.muted) else {
+                return;
+            };
+            let targets = this.state.gang_targets(track_id);
+            let edit = this.begin_track_edit(TrackEditScope::tracks(targets.clone()));
+            for target in &targets {
+                this.state.set_track_mute(target, muted);
+            }
             this.commit_track_edit("Mute", edit, false, cx);
             // Live control: reaches the engine via `on_track_param_change`
             // below; view-only dirty (no engine graph rebuild).
             this.mark_control_state_changed(cx);
-            if let Some(track) = this.state.find_track(track_id) {
-                if let Some(cb) = this.on_track_param_change.as_ref() {
-                    // Engine param id is "muted" ("mute" hits the
-                    // unknown-param branch and is dropped).
+            if let Some(cb) = this.on_track_param_change.as_ref() {
+                // Engine param id is "muted" ("mute" hits the unknown-param
+                // branch and is dropped).
+                for target in &targets {
                     cb(
-                        track_id.clone(),
+                        target.clone(),
                         "muted".to_string(),
-                        if track.muted { 1.0 } else { 0.0 },
+                        if muted { 1.0 } else { 0.0 },
                     );
                 }
             }
@@ -261,16 +270,22 @@ impl Render for Timeline {
         });
 
         let on_toggle_solo = cx.listener(|this, track_id: &String, _window, cx| {
-            let edit = this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
-            this.state.toggle_track_solo(track_id);
+            let Some(solo) = this.state.find_track(track_id).map(|track| !track.solo) else {
+                return;
+            };
+            let targets = this.state.gang_targets(track_id);
+            let edit = this.begin_track_edit(TrackEditScope::tracks(targets.clone()));
+            for target in &targets {
+                this.state.set_track_solo(target, solo);
+            }
             this.commit_track_edit("Solo", edit, false, cx);
             this.mark_control_state_changed(cx);
-            if let Some(track) = this.state.find_track(track_id) {
-                if let Some(cb) = this.on_track_param_change.as_ref() {
+            if let Some(cb) = this.on_track_param_change.as_ref() {
+                for target in &targets {
                     cb(
-                        track_id.clone(),
+                        target.clone(),
                         "solo".to_string(),
-                        if track.solo { 1.0 } else { 0.0 },
+                        if solo { 1.0 } else { 0.0 },
                     );
                 }
             }
@@ -335,79 +350,38 @@ impl Render for Timeline {
             std::sync::Arc::new(on_clear_all_solos);
 
         let on_toggle_arm = cx.listener(|this, track_id: &String, _window, cx| {
-            let edit = this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
-            let previous = this
-                .state
-                .find_track(track_id)
-                .map(|track| (track.armed, track.input_monitor));
-            if !this.state.toggle_track_arm(track_id) {
+            let Some(armed) = this.state.find_track(track_id).map(|track| !track.armed) else {
                 return;
-            }
-            let next = this
-                .state
-                .find_track(track_id)
-                .map(|track| (track.armed, track.input_monitor.is_active(track.armed)));
-            let apply_error = next.and_then(|(armed, monitor)| {
-                this.on_track_input_state_change
-                    .as_ref()
-                    .and_then(|cb| cb(track_id.clone(), armed, monitor).err())
+            };
+            let targets = this.state.gang_targets(track_id);
+            let edit = this.begin_track_edit(TrackEditScope::tracks(targets.clone()));
+            let changed = this.apply_track_input_gang(&targets, |state, target| {
+                state.set_track_armed(target, armed)
             });
-            if let Some(error) = apply_error {
-                if let Some((armed, input_monitor)) = previous {
-                    if let Some(track) = this
-                        .state
-                        .tracks
-                        .iter_mut()
-                        .find(|track| track.id == *track_id)
-                    {
-                        track.armed = armed;
-                        track.input_monitor = input_monitor;
-                    }
-                }
-                eprintln!("[audio] track input update rejected: {error}");
-                cx.notify();
-                return;
+            if changed {
+                this.commit_track_edit("Record Arm", edit, false, cx);
+                this.mark_control_state_changed(cx);
             }
-            this.commit_track_edit("Record Arm", edit, false, cx);
-            this.mark_control_state_changed(cx);
             cx.notify();
         });
 
         let on_toggle_input = cx.listener(|this, track_id: &String, _window, cx| {
-            let edit = this.begin_track_edit(TrackEditScope::tracks([track_id.clone()]));
-            let previous = this
+            let Some(mode) = this
                 .state
                 .find_track(track_id)
-                .map(|track| track.input_monitor);
-            if !this.state.cycle_track_input_monitor(track_id) {
+                .map(|track| track.input_monitor.cycle())
+            else {
                 return;
-            }
-            let next = this
-                .state
-                .find_track(track_id)
-                .map(|track| (track.armed, track.input_monitor.is_active(track.armed)));
-            let apply_error = next.and_then(|(armed, monitor)| {
-                this.on_track_input_state_change
-                    .as_ref()
-                    .and_then(|cb| cb(track_id.clone(), armed, monitor).err())
+            };
+            let targets = this.state.gang_targets(track_id);
+            let edit = this.begin_track_edit(TrackEditScope::tracks(targets.clone()));
+            let changed = this.apply_track_input_gang(&targets, |state, target| {
+                state.set_track_input_monitor(target, mode)
             });
-            if let Some(error) = apply_error {
-                if let Some(input_monitor) = previous {
-                    if let Some(track) = this
-                        .state
-                        .tracks
-                        .iter_mut()
-                        .find(|track| track.id == *track_id)
-                    {
-                        track.input_monitor = input_monitor;
-                    }
-                }
-                eprintln!("[audio] track input update rejected: {error}");
-                cx.notify();
-                return;
+            if changed {
+                this.commit_track_edit("Input Monitor", edit, false, cx);
+                this.mark_control_state_changed(cx);
             }
-            this.commit_track_edit("Input Monitor", edit, false, cx);
-            this.mark_control_state_changed(cx);
             cx.notify();
         });
 
@@ -423,121 +397,96 @@ impl Render for Timeline {
             cx.notify();
         });
 
+        // A double-click reset on one of several selected tracks resets them
+        // all; one undo step.
         let on_volume_change =
             cx.listener(|this, (track_id, volume): &(String, f32), _window, cx| {
-                let prev = this.state.find_track(track_id).map(|track| track.volume);
-                this.state.set_track_volume(track_id, *volume);
-                this.state.clear_track_volume_preview(track_id);
-                if let Some(prev) = prev {
-                    this.record_mixer_value(
-                        EditCommand::SetTrackVolume {
-                            track_id: track_id.clone(),
-                            prev,
-                            next: *volume,
-                        },
-                        cx,
-                    );
-                }
+                let targets = this.set_volume_gang(track_id, *volume, cx);
                 // Double-click reset to 0 dB is the same live control edit a drag
-                // is — the value goes down the realtime path on the next line, so
-                // the engine graph must not be rebuilt for it. `mark_project_changed`
-                // here made a single reset click cost a whole `load_project`.
+                // is — the value goes down the realtime path below, so the engine
+                // graph must not be rebuilt for it. `mark_project_changed` here
+                // made a single reset click cost a whole `load_project`.
                 this.mark_control_state_changed(cx);
                 if let Some(cb) = this.on_track_param_change.as_ref() {
-                    cb(track_id.clone(), "volume".to_string(), *volume);
+                    for target in &targets {
+                        cb(target.clone(), "volume".to_string(), *volume);
+                    }
                 }
-                cx.notify();
             });
+        // A fader drag on one of several selected tracks moves them all by the
+        // same dB, each from its own level (`begin_volume_gang`).
         let on_volume_drag_start =
             cx.listener(|this, (track_id, volume): &(String, f32), _window, cx| {
-                this.state.begin_track_volume_preview(track_id, *volume);
+                this.state.begin_volume_gang(track_id, *volume);
                 cx.notify();
             });
         let on_volume_drag_preview =
             cx.listener(|this, (track_id, volume): &(String, f32), _window, cx| {
-                let changed = this.state.set_track_volume_preview(track_id, *volume);
-                if changed {
+                let changed = this.state.set_volume_gang_preview(track_id, *volume);
+                if !changed.is_empty() {
                     crate::perf::count("fader_drag_preview_count", 1);
                     if let Some(cb) = this.on_track_param_change.as_ref() {
-                        cb(track_id.clone(), "volume".to_string(), *volume);
+                        for (target, level) in changed {
+                            cb(target, "volume".to_string(), level);
+                        }
                     }
                     cx.notify();
                 }
             });
         let on_volume_drag_commit = cx.listener(|this, track_id: &String, _window, cx| {
-            if let Some((prev, next)) = this.state.commit_track_volume_preview(track_id) {
-                crate::perf::count("fader_drag_commit_count", 1);
-                if (prev - next).abs() > 1.0e-5 {
-                    this.record_executed_command(
-                        EditCommand::SetTrackVolume {
-                            track_id: track_id.clone(),
-                            prev,
-                            next,
-                        },
-                        cx,
-                    );
-                } else {
-                    // Gesture that ended where it began: still a live control
-                    // edit, never an engine-graph change. See `on_volume_change`.
-                    this.mark_control_state_changed(cx);
+            let committed = this.finish_volume_gang(track_id, cx);
+            if committed.is_empty() {
+                return;
+            }
+            crate::perf::count("fader_drag_commit_count", 1);
+            // Still a live control edit, never an engine-graph change. See
+            // `on_volume_change`.
+            this.mark_control_state_changed(cx);
+            if let Some(cb) = this.on_track_param_change.as_ref() {
+                for (target, _, next) in committed {
+                    cb(target, "volume".to_string(), next);
                 }
-                if let Some(cb) = this.on_track_param_change.as_ref() {
-                    cb(track_id.clone(), "volume".to_string(), next);
-                }
-                cx.notify();
             }
         });
 
         let on_pan_change = cx.listener(|this, (track_id, pan): &(String, f32), _window, cx| {
-            let Some(prev) = this.state.find_track(track_id).map(|track| track.pan) else {
-                return;
-            };
             let next = pan.clamp(-1.0, 1.0);
-            if (prev - next).abs() <= 1.0e-5 {
+            let targets = this.set_pan_gang(track_id, next, cx);
+            if targets.is_empty() {
                 return;
             }
-            this.run_edit_command(
-                EditCommand::SetTrackPan {
-                    track_id: track_id.clone(),
-                    prev,
-                    next,
-                },
-                cx,
-            );
+            this.mark_control_state_changed(cx);
             if let Some(cb) = this.on_track_param_change.as_ref() {
-                cb(track_id.clone(), "pan".to_string(), next);
+                for target in &targets {
+                    cb(target.clone(), "pan".to_string(), next);
+                }
             }
         });
         let on_pan_drag_start = cx.listener(|this, track_id: &String, _window, cx| {
-            this.state.begin_track_pan_preview(track_id);
+            this.state.begin_pan_gang(track_id);
             cx.notify();
         });
         let on_pan_drag_preview =
             cx.listener(|this, (track_id, pan): &(String, f32), _window, cx| {
-                if this.state.set_track_pan_preview(track_id, *pan) {
+                let changed = this.state.set_pan_gang_preview(track_id, *pan);
+                if !changed.is_empty() {
                     if let Some(cb) = this.on_track_param_change.as_ref() {
-                        cb(track_id.clone(), "pan".to_string(), *pan);
+                        for (target, pan) in changed {
+                            cb(target, "pan".to_string(), pan);
+                        }
                     }
                     cx.notify();
                 }
             });
         let on_pan_drag_commit = cx.listener(|this, track_id: &String, _window, cx| {
-            if let Some((prev, next)) = this.state.commit_track_pan_preview(track_id) {
-                if (prev - next).abs() > 1.0e-5 {
-                    this.record_executed_command(
-                        EditCommand::SetTrackPan {
-                            track_id: track_id.clone(),
-                            prev,
-                            next,
-                        },
-                        cx,
-                    );
+            let committed = this.state.commit_pan_gang(track_id);
+            this.record_pan_gang(&committed, cx);
+            if let Some(cb) = this.on_track_param_change.as_ref() {
+                for (target, _, next) in &committed {
+                    cb(target.clone(), "pan".to_string(), *next);
                 }
-                if let Some(cb) = this.on_track_param_change.as_ref() {
-                    cb(track_id.clone(), "pan".to_string(), next);
-                }
-                cx.notify();
             }
+            cx.notify();
         });
 
         let on_add_clip = cx.listener(
@@ -2104,14 +2053,22 @@ impl Render for Timeline {
         let on_clip_resize_move = cx.listener(
             |this, event: &gpui::DragMoveEvent<ClipResizeDrag>, _window, cx| {
                 let drag = event.drag(cx).clone();
-                // Capture the pre-gesture clip once, before the first mutation.
-                // This is what the drop turns into the undo step's `previous`.
+                // Capture the pre-gesture clips once, before the first
+                // mutation: the grabbed one, then the rest of the selection it
+                // belongs to. This is what the drop turns into the undo step's
+                // `previous`.
                 if this
                     .clip_resize_origin
-                    .as_ref()
+                    .first()
                     .is_none_or(|origin| origin.clip.id != drag.clip_id)
                 {
-                    this.clip_resize_origin = ClipSnapshot::capture(&this.state, &drag.clip_id);
+                    let mut ids = this.clip_drag_selection_ids(&drag.clip_id);
+                    ids.retain(|id| id != &drag.clip_id);
+                    ids.insert(0, drag.clip_id.clone());
+                    this.clip_resize_origin = ids
+                        .iter()
+                        .filter_map(|id| ClipSnapshot::capture(&this.state, id))
+                        .collect();
                     // Keep the pointer where it grabbed the handle. Anything
                     // wider than a handle plus the drag threshold is not a grab
                     // offset, so it is ignored rather than trusted.
@@ -2132,8 +2089,9 @@ impl Render for Timeline {
                     + this.clip_resize_grab_beats;
                 // The Stretch tool turns an audio clip's edge into a time
                 // stretch (same audio, new length); every other tool trims.
-                let stretched = this.state.active_tool == TimelineTool::Time
-                    && this.state.stretch_clip_edge(&drag.clip_id, drag.edge, beat);
+                let stretching = this.state.active_tool == TimelineTool::Time;
+                let stretched =
+                    stretching && this.state.stretch_clip_edge(&drag.clip_id, drag.edge, beat);
                 if !stretched {
                     this.state.resize_clip_with_bypass(
                         &drag.clip_id,
@@ -2142,20 +2100,62 @@ impl Render for Timeline {
                         event.event.modifiers.shift,
                     );
                 }
+                // Every other selected clip's same edge moves by what the
+                // grabbed edge actually moved (after its snap), each from where
+                // it started, so the selection keeps its shape.
+                let edge_of = |clip: &ClipState| match drag.edge {
+                    ClipEdge::Left => clip.start_beat,
+                    ClipEdge::Right => clip.start_beat + clip.duration_beats,
+                };
+                let moved = this
+                    .clip_resize_origin
+                    .first()
+                    .zip(
+                        this.state
+                            .find_clip(&drag.clip_id)
+                            .map(|(_, clip)| edge_of(clip)),
+                    )
+                    .map(|(origin, now)| now - edge_of(&origin.clip));
+                if let Some(delta) = moved {
+                    let peers: Vec<(String, f32)> = this
+                        .clip_resize_origin
+                        .iter()
+                        .skip(1)
+                        .map(|origin| (origin.clip.id.clone(), edge_of(&origin.clip) + delta))
+                        .collect();
+                    for (clip_id, edge) in peers {
+                        let stretched =
+                            stretching && this.state.stretch_clip_edge(&clip_id, drag.edge, edge);
+                        if !stretched {
+                            this.state
+                                .resize_clip_with_bypass(&clip_id, drag.edge, edge, true);
+                        }
+                    }
+                }
                 cx.notify();
             },
         );
         let on_clip_resize_drop = cx.listener(|this, drag: &ClipResizeDrag, _window, cx| {
             // No drag-move means nothing was resized, so there is no undo step.
-            let origin = this
-                .clip_resize_origin
-                .take()
-                .filter(|origin| origin.clip.id == drag.clip_id);
-            if let (Some(previous), Some(next)) =
-                (origin, ClipSnapshot::capture(&this.state, &drag.clip_id))
+            let origins = std::mem::take(&mut this.clip_resize_origin);
+            if origins
+                .first()
+                .is_some_and(|origin| origin.clip.id == drag.clip_id)
             {
-                if previous.clip != next.clip {
+                let mut changes: Vec<(ClipSnapshot, ClipSnapshot)> = origins
+                    .into_iter()
+                    .filter_map(|previous| {
+                        let next = ClipSnapshot::capture(&this.state, &previous.clip.id)?;
+                        (previous.clip != next.clip).then_some((previous, next))
+                    })
+                    .collect();
+                if changes.len() == 1 {
+                    let (previous, next) = changes.remove(0);
                     this.record_executed_command(EditCommand::UpdateClip { previous, next }, cx);
+                    this.mark_project_changed(cx);
+                } else if !changes.is_empty() {
+                    let (previous, next) = changes.into_iter().unzip();
+                    this.record_executed_command(EditCommand::UpdateClips { previous, next }, cx);
                     this.mark_project_changed(cx);
                 }
             }

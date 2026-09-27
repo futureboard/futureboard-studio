@@ -22,6 +22,7 @@ pub mod playhead;
 pub mod region_track;
 pub mod render;
 pub mod song_text_track;
+pub mod take_lane;
 pub mod state;
 pub mod tempo_track;
 pub mod time_signature_track;

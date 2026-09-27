@@ -239,11 +239,13 @@ pub struct Timeline {
     /// Blocks further drag-move/drop events after Escape or focus-loss cancellation.
     song_text_drag_cancelled: bool,
     clip_drag_origin: Option<gpui::Point<gpui::Pixels>>,
-    /// Pre-gesture clip snapshot for the in-flight edge-resize, captured on the
-    /// first drag-move (before any mutation) so the drop can record one exact
-    /// undo step. Kept here rather than inside [`ClipResizeDrag`] so the drag
-    /// payload — rebuilt for every clip on every repaint — stays identity-only.
-    clip_resize_origin: Option<ClipSnapshot>,
+    /// Pre-gesture clip snapshots for the in-flight edge-resize, captured on
+    /// the first drag-move (before any mutation) so the drop can record one
+    /// exact undo step: the grabbed clip first, then every other selected clip
+    /// the same edge moves with. Kept here rather than inside
+    /// [`ClipResizeDrag`] so the drag payload — rebuilt for every clip on every
+    /// repaint — stays identity-only.
+    clip_resize_origin: Vec<ClipSnapshot>,
     /// Beats between the grabbed edge and the pointer when the edge-resize
     /// gesture began. Edge handles are up to 10 px wide; without this the edge
     /// jumped to the pointer on the first move.
@@ -387,6 +389,9 @@ pub struct Timeline {
     /// release the "before" was the last preview and the undo entry recorded
     /// nothing (or a one-pixel step) — undo and redo appeared to do nothing.
     clip_process_origin: Option<ClipState>,
+    /// The other selected audio clips a gain or fade gesture on
+    /// `clip_process_origin` carries along, as the press found them.
+    clip_process_peers: Vec<ClipState>,
     /// The ruler's grid-resolution dropdown is open.
     snap_menu_open: bool,
     /// Where the Smart Tool's razor line is, shared with its overlay.

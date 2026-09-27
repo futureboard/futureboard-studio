@@ -239,7 +239,10 @@ impl Timeline {
     }
 
     /// The first change of a gain or fade gesture remembers the clip as it
-    /// was, for the one undo entry its release records.
+    /// was, for the one undo entry its release records — and, when it is one
+    /// of several selected clips, the other selected audio clips the gesture
+    /// carries along (never on an ARA track, where fades and gain are not
+    /// applied).
     fn capture_clip_process_origin(&mut self, clip_id: &str) {
         if self
             .clip_process_origin
@@ -247,7 +250,82 @@ impl Timeline {
             .is_none_or(|origin| origin.id != clip_id)
         {
             self.clip_process_origin = self.state.find_clip(clip_id).map(|(_, clip)| clip.clone());
+            self.clip_process_peers = self
+                .clip_drag_selection_ids(clip_id)
+                .into_iter()
+                .filter(|id| id != clip_id)
+                .filter_map(|id| {
+                    let (track, clip) = self.state.find_clip(&id)?;
+                    (track.ara.is_none() && matches!(clip.clip_type, ClipType::Audio { .. }))
+                        .then(|| clip.clone())
+                })
+                .collect();
         }
+    }
+
+    /// Gives every carried clip the gain change the grabbed clip made: the
+    /// same ratio, so each keeps its level relative to the others.
+    fn apply_gain_to_peers(&mut self, gain: f32) -> bool {
+        let Some(origin_gain) = self.clip_process_origin.as_ref().map(|clip| clip.gain) else {
+            return false;
+        };
+        let ratio = if origin_gain > 1.0e-6 {
+            gain / origin_gain
+        } else {
+            1.0
+        };
+        let targets: Vec<(String, f32)> = self
+            .clip_process_peers
+            .iter()
+            .map(|peer| {
+                let next = if origin_gain > 1.0e-6 {
+                    peer.gain * ratio
+                } else {
+                    gain
+                };
+                (peer.id.clone(), next)
+            })
+            .collect();
+        let mut changed = false;
+        for (clip_id, next) in targets {
+            changed |= self.state.set_clip_gain(&clip_id, next);
+        }
+        changed
+    }
+
+    /// Gives every carried clip the fade length the grabbed clip now has on
+    /// `edge`, except where that edge of it is crossfaded (the crossfade owns
+    /// it).
+    fn apply_fade_to_peers(&mut self, edge: FadeEdge, seconds: f64) -> bool {
+        let peers: Vec<String> = self
+            .clip_process_peers
+            .iter()
+            .map(|peer| peer.id.clone())
+            .collect();
+        let mut changed = false;
+        for clip_id in peers {
+            let crossfaded = self.state.find_clip(&clip_id).is_some_and(|(track, clip)| {
+                let crossfades = self.state.audio_crossfades(track);
+                self.state
+                    .effective_clip_fades(clip, &crossfades)
+                    .crossfaded(edge)
+            });
+            if !crossfaded {
+                changed |= self.state.set_clip_fade_seconds(&clip_id, edge, seconds);
+            }
+        }
+        changed
+    }
+
+    /// The fade length `clip_id` has on `edge` now.
+    fn clip_fade_seconds(&self, clip_id: &str, edge: FadeEdge) -> Option<f64> {
+        let (track, clip) = self.state.find_clip(clip_id)?;
+        let crossfades = self.state.audio_crossfades(track);
+        let fades = self.state.effective_clip_fades(clip, &crossfades);
+        Some(match edge {
+            FadeEdge::In => fades.in_seconds,
+            FadeEdge::Out => fades.out_seconds,
+        })
     }
 
     /// One update from an audio clip's gain control, fade handles or hover.
@@ -305,7 +383,10 @@ impl Timeline {
                     return ClipProcessEffect::default();
                 }
                 self.capture_clip_process_origin(clip_id);
-                redraw(self.state.set_clip_gain(clip_id, gain))
+                let changed = self.state.set_clip_gain(clip_id, gain);
+                // One of several selected clips: they all follow.
+                let peers = self.apply_gain_to_peers(gain);
+                redraw(changed || peers)
             }
             AudioClipProcessUpdate::FadePress {
                 edge,
@@ -371,10 +452,15 @@ impl Timeline {
                 // own time.
                 let beat = self.beat_from_window_x(window_x - grab_dx);
                 let snapped = self.snap_beat_with_bypass(beat, bypass_snap);
-                redraw(
-                    self.state
-                        .set_clip_fade_at_beat(clip_id, edge, snapped as f64),
-                )
+                let changed = self
+                    .state
+                    .set_clip_fade_at_beat(clip_id, edge, snapped as f64);
+                // One of several selected clips: they take the same length.
+                let peers = match self.clip_fade_seconds(clip_id, edge) {
+                    Some(seconds) => self.apply_fade_to_peers(edge, seconds),
+                    None => false,
+                };
+                redraw(changed || peers)
             }
             AudioClipProcessUpdate::FadeReset { edge, additive } => {
                 self.clip_fades.cancelled = false;
@@ -389,7 +475,8 @@ impl Timeline {
                 }
                 self.capture_clip_process_origin(clip_id);
                 let changed = self.state.set_clip_fade_seconds(clip_id, edge, 0.0);
-                redraw(selected || changed)
+                let peers = self.apply_fade_to_peers(edge, 0.0);
+                redraw(selected || changed || peers)
             }
         }
     }
@@ -409,17 +496,32 @@ impl Timeline {
             return;
         };
         self.clip_fades.fade = None;
-        if let Some(next) = ClipSnapshot::capture(&self.state, &original.id) {
-            if !clip_edit_is_noop(&original, &next.clip) {
-                let previous = ClipSnapshot {
-                    track_id: next.track_id.clone(),
-                    clip: original,
-                    index: next.index,
-                };
+        let peers = std::mem::take(&mut self.clip_process_peers);
+        let mut changes: Vec<(ClipSnapshot, ClipSnapshot)> = std::iter::once(original)
+            .chain(peers)
+            .filter_map(|original| {
+                let next = ClipSnapshot::capture(&self.state, &original.id)?;
+                (!clip_edit_is_noop(&original, &next.clip)).then(|| {
+                    let previous = ClipSnapshot {
+                        track_id: next.track_id.clone(),
+                        clip: original,
+                        index: next.index,
+                        take: next.take.clone(),
+                    };
+                    (previous, next)
+                })
+            })
+            .collect();
+        if !changes.is_empty() {
+            if changes.len() == 1 {
+                let (previous, next) = changes.remove(0);
                 self.record_executed_command(EditCommand::UpdateClip { previous, next }, cx);
-                self.mark_project_changed(cx);
-                self.mark_media_changed(cx);
+            } else {
+                let (previous, next) = changes.into_iter().unzip();
+                self.record_executed_command(EditCommand::UpdateClips { previous, next }, cx);
             }
+            self.mark_project_changed(cx);
+            self.mark_media_changed(cx);
         }
         self.publish_fade_handle_frame(cx);
         cx.notify();
@@ -563,11 +665,13 @@ impl Timeline {
                 track_id: left.track_id.clone(),
                 clip: next_left,
                 index: left.index,
+                take: left.take.clone(),
             },
             ClipSnapshot {
                 track_id: right.track_id.clone(),
                 clip: next_right,
                 index: right.index,
+                take: right.take.clone(),
             },
         ];
         self.run_edit_command(
@@ -649,6 +753,9 @@ impl Timeline {
         }
         if let Some(origin) = self.clip_process_origin.take() {
             self.state.replace_clip_in_place(&origin);
+        }
+        for peer in std::mem::take(&mut self.clip_process_peers) {
+            self.state.replace_clip_in_place(&peer);
         }
         if let Some(drag) = self.clip_fades.crossfade.take() {
             self.state.replace_clip_in_place(&drag.left.clip);
@@ -983,5 +1090,45 @@ mod tests {
         assert!(timeline.clip_fades.crossfade.is_none());
         assert!(!timeline.crossfade_drag_state(&crossfade_drag(&timeline, 6.4)));
         assert_eq!(timeline.state.tracks[0].clips, before);
+    }
+
+    /// A gain drag on one of several selected clips moves them all by the
+    /// same ratio; a cancel puts every one back.
+    #[test]
+    fn a_gain_drag_on_one_selected_clip_moves_every_selected_clip() {
+        let mut other = audio_clip("b", 8.0, 2.0);
+        other.gain = 0.5;
+        let mut timeline = timeline_with(vec![
+            audio_clip("a", 0.0, 2.0),
+            other,
+            audio_clip("c", 16.0, 2.0),
+        ]);
+        timeline.state.selection.selected_clip_ids = vec!["a".to_string(), "b".to_string()];
+        timeline.clip_process_update_state("a", AudioClipProcessUpdate::GainPress);
+        timeline.clip_process_update_state("a", AudioClipProcessUpdate::Gain(2.0));
+        assert!((clip(&timeline, "a").gain - 2.0).abs() < 1e-5);
+        assert!((clip(&timeline, "b").gain - 1.0).abs() < 1e-5);
+        assert!((clip(&timeline, "c").gain - 1.0).abs() < 1e-5);
+
+        assert!(timeline.cancel_clip_handle_state());
+        assert!((clip(&timeline, "a").gain - 1.0).abs() < 1e-5);
+        assert!((clip(&timeline, "b").gain - 0.5).abs() < 1e-5);
+    }
+
+    /// A fade drawn on one of several selected clips gives them all the same
+    /// fade length.
+    #[test]
+    fn a_fade_on_one_selected_clip_fades_every_selected_clip() {
+        let mut timeline =
+            timeline_with(vec![audio_clip("a", 0.0, 2.0), audio_clip("b", 8.0, 2.0)]);
+        timeline.state.selection.selected_clip_ids = vec!["a".to_string(), "b".to_string()];
+        let start = window_x_at_beat(&timeline, 0.0);
+        timeline.clip_process_update_state("a", press(FadeEdge::In, start, false));
+        timeline
+            .clip_process_update_state("a", drag(FadeEdge::In, window_x_at_beat(&timeline, 1.0)));
+        let fade =
+            |timeline: &Timeline, id: &str| timeline.clip_fade_seconds(id, FadeEdge::In).unwrap();
+        assert!(fade(&timeline, "a") > 0.1);
+        assert!((fade(&timeline, "a") - fade(&timeline, "b")).abs() < 1e-6);
     }
 }

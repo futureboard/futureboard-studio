@@ -765,8 +765,21 @@ impl TimelineState {
         let target_id = if self.tracks.iter().any(|track| track.id == target_track_id) {
             target_track_id.to_string()
         } else {
-            source_track_id.unwrap_or_else(|| target_track_id.to_string())
+            source_track_id
+                .clone()
+                .unwrap_or_else(|| target_track_id.to_string())
         };
+        // Taken to another track, a take's clip is that track's plain clip:
+        // its take stays behind with nothing to point at, and goes.
+        if source_track_id.as_deref() != Some(target_id.as_str()) {
+            if let Some(source) = self
+                .tracks
+                .iter_mut()
+                .find(|track| Some(&track.id) == source_track_id.as_ref())
+            {
+                source.takes.retain(|take| take.clip_id != clip_id);
+            }
+        }
 
         if let Some(track) = self.tracks.iter_mut().find(|track| track.id == target_id) {
             track.clips.push(clip);

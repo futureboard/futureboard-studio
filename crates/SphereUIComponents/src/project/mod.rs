@@ -2377,6 +2377,9 @@ pub fn apply_to_timeline(
         })
         .collect();
 
+    // A take whose clip did not load points at nothing.
+    tl.prune_orphaned_takes();
+
     let valid_group_ids: std::collections::HashSet<String> = tl
         .tracks
         .iter()

@@ -97,6 +97,9 @@ pub struct ClipSnapshot {
     /// [`EditCommand::UpdateClips`] puts a clip back at exactly this index;
     /// the older commands still re-append.
     pub index: usize,
+    /// The take the clip is, when it is one: a clip put back by undo comes
+    /// back as the take it was, not as a plain clip beside the take list.
+    pub take: Option<TrackTake>,
 }
 
 impl ClipSnapshot {
@@ -107,10 +110,27 @@ impl ClipSnapshot {
                     track_id: track.id.clone(),
                     clip: track.clips[index].clone(),
                     index,
+                    take: track
+                        .takes
+                        .iter()
+                        .find(|take| take.clip_id == clip_id)
+                        .cloned(),
                 });
             }
         }
         None
+    }
+}
+
+/// Puts `take` back on `track_id` unless the track already has it.
+fn restore_take(state: &mut TimelineState, track_id: &str, take: Option<&TrackTake>) {
+    let Some(take) = take else {
+        return;
+    };
+    if let Some(track) = state.tracks.iter_mut().find(|t| t.id == track_id) {
+        if !track.takes.iter().any(|existing| existing.id == take.id) {
+            track.takes.push(take.clone());
+        }
     }
 }
 
@@ -901,6 +921,22 @@ impl EditCommand {
                         }
                     }
                 }
+                // The pieces of a split take stay that take: each piece is
+                // one, under its name, heard or muted as the whole was.
+                if let Some(take) = &snapshot.take {
+                    for (piece, (track_id, clip)) in clips.iter().enumerate() {
+                        let piece_take = TrackTake {
+                            id: if piece == 0 {
+                                take.id.clone()
+                            } else {
+                                format!("{}-{}", take.id, piece + 1)
+                            },
+                            clip_id: clip.id.clone(),
+                            ..take.clone()
+                        };
+                        restore_take(state, track_id, Some(&piece_take));
+                    }
+                }
                 state.selection.selected_track_id = Some(snapshot.track_id.clone());
                 state.selection.selected_clip_ids =
                     clips.iter().map(|(_, clip)| clip.id.clone()).collect();
@@ -1327,6 +1363,7 @@ fn restore_clip_snapshot(state: &mut TimelineState, snapshot: &ClipSnapshot) {
             track.clips.push(snapshot.clip.clone());
         }
     }
+    restore_take(state, &snapshot.track_id, snapshot.take.as_ref());
 }
 
 /// Put every clip named in `snapshots` exactly at its snapshot: content, track
@@ -1354,6 +1391,12 @@ fn apply_clip_placements(state: &mut TimelineState, snapshots: &[ClipSnapshot]) 
             track.clips.insert(index, snapshot.clip.clone());
         }
     }
+    // A take goes where its clip goes back to; a clip moved off its track
+    // leaves its take behind, which is then no take at all.
+    for snapshot in snapshots {
+        restore_take(state, &snapshot.track_id, snapshot.take.as_ref());
+    }
+    state.prune_orphaned_takes();
     if let Some(selected) = snapshots.iter().find(|snapshot| {
         state
             .selection
@@ -1372,8 +1415,17 @@ fn apply_clip_placements(state: &mut TimelineState, snapshots: &[ClipSnapshot]) 
 fn replace_clip_snapshot(state: &mut TimelineState, clip_id: &str, snapshot: &ClipSnapshot) {
     let selected_clip_ids = state.selection.selected_clip_ids.clone();
     let was_selected = selected_clip_ids.iter().any(|id| id == clip_id);
+    // An in-place edit of a take's clip leaves it that take, whatever the
+    // snapshot carries: deleting the clip drops its take.
+    let kept_take = state
+        .tracks
+        .iter()
+        .flat_map(|track| track.takes.iter())
+        .find(|take| take.clip_id == clip_id)
+        .cloned();
     state.delete_clip(clip_id);
     restore_clip_snapshot(state, snapshot);
+    restore_take(state, &snapshot.track_id, kept_take.as_ref());
     if was_selected {
         state.selection.selected_clip_ids = selected_clip_ids;
         state.selection.selected_track_id = Some(snapshot.track_id.clone());
@@ -1567,11 +1619,13 @@ mod inspector_gesture_command_tests {
                 track_id: track_id.clone(),
                 clip: previous_clip.clone(),
                 index: 0,
+                take: None,
             },
             next: ClipSnapshot {
                 track_id,
                 clip: next_clip,
                 index: 0,
+                take: None,
             },
         };
         let mut history = EditHistory::new(8);
@@ -2736,6 +2790,7 @@ mod update_clips_tests {
             track_id: b.clone(),
             clip: x,
             index: 1,
+            take: None,
         }];
         let command = EditCommand::UpdateClips { previous, next };
         command.execute(&mut state);

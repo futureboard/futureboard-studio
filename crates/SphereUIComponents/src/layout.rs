@@ -2780,6 +2780,17 @@ impl StudioLayout {
             "track:remove-from-folder" => self.remove_context_track_from_folder(cx),
             "track:ungroup" => self.ungroup_context_folder(cx),
             "track:toggle-folder" => self.toggle_context_folder(cx),
+            "track:toggle-takes" => {
+                if let Some(track_id) = self.context_track_id_or_selected(cx) {
+                    self.timeline.update(cx, |timeline, cx| {
+                        if timeline.state.toggle_takes_expanded(&track_id) {
+                            cx.notify();
+                        }
+                    });
+                    self.mark_dirty_view_only();
+                    cx.notify();
+                }
+            }
             "track:duplicate-no-fx" => self.duplicate_context_track(false, cx),
             "track:copy-fx-chain" => self.copy_context_fx_chain(cx),
             "track:paste-fx-chain" => self.paste_context_fx_chain(cx),
