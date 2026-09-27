@@ -2858,8 +2858,36 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
                             "[plugin-bridge] ResizeEditor instance={instance_id} \
                              width={width} height={height} dpi={dpi}"
                         );
-                        processor.view_set_size(width as i32, height as i32);
+                        // The plug-in's own size contract first: a view with a
+                        // minimum, stepped sizes or a fixed size is handed
+                        // what it accepts, and the studio is told so that its
+                        // window snaps to it. Handing it the raw drag size left
+                        // the plug-in drawing its own size inside a window of
+                        // another, cropped at the edges.
+                        let (granted_w, granted_h) =
+                            processor.view_constrain(width as i32, height as i32);
+                        let (granted_w, granted_h) = if granted_w > 0 && granted_h > 0 {
+                            (granted_w, granted_h)
+                        } else {
+                            (width as i32, height as i32)
+                        };
+                        processor.view_set_size(granted_w, granted_h);
                         pending_resizes.remove(&instance_id);
+                        if (granted_w as u32, granted_h as u32) != (width, height) {
+                            eprintln!(
+                                "[plugin-bridge] ResizeEditor constrained instance={instance_id} \
+                                 {width}x{height} -> {granted_w}x{granted_h}"
+                            );
+                            let _ = ipc::write_frame(
+                                &mut out,
+                                &HostEvent::EditorContentResize {
+                                    plugin_instance_id: instance_id.clone(),
+                                    width: granted_w as u32,
+                                    height: granted_h as u32,
+                                    dpi,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -3045,12 +3073,18 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
                         return true;
                     };
                     if let Some((width, height)) = entry.second_resize {
+                        // The size the view has *now*: re-sending the one taken
+                        // at attach undid any resize the plug-in asked for
+                        // since (Kontakt restoring its size on reopen).
+                        let (width, height) = processor
+                            .view_size()
+                            .unwrap_or((width as i32, height as i32));
                         eprintln!(
                             "[PluginEditorLifecycle] second resize instance={} size={}x{}",
                             entry.instance_id, width, height
                         );
                         eprintln!("[editor-size] delayed resize = {}x{}", width, height);
-                        processor.view_set_size(width as i32, height as i32);
+                        processor.view_set_size(width, height);
                     }
                     if !platform::editor_safe_mode() {
                         if let Some(host_hwnd) = registry
@@ -4978,9 +5012,8 @@ fn schedule_unified_editor_attach(
         // The window belongs to the main app, which handed us its HWND. This
         // only creates the plug-in's view and attaches it there -- no shell, no
         // titlebar, no window procedure of ours in the way.
-        let handle = processor
-            .view_attach(parent_hwnd, (w, h))
-            .map(|_| parent_hwnd);
+        let attached = processor.view_attach(parent_hwnd, (w, h));
+        let handle = attached.map(|_| parent_hwnd);
         let elapsed = started.elapsed();
         let attach_hwnd = processor.embed_attach_hwnd();
         eprintln!(
@@ -4990,8 +5023,12 @@ fn schedule_unified_editor_attach(
             plugin_instance_id,
             elapsed.as_millis()
         );
-        let (preferred_width, preferred_height) = processor
-            .view_size()
+        // The size attach settled on is the editor's real one: a plug-in that
+        // restores its own size inside attached() (Kontakt, per instance) has
+        // not applied it yet, so getSize() still says the default, and taking
+        // that one sent the default back to it as the granted size.
+        let (preferred_width, preferred_height) = attached
+            .or_else(|| processor.view_size())
             .map(|(cw, ch)| (cw.max(1) as u32, ch.max(1) as u32))
             .unwrap_or((width.max(1), height.max(1)));
         let resizable = processor.editor_resizable().unwrap_or(true);
@@ -5083,13 +5120,13 @@ fn schedule_unified_editor_attach(
                 w,
                 h
             );
-            let handle = processor
-                .view_attach(parent_hwnd, (w, h))
-                .map(|_| parent_hwnd);
+            let attached = processor.view_attach(parent_hwnd, (w, h));
+            let handle = attached.map(|_| parent_hwnd);
             let elapsed = started.elapsed();
             let attach_hwnd = processor.embed_attach_hwnd();
-            let (preferred_width, preferred_height) = processor
-                .view_size()
+            // The size attach settled on, not getSize(): see the inline path.
+            let (preferred_width, preferred_height) = attached
+                .or_else(|| processor.view_size())
                 .map(|(w, h)| (w.max(1) as u32, h.max(1) as u32))
                 .unwrap_or((width.max(1), height.max(1)));
             let resizable = processor.editor_resizable().unwrap_or(true);

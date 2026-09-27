@@ -49,6 +49,7 @@ pub mod native;
 pub mod plugin_backend;
 pub mod plugin_bridge;
 pub mod recording;
+pub mod render_capture;
 mod runtime;
 mod streaming_source;
 pub mod tempo_map;
@@ -85,11 +86,12 @@ pub use crate::engine::{DropoutDiagnostics, DropoutProtectionMode, DropoutReason
 pub use crate::error::SphereAudioError;
 pub use crate::export::{
     arrangement_bounds_samples, beats_to_samples, export_arrangement,
-    export_arrangement_with_bridges, export_tracks_single_pass,
-    export_tracks_single_pass_with_bridges, partial_path_for, render_offline,
-    render_offline_tracks, ArrangementExportRequest, ArrangementExportSummary, ExportCancelToken,
-    ExportError, ExportNormalizeMode, ExportProgress, ExportStage, ExportTailMode,
-    OfflineRenderRequest, OfflineRenderSummary, TrackExportTarget,
+    export_arrangement_with_bridges, export_render_job, export_render_job_with_bridges,
+    export_tracks_single_pass, export_tracks_single_pass_with_bridges, partial_path_for,
+    record_render_job, render_offline, render_offline_tracks, ArrangementExportRequest,
+    ArrangementExportSummary, ExportCancelToken, ExportError, ExportNormalizeMode, ExportProgress,
+    ExportStage, ExportTailMode, LevelReport, OfflineRenderRequest, OfflineRenderSummary,
+    RenderJob, TrackExportTarget,
 };
 pub use crate::jam_bus::{
     is_jam_device, jam_device_id, jam_stream_id, JamAudioBus, JamChannelMode, JamInputSlot,

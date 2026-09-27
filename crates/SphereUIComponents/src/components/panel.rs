@@ -55,6 +55,7 @@ use crate::overlay::{inspector_combo_menu_position, OverlayAnchor};
 use crate::solfege::{ModelLoadState, SolfegeModelInfo};
 use crate::theme::{space, typography, Colors};
 use sphere_midi_service::mpe::{MpeOutputMode, MpeTrackConfiguration};
+use sphere_midi_service::program::{MidiPatchFormat, MidiProgramSelection, XG_DRUM_BANK_MSB};
 
 type RoutingComboToggleCb =
     Arc<dyn Fn(InspectorRoutingCombo, Option<OverlayAnchor>, &mut Window, &mut App) + 'static>;
@@ -70,6 +71,8 @@ type MidiInputCb = Arc<dyn Fn(&(String, TrackMidiInputRouting), &mut Window, &mu
 type MidiChannelCb = Arc<dyn Fn(&(String, Option<u8>), &mut Window, &mut App) + 'static>;
 type MpeConfigurationCb =
     Arc<dyn Fn(&(String, MpeTrackConfiguration), &mut Window, &mut App) + 'static>;
+type ProgramSelectionCb =
+    Arc<dyn Fn(&(String, MidiProgramSelection), &mut Window, &mut App) + 'static>;
 type InsertPairCb = Arc<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>;
 type InsertOpenCb = Arc<dyn Fn(&(String, usize, String), &mut Window, &mut App) + 'static>;
 type InsertPickerCb = Arc<dyn Fn(&(String, usize, bool), &mut Window, &mut App) + 'static>;
@@ -146,6 +149,11 @@ pub enum InspectorRoutingCombo {
     MidiInput,
     MidiChannel,
     MidiOut,
+    /// Bank Select MSB of the track's program selection.
+    ProgramBank,
+    /// Bank Select LSB of the track's program selection.
+    ProgramBankLsb,
+    Program,
 }
 
 const ROUTING_COMBO_MENU_HEIGHT: f32 = 220.0;
@@ -175,6 +183,7 @@ pub struct InspectorCallbacks {
     pub on_set_midi_input: MidiInputCb,
     pub on_set_midi_channel: MidiChannelCb,
     pub on_set_mpe_configuration: MpeConfigurationCb,
+    pub on_set_program_selection: ProgramSelectionCb,
     pub on_open_insert_picker: InsertPickerCb,
     pub on_remove_insert: InsertPairCb,
     pub on_toggle_insert_bypass: InsertPairCb,
@@ -1299,6 +1308,72 @@ pub(crate) fn inspector_routing_combo_overlay(
             )
             .into_any_element()
         }
+        InspectorRoutingCombo::ProgramBank
+        | InspectorRoutingCombo::ProgramBankLsb
+        | InspectorRoutingCombo::Program => {
+            let selection = track.routing.program.sanitized();
+            let channel = track.routing.midi_channel.unwrap_or(1);
+            // Every choice as (label, the selection it makes).
+            let choices: Vec<(String, MidiProgramSelection)> = match open_combo {
+                InspectorRoutingCombo::ProgramBank => program_bank_options(selection)
+                    .into_iter()
+                    .map(|(label, msb)| {
+                        (
+                            label,
+                            MidiProgramSelection {
+                                bank_msb: msb,
+                                ..selection
+                            },
+                        )
+                    })
+                    .collect(),
+                InspectorRoutingCombo::ProgramBankLsb => program_bank_lsb_options(selection)
+                    .into_iter()
+                    .map(|(label, lsb)| {
+                        (
+                            label,
+                            MidiProgramSelection {
+                                bank_lsb: lsb,
+                                ..selection
+                            },
+                        )
+                    })
+                    .collect(),
+                _ => program_options(selection, channel)
+                    .into_iter()
+                    .map(|(label, program)| {
+                        (
+                            label,
+                            MidiProgramSelection {
+                                program,
+                                ..selection
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            let selected = choices
+                .iter()
+                .find(|(_, choice)| *choice == selection)
+                .map(|(label, _)| label.clone())
+                .unwrap_or_default();
+            let labels: Vec<String> = choices.iter().map(|(label, _)| label.clone()).collect();
+            let cb = callbacks.on_set_program_selection.clone();
+            let close = on_close.clone();
+            combo_box_string_menu(
+                "inspector-program-menu",
+                position,
+                &selected,
+                &labels,
+                Arc::new(move |value, window, cx| {
+                    if let Some((_, next)) = choices.iter().find(|(label, _)| *label == value) {
+                        cb(&(track_id.clone(), *next), window, cx);
+                    }
+                    close(cx);
+                }),
+            )
+            .into_any_element()
+        }
     };
 
     div()
@@ -1364,6 +1439,168 @@ fn routing_section(
     }
 
     section_card("routing", "Routing", callbacks, rows)
+}
+
+const PATCH_FORMAT_OPTIONS: &[InspectorSelectOption<MidiPatchFormat>] = &[
+    InspectorSelectOption {
+        label: "GM",
+        value: MidiPatchFormat::Gm,
+    },
+    InspectorSelectOption {
+        label: "GS",
+        value: MidiPatchFormat::Gs,
+    },
+    InspectorSelectOption {
+        label: "XG",
+        value: MidiPatchFormat::Xg,
+    },
+];
+
+/// Bank Select MSB choices for the selection's format, as (label, MSB). A
+/// value set some other way (an imported file, a later format) stays listed.
+fn program_bank_options(selection: MidiProgramSelection) -> Vec<(String, u8)> {
+    let mut options: Vec<(String, u8)> = match selection.format {
+        MidiPatchFormat::Gm => Vec::new(),
+        MidiPatchFormat::Gs => std::iter::once(("Capital (0)".to_string(), 0))
+            .chain((1..=127).map(|msb| (format!("Variation {msb}"), msb)))
+            .collect(),
+        MidiPatchFormat::Xg => vec![
+            ("Normal Voice (0)".to_string(), 0),
+            ("SFX Voice (64)".to_string(), 64),
+            ("SFX Kit (126)".to_string(), 126),
+            ("Drum Kit (127)".to_string(), 127),
+        ],
+    };
+    if selection.format.has_banks() && !options.iter().any(|(_, msb)| *msb == selection.bank_msb) {
+        options.push((format!("MSB {}", selection.bank_msb), selection.bank_msb));
+    }
+    options
+}
+
+/// Bank Select LSB choices for the selection's format, as (label, LSB).
+fn program_bank_lsb_options(selection: MidiProgramSelection) -> Vec<(String, u8)> {
+    let mut options: Vec<(String, u8)> = match selection.format {
+        MidiPatchFormat::Gm => Vec::new(),
+        MidiPatchFormat::Gs => vec![
+            ("Default Map (0)".to_string(), 0),
+            ("SC-55 Map (1)".to_string(), 1),
+            ("SC-88 Map (2)".to_string(), 2),
+            ("SC-88Pro Map (3)".to_string(), 3),
+            ("SC-8850 Map (4)".to_string(), 4),
+        ],
+        MidiPatchFormat::Xg => (0..=127).map(|lsb| (format!("Bank {lsb}"), lsb)).collect(),
+    };
+    if selection.format.has_banks() && !options.iter().any(|(_, lsb)| *lsb == selection.bank_lsb) {
+        options.push((format!("LSB {}", selection.bank_lsb), selection.bank_lsb));
+    }
+    options
+}
+
+/// Program choices, named for the selection's format and bank on `channel`,
+/// behind a "None" that sends nothing.
+fn program_options(selection: MidiProgramSelection, channel: u8) -> Vec<(String, Option<u8>)> {
+    std::iter::once(("None".to_string(), None))
+        .chain((0..=127).map(|program| (selection.patch_name(program, channel), Some(program))))
+        .collect()
+}
+
+/// A MIDI or Instrument track's bank and program: which patch its instrument
+/// (or MIDI device) is set to, in the GM, GS or XG layout.
+fn program_section(track: &TrackState, callbacks: &InspectorCallbacks) -> impl IntoElement {
+    let selection = track.routing.program.sanitized();
+    let channel = track.routing.midi_channel.unwrap_or(1);
+    let cb = callbacks.on_set_program_selection.clone();
+    let tid = track.id.clone();
+    let format = inspector_select(
+        "inspector-program-format",
+        selection.format,
+        PATCH_FORMAT_OPTIONS,
+        false,
+        move |format, window, cx| {
+            if format == selection.format {
+                return;
+            }
+            // Each format starts on its own first bank. XG plays drums from
+            // its drum bank rather than from channel 10, so a drum channel
+            // starts there.
+            let bank_msb = if format == MidiPatchFormat::Xg && channel == 10 {
+                XG_DRUM_BANK_MSB
+            } else {
+                0
+            };
+            let next = MidiProgramSelection {
+                format,
+                bank_msb,
+                bank_lsb: 0,
+                ..selection
+            };
+            cb(&(tid.clone(), next), window, cx);
+        },
+    );
+    let combo = |id: &'static str, label: String, kind: InspectorRoutingCombo| {
+        routing_combo_trigger(
+            id,
+            label,
+            kind,
+            callbacks.open_routing_combo,
+            callbacks.on_toggle_routing_combo.clone(),
+        )
+    };
+    let label_of = |options: Vec<(String, u8)>, value: u8| {
+        options
+            .into_iter()
+            .find(|(_, v)| *v == value)
+            .map(|(label, _)| label)
+            .unwrap_or_else(|| value.to_string())
+    };
+    let program_label = selection
+        .program
+        .map(|program| selection.patch_name(program, channel))
+        .unwrap_or_else(|| "None".to_string());
+
+    let mut rows = section_rows().child(fb_form_row("Patch Set", format));
+    if selection.format.has_banks() {
+        rows = rows
+            .child(fb_form_row(
+                "Bank",
+                combo(
+                    "inspector-program-bank-combo",
+                    label_of(program_bank_options(selection), selection.bank_msb),
+                    InspectorRoutingCombo::ProgramBank,
+                ),
+            ))
+            .child(fb_form_row(
+                "Bank LSB",
+                combo(
+                    "inspector-program-bank-lsb-combo",
+                    label_of(program_bank_lsb_options(selection), selection.bank_lsb),
+                    InspectorRoutingCombo::ProgramBankLsb,
+                ),
+            ));
+    }
+    rows = rows.child(fb_form_row(
+        "Program",
+        combo(
+            "inspector-program-combo",
+            program_label,
+            InspectorRoutingCombo::Program,
+        ),
+    ));
+    let hint = match (selection.program, selection.format) {
+        (None, _) => "No program is sent; the instrument keeps its own patch.".to_string(),
+        (Some(_), MidiPatchFormat::Gm) => {
+            format!("Program Change on channel {channel}. General MIDI has no banks.")
+        }
+        (Some(_), _) => {
+            format!("Bank Select (CC 0, CC 32), then Program Change, on channel {channel}.")
+        }
+    };
+    section_card(
+        "program",
+        "Program",
+        callbacks,
+        rows.child(inspector_hint_text(hint)),
+    )
 }
 
 const MPE_MODE_OPTIONS: &[InspectorSelectOption<MpeOutputMode>] = &[
@@ -2506,6 +2743,10 @@ fn track_inspector(
             instrument_targets,
             callbacks,
         ))
+        .when(
+            matches!(track.track_type, TrackType::Midi | TrackType::Instrument),
+            |this| this.child(program_section(track, callbacks)),
+        )
         .when(
             crate::edition::professional_features_available()
                 && matches!(track.track_type, TrackType::Midi | TrackType::Instrument),

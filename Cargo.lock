@@ -8150,6 +8150,7 @@ dependencies = [
  "cc",
  "cpal",
  "crossbeam-channel",
+ "ebur128",
  "fbmx-runtime",
  "libc",
  "memmap2",

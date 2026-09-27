@@ -94,6 +94,10 @@ pub enum EngineCommand {
     SetJamMultitrackPairs {
         pairs: [u32; crate::jam_bus::MAX_MULTITRACK_PAIRS],
     },
+    /// Install (or remove) the realtime render capture. The control thread
+    /// keeps its own reference until the callback has taken this one, so the
+    /// callback only ever drops a reference, never the capture itself.
+    SetRenderCapture(Option<std::sync::Arc<crate::render_capture::RenderCapture>>),
     /// Set non-destructive stereo/mono/mid/side monitoring preview.
     SetTrackPreviewMode { track_id: String, value: f32 },
     /// Set a plugin/insert parameter.

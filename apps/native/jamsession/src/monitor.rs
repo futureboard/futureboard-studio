@@ -357,6 +357,7 @@ fn room_project(
 /// is running, so a routed stream is audible the moment it is published.
 fn listener_track(index: usize, listener: &Listener) -> EngineTrackSnapshot {
     EngineTrackSnapshot {
+        midi_programs: Vec::new(),
         id: format!("jam-{index}"),
         track_type: "audio".to_string(),
         volume: listener.volume,
@@ -397,6 +398,7 @@ fn listener_track(index: usize, listener: &Listener) -> EngineTrackSnapshot {
 /// armed — monitoring is hearing, not recording.
 fn self_monitor_track() -> EngineTrackSnapshot {
     EngineTrackSnapshot {
+        midi_programs: Vec::new(),
         id: "jam-self".to_string(),
         track_type: "audio".to_string(),
         volume: 1.0,

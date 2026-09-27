@@ -106,7 +106,28 @@ pub(crate) struct PluginEditorWindows {
     /// A channel's effects as "Copy FX Chain" took them, for "Paste FX
     /// Chain". In-app and not persisted, like `state_clipboard`.
     pub fx_chain_clipboard: Option<FxChainClipboard>,
+    /// When each instance's host last died, for the crash-loop guard: an
+    /// instance whose host keeps dying stops being reloaded.
+    pub host_crashes: std::collections::HashMap<String, Vec<std::time::Instant>>,
+    /// Each bridged instance's state as last captured after an edit, newer
+    /// than the insert's saved blob: what a reload after a crash restores.
+    /// Dropped when a save stores a newer state in the insert itself.
+    pub live_states: std::collections::HashMap<String, Vec<u8>>,
+    /// Instances edited since their state was last captured, and when to ask
+    /// for it — a short while after the first edit, so a knob sweep is one
+    /// request, not one per step.
+    pub state_capture_due: std::collections::HashMap<String, std::time::Instant>,
 }
+
+/// How long after a bridged plug-in's first unsaved edit its state is
+/// captured for [`PluginEditorWindows::live_states`]; also the most often
+/// one plug-in is asked while edits keep coming.
+const LIVE_STATE_CAPTURE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Host crashes within [`HOST_CRASH_WINDOW`] after which an instance is left
+/// crashed instead of being reloaded again.
+const HOST_CRASH_LIMIT: usize = 3;
+const HOST_CRASH_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One channel's copied effects, in chain order. Each slot is the original's
 /// with its state as captured at the copy; a paste lands new instances of
@@ -454,10 +475,17 @@ impl StudioLayout {
         let Some(runtime) = self.plugin_editors.bridge_runtime.as_ref().cloned() else {
             return;
         };
-        let events = runtime
+        let (events, lost) = runtime
             .lock()
-            .map(|mut runtime| runtime.drain_events())
+            .map(|mut runtime| {
+                let events = runtime.drain_events();
+                (events, runtime.take_lost_hosts())
+            })
             .unwrap_or_default();
+        if !lost.is_empty() {
+            self.recover_lost_bridge_hosts(lost, cx);
+        }
+        self.request_due_state_captures(&runtime);
         if events.is_empty() {
             return;
         }
@@ -483,7 +511,10 @@ impl StudioLayout {
             match event {
                 ClientEvent::Host(HostEvent::PluginLoading { plugin_instance_id }) => {
                     eprintln!("[plugin-bridge] event PluginLoading instance={plugin_instance_id}");
-                    let host_pid = runtime.lock().ok().and_then(|r| r.host_pid());
+                    let host_pid = runtime
+                        .lock()
+                        .ok()
+                        .and_then(|r| r.host_pid_for(&plugin_instance_id));
                     changed |= self.timeline.update(cx, |timeline, _cx| {
                         let track_ids = timeline
                             .state
@@ -627,7 +658,10 @@ impl StudioLayout {
                              or a missing runtime dependency. ({error})"
                         )
                     };
-                    let host_pid = runtime.lock().ok().and_then(|r| r.host_pid());
+                    let host_pid = runtime
+                        .lock()
+                        .ok()
+                        .and_then(|r| r.host_pid_for(&plugin_instance_id));
                     changed |= self.timeline.update(cx, |timeline, _cx| {
                         let track_ids = timeline
                             .state
@@ -657,6 +691,13 @@ impl StudioLayout {
                     self.plugin_editors
                         .flush_attempts
                         .remove(&plugin_instance_id);
+                    let editors: Vec<_> = self.plugin_editors.open.values().copied().collect();
+                    for handle in editors {
+                        let _ = handle.update(cx, |editor, _window, cx| {
+                            let error = user_error.clone();
+                            editor.plugin_reload_failed(&plugin_instance_id, error, cx);
+                        });
+                    }
                     for session in self.plugin_editors.bridge.values_mut() {
                         if session.instance_id == plugin_instance_id
                             && !bridge_editor_is_terminal(&session.state)
@@ -719,7 +760,7 @@ impl StudioLayout {
                     eprintln!("[plugin-runtime] dsp_output=ready");
                     let host_pid = runtime.lock().ok().and_then(|mut r| {
                         r.mark_plugin_output_channels(&plugin_instance_id, output_channels);
-                        r.host_pid()
+                        r.host_pid_for(&plugin_instance_id)
                     });
                     let mut pending_opens = Vec::new();
                     let processing_changed = self.timeline.update(cx, |timeline, _cx| {
@@ -819,6 +860,38 @@ impl StudioLayout {
                     );
                     if loaded && owned {
                         self.note_plugin_state_edited(cx);
+                        // Not pushed back by later edits: a plug-in that
+                        // reports edits without pause still gets captured.
+                        self.plugin_editors
+                            .state_capture_due
+                            .entry(plugin_instance_id)
+                            .or_insert_with(|| Instant::now() + LIVE_STATE_CAPTURE_DELAY);
+                    }
+                }
+                // A state asked for by `request_due_state_captures` (or one a
+                // save gave up waiting for). Kept for a reload after a crash;
+                // the insert's saved blob is the save's to write.
+                ClientEvent::Host(HostEvent::PluginState {
+                    plugin_instance_id,
+                    ok: true,
+                    component_b64,
+                    controller_b64,
+                }) => {
+                    let packed = runtime.lock().ok().and_then(|runtime| {
+                        runtime.packed_state_reply(
+                            &plugin_instance_id,
+                            &component_b64,
+                            &controller_b64,
+                        )
+                    });
+                    if let Some(packed) = packed {
+                        ped_log!(
+                            "live state captured instance={plugin_instance_id} bytes={}",
+                            packed.len()
+                        );
+                        self.plugin_editors
+                            .live_states
+                            .insert(plugin_instance_id, packed);
                     }
                 }
                 // Space was pressed while a plug-in editor owned keyboard focus.
@@ -988,7 +1061,7 @@ impl StudioLayout {
                     let host_pid = runtime
                         .as_ref()
                         .and_then(|rt| rt.lock().ok())
-                        .and_then(|r| r.host_pid());
+                        .and_then(|r| r.host_pid_for(&plugin_instance_id));
                     track_ids.into_iter().any(|track_id| {
                         timeline.state.set_insert_runtime(
                             &track_id,
@@ -1169,7 +1242,7 @@ impl StudioLayout {
                 let host_pid = runtime
                     .as_ref()
                     .and_then(|rt| rt.lock().ok())
-                    .and_then(|r| r.host_pid());
+                    .and_then(|r| r.host_pid_for(&plugin_instance_id));
                 self.timeline.update(cx, |timeline, _cx| {
                     let track_ids: Vec<String> = timeline
                         .state
@@ -1410,7 +1483,10 @@ impl StudioLayout {
         };
         match open_result {
             Ok(()) => {
-                let host_pid = runtime.lock().ok().and_then(|r| r.host_pid());
+                let host_pid = runtime
+                    .lock()
+                    .ok()
+                    .and_then(|r| r.host_pid_for(instance_id));
                 eprintln!(
                     "[editor-open] 04 sending_ipc_open_editor host_id={host_pid:?} insert_id={instance_id} host_owned={host_owned} size={content_w}x{content_h}"
                 );
@@ -1825,7 +1901,7 @@ impl StudioLayout {
                 .bridge_runtime
                 .as_ref()
                 .and_then(|rt| rt.lock().ok())
-                .and_then(|r| r.host_pid());
+                .and_then(|r| r.host_pid_for(instance_id));
             let _ = self.timeline.update(cx, |timeline, cx| {
                 timeline.state.set_insert_runtime(
                     track_id,
@@ -1890,6 +1966,7 @@ impl StudioLayout {
                 .is_ok();
             if reused {
                 self.drop_bridge_loading_shell(&track_id, &insert_id);
+                self.show_crash_panel_if_crashed(&track_id, &insert_id, cx);
                 self.refresh_plugin_editor_chrome(cx);
                 return;
             }
@@ -1929,6 +2006,7 @@ impl StudioLayout {
                 // That is the first open closing itself while the second, with
                 // no shell to drop, works.
                 self.drop_bridge_loading_shell(&track_id, &insert_id);
+                self.show_crash_panel_if_crashed(&track_id, &insert_id, cx);
                 self.refresh_plugin_editor_chrome(cx);
             }
             Err(err) => {
@@ -2082,6 +2160,43 @@ impl StudioLayout {
         }
 
         let insert_id = resolved_plugin_instance_id.as_str();
+        // A plug-in whose host died and that was not loaded again: its editor
+        // opens on the crash panel, which is where it is reloaded from. The
+        // gate below would otherwise park it on "Loading" for a load nobody
+        // started.
+        if matches!(runtime_state, PluginRuntimeState::Crashed)
+            && super::plugin_bridge_runtime::bridge_enabled()
+            && !super::plugin_editor_chrome_ops::legacy_native_editor_shell()
+        {
+            eprintln!("[PluginEditor] instance={insert_id} crashed; opening its crash panel");
+            if let Some(editor) = self.editor_showing_insert(track_id, insert_id, cx) {
+                let _ = editor.update(cx, |editor, window, cx| {
+                    editor.show_plugin_crashed(insert_id, None, cx);
+                    window.activate_window();
+                });
+                return;
+            }
+            let owner_bounds = window.bounds();
+            let key = (track_id.to_string(), insert_id.to_string());
+            let track = track_id.to_string();
+            let insert = insert_id.to_string();
+            let executor = cx.background_executor().clone();
+            cx.spawn(async move |this, cx| {
+                executor.timer(std::time::Duration::from_millis(1)).await;
+                let _ = this.update(cx, |layout, cx| {
+                    layout.open_bridged_editor_window(
+                        owner_bounds,
+                        key,
+                        track,
+                        insert,
+                        display_name,
+                        cx,
+                    );
+                });
+            })
+            .detach();
+            return;
+        }
         let editor_session_key = (track_id.to_string(), insert_id.to_string());
         let (editor_state, editor_created, content_hwnd, content_size) = self
             .plugin_editors
@@ -2117,7 +2232,7 @@ impl StudioLayout {
                 .bridge_runtime
                 .as_ref()
                 .and_then(|runtime| runtime.lock().ok())
-                .and_then(|runtime| runtime.host_pid());
+                .and_then(|runtime| runtime.host_pid_for(insert_id));
             let _ = self.timeline.update(cx, |timeline, _cx| {
                 timeline.state.set_insert_runtime(
                     track_id,
@@ -2131,12 +2246,14 @@ impl StudioLayout {
         } else {
             runtime_state.clone()
         };
+        // The host serving this instance, not any host: with several hosts,
+        // another one being alive says nothing about this editor's.
         let plugin_host_alive = self
             .plugin_editors
             .bridge_runtime
             .as_ref()
             .and_then(|runtime| runtime.lock().ok())
-            .and_then(|runtime| runtime.host_pid())
+            .and_then(|runtime| runtime.host_pid_for(insert_id))
             .is_some();
         let controller_known = plugin_id.is_some();
         let mut gate_allowed = true;
@@ -2729,6 +2846,335 @@ impl StudioLayout {
         }
     }
 
+    /// A plug-in host process died. Only what lived in it is touched: each of
+    /// its instances loses its realtime sink (the engine stops waiting on a
+    /// producer that is gone). One whose editor is on screen is left crashed
+    /// and its editor shows the crash panel — the user is looking at it and
+    /// chooses between reloading it as it was and resetting it. The rest are
+    /// loaded again into a fresh host with their last captured state. The
+    /// other hosts — and every plug-in in them — play on. An instance whose
+    /// host keeps dying is left crashed rather than reloaded forever.
+    fn recover_lost_bridge_hosts(
+        &mut self,
+        lost: Vec<super::plugin_bridge_runtime::LostBridgeHost>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::timeline::timeline_state::{
+            PluginRuntimeBackend, PluginRuntimeState,
+        };
+        let now = std::time::Instant::now();
+        let mut reloaded = Vec::new();
+        let mut given_up = Vec::new();
+        let mut waiting = Vec::new();
+        for host in lost {
+            eprintln!(
+                "[plugin-bridge] recovering lost host key={} pid={:?} instances={}",
+                host.key,
+                host.pid,
+                host.instances.len()
+            );
+            for instance in host.instances {
+                let track_id = instance.descriptor.track_id.clone();
+                let insert_id = instance.descriptor.insert_id.clone();
+                if let Some(engine) = self.audio_bridge.engine.as_ref() {
+                    let _ = engine.set_plugin_bridge_sink(insert_id.clone(), None);
+                }
+                self.end_plugin_load_progress(&insert_id, cx);
+                self.plugin_editors.state_capture_due.remove(&insert_id);
+                let still_in_project = self
+                    .timeline
+                    .read(cx)
+                    .state
+                    .find_insert_slot(&track_id, &insert_id)
+                    .is_some();
+                if !still_in_project {
+                    self.close_insert_editor(&track_id, &insert_id, cx);
+                    continue;
+                }
+                if let Some(editor) = self.editor_showing_insert(&track_id, &insert_id, cx) {
+                    let _ = self.timeline.update(cx, |timeline, _cx| {
+                        timeline.state.set_insert_runtime(
+                            &track_id,
+                            &insert_id,
+                            PluginRuntimeBackend::ExternalBridge,
+                            PluginRuntimeState::Crashed,
+                            None,
+                        )
+                    });
+                    let _ = editor.update(cx, |editor, _window, cx| {
+                        editor.show_plugin_crashed(&insert_id, None, cx);
+                    });
+                    waiting.push(instance.descriptor.display_name.clone());
+                    continue;
+                }
+                // A native loading shell of the old instance, if one is up.
+                self.close_bridge_editor(cx, &track_id, &insert_id);
+                let crashes = self
+                    .plugin_editors
+                    .host_crashes
+                    .entry(insert_id.clone())
+                    .or_default();
+                crashes.retain(|at| now.duration_since(*at) < HOST_CRASH_WINDOW);
+                crashes.push(now);
+                if crashes.len() >= HOST_CRASH_LIMIT {
+                    eprintln!(
+                        "[plugin-bridge] instance={insert_id} crashed {} times in {:?}; not reloading",
+                        crashes.len(),
+                        HOST_CRASH_WINDOW
+                    );
+                    let _ = self.timeline.update(cx, |timeline, _cx| {
+                        timeline.state.set_insert_runtime(
+                            &track_id,
+                            &insert_id,
+                            PluginRuntimeBackend::ExternalBridge,
+                            PluginRuntimeState::Crashed,
+                            None,
+                        )
+                    });
+                    given_up.push(instance.descriptor.display_name.clone());
+                    continue;
+                }
+                self.adopt_live_state(&track_id, &insert_id, cx);
+                if self.load_bridge_insert_for_slot(&track_id, &insert_id, cx) {
+                    reloaded.push(instance.descriptor.display_name.clone());
+                } else {
+                    let _ = self.timeline.update(cx, |timeline, _cx| {
+                        timeline.state.set_insert_runtime(
+                            &track_id,
+                            &insert_id,
+                            PluginRuntimeBackend::ExternalBridge,
+                            PluginRuntimeState::Crashed,
+                            None,
+                        )
+                    });
+                    given_up.push(instance.descriptor.display_name.clone());
+                }
+            }
+        }
+        let mut message = Vec::new();
+        if !reloaded.is_empty() {
+            message.push(format!(
+                "A plug-in host stopped; reloaded {}.",
+                reloaded.join(", ")
+            ));
+        }
+        if !given_up.is_empty() {
+            message.push(format!(
+                "{} kept crashing and was left off; its editor can reload it.",
+                given_up.join(", ")
+            ));
+        }
+        if !waiting.is_empty() {
+            message.push(format!(
+                "{} crashed; reload it from its editor.",
+                waiting.join(", ")
+            ));
+        }
+        if !message.is_empty() {
+            self.show_edit_notice(message.join(" "), cx);
+        }
+        self.mark_engine_media_dirty();
+        cx.notify();
+    }
+
+    /// The editor window whose tab on screen is `insert_id`, if there is one.
+    fn editor_showing_insert(
+        &self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::WindowHandle<crate::components::plugin_editor_window::PluginEditorWindow>>
+    {
+        let handle = self.plugin_editor_window_for(track_id)?;
+        handle
+            .update(cx, |editor, _window, _cx| {
+                editor.insert_key().1 == insert_id
+            })
+            .ok()
+            .filter(|showing| *showing)
+            .map(|_| handle)
+    }
+
+    /// An editor just brought `insert_id` to the front: if the plug-in is down,
+    /// show the crash panel instead of opening a view of nothing.
+    pub(super) fn show_crash_panel_if_crashed(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::timeline::timeline_state::PluginRuntimeState;
+        let crashed = self
+            .timeline
+            .read(cx)
+            .state
+            .find_insert_slot(track_id, insert_id)
+            .is_some_and(|slot| matches!(slot.runtime_state, PluginRuntimeState::Crashed));
+        if !crashed {
+            return;
+        }
+        if let Some(editor) = self.editor_showing_insert(track_id, insert_id, cx) {
+            let _ = editor.update(cx, |editor, _window, cx| {
+                editor.show_plugin_crashed(insert_id, None, cx);
+            });
+        }
+    }
+
+    /// Moves the state last captured from `insert_id` into its slot, so the
+    /// next load restores it. It is newer than the saved blob, and it is what
+    /// the next save would have stored anyway.
+    fn adopt_live_state(&mut self, track_id: &str, insert_id: &str, cx: &mut Context<Self>) {
+        let Some(live) = self.plugin_editors.live_states.remove(insert_id) else {
+            return;
+        };
+        eprintln!(
+            "[plugin-bridge] reload uses live state instance={insert_id} bytes={}",
+            live.len()
+        );
+        let live = std::sync::Arc::new(live);
+        let _ = self.timeline.update(cx, |timeline, _cx| {
+            let slot = timeline
+                .state
+                .insert_slots_mut(track_id)
+                .and_then(|slots| slots.iter_mut().find(|slot| slot.id == insert_id));
+            if let Some(slot) = slot {
+                slot.vst3_state = Some(live);
+            }
+        });
+    }
+
+    /// The crash panel's Reload / Reset & Reload. The instance is loaded into
+    /// a fresh host — with its last captured state, or with none so it starts
+    /// at its defaults — and the editor opens on it again once it is back.
+    /// Asked for by the user, so the crash-loop count starts over.
+    pub(super) fn reload_crashed_plugin(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        reset: bool,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::timeline::timeline_state::PluginRuntimeState;
+        let editor = self.editor_showing_insert(track_id, insert_id, cx);
+        let Some(slot) = self
+            .timeline
+            .read(cx)
+            .state
+            .find_insert_slot(track_id, insert_id)
+            .cloned()
+        else {
+            if let Some(editor) = editor {
+                let _ = editor.update(cx, |editor, _window, cx| {
+                    editor.plugin_reload_failed(
+                        insert_id,
+                        "The plug-in is no longer in the project.".to_string(),
+                        cx,
+                    );
+                });
+            }
+            return;
+        };
+        eprintln!(
+            "[plugin-bridge] reload requested instance={insert_id} reset={reset} plugin={}",
+            slot.display_name
+        );
+        // Anything the pool still holds for it (a load that never answered)
+        // would make the load below a no-op.
+        let lingering = self
+            .plugin_editors
+            .bridge_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.lock().ok())
+            .is_some_and(|runtime| runtime.has_load_request(insert_id));
+        if lingering {
+            if let Some(engine) = self.audio_bridge.engine.as_ref() {
+                let _ = engine.set_plugin_bridge_sink(insert_id.to_string(), None);
+            }
+            self.unload_bridge_plugin(insert_id);
+        }
+        self.plugin_editors.host_crashes.remove(insert_id);
+        self.plugin_editors.state_capture_due.remove(insert_id);
+        if reset {
+            self.plugin_editors.live_states.remove(insert_id);
+            crate::components::builtin_plugin_editor::builtin_state_remove(insert_id);
+            let _ = self.timeline.update(cx, |timeline, _cx| {
+                let slot = timeline
+                    .state
+                    .insert_slots_mut(track_id)
+                    .and_then(|slots| slots.iter_mut().find(|slot| slot.id == insert_id));
+                if let Some(slot) = slot {
+                    slot.vst3_state = None;
+                }
+            });
+        } else {
+            self.adopt_live_state(track_id, insert_id, cx);
+        }
+        if let Some(editor) = editor {
+            let _ = editor.update(cx, |editor, _window, cx| {
+                editor.begin_plugin_reload(insert_id, cx);
+            });
+        }
+        if self.load_bridge_insert_for_slot(track_id, insert_id, cx) {
+            self.show_edit_notice(
+                if reset {
+                    format!("Reset and reloaded {}.", slot.display_name)
+                } else {
+                    format!("Reloaded {}.", slot.display_name)
+                },
+                cx,
+            );
+        } else {
+            let reason = match self
+                .timeline
+                .read(cx)
+                .state
+                .find_insert_slot(track_id, insert_id)
+                .map(|slot| slot.runtime_state.clone())
+            {
+                Some(PluginRuntimeState::Missing(reason) | PluginRuntimeState::Failed(reason)) => {
+                    reason
+                }
+                _ => "The plug-in could not be loaded again.".to_string(),
+            };
+            if let Some(editor) = editor {
+                let _ = editor.update(cx, |editor, _window, cx| {
+                    editor.plugin_reload_failed(insert_id, reason, cx);
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Asks each bridged plug-in whose settle time has passed for its state.
+    /// Answered later as `PluginState`, into `live_states`; never waited on.
+    fn request_due_state_captures(
+        &mut self,
+        runtime: &super::plugin_bridge_runtime::SharedPluginBridgeRuntime,
+    ) {
+        if self.plugin_editors.state_capture_due.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .plugin_editors
+            .state_capture_due
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        for id in &due {
+            self.plugin_editors.state_capture_due.remove(id);
+        }
+        if let Ok(mut runtime) = runtime.lock() {
+            for id in due {
+                runtime.request_plugin_state_async(&id);
+            }
+        }
+    }
+
     /// Close the editor window for a slot if one is open. Idempotent. Removing
     /// the GPUI window drops the entity, which detaches the native view.
     pub(super) fn close_insert_editor(
@@ -2807,6 +3253,9 @@ impl StudioLayout {
         // 1. Editor window (native main-owned bridge shell + legacy GPUI) —
         //    disconnects the editor from the instance and releases its clone.
         self.close_insert_editor(track_id, insert_id, cx);
+        self.plugin_editors.live_states.remove(insert_id);
+        self.plugin_editors.state_capture_due.remove(insert_id);
+        self.plugin_editors.host_crashes.remove(insert_id);
         // An editor request may have been queued while the bridge instance was
         // still loading. Instance removal is authoritative: discard every
         // deferred/open-loop reference before a late PluginLoaded event can
@@ -4738,6 +5187,10 @@ impl StudioLayout {
             states.len(),
             instance_ids.len()
         );
+        // The insert now holds a state at least as new as any kept for a reload.
+        for id in states.keys() {
+            self.plugin_editors.live_states.remove(id);
+        }
         self.timeline.update(cx, |timeline, _cx| {
             for slot in &mut timeline.state.master.inserts {
                 if let Some(packed) = states.get(&slot.id) {
@@ -4853,10 +5306,7 @@ impl StudioLayout {
                 );
                 continue;
             };
-            let region_name = super::plugin_bridge_runtime::bridge_region_name(insert_id);
-            eprintln!(
-                "[PluginAdd] bridge_key={insert_id} shared_region={region_name} track={track_id}"
-            );
+            eprintln!("[PluginAdd] bridge_key={insert_id} track={track_id}");
             match engine.set_plugin_bridge_sink(insert_id.clone(), Some(sink)) {
                 Ok(()) => {
                     eprintln!(
@@ -4884,7 +5334,10 @@ impl StudioLayout {
         cx: &mut Context<Self>,
         source: &'static str,
     ) -> bool {
-        let host_pid = runtime.lock().ok().and_then(|r| r.host_pid());
+        let host_pid = runtime
+            .lock()
+            .ok()
+            .and_then(|r| r.host_pid_for(plugin_instance_id));
         let mut pending_opens = Vec::new();
         let slot_changed = self.timeline.update(cx, |timeline, _cx| {
             let mut local_changed = false;
@@ -4936,6 +5389,13 @@ impl StudioLayout {
             }
         }
         eprintln!("[plugin-runtime] state Loading -> Ready source={source}");
+        // An editor waiting on this reload opens on the new instance.
+        let editors: Vec<_> = self.plugin_editors.open.values().copied().collect();
+        for handle in editors {
+            let _ = handle.update(cx, |editor, _window, cx| {
+                editor.resume_after_plugin_reload(plugin_instance_id, cx);
+            });
+        }
         self.sync_plugin_bridge_sinks_to_engine(cx, source);
         // Built-in insert: the host DSP always (re)starts at defaults —
         // replay the mirrored/persisted state through the live param channel
@@ -5211,7 +5671,7 @@ impl StudioLayout {
                 eprintln!(
                     "[PLUGIN_LOAD_REQUEST_DEDUP]\nplugin_instance_id={slot_id}\nexisting_load_state=not_loaded\nnew_request_created=true\nreason=first_load"
                 );
-                let host_pid = runtime.lock().ok().and_then(|r| r.host_pid());
+                let host_pid = runtime.lock().ok().and_then(|r| r.host_pid_for(&slot_id));
                 let _ = self.timeline.update(cx, |timeline, _cx| {
                     timeline.state.set_insert_runtime(
                         track_id,
@@ -5336,6 +5796,9 @@ impl StudioLayout {
         if !super::plugin_bridge_runtime::bridge_enabled() {
             return;
         }
+        self.plugin_editors.live_states.clear();
+        self.plugin_editors.state_capture_due.clear();
+        self.plugin_editors.host_crashes.clear();
         let slots = self.bridge_audio_insert_slots(cx);
         if let Some(engine) = self.audio_bridge.engine.as_ref() {
             for (_, insert_id) in &slots {

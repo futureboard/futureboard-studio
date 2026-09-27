@@ -607,6 +607,12 @@ void SphereDauxVst2Processor::prepare_midi_events(
         dst.midiData[0] = static_cast<char>(0xE0 | channel);
         dst.midiData[1] = static_cast<char>(bend & 0x7F);
         dst.midiData[2] = static_cast<char>((bend >> 7) & 0x7F);
+      } else if (src.pitch == 130) {
+        // Program change (VST3 kCtrlProgramChange), program as n/127.
+        dst.midiData[0] = static_cast<char>(0xC0 | channel);
+        dst.midiData[1] = static_cast<char>(
+            std::min(127, static_cast<int>(normalized * 127.f + 0.5f)));
+        dst.midiData[2] = 0;
       } else {
         dst.midiData[0] = static_cast<char>(0xB0 | channel);
         dst.midiData[1] = static_cast<char>(src.pitch & 0x7F);
@@ -625,7 +631,8 @@ void SphereDauxVst2Processor::prepare_midi_events(
     return;
 
   // Sort by delta so the plug-in receives an ordered block.
-  std::sort(midi_events.begin(), midi_events.begin() + midi_event_count,
+  // Stable: events at one offset keep the order they were queued in.
+  std::stable_sort(midi_events.begin(), midi_events.begin() + midi_event_count,
             [](const VstMidiEvent &a, const VstMidiEvent &b) {
               return a.deltaFrames < b.deltaFrames;
             });

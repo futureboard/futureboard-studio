@@ -1218,11 +1218,14 @@ impl Timeline {
                 let mut pieces: Vec<String> = Vec::new();
                 for split in &splits {
                     if let EditCommand::ReplaceClipWithClips { clips, .. } = split {
-                        for (track_id, clip) in clips {
+                        for (track_id, _) in clips {
                             if !tracks.contains(track_id) {
                                 tracks.push(track_id.clone());
                             }
-                            pieces.push(clip.id.clone());
+                        }
+                        // The piece after each cut, as a single split selects.
+                        if let Some((_, right)) = clips.last() {
+                            pieces.push(right.id.clone());
                         }
                     }
                 }

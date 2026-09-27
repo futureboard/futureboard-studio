@@ -933,6 +933,10 @@ pub struct EngineInner {
     /// would vanish on the next project sync and every live ARA binding would be
     /// destroyed behind the user's back.
     ara_renderers: Mutex<HashMap<String, Vec<crate::runtime::RuntimeAraRenderer>>>,
+    /// The realtime render being recorded and the track ids its lanes carry,
+    /// so every graph built while it runs is mapped to it. Also the control
+    /// thread's own reference to the capture (see `SetRenderCapture`).
+    render_capture: Mutex<Option<(Arc<crate::render_capture::RenderCapture>, Vec<String>)>>,
     audio_cache: Mutex<HashMap<String, Arc<ClipAudioSource>>>,
     inactive_audio_cache_lru: Mutex<VecDeque<String>>,
 
@@ -1093,6 +1097,7 @@ impl EngineInner {
             last_sent_time_signature_map: Mutex::new(default_time_signature_map),
             plugin_bridge_sinks: Mutex::new(Default::default()),
             ara_renderers: Mutex::new(HashMap::new()),
+            render_capture: Mutex::new(None),
             audio_cache: Mutex::new(HashMap::new()),
             inactive_audio_cache_lru: Mutex::new(VecDeque::new()),
             glitch_counter: Arc::new(AtomicU64::new(0)),
@@ -2461,6 +2466,72 @@ impl EngineInner {
     /// and starts assembling blocks into it; announcing the stream is the jam
     /// client's half, and the two are separate calls so a failure in either
     /// never leaves the other running.
+    /// Start a realtime render capture of the master and `track_ids`, in
+    /// that lane order, holding up to `capacity_frames` unread frames. It
+    /// records nothing until [`crate::render_capture::RenderCapture::set_recording`]
+    /// and the transport is playing. Replaces a capture still installed.
+    pub fn begin_render_capture(
+        &self,
+        track_ids: &[String],
+        capacity_frames: usize,
+    ) -> Result<Arc<crate::render_capture::RenderCapture>, SphereAudioError> {
+        let indices = {
+            let project = self.project.lock();
+            let snapshot = project.as_ref().ok_or_else(|| {
+                SphereAudioError::InvalidConfig("no project is loaded".to_string())
+            })?;
+            let indices = render_capture_indices(snapshot, track_ids);
+            if let Some(missing) = track_ids
+                .iter()
+                .zip(&indices)
+                .find_map(|(id, index)| index.is_none().then_some(id))
+            {
+                return Err(SphereAudioError::InvalidConfig(format!(
+                    "track '{missing}' was not found"
+                )));
+            }
+            indices
+        };
+        let sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
+        let capture = Arc::new(crate::render_capture::RenderCapture::new(
+            track_ids.len(),
+            capacity_frames,
+            sample_rate,
+        ));
+        capture.map_tracks(&indices);
+        *self.render_capture.lock() = Some((capture.clone(), track_ids.to_vec()));
+        self.runtime.lock().render_capture = Some(capture.clone());
+        match self.send_command(EngineCommand::SetRenderCapture(Some(capture.clone()))) {
+            Ok(()) => Ok(capture),
+            Err(error) => {
+                self.end_render_capture();
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove the realtime render capture. Waits (bounded) for the callback to
+    /// let go of it before this thread drops the last reference.
+    pub fn end_render_capture(&self) {
+        let Some((capture, _)) = self.render_capture.lock().take() else {
+            return;
+        };
+        capture.set_recording(false);
+        self.runtime.lock().render_capture = None;
+        let _ = self.send_command(EngineCommand::SetRenderCapture(None));
+        let _ = self.wait_for_command_barrier(std::time::Duration::from_secs(2));
+        drop(capture);
+    }
+
+    /// Frames between the transport and the master output it produces: the
+    /// plug-in delay compensation the live graph applies. A realtime render
+    /// skips this many frames from where it starts playing, as an offline
+    /// render does, so both files line up with the timeline.
+    pub fn render_latency_frames(&self) -> u64 {
+        let runtime = self.runtime.lock();
+        crate::export::live_render_latency_frames(&runtime.latency_graph, runtime.pdc_enabled)
+    }
+
     pub fn set_multitrack_jam_publish(
         &self,
         track_ids: &[String],
@@ -3250,6 +3321,12 @@ impl EngineInner {
         // below is stored, or that mirror loses the sinks.
         runtime.plugin_bridge_sinks = self.plugin_bridge_sinks.lock().clone();
         runtime.resolve_bridge_sinks();
+        // A realtime render in progress records the rebuilt graph too, with
+        // its lanes mapped to where the tracks now are.
+        if let Some((capture, track_ids)) = self.render_capture.lock().as_ref() {
+            capture.map_tracks(&render_capture_indices(&snapshot, track_ids));
+            runtime.render_capture = Some(capture.clone());
+        }
         // The callback applies this graph's tempo map wholesale, so record it as
         // sent: the trailing `set_tempo_map` below then costs nothing instead of
         // rebuilding every MIDI event list on the audio thread after every sync.
@@ -5273,6 +5350,7 @@ impl EngineInner {
                 EngineCommand::SetTrackLoopbackPublish { .. } => "SetTrackLoopbackPublish",
                 EngineCommand::SetTrackJamPublish { .. } => "SetTrackJamPublish",
                 EngineCommand::SetJamMultitrackPairs { .. } => "SetJamMultitrackPairs",
+                EngineCommand::SetRenderCapture(_) => "SetRenderCapture",
                 EngineCommand::SetTrackPreviewMode { .. } => "SetTrackPreviewMode",
                 EngineCommand::SetInsertParam { .. } => "SetInsertParam",
                 EngineCommand::SetMonitorSource { .. } => "SetMonitorSource",
@@ -5704,6 +5782,7 @@ where
                             // graph (the block path reads insert.bridge_sink).
                             runtime.resolve_bridge_sinks();
                             runtime.bridge_editor_active = old.bridge_editor_active.clone();
+                            runtime.inherit_midi_programs_sent(&old);
                             // The panic pushed into the preserved sinks above
                             // still needs flushing through the new graph.
                             // Keep the live master-fader ramp continuous across
@@ -6041,6 +6120,12 @@ where
                         EngineCommand::SetJamMultitrackPairs { pairs } => {
                             runtime.apply_jam_multitrack_pairs(&pairs);
                         }
+                        // This callback path does not record a realtime render
+                        // (the DAUx callback does); it still takes the
+                        // reference so the capture is released in step.
+                        EngineCommand::SetRenderCapture(capture) => {
+                            runtime.render_capture = capture;
+                        }
                         EngineCommand::SetTrackPreviewMode { track_id, value } => {
                             runtime.update_track_preview_mode(&track_id, RuntimePreviewMode::from_code(value));
                         }
@@ -6174,6 +6259,8 @@ where
                     metronome.reset_metronome_schedule(base_sample, output_sample_rate);
                 }
                 runtime.begin_meter_block();
+                // Bank/program selections not yet sent, playing or not.
+                runtime.flush_midi_programs();
 
                 // MIDI scheduling — once per block when playing.
                 let mut end_loop_midi_reset = None;
@@ -6422,7 +6509,7 @@ where
                         transport::advance_loop_position(base_sample, frames, loop_bounds);
                     shared.position_samples.store(next_position, Ordering::Relaxed);
                     if let Some(reset_sample) = end_loop_midi_reset {
-                        runtime.reset_midi_playback(reset_sample);
+                        runtime.loop_wrap_midi_playback(reset_sample, 0);
                         metronome.reset_metronome_schedule(reset_sample, output_sample_rate);
                     }
                 }
@@ -6514,6 +6601,7 @@ mod live_input_tests {
             time_signature: [4, 4],
             sample_rate: 48_000,
             tracks: vec![EngineTrackSnapshot {
+                midi_programs: Vec::new(),
                 id: "audio-1".into(),
                 track_type: "audio".into(),
                 volume: 1.0,
@@ -8614,4 +8702,16 @@ mod engine_state_rendering_tests {
             assert_eq!(AudioEngineState::from_u8(state as u8), state);
         }
     }
+}
+
+/// Where each of `track_ids` is in `snapshot`, which is the order the graph
+/// built from it holds its tracks in.
+fn render_capture_indices(
+    snapshot: &EngineProjectSnapshot,
+    track_ids: &[String],
+) -> Vec<Option<usize>> {
+    track_ids
+        .iter()
+        .map(|id| snapshot.tracks.iter().position(|track| &track.id == id))
+        .collect()
 }

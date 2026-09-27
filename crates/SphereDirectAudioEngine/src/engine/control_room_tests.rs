@@ -45,6 +45,7 @@ fn track(id: &str, track_type: &str) -> EngineTrackSnapshot {
     // as a deterministic signal generator through the whole graph.
     let is_audio = track_type == "audio";
     EngineTrackSnapshot {
+        midi_programs: Vec::new(),
         id: id.to_string(),
         track_type: track_type.to_string(),
         volume: 1.0,

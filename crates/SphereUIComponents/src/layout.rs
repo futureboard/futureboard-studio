@@ -414,6 +414,30 @@ pub(crate) fn build_and_warm_audio_engine(
         resolve_output_device_for_backend(&engine, backend, &schema.hardware.audio.device_out);
     #[cfg(target_os = "macos")]
     let desired_output = None;
+    // ASIO is opened later, on the UI thread. This runs on a background pool
+    // thread while the session loads, and an ASIO driver belongs to the
+    // thread that loads it: every other open, close and reset of it happens
+    // on the UI thread, and a driver loaded here — on a thread with no
+    // message loop, possibly a different one each time — could fail to open,
+    // miss its reset messages or be left half released. The config is kept,
+    // device included, and `retry_audio_stream_warm` opens the stream from it
+    // as soon as the session is ready.
+    if engine.config().backend == DirectAudio::AudioBackend::Asio {
+        if let Some(device) = desired_output {
+            engine.set_config(DirectAudio::EngineConfig {
+                output_device: Some(device),
+                ..engine.config().clone()
+            });
+        }
+        eprintln!(
+            "[audio] ASIO stream deferred to the UI thread: device={:?}",
+            schema.hardware.audio.device_out.trim()
+        );
+        let stats = engine.stats();
+        #[cfg(not(target_os = "macos"))]
+        crate::device_registry::scan_audio_for_engine(&engine);
+        return Ok((engine, stats));
+    }
     let open_result = match desired_output {
         Some(device) => {
             eprintln!(
@@ -719,6 +743,9 @@ pub struct StudioLayout {
     session_install_progress: crate::components::progress_dialog::ProgressBarValue,
     /// Non-fatal plugin restore warnings collected during session install.
     session_install_warnings: Vec<String>,
+    /// Where the playhead was when a realtime render took the transport, to
+    /// put it back when the render gives it up.
+    realtime_render_playhead: Option<f32>,
     /// True while the session-install restore is handing the whole batch of
     /// project inserts to the plugin host. Each load would otherwise force its
     /// own engine graph rebuild, so opening a project rebuilt the graph once
@@ -1393,6 +1420,7 @@ impl StudioLayout {
             session_install_progress:
                 crate::components::progress_dialog::ProgressBarValue::Indeterminate,
             session_install_warnings: Vec::new(),
+            realtime_render_playhead: None,
             plugin_restore_batch_active: false,
             last_autosave_at: std::time::Instant::now(),
             autosave_in_flight: false,
@@ -2730,13 +2758,20 @@ impl StudioLayout {
                     self.open_insert_picker(&track_id, None, cx);
                 }
             }
-            // `file:export-audio` and `file:export-stems` are bound in every
-            // shipped keymap; both land here rather than in two dispatch arms
-            // that did not exist, which is why those shortcuts did nothing. The
-            // dialog owns the audio-vs-stems choice.
-            "file:export-arrangement" | "file:export-audio" | "file:export-stems" => {
-                self.open_export_arrangement_external_window(owner_bounds, cx)
-            }
+            // One Export dialog for all three: it renders the mixdown, any
+            // channels, or both. Export Stems only opens it with the channels
+            // picked and the mixdown off.
+            "file:export-arrangement" | "file:export-audio" => self
+                .open_export_arrangement_external_window(
+                    owner_bounds,
+                    crate::export::ExportIntent::Mixdown,
+                    cx,
+                ),
+            "file:export-stems" => self.open_export_arrangement_external_window(
+                owner_bounds,
+                crate::export::ExportIntent::Stems,
+                cx,
+            ),
             "file:export-midi" => self.open_export_midi_dialog(owner_bounds, cx),
             "file:export-project-archive" => self.cmd_export_project_archive(cx),
             // Offered from the MIDI editor status bar and the arrangement's

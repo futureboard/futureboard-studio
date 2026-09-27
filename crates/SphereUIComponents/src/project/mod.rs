@@ -1,6 +1,7 @@
 pub mod format;
 pub mod import;
 pub mod io;
+pub mod migrate;
 pub mod recent;
 pub mod routing_migration;
 pub mod session;
@@ -402,6 +403,8 @@ pub struct TrackRouting {
     /// v46: per-track MPE output policy. Older projects default to Auto so
     /// existing expression curves keep their backwards-compatible playback.
     pub mpe: MpeTrackConfiguration,
+    /// v56: bank/program selection (GM/GS/XG). Older projects choose none.
+    pub program: sphere_midi_service::program::MidiProgramSelection,
     pub sends: Vec<ProjectSend>,
 }
 
@@ -416,6 +419,7 @@ impl Default for TrackRouting {
             midi_channel: None,
             midi_output_per_note: false,
             mpe: MpeTrackConfiguration::default(),
+            program: Default::default(),
             sends: Vec::new(),
         }
     }
@@ -940,6 +944,11 @@ pub struct FutureboardProject {
     /// tree latch. Zoom, scroll and the playhead are per user and live in a
     /// [`view::ViewSidecar`] instead.
     pub view: view::ProjectViewState,
+    /// Runtime only, never written: set when this project was read from a
+    /// file an older version saved, with where the original was kept and
+    /// what changed. The session shows it and stays unsaved until the user
+    /// saves the upgrade. `None` for a current file and every built project.
+    pub migration: Option<migrate::ProjectMigration>,
 }
 
 /// One ARA plug-in's saved document state, for one track.
@@ -1063,6 +1072,7 @@ impl FutureboardProject {
     pub fn new(name: impl Into<String>) -> Self {
         let now = now_secs();
         Self {
+            migration: None,
             audio_connections: Vec::new(),
             master_output_connection_id: None,
             monitor_output_connection_id: None,
@@ -1463,6 +1473,7 @@ impl From<&TimelineState> for FutureboardProject {
                         midi_channel: t.routing.midi_channel.map(|ch| ch.clamp(1, 16)),
                         midi_output_per_note: t.routing.midi_output_per_note,
                         mpe: t.routing.mpe.sanitized(),
+                        program: t.routing.program.sanitized(),
                         sends: t
                             .sends
                             .iter()
@@ -2793,6 +2804,7 @@ fn project_routing_to_timeline(
     state.midi_channel = routing.midi_channel.map(|ch| ch.clamp(1, 16));
     state.midi_output_per_note = routing.midi_output_per_note;
     state.mpe = routing.mpe.sanitized();
+    state.program = routing.program.sanitized();
     state
 }
 
@@ -3171,10 +3183,10 @@ mod v33_routing_adapter_tests {
 
     #[test]
     fn the_encoder_writes_the_current_format_version() {
-        let bytes = crate::project::format::encode_project(&FutureboardProject::new("v46"));
+        let bytes = crate::project::format::encode_project(&FutureboardProject::new("current"));
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        assert_eq!(version, 46);
-        assert_eq!(crate::project::format::PROJECT_VERSION, 46);
+        assert_eq!(version, crate::project::format::PROJECT_VERSION);
+        assert_eq!(crate::project::format::PROJECT_VERSION, 56);
     }
 
     // ── v35 Master / Monitor output routing ─────────────────────────────────
@@ -3800,6 +3812,30 @@ mod project_settings_persistence_tests {
     }
 
     #[test]
+    fn program_selection_survives_save_decode_and_timeline_restore() {
+        use sphere_midi_service::program::{MidiPatchFormat, MidiProgramSelection};
+        let mut timeline = TimelineState::default();
+        let track_id = timeline.create_midi_track();
+        let expected = MidiProgramSelection {
+            format: MidiPatchFormat::Xg,
+            program: Some(24),
+            bank_msb: 127,
+            bank_lsb: 0,
+        };
+        assert!(timeline.set_track_program_selection(&track_id, expected));
+
+        let encoded = crate::project::format::encode_project(&FutureboardProject::from(&timeline));
+        let decoded = crate::project::format::decode_project(&encoded).expect("decode project");
+        assert_eq!(decoded.tracks[0].routing.program, expected);
+
+        let restored = project_routing_to_timeline(
+            &decoded.tracks[0].routing,
+            crate::components::timeline::timeline_state::TrackType::Midi,
+        );
+        assert_eq!(restored.program, expected);
+    }
+
+    #[test]
     fn a_project_without_a_stored_timebase_opens_in_bars_and_beats() {
         use crate::components::timeline::timeline_state::{TimeDisplayFormat, TimecodeRate};
 
@@ -4167,13 +4203,17 @@ mod group_track_persistence_tests {
             .routing
             .output = TrackOutputRouting::Main;
 
-        let mut bytes = encode_project(&FutureboardProject::from(&state));
+        let bytes = encode_project(&FutureboardProject::from(&state));
         let current = decode_project(&bytes).expect("decode");
         assert_eq!(
             current.tracks[1].routing.output,
             ProjectTrackOutputRouting::Main
         );
 
+        // v55 wrote the v54 layout (it only changed how routing is read), so
+        // a v55 file labelled v54 is the file a v54 build wrote.
+        let mut bytes =
+            crate::project::format::encode_project_as(&FutureboardProject::from(&state), 55);
         bytes[8..12].copy_from_slice(&54u32.to_le_bytes());
         let legacy =
             crate::project::format::decode_project_with_options(&bytes, true).expect("decode v54");

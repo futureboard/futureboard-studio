@@ -15,15 +15,26 @@
 //! handshake while the realtime callback remains wait-free.
 
 mod exporter;
+mod level_meter;
 mod offline_renderer;
 mod render_progress;
 mod render_request;
 
 pub use exporter::{
-    export_arrangement, export_arrangement_with_bridges, export_tracks_single_pass,
-    export_tracks_single_pass_with_bridges, partial_path_for, ArrangementExportRequest,
-    ArrangementExportSummary, TrackExportTarget,
+    export_arrangement, export_arrangement_with_bridges, export_render_job,
+    export_render_job_with_bridges, export_tracks_single_pass,
+    export_tracks_single_pass_with_bridges, partial_path_for, record_render_job,
+    ArrangementExportRequest, ArrangementExportSummary, RenderJob, TrackExportTarget,
 };
+pub use level_meter::{LevelMeter, LevelReport};
+
+/// See [`crate::engine::EngineInner::render_latency_frames`].
+pub(crate) fn live_render_latency_frames(
+    latency_graph: &crate::latency_graph::RuntimeLatencyGraph,
+    pdc_enabled: bool,
+) -> u64 {
+    offline_renderer::export_warmup_frames(latency_graph, pdc_enabled)
+}
 pub use offline_renderer::{
     render_offline, render_offline_tracks, render_offline_tracks_with_bridges,
     render_offline_with_bridges, OfflineRenderSummary,

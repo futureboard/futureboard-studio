@@ -54,6 +54,10 @@ pub const CONTROLLER_PITCH_BEND: u8 = 129;
 /// Controller number the engine uses for channel pressure (VST3 `kAfterTouch`).
 pub const CONTROLLER_CHANNEL_PRESSURE: u8 = 128;
 
+/// Controller number the engine uses for a program change (VST3
+/// `kCtrlProgramChange`), with the program as the value.
+pub const CONTROLLER_PROGRAM_CHANGE: u8 = 130;
+
 #[derive(Debug)]
 pub enum SoundfontPlayerError {
     InvalidSampleRate(i32),
@@ -741,6 +745,18 @@ impl SoundfontPlayer {
             // rustysynth has no channel-pressure handling; dropping it is
             // honest, and clamping it into CC 127 would be a wrong sound.
             CONTROLLER_CHANNEL_PRESSURE => Ok(()),
+            // A track's program selection: the patch of the bank last
+            // selected on this channel (CC 0 / CC 32 arrive just before it).
+            CONTROLLER_PROGRAM_CHANGE => {
+                let channel = self.routed_channel(channel);
+                self.synthesizer.process_midi_message(
+                    channel.into(),
+                    0xC0,
+                    value.min(127).into(),
+                    0,
+                );
+                Ok(())
+            }
             _ => {
                 let controller = controller.min(127);
                 let value = value.min(127);

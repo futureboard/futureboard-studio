@@ -660,6 +660,7 @@ pub fn drain_commands(
                 // every insert used to happen right here, on the audio thread,
                 // in the same callback as Play.
                 runtime.bridge_editor_active = old.bridge_editor_active.clone();
+                runtime.inherit_midi_programs_sent(&old);
                 // The panic the all_notes_off above pushed into the (preserved)
                 // sinks still needs flushing through the new graph.
                 // Keep the live master-fader ramp continuous across media/control
@@ -1023,6 +1024,11 @@ pub fn drain_commands(
             EngineCommand::SetJamMultitrackPairs { pairs } => {
                 runtime.apply_jam_multitrack_pairs(&pairs);
             }
+            EngineCommand::SetRenderCapture(capture) => {
+                // Only a reference is dropped here: the control thread holds
+                // its own until this command has been drained.
+                runtime.render_capture = capture;
+            }
             EngineCommand::SetTrackPreviewMode { track_id, value } => {
                 runtime.update_track_preview_mode(&track_id, RuntimePreviewMode::from_code(value));
             }
@@ -1338,6 +1344,8 @@ fn fill_output_f32_inner(
 
     let mut frames = 0u64;
     runtime.begin_meter_block();
+    // Bank/program selections not yet sent, playing or not.
+    runtime.flush_midi_programs();
 
     let mut end_loop_midi_reset = None;
     if transport_playing {
@@ -1415,7 +1423,13 @@ fn fill_output_f32_inner(
             } else {
                 None
             };
-            render_project_block_interleaved_with_inputs(
+            // A realtime render records this block while the transport plays:
+            // the tracks are staged inside the kernel, the master right after.
+            let capture_open = transport_playing
+                && runtime.render_capture.as_deref().is_some_and(|capture| {
+                    capture.begin_block(base_sample, frames_in_block as usize)
+                });
+            let rendered = render_project_block_interleaved_with_inputs(
                 runtime,
                 base_sample,
                 master_vol,
@@ -1427,7 +1441,17 @@ fn fill_output_f32_inner(
                 loop_bounds,
                 live_input,
                 Some(&shared.jam_bus),
-            )
+            );
+            // The graph's master after the master fader: what an offline
+            // mixdown writes. Click, test tone, audition and Control Room are
+            // added below and stay out of it.
+            if capture_open {
+                if let Some(capture) = runtime.render_capture.as_deref() {
+                    capture.stage_master_interleaved(data, channels, rendered as usize);
+                    capture.commit_block();
+                }
+            }
+            rendered
         };
         if !local.render_path_logged {
             local.render_path_logged = true;
@@ -1651,7 +1675,7 @@ fn fill_output_f32_inner(
             .position_samples
             .store(next_position, Ordering::Relaxed);
         if let Some(reset_sample) = end_loop_midi_reset {
-            runtime.reset_midi_playback(reset_sample);
+            runtime.loop_wrap_midi_playback(reset_sample, 0);
             local.reset_metronome_schedule(reset_sample, runtime.sample_rate);
         }
     }

@@ -239,6 +239,18 @@ impl ArticulationLegatoIndex {
         let idx = list.partition_point(|(s, _)| *s <= start + EPS);
         list.get(idx).copied()
     }
+
+    /// Whether any note on `channel` starting at `start` (a whole chord, not
+    /// only the one note [`Self::next_note_after`] returns) has `pitch`.
+    fn starts_with_pitch(&self, channel: u8, start: f32, pitch: u8) -> bool {
+        const EPS: f32 = 1.0e-4;
+        let list = &self.by_channel[channel.min(15) as usize];
+        let from = list.partition_point(|(s, _)| *s < start - EPS);
+        list[from..]
+            .iter()
+            .take_while(|(s, _)| *s <= start + EPS)
+            .any(|(_, p)| *p == pitch)
+    }
 }
 
 /// Resolve and apply a note's articulation for scheduling: per-note wins,
@@ -266,8 +278,11 @@ pub(crate) fn articulated_note_playback(
         articulation,
         next.map(|(start, _)| start),
     );
-    if let Some((next_start, next_pitch)) = next {
-        if next_pitch == note.pitch.min(127) {
+    if let Some((next_start, _)) = next {
+        // Any note of the next chord on this pitch, not just the first one
+        // found: a 7th or add9 voicing shares tones with the chord after it,
+        // and a legato tail crossing that tone's NoteOn cut it off.
+        if legato_index.starts_with_pitch(channel, next_start, note.pitch.min(127)) {
             // Same-pitch neighbor: never let the gate cross its NoteOn.
             let to_next = (next_start - note.start.max(0.0)).max(timeline_state::MIN_NOTE_BEATS);
             length = length.min(to_next);
@@ -905,6 +920,7 @@ fn build_engine_project_snapshot_inner(
         .tracks
         .iter()
         .map(|track| EngineTrackSnapshot {
+            midi_programs: Vec::new(),
             id: track.id.clone(),
             track_type: track_type_name(track.track_type).to_string(),
             // The value under the user's finger, not the one they moved away
@@ -963,6 +979,8 @@ fn build_engine_project_snapshot_inner(
         })
         .collect();
 
+    attach_midi_programs(state, &mut tracks);
+
     let master_inserts = build_engine_inserts_for(
         MASTER_TRACK_ID,
         TrackType::Master,
@@ -973,6 +991,7 @@ fn build_engine_project_snapshot_inner(
     log_track_insert_chain(MASTER_TRACK_ID, &master_inserts);
 
     tracks.push(EngineTrackSnapshot {
+        midi_programs: Vec::new(),
         id: "master".to_string(),
         track_type: "master".to_string(),
         volume: volume_norm_to_linear(state.display_master_volume()),
@@ -1324,6 +1343,41 @@ pub(super) fn log_engine_sync_snapshot(
             clip.start_beat,
             clip.duration_beats
         );
+    }
+}
+
+/// Hands each track's bank/program selection to the track whose instrument
+/// plays it: an Instrument track its own, a MIDI track routed to an
+/// Instrument track that track's, on the MIDI track's channel — so several
+/// MIDI tracks can set up the parts of one multitimbral instrument. A MIDI
+/// track sent to an external device has no instrument here; its selection
+/// goes out with its hardware MIDI instead.
+fn attach_midi_programs(state: &TimelineState, tracks: &mut [EngineTrackSnapshot]) {
+    for track in &state.tracks {
+        let selection = track.routing.program.sanitized();
+        let Some(program) = selection.program else {
+            continue;
+        };
+        let target = state
+            .effective_instrument_track_id(&track.id)
+            .unwrap_or_else(|| track.id.clone());
+        let Some(snapshot) = tracks.iter_mut().find(|t| t.id == target) else {
+            continue;
+        };
+        let channel = track.routing.midi_channel.unwrap_or(1).clamp(1, 16) - 1;
+        let bank = selection.bank();
+        let entry = DirectAudio::types::EngineMidiProgram {
+            channel,
+            bank_msb: bank.map(|(msb, _)| msb),
+            bank_lsb: bank.map(|(_, lsb)| lsb),
+            program,
+        };
+        // One selection per channel: the last track to claim it wins, the
+        // way the channel itself would end up.
+        snapshot
+            .midi_programs
+            .retain(|existing| existing.channel != channel);
+        snapshot.midi_programs.push(entry);
     }
 }
 

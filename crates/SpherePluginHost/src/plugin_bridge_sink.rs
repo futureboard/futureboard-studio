@@ -52,6 +52,12 @@ pub struct SharedRegionSink {
     /// replaying the stale `audio_out` contents every callback.
     last_read_seq: AtomicU64,
     output_channel_peaks: [AtomicU32; MAX_CHANNELS],
+    /// Cleared by the studio when the host process serving this region has
+    /// gone away. Its `done_seq` will never move again, so waiting for it is
+    /// pure loss: with several of its inserts in the graph, every callback
+    /// spent its whole period spinning and the entire mix broke up. `None`
+    /// (tests, older callers) always waits.
+    host_alive: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Share of one block period the sink may spend waiting for a block the host
@@ -112,6 +118,7 @@ impl SharedRegionSink {
             kick,
             last_read_seq: AtomicU64::new(0),
             output_channel_peaks: std::array::from_fn(|_| AtomicU32::new(0)),
+            host_alive: None,
         }
     }
 
@@ -123,6 +130,18 @@ impl SharedRegionSink {
         Arc::new(Self::with_kick(region, kick))
     }
 
+    /// [`Self::into_shared`] for a sink that stops waiting on its host once
+    /// `host_alive` is cleared.
+    pub fn into_shared_with_liveness(
+        region: Arc<SharedAudioRegion>,
+        kick: Option<Arc<BridgeKickEvent>>,
+        host_alive: Arc<std::sync::atomic::AtomicBool>,
+    ) -> SharedPluginBridgeSink {
+        let mut sink = Self::with_kick(region, kick);
+        sink.host_alive = Some(host_alive);
+        Arc::new(sink)
+    }
+
     #[inline]
     fn fresh_done_seq(&self) -> Option<u64> {
         let bridge = self.region.bridge();
@@ -131,7 +150,11 @@ impl SharedRegionSink {
 
         // Request 0 means no host block has ever been kicked (startup), so
         // there is nothing useful to wait for yet.
-        if done == last && bridge.request_seq.load(Ordering::Acquire) != 0 {
+        let host_alive = self
+            .host_alive
+            .as_ref()
+            .is_none_or(|alive| alive.load(Ordering::Relaxed));
+        if host_alive && done == last && bridge.request_seq.load(Ordering::Acquire) != 0 {
             let grace = output_handoff_grace(
                 bridge.block_frames.load(Ordering::Relaxed),
                 bridge.sample_rate.load(Ordering::Relaxed),

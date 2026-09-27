@@ -1636,6 +1636,7 @@ fn render_project_block_interleaved_core(
         // an export would capture. Atomics into a preallocated ring, and one
         // `Option` check for every track that is not being shared.
         publish_track_to_jam(runtime, track_index, frames, jam);
+        stage_track_to_render_capture(runtime, track_index, frames);
         // Track loopback tap: the same post-fader signal, kept for whichever
         // audio track reads this one as its input on the next callback. One
         // `bool` check for every track nobody is listening to, which is almost
@@ -1694,6 +1695,7 @@ fn render_project_block_interleaved_core(
         // an export would capture. Atomics into a preallocated ring, and one
         // `Option` check for every track that is not being shared.
         publish_track_to_jam(runtime, track_index, frames, jam);
+        stage_track_to_render_capture(runtime, track_index, frames);
         if is_vsti_output_child_track_id(&runtime.tracks[track_index].id)
             && (runtime.tracks[track_index]
                 .meter_peak_l
@@ -1834,11 +1836,21 @@ pub fn schedule_midi_render_block(
             crate::transport::advance_loop_position(segment_sample, segment_frames, loop_bounds);
         if wrapped {
             if remaining > 0 {
-                runtime.reset_midi_playback_with_offset(
+                runtime.loop_wrap_midi_playback(
                     next_sample,
                     callback_offset.min(u32::MAX as u64) as u32,
                 );
             } else {
+                // The wrap falls on this block's end. Its note-offs go into
+                // *this* block, on its last sample: released after rendering,
+                // they sat in a list the next callback clears before anything
+                // reads it, so an in-process instrument never heard them and
+                // every pass left its notes stuck, piling voices up until the
+                // next chord could not sound in full.
+                runtime.loop_wrap_midi_playback(
+                    next_sample,
+                    callback_offset.saturating_sub(1).min(u32::MAX as u64) as u32,
+                );
                 end_reset = Some(next_sample);
             }
         }
@@ -3162,6 +3174,17 @@ pub fn apply_insert_block(
     }
 }
 
+/// Stage one track's post-fader block for a realtime render, the same signal
+/// an offline stem takes. One `Option` check when nothing is being rendered.
+#[inline]
+fn stage_track_to_render_capture(runtime: &RuntimeProject, track_index: usize, frames: usize) {
+    let Some(capture) = runtime.render_capture.as_deref() else {
+        return;
+    };
+    let track = &runtime.tracks[track_index];
+    capture.stage_track(track_index, &track.block_l, &track.block_r, frames);
+}
+
 /// Feed one track's post-fader block to its Audio Jam publish slot.
 ///
 /// Realtime-safe by construction: no allocation, no lock, no key lookup — the
@@ -3280,6 +3303,7 @@ mod jam_input_tests {
         input: EngineTrackInputSourceSnapshot,
     ) -> EngineTrackSnapshot {
         EngineTrackSnapshot {
+            midi_programs: Vec::new(),
             id: id.to_string(),
             track_type: track_type.to_string(),
             volume: 1.0,
@@ -3713,6 +3737,7 @@ mod live_input_monitor_tests {
 
     fn track(id: &str, track_type: &str) -> EngineTrackSnapshot {
         EngineTrackSnapshot {
+            midi_programs: Vec::new(),
             id: id.to_string(),
             track_type: track_type.to_string(),
             volume: 1.0,
@@ -3958,6 +3983,7 @@ mod soundfont_instrument_tests {
 
     fn soundfont_track(id: &str, font: &FontFile, preset: (i32, i32)) -> EngineTrackSnapshot {
         EngineTrackSnapshot {
+            midi_programs: Vec::new(),
             id: id.to_string(),
             track_type: "instrument".to_string(),
             volume: 1.0,
@@ -3987,6 +4013,7 @@ mod soundfont_instrument_tests {
 
     fn master_track() -> EngineTrackSnapshot {
         EngineTrackSnapshot {
+            midi_programs: Vec::new(),
             id: "master".to_string(),
             track_type: "master".to_string(),
             volume: 1.0,
@@ -4767,6 +4794,7 @@ mod warp_stretch_render_tests {
 
     fn track(id: &str, track_type: &str) -> EngineTrackSnapshot {
         EngineTrackSnapshot {
+            midi_programs: Vec::new(),
             id: id.to_string(),
             track_type: track_type.to_string(),
             volume: 1.0,

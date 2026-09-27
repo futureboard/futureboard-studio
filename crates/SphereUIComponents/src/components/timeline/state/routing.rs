@@ -1,6 +1,7 @@
 use super::*;
 use crate::audio_connections::{AudioConnectionId, AudioConnectionReference};
 use sphere_midi_service::mpe::MpeTrackConfiguration;
+use sphere_midi_service::program::MidiProgramSelection;
 
 pub use crate::project::InputMonitorMode;
 
@@ -146,6 +147,10 @@ pub struct TrackRoutingState {
     /// Per-track MPE output policy. Community builds retain and play this
     /// state, while the Professional UI exposes its editing controls.
     pub mpe: MpeTrackConfiguration,
+    /// The bank and program this track sets its instrument (or MIDI output
+    /// device) to, on its MIDI channel, in the GM/GS/XG layout it names. No
+    /// program sends nothing.
+    pub program: MidiProgramSelection,
 }
 
 impl TrackRoutingState {
@@ -179,6 +184,7 @@ impl TrackRoutingState {
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
                 mpe: MpeTrackConfiguration::default(),
+                program: MidiProgramSelection::default(),
             },
             TrackType::Instrument => Self {
                 audio_input_connection_id: None,
@@ -189,6 +195,7 @@ impl TrackRoutingState {
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
                 mpe: MpeTrackConfiguration::default(),
+                program: MidiProgramSelection::default(),
             },
             TrackType::Midi => Self {
                 audio_input_connection_id: None,
@@ -199,6 +206,7 @@ impl TrackRoutingState {
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
                 mpe: MpeTrackConfiguration::default(),
+                program: MidiProgramSelection::default(),
             },
             TrackType::Bus | TrackType::Return | TrackType::Group => Self {
                 audio_input_connection_id: None,
@@ -209,6 +217,7 @@ impl TrackRoutingState {
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
                 mpe: MpeTrackConfiguration::default(),
+                program: MidiProgramSelection::default(),
             },
             TrackType::Master => Self {
                 audio_input_connection_id: None,
@@ -219,6 +228,7 @@ impl TrackRoutingState {
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
                 mpe: MpeTrackConfiguration::default(),
+                program: MidiProgramSelection::default(),
             },
             // A Video track is picture-only: no input, no output, no MIDI.
             TrackType::Video => Self {
@@ -230,6 +240,7 @@ impl TrackRoutingState {
                 midi_input_filter: MidiInputChannelFilter::All,
                 midi_output_per_note: false,
                 mpe: MpeTrackConfiguration::default(),
+                program: MidiProgramSelection::default(),
             },
         }
     }
@@ -514,6 +525,29 @@ impl TimelineState {
                     );
                 }
                 t.routing.mpe = configuration;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Set the track's bank/program selection as one mutation, so format,
+    /// bank and program change together for undo, save and the engine.
+    pub fn set_track_program_selection(
+        &mut self,
+        track_id: &str,
+        selection: MidiProgramSelection,
+    ) -> bool {
+        let selection = selection.sanitized();
+        if let Some(t) = self.tracks.iter_mut().find(|t| t.id == track_id) {
+            if t.routing.program != selection {
+                if routing_debug_enabled() {
+                    eprintln!(
+                        "[routing] program track={} old={:?} new={:?}",
+                        track_id, t.routing.program, selection
+                    );
+                }
+                t.routing.program = selection;
                 return true;
             }
         }

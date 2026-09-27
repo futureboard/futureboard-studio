@@ -215,6 +215,34 @@ pub fn render_offline_tracks_with_bridges(
     )
 }
 
+/// Render the master and, when `capture_tracks`, every mixer-channel tap in
+/// one graph pass — the mixdown and the stems of one job from the same
+/// render. `gain` applies to the master only.
+#[allow(clippy::too_many_arguments)]
+pub fn render_offline_mix_and_tracks_with_bridges(
+    snapshot: &EngineProjectSnapshot,
+    request: &OfflineRenderRequest,
+    cancel: &ExportCancelToken,
+    gain: f32,
+    bridge_sinks: Option<&PluginBridgeSinkMap>,
+    capture_tracks: bool,
+    on_block: &mut dyn FnMut(&[f32]) -> Result<(), ExportError>,
+    on_track_block: TrackBlockCallback,
+    on_progress: &mut dyn FnMut(ExportProgress),
+) -> Result<OfflineRenderSummary, ExportError> {
+    render_offline_impl(
+        snapshot,
+        request,
+        cancel,
+        gain,
+        bridge_sinks,
+        capture_tracks,
+        on_block,
+        on_track_block,
+        on_progress,
+    )
+}
+
 // Shared implementation behind the four public render entry points; the
 // parameter set IS the render contract (source, range, bridge handles, and the
 // master/tap/progress callbacks), so grouping them into a struct would only
@@ -627,6 +655,7 @@ fn restore_offline_plugin_states(snapshot: &EngineProjectSnapshot, runtime: &mut
 #[cfg(test)]
 pub(crate) fn make_track_snapshot(id: &str) -> crate::types::EngineTrackSnapshot {
     crate::types::EngineTrackSnapshot {
+        midi_programs: Vec::new(),
         id: id.to_string(),
         track_type: "audio".to_string(),
         volume: 1.0,

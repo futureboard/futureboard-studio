@@ -256,6 +256,10 @@ fn marker_at_beat<'a>(
 
 fn clip_at_beat<'a>(track: &'a TrackState, beat: f64) -> Option<&'a ClipState> {
     track.clips.iter().rev().find(|clip| {
+        // Not drawn in the lane, so not under the pointer there either.
+        if track.is_hidden_take_clip(&clip.id) {
+            return false;
+        }
         let start = clip.start_beat as f64;
         let end = start + clip.duration_beats.max(0.0) as f64;
         beat >= start && beat <= end

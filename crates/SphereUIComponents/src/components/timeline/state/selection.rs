@@ -274,6 +274,10 @@ impl TimelineState {
                 continue;
             }
             for clip in &track.clips {
+                // An alternate take is not drawn in this band.
+                if track.is_hidden_take_clip(&clip.id) {
+                    continue;
+                }
                 // A clip drawn from at or past the rectangle's right edge is
                 // not touched however long it is, so its end (through the
                 // tempo map, for audio) is never measured. This is the left
@@ -319,7 +323,9 @@ impl TimelineState {
                     .iter()
                     .filter(|clip| {
                         let (left, width) = self.clip_lane_x_span(clip);
-                        lane_x >= left && lane_x <= left + width
+                        !track.is_hidden_take_clip(&clip.id)
+                            && lane_x >= left
+                            && lane_x <= left + width
                     })
                     .map(|clip| clip.id.clone())
                     .collect()

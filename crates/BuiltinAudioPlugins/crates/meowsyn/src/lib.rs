@@ -125,6 +125,9 @@ struct Voice {
     velocity: f32,
     stage: Stage,
     env: f32,
+    /// When the voice's note started, in note-ons: the oldest is stolen last
+    /// resort, never one a note of the same chord just started.
+    age: u64,
     unit: Box<dyn AudioUnit>,
 }
 
@@ -138,6 +141,7 @@ impl Voice {
             velocity: 0.0,
             stage: Stage::Idle,
             env: 0.0,
+            age: 0,
             unit,
         }
     }
@@ -165,6 +169,8 @@ pub struct Dsp {
     sample_rate: f32,
     params: Params,
     voices: [Voice; MAX_VOICES],
+    /// Note-ons so far, stamped on each voice as its age.
+    age: u64,
     lp_z_l: f32,
     lp_z_r: f32,
     lp_coeff: f32,
@@ -195,6 +201,7 @@ impl Dsp {
             sample_rate: sr,
             params: default_params(),
             voices,
+            age: 0,
             lp_z_l: 0.0,
             lp_z_r: 0.0,
             lp_coeff: 0.0,
@@ -248,14 +255,25 @@ impl Dsp {
         if let Some((idx, _)) = self.voices.iter().enumerate().find(|(_, v)| !v.active) {
             return idx;
         }
-        self.voices
+        // The quietest releasing voice, then the oldest held one. The quietest
+        // voice outright is the one a note of the same chord just started.
+        if let Some((idx, _)) = self
+            .voices
             .iter()
             .enumerate()
+            .filter(|(_, v)| v.stage == Stage::Release)
             .min_by(|(_, a), (_, b)| {
                 a.env
                     .partial_cmp(&b.env)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+        {
+            return idx;
+        }
+        self.voices
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, v)| v.age)
             .map(|(i, _)| i)
             .unwrap_or(0)
     }
@@ -338,12 +356,15 @@ impl Instrument for Dsp {
             self.params.detune_cents,
             self.sample_rate,
         );
+        self.age = self.age.wrapping_add(1);
+        let age = self.age;
         let voice = &mut self.voices[idx];
         voice.active = true;
         voice.note = note;
         voice.velocity = f32::from(velocity) / 127.0;
         voice.stage = Stage::Attack;
         voice.env = 0.0;
+        voice.age = age;
         voice.unit = unit;
     }
 

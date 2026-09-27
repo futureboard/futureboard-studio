@@ -2641,9 +2641,12 @@ impl Render for Timeline {
             .flex_1()
             .h_full()
             .bg(Colors::surface_base())
-            .border_l(px(1.0))
-            .border_r(px(1.0))
-            .border_color(Colors::border_subtle())
+            // No side borders of its own: each seam belongs to the panel
+            // beside it (the browser's right edge, the dock's left edge, the
+            // bottom panel's top edge), so every seam is one 1px line. Its own
+            // borders doubled the side seams to 2px against the bottom seam's
+            // 1px, drew a line against the window edge with a panel closed,
+            // and took 2px the viewport width never accounted for.
             .relative()
             // Every press starts a new gesture; a cancelled clip drag's
             // refusal ends here, before any clip sees the press.
@@ -3120,11 +3123,10 @@ pub(crate) fn vertical_scrollbar(
         // y minus the thumb half-height when clicking above the thumb,
         // and snap the thumb center to the click otherwise.
         let click_y: f32 = event.position.y.into();
-        // The scrollbar sits at top=RULER_HEIGHT inside the timeline.
-        // Re-derive the local y by subtracting an estimated chrome
-        // height; clamp with `max_scroll` so any over/under-estimate
-        // still yields a valid scroll position.
-        let local = (click_y - 36.0 - content_top).max(0.0);
+        // The track starts `content_top` below the timeline's own top, which
+        // is where the measured origin puts it in the window. (A fixed 36px
+        // guess here missed the chrome's real height by 40px.)
+        let local = (click_y - this.state.timeline_origin_y() - content_top).max(0.0);
         let frac = (local / track_h.max(1.0)).clamp(0.0, 1.0);
         this.state.set_scroll_immediate(
             this.state.viewport.scroll_x,

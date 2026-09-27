@@ -14,6 +14,7 @@ pub mod chords;
 pub mod expression;
 pub mod mpe;
 pub mod performance;
+pub mod program;
 pub mod sysex;
 
 pub use expression::{
@@ -1287,6 +1288,21 @@ fn open_midi_output(device_id_or_name: &str) -> Option<MidiOutputConnection> {
     }
 }
 
+/// Sends `messages` to one output port straight away, outside any playback:
+/// opens the port, writes them in order, closes it. For a setting changed
+/// while the transport is stopped, such as a track's program. Blocking —
+/// call it off the UI thread. `false` when the port cannot be opened: it is
+/// missing, or a running playback holds it.
+pub fn send_midi_output_now(device_id_or_name: &str, messages: &[Vec<u8>]) -> bool {
+    let Some(mut connection) = open_midi_output(device_id_or_name) else {
+        return false;
+    };
+    for message in messages {
+        let _ = connection.send(message);
+    }
+    true
+}
+
 fn send_all_notes_off(connections: &mut HashMap<String, MidiOutputConnection>) {
     for conn in connections.values_mut() {
         for channel in 0..16u8 {
@@ -1343,8 +1359,12 @@ fn midi_order_key(event: &HardwareMidiEvent) -> (u8, u8, u8, u8) {
         0x90 if data2 == 0 => 1,
         0xb0 if data1 == 64 && data2 == 0 => 2,
         0xb0 if data1 == 120 || data1 == 123 => 2,
-        0xc0 => 3,
-        0xb0 if data1 == 0 || data1 == 32 => 4,
+        // Bank select before the program change it qualifies: a device
+        // applies the bank it holds when the program change arrives, so the
+        // other order selects the program in the previous bank. Within the
+        // group the key's data byte keeps CC 0 ahead of CC 32.
+        0xb0 if data1 == 0 || data1 == 32 => 3,
+        0xc0 => 4,
         0xb0 => 5,
         0xe0 => 6,
         0xa0 | 0xd0 => 7,

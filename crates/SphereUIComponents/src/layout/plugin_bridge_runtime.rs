@@ -28,7 +28,9 @@ pub(crate) struct BridgeLoadedPlugin {
     confirmed: bool,
 }
 
-pub(crate) struct PluginBridgeRuntime {
+/// One plug-in host process and what it holds. The studio talks to hosts
+/// only through the pool ([`PluginBridgeRuntime`]).
+pub(crate) struct BridgeHost {
     client: PluginHostClient,
     host_pid: Option<u32>,
     loaded: HashMap<String, BridgeLoadedPlugin>,
@@ -48,6 +50,11 @@ pub(crate) struct PluginBridgeRuntime {
     /// region per wake). `None` when creation failed; the host then falls
     /// back to its poll loop.
     kick: Option<Arc<SpherePluginHost::audio_bridge::BridgeKickEvent>>,
+    /// The process went away (its pipe closed). The pool takes it out.
+    dead: bool,
+    /// Shared with every realtime sink of this host's regions, cleared when
+    /// it dies so they stop waiting on a producer that is gone.
+    host_alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) type SharedPluginBridgeRuntime = Arc<Mutex<PluginBridgeRuntime>>;
@@ -72,18 +79,65 @@ pub(super) fn legacy_in_process_enabled() -> bool {
     SpherePluginHost::plugin_host_client::legacy_in_process_enabled()
 }
 
-/// Named shared-memory region for one insert instance.
+/// Named shared-memory region for one insert instance. Unique per creation:
+/// an instance reloaded into a fresh host after a crash needs a new region
+/// while the engine may still hold the old one, and a name that is already
+/// open cannot be created again.
 pub(crate) fn bridge_region_name(instance_id: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!(
-        "Local\\FutureboardAudioBridge-{}__{}",
+        "Local\\FutureboardAudioBridge-{}__{}__g{}",
         std::process::id(),
-        instance_id
+        instance_id,
+        generation
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bridge_region_name, normalize_persisted_au_state};
+    use super::{
+        bridge_region_name, normalize_persisted_au_state, BridgePluginDescriptor, HostIsolation,
+    };
+
+    fn descriptor(insert: &str, path: &str) -> BridgePluginDescriptor {
+        BridgePluginDescriptor {
+            track_id: "track-1".to_string(),
+            insert_id: insert.to_string(),
+            plugin_path: path.to_string(),
+            class_id: "class".to_string(),
+            display_name: "Plug".to_string(),
+            format: None,
+        }
+    }
+
+    /// Per module: two instances of one plug-in share a host, another plug-in
+    /// gets its own, and the built-ins share theirs — so a crash reaches only
+    /// the plug-in that crashed.
+    #[test]
+    fn instances_are_grouped_into_hosts_by_isolation() {
+        let kontakt_a = descriptor("insert-1", "C:/VST3/Kontakt 7.vst3");
+        let kontakt_b = descriptor("insert-2", "C:/vst3/kontakt 7.VST3");
+        let serum = descriptor("insert-3", "C:/VST3/Serum.vst3");
+        let module = HostIsolation::Module;
+        assert_eq!(
+            module.key_for(&kontakt_a, false),
+            module.key_for(&kontakt_b, false)
+        );
+        assert_ne!(
+            module.key_for(&kontakt_a, false),
+            module.key_for(&serum, false)
+        );
+        assert_eq!(module.key_for(&serum, true), "builtin");
+        assert_eq!(
+            HostIsolation::Shared.key_for(&serum, false),
+            HostIsolation::Shared.key_for(&kontakt_a, true)
+        );
+        assert_ne!(
+            HostIsolation::Instance.key_for(&kontakt_a, false),
+            HostIsolation::Instance.key_for(&kontakt_b, false)
+        );
+    }
 
     #[test]
     fn bridge_region_names_are_unique_per_insert_instance() {
@@ -95,6 +149,9 @@ mod tests {
         );
         assert!(a.contains("insert-track1-1"));
         assert!(b.contains("insert-track1-2"));
+        // A reload after a host crash gets a fresh name, since the old region
+        // may still be open.
+        assert_ne!(a, bridge_region_name("insert-track1-1"));
     }
 
     #[test]
@@ -125,14 +182,9 @@ fn normalize_persisted_au_state(state: &[u8]) -> Vec<u8> {
         .unwrap_or_else(|| state.to_vec())
 }
 
-impl PluginBridgeRuntime {
-    pub fn ensure_shared(
-        slot: &mut Option<SharedPluginBridgeRuntime>,
-    ) -> Result<SharedPluginBridgeRuntime, PluginHostClientError> {
-        if let Some(existing) = slot.as_ref() {
-            return Ok(existing.clone());
-        }
-        eprintln!("[plugin-bridge] ensure_host running=false -> spawn");
+impl BridgeHost {
+    fn spawn(key: String) -> Result<Self, PluginHostClientError> {
+        eprintln!("[plugin-bridge] ensure_host key={key} -> spawn");
         let mut client = PluginHostClient::spawn_bridge()?;
         let host_pid = Some(client.pid());
         // The host emits Ready on startup; retain it for any caller that wants
@@ -157,7 +209,7 @@ impl PluginBridgeRuntime {
                 None
             }
         };
-        let runtime = Arc::new(Mutex::new(Self {
+        Ok(Self {
             client,
             host_pid,
             loaded: HashMap::new(),
@@ -165,9 +217,30 @@ impl PluginBridgeRuntime {
             audio_bridge_config: None,
             shared_audio: HashMap::new(),
             kick,
-        }));
-        *slot = Some(runtime.clone());
-        Ok(runtime)
+            dead: false,
+            host_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        })
+    }
+
+    /// Marks the process gone: sinks stop waiting on it.
+    fn abandon(&mut self) {
+        self.dead = true;
+        self.host_alive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn shutdown(&mut self, timeout: std::time::Duration) {
+        if let Some(pid) = self.host_pid {
+            BridgeHostManager::global().set_host_instances(pid, self.loaded_instance_ids());
+        }
+        self.host_alive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        plugin_host_lifecycle::shutdown_host_client_with_timeout(&mut self.client, timeout);
+        self.client.join_reader();
+        self.loaded.clear();
+        self.shared_audio.clear();
+        self.queued_events.clear();
+        self.host_pid = None;
     }
 
     pub fn host_pid(&self) -> Option<u32> {
@@ -191,9 +264,10 @@ impl PluginBridgeRuntime {
     ) -> Option<DirectAudio::plugin_bridge::SharedPluginBridgeSink> {
         let region = self.shared_audio.get(instance_id)?;
         Some(
-            SpherePluginHost::plugin_bridge_sink::SharedRegionSink::into_shared(
+            SpherePluginHost::plugin_bridge_sink::SharedRegionSink::into_shared_with_liveness(
                 region.clone(),
                 self.kick.clone(),
+                self.host_alive.clone(),
             ),
         )
     }
@@ -718,21 +792,13 @@ impl PluginBridgeRuntime {
         self.loaded.contains_key(plugin_instance_id)
     }
 
-    /// Capture current plugin states from the host for `instance_ids`
-    /// (request/response over IPC with a bounded wait — call on save, not per
-    /// frame). Unrelated events arriving while waiting are queued for the
-    /// normal `drain_events` pump. VST3 state is returned in the host's packed
-    /// component/controller form; Audio Unit ClassInfo remains opaque raw
-    /// bytes. Instances with no state are absent from `states`; instances that
-    /// had not answered when the wait ran out are listed in `unanswered`.
-    pub fn request_plugin_states(
+    /// Asks for the state of each of `instance_ids` this host holds; returns
+    /// the ones asked. Pair with [`Self::collect_state_replies`].
+    fn send_state_requests(
         &mut self,
         instance_ids: &[String],
-        timeout: std::time::Duration,
-    ) -> PluginStateCapture {
-        use base64::Engine as _;
-        let mut results = HashMap::new();
-        let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    ) -> std::collections::HashSet<String> {
+        let mut pending = std::collections::HashSet::new();
         for instance_id in instance_ids {
             if !self.loaded.contains_key(instance_id) {
                 continue;
@@ -746,7 +812,21 @@ impl PluginBridgeRuntime {
                 ),
             }
         }
-        let deadline = std::time::Instant::now() + timeout;
+        pending
+    }
+
+    /// Collects the answers to [`Self::send_state_requests`] until `deadline`
+    /// (request/response over IPC — call on save, not per frame). Unrelated
+    /// events arriving meanwhile are queued for the normal `drain_events`
+    /// pump. VST3 state comes back in the host's packed component/controller
+    /// form; Audio Unit ClassInfo stays opaque raw bytes.
+    fn collect_state_replies(
+        &mut self,
+        mut pending: std::collections::HashSet<String>,
+        deadline: std::time::Instant,
+        timeout: std::time::Duration,
+    ) -> PluginStateCapture {
+        let mut results = HashMap::new();
         while !pending.is_empty() && std::time::Instant::now() < deadline {
             let Some(event) = self.client.try_recv_event() else {
                 std::thread::sleep(std::time::Duration::from_millis(2));
@@ -766,38 +846,14 @@ impl PluginBridgeRuntime {
                         );
                         continue;
                     }
-                    let decode = |b64: &str| {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(b64)
-                            .unwrap_or_default()
-                    };
-                    let component = decode(&component_b64);
-                    let controller = decode(&controller_b64);
-                    let is_audio_unit = self
-                        .loaded
-                        .get(&plugin_instance_id)
-                        .is_some_and(|loaded| loaded.descriptor.class_id.starts_with("au:"));
-                    eprintln!(
-                        "[plugin-bridge] plugin state captured instance={plugin_instance_id} component_bytes={} controller_bytes={}",
-                        component.len(),
-                        controller.len()
-                    );
-                    if is_audio_unit {
-                        if !component.is_empty() {
-                            results.insert(plugin_instance_id, component);
-                        }
-                    } else {
-                        let state = DirectAudio::Vst3PluginState {
-                            component,
-                            controller,
-                        };
-                        if !state.is_empty() {
-                            results.insert(plugin_instance_id, state.to_packed_bytes());
-                        }
+                    if let Some(packed) =
+                        self.packed_state(&plugin_instance_id, &component_b64, &controller_b64)
+                    {
+                        results.insert(plugin_instance_id, packed);
                     }
                 }
                 ClientEvent::Disconnected => {
-                    self.queued_events.push_back(ClientEvent::Disconnected);
+                    self.abandon();
                     break;
                 }
                 other => self.queued_events.push_back(other),
@@ -817,6 +873,42 @@ impl PluginBridgeRuntime {
             states: results,
             unanswered,
         }
+    }
+
+    /// A `PluginState` reply in the form the insert stores: VST3's packed
+    /// component/controller envelope, or an Audio Unit's raw ClassInfo.
+    /// `None` for an empty state.
+    fn packed_state(
+        &self,
+        instance_id: &str,
+        component_b64: &str,
+        controller_b64: &str,
+    ) -> Option<Vec<u8>> {
+        use base64::Engine as _;
+        let decode = |b64: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap_or_default()
+        };
+        let component = decode(component_b64);
+        let controller = decode(controller_b64);
+        let is_audio_unit = self
+            .loaded
+            .get(instance_id)
+            .is_some_and(|loaded| loaded.descriptor.class_id.starts_with("au:"));
+        eprintln!(
+            "[plugin-bridge] plugin state captured instance={instance_id} component_bytes={} controller_bytes={}",
+            component.len(),
+            controller.len()
+        );
+        if is_audio_unit {
+            return (!component.is_empty()).then_some(component);
+        }
+        let state = DirectAudio::Vst3PluginState {
+            component,
+            controller,
+        };
+        (!state.is_empty()).then(|| state.to_packed_bytes())
     }
 
     /// Restore state (from the project file) onto a loaded instance. VST3 uses
@@ -882,6 +974,12 @@ impl PluginBridgeRuntime {
                 | ClientEvent::Host(HostEvent::Pong { pid }) => {
                     self.host_pid = Some(*pid);
                 }
+                // The pipe closed: the process is gone. Reported by the pool
+                // as a lost host, not passed on as an event.
+                ClientEvent::Disconnected => {
+                    self.abandon();
+                    continue;
+                }
                 _ => {}
             }
             self.queued_events.push_back(event);
@@ -940,9 +1038,614 @@ impl PluginBridgeRuntime {
             bridge.load_transport().tempo_bpm,
         ))
     }
+}
 
-    /// Graceful shutdown of the shared bridge host. Drains the runtime slot so
-    /// the [`PluginHostClient`] is dropped and process handles are released.
+// ── Host pool ────────────────────────────────────────────────────────────────
+//
+// Bridged plug-ins used to share one host process, so one plug-in crashing
+// took every other one — the built-ins included — down with it, and nothing
+// brought them back. The pool keeps several host processes, each a
+// [`BridgeHost`], and routes every call by instance id to the host that loaded
+// the instance. Which instances share a host is [`HostIsolation`]'s choice.
+// A host that dies is taken out and reported through
+// [`PluginBridgeRuntime::take_lost_hosts`]; the studio reloads what lived in
+// it, into a fresh host, and nothing else is touched.
+
+/// How bridged instances are spread over host processes
+/// (`FUTUREBOARD_PLUGIN_HOST_ISOLATION`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostIsolation {
+    /// Every instance in one process: the old behaviour.
+    Shared,
+    /// One process per plug-in module; the built-ins share one of their own.
+    /// Instances of one plug-in share its fate, and nothing else does.
+    Module,
+    /// One process per instance.
+    Instance,
+}
+
+impl HostIsolation {
+    fn current() -> Self {
+        static MODE: std::sync::OnceLock<HostIsolation> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            match std::env::var("FUTUREBOARD_PLUGIN_HOST_ISOLATION")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "shared" => Self::Shared,
+                "instance" => Self::Instance,
+                _ => Self::Module,
+            }
+        })
+    }
+
+    fn key_for(self, descriptor: &BridgePluginDescriptor, builtin: bool) -> String {
+        match self {
+            Self::Shared => "shared".to_string(),
+            Self::Instance => format!("instance:{}", descriptor.insert_id),
+            Self::Module if builtin => "builtin".to_string(),
+            Self::Module => {
+                let module = if descriptor.plugin_path.is_empty() {
+                    &descriptor.class_id
+                } else {
+                    &descriptor.plugin_path
+                };
+                format!("module:{}", module.to_ascii_lowercase())
+            }
+        }
+    }
+}
+
+/// A host process that went away, with everything that was loaded in it.
+#[derive(Debug, Clone)]
+pub(crate) struct LostBridgeHost {
+    pub key: String,
+    pub pid: Option<u32>,
+    /// Every instance the host held (loaded or still loading), with the
+    /// descriptor it was loaded from.
+    pub instances: Vec<BridgeLoadedPlugin>,
+}
+
+pub(crate) struct PluginBridgeRuntime {
+    hosts: HashMap<String, BridgeHost>,
+    /// Which host each instance lives in.
+    instance_host: HashMap<String, String>,
+    /// The engine-owned (sample_rate, block) last configured, for hosts
+    /// spawned later.
+    audio_bridge_config: Option<(u32, u32)>,
+    /// Hosts that died since the studio last asked.
+    lost: Vec<LostBridgeHost>,
+}
+
+impl PluginBridgeRuntime {
+    /// The pool, created on first use. No process starts until an instance
+    /// is loaded.
+    pub fn ensure_shared(
+        slot: &mut Option<SharedPluginBridgeRuntime>,
+    ) -> Result<SharedPluginBridgeRuntime, PluginHostClientError> {
+        if let Some(existing) = slot.as_ref() {
+            return Ok(existing.clone());
+        }
+        eprintln!(
+            "[plugin-bridge] host pool ready isolation={:?}",
+            HostIsolation::current()
+        );
+        let runtime = Arc::new(Mutex::new(Self {
+            hosts: HashMap::new(),
+            instance_host: HashMap::new(),
+            audio_bridge_config: None,
+            lost: Vec::new(),
+        }));
+        *slot = Some(runtime.clone());
+        Ok(runtime)
+    }
+
+    fn host_for(&self, instance_id: &str) -> Option<&BridgeHost> {
+        self.hosts.get(self.instance_host.get(instance_id)?)
+    }
+
+    fn host_for_mut(&mut self, instance_id: &str) -> Option<&mut BridgeHost> {
+        let key = self.instance_host.get(instance_id)?;
+        self.hosts.get_mut(key)
+    }
+
+    /// The host an instance about to load goes to, spawned when it is the
+    /// first of its key.
+    fn host_for_load(
+        &mut self,
+        descriptor: &BridgePluginDescriptor,
+        builtin: bool,
+    ) -> Result<&mut BridgeHost, PluginHostClientError> {
+        let key = self
+            .instance_host
+            .get(&descriptor.insert_id)
+            .filter(|key| self.hosts.contains_key(*key))
+            .cloned()
+            .unwrap_or_else(|| HostIsolation::current().key_for(descriptor, builtin));
+        if !self.hosts.contains_key(&key) {
+            let mut host = BridgeHost::spawn(key.clone())?;
+            if let Some((sample_rate, block)) = self.audio_bridge_config {
+                let _ = host.configure_audio_bridge(sample_rate, block);
+            }
+            self.hosts.insert(key.clone(), host);
+        }
+        self.instance_host
+            .insert(descriptor.insert_id.clone(), key.clone());
+        Ok(self.hosts.get_mut(&key).expect("host just ensured"))
+    }
+
+    fn not_loaded(instance_id: &str) -> PluginHostClientError {
+        PluginHostClientError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            format!("no plugin host holds instance {instance_id}"),
+        ))
+    }
+
+    /// A live host's pid: the one serving `instance_id` when given, else any.
+    pub fn host_pid(&self) -> Option<u32> {
+        self.hosts.values().find_map(|host| host.host_pid)
+    }
+
+    pub fn host_pid_for(&self, instance_id: &str) -> Option<u32> {
+        self.host_for(instance_id).and_then(|host| host.host_pid)
+    }
+
+    pub fn has_audio_sink(&self, instance_id: &str) -> bool {
+        self.host_for(instance_id)
+            .is_some_and(|host| host.has_audio_sink(instance_id))
+    }
+
+    pub fn audio_sink_for(
+        &self,
+        instance_id: &str,
+    ) -> Option<DirectAudio::plugin_bridge::SharedPluginBridgeSink> {
+        self.host_for(instance_id)?.audio_sink_for(instance_id)
+    }
+
+    pub fn instance_load(&self, instance_id: &str) -> Option<(Option<f32>, u32)> {
+        self.host_for(instance_id)?.instance_load(instance_id)
+    }
+
+    pub fn loaded_descriptor(&self, instance: &str) -> Option<BridgeLoadedPlugin> {
+        self.host_for(instance)?.loaded_descriptor(instance)
+    }
+
+    pub fn has_load_request(&self, instance: &str) -> bool {
+        self.host_for(instance)
+            .is_some_and(|host| host.has_load_request(instance))
+    }
+
+    pub fn loaded_instance_ids(&self) -> Vec<String> {
+        self.hosts
+            .values()
+            .flat_map(|host| host.loaded_instance_ids())
+            .collect()
+    }
+
+    pub fn loaded_for_track(&self, track_id: &str) -> Option<BridgeLoadedPlugin> {
+        self.hosts
+            .values()
+            .find_map(|host| host.loaded_for_track(track_id))
+    }
+
+    pub fn retarget_tracks<'a>(&mut self, owner_of: impl Fn(&str) -> Option<&'a str>) -> usize {
+        self.hosts
+            .values_mut()
+            .map(|host| host.retarget_tracks(&owner_of))
+            .sum()
+    }
+
+    pub fn mark_plugin_loaded(&mut self, instance: &str) -> bool {
+        match self.host_for_mut(instance) {
+            Some(host) => host.mark_plugin_loaded(instance),
+            None => {
+                eprintln!("[plugin-bridge] confirmed load for unknown instance={instance}");
+                false
+            }
+        }
+    }
+
+    pub fn mark_plugin_output_channels(&mut self, instance: &str, output_channels: u32) {
+        if let Some(host) = self.host_for_mut(instance) {
+            host.mark_plugin_output_channels(instance, output_channels);
+        }
+    }
+
+    pub fn mark_plugin_load_failed(&mut self, instance: &str) {
+        if let Some(host) = self.host_for_mut(instance) {
+            host.mark_plugin_load_failed(instance);
+        }
+        self.instance_host.remove(instance);
+    }
+
+    pub fn configure_audio_bridge(
+        &mut self,
+        sample_rate: u32,
+        max_block_size: u32,
+    ) -> Result<(), PluginHostClientError> {
+        self.audio_bridge_config = Some((sample_rate, max_block_size));
+        let mut result = Ok(());
+        for host in self.hosts.values_mut() {
+            if let Err(error) = host.configure_audio_bridge(sample_rate, max_block_size) {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    pub fn send_load_builtin_plugin(
+        &mut self,
+        descriptor: BridgePluginDescriptor,
+        sample_rate: u32,
+        max_block_size: u32,
+        state_json: Option<String>,
+    ) -> Result<(), PluginHostClientError> {
+        self.audio_bridge_config = Some((sample_rate, max_block_size));
+        self.host_for_load(&descriptor, true)?
+            .send_load_builtin_plugin(descriptor, sample_rate, max_block_size, state_json)
+    }
+
+    pub fn send_load_au_plugin(
+        &mut self,
+        descriptor: BridgePluginDescriptor,
+        sample_rate: u32,
+        max_block_size: u32,
+        state: Option<&[u8]>,
+    ) -> Result<(), PluginHostClientError> {
+        self.audio_bridge_config = Some((sample_rate, max_block_size));
+        self.host_for_load(&descriptor, false)?.send_load_au_plugin(
+            descriptor,
+            sample_rate,
+            max_block_size,
+            state,
+        )
+    }
+
+    pub fn send_load_plugin(
+        &mut self,
+        descriptor: BridgePluginDescriptor,
+        sample_rate: u32,
+        max_block_size: u32,
+    ) -> Result<(), PluginHostClientError> {
+        self.audio_bridge_config = Some((sample_rate, max_block_size));
+        self.host_for_load(&descriptor, false)?.send_load_plugin(
+            descriptor,
+            sample_rate,
+            max_block_size,
+        )
+    }
+
+    pub fn open_editor_with_parent(
+        &mut self,
+        plugin_instance_id: String,
+        parent_hwnd: u64,
+        width: u32,
+        height: u32,
+        dpi: u32,
+    ) -> Result<(), PluginHostClientError> {
+        let Some(host) = self.host_for_mut(&plugin_instance_id) else {
+            return Err(Self::not_loaded(&plugin_instance_id));
+        };
+        host.open_editor_with_parent(plugin_instance_id, parent_hwnd, width, height, dpi)
+    }
+
+    pub fn prepare_editor_view(
+        &mut self,
+        plugin_instance_id: String,
+    ) -> Result<(), PluginHostClientError> {
+        let Some(host) = self.host_for_mut(&plugin_instance_id) else {
+            return Err(Self::not_loaded(&plugin_instance_id));
+        };
+        host.prepare_editor_view(plugin_instance_id)
+    }
+
+    pub fn confirm_editor_content_ready(
+        &mut self,
+        plugin_instance_id: String,
+        parent_hwnd: u64,
+        width: u32,
+        height: u32,
+        dpi: u32,
+    ) -> Result<(), PluginHostClientError> {
+        let Some(host) = self.host_for_mut(&plugin_instance_id) else {
+            return Err(Self::not_loaded(&plugin_instance_id));
+        };
+        host.confirm_editor_content_ready(plugin_instance_id, parent_hwnd, width, height, dpi)
+    }
+
+    pub fn preview_note_on(
+        &mut self,
+        plugin_instance_id: String,
+        channel: u8,
+        pitch: u8,
+        velocity: u8,
+    ) -> Result<(), PluginHostClientError> {
+        let Some(host) = self.host_for_mut(&plugin_instance_id) else {
+            return Err(Self::not_loaded(&plugin_instance_id));
+        };
+        host.preview_note_on(plugin_instance_id, channel, pitch, velocity)
+    }
+
+    pub fn preview_note_off(
+        &mut self,
+        plugin_instance_id: String,
+        channel: u8,
+        pitch: u8,
+    ) -> Result<(), PluginHostClientError> {
+        let Some(host) = self.host_for_mut(&plugin_instance_id) else {
+            return Err(Self::not_loaded(&plugin_instance_id));
+        };
+        host.preview_note_off(plugin_instance_id, channel, pitch)
+    }
+
+    pub fn preview_control_change(
+        &mut self,
+        plugin_instance_id: String,
+        channel: u8,
+        controller: u8,
+        value: u8,
+    ) -> Result<(), PluginHostClientError> {
+        let Some(host) = self.host_for_mut(&plugin_instance_id) else {
+            return Err(Self::not_loaded(&plugin_instance_id));
+        };
+        host.preview_control_change(plugin_instance_id, channel, controller, value)
+    }
+
+    pub fn preview_all_notes_off(
+        &mut self,
+        plugin_instance_id: String,
+    ) -> Result<(), PluginHostClientError> {
+        let Some(host) = self.host_for_mut(&plugin_instance_id) else {
+            return Err(Self::not_loaded(&plugin_instance_id));
+        };
+        host.preview_all_notes_off(plugin_instance_id)
+    }
+
+    pub fn midi_panic(&mut self, plugin_instance_id: String) -> Result<(), PluginHostClientError> {
+        let Some(host) = self.host_for_mut(&plugin_instance_id) else {
+            return Err(Self::not_loaded(&plugin_instance_id));
+        };
+        host.midi_panic(plugin_instance_id)
+    }
+
+    pub fn resize_editor(&mut self, plugin_instance_id: String, width: u32, height: u32, dpi: u32) {
+        if let Some(host) = self.host_for_mut(&plugin_instance_id) {
+            host.resize_editor(plugin_instance_id, width, height, dpi);
+        }
+    }
+
+    pub fn set_editor_chrome(&mut self, chrome: SpherePluginHost::ipc::HostCommand) {
+        let target = match &chrome {
+            HostCommand::SetEditorChrome {
+                plugin_instance_id, ..
+            } => self.instance_host.get(plugin_instance_id).cloned(),
+            _ => None,
+        };
+        if let Some(host) = target.and_then(|key| self.hosts.get_mut(&key)) {
+            host.set_editor_chrome(chrome);
+        }
+    }
+
+    pub fn close_editor(&mut self, plugin_instance_id: String) {
+        if let Some(host) = self.host_for_mut(&plugin_instance_id) {
+            host.close_editor(plugin_instance_id);
+        }
+    }
+
+    pub fn unload_plugin(&mut self, plugin_instance_id: String) {
+        let Some(key) = self.instance_host.remove(&plugin_instance_id) else {
+            return;
+        };
+        let Some(host) = self.hosts.get_mut(&key) else {
+            return;
+        };
+        host.unload_plugin(plugin_instance_id);
+        // A per-instance or per-module host with nothing left in it has no
+        // reason to keep running.
+        if key != "shared" && !self.instance_host.values().any(|other| *other == key) {
+            if let Some(mut host) = self.hosts.remove(&key) {
+                eprintln!("[plugin-bridge] host idle, shutting down key={key}");
+                host.shutdown(plugin_host_lifecycle::HOST_SHUTDOWN_TIMEOUT);
+            }
+        }
+    }
+
+    pub fn is_loaded(&self, plugin_instance_id: &str) -> bool {
+        self.host_for(plugin_instance_id)
+            .is_some_and(|host| host.is_loaded(plugin_instance_id))
+    }
+
+    /// Asks every host that holds one of `instance_ids` first, then collects
+    /// the answers under one shared deadline, so a save does not wait for the
+    /// hosts one after another.
+    pub fn request_plugin_states(
+        &mut self,
+        instance_ids: &[String],
+        timeout: std::time::Duration,
+    ) -> PluginStateCapture {
+        let mut by_host: HashMap<String, Vec<String>> = HashMap::new();
+        for instance_id in instance_ids {
+            if let Some(key) = self.instance_host.get(instance_id) {
+                by_host
+                    .entry(key.clone())
+                    .or_default()
+                    .push(instance_id.clone());
+            }
+        }
+        let mut asked: Vec<(String, std::collections::HashSet<String>)> = Vec::new();
+        for (key, ids) in by_host {
+            if let Some(host) = self.hosts.get_mut(&key) {
+                asked.push((key, host.send_state_requests(&ids)));
+            }
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut capture = PluginStateCapture::default();
+        for (key, pending) in asked {
+            if let Some(host) = self.hosts.get_mut(&key) {
+                let part = host.collect_state_replies(pending, deadline, timeout);
+                capture.states.extend(part.states);
+                capture.unanswered.extend(part.unanswered);
+            }
+        }
+        capture.unanswered.sort();
+        capture
+    }
+
+    /// Asks for one instance's state without waiting for it; the answer comes
+    /// through [`Self::drain_events`] as `PluginState`. For keeping a recent
+    /// state between saves — never on the save path, which has to wait.
+    pub fn request_plugin_state_async(&mut self, instance_id: &str) {
+        let Some(host) = self.host_for_mut(instance_id) else {
+            return;
+        };
+        if !host.is_loaded(instance_id) {
+            return;
+        }
+        if let Err(error) = host.client.get_plugin_state(instance_id.to_string()) {
+            eprintln!("[plugin-bridge] GetPluginState send failed instance={instance_id}: {error}");
+        }
+    }
+
+    /// A drained `PluginState` event in the form the insert stores.
+    pub fn packed_state_reply(
+        &self,
+        instance_id: &str,
+        component_b64: &str,
+        controller_b64: &str,
+    ) -> Option<Vec<u8>> {
+        self.host_for(instance_id)?
+            .packed_state(instance_id, component_b64, controller_b64)
+    }
+
+    pub fn send_plugin_state(
+        &mut self,
+        instance_id: &str,
+        packed: &[u8],
+    ) -> Result<(), PluginHostClientError> {
+        let Some(host) = self.host_for_mut(instance_id) else {
+            return Err(Self::not_loaded(instance_id));
+        };
+        host.send_plugin_state(instance_id, packed)
+    }
+
+    pub fn request_plugin_parameters(
+        &mut self,
+        plugin_instance_id: &str,
+    ) -> Result<(), PluginHostClientError> {
+        match self.host_for_mut(plugin_instance_id) {
+            Some(host) => host.request_plugin_parameters(plugin_instance_id),
+            None => Ok(()),
+        }
+    }
+
+    pub fn poll(&mut self) {
+        for host in self.hosts.values_mut() {
+            host.poll();
+        }
+        self.reap_dead_hosts();
+    }
+
+    /// Events from every host. A host that died is not reported here but
+    /// through [`Self::take_lost_hosts`].
+    pub fn drain_events(&mut self) -> Vec<ClientEvent> {
+        let mut events = Vec::new();
+        for host in self.hosts.values_mut() {
+            events.extend(host.drain_events());
+        }
+        self.reap_dead_hosts();
+        events
+    }
+
+    /// Hosts that died since the last call, each with what it held.
+    pub fn take_lost_hosts(&mut self) -> Vec<LostBridgeHost> {
+        std::mem::take(&mut self.lost)
+    }
+
+    fn reap_dead_hosts(&mut self) {
+        let dead: Vec<String> = self
+            .hosts
+            .iter()
+            .filter(|(_, host)| host.dead)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in dead {
+            let Some(mut host) = self.hosts.remove(&key) else {
+                continue;
+            };
+            let instances: Vec<BridgeLoadedPlugin> = host.loaded.values().cloned().collect();
+            for instance in &instances {
+                self.instance_host.remove(&instance.descriptor.insert_id);
+            }
+            eprintln!(
+                "[plugin-bridge] host lost key={key} pid={:?} instances={}",
+                host.host_pid,
+                instances.len()
+            );
+            let pid = host.host_pid;
+            host.abandon();
+            self.lost.push(LostBridgeHost {
+                key,
+                pid,
+                instances,
+            });
+        }
+    }
+
+    /// Routed by the command's own instance id; a command naming none goes
+    /// to every host.
+    pub fn send_raw(&mut self, command: &HostCommand) -> Result<(), PluginHostClientError> {
+        let target = serde_json::to_value(command).ok().and_then(|value| {
+            fn find(value: &serde_json::Value) -> Option<String> {
+                match value {
+                    serde_json::Value::Object(map) => map
+                        .get("plugin_instance_id")
+                        .and_then(|id| id.as_str().map(str::to_string))
+                        .or_else(|| map.values().find_map(find)),
+                    _ => None,
+                }
+            }
+            find(&value)
+        });
+        match target {
+            Some(instance_id) => match self.host_for_mut(&instance_id) {
+                Some(host) => host.send_raw(command),
+                None => Err(Self::not_loaded(&instance_id)),
+            },
+            None => {
+                let mut result = Ok(());
+                for host in self.hosts.values_mut() {
+                    if let Err(error) = host.send_raw(command) {
+                        result = Err(error);
+                    }
+                }
+                result
+            }
+        }
+    }
+
+    pub fn builtin_meter_frame(
+        &self,
+        instance_id: &str,
+    ) -> Option<SpherePluginHost::audio_bridge::BuiltinMeterFrame> {
+        self.host_for(instance_id)?.builtin_meter_frame(instance_id)
+    }
+
+    pub fn builtin_spectrum_frame(
+        &self,
+        instance_id: &str,
+    ) -> Option<(u32, [f32; SpherePluginHost::spectrum::SPECTRUM_BINS])> {
+        self.host_for(instance_id)?
+            .builtin_spectrum_frame(instance_id)
+    }
+
+    pub fn builtin_host_status(&self, instance_id: &str) -> Option<(u32, u32, u32, f64)> {
+        self.host_for(instance_id)?.builtin_host_status(instance_id)
+    }
+
+    /// Graceful shutdown of every host. Drains the slot so every
+    /// [`PluginHostClient`] is dropped and process handles are released.
     pub fn shutdown_shared(slot: &mut Option<SharedPluginBridgeRuntime>) {
         let _ = shutdown_bridge_runtime(
             slot.take(),
@@ -974,27 +1677,22 @@ pub(crate) fn shutdown_bridge_runtime(
         return report;
     };
 
-    let host_pid = runtime.lock().ok().and_then(|bridge| bridge.host_pid());
-    if let Some(pid) = host_pid {
-        progress(
-            format!("Waiting for plugin host pid={pid}"),
-            ProgressBarValue::value(0.7),
-        );
-    }
-
-    if let Ok(mut bridge) = runtime.lock() {
-        let instance_ids = bridge.loaded_instance_ids();
-        if let Some(pid) = bridge.host_pid() {
-            BridgeHostManager::global().set_host_instances(pid, instance_ids);
-        }
-        plugin_host_lifecycle::shutdown_host_client_with_timeout(&mut bridge.client, timeout);
-        bridge.client.join_reader();
-        bridge.loaded.clear();
-        bridge.shared_audio.clear();
-        bridge.queued_events.clear();
-        bridge.host_pid = None;
-        if host_pid.is_some() {
-            report.hosts_shutdown += 1;
+    if let Ok(mut pool) = runtime.lock() {
+        let hosts: Vec<(String, BridgeHost)> = pool.hosts.drain().collect();
+        pool.instance_host.clear();
+        for (key, mut host) in hosts {
+            if let Some(pid) = host.host_pid {
+                progress(
+                    format!("Waiting for plugin host pid={pid}"),
+                    ProgressBarValue::value(0.7),
+                );
+            }
+            let had_pid = host.host_pid.is_some();
+            eprintln!("[plugin-bridge] shutdown host key={key}");
+            host.shutdown(timeout);
+            if had_pid {
+                report.hosts_shutdown += 1;
+            }
         }
     }
     drop(runtime);

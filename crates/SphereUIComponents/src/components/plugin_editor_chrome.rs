@@ -985,6 +985,10 @@ pub enum PluginEditorAction {
     SelectTab(String),
     /// Close one plug-in's tab. Closing the last one closes the window.
     CloseTab(String),
+    /// Load a crashed plug-in again, into a fresh host. `reset: false` brings
+    /// back the last state captured from it; `reset: true` starts it from its
+    /// defaults, for a state that is itself what makes it crash.
+    ReloadPlugin { reset: bool },
 }
 
 /// Small square/pill button used across the chrome.

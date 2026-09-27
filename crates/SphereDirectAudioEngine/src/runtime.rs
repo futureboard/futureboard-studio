@@ -2142,6 +2142,46 @@ pub struct RuntimeProject {
     /// Control Room / Listen Bus configuration and per-block scratch. Read
     /// only by the realtime device callback — see [`RuntimeMonitor`].
     pub monitor: RuntimeMonitor,
+    /// Each track's bank/program selection and whether its instrument has
+    /// been sent it — see [`RuntimeProject::flush_midi_programs`].
+    pub midi_programs: Vec<RuntimeMidiProgram>,
+    /// The realtime render being recorded, if one is. Set on the control
+    /// thread for every graph it builds while a capture is active.
+    pub render_capture: Option<Arc<crate::render_capture::RenderCapture>>,
+}
+
+/// One track's program selection on one MIDI channel, bound to the track
+/// whose instrument receives it.
+#[derive(Debug, Clone)]
+pub struct RuntimeMidiProgram {
+    /// The receiving track, for carrying `sent_to` across a graph swap.
+    pub track_id: String,
+    pub track_index: usize,
+    pub program: crate::types::EngineMidiProgram,
+    /// The destination it was last sent to ([`midi_program_route`]), so a
+    /// rebuilt graph or a restarted transport does not send it again — a
+    /// program change makes some instruments reload — while a plug-in
+    /// reloaded behind a new sink does get it.
+    pub sent_to: Option<usize>,
+}
+
+/// Where a track's program selection would go this block, as an identity to
+/// compare with the last send: the bridged instrument's sink, or the track's
+/// own in-process instrument. `None` when there is nothing to receive it yet
+/// — a bridged instrument still loading has no sink, and sending into the
+/// in-process list for it would mark the program sent to nobody.
+fn midi_program_route(track: &RuntimeTrack) -> Option<usize> {
+    if let Some(insert) = track
+        .midi_instrument_insert_ix
+        .and_then(|ix| track.inserts.get(ix))
+    {
+        return match (&insert.bridge_sink, insert.kind_tag) {
+            (Some(sink), _) => Some(Arc::as_ptr(sink) as *const () as usize),
+            (None, RuntimeInsertKind::ExternalBridge) => None,
+            (None, _) => Some(1),
+        };
+    }
+    (track.soundfont_player.is_some() || track.solfege_engine.is_some()).then_some(1)
 }
 
 impl RuntimeProject {
@@ -3355,6 +3395,23 @@ impl RuntimeProject {
             // freshly built project (preserved across reloads in drain_commands).
             plugin_bridge_sinks: std::collections::HashMap::new(),
             bridge_editor_active: std::collections::HashSet::new(),
+            midi_programs: snapshot
+                .tracks
+                .iter()
+                .enumerate()
+                .flat_map(|(track_index, track)| {
+                    track
+                        .midi_programs
+                        .iter()
+                        .map(move |program| RuntimeMidiProgram {
+                            track_id: track.id.clone(),
+                            track_index,
+                            program: program.sanitized(),
+                            sent_to: None,
+                        })
+                })
+                .collect(),
+            render_capture: None,
         };
         // Resolve cross-entity indices once, on this worker thread, so the
         // audio callback never does an id lookup per block.
@@ -3365,6 +3422,73 @@ impl RuntimeProject {
         // latency the callback observes would have nowhere to grow into.
         project.ensure_pdc_delay_capacity();
         Ok(project)
+    }
+
+    /// Send each track's bank and program to its instrument where it has not
+    /// been sent yet: on the first block after it is set or changed, and when
+    /// the instrument behind it is replaced. Runs every callback, playing or
+    /// not, so choosing a patch is heard at once. Allocation-free: the events
+    /// go into the bridge ring or the track's preallocated block list.
+    pub fn flush_midi_programs(&mut self) {
+        for index in 0..self.midi_programs.len() {
+            let entry = &self.midi_programs[index];
+            let track_index = entry.track_index;
+            let Some(track) = self.tracks.get(track_index) else {
+                continue;
+            };
+            let Some(route) = midi_program_route(track) else {
+                continue;
+            };
+            if entry.sent_to == Some(route) {
+                continue;
+            }
+            let program = entry.program;
+            let channel = program.channel & 0x0F;
+            let events = [
+                program.bank_msb.map(|msb| {
+                    Vst3MidiEvent::control_change(0, channel, 0, f32::from(msb) / 127.0)
+                }),
+                program.bank_lsb.map(|lsb| {
+                    Vst3MidiEvent::control_change(0, channel, 32, f32::from(lsb) / 127.0)
+                }),
+                Some(Vst3MidiEvent::control_change(
+                    0,
+                    channel,
+                    u16::from(VST3_CTRL_PROGRAM_CHANGE),
+                    f32::from(program.program) / 127.0,
+                )),
+            ];
+            let track = &mut self.tracks[track_index];
+            let sink = track
+                .midi_instrument_insert_ix
+                .and_then(|ix| track.inserts.get(ix))
+                .and_then(|insert| insert.bridge_sink.clone());
+            for event in events.into_iter().flatten() {
+                match &sink {
+                    Some(sink) => push_vst3_midi_event_to_sink(sink.as_ref(), &event, "", false),
+                    None => {
+                        if track.midi_block_events.len() < track.midi_block_events.capacity() {
+                            track.midi_block_events.push(event);
+                        }
+                    }
+                }
+            }
+            self.midi_programs[index].sent_to = Some(route);
+        }
+    }
+
+    /// Keeps, from the graph this one replaces, which program selections its
+    /// instruments already have — the same selection to the same destination
+    /// is not sent again. Called on the audio thread at the swap; compares
+    /// ids in place and allocates nothing.
+    pub fn inherit_midi_programs_sent(&mut self, previous: &RuntimeProject) {
+        for entry in &mut self.midi_programs {
+            entry.sent_to = previous
+                .midi_programs
+                .iter()
+                .find(|old| old.track_id == entry.track_id && old.program == entry.program)
+                .and_then(|old| old.sent_to);
+        }
     }
 
     /// Reposition every MIDI track's cursor to the first event at/after
@@ -3378,7 +3502,24 @@ impl RuntimeProject {
     /// at `sample_offset` within the current callback block. Used when the
     /// render kernel wraps a loop in the middle of a device block.
     pub fn reset_midi_playback_with_offset(&mut self, position_sample: u64, sample_offset: u32) {
-        self.all_notes_off_with_offset("seek/play", sample_offset);
+        self.all_notes_off_with_offset("seek/play", sample_offset, true);
+        self.rewind_midi_cursors(position_sample);
+    }
+
+    /// The transport wrapped from the loop end back to `position_sample`, at
+    /// `sample_offset` in the current block. Only the notes still sounding
+    /// are released, with note-offs: no sustain / all-sound-off / all-notes-
+    /// off controllers. Those land on the same sample as the chord that
+    /// starts the next pass, and an instrument that applies them after the
+    /// notes (VST3 turns them into parameter changes, whose order against
+    /// same-sample events is the plug-in's choice) killed part of that chord
+    /// on every pass. A seek or a stop still sends the full panic.
+    pub fn loop_wrap_midi_playback(&mut self, position_sample: u64, sample_offset: u32) {
+        self.all_notes_off_with_offset("loop", sample_offset, false);
+        self.rewind_midi_cursors(position_sample);
+    }
+
+    fn rewind_midi_cursors(&mut self, position_sample: u64) {
         for mt in &mut self.midi_tracks {
             // Binary search: first event with sample >= position.
             mt.cursor = mt.events.partition_point(|ev| ev.sample < position_sample);
@@ -3448,10 +3589,12 @@ impl RuntimeProject {
     /// Emit note-off for all active notes on every MIDI track and clear the
     /// active set. Called on stop/seek to prevent stuck notes.
     pub fn all_notes_off(&mut self, reason: &str) {
-        self.all_notes_off_with_offset(reason, 0);
+        self.all_notes_off_with_offset(reason, 0, true);
     }
 
-    fn all_notes_off_with_offset(&mut self, reason: &str, sample_offset: u32) {
+    /// `controllers`: also send sustain-off, all-sound-off and all-notes-off
+    /// on every channel (stop, seek), not only the active notes' note-offs.
+    fn all_notes_off_with_offset(&mut self, reason: &str, sample_offset: u32, controllers: bool) {
         let debug = midi_engine_debug_enabled();
         if debug && reason.contains("seek") {
             for mt in &self.midi_tracks {
@@ -3485,7 +3628,7 @@ impl RuntimeProject {
                 );
             }
             let track_index = self.midi_tracks[mt_ix].track_index;
-            push_all_notes_off_for_track(self, track_index, &active, sample_offset);
+            push_all_notes_off_for_track(self, track_index, &active, sample_offset, controllers);
             active.clear();
             self.midi_tracks[mt_ix].active = active;
             self.midi_tracks[mt_ix].preview_active.clear();
@@ -3926,7 +4069,7 @@ impl RuntimeProject {
                 active.len()
             );
         }
-        push_all_notes_off_for_track(self, track_index, &active, 0);
+        push_all_notes_off_for_track(self, track_index, &active, 0, true);
         if self.plugin_bridge_sinks.contains_key(plugin_instance_id) {
             if let Some(sink) = self.plugin_bridge_sinks.get(plugin_instance_id) {
                 for &(channel, pitch) in &active {
@@ -4522,6 +4665,12 @@ impl RuntimeProject {
 
 static MIDI_WRITE_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// VST3's controller number for a program change (`kCtrlProgramChange`). The
+/// engine's MIDI events carry it as a controller change with the program in
+/// the value, like aftertouch (128) and pitch bend (129); each destination
+/// turns it back into a MIDI program change (`0xC0`).
+pub const VST3_CTRL_PROGRAM_CHANGE: u8 = 130;
+
 pub fn push_vst3_midi_event_to_sink(
     sink: &dyn crate::plugin_bridge::PluginBridgeSink,
     ev: &Vst3MidiEvent,
@@ -4580,6 +4729,8 @@ pub fn push_vst3_midi_event_to_sink(
                     (bend >> 7) as u8,
                     ev.sample_offset,
                 );
+            } else if ev.pitch == VST3_CTRL_PROGRAM_CHANGE {
+                sink.push_midi(0xC0 | channel, val, 0, ev.sample_offset);
             } else {
                 sink.push_midi(0xB0 | channel, ev.pitch.min(127), val, ev.sample_offset);
             }
@@ -4587,6 +4738,7 @@ pub fn push_vst3_midi_event_to_sink(
                 let kind = match ev.pitch {
                     128 => "channel_pressure",
                     129 => "pitch_bend",
+                    VST3_CTRL_PROGRAM_CHANGE => "program_change",
                     _ => "cc",
                 };
                 eprintln!(
@@ -4734,6 +4886,7 @@ fn push_all_notes_off_for_track(
     track_index: Option<usize>,
     active: &[(u8, u8)],
     sample_offset: u32,
+    controllers: bool,
 ) {
     let Some(ti) = track_index.filter(|&ti| ti < project.tracks.len()) else {
         return;
@@ -4765,10 +4918,12 @@ fn push_all_notes_off_for_track(
         for &(channel, pitch) in active {
             sink.push_midi(0x80 | (channel & 0x0F), pitch, 0, sample_offset);
         }
-        for ch in 0u8..16 {
-            sink.push_midi(0xB0 | (ch & 0x0F), 64, 0, sample_offset);
-            sink.push_midi(0xB0 | (ch & 0x0F), 123, 0, sample_offset);
-            sink.push_midi(0xB0 | (ch & 0x0F), 120, 0, sample_offset);
+        if controllers {
+            for ch in 0u8..16 {
+                sink.push_midi(0xB0 | (ch & 0x0F), 64, 0, sample_offset);
+                sink.push_midi(0xB0 | (ch & 0x0F), 123, 0, sample_offset);
+                sink.push_midi(0xB0 | (ch & 0x0F), 120, 0, sample_offset);
+            }
         }
         return;
     }
@@ -4776,6 +4931,9 @@ fn push_all_notes_off_for_track(
         project.tracks[ti]
             .midi_block_events
             .push(Vst3MidiEvent::note_off(sample_offset, channel, pitch, 0.0));
+    }
+    if !controllers {
+        return;
     }
     for channel in 0..16 {
         project.tracks[ti]
@@ -4917,6 +5075,45 @@ fn push_mpe_configuration_events(
         beat,
         sample,
     );
+}
+
+/// Makes every key (channel, pitch) sound one note at a time. Two notes of
+/// the same pitch that overlap (a chord tone held into the next chord, a
+/// legato tail, notes drawn over each other) used to reach the instrument as
+/// on, on, off, off: the first note-off then silenced the note still meant to
+/// sound, and the key went quiet early. The later note retriggers the key
+/// instead (an off right before its on), and only the last note-off of the
+/// overlap releases it. Runs when the schedule is built, never on the audio
+/// thread; `events` must already be sorted.
+fn resolve_overlapping_notes(events: Vec<RuntimeMidiEvent>) -> Vec<RuntimeMidiEvent> {
+    let mut held: HashMap<(u8, u8), u32> = HashMap::new();
+    let mut out = Vec::with_capacity(events.len());
+    for event in events {
+        let key = (event.channel, event.pitch);
+        match event.kind {
+            RuntimeMidiEventKind::NoteOn => {
+                let count = held.entry(key).or_insert(0);
+                if *count > 0 {
+                    out.push(RuntimeMidiEvent {
+                        kind: RuntimeMidiEventKind::NoteOff,
+                        velocity: 0,
+                        ..event.clone()
+                    });
+                }
+                *count += 1;
+                out.push(event);
+            }
+            RuntimeMidiEventKind::NoteOff => {
+                let count = held.entry(key).or_insert(0);
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    out.push(event);
+                }
+            }
+            _ => out.push(event),
+        }
+    }
+    out
 }
 
 fn sort_midi_events(events: &mut [RuntimeMidiEvent]) {
@@ -5353,6 +5550,7 @@ fn build_midi_runtime(
         .into_iter()
         .map(|(track_id, mut events)| {
             sort_midi_events(&mut events);
+            let events = resolve_overlapping_notes(events);
             let active = Vec::with_capacity(128); // bound growth out of the audio callback
             RuntimeMidiTrack {
                 track_id,
@@ -5719,6 +5917,7 @@ mod pdc_reset_tests {
 
     fn track_snapshot(id: &str, track_type: &str) -> EngineTrackSnapshot {
         EngineTrackSnapshot {
+            midi_programs: Vec::new(),
             id: id.to_string(),
             track_type: track_type.to_string(),
             volume: 1.0,
@@ -7068,6 +7267,7 @@ mod midi_tests {
         automation_lanes: Vec<EngineAutomationLaneSnapshot>,
     ) -> crate::types::EngineTrackSnapshot {
         crate::types::EngineTrackSnapshot {
+            midi_programs: Vec::new(),
             id: "track-1".to_string(),
             track_type: "audio".to_string(),
             volume: 1.0,
@@ -7093,6 +7293,52 @@ mod midi_tests {
             soundfont_quality: Default::default(),
             solfege_engine: None,
         }
+    }
+
+    /// Two notes of one pitch that overlap: the later retriggers the key, and
+    /// only the last note-off releases it, so the first note's off can no
+    /// longer silence the note meant to be sounding.
+    #[test]
+    fn overlapping_notes_of_one_pitch_retrigger_instead_of_cutting() {
+        let ev = |sample: u64, kind: RuntimeMidiEventKind, pitch: u8| RuntimeMidiEvent {
+            sample,
+            beat: 0.0,
+            kind,
+            pitch,
+            velocity: 100,
+            channel: 0,
+            note_id: 0,
+            cc_number: 0,
+            cc_value: 0.0,
+            pitch_hz: 0.0,
+        };
+        use RuntimeMidiEventKind::{NoteOff, NoteOn};
+        // C held 0..300; C again 100..200; E 0..300 untouched.
+        let mut events = vec![
+            ev(0, NoteOn, 60),
+            ev(0, NoteOn, 64),
+            ev(100, NoteOn, 60),
+            ev(200, NoteOff, 60),
+            ev(300, NoteOff, 60),
+            ev(300, NoteOff, 64),
+        ];
+        sort_midi_events(&mut events);
+        let resolved = resolve_overlapping_notes(events);
+        let shape: Vec<(u64, bool, u8)> = resolved
+            .iter()
+            .map(|e| (e.sample, e.kind == NoteOn, e.pitch))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (0, true, 60),
+                (0, true, 64),
+                (100, false, 60),
+                (100, true, 60),
+                (300, false, 60),
+                (300, false, 64),
+            ]
+        );
     }
 
     fn automation_runtime(track: crate::types::EngineTrackSnapshot) -> RuntimeProject {
@@ -7324,6 +7570,56 @@ mod midi_tests {
             smoothed_gain_l: 1.0,
             smoothed_gain_r: 1.0,
         }
+    }
+
+    /// A track's bank and program reach its instrument once, in bank-first
+    /// order — not again on every block, rebuilt graph or restart, since a
+    /// program change makes some instruments reload — and again when the
+    /// plug-in behind the track is replaced.
+    #[test]
+    fn a_program_selection_is_sent_once_per_instrument() {
+        use crate::plugin_bridge::PluginBridgeSink;
+        let selection = RuntimeMidiProgram {
+            track_id: "track-1".to_string(),
+            track_index: 0,
+            program: crate::types::EngineMidiProgram {
+                channel: 2,
+                bank_msb: Some(127),
+                bank_lsb: Some(0),
+                program: 25,
+            },
+            sent_to: None,
+        };
+        let mut p = project_with(vec![]);
+        p.tracks = vec![bridged_instrument_track("track-1")];
+        p.midi_programs = vec![selection.clone()];
+
+        // Still loading: no sink, so nothing is sent and nothing marked sent.
+        p.flush_midi_programs();
+        assert_eq!(p.midi_programs[0].sent_to, None);
+
+        let sink = Arc::new(RecordingSink::default());
+        p.tracks[0].inserts[0].bridge_sink = Some(sink.clone() as Arc<dyn PluginBridgeSink>);
+        p.flush_midi_programs();
+        assert_eq!(
+            sink.take(),
+            vec![(0xB2, 0, 127, 0), (0xB2, 32, 0, 0), (0xC2, 25, 0, 0)]
+        );
+        p.flush_midi_programs();
+        assert!(sink.take().is_empty(), "sent again on the next block");
+
+        let mut next = project_with(vec![]);
+        next.tracks = vec![bridged_instrument_track("track-1")];
+        next.tracks[0].inserts[0].bridge_sink = Some(sink.clone() as Arc<dyn PluginBridgeSink>);
+        next.midi_programs = vec![selection];
+        next.inherit_midi_programs_sent(&p);
+        next.flush_midi_programs();
+        assert!(sink.take().is_empty(), "sent again after a graph swap");
+
+        let reloaded = Arc::new(RecordingSink::default());
+        next.tracks[0].inserts[0].bridge_sink = Some(reloaded.clone() as Arc<dyn PluginBridgeSink>);
+        next.flush_midi_programs();
+        assert_eq!(reloaded.take().len(), 3, "a reloaded plug-in is not told");
     }
 
     #[test]
@@ -7589,6 +7885,7 @@ mod loopback_resolve_tests {
 
     fn track(id: &str, track_type: &str) -> EngineTrackSnapshot {
         EngineTrackSnapshot {
+            midi_programs: Vec::new(),
             id: id.to_string(),
             track_type: track_type.to_string(),
             volume: 1.0,

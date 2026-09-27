@@ -244,6 +244,14 @@ enum PluginEditorStatus {
     /// cannot do what it says, and it sent people looking for a broken plug-in
     /// or a timing bug that was never there.
     Unsupported(String),
+    /// The plug-in's host process died under it. There is no editor left to
+    /// retry, so the panel offers to load the plug-in again — with its last
+    /// captured state, or reset to its defaults. The text says why a reload
+    /// did not take, when one was tried.
+    Crashed(Option<String>),
+    /// A reload asked for from the crash panel is under way. The editor opens
+    /// again when the studio reports the plug-in back.
+    Reloading,
 }
 
 /// Phase 6: delays (ms) between visible-UI re-checks after a successful
@@ -316,6 +324,9 @@ pub struct PluginEditorWindow {
     host_preferred_size: Option<(i32, i32)>,
     host_auto_size_applied: bool,
     host_auto_size_settled: bool,
+    /// Whether the bridged view accepts host resizing (`canResize`), as its
+    /// `EditorAttached` said; `None` before it has.
+    host_resizable: Option<bool>,
     /// Editor quirk resolved from the plug-in path + name at construction.
     /// Drives the delayed-ready ramp and informs failure messaging.
     quirk: PluginEditorQuirk,
@@ -498,6 +509,7 @@ impl PluginEditorWindow {
             host_preferred_size: None,
             host_auto_size_applied: false,
             host_auto_size_settled: false,
+            host_resizable: None,
             quirk,
             host,
             bridge_required,
@@ -544,9 +556,12 @@ impl PluginEditorWindow {
         // released by `maybe_release_initial_preferred_size` once the user
         // resizes away from the plug-in's preferred size — so it keeps using the
         // recorded content size, exactly as before.
+        // A bridged view that said it resizes follows the window like a local
+        // one; the host holds it to its own size contract and reports what it
+        // accepted, and the window snaps to that.
         let fixed = match self.processor.as_ref() {
             Some(processor) => !processor.view_can_resize(),
-            None => true,
+            None => self.host_resizable != Some(true),
         };
         if fixed {
             if let Some((content_w, content_h)) = self.editor_content_size {
@@ -895,7 +910,10 @@ impl PluginEditorWindow {
                 return;
             }
             // Nothing to retry and nothing to wait for: stop driving.
-            PluginEditorStatus::Failed(_) | PluginEditorStatus::Unsupported(_) => return,
+            PluginEditorStatus::Failed(_)
+            | PluginEditorStatus::Unsupported(_)
+            | PluginEditorStatus::Crashed(_)
+            | PluginEditorStatus::Reloading => return,
             PluginEditorStatus::Attaching => {
                 self.perform_attach(window, cx);
                 return;
@@ -1450,7 +1468,9 @@ impl PluginEditorWindow {
             // be silent: the editor simply would not appear, with nothing
             // anywhere saying why. Showing the window is the whole point of
             // having kept it.
-            PluginEditorStatus::Failed(_) | PluginEditorStatus::Unsupported(_)
+            PluginEditorStatus::Failed(_)
+            | PluginEditorStatus::Unsupported(_)
+            | PluginEditorStatus::Crashed(_)
                 if !self.failure_surfaced =>
             {
                 self.failure_surfaced = true;
@@ -1469,8 +1489,12 @@ impl PluginEditorWindow {
                 self.schedule_tick(cx);
                 return;
             }
-            // Nothing to retry and nothing to wait for: stop driving.
-            PluginEditorStatus::Failed(_) | PluginEditorStatus::Unsupported(_) => return,
+            // Nothing to retry and nothing to wait for: stop driving. A crashed
+            // plug-in waits on the user; a reloading one on the studio.
+            PluginEditorStatus::Failed(_)
+            | PluginEditorStatus::Unsupported(_)
+            | PluginEditorStatus::Crashed(_)
+            | PluginEditorStatus::Reloading => return,
             PluginEditorStatus::Attaching | PluginEditorStatus::ProbingReady { .. } => {
                 // Waiting for EditorAttached / EditorAttachFailed.
                 self.schedule_tick(cx);
@@ -1689,7 +1713,9 @@ impl PluginEditorWindow {
         match self.status {
             // Already reported, and already on screen. Bring it forward again:
             // the user asked for this editor and the message is the answer.
-            PluginEditorStatus::Failed(_) | PluginEditorStatus::Unsupported(_) => {
+            PluginEditorStatus::Failed(_)
+            | PluginEditorStatus::Unsupported(_)
+            | PluginEditorStatus::Crashed(_) => {
                 window.activate_window();
             }
             // Attached: ask the host again. It answers an open for an instance
@@ -2017,6 +2043,72 @@ impl PluginEditorWindow {
         cx.notify();
     }
 
+    /// The studio found `insert_id`'s host process gone. Only the tab on
+    /// screen changes: another tab re-opens through `activate_tab` like any
+    /// other, and the studio marks it there if it is still down.
+    pub(crate) fn show_plugin_crashed(
+        &mut self,
+        insert_id: &str,
+        detail: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.insert_id != insert_id {
+            return;
+        }
+        self.close_preset_menu(cx);
+        // The view died with its process; what is left here is the content
+        // child it was parented to.
+        self.release_active_view();
+        self.status = PluginEditorStatus::Crashed(detail);
+        self.wait_ticks = 0;
+        self.last_region = None;
+        self.host_resizable = None;
+        // A host-owned shell is off screen until something shows it, and the
+        // panel is the only place the reload is offered.
+        if !EditorBackendKind::current().embeds_in_editor_window() {
+            self.failure_surfaced = false;
+        }
+        cx.notify();
+    }
+
+    /// Whether the tab on screen is `insert_id`'s crash panel or its reload.
+    pub(crate) fn is_showing_crash(&self, insert_id: &str) -> bool {
+        self.insert_id == insert_id
+            && matches!(
+                self.status,
+                PluginEditorStatus::Crashed(_) | PluginEditorStatus::Reloading
+            )
+    }
+
+    /// The studio has sent `insert_id` to be loaded again.
+    pub(crate) fn begin_plugin_reload(&mut self, insert_id: &str, cx: &mut Context<Self>) {
+        if self.insert_id == insert_id {
+            self.status = PluginEditorStatus::Reloading;
+            cx.notify();
+        }
+    }
+
+    /// `insert_id` is loaded again: open its editor from the start.
+    pub(crate) fn resume_after_plugin_reload(&mut self, insert_id: &str, cx: &mut Context<Self>) {
+        if self.insert_id == insert_id && self.status == PluginEditorStatus::Reloading {
+            self.retry(cx);
+        }
+    }
+
+    /// The reload of `insert_id` did not take; back to the crash panel, with
+    /// the reason.
+    pub(crate) fn plugin_reload_failed(
+        &mut self,
+        insert_id: &str,
+        detail: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.insert_id == insert_id && self.status == PluginEditorStatus::Reloading {
+            self.status = PluginEditorStatus::Crashed(Some(detail));
+            cx.notify();
+        }
+    }
+
     /// Detaches whatever this window currently hosts, without closing it.
     fn release_active_view(&mut self) {
         if self.embed_handle.take().is_some() {
@@ -2095,6 +2187,12 @@ impl PluginEditorWindow {
             })
             | ClientEvent::Host(HostEvent::EditorChromeAction {
                 plugin_instance_id, ..
+            })
+            // The plug-in resized its editor (its own request, or the size it
+            // accepted for a drag). Missing here, the shared bridge dropped it
+            // before it reached this window, which never followed.
+            | ClientEvent::Host(HostEvent::EditorContentResize {
+                plugin_instance_id, ..
             }) => Some(plugin_instance_id.as_str()),
             _ => None,
         }
@@ -2120,8 +2218,10 @@ impl PluginEditorWindow {
                 result,
                 preferred_width,
                 preferred_height,
+                resizable,
                 ..
             }) => {
+                self.host_resizable = Some(resizable);
                 eprintln!(
                     "[plugin-view][host] EditorAttached editor_id={id} attached_result={result} \
                      preferred={preferred_width}x{preferred_height}"
@@ -2209,6 +2309,10 @@ impl PluginEditorWindow {
                 let size = Self::preferred_size_or_default(width, height);
                 self.host_preferred_size = Some(size);
                 self.editor_content_size = Some(size);
+                // The plug-in resized its own editor: the window follows it,
+                // which the one-shot auto-size would otherwise refuse once the
+                // first size was applied.
+                self.host_auto_size_applied = false;
                 cx.notify();
             }
             ClientEvent::Host(HostEvent::EditorPreferredSize {
@@ -2277,6 +2381,20 @@ impl PluginEditorWindow {
     /// owned by the main app) and the host (`ResizeEditor` → `onSize`).
     fn sync_host_region(&mut self, window: &mut Window) {
         self.maybe_release_initial_preferred_size(window);
+        // A bridged editor that cannot resize: the window goes back to its
+        // size instead of cropping it or showing blank space around it.
+        if self.host_resizable == Some(false) && self.host_auto_size_applied {
+            if let Some((content_w, content_h)) = self.editor_content_size {
+                let (viewport_w, viewport_h) = self.viewport_content_size(window);
+                if (viewport_w - content_w).abs() > 2 || (viewport_h - content_h).abs() > 2 {
+                    self.host_preferred_size = Some((content_w, content_h));
+                    self.host_auto_size_applied = false;
+                    // Resizes the window, then comes back through here once.
+                    self.apply_host_preferred_size(window);
+                    return;
+                }
+            }
+        }
         let region = self.host_region_for(window);
         let rect = ContentRect {
             x: region.x,
@@ -2343,7 +2461,9 @@ impl PluginEditorWindow {
     }
 
     fn maybe_release_initial_preferred_size(&mut self, window: &Window) {
-        if !self.bridge_required || !self.host_auto_size_applied {
+        // A fixed-size editor never lets go of its size, and a resizable one
+        // already follows the window.
+        if !self.bridge_required || !self.host_auto_size_applied || self.host_resizable.is_some() {
             return;
         }
         let Some((preferred_w, preferred_h)) = self.editor_content_size else {
@@ -2618,6 +2738,103 @@ impl PluginEditorWindow {
             )
             .into_any_element()
     }
+
+    /// The plug-in's process is gone. Reload brings it back as it was last
+    /// captured; Reset brings it back at its defaults, for when that state is
+    /// what keeps crashing it. Both go to the studio, which owns the insert.
+    fn render_crash_panel(&self, detail: Option<&str>, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .px(px(14.0))
+                .py(px(6.0))
+                .rounded(px(crate::theme::radius::CONTROL))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .bg(if primary {
+                    Colors::accent_muted()
+                } else {
+                    Colors::surface_raised()
+                })
+                .text_size(px(crate::theme::typography::UI_SM))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(if primary {
+                    Colors::accent_primary()
+                } else {
+                    Colors::text_secondary()
+                })
+                .hover(|s| s.bg(Colors::surface_control_hover()))
+                .child(label)
+        };
+        let request = |reset: bool| {
+            cx.listener(move |this: &mut Self, _ev, _window, cx| {
+                this.chrome_actions
+                    .push(PluginEditorAction::ReloadPlugin { reset });
+                // Shown at once, and a second press cannot queue another.
+                this.status = PluginEditorStatus::Reloading;
+                cx.notify();
+            })
+        };
+        let reload = button("plugin-editor-reload", "Reload", true).on_click(request(false));
+        let reset =
+            button("plugin-editor-reset-reload", "Reset & Reload", false).on_click(request(true));
+        let close = button("plugin-editor-close", "Close", false)
+            .on_click(|_ev, window, _cx| window.remove_window());
+
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .items_center()
+            .justify_center()
+            .size_full()
+            .bg(Colors::surface_base())
+            .p(px(20.0))
+            .child(
+                div()
+                    .text_size(px(crate::theme::typography::UI_MD))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(Colors::text_primary())
+                    .child(self.display_name.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(crate::theme::typography::UI_SM))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(Colors::status_error())
+                    .child("The plug-in crashed"),
+            )
+            .child(
+                div()
+                    .max_w(px(560.0))
+                    .text_size(px(crate::theme::typography::UI_SM))
+                    .text_color(Colors::text_secondary())
+                    .child(
+                        "Its host process stopped; other plug-ins keep playing. Reload \
+                         brings it back with its last captured settings. Reset & Reload \
+                         starts it from its defaults.",
+                    ),
+            );
+        if let Some(detail) = detail {
+            panel = panel.child(
+                div()
+                    .max_w(px(560.0))
+                    .text_size(px(crate::theme::typography::UI_SM))
+                    .text_color(Colors::status_error())
+                    .child(detail.to_string()),
+            );
+        }
+        panel
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(8.0))
+                    .child(reload)
+                    .child(reset)
+                    .child(close),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for PluginEditorWindow {
@@ -2686,6 +2903,13 @@ impl Render for PluginEditorWindow {
             PluginEditorStatus::Unsupported(reason) => {
                 let reason = reason.clone();
                 Some(self.render_unsupported_panel(&reason))
+            }
+            PluginEditorStatus::Crashed(detail) => {
+                let detail = detail.clone();
+                Some(self.render_crash_panel(detail.as_deref(), cx))
+            }
+            PluginEditorStatus::Reloading => {
+                Some(self.render_status_message(&format!("Reloading: {}", self.display_name)))
             }
             PluginEditorStatus::Attached(PluginEditorPresentationMode::DetachedNativeWindow) => {
                 // The plug-in is in a window the host process owns, so this

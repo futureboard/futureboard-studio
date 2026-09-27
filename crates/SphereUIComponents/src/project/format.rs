@@ -147,13 +147,17 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// fader, pan, mute and inserts act on them. In a pre-v55 file membership was
 /// only visual, and a member whose output is the main mix loads routed to its
 /// folder instead; a member routed anywhere else keeps its route.
-pub const PROJECT_VERSION: u32 = 55;
+/// v56 appends each track's bank/program selection after its MPE settings:
+/// the GM/GS/XG format tag, a program flag and value, and the bank MSB and
+/// LSB. A pre-v56 track loads with no program chosen, so nothing is sent.
+pub const PROJECT_VERSION: u32 = 56;
 
-/// Minimum on-disk format version that can be loaded without data loss.
-/// Versions below this will show a warning but can still be loaded.
-/// Currently set to v33 (Video track introduction) since v32 and earlier
-/// lack Video track, modern Audio Connections, and other critical features.
-pub const MIN_SUPPORTED_VERSION: u32 = 33;
+/// Oldest on-disk format version whose migration to the current one is
+/// supported (see [`super::migrate`]): v30, which introduced arrangement
+/// folders. A file from v30 on opens migrated, with its original kept; an
+/// older one still opens as well as its decoder can, reported as outside the
+/// supported range.
+pub const MIN_SUPPORTED_VERSION: u32 = 30;
 
 /// Minimum on-disk header size: magic (8) + version (4) + reserved (4) + body_len (4).
 pub const PROJECT_HEADER_SIZE: usize = 20;
@@ -1048,7 +1052,7 @@ fn routing_output_bus_id(output: &ProjectTrackOutputRouting) -> Option<String> {
     }
 }
 
-fn encode_track(w: &mut FbWriter, t: &ProjectTrack) {
+fn encode_track(w: &mut FbWriter, t: &ProjectTrack, version: u32) {
     w.write_str(&t.id);
     w.write_str(&t.name);
     encode_track_type(w, t.track_type);
@@ -1130,6 +1134,14 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack) {
     w.write_u8(mpe.member_channels);
     w.write_f32(mpe.member_pitch_range);
     w.write_f32(mpe.manager_pitch_range);
+    // v56: bank/program selection, appended for the same reason.
+    if version >= 56 {
+        let program = t.routing.program.sanitized();
+        w.write_u8(program.format.to_tag());
+        w.write_opt_u8(&program.program);
+        w.write_u8(program.bank_msb);
+        w.write_u8(program.bank_lsb);
+    }
 }
 
 /// v28: built-in Soundfont Player instrument state. A leading flag keeps the
@@ -1472,7 +1484,13 @@ fn migrate_legacy_song_text_cue(
     }
 }
 
+/// The body in the current layout (tests build bodies to frame by hand).
+#[cfg(test)]
 fn encode_body(project: &FutureboardProject) -> Vec<u8> {
+    encode_body_versioned(project, PROJECT_VERSION)
+}
+
+fn encode_body_versioned(project: &FutureboardProject, version: u32) -> Vec<u8> {
     let mut w = FbWriter::new();
 
     // Header fields
@@ -1498,7 +1516,7 @@ fn encode_body(project: &FutureboardProject) -> Vec<u8> {
     // Tracks
     w.write_u32(project.tracks.len() as u32);
     for t in &project.tracks {
-        encode_track(&mut w, t);
+        encode_track(&mut w, t, version);
     }
 
     // Assets
@@ -2380,12 +2398,30 @@ fn decode_audio_connection(r: &mut FbReader) -> Result<ProjectAudioConnection, P
 
 /// Encodes a `FutureboardProject` into the full `.fbproj` binary format.
 pub fn encode_project(project: &FutureboardProject) -> Vec<u8> {
-    let body = encode_body(project);
+    encode_project_versioned(project, PROJECT_VERSION)
+}
+
+/// [`encode_project`] in the byte layout of format `version`, which must be
+/// v55 or later: the fields a v55 build did not write are left out and the
+/// header says v55. Lets a test load a genuinely older file instead of a
+/// current one relabelled, which stops being the same thing the moment a
+/// version adds bytes.
+#[cfg(test)]
+pub(crate) fn encode_project_as(project: &FutureboardProject, version: u32) -> Vec<u8> {
+    assert!(
+        (55..=PROJECT_VERSION).contains(&version),
+        "encode_project_as writes v55 and later"
+    );
+    encode_project_versioned(project, version)
+}
+
+fn encode_project_versioned(project: &FutureboardProject, version: u32) -> Vec<u8> {
+    let body = encode_body_versioned(project, version);
     let checksum = crc32fast::hash(&body);
 
     let mut out = Vec::with_capacity(8 + 4 + 4 + 4 + body.len() + 4);
     out.extend_from_slice(PROJECT_MAGIC);
-    out.extend_from_slice(&PROJECT_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // reserved
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
     out.extend_from_slice(&body);
@@ -3045,6 +3081,7 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
             midi_channel,
             midi_output_per_note,
             mpe: MpeTrackConfiguration::default(),
+            program: Default::default(),
             sends: Vec::new(),
         }
     } else {
@@ -3151,6 +3188,17 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
             member_channels: r.read_u8()?,
             member_pitch_range: r.read_f32()?,
             manager_pitch_range: r.read_f32()?,
+        }
+        .sanitized();
+    }
+
+    // v56: bank/program selection. A pre-v56 track chooses none.
+    if version >= 56 {
+        routing.program = sphere_midi_service::program::MidiProgramSelection {
+            format: sphere_midi_service::program::MidiPatchFormat::from_tag(r.read_u8()?),
+            program: r.read_opt_u8()?,
+            bank_msb: r.read_u8()?,
+            bank_lsb: r.read_u8()?,
         }
         .sanitized();
     }
@@ -3614,6 +3662,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
     };
 
     Ok(FutureboardProject {
+        migration: None,
         view,
         audio_connections,
         global_lanes,
@@ -5388,7 +5437,7 @@ mod tests {
         // Four collapse latches plus five absent optional heights.
         body.truncate(body.len() - (4 + 5));
         let bytes = project_bytes_with_version(body, 39);
-        let decoded = decode_project(&bytes).expect("v39 loads");
+        let decoded = decode_project_with_options(&bytes, true).expect("v39 loads");
         assert_eq!(
             decoded.global_lanes,
             super::super::ProjectGlobalLanes::default()
@@ -5405,7 +5454,7 @@ mod tests {
         // v33 also stores the combined union per track, so a track-bearing
         // fixture would need the older track layout; an empty project is
         // enough to prove the section is version-gated.
-        let decoded = decode_project(&bytes).expect("v33 loads");
+        let decoded = decode_project_with_options(&bytes, true).expect("v33 loads");
         assert!(decoded.audio_connections.is_empty());
     }
 

@@ -2170,6 +2170,22 @@ impl StudioLayout {
             if !enabled_outputs.contains(device_id) {
                 continue;
             }
+            // The track's bank and program lead its part, at the playhead: a
+            // module keeps whatever patch it was left on, so it is set up on
+            // every start, not only when the selection changed.
+            for message in track_program_messages(track) {
+                events.push(sphere_midi_service::HardwareMidiEvent {
+                    device_id: device_id.clone(),
+                    delay_seconds: 0.0,
+                    beat: playhead_beats.max(0.0) as f64,
+                    absolute_sample: state.tempo_map.samples_at_beat(
+                        playhead_beats.max(0.0) as f64,
+                        base_bpm,
+                        sample_rate as f64,
+                    ),
+                    message,
+                });
+            }
             let output_mode = track.routing.output_channel_mode();
             for clip in &track.clips {
                 if clip.muted || clip.start_beat + clip.duration_beats <= playhead_beats {
@@ -2264,6 +2280,39 @@ impl StudioLayout {
         }
 
         events
+    }
+
+    /// A track's program was chosen. A MIDI track on a hardware route has no
+    /// engine instrument to receive it, so it goes to the device now, from a
+    /// thread of its own (opening a port can block). While hardware playback
+    /// runs the port is held, and the selection goes out with the next start.
+    pub(super) fn send_track_program_to_hardware(
+        &mut self,
+        track_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let (device_id, messages) = {
+            let timeline = self.timeline.read(cx);
+            let Some(track) = timeline.state.find_track(track_id) else {
+                return;
+            };
+            let TrackOutputRouting::HardwareOutput { device_id, .. } = &track.routing.output else {
+                return;
+            };
+            (device_id.clone(), track_program_messages(track))
+        };
+        if messages.is_empty() {
+            return;
+        }
+        let _ = std::thread::Builder::new()
+            .name("midi-program-send".to_string())
+            .spawn(move || {
+                if !sphere_midi_service::send_midi_output_now(&device_id, &messages) {
+                    eprintln!(
+                        "[midi-output] program not sent device={device_id}: port busy or missing"
+                    );
+                }
+            });
     }
 
     pub(super) fn current_audio_sample_rate(&self) -> u32 {
@@ -4452,4 +4501,21 @@ mod stop_lifecycle_tests {
             false
         ));
     }
+}
+
+/// A track's bank/program selection as raw MIDI on its channel, in sending
+/// order. Empty when it chooses no program.
+fn track_program_messages(
+    track: &crate::components::timeline::timeline_state::TrackState,
+) -> Vec<Vec<u8>> {
+    let channel = track.routing.midi_channel.unwrap_or(1).clamp(1, 16) - 1;
+    track
+        .routing
+        .program
+        .messages()
+        .map(|message| {
+            let (bytes, len) = message.bytes(channel);
+            bytes[..len].to_vec()
+        })
+        .collect()
 }

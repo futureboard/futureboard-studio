@@ -387,6 +387,7 @@ impl StudioLayout {
         let _ = handle.update(cx, |editor, window, cx| {
             editor.activate_tab(insert_id, &display_name, window, cx);
         });
+        self.show_crash_panel_if_crashed(track_id, insert_id, cx);
     }
 
     /// Closes one tab. The last one closes the window with it.
@@ -552,6 +553,9 @@ impl StudioLayout {
             }
             PluginEditorAction::CloseTab(target) => {
                 self.close_plugin_editor_tab(track_id, &target, cx);
+            }
+            PluginEditorAction::ReloadPlugin { reset } => {
+                self.reload_crashed_plugin(track_id, insert_id, reset, cx);
             }
         }
     }

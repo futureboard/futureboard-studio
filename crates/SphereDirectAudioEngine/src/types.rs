@@ -441,6 +441,36 @@ pub struct EngineTrackSnapshot {
     /// existing snapshots remain source-compatible and deserialize unchanged.
     #[serde(default)]
     pub solfege_engine: Option<EngineSolfegeSnapshot>,
+    /// Bank/program selections this track's instrument is to be set to, one
+    /// per MIDI channel: its own, and those of MIDI tracks that play it.
+    #[serde(default)]
+    pub midi_programs: Vec<EngineMidiProgram>,
+}
+
+/// A bank and program for one MIDI channel of a track's instrument.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineMidiProgram {
+    /// 0-based MIDI channel.
+    pub channel: u8,
+    /// Bank Select MSB (CC 0), when the format sends banks.
+    #[serde(default)]
+    pub bank_msb: Option<u8>,
+    /// Bank Select LSB (CC 32), when the format sends banks.
+    #[serde(default)]
+    pub bank_lsb: Option<u8>,
+    pub program: u8,
+}
+
+impl EngineMidiProgram {
+    pub fn sanitized(self) -> Self {
+        Self {
+            channel: self.channel.min(15),
+            bank_msb: self.bank_msb.map(|msb| msb.min(127)),
+            bank_lsb: self.bank_lsb.map(|lsb| lsb.min(127)),
+            program: self.program.min(127),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

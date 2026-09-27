@@ -549,6 +549,13 @@ impl AudioEngine {
         config: &EngineConfig,
     ) -> Result<JsDauxConfig, SphereAudioError> {
         Self::validate_config(config)?;
+        // ASIO has no default device: opening one "by no name" loads the
+        // first driver in the registry, which is rarely the interface in use.
+        if config.backend == AudioBackend::Asio && config.output_device.is_none() {
+            return Err(SphereAudioError::DeviceNotFound(
+                "no ASIO driver is selected; choose one in Audio Device Setup".to_string(),
+            ));
+        }
         Ok(JsDauxConfig {
             backend_id: config.backend.backend_id().to_string(),
             output_device_id: config
@@ -630,9 +637,20 @@ impl AudioEngine {
             self.ensure_asio_device_cache()?;
         }
         let daux = Self::daux_config_from_engine_config(&config)?;
-        self.inner.open_daux_safe(daux)?;
+        // Kept even when the open fails: the retry that follows is a plain
+        // `start()` from this config, and it has to name the device the user
+        // chose. Storing it only on success sent the retry out with the old,
+        // device-less config — for ASIO, the first driver in the registry.
         self.config = config;
+        self.inner.open_daux_safe(daux)?;
         self.inner.start()
+    }
+
+    /// Takes `config` for the next [`Self::start`] without opening anything.
+    /// For a driver that must be opened from one thread and not from the one
+    /// preparing the engine (ASIO: see `build_and_warm_audio_engine`).
+    pub fn set_config(&mut self, config: EngineConfig) {
+        self.config = config;
     }
 
     /// Stop the audio stream (closes the device, frees realtime resources).
@@ -735,6 +753,25 @@ impl AudioEngine {
         sink: Option<std::sync::Arc<dyn crate::plugin_bridge::PluginBridgeSink>>,
     ) -> Result<(), SphereAudioError> {
         self.inner.set_plugin_bridge_sink(insert_id, sink)
+    }
+
+    /// See [`crate::engine::EngineInner::begin_render_capture`].
+    pub fn begin_render_capture(
+        &self,
+        track_ids: &[String],
+        capacity_frames: usize,
+    ) -> Result<std::sync::Arc<crate::render_capture::RenderCapture>, SphereAudioError> {
+        self.inner.begin_render_capture(track_ids, capacity_frames)
+    }
+
+    /// See [`crate::engine::EngineInner::end_render_capture`].
+    pub fn end_render_capture(&self) {
+        self.inner.end_render_capture()
+    }
+
+    /// See [`crate::engine::EngineInner::render_latency_frames`].
+    pub fn render_latency_frames(&self) -> u64 {
+        self.inner.render_latency_frames()
     }
 
     /// Wait (bounded, control thread only) until the audio callback has drained

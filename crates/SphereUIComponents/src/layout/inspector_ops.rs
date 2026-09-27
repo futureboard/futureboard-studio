@@ -53,6 +53,10 @@ type MidiInputCb = Arc<dyn Fn(&(String, TrackMidiInputRouting), &mut Window, &mu
 type MidiChannelCb = Arc<dyn Fn(&(String, Option<u8>), &mut Window, &mut App) + 'static>;
 type MpeConfigurationCb =
     Arc<dyn Fn(&(String, MpeTrackConfiguration), &mut Window, &mut App) + 'static>;
+type ProgramSelectionCb = Arc<
+    dyn Fn(&(String, sphere_midi_service::program::MidiProgramSelection), &mut Window, &mut App)
+        + 'static,
+>;
 type InsertPairCb = Arc<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>;
 type InsertOpenCb = Arc<dyn Fn(&(String, usize, String), &mut Window, &mut App) + 'static>;
 type InsertPickerCb = Arc<dyn Fn(&(String, usize, bool), &mut Window, &mut App) + 'static>;
@@ -347,6 +351,7 @@ impl StudioLayout {
         let on_set_midi_input = self.midi_input_cb(owner.clone());
         let on_set_midi_channel = self.midi_channel_cb(owner.clone());
         let on_set_mpe_configuration = self.mpe_configuration_cb(owner.clone());
+        let on_set_program_selection = self.program_selection_cb(owner.clone());
         let on_open_insert_picker = self.insert_picker_cb(owner.clone());
         let on_remove_insert = self.remove_insert_cb(owner.clone());
         let on_toggle_insert_bypass = self.toggle_insert_bypass_cb(owner.clone());
@@ -458,6 +463,7 @@ impl StudioLayout {
             on_set_midi_input,
             on_set_midi_channel,
             on_set_mpe_configuration,
+            on_set_program_selection,
             on_open_insert_picker,
             on_remove_insert,
             on_toggle_insert_bypass,
@@ -1348,6 +1354,47 @@ impl StudioLayout {
                 }
             },
         )
+    }
+
+    /// The Program card: one undoable change of the track's bank/program
+    /// selection, then an engine sync so the instrument receives it — and a
+    /// MIDI device on a hardware route, which the engine does not reach.
+    fn program_selection_cb(&self, owner: Entity<Self>) -> ProgramSelectionCb {
+        let timeline = self.timeline.clone();
+        Arc::new(move |(id, selection), _w, cx| {
+            let id = id.clone();
+            let next = selection.sanitized();
+            let changed = timeline.update(cx, |timeline, cx| {
+                let Some(prev) = timeline
+                    .state
+                    .find_track(&id)
+                    .map(|track| track.routing.program)
+                else {
+                    return false;
+                };
+                if prev == next {
+                    return false;
+                }
+                timeline.run_edit_command(
+                    EditCommand::SetTrackProgramSelection {
+                        track_id: id.clone(),
+                        prev,
+                        next,
+                    },
+                    cx,
+                );
+                true
+            });
+            if changed {
+                inspector_debug(&format!("routing program track={id} selection={next:?}"));
+                StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                    this.mark_dirty();
+                    this.schedule_audio_project_sync(cx, true, "inspector_program_selection");
+                    this.send_track_program_to_hardware(&id, cx);
+                    this.push_mixer_snapshot_to_window(cx);
+                });
+            }
+        })
     }
 
     /// Build one of the four M/S/R/I toggle callbacks. Every toggle is persisted
