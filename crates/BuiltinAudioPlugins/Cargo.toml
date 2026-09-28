@@ -28,6 +28,7 @@ transient.workspace = true
 c1073.workspace = true
 meowsyn.workspace = true
 wrapsynth.workspace = true
+drumsampler.workspace = true
 zcomp.workspace = true
 mixstation.workspace = true
 

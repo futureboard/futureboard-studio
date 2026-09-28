@@ -44,6 +44,7 @@ burnlimit.workspace = true
 clipper67.workspace = true
 transient.workspace = true
 wrapsynth.workspace = true
+drumsampler.workspace = true
 zcomp.workspace = true
 mixstation.workspace = true
 # Analyser FFT for the bridged-insert spectrum (src/spectrum.rs). Already a

@@ -2,15 +2,15 @@ use std::time::{Duration, Instant};
 
 use gpui::{App, Bounds, Context, Window};
 
-use crate::components::native_editor_shell::{NativeEditorShell, shell_defaults};
+use crate::components::native_editor_shell::{shell_defaults, NativeEditorShell};
 use crate::components::plugin_manager::open_plugin_manager_window;
 use crate::components::plugin_picker::{
-    PickerFilter, PluginInsertKind, PluginPickerState, STUB_PLUGIN_ID, ensure_default_highlight,
+    ensure_default_highlight, PickerFilter, PluginInsertKind, PluginPickerState, STUB_PLUGIN_ID,
 };
 use crate::components::timeline::timeline_state::{PluginRuntimeBackend, PluginRuntimeState};
 use crate::components::transport_key::{self, TransportKeySource};
 use crate::layout::plugin_editor_chrome_ops::is_ara_editor_key;
-use SpherePluginHost::{CatalogLoad, load_au_cache_state};
+use SpherePluginHost::{load_au_cache_state, CatalogLoad};
 
 use super::{PluginCatalogStatus, PluginSearchIndex, StudioLayout};
 
@@ -601,6 +601,45 @@ impl StudioLayout {
                                 latency_samples,
                                 stereo,
                                 truncated,
+                            );
+                        });
+                    }
+                }
+                ClientEvent::Host(HostEvent::BuiltinDrumSampleResult {
+                    plugin_instance_id,
+                    pad_index,
+                    ok,
+                    name,
+                    error,
+                    frames,
+                    channels,
+                }) => {
+                    eprintln!(
+                        "[plugin-bridge] event BuiltinDrumSampleResult instance={plugin_instance_id} pad={pad_index} ok={ok} name={name} error={error:?}"
+                    );
+                    if ok {
+                        // Every `LoadBuiltinDrumSample` command originates from a
+                        // drumsampler-bound forwarder, so this event is always
+                        // that plugin's — fold the assignment into the mirror so
+                        // it survives project save/reload.
+                        crate::components::builtin_plugin_editor::builtin_state_set_drum_sample(
+                            "drumsampler",
+                            &plugin_instance_id,
+                            pad_index as usize,
+                            Some(name.clone()),
+                        );
+                        self.note_plugin_state_edited(cx);
+                    }
+                    for handle in self.plugin_editors.builtin.values() {
+                        let _ = handle.update(cx, |editor, _window, _cx| {
+                            editor.notify_drum_sample_result(
+                                &plugin_instance_id,
+                                pad_index,
+                                ok,
+                                &name,
+                                error.as_deref(),
+                                frames,
+                                channels,
                             );
                         });
                     }
@@ -2500,10 +2539,11 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) {
         use crate::components::builtin_plugin_editor_window::{
-            BuiltinEditorHostOps, BuiltinGlobalCommandDispatcher, BuiltinHostStatusSource,
-            BuiltinIrLoadForwarder, BuiltinIrLoadRequest, BuiltinMeterSource,
-            BuiltinNamLoadForwarder, BuiltinNamLoadRequest, BuiltinParamForwarder,
-            BuiltinSpectrumSource, BuiltinTransportSource, PluginInstanceKey,
+            BuiltinDrumSampleLoadForwarder, BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps,
+            BuiltinGlobalCommandDispatcher, BuiltinHostStatusSource, BuiltinIrLoadForwarder,
+            BuiltinIrLoadRequest, BuiltinMeterSource, BuiltinNamLoadForwarder,
+            BuiltinNamLoadRequest, BuiltinParamForwarder, BuiltinSpectrumSource,
+            BuiltinTransportSource, PluginInstanceKey,
         };
 
         let target = PluginInstanceKey {
@@ -2614,6 +2654,36 @@ impl StudioLayout {
                 },
             ) as BuiltinIrLoadForwarder
         });
+        let load_pad_sample: Option<BuiltinDrumSampleLoadForwarder> =
+            bridge_runtime.clone().map(|runtime| {
+                std::sync::Arc::new(
+                    move |key: &PluginInstanceKey, request: BuiltinDrumSampleLoadRequest| {
+                        use base64::Engine as _;
+                        // Binary through a newline-framed JSON transport: base64
+                        // here, decoded once in the host process.
+                        let command = SpherePluginHost::ipc::HostCommand::LoadBuiltinDrumSample {
+                            plugin_instance_id: key.insert_id.clone(),
+                            pad_index: request.pad_index,
+                            name: request.name,
+                            audio_b64: base64::engine::general_purpose::STANDARD
+                                .encode(&request.bytes),
+                        };
+                        match runtime.lock() {
+                            Ok(mut bridge) => {
+                                if let Err(error) = bridge.send_raw(&command) {
+                                    eprintln!(
+                                        "[BuiltinPluginEditor] loadSample send failed insert={} error={error}",
+                                        key.insert_id
+                                    );
+                                }
+                            }
+                            Err(_) => eprintln!(
+                                "[BuiltinPluginEditor] loadSample dropped: bridge runtime poisoned"
+                            ),
+                        }
+                    },
+                ) as BuiltinDrumSampleLoadForwarder
+            });
         let meter_source: Option<BuiltinMeterSource> = bridge_runtime.clone().map(|runtime| {
             std::sync::Arc::new(move |key: &PluginInstanceKey| {
                 runtime
@@ -2659,6 +2729,7 @@ impl StudioLayout {
             dispatch_global_command,
             load_nam_capture,
             load_ir,
+            load_pad_sample,
             meter_source,
             host_status_source,
             spectrum_source,
@@ -3388,7 +3459,7 @@ impl StudioLayout {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
-        use crate::components::timeline::timeline_state::{MASTER_TRACK_ID, TrackType};
+        use crate::components::timeline::timeline_state::{TrackType, MASTER_TRACK_ID};
 
         let debug = std::env::var_os("FUTUREBOARD_PLUGIN_PICKER_DEBUG").is_some();
         let started = std::time::Instant::now();
@@ -5853,7 +5924,7 @@ fn log_bridge_paint_stats(session: &BridgeEditorSession) {
 
 #[cfg(test)]
 mod insert_ownership_tests {
-    use super::{EditorTabDetach, InsertKeyStatus, classify_insert_key, plan_editor_tab_detach};
+    use super::{classify_insert_key, plan_editor_tab_detach, EditorTabDetach, InsertKeyStatus};
     use crate::components::timeline::timeline_state::{
         CreateTrackOptions, InputMonitorMode, InsertPluginFormat, TimelineState, TrackType,
     };
@@ -5970,8 +6041,8 @@ mod insert_ownership_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        BridgeEditorState, EditorReopenAction, PluginEditorWindows, bridge_editor_is_open,
-        bridge_editor_is_terminal, editor_reopen_action,
+        bridge_editor_is_open, bridge_editor_is_terminal, editor_reopen_action, BridgeEditorState,
+        EditorReopenAction, PluginEditorWindows,
     };
 
     // Every non-terminal, non-Loading state. These are "live or in flight" and
@@ -6061,9 +6132,9 @@ mod plugin_state_dirty_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        PLUGIN_EDIT_GESTURE_GAP, PLUGIN_STATE_CAPTURE_TASK_ID, PluginEditGesture, PluginEditSettle,
-        PluginEditStep, PluginStateCaptureFor, forget_plugin_state_capture_report,
-        plugin_state_label, uncaptured_plugin_states_message,
+        forget_plugin_state_capture_report, plugin_state_label, uncaptured_plugin_states_message,
+        PluginEditGesture, PluginEditSettle, PluginEditStep, PluginStateCaptureFor,
+        PLUGIN_EDIT_GESTURE_GAP, PLUGIN_STATE_CAPTURE_TASK_ID,
     };
     use crate::components::timeline::timeline_state::{
         CreateTrackOptions, InputMonitorMode, InsertPluginFormat, TimelineState, TrackType,

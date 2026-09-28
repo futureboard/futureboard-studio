@@ -81,6 +81,7 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
         clipper67::ui::UI_ORIGIN => clipper67::ui_param_index(param_id),
         transient::ui::UI_ORIGIN => transient::ui_param_index(param_id),
         wrapsynth::ui::UI_ORIGIN => wrapsynth::ui_param_index(param_id),
+        drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_index(param_id),
         zcomp::ui::UI_ORIGIN => zcomp::ui_param_index(param_id),
         mixstation::ui::UI_ORIGIN => mixstation::ui_param_index(param_id),
         _ => None,
@@ -127,6 +128,7 @@ mod state_mirror {
         Clipper67(Box<clipper67::Params>),
         Transient(Box<transient::Params>),
         WrapSynth(Box<wrapsynth::Params>),
+        DrumSampler(Box<drumsampler::Params>),
         Zcomp(Box<zcomp::Params>),
         MixStation(Box<mixstation::Params>),
     }
@@ -144,6 +146,7 @@ mod state_mirror {
                 Self::Clipper67(_) => clipper67::ui::UI_ORIGIN,
                 Self::Transient(_) => transient::ui::UI_ORIGIN,
                 Self::WrapSynth(_) => wrapsynth::ui::UI_ORIGIN,
+                Self::DrumSampler(_) => drumsampler::ui::UI_ORIGIN,
                 Self::Zcomp(_) => zcomp::ui::UI_ORIGIN,
                 Self::MixStation(_) => mixstation::ui::UI_ORIGIN,
             }
@@ -175,6 +178,9 @@ mod state_mirror {
                 }
                 wrapsynth::ui::UI_ORIGIN => {
                     Some(Self::WrapSynth(Box::new(wrapsynth::default_params())))
+                }
+                drumsampler::ui::UI_ORIGIN => {
+                    Some(Self::DrumSampler(Box::new(drumsampler::default_params())))
                 }
                 zcomp::ui::UI_ORIGIN => Some(Self::Zcomp(Box::new(zcomp::default_params()))),
                 mixstation::ui::UI_ORIGIN => {
@@ -224,6 +230,7 @@ mod state_mirror {
             clipper67::ui::UI_ORIGIN => clipper67::ui_param_id(wire_index).is_some(),
             transient::ui::UI_ORIGIN => transient::ui_param_id(wire_index).is_some(),
             wrapsynth::ui::UI_ORIGIN => wrapsynth::ui_param_id(wire_index).is_some(),
+            drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_id(wire_index).is_some(),
             zcomp::ui::UI_ORIGIN => zcomp::ui_param_id(wire_index).is_some(),
             mixstation::ui::UI_ORIGIN => mixstation::ui_param_id(wire_index).is_some(),
             _ => false,
@@ -266,6 +273,9 @@ mod state_mirror {
             }
             Some(BuiltinParams::WrapSynth(params)) => {
                 let _ = wrapsynth::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::DrumSampler(params)) => {
+                let _ = drumsampler::ipc::apply_wire_param(params, wire_index, value);
             }
             Some(BuiltinParams::Zcomp(params)) => {
                 let _ = zcomp::ipc::apply_wire_param(params, wire_index, value);
@@ -317,6 +327,9 @@ mod state_mirror {
             wrapsynth::ui::UI_ORIGIN => wrapsynth::ipc::WrapSynthState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::WrapSynth(Box::new(state.params))),
+            drumsampler::ui::UI_ORIGIN => drumsampler::ipc::DrumSamplerState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::DrumSampler(Box::new(state.params))),
             zcomp::ui::UI_ORIGIN => zcomp::ipc::ZcompState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Zcomp(Box::new(state.params))),
@@ -394,6 +407,11 @@ mod state_mirror {
             }
             BuiltinParams::WrapSynth(params) if origin == wrapsynth::ui::UI_ORIGIN => {
                 wrapsynth::ipc::WrapSynthState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::DrumSampler(params) if origin == drumsampler::ui::UI_ORIGIN => {
+                drumsampler::ipc::DrumSamplerState::new((**params).clone())
                     .to_json()
                     .ok()?
             }
@@ -485,6 +503,12 @@ mod state_mirror {
                     .filter_map(|(id, value)| wrapsynth::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
+            Some(BuiltinParams::DrumSampler(params)) if origin == drumsampler::ui::UI_ORIGIN => {
+                drumsampler::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| drumsampler::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
             Some(BuiltinParams::Zcomp(params)) if origin == zcomp::ui::UI_ORIGIN => {
                 zcomp::ipc::ui_values(params)
                     .into_iter()
@@ -499,6 +523,33 @@ mod state_mirror {
                     .collect()
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Record which sample a `drumsampler` pad has loaded, so it survives
+    /// project save/reload. Not a wire param (a file name is not an `f32`),
+    /// so it bypasses `builtin_state_apply`'s numeric path. Creates the entry
+    /// at defaults if this is the first thing ever recorded for the insert.
+    /// A no-op for any other plugin id.
+    pub fn builtin_state_set_drum_sample(
+        plugin_id: &str,
+        insert_id: &str,
+        pad_index: usize,
+        name: Option<String>,
+    ) {
+        if origin_for_plugin_id(plugin_id) != Some(drumsampler::ui::UI_ORIGIN) {
+            return;
+        }
+        let Ok(mut states) = map().lock() else {
+            return;
+        };
+        let Some(entry) = entry_for(&mut states, insert_id, drumsampler::ui::UI_ORIGIN) else {
+            return;
+        };
+        if let BuiltinParams::DrumSampler(params) = entry {
+            if let Some(pad) = params.pads.get_mut(pad_index) {
+                pad.sample_name = name;
+            }
         }
     }
 
@@ -521,7 +572,7 @@ mod state_mirror {
 #[cfg(feature = "builtin-plugin-editor")]
 pub use state_mirror::{
     builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
-    builtin_state_replay, builtin_state_seed,
+    builtin_state_replay, builtin_state_seed, builtin_state_set_drum_sample,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is
@@ -538,12 +589,19 @@ mod state_mirror_stubs {
     }
     pub fn builtin_state_remove(_insert_id: &str) {}
     pub fn builtin_state_clear() {}
+    pub fn builtin_state_set_drum_sample(
+        _plugin_id: &str,
+        _insert_id: &str,
+        _pad_index: usize,
+        _name: Option<String>,
+    ) {
+    }
 }
 
 #[cfg(not(feature = "builtin-plugin-editor"))]
 pub use state_mirror_stubs::{
     builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
-    builtin_state_replay, builtin_state_seed,
+    builtin_state_replay, builtin_state_seed, builtin_state_set_drum_sample,
 };
 
 /// Physical-pixel rect the editor view occupies inside its parent window.
@@ -988,6 +1046,7 @@ mod imp {
             clipper67::ui::UI_ORIGIN => clipper67::ui::Clipper67Ui::resolve_ui_asset(path)?,
             transient::ui::UI_ORIGIN => transient::ui::TransientUi::resolve_ui_asset(path)?,
             wrapsynth::ui::UI_ORIGIN => wrapsynth::ui::WrapSynthUi::resolve_ui_asset(path)?,
+            drumsampler::ui::UI_ORIGIN => drumsampler::ui::DrumSamplerUi::resolve_ui_asset(path)?,
             zcomp::ui::UI_ORIGIN => zcomp::ui::ZcompUi::resolve_ui_asset(path)?,
             mixstation::ui::UI_ORIGIN => mixstation::ui::MixStationUi::resolve_ui_asset(path)?,
             _ => return None,
@@ -1015,6 +1074,7 @@ mod imp {
                 | clipper67::ui::UI_ORIGIN
                 | transient::ui::UI_ORIGIN
                 | wrapsynth::ui::UI_ORIGIN
+                | drumsampler::ui::UI_ORIGIN
                 | zcomp::ui::UI_ORIGIN
                 | mixstation::ui::UI_ORIGIN
         )
@@ -1033,6 +1093,7 @@ mod imp {
             clipper67::ui::UI_ORIGIN => clipper67::ui::Clipper67Ui::is_embedded(),
             transient::ui::UI_ORIGIN => transient::ui::TransientUi::is_embedded(),
             wrapsynth::ui::UI_ORIGIN => wrapsynth::ui::WrapSynthUi::is_embedded(),
+            drumsampler::ui::UI_ORIGIN => drumsampler::ui::DrumSamplerUi::is_embedded(),
             zcomp::ui::UI_ORIGIN => zcomp::ui::ZcompUi::is_embedded(),
             mixstation::ui::UI_ORIGIN => mixstation::ui::MixStationUi::is_embedded(),
             _ => false,

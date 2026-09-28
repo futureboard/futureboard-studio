@@ -37,6 +37,7 @@ builtin-plugin-editor = [
     "dep:clipper67",
     "dep:transient",
     "dep:wrapsynth",
+    "dep:drumsampler",
     "dep:zcomp",
     "dep:mixstation",
     "dep:builtin-ui-embed",
@@ -87,6 +88,7 @@ burnlimit = { workspace = true, optional = true }
 clipper67 = { workspace = true, optional = true }
 transient = { workspace = true, optional = true }
 wrapsynth = { workspace = true, optional = true }
+drumsampler = { workspace = true, optional = true }
 zcomp = { workspace = true, optional = true }
 mixstation = { workspace = true, optional = true }
 builtin-ui-embed = { workspace = true, optional = true }

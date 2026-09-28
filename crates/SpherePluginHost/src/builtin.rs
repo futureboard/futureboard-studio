@@ -143,6 +143,13 @@ const CATALOG: &[BuiltinEntry] = &[
         kind: PluginKind::Instrument,
         has_editor: true,
     },
+    BuiltinEntry {
+        stem: "drumsampler",
+        name: "Drum Sampler",
+        category: "Instrument",
+        kind: PluginKind::Instrument,
+        has_editor: true,
+    },
 ];
 
 const VENDOR: &str = "Futureboard";
@@ -209,6 +216,7 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "clipper67",
     "transient",
     "wrapsynth",
+    "drumsampler",
     "zcomp",
     "mixstation",
 ];
@@ -396,6 +404,8 @@ mod tests {
         assert!(builtin_audio_bridge_supported("builtin:transient"));
         assert!(builtin_audio_bridge_supported("wrapsynth"));
         assert!(builtin_audio_bridge_supported("builtin:wrapsynth"));
+        assert!(builtin_audio_bridge_supported("drumsampler"));
+        assert!(builtin_audio_bridge_supported("builtin:drumsampler"));
         // Catalogued, but the host has no DSP for it — must keep its old path.
         assert!(!builtin_audio_bridge_supported("compresser"));
         assert!(!builtin_audio_bridge_supported("vst3:whatever"));

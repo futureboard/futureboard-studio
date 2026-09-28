@@ -115,6 +115,7 @@ scripts/translations/unique-en.txt
 scripts/translations/zh-CN.json
 scripts/translations/ja-JP.json
 scripts/translations/th-TH.json
+scripts/sync-release-from-build.sh
 
 references
 ref

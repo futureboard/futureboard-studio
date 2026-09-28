@@ -303,6 +303,7 @@ enum BuiltinDsp {
     Clipper67(clipper67::Dsp),
     Transient(transient::Dsp),
     WrapSynth(wrapsynth::Dsp),
+    DrumSampler(drumsampler::Dsp),
     Zcomp(zcomp::Dsp),
     MixStation(mixstation::Dsp),
 }
@@ -328,6 +329,10 @@ struct BuiltinHostProcessor {
     /// Control-side impulse-response loader (safe from the IPC thread). `None`
     /// for a built-in with no cabinet stage.
     ir_loader: Option<rodharerist::IrLoader>,
+    /// Control-side per-pad sample loaders for a built-in `drumsampler`
+    /// instance (safe from the IPC thread), indexed by pad. `None` for every
+    /// other built-in.
+    drum_pad_loaders: Option<Vec<drumsampler::PadLoader>>,
     /// Engine sample rate the DSP was built at — needed to validate a `.nam`
     /// capture's declared rate on the IPC thread.
     sample_rate: f32,
@@ -355,6 +360,7 @@ impl BuiltinHostProcessor {
             "clipper67" => Some(Self::clipper67(sample_rate, state_json)),
             "transient" => Some(Self::transient(sample_rate, state_json)),
             "wrapsynth" => Some(Self::wrapsynth(sample_rate, state_json)),
+            "drumsampler" => Some(Self::drumsampler(sample_rate, state_json)),
             "zcomp" => Some(Self::zcomp(sample_rate, state_json)),
             "mixstation" => Some(Self::mixstation(sample_rate, state_json)),
             _ => None,
@@ -388,6 +394,7 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader,
             ir_loader,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -416,6 +423,7 @@ impl BuiltinHostProcessor {
             // An EQ has no capture or cabinet stage to hand off into.
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -444,6 +452,7 @@ impl BuiltinHostProcessor {
             // A compressor has no capture or cabinet stage to hand off into.
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -472,6 +481,7 @@ impl BuiltinHostProcessor {
             // A compressor has no capture or cabinet stage to hand off into.
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -498,6 +508,7 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -524,6 +535,7 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -550,6 +562,7 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -578,6 +591,7 @@ impl BuiltinHostProcessor {
             // A delay has no capture or cabinet stage to hand off into.
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -606,6 +620,7 @@ impl BuiltinHostProcessor {
             // A reverb has no capture or cabinet stage to hand off into.
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -626,6 +641,31 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn drumsampler(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = drumsampler::Dsp::new(sr);
+        if let Some(json) = state_json {
+            match drumsampler::ipc::DrumSamplerState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] DrumSampler state rejected: {error}");
+                }
+            }
+        }
+        let pad_loaders = (0..drumsampler::PADS)
+            .map(|pad_index| dsp.pad_loader(pad_index).expect("pad_index is within PADS"))
+            .collect();
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::DrumSampler(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: Some(pad_loaders),
             sample_rate: sr,
         }
     }
@@ -652,6 +692,7 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -681,6 +722,7 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -754,6 +796,13 @@ impl BuiltinHostProcessor {
                 }
             }
             BuiltinDsp::WrapSynth(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo();
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
+            BuiltinDsp::DrumSampler(dsp) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo();
                     interleaved[i * 2] = l;
@@ -942,7 +991,8 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Equz8(_)
             | BuiltinDsp::Verbspace(_)
             | BuiltinDsp::Echospace(_)
-            | BuiltinDsp::WrapSynth(_) => None,
+            | BuiltinDsp::WrapSynth(_)
+            | BuiltinDsp::DrumSampler(_) => None,
         }
     }
 
@@ -964,6 +1014,7 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Transient(dsp) => dsp.latency_samples(),
             BuiltinDsp::Echospace(dsp) => dsp.latency_samples(),
             BuiltinDsp::WrapSynth(_) => 0,
+            BuiltinDsp::DrumSampler(_) => 0,
             BuiltinDsp::Zcomp(dsp) => dsp.latency_samples(),
             BuiltinDsp::MixStation(dsp) => dsp.latency_samples(),
         }
@@ -1010,6 +1061,9 @@ impl BuiltinHostProcessor {
             BuiltinDsp::WrapSynth(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
+            BuiltinDsp::DrumSampler(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
             BuiltinDsp::Zcomp(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
@@ -1021,14 +1075,22 @@ impl BuiltinHostProcessor {
 
     /// Deliver one MIDI event to an instrument built-in. The event has already
     /// been routed through this exact instance's bounded shared-memory ring.
+    /// Every non-instrument built-in ignores MIDI entirely.
     fn apply_midi(&self, event: SharedMidiEvent) {
-        let BuiltinDsp::WrapSynth(dsp) = (unsafe { &mut *self.dsp.get() }) else {
-            return;
-        };
-        match event.status & 0xf0 {
-            0x90 if event.data2 > 0 => dsp.note_on(event.data1, event.data2),
-            0x80 | 0x90 => dsp.note_off(event.data1),
-            0xb0 if matches!(event.data1, 120 | 123) => dsp.all_notes_off(),
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        match unsafe { &mut *self.dsp.get() } {
+            BuiltinDsp::WrapSynth(dsp) => match event.status & 0xf0 {
+                0x90 if event.data2 > 0 => dsp.note_on(event.data1, event.data2),
+                0x80 | 0x90 => dsp.note_off(event.data1),
+                0xb0 if matches!(event.data1, 120 | 123) => dsp.all_notes_off(),
+                _ => {}
+            },
+            BuiltinDsp::DrumSampler(dsp) => match event.status & 0xf0 {
+                0x90 if event.data2 > 0 => dsp.note_on(event.data1, event.data2),
+                0x80 | 0x90 => dsp.note_off(event.data1),
+                0xb0 if matches!(event.data1, 120 | 123) => dsp.all_notes_off(),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -3705,6 +3767,85 @@ fn dispatch(
                         latency_samples: 0,
                         stereo: false,
                         truncated: false,
+                    }
+                }
+            };
+            let _ = ipc::write_frame(out, &event);
+        }
+        HostCommand::LoadBuiltinDrumSample {
+            plugin_instance_id,
+            pad_index,
+            name,
+            audio_b64,
+        } => {
+            use base64::Engine as _;
+            // IPC thread: base64 + symphonia decode here (allocation-heavy,
+            // never on the producer thread), then hand off through the pad's
+            // wait-free cell.
+            let processor = builtin_processors
+                .lock()
+                .ok()
+                .and_then(|processors| processors.get(&plugin_instance_id).cloned());
+            let ext_hint = std::path::Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_string();
+            let result = base64::engine::general_purpose::STANDARD
+                .decode(audio_b64.as_bytes())
+                .map_err(|e| format!("sample payload is not valid base64: {e}"))
+                .and_then(|bytes| DirectAudio::load_audio_bytes(&bytes, &ext_hint))
+                .and_then(|decoded| {
+                    let loaders = match &processor {
+                        Some(p) => p.drum_pad_loaders.as_ref().ok_or_else(|| {
+                            format!("built-in DSP for {plugin_instance_id} has no drum pads")
+                        })?,
+                        None => {
+                            return Err(format!(
+                                "no built-in DSP instance loaded for {plugin_instance_id}"
+                            ));
+                        }
+                    };
+                    let loader = loaders.get(pad_index as usize).ok_or_else(|| {
+                        format!("pad_index {pad_index} out of range for {plugin_instance_id}")
+                    })?;
+                    let frames = decoded.frames;
+                    let channels = decoded.channels;
+                    loader.submit(Box::new(drumsampler::PadBuffer {
+                        samples: decoded.samples.into_boxed_slice(),
+                        channels,
+                        frames,
+                        sample_rate: decoded.sample_rate as f32,
+                    }));
+                    Ok((frames, channels))
+                });
+            let event = match result {
+                Ok((frames, channels)) => {
+                    eprintln!(
+                        "[plugin-host-drumsampler] loaded instance={plugin_instance_id} pad={pad_index} name={name} frames={frames} channels={channels}"
+                    );
+                    HostEvent::BuiltinDrumSampleResult {
+                        plugin_instance_id,
+                        pad_index,
+                        ok: true,
+                        name,
+                        error: None,
+                        frames: frames as u64,
+                        channels: channels as u32,
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[plugin-host-drumsampler] load FAILED instance={plugin_instance_id} pad={pad_index} name={name} error={error}"
+                    );
+                    HostEvent::BuiltinDrumSampleResult {
+                        plugin_instance_id,
+                        pad_index,
+                        ok: false,
+                        name,
+                        error: Some(error),
+                        frames: 0,
+                        channels: 0,
                     }
                 }
             };
