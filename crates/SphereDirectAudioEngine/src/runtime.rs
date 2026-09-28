@@ -642,6 +642,9 @@ pub struct RuntimeSpatial {
     pub fold: solfege_spatialaudio::MonitorFold,
     pub bus: solfege_spatialaudio::SpatialBus,
     pub virtual_speakers: Option<solfege_spatialaudio::VirtualSpeakers>,
+    /// The room's late tail, added to what reaches headphones: the binaural
+    /// mix, and a surround mix heard through the virtual speakers.
+    pub tail: Option<solfege_spatialaudio::RoomTail>,
     pub sample_rate: u32,
 }
 
@@ -653,6 +656,7 @@ impl Default for RuntimeSpatial {
             fold: solfege_spatialaudio::MonitorFold::default(),
             bus: solfege_spatialaudio::SpatialBus::new(2, 0),
             virtual_speakers: None,
+            tail: None,
             sample_rate: 48_000,
         }
     }
@@ -679,15 +683,19 @@ impl RuntimeSpatial {
             }
             _ => None,
         };
+        let room = snapshot.room.sanitized();
+        let tail = Some(solfege_spatialaudio::RoomTail::new(&room, sample_rate))
+            .filter(solfege_spatialaudio::RoomTail::is_audible);
         Self {
             format,
-            room: snapshot.room.sanitized(),
+            room,
             fold: snapshot.fold,
             bus: solfege_spatialaudio::SpatialBus::new(
                 format.channel_count(),
                 DEFAULT_AUDIO_BLOCK_CAPACITY,
             ),
             virtual_speakers,
+            tail,
             sample_rate,
         }
     }

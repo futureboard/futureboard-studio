@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "Surround (5.1, 7.1, 7.1.4, ...) and binaural spatialisation for Futureboard: square-room panning, a structural HRTF, virtual speakers and fold-down."
+description = "Surround (5.1, 7.1, 7.1.4, ...) and binaural spatialisation for Futureboard: square-room panning, the MIT KEMAR HRTF, a room tail, virtual speakers and fold-down."
 
 [lib]
 name = "solfege_spatialaudio"

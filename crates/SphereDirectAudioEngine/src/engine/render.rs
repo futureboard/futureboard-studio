@@ -667,15 +667,26 @@ fn mix_spatial_bus(
         spatial, monitor, ..
     } = runtime;
     let frames = frames.min(spatial.bus.capacity());
+    // Stack scratch a chunk at a time: no allocation, and the renderers
+    // carry their state across chunk boundaries as they do across blocks.
+    const CHUNK: usize = 256;
     match spatial.format {
         solfege_spatialaudio::SpatialFormat::Binaural => {
-            let (l, r) = (
-                spatial.bus.channel(0, frames),
-                spatial.bus.channel(1, frames),
-            );
-            for f in 0..frames {
-                output[f * channels] += l[f];
-                output[f * channels + 1] += r[f];
+            let mut l = [0.0f32; CHUNK];
+            let mut r = [0.0f32; CHUNK];
+            let mut offset = 0;
+            while offset < frames {
+                let n = (frames - offset).min(CHUNK);
+                l[..n].copy_from_slice(&spatial.bus.channel(0, frames)[offset..offset + n]);
+                r[..n].copy_from_slice(&spatial.bus.channel(1, frames)[offset..offset + n]);
+                if let Some(tail) = spatial.tail.as_mut() {
+                    tail.process(&mut l[..n], &mut r[..n]);
+                }
+                for i in 0..n {
+                    output[(offset + i) * channels] += l[i];
+                    output[(offset + i) * channels + 1] += r[i];
+                }
+                offset += n;
             }
             None
         }
@@ -689,10 +700,7 @@ fn mix_spatial_bus(
                 }
                 return Some(count);
             }
-            // Folded into the first pair, through stack scratch a chunk at a
-            // time: no allocation, and the binaural renderer carries its state
-            // across chunk boundaries as it does across blocks.
-            const CHUNK: usize = 256;
+            // Folded into the first pair.
             let mut l = [0.0f32; CHUNK];
             let mut r = [0.0f32; CHUNK];
             let mut offset = 0;
@@ -710,6 +718,9 @@ fn mix_spatial_bus(
                             &mut l[..n],
                             &mut r[..n],
                         );
+                        if let Some(tail) = spatial.tail.as_mut() {
+                            tail.process(&mut l[..n], &mut r[..n]);
+                        }
                         for i in 0..n {
                             output[(offset + i) * channels] += l[i];
                             output[(offset + i) * channels + 1] += r[i];

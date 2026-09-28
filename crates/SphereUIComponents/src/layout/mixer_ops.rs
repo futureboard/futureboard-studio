@@ -142,7 +142,9 @@ impl StudioLayout {
             .cached_bounds
             .map(|b| f32::from(b.size.width))
             .unwrap_or(1280.0);
-        let mixer_viewport_width = (window_w - tree_w - 90.0).max(100.0);
+        // The pinned Master and Control Room strips and the rule before them.
+        let pinned_w = 2.0 * STRIP_WIDTH + 1.0;
+        let mixer_viewport_width = (window_w - tree_w - pinned_w).max(100.0);
         let mixer_viewport_height = (self.bottom_panel_state.height_px - 28.0 - 30.0).max(0.0);
         let strip_available_px = mixer_viewport_height.max(STRIP_WIDTH);
         let _ = cx;

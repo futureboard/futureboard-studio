@@ -1109,7 +1109,8 @@ impl Colors {
         }
     }
 
-    /// Source-over composite of a translucent `layer` onto an opaque `base`.
+    /// Source-over composite of a translucent `layer` onto `base` (opaque, or
+    /// itself a tint over the window).
     ///
     /// This is what makes the state-layer model implementable at all. A GPUI
     /// div has exactly one `background`, so `.hover(|s| s.bg(state_hover()))`
@@ -1126,15 +1127,29 @@ impl Colors {
     /// Control-path only: this is a few float ops, but it belongs in the style
     /// closure's captured value, not inside a per-frame paint loop.
     pub fn composite(base: Rgba, layer: Rgba) -> Rgba {
-        let a = layer.a.clamp(0.0, 1.0);
-        let inv = 1.0 - a;
+        // Porter-Duff "over". On an opaque base this is the plain blend; on a
+        // see-through one (a theme whose surfaces are tints over the window)
+        // the base's colour only counts as far as it is there — otherwise a
+        // faint white strip under a dark recess layer came out light grey.
+        let la = layer.a.clamp(0.0, 1.0);
+        let ba = base.a.clamp(0.0, 1.0);
+        // The result is never more see-through than the base: a state layer
+        // must never punch a hole through the control it is lifting.
+        let a = la + ba * (1.0 - la);
+        if a <= f32::EPSILON {
+            return Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            };
+        }
+        let k = ba * (1.0 - la);
         Rgba {
-            r: layer.r * a + base.r * inv,
-            g: layer.g * a + base.g * inv,
-            b: layer.b * a + base.b * inv,
-            // The base plane stays opaque; a state layer must never punch a
-            // hole through the control it is lifting.
-            a: base.a + a * (1.0 - base.a),
+            r: (layer.r * la + base.r * k) / a,
+            g: (layer.g * la + base.g * k) / a,
+            b: (layer.b * la + base.b * k) / a,
+            a,
         }
     }
 
@@ -1219,6 +1234,36 @@ mod font_stack_tests {
             ui_font_weight(FontWeight::BOLD).family
         );
         assert_eq!(ui_font_weight(FontWeight::BOLD).weight, FontWeight::BOLD);
+    }
+}
+
+#[cfg(test)]
+mod composite_tests {
+    use super::*;
+
+    fn rgba(r: f32, g: f32, b: f32, a: f32) -> Rgba {
+        Rgba { r, g, b, a }
+    }
+
+    /// Over the window colour, then onto black: what reaches the screen.
+    fn on_black(c: Rgba) -> f32 {
+        c.r * c.a
+    }
+
+    #[test]
+    fn an_opaque_base_blends_as_before() {
+        let c = Colors::composite(rgba(0.2, 0.2, 0.2, 1.0), rgba(0.0, 0.0, 0.0, 0.5));
+        assert!((c.r - 0.1).abs() < 1.0e-6 && (c.a - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn a_dark_layer_on_a_faint_tint_stays_dark() {
+        // A theme's strip: white at 3% over the window. A 12% black recess on
+        // it must come out darker than the strip, not light grey.
+        let strip = rgba(1.0, 1.0, 1.0, 0.03);
+        let well = Colors::composite(strip, rgba(0.0, 0.0, 0.0, 0.12));
+        assert!(on_black(well) < on_black(strip), "{well:?}");
+        assert!(well.a >= strip.a);
     }
 }
 

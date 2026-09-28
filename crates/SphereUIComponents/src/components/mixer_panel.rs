@@ -3661,13 +3661,17 @@ pub(crate) fn mixer_strip_scroller(
             // A normal flex child expands across the entire scroller and, in
             // GPU-decoration mode, paints over every strip when the window is
             // wide enough to show all channels.
+            //
+            // Anchored where the strips end rather than sized from the right:
+            // the viewport width is an estimate, and when it ran wide the bay
+            // slid under the last strips and showed through them.
             d.child(
                 div()
                     .absolute()
+                    .left(px(total_content_w - scroll_x))
                     .right_0()
                     .top_0()
                     .bottom_0()
-                    .w(px(spare_channel_w))
                     .overflow_hidden()
                     .child(mixer_empty_bay(spare_channel_w, strip_available_px)),
             )

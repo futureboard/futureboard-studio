@@ -15,17 +15,24 @@
 //!   120 Hz. [`SurroundSource`] renders a channel's audio with those gains,
 //!   ramped per block so a moving source never zippers.
 //! * **Binaural** (headphones). [`BinauralSource`] renders each source through
-//!   a structural head model (Brown & Duda, 1998): interaural time difference
-//!   from a spherical head, a head-shadow filter per ear, and pinna echoes that
-//!   carry elevation and front/back. Distance attenuates and darkens the
-//!   source, first-order reflections off the room's four walls put it outside
-//!   the head, and a source at the centre of the room settles inside it. No
-//!   measured HRIR set is needed, so nothing is loaded from disk and nothing
-//!   allocates while rendering.
+//!   the measured MIT KEMAR dummy head (embedded; see `data/`): its time
+//!   difference between the ears and its per-ear filters, minimum-phase and
+//!   diffuse-field-equalised, interpolated between the measured directions.
+//!   Distance attenuates and darkens the source, first-order reflections off
+//!   the room's four walls and the room's late tail ([`RoomTail`]) put it
+//!   outside the head, and a source at the centre of the room settles inside
+//!   it. Nothing is loaded from disk and nothing allocates while rendering.
 //!
 //! A surround mix is heard on headphones through [`VirtualSpeakers`] (each
 //! speaker rendered binaurally where it stands in the room) or folded to
 //! stereo with the ITU coefficients ([`fold_down`]).
+//!
+//! # Data
+//!
+//! The binaural head is the MIT KEMAR set: Bill Gardner and Keith Martin,
+//! "HRTF Measurements of a KEMAR Dummy-Head Microphone", MIT Media Lab
+//! Perceptual Computing Technical Report #280, 1994. The authors are to be
+//! cited wherever it is used (`data/MIT_KEMAR_NOTICE.md`).
 //!
 //! # Realtime contract
 //!
@@ -38,9 +45,11 @@ mod binaural;
 mod bus;
 mod dsp;
 mod format;
+mod hrtf;
 mod layout;
 mod panner;
 mod position;
+mod room_tail;
 mod surround;
 mod virtual_speakers;
 
@@ -50,6 +59,7 @@ pub use format::{MonitorFold, SpatialFormat};
 pub use layout::{MAX_CHANNELS, Speaker, SpeakerLayout};
 pub use panner::SurroundPanner;
 pub use position::{RoomPosition, RoomSettings, SourceParams};
+pub use room_tail::RoomTail;
 pub use surround::SurroundSource;
 pub use virtual_speakers::{VirtualSpeakers, fold_down, fold_down_range, speaker_position};
 

@@ -462,13 +462,17 @@ impl gpui::Render for RoomDrag {
     }
 }
 
+/// How far in from the pad's edge its walls are drawn, so the puck stays
+/// whole inside the pad even in a corner.
+const ROOM_PAD_INSET: f32 = 4.5;
+
 /// Map a window point inside `bounds` to the room: left wall to right wall on
 /// x, front wall at the top.
 fn room_at(bounds: gpui::Bounds<gpui::Pixels>, x: f32, y: f32) -> (f32, f32) {
-    let left = f32::from(bounds.origin.x);
-    let top = f32::from(bounds.origin.y);
-    let w = f32::from(bounds.size.width).max(1.0);
-    let h = f32::from(bounds.size.height).max(1.0);
+    let left = f32::from(bounds.origin.x) + ROOM_PAD_INSET;
+    let top = f32::from(bounds.origin.y) + ROOM_PAD_INSET;
+    let w = (f32::from(bounds.size.width) - 2.0 * ROOM_PAD_INSET).max(1.0);
+    let h = (f32::from(bounds.size.height) - 2.0 * ROOM_PAD_INSET).max(1.0);
     ((x - left) / w * 2.0 - 1.0, 1.0 - (y - top) / h * 2.0)
 }
 
@@ -477,11 +481,11 @@ fn pad_point(
     bounds: gpui::Bounds<gpui::Pixels>,
     position: solfege_spatialaudio::RoomPosition,
 ) -> gpui::Point<gpui::Pixels> {
-    let w = f32::from(bounds.size.width);
-    let h = f32::from(bounds.size.height);
+    let w = (f32::from(bounds.size.width) - 2.0 * ROOM_PAD_INSET).max(1.0);
+    let h = (f32::from(bounds.size.height) - 2.0 * ROOM_PAD_INSET).max(1.0);
     gpui::point(
-        bounds.origin.x + px((position.x + 1.0) / 2.0 * w),
-        bounds.origin.y + px((1.0 - position.y) / 2.0 * h),
+        bounds.origin.x + px(ROOM_PAD_INSET + (position.x + 1.0) / 2.0 * w),
+        bounds.origin.y + px(ROOM_PAD_INSET + (1.0 - position.y) / 2.0 * h),
     )
 }
 
@@ -738,9 +742,11 @@ pub(crate) fn name_plate(
     number: Option<usize>,
     name: impl Into<String>,
     selected: bool,
-    // The GPU primitive layer paints the plate fill for scrolling channel
-    // strips; when it does, this renders the text over it and nothing else.
-    painted_by_gpu: bool,
+    // The GPU primitive layer also paints the plate fill for scrolling
+    // channel strips. The plate paints it too — the same opaque colour — so
+    // its text can never end up on whatever happens to be drawn over that
+    // layer.
+    _painted_by_gpu: bool,
 ) -> impl IntoElement {
     let text = Colors::on_color(fill);
     div()
@@ -751,7 +757,7 @@ pub(crate) fn name_plate(
         .gap(px(3.0))
         .h(px(PLATE_H))
         .px(px(5.0))
-        .when(!painted_by_gpu, |s| s.bg(fill))
+        .bg(fill)
         .when(selected, |s| {
             s.border_t(px(2.0)).border_color(Colors::text_primary())
         })
