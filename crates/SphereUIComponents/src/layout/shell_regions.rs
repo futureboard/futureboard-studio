@@ -814,6 +814,7 @@ impl StudioLayout {
                         callbacks: inspector_color_callbacks,
                     },
                     active_panel == WorkspaceActivePanel::Inspector,
+                    self.timeline.read(cx).state.spatial_mix.format,
                     &inspector_callbacks,
                     i18n,
                 )

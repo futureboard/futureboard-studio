@@ -37,7 +37,7 @@ impl Render for EffectEditorTabView {
         let callbacks = self
             .owner
             .read(cx)
-            .build_mixer_callbacks(owner_entity.clone());
+            .build_mixer_callbacks(owner_entity.clone(), cx);
         let (selected_track_id, selected_track) = {
             let timeline = self.timeline.read(cx);
             let selected_id = timeline.state.selection.selected_track_id.clone();

@@ -298,6 +298,36 @@ pub struct EngineProjectSnapshot {
     #[serde(default)]
     pub latency_graph_version: u64,
     pub routing: EngineRoutingSnapshot,
+    /// The mix's spatial format (stereo, binaural, a speaker layout) and each
+    /// channel's place in the square room. Defaulted: stereo, as every
+    /// snapshot before it was.
+    #[serde(default)]
+    pub spatial: EngineSpatialSnapshot,
+}
+
+/// How the mix is spatialised, and where each channel is.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSpatialSnapshot {
+    #[serde(default)]
+    pub format: solfege_spatialaudio::SpatialFormat,
+    /// The room a binaural mix, or a surround mix heard on headphones, is in.
+    #[serde(default)]
+    pub room: solfege_spatialaudio::RoomSettings,
+    /// How a surround mix reaches a device with too few outputs.
+    #[serde(default)]
+    pub fold: solfege_spatialaudio::MonitorFold,
+    /// Each channel's placement, by track id. A channel not listed is front
+    /// and centre.
+    #[serde(default)]
+    pub sources: Vec<EngineSpatialSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSpatialSource {
+    pub track_id: String,
+    pub params: solfege_spatialaudio::SourceParams,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

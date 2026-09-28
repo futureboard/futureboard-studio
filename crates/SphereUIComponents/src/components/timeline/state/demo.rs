@@ -6,6 +6,7 @@ impl TimelineState {
     /// app entry point; never used by the real runtime default.
     pub fn demo_project() -> Self {
         let track1 = TrackState {
+            spatial: Default::default(),
             listen: ListenMode::Off,
             id: "track-1".to_string(),
             name: "Audio 1".to_string(),
@@ -94,6 +95,7 @@ impl TimelineState {
         };
 
         let track2 = TrackState {
+            spatial: Default::default(),
             listen: ListenMode::Off,
             id: "track-2".to_string(),
             name: "Audio 2".to_string(),
@@ -153,6 +155,7 @@ impl TimelineState {
         };
 
         let track3 = TrackState {
+            spatial: Default::default(),
             listen: ListenMode::Off,
             id: "track-3".to_string(),
             name: "Synth 3".to_string(),
@@ -228,6 +231,7 @@ impl TimelineState {
             resolved_tempo: ResolvedTempo::default(),
             time_signature_map: TimeSignatureMap::with_default_4_4(),
             time_display_format: TimeDisplayFormat::default(),
+            spatial_mix: Default::default(),
             timecode_rate: TimecodeRate::default(),
             project_key: None,
             markers: Vec::new(),

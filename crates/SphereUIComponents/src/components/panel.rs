@@ -80,6 +80,12 @@ type InsertOutputChannelCb =
     Arc<dyn Fn(&(String, String, u8, bool), &mut Window, &mut App) + 'static>;
 type ClipF32Cb = Arc<dyn Fn(&(String, f32), &mut Window, &mut App) + 'static>;
 type ClipBoolCb = Arc<dyn Fn(&(String, bool), &mut Window, &mut App) + 'static>;
+type SpatialCb =
+    Arc<dyn Fn(&(String, solfege_spatialaudio::SourceParams), &mut Window, &mut App) + 'static>;
+type SpatialCommitCb = Arc<dyn Fn(&(String, &'static str), &mut Window, &mut App) + 'static>;
+/// One placement control's edit: the placement with the control's value in it.
+type SpatialApply =
+    fn(solfege_spatialaudio::SourceParams, f32) -> solfege_spatialaudio::SourceParams;
 /// Apply a full replacement of a clip's stretch/pitch state. One callback drives
 /// every stretch control; the inspector builds the mutated state and the layout
 /// records it as a single undo entry (see `set_clip_stretch_cb`).
@@ -173,6 +179,12 @@ pub struct InspectorCallbacks {
     pub on_pan_drag_start: StrCb,
     pub on_pan_drag_preview: StrF32Cb,
     pub on_pan_drag_commit: StrCb,
+    /// Start a gesture on a channel's placement in the spatial mix.
+    pub on_spatial_drag_start: StrCb,
+    /// A live value of that gesture: `(track_id, params)`.
+    pub on_spatial_drag_preview: SpatialCb,
+    /// Its release, recorded as one undo step: `(track_id, undo label)`.
+    pub on_spatial_drag_commit: SpatialCommitCb,
     pub on_toggle_mute: StrCb,
     pub on_toggle_solo: StrCb,
     pub on_toggle_arm: StrCb,
@@ -388,6 +400,7 @@ pub fn inspector_panel<'a>(
     clip_name_callbacks: TextInputCallbacks,
     color_picker: InspectorColorPicker<'a>,
     active: bool,
+    spatial_format: solfege_spatialaudio::SpatialFormat,
     callbacks: &InspectorCallbacks,
     i18n: I18n,
 ) -> impl IntoElement {
@@ -422,6 +435,7 @@ pub fn inspector_panel<'a>(
                     name_callbacks,
                     &instrument_targets,
                     &color_picker,
+                    spatial_format,
                     callbacks,
                     i18n,
                 )
@@ -2505,9 +2519,16 @@ fn track_inspector(
     name_callbacks: TextInputCallbacks,
     instrument_targets: &[(String, String)],
     color_picker: &InspectorColorPicker<'_>,
+    spatial_format: solfege_spatialaudio::SpatialFormat,
     callbacks: &InspectorCallbacks,
     i18n: I18n,
 ) -> impl IntoElement {
+    // In a spatial mix every channel that sums into the master is placed in
+    // the room instead of panned (the engine holds its pan at centre), so its
+    // pan row gives way to the Spatial card. A channel sent to a bus still
+    // pans into that bus.
+    let in_room = spatial_format.is_spatial() && track.track_type != TrackType::Master;
+    let placed = in_room && !matches!(track.routing.output, TrackOutputRouting::Bus { .. });
     let automation_points: usize = track
         .automation_lanes
         .iter()
@@ -2733,10 +2754,15 @@ fn track_inspector(
                     text_field_with_callbacks(name_input, name_focused, name_callbacks),
                 ))
                 .child(fb_form_row(i18n.tr("inspector.field.volume"), volume_row))
-                .child(fb_form_row(i18n.tr("inspector.field.pan"), pan_row))
+                .when(!placed, |rows| {
+                    rows.child(fb_form_row(i18n.tr("inspector.field.pan"), pan_row))
+                })
                 .child(fb_form_row("Color", color_field(color_picker)))
                 .child(fb_form_row(i18n.tr("inspector.section.state"), state_row)),
         ))
+        .when(in_room, |this| {
+            this.child(spatial_section(track, spatial_format, placed, callbacks))
+        })
         .child(routing_section(
             track,
             connections,
@@ -2776,6 +2802,195 @@ fn track_inspector(
                 ))
                 .child(kv_row("Automation Points", automation_points.to_string())),
         ))
+}
+
+/// The rest of a channel's placement in a spatial mix, beside the room
+/// position the Mixer's room panner sets. Rows the format cannot hear are left
+/// out: height on a flat layout, the LFE send without an LFE channel.
+fn spatial_section(
+    track: &TrackState,
+    format: solfege_spatialaudio::SpatialFormat,
+    placed: bool,
+    callbacks: &InspectorCallbacks,
+) -> impl IntoElement {
+    let title = format!("Spatial · {}", format.name());
+    if !placed {
+        return section_card(
+            "spatial",
+            title,
+            callbacks,
+            section_rows().child(inspector_hint_text(
+                "Sent to a bus: the bus is placed in the room, not this channel.",
+            )),
+        )
+        .into_any_element();
+    }
+    let params = track.spatial;
+    let row = |id: &'static str,
+               undo: &'static str,
+               value: f32,
+               readout: String,
+               reset: f32,
+               apply: SpatialApply| {
+        spatial_slider(
+            &track.id,
+            id,
+            undo,
+            track.color,
+            params,
+            value,
+            readout,
+            reset,
+            apply,
+            callbacks,
+        )
+    };
+    let percent = |v: f32| format!("{}%", (v * 100.0).round() as i32);
+    section_card(
+        "spatial",
+        title,
+        callbacks,
+        section_rows()
+            .child(fb_form_row(
+                "Position",
+                inspector_kit::ins_value(crate::components::mixer_panel::describe_room_position(
+                    &params,
+                )),
+            ))
+            .when(format.has_height(), |rows| {
+                rows.child(fb_form_row(
+                    "Height",
+                    row(
+                        "inspector-spatial-height",
+                        "Spatial Height",
+                        params.position.z,
+                        percent(params.position.z),
+                        0.0,
+                        |mut p, v| {
+                            p.position.z = v;
+                            p
+                        },
+                    ),
+                ))
+            })
+            .child(fb_form_row(
+                "Spread",
+                row(
+                    "inspector-spatial-spread",
+                    "Spatial Spread",
+                    params.spread,
+                    percent(params.spread),
+                    0.0,
+                    |mut p, v| {
+                        p.spread = v;
+                        p
+                    },
+                ),
+            ))
+            .child(fb_form_row(
+                "Width",
+                row(
+                    "inspector-spatial-width",
+                    "Spatial Width",
+                    params.width,
+                    format!(
+                        "±{}°",
+                        params.half_width_radians().to_degrees().round() as i32
+                    ),
+                    1.0,
+                    |mut p, v| {
+                        p.width = v;
+                        p
+                    },
+                ),
+            ))
+            .when(format.has_lfe(), |rows| {
+                rows.child(fb_form_row(
+                    "LFE",
+                    row(
+                        "inspector-spatial-lfe",
+                        "LFE Send",
+                        params.lfe,
+                        format_send_db(params.lfe),
+                        0.0,
+                        |mut p, v| {
+                            p.lfe = v;
+                            p
+                        },
+                    ),
+                ))
+            })
+            .child(inspector_hint_text(
+                "Place the channel on the Mixer's room panner.",
+            )),
+    )
+    .into_any_element()
+}
+
+/// A linear send level as the dB a console shows, `Off` at silence.
+fn format_send_db(gain: f32) -> String {
+    if gain < 0.001 {
+        "Off".to_string()
+    } else {
+        format!("{:.1} dB", 20.0 * gain.log10())
+    }
+}
+
+/// One `0..=1` placement control: a slider and its readout, on the same
+/// 48 px column as the volume readout. A drag is one undo step named `undo`;
+/// a double-click puts the value back to `reset`.
+#[allow(clippy::too_many_arguments)]
+fn spatial_slider(
+    track_id: &str,
+    id: &'static str,
+    undo: &'static str,
+    accent: gpui::Rgba,
+    params: solfege_spatialaudio::SourceParams,
+    value: f32,
+    readout: String,
+    reset: f32,
+    apply: SpatialApply,
+    callbacks: &InspectorCallbacks,
+) -> impl IntoElement {
+    let start = callbacks.on_spatial_drag_start.clone();
+    let preview = callbacks.on_spatial_drag_preview.clone();
+    let commit = callbacks.on_spatial_drag_commit.clone();
+    let (reset_start, reset_preview, reset_commit) =
+        (start.clone(), preview.clone(), commit.clone());
+    let tid_start = track_id.to_string();
+    let tid_preview = track_id.to_string();
+    let tid_commit = track_id.to_string();
+    let tid_reset = track_id.to_string();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::BASE))
+        .child(slider_with_drag_callbacks(
+            id,
+            value,
+            accent,
+            Some(move |_: &f32, w: &mut Window, cx: &mut App| start(&tid_start, w, cx)),
+            Some(move |v: &f32, w: &mut Window, cx: &mut App| {
+                preview(&(tid_preview.clone(), apply(params, *v)), w, cx)
+            }),
+            Some(move |w: &mut Window, cx: &mut App| commit(&(tid_commit.clone(), undo), w, cx)),
+            Some(move |w: &mut Window, cx: &mut App| {
+                reset_start(&tid_reset, w, cx);
+                reset_preview(&(tid_reset.clone(), apply(params, reset)), w, cx);
+                reset_commit(&(tid_reset.clone(), undo), w, cx);
+            }),
+        ))
+        .child(
+            div()
+                .flex_shrink_0()
+                .flex()
+                .justify_end()
+                .min_w(px(48.0))
+                .text_size(px(typography::DENSE_LABEL))
+                .text_color(Colors::text_secondary())
+                .child(readout),
+        )
 }
 
 /// A clip-inspector section.

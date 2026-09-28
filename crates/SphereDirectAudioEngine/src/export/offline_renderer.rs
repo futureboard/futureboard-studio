@@ -687,6 +687,7 @@ pub(crate) fn make_track_snapshot(id: &str) -> crate::types::EngineTrackSnapshot
 pub(crate) fn silence_snapshot(sample_rate: u32) -> EngineProjectSnapshot {
     use crate::types::EngineRoutingSnapshot;
     EngineProjectSnapshot {
+        spatial: Default::default(),
         project_id: "test".to_string(),
         project_root: None,
         preferred_input_device: None,

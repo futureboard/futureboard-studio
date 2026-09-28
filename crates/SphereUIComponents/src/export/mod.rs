@@ -47,6 +47,7 @@ mod tests {
             Vec::new()
         };
         EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "p".to_string(),
             project_root: None,
             preferred_input_device: None,

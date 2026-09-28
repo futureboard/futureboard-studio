@@ -2202,6 +2202,7 @@ impl StudioLayout {
             engine_sample_rate,
             time_display_format: timeline.state.time_display_format,
             timecode_rate: timeline.state.timecode_rate,
+            spatial_mix: timeline.state.spatial_mix,
             track_count: timeline.state.tracks.len(),
         }
     }
@@ -2295,6 +2296,15 @@ impl StudioLayout {
                     });
                 })
             },
+            on_set_spatial_mix: {
+                let owner = owner.clone();
+                Arc::new(move |mix, cx| {
+                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                        this.set_project_spatial_mix(mix, cx);
+                        this.push_project_settings_snapshot_to_window(cx);
+                    });
+                })
+            },
             on_set_timecode_rate: {
                 let owner = owner.clone();
                 Arc::new(move |rate, cx| {
@@ -2377,6 +2387,34 @@ impl StudioLayout {
         });
         if changed {
             self.mark_dirty();
+            cx.notify();
+        }
+    }
+
+    /// Set the mix's spatial format and room. Project state: it marks the
+    /// project dirty, which rebuilds the engine graph in the new format, and
+    /// the Mixer swaps its pan controls for room panners (or back).
+    fn set_project_spatial_mix(
+        &mut self,
+        mix: crate::components::timeline::timeline_state::SpatialMix,
+        cx: &mut Context<Self>,
+    ) {
+        let mix = crate::components::timeline::timeline_state::SpatialMix {
+            room: mix.room.sanitized(),
+            ..mix
+        };
+        let changed = self.timeline.update(cx, |timeline, cx| {
+            if timeline.state.spatial_mix == mix {
+                return false;
+            }
+            timeline.state.spatial_mix = mix;
+            cx.notify();
+            true
+        });
+        if changed {
+            self.mark_dirty();
+            let _ = self.mixer_panel.update(cx, |_, cx| cx.notify());
+            self.push_mixer_snapshot_to_window(cx);
             cx.notify();
         }
     }
@@ -2714,7 +2752,7 @@ impl StudioLayout {
         self.panels.bottom_docked = false;
 
         let snapshot = self.build_mixer_snapshot(cx);
-        let callbacks = self.build_mixer_callbacks(cx.entity().clone());
+        let callbacks = self.build_mixer_callbacks(cx.entity().clone(), cx);
         let owner = cx.entity().clone();
         let on_close: std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync> =
             std::sync::Arc::new(move |_window, cx| {

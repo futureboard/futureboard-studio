@@ -1241,6 +1241,15 @@ impl AudioEngine {
         self.inner.set_track_listen(track_id, listen)
     }
 
+    /// Move one channel in the spatial mix's room, live.
+    pub fn set_track_spatial(
+        &self,
+        track_id: &str,
+        params: solfege_spatialaudio::SourceParams,
+    ) -> Result<(), SphereAudioError> {
+        self.inner.set_track_spatial(track_id, params)
+    }
+
     /// Clear Listen on every channel.
     pub fn clear_all_listen(&self) -> Result<(), SphereAudioError> {
         self.inner.clear_all_listen()

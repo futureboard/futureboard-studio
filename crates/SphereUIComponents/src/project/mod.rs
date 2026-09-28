@@ -405,6 +405,8 @@ pub struct TrackRouting {
     pub mpe: MpeTrackConfiguration,
     /// v56: bank/program selection (GM/GS/XG). Older projects choose none.
     pub program: sphere_midi_service::program::MidiProgramSelection,
+    /// v57: place in a spatial mix's square room. Older projects: front centre.
+    pub spatial: solfege_spatialaudio::SourceParams,
     pub sends: Vec<ProjectSend>,
 }
 
@@ -420,6 +422,7 @@ impl Default for TrackRouting {
             midi_output_per_note: false,
             mpe: MpeTrackConfiguration::default(),
             program: Default::default(),
+            spatial: Default::default(),
             sends: Vec::new(),
         }
     }
@@ -871,6 +874,10 @@ pub struct ProjectSettings {
     pub time_display_format: u8,
     /// Frame rate Timecode is counted at, as the stable `TimecodeRate` tag.
     pub timecode_rate: u8,
+    /// v57: the mix's spatial format, room, and surround fold.
+    pub spatial_format: solfege_spatialaudio::SpatialFormat,
+    pub spatial_room: solfege_spatialaudio::RoomSettings,
+    pub spatial_fold: solfege_spatialaudio::MonitorFold,
 }
 
 impl Default for ProjectSettings {
@@ -894,6 +901,9 @@ impl Default for ProjectSettings {
                 crate::components::timeline::timeline_state::TimeDisplayFormat::default().to_tag(),
             timecode_rate: crate::components::timeline::timeline_state::TimecodeRate::default()
                 .to_tag(),
+            spatial_format: Default::default(),
+            spatial_room: Default::default(),
+            spatial_fold: Default::default(),
         }
     }
 }
@@ -1474,6 +1484,7 @@ impl From<&TimelineState> for FutureboardProject {
                         midi_output_per_note: t.routing.midi_output_per_note,
                         mpe: t.routing.mpe.sanitized(),
                         program: t.routing.program.sanitized(),
+                        spatial: t.spatial.sanitized(),
                         sends: t
                             .sends
                             .iter()
@@ -1548,6 +1559,9 @@ impl From<&TimelineState> for FutureboardProject {
         project.settings.sample_rate = tl.project_sample_rate;
         project.settings.time_display_format = tl.time_display_format.to_tag();
         project.settings.timecode_rate = tl.timecode_rate.to_tag();
+        project.settings.spatial_format = tl.spatial_mix.format;
+        project.settings.spatial_room = tl.spatial_mix.room.sanitized();
+        project.settings.spatial_fold = tl.spatial_mix.fold;
         project.settings.tempo_points = tl
             .tempo_map
             .points
@@ -1768,6 +1782,11 @@ pub fn apply_to_timeline(
     tl.timecode_rate = crate::components::timeline::timeline_state::TimecodeRate::from_tag(
         project.settings.timecode_rate,
     );
+    tl.spatial_mix = crate::components::timeline::timeline_state::SpatialMix {
+        format: project.settings.spatial_format,
+        room: project.settings.spatial_room.sanitized(),
+        fold: project.settings.spatial_fold,
+    };
     tl.tempo_map = crate::components::timeline::timeline_state::TempoMap::with_points(
         project
             .settings
@@ -2233,6 +2252,7 @@ pub fn apply_to_timeline(
                 _ => None,
             };
             TrackState {
+                spatial: pt.routing.spatial.sanitized(),
                 listen: crate::components::timeline::timeline_state::ListenMode::Off,
                 id: pt.id.clone(),
                 name: pt.name.clone(),
@@ -3186,7 +3206,7 @@ mod v33_routing_adapter_tests {
         let bytes = crate::project::format::encode_project(&FutureboardProject::new("current"));
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         assert_eq!(version, crate::project::format::PROJECT_VERSION);
-        assert_eq!(crate::project::format::PROJECT_VERSION, 56);
+        assert_eq!(crate::project::format::PROJECT_VERSION, 57);
     }
 
     // ── v35 Master / Monitor output routing ─────────────────────────────────
@@ -3833,6 +3853,73 @@ mod project_settings_persistence_tests {
             crate::components::timeline::timeline_state::TrackType::Midi,
         );
         assert_eq!(restored.program, expected);
+    }
+
+    #[test]
+    fn the_spatial_mix_survives_save_decode_and_timeline_restore() {
+        use crate::components::timeline::timeline_state::SpatialMix;
+        use solfege_spatialaudio::{
+            MonitorFold, RoomPosition, RoomSettings, SourceParams, SpatialFormat, SpeakerLayout,
+        };
+        let mut timeline = TimelineState::default();
+        let track_id = timeline.create_midi_track();
+        let placed = SourceParams {
+            position: RoomPosition::new(-0.5, -0.75, 0.25),
+            spread: 0.3,
+            width: 0.6,
+            lfe: 0.2,
+        };
+        timeline
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == track_id)
+            .expect("track")
+            .spatial = placed;
+        timeline.spatial_mix = SpatialMix {
+            format: SpatialFormat::Surround(SpeakerLayout::Surround714),
+            room: RoomSettings {
+                half_size_m: 5.5,
+                reflections: 0.6,
+            },
+            fold: MonitorFold::Stereo,
+        };
+
+        let encoded = crate::project::format::encode_project(&FutureboardProject::from(&timeline));
+        let decoded = crate::project::format::decode_project(&encoded).expect("decode project");
+        assert_eq!(decoded.tracks[0].routing.spatial, placed);
+
+        let mut restored = TimelineState::default();
+        let _ = apply_to_timeline(&decoded, &mut restored);
+        assert_eq!(restored.spatial_mix, timeline.spatial_mix);
+        assert_eq!(restored.tracks[0].spatial, placed);
+    }
+
+    #[test]
+    fn a_project_before_v57_is_a_stereo_mix_with_every_track_front_and_centre() {
+        let mut timeline = TimelineState::default();
+        let track_id = timeline.create_midi_track();
+        timeline
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == track_id)
+            .expect("track")
+            .spatial
+            .position = solfege_spatialaudio::RoomPosition::new(1.0, -1.0, 0.0);
+        timeline.spatial_mix.format = solfege_spatialaudio::SpatialFormat::Binaural;
+        let bytes =
+            crate::project::format::encode_project_as(&FutureboardProject::from(&timeline), 56);
+        let decoded =
+            crate::project::format::decode_project_with_options(&bytes, true).expect("decode v56");
+        let mut restored = TimelineState::default();
+        let _ = apply_to_timeline(&decoded, &mut restored);
+        assert_eq!(
+            restored.spatial_mix.format,
+            solfege_spatialaudio::SpatialFormat::Stereo
+        );
+        assert_eq!(
+            restored.tracks[0].spatial,
+            solfege_spatialaudio::SourceParams::default()
+        );
     }
 
     #[test]

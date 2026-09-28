@@ -72,6 +72,7 @@ serde_json.workspace = true
 sphere-audio-processor.workspace = true
 # Per-file true peak and integrated loudness of export renders.
 ebur128.workspace = true
+solfege_spatialaudio.workspace = true
 sphere-audio-plugins.workspace = true
 sphere-midi-service.workspace = true
 sphere-encoder.workspace = true

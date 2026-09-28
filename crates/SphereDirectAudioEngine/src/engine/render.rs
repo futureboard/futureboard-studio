@@ -465,7 +465,13 @@ pub(crate) fn effective_track_muted(track: &RuntimeTrack, beat: f64) -> bool {
 fn apply_fader(track: &mut RuntimeTrack, frames: usize, beat: f64, smooth: bool) {
     let automation = track.automation_values_at_beat(beat);
     let volume = automation.volume.unwrap_or(track.volume);
-    let pan = automation.pan.unwrap_or(track.pan);
+    // A spatialised channel is placed by its room position on the way into
+    // the master, so its fader carries level only.
+    let pan = if track.spatial.is_some() {
+        0.0
+    } else {
+        automation.pan.unwrap_or(track.pan)
+    };
     let (pan_l, pan_r) = pan_gains(pan);
     let target_l = volume * pan_l;
     let target_r = volume * pan_r;
@@ -614,12 +620,126 @@ pub(crate) fn route_main_output(
         }
     }
 
+    // A spatial mix: the channel is rendered where it sits in the room, into
+    // the spatial bus the master stage reads.
+    {
+        let crate::runtime::RuntimeProject {
+            tracks, spatial, ..
+        } = runtime;
+        let track = &mut tracks[src_index];
+        if let Some(spatialiser) = track.spatial.as_mut() {
+            spatialiser.process(
+                &track.block_l[..frames],
+                &track.block_r[..frames],
+                &track.spatial_params,
+                &spatial.room,
+                &mut spatial.bus,
+            );
+            return;
+        }
+    }
+
     // Default / fallback: sum into the master output.
     let track = &runtime.tracks[src_index];
     for f in 0..frames {
         let out = &mut output[f * channels..f * channels + channels];
         out[0] += track.block_l[f];
         out[1] += track.block_r[f];
+    }
+}
+
+/// Put the spatial bus into the interleaved device buffer. Returns the number
+/// of channels a surround mix occupies when it went out discretely, or `None`
+/// when the mix is in channels 0/1 (stereo, binaural, or a folded surround).
+///
+/// Realtime-safe: reads the preallocated bus, writes the device buffer; the
+/// virtual speakers render with their own preallocated state.
+fn mix_spatial_bus(
+    runtime: &mut RuntimeProject,
+    frames: usize,
+    output: &mut [f32],
+    channels: usize,
+) -> Option<usize> {
+    if !runtime.spatial.active() || channels < 2 {
+        return None;
+    }
+    let crate::runtime::RuntimeProject {
+        spatial, monitor, ..
+    } = runtime;
+    let frames = frames.min(spatial.bus.capacity());
+    match spatial.format {
+        solfege_spatialaudio::SpatialFormat::Binaural => {
+            let (l, r) = (
+                spatial.bus.channel(0, frames),
+                spatial.bus.channel(1, frames),
+            );
+            for f in 0..frames {
+                output[f * channels] += l[f];
+                output[f * channels + 1] += r[f];
+            }
+            None
+        }
+        solfege_spatialaudio::SpatialFormat::Surround(layout) => {
+            if let Some(count) = spatial.discrete_channels(channels, monitor) {
+                for c in 0..count {
+                    let bus = spatial.bus.channel(c, frames);
+                    for f in 0..frames {
+                        output[f * channels + c] += bus[f];
+                    }
+                }
+                return Some(count);
+            }
+            // Folded into the first pair, through stack scratch a chunk at a
+            // time: no allocation, and the binaural renderer carries its state
+            // across chunk boundaries as it does across blocks.
+            const CHUNK: usize = 256;
+            let mut l = [0.0f32; CHUNK];
+            let mut r = [0.0f32; CHUNK];
+            let mut offset = 0;
+            if spatial.fold == solfege_spatialaudio::MonitorFold::Binaural {
+                if let Some(speakers) = spatial.virtual_speakers.as_mut() {
+                    while offset < frames {
+                        let n = (frames - offset).min(CHUNK);
+                        l[..n].fill(0.0);
+                        r[..n].fill(0.0);
+                        speakers.render_range(
+                            &spatial.bus,
+                            offset,
+                            n,
+                            &spatial.room,
+                            &mut l[..n],
+                            &mut r[..n],
+                        );
+                        for i in 0..n {
+                            output[(offset + i) * channels] += l[i];
+                            output[(offset + i) * channels + 1] += r[i];
+                        }
+                        offset += n;
+                    }
+                    return None;
+                }
+            }
+            while offset < frames {
+                let n = (frames - offset).min(CHUNK);
+                l[..n].fill(0.0);
+                r[..n].fill(0.0);
+                solfege_spatialaudio::fold_down_range(
+                    &spatial.bus,
+                    layout,
+                    offset,
+                    n,
+                    &mut l[..n],
+                    &mut r[..n],
+                );
+                for i in 0..n {
+                    output[(offset + i) * channels] += l[i];
+                    output[(offset + i) * channels + 1] += r[i];
+                }
+                offset += n;
+            }
+            None
+        }
+        solfege_spatialaudio::SpatialFormat::Stereo => None,
     }
 }
 
@@ -1537,6 +1657,9 @@ fn render_project_block_interleaved_core(
     // Take the precomputed pass order out by move (zero alloc) rather than
     // cloning the Vec every audio block; the loop body never reads it back, and
     // it is restored below. `audio_graph` is otherwise untouched here.
+    if runtime.spatial.active() {
+        runtime.spatial.bus.clear(frames);
+    }
     let pass1_indices = std::mem::take(&mut runtime.audio_graph.pass1_source_indices);
     for &track_index in &pass1_indices {
         let source_active = runtime
@@ -1707,8 +1830,13 @@ fn render_project_block_interleaved_core(
     }
     runtime.audio_graph.pass2_routing_indices = pass2_indices;
 
+    // ── Spatial bus → device ──
+    let discrete_channels = mix_spatial_bus(runtime, frames, output, channels);
+
     // ── Master bus: apply master track inserts on the summed output ──
-    if let Some(m_idx) = master_index {
+    // A discrete surround mix bypasses them: the master chain is stereo, and
+    // processing two of its channels and not the rest would split the mix.
+    if let Some(m_idx) = master_index.filter(|_| discrete_channels.is_none()) {
         let muted = effective_track_muted(&runtime.tracks[m_idx], block_beat);
         if !muted {
             let master = &mut runtime.tracks[m_idx];
@@ -1750,22 +1878,27 @@ fn render_project_block_interleaved_core(
     // meter, instead of being quietly reshaped on its way to the device.
     // In realtime the gain ramps across the block so dragging the master fader
     // does not zipper; offline export applies the exact constant gain.
+    // Every channel the mix occupies: the stereo pair, or a discrete
+    // surround layout's full width.
+    let mix_width = discrete_channels.unwrap_or(2).min(channels);
     if runtime.fader_smoothing {
         let start = runtime.smoothed_master_gain;
         let inc = (master_volume - start) / frames as f32;
         for i in 0..frames {
             let g = start + inc * i as f32;
             let out = &mut output[i * channels..i * channels + channels];
-            out[0] *= g;
-            out[1] *= g;
+            for sample in &mut out[..mix_width] {
+                *sample *= g;
+            }
         }
         runtime.smoothed_master_gain = master_volume;
     } else {
         runtime.smoothed_master_gain = master_volume;
         for i in 0..frames {
             let out = &mut output[i * channels..i * channels + channels];
-            out[0] *= master_volume;
-            out[1] *= master_volume;
+            for sample in &mut out[..mix_width] {
+                *sample *= master_volume;
+            }
         }
     }
     // Audio Jam multitrack tap. Last, so every shared track — source, bus and
@@ -2247,6 +2380,30 @@ pub fn apply_track_chain_block(
         }
         publish_insert_cpu(insert, started.elapsed());
     }
+    silence_nonfinite_block(&mut track.block_l[..frames], &mut track.block_r[..frames]);
+}
+
+/// Replace a block holding NaN or infinity with silence, at the channel that
+/// produced it.
+///
+/// One such sample from a plug-in or instrument poisons every sum it reaches:
+/// the bus it feeds becomes NaN, then the master, and the device plays NaN as
+/// silence — the whole project goes quiet, with the meters reading empty
+/// because `max` skips NaN. Soloing any *other* channel cuts the bad one out of
+/// the mix and the sound comes back, and un-soloing puts it back in and the
+/// project goes silent again. Clearing it here costs that one channel one
+/// block instead. Realtime-safe: a scan and, rarely, two slice fills.
+#[inline]
+pub(crate) fn silence_nonfinite_block(block_l: &mut [f32], block_r: &mut [f32]) -> bool {
+    let finite = block_l
+        .iter()
+        .chain(block_r.iter())
+        .all(|sample| sample.is_finite());
+    if !finite {
+        block_l.fill(0.0);
+        block_r.fill(0.0);
+    }
+    !finite
 }
 
 /// Fold one insert's block time into its smoothed meter.
@@ -3333,6 +3490,7 @@ mod jam_input_tests {
 
     fn snapshot(input: EngineTrackInputSourceSnapshot) -> EngineProjectSnapshot {
         EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "jam-test".to_string(),
             project_root: None,
             preferred_input_device: None,
@@ -3774,6 +3932,7 @@ mod live_input_monitor_tests {
 
     fn runtime() -> RuntimeProject {
         let snapshot = EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "monitor-test".to_string(),
             project_root: None,
             preferred_input_device: None,
@@ -3897,6 +4056,7 @@ mod live_input_monitor_tests {
             .collect();
         tracks.push(track("master", "master"));
         let snapshot = EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "stress-1k-tracks".to_string(),
             project_root: None,
             preferred_input_device: None,
@@ -4059,6 +4219,7 @@ mod soundfont_instrument_tests {
 
     fn build_runtime(tracks: Vec<EngineTrackSnapshot>) -> RuntimeProject {
         let snapshot = EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "soundfont-test".to_string(),
             project_root: None,
             preferred_input_device: None,
@@ -4420,6 +4581,7 @@ mod soundfont_instrument_tests {
         let font = FontFile::new("clip");
         let bpm = 120.0;
         let mut snapshot = EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "soundfont-clip".to_string(),
             project_root: None,
             preferred_input_device: None,
@@ -4503,6 +4665,7 @@ mod soundfont_instrument_tests {
         let mut track = soundfont_track("sf-1", &font, test_font::MELODIC_PRESET);
         track.soundfont_path = Some("/definitely/not/a/soundfont.sf2".to_string());
         let snapshot = EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "soundfont-missing".to_string(),
             project_root: None,
             preferred_input_device: None,
@@ -4885,6 +5048,7 @@ mod warp_stretch_render_tests {
             audio_process: Some(audio_process),
         };
         let snapshot = EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "warp-stretch".to_string(),
             project_root: None,
             preferred_input_device: None,
@@ -4946,5 +5110,164 @@ mod warp_stretch_render_tests {
             energy_by_second[1] > 100.0,
             "second segment {energy_by_second:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod nonfinite_guard_tests {
+    use super::silence_nonfinite_block;
+
+    /// One NaN from a plug-in used to turn the whole master sum into NaN,
+    /// which the device plays as silence. The channel that made it goes
+    /// quiet for the block instead.
+    #[test]
+    fn a_block_with_nan_or_infinity_is_silenced() {
+        let mut l = vec![0.5, f32::NAN, 0.25];
+        let mut r = vec![0.5, 0.5, 0.5];
+        assert!(silence_nonfinite_block(&mut l, &mut r));
+        assert!(l.iter().chain(r.iter()).all(|s| *s == 0.0));
+
+        let mut l = vec![0.1, 0.2];
+        let mut r = vec![f32::INFINITY, 0.0];
+        assert!(silence_nonfinite_block(&mut l, &mut r));
+        assert!(l.iter().chain(r.iter()).all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn a_finite_block_is_left_alone() {
+        let mut l = vec![0.5, -1.5, 0.25];
+        let mut r = vec![0.0, 2.0, -0.75];
+        assert!(!silence_nonfinite_block(&mut l, &mut r));
+        assert_eq!(l, vec![0.5, -1.5, 0.25]);
+        assert_eq!(r, vec![0.0, 2.0, -0.75]);
+    }
+}
+
+#[cfg(test)]
+mod spatial_mix_tests {
+    use super::{mix_spatial_bus, route_main_output};
+    use crate::export::{make_track_snapshot, silence_snapshot};
+    use crate::runtime::RuntimeProject;
+    use crate::types::{EngineSpatialSnapshot, EngineSpatialSource};
+    use solfege_spatialaudio::{
+        MonitorFold, RoomPosition, RoomSettings, SourceParams, SpatialFormat, SpeakerLayout,
+    };
+
+    const FRAMES: usize = 256;
+
+    fn runtime(format: SpatialFormat, fold: MonitorFold, x: f32, y: f32) -> RuntimeProject {
+        let mut snapshot = silence_snapshot(48_000);
+        snapshot.tracks = vec![make_track_snapshot("t1")];
+        snapshot.spatial = EngineSpatialSnapshot {
+            format,
+            room: RoomSettings {
+                reflections: 0.0,
+                ..RoomSettings::default()
+            },
+            fold,
+            sources: vec![EngineSpatialSource {
+                track_id: "t1".into(),
+                params: SourceParams {
+                    position: RoomPosition::new(x, y, 0.0),
+                    width: 0.0,
+                    ..SourceParams::default()
+                },
+            }],
+        };
+        let mut cache = std::collections::HashMap::new();
+        RuntimeProject::build(&snapshot, 48_000, &mut cache, None, true).expect("build")
+    }
+
+    /// Two blocks of a steady tone through the track into `channels` device
+    /// channels; the second block's interleaved output.
+    fn render(runtime: &mut RuntimeProject, channels: usize) -> (Vec<f32>, Option<usize>) {
+        let mut out = vec![0.0f32; FRAMES * channels];
+        let mut discrete = None;
+        for _ in 0..2 {
+            out.fill(0.0);
+            runtime.spatial.bus.clear(FRAMES);
+            let track = &mut runtime.tracks[0];
+            for n in 0..FRAMES {
+                let v = (n as f32 * 0.21).sin() * 0.5;
+                track.block_l[n] = v;
+                track.block_r[n] = v;
+            }
+            route_main_output(runtime, 0, FRAMES, &mut out, channels);
+            discrete = mix_spatial_bus(runtime, FRAMES, &mut out, channels);
+        }
+        (out, discrete)
+    }
+
+    fn energy(out: &[f32], channels: usize, channel: usize) -> f32 {
+        out.chunks(channels).map(|f| f[channel] * f[channel]).sum()
+    }
+
+    #[test]
+    fn a_stereo_mix_keeps_the_ordinary_sum() {
+        let mut rt = runtime(SpatialFormat::Stereo, MonitorFold::Binaural, 1.0, 0.0);
+        assert!(rt.tracks[0].spatial.is_none());
+        let (out, discrete) = render(&mut rt, 2);
+        assert_eq!(discrete, None);
+        assert!((energy(&out, 2, 0) - energy(&out, 2, 1)).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn a_binaural_channel_on_the_right_is_heard_on_the_right() {
+        let mut rt = runtime(SpatialFormat::Binaural, MonitorFold::Binaural, 1.0, 0.0);
+        assert!(rt.tracks[0].spatial.is_some());
+        let (out, discrete) = render(&mut rt, 2);
+        assert_eq!(discrete, None);
+        assert!(energy(&out, 2, 1) > energy(&out, 2, 0) * 1.5);
+    }
+
+    #[test]
+    fn a_surround_mix_goes_out_discretely_when_master_owns_the_device() {
+        let mut rt = runtime(
+            SpatialFormat::Surround(SpeakerLayout::Surround51),
+            MonitorFold::Stereo,
+            -1.0,
+            -1.0,
+        );
+        rt.monitor.hardware_owner = crate::monitor::HardwareOutputOwner::MasterDirect;
+        rt.monitor.master_output = Some((0, 1));
+        let (out, discrete) = render(&mut rt, 8);
+        assert_eq!(discrete, Some(6));
+        // Left-rear corner: the left surround speaker, channel 4, carries it.
+        let ls = energy(&out, 8, 4);
+        assert!(ls > 1.0, "{ls}");
+        for other in [0usize, 1, 2, 3] {
+            assert!(energy(&out, 8, other) < ls * 0.05, "channel {other}");
+        }
+        // Nothing past the layout.
+        assert_eq!(energy(&out, 8, 6) + energy(&out, 8, 7), 0.0);
+    }
+
+    #[test]
+    fn a_surround_mix_folds_to_the_first_pair_on_a_stereo_device() {
+        // On the left wall: between L and Ls, both of which fold left.
+        let mut rt = runtime(
+            SpatialFormat::Surround(SpeakerLayout::Surround51),
+            MonitorFold::Stereo,
+            -1.0,
+            0.0,
+        );
+        let (out, discrete) = render(&mut rt, 2);
+        assert_eq!(discrete, None);
+        assert!(energy(&out, 2, 0) > 1.0 && energy(&out, 2, 1) < energy(&out, 2, 0) * 0.05);
+    }
+
+    #[test]
+    fn a_live_move_reaches_the_channel() {
+        let mut rt = runtime(SpatialFormat::Binaural, MonitorFold::Binaural, 1.0, 0.0);
+        rt.update_track_spatial(
+            0,
+            SourceParams {
+                position: RoomPosition::new(-1.0, 0.0, 0.0),
+                width: 0.0,
+                ..SourceParams::default()
+            },
+        );
+        let (out, _) = render(&mut rt, 2);
+        assert!(energy(&out, 2, 0) > energy(&out, 2, 1) * 1.5);
     }
 }

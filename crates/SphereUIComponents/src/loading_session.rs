@@ -1348,16 +1348,6 @@ impl Render for LoadingSessionWindow {
             .font(theme::ui_font())
             .bg(Colors::surface_base())
             .overflow_hidden()
-            .rounded(px(crate::theme::radius::DIALOG))
-            .border(px(1.0))
-            .border_color(Colors::border_subtle())
-            .shadow(vec![gpui::BoxShadow {
-                color: Colors::surface_overlay().into(),
-                offset: gpui::point(px(0.0), px(6.0)),
-                blur_radius: px(20.0),
-                spread_radius: px(0.0),
-                inset: false,
-            }])
             .child(div().w(px(0.0)).h(px(0.0)).track_focus(&self.focus_handle))
             .capture_key_down(move |event, _window, cx| {
                 if event.keystroke.key.as_str() == "escape" {

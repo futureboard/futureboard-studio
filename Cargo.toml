@@ -57,6 +57,7 @@ members = [
     "crates/BuiltinAudioPlugins/crates/mixstation",
     "crates/BuiltinAudioPlugins/crates/rodharerist",
     "crates/BuiltinAudioPlugins/crates/verbspace",
+    "crates/solfege_spatialaudio",
     "xtask"
 ]
 
@@ -106,6 +107,7 @@ sphere-graphic-engine = { path = "crates/SphereGraphicEngine" }
 sphere-midi-service = { path = "crates/SphereMidiService", package = "SphereMidiService" }
 sphere-plugin-host = { path = "crates/SpherePluginHost", default-features = false }
 sphere-soundfont-player = { path = "crates/SphereSoundfontPlayer", package = "SphereSoundfontPlayer" }
+solfege_spatialaudio = { path = "crates/solfege_spatialaudio" }
 # Video preview/reference decoding for the arrangement Video Track. Uses OS
 # codecs (Media Foundation on Windows) — no FFmpeg/libav anywhere.
 sphere-video-player = { path = "crates/SphereVideoPlayer" }

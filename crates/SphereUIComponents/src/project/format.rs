@@ -150,7 +150,12 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v56 appends each track's bank/program selection after its MPE settings:
 /// the GM/GS/XG format tag, a program flag and value, and the bank MSB and
 /// LSB. A pre-v56 track loads with no program chosen, so nothing is sent.
-pub const PROJECT_VERSION: u32 = 56;
+/// v57 adds the spatial mix: each track appends its place in the square room
+/// (x, y, height, spread, width, LFE), and the project writes its format, the
+/// room (half-size, reflections) and the surround fold after the tempo
+/// tensions. A pre-v57 project is a stereo mix with every track front and
+/// centre.
+pub const PROJECT_VERSION: u32 = 57;
 
 /// Oldest on-disk format version whose migration to the current one is
 /// supported (see [`super::migrate`]): v30, which introduced arrangement
@@ -1142,6 +1147,16 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack, version: u32) {
         w.write_u8(program.bank_msb);
         w.write_u8(program.bank_lsb);
     }
+    // v57: the track's place in a spatial mix's square room.
+    if version >= 57 {
+        let spatial = t.routing.spatial.sanitized();
+        w.write_f32(spatial.position.x);
+        w.write_f32(spatial.position.y);
+        w.write_f32(spatial.position.z);
+        w.write_f32(spatial.spread);
+        w.write_f32(spatial.width);
+        w.write_f32(spatial.lfe);
+    }
 }
 
 /// v28: built-in Soundfont Player instrument state. A leading flag keeps the
@@ -1677,6 +1692,20 @@ fn encode_body_versioned(project: &FutureboardProject, version: u32) -> Vec<u8> 
     w.write_u32(project.settings.tempo_points.len() as u32);
     for point in &project.settings.tempo_points {
         w.write_f32(point.tension);
+    }
+
+    // Spatial mix (v57): the format by its stable token, the room, and how a
+    // surround mix reaches a stereo device.
+    if version >= 57 {
+        let settings = &project.settings;
+        w.write_str(settings.spatial_format.token());
+        let room = settings.spatial_room.sanitized();
+        w.write_f32(room.half_size_m);
+        w.write_f32(room.reflections);
+        w.write_u8(match settings.spatial_fold {
+            solfege_spatialaudio::MonitorFold::Binaural => 0,
+            solfege_spatialaudio::MonitorFold::Stereo => 1,
+        });
     }
 
     // View section (v54+). Self-delimiting: see `encode_view_section`.
@@ -3082,6 +3111,7 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
             midi_output_per_note,
             mpe: MpeTrackConfiguration::default(),
             program: Default::default(),
+            spatial: Default::default(),
             sends: Vec::new(),
         }
     } else {
@@ -3199,6 +3229,18 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
             program: r.read_opt_u8()?,
             bank_msb: r.read_u8()?,
             bank_lsb: r.read_u8()?,
+        }
+        .sanitized();
+    }
+
+    // v57: the track's place in the room. A pre-v57 track is front and centre.
+    if version >= 57 {
+        let (x, y, z) = (r.read_f32()?, r.read_f32()?, r.read_f32()?);
+        routing.spatial = solfege_spatialaudio::SourceParams {
+            position: solfege_spatialaudio::RoomPosition { x, y, z },
+            spread: r.read_f32()?,
+            width: r.read_f32()?,
+            lfe: r.read_f32()?,
         }
         .sanitized();
     }
@@ -3641,6 +3683,25 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
         }
     }
 
+    // Spatial mix (v57). An unknown format token — a newer build's layout —
+    // opens as stereo rather than failing the file.
+    let (spatial_format, spatial_room, spatial_fold) = if version >= 57 {
+        let format =
+            solfege_spatialaudio::SpatialFormat::from_token(&r.read_str()?).unwrap_or_default();
+        let room = solfege_spatialaudio::RoomSettings {
+            half_size_m: r.read_f32()?,
+            reflections: r.read_f32()?,
+        }
+        .sanitized();
+        let fold = match r.read_u8()? {
+            1 => solfege_spatialaudio::MonitorFold::Stereo,
+            _ => solfege_spatialaudio::MonitorFold::Binaural,
+        };
+        (format, room, fold)
+    } else {
+        Default::default()
+    };
+
     // View section (v54+). A v53 file has none and opens on the defaults
     // described at `PROJECT_VERSION`.
     let view = if version >= 54 {
@@ -3693,6 +3754,9 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
             bit_depth,
             time_display_format,
             timecode_rate,
+            spatial_format,
+            spatial_room,
+            spatial_fold,
         },
         tracks,
         mixer: ProjectMixer {
@@ -4136,15 +4200,17 @@ mod tests {
         // ARA document count, the v43 timebase pair, the v50 marker SysEx
         // count, the v51 Chord Track block (event count, collapse latch,
         // custom height), the v52 project key (root, scale), the v53 tempo
-        // tension count (no markers, so no values) and the v54 view section.
-        // A v24-v26 fixture reads none of them, so drop the whole tail before
-        // appending the legacy cue block in its place.
+        // tension count (no markers, so no values), the v57 spatial mix
+        // (format token, room, fold) and the v54 view section. A v24-v26
+        // fixture reads none of them, so drop the whole tail before appending
+        // the legacy cue block in its place.
         let v35_output_routing_bytes = 1 + 1 + 1;
         let v40_global_lane_bytes = 4 + 5;
         let v43_timebase_bytes = 1 + 1;
         let v51_chord_track_bytes = 4 + 1 + 4;
         let v52_project_key_bytes = 1 + 1;
         let v53_tempo_tension_bytes = 4;
+        let v57_spatial_bytes = 4 + project.settings.spatial_format.token().len() + 4 + 4 + 1;
         let v54_view_bytes = view_section_len(&project.view);
         body.truncate(
             body.len()
@@ -4155,6 +4221,7 @@ mod tests {
                 - v51_chord_track_bytes
                 - v52_project_key_bytes
                 - v53_tempo_tension_bytes
+                - v57_spatial_bytes
                 - v54_view_bytes,
         );
 

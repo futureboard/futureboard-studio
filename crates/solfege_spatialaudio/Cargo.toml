@@ -1,0 +1,19 @@
+[package]
+name = "solfege_spatialaudio"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Surround (5.1, 7.1, 7.1.4, ...) and binaural spatialisation for Futureboard: square-room panning, a structural HRTF, virtual speakers and fold-down."
+
+[lib]
+name = "solfege_spatialaudio"
+path = "src/lib.rs"
+
+[dependencies]
+# The format, layout and source parameters are persisted in the project and
+# carried in the engine snapshot, so they are defined here (one authority).
+serde.workspace = true
+
+[lints]
+workspace = true

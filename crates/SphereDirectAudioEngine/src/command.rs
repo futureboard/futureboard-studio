@@ -39,6 +39,12 @@ pub enum EngineCommand {
         /// The effective monitoring `(left, right)` device channels.
         monitor: Option<(u16, u16)>,
     },
+    /// Move one channel in the spatial mix's square room. `track_index` is
+    /// resolved by the control thread; the payload is plain numbers.
+    SetTrackSpatial {
+        track_index: usize,
+        params: solfege_spatialaudio::SourceParams,
+    },
     /// Set one channel's Pre/After-Fader Listen state. `track_index` is
     /// resolved by the control thread so the payload owns no allocation.
     SetTrackListen {

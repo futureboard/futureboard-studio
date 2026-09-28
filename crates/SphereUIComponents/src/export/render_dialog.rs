@@ -29,7 +29,7 @@ use crate::components::controls::{fb_badge, fb_button, FbButtonKind};
 use crate::components::progress_dialog::{progress_bar, ProgressBarValue};
 use crate::components::title_bar::{external_window_titlebar_with_icon, TITLEBAR_HEIGHT};
 use crate::i18n::I18n;
-use crate::theme::{self, elevation, radius, size, space, typography, Colors};
+use crate::theme::{self, radius, size, space, typography, Colors};
 
 use super::ui_kit::*;
 
@@ -442,10 +442,6 @@ impl Render for RenderDialog {
             .font(theme::ui_font())
             .bg(Colors::surface_base())
             .overflow_hidden()
-            .rounded(px(radius::DIALOG))
-            .border(px(1.0))
-            .border_color(Colors::border_normal())
-            .shadow(elevation::shadow(elevation::OVERLAY))
             .track_focus(&self.focus_handle)
             .capture_key_down({
                 let target = target.clone();

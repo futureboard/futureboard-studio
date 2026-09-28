@@ -1280,6 +1280,32 @@ fn build_engine_project_snapshot_inner(
             sample_rate: sample_rate.max(1),
             buffer_size: 256,
         },
+        spatial: build_engine_spatial_snapshot(state),
+    }
+}
+
+/// The mix's spatial format and every channel's place in the room. Empty of
+/// sources in a stereo mix: nothing reads them there.
+pub(super) fn build_engine_spatial_snapshot(
+    state: &TimelineState,
+) -> DirectAudio::types::EngineSpatialSnapshot {
+    let mix = state.spatial_mix;
+    DirectAudio::types::EngineSpatialSnapshot {
+        format: mix.format,
+        room: mix.room.sanitized(),
+        fold: mix.fold,
+        sources: if mix.is_spatial() {
+            state
+                .tracks
+                .iter()
+                .map(|track| DirectAudio::types::EngineSpatialSource {
+                    track_id: track.id.clone(),
+                    params: track.spatial.sanitized(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 

@@ -1436,6 +1436,12 @@ impl Render for StudioLayout {
             } else {
                 None
             })
+            // The docked mixer's meters, painted over the bottom panel from
+            // outside it so a meter tick never rebuilds the panel.
+            .children(
+                (show_bottom_docked && self.docked_mixer_meters_visible())
+                    .then(|| self.mixer_meter_overlay.clone()),
+            )
             .child({
                 let _s = crate::perf::PerfScope::enter("StatusBar");
                 self.status_bar.clone()

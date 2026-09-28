@@ -217,6 +217,13 @@ impl StudioLayout {
             .update(cx, |meter, cx| meter.apply(perf, cx));
 
         if self.mixer_panel_chrome_visible() {
+            // Levels move in the overlay alone; the panel repaints only for
+            // what else a playing project moves on the strips (automation).
+            if self.docked_mixer_meters_visible() {
+                let _ = self.mixer_meter_overlay.update(cx, |_, cx| cx.notify());
+            } else {
+                self.mixer_meter_layout.borrow_mut().clear();
+            }
             let _ = self
                 .mixer_panel
                 .update(cx, |panel, cx| panel.on_meter_tick(cx));
@@ -1060,6 +1067,11 @@ impl StudioLayout {
         self.external_windows.mixer.clone()
     }
 
+    /// The docked mixer is on screen, so its meter overlay paints.
+    pub(super) fn docked_mixer_meters_visible(&self) -> bool {
+        self.panels.bottom_docked && self.active_bottom_tab == crate::components::BottomTab::Mixer
+    }
+
     pub(super) fn mixer_panel_chrome_visible(&self) -> bool {
         if self.external_windows.mixer.is_some() {
             return true;
@@ -1201,7 +1213,11 @@ impl StudioLayout {
     /// Build the callback bundle used by the mixer. Every mutation lands in
     /// the same `TimelineState` instance owned by the Timeline entity, so the
     /// TrackHeader and Mixer always read identical values.
-    pub(crate) fn build_mixer_callbacks(&self, owner: Entity<Self>) -> MixerCallbacks {
+    pub(crate) fn build_mixer_callbacks(
+        &self,
+        owner: Entity<Self>,
+        cx: &gpui::App,
+    ) -> MixerCallbacks {
         let audio_engine = self.audio_bridge.engine.clone();
         let timeline_select = self.timeline.clone();
         let mixer_panel_select = self.mixer_panel.clone();
@@ -1417,6 +1433,26 @@ impl StudioLayout {
                 }
             }
         });
+
+        let audio_engine_spatial = self.audio_bridge.engine.clone();
+        let timeline_spatial = self.timeline.clone();
+        let owner_spatial = owner.clone();
+        let on_spatial_change: std::sync::Arc<
+            dyn Fn(&(String, solfege_spatialaudio::SourceParams), &mut Window, &mut gpui::App)
+                + 'static,
+        > = std::sync::Arc::new(move |(id, params), _w, cx| {
+            // Live like pan: the engine hears the move at once through
+            // `SetTrackSpatial`, with no graph rebuild per mouse-move.
+            let placed = timeline_spatial.update(cx, |t, cx| t.move_track_in_room(id, *params, cx));
+            if let (Some(params), Some(engine)) = (placed, audio_engine_spatial.as_ref()) {
+                let _ = engine.set_track_spatial(id, params);
+            }
+            StudioLayout::defer_update(&owner_spatial, cx, |this, cx| {
+                this.mark_dirty_view_only();
+                this.push_mixer_snapshot_to_window(cx);
+            });
+        });
+        let spatial_format = self.timeline.read(cx).state.spatial_mix.format;
 
         let audio_engine = self.audio_bridge.engine.clone();
         let timeline_mute = self.timeline.clone();
@@ -2212,6 +2248,8 @@ impl StudioLayout {
             on_volume_drag_preview,
             on_volume_drag_commit,
             on_pan_change,
+            on_spatial_change,
+            spatial_format,
             on_toggle_mute,
             on_toggle_solo,
             on_toggle_arm,
@@ -2650,6 +2688,7 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         volume_effective,
         volume_automation_read,
         pan,
+        spatial,
         muted,
         solo,
         armed,
@@ -2699,6 +2738,7 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         volume_effective: *volume_effective,
         volume_automation_read: *volume_automation_read,
         pan: *pan,
+        spatial: *spatial,
         muted: *muted,
         solo: *solo,
         armed: *armed,

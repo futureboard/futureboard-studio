@@ -17,6 +17,8 @@
 mod exporter;
 mod level_meter;
 mod offline_renderer;
+#[cfg(test)]
+pub(crate) use offline_renderer::{make_track_snapshot, silence_snapshot};
 mod render_progress;
 mod render_request;
 

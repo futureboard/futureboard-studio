@@ -392,6 +392,10 @@ pub struct Timeline {
     /// The other selected audio clips a gain or fade gesture on
     /// `clip_process_origin` carries along, as the press found them.
     clip_process_peers: Vec<ClipState>,
+    /// The track as it was before the Inspector's spatial gesture now in
+    /// flight (height, spread, width, LFE): its previews apply live and the
+    /// release records them as one undo step.
+    room_edit: Option<crate::components::timeline::timeline_state::PendingTrackEdit>,
     /// The ruler's grid-resolution dropdown is open.
     snap_menu_open: bool,
     /// Where the Smart Tool's razor line is, shared with its overlay.

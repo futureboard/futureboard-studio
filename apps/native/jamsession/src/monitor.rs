@@ -330,6 +330,7 @@ fn room_project(
     preferred_input_device: Option<String>,
 ) -> EngineProjectSnapshot {
     EngineProjectSnapshot {
+        spatial: Default::default(),
         project_id: "futureboard-jam".to_string(),
         project_root: None,
         preferred_input_device,

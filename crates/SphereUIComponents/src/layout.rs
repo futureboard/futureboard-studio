@@ -686,6 +686,11 @@ pub struct StudioLayout {
     mixer_tree_ui_hooks: Option<mixer_ops::MixerTreeUiHooks>,
     mixer_tree_sidebar: gpui::Entity<components::MixerTreeSidebar>,
     mixer_master_strip: gpui::Entity<components::MixerMasterStripView>,
+    /// Where the docked mixer's meters sit, recorded as its strips lay out.
+    mixer_meter_layout: components::mixer_meter_layer::SharedMeterLayout,
+    /// Paints the docked mixer's meters, over the bottom panel rather than in
+    /// it: see `components::mixer_meter_layer`.
+    mixer_meter_overlay: gpui::Entity<components::mixer_meter_layer::MixerMeterOverlay>,
     /// Transport-bar master level strip. Its own entity so the meter poll
     /// repaints it alone rather than the whole application chrome.
     master_transport_meter: gpui::Entity<components::MasterTransportMeter>,
@@ -886,12 +891,22 @@ impl StudioLayout {
         });
         let mixer_callbacks = components::mixer_panel::noop_mixer_callbacks();
         let mixer_split = components::mixer_panel::MixerSplit::inert();
+        let mixer_meter_layout: components::mixer_meter_layer::SharedMeterLayout =
+            Default::default();
+        let mixer_meter_overlay = cx.new(|_cx| {
+            components::mixer_meter_layer::MixerMeterOverlay::new(
+                studio_entity.clone(),
+                timeline.clone(),
+                mixer_meter_layout.clone(),
+            )
+        });
         let mixer_master_strip = cx.new(|_cx| {
             components::MixerMasterStripView::new(
                 timeline.clone(),
                 mixer_callbacks,
                 mixer_split,
                 components::mixer_panel::STRIP_MIN_HEIGHT,
+                mixer_meter_layout.clone(),
             )
         });
         let transport_perf_meter = cx.new(|_cx| components::TransportPerfMeter::new());
@@ -907,6 +922,7 @@ impl StudioLayout {
                 timeline.clone(),
                 mixer_tree_sidebar.clone(),
                 mixer_master_strip.clone(),
+                mixer_meter_layout.clone(),
             )
         });
         let effect_editor_tab = cx
@@ -1388,6 +1404,8 @@ impl StudioLayout {
             mixer_tree_ui_hooks: None,
             mixer_tree_sidebar,
             mixer_master_strip,
+            mixer_meter_layout,
+            mixer_meter_overlay,
             master_transport_meter,
             transport_perf_meter,
             chord_display_panel,

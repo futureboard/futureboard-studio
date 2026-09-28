@@ -937,6 +937,9 @@ pub struct EngineInner {
     /// so every graph built while it runs is mapped to it. Also the control
     /// thread's own reference to the capture (see `SetRenderCapture`).
     render_capture: Mutex<Option<(Arc<crate::render_capture::RenderCapture>, Vec<String>)>>,
+    /// The Control Room configuration as last set, applied to every graph a
+    /// project sync builds (see [`MonitorMirror`]).
+    monitor_mirror: Mutex<MonitorMirror>,
     audio_cache: Mutex<HashMap<String, Arc<ClipAudioSource>>>,
     inactive_audio_cache_lru: Mutex<VecDeque<String>>,
 
@@ -1098,6 +1101,7 @@ impl EngineInner {
             plugin_bridge_sinks: Mutex::new(Default::default()),
             ara_renderers: Mutex::new(HashMap::new()),
             render_capture: Mutex::new(None),
+            monitor_mirror: Mutex::new(MonitorMirror::default()),
             audio_cache: Mutex::new(HashMap::new()),
             inactive_audio_cache_lru: Mutex::new(VecDeque::new()),
             glitch_counter: Arc::new(AtomicU64::new(0)),
@@ -2310,6 +2314,7 @@ impl EngineInner {
         &self,
         source: crate::monitor::MonitorSource,
     ) -> Result<(), SphereAudioError> {
+        self.monitor_mirror.lock().source = source.clone();
         self.send_command(EngineCommand::SetMonitorSource { source })
     }
 
@@ -2319,6 +2324,7 @@ impl EngineInner {
         &self,
         control: crate::monitor::MonitorControl,
     ) -> Result<(), SphereAudioError> {
+        self.monitor_mirror.lock().control = control;
         self.send_command(EngineCommand::SetMonitorControl { control })
     }
 
@@ -2327,6 +2333,7 @@ impl EngineInner {
         &self,
         target: crate::monitor::MonitorOutputTarget,
     ) -> Result<(), SphereAudioError> {
+        self.monitor_mirror.lock().output = target.clone();
         self.send_command(EngineCommand::SetMonitorOutput { target })
     }
 
@@ -2342,6 +2349,9 @@ impl EngineInner {
         master: Option<(u16, u16)>,
         monitor: Option<(u16, u16)>,
     ) -> Result<(), SphereAudioError> {
+        self.monitor_mirror
+            .lock()
+            .set_hardware_output_ownership(owner, master, monitor);
         self.send_command(EngineCommand::SetHardwareOutputOwnership {
             owner,
             master,
@@ -2362,6 +2372,14 @@ impl EngineInner {
                 .as_ref()
                 .and_then(|p| p.tracks.iter().position(|t| t.id == track_id))
         };
+        {
+            let mut mirror = self.monitor_mirror.lock();
+            if listen == crate::monitor::ListenMode::Off {
+                mirror.listen.remove(track_id);
+            } else {
+                mirror.listen.insert(track_id.to_string(), listen);
+            }
+        }
         let Some(track_index) = track_index else {
             return Ok(());
         };
@@ -2371,9 +2389,53 @@ impl EngineInner {
         })
     }
 
+    /// Move one channel in the spatial mix's room, live. The control thread's
+    /// copies (the stored snapshot, the graph mirror) are updated too, so a
+    /// later rebuild or device reopen keeps the position.
+    pub fn set_track_spatial(
+        &self,
+        track_id: &str,
+        params: solfege_spatialaudio::SourceParams,
+    ) -> Result<(), SphereAudioError> {
+        let params = params.sanitized();
+        let track_index = {
+            let mut project = self.project.lock();
+            let Some(project) = project.as_mut() else {
+                return Ok(());
+            };
+            match project
+                .spatial
+                .sources
+                .iter_mut()
+                .find(|source| source.track_id == track_id)
+            {
+                Some(source) => source.params = params,
+                None => project
+                    .spatial
+                    .sources
+                    .push(crate::types::EngineSpatialSource {
+                        track_id: track_id.to_string(),
+                        params,
+                    }),
+            }
+            project.tracks.iter().position(|t| t.id == track_id)
+        };
+        let Some(track_index) = track_index else {
+            return Ok(());
+        };
+        self.runtime
+            .lock()
+            .update_track_spatial(track_index, params);
+        self.send_command(EngineCommand::SetTrackSpatial {
+            track_index,
+            params,
+        })
+    }
+
     /// Clear Listen on every channel — the Control Room returns to its
     /// selected source, normally the master bus.
     pub fn clear_all_listen(&self) -> Result<(), SphereAudioError> {
+        self.monitor_mirror.lock().listen.clear();
         self.send_command(EngineCommand::ClearAllListen)
     }
 
@@ -2771,7 +2833,7 @@ impl EngineInner {
             return self.set_master_volume(value as f32);
         }
 
-        match param_id {
+        let live = match param_id {
             "volume" => self.send_command(EngineCommand::SetTrackVolume {
                 track_id: track_id.into(),
                 value: value as f32,
@@ -2788,7 +2850,57 @@ impl EngineInner {
                 track_id: track_id.into(),
                 solo: value != 0.0,
             }),
+            _ => return self.update_track_param_other(track_id, param_id, value),
+        };
+        if live.is_ok() {
+            self.mirror_live_track_control(track_id, param_id, value);
+        }
+        live
+    }
 
+    /// Keep the control thread's copies of the graph in step with a live
+    /// volume / pan / mute / solo change.
+    ///
+    /// The command reaches only the callback's graph. The control thread's
+    /// mirror (`runtime`) is what a device reopen starts the callback from,
+    /// and the stored snapshot (`project`) is what later edits are reconciled
+    /// against; both kept the value from the last full project sync. A mute or
+    /// solo made since then came back on the next reopen — most visibly a
+    /// cleared solo returning, which silences every other channel while the
+    /// mixer shows nothing soloed.
+    fn mirror_live_track_control(&self, track_id: &str, param_id: &str, value: f64) {
+        {
+            let mut runtime = self.runtime.lock();
+            match param_id {
+                "volume" => {
+                    runtime.update_track_volume(track_id, value as f32);
+                }
+                "pan" => runtime.update_track_pan(track_id, value as f32),
+                "muted" => runtime.update_track_mute(track_id, value != 0.0),
+                "solo" => runtime.update_track_solo(track_id, value != 0.0),
+                _ => return,
+            }
+        }
+        if let Some(project) = self.project.lock().as_mut() {
+            if let Some(track) = project.tracks.iter_mut().find(|t| t.id == track_id) {
+                match param_id {
+                    "volume" => track.volume = value as f32,
+                    "pan" => track.pan = value as f32,
+                    "muted" => track.muted = value != 0.0,
+                    "solo" => track.solo = value != 0.0,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn update_track_param_other(
+        &self,
+        track_id: &str,
+        param_id: &str,
+        value: f64,
+    ) -> Result<(), SphereAudioError> {
+        match param_id {
             "previewMode" => self.send_command(EngineCommand::SetTrackPreviewMode {
                 track_id: track_id.into(),
                 value: value as f32,
@@ -3321,6 +3433,11 @@ impl EngineInner {
         // below is stored, or that mirror loses the sinks.
         runtime.plugin_bridge_sinks = self.plugin_bridge_sinks.lock().clone();
         runtime.resolve_bridge_sinks();
+        // The same for the Control Room: a rebuilt graph starts from a default
+        // monitor, and nothing re-sends the configuration after a sync — so
+        // every sync used to put Master back on the default output pair and
+        // drop the Control Room's source, level and Listen taps.
+        self.monitor_mirror.lock().apply_to(&mut runtime);
         // A realtime render in progress records the rebuilt graph too, with
         // its lanes mapped to where the tracks now are.
         if let Some((capture, track_ids)) = self.render_capture.lock().as_ref() {
@@ -5358,6 +5475,7 @@ impl EngineInner {
                 EngineCommand::SetMonitorOutput { .. } => "SetMonitorOutput",
                 EngineCommand::SetHardwareOutputOwnership { .. } => "SetHardwareOutputOwnership",
                 EngineCommand::SetTrackListen { .. } => "SetTrackListen",
+                EngineCommand::SetTrackSpatial { .. } => "SetTrackSpatial",
                 EngineCommand::ClearAllListen => "ClearAllListen",
                 EngineCommand::MidiPreviewNoteOn { .. } => "MidiPreviewNoteOn",
                 EngineCommand::MidiPreviewNoteOff { .. } => "MidiPreviewNoteOff",
@@ -6028,6 +6146,12 @@ where
                                 runtime.monitor.output.left_channel = left;
                             }
                         }
+                        EngineCommand::SetTrackSpatial {
+                            track_index,
+                            params,
+                        } => {
+                            runtime.update_track_spatial(track_index, params);
+                        }
                         EngineCommand::SetTrackListen {
                             track_index,
                             listen,
@@ -6593,6 +6717,7 @@ mod live_input_tests {
 
     fn monitored_audio_snapshot() -> EngineProjectSnapshot {
         EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "asio-routing-test".into(),
             project_root: None,
             preferred_input_device: None,
@@ -7030,6 +7155,8 @@ mod bridge_insert_tests {
         let mut params = HashMap::new();
         params.insert("role".to_string(), serde_json::json!("effect"));
         RuntimeTrack {
+            spatial: None,
+            spatial_params: Default::default(),
             active_voices: 0,
             listen: crate::monitor::ListenMode::Off,
             id: "track-1".to_string(),
@@ -7296,6 +7423,7 @@ mod bridge_insert_tests {
         let tracks = vec![fast, slow];
         let audio_graph = crate::audio_graph::plan_runtime_audio_graph(&tracks).unwrap();
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks,
             audio_graph,
             pdc_enabled: true,
@@ -7382,6 +7510,7 @@ mod bridge_insert_tests {
         let tracks = vec![src, ret, master];
         let audio_graph = crate::audio_graph::plan_runtime_audio_graph(&tracks).unwrap();
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks,
             audio_graph,
             pdc_enabled: true,
@@ -7529,6 +7658,8 @@ mod bridge_insert_tests {
         }
 
         let mut track = RuntimeTrack {
+            spatial: None,
+            spatial_params: Default::default(),
             active_voices: 0,
             listen: crate::monitor::ListenMode::Off,
             id: "track-1".to_string(),
@@ -7677,6 +7808,8 @@ mod bridge_insert_tests {
         }
 
         let mut track = RuntimeTrack {
+            spatial: None,
+            spatial_params: Default::default(),
             active_voices: 0,
             listen: crate::monitor::ListenMode::Off,
             id: "track-1".to_string(),
@@ -7779,6 +7912,8 @@ mod routing_tests {
     fn track(id: &str, ty: &str, sends: Vec<RuntimeSend>) -> RuntimeTrack {
         let cap = 8;
         RuntimeTrack {
+            spatial: None,
+            spatial_params: Default::default(),
             active_voices: 0,
             listen: crate::monitor::ListenMode::Off,
             id: id.to_string(),
@@ -7886,6 +8021,7 @@ mod routing_tests {
             samples,
         })));
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             sample_rate: 48_000,
             tracks,
             clips: vec![RuntimeClip {
@@ -8043,6 +8179,7 @@ mod routing_tests {
             };
             configure(&mut clip);
             let mut p = RuntimeProject {
+                spatial: Default::default(),
                 sample_rate: 48_000,
                 tracks,
                 clips: vec![clip],
@@ -8119,6 +8256,7 @@ mod routing_tests {
                 samples: samples.clone(),
             })));
             let mut p = RuntimeProject {
+                spatial: Default::default(),
                 sample_rate: 48_000,
                 tracks,
                 clips: vec![RuntimeClip {
@@ -8264,6 +8402,7 @@ mod routing_tests {
     fn send_to_return_accumulates_scaled() {
         let frames = 4;
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![
                 track("audio", "audio", vec![send("ret", 0.5)]),
                 track("ret", "return", vec![]),
@@ -8291,6 +8430,7 @@ mod routing_tests {
         let mut pre = send("ret", 1.0);
         pre.pre_fader = true;
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![
                 track("audio", "audio", vec![pre]),
                 track("ret", "return", vec![]),
@@ -8315,6 +8455,7 @@ mod routing_tests {
     fn send_to_non_routing_target_is_rejected() {
         let frames = 4;
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![
                 track("a", "audio", vec![send("b", 1.0)]),
                 track("b", "audio", vec![]),
@@ -8334,6 +8475,7 @@ mod routing_tests {
         // "late" at index 1 sends to "early" at index 0 — valid DAG when there
         // is no back-edge. Pass-2 topo order processes late before early.
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![
                 track("early", "return", vec![]),
                 track("late", "bus", vec![send("early", 1.0)]),
@@ -8357,6 +8499,7 @@ mod routing_tests {
         // and never resolves into a live runtime send. Direct accumulate of a
         // self-cycle is still dropped by the self-target guard.
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![
                 track("early", "bus", vec![send("late", 1.0)]),
                 track("late", "return", vec![send("early", 1.0)]),
@@ -8387,6 +8530,7 @@ mod routing_tests {
         let mut a = track("a", "audio", vec![]);
         a.output_track_id = Some("bus".to_string());
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![a, track("bus", "bus", vec![])],
             ..Default::default()
         };
@@ -8413,6 +8557,7 @@ mod routing_tests {
         let frames = 4;
         let channels = 2;
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![track("a", "audio", vec![])], // output_track_id = None → master
             ..Default::default()
         };
@@ -8435,6 +8580,7 @@ mod routing_tests {
         let mut a = track("a", "audio", vec![]);
         a.output_track_id = Some("b".to_string()); // "b" is a plain audio track
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![a, track("b", "audio", vec![])],
             ..Default::default()
         };
@@ -8706,6 +8852,56 @@ mod engine_state_rendering_tests {
 
 /// Where each of `track_ids` is in `snapshot`, which is the order the graph
 /// built from it holds its tracks in.
+/// The Control Room configuration as last set, kept on the control thread.
+///
+/// The callback's `RuntimeMonitor` is the graph's, so it is replaced with a
+/// default one by every project sync; this is what puts the configuration back
+/// into each new graph before it is sent. Each setter records here exactly what
+/// its command does to the callback's copy.
+#[derive(Default)]
+struct MonitorMirror {
+    source: crate::monitor::MonitorSource,
+    control: crate::monitor::MonitorControl,
+    output: crate::monitor::MonitorOutputTarget,
+    hardware_owner: crate::monitor::HardwareOutputOwner,
+    master_output: Option<(u16, u16)>,
+    /// Listen taps by track id: indices move between graphs, ids do not.
+    listen: HashMap<String, crate::monitor::ListenMode>,
+}
+
+impl MonitorMirror {
+    /// What `SetHardwareOutputOwnership` does on the callback.
+    fn set_hardware_output_ownership(
+        &mut self,
+        owner: crate::monitor::HardwareOutputOwner,
+        master: Option<(u16, u16)>,
+        monitor: Option<(u16, u16)>,
+    ) {
+        self.hardware_owner = owner;
+        self.master_output = master;
+        if let Some((left, _right)) = monitor {
+            self.output.left_channel = left;
+        }
+    }
+
+    fn apply_to(&self, runtime: &mut RuntimeProject) {
+        runtime.monitor.source = self.source.clone();
+        runtime.monitor.control = self.control;
+        runtime.monitor.output = self.output.clone();
+        runtime.monitor.hardware_owner = self.hardware_owner;
+        runtime.monitor.master_output = self.master_output;
+        for track in runtime.tracks.iter_mut() {
+            track.listen = self
+                .listen
+                .get(&track.id)
+                .copied()
+                .unwrap_or(crate::monitor::ListenMode::Off);
+        }
+        // The source names a track by id; resolve it against this graph.
+        runtime.resolve_indices();
+    }
+}
+
 fn render_capture_indices(
     snapshot: &EngineProjectSnapshot,
     track_ids: &[String],

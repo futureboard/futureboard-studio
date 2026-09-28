@@ -229,6 +229,10 @@ pub struct TrackState {
     pub volume_automation_read: bool,
     /// Pan position in `-1.0..=1.0`. `-1.0` is hard left, `+1.0` is hard right.
     pub pan: f32,
+    /// Where this channel sits in the square room when the project's mix is
+    /// spatial (binaural or surround); the pan above applies in stereo. Saved
+    /// with the track (v57).
+    pub spatial: solfege_spatialaudio::SourceParams,
     pub muted: bool,
     pub solo: bool,
     pub armed: bool,
@@ -489,6 +493,7 @@ impl TimelineState {
         let id = self.next_track_id();
         let track_type = options.track_type;
         self.tracks.push(TrackState {
+            spatial: Default::default(),
             listen: ListenMode::Off,
             id: id.clone(),
             name: options.name,

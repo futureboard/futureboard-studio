@@ -325,26 +325,7 @@ impl Render for Timeline {
             std::sync::Arc::new(on_clear_all_mutes);
 
         let on_clear_all_solos = cx.listener(|this, _: &(), _window, cx| {
-            let soloed: Vec<String> = this
-                .state
-                .tracks
-                .iter()
-                .filter(|track| track.solo)
-                .map(|track| track.id.clone())
-                .collect();
-            let edit = this.begin_track_edit(TrackEditScope::tracks(soloed));
-            let cleared = this.state.clear_all_track_solos();
-            if cleared.is_empty() {
-                return;
-            }
-            this.commit_track_edit("Clear All Solos", edit, false, cx);
-            if let Some(cb) = this.on_track_param_change.as_ref() {
-                for track_id in &cleared {
-                    cb(track_id.clone(), "solo".to_string(), 0.0);
-                }
-            }
-            this.mark_control_state_changed(cx);
-            cx.notify();
+            this.clear_all_solos(cx);
         });
         let on_clear_all_solos: std::sync::Arc<dyn Fn(&(), &mut Window, &mut gpui::App) + 'static> =
             std::sync::Arc::new(on_clear_all_solos);

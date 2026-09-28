@@ -77,6 +77,7 @@ fn track(id: &str, track_type: &str, solfege: bool) -> EngineTrackSnapshot {
 
 fn snapshot(notes: Vec<EngineMidiNoteSnapshot>) -> EngineProjectSnapshot {
     EngineProjectSnapshot {
+        spatial: Default::default(),
         project_id: "solfege-pitch-test".to_string(),
         project_root: None,
         preferred_input_device: None,

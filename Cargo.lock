@@ -8027,6 +8027,13 @@ version = "0.1.0"
 source = "git+https://github.com/futureboard/solfage-engine#6cf3c67f7dfb232f5c2b18d239157bc5399e703b"
 
 [[package]]
+name = "solfege_spatialaudio"
+version = "2026.9.27-beta1.4.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "sphere-audio-editor"
 version = "2026.9.27-beta1.4.1"
 dependencies = [
@@ -8168,6 +8175,7 @@ dependencies = [
  "solfege-engine",
  "solfege-event",
  "solfege-model",
+ "solfege_spatialaudio",
  "sphere-audio-plugins",
  "sphere-audio-processor",
  "sphere-encoder",
@@ -8216,6 +8224,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "solfege-model",
+ "solfege_spatialaudio",
  "sphere-audio-editor",
  "sphere-audio-processor",
  "sphere-encoder",

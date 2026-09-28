@@ -398,9 +398,31 @@ pub fn external_window_titlebar_with_icon(
     close_id: impl Into<gpui::ElementId>,
     on_close: impl Fn(&mut Window, &mut App) + 'static + Clone,
 ) -> impl IntoElement {
+    external_titlebar(icon_path, title.into(), close_id.into(), on_close, true)
+}
+
+/// The same external-dialog title bar with Close as its only caption button,
+/// for fixed-size windows that can neither minimize nor maximize (message
+/// boxes, progress). Same height, inset, title weight and close control as
+/// [`external_window_titlebar`], so a message box reads as the same family as
+/// the dialog that raised it.
+pub fn external_window_titlebar_compact(
+    title: impl Into<String>,
+    close_id: impl Into<gpui::ElementId>,
+    on_close: impl Fn(&mut Window, &mut App) + 'static + Clone,
+) -> impl IntoElement {
+    external_titlebar(None, title.into(), close_id.into(), on_close, false)
+}
+
+fn external_titlebar(
+    icon_path: Option<&'static str>,
+    title: String,
+    close_id: gpui::ElementId,
+    on_close: impl Fn(&mut Window, &mut App) + 'static + Clone,
+    min_max: bool,
+) -> Div {
     let policy = PlatformChromePolicy::external_dialog();
-    let on_close = on_close.clone();
-    let title_text = crate::platform_chrome::branded_window_title(&title.into());
+    let title_text = crate::platform_chrome::branded_window_title(&title);
 
     let title_row = draggable_title(
         icon_path.filter(|_| policy.show_titlebar_icon()),
@@ -412,6 +434,7 @@ pub fn external_window_titlebar_with_icon(
         .flex()
         .flex_row()
         .items_center()
+        .flex_shrink_0()
         .h(px(policy.titlebar_height_px))
         .pl(policy.external_titlebar_left_padding())
         .pr(px(if policy.show_window_controls {
@@ -425,25 +448,27 @@ pub fn external_window_titlebar_with_icon(
         .child(title_row);
 
     if policy.show_window_controls {
-        bar = bar
-            .child(external_window_control_button(
-                WindowControlArea::Min,
-                "external-window-minimize",
-                assets::ICON_MINIMIZE_PATH,
-                move |window, _cx| window.minimize_window(),
-            ))
-            .child(external_window_control_button(
-                WindowControlArea::Max,
-                "external-window-maximize",
-                assets::ICON_MAXIMIZE_PATH,
-                move |window, _cx| window.zoom_window(),
-            ))
-            .child(external_window_control_button(
-                WindowControlArea::Close,
-                close_id,
-                assets::ICON_X_PATH,
-                move |window, cx| on_close(window, cx),
-            ));
+        if min_max {
+            bar = bar
+                .child(external_window_control_button(
+                    WindowControlArea::Min,
+                    "external-window-minimize",
+                    assets::ICON_MINIMIZE_PATH,
+                    move |window, _cx| window.minimize_window(),
+                ))
+                .child(external_window_control_button(
+                    WindowControlArea::Max,
+                    "external-window-maximize",
+                    assets::ICON_MAXIMIZE_PATH,
+                    move |window, _cx| window.zoom_window(),
+                ));
+        }
+        bar = bar.child(external_window_control_button(
+            WindowControlArea::Close,
+            close_id,
+            assets::ICON_X_PATH,
+            move |window, cx| on_close(window, cx),
+        ));
     } else if policy.needs_drawn_close_fallback() {
         bar = bar.child(
             div()
@@ -473,53 +498,6 @@ pub fn external_window_titlebar_with_icon(
     }
 
     bar
-}
-
-/// Close-only compact title bar for native message boxes (no min/max controls).
-pub fn external_window_titlebar_compact(
-    title: impl Into<String>,
-    close_id: impl Into<gpui::ElementId>,
-    on_close: impl Fn(&mut Window, &mut App) + 'static + Clone,
-) -> impl IntoElement {
-    let policy = PlatformChromePolicy::external_dialog();
-    let on_close = on_close.clone();
-    let title_text = crate::platform_chrome::branded_window_title(&title.into());
-
-    let close_button = policy.needs_drawn_close_fallback().then(|| {
-        div()
-            .id(close_id)
-            .role(Role::Button)
-            .aria_label("Close window")
-            .focusable()
-            .tab_stop(true)
-            .focus_visible(|style| style.bg(Colors::surface_control_hover()))
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(WINDOW_CONTROL_WIDTH))
-            .h(px(TITLEBAR_HEIGHT))
-            .cursor(gpui::CursorStyle::PointingHand)
-            .hover(|s| s.bg(Colors::surface_control_hover()))
-            .occlude()
-            .on_click(move |_, window, cx| on_close(window, cx))
-            .child(
-                window_control_icon(WindowControlArea::Close, assets::ICON_X_PATH, "X")
-                    .text_color(Colors::text_faint()),
-            )
-    });
-
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(policy.titlebar_height_px))
-        .pl(policy.external_titlebar_left_padding())
-        .pr(px(CHROME_PAD_X))
-        .border_b(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_titlebar())
-        .child(draggable_title(None, title_text, gpui::FontWeight::MEDIUM))
-        .children(close_button)
 }
 
 pub type WindowChromeCloseCb = std::sync::Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>;

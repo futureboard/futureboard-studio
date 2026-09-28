@@ -43,6 +43,74 @@ const HORIZONTAL_ACCENT_LINE_W: f32 = 2.0;
 #[derive(Clone, Debug)]
 pub struct FaderDrag {
     pub id: String,
+    /// Where a vertical drag is measured from: the pointer's window y and the
+    /// value when the drag started, or when Shift last changed. The cap moves
+    /// by how far the pointer travels from here, not to where it is — see
+    /// [`relative_drag_value`].
+    anchor: std::rc::Rc<std::cell::Cell<Option<DragAnchor>>>,
+}
+
+impl FaderDrag {
+    pub(crate) fn new(id: String) -> Self {
+        Self {
+            id,
+            anchor: Default::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DragAnchor {
+    pointer: f32,
+    value: f32,
+    fine: bool,
+}
+
+/// Holding Shift moves the cap this much slower, for the last fraction of a dB.
+const FINE_DRAG_SCALE: f32 = 0.1;
+
+/// The value a relative drag reaches.
+///
+/// The cap follows the pointer's *travel*, not its position: grabbing it a few
+/// pixels off-centre used to jump the channel to wherever the press landed —
+/// several dB for a fader of ordinary height — before the hand had moved at
+/// all. `travel` is the pointer's movement toward higher values, in pixels;
+/// `span` is the rail's length. Shift scales the travel down, and changing it
+/// re-anchors (see [`FaderDrag`]) so the cap never jumps when it is pressed or
+/// released mid-drag.
+fn relative_drag_value(anchor: DragAnchor, travel: f32, span: f32) -> f32 {
+    let scale = if anchor.fine { FINE_DRAG_SCALE } else { 1.0 };
+    (anchor.value + travel / span.max(1.0) * scale).clamp(0.0, 1.0)
+}
+
+/// Advance a drag to `pointer` and return the value it reaches. `toward_max`
+/// turns pointer movement into travel toward higher values (up for a vertical
+/// fader, right for a horizontal one).
+pub(crate) fn drag_to(
+    drag: &FaderDrag,
+    start_value: f32,
+    pointer: f32,
+    fine: bool,
+    span: f32,
+    toward_max: impl Fn(f32) -> f32,
+) -> f32 {
+    let anchor = drag.anchor.get().unwrap_or(DragAnchor {
+        pointer,
+        value: start_value,
+        fine,
+    });
+    // Shift changed: continue from where the cap is now, at the new rate.
+    let anchor = if anchor.fine != fine {
+        DragAnchor {
+            pointer,
+            value: relative_drag_value(anchor, toward_max(pointer - anchor.pointer), span),
+            fine,
+        }
+    } else {
+        anchor
+    };
+    drag.anchor.set(Some(anchor));
+    relative_drag_value(anchor, toward_max(pointer - anchor.pointer), span)
 }
 
 impl Render for FaderDrag {
@@ -77,18 +145,23 @@ fn db_to_top_fraction(db: f32) -> f32 {
     1.0 - volume::db_to_norm(db)
 }
 
-fn pointer_y_to_norm(pointer_y: f32, bounds_y: f32, bounds_h: f32) -> f32 {
-    let rail_top = FADER_THUMB_HEIGHT / 2.0;
-    let rail_h = (bounds_h - FADER_THUMB_HEIGHT).max(1.0);
-    let rail_y = (pointer_y - bounds_y - rail_top).clamp(0.0, rail_h);
-    1.0 - rail_y / rail_h
-}
-
-fn pointer_x_to_norm(pointer_x: f32, bounds_x: f32, bounds_w: f32) -> f32 {
-    let rail_left = HORIZONTAL_THUMB_W / 2.0;
-    let rail_w = (bounds_w - HORIZONTAL_THUMB_W).max(1.0);
-    let rail_x = (pointer_x - bounds_x - rail_left).clamp(0.0, rail_w);
-    rail_x / rail_w
+/// A click that resets the fader to its default: a stationary double-click,
+/// or a click with Alt held (the console shortcut for "back to unity").
+pub(crate) fn is_reset_click(event: &gpui::ClickEvent) -> bool {
+    if is_reset_double_click(event) {
+        return true;
+    }
+    match event {
+        gpui::ClickEvent::Mouse(mouse) => {
+            mouse.down.modifiers.alt
+                && event.click_count() == 1
+                && f32::from(mouse.up.position.x - mouse.down.position.x).abs()
+                    <= RESET_CLICK_SLOP_PX
+                && f32::from(mouse.up.position.y - mouse.down.position.y).abs()
+                    <= RESET_CLICK_SLOP_PX
+        }
+        gpui::ClickEvent::Keyboard(_) => false,
+    }
 }
 
 /// How far the pointer may travel between press and release and still count as
@@ -451,30 +524,26 @@ pub fn fader_with_drag_callbacks(
         .justify_center()
         .child(fader_rail(value))
         .on_drag(
-            FaderDrag {
-                id: id_string.clone(),
-            },
+            FaderDrag::new(id_string.clone()),
             move |drag, _offset, window, cx| {
                 if let Some(start) = on_drag_start.as_ref() {
                     start(&value, window, cx);
                 }
-                cx.new(|_| FaderDrag {
-                    id: drag.id.clone(),
-                })
+                cx.new(|_| FaderDrag::new(drag.id.clone()))
             },
         )
         .on_drag_move::<FaderDrag>(move |event: &DragMoveEvent<FaderDrag>, window, cx| {
-            if event.drag(cx).id != id_string {
+            let drag = event.drag(cx);
+            if drag.id != id_string {
                 return;
             }
-            let bounds = event.bounds;
             let y: f32 = event.event.position.y.into();
-            let oy: f32 = bounds.origin.y.into();
-            let oh: f32 = f32::from(bounds.size.height).max(FADER_THUMB_HEIGHT + 1.0);
-            let new_value = pointer_y_to_norm(y, oy, oh);
+            let span = (f32::from(event.bounds.size.height) - FADER_THUMB_HEIGHT).max(1.0);
+            // Up is louder: travel toward the maximum is the pointer moving up.
+            let new_value = drag_to(drag, value, y, event.event.modifiers.shift, span, |dy| -dy);
             if fader_map_debug_enabled() {
                 eprintln!(
-                    "[fader-map] v id={id_string} pointer_y={y:.1} bounds_y={oy:.1}                      bounds_h={oh:.1} norm={new_value:.4}"
+                    "[fader-map] v id={id_string} pointer_y={y:.1} span={span:.1} norm={new_value:.4}"
                 );
             }
             if let Some(preview) = on_drag_preview.as_ref() {
@@ -494,7 +563,7 @@ pub fn fader_with_drag_callbacks(
         })
         .when_some(on_double_click_reset, |this, reset| {
             this.on_click(move |event, window, cx| {
-                if is_reset_double_click(event) {
+                if is_reset_click(event) {
                     reset(window, cx);
                 }
             })
@@ -525,30 +594,25 @@ pub fn horizontal_fader_with_drag_callbacks(
         .cursor(gpui::CursorStyle::ResizeLeftRight)
         .child(horizontal_fader_rail(value, accent))
         .on_drag(
-            FaderDrag {
-                id: id_string.clone(),
-            },
+            FaderDrag::new(id_string.clone()),
             move |drag, _offset, window, cx| {
                 if let Some(start) = on_drag_start.as_ref() {
                     start(&value, window, cx);
                 }
-                cx.new(|_| FaderDrag {
-                    id: drag.id.clone(),
-                })
+                cx.new(|_| FaderDrag::new(drag.id.clone()))
             },
         )
         .on_drag_move::<FaderDrag>(move |event: &DragMoveEvent<FaderDrag>, window, cx| {
-            if event.drag(cx).id != id_string {
+            let drag = event.drag(cx);
+            if drag.id != id_string {
                 return;
             }
-            let bounds = event.bounds;
             let x: f32 = event.event.position.x.into();
-            let ox: f32 = bounds.origin.x.into();
-            let ow: f32 = f32::from(bounds.size.width).max(HORIZONTAL_THUMB_W + 1.0);
-            let new_value = pointer_x_to_norm(x, ox, ow);
+            let span = (f32::from(event.bounds.size.width) - HORIZONTAL_THUMB_W).max(1.0);
+            let new_value = drag_to(drag, value, x, event.event.modifiers.shift, span, |dx| dx);
             if fader_map_debug_enabled() {
                 eprintln!(
-                    "[fader-map] h id={id_string} pointer_x={x:.1} bounds_x={ox:.1}                      bounds_w={ow:.1} norm={new_value:.4}"
+                    "[fader-map] h id={id_string} pointer_x={x:.1} span={span:.1} norm={new_value:.4}"
                 );
             }
             if let Some(preview) = on_drag_preview.as_ref() {
@@ -568,7 +632,7 @@ pub fn horizontal_fader_with_drag_callbacks(
         })
         .when_some(on_double_click_reset, |this, reset| {
             this.on_click(move |event, window, cx| {
-                if is_reset_double_click(event) {
+                if is_reset_click(event) {
                     reset(window, cx);
                 }
             })
@@ -587,25 +651,32 @@ mod tests {
     }
 
     #[test]
-    fn pointer_mapping_uses_rail_travel_not_outer_hitbox() {
-        let h = 210.0;
-        let top = FADER_THUMB_HEIGHT / 2.0;
-        let bottom = h - FADER_THUMB_HEIGHT / 2.0;
-
-        assert!((pointer_y_to_norm(top, 0.0, h) - 1.0).abs() < 1.0e-6);
-        assert!((pointer_y_to_norm(bottom, 0.0, h) - 0.0).abs() < 1.0e-6);
-        assert!((pointer_y_to_norm(h / 2.0, 0.0, h) - 0.5).abs() < 1.0e-6);
+    fn grabbing_the_fader_does_not_move_it() {
+        let drag = FaderDrag::new("f".into());
+        // Pressed anywhere, not moved: the value stays where it was.
+        assert_eq!(drag_to(&drag, 0.62, 140.0, false, 200.0, |dy| -dy), 0.62);
+        // 50 px up a 200 px rail is a quarter of the travel.
+        let v = drag_to(&drag, 0.62, 90.0, false, 200.0, |dy| -dy);
+        assert!((v - 0.87).abs() < 1.0e-5, "{v}");
+        // Clamped at the ends.
+        assert_eq!(drag_to(&drag, 0.62, -500.0, false, 200.0, |dy| -dy), 1.0);
     }
 
     #[test]
-    fn horizontal_pointer_mapping_uses_thumb_center_travel() {
-        let w = 210.0;
-        let left = HORIZONTAL_THUMB_W / 2.0;
-        let right = w - HORIZONTAL_THUMB_W / 2.0;
-
-        assert!((pointer_x_to_norm(left, 0.0, w) - 0.0).abs() < 1.0e-6);
-        assert!((pointer_x_to_norm(right, 0.0, w) - 1.0).abs() < 1.0e-6);
-        assert!((pointer_x_to_norm(w / 2.0, 0.0, w) - 0.5).abs() < 1.0e-6);
+    fn shift_is_fine_and_never_jumps() {
+        let drag = FaderDrag::new("f".into());
+        assert_eq!(drag_to(&drag, 0.5, 100.0, false, 200.0, |dy| -dy), 0.5);
+        let coarse = drag_to(&drag, 0.5, 80.0, false, 200.0, |dy| -dy);
+        assert!((coarse - 0.6).abs() < 1.0e-5);
+        // Shift pressed at the same pointer: same value, no jump.
+        let held = drag_to(&drag, 0.5, 80.0, true, 200.0, |dy| -dy);
+        assert!((held - coarse).abs() < 1.0e-5);
+        // 20 px more with Shift is a tenth of what it would be without.
+        let fine = drag_to(&drag, 0.5, 60.0, true, 200.0, |dy| -dy);
+        assert!((fine - (coarse + 0.01)).abs() < 1.0e-5, "{fine}");
+        // Released: continues from there at full rate.
+        let released = drag_to(&drag, 0.5, 60.0, false, 200.0, |dy| -dy);
+        assert!((released - fine).abs() < 1.0e-5);
     }
 
     fn mouse_click(

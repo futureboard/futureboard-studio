@@ -1777,6 +1777,7 @@ impl TimelineState {
             self.tracks.insert(
                 insert_at,
                 TrackState {
+                    spatial: Default::default(),
                     listen: ListenMode::Off,
                     id: child_id,
                     name,

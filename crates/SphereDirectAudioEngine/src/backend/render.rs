@@ -932,6 +932,12 @@ pub fn drain_commands(
                     runtime.monitor.output.left_channel = left;
                 }
             }
+            EngineCommand::SetTrackSpatial {
+                track_index,
+                params,
+            } => {
+                runtime.update_track_spatial(track_index, params);
+            }
             EngineCommand::SetTrackListen {
                 track_index,
                 listen,

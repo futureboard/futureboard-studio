@@ -14,6 +14,16 @@ pub struct MixerCallbacks {
         std::sync::Arc<dyn Fn(&(String, f32), &mut Window, &mut App) + 'static>,
     pub on_volume_drag_commit: std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     pub on_pan_change: std::sync::Arc<dyn Fn(&(String, f32), &mut Window, &mut App) + 'static>,
+    /// Move a channel in the spatial mix's square room `(track_id, params)`.
+    /// Consecutive moves of one drag fold into one undo step.
+    pub on_spatial_change: std::sync::Arc<
+        dyn Fn(&(String, solfege_spatialaudio::SourceParams), &mut Window, &mut App) + 'static,
+    >,
+    /// Not a callback: the project's spatial format, which decides whether a
+    /// strip's pan is a knob (stereo) or a room panner (binaural, surround),
+    /// and which speakers the panner shows. Carried here because every mixer
+    /// surface already receives this bundle.
+    pub spatial_format: solfege_spatialaudio::SpatialFormat,
     pub on_toggle_mute: std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     pub on_toggle_solo: std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
     pub on_toggle_arm: std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
@@ -140,6 +150,10 @@ pub fn noop_mixer_callbacks() -> MixerCallbacks {
         on_volume_drag_preview: noop_vol,
         on_volume_drag_commit: noop_vol_commit,
         on_pan_change: noop_pan,
+        on_spatial_change: Arc::new(
+            |_: &(String, solfege_spatialaudio::SourceParams), _: &mut Window, _: &mut App| {},
+        ),
+        spatial_format: solfege_spatialaudio::SpatialFormat::Stereo,
         on_toggle_mute: noop_track.clone(),
         on_toggle_solo: noop_track.clone(),
         on_toggle_arm: noop_track.clone(),

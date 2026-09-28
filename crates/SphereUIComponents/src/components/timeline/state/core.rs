@@ -143,6 +143,23 @@ pub struct PendingViewRestore {
     pub scroll_y: f32,
 }
 
+/// The project's spatial mix settings.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SpatialMix {
+    pub format: solfege_spatialaudio::SpatialFormat,
+    /// The room a binaural mix, or a surround mix heard on headphones, is in.
+    pub room: solfege_spatialaudio::RoomSettings,
+    /// How a surround mix reaches a device with too few outputs for it.
+    pub fold: solfege_spatialaudio::MonitorFold,
+}
+
+impl SpatialMix {
+    /// Channels are placed in the room rather than panned.
+    pub fn is_spatial(&self) -> bool {
+        self.format.is_spatial()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineState {
     pub bpm: f32,
@@ -169,6 +186,9 @@ pub struct TimelineState {
     /// Frame rate used when [`Self::time_display_format`] is
     /// [`TimeDisplayFormat::Timecode`]. Ignored by every other format.
     pub timecode_rate: TimecodeRate,
+    /// The mix's spatial format — stereo, binaural, or a speaker layout — and
+    /// the room it is heard in (v57).
+    pub spatial_mix: SpatialMix,
     /// The project's key: root and scale. `None` until someone sets one — a
     /// project has no key by default, and "C major" would be a guess.
     pub project_key: Option<MidiScale>,
@@ -338,6 +358,7 @@ impl Default for TimelineState {
             resolved_tempo: ResolvedTempo::default(),
             time_signature_map: TimeSignatureMap::with_default_4_4(),
             time_display_format: TimeDisplayFormat::default(),
+            spatial_mix: SpatialMix::default(),
             timecode_rate: TimecodeRate::default(),
             project_key: None,
             markers: Vec::new(),

@@ -626,6 +626,98 @@ impl Clone for RuntimeSolfegeEngine {
     }
 }
 
+/// The spatial mix of a graph.
+///
+/// In a stereo project this is inert (`format` stereo, a two-channel bus
+/// nobody writes). In a spatial one, every channel that sums into the master
+/// is rendered by its own [`solfege_spatialaudio::SpatialSource`] into `bus`
+/// instead of being panned, and the master stage takes the bus from there:
+/// a binaural bus is already the stereo mix; a surround bus goes out discretely
+/// when the device has the channels and Master owns channels 0/1, and is
+/// otherwise heard through `virtual_speakers` (headphones) or the ITU fold.
+#[derive(Debug, Clone)]
+pub struct RuntimeSpatial {
+    pub format: solfege_spatialaudio::SpatialFormat,
+    pub room: solfege_spatialaudio::RoomSettings,
+    pub fold: solfege_spatialaudio::MonitorFold,
+    pub bus: solfege_spatialaudio::SpatialBus,
+    pub virtual_speakers: Option<solfege_spatialaudio::VirtualSpeakers>,
+    pub sample_rate: u32,
+}
+
+impl Default for RuntimeSpatial {
+    fn default() -> Self {
+        Self {
+            format: solfege_spatialaudio::SpatialFormat::Stereo,
+            room: solfege_spatialaudio::RoomSettings::default(),
+            fold: solfege_spatialaudio::MonitorFold::default(),
+            bus: solfege_spatialaudio::SpatialBus::new(2, 0),
+            virtual_speakers: None,
+            sample_rate: 48_000,
+        }
+    }
+}
+
+impl RuntimeSpatial {
+    /// Allocates the bus (and, for surround, the virtual speakers) at the
+    /// callback's block capacity. Control thread only.
+    pub fn from_snapshot(snapshot: &crate::types::EngineSpatialSnapshot, sample_rate: u32) -> Self {
+        let format = snapshot.format;
+        if !format.is_spatial() {
+            return Self {
+                sample_rate,
+                ..Self::default()
+            };
+        }
+        let virtual_speakers = match format {
+            solfege_spatialaudio::SpatialFormat::Surround(layout) => {
+                Some(solfege_spatialaudio::VirtualSpeakers::new(
+                    layout,
+                    sample_rate,
+                    DEFAULT_AUDIO_BLOCK_CAPACITY,
+                ))
+            }
+            _ => None,
+        };
+        Self {
+            format,
+            room: snapshot.room.sanitized(),
+            fold: snapshot.fold,
+            bus: solfege_spatialaudio::SpatialBus::new(
+                format.channel_count(),
+                DEFAULT_AUDIO_BLOCK_CAPACITY,
+            ),
+            virtual_speakers,
+            sample_rate,
+        }
+    }
+
+    /// Whether channels are being spatialised.
+    #[inline]
+    pub fn active(&self) -> bool {
+        self.format.is_spatial()
+    }
+
+    /// Channels a surround bus writes to the device directly, or `None` when it
+    /// must be folded to channels 0/1 instead: the device is too small, or
+    /// Master does not own the first pair outright (the Control Room is
+    /// monitoring, or Master is routed elsewhere).
+    pub fn discrete_channels(
+        &self,
+        device_channels: usize,
+        monitor: &RuntimeMonitor,
+    ) -> Option<usize> {
+        let solfege_spatialaudio::SpatialFormat::Surround(layout) = self.format else {
+            return None;
+        };
+        let count = layout.channel_count();
+        let master_owns_first_pair = monitor.hardware_owner
+            == crate::monitor::HardwareOutputOwner::MasterDirect
+            && monitor.master_output == Some((0, 1));
+        (count > 2 && device_channels >= count && master_owns_first_pair).then_some(count)
+    }
+}
+
 /// Control Room state carried by the render graph.
 ///
 /// Lives on [`RuntimeProject`] so the audio callback reads a resolved,
@@ -806,6 +898,14 @@ pub struct RuntimeTrack {
     /// so replacing the renderer set can subtract exactly what it added instead
     /// of forcing a whole graph rebuild.
     pub ara_latency_samples: u32,
+    /// Where this channel sits in the square room when the mix is spatial
+    /// (surround or binaural). Live-updated by `SetTrackSpatial`.
+    pub spatial_params: solfege_spatialaudio::SourceParams,
+    /// The channel's spatialiser, when the mix is spatial and this channel
+    /// sums into the master: it replaces the stereo pan on that last hop.
+    /// `None` in a stereo mix and for channels routed into a bus (the bus is
+    /// placed instead). Preallocated by [`RuntimeProject::ensure_spatial`].
+    pub spatial: Option<solfege_spatialaudio::SpatialSource>,
     /// Per-block MIDI events for the instrument VST3 insert (Phase 2B).
     /// Cleared at the start of `schedule_midi_block`; no steady-path allocation.
     pub midi_block_events: Vec<Vst3MidiEvent>,
@@ -2148,6 +2248,9 @@ pub struct RuntimeProject {
     /// The realtime render being recorded, if one is. Set on the control
     /// thread for every graph it builds while a capture is active.
     pub render_capture: Option<Arc<crate::render_capture::RenderCapture>>,
+    /// The spatial mix: format, room, the multichannel bus spatialised
+    /// channels sum into, and how a surround bus reaches a stereo device.
+    pub spatial: RuntimeSpatial,
 }
 
 /// One track's program selection on one MIDI channel, bound to the track
@@ -3070,6 +3173,8 @@ impl RuntimeProject {
                 (1.0 - init_pan, 1.0)
             };
             tracks.push(RuntimeTrack {
+                spatial: None,
+                spatial_params: Default::default(),
                 listen: crate::monitor::ListenMode::Off,
                 id: t.id.clone(),
                 track_type: t.track_type.clone(),
@@ -3412,10 +3517,13 @@ impl RuntimeProject {
                 })
                 .collect(),
             render_capture: None,
+            spatial: RuntimeSpatial::from_snapshot(&snapshot.spatial, output_sample_rate),
         };
         // Resolve cross-entity indices once, on this worker thread, so the
         // audio callback never does an id lookup per block.
         project.resolve_indices();
+        project.apply_spatial_sources(&snapshot.spatial);
+        project.ensure_spatial();
         // Size the PDC rings here rather than inline above, so a freshly built
         // project starts with the same reserved headroom every other
         // control-thread path leaves behind — without it the first bridge
@@ -4439,6 +4547,62 @@ impl RuntimeProject {
     }
 
     #[inline]
+    /// Place each channel as the snapshot says; a channel it does not list
+    /// stays front and centre.
+    pub fn apply_spatial_sources(&mut self, snapshot: &crate::types::EngineSpatialSnapshot) {
+        for source in &snapshot.sources {
+            if let Some(track) = self.tracks.iter_mut().find(|t| t.id == source.track_id) {
+                track.spatial_params = source.params.sanitized();
+            }
+        }
+    }
+
+    /// Give every channel that sums into the master its spatialiser for the
+    /// graph's format, and take them away from the rest. Must run after
+    /// [`Self::resolve_indices`], which decides where each channel goes.
+    /// Allocates; control thread only.
+    pub fn ensure_spatial(&mut self) {
+        let format = self.spatial.format;
+        let sample_rate = self.spatial.sample_rate;
+        for track in self.tracks.iter_mut() {
+            let to_master = track.track_type != "master" && track.output_track_index.is_none();
+            if !format.is_spatial() || !to_master {
+                track.spatial = None;
+                continue;
+            }
+            let keep = matches!(
+                (&track.spatial, format),
+                (
+                    Some(solfege_spatialaudio::SpatialSource::Binaural(_)),
+                    solfege_spatialaudio::SpatialFormat::Binaural
+                )
+            ) || matches!(
+                (&track.spatial, format),
+                (Some(solfege_spatialaudio::SpatialSource::Surround(source)), solfege_spatialaudio::SpatialFormat::Surround(layout))
+                    if source.layout() == layout
+            );
+            if !keep {
+                track.spatial = solfege_spatialaudio::SpatialSource::for_format(
+                    format,
+                    sample_rate,
+                    DEFAULT_AUDIO_BLOCK_CAPACITY,
+                );
+            }
+        }
+    }
+
+    /// Move one channel in the room. Realtime-safe: a copy.
+    #[inline]
+    pub fn update_track_spatial(
+        &mut self,
+        track_index: usize,
+        params: solfege_spatialaudio::SourceParams,
+    ) {
+        if let Some(track) = self.tracks.get_mut(track_index) {
+            track.spatial_params = params.sanitized();
+        }
+    }
+
     pub fn update_track_solo(&mut self, track_id: &str, solo: bool) {
         if let Some(track) = self.tracks.iter_mut().find(|t| t.id == track_id) {
             track.solo = solo;
@@ -5947,6 +6111,7 @@ mod pdc_reset_tests {
 
     fn two_track_snapshot(sample_rate: u32) -> EngineProjectSnapshot {
         EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "pdc-reset".to_string(),
             project_root: None,
             preferred_input_device: None,
@@ -6587,6 +6752,7 @@ mod midi_tests {
         let tempo_map = RuntimeTempoMapSnapshot::static_tempo(120.0);
         let (midi_clips, midi_tracks) = build_midi_runtime(&clips, &tempo_map, 48_000);
         RuntimeProject {
+            spatial: Default::default(),
             sample_rate: 48_000,
             tempo_map,
             midi_clips,
@@ -7343,6 +7509,7 @@ mod midi_tests {
 
     fn automation_runtime(track: crate::types::EngineTrackSnapshot) -> RuntimeProject {
         let snapshot = EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "automation-lane".to_string(),
             project_root: None,
             preferred_input_device: None,
@@ -7496,6 +7663,8 @@ mod midi_tests {
 
     fn bridged_instrument_track(id: &str) -> RuntimeTrack {
         RuntimeTrack {
+            spatial: None,
+            spatial_params: Default::default(),
             active_voices: 0,
             listen: crate::monitor::ListenMode::Off,
             id: id.to_string(),
@@ -7924,6 +8093,7 @@ mod loopback_resolve_tests {
         };
         audio.id = destination.to_string();
         EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "loopback".to_string(),
             project_root: None,
             preferred_input_device: None,

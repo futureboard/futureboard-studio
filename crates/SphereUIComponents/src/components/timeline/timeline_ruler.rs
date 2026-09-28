@@ -400,7 +400,7 @@ pub fn timeline_ruler(
                                     "ruler-clear-all-mutes",
                                     "M",
                                     any_muted,
-                                    Colors::status_warning(),
+                                    Colors::state_mute(),
                                     if any_muted {
                                         "Tracks are muted — click to unmute all"
                                     } else {
@@ -412,7 +412,7 @@ pub fn timeline_ruler(
                                     "ruler-clear-all-solos",
                                     "S",
                                     any_soloed,
-                                    Colors::accent_primary(),
+                                    Colors::state_solo(),
                                     if any_soloed {
                                         "Tracks are soloed — click to clear all solo"
                                     } else {

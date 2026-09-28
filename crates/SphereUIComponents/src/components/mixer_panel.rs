@@ -37,6 +37,10 @@ use std::collections::HashSet;
 use crate::assets;
 use crate::components::fader::fader_with_drag_callbacks;
 use crate::components::knob::knob_bipolar;
+use crate::components::mixer_meter_layer::{
+    clip_region, meter_slot, peak_readout_text, peak_slot, ClipRegion, MeterSource,
+    SharedMeterLayout, VstiMeterFallback, PEAK_TEXT_SIZE,
+};
 use crate::components::mixer_render::{MixerRenderSnapshot, MixerRenderViewport, MixerStripGeom};
 use crate::components::mixer_surface::{mixer_gpu_primitives_active, render_mixer_primitives};
 use crate::components::mixer_tree_sidebar_view::MixerTreeSidebar;
@@ -59,6 +63,7 @@ use crate::theme::{typography, Colors};
 
 mod callbacks;
 mod console;
+pub(crate) use console::describe_room_position;
 mod drag;
 mod split;
 pub use callbacks::*;
@@ -86,7 +91,64 @@ use crate::components::timeline::timeline_state::MAX_INSERT_SLOTS;
 /// Height of the "Mixer  N ch" strip above the console.
 pub const MIXER_SUB_HEADER_H: f32 = 30.0;
 
-pub fn mixer_sub_header(track_count: usize, i18n: I18n) -> impl IntoElement {
+/// Clears every solo, from the mixer header. `None` where the surface has no
+/// timeline to clear it on (the detached window's snapshot).
+pub type ClearSolosCb = std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>;
+
+pub fn mixer_sub_header(
+    track_count: usize,
+    soloed_count: usize,
+    on_clear_solos: Option<ClearSolosCb>,
+    i18n: I18n,
+) -> impl IntoElement {
+    // Any solo silences every channel that is not soloed — including one on a
+    // strip scrolled out of view, or on a channel in a collapsed folder. The
+    // header says so, and clears it, from wherever the mixer is scrolled.
+    let solo_chip = (soloed_count > 0).then(|| {
+        let solo = Colors::state_solo();
+        let mut chip = div()
+            .id("mixer-clear-solos")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .h(px(18.0))
+            .px(px(6.0))
+            .rounded(px(crate::theme::radius::CONTROL_SM))
+            .bg(Colors::with_alpha(solo, 0.18))
+            .border(px(1.0))
+            .border_color(Colors::with_alpha(solo, 0.55))
+            .text_size(px(typography::DENSE_CAPTION))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(solo)
+            .child(
+                div()
+                    .px(px(3.0))
+                    .rounded(px(crate::theme::radius::MICRO))
+                    .bg(solo)
+                    .text_color(Colors::on_color(solo))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child("S"),
+            )
+            .child(format!("{soloed_count} soloed"));
+        if let Some(on_clear) = on_clear_solos {
+            chip = chip
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(Colors::with_alpha(solo, 0.28)))
+                .tooltip(crate::components::controls::fb_tooltip(
+                    "Every channel that is not soloed is silent. Click to clear all solos.",
+                ))
+                .on_click(move |_, window, cx| on_clear(window, cx))
+                .child(
+                    svg()
+                        .path(assets::ICON_X_PATH)
+                        .w(px(9.0))
+                        .h(px(9.0))
+                        .text_color(solo),
+                );
+        }
+        chip
+    });
     div()
         .flex()
         .flex_row()
@@ -124,6 +186,7 @@ pub fn mixer_sub_header(track_count: usize, i18n: I18n) -> impl IntoElement {
                 .text_color(Colors::text_secondary())
                 .child(format!("{} ch", track_count)),
         )
+        .children(solo_chip)
 }
 
 fn mixer_track_type_label(track_type: TrackType, i18n: I18n) -> String {
@@ -1306,13 +1369,27 @@ fn sends_section(
 /// nothing a bipolar knob has not already said with its centre tick. The
 /// position does need saying — "is that dead centre or two degrees off?" is not
 /// answerable from a 26 px disc — so the number takes the line instead.
-fn pan_section(track: &TrackState, callbacks: &MixerCallbacks) -> impl IntoElement {
+fn pan_section(
+    track: &TrackState,
+    callbacks: &MixerCallbacks,
+    base: gpui::Rgba,
+) -> gpui::AnyElement {
+    // A spatial mix places the channel in the room instead of panning it.
+    if callbacks.spatial_format.is_spatial() {
+        let track_id = track.id.clone();
+        let on_spatial = callbacks.on_spatial_change.clone();
+        return console::room_panner(
+            gpui::SharedString::from(format!("mix-room-{}", track.id)),
+            track.spatial,
+            callbacks.spatial_format,
+            base,
+            move |params, w, cx| on_spatial(&(track_id.clone(), params), w, cx),
+        )
+        .into_any_element();
+    }
     let track_id = track.id.clone();
     let pan_cb = callbacks.on_pan_change.clone();
-    let on_pan_change = move |new_pan: &f32, w: &mut gpui::Window, cx: &mut gpui::App| {
-        pan_cb(&(track_id.clone(), *new_pan), w, cx);
-    };
-
+    let centred = track.pan.abs() < 0.005;
     div()
         .flex()
         .flex_col()
@@ -1330,36 +1407,31 @@ fn pan_section(track: &TrackState, callbacks: &MixerCallbacks) -> impl IntoEleme
             track.pan,
             -1.0,
             1.0,
+            console::PAN_KNOB_SIZE,
             // Neutral, not the app accent: there is a pan knob on every strip,
-            // and twenty cyan arcs across the panel is the same wall of colour
-            // the coloured strip borders were, moved twenty pixels down.
+            // and twenty accent arcs across the panel is a wall of colour that
+            // says nothing about which channel is selected.
             Colors::text_secondary(),
             None,
             0.0,
-            on_pan_change,
+            move |new_pan: &f32, w: &mut gpui::Window, cx: &mut gpui::App| {
+                pan_cb(&(track_id.clone(), *new_pan), w, cx)
+            },
         ))
         .child(
             div()
                 .flex_none()
+                .h(px(12.0))
                 .text_size(px(type_scale::CAPTION))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(Colors::text_muted())
-                .child(format_pan(track.pan)),
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(if centred {
+                    Colors::text_muted()
+                } else {
+                    Colors::text_primary()
+                })
+                .child(console::format_pan(track.pan)),
         )
-}
-
-/// `C`, `L34`, `R100` — the console shorthand, not a signed float. A pan is a
-/// side and an amount, and reading "-0.34" forces the eye to decode which side
-/// negative means.
-fn format_pan(pan: f32) -> String {
-    let amount = (pan.abs() * 100.0).round() as i32;
-    if amount == 0 {
-        "C".to_string()
-    } else if pan < 0.0 {
-        format!("L{amount}")
-    } else {
-        format!("R{amount}")
-    }
+        .into_any_element()
 }
 
 /// The fader bay: cap, meter, and the channel's gain printed under both.
@@ -1373,6 +1445,8 @@ fn fader_area(
     track: &TrackState,
     callbacks: &MixerCallbacks,
     is_selected: bool,
+    meter: gpui::AnyElement,
+    peak: gpui::AnyElement,
 ) -> impl IntoElement {
     let display_vol = track.display_volume();
     let db_str = volume::format_db(display_vol);
@@ -1410,7 +1484,34 @@ fn fader_area(
             Some(on_vol_reset),
         )
         .into_any_element(),
-        meter_surface(
+        meter,
+        peak,
+        db_str,
+        is_selected || automation_reading,
+        has_volume_automation.then_some(automation_reading),
+    )
+}
+
+/// A channel strip's meter: drawn in place, or — in the docked mixer, where
+/// meters move without rebuilding the strips — an empty slot the meter layer
+/// paints (see [`crate::components::mixer_meter_layer`]).
+fn strip_meter(
+    track: &TrackState,
+    track_index: usize,
+    meter_layer: Option<&SharedMeterLayout>,
+    vsti: Option<VstiMeterFallback>,
+) -> gpui::AnyElement {
+    match meter_layer {
+        Some(layout) => meter_slot(
+            layout,
+            MeterSource::Track {
+                id: track.id.clone(),
+                index: track_index,
+                vsti,
+            },
+        )
+        .into_any_element(),
+        None => meter_surface(
             track.meter_level_l,
             track.meter_level_r,
             track.meter_peak_hold_l,
@@ -1418,10 +1519,37 @@ fn fader_area(
             track.meter_clip,
         )
         .into_any_element(),
-        db_str,
-        is_selected || automation_reading,
-        has_volume_automation.then_some(automation_reading),
-    )
+    }
+}
+
+/// The peak readout's content: a slot the meter layer prints into, or — in
+/// the detached window — the number itself.
+fn peak_readout(
+    meter_layer: Option<&SharedMeterLayout>,
+    source: MeterSource,
+    hold_l: f32,
+    hold_r: f32,
+    clip: bool,
+) -> gpui::AnyElement {
+    match meter_layer {
+        Some(layout) => peak_slot(layout, source).into_any_element(),
+        None => div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(crate::theme::radius::MICRO))
+            .when(clip, |s| s.bg(Colors::status_error()))
+            .text_size(px(PEAK_TEXT_SIZE))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(if clip {
+                Colors::on_color(Colors::status_error())
+            } else {
+                Colors::text_secondary()
+            })
+            .child(peak_readout_text(hold_l, hold_r, clip))
+            .into_any_element(),
+    }
 }
 
 /// The shared bay every strip's fader sits in — channel, VSTi sub-strip, Master
@@ -1434,6 +1562,7 @@ fn fader_area(
 fn fader_bay(
     fader: gpui::AnyElement,
     meter: gpui::AnyElement,
+    peak: gpui::AnyElement,
     db_text: String,
     highlight: bool,
     automation: Option<bool>,
@@ -1463,48 +1592,72 @@ fn fader_bay(
                 .child(console::meter_scale())
                 .child(meter),
         )
+        // Two readouts, like a console's: the fader's gain on the left, the
+        // channel's held peak on the right — what it is set to, and what it
+        // is doing.
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_center()
                 .gap(px(3.0))
                 .w_full()
-                .h(px(13.0))
+                .h(px(console::READOUT_H))
                 .child(
                     div()
-                        .text_size(px(type_scale::VALUE))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(if highlight {
-                            Colors::text_primary()
-                        } else {
-                            Colors::text_secondary()
-                        })
-                        .child(db_text),
-                )
-                .children(automation.map(|reading| {
-                    div()
                         .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
                         .items_center()
                         .justify_center()
-                        .h(px(11.0))
-                        .px(px(3.0))
+                        .gap(px(2.0))
                         .rounded(px(crate::theme::radius::MICRO))
-                        .bg(if reading {
-                            Colors::state_automation()
-                        } else {
-                            Colors::state_hover()
-                        })
-                        .text_size(px(type_scale::CAPTION))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(if reading {
-                            Colors::on_color(Colors::state_automation())
-                        } else {
-                            Colors::text_muted()
-                        })
-                        .child("A")
-                })),
+                        .bg(console::well(Colors::mixer_strip_bg()))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(type_scale::VALUE))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(if highlight {
+                                    Colors::text_primary()
+                                } else {
+                                    Colors::text_secondary()
+                                })
+                                .child(db_text),
+                        )
+                        .children(automation.map(|reading| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(px(11.0))
+                                .px(px(3.0))
+                                .rounded(px(crate::theme::radius::MICRO))
+                                .bg(if reading {
+                                    Colors::state_automation()
+                                } else {
+                                    Colors::state_hover()
+                                })
+                                .text_size(px(type_scale::CAPTION))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(if reading {
+                                    Colors::on_color(Colors::state_automation())
+                                } else {
+                                    Colors::text_muted()
+                                })
+                                .child("A")
+                        })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .rounded(px(crate::theme::radius::MICRO))
+                        .bg(console::well(Colors::mixer_strip_bg()))
+                        .child(peak),
+                ),
         )
 }
 
@@ -1681,6 +1834,7 @@ fn channel_strip(
     // the batched canvas behind shows through. Inner sections keep their own
     // styling.
     gpu_decor: bool,
+    meter_layer: Option<&SharedMeterLayout>,
     i18n: I18n,
 ) -> impl IntoElement {
     log_vsti_child_meter_subscribe_once(track);
@@ -1805,8 +1959,24 @@ fn channel_strip(
                     base,
                     callbacks.on_open_output_picker.clone(),
                 ))
-                .child(pan_section(track, callbacks))
-                .child(fader_area(track, callbacks, is_selected))
+                .child(pan_section(track, callbacks, base))
+                .child(fader_area(
+                    track,
+                    callbacks,
+                    is_selected,
+                    strip_meter(track, index, meter_layer, None),
+                    peak_readout(
+                        meter_layer,
+                        MeterSource::Track {
+                            id: track.id.clone(),
+                            index,
+                            vsti: None,
+                        },
+                        track.meter_peak_hold_l,
+                        track.meter_peak_hold_r,
+                        track.meter_clip,
+                    ),
+                ))
                 .child(button_row(track, callbacks, id_num, false, base)),
         )
         .child(console::name_plate(
@@ -1822,6 +1992,7 @@ fn channel_strip(
 fn vsti_output_sub_strip(
     parent_track: &TrackState,
     child_track: &TrackState,
+    child_index: usize,
     all_tracks: &[TrackState],
     insert_id: &str,
     bus_index: u8,
@@ -1833,6 +2004,7 @@ fn vsti_output_sub_strip(
     split: &MixerSplit,
     strip_available_px: f32,
     gpu_decor: bool,
+    meter_layer: Option<&SharedMeterLayout>,
     i18n: I18n,
 ) -> impl IntoElement {
     let id_num = {
@@ -1878,6 +2050,14 @@ fn vsti_output_sub_strip(
         }
     }
     let is_selected = focus_highlight || selected_track_id == Some(child_track.id.as_str());
+    let vsti_fallback = vsti_output_child_channels_for_bus_layout(bus_counts, bus_index).map(
+        |(channel_l, channel_r)| VstiMeterFallback {
+            parent_track_id: parent_track.id.clone(),
+            insert_id: insert_id.to_string(),
+            channel_l,
+            channel_r,
+        },
+    );
     // A sunken body is what marks these as children of the instrument above
     // them. The parent's colour used to bracket the group with tinted side
     // borders; it now reaches them the way it reaches every other strip —
@@ -1977,8 +2157,27 @@ fn vsti_output_sub_strip(
                     base,
                     callbacks.on_open_output_picker.clone(),
                 ))
-                .child(pan_section(&sub_track, callbacks))
-                .child(fader_area(&sub_track, callbacks, is_selected))
+                .child(pan_section(&sub_track, callbacks, base))
+                .child(fader_area(
+                    &sub_track,
+                    callbacks,
+                    is_selected,
+                    // `sub_track` is the child with the plug-in meter fallback
+                    // already applied, for the inline meter; the meter layer
+                    // applies the same fallback itself at paint time.
+                    strip_meter(&sub_track, child_index, meter_layer, vsti_fallback.clone()),
+                    peak_readout(
+                        meter_layer,
+                        MeterSource::Track {
+                            id: sub_track.id.clone(),
+                            index: child_index,
+                            vsti: vsti_fallback,
+                        },
+                        sub_track.meter_peak_hold_l,
+                        sub_track.meter_peak_hold_r,
+                        sub_track.meter_clip,
+                    ),
+                ))
                 // Solo on the parent instrument sounds every one of its output
                 // channels (engine: `has_soloed_vsti_output_parent`), so this
                 // channel's S shows the inherited state rather than sitting
@@ -2008,6 +2207,7 @@ pub(crate) fn master_strip(
     callbacks: &MixerCallbacks,
     split: &MixerSplit,
     strip_available_px: f32,
+    meter_layer: Option<&SharedMeterLayout>,
     i18n: I18n,
 ) -> impl IntoElement {
     let db_str = volume::format_db(master.volume);
@@ -2097,14 +2297,22 @@ pub(crate) fn master_strip(
                         Some(on_master_reset),
                     )
                     .into_any_element(),
-                    meter_surface(
+                    pinned_meter(
+                        meter_layer,
+                        MeterSource::Master,
                         master.meter_level_l,
                         master.meter_level_r,
                         master.meter_peak_hold_l,
                         master.meter_peak_hold_r,
                         master.meter_clip,
-                    )
-                    .into_any_element(),
+                    ),
+                    peak_readout(
+                        meter_layer,
+                        MeterSource::Master,
+                        master.meter_peak_hold_l,
+                        master.meter_peak_hold_r,
+                        master.meter_clip,
+                    ),
                     db_str,
                     true,
                     None,
@@ -2382,6 +2590,7 @@ pub(crate) fn monitor_strip(
     callbacks: &MixerCallbacks,
     split: &MixerSplit,
     strip_available_px: f32,
+    meter_layer: Option<&SharedMeterLayout>,
     i18n: I18n,
 ) -> impl IntoElement {
     let db_str = volume::format_db(monitor.volume);
@@ -2494,14 +2703,22 @@ pub(crate) fn monitor_strip(
                         Some(on_monitor_reset),
                     )
                     .into_any_element(),
-                    meter_surface(
+                    pinned_meter(
+                        meter_layer,
+                        MeterSource::Monitor,
                         monitor.meter_level_l,
                         monitor.meter_level_r,
                         monitor.meter_peak_hold_l,
                         monitor.meter_peak_hold_r,
                         monitor.meter_clip,
-                    )
-                    .into_any_element(),
+                    ),
+                    peak_readout(
+                        meter_layer,
+                        MeterSource::Monitor,
+                        monitor.meter_peak_hold_l,
+                        monitor.meter_peak_hold_r,
+                        monitor.meter_clip,
+                    ),
                     db_str,
                     monitor.dim || monitor.mute,
                     None,
@@ -3125,6 +3342,7 @@ pub fn mixer_panel(
                 &callbacks,
                 &split,
                 strip_available_px,
+                None,
                 i18n,
             ));
 
@@ -3154,7 +3372,12 @@ pub fn mixer_panel(
             .on_mouse_up(gpui::MouseButton::Left, move |_e, w, cx| {
                 (split_for_end.on_action)(MixerSplitAction::ResizeEnd, w, cx);
             })
-            .child(mixer_sub_header(track_count, i18n))
+            .child(mixer_sub_header(
+                track_count,
+                tracks.iter().filter(|track| track.solo).count(),
+                None,
+                i18n,
+            ))
             .child(content_row);
     }
 
@@ -3172,6 +3395,7 @@ pub fn mixer_panel(
         &split,
         on_scroll,
         gpu_active,
+        None,
         i18n,
     );
 
@@ -3182,6 +3406,7 @@ pub fn mixer_panel(
         &callbacks,
         &split,
         strip_available_px,
+        None,
         i18n,
     );
 
@@ -3243,7 +3468,12 @@ pub fn mixer_panel(
         .on_mouse_up(gpui::MouseButton::Left, move |_e, w, cx| {
             (split_for_end.on_action)(MixerSplitAction::ResizeEnd, w, cx);
         })
-        .child(mixer_sub_header(track_count, i18n))
+        .child(mixer_sub_header(
+            track_count,
+            tracks.iter().filter(|track| track.solo).count(),
+            None,
+            i18n,
+        ))
         .child(content_row)
 }
 
@@ -3283,6 +3513,7 @@ pub(crate) fn mixer_strip_scroller(
     split: &MixerSplit,
     on_scroll: std::sync::Arc<dyn Fn(f32, &mut gpui::Window, &mut gpui::App) + 'static>,
     gpu_decor: bool,
+    meter_layer: Option<&SharedMeterLayout>,
     i18n: I18n,
 ) -> impl IntoElement {
     let _scope = crate::perf::PerfScope::enter("MixerStripScroller");
@@ -3337,6 +3568,7 @@ pub(crate) fn mixer_strip_scroller(
                     vsti_group_expanded,
                     &MixerFolderPlacement::of(tracks, &folders, track_index),
                     gpu_decor,
+                    meter_layer,
                     i18n,
                 )
                 .into_any_element()
@@ -3359,6 +3591,7 @@ pub(crate) fn mixer_strip_scroller(
                 vsti_output_sub_strip(
                     parent,
                     &tracks[child_index],
+                    child_index,
                     tracks,
                     &parent.inserts[insert_index].id,
                     bus_index,
@@ -3370,6 +3603,7 @@ pub(crate) fn mixer_strip_scroller(
                     split,
                     strip_available_px,
                     gpu_decor,
+                    meter_layer,
                     i18n,
                 )
                 .into_any_element()
@@ -3469,6 +3703,7 @@ pub(crate) fn mixer_strip_scroller(
                 }),
         )
         .children(scrollbar)
+        .children(meter_layer.map(|layout| clip_region(layout, ClipRegion::Strips)))
 }
 
 /// The pinned right-hand pair: Master then Monitor, sharing one divider.
@@ -3483,6 +3718,7 @@ pub(crate) fn mixer_master_strip_pinned(
     callbacks: &MixerCallbacks,
     split: &MixerSplit,
     strip_available_px: f32,
+    meter_layer: Option<&SharedMeterLayout>,
     i18n: I18n,
 ) -> impl IntoElement {
     let _scope = crate::perf::PerfScope::enter("MixerMasterStrip");
@@ -3497,6 +3733,7 @@ pub(crate) fn mixer_master_strip_pinned(
             callbacks,
             split,
             strip_available_px,
+            meter_layer,
             i18n,
         ))
         .child(monitor_strip(
@@ -3504,8 +3741,27 @@ pub(crate) fn mixer_master_strip_pinned(
             callbacks,
             split,
             strip_available_px,
+            meter_layer,
             i18n,
         ))
+}
+
+/// A pinned strip's meter: a slot for the meter layer in the docked mixer,
+/// drawn in place in the detached Mixer window.
+#[allow(clippy::too_many_arguments)]
+fn pinned_meter(
+    meter_layer: Option<&SharedMeterLayout>,
+    source: MeterSource,
+    level_l: f32,
+    level_r: f32,
+    hold_l: f32,
+    hold_r: f32,
+    clip: bool,
+) -> gpui::AnyElement {
+    match meter_layer {
+        Some(layout) => meter_slot(layout, source).into_any_element(),
+        None => meter_surface(level_l, level_r, hold_l, hold_r, clip).into_any_element(),
+    }
 }
 
 #[cfg(test)]

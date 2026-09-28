@@ -12,8 +12,8 @@
 //!
 //! Three rules shape the layout.
 //!
-//! * **One scroll owner, one clip owner.** The root clips (that is what makes
-//!   `radius::DIALOG` cut the square titlebar), the body `export-body` is the
+//! * **One scroll owner, one clip owner.** The root clips (its corners and
+//!   frame are the window shell's, not painted here), the body `export-body` is the
 //!   only scroller, and the status strip plus the action footer stay pinned. A
 //!   short or narrow window scrolls its form instead of hiding it.
 //! * **Readouts come from the request, not from a parallel calculation.**
@@ -30,10 +30,9 @@ use std::sync::{Arc, Mutex};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, svg, AnyWindowHandle, App, AppContext, Bounds, Context, Entity, EntityInputHandler,
-    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Point,
-    Render, Role, StatefulInteractiveElement, Styled, Toggled, UTF16Selection, Window,
-    WindowHandle,
+    div, px, svg, App, AppContext, Bounds, Context, Entity, EntityInputHandler, FocusHandle,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Render, Role,
+    StatefulInteractiveElement, Styled, Toggled, UTF16Selection, Window, WindowHandle,
 };
 
 use sphere_encoder::AudioFileFormat;
@@ -46,10 +45,6 @@ use crate::components::controls::{
     fb_button, fb_section_header, fb_segment, fb_segmented_track, FbButtonKind, FbSegment,
 };
 use crate::components::form::select::{select, select_dismiss_backdrop, SelectOption};
-use crate::components::message_box_dialog::{
-    open_message_box_window, MessageBoxKind, MessageBoxOptions, MessageBoxResponseCb,
-    MessageBoxResult,
-};
 use crate::components::text_input::{bind_mouse_selection, text_field_with_callbacks_and_ime};
 use crate::components::title_bar::{external_window_titlebar_with_icon, TITLEBAR_HEIGHT};
 use crate::components::{TextInputAction, TextInputState};
@@ -157,10 +152,9 @@ pub struct ExportArrangementWindow {
     /// One-shot: the first frame moves keyboard focus into the name field, so
     /// the first Tab has an anchor instead of starting from nowhere.
     focus_primed: bool,
-    /// This window, recorded on the first frame, so Render can close it from
-    /// the overwrite prompt's callback too (where the `Window` at hand is the
-    /// prompt's).
-    own_window: Option<AnyWindowHandle>,
+    /// Files the last Render press would replace, shown for confirmation;
+    /// the next press with the same files goes ahead. Cleared by any edit.
+    confirm_replace: Option<Vec<PathBuf>>,
     focus_handle: FocusHandle,
 }
 
@@ -225,7 +219,7 @@ impl ExportArrangementWindow {
             open_select: None,
             realtime_hooks,
             focus_primed: false,
-            own_window: None,
+            confirm_replace: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -273,6 +267,7 @@ impl ExportArrangementWindow {
     fn refresh_estimate(&mut self) {
         self.estimate = self.settings.estimate(&self.snapshot, &self.defaults);
         self.failure = None;
+        self.confirm_replace = None;
     }
 
     fn can_export(&self) -> bool {
@@ -446,6 +441,9 @@ impl ExportArrangementWindow {
     /// success, so this is a destructive action and DESIGN.md requires an
     /// explicit Cancel.
     fn start_render(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A confirmation holds only for the settings it was asked about: the
+        // refresh below clears it, so take it first.
+        let confirmed = self.confirm_replace.take();
         self.open_select = None;
         self.sync_output_from_name();
         self.refresh_estimate();
@@ -453,61 +451,18 @@ impl ExportArrangementWindow {
             return;
         };
 
+        // Replacing files is confirmed in this window (the status strip names
+        // them, the button turns into "Replace & Render") rather than by a
+        // prompt window: a prompt closes as the Render dialog opens, and on
+        // Windows a dialog created while the prompt is still being destroyed
+        // is owned by it and goes with it.
         let existing = existing_destinations(&job);
-        if existing.is_empty() {
-            self.launch_render(job, window, cx);
+        if !existing.is_empty() && confirmed.as_deref() != Some(existing.as_slice()) {
+            self.confirm_replace = Some(existing);
+            cx.notify();
             return;
         }
-
-        let i18n = I18n::new(&self.language);
-        let entity = cx.entity().clone();
-        let detail = existing
-            .iter()
-            .take(4)
-            .map(|path| file_label(path))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let detail = if existing.len() > 4 {
-            format!(
-                "{detail}\n{}",
-                tr_vars_or(
-                    i18n,
-                    "export.overwrite.more",
-                    "…and { $count } more.",
-                    &[("count", (existing.len() - 4).to_string())],
-                )
-            )
-        } else {
-            detail
-        };
-        let options = MessageBoxOptions::new(tr_vars_or(
-            i18n,
-            "export.overwrite.message",
-            "Replace { $count } existing file(s)?",
-            &[("count", existing.len().to_string())],
-        ))
-        .title(i18n.tr_or("export.overwrite.title", "Replace Existing Files"))
-        .detail(detail)
-        .kind(MessageBoxKind::Warning)
-        .buttons([
-            i18n.tr_or("export.action.cancel", "Cancel"),
-            i18n.tr_or("export.overwrite.replace", "Replace"),
-        ])
-        .default_id(0)
-        .cancel_id(0);
-
-        let on_response: MessageBoxResponseCb =
-            Arc::new(move |result: MessageBoxResult, window, cx| {
-                if result.response != 1 {
-                    return;
-                }
-                let _ = entity.update(cx, |this, cx| {
-                    if let Some(job) = this.resolve_job(cx) {
-                        this.launch_render(job, window, cx);
-                    }
-                });
-            });
-        let _ = open_message_box_window(Some(window.bounds()), options, on_response, cx);
+        self.launch_render(job, window, cx);
     }
 
     /// The job for the current settings, or `None` with the reason shown.
@@ -525,8 +480,8 @@ impl ExportArrangementWindow {
         }
     }
 
-    /// Open the Render dialog on `job` and close this window. The settings
-    /// are remembered for the next time it opens.
+    /// Open the Render dialog on `job` over this window. The settings are
+    /// remembered for the next time the window opens.
     fn launch_render(&mut self, job: RenderJob, window: &mut Window, cx: &mut Context<Self>) {
         let realtime = self.settings.render_mode == ExportRenderMode::Realtime;
         let launch = RenderLaunch {
@@ -551,37 +506,16 @@ impl ExportArrangementWindow {
         if let Ok(mut last) = LAST_SETTINGS.lock() {
             *last = Some(self.settings.clone());
         }
-        // Close this window first, then open the Render dialog. On Windows a
-        // dialog is owned by the window active when it is created and is
-        // destroyed with it, so a Render dialog opened from here would vanish
-        // as this window closes. Closing first hands activation back to the
-        // studio (the owner re-enables and foregrounds it on destroy), and the
-        // Render dialog is created over that instead. Deferred because `window`
-        // may be this window mid-update or the overwrite prompt's.
-        let own_window = self.own_window.unwrap_or_else(|| window.window_handle());
-        let fallback_bounds = window.bounds();
-        let language = self.language.clone();
-        cx.defer(move |cx| {
-            let owner_bounds = own_window
-                .update(cx, |_, window, _| {
-                    let bounds = window.bounds();
-                    window.remove_window();
-                    bounds
-                })
-                .unwrap_or(fallback_bounds);
-            if let Err(error) = open_render_dialog(Some(owner_bounds), &language, launch, cx) {
-                let i18n = I18n::new(&language);
-                let options = MessageBoxOptions::new(i18n.tr_or(
-                    "export.render.open-failed",
-                    "The Render window could not be opened.",
-                ))
-                .title(i18n.tr_or("export.title", "Export"))
-                .detail(error)
-                .kind(MessageBoxKind::Error);
-                let on_response: MessageBoxResponseCb = Arc::new(|_, _, _| {});
-                let _ = open_message_box_window(Some(owner_bounds), options, on_response, cx);
-            }
-        });
+        // The Render dialog opens over this window, which stays open behind
+        // it: closing the report brings back the same settings to adjust and
+        // render again. (It cannot close first and hand over: on Windows a
+        // dialog is owned by the window active when it is created, window
+        // destruction is asynchronous, and a dialog whose owner goes away goes
+        // with it.)
+        if let Err(error) = open_render_dialog(Some(window.bounds()), &self.language, launch, cx) {
+            self.failure = Some(error);
+            cx.notify();
+        }
     }
 }
 
@@ -593,7 +527,6 @@ impl Render for ExportArrangementWindow {
         // from, so no focus ring is ever visible.
         if !self.focus_primed {
             self.focus_primed = true;
-            self.own_window = Some(window.window_handle());
             self.name_input.focus_handle.focus(window, cx);
         }
 
@@ -620,13 +553,9 @@ impl Render for ExportArrangementWindow {
             .size_full()
             .font(theme::ui_font())
             .bg(Colors::surface_base())
-            // The clip owner: this is what makes the dialog radius actually cut
-            // the square-cornered titlebar child.
+            // The clip owner. No radius, frame or shadow: the window shell
+            // draws those.
             .overflow_hidden()
-            .rounded(px(radius::DIALOG))
-            .border(px(1.0))
-            .border_color(Colors::border_normal())
-            .shadow(elevation::shadow(elevation::OVERLAY))
             .capture_key_down({
                 let target = target.clone();
                 move |event, window, cx| {
@@ -1463,8 +1392,36 @@ impl ExportArrangementWindow {
     /// past is an error they cannot act on. It wraps rather than truncates,
     /// because `OutputDirMissing` carries the path that has to be fixed.
     fn status_strip(&self, i18n: I18n) -> Option<gpui::AnyElement> {
-        let (message, tone) = match &self.failure {
-            Some(message) => (
+        let (message, tone) = match (&self.failure, &self.confirm_replace) {
+            (None, Some(existing)) => {
+                let mut names: Vec<String> = existing
+                    .iter()
+                    .take(3)
+                    .map(|path| file_label(path))
+                    .collect();
+                if existing.len() > 3 {
+                    names.push(tr_vars_or(
+                        i18n,
+                        "export.overwrite.more",
+                        "…and { $count } more",
+                        &[("count", (existing.len() - 3).to_string())],
+                    ));
+                }
+                (
+                    tr_vars_or(
+                        i18n,
+                        "export.status.replace",
+                        "{ $count } file(s) already exist and will be replaced: { $names }. \
+                         Press Replace & Render to go ahead.",
+                        &[
+                            ("count", existing.len().to_string()),
+                            ("names", names.join(", ")),
+                        ],
+                    ),
+                    Colors::status_warning(),
+                )
+            }
+            (Some(message), _) => (
                 tr_vars_or(
                     i18n,
                     "export.status.failed",
@@ -1473,7 +1430,7 @@ impl ExportArrangementWindow {
                 ),
                 Colors::status_error(),
             ),
-            None => {
+            (None, None) => {
                 if self.range_draft_invalid {
                     (
                         i18n.tr_or(
@@ -1540,7 +1497,7 @@ impl ExportArrangementWindow {
         footer_band()
             .child(fb_button(
                 "export-cancel",
-                i18n.tr_or("export.action.cancel", "Cancel"),
+                i18n.tr_or("export.action.close", "Close"),
                 FbButtonKind::Default,
                 true,
                 {
@@ -1552,7 +1509,11 @@ impl ExportArrangementWindow {
             ))
             .child(fb_button(
                 "export-start",
-                i18n.tr_or("export.action.render", "Render"),
+                if self.confirm_replace.is_some() {
+                    i18n.tr_or("export.action.replace-render", "Replace & Render")
+                } else {
+                    i18n.tr_or("export.action.render", "Render")
+                },
                 FbButtonKind::Primary,
                 can_export,
                 {

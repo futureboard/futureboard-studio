@@ -94,6 +94,7 @@ fn gain_insert(id: &str, gain_db: f32) -> EngineInsertSnapshot {
 
 fn build(tracks: Vec<EngineTrackSnapshot>) -> RuntimeProject {
     let snapshot = EngineProjectSnapshot {
+        spatial: Default::default(),
         project_id: "control-room".to_string(),
         project_root: None,
         preferred_input_device: None,

@@ -439,6 +439,38 @@ impl StudioLayout {
             },
         );
 
+        // A channel's placement in the spatial mix: previews reach the engine
+        // live through `SetTrackSpatial` (no graph rebuild), the release is
+        // one undo step.
+        let timeline_spatial_start = self.timeline.clone();
+        let on_spatial_drag_start: StrCb = Arc::new(move |id: &String, _w, cx| {
+            timeline_spatial_start.update(cx, |timeline, _cx| timeline.begin_room_edit(id));
+        });
+        let timeline_spatial_preview = self.timeline.clone();
+        let audio_engine_spatial_preview = self.audio_bridge.engine.clone();
+        let on_spatial_drag_preview: Arc<
+            dyn Fn(&(String, solfege_spatialaudio::SourceParams), &mut Window, &mut App) + 'static,
+        > = Arc::new(move |(id, params), _w, cx| {
+            let placed = timeline_spatial_preview.update(cx, |timeline, cx| {
+                timeline.preview_track_room(id, *params, cx)
+            });
+            if let (Some(params), Some(engine)) = (placed, audio_engine_spatial_preview.as_ref()) {
+                let _ = engine.set_track_spatial(id, params);
+            }
+        });
+        let timeline_spatial_commit = self.timeline.clone();
+        let owner_spatial_commit = owner.clone();
+        let on_spatial_drag_commit: Arc<
+            dyn Fn(&(String, &'static str), &mut Window, &mut App) + 'static,
+        > = Arc::new(move |(_id, label), _w, cx| {
+            let label = *label;
+            timeline_spatial_commit.update(cx, |timeline, cx| timeline.finish_room_edit(label, cx));
+            StudioLayout::defer_update(&owner_spatial_commit, cx, |this, cx| {
+                this.mark_dirty_view_only();
+                this.push_mixer_snapshot_to_window(cx);
+            });
+        });
+
         // Track colour is committed by `StudioLayout::apply_inspector_color`,
         // driven by the shared colour picker the Inspector renders — there is
         // no separate palette callback here any more.
@@ -453,6 +485,9 @@ impl StudioLayout {
             on_pan_drag_start,
             on_pan_drag_preview,
             on_pan_drag_commit,
+            on_spatial_drag_start,
+            on_spatial_drag_preview,
+            on_spatial_drag_commit,
             on_toggle_mute,
             on_toggle_solo,
             on_toggle_arm,

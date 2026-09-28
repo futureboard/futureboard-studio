@@ -14,7 +14,9 @@ use crate::components::timeline::timeline_state::{
 };
 use crate::components::timeline::Timeline;
 
-use super::engine_snapshot::{build_engine_project_snapshot, log_engine_sync_snapshot};
+use super::engine_snapshot::{
+    build_engine_project_snapshot, log_engine_sync_snapshot, volume_norm_to_linear,
+};
 use super::helpers::{smooth_meter_value, update_meter_clip, update_meter_hold};
 use super::transport_freeze_debug::{self, PlayWatchdog};
 use super::{ContextMenuRequest, ContextMenuTarget, ContextTarget, OpenPopover, StudioLayout};
@@ -1653,6 +1655,7 @@ impl StudioLayout {
             "audio_load_project_count",
             self.audio_bridge.audio_load_project_count,
         );
+        let sent_controls = SentTrackControls::of(&snapshot);
         let owner = cx.entity().clone();
         cx.spawn(async move |_this, cx| {
             // On the background executor, and awaited there.
@@ -1682,7 +1685,13 @@ impl StudioLayout {
                 })
                 .await;
             let _ = owner.update(cx, |this, cx| {
-                this.complete_audio_project_sync(cx, result, signature, sync_generation);
+                this.complete_audio_project_sync(
+                    cx,
+                    result,
+                    signature,
+                    sync_generation,
+                    sent_controls,
+                );
             });
             if !crate::shutdown::ShutdownState::global().is_shutting_down() {
                 let studio_id = owner.entity_id();
@@ -1692,12 +1701,47 @@ impl StudioLayout {
         .detach();
     }
 
+    /// Re-send every live channel control that changed while a sync was in
+    /// flight. See [`SentTrackControls`].
+    fn reconcile_live_track_controls(&self, sent: &SentTrackControls, cx: &App) {
+        let Some(engine) = self.audio_bridge.engine.as_ref() else {
+            return;
+        };
+        let state = &self.timeline.read(cx).state;
+        let sent: std::collections::HashMap<&str, SentControl> = sent
+            .0
+            .iter()
+            .map(|(id, control)| (id.as_str(), *control))
+            .collect();
+        for track in &state.tracks {
+            // A track the snapshot did not carry is new since; the next sync
+            // carries all of it.
+            let Some(was) = sent.get(track.id.as_str()) else {
+                continue;
+            };
+            let now = SentControl::of_track(state, track);
+            if now.muted != was.muted {
+                let _ = engine.update_track_param(&track.id, "muted", f64::from(now.muted as u8));
+            }
+            if now.solo != was.solo {
+                let _ = engine.update_track_param(&track.id, "solo", f64::from(now.solo as u8));
+            }
+            if (now.pan - was.pan).abs() > 1.0e-6 {
+                let _ = engine.update_track_param(&track.id, "pan", f64::from(now.pan));
+            }
+            if (now.volume - was.volume).abs() > 1.0e-6 {
+                let _ = engine.update_track_param(&track.id, "volume", f64::from(now.volume));
+            }
+        }
+    }
+
     pub(super) fn complete_audio_project_sync(
         &mut self,
         cx: &mut Context<Self>,
         result: Result<(), DirectAudio::SphereAudioError>,
         signature: String,
         generation: u64,
+        sent_controls: SentTrackControls,
     ) {
         // Freshness guard: ignore a completion that belongs to a superseded sync.
         // The watchdog timeout (`timeout_audio_project_sync`) bumps the generation
@@ -1740,6 +1784,7 @@ impl StudioLayout {
                     "native-sync",
                     Some("Engine graph ready".to_string()),
                 );
+                self.reconcile_live_track_controls(&sent_controls, cx);
             }
             Err(error) => {
                 self.audio_bridge.sync_failed_count =
@@ -4518,4 +4563,67 @@ fn track_program_messages(
             bytes[..len].to_vec()
         })
         .collect()
+}
+
+/// The live channel controls a project sync carried to the engine.
+///
+/// Mute, solo, pan and volume change live: a command to the running graph and
+/// no rebuild. One made while a sync is building its graph reaches the graph
+/// that sync is about to replace, and the sync then installs the value from
+/// when its snapshot was taken — so the engine plays that while the mixer
+/// shows the newer one. A solo cleared in that window stayed in effect,
+/// silencing every other channel with nothing on screen soloed, until the
+/// next solo made the mixer and the engine agree again. Opening a project
+/// saved with a solo and clearing it straight away is the easy way into it.
+///
+/// Kept per sync and compared with the mixer when the sync lands; anything that
+/// moved since is sent again, after the new graph.
+pub(super) struct SentTrackControls(Vec<(String, SentControl)>);
+
+#[derive(Clone, Copy, PartialEq)]
+struct SentControl {
+    muted: bool,
+    solo: bool,
+    pan: f32,
+    /// Linear gain, as the engine receives it.
+    volume: f32,
+}
+
+impl SentControl {
+    /// A channel's controls exactly as `build_engine_project_snapshot` sends
+    /// them.
+    fn of_track(
+        state: &crate::components::timeline::timeline_state::TimelineState,
+        track: &crate::components::timeline::timeline_state::TrackState,
+    ) -> Self {
+        Self {
+            muted: track.muted,
+            solo: track.solo,
+            pan: track.pan.clamp(-1.0, 1.0),
+            volume: volume_norm_to_linear(state.display_track_volume(track)),
+        }
+    }
+}
+
+impl SentTrackControls {
+    fn of(snapshot: &DirectAudio::types::EngineProjectSnapshot) -> Self {
+        Self(
+            snapshot
+                .tracks
+                .iter()
+                .filter(|track| track.track_type != "master")
+                .map(|track| {
+                    (
+                        track.id.clone(),
+                        SentControl {
+                            muted: track.muted,
+                            solo: track.solo,
+                            pan: track.pan,
+                            volume: track.volume,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
 }

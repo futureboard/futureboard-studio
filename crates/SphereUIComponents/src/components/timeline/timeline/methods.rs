@@ -267,6 +267,7 @@ impl Timeline {
             focus_lost_subscription: None,
             clip_process_origin: None,
             clip_process_peers: Vec::new(),
+            room_edit: None,
             snap_menu_open: false,
             cut_guide: Default::default(),
             cut_guide_overlay: None,
@@ -362,6 +363,7 @@ impl Timeline {
             focus_lost_subscription: None,
             clip_process_origin: None,
             clip_process_peers: Vec::new(),
+            room_edit: None,
             snap_menu_open: false,
             cut_guide: Default::default(),
             cut_guide_overlay: None,
@@ -662,6 +664,71 @@ impl Timeline {
         }
         cx.notify();
         targets
+    }
+
+    /// Place a channel in the spatial mix's room. Like the mixer's pan knob,
+    /// every sample of a drag folds into one undo step. Returns the placement
+    /// as stored, or `None` when the track is gone.
+    pub(crate) fn move_track_in_room(
+        &mut self,
+        track_id: &str,
+        params: solfege_spatialaudio::SourceParams,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<solfege_spatialaudio::SourceParams> {
+        let params = params.sanitized();
+        if self.state.find_track(track_id)?.spatial == params {
+            return Some(params);
+        }
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::tracks(vec![
+                track_id.to_string(),
+            ]),
+        );
+        if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
+            track.spatial = params;
+        }
+        self.commit_track_edit("Move in Room", edit, true, cx);
+        cx.notify();
+        Some(params)
+    }
+
+    /// Start an Inspector gesture on a channel's placement. See
+    /// [`Self::preview_track_room`] and [`Self::finish_room_edit`].
+    pub(crate) fn begin_room_edit(&mut self, track_id: &str) {
+        self.room_edit = Some(self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::tracks(vec![
+                track_id.to_string(),
+            ]),
+        ));
+    }
+
+    /// One live value of that gesture, recorded by nothing until
+    /// [`Self::finish_room_edit`]. Returns the placement as stored, or `None`
+    /// when the track is gone.
+    pub(crate) fn preview_track_room(
+        &mut self,
+        track_id: &str,
+        params: solfege_spatialaudio::SourceParams,
+        cx: &mut gpui::Context<Self>,
+    ) -> Option<solfege_spatialaudio::SourceParams> {
+        let params = params.sanitized();
+        if self.room_edit.is_none() {
+            self.begin_room_edit(track_id);
+        }
+        let track = self.state.tracks.iter_mut().find(|t| t.id == track_id)?;
+        if track.spatial != params {
+            track.spatial = params;
+            cx.notify();
+        }
+        Some(params)
+    }
+
+    /// Record the gesture as one undo step named `label`, or nothing when it
+    /// changed nothing.
+    pub(crate) fn finish_room_edit(&mut self, label: &'static str, cx: &mut gpui::Context<Self>) {
+        if let Some(edit) = self.room_edit.take() {
+            self.commit_track_edit(label, edit, false, cx);
+        }
     }
 
     /// A pan control that reports absolute values and no release (the mixer
@@ -1451,6 +1518,33 @@ impl Timeline {
     ///
     /// Only entities that exist are fed: `render` creates them for the tracks
     /// it draws, so a track scrolled out of view costs nothing here either.
+    /// Clear every solo, hidden channels included, as one undoable edit, and
+    /// tell the engine. Shared by the ruler's S latch and the mixer header.
+    pub(crate) fn clear_all_solos(&mut self, cx: &mut gpui::Context<Self>) {
+        let soloed: Vec<String> = self
+            .state
+            .tracks
+            .iter()
+            .filter(|track| track.solo)
+            .map(|track| track.id.clone())
+            .collect();
+        let edit = self.begin_track_edit(
+            crate::components::timeline::timeline_state::TrackEditScope::tracks(soloed),
+        );
+        let cleared = self.state.clear_all_track_solos();
+        if cleared.is_empty() {
+            return;
+        }
+        self.commit_track_edit("Clear All Solos", edit, false, cx);
+        if let Some(cb) = self.on_track_param_change.as_ref() {
+            for track_id in &cleared {
+                cb(track_id.clone(), "solo".to_string(), 0.0);
+            }
+        }
+        self.mark_control_state_changed(cx);
+        cx.notify();
+    }
+
     pub(crate) fn publish_track_meters(&self, cx: &mut gpui::App) -> bool {
         if self.track_meters.is_empty() {
             return false;

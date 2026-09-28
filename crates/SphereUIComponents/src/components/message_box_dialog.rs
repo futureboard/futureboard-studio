@@ -1,43 +1,44 @@
 //! Borderless native message box (cross-platform GPUI dialog).
 //!
-//! Mirrors the Electron / web [`MessageBoxOptions`] surface: title, message,
-//! optional detail, custom button labels, default/cancel indices, and kind
-//! (info / warning / error / question). Opens as a compact GPUI-rendered native
-//! dialog using the same chrome as Add Track / Settings dialogs.
+//! Title, message, optional detail, custom button labels, default/cancel
+//! indices, and kind (info / warning / error / question). Built on the Studio
+//! dialog shell every other dialog uses: the external-dialog title bar,
+//! `fb_button` actions in the shared footer band, and only theme tokens for
+//! size and type. The window's corners, frame and shadow are the platform
+//! window shell's; the content paints none of its own.
+//!
+//! **Size contract.** The width is fixed; the height is the content's. The
+//! window opens at an estimate (so it is centred close to right), then, once
+//! the first layout has measured the title bar, body and footer, it is resized
+//! to exactly their sum. A long message is never clipped: the body grows up to
+//! [`MESSAGE_BODY_MAX_HEIGHT`] and scrolls past it, so the footer always stays
+//! on screen.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::components::controls::{fb_button, FbButtonKind};
 use crate::components::title_bar::{external_window_titlebar_compact, TITLEBAR_HEIGHT};
-use crate::theme::{self, Colors};
+use crate::theme::{self, radius, size, space, typography, Colors};
 use gpui::{
     div, px, App, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, Render, StatefulInteractiveElement, Styled, Window, WindowHandle,
 };
 
-pub const MESSAGE_BOX_WIDTH: f32 = 450.0;
-const BODY_PAD_X: f32 = 14.0;
-const BODY_PAD_Y: f32 = 12.0;
-const FOOTER_PAD_X: f32 = 12.0;
-const FOOTER_PAD_Y: f32 = 8.0;
-const FOOTER_GAP: f32 = 6.0;
-const BUTTON_H: f32 = 27.0;
-const BUTTON_PAD_X: f32 = 12.0;
-const BUTTON_RADIUS: f32 = 5.0;
-/// Compact native-control min width. Wider labels (e.g. "Don't Save") grow past
-/// this from their own content + padding rather than forcing every button up.
-const BUTTON_MIN_W: f32 = 80.0;
-const FOOTER_H: f32 = BUTTON_H + FOOTER_PAD_Y * 2.0;
-const MESSAGE_TEXT_SIZE: f32 = 12.0;
-const MESSAGE_LINE_H: f32 = 18.0;
-/// Vertical room for up to two wrapped message lines at 12px / 18px line-height.
-const MESSAGE_BLOCK_H: f32 = MESSAGE_LINE_H * 2.0;
-const DETAIL_TEXT_SIZE: f32 = 11.0;
-const DETAIL_LINE_H: f32 = 16.0;
-const DETAIL_BLOCK_H: f32 = DETAIL_LINE_H * 2.0;
-const ICON_GAP: f32 = 10.0;
-const BODY_TEXT_GAP: f32 = 4.0;
-const WARNING_TOKEN_SIZE: f32 = 28.0;
-const ICON_GLYPH_SIZE: f32 = 14.0;
+pub const MESSAGE_BOX_WIDTH: f32 = 460.0;
+/// Ceiling for the message + detail block before it scrolls, so a long
+/// report still leaves the window a reasonable height with its footer
+/// visible.
+const MESSAGE_BODY_MAX_HEIGHT: f32 = 420.0;
+/// Inset around the body: a message box is read, not scanned, so it takes
+/// the section step rather than a form's.
+const BODY_PAD: f32 = space::SECTION;
+/// Action band: one `PROMINENT` button plus its breathing room — the same
+/// band as the Export and Render dialogs.
+const FOOTER_HEIGHT: f32 = size::PROMINENT + 2.0 * space::BASE;
+/// The kind token (i / ! / ?) beside the message.
+const KIND_TOKEN_SIZE: f32 = size::COMFORTABLE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageBoxKind {
@@ -125,19 +126,24 @@ pub struct MessageBoxResult {
 /// can name the callback type instead of respelling the whole `dyn Fn`.
 pub type MessageBoxResponseCb = Arc<dyn Fn(MessageBoxResult, &mut Window, &mut App) + Send + Sync>;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MessageBoxButtonStyle {
-    Default,
-    Primary,
-    Destructive,
-}
-
-fn message_box_height(options: &MessageBoxOptions) -> f32 {
-    let mut h = TITLEBAR_HEIGHT + BODY_PAD_Y + MESSAGE_BLOCK_H + BODY_PAD_Y + FOOTER_H;
-    if options.detail.as_ref().is_some_and(|d| !d.is_empty()) {
-        h += BODY_TEXT_GAP + DETAIL_BLOCK_H;
+/// Opening height, before the real layout is measured: wraps each paragraph
+/// at an average glyph width. Only placement depends on it — the window is
+/// resized to the measured content on its first frame.
+fn estimated_height(options: &MessageBoxOptions) -> f32 {
+    let text_width = MESSAGE_BOX_WIDTH - 2.0 * BODY_PAD - KIND_TOKEN_SIZE - space::LOOSE;
+    let lines = |text: &str, font: f32| -> f32 {
+        let per_line = (text_width / (font * 0.55)).max(1.0);
+        text.split('\n')
+            .map(|line| (line.chars().count() as f32 / per_line).ceil().max(1.0))
+            .sum()
+    };
+    let line_height = |font: f32| font * typography::LINE_HEIGHT;
+    let mut body = lines(&options.message, typography::UI_MD) * line_height(typography::UI_MD);
+    if let Some(detail) = options.detail.as_ref().filter(|d| !d.is_empty()) {
+        body += space::SNUG + lines(detail, typography::UI_SM) * line_height(typography::UI_SM);
     }
-    h
+    let body = body.max(KIND_TOKEN_SIZE).min(MESSAGE_BODY_MAX_HEIGHT);
+    TITLEBAR_HEIGHT + 2.0 * BODY_PAD + body + FOOTER_HEIGHT
 }
 
 fn normalized_buttons(options: &MessageBoxOptions) -> Vec<String> {
@@ -151,20 +157,15 @@ fn clamp_index(index: Option<usize>, len: usize) -> Option<usize> {
     index.filter(|&i| i < len)
 }
 
-fn button_style(
-    index: usize,
-    label: &str,
-    options: &MessageBoxOptions,
-    len: usize,
-) -> MessageBoxButtonStyle {
+fn button_kind(index: usize, label: &str, options: &MessageBoxOptions, len: usize) -> FbButtonKind {
     if clamp_index(Some(options.default_id), len) == Some(index) {
-        return MessageBoxButtonStyle::Primary;
+        return FbButtonKind::Primary;
     }
     let lower = label.to_ascii_lowercase();
     if lower.contains("don't save") || lower == "discard" || lower == "delete" {
-        return MessageBoxButtonStyle::Destructive;
+        return FbButtonKind::Danger;
     }
-    MessageBoxButtonStyle::Default
+    FbButtonKind::Default
 }
 
 fn kind_accent(kind: MessageBoxKind) -> gpui::Rgba {
@@ -186,72 +187,18 @@ fn kind_glyph(kind: MessageBoxKind) -> &'static str {
     }
 }
 
-/// A calm, flat footer button. Only the primary action is filled; the
-/// destructive and neutral actions are ghost/outline so the hierarchy reads
-/// softly rather than as three competing solid blocks.
-fn message_box_button(
-    index: usize,
-    label: String,
-    style: MessageBoxButtonStyle,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    // (background, border, text, hover background)
-    let (bg, border, text, hover_bg) = match style {
-        MessageBoxButtonStyle::Primary => (
-            Colors::accent_primary(),
-            Colors::border_accent(),
-            Colors::on_accent(),
-            Colors::accent_primary(),
-        ),
-        MessageBoxButtonStyle::Destructive => (
-            Colors::with_alpha(Colors::status_error(), 0.0), // transparent
-            Colors::with_alpha(Colors::status_error(), 0.45),
-            Colors::status_error(),
-            Colors::with_alpha(Colors::status_error(), 0.10),
-        ),
-        MessageBoxButtonStyle::Default => (
-            Colors::with_alpha(Colors::surface_base(), 0.0), // transparent (ghost)
-            Colors::border_subtle(),
-            Colors::text_secondary(),
-            Colors::surface_control_hover(),
-        ),
-    };
-
-    div()
-        .id(("message-box-btn", index))
-        .flex()
-        .items_center()
-        .justify_center()
-        .h(px(BUTTON_H))
-        .min_w(px(BUTTON_MIN_W))
-        .px(px(BUTTON_PAD_X))
-        .rounded(px(BUTTON_RADIUS))
-        .border(px(1.0))
-        .border_color(border)
-        .bg(bg)
-        .text_size(px(MESSAGE_TEXT_SIZE))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(text)
-        .cursor(gpui::CursorStyle::PointingHand)
-        .hover(move |s| s.bg(hover_bg))
-        .on_click(on_click)
-        .child(label)
-}
-
-fn message_box_body(
-    options: &MessageBoxOptions,
-    on_response: MessageBoxResponseCb,
-) -> impl IntoElement {
-    let buttons = normalized_buttons(options);
-    let len = buttons.len();
+fn message_box_body(options: &MessageBoxOptions) -> impl IntoElement {
     let accent = kind_accent(options.kind);
     let glyph = kind_glyph(options.kind);
 
-    // Body: icon + message, top-aligned (no flex grow — native message-box density).
-    let content = div()
+    // The body's own scroller: it takes the text's height up to the ceiling
+    // and scrolls past it, so the window never has to clip.
+    div()
+        .id("message-box-body")
         .flex_shrink_0()
-        .px(px(BODY_PAD_X))
-        .py(px(BODY_PAD_Y))
+        .max_h(px(MESSAGE_BODY_MAX_HEIGHT + 2.0 * BODY_PAD))
+        .overflow_y_scroll()
+        .p(px(BODY_PAD))
         .child(
             div()
                 .flex()
@@ -259,21 +206,20 @@ fn message_box_body(
                 .items_start()
                 .w_full()
                 .min_w_0()
-                .min_h(px(MESSAGE_BLOCK_H))
-                .gap(px(ICON_GAP))
+                .gap(px(space::LOOSE))
                 .child(
+                    // Kind is carried by the glyph as well as the colour.
                     div()
                         .flex_shrink_0()
-                        .w(px(WARNING_TOKEN_SIZE))
-                        .h(px(WARNING_TOKEN_SIZE))
-                        .rounded(px(crate::theme::radius::PILL))
+                        .size(px(KIND_TOKEN_SIZE))
+                        .rounded(px(radius::PILL))
                         .border(px(1.0))
                         .border_color(Colors::with_alpha(accent, 0.35))
                         .bg(Colors::with_alpha(accent, 0.10))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(ICON_GLYPH_SIZE))
+                        .text_size(px(typography::UI_MD))
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(accent)
                         .child(glyph),
@@ -284,62 +230,55 @@ fn message_box_body(
                         .min_w_0()
                         .flex()
                         .flex_col()
-                        .gap(px(BODY_TEXT_GAP))
+                        .gap(px(space::SNUG))
                         .child(
                             div()
-                                .text_size(px(MESSAGE_TEXT_SIZE))
+                                .text_size(px(typography::UI_MD))
                                 .font_weight(gpui::FontWeight::MEDIUM)
-                                .line_height(px(MESSAGE_LINE_H))
                                 .text_color(Colors::text_primary())
                                 .child(options.message.clone()),
                         )
                         .children(options.detail.as_ref().filter(|d| !d.is_empty()).map(
                             |detail| {
                                 div()
-                                    .text_size(px(DETAIL_TEXT_SIZE))
-                                    .line_height(px(DETAIL_LINE_H))
+                                    .text_size(px(typography::UI_SM))
                                     .text_color(Colors::text_muted())
                                     .child(detail.clone())
                             },
                         )),
                 ),
-        );
+        )
+}
 
-    let mut footer = div()
+fn message_box_footer(
+    options: &MessageBoxOptions,
+    on_response: impl Fn(usize, &mut Window, &mut App) + Clone + 'static,
+) -> impl IntoElement {
+    let buttons = normalized_buttons(options);
+    let len = buttons.len();
+    div()
+        .flex_shrink_0()
         .flex()
         .flex_row()
-        .justify_end()
         .items_center()
-        .gap(px(FOOTER_GAP))
-        .h(px(FOOTER_H))
-        .px(px(FOOTER_PAD_X))
-        .py(px(FOOTER_PAD_Y))
+        .justify_end()
+        .gap(px(space::BASE))
+        .h(px(FOOTER_HEIGHT))
+        .px(px(space::LOOSE))
         .border_t(px(1.0))
-        .border_color(Colors::border_subtle());
-
-    for (index, label) in buttons.iter().enumerate() {
-        let style = button_style(index, label, options, len);
-        let on_response = on_response.clone();
-        let label = label.clone();
-        let on_click = move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
-            on_response(
-                MessageBoxResult {
-                    response: index,
-                    dismissed: false,
-                },
-                window,
-                cx,
-            );
-        };
-        footer = footer.child(message_box_button(index, label, style, on_click));
-    }
-
-    div()
-        .flex()
-        .flex_col()
-        .flex_1()
-        .child(content)
-        .child(footer.flex_shrink_0())
+        .border_color(Colors::border_subtle())
+        .bg(Colors::surface_titlebar())
+        .children(buttons.into_iter().enumerate().map(|(index, label)| {
+            let kind = button_kind(index, &label, options, len);
+            let on_response = on_response.clone();
+            fb_button(
+                ("message-box-btn", index),
+                label,
+                kind,
+                true,
+                move |_, window, cx| on_response(index, window, cx),
+            )
+        }))
 }
 
 pub struct MessageBoxWindow {
@@ -347,6 +286,9 @@ pub struct MessageBoxWindow {
     on_response: MessageBoxResponseCb,
     focus_handle: FocusHandle,
     responded: bool,
+    /// The height last asked of the window, so the fit runs once per real
+    /// change in content height instead of chasing DPI rounding.
+    fitted_height: Rc<Cell<f32>>,
 }
 
 impl MessageBoxWindow {
@@ -360,6 +302,7 @@ impl MessageBoxWindow {
             on_response,
             focus_handle: cx.focus_handle(),
             responded: false,
+            fitted_height: Rc::new(Cell::new(0.0)),
         }
     }
 
@@ -420,6 +363,7 @@ impl Render for MessageBoxWindow {
             self.options.title.clone()
         };
         let target = cx.entity().clone();
+        let fitted_height = self.fitted_height.clone();
 
         div()
             .flex()
@@ -427,21 +371,31 @@ impl Render for MessageBoxWindow {
             .size_full()
             .font(theme::ui_font())
             .bg(Colors::surface_base())
+            // The clip owner. No radius, frame or shadow: the window shell
+            // draws those.
             .overflow_hidden()
-            .rounded(px(crate::theme::radius::CONTROL))
-            .border(px(1.0))
-            .border_color(Colors::border_subtle())
-            .shadow(vec![gpui::BoxShadow {
-                color: Colors::surface_overlay().into(),
-                offset: gpui::point(px(0.0), px(6.0)),
-                blur_radius: px(20.0),
-                spread_radius: px(0.0),
-                inset: false,
-            }])
             .capture_key_down({
                 let target = target.clone();
                 move |event, window, cx| {
                     let _ = target.update(cx, |this, cx| this.handle_key(event, window, cx));
+                }
+            })
+            // Fit the window to what was laid out: the children keep their
+            // natural heights (none of them grows or shrinks), so their sum is
+            // the height the content needs whatever size the window has now.
+            .on_children_prepainted(move |children, window, cx| {
+                let content: f32 = children
+                    .iter()
+                    .map(|bounds| f32::from(bounds.size.height))
+                    .sum();
+                let needed = content.ceil();
+                let current = f32::from(window.viewport_size().height);
+                if (needed - current).abs() > 1.0 && (needed - fitted_height.get()).abs() > 1.0 {
+                    fitted_height.set(needed);
+                    let width = window.viewport_size().width;
+                    window.defer(cx, move |window, _| {
+                        window.resize(gpui::size(width, px(needed)));
+                    });
                 }
             })
             .child(div().w(px(0.0)).h(px(0.0)).track_focus(&self.focus_handle))
@@ -457,17 +411,15 @@ impl Render for MessageBoxWindow {
                     }
                 },
             ))
-            .child(message_box_body(
-                &self.options,
-                Arc::new({
-                    let target = target.clone();
-                    move |result, window, cx| {
-                        let _ = target.update(cx, |this, cx| {
-                            this.finish(result.response, false, window, cx);
-                        });
-                    }
-                }),
-            ))
+            .child(message_box_body(&self.options))
+            .child(message_box_footer(&self.options, {
+                let target = target.clone();
+                move |response, window, cx| {
+                    let _ = target.update(cx, |this, cx| {
+                        this.finish(response, false, window, cx);
+                    });
+                }
+            }))
     }
 }
 
@@ -508,7 +460,7 @@ fn open_message_box_window_with_kind(
     use crate::window_position::{apply_owner_display, centered_window_bounds};
     use gpui::{size, AppContext, WindowBackgroundAppearance, WindowBounds};
 
-    let height = message_box_height(&options);
+    let height = estimated_height(&options);
     let window_bounds =
         centered_window_bounds(owner_bounds, size(px(MESSAGE_BOX_WIDTH), px(height)), cx);
 
