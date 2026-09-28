@@ -5087,6 +5087,7 @@ mod warp_stretch_render_tests {
         let block = 512usize;
         let mut output = vec![0.0f32; block * 2];
         let mut energy_by_second = [0.0f64; 2];
+        let mut left = Vec::with_capacity(frames);
         let mut sample = 0u64;
         while (sample as usize) < frames {
             output.iter_mut().for_each(|v| *v = 0.0);
@@ -5110,7 +5111,26 @@ mod warp_stretch_render_tests {
             );
             let second = (sample as usize / SR as usize).min(1);
             energy_by_second[second] += output.iter().map(|v| (*v as f64).powi(2)).sum::<f64>();
+            left.extend(output.iter().step_by(2).copied());
             sample += block as u64;
+        }
+        // The pitch holds in both segments: the first plays its audio at
+        // half speed, the second at 1.5x — resampled, they would sound at
+        // 110 Hz and 330 Hz.
+        let pitch_hz = |from: f64, to: f64| {
+            let span = &left[(from * SR as f64) as usize..(to * SR as f64) as usize];
+            let crossings = span
+                .windows(2)
+                .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+                .count();
+            crossings as f64 / 2.0 / (to - from)
+        };
+        for (from, to) in [(0.25, 0.75), (1.25, 1.75)] {
+            let hz = pitch_hz(from, to);
+            assert!(
+                (hz - 220.0).abs() < 8.0,
+                "{from}-{to} s plays at {hz:.1} Hz"
+            );
         }
         // Both warp segments are heard — neither half was starved of input.
         assert!(

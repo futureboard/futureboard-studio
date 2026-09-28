@@ -2838,6 +2838,7 @@ fn decode_stretch(r: &mut FbReader, version: u32) -> Result<AudioClipStretchStat
         dehum_harmonics,
         dehum_reduction_db,
     };
+    stretch.repair_undecided_warp_pitch();
     stretch.sanitize_in_place();
     Ok(stretch)
 }

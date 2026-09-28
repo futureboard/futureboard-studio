@@ -1096,10 +1096,17 @@ fn build_engine_project_snapshot_inner(
                         quality: stretch.algorithm.label().to_string(),
                         source_start_samples: stretch.source_start_samples,
                         source_end_samples: stretch.source_end_samples,
+                        // Markers bend the audio only while the clip is in
+                        // Warp, as the editors draw it. A clip switched to
+                        // Speed or Off keeps them for later, and the engine
+                        // used to go on warping it — by resampling, so its
+                        // pitch moved while the picture said it did not.
                         warp_markers: {
+                            let warping = stretch.mode == StretchMode::Warp;
                             let mut markers: Vec<_> = stretch
                                 .warp_markers
                                 .iter()
+                                .filter(|_| warping)
                                 .map(|marker| EngineWarpMarkerSnapshot {
                                     id: marker.id,
                                     source_sample: marker.source_sample,
@@ -2543,6 +2550,27 @@ mod tests {
         assert_eq!(process.warp_markers[0].id, 1);
         assert_eq!(process.warp_markers[1].id, 2);
         assert!((process.effective_time_ratio - 2.0).abs() < 1e-9);
+    }
+
+    /// A clip taken out of Warp keeps its markers for later, but the engine
+    /// must not go on bending it (by resampling) while the editors show it
+    /// unwarped.
+    #[test]
+    fn warp_markers_stay_home_outside_warp() {
+        let (mut state, clip_id) = audio_state_with_clip();
+        let mut stretch = state.clip_stretch(&clip_id).cloned().unwrap();
+        stretch.mode = StretchMode::Manual;
+        stretch.warp_markers = vec![timeline_state::WarpMarker {
+            id: 1,
+            source_sample: 1_000,
+            timeline_beat: 1.0,
+            locked: false,
+        }];
+        state.set_clip_stretch(&clip_id, stretch);
+
+        let snap = build_engine_project_snapshot(&state, 48_000, None, None);
+        let process = snap.clips[0].audio_process.as_ref().unwrap();
+        assert!(process.warp_markers.is_empty());
     }
 
     #[test]

@@ -1422,6 +1422,21 @@ impl AudioClipStretchState {
         next
     }
 
+    /// Repair a Warp clip that never made a pitch choice. Every way into Warp
+    /// sets one (`algorithm` becomes Phase Vocoder or Resample Only), except
+    /// the Audio Editor's first marker, which used to set the mode alone —
+    /// from an unstretched clip that left `Auto` with pitch not kept, so the
+    /// clip re-pitched with every marker. It keeps its pitch, as it would
+    /// have from the Inspector. For loading projects saved with that.
+    pub fn repair_undecided_warp_pitch(&mut self) {
+        if self.mode == StretchMode::Warp
+            && self.algorithm == StretchAlgorithm::Auto
+            && !self.preserve_pitch
+        {
+            self.apply_keep_pitch(true);
+        }
+    }
+
     /// Effective playback duration of the source window after stretching, in
     /// samples. `ratio 2.0` → twice as long; `ratio 0.5` → half (spec §2 Manual).
     pub fn effective_duration_samples(&self) -> u64 {
@@ -1686,6 +1701,25 @@ mod tests {
         let tape = s.with_keep_pitch(false);
         assert!(!tape.to_sphere_stretch_params(120.0).preserve_pitch);
         assert_eq!(tape.timing(), StretchTiming::Warp);
+    }
+
+    /// The Audio Editor's first marker used to set the Warp mode alone, so
+    /// the clip re-pitched with every marker. Loading repairs that; a warp
+    /// the user set to re-pitch stays as it is.
+    #[test]
+    fn a_warp_without_a_pitch_choice_keeps_pitch_on_load() {
+        let mut undecided = decoded(48_000, 48_000);
+        undecided.mode = StretchMode::Warp;
+        assert!(!undecided.keeps_pitch());
+        undecided.repair_undecided_warp_pitch();
+        assert!(undecided.keeps_pitch());
+        assert!(undecided.to_sphere_stretch_params(120.0).preserve_pitch);
+
+        let mut tape = decoded(48_000, 48_000)
+            .with_timing(StretchTiming::Warp, 120.0)
+            .with_keep_pitch(false);
+        tape.repair_undecided_warp_pitch();
+        assert!(!tape.keeps_pitch());
     }
 
     #[test]

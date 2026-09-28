@@ -49,7 +49,7 @@ use crate::components::controls::{fb_segment, fb_segmented_track, fb_tooltip, Fb
 use crate::components::timeline::timeline::Timeline;
 use crate::components::timeline::timeline_state::{
     beats_per_bar_from_sig, clamp_fade_seconds, AudioClipStretchState, AudioImportState, ClipEdge,
-    ClipState, ClipType, StretchMode, TimeSignatureMap, TimelineState, TrackState, WarpMarker,
+    ClipState, ClipType, StretchTiming, TimeSignatureMap, TimelineState, TrackState, WarpMarker,
 };
 use crate::components::timeline::waveform_cache;
 use crate::theme::{radius, size, space, typography, Colors};
@@ -830,6 +830,7 @@ impl AudioEditorHost {
                         let abs_end = view.abs_start + view.duration;
                         let (s0, s1) = map.window;
                         let source_sample = map.source_at(rel).round() as u64;
+                        let bpm = self.timeline.read(cx).state.bpm.max(1.0) as f64;
                         let mut new_id = 0;
                         self.edit_stretch(&view.id, cx, |s| {
                             let mut next_id =
@@ -856,7 +857,10 @@ impl AudioEditorHost {
                             s.warp_markers.push(placed);
                             s.warp_markers
                                 .sort_by(|a, b| a.timeline_beat.total_cmp(&b.timeline_beat));
-                            s.mode = StretchMode::Warp;
+                            // Into Warp the way the Inspector goes there, so
+                            // the clip keeps its pitch choice: setting the
+                            // mode alone left it re-pitching with every marker.
+                            *s = s.with_timing(StretchTiming::Warp, bpm);
                         });
                         self.drag = Drag::Warp { id: new_id };
                     }

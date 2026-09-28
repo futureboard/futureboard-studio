@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    canvas, deferred, div, fill, point, pulsating_between, px, size, svg, Animation, AnimationExt,
+    canvas, deferred, div, fill, point, px, size, svg, Animation, AnimationExt,
     AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     Render, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Window,
@@ -570,7 +570,21 @@ const LANE_H: f32 = 140.0;
 /// Paint above the piano grid/body so the lane selector is never hidden by the
 /// editor's scroll/clip containers.
 const LANE_MENU_PRIORITY: usize = 100;
-const RULER_H: f32 = 18.0; // bar/beat ruler header height
+/// Bar/beat ruler header height — the same as the Audio Editor's and the
+/// Solfege pitch tab's, so the editors read as one family.
+const RULER_H: f32 = 22.0;
+/// The editor's toolbar: a prominent-tier row holding default-tier controls.
+const TOOLBAR_H: f32 = crate::theme::size::PROMINENT + crate::theme::space::TIGHT;
+/// The status footer under the editor.
+const FOOTER_H: f32 = crate::theme::size::ROW_DENSE;
+/// The note inspector column on the right.
+const INSPECTOR_W: f32 = 232.0;
+/// A collapsed controller lane keeps a strip with its selector, so the lane
+/// can be brought back from where it went.
+const LANE_COLLAPSED_H: f32 = crate::theme::size::DEFAULT;
+/// Black keys cover this share of the key lane; the rest of each white key
+/// is where its name sits.
+const BLACK_KEY_SHARE: f32 = 0.6;
 /// Px on a note's right edge that starts a resize. Sized for a comfortable grab
 /// at workstation density; a note narrower than [`NOTE_RESIZE_MIN_W`] shows no
 /// handle so the move zone never disappears under it.
@@ -852,8 +866,10 @@ impl GridRes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PianoSelectMenu {
     Grid,
-    ScaleRoot,
-    ScaleKind,
+    /// Root and scale kind together: roots as a grid above the kinds.
+    Scale,
+    /// Chord stacking for the Draw tool.
+    Chord,
     Lane,
     /// Channel view filter (All Channels / Channel 1–16).
     Channel,
@@ -1128,6 +1144,12 @@ pub struct PianoRoll {
     playhead_overlay: Option<Entity<playhead::PianoRollPlayheadOverlay>>,
     /// Docked editor only: opens the floating MIDI editor window.
     on_pop_out: Option<std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync>>,
+    /// Floating editor only: the window's own actions, shown in the editor's
+    /// footer so the window needs no second status row under it.
+    on_export_midi: Option<std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync>>,
+    on_dock: Option<std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync>>,
+    /// Whether the note inspector column is shown.
+    inspector_open: bool,
     on_midi_preview:
         Option<std::sync::Arc<dyn Fn(UiMidiPreviewCommand, &mut gpui::App) + Send + Sync>>,
     tool: PianoTool,
@@ -1433,6 +1455,9 @@ impl PianoRoll {
             )),
             playhead_overlay: None,
             on_pop_out: None,
+            on_export_midi: None,
+            on_dock: None,
+            inspector_open: true,
             on_midi_preview: None,
             tool: PianoTool::Draw,
             ppb: 80.0,
@@ -1500,6 +1525,17 @@ impl PianoRoll {
         handler: Option<std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync>>,
     ) {
         self.on_pop_out = handler;
+    }
+
+    /// The floating window's actions — export the clip, and put the editor
+    /// back in the bottom panel — shown in the editor's own footer.
+    pub fn set_window_actions(
+        &mut self,
+        export_midi: Option<std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync>>,
+        dock: Option<std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync>>,
+    ) {
+        self.on_export_midi = export_midi;
+        self.on_dock = dock;
     }
 
     pub fn set_midi_preview_handler(
@@ -1632,12 +1668,14 @@ impl PianoRoll {
         self.grid_res.label()
     }
 
-    fn toolbar_status(&self, note_count: usize, sel_count: usize) -> String {
+    /// What the pointer is over, or what the gesture in flight is doing — the
+    /// footer's live readout. The counts sit beside it, separately.
+    fn pointer_status(&self) -> String {
         let pointer = match (self.hover_pitch, self.hover_beat) {
             (Some(pitch), Some(beat)) => format!("{} @ {:.2}", note_name(pitch as i32), beat),
-            _ => "Pointer: —".to_string(),
+            _ => String::new(),
         };
-        let drag = match &self.drag {
+        match &self.drag {
             PianoDrag::Velocity { prev, .. } => self
                 .drag_value_status
                 .clone()
@@ -1719,8 +1757,7 @@ impl PianoRoll {
             }
             PianoDrag::Pan { .. } => "Pan".to_string(),
             PianoDrag::None => self.hover_note_status.clone().unwrap_or(pointer),
-        };
-        format!("{} notes · {} sel · {}", note_count, sel_count, drag)
+        }
     }
 
     // ── Unified controller lane selection ────────────────────────────────
@@ -2490,7 +2527,22 @@ impl PianoRoll {
         if local_x < 0.0 || local_x > w || local_y < 0.0 || local_y > h {
             return None;
         }
-        Some(self.y_to_pitch(local_y))
+        Some(self.key_pitch_at_local(local_x, local_y, w))
+    }
+
+    /// The key under a point in the key lane, as it is drawn: black keys are
+    /// [`BLACK_KEY_SHARE`] of the lane wide, and to their right a black row
+    /// belongs to the white keys either side of it — its upper half to the key
+    /// above, its lower half to the one below.
+    fn key_pitch_at_local(&self, local_x: f32, local_y: f32, lane_w: f32) -> u8 {
+        let pitch = self.y_to_pitch(local_y);
+        keyboard_key_at(
+            pitch,
+            local_y - self.pitch_to_y(pitch),
+            self.note_row_h(),
+            local_x,
+            lane_w,
+        )
     }
 
     /// `true` when the edited clip sits on a Solfege track. The Solfege editor
@@ -5817,6 +5869,42 @@ fn controller_default_value(kind: MidiControllerKind) -> f32 {
     }
 }
 
+/// The key drawn at a point of the key lane, given the grid row under it
+/// (`row_pitch`) and how far down that row the point is. Only a black row is
+/// ambiguous: left of the black key's edge it is the black key; right of it,
+/// its upper half belongs to the white key above and its lower half to the
+/// white key below.
+fn keyboard_key_at(row_pitch: u8, y_in_row: f32, row_h: f32, x: f32, lane_w: f32) -> u8 {
+    if x <= lane_w * BLACK_KEY_SHARE || !is_black(row_pitch as i32) {
+        return row_pitch;
+    }
+    if y_in_row < row_h * 0.5 {
+        row_pitch.saturating_add(1).min((PITCH_CNT - 1) as u8)
+    } else {
+        row_pitch.saturating_sub(1)
+    }
+}
+
+/// Lane-local y of a velocity: the exact inverse of
+/// [`PianoRoll::velocity_from_local_y`], so drawn and grabbed values agree.
+fn velocity_lane_y(velocity: u8, usable_h: f32) -> f32 {
+    let norm = (velocity.clamp(1, 127) as f32 - 1.0) / 126.0;
+    2.0 + (1.0 - norm) * usable_h
+}
+
+/// `2401` → `2,401`.
+fn group_thousands(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn value_chip(label: &str, left: f32, top: f32) -> impl IntoElement {
     div()
         .absolute()
@@ -5833,175 +5921,386 @@ fn value_chip(label: &str, left: f32, top: f32) -> impl IntoElement {
         .child(label.to_string())
 }
 
-fn toolbar_group(label: &'static str) -> gpui::Div {
+// ── Editor chrome ───────────────────────────────────────────────────────────
+//
+// The editor's controls speak the Studio's state language: a ghost control
+// paints nothing at rest, hover composites `state.hover` over the plane it sits
+// on, pressed goes recessed, and a latched control carries the accent on two
+// channels — a wash and the glyph.
+
+/// Thin rule between toolbar modules.
+fn bar_divider() -> gpui::Div {
     div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(2.0))
-        .px(px(3.0))
-        .py(px(2.0))
-        .rounded(px(crate::theme::radius::CONTROL))
-        .bg(Colors::surface_panel_alt())
-        .border(px(1.0))
-        .border_color(Colors::divider())
-        .child(
-            div()
-                .px(px(3.0))
-                .text_size(px(8.0))
-                .text_color(Colors::text_faint())
-                .child(label),
-        )
+        .flex_shrink_0()
+        .w(px(1.0))
+        .h(px(crate::theme::size::MICRO))
+        .mx(px(crate::theme::space::SNUG))
+        .bg(Colors::divider())
 }
 
-fn tool_btn(
-    id: &'static str,
-    label: &str,
-    active: bool,
+/// Tooltip for a control with a command behind it: its name and, when one is
+/// bound, its shortcut.
+fn command_tip(label: &str, command: &str) -> gpui::SharedString {
+    match crate::keymap::shortcut_for_command(command) {
+        Some(keys) => format!("{label}  {keys}").into(),
+        None => label.to_string().into(),
+    }
+}
+
+/// Ghost icon button on the toolbar. `toggled: Some(true)` latches it.
+fn bar_icon_button(
+    id: impl Into<gpui::ElementId>,
+    icon: &'static str,
+    tip: gpui::SharedString,
+    toggled: Option<bool>,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
+    use crate::theme::{radius, size};
+    let active = toggled.unwrap_or(false);
+    let base = Colors::surface_panel();
+    let rest = if active {
+        Colors::composite(base, Colors::accent_active())
+    } else {
+        Colors::with_alpha(base, 0.0)
+    };
+    let hover = Colors::composite(if active { rest } else { base }, Colors::state_hover());
+    let pressed = Colors::composite(if active { rest } else { base }, Colors::state_recessed());
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(tip.clone())
+        .when_some(toggled, |b, t| {
+            b.aria_toggled(if t {
+                gpui::Toggled::True
+            } else {
+                gpui::Toggled::False
+            })
+        })
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .size(px(size::DEFAULT))
+        .rounded(px(radius::CONTROL))
+        .bg(rest)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover))
+        .active(move |s| s.bg(pressed))
+        .tooltip(crate::components::controls::fb_tooltip(tip))
+        .on_click(on_click)
+        .child(svg().path(icon).size(px(14.0)).text_color(if active {
+            Colors::accent_primary()
+        } else {
+            Colors::text_secondary()
+        }))
+}
+
+/// Ghost text button on the toolbar or in the footer.
+fn bar_text_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    tip: Option<gpui::SharedString>,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    use crate::theme::{radius, size, space, typography};
+    let label = label.into();
+    let base = Colors::surface_panel();
+    let hover = Colors::composite(base, Colors::state_hover());
+    let pressed = Colors::composite(base, Colors::state_recessed());
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label.clone())
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .h(px(size::DEFAULT))
+        .px(px(space::BASE))
+        .rounded(px(radius::CONTROL))
+        .text_size(px(typography::UI_XS))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(Colors::text_secondary())
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover).text_color(Colors::text_primary()))
+        .active(move |s| s.bg(pressed))
+        .when_some(tip, |b, tip| {
+            b.tooltip(crate::components::controls::fb_tooltip(tip))
+        })
+        .on_click(on_click)
+        .child(label)
+}
+
+/// One tool in the tool strip: an icon that is either the active tool or not.
+fn tool_segment(
+    id: &'static str,
+    icon: &'static str,
+    tip: gpui::SharedString,
+    active: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    use crate::theme::{radius, size, space};
+    let track = Colors::surface_input();
+    let rest = if active {
+        Colors::composite(track, Colors::state_selected())
+    } else {
+        Colors::with_alpha(track, 0.0)
+    };
+    let hover = Colors::composite(if active { rest } else { track }, Colors::state_hover());
+    let pressed = Colors::composite(if active { rest } else { track }, Colors::state_recessed());
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(tip.clone())
+        .aria_toggled(if active {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
         .flex()
         .items_center()
         .justify_center()
-        .h(px(22.0))
-        .min_w(px(24.0))
-        .px(px(7.0))
-        .rounded(px(crate::theme::radius::CONTROL_SM))
-        .text_size(px(10.0))
-        .text_color(if active {
-            Colors::text_primary()
-        } else {
-            Colors::text_secondary()
-        })
-        // Active is accent-based (matching the Solfege tab chips and the Pitch
-        // tab's tools); hover is a weaker graphite wash. Painting both with
-        // `surface_hover` made a hovered tool indistinguishable from the
-        // selected one.
-        .bg(if active {
-            Colors::accent_muted()
-        } else {
-            Colors::with_alpha(Colors::text_primary(), 0.0)
-        })
-        .border(px(1.0))
-        .border_color(if active {
+        .w(px(size::COMFORTABLE))
+        .h(px(size::DENSE))
+        // Inset one `HAIR` inside the strip's `CONTROL` corner.
+        .rounded(px(radius::inner(radius::CONTROL, space::HAIR)))
+        .bg(rest)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover))
+        .active(move |s| s.bg(pressed))
+        .tooltip(crate::components::controls::fb_tooltip(tip))
+        .on_click(on_click)
+        .child(svg().path(icon).size(px(13.0)).text_color(if active {
             Colors::accent_primary()
         } else {
-            Colors::with_alpha(Colors::text_primary(), 0.0)
-        })
-        .when(!active, |s| s.hover(|s| s.bg(Colors::surface_hover())))
-        .cursor(gpui::CursorStyle::PointingHand)
-        .on_click(move |ev, w, cx| on_click(ev, w, cx))
-        .child(label.to_string())
+            Colors::text_muted()
+        }))
 }
 
-fn note_inspector_label(label: &str) -> impl IntoElement {
+/// The inset strip the tool segments sit in.
+fn tool_strip() -> gpui::Div {
+    use crate::theme::{radius, space};
     div()
-        .text_size(px(9.0))
-        .text_color(Colors::text_muted())
-        .font_weight(gpui::FontWeight::BOLD)
-        .child(label.to_string())
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .items_center()
+        .gap(px(space::HAIR))
+        .p(px(space::HAIR))
+        .rounded(px(radius::CONTROL))
+        .bg(Colors::surface_input())
+        .border(px(1.0))
+        .border_color(Colors::border_subtle())
 }
 
-fn note_value_row(label: &str, value: String) -> impl IntoElement {
+// ── Note inspector ──────────────────────────────────────────────────────────
+
+/// Section heading: a quiet caption and a rule to the edge.
+fn insp_section(title: &'static str) -> gpui::Div {
+    use crate::theme::{space, typography};
     div()
         .flex()
         .flex_row()
         .items_center()
-        .justify_between()
-        .gap(px(8.0))
-        .min_h(px(22.0))
+        .gap(px(space::SNUG))
+        .pt(px(space::BASE))
+        .pb(px(space::HAIR))
         .child(
             div()
-                .text_size(px(9.0))
+                .flex_shrink_0()
+                .text_size(px(typography::DENSE_CAPTION))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(Colors::text_faint())
+                .child(title),
+        )
+        .child(div().flex_1().h(px(1.0)).bg(Colors::divider()))
+}
+
+/// Label, value and — for a value the selection can nudge — a −/+ pair.
+fn insp_row(label: &str, value: String, stepper: Option<gpui::AnyElement>) -> gpui::Div {
+    use crate::theme::{size, space, typography};
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::SNUG))
+        .h(px(size::DEFAULT))
+        .child(
+            div()
+                .w(px(60.0))
+                .flex_shrink_0()
+                .text_size(px(typography::DENSE_LABEL))
                 .text_color(Colors::text_muted())
                 .child(label.to_string()),
         )
         .child(
             div()
+                .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(px(10.0))
-                .text_color(Colors::text_primary())
+                .text_size(px(typography::UI_XS))
                 .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(Colors::text_primary())
                 .child(value),
         )
+        .children(stepper)
 }
 
-fn note_button_row(children: Vec<gpui::AnyElement>) -> impl IntoElement {
+/// The −/+ pair of an inspector row.
+fn insp_stepper(
+    id: &'static str,
+    on_down: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    on_up: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
     div()
         .flex()
         .flex_row()
-        .flex_wrap()
-        .gap(px(4.0))
-        .children(children)
+        .flex_shrink_0()
+        .gap(px(crate::theme::space::HAIR))
+        .child(insp_step_button(
+            (id, 0usize),
+            assets::ICON_MINUS_PATH,
+            "Decrease",
+            on_down,
+        ))
+        .child(insp_step_button(
+            (id, 1usize),
+            assets::ICON_PLUS_PATH,
+            "Increase",
+            on_up,
+        ))
+        .into_any_element()
 }
 
-fn note_action_button(
-    id: &'static str,
-    label: &str,
+fn insp_step_button(
+    id: impl Into<gpui::ElementId>,
+    icon: &'static str,
+    label: &'static str,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
+    use crate::theme::{radius, size};
+    let rest = Colors::button_bg();
+    let hover = Colors::composite(rest, Colors::state_hover());
+    let pressed = Colors::composite(rest, Colors::state_recessed());
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label)
         .flex()
         .items_center()
         .justify_center()
-        .h(px(22.0))
-        .min_w(px(54.0))
-        .px(px(6.0))
-        .rounded(px(crate::theme::radius::CONTROL_SM))
-        .text_size(px(10.0))
-        .text_color(Colors::text_secondary())
+        .size(px(size::DENSE))
+        .rounded(px(radius::CONTROL_SM))
         .border(px(1.0))
-        .border_color(Colors::border_subtle())
-        .bg(Colors::surface_raised())
-        .hover(|s| s.bg(Colors::surface_hover()))
+        .border_color(Colors::button_border())
+        .bg(rest)
         .cursor(gpui::CursorStyle::PointingHand)
-        .on_click(move |ev, w, cx| on_click(ev, w, cx))
-        .child(label.to_string())
+        .hover(move |s| s.bg(hover))
+        .active(move |s| s.bg(pressed))
+        .on_click(on_click)
+        .child(
+            svg()
+                .path(icon)
+                .size(px(11.0))
+                .text_color(Colors::text_secondary()),
+        )
 }
 
-/// A [`note_action_button`] that also shows whether its value is the one the
-/// selection currently carries. Used by the articulation palette, where a rail
-/// of identical buttons otherwise gave no indication of the current value.
-fn note_toggle_button(
+/// A value the selection either carries or does not — the articulation
+/// palette. Latched on fill and border.
+fn insp_chip(
     id: &'static str,
     label: &str,
     active: bool,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
+    use crate::theme::{radius, size, space, typography};
+    let base = Colors::surface_panel();
+    let rest = if active {
+        Colors::composite(base, Colors::accent_active())
+    } else {
+        Colors::with_alpha(base, 0.0)
+    };
+    let hover = Colors::composite(if active { rest } else { base }, Colors::state_hover());
     div()
         .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label.to_string())
+        .aria_toggled(if active {
+            gpui::Toggled::True
+        } else {
+            gpui::Toggled::False
+        })
         .flex()
         .items_center()
-        .justify_center()
-        .h(px(22.0))
-        .min_w(px(54.0))
-        .px(px(6.0))
-        .rounded(px(crate::theme::radius::CONTROL_SM))
-        .text_size(px(10.0))
-        .text_color(if active {
-            Colors::text_primary()
-        } else {
-            Colors::text_secondary()
-        })
+        .h(px(size::DENSE))
+        .px(px(space::SNUG))
+        .rounded(px(radius::CONTROL_SM))
         .border(px(1.0))
         .border_color(if active {
             Colors::accent_primary()
         } else {
             Colors::border_subtle()
         })
-        .bg(if active {
-            Colors::accent_muted()
+        .bg(rest)
+        .text_size(px(typography::DENSE_LABEL))
+        .text_color(if active {
+            Colors::text_primary()
         } else {
-            Colors::surface_raised()
+            Colors::text_secondary()
         })
-        .when(!active, |s| s.hover(|s| s.bg(Colors::surface_hover())))
         .cursor(gpui::CursorStyle::PointingHand)
-        .on_click(move |ev, w, cx| on_click(ev, w, cx))
+        .hover(move |s| s.bg(hover))
+        .on_click(on_click)
         .child(label.to_string())
+}
+
+/// A command on the selection.
+fn insp_action(
+    id: &'static str,
+    label: &str,
+    destructive: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    use crate::theme::{radius, size, typography};
+    let rest = Colors::button_bg();
+    let hover = Colors::composite(rest, Colors::state_hover());
+    let pressed = Colors::composite(rest, Colors::state_recessed());
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label.to_string())
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .items_center()
+        .justify_center()
+        .h(px(size::DEFAULT))
+        .rounded(px(radius::CONTROL))
+        .border(px(1.0))
+        .border_color(Colors::button_border())
+        .bg(rest)
+        .text_size(px(typography::UI_XS))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(if destructive {
+            Colors::status_error()
+        } else {
+            Colors::button_text()
+        })
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover))
+        .active(move |s| s.bg(pressed))
+        .on_click(on_click)
+        .child(label.to_string())
+}
+
+/// Two inspector actions side by side.
+fn insp_action_row(children: Vec<gpui::AnyElement>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .gap(px(crate::theme::space::TIGHT))
+        .children(children)
 }
 
 fn uniform_u8(notes: &[MidiNoteState], f: impl Fn(&MidiNoteState) -> u8) -> Option<u8> {
@@ -6380,6 +6679,56 @@ mod shared_grid_step_tests {
     #[test]
     fn a_zero_step_is_a_pass_through() {
         assert_eq!(snap_beat_to_step(1.234, 0.0), 1.234);
+    }
+}
+
+#[cfg(test)]
+mod keyboard_and_lane_tests {
+    use super::*;
+
+    const LANE_W: f32 = 72.0;
+    const ROW: f32 = 14.0;
+
+    #[test]
+    fn a_black_row_is_the_black_key_left_of_its_edge() {
+        // C#4 = 61.
+        assert_eq!(keyboard_key_at(61, 2.0, ROW, 10.0, LANE_W), 61);
+        assert_eq!(keyboard_key_at(61, 12.0, ROW, 10.0, LANE_W), 61);
+    }
+
+    #[test]
+    fn right_of_a_black_key_its_row_splits_between_the_white_keys() {
+        let right = LANE_W * BLACK_KEY_SHARE + 4.0;
+        // Upper half of C#4's row: D4 above it; lower half: C4 below.
+        assert_eq!(keyboard_key_at(61, 3.0, ROW, right, LANE_W), 62);
+        assert_eq!(keyboard_key_at(61, 11.0, ROW, right, LANE_W), 60);
+    }
+
+    #[test]
+    fn a_white_row_is_its_own_key_anywhere() {
+        assert_eq!(keyboard_key_at(60, 7.0, ROW, 5.0, LANE_W), 60);
+        assert_eq!(keyboard_key_at(60, 7.0, ROW, 70.0, LANE_W), 60);
+    }
+
+    #[test]
+    fn velocity_lane_y_inverts_the_press_mapping() {
+        // `velocity_from_local_y`'s arithmetic, for a 139 px lane.
+        let usable = 139.0 - 8.0;
+        let from_y = |y: f32| {
+            let norm = (1.0 - ((y - 2.0) / usable)).clamp(0.0, 1.0);
+            (1.0 + norm * 126.0).round() as u8
+        };
+        for velocity in [1u8, 32, 64, 100, 127] {
+            assert_eq!(from_y(velocity_lane_y(velocity, usable)), velocity);
+        }
+    }
+
+    #[test]
+    fn counts_group_their_thousands() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(2401), "2,401");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
     }
 }
 

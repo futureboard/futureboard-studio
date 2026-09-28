@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gpui::{
     div, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, StatefulInteractiveElement, Styled, Window,
+    IntoElement, KeyDownEvent, ParentElement, Render, Styled, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 
@@ -66,6 +66,26 @@ impl MidiEditorWindow {
         dispatch_command: Arc<dyn Fn(&'static str, &mut App) + Send + Sync>,
         cx: &mut Context<Self>,
     ) -> Self {
+        // The window's actions live in the editor's footer, so the window
+        // needs no second status row of its own.
+        let export = {
+            let dispatch_command = dispatch_command.clone();
+            Arc::new(move |_window: &mut Window, cx: &mut App| {
+                // The editor always shows the selected clip, which is exactly
+                // what the command resolves, so no id has to be threaded
+                // through the &'static str command channel.
+                (dispatch_command)("midi:export-clip", cx);
+            }) as Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>
+        };
+        let dock = {
+            let dispatch_command = dispatch_command.clone();
+            Arc::new(move |_window: &mut Window, cx: &mut App| {
+                (dispatch_command)("editor:open-bottom", cx);
+            }) as Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>
+        };
+        piano_roll.update(cx, |roll, _cx| {
+            roll.set_window_actions(Some(export), Some(dock));
+        });
         Self {
             timeline,
             piano_roll,
@@ -107,21 +127,6 @@ impl MidiEditorWindow {
             .state
             .find_clip(clip_id)
             .is_some_and(|(_, c)| matches!(c.clip_type, ClipType::Midi { .. }))
-    }
-
-    fn status_line(&self, cx: &Context<Self>) -> String {
-        let tl = self.timeline.read(cx);
-        let Some(clip_id) = tl.state.selection.selected_clip_ids.first() else {
-            return "No clip · grid —".to_string();
-        };
-        let notes = tl
-            .state
-            .midi_clip_notes(clip_id)
-            .map(|n| n.len())
-            .unwrap_or(0);
-        let sel = self.piano_roll.read(cx).selected_note_count();
-        let grid = self.piano_roll.read(cx).grid_label();
-        format!("{notes} notes · {sel} selected · grid {grid}")
     }
 
     fn should_route_to_piano_roll(event: &KeyDownEvent) -> bool {
@@ -206,7 +211,6 @@ impl MidiEditorWindow {
 impl Render for MidiEditorWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.title_for_clip(cx);
-        let status = self.status_line(cx);
 
         let body: gpui::AnyElement = match self.current_midi_clip(cx) {
             Some((_track_id, clip_id)) => {
@@ -231,7 +235,6 @@ impl Render for MidiEditorWindow {
         };
 
         let on_close = self.on_close.clone();
-        let dispatch_command = self.dispatch_command.clone();
         let target = cx.entity().clone();
 
         div()
@@ -284,55 +287,6 @@ impl Render for MidiEditorWindow {
                     .min_h_0()
                     .bg(Colors::surface_base())
                     .child(body),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(px(22.0))
-                    .px(px(10.0))
-                    .border_t(px(1.0))
-                    .border_color(Colors::panel_border())
-                    .bg(Colors::surface_panel())
-                    .text_size(px(10.0))
-                    .text_color(Colors::text_muted())
-                    .child(status)
-                    .child(div().flex_1())
-                    .child({
-                        // The editor always shows the selected clip, which is
-                        // exactly what the command resolves, so no id has to be
-                        // threaded through the &'static str command channel.
-                        let dispatch_command = dispatch_command.clone();
-                        div()
-                            .id("midi-editor-export-midi")
-                            .px(px(8.0))
-                            .py(px(2.0))
-                            .rounded(px(crate::theme::radius::CONTROL))
-                            .text_size(px(10.0))
-                            .text_color(Colors::text_secondary())
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .hover(|s| s.bg(Colors::surface_hover()))
-                            .on_click(move |_, _window, cx| {
-                                (dispatch_command)("midi:export-clip", cx);
-                            })
-                            .child("Export MIDI...")
-                    })
-                    .child(
-                        div()
-                            .id("midi-editor-pop-in")
-                            .px(px(8.0))
-                            .py(px(2.0))
-                            .rounded(px(crate::theme::radius::CONTROL))
-                            .text_size(px(10.0))
-                            .text_color(Colors::text_secondary())
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .hover(|s| s.bg(Colors::surface_hover()))
-                            .on_click(move |_, _window, cx| {
-                                (dispatch_command)("editor:open-bottom", cx);
-                            })
-                            .child("Open in bottom panel"),
-                    ),
             )
     }
 }
