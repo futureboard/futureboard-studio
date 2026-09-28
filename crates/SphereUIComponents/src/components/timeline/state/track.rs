@@ -400,15 +400,21 @@ impl TimelineState {
         self.drag_current_y = y;
         self.drag_target_index = Some(origin_index.min(self.tracks.len()));
         self.drag_folder_target_id = None;
+        self.drag_indicator_from_index = None;
+        self.drag_indicator_generation = self.drag_indicator_generation.wrapping_add(1);
     }
 
     pub fn update_track_drag(&mut self, y: f32) {
         self.drag_current_y = y;
-        self.drag_folder_target_id = self.folder_drop_target_at_y(y);
-        self.drag_target_index = self
-            .drag_folder_target_id
-            .is_none()
-            .then(|| self.track_insert_index_at_y(y));
+        let folder = self.folder_drop_target_at_y(y);
+        let target = folder.is_none().then(|| self.track_insert_index_at_y(y));
+        if target != self.drag_target_index || folder != self.drag_folder_target_id {
+            // The hint slides from where it was to where it now is.
+            self.drag_indicator_from_index = self.drag_target_index.or(target);
+            self.drag_indicator_generation = self.drag_indicator_generation.wrapping_add(1);
+        }
+        self.drag_folder_target_id = folder;
+        self.drag_target_index = target;
     }
 
     pub fn clear_track_drag(&mut self) {
@@ -417,6 +423,7 @@ impl TimelineState {
         self.drag_current_y = 0.0;
         self.drag_target_index = None;
         self.drag_folder_target_id = None;
+        self.drag_indicator_from_index = None;
     }
 
     pub fn reorder_track(&mut self, track_id: &str, target_index: usize) -> bool {
@@ -924,5 +931,36 @@ mod rename_tests {
         let id = state.create_midi_track();
         assert!(state.rename_track(&id, "Bass\tDI\n"));
         assert_eq!(state.tracks[0].name, "Bass DI");
+    }
+}
+
+#[cfg(test)]
+mod move_hint_tests {
+    use super::*;
+
+    #[test]
+    fn the_move_hint_slides_only_when_the_target_changes() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        for _ in 0..3 {
+            state.create_midi_track();
+        }
+        let row = state.track_row_layout().rows[1].height;
+        state.begin_track_drag(&state.tracks[0].id.clone(), 0, 1.0);
+        let started = state.drag_indicator_generation;
+        assert_eq!(state.drag_indicator_from_index, None);
+
+        // Still over the same gap: nothing new to show, nothing to replay.
+        state.update_track_drag(2.0);
+        assert_eq!(state.drag_indicator_generation, started);
+
+        // Down past the second track: the line moves, from where it was.
+        state.update_track_drag(row * 2.0 - 2.0);
+        assert_ne!(state.drag_target_index, Some(0));
+        assert_eq!(state.drag_indicator_from_index, Some(0));
+        assert_eq!(state.drag_indicator_generation, started + 1);
+
+        state.clear_track_drag();
+        assert_eq!(state.drag_indicator_from_index, None);
     }
 }

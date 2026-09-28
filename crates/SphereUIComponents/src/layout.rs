@@ -581,6 +581,10 @@ pub struct StudioLayout {
     /// plugin-manager, export) + deferred external-mixer open bounds. Grouped
     /// into [`window_ops::ExternalWindows`] (decomposition slice).
     external_windows: window_ops::ExternalWindows,
+    /// The Control Room's listening simulation (Virtual Speaker) as set this
+    /// session; `None` until first changed, when it reads as off on the
+    /// remembered profile (see `listening_simulation`).
+    listening_simulation: Option<solfege_spatialaudio::SimulationSettings>,
     /// Plugin catalog / registry-scan state backing the insert picker (cached
     /// scan result, preset-cache presence, catalog load phase). Grouped into
     /// [`plugin_ops::PluginCatalogState`] (decomposition slice).
@@ -1374,6 +1378,7 @@ impl StudioLayout {
             )
             .with_placeholder("Search parameters…"),
             external_windows: window_ops::ExternalWindows::default(),
+            listening_simulation: None,
             plugin_catalog: plugin_ops::PluginCatalogState::default(),
             plugin_editors: plugin_ops::PluginEditorWindows::default(),
             ara: ara_ops::AraState::default(),
@@ -1562,6 +1567,9 @@ impl StudioLayout {
         engine: &DirectAudio::AudioEngine,
         cx: &mut Context<Self>,
     ) {
+        // A new engine starts with the Control Room's simulation off; give it
+        // this session's.
+        let _ = engine.set_listening_simulation(self.listening_simulation(cx));
         let seek_engine = engine.clone();
         let param_engine = engine.clone();
         let input_engine = engine.clone();
@@ -2728,6 +2736,7 @@ impl StudioLayout {
             "window:performance" | "view:performance" => {
                 self.open_performance_window(owner_bounds, cx)
             }
+            "window:virtual-speaker" => self.open_virtual_speaker_window(owner_bounds, cx),
             "midi:sysex-editor" | "window:sysex-editor" => {
                 self.open_sysex_editor_window(owner_bounds, cx)
             }

@@ -628,9 +628,6 @@ pub fn track_header(
     // header so controls never overlap, clip, or float outside the row.
     let show_controls = row_height >= TRACK_HEADER_CONTROLS_MIN_HEIGHT;
     let is_dragging = state.dragging_track_id.as_deref() == Some(track.id.as_str());
-    let is_drop_target =
-        state.drag_target_index == Some(index) || state.drag_target_index == Some(index + 1);
-    let is_folder_drop_target = state.drag_folder_target_id.as_deref() == Some(track.id.as_str());
     // Selection, drag, and drop-target are *tints*: translucent washes designed
     // to sit on the header's surface, not to be it. Using one as the whole
     // background left a selected header with no opaque pixel of its own, so
@@ -644,8 +641,6 @@ pub fn track_header(
         Some(Colors::surface_selected_soft())
     } else if is_selected {
         Some(Colors::track_selected_overlay())
-    } else if is_drop_target && state.dragging_track_id.is_some() {
-        Some(Colors::with_alpha(Colors::text_primary(), 0.05))
     } else {
         None
     };
@@ -826,17 +821,6 @@ pub fn track_header(
         // State tint over the opaque base.
         .when_some(header_tint, |header, tint| {
             header.child(div().absolute().inset_0().bg(tint))
-        })
-        // The folder a drag in flight would drop into.
-        .when(is_folder_drop_target, |header| {
-            header.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .bg(Colors::with_alpha(Colors::accent_primary(), 0.10))
-                    .border(px(1.0))
-                    .border_color(Colors::accent_primary()),
-            )
         })
         // Left accent strip — same column as the track lane stripe.
         .child(div().w(px(3.0)).h_full().flex_none().bg(track.color))

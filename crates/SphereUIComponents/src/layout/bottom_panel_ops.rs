@@ -338,6 +338,7 @@ fn left_audio_signature(content: &StatusBarContent) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.left.hash(&mut hasher);
     content.audio.hash(&mut hasher);
+    content.listening.hash(&mut hasher);
     hasher.finish()
 }
 

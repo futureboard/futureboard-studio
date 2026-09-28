@@ -8030,6 +8030,7 @@ source = "git+https://github.com/futureboard/solfage-engine#6cf3c67f7dfb232f5c2b
 name = "solfege_spatialaudio"
 version = "2026.9.27-beta1.4.1"
 dependencies = [
+ "rustfft",
  "serde",
 ]
 

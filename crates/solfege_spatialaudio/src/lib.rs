@@ -43,10 +43,13 @@
 
 mod binaural;
 mod bus;
+mod convolver;
 mod dsp;
+mod environment;
 mod format;
 mod hrtf;
 mod layout;
+mod listening;
 mod panner;
 mod position;
 mod room_tail;
@@ -57,6 +60,9 @@ pub use binaural::{BinauralSource, HEAD_RADIUS_M, SPEED_OF_SOUND_M_S};
 pub use bus::SpatialBus;
 pub use format::{MonitorFold, SpatialFormat};
 pub use layout::{MAX_CHANNELS, Speaker, SpeakerLayout};
+pub use listening::{
+    ListeningDevice, ListeningGroup, ListeningProfile, ListeningSimulator, SimulationSettings,
+};
 pub use panner::SurroundPanner;
 pub use position::{RoomPosition, RoomSettings, SourceParams};
 pub use room_tail::RoomTail;

@@ -506,6 +506,7 @@ menu.window-lyric_editor_panel = 右侧停靠歌词编辑器
 menu.window-maximize = 最大化
 menu.window-minimize = 最小化
 menu.window-performance = 性能监视器
+menu.window-virtual_speaker = 虚拟扬声器
 menu.window-reset_zoom = 重置缩放
 menu.window-routing_matrix = 路由矩阵
 menu.window-show_automation = 显示自动化

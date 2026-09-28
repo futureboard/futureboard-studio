@@ -919,6 +919,11 @@ pub fn drain_commands(
             EngineCommand::SetMonitorOutput { target } => {
                 runtime.monitor.output = target;
             }
+            EngineCommand::SetListeningSimulation { settings } => {
+                if let Some(simulator) = runtime.monitor.simulator.as_deref_mut() {
+                    simulator.configure(settings);
+                }
+            }
             // Plain integers: applying ownership on this thread stores a small
             // enum and two channel pairs — no lookup, no allocation.
             EngineCommand::SetHardwareOutputOwnership {
@@ -1896,6 +1901,19 @@ pub(crate) fn run_control_room(
             None,
             transport,
         );
+    }
+
+    // ── 2b. Listening simulation (Virtual Speaker) ──────────────────────────
+    {
+        let monitor = &mut runtime.monitor;
+        if let Some(simulator) = monitor.simulator.as_deref_mut() {
+            if simulator.is_audible() {
+                simulator.process(
+                    &mut monitor.source_l[..frames],
+                    &mut monitor.source_r[..frames],
+                );
+            }
+        }
     }
 
     // ── 3. Monitor control processor (mono → dim → gain → mute) ─────────────

@@ -506,6 +506,7 @@ menu.window-lyric_editor_panel = Lyric Editor in Right Dock
 menu.window-maximize = Maximize
 menu.window-minimize = Minimize
 menu.window-performance = Performance Monitor
+menu.window-virtual_speaker = Virtual Speaker
 menu.window-reset_zoom = Reset Zoom
 menu.window-routing_matrix = Routing Matrix
 menu.window-show_automation = Show Automation

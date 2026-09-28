@@ -23,6 +23,12 @@ pub enum EngineCommand {
     SetMonitorControl {
         control: crate::monitor::MonitorControl,
     },
+    /// Set the Control Room's listening simulation (Virtual Speaker): the
+    /// mix as heard in a car, on a phone, through a PA... Playback-only, like
+    /// every Control Room stage.
+    SetListeningSimulation {
+        settings: solfege_spatialaudio::SimulationSettings,
+    },
     /// Select the hardware output pair the Control Room feeds.
     SetMonitorOutput {
         target: crate::monitor::MonitorOutputTarget,

@@ -22,6 +22,7 @@ impl StatusBarView {
                 left: String::new(),
                 audio: String::new(),
                 perf: None,
+                listening: None,
             },
             content_sig: u64::MAX,
         }
@@ -74,6 +75,14 @@ impl Render for StatusBarView {
             None
         };
 
+        let owner_listening = self.owner.clone();
+        let on_open_listening: crate::components::status_bar::ListeningOpenCb =
+            Arc::new(move |_w, cx| {
+                StudioLayout::defer_update(&owner_listening, cx, |layout, cx| {
+                    layout.open_virtual_speaker_window(None, cx);
+                });
+            });
+
         status_bar_with_background_tasks(
             self.cached.clone(),
             tasks,
@@ -81,6 +90,7 @@ impl Render for StatusBarView {
             on_cancel_task,
             perf_popover_open,
             on_toggle_perf,
+            Some(on_open_listening),
         )
     }
 }
@@ -90,6 +100,7 @@ pub fn status_content_signature(content: &StatusBarContent) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     content.left.hash(&mut hasher);
     content.audio.hash(&mut hasher);
+    content.listening.hash(&mut hasher);
     if let Some(perf) = &content.perf {
         perf.pill_label.hash(&mut hasher);
         ((perf.fps * 2.0).round() as i32).hash(&mut hasher);

@@ -1,3 +1,4 @@
+use gpui::prelude::FluentBuilder;
 use gpui::{div, px, InteractiveElement, IntoElement, ParentElement, Styled};
 
 use crate::components::edit::{lane_press_intent, LanePressIntent};
@@ -115,11 +116,13 @@ pub fn track_list(
             tail_start_y
         );
     }
-    let insert_y = state.drag_target_index.and_then(|index| {
-        row_layout.row_for_index(index).map(|row| {
-            (row.y - state.viewport.scroll_y).clamp(0.0, grid_height.max(DEFAULT_TRACK_HEIGHT))
-        })
-    });
+    let move_hint = track_move_hint(state, row_layout, grid_height);
+    // The track a drag is carrying, and (for a folder) everything inside it:
+    // dimmed where they are, so the move reads as from here to there.
+    let dragged_index = state
+        .dragging_track_id
+        .as_deref()
+        .and_then(|id| state.tracks.iter().position(|t| t.id == id));
 
     let scroll_y = state.viewport.scroll_y;
     let viewport_height = state.viewport.viewport_height;
@@ -218,9 +221,12 @@ pub fn track_list(
             }
         }
 
+        let carried =
+            dragged_index.is_some_and(|from| index == from || group_tree.is_inside(index, from));
         let row = div()
             .relative()
             .w_full()
+            .when(carried, |row| row.opacity(0.4))
             .h(px(total_row_height))
             .flex()
             .flex_col()
@@ -415,14 +421,186 @@ pub fn track_list(
                 .w_full()
                 .children(rows),
         )
-        .children(insert_y.map(|y| {
+        .children(move_hint)
+}
+
+/// Where a dragged track will land, said so it cannot be missed: across the
+/// header column and the lanes, with a label in the header column saying what
+/// the drop will do.
+///
+/// * Between tracks — a bold insertion line with a marker, "Move here" (and
+///   the folder it would land in), or "No change" where the drop would leave
+///   the order as it is.
+/// * Onto a folder — the folder's whole row framed, "Into <folder>".
+///
+/// Motion confirms each change and then rests: the line slides from its old
+/// place to its new one (`motion::MICRO_MS`) and its glow flashes once
+/// (`motion::SLOW_MS`). Nothing loops, so the timeline is not redrawn every
+/// frame while the pointer is still.
+fn track_move_hint(
+    state: &TimelineState,
+    row_layout: &TrackRowLayout,
+    grid_height: f32,
+) -> Option<gpui::AnyElement> {
+    use gpui::{Animation, AnimationExt, ease_out_quint};
+    use std::time::Duration;
+
+    let dragging = state.dragging_track_id.as_deref()?;
+    let scroll_y = state.viewport.scroll_y;
+    let accent = Colors::accent_primary();
+    let generation = state.drag_indicator_generation as usize;
+    let slide = Duration::from_millis(crate::theme::motion::MICRO_MS);
+    let flash = Duration::from_millis(crate::theme::motion::SLOW_MS);
+    let label = |text: String, tone: gpui::Rgba| {
+        div()
+            .px(px(7.0))
+            .py(px(2.0))
+            .rounded(px(crate::theme::radius::CONTROL_SM))
+            .border(px(1.0))
+            .border_color(Colors::with_alpha(tone, 0.7))
+            .bg(Colors::surface_raised())
+            .shadow_lg()
+            .text_size(px(crate::theme::typography::DENSE_LABEL))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(Colors::text_primary())
+            .whitespace_nowrap()
+            .child(text)
+    };
+
+    if let Some(folder_id) = state.drag_folder_target_id.as_deref() {
+        let row = row_layout.row_for_track(folder_id)?;
+        let name = state.tracks.get(row.index).map(|t| t.name.clone())?;
+        let top = row.y - scroll_y;
+        return Some(
             div()
                 .absolute()
                 .left_0()
                 .right_0()
-                .top(px((y - 1.0).max(0.0)))
-                .h(px(2.0))
-                .bg(Colors::accent_primary())
-                .shadow_lg()
-        }))
+                .top(px(top))
+                .h(px(row.height))
+                .rounded(px(crate::theme::radius::CONTROL_SM))
+                .border(px(2.0))
+                .border_color(accent)
+                .bg(Colors::with_alpha(accent, 0.10))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(26.0))
+                        .top(px(-10.0))
+                        .child(label(format!("Into {name}"), accent)),
+                )
+                .with_animation(
+                    ("track-move-folder", generation),
+                    Animation::new(flash).with_easing(ease_out_quint()),
+                    move |this, t| this.bg(Colors::with_alpha(accent, 0.28 - 0.18 * t)),
+                )
+                .into_any_element(),
+        );
+    }
+
+    let index = state.drag_target_index?;
+    // The top of the row the line sits above, or the end of the last track.
+    let line_y = |index: usize| -> f32 {
+        row_layout
+            .row_for_index(index)
+            .map(|row| row.y)
+            .unwrap_or(row_layout.total_height)
+            - scroll_y
+    };
+    let limit = grid_height.max(DEFAULT_TRACK_HEIGHT);
+    let to = line_y(index).clamp(0.0, limit);
+    let from = state
+        .drag_indicator_from_index
+        .map(|i| line_y(i).clamp(0.0, limit))
+        .unwrap_or(to);
+
+    let origin = state.tracks.iter().position(|t| t.id == dragging);
+    let block_end = origin.map(|o| state.group_tree().block_end(o));
+    let unchanged = match (origin, block_end) {
+        (Some(o), Some(end)) => (o..=end).contains(&index),
+        _ => false,
+    };
+    let text = if unchanged {
+        "No change".to_string()
+    } else {
+        // It lands in the folder of the row below the line.
+        let tree = state.group_tree();
+        match (index < state.tracks.len())
+            .then(|| tree.ancestors(index).first().copied())
+            .flatten()
+            .and_then(|folder| state.tracks.get(folder))
+        {
+            Some(folder) => format!("Move here \u{00B7} in {}", folder.name),
+            None => "Move here".to_string(),
+        }
+    };
+    let tone = if unchanged {
+        Colors::text_muted()
+    } else {
+        accent
+    };
+
+    const BAND: f32 = 14.0;
+    Some(
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(px(to - BAND / 2.0))
+            .h(px(BAND))
+            // Glow: flashes on each new place, then settles to a quiet band.
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(BAND / 2.0 - 4.0))
+                    .h(px(8.0))
+                    .rounded(px(crate::theme::radius::PILL))
+                    .bg(Colors::with_alpha(tone, 0.14))
+                    .with_animation(
+                        ("track-move-glow", generation),
+                        Animation::new(flash).with_easing(ease_out_quint()),
+                        move |this, t| this.bg(Colors::with_alpha(tone, 0.42 - 0.28 * t)),
+                    ),
+            )
+            // The line itself.
+            .child(
+                div()
+                    .absolute()
+                    .left(px(12.0))
+                    .right_0()
+                    .top(px(BAND / 2.0 - 1.5))
+                    .h(px(3.0))
+                    .rounded(px(crate::theme::radius::PILL))
+                    .bg(tone),
+            )
+            // The marker at the header end, where the drag handle is.
+            .child(
+                div()
+                    .absolute()
+                    .left(px(4.0))
+                    .top(px(BAND / 2.0 - 5.0))
+                    .size(px(10.0))
+                    .rounded(px(crate::theme::radius::PILL))
+                    .border(px(2.0))
+                    .border_color(tone)
+                    .bg(Colors::surface_panel()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(26.0))
+                    .top(px(if to < 20.0 { BAND } else { -18.0 }))
+                    .max_w(px(HEADER_WIDTH - 32.0))
+                    .overflow_hidden()
+                    .child(label(text, tone)),
+            )
+            .with_animation(
+                ("track-move-slide", generation),
+                Animation::new(slide).with_easing(ease_out_quint()),
+                move |this, t| this.top(px(from + (to - from) * t - BAND / 2.0)),
+            )
+            .into_any_element(),
+    )
 }

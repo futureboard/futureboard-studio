@@ -104,6 +104,7 @@ pub mod transport_perf_meter;
 pub mod update_dialog;
 pub mod video_player_window;
 pub mod virtual_keyboard;
+pub mod virtual_speaker_window;
 
 pub use about_window::{open_about_window, AboutWindow};
 pub use add_track_dialog::{

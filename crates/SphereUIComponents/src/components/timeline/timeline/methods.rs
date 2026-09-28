@@ -141,6 +141,7 @@ impl Timeline {
         // for the caller's notify to take the razor line down.
         self.cut_guide.set(None);
         self.clip_drag_target_track_index = None;
+        self.clip_move_hint_from = None;
         self.clip_clone_drag_id = None;
         self.pen_clip_draw = None;
         // Ends a marquee and keeps the selection it previewed; Escape goes
@@ -221,6 +222,8 @@ impl Timeline {
             clip_resize_origin: Vec::new(),
             clip_resize_grab_beats: 0.0,
             clip_drag_target_track_index: None,
+            clip_move_hint_from: None,
+            clip_move_hint_generation: 0,
             clip_clone_drag_id: None,
             pen_clip_draw: None,
             range_select_drag: None,
@@ -317,6 +320,8 @@ impl Timeline {
             clip_resize_origin: Vec::new(),
             clip_resize_grab_beats: 0.0,
             clip_drag_target_track_index: None,
+            clip_move_hint_from: None,
+            clip_move_hint_generation: 0,
             clip_clone_drag_id: None,
             pen_clip_draw: None,
             range_select_drag: None,
@@ -3564,6 +3569,11 @@ impl Timeline {
         }
         let (target_index, snapped) =
             self.resolve_clip_drag_target_with_bypass(drag, origin, position, bypass_snap);
+        if self.clip_drag_target_track_index != Some(target_index) {
+            // The move hint slides from the track it was over.
+            self.clip_move_hint_from = self.clip_drag_target_track_index;
+            self.clip_move_hint_generation = self.clip_move_hint_generation.wrapping_add(1);
+        }
         self.clip_drag_target_track_index = Some(target_index);
 
         let Some(move_origin) = self.clip_move_origin.as_ref() else {

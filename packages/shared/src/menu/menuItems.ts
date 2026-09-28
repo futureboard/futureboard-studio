@@ -772,6 +772,14 @@ export const APP_MENUS: AppMenuGroup[] = [
           "Audio engine latency and PDC, plus every CPU core, memory and local drive",
       },
       {
+        id: "window.virtual_speaker",
+        label: "Virtual Speaker",
+        icon: "speaker",
+        action: "window:virtual-speaker",
+        description:
+          "Hear the mix as it would play in a car, on a phone, through a PA or in other rooms (monitoring only)",
+      },
+      {
         type: "separator",
         id: "window.sep.extensions",
       },

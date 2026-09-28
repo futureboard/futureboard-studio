@@ -983,6 +983,26 @@ pub struct PlaybackSettings {
     /// How following scrolls, as last chosen with the auto-scroll toggle.
     #[serde(default)]
     pub auto_scroll_mode: AutoScrollPreference,
+    /// Virtual Speaker's last playback system and listening device, as
+    /// `solfege_spatialaudio` tokens. Whether the simulation is on is never
+    /// saved: one left on from the last session would be mixed against by
+    /// mistake.
+    #[serde(default = "default_virtual_speaker_profile")]
+    pub virtual_speaker_profile: String,
+    #[serde(default = "default_virtual_speaker_device")]
+    pub virtual_speaker_device: String,
+}
+
+fn default_virtual_speaker_profile() -> String {
+    solfege_spatialaudio::ListeningProfile::default()
+        .token()
+        .to_string()
+}
+
+fn default_virtual_speaker_device() -> String {
+    solfege_spatialaudio::ListeningDevice::default()
+        .token()
+        .to_string()
 }
 
 impl Default for PlaybackSettings {
@@ -994,6 +1014,8 @@ impl Default for PlaybackSettings {
             return_playhead_on_stop: false,
             follow_playhead: default_true(),
             auto_scroll_mode: AutoScrollPreference::default(),
+            virtual_speaker_profile: default_virtual_speaker_profile(),
+            virtual_speaker_device: default_virtual_speaker_device(),
         }
     }
 }

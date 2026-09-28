@@ -1212,6 +1212,14 @@ impl AudioEngine {
         self.inner.set_monitor_control(control)
     }
 
+    /// Set the Control Room's listening simulation (Virtual Speaker).
+    pub fn set_listening_simulation(
+        &self,
+        settings: solfege_spatialaudio::SimulationSettings,
+    ) -> Result<(), SphereAudioError> {
+        self.inner.set_listening_simulation(settings)
+    }
+
     /// Select the hardware output pair the Control Room feeds.
     pub fn set_monitor_output(
         &self,

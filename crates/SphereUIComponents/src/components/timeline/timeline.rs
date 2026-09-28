@@ -251,6 +251,12 @@ pub struct Timeline {
     /// jumped to the pointer on the first move.
     clip_resize_grab_beats: f32,
     clip_drag_target_track_index: Option<usize>,
+    /// The track the move hint's ghost was over before the latest change,
+    /// so it slides from there (`None`: it has just appeared).
+    clip_move_hint_from: Option<usize>,
+    /// Bumped whenever a clip drag's target track changes: keys the ghost's
+    /// one-shot slide and flash.
+    clip_move_hint_generation: u64,
     clip_clone_drag_id: Option<String>,
     /// Pen-tool click-drag MIDI clip preview, live until mouse-up creates the clip.
     pen_clip_draw: Option<ClipDrawPreview>,

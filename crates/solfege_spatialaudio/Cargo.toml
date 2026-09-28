@@ -14,6 +14,8 @@ path = "src/lib.rs"
 # The format, layout and source parameters are persisted in the project and
 # carried in the engine snapshot, so they are defined here (one authority).
 serde.workspace = true
+# Partitioned convolution of the Virtual Speaker rooms.
+rustfft.workspace = true
 
 [lints]
 workspace = true

@@ -757,6 +757,10 @@ pub struct RuntimeMonitor {
     pub master_output: Option<(u16, u16)>,
     /// Monitor-only insert chain. Never reached by export.
     pub inserts: Vec<RuntimeInsert>,
+    /// The listening simulation (Virtual Speaker), after the monitor inserts
+    /// and before the monitor control. Built with the graph; `None` only in
+    /// a default-constructed monitor.
+    pub simulator: Option<Box<solfege_spatialaudio::ListeningSimulator>>,
     /// Scratch holding the routed non-master source for this block.
     pub source_l: Vec<f32>,
     pub source_r: Vec<f32>,
@@ -3485,6 +3489,10 @@ impl RuntimeProject {
                 // block buffers so the device callback never resizes it.
                 let mut monitor = RuntimeMonitor::default();
                 monitor.ensure_block_capacity(DEFAULT_AUDIO_BLOCK_CAPACITY);
+                monitor.simulator = Some(Box::new(solfege_spatialaudio::ListeningSimulator::new(
+                    output_sample_rate,
+                    DEFAULT_AUDIO_BLOCK_CAPACITY,
+                )));
                 monitor
             },
             sample_rate: output_sample_rate,

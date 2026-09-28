@@ -506,6 +506,7 @@ menu.window-lyric_editor_panel = Lyric Editor ใน Dock ขวา
 menu.window-maximize = ขยายหน้าต่าง
 menu.window-minimize = ย่อ
 menu.window-performance = Performance Monitor
+menu.window-virtual_speaker = Virtual Speaker
 menu.window-reset_zoom = รีเซ็ต Zoom
 menu.window-routing_matrix = Routing Matrix
 menu.window-show_automation = แสดง Automation

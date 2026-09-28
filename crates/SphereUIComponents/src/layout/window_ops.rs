@@ -269,6 +269,9 @@ pub(crate) struct ExternalWindows {
     /// Performance Monitor — engine latency and PDC, cores, memory and drives.
     pub performance:
         Option<gpui::WindowHandle<crate::components::performance_window::PerformanceWindow>>,
+    /// Virtual Speaker — the Control Room's listening simulation.
+    pub virtual_speaker:
+        Option<gpui::WindowHandle<crate::components::virtual_speaker_window::VirtualSpeakerWindow>>,
     /// SysEx Editor — clip and marker System Exclusive messages.
     pub sysex_editor:
         Option<gpui::WindowHandle<crate::components::sysex_editor_window::SysExEditorWindow>>,
@@ -2111,6 +2114,120 @@ impl StudioLayout {
         ) {
             Ok(handle) => self.external_windows.sysex_editor = Some(handle),
             Err(err) => eprintln!("[sysex-editor] failed to open window: {err}"),
+        }
+    }
+
+    /// The Control Room's listening simulation as it stands: on or off as
+    /// set this session (always off at launch), on the playback system and
+    /// listening device last chosen, which the settings remember.
+    pub(crate) fn listening_simulation(
+        &self,
+        cx: &gpui::App,
+    ) -> solfege_spatialaudio::SimulationSettings {
+        if let Some(settings) = self.listening_simulation {
+            return settings;
+        }
+        let playback = &self.settings.read(cx).current.playback;
+        solfege_spatialaudio::SimulationSettings {
+            enabled: false,
+            profile: solfege_spatialaudio::ListeningProfile::from_token(
+                &playback.virtual_speaker_profile,
+            )
+            .unwrap_or_default(),
+            device: solfege_spatialaudio::ListeningDevice::from_token(
+                &playback.virtual_speaker_device,
+            )
+            .unwrap_or_default(),
+        }
+    }
+
+    fn virtual_speaker_snapshot(
+        &self,
+        cx: &gpui::App,
+    ) -> crate::components::virtual_speaker_window::VirtualSpeakerSnapshot {
+        crate::components::virtual_speaker_window::VirtualSpeakerSnapshot {
+            settings: self.listening_simulation(cx),
+            control_room_in_path: self.timeline.read(cx).state.monitor.control_room_enabled,
+            engine_ready: self.audio_bridge.engine.is_some(),
+        }
+    }
+
+    /// Apply a Virtual Speaker choice: to the engine at once (the Control
+    /// Room fades between systems itself), to the settings for the next
+    /// session, and to the window.
+    pub(crate) fn set_listening_simulation(
+        &mut self,
+        settings: solfege_spatialaudio::SimulationSettings,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.listening_simulation(cx);
+        self.listening_simulation = Some(settings);
+        if let Some(engine) = self.audio_bridge.engine.as_ref() {
+            let _ = engine.set_listening_simulation(settings);
+        }
+        if before.profile != settings.profile || before.device != settings.device {
+            self.settings.update(cx, |store, cx| {
+                store.update_setting(
+                    |schema| {
+                        schema.playback.virtual_speaker_profile =
+                            settings.profile.token().to_string();
+                        schema.playback.virtual_speaker_device =
+                            settings.device.token().to_string();
+                    },
+                    cx,
+                );
+            });
+        }
+        let snapshot = self.virtual_speaker_snapshot(cx);
+        if let Some(handle) = self.external_windows.virtual_speaker.clone() {
+            if handle
+                .update(cx, |view, _window, cx| view.set_snapshot(snapshot, cx))
+                .is_err()
+            {
+                self.external_windows.virtual_speaker = None;
+            }
+        }
+        self.notify_status_bar_if_changed(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn open_virtual_speaker_window(
+        &mut self,
+        owner_bounds: Option<Bounds<gpui::Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.virtual_speaker_snapshot(cx);
+        if let Some(handle) = self.external_windows.virtual_speaker.clone() {
+            if handle
+                .update(cx, |view, window, cx| {
+                    view.set_snapshot(snapshot, cx);
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            self.external_windows.virtual_speaker = None;
+        }
+
+        // The window hands a choice back; the Studio applies it after the
+        // window's own update has returned, never inside it.
+        let owner = cx.entity().clone();
+        let on_change: crate::components::virtual_speaker_window::SimulationChangeCb =
+            Arc::new(move |settings, app: &mut gpui::App| {
+                StudioLayout::defer_update(&owner, app, move |layout, cx| {
+                    layout.set_listening_simulation(settings, cx);
+                });
+            });
+
+        match crate::components::virtual_speaker_window::open_virtual_speaker_window(
+            owner_bounds,
+            snapshot,
+            on_change,
+            cx,
+        ) {
+            Ok(handle) => self.external_windows.virtual_speaker = Some(handle),
+            Err(err) => eprintln!("[virtual-speaker] failed to open window: {err}"),
         }
     }
 

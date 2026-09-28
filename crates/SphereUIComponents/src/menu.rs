@@ -226,6 +226,7 @@ mod tests {
             "window:audio-jam",
             "window:extensions",
             "window:performance",
+            "window:virtual-speaker",
             "panel:toggle-bottom",
         ] {
             assert!(

@@ -2328,6 +2328,15 @@ impl EngineInner {
         self.send_command(EngineCommand::SetMonitorControl { control })
     }
 
+    /// Set the Control Room's listening simulation (Virtual Speaker).
+    pub fn set_listening_simulation(
+        &self,
+        settings: solfege_spatialaudio::SimulationSettings,
+    ) -> Result<(), SphereAudioError> {
+        self.monitor_mirror.lock().simulation = settings;
+        self.send_command(EngineCommand::SetListeningSimulation { settings })
+    }
+
     /// Select the hardware output pair the Control Room feeds.
     pub fn set_monitor_output(
         &self,
@@ -5473,6 +5482,7 @@ impl EngineInner {
                 EngineCommand::SetMonitorSource { .. } => "SetMonitorSource",
                 EngineCommand::SetMonitorControl { .. } => "SetMonitorControl",
                 EngineCommand::SetMonitorOutput { .. } => "SetMonitorOutput",
+                EngineCommand::SetListeningSimulation { .. } => "SetListeningSimulation",
                 EngineCommand::SetHardwareOutputOwnership { .. } => "SetHardwareOutputOwnership",
                 EngineCommand::SetTrackListen { .. } => "SetTrackListen",
                 EngineCommand::SetTrackSpatial { .. } => "SetTrackSpatial",
@@ -6134,6 +6144,11 @@ where
                         }
                         EngineCommand::SetMonitorOutput { target } => {
                             runtime.monitor.output = target;
+                        }
+                        EngineCommand::SetListeningSimulation { settings } => {
+                            if let Some(simulator) = runtime.monitor.simulator.as_deref_mut() {
+                                simulator.configure(settings);
+                            }
                         }
                         EngineCommand::SetHardwareOutputOwnership {
                             owner,
@@ -8867,6 +8882,7 @@ struct MonitorMirror {
     master_output: Option<(u16, u16)>,
     /// Listen taps by track id: indices move between graphs, ids do not.
     listen: HashMap<String, crate::monitor::ListenMode>,
+    simulation: solfege_spatialaudio::SimulationSettings,
 }
 
 impl MonitorMirror {
@@ -8890,6 +8906,9 @@ impl MonitorMirror {
         runtime.monitor.output = self.output.clone();
         runtime.monitor.hardware_owner = self.hardware_owner;
         runtime.monitor.master_output = self.master_output;
+        if let Some(simulator) = runtime.monitor.simulator.as_deref_mut() {
+            simulator.configure_now(self.simulation);
+        }
         for track in runtime.tracks.iter_mut() {
             track.listen = self
                 .listen
