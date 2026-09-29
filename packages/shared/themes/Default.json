@@ -198,6 +198,12 @@
       "rulerText": "#D3D7DE",
       "selection": "#2FC9D62E"
     },
+    "piano": {
+      "whiteKey": "#E4E6EA",
+      "blackKey": "#15171C",
+      "keySeam": "#A3A8B2",
+      "keyLabel": "#4A505C"
+    },
     "track": {
       "audio": "#38C7B4",
       "midi": "#E8B75C",

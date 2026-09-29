@@ -249,6 +249,26 @@ impl EditorMeter {
         Self { segments }
     }
 
+    /// `bar.beat` of a project beat, numbered the way the ruler numbers bars
+    /// (1-based, counting through every meter change). Before the song start
+    /// reads as its first beat.
+    pub fn bar_beat_label(&self, beat: f32) -> String {
+        let beat = beat.max(0.0);
+        let Some(seg) = self
+            .segments
+            .iter()
+            .find(|seg| beat >= seg.start && beat < seg.end)
+            .or(self.segments.last())
+        else {
+            return "1.1".to_string();
+        };
+        let into = (beat - seg.start).max(0.0);
+        let bar = seg.first_bar + (into / seg.bar_beats).floor() as i64;
+        let in_bar = into - (into / seg.bar_beats).floor() * seg.bar_beats;
+        let counted = (in_bar / seg.beat_unit.max(0.0001)).floor() as i64 + 1;
+        format!("{bar}.{}", counted.clamp(1, seg.beats.max(1) as i64))
+    }
+
     /// Segments overlapping `[start, end]`.
     fn overlapping(&self, start: f32, end: f32) -> impl Iterator<Item = &MeterSegment> {
         self.segments
@@ -557,7 +577,9 @@ struct PianoRollTheme {
 
 fn piano_roll_theme() -> PianoRollTheme {
     PianoRollTheme {
-        key_lane_width: 72.0,
+        // Room for a keyboard's worth of key and, under it, the controller
+        // lane's selector with its name readable.
+        key_lane_width: 84.0,
     }
 }
 
@@ -1671,8 +1693,14 @@ impl PianoRoll {
     /// What the pointer is over, or what the gesture in flight is doing — the
     /// footer's live readout. The counts sit beside it, separately.
     fn pointer_status(&self) -> String {
+        // Where the pointer is on the song, the way the ruler says it — not
+        // a beat count from the clip's start, which reads negative left of it.
         let pointer = match (self.hover_pitch, self.hover_beat) {
-            (Some(pitch), Some(beat)) => format!("{} @ {:.2}", note_name(pitch as i32), beat),
+            (Some(pitch), Some(beat)) => format!(
+                "{} · {}",
+                note_name(pitch as i32),
+                self.meter.bar_beat_label(self.edit_origin() + beat)
+            ),
             _ => String::new(),
         };
         match &self.drag {
@@ -6819,6 +6847,21 @@ mod editor_meter_tests {
             marks.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
             vec!["1", "2", "3", "4", "5", "6", "7"]
         );
+    }
+
+    #[test]
+    fn pointer_positions_read_as_the_time_signature_map_counts_them() {
+        let map = four_then_three();
+        let meter = EditorMeter::from_map(&map);
+        for beat in [0.0_f32, 1.0, 3.5, 4.0, 7.9, 8.0, 9.0, 10.5, 11.0, 17.0] {
+            let bb = map.bar_beat_at_beat(f64::from(beat));
+            assert_eq!(
+                meter.bar_beat_label(beat),
+                format!("{}.{}", bb.bar, bb.beat_in_bar),
+                "beat {beat}"
+            );
+        }
+        assert_eq!(meter.bar_beat_label(-4.0), "1.1");
     }
 
     #[test]

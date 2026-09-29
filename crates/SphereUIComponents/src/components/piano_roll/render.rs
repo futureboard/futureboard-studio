@@ -748,11 +748,13 @@ impl PianoRoll {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(space::SNUG))
+            // A column-filling trigger lives in a narrow column; its padding
+            // tightens so the value keeps the room.
+            .gap(px(if fill { space::TIGHT } else { space::SNUG }))
             .h(px(size::DEFAULT))
             .when(fill, |t| t.w_full())
-            .pl(px(space::BASE))
-            .pr(px(space::SNUG))
+            .pl(px(if fill { space::SNUG } else { space::BASE }))
+            .pr(px(if fill { space::TIGHT } else { space::SNUG }))
             .rounded(px(radius::CONTROL))
             .bg(rest)
             .border(px(1.0))
@@ -1971,15 +1973,18 @@ impl PianoRoll {
         let scale_active = scale.kind != ScaleKind::Chromatic;
         let pressed = self.key_lane_pressed_pitch;
 
-        // Resolved once here; the paint closure only fills quads.
-        let lane = Colors::surface_panel();
-        let white = Colors::composite(lane, Colors::with_alpha(Colors::text_primary(), 0.10));
-        let white_out = Colors::composite(lane, Colors::with_alpha(Colors::text_primary(), 0.03));
-        let black = Colors::surface_canvas();
-        let black_out = Colors::composite(black, Colors::with_alpha(lane, 0.45));
-        let root_wash = Colors::accent_active();
-        let press = Colors::with_alpha(Colors::accent_primary(), 0.55);
-        let seam = Colors::with_alpha(Colors::surface_canvas(), 0.95);
+        // Resolved once here; the paint closure only fills quads. Keys out of
+        // the scale are shaded toward the canvas; the scale's root and the
+        // sounding key take the accent.
+        let white = Colors::piano_white_key();
+        let black = Colors::piano_black_key();
+        let shade = Colors::with_alpha(Colors::surface_canvas(), 0.38);
+        let white_out = Colors::composite(white, shade);
+        let black_out = Colors::composite(black, Colors::with_alpha(white, 0.10));
+        let root_wash = Colors::with_alpha(Colors::accent_primary(), 0.28);
+        let press = Colors::with_alpha(Colors::accent_primary(), 0.62);
+        let seam = Colors::piano_key_seam();
+        let key_label = Colors::piano_key_label();
 
         let mut whites: Vec<(f32, f32, gpui::Rgba)> = Vec::new();
         let mut blacks: Vec<(f32, f32, gpui::Rgba)> = Vec::new();
@@ -2021,14 +2026,12 @@ impl PianoRoll {
             // and every white key once rows are tall enough to read them.
             let is_c = p % 12 == 0;
             if is_c || is_root || is_pressed || row_h >= 14.0 {
-                let color = if is_pressed {
-                    Colors::text_primary()
-                } else if is_root {
-                    Colors::accent_primary()
-                } else if is_c {
-                    Colors::text_secondary()
+                // Dark on the white key; the octave and the root are set in
+                // full strength and weight, the rest quieter.
+                let color = if is_c || is_root || is_pressed {
+                    key_label
                 } else {
-                    Colors::text_faint()
+                    Colors::with_alpha(key_label, 0.62)
                 };
                 let center = (top + bottom) * 0.5;
                 labels.push(
@@ -2138,22 +2141,22 @@ impl PianoRoll {
             .border_r(px(1.0))
             .border_color(Colors::panel_border())
             .bg(Colors::surface_panel())
+            // The selector takes the whole width so the lane's name reads.
             .child(
                 div()
                     .absolute()
                     .top(px(space::TIGHT))
                     .left(px(space::TIGHT))
                     .right(px(space::TIGHT))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(space::HAIR))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(self.render_lane_selector(cx)),
-                    )
+                    .child(self.render_lane_selector(cx)),
+            )
+            .children(scale_labels)
+            // Hide sits at the foot, where the lane folds down to.
+            .child(
+                div()
+                    .absolute()
+                    .left(px(space::TIGHT))
+                    .bottom(px(space::TIGHT))
                     .child(
                         bar_icon_button(
                             "pr-lane-toggle",
@@ -2165,7 +2168,6 @@ impl PianoRoll {
                         .size(px(size::DENSE)),
                     ),
             )
-            .children(scale_labels)
             .into_any_element()
     }
 

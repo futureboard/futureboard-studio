@@ -358,8 +358,10 @@ impl StudioLayout {
         // references a bus.
         match edit {
             ConnectionEdit::OpenAudioDeviceSetup => {
+                // "Audio device setup" is the Audio page, not whichever page
+                // Preferences opens on.
                 let owner = self.audio_connections_window_bounds(cx);
-                self.open_settings_dialog(owner, cx);
+                self.open_settings_dialog_on_tab(owner, Some(SettingsTab::Audio), cx);
                 return;
             }
             ConnectionEdit::RequestRemove { id } => {

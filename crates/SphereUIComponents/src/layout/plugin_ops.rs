@@ -3763,6 +3763,9 @@ impl StudioLayout {
                         this.plugin_catalog.cache_present = true;
                         this.plugin_catalog.status = PluginCatalogStatus::Ready;
                         this.update_add_track_instrument_plugins(cx);
+                        // The Browser's Instruments tab reads the same database;
+                        // a catalog that changed (a scan finished) changes it too.
+                        this.spawn_browser_instruments_load(cx);
                         if debug {
                             eprintln!(
                                 "[plugin-db] loaded rows={count} sqlite_ms={sqlite_ms} path={} total_ms={}",

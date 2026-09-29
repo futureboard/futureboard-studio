@@ -135,6 +135,52 @@ impl StudioLayout {
         })
         .detach();
     }
+    /// Read the Instruments tab's list from the plug-in database, off the UI
+    /// thread. Only the database: an instrument it does not list — or lists
+    /// without a `.pst` — is not offered.
+    pub(crate) fn spawn_browser_instruments_load(&mut self, cx: &mut Context<Self>) {
+        if self.file_browser.instruments_load
+            == crate::components::file_browser::InstrumentsLoad::Loading
+        {
+            return;
+        }
+        self.file_browser.mark_instruments_loading();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    use SpherePluginHost::plugin_db;
+                    // No database yet is not an error: nothing has been scanned.
+                    if !plugin_db::database_exists() {
+                        return Ok(Vec::new());
+                    }
+                    let conn = plugin_db::open_database_readonly()?;
+                    plugin_db::instrument_presets(&conn)
+                        .map_err(|error| error.to_string())
+                        .map(|list| {
+                            list.into_iter()
+                                .map(|i| crate::components::file_browser::BrowserInstrument {
+                                    name: i.name,
+                                    vendor: i.vendor,
+                                    format: i.format.label().to_string(),
+                                    category: i.category,
+                                    preset_path: i.preset_path,
+                                })
+                                .collect()
+                        })
+                })
+                .await;
+            let _ = this.update(cx, move |this, cx| {
+                if let Err(error) = &result {
+                    eprintln!("[browser] instrument list failed: {error}");
+                }
+                this.file_browser.apply_instruments(result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Run a single-level directory scan on the GPUI background executor,
     /// then push the result back into `file_browser.index` on the UI
     /// thread. Never blocks render — this is the only place `read_dir`

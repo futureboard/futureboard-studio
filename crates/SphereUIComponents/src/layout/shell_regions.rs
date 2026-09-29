@@ -115,6 +115,14 @@ impl StudioLayout {
         let i18n = crate::i18n::I18n::from_app(cx);
         self.browser_search_input.placeholder = Some(i18n.tr("search.browser.placeholder"));
         let active_panel = self.active_panel;
+        // The Instruments tab is the first one shown; read its list the first
+        // time it is on screen.
+        if self.file_browser.tab == crate::components::file_browser::BrowserTab::Instruments
+            && self.file_browser.instruments_load
+                == crate::components::file_browser::InstrumentsLoad::NotLoaded
+        {
+            self.spawn_browser_instruments_load(cx);
+        }
 
         // ── File browser callbacks ──────────────────────────────────────
         let on_browser_search_context: std::sync::Arc<
@@ -201,13 +209,15 @@ impl StudioLayout {
             })
         };
         // Double-click on an audio file imports it onto the timeline using the
-        // existing waveform-cache + import_audio_at path.
+        // existing waveform-cache + import_audio_at path; on a plug-in `.pst`
+        // it does what dropping it on the arrangement does — an instrument
+        // gets its own track, an effect goes on the selected track.
         let on_browser_activate: std::sync::Arc<
             dyn Fn(&PathBuf, &mut Window, &mut gpui::App) + 'static,
         > = {
             let timeline = self.timeline.clone();
             let layout = cx.entity().clone();
-            std::sync::Arc::new(move |path: &PathBuf, _w, cx| {
+            std::sync::Arc::new(move |path: &PathBuf, window, cx| {
                 // Filter on extension before mutating timeline state so
                 // double-clicking a non-audio file (e.g. .txt, .png) does
                 // not create a phantom clip with the 8-bar fallback
@@ -217,6 +227,24 @@ impl StudioLayout {
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_ascii_lowercase())
                     .unwrap_or_default();
+                if ext == "pst" {
+                    let preset = path.clone();
+                    let selected_track =
+                        timeline.read(cx).state.selection.selected_track_id.clone();
+                    StudioLayout::defer_update_in_window(
+                        &layout,
+                        window,
+                        cx,
+                        move |this, _window, cx| {
+                            this.apply_dropped_plugin_preset(
+                                selected_track.as_deref(),
+                                &preset,
+                                cx,
+                            );
+                        },
+                    );
+                    return;
+                }
                 if !is_supported_audio_ext(&ext) {
                     eprintln!(
                         "[import] ignoring non-audio activation: ext='{}' path={}",
@@ -300,6 +328,8 @@ impl StudioLayout {
                         this.file_browser.mark_loading(p.clone());
                         this.spawn_directory_load(cx, p);
                     }
+                    // Rescan re-reads the plug-in database too.
+                    this.spawn_browser_instruments_load(cx);
                     cx.notify();
                 });
             })
@@ -329,7 +359,27 @@ impl StudioLayout {
             })
         };
 
+        let on_browser_select_tab: std::sync::Arc<
+            dyn Fn(&crate::components::file_browser::BrowserTab, &mut Window, &mut gpui::App)
+                + 'static,
+        > = {
+            let this = cx.entity().clone();
+            std::sync::Arc::new(move |tab, _w, cx| {
+                let tab = *tab;
+                let _ = this.update(cx, |this, cx| {
+                    if this.file_browser.set_tab(tab) {
+                        this.spawn_browser_instruments_load(cx);
+                    }
+                    this.drain_browser_directory_loads(cx);
+                    this.browser_scroll
+                        .scroll_to_item(0, gpui::ScrollStrategy::Top);
+                    cx.notify();
+                });
+            })
+        };
+
         let browser_callbacks = components::BrowserCallbacks {
+            on_select_tab: on_browser_select_tab,
             on_toggle: on_browser_toggle,
             on_select: on_browser_select,
             on_reveal: on_browser_reveal,

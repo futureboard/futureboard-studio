@@ -14,46 +14,45 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, svg, App, AppContext, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window,
+    App, AppContext, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    StatefulInteractiveElement, Styled, Window, div, px, svg,
 };
 
 use crate::assets;
 use crate::audio_connections::AudioConnectionRegistry;
 use crate::components::color_picker::{
-    color_picker_field, default_presets, ColorPickerCallbacks, ColorPickerPlacement,
-    ColorPickerState,
+    ColorPickerCallbacks, ColorPickerPlacement, ColorPickerState, color_picker_field,
+    default_presets,
 };
 use crate::components::combo_box::{combo_box_string_menu, combo_box_trigger};
 use crate::components::controls::{
-    fb_button, fb_checkbox, fb_form_row, fb_segment, fb_segmented_track, fb_shortcut_hint,
-    FbButtonKind, FbSegment,
+    FbButtonKind, FbSegment, fb_button, fb_checkbox, fb_segment, fb_segmented_track,
+    fb_shortcut_hint,
 };
 use crate::components::inspector::{
-    inspector_checkbox as shared_inspector_checkbox, inspector_hint_text, inspector_mini_button,
-    inspector_numeric_stepper, inspector_numeric_stepper_coarse,
-    inspector_numeric_stepper_with_drag_callbacks, inspector_row as shared_inspector_row,
-    inspector_section as shared_inspector_section, inspector_select, InspectorSelectOption,
+    InspectorSelectOption, inspector_checkbox as shared_inspector_checkbox, inspector_hint_text,
+    inspector_mini_button, inspector_numeric_stepper, inspector_numeric_stepper_coarse,
+    inspector_numeric_stepper_with_drag_callbacks, inspector_select,
 };
 use crate::components::inspector_kit;
 use crate::components::reorder::{
-    insert_drop_forwarder, insert_drop_target, DragRefusal, DropIndicator, DropSlot, InsertDropCb,
-    InsertDropTarget,
+    DragRefusal, DropIndicator, DropSlot, InsertDropCb, InsertDropTarget, insert_drop_forwarder,
+    insert_drop_target,
 };
 use crate::components::slider::{bipolar_slider_with_drag_callbacks, slider_with_drag_callbacks};
 use crate::components::solfege_editor::SolfegePitchSummary;
 use crate::components::text_input::{
-    text_field_with_callbacks, TextInputCallbacks, TextInputState,
+    TextInputCallbacks, TextInputState, text_field_with_callbacks,
 };
 use crate::components::timeline::timeline_state::{
-    volume, vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
     AudioClipStretchState, ClipType, InsertLoadStatus, InsertSlotState, StretchTiming,
-    TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting, TrackState, TrackType,
+    TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting, TrackState, TrackType, volume,
+    vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
 };
 use crate::i18n::I18n;
-use crate::overlay::{inspector_combo_menu_position, OverlayAnchor};
+use crate::overlay::{OverlayAnchor, inspector_combo_menu_position};
 use crate::solfege::{ModelLoadState, SolfegeModelInfo};
-use crate::theme::{space, typography, Colors};
+use crate::theme::{Colors, space, typography};
 use sphere_midi_service::mpe::{MpeOutputMode, MpeTrackConfiguration};
 use sphere_midi_service::program::{MidiPatchFormat, MidiProgramSelection, XG_DRUM_BANK_MSB};
 
@@ -507,16 +506,7 @@ fn inspector_shell(active: bool, i18n: I18n) -> gpui::Div {
 
 /// Scrollable body wrapper shared by every populated inspector view.
 fn scroll_body() -> gpui::Stateful<gpui::Div> {
-    div()
-        .id("inspector-scroll")
-        .flex_1()
-        .min_h_0()
-        .overflow_y_scroll()
-        .flex()
-        .flex_col()
-        .px(px(10.0))
-        .py(px(10.0))
-        .gap(px(12.0))
+    inspector_kit::ins_body("inspector-scroll")
 }
 
 fn no_selection(track_count: usize, i18n: I18n) -> impl IntoElement {
@@ -1411,42 +1401,42 @@ fn routing_section(
     match track.track_type {
         TrackType::Audio => {
             rows = rows
-                .child(fb_form_row("Format", format_selector(track, callbacks)))
-                .child(fb_form_row(
+                .child(field_row("Format", format_selector(track, callbacks)))
+                .child(field_row(
                     "Input",
                     audio_input_selector(track, connections, callbacks),
                 ))
-                .child(fb_form_row("Output", output_selector(track, callbacks)));
+                .child(field_row("Output", output_selector(track, callbacks)));
         }
         TrackType::Instrument => {
             rows = rows
-                .child(fb_form_row(
+                .child(field_row(
                     "MIDI Input",
                     midi_input_selector(track, callbacks),
                 ))
-                .child(fb_form_row(
+                .child(field_row(
                     "MIDI Ch",
                     midi_channel_selector(track, callbacks),
                 ))
-                .child(fb_form_row("Output", output_selector(track, callbacks)));
+                .child(field_row("Output", output_selector(track, callbacks)));
         }
         TrackType::Midi => {
             rows = rows
-                .child(fb_form_row(
+                .child(field_row(
                     "MIDI Input",
                     midi_input_selector(track, callbacks),
                 ))
-                .child(fb_form_row(
+                .child(field_row(
                     "MIDI Ch",
                     midi_channel_selector(track, callbacks),
                 ))
-                .child(fb_form_row(
+                .child(field_row(
                     "MIDI Out",
                     midi_output_selector(track, instrument_targets, callbacks),
                 ));
         }
         TrackType::Bus | TrackType::Return | TrackType::Group | TrackType::Master => {
-            rows = rows.child(fb_form_row("Output", output_selector(track, callbacks)));
+            rows = rows.child(field_row("Output", output_selector(track, callbacks)));
         }
         // A Video track has no audio path, so it exposes no routing controls.
         TrackType::Video => {}
@@ -1572,10 +1562,10 @@ fn program_section(track: &TrackState, callbacks: &InspectorCallbacks) -> impl I
         .map(|program| selection.patch_name(program, channel))
         .unwrap_or_else(|| "None".to_string());
 
-    let mut rows = section_rows().child(fb_form_row("Patch Set", format));
+    let mut rows = section_rows().child(field_row("Patch Set", format));
     if selection.format.has_banks() {
         rows = rows
-            .child(fb_form_row(
+            .child(field_row(
                 "Bank",
                 combo(
                     "inspector-program-bank-combo",
@@ -1583,7 +1573,7 @@ fn program_section(track: &TrackState, callbacks: &InspectorCallbacks) -> impl I
                     InspectorRoutingCombo::ProgramBank,
                 ),
             ))
-            .child(fb_form_row(
+            .child(field_row(
                 "Bank LSB",
                 combo(
                     "inspector-program-bank-lsb-combo",
@@ -1592,7 +1582,7 @@ fn program_section(track: &TrackState, callbacks: &InspectorCallbacks) -> impl I
                 ),
             ));
     }
-    rows = rows.child(fb_form_row(
+    rows = rows.child(field_row(
         "Program",
         combo(
             "inspector-program-combo",
@@ -1724,10 +1714,10 @@ fn mpe_section(track: &TrackState, callbacks: &InspectorCallbacks) -> impl IntoE
         "MPE",
         callbacks,
         section_rows()
-            .child(fb_form_row("Mode", mode))
-            .child(fb_form_row("Members", members))
-            .child(fb_form_row("Member Range", member_range))
-            .child(fb_form_row("Manager Range", manager_range))
+            .child(field_row("Mode", mode))
+            .child(field_row("Members", members))
+            .child(field_row("Member Range", member_range))
+            .child(field_row("Manager Range", manager_range))
             .child(inspector_hint_text(hint)),
     )
 }
@@ -1998,48 +1988,30 @@ fn instrument_section(track: &TrackState, callbacks: &InspectorCallbacks) -> gpu
     } else {
         plugin_slot_name(slot, "No Instrument")
     };
-    let mut section = section_rows()
-        .child(kv_row("Plugin", slot_name))
-        .child(kv_row(
-            "Format",
-            slot.map(plugin_format_label).unwrap_or("-").to_string(),
-        ))
-        .child(kv_row(
-            "State",
-            slot.map(plugin_state_label)
-                .unwrap_or_else(|| "Empty".to_string()),
-        ))
-        .child(kv_row("MIDI Input", track.routing.midi_input.label()))
-        .child(kv_row(
-            "MIDI Ch",
-            track
-                .routing
-                .midi_channel
-                .map(|ch| ch.to_string())
-                .unwrap_or_else(|| "All".to_string()),
-        ))
-        .child(kv_row("Output", track.routing.output.label()));
-
+    let mut section = section_rows();
     if let Some(slot) = slot {
         section = section
-            .child(fb_form_row(
-                "VSTi Outputs",
-                vsti_output_selector(slot, callbacks),
-            ))
             // The instrument is a chain of one, so it gets the same row every
             // effect gets: power, name, editor, bin.
-            .child(plugin_slot_row(track, slot, 0, 1, callbacks, true, 0.0));
+            .child(plugin_slot_row(track, slot, 0, 1, callbacks, true, 0.0))
+            .child(field_row("Outputs", vsti_output_selector(slot, callbacks)));
     } else if track.solfege.is_some() {
-        section = section.child(kv_row("Details", "Open the Solfege tab"));
+        section = section
+            .child(inspector_kit::ins_value_muted(slot_name))
+            .child(inspector_kit::ins_value_muted(
+                "Its voice and model are on the Solfège tab.",
+            ));
     } else if track.builtin_soundfont_player {
         let track_id = track.id.clone();
         let open = callbacks.on_open_soundfont_player.clone();
-        section = section.child(compact_action_button(
-            "soundfont-player-open",
-            "Open",
-            true,
-            move |_, w, cx| open(&track_id.clone(), w, cx),
-        ));
+        section = section
+            .child(inspector_kit::ins_value_muted(slot_name))
+            .child(compact_action_button(
+                "soundfont-player-open",
+                "Open",
+                true,
+                move |_, w, cx| open(&track_id.clone(), w, cx),
+            ));
     } else {
         let track_id = track.id.clone();
         let picker = callbacks.on_open_insert_picker.clone();
@@ -2529,11 +2501,6 @@ fn track_inspector(
     // pans into that bus.
     let in_room = spatial_format.is_spatial() && track.track_type != TrackType::Master;
     let placed = in_room && !matches!(track.routing.output, TrackOutputRouting::Bus { .. });
-    let automation_points: usize = track
-        .automation_lanes
-        .iter()
-        .map(|lane| lane.points.len())
-        .sum();
     let tid = track.id.clone();
 
     // ── Volume slider + dB readout ──────────────────────────────────────
@@ -2735,30 +2702,34 @@ fn track_inspector(
 
     let type_label = track_type_label(i18n, track.track_type);
     scroll_body()
-        .child(inspector_header(
-            track_type_color(track.track_type),
-            track.name.clone(),
-            type_label.clone(),
-        ))
+        // Who this is — the track's own colour, its name, its kind — and the
+        // four switches it is played with, before any section.
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::BASE))
+                .child(inspector_kit::ins_identity(
+                    track.color,
+                    track.name.clone(),
+                    type_label,
+                ))
+                .child(state_row),
+        )
         .child(section_card(
             "track",
             &i18n.tr("inspector.section.track"),
             callbacks,
             section_rows()
-                .child(fb_form_row(
-                    i18n.tr("inspector.field.type"),
-                    inspector_kit::ins_value(type_label),
-                ))
-                .child(fb_form_row(
+                .child(field_row(
                     "Name",
                     text_field_with_callbacks(name_input, name_focused, name_callbacks),
                 ))
-                .child(fb_form_row(i18n.tr("inspector.field.volume"), volume_row))
+                .child(field_row(i18n.tr("inspector.field.volume"), volume_row))
                 .when(!placed, |rows| {
-                    rows.child(fb_form_row(i18n.tr("inspector.field.pan"), pan_row))
+                    rows.child(field_row(i18n.tr("inspector.field.pan"), pan_row))
                 })
-                .child(fb_form_row("Color", color_field(color_picker)))
-                .child(fb_form_row(i18n.tr("inspector.section.state"), state_row)),
+                .child(field_row("Color", color_field(color_picker))),
         ))
         .when(in_room, |this| {
             this.child(spatial_section(track, spatial_format, placed, callbacks))
@@ -2785,23 +2756,6 @@ fn track_inspector(
             matches!(track.track_type, TrackType::Audio | TrackType::Instrument),
             |this| this.child(insert_effects_section(track, callbacks)),
         )
-        .child(section_card(
-            "contents",
-            "Contents",
-            callbacks,
-            section_rows()
-                .child(kv_row(
-                    i18n.tr("inspector.field.clips"),
-                    track.clips.len().to_string(),
-                ))
-                .child(kv_row("Inserts", track.effect_inserts().len().to_string()))
-                .child(kv_row("Sends", track.sends.len().to_string()))
-                .child(kv_row(
-                    "Automation Lanes",
-                    track.automation_lanes.len().to_string(),
-                ))
-                .child(kv_row("Automation Points", automation_points.to_string())),
-        ))
 }
 
 /// The rest of a channel's placement in a spatial mix, beside the room
@@ -2851,14 +2805,14 @@ fn spatial_section(
         title,
         callbacks,
         section_rows()
-            .child(fb_form_row(
+            .child(field_row(
                 "Position",
                 inspector_kit::ins_value(crate::components::mixer_panel::describe_room_position(
                     &params,
                 )),
             ))
             .when(format.has_height(), |rows| {
-                rows.child(fb_form_row(
+                rows.child(field_row(
                     "Height",
                     row(
                         "inspector-spatial-height",
@@ -2873,7 +2827,7 @@ fn spatial_section(
                     ),
                 ))
             })
-            .child(fb_form_row(
+            .child(field_row(
                 "Spread",
                 row(
                     "inspector-spatial-spread",
@@ -2887,7 +2841,7 @@ fn spatial_section(
                     },
                 ),
             ))
-            .child(fb_form_row(
+            .child(field_row(
                 "Width",
                 row(
                     "inspector-spatial-width",
@@ -2905,7 +2859,7 @@ fn spatial_section(
                 ),
             ))
             .when(format.has_lfe(), |rows| {
-                rows.child(fb_form_row(
+                rows.child(field_row(
                     "LFE",
                     row(
                         "inspector-spatial-lfe",
@@ -3003,6 +2957,12 @@ fn inspector_section(label: impl Into<String>, child: impl IntoElement) -> impl 
 }
 
 fn compact_property_row(label: impl Into<String>, child: impl IntoElement) -> impl IntoElement {
+    inspector_kit::ins_row(label, child)
+}
+
+/// Label on the left, control on the right — the one row shape every section
+/// of this panel uses.
+fn field_row(label: impl Into<String>, child: impl IntoElement) -> impl IntoElement {
     inspector_kit::ins_row(label, child)
 }
 
@@ -3680,7 +3640,6 @@ fn clip_inspector(
             .map(file_name_from_path)
             .unwrap_or_else(|| "Missing source".to_string());
         let path = clip.source_path.unwrap_or("-");
-        let gain_db = linear_gain_to_db(clip.gain);
         let muted_id = clip.clip_id.to_string();
         let mute_cb = callbacks.on_set_clip_muted.clone();
         let s = clip.stretch;
@@ -3693,67 +3652,14 @@ fn clip_inspector(
             n
         };
         let mut body = scroll_body()
-            .gap(px(10.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .w(px(4.0))
-                                    .h(px(30.0))
-                                    .rounded(px(crate::theme::radius::CONTROL))
-                                    .bg(Colors::accent_primary()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(13.0))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(Colors::text_primary())
-                                    .child(clip.name.to_string()),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .px(px(7.0))
-                                    .py(px(2.0))
-                                    .rounded(px(crate::theme::radius::CONTROL))
-                                    .bg(Colors::with_alpha(Colors::accent_primary(), 0.16))
-                                    .text_size(px(typography::DENSE_CAPTION))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(Colors::accent_primary())
-                                    .child("Audio Clip"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .pl(px(12.0))
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(10.5))
-                            .text_color(Colors::text_muted())
-                            .child(format!(
-                                "{} • {} source • Gain {:.1} dB",
-                                clip.track_name, source_duration, gain_db
-                            )),
-                    ),
-            )
+            .child(inspector_kit::ins_identity(
+                Colors::track_audio(),
+                clip.name.to_string(),
+                format!("Audio clip · {}", clip.track_name),
+            ))
             .child(inspector_section(
                 i18n.tr("inspector.section.clip"),
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
+                section_rows()
                     .child(compact_property_row(
                         "Name",
                         text_field_with_callbacks(
@@ -3761,14 +3667,7 @@ fn clip_inspector(
                             clip_name_focused,
                             clip_name_callbacks.clone(),
                         ),
-                    )),
-            ))
-            .child(inspector_section(
-                "TIMING",
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
+                    ))
                     .child(compact_property_row(
                         i18n.tr("inspector.clip.start"),
                         beat_stepper(
@@ -3797,11 +3696,8 @@ fn clip_inspector(
                     )),
             ))
             .child(inspector_section(
-                "AUDIO",
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
+                "Audio",
+                section_rows()
                     .child(compact_property_row(
                         "Muted",
                         fb_checkbox("clip-muted", "Muted", clip.muted, true, move |_, w, cx| {
@@ -3863,48 +3759,17 @@ fn clip_inspector(
                 "Time & Pitch",
                 stretch_section_body(&clip, s, clip.project_bpm, &tempo, &stretch_cb, callbacks),
             ))
-            .child(shared_inspector_section(
+            .child(inspector_section(
                 "Source",
-                None::<String>,
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
-                    .child(shared_inspector_row(
-                        "File",
-                        false,
-                        truncate_value(file_name),
-                    ))
-                    .child(shared_inspector_row(
+                section_rows()
+                    .child(compact_property_row("File", truncate_value(file_name)))
+                    .child(compact_property_row(
                         "Duration",
-                        false,
                         truncate_value(source_duration),
                     ))
-                    .child(shared_inspector_row(
+                    .child(compact_property_row(
                         "Path",
-                        false,
                         truncate_value(path.to_string()),
-                    ))
-                    .child(shared_inspector_row(
-                        "",
-                        false,
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap(px(4.0))
-                            // TODO(source-actions): reveal/replace need shell + relink callbacks.
-                            .child(compact_action_button(
-                                "clip-reveal",
-                                "Reveal",
-                                false,
-                                |_, _, _| {},
-                            ))
-                            .child(compact_action_button(
-                                "clip-replace",
-                                "Replace",
-                                false,
-                                |_, _, _| {},
-                            )),
                     )),
             ));
 
@@ -3922,30 +3787,23 @@ fn clip_inspector(
         return body;
     }
 
-    let clip_type_label = match clip.kind {
-        "Audio" => i18n.tr("inspector.clip.type.audio"),
-        "MIDI" => i18n.tr("inspector.clip.type.midi"),
-        other => other.to_string(),
+    let muted_id = clip.clip_id.to_string();
+    let mute_cb = callbacks.on_set_clip_muted.clone();
+    let (accent, kind_label) = match clip.kind {
+        "MIDI" => (Colors::track_midi(), i18n.tr("inspector.clip.type.midi")),
+        "Audio" => (Colors::track_audio(), i18n.tr("inspector.clip.type.audio")),
+        other => (Colors::text_muted(), other.to_string()),
     };
     let mut body = scroll_body()
-        .child(inspector_header(
-            Colors::accent_primary(),
+        .child(inspector_kit::ins_identity(
+            accent,
             clip.name.to_string(),
-            "Clip",
+            format!("{kind_label} · {}", clip.track_name),
         ))
-        .child(
-            inspector_kit::ins_section_container()
-                .child(inspector_kit::ins_section_header(
-                    assets::ICON_LIST_MUSIC_PATH,
-                    i18n.tr("inspector.section.clip"),
-                ))
-                .child(kv_row(i18n.tr("inspector.clip.type"), clip_type_label))
-                .child(kv_row(
-                    i18n.tr("inspector.clip.track"),
-                    clip.track_name.to_string(),
-                ))
-                .child(kv_row("Track ID", clip.track_id.to_string()))
-                .child(fb_form_row(
+        .child(inspector_section(
+            i18n.tr("inspector.section.clip"),
+            section_rows()
+                .child(field_row(
                     "Name",
                     text_field_with_callbacks(
                         clip_name_input,
@@ -3953,7 +3811,7 @@ fn clip_inspector(
                         clip_name_callbacks,
                     ),
                 ))
-                .child(fb_form_row(
+                .child(field_row(
                     i18n.tr("inspector.clip.start"),
                     beat_stepper(
                         "clip-start",
@@ -3964,7 +3822,7 @@ fn clip_inspector(
                         0.0,
                     ),
                 ))
-                .child(fb_form_row(
+                .child(field_row(
                     i18n.tr("inspector.clip.length"),
                     beat_stepper(
                         "clip-length",
@@ -3975,31 +3833,26 @@ fn clip_inspector(
                         0.25,
                     ),
                 ))
-                .child(kv_row(
+                .child(field_row(
                     "End",
-                    format!("{:.2} bt", clip.start_beat + clip.duration_beats),
+                    readonly_value(format!("{:.2} bt", clip.start_beat + clip.duration_beats)),
                 ))
-                .child(kv_row(
+                .child(field_row(
                     "Muted",
-                    if clip.muted { "Yes" } else { "No" }.to_string(),
+                    fb_checkbox("clip-muted", "Muted", clip.muted, true, move |_, w, cx| {
+                        mute_cb(&(muted_id.clone(), !clip.muted), w, cx)
+                    }),
                 )),
-        );
+        ));
 
     if clip.kind == "MIDI" {
         let bottom_id = clip_id.clone();
-        body = body.child(
-            inspector_kit::ins_section_container()
-                .child(inspector_kit::ins_section_header(
-                    assets::ICON_MUSIC_PATH,
-                    "MIDI CLIP",
-                ))
+        body = body.child(inspector_section(
+            "Notes",
+            section_rows()
                 .child(kv_row(
                     "Notes",
                     clip.note_count.unwrap_or_default().to_string(),
-                ))
-                .child(kv_row(
-                    "Local Length",
-                    format!("{:.2} bt", clip.duration_beats),
                 ))
                 .child(
                     div()
@@ -4020,14 +3873,11 @@ fn clip_inspector(
                             move |_, w, cx| open_external(&clip_id, w, cx),
                         )),
                 ),
-        );
+        ));
     } else {
-        body = body.child(
-            inspector_kit::ins_section_container()
-                .child(inspector_kit::ins_section_header(
-                    assets::ICON_AUDIO_LINES_PATH,
-                    "AUDIO CLIP",
-                ))
+        body = body.child(inspector_section(
+            "Source",
+            section_rows()
                 .child(kv_row(
                     "File",
                     clip.source_path
@@ -4047,7 +3897,7 @@ fn clip_inspector(
                         .unwrap_or_else(|| "Pending".to_string()),
                 ))
                 .child(kv_row("Gain", format!("{:.2}", clip.gain))),
-        );
+        ));
     }
 
     body
@@ -4275,12 +4125,14 @@ mod solfege_inspector_tests {
             weight_bytes: 4_096,
             usable: false,
         });
-        assert!(model
-            .accent
-            .as_ref()
-            .unwrap()
-            .summary()
-            .contains("uses the rule"));
+        assert!(
+            model
+                .accent
+                .as_ref()
+                .unwrap()
+                .summary()
+                .contains("uses the rule")
+        );
     }
 
     #[test]

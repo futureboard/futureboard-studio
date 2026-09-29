@@ -118,6 +118,83 @@ pub enum BrowserIcon {
     GenericFile,
 }
 
+/// What the browser lists: one tab at a time, chosen from the strip at its
+/// top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BrowserTab {
+    /// Instruments from the plug-in database, by vendor.
+    Instruments,
+    /// Samples, audio files and the user library.
+    Samples,
+    /// The computer: places and drives.
+    Files,
+    /// The plug-in `.pst` folders.
+    Plugins,
+    /// The current project, projects and templates.
+    Projects,
+}
+
+impl BrowserTab {
+    pub const ALL: [BrowserTab; 5] = [
+        BrowserTab::Instruments,
+        BrowserTab::Samples,
+        BrowserTab::Files,
+        BrowserTab::Plugins,
+        BrowserTab::Projects,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BrowserTab::Instruments => "Instruments",
+            BrowserTab::Samples => "Samples",
+            BrowserTab::Files => "Files",
+            BrowserTab::Plugins => "Plug-ins",
+            BrowserTab::Projects => "Projects",
+        }
+    }
+
+    pub fn label_key(self) -> &'static str {
+        match self {
+            BrowserTab::Instruments => "browser.category.instruments",
+            BrowserTab::Samples => "browser.category.samples",
+            BrowserTab::Files => "browser.tab.files",
+            BrowserTab::Plugins => "browser.category.plugins",
+            BrowserTab::Projects => "browser.category.projects",
+        }
+    }
+
+    pub fn icon(self) -> BrowserIcon {
+        match self {
+            BrowserTab::Instruments => BrowserIcon::Instruments,
+            BrowserTab::Samples => BrowserIcon::Samples,
+            BrowserTab::Files => BrowserIcon::Folder,
+            BrowserTab::Plugins => BrowserIcon::Plugins,
+            BrowserTab::Projects => BrowserIcon::Projects,
+        }
+    }
+}
+
+/// One instrument the Instruments tab lists, read from the plug-in database.
+/// `preset_path` is the `.pst` the database points at — the file a drag
+/// carries and a double-click loads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrowserInstrument {
+    pub name: String,
+    pub vendor: String,
+    pub format: String,
+    pub category: String,
+    pub preset_path: PathBuf,
+}
+
+/// Where the Instruments tab's list stands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InstrumentsLoad {
+    NotLoaded,
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct BrowserRootSection {
     pub id: String,
@@ -145,6 +222,8 @@ pub struct BrowserVisibleNode {
     pub size_bytes: Option<u64>,
     /// Semantic icon hint, resolved to a glyph by the view layer.
     pub icon: BrowserIcon,
+    /// A short tag the row shows at its end — an instrument's format.
+    pub detail: Option<String>,
 }
 
 impl BrowserVisibleNode {
@@ -298,6 +377,11 @@ pub struct FileBrowserState {
     /// with the renderer by `Arc` — the sidebar used to deep-copy every node
     /// on every frame.
     pub visible_nodes: Arc<Vec<BrowserVisibleNode>>,
+    /// The tab the list shows.
+    pub tab: BrowserTab,
+    /// The Instruments tab's rows, as the plug-in database last reported them.
+    pub instruments: Arc<Vec<BrowserInstrument>>,
+    pub instruments_load: InstrumentsLoad,
     /// Type-ahead buffer and the time of its last keystroke.
     type_ahead: String,
     type_ahead_at: Option<Instant>,
@@ -319,15 +403,18 @@ impl Default for FileBrowserState {
             preview_playing: None,
             preview_position_seconds: None,
             collapsed_groups: {
-                // "Filesystem" (raw drives / `/` / mounted volumes) is advanced,
-                // beginner-unfriendly territory — start collapsed. Every other
-                // group defaults to expanded.
+                // Drives (raw drive letters / `/` / mounted volumes) are
+                // advanced territory — start collapsed. Every other group
+                // defaults to expanded.
                 let mut collapsed = HashSet::new();
                 collapsed.insert("group:filesystem".to_string());
                 collapsed
             },
             expanded_virtual: HashSet::new(),
             visible_nodes: Arc::new(Vec::new()),
+            tab: BrowserTab::Instruments,
+            instruments: Arc::new(Vec::new()),
+            instruments_load: InstrumentsLoad::NotLoaded,
             type_ahead: String::new(),
             type_ahead_at: None,
         };
@@ -433,6 +520,41 @@ impl FileBrowserState {
     pub fn set_project_folder(&mut self, folder: Option<PathBuf>) {
         self.project_folder = folder;
         self.update_visible_nodes();
+    }
+
+    /// Show `tab`. Returns whether the Instruments list has yet to be read
+    /// (the caller starts the database read).
+    pub fn set_tab(&mut self, tab: BrowserTab) -> bool {
+        if self.tab != tab {
+            self.tab = tab;
+            self.update_visible_nodes();
+        }
+        tab == BrowserTab::Instruments && self.instruments_load == InstrumentsLoad::NotLoaded
+    }
+
+    /// A database read has been started.
+    pub fn mark_instruments_loading(&mut self) {
+        self.instruments_load = InstrumentsLoad::Loading;
+        self.update_visible_nodes();
+    }
+
+    /// The database read finished.
+    pub fn apply_instruments(&mut self, result: Result<Vec<BrowserInstrument>, String>) {
+        match result {
+            Ok(list) => {
+                self.instruments = Arc::new(list);
+                self.instruments_load = InstrumentsLoad::Loaded;
+            }
+            Err(error) => self.instruments_load = InstrumentsLoad::Failed(error),
+        }
+        self.update_visible_nodes();
+    }
+
+    /// The listed instrument whose `.pst` is `path`, on the Instruments tab.
+    pub fn instrument_for(&self, path: &Path) -> Option<&BrowserInstrument> {
+        (self.tab == BrowserTab::Instruments)
+            .then(|| self.instruments.iter().find(|i| i.preset_path == path))
+            .flatten()
     }
 
     /// Set search filter query.
@@ -580,265 +702,303 @@ impl FileBrowserState {
         Arc::clone(&self.visible_nodes)
     }
 
-    /// Re-calculate the cached visible flattened nodes.
+    /// Re-calculate the cached visible flattened nodes — for the current tab
+    /// only.
     ///
-    /// The browser is organized into four subtle groups — **Collections**,
-    /// **Library**, **Places** and **Filesystem** — each a collapsible header
-    /// followed by its items (depth 1) and their lazily-loaded filesystem
-    /// children (depth 2+). Every Library/Places item is backed by a real path;
-    /// Collections items (Favorites/Recent) have no provider yet and show an
-    /// honest empty state.
+    /// * **Instruments** — the plug-in database's instruments, one group per
+    ///   vendor, each row pointing at its `.pst`.
+    /// * **Samples** — Samples, Audio Files and the User Library.
+    /// * **Files** — Places (the project, user folders), then Drives.
+    /// * **Plug-ins** — the `.pst` folders.
+    /// * **Projects** — the current project, Projects and Templates.
+    ///
+    /// Folder roots are depth 1 with lazily-loaded children below them.
     pub fn update_visible_nodes(&mut self) {
         let mut nodes = Vec::new();
-        // Folders already listed by an earlier, more specific group. See
+        // Folders already listed by an earlier, more specific root. See
         // `push_root`.
         let mut seen: HashSet<PathBuf> = HashSet::new();
+        let roots = self.roots.clone();
 
-        // ── Collections ───────────────────────────────────────────────
-        if self.push_group_header(
-            "group:collections",
-            "Collections",
-            "browser.group.collections",
-            &mut nodes,
-        ) {
-            // No favorites/recent provider exists yet. These stay honest empty
-            // categories rather than fabricated content.
-            self.push_virtual_category(
-                "collections:favorites",
-                "Favorites",
-                "browser.category.favorites",
-                BrowserIcon::Favorites,
-                "No favorites yet",
-                "browser.empty.favorites",
-                &mut nodes,
-            );
-            self.push_virtual_category(
-                "collections:recent",
-                "Recent",
-                "browser.category.recent",
-                BrowserIcon::Recent,
-                "No recent items",
-                "browser.empty.recent",
-                &mut nodes,
-            );
-        }
-
-        // ── Library ───────────────────────────────────────────────────
-        if self.push_group_header(
-            "group:library",
-            "Library",
-            "browser.group.library",
-            &mut nodes,
-        ) {
-            if let Some(p) = self.roots.samples.clone() {
-                self.push_root(
-                    "lib:samples",
-                    "Samples",
-                    Some("browser.category.samples"),
-                    &p,
-                    BrowserIcon::Samples,
-                    &mut seen,
-                    &mut nodes,
-                );
+        match self.tab {
+            BrowserTab::Instruments => self.push_instruments(&mut nodes),
+            BrowserTab::Samples => {
+                for (id, label, key, path, icon) in [
+                    (
+                        "lib:samples",
+                        "Samples",
+                        "browser.category.samples",
+                        &roots.samples,
+                        BrowserIcon::Samples,
+                    ),
+                    (
+                        "lib:audio_files",
+                        "Audio Files",
+                        "browser.category.audio-files",
+                        &roots.audio_files,
+                        BrowserIcon::AudioFiles,
+                    ),
+                    (
+                        "lib:user_library",
+                        "User Library",
+                        "browser.category.user-library",
+                        &roots.user_library,
+                        BrowserIcon::UserLibrary,
+                    ),
+                ] {
+                    if let Some(p) = path {
+                        self.push_root(id, label, Some(key), p, icon, &mut seen, &mut nodes);
+                    }
+                }
             }
-            if self.roots.plugins.is_some() {
-                // Instrument presets are stored below format-specific roots
-                // (`VST3/Instruments`, `CLAP/Instruments`). Do not point this
-                // category at the nonexistent `Audio Plug-ins/Instruments`.
-                // A registry-backed aggregate can replace this honest virtual
-                // state when cross-format browser providers are introduced.
-                self.push_virtual_category(
-                    "lib:instruments",
-                    "Instruments",
-                    "browser.category.instruments",
-                    BrowserIcon::Instruments,
-                    "Available after a plug-in scan",
-                    "browser.empty.instruments",
+            BrowserTab::Files => {
+                if self.push_group_header(
+                    "group:places",
+                    "Places",
+                    "browser.group.places",
                     &mut nodes,
-                );
+                ) {
+                    if let Some(proj) = self.project_folder.clone() {
+                        self.push_project_root(&proj, &mut seen, &mut nodes);
+                    }
+                    for (id, label, key, path, icon) in [
+                        (
+                            "places:user_data",
+                            "User Data",
+                            "browser.category.user-data",
+                            &roots.user_data,
+                            BrowserIcon::UserLibrary,
+                        ),
+                        (
+                            "places:home",
+                            "Home",
+                            "browser.category.home",
+                            &roots.home,
+                            BrowserIcon::Home,
+                        ),
+                        (
+                            "places:documents",
+                            "Documents",
+                            "browser.category.documents",
+                            &roots.documents,
+                            BrowserIcon::Documents,
+                        ),
+                        (
+                            "places:desktop",
+                            "Desktop",
+                            "browser.category.desktop",
+                            &roots.desktop,
+                            BrowserIcon::Desktop,
+                        ),
+                        (
+                            "places:downloads",
+                            "Downloads",
+                            "browser.category.downloads",
+                            &roots.downloads,
+                            BrowserIcon::Downloads,
+                        ),
+                        (
+                            "places:music",
+                            "Music",
+                            "browser.category.music",
+                            &roots.music,
+                            BrowserIcon::Music,
+                        ),
+                    ] {
+                        if let Some(p) = path {
+                            self.push_root(id, label, Some(key), p, icon, &mut seen, &mut nodes);
+                        }
+                    }
+                }
+                if !self.root_drives.is_empty()
+                    && self.push_group_header(
+                        "group:filesystem",
+                        "Drives",
+                        "browser.group.drives",
+                        &mut nodes,
+                    )
+                {
+                    let drives = self.root_drives.clone();
+                    for drive in &drives {
+                        if let Some(drive_path) = drive.root_path.as_ref() {
+                            self.push_root(
+                                &drive.id,
+                                &drive.label,
+                                None,
+                                drive_path,
+                                BrowserIcon::Drive,
+                                &mut seen,
+                                &mut nodes,
+                            );
+                        }
+                    }
+                }
             }
-            if let Some(p) = self.roots.plugins.clone() {
-                self.push_root(
-                    "lib:plugins",
-                    "Plug-ins",
-                    Some("browser.category.plugins"),
-                    &p,
-                    BrowserIcon::Plugins,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-            if let Some(p) = self.roots.audio_files.clone() {
-                self.push_root(
-                    "lib:audio_files",
-                    "Audio Files",
-                    Some("browser.category.audio-files"),
-                    &p,
-                    BrowserIcon::AudioFiles,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-            if let Some(p) = self.roots.projects.clone() {
-                self.push_root(
-                    "lib:projects",
-                    "Projects",
-                    Some("browser.category.projects"),
-                    &p,
-                    BrowserIcon::Projects,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-            if let Some(p) = self.roots.user_library.clone() {
-                self.push_root(
-                    "lib:user_library",
-                    "User Library",
-                    Some("browser.category.user-library"),
-                    &p,
-                    BrowserIcon::UserLibrary,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-            if let Some(p) = self.roots.templates.clone() {
-                self.push_root(
-                    "lib:templates",
-                    "Templates",
-                    Some("browser.category.templates"),
-                    &p,
-                    BrowserIcon::Templates,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-        }
-
-        // ── Places ────────────────────────────────────────────────────
-        if self.push_group_header("group:places", "Places", "browser.group.places", &mut nodes) {
-            if let Some(proj) = self.project_folder.clone() {
-                let label = proj
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Current Project".to_string());
-                self.push_root(
-                    "places:project",
-                    &label,
-                    // The project's own folder name is data; only the row's
-                    // icon marks it as the project root.
-                    None,
-                    &proj,
-                    BrowserIcon::Projects,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-            if let Some(p) = self.roots.user_data.clone() {
-                self.push_root(
-                    "places:user_data",
-                    "User Data",
-                    Some("browser.category.user-data"),
-                    &p,
-                    BrowserIcon::UserLibrary,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-            // Friendly, platform-provided user folders (Home/Documents/Desktop/
-            // Downloads/Music) — the normal beginner-facing entries. Raw
-            // filesystem roots (drive letters, `/`, mounted volumes) live in the
-            // separate "Filesystem" group below instead of being mixed in here.
-            if let Some(p) = self.roots.home.clone() {
-                self.push_root(
-                    "places:home",
-                    "Home",
-                    Some("browser.category.home"),
-                    &p,
-                    BrowserIcon::Home,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-            if let Some(p) = self.roots.documents.clone() {
-                self.push_root(
-                    "places:documents",
-                    "Documents",
-                    Some("browser.category.documents"),
-                    &p,
-                    BrowserIcon::Documents,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-            if let Some(p) = self.roots.desktop.clone() {
-                self.push_root(
-                    "places:desktop",
-                    "Desktop",
-                    Some("browser.category.desktop"),
-                    &p,
-                    BrowserIcon::Desktop,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-            if let Some(p) = self.roots.downloads.clone() {
-                self.push_root(
-                    "places:downloads",
-                    "Downloads",
-                    Some("browser.category.downloads"),
-                    &p,
-                    BrowserIcon::Downloads,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-            if let Some(p) = self.roots.music.clone() {
-                self.push_root(
-                    "places:music",
-                    "Music",
-                    Some("browser.category.music"),
-                    &p,
-                    BrowserIcon::Music,
-                    &mut seen,
-                    &mut nodes,
-                );
-            }
-        }
-
-        // ── Filesystem (advanced) ────────────────────────────────────────
-        // Raw drive letters / `/` / mounted volumes. Collapsed by default so
-        // beginners see the friendly Places list first; full root access
-        // remains one click away.
-        if !self.root_drives.is_empty()
-            && self.push_group_header(
-                "group:filesystem",
-                "Filesystem",
-                "browser.group.filesystem",
-                &mut nodes,
-            )
-        {
-            let drives = self.root_drives.clone();
-            for drive in &drives {
-                if let Some(drive_path) = drive.root_path.as_ref() {
+            BrowserTab::Plugins => {
+                if let Some(p) = roots.plugins.as_ref() {
                     self.push_root(
-                        &drive.id,
-                        &drive.label,
-                        None,
-                        drive_path,
-                        BrowserIcon::Drive,
+                        "lib:plugins",
+                        "Plug-ins",
+                        Some("browser.category.plugins"),
+                        p,
+                        BrowserIcon::Plugins,
                         &mut seen,
                         &mut nodes,
                     );
                 }
             }
+            BrowserTab::Projects => {
+                if let Some(proj) = self.project_folder.clone() {
+                    self.push_project_root(&proj, &mut seen, &mut nodes);
+                }
+                for (id, label, key, path, icon) in [
+                    (
+                        "lib:projects",
+                        "Projects",
+                        "browser.category.projects",
+                        &roots.projects,
+                        BrowserIcon::Projects,
+                    ),
+                    (
+                        "lib:templates",
+                        "Templates",
+                        "browser.category.templates",
+                        &roots.templates,
+                        BrowserIcon::Templates,
+                    ),
+                ] {
+                    if let Some(p) = path {
+                        self.push_root(id, label, Some(key), p, icon, &mut seen, &mut nodes);
+                    }
+                }
+            }
         }
 
-        // Apply the active search filter across the whole flattened tree.
+        // Apply the active search filter across the tab's flattened rows.
         if !self.filter.is_empty() {
             nodes = self.filter_flattened_nodes(nodes);
         }
 
         self.visible_nodes = Arc::new(nodes);
+    }
+
+    /// The open project's folder, named after itself.
+    fn push_project_root(
+        &self,
+        proj: &Path,
+        seen: &mut HashSet<PathBuf>,
+        nodes: &mut Vec<BrowserVisibleNode>,
+    ) {
+        let label = proj
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Current Project".to_string());
+        // The project's own folder name is data; only the row's icon marks it
+        // as the project root.
+        self.push_root(
+            "places:project",
+            &label,
+            None,
+            proj,
+            BrowserIcon::Projects,
+            seen,
+            nodes,
+        );
+    }
+
+    /// The Instruments tab: one collapsible group per vendor, each instrument
+    /// a row carrying its `.pst`. While the database is being read, when it
+    /// could not be, and when it lists nothing, one honest row says so.
+    fn push_instruments(&self, nodes: &mut Vec<BrowserVisibleNode>) {
+        let status = match &self.instruments_load {
+            InstrumentsLoad::NotLoaded | InstrumentsLoad::Loading => Some((
+                "Reading the plug-in database…",
+                "browser.instruments.loading",
+                None,
+            )),
+            InstrumentsLoad::Failed(error) => Some((
+                "Could not read the plug-in database",
+                "browser.instruments.failed",
+                Some(error.clone()),
+            )),
+            InstrumentsLoad::Loaded if self.instruments.is_empty() => Some((
+                "No instruments yet — scan plug-ins in the Plug-in Manager",
+                "browser.instruments.empty",
+                None,
+            )),
+            InstrumentsLoad::Loaded => None,
+        };
+        if let Some((label, key, error)) = status {
+            nodes.push(BrowserVisibleNode {
+                id: "instruments:status".to_string(),
+                label: label.to_string(),
+                label_key: Some(key),
+                path: None,
+                kind: BrowserNodeKind::Info,
+                depth: 0,
+                extension: String::new(),
+                expandable: false,
+                expanded: false,
+                selected: false,
+                error,
+                size_bytes: None,
+                icon: BrowserIcon::None,
+                detail: None,
+            });
+            return;
+        }
+
+        let searching = !self.filter.is_empty();
+        let mut vendor: Option<&str> = None;
+        let mut open = true;
+        for instrument in self.instruments.iter() {
+            let this_vendor = if instrument.vendor.trim().is_empty() {
+                "Other"
+            } else {
+                instrument.vendor.as_str()
+            };
+            if vendor != Some(this_vendor) {
+                vendor = Some(this_vendor);
+                let id = format!("group:vendor:{this_vendor}");
+                open = searching || !self.collapsed_groups.contains(&id);
+                nodes.push(BrowserVisibleNode {
+                    id,
+                    label: this_vendor.to_string(),
+                    label_key: None,
+                    path: None,
+                    kind: BrowserNodeKind::GroupHeader,
+                    depth: 0,
+                    extension: String::new(),
+                    expandable: !searching,
+                    expanded: open,
+                    selected: false,
+                    error: None,
+                    size_bytes: None,
+                    icon: BrowserIcon::None,
+                    detail: None,
+                });
+            }
+            if !open {
+                continue;
+            }
+            let path = instrument.preset_path.clone();
+            nodes.push(BrowserVisibleNode {
+                id: format!("instrument\u{1f}{}", path.to_string_lossy()),
+                label: instrument.name.clone(),
+                label_key: None,
+                selected: self.selected.as_deref() == Some(path.as_path()),
+                path: Some(path),
+                kind: BrowserNodeKind::File,
+                depth: 1,
+                extension: "pst".to_string(),
+                expandable: false,
+                expanded: false,
+                error: None,
+                size_bytes: None,
+                icon: BrowserIcon::Instruments,
+                detail: Some(instrument.format.clone()),
+            });
+        }
     }
 
     /// Push a collapsible group header. Returns `true` when the group is open
@@ -870,6 +1030,7 @@ impl FileBrowserState {
             error: None,
             size_bytes: None,
             icon: BrowserIcon::None,
+            detail: None,
         });
         open
     }
@@ -918,58 +1079,10 @@ impl FileBrowserState {
             error: None,
             size_bytes: None,
             icon,
+            detail: None,
         });
         if expanded {
             self.append_cached_dir(id, path, 2, nodes);
-        }
-    }
-
-    /// Push a path-less category (e.g. Favorites) whose provider does not exist
-    /// yet. Expanding it reveals a single honest empty-state row — never mock
-    /// content.
-    #[allow(clippy::too_many_arguments)]
-    fn push_virtual_category(
-        &self,
-        id: &str,
-        label: &str,
-        label_key: &'static str,
-        icon: BrowserIcon,
-        empty_hint: &str,
-        empty_key: &'static str,
-        nodes: &mut Vec<BrowserVisibleNode>,
-    ) {
-        let expanded = self.expanded_virtual.contains(id);
-        nodes.push(BrowserVisibleNode {
-            id: id.to_string(),
-            label: label.to_string(),
-            label_key: Some(label_key),
-            path: None,
-            kind: BrowserNodeKind::Folder,
-            depth: 1,
-            extension: String::new(),
-            expandable: true,
-            expanded,
-            selected: false,
-            error: None,
-            size_bytes: None,
-            icon,
-        });
-        if expanded {
-            nodes.push(BrowserVisibleNode {
-                id: format!("{id}:empty"),
-                label: empty_hint.to_string(),
-                label_key: Some(empty_key),
-                path: None,
-                kind: BrowserNodeKind::Info,
-                depth: 2,
-                extension: String::new(),
-                expandable: false,
-                expanded: false,
-                selected: false,
-                error: None,
-                size_bytes: None,
-                icon: BrowserIcon::None,
-            });
         }
     }
 
@@ -1046,6 +1159,7 @@ impl FileBrowserState {
                 error: None,
                 size_bytes: entry.size_bytes,
                 icon: entry_icon(is_folder, expanded, entry),
+                detail: None,
             });
 
             if expanded {
@@ -1064,6 +1178,14 @@ impl FileBrowserState {
             let matches_query = node.label.to_lowercase().contains(&query);
             if matches_query {
                 kept[i] = true;
+                if node.kind == BrowserNodeKind::GroupHeader {
+                    for j in (i + 1)..nodes.len() {
+                        if nodes[j].depth <= node.depth {
+                            break;
+                        }
+                        kept[j] = true;
+                    }
+                }
                 continue;
             }
 
@@ -1453,6 +1575,7 @@ fn placeholder_row(dir: &Path, depth: usize, label: String, is_error: bool) -> B
         },
         size_bytes: None,
         icon: BrowserIcon::None,
+        detail: None,
     }
 }
 
@@ -1801,46 +1924,180 @@ mod tests {
     }
 
     /// Two roots that resolve to the same folder collapse to one row rather
-    /// than listing it twice and sharing its expansion state.
+    /// than listing it twice and sharing its expansion state — on every tab.
     #[test]
     fn roots_pointing_at_one_folder_are_listed_once() {
-        let state = FileBrowserState::default();
-        let ids = ids(&state);
-        let paths: Vec<PathBuf> = state
-            .visible_nodes
-            .iter()
-            .filter(|node| node.depth == 1)
-            .filter_map(|node| node.path.clone())
-            .map(|path| dedupe_key(&path))
-            .collect();
-        let unique: HashSet<PathBuf> = paths.iter().cloned().collect();
-        assert_eq!(
-            unique.len(),
-            paths.len(),
-            "a folder is listed under more than one root: {ids:?}"
-        );
+        let mut state = FileBrowserState::default();
+        for tab in BrowserTab::ALL {
+            state.set_tab(tab);
+            let ids = ids(&state);
+            let paths: Vec<PathBuf> = state
+                .visible_nodes
+                .iter()
+                .filter(|node| node.depth == 1 && node.kind == BrowserNodeKind::Folder)
+                .filter_map(|node| node.path.clone())
+                .map(|path| dedupe_key(&path))
+                .collect();
+            let unique: HashSet<PathBuf> = paths.iter().cloned().collect();
+            assert_eq!(
+                unique.len(),
+                paths.len(),
+                "{tab:?}: a folder is listed under more than one root: {ids:?}"
+            );
+        }
     }
 
-    #[test]
-    fn default_browser_has_grouped_navigation() {
-        let state = FileBrowserState::default();
-        let ids = ids(&state);
-        // The three subtle groups are always present and open by default.
-        for group in ["group:collections", "group:library", "group:places"] {
-            assert!(ids.iter().any(|id| id == group), "missing {group}");
+    fn instrument(vendor: &str, name: &str, format: &str) -> BrowserInstrument {
+        BrowserInstrument {
+            name: name.to_string(),
+            vendor: vendor.to_string(),
+            format: format.to_string(),
+            category: "Synth".to_string(),
+            preset_path: PathBuf::from(format!("C:/presets/{name}.pst")),
         }
-        // Collections exposes the Favorites/Recent categories.
-        assert!(ids.iter().any(|id| id == "collections:favorites"));
-        assert!(ids.iter().any(|id| id == "collections:recent"));
-        // Group headers are never selectable and carry no path.
-        let header = state
+    }
+
+    /// Each tab lists its own things and nothing else: the Instruments tab no
+    /// folders, the Files tab no library roots.
+    #[test]
+    fn each_tab_lists_only_its_own_roots() {
+        let mut state = FileBrowserState::default();
+        assert_eq!(state.tab, BrowserTab::Instruments);
+        assert!(
+            state
+                .visible_nodes
+                .iter()
+                .all(|n| n.kind != BrowserNodeKind::Folder),
+            "the Instruments tab lists no folders"
+        );
+
+        state.set_tab(BrowserTab::Files);
+        let files = ids(&state);
+        assert!(files.iter().any(|id| id == "group:places"));
+        assert!(!files.iter().any(|id| id.starts_with("lib:")));
+
+        state.set_tab(BrowserTab::Samples);
+        let samples = ids(&state);
+        assert!(!samples.iter().any(|id| id.starts_with("places:")));
+        assert!(!samples.iter().any(|id| id.starts_with("group:")));
+    }
+
+    /// Asking for the Instruments tab the first time asks for the database
+    /// read; after the list arrives it does not ask again.
+    #[test]
+    fn the_instruments_tab_reads_the_database_once() {
+        let mut state = FileBrowserState::default();
+        state.set_tab(BrowserTab::Files);
+        assert!(state.set_tab(BrowserTab::Instruments), "not read yet");
+        state.mark_instruments_loading();
+        assert!(!state.set_tab(BrowserTab::Instruments), "a read is running");
+        state.apply_instruments(Ok(vec![instrument("Acme", "Synth", "VST3")]));
+        assert!(!state.set_tab(BrowserTab::Instruments));
+    }
+
+    /// The Instruments tab is the database's instruments, one group per
+    /// vendor, each row carrying the `.pst` the database points at — which is
+    /// what a drag hands the arrangement.
+    #[test]
+    fn instruments_are_listed_by_vendor_with_their_pst() {
+        let mut state = FileBrowserState::default();
+        state.apply_instruments(Ok(vec![
+            instrument("Acme", "Omega", "CLAP"),
+            instrument("Beta Audio", "Alpha", "VST3"),
+            instrument("Beta Audio", "Zeta", "VST3"),
+        ]));
+        let rows: Vec<(BrowserNodeKind, String, Option<String>)> = state
             .visible_nodes
             .iter()
-            .find(|n| n.id == "group:library")
+            .map(|n| (n.kind, n.label.clone(), n.detail.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (BrowserNodeKind::GroupHeader, "Acme".to_string(), None),
+                (
+                    BrowserNodeKind::File,
+                    "Omega".to_string(),
+                    Some("CLAP".to_string())
+                ),
+                (BrowserNodeKind::GroupHeader, "Beta Audio".to_string(), None),
+                (
+                    BrowserNodeKind::File,
+                    "Alpha".to_string(),
+                    Some("VST3".to_string())
+                ),
+                (
+                    BrowserNodeKind::File,
+                    "Zeta".to_string(),
+                    Some("VST3".to_string())
+                ),
+            ]
+        );
+        let alpha = state
+            .visible_nodes
+            .iter()
+            .find(|n| n.label == "Alpha")
             .unwrap();
-        assert_eq!(header.kind, BrowserNodeKind::GroupHeader);
-        assert!(!header.is_selectable());
-        assert!(header.path.is_none());
+        assert_eq!(
+            alpha.path.as_deref(),
+            Some(Path::new("C:/presets/Alpha.pst"))
+        );
+        assert!(alpha.is_plugin_preset());
+        assert!(
+            state
+                .instrument_for(Path::new("C:/presets/Alpha.pst"))
+                .is_some()
+        );
+
+        // A vendor folds away like any group.
+        state.toggle_node("group:vendor:Beta Audio", None);
+        assert!(!ids(&state).iter().any(|id| id.contains("Alpha")));
+    }
+
+    /// Searching a vendor's name lists its instruments; searching an
+    /// instrument's name keeps its vendor as the heading.
+    #[test]
+    fn instrument_search_matches_names_and_vendors() {
+        let mut state = FileBrowserState::default();
+        state.apply_instruments(Ok(vec![
+            instrument("Acme", "Omega", "CLAP"),
+            instrument("Beta Audio", "Alpha", "VST3"),
+            instrument("Beta Audio", "Zeta", "VST3"),
+        ]));
+        state.set_filter("beta");
+        let labels: Vec<String> = state
+            .visible_nodes
+            .iter()
+            .map(|n| n.label.clone())
+            .collect();
+        assert_eq!(labels, ["Beta Audio", "Alpha", "Zeta"]);
+
+        state.set_filter("ome");
+        let labels: Vec<String> = state
+            .visible_nodes
+            .iter()
+            .map(|n| n.label.clone())
+            .collect();
+        assert_eq!(labels, ["Acme", "Omega"]);
+    }
+
+    /// Before, during and after a failed read, and with nothing scanned, the
+    /// tab says so in one row rather than showing nothing.
+    #[test]
+    fn the_instruments_tab_says_what_it_is_waiting_for() {
+        let mut state = FileBrowserState::default();
+        let status = |state: &FileBrowserState| {
+            let rows = &state.visible_nodes;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].kind, BrowserNodeKind::Info);
+            rows[0].label_key
+        };
+        assert_eq!(status(&state), Some("browser.instruments.loading"));
+        state.apply_instruments(Ok(Vec::new()));
+        assert_eq!(status(&state), Some("browser.instruments.empty"));
+        state.apply_instruments(Err("locked".to_string()));
+        assert_eq!(status(&state), Some("browser.instruments.failed"));
+        assert_eq!(state.visible_nodes[0].error.as_deref(), Some("locked"));
     }
 
     #[test]
@@ -1876,51 +2133,22 @@ mod tests {
     #[test]
     fn collapsing_a_group_hides_its_items() {
         let mut state = FileBrowserState::default();
-        assert!(ids(&state).iter().any(|id| id.starts_with("lib:")));
-        // Toggle the Library group closed.
-        let expanded = state.toggle_node("group:library", None);
+        state.set_tab(BrowserTab::Files);
+        assert!(ids(&state).iter().any(|id| id.starts_with("places:")));
+        // Toggle the Places group closed.
+        let expanded = state.toggle_node("group:places", None);
         assert!(!expanded, "group should collapse on first toggle");
         assert!(
-            !ids(&state).iter().any(|id| id.starts_with("lib:")),
-            "library items must be hidden while the group is collapsed"
+            !ids(&state).iter().any(|id| id.starts_with("places:")),
+            "place items must be hidden while the group is collapsed"
         );
         // The header itself stays visible and reflects the collapsed state.
         let header = state
             .visible_nodes
             .iter()
-            .find(|n| n.id == "group:library")
+            .find(|n| n.id == "group:places")
             .unwrap();
         assert!(!header.expanded);
-    }
-
-    #[test]
-    fn favorites_expands_to_an_honest_empty_state() {
-        let mut state = FileBrowserState::default();
-        // No fabricated children before expansion.
-        assert!(!ids(&state)
-            .iter()
-            .any(|id| id == "collections:favorites:empty"));
-        let expanded = state.toggle_node("collections:favorites", None);
-        assert!(expanded);
-        let empty = state
-            .visible_nodes
-            .iter()
-            .find(|n| n.id == "collections:favorites:empty")
-            .expect("empty-state row should appear");
-        assert_eq!(empty.kind, BrowserNodeKind::Info);
-        assert!(!empty.is_selectable());
-        assert!(empty.path.is_none());
-    }
-
-    #[test]
-    fn instruments_is_not_backed_by_a_nonexistent_aggregate_path() {
-        let state = FileBrowserState::default();
-        let instruments = state
-            .visible_nodes
-            .iter()
-            .find(|node| node.id == "lib:instruments")
-            .expect("instruments category should exist");
-        assert!(instruments.path.is_none());
     }
 
     #[test]

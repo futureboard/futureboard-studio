@@ -18,17 +18,18 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::registry::{
-    classify_kind, display_category, PluginFormat, PluginKind, PluginStatus, RegistryPlugin,
+    PluginFormat, PluginKind, PluginStatus, RegistryPlugin, classify_kind, display_category,
 };
 
-/// 1 → 2 added `plugins.sub_categories`; 2 → 3 added `plugins.is_ara`. Every
-/// migration is additive (`ALTER TABLE ADD COLUMN`) and read paths tolerate the
-/// column's absence, so a database written by an older build keeps loading and
-/// an older build keeps reading a database written by this one.
-const SCHEMA_VERSION: i32 = 3;
+/// 1 → 2 added `plugins.sub_categories`; 2 → 3 added `plugins.is_ara`; 3 → 4
+/// added `plugins.preset_path`. Every migration is additive (`ALTER TABLE ADD
+/// COLUMN`) and read paths tolerate the column's absence, so a database written
+/// by an older build keeps loading and an older build keeps reading a database
+/// written by this one.
+const SCHEMA_VERSION: i32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginScanStatus {
@@ -107,6 +108,11 @@ pub struct PluginCatalogEntry {
     pub last_scanned_at: Option<String>,
     pub error: Option<String>,
     pub metadata_json: Option<String>,
+    /// The plug-in's `.pst` — the file the scan wrote for it, which the
+    /// Browser's Instruments list and a drop onto the arrangement load it
+    /// through. `None` for a row written before the column existed, until the
+    /// next scan fills it.
+    pub preset_path: Option<PathBuf>,
     /// Precomputed lowercased `name + vendor + category + format` string for
     /// substring search.
     pub search_text: String,
@@ -114,8 +120,7 @@ pub struct PluginCatalogEntry {
 
 impl PluginCatalogEntry {
     /// Project a catalog row back into the legacy [`RegistryPlugin`] shape the
-    /// rest of the UI consumes. `preset_path` is derived for completeness; the
-    /// picker never touches `.pst` files so it can be a zero-cost placeholder.
+    /// rest of the UI consumes, `.pst` path included.
     pub fn to_registry_plugin(&self) -> RegistryPlugin {
         let raw_category = self.category.clone();
         let category = display_category(
@@ -143,7 +148,7 @@ impl PluginCatalogEntry {
             version: self.version.clone(),
             sdk_metadata_loaded: self.scan_status.is_usable(),
             is_ara: self.is_ara,
-            preset_path: PathBuf::new(),
+            preset_path: self.preset_path.clone().unwrap_or_default(),
             scanned_at_ms: parse_iso8601_to_ms(self.last_scanned_at.as_deref()).unwrap_or(0),
             status,
             scan_status: self.scan_status,
@@ -215,6 +220,7 @@ impl From<&RegistryPlugin> for PluginCatalogEntry {
             last_scanned_at,
             error: p.error_message.clone(),
             metadata_json: None,
+            preset_path: (!p.preset_path.as_os_str().is_empty()).then(|| p.preset_path.clone()),
             search_text,
         }
     }
@@ -334,7 +340,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              last_scanned_at TEXT,
              error TEXT,
              metadata_json TEXT,
-             search_text TEXT NOT NULL
+             search_text TEXT NOT NULL,
+             preset_path TEXT
          );
          CREATE TABLE IF NOT EXISTS plugin_scan_runs (
              id TEXT PRIMARY KEY,
@@ -379,6 +386,12 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         // instead of serving the placeholder forever.
         conn.execute_batch("UPDATE plugins SET file_modified_at = NULL, file_size = NULL")?;
     }
+    if !has_column(conn, "plugins", "preset_path")? {
+        // Filled by the next scan: the `.pst` a row points at is the one that
+        // scan writes, and a guess made here from the name could name a file
+        // that belongs to a different plug-in of the same name.
+        conn.execute_batch("ALTER TABLE plugins ADD COLUMN preset_path TEXT")?;
+    }
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?1)",
         params![SCHEMA_VERSION.to_string()],
@@ -421,11 +434,16 @@ pub fn read_all(conn: &Connection) -> rusqlite::Result<Vec<PluginCatalogEntry>> 
     } else {
         "0"
     };
+    let preset_path_expr = if has_column(conn, "plugins", "preset_path")? {
+        "preset_path"
+    } else {
+        "NULL"
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT id, format, name, vendor, category, path, class_id, bundle_id, version,
                 is_instrument, is_effect, scan_status, validation_level, disabled, favorite,
                 file_modified_at, file_size, last_scanned_at, error, metadata_json, search_text,
-                {sub_categories_expr}, {is_ara_expr}
+                {sub_categories_expr}, {is_ara_expr}, {preset_path_expr}
            FROM plugins
           ORDER BY favorite DESC, vendor COLLATE NOCASE ASC, name COLLATE NOCASE ASC"
     ))?;
@@ -456,6 +474,10 @@ pub fn read_all(conn: &Connection) -> rusqlite::Result<Vec<PluginCatalogEntry>> 
             last_scanned_at: row.get(17)?,
             error: row.get(18)?,
             metadata_json: row.get(19)?,
+            preset_path: row
+                .get::<_, Option<String>>(23)?
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
             search_text: row.get(20)?,
         })
     })?;
@@ -463,6 +485,48 @@ pub fn read_all(conn: &Connection) -> rusqlite::Result<Vec<PluginCatalogEntry>> 
     for r in rows {
         out.push(r?);
     }
+    Ok(out)
+}
+
+/// One instrument the Browser lists: straight from the catalog, pointing at
+/// the `.pst` the scan wrote for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstrumentPreset {
+    pub id: String,
+    pub name: String,
+    pub vendor: String,
+    pub format: PluginFormat,
+    pub category: String,
+    pub preset_path: PathBuf,
+}
+
+/// Every usable instrument in the catalog that has a `.pst`, by vendor then
+/// name. A row the user disabled, one the scan could not load, and one with
+/// no `.pst` yet (a database from before the column, until the next scan) are
+/// not offered: each would be a row that does nothing when dragged.
+pub fn instrument_presets(conn: &Connection) -> rusqlite::Result<Vec<InstrumentPreset>> {
+    let mut out: Vec<InstrumentPreset> = read_all(conn)?
+        .into_iter()
+        .filter(|e| e.is_instrument && !e.disabled && e.scan_status.is_usable())
+        .filter_map(|e| {
+            let preset_path = e.preset_path.clone()?;
+            let plugin = e.to_registry_plugin();
+            Some(InstrumentPreset {
+                id: e.id,
+                name: e.name,
+                vendor: e.vendor.unwrap_or_default(),
+                format: e.format,
+                category: plugin.display_category().to_string(),
+                preset_path,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.vendor
+            .to_lowercase()
+            .cmp(&b.vendor.to_lowercase())
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
     Ok(out)
 }
 
@@ -544,9 +608,9 @@ fn upsert_within(
                 (id, format, name, vendor, category, path, class_id, bundle_id, version,
                  is_instrument, is_effect, scan_status, validation_level, disabled, favorite,
                  file_modified_at, file_size, last_scanned_at, error, metadata_json, search_text,
-                 sub_categories, is_ara)
+                 sub_categories, is_ara, preset_path)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
              ON CONFLICT(id) DO UPDATE SET
                 format = excluded.format,
                 name = excluded.name,
@@ -568,7 +632,8 @@ fn upsert_within(
                 error = excluded.error,
                 metadata_json = excluded.metadata_json,
                 search_text = excluded.search_text,
-                is_ara = excluded.is_ara",
+                is_ara = excluded.is_ara,
+                preset_path = excluded.preset_path",
         )?;
         for e in entries {
             stmt.execute(params![
@@ -595,6 +660,9 @@ fn upsert_within(
                 e.search_text,
                 e.sub_categories,
                 e.is_ara as i64,
+                e.preset_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
             ])?;
         }
     }
@@ -866,6 +934,7 @@ mod tests {
             last_scanned_at: None,
             error: None,
             metadata_json: None,
+            preset_path: Some(PathBuf::from("C:/presets/Row.pst")),
             search_text: "row".into(),
         };
         assert_eq!(super::replace_plugins(&mut conn, &[fresh]).unwrap(), 2);
@@ -874,6 +943,71 @@ mod tests {
         // And the tags round-trip, so a restart classifies the same way.
         let rows = super::read_all(&conn).unwrap();
         assert_eq!(rows[0].sub_categories.as_deref(), Some("Fx|EQ"));
+        // …and so does the `.pst` the row points at.
+        assert_eq!(
+            rows[0].preset_path.as_deref(),
+            Some(std::path::Path::new("C:/presets/Row.pst"))
+        );
+        assert_eq!(
+            rows[0].to_registry_plugin().preset_path,
+            PathBuf::from("C:/presets/Row.pst")
+        );
+    }
+
+    #[test]
+    fn a_v3_database_gains_the_preset_column_and_reads_it_empty() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE plugins (
+                 id TEXT PRIMARY KEY, format TEXT NOT NULL, name TEXT NOT NULL,
+                 vendor TEXT, category TEXT, sub_categories TEXT,
+                 is_ara INTEGER NOT NULL DEFAULT 0, path TEXT NOT NULL, class_id TEXT,
+                 bundle_id TEXT, version TEXT, is_instrument INTEGER NOT NULL DEFAULT 0,
+                 is_effect INTEGER NOT NULL DEFAULT 1, scan_status TEXT NOT NULL,
+                 validation_level TEXT, disabled INTEGER NOT NULL DEFAULT 0,
+                 favorite INTEGER NOT NULL DEFAULT 0, file_modified_at TEXT, file_size INTEGER,
+                 last_scanned_at TEXT, error TEXT, metadata_json TEXT, search_text TEXT NOT NULL
+             );
+             INSERT INTO plugins (id, format, name, path, is_instrument, is_effect,
+                                  scan_status, search_text)
+             VALUES ('vst3:synth', 'VST3', 'Synth', 'C:/s.vst3', 1, 0, 'success', 'synth');",
+        )
+        .unwrap();
+        // Read as-is (a read-only open cannot migrate)…
+        assert!(super::read_all(&conn).unwrap()[0].preset_path.is_none());
+        // …and after the migration the column is there, still empty.
+        super::init_schema(&conn).unwrap();
+        assert!(super::has_column(&conn, "plugins", "preset_path").unwrap());
+        assert!(super::read_all(&conn).unwrap()[0].preset_path.is_none());
+        // An instrument without its `.pst` is not offered to the Browser.
+        assert!(super::instrument_presets(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_browser_lists_usable_instruments_with_a_preset_only() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::init_schema(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO plugins (id, format, name, vendor, path, is_instrument, is_effect,
+                                  scan_status, disabled, preset_path, search_text) VALUES
+             ('a', 'VST3', 'Zeta', 'Beta Audio', 'C:/z', 1, 0, 'success', 0, 'C:/p/Zeta.pst', 'z'),
+             ('b', 'VST3', 'Alpha', 'Beta Audio', 'C:/a', 1, 0, 'success', 0, 'C:/p/Alpha.pst', 'a'),
+             ('c', 'CLAP', 'Omega', 'Acme', 'C:/o', 1, 0, 'success', 0, 'C:/p/Omega.pst', 'o'),
+             ('d', 'VST3', 'Comp', 'Acme', 'C:/c', 0, 1, 'success', 0, 'C:/p/Comp.pst', 'c'),
+             ('e', 'VST3', 'Off', 'Acme', 'C:/f', 1, 0, 'success', 1, 'C:/p/Off.pst', 'f'),
+             ('f', 'VST3', 'Broken', 'Acme', 'C:/b', 1, 0, 'failed', 0, 'C:/p/Broken.pst', 'b'),
+             ('g', 'VST3', 'NoPst', 'Acme', 'C:/n', 1, 0, 'success', 0, NULL, 'n');",
+        )
+        .unwrap();
+        let names: Vec<String> = super::instrument_presets(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|i| format!("{} / {}", i.vendor, i.name))
+            .collect();
+        assert_eq!(
+            names,
+            ["Acme / Omega", "Beta Audio / Alpha", "Beta Audio / Zeta"]
+        );
     }
 
     #[test]

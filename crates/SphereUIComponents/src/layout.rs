@@ -2042,7 +2042,7 @@ impl StudioLayout {
         if command_id == "settings:open-metronome" {
             self.open_settings_dialog_on_tab(
                 owner_bounds,
-                Some(crate::components::SettingsTab::Metronome),
+                Some(crate::components::SettingsTab::Playback),
                 cx,
             );
             self.overlay.open_popover = None;

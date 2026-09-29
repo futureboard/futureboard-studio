@@ -211,7 +211,7 @@ pub use settings_components::{
     settings_toggle, RESTART_FOOTER_TEXT,
 };
 pub use settings_dialog::{
-    open_settings_window, settings_dialog, HardwareCombo, OnSettingUpdate, SettingsDialogCallbacks,
+    open_settings_window, HardwareCombo, OnSettingUpdate, SettingsDialogCallbacks,
     SettingsDialogState, SettingsTab, SettingsWindow,
 };
 pub use sidebar::{sidebar, BrowserCallbacks, SIDEBAR_WIDTH};

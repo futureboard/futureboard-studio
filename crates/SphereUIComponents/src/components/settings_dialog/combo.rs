@@ -148,28 +148,6 @@ pub(crate) fn hardware_combo_overlay(
             )
             .into_any_element()
         }
-        HardwareCombo::ClockSource => {
-            let selected = schema.hardware.sync.clock_source.clone();
-            let options: Vec<String> = CLOCK_SOURCE_OPTIONS.iter().map(|s| s.to_string()).collect();
-            let up = on_update;
-            combo_box_string_menu(
-                "settings-clock-source-menu",
-                position,
-                &selected,
-                &options,
-                Arc::new(move |value, window, cx| {
-                    if midi_settings_debug_enabled() {
-                        eprintln!("[MIDI settings] clock_source={value}");
-                    }
-                    up(
-                        Arc::new(move |s| s.hardware.sync.clock_source = value.clone()),
-                        window,
-                        cx,
-                    );
-                }),
-            )
-            .into_any_element()
-        }
         HardwareCombo::Language => {
             let selected = selected_locale_label(i18n, &schema.general.language);
             let options: Vec<String> = Locale::ALL
@@ -246,29 +224,6 @@ pub(crate) fn hardware_combo_overlay(
                         .unwrap_or(5);
                     up(
                         Arc::new(move |s| s.general.autosave.interval_minutes = minutes),
-                        window,
-                        cx,
-                    );
-                }),
-            )
-            .into_any_element()
-        }
-        HardwareCombo::AutosaveMaxBackups => {
-            let selected = schema.general.autosave.max_backups.to_string();
-            let options: Vec<String> = AUTOSAVE_MAX_BACKUPS_OPTIONS
-                .iter()
-                .map(|v| v.to_string())
-                .collect();
-            let up = on_update;
-            combo_box_string_menu(
-                "settings-general-autosave-backups-menu",
-                position,
-                &selected,
-                &options,
-                Arc::new(move |value, window, cx| {
-                    let backups = value.parse::<u32>().unwrap_or(10);
-                    up(
-                        Arc::new(move |s| s.general.autosave.max_backups = backups),
                         window,
                         cx,
                     );

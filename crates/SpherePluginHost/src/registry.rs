@@ -1021,10 +1021,22 @@ impl PluginRegistry {
                         )
                     }));
                     if reusable {
-                        for plugin in reuse {
+                        for mut plugin in reuse {
                             let key = registry_display_key(&plugin);
                             if !seen.insert(key) {
                                 continue;
+                            }
+                            // A row from a database older than its `.pst`
+                            // column comes back without the path; derive it
+                            // as a fresh scan would, or re-registering it
+                            // writes to an empty path and fails.
+                            if plugin.preset_path.as_os_str().is_empty() {
+                                plugin.preset_path = preset_path_for_plugin(
+                                    &default_preset_root(),
+                                    plugin.format,
+                                    plugin.kind,
+                                    &plugin.name,
+                                );
                             }
                             let plugin = resolve_unique_preset_path(plugin, &mut occupied_presets);
                             pending.push(plugin);

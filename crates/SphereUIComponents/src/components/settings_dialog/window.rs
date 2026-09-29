@@ -369,6 +369,8 @@ impl Render for SettingsWindow {
                         if tab != SettingsTab::Recording && this.input_test_active {
                             this.stop_input_test(cx);
                         }
+                        // Picking a page leaves the search for that page.
+                        this.search_input.set_value("");
                         this.active_tab = tab;
                         this.open_hardware_combo = None;
                         this.hardware_combo_anchor = None;
@@ -590,7 +592,7 @@ impl Render for SettingsWindow {
                     }
                 },
             ))
-            // Two-column body — DAW studio control center layout
+            // Sidebar (search over the page list) | the page.
             .child(
                 div()
                     .flex()
@@ -599,17 +601,37 @@ impl Render for SettingsWindow {
                     .min_h_0()
                     .child(
                         div()
-                            .id("settings-sidebar")
                             .w(px(SETTINGS_SIDEBAR_WIDTH))
                             .flex_shrink_0()
+                            .flex()
+                            .flex_col()
                             .border_r(px(1.0))
                             .border_color(Colors::divider())
                             .bg(Colors::surface_panel_alt())
-                            .overflow_y_scroll()
-                            .py(px(6.0))
-                            .flex()
-                            .flex_col()
-                            .children(sidebar_items),
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px(px(theme::space::BASE))
+                                    .pt(px(theme::space::BASE))
+                                    .pb(px(theme::space::SNUG))
+                                    .child(text_field_with_callbacks(
+                                        &self.search_input,
+                                        search_focused,
+                                        search_callbacks,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("settings-sidebar")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .pb(px(theme::space::BASE))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::space::HAIR))
+                                    .children(sidebar_items),
+                            ),
                     )
                     .child(
                         div()
@@ -623,30 +645,21 @@ impl Render for SettingsWindow {
                             .child(
                                 div()
                                     .flex_shrink_0()
-                                    .px(px(SETTINGS_CONTENT_PAD))
-                                    .pt(px(10.0))
-                                    .pb(px(8.0))
-                                    .border_b(px(1.0))
-                                    .border_color(Colors::divider())
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(px(12.0))
-                                            .child(settings_page_header(
-                                                i18n.tr(self.active_tab.label_key()),
-                                                i18n.tr(self.active_tab.page_description_key()),
-                                            ))
-                                            .child(div().w(px(208.0)).flex_shrink_0().child(
-                                                text_field_with_callbacks(
-                                                    &self.search_input,
-                                                    search_focused,
-                                                    search_callbacks,
-                                                ),
-                                            )),
-                                    ),
+                                    .flex()
+                                    .items_center()
+                                    .h(px(theme::size::PROMINENT + theme::space::LOOSE))
+                                    .px(px(PREFS_CONTENT_PAD_X))
+                                    .text_size(px(theme::typography::UI_TITLE))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(Colors::text_primary())
+                                    .child(if self.search_input.value.trim().is_empty() {
+                                        i18n.tr(self.active_tab.label_key())
+                                    } else {
+                                        format!(
+                                            "Results for \u{201C}{}\u{201D}",
+                                            self.search_input.value.trim()
+                                        )
+                                    }),
                             )
                             .child({
                                 let scroll_close = sw_target.clone();
@@ -655,10 +668,11 @@ impl Render for SettingsWindow {
                                     .flex_1()
                                     .min_h_0()
                                     .overflow_y_scroll()
-                                    .p(px(SETTINGS_CONTENT_PAD))
+                                    .px(px(PREFS_CONTENT_PAD_X))
+                                    .pb(px(theme::space::BLOCK))
                                     .flex()
                                     .flex_col()
-                                    .gap(px(SETTINGS_SECTION_GAP))
+                                    .gap(px(theme::space::BLOCK))
                                     .on_scroll_wheel(move |_, _window, cx| {
                                         let _ = scroll_close.update(cx, |this, cx| {
                                             if this.open_hardware_combo.take().is_some() {

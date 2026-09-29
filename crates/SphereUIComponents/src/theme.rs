@@ -885,6 +885,11 @@ impl Colors {
     theme_color!(timeline_grid_minor, "timeline.gridMinor", "#FFFFFF0D");
     theme_color!(timeline_grid_bar, "timeline.gridBar", "#FFFFFF3D");
     theme_color!(timeline_playhead, "timeline.playhead", "#FF6A5A");
+    // The MIDI editor's keyboard: white keys that read as white keys.
+    theme_color!(piano_white_key, "piano.whiteKey", "#E4E6EA");
+    theme_color!(piano_black_key, "piano.blackKey", "#15171C");
+    theme_color!(piano_key_seam, "piano.keySeam", "#A3A8B2");
+    theme_color!(piano_key_label, "piano.keyLabel", "#4A505C");
     theme_color!(timeline_background, "timeline.background", "#16181F");
     theme_color!(
         timeline_content_background,
