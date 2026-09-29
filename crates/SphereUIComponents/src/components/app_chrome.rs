@@ -143,6 +143,89 @@ fn chrome_action_button(
         .children(shortcut.as_deref().map(|s| fb_shortcut_hint(s)))
 }
 
+/// One transport-bar button.
+///
+/// Ghost at rest. Latched, it takes its state's hue as a wash *and* a border
+/// (state on two channels, never hue alone), with the glyph at full strength.
+/// The border is always there — transparent at rest — so latching never
+/// reflows the bar. `base` is the plane the button sits on, which its fills
+/// composite over.
+#[allow(clippy::too_many_arguments)]
+fn transport_button(
+    id: &'static str,
+    icon_path: &'static str,
+    label: impl Into<gpui::SharedString>,
+    latched: Option<bool>,
+    hue: gpui::Rgba,
+    rest_glyph: gpui::Rgba,
+    base: gpui::Rgba,
+    action: ChromeActionCb,
+    on_right_click: Option<ChromeRightClickCb>,
+) -> gpui::AnyElement {
+    let label = label.into();
+    let on = latched.unwrap_or(false);
+    let (fill, border) = if on {
+        Colors::latched(base, hue)
+    } else {
+        (Colors::with_alpha(base, 0.0), Colors::with_alpha(hue, 0.0))
+    };
+    let under = if on { fill } else { base };
+    let hover = Colors::composite(under, Colors::state_hover());
+    let pressed = Colors::composite(under, Colors::state_recessed());
+    let glyph = if on { hue } else { rest_glyph };
+    div()
+        .id(id)
+        .role(Role::Button)
+        .aria_label(label.clone())
+        .when_some(latched, |button, latched| {
+            button.aria_toggled(if latched {
+                Toggled::True
+            } else {
+                Toggled::False
+            })
+        })
+        .flex_none()
+        .w(px(crate::components::title_bar::CHROME_ICON_BUTTON_SIZE))
+        .h(px(crate::components::title_bar::CHROME_ICON_BUTTON_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::radius::CONTROL))
+        .border(px(1.0))
+        .border_color(border)
+        .bg(fill)
+        .focusable()
+        .tab_stop(true)
+        .focus_visible(|style| {
+            style.shadow(theme::elevation::focus_ring(Colors::state_focus_ring()))
+        })
+        .hover(move |style| style.bg(hover))
+        .active(move |style| style.bg(pressed))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .tooltip(fb_tooltip(label))
+        .child(
+            svg()
+                .path(icon_path)
+                .w(px(14.0))
+                .h(px(14.0))
+                .text_color(glyph),
+        )
+        .on_click(move |_, window, cx| action(&(), window, cx))
+        .when_some(on_right_click, |button, handler| {
+            button.on_mouse_down(gpui::MouseButton::Right, move |event, window, cx| {
+                handler(event, window, cx)
+            })
+        })
+        .occlude()
+        .into_any_element()
+}
+
+/// Tabular figures, so a running position or a scrubbed tempo changes its
+/// digits without the readout jittering sideways.
+fn tabular_figures() -> gpui::FontFeatures {
+    gpui::FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]))
+}
+
 #[derive(Clone)]
 pub struct ProjectChromeState {
     pub name: String,
@@ -415,6 +498,7 @@ fn bpm_display(
         .text_color(Colors::text_primary())
         .text_size(px(14.0))
         .font_weight(gpui::FontWeight::SEMIBOLD)
+        .font_features(tabular_figures())
         .cursor(gpui::CursorStyle::ResizeUpDown)
         .hover(|s| s.bg(Colors::surface_control_hover()))
         .child(label)
@@ -667,21 +751,6 @@ fn lcd_divider() -> impl IntoElement {
 /// a player reads mid-take, so they get a recessed panel, tabular figures, and
 /// captions rather than being scattered along a toolbar as bare text.
 fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -> impl IntoElement {
-    let play_color = if state.playing {
-        Colors::accent_primary()
-    } else {
-        Colors::text_secondary()
-    };
-    let record_color = if state.recording {
-        Colors::state_arm()
-    } else {
-        Colors::text_secondary()
-    };
-    let loop_color = if state.loop_enabled {
-        Colors::accent_primary()
-    } else {
-        Colors::text_muted()
-    };
     let metronome_color = if state.metronome_enabled {
         Colors::accent_primary()
     } else {
@@ -689,14 +758,20 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
     };
     // Continuous mode reads as a distinct hue so the right-click toggle is
     // visible at a glance; paged follow keeps the standard accent.
-    let follow_color = if state.follow_playhead {
-        if state.auto_scroll_continuous {
-            Colors::state_monitor()
-        } else {
-            Colors::accent_primary()
-        }
+    let follow_hue = if state.auto_scroll_continuous {
+        Colors::state_monitor()
     } else {
-        Colors::text_muted()
+        Colors::accent_primary()
+    };
+    // The rule between a split control's two halves: an inset hairline while
+    // the pair is a ghost, the full height once the latched border frames it.
+    let split_seam = |latched: bool| {
+        div()
+            .flex_none()
+            .w(px(1.0))
+            .when(latched, |seam| seam.h_full())
+            .when(!latched, |seam| seam.h(px(14.0)))
+            .bg(Colors::border_subtle())
     };
 
     let on_return = state.on_return_to_start.clone();
@@ -758,77 +833,100 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
     let label_follow = i18n.tr("transport.follow");
 
     // ── Left track: transport, count-in, and the mode toggles ────────────────
-    let transport_group = chrome_cluster()
-        .child(chrome_action_button(
+    // The four transport buttons share one recessed plate, the same plane and
+    // height as the readout beside them: the two things a player reaches for
+    // mid-take read as a pair, and the toggles between them stay ghosts.
+    let bar_plane = Colors::surface_base();
+    let plate_plane = Colors::surface_canvas();
+    let transport_group = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_none()
+        .h(px(crate::shell_metrics::TRANSPORT_READOUT_HEIGHT))
+        .px(px(crate::theme::space::HAIR))
+        .gap(px(crate::theme::space::HAIR))
+        .rounded(px(crate::theme::radius::SURFACE))
+        .bg(plate_plane)
+        .border(px(1.0))
+        .border_color(Colors::border_normal())
+        .child(transport_button(
             "transport-return-to-start",
             assets::ICON_SKIP_BACK_PATH,
             label_skip_back,
             None,
             Colors::text_secondary(),
+            Colors::text_secondary(),
+            plate_plane,
             on_return,
             None,
-            None,
         ))
-        .child(chrome_action_button(
+        .child(transport_button(
             "transport-play",
             assets::ICON_PLAY_PATH,
             label_play,
             Some(state.playing),
-            play_color,
+            Colors::accent_primary(),
+            Colors::text_primary(),
+            plate_plane,
             on_play,
             None,
-            None,
         ))
-        .child(chrome_action_button(
+        .child(transport_button(
             "transport-stop",
             assets::ICON_SQUARE_PATH,
             label_stop,
             None,
             Colors::text_secondary(),
+            Colors::text_secondary(),
+            plate_plane,
             on_stop,
             None,
-            None,
         ))
-        .child(chrome_action_button(
+        // Record keeps its red at rest: it is the one button whose mistake
+        // costs a take, so it is recognisable before it is armed.
+        .child(transport_button(
             "transport-record",
             assets::ICON_CIRCLE_PATH,
             label_record,
             Some(state.recording),
-            record_color,
+            Colors::state_arm(),
+            Colors::with_alpha(Colors::state_arm(), 0.8),
+            plate_plane,
             on_record,
-            None,
             None,
         ));
 
     // Count-in split control: the label is a true on/off toggle, the chevron
     // opens the duration menu. Split buttons share an edge, so only the group's
     // outer corners round — a radius on the seam would leave a notch between
-    // the two halves.
-    let count_in_rest = Colors::button_bg();
-    let count_in_active = Colors::composite(
-        Colors::surface_titlebar(),
-        Colors::with_alpha(Colors::accent_primary(), crate::theme::state::ARMED_WASH),
-    );
+    // the two halves. Ghost at rest like the toggles beside it, with only the
+    // seam saying it is two targets; latched, wash and border as one control.
     let count_in_fill = if state.count_in_enabled {
-        count_in_active
+        Colors::latched(bar_plane, Colors::accent_primary()).0
     } else {
-        // Transparent at rest; the split's own border is what holds its two
-        // halves together as one control.
-        Colors::with_alpha(count_in_rest, 0.0)
+        Colors::with_alpha(bar_plane, 0.0)
     };
-    let count_in_hover = Colors::composite(count_in_fill, Colors::state_hover());
+    let count_in_hover = Colors::composite(
+        if state.count_in_enabled {
+            count_in_fill
+        } else {
+            bar_plane
+        },
+        Colors::state_hover(),
+    );
     let count_in_split = div()
-        .h(px(crate::theme::size::DENSE))
+        .h(px(crate::components::title_bar::CHROME_ICON_BUTTON_SIZE))
         .flex()
         .flex_row()
         .items_center()
-        .rounded(px(crate::theme::radius::CONTROL_SM))
+        .rounded(px(crate::theme::radius::CONTROL))
         .overflow_hidden()
         .border(px(1.0))
         .border_color(if state.count_in_enabled {
-            Colors::with_alpha(Colors::accent_primary(), crate::theme::state::ARMED_BORDER)
+            Colors::latched(bar_plane, Colors::accent_primary()).1
         } else {
-            Colors::button_border()
+            Colors::with_alpha(Colors::button_border(), 0.0)
         })
         .child(
             div()
@@ -867,7 +965,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
                         }),
                 ),
         )
-        .child(div().w(px(1.0)).h_full().bg(Colors::border_subtle()))
+        .child(split_seam(state.count_in_enabled))
         .child(
             div()
                 .id("transport-count-in-menu")
@@ -902,27 +1000,31 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
         );
 
     let metronome_fill = if state.metronome_enabled {
-        Colors::composite(
-            Colors::surface_titlebar(),
-            Colors::with_alpha(Colors::accent_primary(), crate::theme::state::ARMED_WASH),
-        )
+        Colors::latched(bar_plane, Colors::accent_primary()).0
     } else {
-        Colors::with_alpha(Colors::button_bg(), 0.0)
+        Colors::with_alpha(bar_plane, 0.0)
     };
-    let metronome_hover = Colors::composite(metronome_fill, Colors::state_hover());
+    let metronome_hover = Colors::composite(
+        if state.metronome_enabled {
+            metronome_fill
+        } else {
+            bar_plane
+        },
+        Colors::state_hover(),
+    );
     let on_metronome_menu_icon = on_metronome_menu.clone();
     let metronome_split = div()
-        .h(px(crate::theme::size::DENSE))
+        .h(px(crate::components::title_bar::CHROME_ICON_BUTTON_SIZE))
         .flex()
         .flex_row()
         .items_center()
-        .rounded(px(crate::theme::radius::CONTROL_SM))
+        .rounded(px(crate::theme::radius::CONTROL))
         .overflow_hidden()
         .border(px(1.0))
         .border_color(if state.metronome_enabled {
-            Colors::with_alpha(Colors::accent_primary(), crate::theme::state::ARMED_BORDER)
+            Colors::latched(bar_plane, Colors::accent_primary()).1
         } else {
-            Colors::button_border()
+            Colors::with_alpha(Colors::button_border(), 0.0)
         })
         .child(
             div()
@@ -958,7 +1060,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
                         .text_color(metronome_color),
                 ),
         )
-        .child(div().w(px(1.0)).h_full().bg(Colors::border_subtle()))
+        .child(split_seam(state.metronome_enabled))
         .child(
             div()
                 .id("transport-metronome-menu")
@@ -990,25 +1092,27 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
         );
 
     let mode_group = chrome_cluster()
-        .child(chrome_action_button(
+        .child(transport_button(
             "transport-loop",
             assets::ICON_REPEAT_PATH,
             label_loop,
             Some(state.loop_enabled),
-            loop_color,
+            Colors::accent_primary(),
+            Colors::text_muted(),
+            bar_plane,
             on_loop,
-            None,
             None,
         ))
         .child(metronome_split)
-        .child(chrome_action_button(
+        .child(transport_button(
             "transport-follow-playhead",
             assets::TIMELINE_SCROLL_PATH,
             label_follow,
             Some(state.follow_playhead),
-            follow_color,
+            follow_hue,
+            Colors::text_muted(),
+            bar_plane,
             on_follow,
-            None,
             Some(Arc::new(move |_, window, cx| {
                 on_follow_mode(&(), window, cx);
             })),
@@ -1023,9 +1127,16 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
         .flex()
         .items_center()
         .justify_center()
-        .text_color(Colors::text_primary())
+        // Red while a take is being written — the same hue as the armed
+        // record button, so the running number says what it is counting.
+        .text_color(if state.recording {
+            Colors::state_arm()
+        } else {
+            Colors::text_primary()
+        })
         .text_size(px(17.0))
         .font_weight(gpui::FontWeight::SEMIBOLD)
+        .font_features(tabular_figures())
         .child(state.position_label)
         .into_any_element();
 
@@ -1079,6 +1190,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             .text_color(Colors::text_primary())
             .text_size(px(13.0))
             .font_weight(gpui::FontWeight::SEMIBOLD)
+            .font_features(tabular_figures())
             .child(text)
     };
     let ts_value = div()
@@ -1325,11 +1437,10 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
                 .flex_row()
                 .items_center()
                 .flex_none()
-                .gap(px(crate::theme::space::SNUG))
+                .gap(px(crate::theme::space::BASE))
                 .child(transport_group)
                 .child(count_in_split)
                 .child(mode_group)
-                .child(div().w(px(crate::theme::space::SNUG)))
                 .child(readout),
         )
         // The right gutter carries the master strip. It stays `flex_1` with a

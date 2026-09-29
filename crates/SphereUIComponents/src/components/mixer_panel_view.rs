@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
-    div, px, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
-    Window,
+    div, px, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::components::mixer_master_strip_view::{
@@ -147,6 +147,7 @@ impl MixerPanelView {
             scroll_x: chrome.scroll_x,
             viewport_width: chrome.viewport_width,
             strip_available_px: chrome.strip_available_px,
+            body_scrolls: chrome.body_scrolls,
             strip_count,
             track_count: timeline.state.tracks.len(),
             tree_enabled: chrome.tree_sidebar_enabled,
@@ -165,6 +166,7 @@ impl MixerPanelView {
         q(state.scroll_x).hash(&mut hasher);
         q(state.viewport_width).hash(&mut hasher);
         q(state.strip_available_px).hash(&mut hasher);
+        state.body_scrolls.hash(&mut hasher);
         q(split.insert_px).hash(&mut hasher);
         q(split.send_px).hash(&mut hasher);
         split.active_target.hash(&mut hasher);
@@ -185,6 +187,7 @@ struct MixerPanelViewState {
     scroll_x: f32,
     viewport_width: f32,
     strip_available_px: f32,
+    body_scrolls: bool,
     strip_count: usize,
     track_count: usize,
     tree_enabled: bool,
@@ -225,13 +228,22 @@ impl Render for MixerPanelView {
         let split_for_move = split.clone();
         let split_for_end = split.clone();
 
+        // A panel shorter than one strip lays the strips out at their full
+        // height and scrolls them, rather than clipping the fader and the name
+        // plate off their bottom.
+        let body_scrolls = state.body_scrolls;
+        let strip_h = state.strip_available_px;
+        let fill = move |row: gpui::Div| {
+            if body_scrolls {
+                row.flex_none().h(px(strip_h))
+            } else {
+                row.flex_1().min_h_0()
+            }
+        };
+
         let mut channel_row = if state.strip_count == 0 {
             crate::perf::count("mixer_center_paint_count", 1);
-            div()
-                .flex()
-                .flex_row()
-                .flex_1()
-                .min_h_0()
+            fill(div().flex().flex_row())
                 .child(mixer_center_lightweight(
                     state.viewport_width,
                     state.strip_available_px,
@@ -250,17 +262,14 @@ impl Render for MixerPanelView {
                 state.scroll_x,
                 state.viewport_width,
                 state.strip_available_px,
+                state.body_scrolls,
                 &split,
                 on_scroll,
                 state.gpu_decor,
                 Some(&self.meter_layout),
                 i18n,
             );
-            div()
-                .flex()
-                .flex_row()
-                .flex_1()
-                .min_h_0()
+            fill(div().flex().flex_row())
                 .child(strip_row)
                 .child(div().w(px(1.0)).h_full().bg(Colors::border_default()))
                 .child(self.master_strip.clone())
@@ -281,18 +290,36 @@ impl Render for MixerPanelView {
                 state.strip_available_px,
             );
             let primitives = render_mixer_primitives(&snapshot);
-            channel_row = div()
-                .relative()
-                .flex_1()
-                .min_h_0()
+            channel_row = fill(div().relative())
                 .child(primitives)
                 .child(channel_row.size_full());
         }
 
+        let channel_row = if body_scrolls {
+            div()
+                .id("mixer-body-scroll")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(channel_row)
+                .into_any_element()
+        } else {
+            channel_row.into_any_element()
+        };
         // The region the meter layer may paint in: the strips and the pinned
-        // pair, never the tree sidebar or the header.
-        let channel_row = channel_row
+        // pair as far as they are on screen, never the tree sidebar or the
+        // header. It sits beside the scroller, not in it, so it stays the
+        // visible part when the strips scroll.
+        let channel_row = div()
             .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(channel_row)
             .child(clip_region(&self.meter_layout, ClipRegion::Body));
         let body = if state.tree_enabled {
             div()

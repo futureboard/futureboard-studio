@@ -3392,6 +3392,7 @@ pub fn mixer_panel(
         scroll_x,
         viewport_width,
         strip_available_px,
+        body_scrolls,
         &split,
         on_scroll,
         gpu_active,
@@ -3510,6 +3511,7 @@ pub(crate) fn mixer_strip_scroller(
     scroll_x: f32,
     viewport_width: f32,
     strip_available_px: f32,
+    body_scrolls: bool,
     split: &MixerSplit,
     on_scroll: std::sync::Arc<dyn Fn(f32, &mut gpui::Window, &mut gpui::App) + 'static>,
     gpu_decor: bool,
@@ -3618,6 +3620,11 @@ pub(crate) fn mixer_strip_scroller(
                 gpui::ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
                 gpui::ScrollDelta::Lines(l) => (l.x * STRIP_WIDTH, l.y * STRIP_WIDTH * 0.5),
             };
+            // A panel too short for its strips scrolls them vertically: a
+            // plain vertical wheel is that scroll's, not a sideways one.
+            if body_scrolls && !event.modifiers.shift && dy.abs() > dx.abs() {
+                return;
+            }
             let delta = if event.modifiers.shift {
                 if dx.abs() > f32::EPSILON {
                     dx

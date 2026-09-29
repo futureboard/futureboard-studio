@@ -501,15 +501,22 @@ pub struct InstrumentPreset {
 }
 
 /// Every usable instrument in the catalog that has a `.pst`, by vendor then
-/// name. A row the user disabled, one the scan could not load, and one with
-/// no `.pst` yet (a database from before the column, until the next scan) are
-/// not offered: each would be a row that does nothing when dragged.
-pub fn instrument_presets(conn: &Connection) -> rusqlite::Result<Vec<InstrumentPreset>> {
+/// name. A row the user disabled and one the scan could not load are not
+/// offered.
+///
+/// A row with no `.pst` recorded — every row of a database written before the
+/// column existed, until the next scan — asks `cached_preset` for the scan
+/// cache's file with that plug-in id. One still without a file is left out:
+/// it would be a row that does nothing when dragged.
+pub fn instrument_presets(
+    conn: &Connection,
+    mut cached_preset: impl FnMut(&str) -> Option<PathBuf>,
+) -> rusqlite::Result<Vec<InstrumentPreset>> {
     let mut out: Vec<InstrumentPreset> = read_all(conn)?
         .into_iter()
         .filter(|e| e.is_instrument && !e.disabled && e.scan_status.is_usable())
         .filter_map(|e| {
-            let preset_path = e.preset_path.clone()?;
+            let preset_path = e.preset_path.clone().or_else(|| cached_preset(&e.id))?;
             let plugin = e.to_registry_plugin();
             Some(InstrumentPreset {
                 id: e.id,
@@ -979,8 +986,19 @@ mod tests {
         super::init_schema(&conn).unwrap();
         assert!(super::has_column(&conn, "plugins", "preset_path").unwrap());
         assert!(super::read_all(&conn).unwrap()[0].preset_path.is_none());
-        // An instrument without its `.pst` is not offered to the Browser.
-        assert!(super::instrument_presets(&conn).unwrap().is_empty());
+        // An instrument without its `.pst` is not offered to the Browser…
+        assert!(
+            super::instrument_presets(&conn, |_| None)
+                .unwrap()
+                .is_empty()
+        );
+        // …unless the scan cache holds one for that plug-in id.
+        let cached = std::path::PathBuf::from("C:/cache/Synth.pst");
+        let listed =
+            super::instrument_presets(&conn, |id| (id == "vst3:synth").then(|| cached.clone()))
+                .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].preset_path, cached);
     }
 
     #[test]
@@ -999,7 +1017,7 @@ mod tests {
              ('g', 'VST3', 'NoPst', 'Acme', 'C:/n', 1, 0, 'success', 0, NULL, 'n');",
         )
         .unwrap();
-        let names: Vec<String> = super::instrument_presets(&conn)
+        let names: Vec<String> = super::instrument_presets(&conn, |_| None)
             .unwrap()
             .into_iter()
             .map(|i| format!("{} / {}", i.vendor, i.name))

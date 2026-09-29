@@ -6,7 +6,7 @@ use crate::components::mixer_panel::{
     clamp_mixer_section_height_px, mixer_render_item_count, mixer_scroll_x_for_strip_index,
     mixer_strip_index_for_channel, MixerCallbacks, MixerSplitAction, MixerSplitTarget,
     VstiOutputMeterState, MIXER_INSERT_SECTION_DEFAULT_PX, MIXER_SEND_SECTION_DEFAULT_PX,
-    STRIP_WIDTH,
+    MIXER_SUB_HEADER_H, STRIP_MIN_HEIGHT, STRIP_WIDTH,
 };
 use crate::components::mixer_tree_model::{
     ensure_timeline_mixer_tree_defaults, expand_ancestors_for_channel, MixerTreeModel,
@@ -127,6 +127,8 @@ pub(crate) struct DockedMixerPanelState<'a> {
     pub tree_sidebar_enabled: bool,
     pub viewport_width: f32,
     pub strip_available_px: f32,
+    /// The panel is shorter than one strip, so the strips scroll vertically.
+    pub body_scrolls: bool,
 }
 
 impl StudioLayout {
@@ -145,8 +147,13 @@ impl StudioLayout {
         // The pinned Master and Control Room strips and the rule before them.
         let pinned_w = 2.0 * STRIP_WIDTH + 1.0;
         let mixer_viewport_width = (window_w - tree_w - pinned_w).max(100.0);
-        let mixer_viewport_height = (self.bottom_panel_state.height_px - 28.0 - 30.0).max(0.0);
-        let strip_available_px = mixer_viewport_height.max(STRIP_WIDTH);
+        // The dock's top rule, its tab strip and the mixer's own sub-header.
+        let chrome_h = 1.0 + crate::theme::size::COMFORTABLE + MIXER_SUB_HEADER_H;
+        let mixer_viewport_height = (self.bottom_panel_state.height_px - chrome_h).max(0.0);
+        // A strip is never laid out shorter than its sections add up to: a
+        // shorter panel scrolls the strips (see `MixerPanelView`) instead of
+        // clipping the fader and the name plate off their bottom.
+        let strip_available_px = mixer_viewport_height.max(STRIP_MIN_HEIGHT);
         let _ = cx;
         (
             mixer_viewport_width,
@@ -157,13 +164,14 @@ impl StudioLayout {
 
     /// Snapshot for the docked mixer panel entity (read-only view of mixer chrome).
     pub(crate) fn docked_mixer_panel_state(&self, cx: &gpui::App) -> DockedMixerPanelState<'_> {
-        let (viewport_width, _viewport_height, strip_available_px) =
+        let (viewport_width, viewport_height, strip_available_px) =
             self.mixer_panel_viewport_metrics(cx);
         DockedMixerPanelState {
             scroll_x: self.mixer_view.scroll_x,
             vsti_output_meters: &self.mixer_view.vsti_output_meters,
             tree_sidebar_enabled: self.mixer_view.tree_sidebar_enabled,
             viewport_width,
+            body_scrolls: viewport_height + 0.5 < strip_available_px,
             strip_available_px,
         }
     }

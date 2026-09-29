@@ -155,19 +155,33 @@ impl StudioLayout {
                         return Ok(Vec::new());
                     }
                     let conn = plugin_db::open_database_readonly()?;
-                    plugin_db::instrument_presets(&conn)
-                        .map_err(|error| error.to_string())
-                        .map(|list| {
-                            list.into_iter()
-                                .map(|i| crate::components::file_browser::BrowserInstrument {
-                                    name: i.name,
-                                    vendor: i.vendor,
-                                    format: i.format.label().to_string(),
-                                    category: i.category,
-                                    preset_path: i.preset_path,
-                                })
-                                .collect()
-                        })
+                    // Rows from before the database recorded each `.pst` find
+                    // theirs in the scan cache by plug-in id; the cache is read
+                    // once, and only if such a row exists.
+                    let mut cache: Option<std::collections::HashMap<String, PathBuf>> = None;
+                    plugin_db::instrument_presets(&conn, |id| {
+                        cache
+                            .get_or_insert_with(|| {
+                                SpherePluginHost::preset::load_cached_plugins()
+                                    .into_iter()
+                                    .map(|p| (p.id, p.preset_path))
+                                    .collect()
+                            })
+                            .get(id)
+                            .cloned()
+                    })
+                    .map_err(|error| error.to_string())
+                    .map(|list| {
+                        list.into_iter()
+                            .map(|i| crate::components::file_browser::BrowserInstrument {
+                                name: i.name,
+                                vendor: i.vendor,
+                                format: i.format.label().to_string(),
+                                category: i.category,
+                                preset_path: i.preset_path,
+                            })
+                            .collect()
+                    })
                 })
                 .await;
             let _ = this.update(cx, move |this, cx| {
