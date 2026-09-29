@@ -162,6 +162,48 @@ fn wire_instance_id(key: &PluginInstanceKey) -> String {
     format!("{}::{}", key.track_id, key.insert_id)
 }
 
+/// Copy a file the user picked through the OS "Load Sample" dialog into the
+/// plugin's own Samples sandbox, deduping the name against whatever is
+/// already there. Returns the resulting bare file name — what a pad's
+/// `sample_name` and every later `futureboard.loadSample` reference by.
+/// Background-thread only (filesystem I/O).
+#[cfg(feature = "native-dialogs")]
+fn import_sample_file(
+    samples_dir: &std::path::Path,
+    source: &std::path::Path,
+) -> Result<String, String> {
+    use crate::components::builtin_plugin_files::{sanitize_file_name, BuiltinFileKind};
+
+    let source_name = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "selected file has no name".to_string())?;
+    let clean = sanitize_file_name(BuiltinFileKind::Samples, source_name)
+        .ok_or_else(|| format!("'{source_name}' is not a supported audio file name"))?;
+    let (stem, ext) = clean
+        .rsplit_once('.')
+        .map(|(stem, ext)| (stem.to_string(), ext.to_string()))
+        .unwrap_or((clean.clone(), String::new()));
+    let target = (1..)
+        .map(|n| {
+            let name = if n == 1 {
+                clean.clone()
+            } else {
+                format!("{stem} {n}.{ext}")
+            };
+            samples_dir.join(name)
+        })
+        .find(|candidate| !candidate.exists())
+        .ok_or_else(|| "could not find a free file name".to_string())?;
+    std::fs::copy(source, &target)
+        .map_err(|e| format!("could not copy {}: {e}", source.display()))?;
+    target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| "copied file has no name".to_string())
+}
+
 /// The key `active` answers to now that its insert sits on another channel:
 /// the listed instance with the same insert id under a different track.
 /// `None` when the insert is gone, or still where it was.
@@ -440,6 +482,21 @@ struct IrLoadResultMsg {
     truncated: bool,
 }
 
+/// Native -> React: async outcome of a `futureboard.loadSample` request.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DrumSampleLoadResultMsg {
+    r#type: &'static str,
+    protocol_version: u32,
+    instance_id: String,
+    pad_index: u32,
+    ok: bool,
+    name: String,
+    error: Option<String>,
+    frames: u64,
+    channels: u32,
+}
+
 /// One parameter edit inside a `futureboard.setParams` batch. `id` is the
 /// editor's string param id (the `Dsp::apply_ui_param` contract); it is
 /// resolved to the plugin's u32 wire index before leaving the UI thread.
@@ -542,6 +599,32 @@ enum InboundMsg {
         instance_id: String,
         binding_generation: u64,
         file_name: String,
+    },
+    /// Load a one-shot drum sample into `pad_index` of the bound
+    /// `drumsampler` instance. Same shape and staleness rules as `loadIr`: the
+    /// page sends only a file name from the plugin's Samples folder.
+    #[serde(rename = "futureboard.loadSample", rename_all = "camelCase")]
+    LoadSample {
+        #[allow(dead_code)]
+        plugin_id: String,
+        instance_id: String,
+        binding_generation: u64,
+        pad_index: u32,
+        file_name: String,
+    },
+    /// Ask native to open an OS file picker, copy the chosen audio file into
+    /// this plugin's Samples folder, and load it into `pad_index` — the
+    /// "Browse…" gesture on a pad. Native replies the same way `loadSample`
+    /// does (`futureboard.drumSampleLoadResult`), plus a `futureboard.fileList`
+    /// refresh for the Samples kind so the page's file picker (if open) stays
+    /// in sync.
+    #[serde(rename = "futureboard.browseSample", rename_all = "camelCase")]
+    BrowseSample {
+        #[allow(dead_code)]
+        plugin_id: String,
+        instance_id: String,
+        binding_generation: u64,
+        pad_index: u32,
     },
     /// Ask whether TONE3000 fetch is configured (API key present). No secrets
     /// come back — only a boolean and a user-facing reason when it is not.
@@ -680,6 +763,23 @@ pub struct BuiltinIrLoadRequest {
 /// with `BuiltinIrResult`, routed back through `notify_ir_load_result`.
 pub type BuiltinIrLoadForwarder = std::sync::Arc<dyn Fn(&PluginInstanceKey, BuiltinIrLoadRequest)>;
 
+/// A validated drum-pad sample load request on its way to the plugin-host
+/// process. The bytes are the raw audio file, already read from the plugin's
+/// Samples folder.
+#[derive(Debug, Clone)]
+pub struct BuiltinDrumSampleLoadRequest {
+    pub pad_index: u32,
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Forwards a drum-pad sample load toward the plugin-host bridge
+/// (`HostCommand::LoadBuiltinDrumSample`). UI thread; the host replies
+/// asynchronously with `BuiltinDrumSampleResult`, routed back through
+/// `notify_drum_sample_result`.
+pub type BuiltinDrumSampleLoadForwarder =
+    std::sync::Arc<dyn Fn(&PluginInstanceKey, BuiltinDrumSampleLoadRequest)>;
+
 /// Polls the latest telemetry frame for an instance's shared region (pure
 /// atomic loads). UI thread, ~30 Hz.
 pub type BuiltinMeterSource = std::sync::Arc<
@@ -711,6 +811,7 @@ pub struct BuiltinEditorHostOps {
     pub dispatch_global_command: Option<BuiltinGlobalCommandDispatcher>,
     pub load_nam_capture: Option<BuiltinNamLoadForwarder>,
     pub load_ir: Option<BuiltinIrLoadForwarder>,
+    pub load_pad_sample: Option<BuiltinDrumSampleLoadForwarder>,
     pub meter_source: Option<BuiltinMeterSource>,
     pub host_status_source: Option<BuiltinHostStatusSource>,
     pub spectrum_source: Option<BuiltinSpectrumSource>,
@@ -723,6 +824,7 @@ impl BuiltinEditorHostOps {
             && self.dispatch_global_command.is_none()
             && self.load_nam_capture.is_none()
             && self.load_ir.is_none()
+            && self.load_pad_sample.is_none()
             && self.meter_source.is_none()
             && self.host_status_source.is_none()
             && self.spectrum_source.is_none()
@@ -960,6 +1062,69 @@ impl BuiltinPluginEditorWindow {
             }
         }
         self.files_root.clone()
+    }
+
+    /// Read `file_name` from this plugin's Samples folder and forward it to
+    /// the bound instance's `pad_index`, or report the failure back to the
+    /// page. Shared by `futureboard.loadSample` (the page already listed the
+    /// file) and the `futureboard.browseSample` continuation (native just
+    /// imported it). Assumes the caller already validated the binding
+    /// generation.
+    fn load_sample_into_pad(&mut self, pad_index: u32, file_name: String) {
+        use crate::components::builtin_plugin_files as files;
+        // Clone the key up front: reading the Samples folder needs `&mut
+        // self`, which cannot coexist with a borrow of `active_instance`.
+        let Some(active) = self.active_instance.clone() else {
+            return;
+        };
+        if self.host_ops.load_pad_sample.is_none() {
+            eprintln!(
+                "[plugin-bridge] loadSample dropped (bridge not wired) plugin={}",
+                self.plugin_id
+            );
+            return;
+        }
+        // The read is filesystem I/O; the *host* does the decode work off
+        // this thread.
+        let read = self
+            .ensure_files_root()
+            .ok_or_else(|| "user folder unavailable".to_string())
+            .and_then(|root| {
+                files::read_file_bytes(&root, files::BuiltinFileKind::Samples, &file_name)
+                    .map_err(|e| e.to_string())
+            });
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let insert_id = active.insert_id.clone();
+                self.notify_drum_sample_result(
+                    &insert_id,
+                    pad_index,
+                    false,
+                    &file_name,
+                    Some(&error),
+                    0,
+                    0,
+                );
+                return;
+            }
+        };
+        eprintln!(
+            "[plugin-bridge] loadSample plugin={} instance={} pad={pad_index} file={file_name} bytes={}",
+            self.plugin_id,
+            active.insert_id,
+            bytes.len()
+        );
+        if let Some(forwarder) = self.host_ops.load_pad_sample.as_ref() {
+            forwarder(
+                &active,
+                BuiltinDrumSampleLoadRequest {
+                    pad_index,
+                    name: file_name,
+                    bytes,
+                },
+            );
+        }
     }
 
     pub fn plugin_id(&self) -> &str {
@@ -1477,6 +1642,110 @@ impl BuiltinPluginEditorWindow {
                     );
                 }
             }
+            InboundMsg::LoadSample {
+                instance_id,
+                binding_generation,
+                pad_index,
+                file_name,
+                ..
+            } => {
+                if binding_generation != self.binding_generation {
+                    eprintln!(
+                        "[plugin-bridge] loadSample stale plugin={} instance={instance_id}",
+                        self.plugin_id
+                    );
+                    return;
+                }
+                if !self
+                    .active_instance
+                    .as_ref()
+                    .is_some_and(|active| wire_instance_id(active) == instance_id)
+                {
+                    eprintln!(
+                        "[plugin-bridge] loadSample instance mismatch plugin={} got={instance_id}",
+                        self.plugin_id
+                    );
+                    return;
+                }
+                self.load_sample_into_pad(pad_index, file_name);
+            }
+            #[cfg(feature = "native-dialogs")]
+            InboundMsg::BrowseSample {
+                instance_id,
+                binding_generation,
+                pad_index,
+                ..
+            } => {
+                if binding_generation != self.binding_generation {
+                    eprintln!(
+                        "[plugin-bridge] browseSample stale plugin={} instance={instance_id}",
+                        self.plugin_id
+                    );
+                    return;
+                }
+                let Some(active) = self.active_instance.clone() else {
+                    return;
+                };
+                if wire_instance_id(&active) != instance_id {
+                    eprintln!(
+                        "[plugin-bridge] browseSample instance mismatch plugin={} got={instance_id}",
+                        self.plugin_id
+                    );
+                    return;
+                }
+                let Some(root) = self.ensure_files_root() else {
+                    return;
+                };
+                let samples_dir = root.join(
+                    crate::components::builtin_plugin_files::BuiltinFileKind::Samples.dir_name(),
+                );
+                let _ = std::fs::create_dir_all(&samples_dir);
+                cx.spawn(async move |this, cx| {
+                    let Some(handle) = rfd::AsyncFileDialog::new()
+                        .set_title("Load Sample")
+                        .set_directory(&samples_dir)
+                        .add_filter("Audio", &["wav", "aiff", "aif", "mp3", "flac"])
+                        .pick_file()
+                        .await
+                    else {
+                        return; // cancelled
+                    };
+                    let source = handle.path().to_path_buf();
+                    let imported = cx
+                        .background_executor()
+                        .spawn({
+                            let samples_dir = samples_dir.clone();
+                            let source = source.clone();
+                            async move { import_sample_file(&samples_dir, &source) }
+                        })
+                        .await;
+                    let _ = this.update(cx, |editor, _cx| match imported {
+                        Ok(file_name) => editor.load_sample_into_pad(pad_index, file_name),
+                        Err(error) => {
+                            eprintln!(
+                                "[plugin-bridge] browseSample import failed source={} error={error}",
+                                source.display()
+                            );
+                            editor.notify_drum_sample_result(
+                                &active.insert_id,
+                                pad_index,
+                                false,
+                                &source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                                Some(&error),
+                                0,
+                                0,
+                            );
+                        }
+                    });
+                })
+                .detach();
+            }
+            #[cfg(not(feature = "native-dialogs"))]
+            InboundMsg::BrowseSample { .. } => {
+                eprintln!(
+                    "[plugin-bridge] browseSample dropped: native file dialogs are disabled in this build"
+                );
+            }
             InboundMsg::Tone3000Status { .. } => {
                 self.post_tone3000_status();
             }
@@ -1761,6 +2030,35 @@ impl BuiltinPluginEditorWindow {
             latency_samples,
             stereo,
             truncated,
+        });
+    }
+
+    pub(crate) fn notify_drum_sample_result(
+        &self,
+        plugin_instance_id: &str,
+        pad_index: u32,
+        ok: bool,
+        name: &str,
+        error: Option<&str>,
+        frames: u64,
+        channels: u32,
+    ) {
+        let Some(active) = self.active_instance.as_ref() else {
+            return;
+        };
+        if active.insert_id != plugin_instance_id {
+            return;
+        }
+        self.post_to_view(&DrumSampleLoadResultMsg {
+            r#type: "futureboard.drumSampleLoadResult",
+            protocol_version: BRIDGE_PROTOCOL_VERSION,
+            instance_id: wire_instance_id(active),
+            pad_index,
+            ok,
+            name: name.to_string(),
+            error: error.map(str::to_string),
+            frames,
+            channels,
         });
     }
 
@@ -3911,6 +4209,37 @@ mod tests {
                 assert_eq!(file_name, "Vintage 4x12 SM57.wav");
             }
             other => panic!("expected LoadIr, got {other:?}"),
+        }
+    }
+
+    /// Same shape as the IR load: a pad index plus a file name from the
+    /// plugin's Samples folder, never the file bytes.
+    #[test]
+    fn inbound_load_sample_parses_by_tag_and_carries_pad_index_and_file_name() {
+        let raw = br#"{
+            "type":"futureboard.loadSample",
+            "protocolVersion":1,
+            "pluginId":"drumsampler",
+            "instanceId":"track-3::insert-9",
+            "bindingGeneration":7,
+            "padIndex":4,
+            "fileName":"Kick 808.wav"
+        }"#;
+        let msg: InboundMsg = serde_json::from_slice(raw).unwrap();
+        match msg {
+            InboundMsg::LoadSample {
+                instance_id,
+                binding_generation,
+                pad_index,
+                file_name,
+                ..
+            } => {
+                assert_eq!(instance_id, "track-3::insert-9");
+                assert_eq!(binding_generation, 7);
+                assert_eq!(pad_index, 4);
+                assert_eq!(file_name, "Kick 808.wav");
+            }
+            other => panic!("expected LoadSample, got {other:?}"),
         }
     }
 

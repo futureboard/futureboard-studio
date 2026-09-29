@@ -2353,10 +2353,12 @@ impl PluginEditorWindow {
             | ClientEvent::Host(HostEvent::PluginParameters { .. })
             // The project's dirty flag is the studio's (`poll_plugin_bridge_runtime`).
             | ClientEvent::Host(HostEvent::PluginStateTouched { .. })
-            // Built-in NAM results are routed to the built-in editor windows
-            // by `poll_plugin_bridge_runtime`, not this VST3 state machine.
+            // Built-in NAM/IR/drum-sample results are routed to the built-in
+            // editor windows by `poll_plugin_bridge_runtime`, not this VST3
+            // state machine.
             | ClientEvent::Host(HostEvent::BuiltinNamCaptureResult { .. })
-            | ClientEvent::Host(HostEvent::BuiltinIrResult { .. }) => {}
+            | ClientEvent::Host(HostEvent::BuiltinIrResult { .. })
+            | ClientEvent::Host(HostEvent::BuiltinDrumSampleResult { .. }) => {}
             // Transport keys are a workspace command, not editor state — the
             // studio layout runs them (see `poll_plugin_bridge_runtime`).
             ClientEvent::Host(HostEvent::TransportToggleRequested { .. }) => {}

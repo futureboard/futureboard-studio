@@ -430,7 +430,7 @@ fn generate_wav_peaks_streaming(
         bits => {
             return Err(SphereAudioError::NativeError(format!(
                 "unsupported WAV bit depth for peak scan: {bits}"
-            )))
+            )));
         }
     };
     let bytes_per_frame = fmt.channels * bytes_per_sample;
@@ -996,7 +996,7 @@ fn decode_frame_count(
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(SymphoniaError::IoError(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                break
+                break;
             }
             Err(SymphoniaError::ResetRequired) => {
                 decoder.reset();
@@ -1005,7 +1005,7 @@ fn decode_frame_count(
             Err(e) => {
                 return Err(SphereAudioError::NativeError(format!(
                     "Packet read error: {e}"
-                )))
+                )));
             }
         };
 
@@ -1153,10 +1153,40 @@ fn load_via_symphonia(path: &Path) -> Result<AudioFileBuffer, String> {
     }
 
     let src = File::open(path).map_err(|e| format!("Cannot open '{}': {e}", path.display()))?;
-    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+    let ext_hint = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_string());
+    decode_symphonia_source(Box::new(src), ext_hint.as_deref())
+}
+
+/// Decode an in-memory audio file, for callers that only receive bytes (e.g.
+/// across an IPC boundary that never touches the sender's filesystem).
+/// `ext_hint` (a bare extension like `"wav"` or `"flac"`, no dot) helps
+/// symphonia's probe pick a demuxer faster; pass `""` if unknown.
+///
+/// Same size ceiling and output shape as [`load_audio_file`] — always
+/// interleaved `f32`, normalized to −1.0…1.0.
+pub fn load_audio_bytes(bytes: &[u8], ext_hint: &str) -> Result<AudioFileBuffer, String> {
+    if bytes.len() as u64 > MAX_IN_MEMORY_DECODE_BYTES {
+        return Err(format!(
+            "payload too large ({} bytes) for in-memory decode",
+            bytes.len()
+        ));
+    }
+    let cursor = io::Cursor::new(bytes.to_vec());
+    let hint = (!ext_hint.is_empty()).then_some(ext_hint);
+    decode_symphonia_source(Box::new(cursor), hint)
+}
+
+fn decode_symphonia_source(
+    src: Box<dyn symphonia::core::io::MediaSource>,
+    ext_hint: Option<&str>,
+) -> Result<AudioFileBuffer, String> {
+    let mss = MediaSourceStream::new(src, Default::default());
 
     let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+    if let Some(ext) = ext_hint {
         hint.with_extension(ext);
     }
 
@@ -1928,8 +1958,8 @@ mod audition_head_tests {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// 16-bit stereo WAV of `frames` frames at 48 kHz.
-    fn write_wav(path: &Path, frames: usize) {
+    /// 16-bit stereo WAV of `frames` frames at 48 kHz, as raw bytes.
+    fn wav_bytes(frames: usize) -> Vec<u8> {
         let sample_rate = 48_000u32;
         let channels = 2u16;
         let bits = 16u16;
@@ -1953,8 +1983,31 @@ mod audition_head_tests {
             out.extend_from_slice(&v.to_le_bytes());
             out.extend_from_slice(&v.to_le_bytes());
         }
+        out
+    }
+
+    /// 16-bit stereo WAV of `frames` frames at 48 kHz.
+    fn write_wav(path: &Path, frames: usize) {
         let mut f = File::create(path).unwrap();
-        f.write_all(&out).unwrap();
+        f.write_all(&wav_bytes(frames)).unwrap();
+    }
+
+    /// `load_audio_bytes` (used by the plugin host, which only ever receives
+    /// bytes over IPC) must decode the same PCM as the path-based decoder.
+    #[test]
+    fn bytes_decode_matches_file_decode() {
+        let bytes = wav_bytes(4_800);
+        let from_bytes = load_audio_bytes(&bytes, "wav").expect("decode from bytes");
+        assert_eq!(from_bytes.sample_rate, 48_000);
+        assert_eq!(from_bytes.channels, 2);
+        assert_eq!(from_bytes.frames, 4_800);
+        assert_eq!(from_bytes.samples.len(), 4_800 * 2);
+
+        let path = temp_wav("bytes-vs-file");
+        write_wav(&path, 4_800);
+        let from_file = load_audio_file(path.to_str().unwrap()).expect("decode from file");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(from_bytes.samples, from_file.samples);
     }
 
     fn temp_wav(label: &str) -> PathBuf {

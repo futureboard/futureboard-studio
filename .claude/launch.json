@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "rodharerist-editorui",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "--cwd", "crates/BuiltinAudioPlugins/crates/rodharerist/editorui", "dev"],
+      "port": 5173
+    },
+    {
+      "name": "drumsampler-editor",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "--cwd", "crates/BuiltinAudioPlugins/crates/drumsampler/editor", "dev"],
+      "port": 5174
+    }
+  ]
+}

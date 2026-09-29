@@ -1,0 +1,544 @@
+@import '@fontsource-variable/jetbrains-mono';
+@import '@fontsource-variable/space-grotesk';
+
+:root {
+  /* Two-font system: Space Grotesk carries chrome/labels, JetBrains Mono
+     carries every tabular readout. Splitting these is what gives the panel
+     hierarchy instead of one flat wall of monospace. */
+  --font-display: 'Space Grotesk Variable', 'Space Grotesk', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, 'SFMono-Regular', monospace;
+
+  /* Warm graphite body — the instrument's own material, distinct from the
+     host's cool blue-graphite chrome. */
+  --bg-app: #0a0907;
+  --bg-shell: #141110;
+  --bg-topbar: #1a1613;
+  --bg-panel: #17130f;
+  --bg-recess: #0d0b09;
+  --bg-lcd: #140d09;
+  --bg-pad: #1c1712;
+  --bg-pad-hover: #231c15;
+  --bg-pad-empty: #17130f;
+  --bg-pad-selected: #241d15;
+
+  --line: #322b22;
+  --line-soft: #2a241c;
+  --line-hair: rgba(233, 220, 199, 0.08);
+
+  --text: #ddd5c8;
+  --text-dim: #93876f;
+  --text-faint: #625a49;
+
+  /* Reserved strictly for focus, selection and live-connection state, per the
+     host's accent contract — never used decoratively below. */
+  --accent-cyan: #5bd2e4;
+  --accent-cyan-bright: #79dce9;
+
+  /* The instrument's own identity hue: brand mark, loaded-pad marker, LCD
+     phosphor. Kept well clear of cyan (focus) and the fixed state hues
+     (mute = blue, solo = amber). */
+  --identity: #ff9d2e;
+  --identity-dim: #8a5a24;
+
+  --state-mute: #5b8fd6;
+  --state-mute-ink: #06121f;
+  --state-solo: #d6a355;
+  --state-solo-ink: #1f1305;
+  --state-error: #dd8768;
+
+  /* Radius scale: a small deliberate set, not one value everywhere — the
+     window, panels, and small controls each get their own tier so rounding
+     still reads as hierarchy at a much softer, more "plugin" angle than the
+     host's own tighter control-height ratio. */
+  --r-shell: 18px;
+  --r-panel: 14px;
+  --r-control: 10px;
+  --r-pad: 14px;
+
+  color: var(--text);
+  background: var(--bg-app);
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; min-width: 820px; min-height: 100%; margin: 0; }
+button, input { font: inherit; }
+button { color: inherit; }
+
+main {
+  min-height: 100vh;
+  padding: 8px;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  background: var(--bg-app);
+}
+
+.instrument-shell {
+  width: min(980px, 100%);
+  background: var(--bg-shell);
+  border: 1px solid var(--line);
+  border-radius: var(--r-shell);
+  /* The one floating layer in this panel — everything else sits flat on it,
+     so it alone carries an elevation shadow. overflow can't be hidden here
+     (that would clip this very shadow), so the topbar/footer round their own
+     corners to match instead. */
+  box-shadow: 0 12px 28px -14px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+.topbar {
+  height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 0 18px;
+  background: var(--bg-topbar);
+  border-bottom: 1px solid var(--line);
+  border-radius: var(--r-shell) var(--r-shell) 0 0;
+}
+
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand > span {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--identity-dim);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.4);
+  color: var(--identity);
+  background: var(--bg-recess);
+  font: 700 15px/1 var(--font-display);
+}
+.brand div { display: flex; flex-direction: column; gap: 1px; }
+.brand strong {
+  font: 600 13px/1 var(--font-display);
+  letter-spacing: .03em;
+  text-transform: uppercase;
+}
+.brand small,
+.module header small,
+footer {
+  color: var(--text-dim);
+  font: 500 9px/1.5 var(--font-display);
+  letter-spacing: .02em;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-dim);
+  font: 500 9px var(--font-display);
+  letter-spacing: .03em;
+  text-transform: uppercase;
+}
+.status i { width: 5px; height: 5px; border-radius: 50%; background: var(--text-faint); }
+.status i.online { background: var(--accent-cyan); }
+
+.workspace {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px;
+}
+
+/* Each column sizes to its own content — a plain two-column grid here made
+   the pad block's aspect-ratio-driven height fight the inspector's stacked
+   content for the shared row track, so the two sides never lined up the
+   same way twice. Flex removes that coupling outright. */
+.pad-panel { flex: 1.3 1 520px; }
+.inspector { flex: 1 1 360px; }
+
+/* ── Pad grid ─────────────────────────────────────────────────────────── */
+
+.pad-panel .pad-count {
+  font: 600 10px var(--font-mono);
+  color: var(--identity);
+  font-variant-numeric: tabular-nums;
+}
+
+.pad-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 7px;
+  padding: 10px;
+}
+
+.pad-cell {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 8px 9px;
+  background: var(--bg-pad);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pad);
+  border-top-width: 3px;
+  /* A real pad cap: light catches the top-left, weight pools at the
+     bottom-right — a bevel, not a flat swatch. */
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    inset -1px -2px 4px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  text-align: left;
+  transition: background 120ms ease-out, border-color 120ms ease-out, transform 80ms ease-out, box-shadow 80ms ease-out;
+}
+.pad-cell:hover { background: var(--bg-pad-hover); }
+.pad-cell:active {
+  transform: translateY(1px);
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.55);
+}
+.pad-cell.empty {
+  border-style: dashed;
+  background: var(--bg-pad-empty);
+  box-shadow: none;
+}
+.pad-cell.empty .pad-name { color: var(--text-faint); }
+.pad-cell.selected {
+  border-top-color: var(--accent-cyan);
+  background: var(--bg-pad-selected);
+}
+.pad-cell.selected .pad-index { color: var(--accent-cyan-bright); }
+.pad-cell.loading .pad-name { color: var(--accent-cyan-bright); }
+
+/* A pad carrying a sample gets a quiet identity-colored mark, independent of
+   selection (cyan) — "has content" and "is selected" are different facts and
+   must not share one channel. */
+.pad-cell:not(.empty)::after {
+  content: '';
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--identity-dim);
+  transition: background 200ms ease-out;
+}
+.pad-cell.selected:not(.empty)::after { background: var(--identity); }
+
+/* Live readout for the pad-drag quick-tweak — only exists while actively
+   dragging, so the pad stays clean at rest. */
+.pad-adjust {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  background: rgba(10, 8, 6, 0.88);
+  border-radius: inherit;
+  pointer-events: none;
+  font: 600 12px var(--font-mono);
+  color: var(--identity);
+  font-variant-numeric: tabular-nums;
+}
+.pad-adjust b {
+  font: 700 8px var(--font-display);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.pad-index {
+  font: 700 9px var(--font-mono);
+  color: var(--text-faint);
+  letter-spacing: .04em;
+  font-variant-numeric: tabular-nums;
+}
+.pad-name {
+  font: 500 10.5px var(--font-display);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pad-tags {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 14px;
+}
+.pad-tag {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  font: 700 8px/1 var(--font-mono);
+  font-style: normal;
+  color: #0b0f12;
+}
+.pad-tag.mute { background: var(--state-mute); color: var(--state-mute-ink); }
+.pad-tag.solo { background: var(--state-solo); color: var(--state-solo-ink); }
+
+/* ── Inspector ────────────────────────────────────────────────────────── */
+
+.inspector {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.lcd {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 11px 13px;
+  background: var(--bg-lcd);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-panel);
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.5);
+}
+.lcd-label {
+  font: 600 8px var(--font-display);
+  letter-spacing: .1em;
+  color: var(--text-faint);
+  text-transform: uppercase;
+}
+.lcd-value {
+  font: 600 15px var(--font-mono);
+  letter-spacing: .02em;
+  color: var(--identity);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lcd-error {
+  font: 500 9px var(--font-mono);
+  color: var(--state-error);
+}
+
+.browse {
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-control);
+  background: var(--bg-pad);
+  font: 600 9px var(--font-display);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 120ms ease-out;
+}
+.browse:hover { background: var(--bg-pad-hover); }
+.browse:active { box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.5); }
+.browse:disabled { color: var(--text-faint); cursor: default; box-shadow: none; }
+
+.module {
+  background: var(--bg-panel);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-panel);
+  overflow: hidden;
+}
+.module header {
+  height: 32px;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.module header strong { font: 600 10px var(--font-display); letter-spacing: .02em; text-transform: uppercase; }
+.module header small { margin-left: auto; }
+
+/* The one repeated hardware-identity gesture: the pad face reads as a
+   mounted panel, not a card, so it alone carries the corner fasteners —
+   repeating it on every module would turn a detail into wallpaper. */
+.pad-panel {
+  position: relative;
+  background-color: var(--bg-panel);
+  background-repeat: no-repeat;
+  background-size: 5px 5px;
+  background-image:
+    radial-gradient(circle at 35% 32%, rgba(255, 255, 255, 0.18), rgba(0, 0, 0, 0.6) 70%),
+    radial-gradient(circle at 35% 32%, rgba(255, 255, 255, 0.18), rgba(0, 0, 0, 0.6) 70%),
+    radial-gradient(circle at 35% 32%, rgba(255, 255, 255, 0.18), rgba(0, 0, 0, 0.6) 70%),
+    radial-gradient(circle at 35% 32%, rgba(255, 255, 255, 0.18), rgba(0, 0, 0, 0.6) 70%);
+  background-position:
+    13px 13px,
+    calc(100% - 13px) 13px,
+    13px calc(100% - 13px),
+    calc(100% - 13px) calc(100% - 13px);
+}
+
+.knob-row {
+  display: flex;
+  justify-content: space-around;
+  gap: 3px;
+  padding: 10px 7px 12px;
+}
+.knob-control {
+  min-width: 50px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+}
+.knob-label {
+  color: var(--text-dim);
+  font: 600 8px var(--font-display);
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+.knob {
+  width: 40px;
+  height: 40px;
+  position: relative;
+  display: block;
+  border-radius: 50%;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.5), inset 0 -1px 0 var(--line-hair);
+}
+/* Printed-scale reference ticks at the knob's five real stops (-135, -67.5,
+   0, +67.5, +135deg — the same sweep the indicator travels), positioned by
+   the actual trig, not eyeballed. Calibration marks, not a decorative ring. */
+.knob::before {
+  content: '';
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle, var(--text-dim) 1px, transparent 1.3px) 14.6% 85.4% / 2.4px 2.4px no-repeat,
+    radial-gradient(circle, var(--text-dim) 1px, transparent 1.3px) 3.8% 30.9% / 2.4px 2.4px no-repeat,
+    radial-gradient(circle, var(--text-dim) 1px, transparent 1.3px) 50% 0% / 2.4px 2.4px no-repeat,
+    radial-gradient(circle, var(--text-dim) 1px, transparent 1.3px) 96.2% 30.9% / 2.4px 2.4px no-repeat,
+    radial-gradient(circle, var(--text-dim) 1px, transparent 1.3px) 85.4% 85.4% / 2.4px 2.4px no-repeat;
+  pointer-events: none;
+}
+.knob-cap {
+  position: absolute;
+  z-index: 1;
+  inset: 5px;
+  border-radius: 50%;
+  background: var(--bg-pad);
+  border: 1px solid var(--line-soft);
+}
+.knob-cap i {
+  position: absolute;
+  width: 2px;
+  height: 8px;
+  border-radius: 1px;
+  left: 50%;
+  top: 3px;
+  background: var(--text);
+  transform-origin: 1px 12px;
+  transform: rotate(var(--knob-angle));
+}
+.knob:focus-within .knob-cap i { background: var(--accent-cyan-bright); }
+.knob input {
+  position: absolute;
+  z-index: 3;
+  inset: -5px;
+  width: 50px;
+  opacity: 0;
+  cursor: ns-resize;
+}
+.knob-control output {
+  color: var(--text);
+  font: 500 9px var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.stepper-row {
+  display: flex;
+  gap: 8px;
+  padding: 9px 9px 0;
+}
+.stepper {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.stepper > span {
+  font: 600 8px var(--font-display);
+  letter-spacing: .03em;
+  color: var(--text-dim);
+}
+.stepper-control {
+  display: grid;
+  grid-template-columns: 22px 1fr 22px;
+  align-items: stretch;
+  height: 26px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-control);
+  background: var(--bg-recess);
+  overflow: hidden;
+}
+.stepper-control button {
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font: 700 11px var(--font-display);
+  transition: background 100ms ease-out, color 100ms ease-out;
+}
+.stepper-control button:hover { color: var(--text); background: var(--bg-pad); }
+.stepper-control button:active { background: var(--bg-recess); }
+.stepper-control output {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  font: 500 10px var(--font-mono);
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.choke-swatch {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+}
+
+.toggle-row {
+  display: flex;
+  gap: 6px;
+  padding: 9px;
+}
+.toggle-row button {
+  flex: 1;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-control);
+  background: var(--bg-pad);
+  color: var(--text-dim);
+  font: 600 9px var(--font-display);
+  letter-spacing: .03em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 100ms ease-out, color 100ms ease-out;
+}
+.toggle-row button:hover { color: var(--text); }
+.toggle-row button:active { box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.5); }
+.toggle-row button.active { color: #0b0f12; border-color: transparent; }
+.toggle-row button.active:not(.mute):not(.solo) { background: var(--line); color: var(--text); border-color: var(--line-soft); }
+.toggle-row button.active.mute { background: var(--state-mute); }
+.toggle-row button.active.solo { background: var(--state-solo); }
+
+footer {
+  height: 26px;
+  display: flex;
+  align-items: center;
+  gap: 25px;
+  padding: 0 11px;
+  border-top: 1px solid var(--line);
+  border-radius: 0 0 var(--r-shell) var(--r-shell);
+  background: var(--bg-recess);
+  text-transform: uppercase;
+}
+footer span:last-child { margin-left: auto; }
+
+button:focus-visible,
+input:focus-visible {
+  outline: 1px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+@media (max-width: 760px) {
+  .workspace { grid-template-columns: 1fr; }
+}

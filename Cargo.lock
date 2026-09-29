@@ -12,6 +12,7 @@ dependencies = [
  "c1073",
  "clipper67",
  "compresser",
+ "drumsampler",
  "echospace",
  "equz8",
  "equzx",
@@ -2587,6 +2588,16 @@ dependencies = [
  "tar",
  "thiserror 2.0.18",
  "ureq 3.3.0",
+]
+
+[[package]]
+name = "drumsampler"
+version = "2026.9.27-beta1.4.1"
+dependencies = [
+ "builtin_dsp_core",
+ "builtin_ui_embed",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -8112,6 +8123,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "dirs 5.0.1",
+ "drumsampler",
  "echospace",
  "embed-resource",
  "equz8",
@@ -8201,6 +8213,7 @@ dependencies = [
  "core-foundation-sys",
  "crc32fast",
  "dirs 5.0.1",
+ "drumsampler",
  "echospace",
  "equz8",
  "fa2a",
