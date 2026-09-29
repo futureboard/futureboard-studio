@@ -4773,7 +4773,7 @@ mod soundfont_instrument_tests {
                 master_track(),
             ],
             clips: Vec::new(),
-            midi_clips: vec![EngineMidiClipSnapshot {
+            midi_clips: vec![std::sync::Arc::new(EngineMidiClipSnapshot {
                 id: "clip-1".to_string(),
                 track_id: "sf-1".to_string(),
                 start_beat: 1.0,
@@ -4804,7 +4804,7 @@ mod soundfont_instrument_tests {
                 ],
                 controllers: Vec::new(),
                 mpe: sphere_midi_service::mpe::MpeTrackConfiguration::default(),
-            }],
+            })],
             pdc_enabled: true,
             latency_graph_version: 1,
             routing: EngineRoutingSnapshot {
@@ -4813,7 +4813,7 @@ mod soundfont_instrument_tests {
                 buffer_size: FRAMES as u32,
             },
         };
-        snapshot.midi_clips[0].length_beats = 4.0;
+        std::sync::Arc::make_mut(&mut snapshot.midi_clips[0]).length_beats = 4.0;
 
         let mut runtime =
             RuntimeProject::build(&snapshot, SAMPLE_RATE, &mut HashMap::new(), None, true)

@@ -3788,19 +3788,14 @@ impl RuntimeProject {
     /// Build the MIDI schedule for `snapshot` against this graph's tracks, for
     /// [`Self::replace_midi_schedule`]. Control thread only: it allocates.
     pub fn build_midi_schedule(&self, snapshot: &EngineProjectSnapshot) -> RuntimeMidiData {
-        let tempo_map = build_project_tempo_map(snapshot);
-        let (midi_clips, mut midi_tracks) =
-            build_midi_runtime(&snapshot.midi_clips, &tempo_map, self.sample_rate);
-        for midi_track in &mut midi_tracks {
-            midi_track.track_index = self
-                .tracks
-                .iter()
-                .position(|track| track.id == midi_track.track_id);
-        }
-        RuntimeMidiData {
-            midi_clips,
-            midi_tracks,
-        }
+        let mut data = build_unresolved_midi_schedule(snapshot, self.sample_rate);
+        resolve_midi_schedule_tracks(&mut data, &self.track_ids());
+        data
+    }
+
+    /// This graph's track ids, in track-index order.
+    pub fn track_ids(&self) -> Vec<String> {
+        self.tracks.iter().map(|track| track.id.clone()).collect()
     }
 
     /// Store a MIDI schedule in a graph that is not playing (the control
@@ -5620,8 +5615,40 @@ fn apply_active(active: &mut Vec<(u8, u8)>, ev: &RuntimeMidiEvent) {
 /// converted to absolute project beats/samples here (outside the audio
 /// callback). Events are sorted by sample, with NoteOff before NoteOn at the
 /// same sample to avoid retrigger glitches / stuck notes.
+/// A project's MIDI schedule with no track resolved yet. It needs no graph, so
+/// a caller can build it without holding the graph's lock — the part of a note
+/// edit that scales with every note in the project — and resolve the tracks
+/// afterwards with [`resolve_midi_schedule_tracks`].
+pub fn build_unresolved_midi_schedule(
+    snapshot: &EngineProjectSnapshot,
+    sample_rate: u32,
+) -> RuntimeMidiData {
+    let tempo_map = build_project_tempo_map(snapshot);
+    let (midi_clips, midi_tracks) =
+        build_midi_runtime(&snapshot.midi_clips, &tempo_map, sample_rate);
+    RuntimeMidiData {
+        midi_clips,
+        midi_tracks,
+    }
+}
+
+/// Point each MIDI track of `data` at the graph track of the same id, given
+/// the graph's ids in track-index order.
+pub fn resolve_midi_schedule_tracks(data: &mut RuntimeMidiData, track_ids: &[String]) {
+    for midi_track in &mut data.midi_tracks {
+        midi_track.track_index = track_ids.iter().position(|id| *id == midi_track.track_id);
+    }
+}
+
+#[cfg(test)]
+fn shared_midi_clips(
+    clips: &[EngineMidiClipSnapshot],
+) -> Vec<std::sync::Arc<EngineMidiClipSnapshot>> {
+    clips.iter().cloned().map(std::sync::Arc::new).collect()
+}
+
 fn build_midi_runtime(
-    snapshot_clips: &[EngineMidiClipSnapshot],
+    snapshot_clips: &[std::sync::Arc<EngineMidiClipSnapshot>],
     tempo_map: &RuntimeTempoMapSnapshot,
     sample_rate: u32,
 ) -> (Vec<RuntimeMidiClip>, Vec<RuntimeMidiTrack>) {
@@ -6308,7 +6335,8 @@ mod stretch_runtime_tests {
                 controllers: Vec::new(),
                 mpe: sphere_midi_service::mpe::MpeTrackConfiguration::default(),
             };
-            let (_clips, tracks) = build_midi_runtime(&[midi_clip], &tempo_map, sample_rate);
+            let (_clips, tracks) =
+                build_midi_runtime(&[std::sync::Arc::new(midi_clip)], &tempo_map, sample_rate);
             let note_on_samples: Vec<u64> = tracks[0]
                 .events
                 .iter()
@@ -7171,7 +7199,8 @@ mod midi_tests {
 
     fn project_with(clips: Vec<EngineMidiClipSnapshot>) -> RuntimeProject {
         let tempo_map = RuntimeTempoMapSnapshot::static_tempo(120.0);
-        let (midi_clips, midi_tracks) = build_midi_runtime(&clips, &tempo_map, 48_000);
+        let (midi_clips, midi_tracks) =
+            build_midi_runtime(&shared_midi_clips(&clips), &tempo_map, 48_000);
         RuntimeProject {
             spatial: Default::default(),
             sample_rate: 48_000,
@@ -8339,7 +8368,8 @@ mod midi_tests {
     /// The schedule a note edit swaps in, resolved to the one bridged track.
     fn schedule_of(clips: Vec<EngineMidiClipSnapshot>) -> RuntimeMidiData {
         let tempo_map = RuntimeTempoMapSnapshot::static_tempo(120.0);
-        let (midi_clips, mut midi_tracks) = build_midi_runtime(&clips, &tempo_map, 48_000);
+        let (midi_clips, mut midi_tracks) =
+            build_midi_runtime(&shared_midi_clips(&clips), &tempo_map, 48_000);
         for track in &mut midi_tracks {
             track.track_index = Some(0);
         }

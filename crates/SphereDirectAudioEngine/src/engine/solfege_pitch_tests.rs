@@ -90,7 +90,7 @@ fn snapshot(notes: Vec<EngineMidiNoteSnapshot>) -> EngineProjectSnapshot {
             track("master", "master", false),
         ],
         clips: Vec::new(),
-        midi_clips: vec![EngineMidiClipSnapshot {
+        midi_clips: vec![std::sync::Arc::new(EngineMidiClipSnapshot {
             id: "clip-1".to_string(),
             track_id: TRACK.to_string(),
             start_beat: 0.0,
@@ -98,7 +98,7 @@ fn snapshot(notes: Vec<EngineMidiNoteSnapshot>) -> EngineProjectSnapshot {
             notes,
             controllers: Vec::new(),
             mpe: sphere_midi_service::mpe::MpeTrackConfiguration::default(),
-        }],
+        })],
         pdc_enabled: false,
         latency_graph_version: 1,
         routing: EngineRoutingSnapshot {

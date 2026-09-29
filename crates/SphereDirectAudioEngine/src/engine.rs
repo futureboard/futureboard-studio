@@ -3271,15 +3271,36 @@ impl EngineInner {
         snapshot: EngineProjectSnapshot,
     ) -> Result<(), SphereAudioError> {
         let mut current_project = self.project.lock();
-        let schedule = {
+        // Built and copied outside the graph lock. The UI thread takes that
+        // lock for its meter poll every frame, so building a whole project's
+        // schedule under it froze the editor after every note drawn, for as
+        // long as the build took. Only the id lookup and the store hold it.
+        let (sample_rate, track_ids) = {
+            let mirror = self.runtime.lock();
+            (mirror.sample_rate, mirror.track_ids())
+        };
+        let mut schedule = crate::runtime::build_unresolved_midi_schedule(&snapshot, sample_rate);
+        crate::runtime::resolve_midi_schedule_tracks(&mut schedule, &track_ids);
+        let mut mirror_copy = schedule.clone();
+        {
             let mut mirror = self.runtime.lock();
-            let schedule = mirror.build_midi_schedule(&snapshot);
+            // `load_project` runs one at a time, so the graph cannot have been
+            // rebuilt meanwhile; if it somehow was, resolve against it now.
+            if mirror.sample_rate != sample_rate
+                || !mirror
+                    .tracks
+                    .iter()
+                    .map(|track| &track.id)
+                    .eq(track_ids.iter())
+            {
+                schedule = mirror.build_midi_schedule(&snapshot);
+                mirror_copy = schedule.clone();
+            }
             // The mirror seeds a stream opened later, so it plays this too.
             // Stored, not swapped: a swap releases notes, and the mirror
             // shares its plug-in bridge sinks with the live graph.
-            mirror.install_midi_schedule(schedule.clone());
-            schedule
-        };
+            mirror.install_midi_schedule(mirror_copy);
+        }
         *current_project = Some(snapshot);
         let result = self.send_command(EngineCommand::ReplaceMidi(Box::new(schedule)));
         drop(current_project);
@@ -9089,14 +9110,16 @@ mod structure_key_tests {
             clips: Vec::new(),
             midi_clips: midi_clip_ids
                 .iter()
-                .map(|id| EngineMidiClipSnapshot {
-                    id: id.to_string(),
-                    track_id: "track-1".to_string(),
-                    start_beat: 0.0,
-                    length_beats: 4.0,
-                    notes: Vec::new(),
-                    controllers: Vec::new(),
-                    mpe: Default::default(),
+                .map(|id| {
+                    std::sync::Arc::new(EngineMidiClipSnapshot {
+                        id: id.to_string(),
+                        track_id: "track-1".to_string(),
+                        start_beat: 0.0,
+                        length_beats: 4.0,
+                        notes: Vec::new(),
+                        controllers: Vec::new(),
+                        mpe: Default::default(),
+                    })
                 })
                 .collect(),
             pdc_enabled: true,

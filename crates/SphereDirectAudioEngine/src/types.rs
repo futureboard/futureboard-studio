@@ -283,8 +283,12 @@ pub struct EngineProjectSnapshot {
     /// MIDI clips (Phase 2). Defaulted so older snapshots without the field
     /// still deserialize. Notes are stored relative to the clip start; the
     /// runtime converts them to absolute project beats/samples at build time.
+    ///
+    /// Shared, not owned: a note edit republishes the whole project, and the
+    /// UI hands every clip that did not change to the next snapshot as the
+    /// same allocation instead of copying its notes again.
     #[serde(default)]
-    pub midi_clips: Vec<EngineMidiClipSnapshot>,
+    pub midi_clips: Vec<std::sync::Arc<EngineMidiClipSnapshot>>,
     /// Whether playback plug-in delay compensation (Global Latency Sync / PDC)
     /// is active. Carried in the snapshot so the offline exporter consumes the
     /// *same* latency-compensated graph as realtime playback instead of a
