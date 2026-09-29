@@ -1193,6 +1193,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             .font_features(tabular_figures())
             .child(text)
     };
+    let on_ts_menu_left = on_ts_menu.clone();
     let ts_value = div()
         .flex()
         .flex_row()
@@ -1230,19 +1231,37 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             ]
         } else {
             let on_ts_edit = on_ts_edit_start.clone();
+            let on_ts_menu_click = on_ts_menu_left.clone();
             let (num, den) = state
                 .time_signature_label
                 .split_once('/')
                 .map(|(n, d)| (n.to_string(), d.to_string()))
                 .unwrap_or_else(|| ("4".to_string(), "4".to_string()));
+            let hover = Colors::composite(Colors::surface_canvas(), Colors::state_hover());
+            // A click opens the meter dropdown, like the key's root and scale
+            // beside it. It used to answer only a right-click or a
+            // double-click, so the obvious gesture did nothing at all.
             vec![div()
+                .id("lcd-timesig-value")
+                .role(Role::Button)
+                .aria_label(format!("Time signature {num}/{den}. Activate to choose"))
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(1.0))
+                .h(px(20.0))
+                .px(px(crate::theme::space::HAIR))
+                .rounded(px(crate::theme::radius::CONTROL_SM))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(hover))
+                .occlude()
                 .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                     if event.click_count >= 2 {
                         on_ts_edit(&(), window, cx);
+                    } else {
+                        let x: f32 = event.position.x.into();
+                        let y: f32 = event.position.y.into();
+                        on_ts_menu_click(&(x, y), window, cx);
                     }
                 })
                 .child(ts_digit(num))

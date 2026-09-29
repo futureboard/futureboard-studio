@@ -1061,6 +1061,14 @@ impl StudioLayout {
             if playhead_moved {
                 let docked = self.piano_roll.clone();
                 let floating = self.piano_roll_floating.clone();
+                // Continuous scrolling, for a roll that is on screen: a hidden
+                // one repainting every frame would be all cost.
+                if self.docked_midi_editor_visible() {
+                    crate::components::piano_roll::PianoRoll::follow_playhead(&docked, cx);
+                }
+                if self.midi_editor.window.is_some() {
+                    crate::components::piano_roll::PianoRoll::follow_playhead(&floating, cx);
+                }
                 crate::components::piano_roll::PianoRoll::publish_playhead(&docked, cx);
                 crate::components::piano_roll::PianoRoll::publish_playhead(&floating, cx);
             }
@@ -1076,6 +1084,9 @@ impl StudioLayout {
             // dimmer, and only the overlay needs to hear about it.
             let docked = self.piano_roll.clone();
             let floating = self.piano_roll_floating.clone();
+            // Stopped: a pause from a user scroll ends with the take.
+            crate::components::piano_roll::PianoRoll::follow_playhead(&docked, cx);
+            crate::components::piano_roll::PianoRoll::follow_playhead(&floating, cx);
             crate::components::piano_roll::PianoRoll::publish_playhead(&docked, cx);
             crate::components::piano_roll::PianoRoll::publish_playhead(&floating, cx);
             self.tick_audio_editor(false, cx);
@@ -3889,6 +3900,51 @@ impl StudioLayout {
         self.tempo_edit.ts_num_input.select_all();
         self.tempo_edit.ts_editing = true;
         self.tempo_edit.ts_edit_focus_num = true;
+        cx.notify();
+    }
+
+    /// Change the meter in force at the playhead to `num/den` — the one the
+    /// transport readout shows. It edits the marker governing the playhead,
+    /// or the project's own meter when there is none yet, rather than adding a
+    /// marker: picking 3/4 from the readout means "this song is in 3/4".
+    pub(super) fn set_time_signature_at_playhead(
+        &mut self,
+        num: u16,
+        den: u16,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::timeline::timeline_state::{
+            TS_ALLOWED_DENOMINATORS, normalize_time_signature_denominator,
+        };
+        let den = normalize_time_signature_denominator(den);
+        if !(1..=64).contains(&num) || !TS_ALLOWED_DENOMINATORS.contains(&den) {
+            return;
+        }
+        let governing = {
+            let state = &self.timeline.read(cx).state;
+            let pt = state.time_signature_at_playhead();
+            if pt.numerator == num && pt.denominator == den {
+                return;
+            }
+            state
+                .time_signature_map
+                .points
+                .iter()
+                .any(|p| p.id == pt.id)
+                .then_some(pt.id)
+        };
+        self.edit_time_signature_state(
+            "Set Time Signature",
+            |timeline| match &governing {
+                Some(id) => {
+                    timeline.state.update_time_signature_point(id, num, den);
+                }
+                None => {
+                    timeline.state.add_time_signature_point(0.0, num, den);
+                }
+            },
+            cx,
+        );
         cx.notify();
     }
 

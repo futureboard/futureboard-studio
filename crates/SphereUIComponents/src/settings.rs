@@ -896,6 +896,45 @@ pub struct PerformanceSettings {
     /// Floating verbose performance overlay (View → Developer).
     #[serde(default)]
     pub show_performance_overlay: bool,
+    /// How the audio engine spends the CPU. Applied live; see
+    /// [`AudioProcessingSettings`].
+    #[serde(default)]
+    pub audio_processing: AudioProcessingSettings,
+}
+
+/// Audio engine CPU use (Settings → Performance → Audio Processing). Both
+/// parts are process-wide and take effect on the next audio block.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AudioProcessingSettings {
+    /// Spread track and bus processing over several cores. Off by default:
+    /// the audio thread then processes every channel itself.
+    #[serde(default)]
+    pub multicore: bool,
+    /// Threads a block is processed on, the audio thread included. `0` is
+    /// Auto — every core but one.
+    #[serde(default)]
+    pub threads: u32,
+    #[serde(default)]
+    pub instruction_set: AudioInstructionSet,
+}
+
+/// Instruction set of the engine's mixing, fader and meter kernels. AVX2 is
+/// the default; a CPU without it runs SSE whatever is chosen here.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AudioInstructionSet {
+    #[default]
+    Avx2,
+    Sse,
+}
+
+impl AudioInstructionSet {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Avx2 => "AVX2",
+            Self::Sse => "SSE",
+        }
+    }
 }
 
 /// Dropout Protection mode (Settings → Playback). Keeps internal headroom

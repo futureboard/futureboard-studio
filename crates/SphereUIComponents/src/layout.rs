@@ -338,6 +338,18 @@ fn engine_dropout_mode(
     }
 }
 
+/// Push Settings → Performance → Audio Processing into the engine. Both parts
+/// are process-wide and cheap to re-apply: the worker pool only spawns the
+/// threads it does not have yet, and the instruction set is one atomic store.
+fn apply_audio_processing_settings(settings: &crate::settings::AudioProcessingSettings) {
+    use crate::settings::AudioInstructionSet;
+    DirectAudio::set_simd_level(match settings.instruction_set {
+        AudioInstructionSet::Avx2 => DirectAudio::SimdLevel::Avx2,
+        AudioInstructionSet::Sse => DirectAudio::SimdLevel::Sse,
+    });
+    DirectAudio::configure_multicore(settings.multicore, settings.threads as usize);
+}
+
 fn resolve_output_device_for_backend(
     engine: &DirectAudio::AudioEngine,
     backend: DirectAudio::AudioBackend,
@@ -399,6 +411,7 @@ pub(crate) fn build_and_warm_audio_engine(
 
     engine.set_pdc_enabled(schema.playback.latency_compensation);
     engine.set_dropout_protection_mode(engine_dropout_mode(schema.playback.dropout_protection));
+    apply_audio_processing_settings(&schema.performance.audio_processing);
 
     // Open on the device the user actually chose.
     //
@@ -1318,7 +1331,9 @@ impl StudioLayout {
 
         let app_data = paths.app_data.clone();
         let mut layout = Self {
-            active_panel: WorkspaceActivePanel::Mixer,
+            // The arrangement has the keyboard until the user works somewhere
+            // else: starting on the Mixer made S solo instead of split.
+            active_panel: WorkspaceActivePanel::Arrangement,
             right_dock_tab: RightDockTab::Inspector,
             active_bottom_tab: components::BottomTab::Mixer,
             bottom_panel_state: BottomPanelState::default(),
@@ -1431,11 +1446,7 @@ impl StudioLayout {
             window_hooks: window_ops::StudioWindowHooks::default(),
             lifecycle_guard: close_ops::LifecycleGuardState::default(),
             project_switch: project_switch::ProjectSwitchGuardState::default(),
-            keymap_manager: {
-                let manager = crate::keymap::KeymapManager::new(app_data.clone());
-                crate::keymap::init_global_keymap(app_data);
-                manager
-            },
+            keymap_manager: crate::keymap::KeymapManager::new(app_data),
             project_state: crate::app_state::ProjectState::NoProject,
             last_window_title: None,
             session_install_status: crate::app_state::SessionInstallStatus::Ready,
@@ -1480,6 +1491,9 @@ impl StudioLayout {
                     }
                 }
             }
+            // Tooltips and menus read the published copy, so they show the
+            // keys of the profile actually in use.
+            crate::keymap::set_global_keymap(layout.keymap_manager.clone());
         }
         // Restore saved panel visibility, sizes, and tab selections.
         layout.load_and_restore_workspace_layout();
@@ -1668,6 +1682,7 @@ impl StudioLayout {
                 eprintln!("[shortcut] profile id={id} unavailable: {error}");
             }
         }
+        crate::keymap::set_global_keymap(self.keymap_manager.clone());
         let active = self.keymap_manager.active_profile_id().to_string();
         let _ = self.settings.update(cx, |settings, cx| {
             if settings.current.general.keymap_profile != active {
@@ -2355,6 +2370,14 @@ impl StudioLayout {
             "ts:edit" => {
                 self.begin_ts_edit(self.ts_track_context_point_id(), cx);
             }
+            cmd if cmd.starts_with("ts:set:") => {
+                let meter = cmd["ts:set:".len()..]
+                    .split_once('/')
+                    .and_then(|(n, d)| Some((n.parse::<u16>().ok()?, d.parse::<u16>().ok()?)));
+                if let Some((num, den)) = meter {
+                    self.set_time_signature_at_playhead(num, den, cx);
+                }
+            }
             "ts:clear" => {
                 self.clear_time_signature_markers(cx);
             }
@@ -2525,13 +2548,15 @@ impl StudioLayout {
             }
 
             // ── Project / track / edit commands available in native shell ─
-            // New Project no longer opens a modal wizard — it drops straight
-            // into a fresh, empty, unsaved workspace. All four lifecycle
-            // entry points share one unsaved-changes guard (Save / Don't Save /
-            // Cancel) before replacing or unloading the current project.
-            "project:new" | "project:new-from-template" => {
-                self.guard_dirty_then_lifecycle(LifecycleAction::NewProject, owner_bounds, cx)
-            }
+            // New Project goes Home: the session ends (behind the same Save /
+            // Don't Save / Cancel guard as Close) and Welcome opens on its New
+            // Project pane, where the template, name and tempo are chosen.
+            // Dropping straight into an empty workspace skipped the template.
+            "project:new" | "project:new-from-template" => self.request_close(
+                close_ops::PendingCloseAction::NewProjectAtHome,
+                owner_bounds,
+                cx,
+            ),
             "project:close" => self.request_close(
                 close_ops::PendingCloseAction::CloseProject,
                 owner_bounds,
@@ -2602,6 +2627,23 @@ impl StudioLayout {
             // means the Mixer; this one means "get the bottom panel out of the
             // way", whichever tab is in it.
             "panel:toggle-bottom" => self.toggle_bottom_panel(cx),
+            "view:waveform-zoom-in" | "view:waveform-zoom-out" | "view:waveform-zoom-reset" => {
+                let steps = match command_id {
+                    "view:waveform-zoom-in" => 1,
+                    "view:waveform-zoom-out" => -1,
+                    _ => 0,
+                };
+                let _ = self.timeline.update(cx, |timeline, cx| {
+                    if timeline.state.step_waveform_zoom(steps) {
+                        cx.notify();
+                    }
+                });
+            }
+            // The dock's Editor tab, the way Ctrl+3 is its Mixer tab — the key
+            // the tab's own hint has always shown.
+            "panel:toggle-midi-editor" => {
+                self.toggle_bottom_panel_tab(components::BottomTab::Editor, cx)
+            }
             "panel:show-chord-display" => {
                 self.panels.inspector = true;
                 self.right_dock_tab = RightDockTab::ChordDisplay;
@@ -2617,71 +2659,74 @@ impl StudioLayout {
                 self.right_dock_tab = RightDockTab::LyricEditor;
                 self.set_active_panel(WorkspaceActivePanel::LyricEditor, cx);
             }
-            "song_text.add_chord_at_playhead" => {
+            // Profiles and menus say `song_text.commit`; the id is normalized
+            // before this match, so the arms name the normalized form — the
+            // dot form they used to name could never arrive here.
+            "song-text:add-chord-at-playhead" => {
                 if self.song_text_editor_accepts_input_commands(cx) {
                     let _ = self
                         .lyric_editor_panel
                         .update(cx, |panel, cx| panel.command_add_chord_at_playhead(cx));
                 }
             }
-            "song_text.add_lyric_at_playhead" => {
+            "song-text:add-lyric-at-playhead" => {
                 if self.song_text_editor_accepts_input_commands(cx) {
                     let _ = self
                         .lyric_editor_panel
                         .update(cx, |panel, cx| panel.command_add_lyric_at_playhead(cx));
                 }
             }
-            "song_text.add_both_at_playhead" => {
+            "song-text:add-both-at-playhead" => {
                 if self.song_text_editor_accepts_input_commands(cx) {
                     let _ = self
                         .lyric_editor_panel
                         .update(cx, |panel, cx| panel.command_add_both_at_playhead(cx));
                 }
             }
-            "song_text.commit" => {
+            "song-text:commit" => {
                 if self.song_text_editor_accepts_input_commands(cx) {
                     let _ = self
                         .lyric_editor_panel
                         .update(cx, |panel, cx| panel.command_commit(cx));
                 }
             }
-            "song_text.commit_next_grid" => {
+            "song-text:commit-next-grid" => {
                 if self.song_text_editor_accepts_input_commands(cx) {
                     let _ = self
                         .lyric_editor_panel
                         .update(cx, |panel, cx| panel.command_commit_next_grid(cx));
                 }
             }
-            "song_text.commit_next_beat" => {
+            "song-text:commit-next-beat" => {
                 if self.song_text_editor_accepts_input_commands(cx) {
                     let _ = self
                         .lyric_editor_panel
                         .update(cx, |panel, cx| panel.command_commit_next_beat(cx));
                 }
             }
-            "song_text.commit_next_bar" => {
+            "song-text:commit-next-bar" => {
                 if self.song_text_editor_accepts_input_commands(cx) {
                     let _ = self
                         .lyric_editor_panel
                         .update(cx, |panel, cx| panel.command_commit_next_bar(cx));
                 }
             }
-            "song_text.previous_event" => {
+            "song-text:previous-event" => {
                 let _ = self
                     .lyric_editor_panel
                     .update(cx, |panel, cx| panel.command_previous_event(cx));
             }
-            "song_text.next_event" => {
+            "song-text:next-event" => {
                 let _ = self
                     .lyric_editor_panel
                     .update(cx, |panel, cx| panel.command_next_event(cx));
             }
-            "song_text.move_to_playhead" => {
+            "song-text:move-to-playhead" => {
                 let _ = self
                     .lyric_editor_panel
                     .update(cx, |panel, cx| panel.command_move_to_playhead(cx));
             }
-            "song_text.delete_selected" => {
+            "song-text:delete-selected" => {
                 let _ = self
                     .lyric_editor_panel
                     .update(cx, |panel, cx| panel.command_delete_selected(cx));
@@ -3205,6 +3250,7 @@ impl StudioLayout {
     fn sync_settings_to_systems(&mut self, cx: &mut Context<Self>) {
         let schema = self.settings.read(cx).current.clone();
 
+        apply_audio_processing_settings(&schema.performance.audio_processing);
         if let Some(ref engine) = self.audio_bridge.engine {
             // Dropout Protection is a lightweight atomic — push it every sync; no
             // engine graph rebuild (it never changes the audio graph). Done before
@@ -3362,30 +3408,65 @@ impl StudioLayout {
         }
     }
 
-    /// Map a keystroke to a shared menu command ID. Keys mirror the
-    /// `transport:*` IDs from `packages/shared/generated/native-menu.json`
-    /// so the keyboard and menu paths fan into the same dispatcher.
-    /// Text-input guarding is N/A here because GPUI delivers key events
-    /// only when nothing focusable consumes them; if/when text inputs
-    /// land in the studio surface, gate this on `event.bubble_phase`.
-    /// Resolve a key event to a command id under the active shortcut profile.
-    /// Profiles are data-driven (`packages/keymaps/*.json`). `Ctrl+Shift+P` keeps
-    /// a special case for the command palette since that command is not always
-    /// present in a user-supplied map.
-    fn shortcut_command_id(&self, event: &KeyDownEvent) -> Option<String> {
-        if let Some(command) = self.keymap_manager.command_for_event(event) {
+    /// Which keymap scope has the keyboard in the studio window.
+    ///
+    /// An editor that holds focus wins — the docked piano roll or Solfege
+    /// pitch grid, the audio editor, the lyric editor's fields — then the
+    /// surface the user last worked in (the dock's Mixer tab, the lyric
+    /// editor), and otherwise the arrangement, with the Automation tool
+    /// layering its keys over it.
+    pub(crate) fn key_scope(&self, window: &Window, cx: &gpui::App) -> crate::keymap::KeymapScope {
+        use crate::keymap::KeymapScope;
+        use components::timeline::timeline_state::TimelineTool;
+        let lyric_editor_shown =
+            self.panels.inspector && self.right_dock_tab == RightDockTab::LyricEditor;
+        if lyric_editor_shown
+            && self
+                .lyric_editor_panel
+                .read(cx)
+                .is_text_input_focused(window)
+        {
+            return KeymapScope::SongTextEditor;
+        }
+        if self.docked_midi_editor_visible() {
+            if self.piano_roll.read(cx).is_focused(window)
+                || self.solfege_editor.read(cx).pitch_grid_is_focused(window)
+            {
+                return KeymapScope::MidiEditor;
+            }
+            if !self.clip_editor_panel.read(cx).ara_tab_active()
+                && self.audio_editor.read(cx).owns_edit_commands()
+            {
+                return KeymapScope::AudioEditor;
+            }
+        }
+        match self.active_panel {
+            WorkspaceActivePanel::Mixer
+                if self.panels.bottom_docked
+                    && self.active_bottom_tab == components::BottomTab::Mixer =>
+            {
+                KeymapScope::Mixer
+            }
+            WorkspaceActivePanel::LyricEditor if lyric_editor_shown => KeymapScope::SongTextEditor,
+            _ if self.timeline.read(cx).state.active_tool == TimelineTool::Automation => {
+                KeymapScope::AutomationEditor
+            }
+            _ => KeymapScope::Arrangement,
+        }
+    }
+
+    /// Resolve a key event to a command id in `scope` under the active
+    /// shortcut profile. Profiles are data-driven (`packages/keymaps/*.json`).
+    pub(crate) fn shortcut_command_id(
+        &self,
+        event: &KeyDownEvent,
+        scope: crate::keymap::KeymapScope,
+    ) -> Option<String> {
+        if let Some(command) = self.keymap_manager.command_for_event(event, scope) {
             return Some(command.to_string());
         }
         let mods = event.keystroke.modifiers;
         let key = event.keystroke.key.as_str();
-        if (mods.control || mods.platform)
-            && mods.shift
-            && !mods.alt
-            && !mods.function
-            && matches!(key, "p" | "P")
-        {
-            return Some("tools:command-palette".to_string());
-        }
         // Quit is the one accelerator the shared keymaps can't express portably:
         // they bind `app:quit` to `Alt+F4` for Windows, which leaves macOS/Linux
         // with no keyboard quit at all. Cmd+Q (macOS) and Ctrl+Q (Windows/Linux)

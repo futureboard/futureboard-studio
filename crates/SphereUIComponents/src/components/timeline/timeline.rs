@@ -278,6 +278,8 @@ pub struct Timeline {
     automation_curve_drag: Option<crate::components::timeline::timeline_state::AutomationCurveDrag>,
     /// In-flight automation marquee (rubber-band) selection. UI-only.
     automation_marquee: Option<crate::components::timeline::timeline_state::AutomationMarquee>,
+    /// Pen-tool freehand stroke across an automation lane, while it is drawn.
+    automation_paint: Option<crate::components::timeline::timeline_state::AutomationPaintStroke>,
     /// Hovered automation point / curve segment under the cursor. UI-only; drives
     /// the per-segment highlight + hover cursor. Self-corrects on mouse-move and
     /// is cleared on hover-out, so it is never persisted or reset on gesture end.

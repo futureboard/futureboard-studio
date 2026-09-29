@@ -27,6 +27,11 @@ unsafe extern "C" {
         quality: f32,
     ) -> i32;
     fn fb_signalsmith_latency_samples(handle: *mut std::ffi::c_void) -> i32;
+    fn fb_signalsmith_io_latency(
+        handle: *mut std::ffi::c_void,
+        input_latency: *mut i32,
+        output_latency: *mut i32,
+    );
     fn fb_signalsmith_output_seek_length(handle: *mut std::ffi::c_void, playback_rate: f32) -> i32;
     fn fb_signalsmith_output_seek(
         handle: *mut std::ffi::c_void,
@@ -96,6 +101,19 @@ impl StretchProcessor for SignalsmithProcessor {
     fn latency_samples(&self) -> usize {
         let latency = unsafe { fb_signalsmith_latency_samples(self.handle.as_ptr()) };
         latency.max(0) as usize
+    }
+
+    fn io_latency(&self) -> (usize, usize) {
+        let (mut input, mut output) = (0i32, 0i32);
+        unsafe {
+            fb_signalsmith_io_latency(self.handle.as_ptr(), &mut input, &mut output);
+        }
+        // Same bound as `seek_input_len`: a malformed bridge result must not
+        // size a realtime read.
+        (
+            input.clamp(0, 262_144) as usize,
+            output.clamp(0, 262_144) as usize,
+        )
     }
 
     fn seek_input_len(&self, playback_rate: f32) -> usize {

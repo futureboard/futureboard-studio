@@ -476,11 +476,12 @@ fn draw_chunk_waveform_locked(
 
     let waveform_color = Colors::timeline_audio_clip_waveform(color);
     let clip_gain = clip.gain;
+    let zoom = state.waveform_zoom;
 
     let element = canvas(
         |_bounds, _window, _cx| {},
         move |bounds: Bounds<Pixels>, (), window, _cx| {
-            paint_waveform_bars(bounds, &bars, waveform_color, clip_gain, window);
+            paint_waveform_bars(bounds, &bars, waveform_color, clip_gain, zoom, window);
         },
     )
     .absolute()
@@ -565,11 +566,12 @@ fn draw_preview_waveform(
     };
 
     let waveform_color = Colors::timeline_audio_clip_waveform(color);
+    let zoom = state.waveform_zoom;
 
     let element = canvas(
         |_b, _w, _cx| {},
         move |bounds: Bounds<Pixels>, (), window, _cx| {
-            paint_waveform_bars(bounds, &bars, waveform_color, clip_gain, window);
+            paint_waveform_bars(bounds, &bars, waveform_color, clip_gain, zoom, window);
         },
     )
     .absolute()
@@ -582,7 +584,12 @@ fn draw_preview_waveform(
         .child(element)
 }
 
-/// Paint the cached bars scaled by the clip's current gain.
+/// Paint the cached bars scaled by the clip's current gain and the
+/// arrangement's waveform zoom.
+///
+/// Zoom only magnifies the drawing. The overload color still means the *gain*
+/// drives samples past full scale: a zoomed quiet take fills the lane without
+/// turning red, because nothing in it clips.
 ///
 /// Gain is applied here, at paint time, rather than baked into `bars`: the bar
 /// geometry cache is keyed on the horizontal mapping only, so scrubbing the
@@ -595,6 +602,7 @@ fn paint_waveform_bars(
     bars: &WaveformBars,
     color: gpui::Rgba,
     gain: f32,
+    zoom: f32,
     window: &mut gpui::Window,
 ) {
     let h: f32 = bounds.size.height.into();
@@ -602,14 +610,15 @@ fn paint_waveform_bars(
         return;
     }
     let gain = gain.max(0.0);
+    let zoom = zoom.max(1.0);
     let center = h / 2.0;
     let overload_color = Colors::meter_high();
     for (x, mn, mx) in bars {
         let scaled_mx = mx * gain;
         let scaled_mn = mn * gain;
         let clipped = scaled_mx > 1.0 || scaled_mn < -1.0;
-        let top = center - scaled_mx.clamp(-1.0, 1.0) * center;
-        let bottom = center - scaled_mn.clamp(-1.0, 1.0) * center;
+        let top = center - (scaled_mx * zoom).clamp(-1.0, 1.0) * center;
+        let bottom = center - (scaled_mn * zoom).clamp(-1.0, 1.0) * center;
         let bar_h = (bottom - top).max(1.0);
         let r = Bounds::new(
             bounds.origin + point(px(*x), px(top)),

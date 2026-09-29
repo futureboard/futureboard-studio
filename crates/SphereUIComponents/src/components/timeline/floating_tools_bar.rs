@@ -12,6 +12,8 @@ pub fn floating_tools_bar(
         dyn Fn(&TimelineTool, &mut gpui::Window, &mut gpui::App) + 'static,
     >,
     on_drag_start: std::sync::Arc<dyn Fn(&(f32, f32), &mut gpui::Window, &mut gpui::App) + 'static>,
+    waveform_zoom: f32,
+    on_waveform_zoom: std::sync::Arc<dyn Fn(&i32, &mut gpui::Window, &mut gpui::App) + 'static>,
 ) -> impl IntoElement {
     let tools = [
         (
@@ -169,4 +171,99 @@ pub fn floating_tools_bar(
                         })
                 }),
         )
+        .child(
+            div()
+                .mx(px(4.0))
+                .h(px(16.0))
+                .w(px(1.0))
+                .bg(Colors::divider()),
+        )
+        .child(waveform_zoom_control(waveform_zoom, on_waveform_zoom))
+}
+
+/// Waveform zoom: taller waveforms for reading quiet audio, without touching
+/// clip gain. − and + step it; the readout goes back to 1×.
+fn waveform_zoom_control(
+    zoom: f32,
+    on_step: std::sync::Arc<dyn Fn(&i32, &mut gpui::Window, &mut gpui::App) + 'static>,
+) -> impl IntoElement {
+    let zoomed = zoom > 1.0 + 1.0e-3;
+    let step_button = |id: &'static str, icon: &'static str, tip: &'static str, steps: i32| {
+        let on_step = on_step.clone();
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(20.0))
+            .h(px(28.0))
+            .rounded(px(crate::theme::radius::CONTROL))
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(|style| style.bg(Colors::surface_hover()))
+            .tooltip(crate::components::fb_tooltip(tip))
+            .on_click(move |_, window, cx| on_step(&steps, window, cx))
+            .child(
+                svg()
+                    .path(icon)
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .text_color(Colors::text_muted()),
+            )
+    };
+    let reset = on_step.clone();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .child(step_button(
+            "waveform-zoom-out",
+            assets::ICON_MINUS_PATH,
+            "Waveform zoom out",
+            -1,
+        ))
+        .child(
+            div()
+                .id("waveform-zoom-reset")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(3.0))
+                .h(px(28.0))
+                .px(px(4.0))
+                .rounded(px(crate::theme::radius::CONTROL))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(|style| style.bg(Colors::surface_hover()))
+                .tooltip(crate::components::fb_tooltip(
+                    "Waveform zoom — view only, clip gain is unchanged. Click for 1×",
+                ))
+                .on_click(move |_, window, cx| reset(&0, window, cx))
+                .child(
+                    svg()
+                        .path(assets::ICON_AUDIO_LINES_PATH)
+                        .w(px(14.0))
+                        .h(px(14.0))
+                        .text_color(if zoomed {
+                            Colors::text_primary()
+                        } else {
+                            Colors::text_muted()
+                        }),
+                )
+                .child(
+                    div()
+                        .min_w(px(22.0))
+                        .text_size(px(crate::theme::typography::UI_XS))
+                        .text_color(if zoomed {
+                            Colors::text_primary()
+                        } else {
+                            Colors::text_muted()
+                        })
+                        .child(format!("{:.1}×", zoom)),
+                ),
+        )
+        .child(step_button(
+            "waveform-zoom-in",
+            assets::ICON_PLUS_PATH,
+            "Waveform zoom in",
+            1,
+        ))
 }

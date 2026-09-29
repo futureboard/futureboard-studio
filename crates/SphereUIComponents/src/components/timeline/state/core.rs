@@ -271,6 +271,11 @@ pub struct TimelineState {
     /// shows and Settings saves. UI-only, never saved.
     pub follow_playhead_suspended: bool,
     pub auto_scroll_mode: AutoScrollMode,
+    /// How tall the arrangement draws audio waveforms: a view magnification
+    /// for reading quiet material, separate from clip gain — it changes what
+    /// the waveform looks like, never what plays, and never shows clipping
+    /// that is not there. 1.0 is true scale. UI-only, never saved.
+    pub waveform_zoom: f32,
     /// Arrangement time-range selection in beats. UI-only; never marks the
     /// project or engine dirty by itself.
     pub arrangement_range: Option<TimelineRangeSelection>,
@@ -453,6 +458,7 @@ impl Default for TimelineState {
             follow_playhead: true,
             follow_playhead_suspended: false,
             auto_scroll_mode: AutoScrollMode::Page,
+            waveform_zoom: 1.0,
             arrangement_range: None,
             // Tempo and meter are properties of every project, so both
             // conductor lanes are on by default. Neither seeds a point into its

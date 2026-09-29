@@ -162,6 +162,7 @@ impl Timeline {
         self.automation_drag = None;
         self.automation_curve_drag = None;
         self.automation_marquee = None;
+        self.automation_paint = None;
         self.tempo_drag = None;
         self.tempo_gesture_origin = None;
         self.tempo_gesture_linear_anchors.clear();
@@ -232,6 +233,7 @@ impl Timeline {
             automation_drag: None,
             automation_curve_drag: None,
             automation_marquee: None,
+            automation_paint: None,
             automation_hover: None,
             on_automation_control: None,
             tempo_drag: None,
@@ -330,6 +332,7 @@ impl Timeline {
             automation_drag: None,
             automation_curve_drag: None,
             automation_marquee: None,
+            automation_paint: None,
             automation_hover: None,
             on_automation_control: None,
             tempo_drag: None,
@@ -2910,6 +2913,24 @@ impl Timeline {
         true
     }
 
+    /// Redraw the stroke's lane from its base points and what has been drawn.
+    fn apply_automation_paint(
+        &mut self,
+        stroke: &crate::components::timeline::timeline_state::AutomationPaintStroke,
+    ) {
+        use crate::components::timeline::timeline_state::{
+            AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT, paint_automation_stroke,
+        };
+        let ppb = self.state.viewport.pixels_per_beat.max(1.0);
+        let usable = (AUTOMATION_SUBLANE_HEIGHT - 2.0 * AUTOMATION_LANE_PAD).max(1.0);
+        // A point every 3 px at most, and none a straight line already draws
+        // to within half a pixel.
+        let points =
+            paint_automation_stroke(&stroke.base, &stroke.samples, 3.0 / ppb, 0.5 / usable);
+        self.state
+            .set_automation_lane_points(&stroke.track_id, &stroke.lane_id, points);
+    }
+
     pub(super) fn begin_automation_interaction(
         &mut self,
         track_id: &str,
@@ -3039,6 +3060,28 @@ impl Timeline {
             self.state.active_tool,
             TimelineTool::Pen | TimelineTool::Automation
         );
+        // The Pen draws freehand: a drag across the lane lays the curve under
+        // the pointer, replacing the points it passes over, and a click
+        // without moving adds one point. The Automation tool keeps
+        // click-to-add-and-drag for placing single points precisely.
+        if self.state.active_tool == TimelineTool::Pen && !additive {
+            let base = self
+                .state
+                .automation_lane(track_id, &lane_id)
+                .map(|lane| lane.points.clone())
+                .unwrap_or_default();
+            let stroke = crate::components::timeline::timeline_state::AutomationPaintStroke {
+                track_id: track_id.to_string(),
+                lane_id,
+                undo_before: lanes_before,
+                base,
+                samples: vec![(beat.max(0.0), value)],
+            };
+            self.apply_automation_paint(&stroke);
+            self.automation_paint = Some(stroke);
+            cx.notify();
+            return;
+        }
         match self.state.active_tool {
             TimelineTool::Pen | TimelineTool::Automation if !(draws && additive) => {
                 // Add a point and begin dragging it. The commit happens once on
@@ -3097,6 +3140,31 @@ impl Timeline {
         fine: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        if let Some(mut stroke) = self.automation_paint.take() {
+            // Freehand ignores the grid: it draws where the pointer is. The
+            // gap since the last sample is filled every few pixels, so a
+            // fast flick draws a line rather than two distant points.
+            const SAMPLE_PX: f32 = 3.0;
+            let beat = self.beat_from_window_x(window_x).max(0.0);
+            let value =
+                self.automation_value_from_window_y(&stroke.track_id, &stroke.lane_id, window_y);
+            let ppb = self.state.viewport.pixels_per_beat.max(1.0);
+            let (last_beat, last_value) = *stroke.samples.last().unwrap_or(&(beat, value));
+            let distance_px = ((beat - last_beat) * ppb).abs();
+            let steps = (distance_px / SAMPLE_PX).floor() as usize;
+            for step in 1..=steps.min(4096) {
+                let t = step as f32 * SAMPLE_PX / distance_px;
+                stroke.samples.push((
+                    last_beat + (beat - last_beat) * t,
+                    last_value + (value - last_value) * t,
+                ));
+            }
+            stroke.samples.push((beat, value));
+            self.apply_automation_paint(&stroke);
+            self.automation_paint = Some(stroke);
+            cx.notify();
+            return true;
+        }
         if let Some(drag) = self.automation_drag.clone() {
             let beat = self.snap_beat(self.beat_from_window_x(window_x)).max(0.0);
             let value =
@@ -3190,6 +3258,11 @@ impl Timeline {
     /// gesture was active.
     pub(super) fn finish_automation_interaction(&mut self, cx: &mut Context<Self>) -> bool {
         let mut handled = false;
+        if let Some(stroke) = self.automation_paint.take() {
+            // The whole stroke is one undo entry; the lane was redrawn live.
+            self.record_automation_lanes_edit(&stroke.track_id, stroke.undo_before, cx);
+            handled = true;
+        }
         if let Some(drag) = self.automation_drag.take() {
             if drag.moved {
                 // One history entry for the whole drag: the points were mutated
@@ -3237,6 +3310,10 @@ impl Timeline {
     /// step to take them back. A marquee restores the selection it started
     /// from.
     pub(super) fn cancel_automation_gesture(&mut self) {
+        if let Some(stroke) = self.automation_paint.take() {
+            self.state
+                .set_track_automation_lanes(&stroke.track_id, stroke.undo_before);
+        }
         if let Some(drag) = self.automation_drag.take() {
             if drag.moved {
                 self.state
@@ -3283,6 +3360,7 @@ impl Timeline {
         if self.automation_drag.is_some()
             || self.automation_curve_drag.is_some()
             || self.automation_marquee.is_some()
+            || self.automation_paint.is_some()
         {
             return;
         }

@@ -124,7 +124,7 @@ fn collect_menu_items(
                     entries.push(CommandPaletteEntry {
                         label,
                         command: command.clone(),
-                        shortcut: item.shortcut.clone(),
+                        shortcut: item.live_shortcut(),
                         path: path.to_string(),
                     });
                 }

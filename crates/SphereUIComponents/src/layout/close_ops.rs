@@ -35,6 +35,9 @@ pub(crate) struct LifecycleGuardState {
 pub enum PendingCloseAction {
     /// Unload the session and return to Welcome (File → Close Project).
     CloseProject,
+    /// New Project: unload the session and return to Welcome on its New
+    /// Project pane, where the template is chosen.
+    NewProjectAtHome,
     /// Exit the application (File → Quit, window X, Alt+F4).
     QuitApp,
     /// Platform window close for a specific handle (studio main window).
@@ -45,6 +48,7 @@ impl PendingCloseAction {
     fn label(self) -> &'static str {
         match self {
             Self::CloseProject => "close_project",
+            Self::NewProjectAtHome => "new_project_at_home",
             Self::QuitApp => "quit_app",
             Self::CloseWindow(_) => "close_window",
         }
@@ -237,6 +241,10 @@ impl StudioLayout {
         shutdown::log(&format!("perform_pending_close action={}", action.label()));
         match action {
             PendingCloseAction::CloseProject => self.do_close_project(cx),
+            PendingCloseAction::NewProjectAtHome => {
+                crate::welcome::open_next_on_new_project();
+                self.do_close_project(cx);
+            }
             PendingCloseAction::QuitApp | PendingCloseAction::CloseWindow(_) => {
                 self.do_quit(cx);
             }

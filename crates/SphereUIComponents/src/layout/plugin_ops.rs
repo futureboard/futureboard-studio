@@ -61,7 +61,7 @@ pub(crate) struct PluginEditorWindows {
     /// Open built-in plugin editor windows keyed by `plugin_id` — one shared
     /// CEF browser per built-in plugin type, not one per insert. Many
     /// track/insert DSP instances of the same `plugin_id` bind to the same
-    /// window; the window's own sidebar tracks which one is active. See
+    /// window; the window's own instance tabs track which one is active. See
     /// `open_builtin_insert_editor`.
     pub builtin: std::collections::HashMap<
         String,
@@ -2575,7 +2575,7 @@ impl StudioLayout {
         }
     }
 
-    /// Build the sidebar's instance list for `plugin_id`: every insert slot
+    /// Build the instance tabs for `plugin_id`: every insert slot
     /// across every track whose `plugin_id` matches, in track order. Cheap
     /// enough (project-sized, not audio-rate) to rebuild wholesale on every
     /// open/lifecycle event rather than diff in place.
@@ -2600,7 +2600,7 @@ impl StudioLayout {
                 &state.master.inserts,
             )));
         for (track_id, track_name, inserts) in owners {
-            for slot in inserts {
+            for (slot_index, slot) in inserts.iter().enumerate() {
                 let Some(slot_plugin_id) = slot.plugin_id.as_deref() else {
                     continue;
                 };
@@ -2631,6 +2631,7 @@ impl StudioLayout {
                     plugin_id: plugin_id.to_string(),
                     track_name: track_name.to_string(),
                     insert_name: slot.display_name.clone(),
+                    insert_number: slot_index + 1,
                     bypassed: slot.bypassed,
                     enabled: slot.enabled,
                     state_bytes,
@@ -2645,7 +2646,7 @@ impl StudioLayout {
     /// Built-in editors are shared per `plugin_id`: one native window and one
     /// CEF browser serve every track/insert using that plugin. Opening a
     /// second insert of the same plugin_id focuses the existing window and
-    /// switches its sidebar selection — it never creates a second browser.
+    /// switches its instance tab — it never creates a second browser.
     fn open_builtin_insert_editor(
         &mut self,
         track_id: &str,
@@ -2898,9 +2899,9 @@ impl StudioLayout {
         }
     }
 
-    /// Refresh every open shared built-in editor's sidebar from current
+    /// Refresh every open shared built-in editor's instance tabs from current
     /// project state. Call after any insert/track add/remove/rename/reorder
-    /// (spec: sidebar must reflect the live project, not a stale snapshot
+    /// (spec: the tabs must reflect the live project, not a stale snapshot
     /// taken at open time). Cheap no-op when no built-in editor is open.
     pub(super) fn refresh_builtin_editor_sidebars(&mut self, cx: &mut Context<Self>) {
         if self.plugin_editors.builtin.is_empty() {
@@ -3260,7 +3261,7 @@ impl StudioLayout {
         let key = (track_id.to_string(), insert_id.to_string());
         // Built-in CEF editor: this instance is gone (unloaded/replaced), but
         // the shared browser other instances of the same plugin_id use must
-        // not be torn down. Refresh every open shared editor's sidebar so it
+        // not be torn down. Refresh every open shared editor's instance tabs so it
         // drops the now-gone instance (and reselects/clears active selection
         // if it was the one showing) instead of destroying the window.
         self.refresh_builtin_editor_sidebars(cx);

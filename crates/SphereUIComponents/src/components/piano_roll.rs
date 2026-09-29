@@ -1187,6 +1187,10 @@ pub struct PianoRoll {
     selection: HashSet<u64>,
     scroll_x: f32,
     scroll_y: f32,
+    /// The user scrolled the view sideways during this playback, so the
+    /// editor stops following the playhead until the transport stops —
+    /// playback must not drag the view away from what they went to look at.
+    follow_paused: bool,
     drag: PianoDrag,
     /// Selection snapshot taken when a marquee gesture begins (for modifier modes).
     selection_before_marquee: HashSet<u64>,
@@ -1490,6 +1494,7 @@ impl PianoRoll {
             selection: HashSet::new(),
             scroll_x: 0.0,
             scroll_y: 0.0,
+            follow_paused: false,
             drag: PianoDrag::None,
             selection_before_marquee: HashSet::new(),
             erase_preview_ids: HashSet::new(),
@@ -4156,8 +4161,10 @@ impl PianoRoll {
                 let dy = cur_y - *last_y;
                 *last_x = cur_x;
                 *last_y = cur_y;
+                let before_x = self.scroll_x;
                 self.scroll_x = (self.scroll_x - dx).clamp(0.0, max_scroll_x);
                 self.scroll_y = (self.scroll_y - dy).clamp(0.0, max_scroll_y);
+                self.note_user_scrolled_x(before_x, cx);
             }
             cx.notify();
             return;
@@ -5212,6 +5219,63 @@ impl PianoRoll {
         true
     }
 
+    /// Continuous scrolling: while the transport plays and Follow is on, keep
+    /// the playhead at the middle of the editor and scroll the notes under
+    /// it. Call it only for a roll that is on screen — it repaints the whole
+    /// roll whenever the view moves. Returns whether the view moved.
+    ///
+    /// Follows the transport's own Follow switch, so one control turns
+    /// following on and off in the arrangement and the editor alike. A user
+    /// scroll pauses it until the transport stops, and the view stops at the
+    /// end of the track rather than scrolling into nothing.
+    pub fn follow_playhead(roll: &Entity<Self>, cx: &mut gpui::App) -> bool {
+        let (playing, target) = {
+            let this = roll.read(cx);
+            let state = &this.timeline.read(cx).state;
+            let playing = state.transport.playing;
+            let follow = state.follow_playhead
+                && !state.follow_playhead_suspended
+                && state.auto_scroll_mode
+                    != crate::components::timeline::timeline_state::AutoScrollMode::Off;
+            let target = (playing
+                && follow
+                && !this.follow_paused
+                && !state.selection.selected_clip_ids.is_empty())
+            .then(|| {
+                let (view_w, _) = this.grid_view_size();
+                let end = this.scope.extent().map_or(0.0, |(_, end)| end);
+                let max_scroll_x = ((end + 4.0) * this.ppb - view_w).max(0.0);
+                (state.transport.playhead_beats * this.ppb - view_w * 0.5).clamp(0.0, max_scroll_x)
+            })
+            .filter(|target| view_ready(this) && (target - this.scroll_x).abs() >= 0.5);
+            (playing, target)
+        };
+        fn view_ready(roll: &PianoRoll) -> bool {
+            roll.grid_view_size().0 > 1.0
+        }
+        if !playing {
+            if roll.read(cx).follow_paused {
+                roll.update(cx, |this, _| this.follow_paused = false);
+            }
+            return false;
+        }
+        let Some(target) = target else {
+            return false;
+        };
+        roll.update(cx, |this, cx| {
+            this.scroll_x = target;
+            cx.notify();
+        });
+        true
+    }
+
+    /// A sideways scroll by the user during playback pauses following.
+    fn note_user_scrolled_x(&mut self, before: f32, cx: &Context<Self>) {
+        if (self.scroll_x - before).abs() > 0.5 && self.timeline.read(cx).state.transport.playing {
+            self.follow_paused = true;
+        }
+    }
+
     /// The playhead frame for the clip currently being edited.
     ///
     /// Clip-local, like everything else the roll draws: the transport is a
@@ -5747,12 +5811,14 @@ impl PianoRoll {
             .map(|g| g.0.read(cx).current.editing.mouse.natural_scroll)
             .unwrap_or(false);
         let (dx, dy) = if natural { (-dx, -dy) } else { (dx, dy) };
+        let before_x = self.scroll_x;
         if event.modifiers.shift {
             self.scroll_x = (self.scroll_x - dy - dx).clamp(0.0, max_scroll_x);
         } else {
             self.scroll_y = (self.scroll_y - dy).clamp(0.0, self.max_scroll_y());
             self.scroll_x = (self.scroll_x - dx).clamp(0.0, max_scroll_x);
         }
+        self.note_user_scrolled_x(before_x, cx);
         cx.notify();
     }
 }

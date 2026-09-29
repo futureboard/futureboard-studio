@@ -38,6 +38,10 @@ use crate::components::builtin_plugin_editor_surface::{
     editor_char_keys, editor_key, editor_mouse_button, OffscreenSurface,
 };
 use crate::components::plugin_content_host::{ContentChildHwnd, ContentHostKind, ContentRect};
+use crate::components::plugin_editor_chrome::{
+    CHROME_ROW_H, InstanceTab, PluginEditorAction, PluginEditorChrome, TAB_STRIP_H,
+    render_builtin_chrome_tools, render_instance_tab_strip,
+};
 use crate::components::title_bar::{external_window_titlebar, TITLEBAR_HEIGHT};
 use crate::components::transport_key::{self, TransportKeySource};
 use crate::theme::Colors;
@@ -53,10 +57,12 @@ pub const BUILTIN_EDITOR_MIN_HEIGHT: f32 = 620.0;
 const ZCOMP_EDITOR_CONTENT_WIDTH: f32 = 1024.0;
 const ZCOMP_EDITOR_CONTENT_HEIGHT: f32 = 720.0;
 
-/// Height of the GPUI-drawn header strip above the browser rect. Uses the
-/// shared external-dialog titlebar height so the browser rect and the chrome
-/// can never disagree about where the content starts.
-const HEADER_H: f32 = TITLEBAR_HEIGHT;
+/// Height of the GPUI-drawn header above the browser rect: the titlebar, the
+/// instance tabs and the chrome row — the same three bands, at the same
+/// heights, as an external plug-in's editor window. Built from their own
+/// constants so the browser rect and the header can never disagree about
+/// where the content starts.
+const HEADER_H: f32 = TITLEBAR_HEIGHT + TAB_STRIP_H + CHROME_ROW_H;
 
 /// Logical pixels one line-based scroll notch scrolls the page by. GPUI
 /// reports discrete wheel steps in lines; CEF wants pixel deltas. Matches
@@ -69,15 +75,10 @@ const SCROLL_LINE_HEIGHT: f32 = 40.0;
 /// would otherwise saturate the `i32` CEF is handed.
 const MAX_SCROLL_DELTA: f32 = 10_000.0;
 
-/// Width of the native instance sidebar. Reserved out of the CEF content rect
-/// the same way `HEADER_H` is — the browser must never be told to draw under
-/// it, and the sidebar must never be told to draw over the browser.
-const SIDEBAR_W: f32 = 208.0;
-
 fn default_editor_window_size(plugin_id: &str) -> (f32, f32) {
     if host::origin_for_plugin_id(plugin_id) == Some("zcomp") {
         (
-            SIDEBAR_W + ZCOMP_EDITOR_CONTENT_WIDTH,
+            ZCOMP_EDITOR_CONTENT_WIDTH,
             HEADER_H + ZCOMP_EDITOR_CONTENT_HEIGHT,
         )
     } else {
@@ -133,7 +134,7 @@ pub struct PluginInstanceKey {
     pub insert_id: String,
 }
 
-/// One row in the shared editor's sidebar: enough to render the row and to
+/// One instance tab of the shared editor: enough to render the tab and to
 /// re-resolve the live insert slot when selected. Cheap to rebuild wholesale
 /// on every lifecycle event (add/remove/rename/reorder) rather than diffed.
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +143,9 @@ pub struct PluginInstanceDescriptor {
     pub plugin_id: String,
     pub track_name: String,
     pub insert_name: String,
+    /// 1-based slot of the insert on its channel, for the tab's leading
+    /// number; `0` when unknown.
+    pub insert_number: usize,
     pub bypassed: bool,
     pub enabled: bool,
     /// Persisted per-insert DSP state, if this insert has ever been saved —
@@ -913,7 +917,12 @@ pub struct BuiltinPluginEditorWindow {
     /// superseded selection is provably stale and can be rejected instead of
     /// mutating whatever instance happens to be active when it arrives.
     binding_generation: u64,
-    sidebar_collapsed: bool,
+    /// The bound insert's chrome (active, CPU, latency), pushed by the studio
+    /// on its poll the way an external plug-in window's is.
+    chrome: Option<PluginEditorChrome>,
+    /// What the chrome row asked for, per instance, until the studio drains
+    /// it — the same queue-and-apply contract as the external editor window.
+    chrome_actions: Vec<(PluginInstanceKey, PluginEditorAction)>,
     /// Set once `futureboard.bridgeReady` arrives. Before that, `select_instance`
     /// still updates native state (so reopening/refocusing works) but has no
     /// live page to push `selectInstance` into yet — the selection made while
@@ -1021,7 +1030,8 @@ impl BuiltinPluginEditorWindow {
             instances,
             active_instance,
             binding_generation: 0,
-            sidebar_collapsed: false,
+            chrome: None,
+            chrome_actions: Vec::new(),
             browser_ready: false,
             attached_at: None,
             bridge_ready_retries: 0,
@@ -1140,7 +1150,7 @@ impl BuiltinPluginEditorWindow {
         }
     }
 
-    /// Replace the sidebar's instance list wholesale. Called whenever an
+    /// Replace the instance tabs' list wholesale. Called whenever an
     /// insert using this `plugin_id` is added/removed/renamed/reordered
     /// anywhere in the project, and whenever this window is (re)focused from
     /// an Open-Editor request.
@@ -1204,10 +1214,10 @@ impl BuiltinPluginEditorWindow {
 
     /// Rebind the shared browser to a different instance. A no-op re-select
     /// of the already-active instance still bumps `binding_generation` — the
-    /// caller (sidebar click, or `requestSelectInstance`) does not need to
+    /// caller (a tab click, or `requestSelectInstance`) does not need to
     /// special-case "already selected".
     ///
-    /// Native decides, always: this is called from the sidebar click handler
+    /// Native decides, always: this is called from the instance tab handler
     /// AND from the inbound `requestSelectInstance` handler in `tick()` — the
     /// latter validates the request against `self.instances` exactly the same
     /// way before calling this, so a route change alone can never bind an
@@ -1216,7 +1226,7 @@ impl BuiltinPluginEditorWindow {
     pub(crate) fn select_instance(&mut self, key: PluginInstanceKey, cx: &mut Context<Self>) {
         if !self.instances.iter().any(|i| i.instance_key == key) {
             eprintln!(
-                "[BuiltinPluginEditor] select_instance rejected: {}::{} is not in the sidebar for plugin={}",
+                "[BuiltinPluginEditor] select_instance rejected: {}::{} is not an instance tab of plugin={}",
                 key.track_id, key.insert_id, self.plugin_id
             );
             return;
@@ -1357,7 +1367,7 @@ impl BuiltinPluginEditorWindow {
                     .map(|i| i.instance_key.clone())
                 else {
                     eprintln!(
-                        "[plugin-bridge] requestSelectInstance rejected plugin={} instance={instance_id} reason=not_in_sidebar",
+                        "[plugin-bridge] requestSelectInstance rejected plugin={} instance={instance_id} reason=not_an_instance",
                         self.plugin_id
                     );
                     // Restore the route the browser actually has a valid
@@ -2157,17 +2167,72 @@ impl BuiltinPluginEditorWindow {
         });
     }
 
-    pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_collapsed = !self.sidebar_collapsed;
-        cx.notify();
+    /// The instance the editor is bound to, for the studio's chrome refresh.
+    pub(crate) fn active_instance_key(&self) -> Option<&PluginInstanceKey> {
+        self.active_instance.as_ref()
     }
 
-    fn sidebar_width(&self) -> f32 {
-        if self.sidebar_collapsed {
-            0.0
-        } else {
-            SIDEBAR_W
+    /// The studio's chrome for the bound instance. Repaints only on a change,
+    /// so a steady CPU reading costs nothing.
+    pub(crate) fn set_chrome(
+        &mut self,
+        chrome: Option<PluginEditorChrome>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chrome != chrome {
+            self.chrome = chrome;
+            cx.notify();
         }
+    }
+
+    /// Chrome actions queued since the studio last drained them.
+    pub(crate) fn take_chrome_actions(&mut self) -> Vec<(PluginInstanceKey, PluginEditorAction)> {
+        std::mem::take(&mut self.chrome_actions)
+    }
+
+    /// A control in the header. A tab rebinds the shared browser through the
+    /// same `select_instance` the page's own request uses, so the page, its
+    /// URL and the bridge see exactly what they always did. Anything else is
+    /// the insert's business, and waits for the studio.
+    fn handle_chrome_action(&mut self, action: PluginEditorAction, cx: &mut Context<Self>) {
+        match action {
+            PluginEditorAction::SelectTab(id) => {
+                let key = self
+                    .instances
+                    .iter()
+                    .map(|instance| &instance.instance_key)
+                    .find(|key| wire_instance_id(key) == id)
+                    .cloned();
+                if let Some(key) = key {
+                    self.select_instance(key, cx);
+                }
+            }
+            action => {
+                if let Some(key) = self.active_instance.clone() {
+                    self.chrome_actions.push((key, action));
+                }
+            }
+        }
+    }
+
+    fn instance_tabs(&self) -> Vec<InstanceTab> {
+        self.instances
+            .iter()
+            .map(|instance| InstanceTab {
+                id: wire_instance_id(&instance.instance_key),
+                insert_number: instance.insert_number,
+                // Every tab is this plug-in, so the channel is what tells them
+                // apart; a renamed insert keeps its own name beside it.
+                label: if instance.insert_name.is_empty()
+                    || instance.insert_name == self.display_name
+                {
+                    instance.track_name.clone()
+                } else {
+                    format!("{} · {}", instance.track_name, instance.insert_name)
+                },
+                dimmed: instance.bypassed || !instance.enabled,
+            })
+            .collect()
     }
 
     /// Drive CEF and, until it succeeds, keep retrying the attach.
@@ -2385,7 +2450,7 @@ impl BuiltinPluginEditorWindow {
     fn attach(&mut self, window: &mut Window, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
         self.attach_attempts += 1;
         let scale = window.scale_factor();
-        let rect = content_rect(bounds, scale, self.sidebar_width());
+        let rect = content_rect(bounds, scale);
         if rect.width <= 0 || rect.height <= 0 {
             // Routine for the first render pass on a compositor that sizes the
             // surface asynchronously; the waiting tick schedules another pass.
@@ -2479,7 +2544,7 @@ impl BuiltinPluginEditorWindow {
     /// rect. Only issues native calls when the rect actually changed.
     fn resync_bounds(&mut self, window: &Window, bounds: Bounds<Pixels>) {
         let scale_factor = window.scale_factor();
-        let rect = content_rect(bounds, scale_factor, self.sidebar_width());
+        let rect = content_rect(bounds, scale_factor);
         let scale_unchanged = (self.last_scale - scale_factor).abs() <= f32::EPSILON;
         if rect.width <= 0 || rect.height <= 0 || (self.last_rect == Some(rect) && scale_unchanged)
         {
@@ -2555,17 +2620,16 @@ impl Drop for BuiltinPluginEditorWindow {
 }
 
 /// The physical-pixel rect the browser occupies inside the shell's client
-/// area: everything below the GPUI-drawn header and right of the native
-/// sidebar. `sidebar_w` is reserved the same way as `HEADER_H` — the browser
-/// must never be told to draw under either.
-fn content_rect(bounds: Bounds<Pixels>, scale: f32, sidebar_w: f32) -> ViewRect {
+/// area: the full width, below the GPUI-drawn header (titlebar, instance tabs,
+/// chrome row) — the browser must never be told to draw under it.
+fn content_rect(bounds: Bounds<Pixels>, scale: f32) -> ViewRect {
     let width: f32 = bounds.size.width.into();
     let height: f32 = bounds.size.height.into();
     let phys = |v: f32| (v * scale).round() as i32;
     ViewRect {
-        x: phys(sidebar_w),
+        x: 0,
         y: phys(HEADER_H),
-        width: (phys(width) - phys(sidebar_w)).max(0),
+        width: phys(width).max(0),
         height: (phys(height) - phys(HEADER_H)).max(0),
     }
 }
@@ -2676,7 +2740,7 @@ struct LastBrowserClick {
 ///
 /// GPUI's `MouseDownEvent::click_count` comes from a window-global
 /// `ClickState` that every part of the shell feeds — titlebar, instance
-/// sidebar and browser alike. Forwarding it verbatim means a sidebar click
+/// tabs and browser alike. Forwarding it verbatim means a tab click
 /// followed quickly by a browser click arrives at Blink as `clickCount = 2`,
 /// and Blink turns that into a `dblclick` on a control the user clicked once.
 /// Plugin editors bind double-click to "reset to default", so that is a
@@ -2850,7 +2914,7 @@ impl Render for BuiltinPluginEditorWindow {
         };
 
         // Same focus-reclaim contract as MixerWindow: GPUI only routes key events
-        // along the focused dispatch path. Sidebar / titlebar clicks leave no
+        // along the focused dispatch path. Tab / titlebar clicks leave no
         // focus handle, so capture_key_down never runs and Space dies — especially
         // on Linux. Off-screen CEF still receives keys through our surface
         // forwarder once this shell holds focus again.
@@ -2860,7 +2924,7 @@ impl Render for BuiltinPluginEditorWindow {
         let focus_on_pointer = self.focus.clone();
 
         // Space must work even when focus is not on the CEF surface (titlebar /
-        // instance sidebar) and on every OS — not only off-screen hosts. Capture
+        // instance tabs) and on every OS — not only off-screen hosts. Capture
         // phase on the shell so bare Space always reaches the same transport
         // command as the arrangement. Windowed CEF still also claims via
         // OnPreKeyEvent; that path returns 1 (consumed) so we never toggle twice.
@@ -2874,20 +2938,27 @@ impl Render for BuiltinPluginEditorWindow {
             Self::claim_transport_key();
         });
 
+        let emit = {
+            let this = cx.weak_entity();
+            move |action: PluginEditorAction, cx: &mut App| {
+                let _ = this.update(cx, |this, cx| this.handle_chrome_action(action, cx));
+            }
+        };
+
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(Colors::surface_panel())
-            // Pointer anywhere on the shell (titlebar, sidebar, browser) reclaims
+            // Pointer anywhere on the shell (titlebar, tabs, browser) reclaims
             // the keyboard anchor so the next Space hits the transport claim.
             .capture_any_mouse_down(move |_event, window, cx| {
                 focus_on_pointer.focus(window, cx);
             })
             // Capture phase, so this runs before the browser region's own
             // bubble-phase press handler: a press on the titlebar or the
-            // instance sidebar breaks any click sequence the browser had going,
-            // which is what stops "sidebar click, then knob click" from
+            // instance tabs breaks any click sequence the browser had going,
+            // which is what stops "tab click, then knob click" from
             // reaching Blink as a double click.
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _window, _cx| {
                 let (x, y) = this.to_view_point(event.position);
@@ -2912,13 +2983,30 @@ impl Render for BuiltinPluginEditorWindow {
                     },
                 )),
             )
+            // The same header as an external plug-in's editor: instance tabs
+            // under the titlebar, then the chrome row. Both are GPUI-drawn
+            // above the browser rect, never over it (`HEADER_H`).
+            .child(
+                div().flex_none().child(render_instance_tab_strip(
+                    &self.instance_tabs(),
+                    self.active_instance
+                        .as_ref()
+                        .map(wire_instance_id)
+                        .as_deref(),
+                    emit.clone(),
+                )),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .child(render_builtin_chrome_tools(self.chrome.as_ref(), emit)),
+            )
             .child(
                 div()
                     .flex_1()
                     .min_h(px(0.0))
                     .flex()
                     .flex_row()
-                    .child(self.render_sidebar(cx))
                     .child(match failure {
                         None => self.render_browser_region(cx),
                         Some(reason) => self.render_failure(reason, cx),
@@ -3063,10 +3151,7 @@ impl BuiltinPluginEditorWindow {
     fn to_view_point(&self, position: Point<Pixels>) -> (i32, i32) {
         let x: f32 = position.x.into();
         let y: f32 = position.y.into();
-        (
-            (x - self.sidebar_width()).round() as i32,
-            (y - HEADER_H).round() as i32,
-        )
+        (x.round() as i32, (y - HEADER_H).round() as i32)
     }
 
     fn send_input(&self, input: EditorInput) {
@@ -3148,7 +3233,7 @@ impl BuiltinPluginEditorWindow {
         // the child's origin *is* the view origin. Off-screen hosting — which
         // is every built-in editor today — has no child, so the view sits at
         // its content offset inside the shell's own client area; using the
-        // shell origin unadjusted would be off by the sidebar and header.
+        // shell origin unadjusted would be off by the header.
         let (host_hwnd, offset) = match self.content.as_ref().filter(|c| c.is_valid()) {
             Some(content) => (content.hwnd(), (0, 0)),
             None => (native_hwnd(window)?, (rect.x, rect.y)),
@@ -3552,84 +3637,6 @@ impl BuiltinPluginEditorWindow {
         }
         Self::schedule_input_pump(cx);
     }
-
-    /// Native instance list. Reserved width matches `sidebar_width()`, which
-    /// `content_rect` also reads so CEF and this column share one boundary.
-    fn render_sidebar(&self, cx: &Context<Self>) -> impl IntoElement {
-        if self.sidebar_collapsed {
-            return div().flex_none().w(px(0.0)).into_any_element();
-        }
-
-        let rows = if self.instances.is_empty() {
-            vec![div()
-                .p(px(10.0))
-                .text_size(px(11.0))
-                .text_color(Colors::text_secondary())
-                .child(format!(
-                    "No {} instances are available in this project.",
-                    self.plugin_id
-                ))
-                .into_any_element()]
-        } else {
-            self.instances
-                .iter()
-                .map(|instance| {
-                    let is_active = self.active_instance.as_ref() == Some(&instance.instance_key);
-                    let key = instance.instance_key.clone();
-                    let weak = cx.weak_entity();
-                    div()
-                        .id(("builtin-plugin-instance-row", {
-                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                            std::hash::Hash::hash(&key, &mut hasher);
-                            std::hash::Hasher::finish(&hasher) as usize
-                        }))
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .when(is_active, |el| el.bg(Colors::surface_raised()))
-                        .when(!is_active, |el| el.bg(Colors::surface_panel()))
-                        .cursor_pointer()
-                        .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                            let _ = weak.update(cx, |editor, cx| {
-                                editor.select_instance(key.clone(), cx);
-                            });
-                        })
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .text_color(Colors::text_secondary())
-                                .child(instance.track_name.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(Colors::text_primary())
-                                .child(if instance.bypassed {
-                                    format!("{} (bypassed)", instance.insert_name)
-                                } else {
-                                    instance.insert_name.clone()
-                                }),
-                        )
-                        .into_any_element()
-                })
-                .collect()
-        };
-
-        div()
-            .flex_none()
-            .w(px(SIDEBAR_W))
-            .h_full()
-            .flex()
-            .flex_col()
-            .border_r_1()
-            .border_color(Colors::border_subtle())
-            .bg(Colors::surface_panel())
-            .overflow_hidden()
-            .children(rows)
-            .into_any_element()
-    }
 }
 
 /// Open the shared shell window for a built-in plugin's editor. One per
@@ -3702,7 +3709,7 @@ mod tests {
 
     #[test]
     fn content_rect_sits_below_the_header() {
-        let rect = content_rect(bounds(1000.0, 700.0), 1.0, 0.0);
+        let rect = content_rect(bounds(1000.0, 700.0), 1.0);
         assert_eq!(rect.x, 0);
         assert_eq!(rect.y, HEADER_H as i32);
         assert_eq!(rect.width, 1000);
@@ -3711,7 +3718,7 @@ mod tests {
 
     #[test]
     fn content_rect_scales_with_dpi() {
-        let rect = content_rect(bounds(1000.0, 700.0), 2.0, 0.0);
+        let rect = content_rect(bounds(1000.0, 700.0), 2.0);
         assert_eq!(rect.y, (HEADER_H * 2.0) as i32);
         assert_eq!(rect.width, 2000);
         assert_eq!(rect.height, 1400 - (HEADER_H * 2.0) as i32);
@@ -3721,7 +3728,7 @@ mod tests {
 
     #[test]
     fn a_window_shorter_than_the_header_clamps_to_zero_rather_than_going_negative() {
-        let rect = content_rect(bounds(400.0, 10.0), 1.0, 0.0);
+        let rect = content_rect(bounds(400.0, 10.0), 1.0);
         assert_eq!(rect.height, 0);
         assert!(rect.height >= 0);
     }
@@ -3853,7 +3860,7 @@ mod tests {
     }
 
     /// The defect this tracker exists to fix: GPUI's window-global click count
-    /// is fed by the titlebar and instance sidebar too, so a chrome click
+    /// is fed by the titlebar and instance tabs too, so a chrome click
     /// followed quickly by a browser click reached Blink as a `dblclick` on a
     /// control the user clicked exactly once.
     #[test]
@@ -3869,7 +3876,7 @@ mod tests {
         assert_eq!(
             tracker.press(EditorMouseButton::Left, (10, 10), soon),
             1,
-            "a sidebar click in between must not produce a double click"
+            "a tab click in between must not produce a double click"
         );
     }
 
@@ -3904,16 +3911,9 @@ mod tests {
     }
 
     #[test]
-    fn content_rect_reserves_sidebar_width_on_the_left() {
-        let rect = content_rect(bounds(1000.0, 700.0), 1.0, SIDEBAR_W);
-        assert_eq!(rect.x, SIDEBAR_W as i32);
-        assert_eq!(rect.width, 1000 - SIDEBAR_W as i32);
-    }
-
-    #[test]
     fn zcomp_window_preserves_the_full_editor_canvas() {
         let (width, height) = default_editor_window_size("builtin:zcomp");
-        let rect = content_rect(bounds(width, height), 1.0, SIDEBAR_W);
+        let rect = content_rect(bounds(width, height), 1.0);
         assert_eq!(rect.width, ZCOMP_EDITOR_CONTENT_WIDTH as i32);
         assert_eq!(rect.height, ZCOMP_EDITOR_CONTENT_HEIGHT as i32);
         assert_eq!(
@@ -3922,39 +3922,29 @@ mod tests {
         );
     }
 
+    /// The same header as an external plug-in's editor window, band for band,
+    /// so the two shells line up and the browser starts where that window's
+    /// plug-in view does.
+    #[test]
+    fn the_header_is_the_plugin_host_shells_header() {
+        assert_eq!(HEADER_H, TITLEBAR_HEIGHT + TAB_STRIP_H + CHROME_ROW_H);
+        let rect = content_rect(bounds(1000.0, 700.0), 1.0);
+        assert_eq!((rect.x, rect.width), (0, 1000), "no sidebar: full width");
+    }
+
     /// The browser is told to lay out in logical pixels, so a window-space
-    /// pointer position becomes a view-space one by subtracting the chrome this
-    /// window reserves — the same offsets `content_rect` reserves. Verified
-    /// end-to-end by `examples/osr_editor_probe`, which reports the coordinate
-    /// the page actually received (a click sent at 400,300 arrives at 400,300).
+    /// pointer position becomes a view-space one by subtracting the header
+    /// this window reserves — the same offset `content_rect` reserves.
+    /// Verified end-to-end by `examples/osr_editor_probe`, which reports the
+    /// coordinate the page actually received.
     #[test]
-    fn view_space_points_subtract_the_reserved_chrome() {
-        let to_view = |x: f32, y: f32, sidebar: f32| {
-            ((x - sidebar).round() as i32, (y - HEADER_H).round() as i32)
-        };
-        assert_eq!(to_view(SIDEBAR_W, HEADER_H, SIDEBAR_W), (0, 0));
-        assert_eq!(
-            to_view(SIDEBAR_W + 400.0, HEADER_H + 300.0, SIDEBAR_W),
-            (400, 300)
-        );
-        // Collapsed sidebar reserves nothing on the left.
-        assert_eq!(to_view(400.0, HEADER_H + 300.0, 0.0), (400, 300));
-        // A position over the chrome maps outside the view, which is what the
+    fn view_space_points_subtract_the_reserved_header() {
+        let to_view = |x: f32, y: f32| (x.round() as i32, (y - HEADER_H).round() as i32);
+        assert_eq!(to_view(0.0, HEADER_H), (0, 0));
+        assert_eq!(to_view(400.0, HEADER_H + 300.0), (400, 300));
+        // A position over the header maps outside the view, which is what the
         // page should see — not a clamp onto its edge.
-        assert!(to_view(0.0, 0.0, SIDEBAR_W).0 < 0);
-    }
-
-    #[test]
-    fn content_rect_sidebar_width_scales_with_dpi() {
-        let rect = content_rect(bounds(1000.0, 700.0), 2.0, SIDEBAR_W);
-        assert_eq!(rect.x, (SIDEBAR_W * 2.0) as i32);
-        assert_eq!(rect.width, 2000 - (SIDEBAR_W * 2.0) as i32);
-    }
-
-    #[test]
-    fn a_sidebar_wider_than_the_window_clamps_content_to_zero_rather_than_going_negative() {
-        let rect = content_rect(bounds(100.0, 700.0), 1.0, SIDEBAR_W);
-        assert_eq!(rect.width, 0);
+        assert!(to_view(0.0, 0.0).1 < 0);
     }
 
     #[test]
@@ -3972,6 +3962,7 @@ mod tests {
             plugin_id: "rodharerist".into(),
             track_name: "Track".into(),
             insert_name: "Insert".into(),
+            insert_number: 1,
             bypassed: false,
             enabled: true,
             state_bytes: None,
@@ -3997,6 +3988,7 @@ mod tests {
             plugin_id: "rodharerist".into(),
             track_name: "Track".into(),
             insert_name: "Insert".into(),
+            insert_number: 1,
             bypassed: false,
             enabled: true,
             state_bytes: None,

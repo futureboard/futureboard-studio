@@ -895,10 +895,11 @@ impl PianoRoll {
         match self.drag {
             PianoDrag::CcSelect { .. } => self.update_cc_select(lx, ly, cx),
             PianoDrag::CcPaint { erase, .. } => {
-                // Alt is the live "free" modifier: releasing the grid
-                // mid-stroke takes effect on the next segment.
+                // Painting is freehand; Alt snaps it to the grid, live, so
+                // pressing it mid-stroke takes effect on the next segment.
+                let select_tool = self.tool == PianoTool::Select;
                 if let PianoDrag::CcPaint { unsnap, .. } = &mut self.drag {
-                    *unsnap = event.modifiers.alt;
+                    *unsnap = select_tool || !event.modifiers.alt;
                 }
                 self.cc_paint_stroke_to(lx, ly, erase, cx);
             }
@@ -1158,7 +1159,7 @@ impl PianoRoll {
                     PianoTool::Line => "Drag a ramp · Alt or Shift releases the grid",
                     PianoTool::Erase => "Drag across points to erase",
                     _ => {
-                        "Drag to draw · Alt+drag draws free (no snap) · Shift-drag line · Right-click a point to delete"
+                        "Drag to draw freehand · Alt+drag snaps to the grid · Shift-drag line · Right-click a point to delete"
                     }
                 })
         });
@@ -1225,8 +1226,11 @@ impl PianoRoll {
                         this.begin_cc_line(lx, ly, unsnap, window, cx);
                         return;
                     }
+                    // Painting (and erasing) is freehand — it draws where the
+                    // pointer is, not on grid steps — and Alt snaps it to the
+                    // grid instead. Every other gesture keeps Alt as "free".
                     if this.tool == PianoTool::Erase {
-                        this.begin_cc_paint(true, free, lx, ly, window, cx);
+                        this.begin_cc_paint(true, !free, lx, ly, window, cx);
                         return;
                     }
 
@@ -1277,7 +1281,10 @@ impl PianoRoll {
                         return;
                     }
                     this.cc_selection.clear();
-                    this.begin_cc_paint(false, free, lx, ly, window, cx);
+                    // From the Select tool, Alt is what asks for drawing at
+                    // all, so it draws freehand like the Draw tool does.
+                    let unsnap = this.tool == PianoTool::Select || !free;
+                    this.begin_cc_paint(false, unsnap, lx, ly, window, cx);
                 }),
             )
             .on_mouse_down(

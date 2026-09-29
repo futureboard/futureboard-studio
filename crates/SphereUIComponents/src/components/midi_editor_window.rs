@@ -54,8 +54,14 @@ pub struct MidiEditorWindow {
     last_clip_id: Option<String>,
     on_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
     dispatch_command: Arc<dyn Fn(&'static str, &mut App) + Send + Sync>,
+    /// Runs the studio keymap's MIDI Editor scope (and the global keys) for a
+    /// key pressed here. Returns whether a command took the key.
+    dispatch_key: MidiEditorKeyCb,
     focus_handle: FocusHandle,
 }
+
+/// Resolves and runs a key pressed in the floating MIDI editor.
+pub type MidiEditorKeyCb = Arc<dyn Fn(&KeyDownEvent, &mut App) -> bool + Send + Sync>;
 
 impl MidiEditorWindow {
     pub fn new(
@@ -64,6 +70,7 @@ impl MidiEditorWindow {
         virtual_keyboard: Entity<VirtualKeyboardPanel>,
         on_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
         dispatch_command: Arc<dyn Fn(&'static str, &mut App) + Send + Sync>,
+        dispatch_key: MidiEditorKeyCb,
         cx: &mut Context<Self>,
     ) -> Self {
         // The window's actions live in the editor's footer, so the window
@@ -93,6 +100,7 @@ impl MidiEditorWindow {
             last_clip_id: None,
             on_close,
             dispatch_command,
+            dispatch_key,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -188,6 +196,15 @@ impl MidiEditorWindow {
             cx.stop_propagation();
             midi_editor_debug("command dispatch transport:play-pause");
             (self.dispatch_command)("transport:play-pause", cx);
+            return;
+        }
+        // Every other key goes to the keymap first, in the MIDI Editor scope:
+        // Q quantizes, the arrows nudge and transpose, R records — the same
+        // keys as the docked editor. A key the keymap does not bind falls
+        // through to the piano roll's own editing keys below.
+        if (self.dispatch_key)(event, cx) {
+            window.prevent_default();
+            cx.stop_propagation();
             return;
         }
         if (mods.control || mods.platform) && !mods.alt && !mods.function {
@@ -323,6 +340,7 @@ pub fn open_midi_editor_window(
     virtual_keyboard: Entity<VirtualKeyboardPanel>,
     on_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
     dispatch_command: Arc<dyn Fn(&'static str, &mut App) + Send + Sync>,
+    dispatch_key: MidiEditorKeyCb,
     cx: &mut App,
 ) -> Result<WindowHandle<MidiEditorWindow>, String> {
     let window_bounds = crate::window_position::centered_window_bounds(
@@ -355,6 +373,7 @@ pub fn open_midi_editor_window(
                 virtual_keyboard,
                 on_close,
                 dispatch_command,
+                dispatch_key,
                 cx,
             )
         })

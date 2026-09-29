@@ -168,15 +168,16 @@ impl StudioLayout {
     /// the engine without a timer of their own. An unchanged chrome notifies
     /// nothing, so a steady CPU reading does not repaint the window.
     pub(super) fn refresh_plugin_editor_chrome(&mut self, cx: &mut Context<Self>) {
-        if self.plugin_editors.open.is_empty() {
-            return;
-        }
         let sample_rate = self
             .audio_bridge
             .stats
             .as_ref()
             .map(|stats| stats.sample_rate)
             .unwrap_or(0);
+        self.refresh_builtin_editor_chrome(sample_rate, cx);
+        if self.plugin_editors.open.is_empty() {
+            return;
+        }
         let handles: Vec<_> = self.plugin_editors.open.values().cloned().collect();
         for handle in handles {
             let Ok(Some(chrome)) = handle.update(cx, |editor, _window, _cx| {
@@ -448,8 +449,44 @@ impl StudioLayout {
             .map(|(_, handle)| *handle)
     }
 
+    /// The chrome of each built-in plug-in's editor, for the instance it is
+    /// bound to: the same insert chrome an external plug-in's window gets.
+    fn refresh_builtin_editor_chrome(&mut self, sample_rate: u32, cx: &mut Context<Self>) {
+        if self.plugin_editors.builtin.is_empty() {
+            return;
+        }
+        let handles: Vec<_> = self.plugin_editors.builtin.values().cloned().collect();
+        for handle in handles {
+            let Ok(bound) = handle.update(cx, |editor, _window, _cx| {
+                editor.active_instance_key().cloned()
+            }) else {
+                continue;
+            };
+            let chrome = bound.and_then(|key| {
+                self.plugin_editor_chrome_for(&key.track_id, &key.insert_id, sample_rate, cx)
+            });
+            let _ = handle.update(cx, |editor, _window, cx| editor.set_chrome(chrome, cx));
+        }
+    }
+
     /// Applies whatever the chrome's controls asked for since the last poll.
     pub(super) fn drain_plugin_editor_chrome_actions(&mut self, cx: &mut Context<Self>) {
+        // Built-in editors queue per instance, and only for what applies to a
+        // built-in (power). A changed insert changes its tab, so the tabs are
+        // rebuilt after.
+        let builtin: Vec<_> = self.plugin_editors.builtin.values().cloned().collect();
+        let mut builtin_requests = Vec::new();
+        for handle in builtin {
+            let _ = handle.update(cx, |editor, _window, _cx| {
+                builtin_requests.extend(editor.take_chrome_actions());
+            });
+        }
+        if !builtin_requests.is_empty() {
+            for (key, action) in builtin_requests {
+                self.apply_plugin_editor_action(&key.track_id, &key.insert_id, action, cx);
+            }
+            self.refresh_builtin_editor_sidebars(cx);
+        }
         if self.plugin_editors.open.is_empty() {
             return;
         }

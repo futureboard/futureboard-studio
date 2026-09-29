@@ -85,6 +85,20 @@ pub struct MenuItem {
     pub detail: Option<String>,
 }
 
+impl MenuItem {
+    /// The shortcut to show beside this item: the active keymap's, so the
+    /// menu tells the truth after a profile switch or a rebinding. The
+    /// manifest's `shortcut` is only the fallback before the keymap loads.
+    pub fn live_shortcut(&self) -> Option<String> {
+        match self.command.as_deref().filter(|c| !c.is_empty()) {
+            Some(command) => {
+                crate::keymap::global_keymap_shortcut(command, self.shortcut.as_deref())
+            }
+            None => self.shortcut.clone(),
+        }
+    }
+}
+
 /// Runtime state for one command item: whether it can run now, and what it
 /// would act on. See [`patch_command_states`].
 pub struct CommandMenuState<'a> {

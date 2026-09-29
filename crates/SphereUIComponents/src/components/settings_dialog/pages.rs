@@ -868,7 +868,94 @@ fn performance(cx: &PageCtx) -> Vec<PrefGroup> {
                 ),
             ))
             .note(RESTART_NOTE),
+        audio_processing_group(cx),
     ]
+}
+
+/// Settings → Performance → Audio Processing. Applied on the next audio block;
+/// the descriptions report what the engine is actually running.
+fn audio_processing_group(cx: &PageCtx) -> PrefGroup {
+    use crate::settings::AudioInstructionSet as Isa;
+    let settings = &cx.schema.performance.audio_processing;
+    let up = cx.up();
+    let running = DirectAudio::multicore_status();
+    let auto = DirectAudio::auto_processing_threads();
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let multicore_status = if running.enabled {
+        format!(
+            "On · {} threads. Tracks and buses that do not feed each other are processed side by side; the mix is unchanged.",
+            running.threads
+        )
+    } else {
+        "Process tracks and buses on several cores, for projects the audio thread cannot keep up with alone. The mix is unchanged.".to_string()
+    };
+    let mut group = PrefGroup::new("Audio Processing").row(PrefRow::described(
+        "Multi-Core Processing",
+        multicore_status,
+        &[
+            "multi",
+            "core",
+            "multicore",
+            "thread",
+            "cpu",
+            "parallel",
+            "processing",
+        ],
+        pref_switch(
+            "audio-multicore",
+            settings.multicore,
+            apply(&up, |s| {
+                s.performance.audio_processing.multicore = !s.performance.audio_processing.multicore
+            }),
+        ),
+    ));
+    if settings.multicore {
+        let mut options = vec![(0u32, "Auto".to_string())];
+        options.extend(
+            [2u32, 4, 8]
+                .into_iter()
+                .filter(|&threads| threads as usize <= cores)
+                .map(|threads| (threads, threads.to_string())),
+        );
+        group = group.row(PrefRow::described(
+            "Processing Threads",
+            format!("The audio thread included. Auto uses {auto} of {cores} cores."),
+            &["threads", "cores", "cpu", "multi", "core"],
+            choice("audio-threads", options, settings.threads, &up, |s, v| {
+                s.performance.audio_processing.threads = v
+            }),
+        ));
+    }
+    if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+        let active = DirectAudio::active_simd_level();
+        let status = if !DirectAudio::cpu_supports_avx2() {
+            "This CPU has no AVX2, so the engine runs SSE.".to_string()
+        } else {
+            format!(
+                "Mixing, faders and meters run on {}. SSE is the fallback for CPUs without AVX2.",
+                active.label()
+            )
+        };
+        group = group.row(PrefRow::described(
+            "Instruction Set",
+            status,
+            &["avx", "avx2", "sse", "simd", "instruction", "cpu", "vector"],
+            choice(
+                "audio-instruction-set",
+                vec![
+                    (Isa::Avx2, Isa::Avx2.label().to_string()),
+                    (Isa::Sse, Isa::Sse.label().to_string()),
+                ],
+                settings.instruction_set,
+                &up,
+                |s, v| s.performance.audio_processing.instruction_set = v,
+            ),
+        ));
+    }
+    group
 }
 
 // ── About ───────────────────────────────────────────────────────────────────

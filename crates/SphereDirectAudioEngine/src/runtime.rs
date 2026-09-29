@@ -6525,7 +6525,8 @@ fn build_clip_runtime(
     // zero-latency backends / no processor.
     let stretch_prime_len = stretch_processor
         .as_ref()
-        .map(|p| p.seek_input_len(1.0 / capacity_time_ratio.max(0.01)))
+        // +2: the render floors both ends of the pre-roll span separately.
+        .map(|p| p.seek_input_len(1.0 / capacity_time_ratio.max(0.01)) + 2)
         .unwrap_or(0);
 
     Some(RuntimeClip {

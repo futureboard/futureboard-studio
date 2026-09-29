@@ -18,7 +18,8 @@ use crate::components::text_input::{
 };
 use crate::components::title_bar::external_window_titlebar;
 use crate::keymap::{
-    format_keystroke_list, KeymapConflict, KeymapManager, KeymapRow, PROFILE_DESCRIPTORS,
+    format_keystroke_list, KeymapConflict, KeymapManager, KeymapRow, KeymapScope,
+    PROFILE_DESCRIPTORS,
 };
 use crate::theme::{self, Colors};
 use crate::window_position::{apply_owner_display, centered_window_bounds};
@@ -46,7 +47,9 @@ struct EditDialogState {
     action_id: String,
     action_label: String,
     arguments_json: String,
-    context: String,
+    /// Where the binding answers. Chosen in the dialog; a new binding starts
+    /// in the scope its action acts on.
+    scope: KeymapScope,
     recorder: KeyRecorderState,
     conflicts: Vec<KeymapConflict>,
     show_conflict: bool,
@@ -66,14 +69,14 @@ impl EditDialogState {
         action_id: String,
         action_label: String,
         arguments_json: String,
-        context: String,
+        scope: KeymapScope,
         captured: Option<String>,
     ) -> Self {
         Self {
             action_id,
             action_label,
             arguments_json,
-            context,
+            scope,
             recorder: KeyRecorderState {
                 captured,
                 ..KeyRecorderState::default()
@@ -90,7 +93,7 @@ impl EditDialogState {
             action_id: String::new(),
             action_label: "New binding".into(),
             arguments_json: String::new(),
-            context: "Studio".into(),
+            scope: KeymapScope::Global,
             recorder: KeyRecorderState::default(),
             conflicts: Vec::new(),
             show_conflict: false,
@@ -106,6 +109,8 @@ pub struct KeymapWindow {
     search_input: TextInputState,
     filter_query: String,
     filter_pending: String,
+    /// Only this scope's rows, or every scope.
+    scope_filter: Option<KeymapScope>,
     json_input: TextInputState,
     json_error: Option<String>,
     selected_row_id: Option<String>,
@@ -135,6 +140,7 @@ impl KeymapWindow {
                 .with_placeholder("Filter action names..."),
             filter_query: String::new(),
             filter_pending: String::new(),
+            scope_filter: None,
             json_input: TextInputState::new("keymap-json", cx.focus_handle())
                 .with_accessible_label("Keymap JSON"),
             json_error: None,
@@ -182,6 +188,7 @@ impl KeymapWindow {
         self.manager
             .filtered_rows(&self.filter_query)
             .into_iter()
+            .filter(|row| self.scope_filter.is_none_or(|scope| row.scope == scope))
             .cloned()
             .collect()
     }
@@ -228,7 +235,7 @@ impl KeymapWindow {
             row.action_id.clone(),
             row.action_label.clone(),
             row.arguments_json.clone().unwrap_or_default(),
-            row.context.clone().unwrap_or_else(|| "Studio".to_string()),
+            row.scope,
             row.keystrokes.first().cloned(),
         ));
         // Armed on open. Recording used to need a second, separate click on the
@@ -324,7 +331,7 @@ impl KeymapWindow {
         }
         match self
             .manager
-            .tap_binding(&action_id, keys, Some(dialog.context.clone()), None, force)
+            .tap_binding(&action_id, keys, dialog.scope, None, force)
         {
             Ok(conflicts) if !conflicts.is_empty() && !force => {
                 let mut restored = dialog;
@@ -573,13 +580,14 @@ impl KeymapWindow {
                     }
                 } else if matches!(key, "delete" | "backspace") {
                     if let Some(id) = self.selected_row_id.clone() {
-                        if self
+                        let overridden = self
                             .manager
                             .rows()
                             .iter()
-                            .any(|row| row.id == id && row.is_user_override)
-                        {
-                            self.manager.reset_binding(&id);
+                            .find(|row| row.id == id && row.is_user_override)
+                            .map(|row| (row.action_id.clone(), row.scope));
+                        if let Some((action, scope)) = overridden {
+                            self.manager.reset_binding(&action, scope);
                             let _ = self.manager.save_changes();
                             self.publish_changes(cx);
                             cx.notify();
@@ -725,7 +733,30 @@ impl Render for KeymapWindow {
                 false,
                 on_profile_toggle,
                 on_profile_change,
-            )));
+            )))
+            .child(div().w(px(12.0)))
+            .child(fb_field_label("Scope"))
+            .children(
+                std::iter::once(None)
+                    .chain(KeymapScope::ALL.into_iter().map(Some))
+                    .map(|scope| {
+                        let entity = entity.clone();
+                        scope_chip(
+                            gpui::SharedString::from(format!(
+                                "keymap-scope-filter-{}",
+                                scope.map_or("all", KeymapScope::key)
+                            )),
+                            scope.map_or("All", KeymapScope::label),
+                            self.scope_filter == scope,
+                            move |_, _, cx| {
+                                let _ = entity.update(cx, |this, cx| {
+                                    this.scope_filter = scope;
+                                    cx.notify();
+                                });
+                            },
+                        )
+                    }),
+            );
 
         let header = keymap_table_header();
 
@@ -937,15 +968,56 @@ fn keymap_table_header() -> impl IntoElement {
         .text_size(px(10.0))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(Colors::text_muted())
-        .child(header_cell("Action", 360.0))
-        .child(vsep())
-        .child(header_cell("Arguments", 140.0))
+        .child(header_cell("Action", 420.0))
         .child(vsep())
         .child(header_cell("Keystrokes", 220.0))
         .child(vsep())
-        .child(header_cell("Context", 200.0))
+        .child(header_cell("Scope", 160.0))
         .child(vsep())
-        .child(header_cell("Source", 120.0))
+        .child(header_cell("Source", 240.0))
+}
+
+/// One pill in a row of scope choices — the filter above the table and the
+/// scope picker in the edit dialog.
+fn scope_chip(
+    id: gpui::SharedString,
+    label: &'static str,
+    active: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let rest = if active {
+        Colors::accent_soft()
+    } else {
+        Colors::with_alpha(Colors::surface_base(), 0.0)
+    };
+    let hover = Colors::composite(
+        if active { rest } else { Colors::surface_base() },
+        Colors::state_hover(),
+    );
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .h(px(22.0))
+        .px(px(8.0))
+        .rounded(px(crate::theme::radius::PILL))
+        .border(px(1.0))
+        .border_color(if active {
+            Colors::accent_primary()
+        } else {
+            Colors::border_subtle()
+        })
+        .bg(rest)
+        .text_size(px(11.0))
+        .text_color(if active {
+            Colors::text_primary()
+        } else {
+            Colors::text_secondary()
+        })
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |style| style.bg(hover))
+        .on_click(on_click)
+        .child(label)
 }
 
 fn header_cell(label: &'static str, width: f32) -> impl IntoElement {
@@ -973,15 +1045,13 @@ fn keymap_row_element(
         Colors::text_muted()
     };
     let keystrokes = format_keystroke_list(&row.keystrokes);
-    let args = row
-        .arguments_json
-        .clone()
-        .unwrap_or_else(|| "—".to_string());
-    let context = row.context.clone().unwrap_or_else(|| "Studio".to_string());
+    // A conflict names what it collides with, so it can be fixed from here.
     let source = if row.is_conflict {
-        "Conflict"
+        format!("Conflicts with {}", row.conflict_with.join(", "))
+    } else if row.is_user_override {
+        "Changed".to_string()
     } else {
-        row.source.label()
+        row.source.label().to_string()
     };
     div()
         .flex()
@@ -997,9 +1067,7 @@ fn keymap_row_element(
         .text_color(text_color)
         .text_size(px(11.0))
         .cursor(gpui::CursorStyle::PointingHand)
-        .child(body_cell(&row.action_label, 360.0))
-        .child(vsep())
-        .child(body_cell(&args, 140.0))
+        .child(body_cell(&row.action_label, 420.0))
         .child(vsep())
         .child(
             body_cell(&keystrokes, 220.0)
@@ -1012,9 +1080,9 @@ fn keymap_row_element(
                 .on_mouse_down(MouseButton::Left, on_keystrokes),
         )
         .child(vsep())
-        .child(body_cell(&context, 200.0))
+        .child(body_cell(row.scope.label(), 160.0))
         .child(vsep())
-        .child(body_cell(source, 120.0).text_color(if row.is_conflict {
+        .child(body_cell(&source, 240.0).text_color(if row.is_conflict {
             Colors::status_warning()
         } else {
             Colors::text_muted()
@@ -1125,9 +1193,19 @@ fn action_picker(
                             let picked = picked.clone();
                             let label = label.clone();
                             let _ = entity.update(cx, |this, cx| {
+                                // Start where the action already lives, so a new
+                                // key for it lands beside the ones it has.
+                                let scope = this
+                                    .manager
+                                    .rows()
+                                    .iter()
+                                    .find(|row| row.action_id == picked)
+                                    .map(|row| row.scope)
+                                    .unwrap_or_else(|| KeymapScope::home_of(&picked));
                                 if let Some(dialog) = this.edit_dialog.as_mut() {
                                     dialog.action_id = picked.clone();
                                     dialog.action_label = label.clone();
+                                    dialog.scope = scope;
                                 }
                                 // Action chosen: the keys belong to the recorder
                                 // from here, which is the next thing the user
@@ -1172,8 +1250,35 @@ fn edit_dialog_overlay(
     let conflict_lines: Vec<_> = dialog
         .conflicts
         .iter()
-        .map(|c| format!("{} ({})", c.action, c.keystroke))
+        .map(|c| {
+            format!(
+                "{} already uses {} in {}. Replace takes it off that action.",
+                c.action,
+                format_keystroke_list(std::slice::from_ref(&c.keystroke)),
+                c.scope.label()
+            )
+        })
         .collect();
+    let scope_choices = KeymapScope::ALL.into_iter().map(|scope| {
+        let entity = entity.clone();
+        scope_chip(
+            gpui::SharedString::from(format!("keymap-edit-scope-{}", scope.key())),
+            scope.label(),
+            dialog.scope == scope,
+            move |_, _, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    if let Some(dialog) = this.edit_dialog.as_mut() {
+                        dialog.scope = scope;
+                        // A conflict found in the old scope says nothing
+                        // about the new one.
+                        dialog.conflicts.clear();
+                        dialog.show_conflict = false;
+                    }
+                    cx.notify();
+                });
+            },
+        )
+    });
 
     div()
         .absolute()
@@ -1230,12 +1335,24 @@ fn edit_dialog_overlay(
                             dialog.recorder.armed,
                         )),
                 )
-                .child(fb_field_label("Context"))
+                .child(fb_field_label("Scope"))
                 .child(
                     div()
-                        .text_size(px(11.0))
-                        .text_color(Colors::text_secondary())
-                        .child(dialog.context.clone()),
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap(px(4.0))
+                        .children(scope_choices),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(Colors::text_muted())
+                        .child(if dialog.scope == KeymapScope::Global {
+                            "Works everywhere. Editors cannot reuse a global key."
+                        } else {
+                            "Works while this editor has the keyboard."
+                        }),
                 )
                 .children(if dialog.show_conflict {
                     Some(

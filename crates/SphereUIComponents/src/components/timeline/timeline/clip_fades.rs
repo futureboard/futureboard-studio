@@ -336,11 +336,40 @@ impl Timeline {
         cx: &mut Context<Self>,
     ) {
         let effect = self.clip_process_update_state(clip_id, update);
-        if effect.redraw {
+        if effect.redraw && matches!(update, AudioClipProcessUpdate::Gain(_)) {
+            // A gain drag changes what the lanes of the dragged clips draw
+            // and nothing else, so only those lanes repaint. Notifying the
+            // Timeline instead rebuilt every visible lane and every view that
+            // observes it — the inspector, the chrome, the editors — on each
+            // mouse move, which is what made the drag stutter. The release
+            // commits with a full notify.
+            self.notify_clip_process_lanes(clip_id, cx);
+        } else if effect.redraw {
             // The render re-resolves the overlay's frame.
             cx.notify();
         } else if effect.handles {
             self.publish_fade_handle_frame(cx);
+        }
+    }
+
+    /// Repaint the lanes that hold `clip_id` and the clips its gesture
+    /// carries along, and nothing else. A lane not built yet (off screen)
+    /// has nothing to repaint.
+    fn notify_clip_process_lanes(&mut self, clip_id: &str, cx: &mut Context<Self>) {
+        let mut tracks: Vec<String> = Vec::with_capacity(1 + self.clip_process_peers.len());
+        let ids =
+            std::iter::once(clip_id).chain(self.clip_process_peers.iter().map(|c| c.id.as_str()));
+        for id in ids {
+            if let Some((track, _)) = self.state.find_clip(id) {
+                if !tracks.contains(&track.id) {
+                    tracks.push(track.id.clone());
+                }
+            }
+        }
+        for track_id in tracks {
+            if let Some(lane) = self.track_lanes.get(&track_id) {
+                lane.update(cx, |_, cx| cx.notify());
+            }
         }
     }
 

@@ -52,8 +52,8 @@ export function PresetMenu({
 
   return (
     <Popover anchorRef={anchorRef} onClose={onClose} align="center" width={300}>
-      <div className="flex items-center gap-2 border-b border-hairline px-3 py-2">
-        <MagnifyingGlassIcon size={13} className="shrink-0 text-ink-dim" />
+      <div className="flex items-center gap-2 border-b border-line px-3 py-2">
+        <MagnifyingGlassIcon size={13} className="shrink-0 text-ink-3" />
         <input
           ref={searchRef}
           type="search"
@@ -62,13 +62,13 @@ export function PresetMenu({
           onKeyDown={onKeyDown}
           placeholder="Search presets"
           aria-label="Search factory presets"
-          className="min-w-0 flex-1 bg-transparent text-[12px] text-ink outline-none placeholder:text-ink-dim"
+          className="min-w-0 flex-1 bg-transparent text-[12px] text-ink outline-none placeholder:text-ink-3"
         />
       </div>
 
       <div role="listbox" aria-label="Factory presets" className="max-h-72 overflow-y-auto py-1">
         {matches.length === 0 ? (
-          <p className="px-3 py-5 text-center text-[11px] text-ink-dim">
+          <p className="px-3 py-5 text-center text-[11px] text-ink-3">
             No preset matches “{query}”.
           </p>
         ) : (
@@ -91,7 +91,7 @@ export function PresetMenu({
                 }}
               >
                 <span className="grid w-4 shrink-0 place-items-center">
-                  {current && <CheckIcon size={12} weight="bold" className="text-signal" />}
+                  {current && <CheckIcon size={12} weight="bold" className="text-accent" />}
                 </span>
                 <span className="min-w-0 flex-1 truncate">{preset.name}</span>
               </button>

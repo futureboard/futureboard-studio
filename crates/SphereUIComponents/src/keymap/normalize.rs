@@ -238,17 +238,14 @@ pub fn canonical_key(key: &str) -> String {
         "arrowdown" | "arrow_down" | "down" => "down",
         "plus" => "=",
         "minus" => "-",
+        // GPUI reports punctuation as the character; profiles may spell it.
+        "comma" => ",",
+        "period" | "dot" => ".",
+        "slash" => "/",
+        "semicolon" => ";",
         other => other,
     }
     .to_string()
-}
-
-pub fn global_priority(command: &str) -> u8 {
-    if command.starts_with("midi:") || command.starts_with("automation:") {
-        2
-    } else {
-        0
-    }
 }
 
 #[cfg(test)]

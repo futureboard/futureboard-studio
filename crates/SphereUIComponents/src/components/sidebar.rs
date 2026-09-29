@@ -177,16 +177,14 @@ pub fn sidebar(
     tree_focus: &FocusHandle,
     search_input: &TextInputState,
     search_focused: bool,
-    active: bool,
+    _active: bool,
     search_callbacks: TextInputCallbacks,
     callbacks: BrowserCallbacks,
     i18n: I18n,
 ) -> impl IntoElement {
-    let panel_border = if active {
-        Colors::panel_border_focused()
-    } else {
-        Colors::border_subtle()
-    };
+    // Which panel has the keyboard is no longer painted: an accent title and
+    // an accent rule down the column's edge were loud for what they said.
+    let panel_border = Colors::border_subtle();
 
     // ── Header ──────────────────────────────────────────────────────
     // Mirrors the Inspector dock header (32 px, DENSE_LABEL, bold) so the two
@@ -214,11 +212,7 @@ pub fn sidebar(
                 .path(assets::ICON_FOLDER_PATH)
                 .w(px(typography::UI_MD))
                 .h(px(typography::UI_MD))
-                .text_color(if active {
-                    Colors::panel_header_active()
-                } else {
-                    Colors::text_muted()
-                }),
+                .text_color(Colors::text_muted()),
         )
         .child(
             div()
@@ -228,11 +222,7 @@ pub fn sidebar(
                 .truncate()
                 .text_size(px(typography::DENSE_LABEL))
                 .font_weight(gpui::FontWeight::BOLD)
-                .text_color(if active {
-                    Colors::panel_header_active()
-                } else {
-                    Colors::tab_text()
-                })
+                .text_color(Colors::tab_text())
                 .child(i18n.tr("browser.panel.title")),
         )
         .child(fb_shortcut_hint(crate::keymap::accel_display("Ctrl+1")))
@@ -467,7 +457,7 @@ fn tab_strip(active: BrowserTab, on_select: BrowserTabCb, i18n: I18n) -> impl In
                         .w(px(GLYPH))
                         .h(px(GLYPH))
                         .text_color(if is_active {
-                            Colors::accent_primary()
+                            Colors::text_primary()
                         } else {
                             Colors::text_muted()
                         }),

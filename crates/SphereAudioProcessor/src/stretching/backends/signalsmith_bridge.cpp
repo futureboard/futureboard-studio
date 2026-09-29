@@ -209,6 +209,25 @@ int fb_signalsmith_latency_samples(void *handle) {
     return state->stretch.inputLatency() + state->stretch.outputLatency();
 }
 
+void fb_signalsmith_io_latency(void *handle, int *input_latency, int *output_latency) {
+    int in = 0;
+    int out = 0;
+    if (handle != nullptr) {
+        auto *state = static_cast<FbSignalsmithHandle *>(handle);
+        if (!state->configured) {
+            state->apply_preset();
+        }
+        in = state->stretch.inputLatency();
+        out = state->stretch.outputLatency();
+    }
+    if (input_latency != nullptr) {
+        *input_latency = in > 0 ? in : 0;
+    }
+    if (output_latency != nullptr) {
+        *output_latency = out > 0 ? out : 0;
+    }
+}
+
 int fb_signalsmith_output_seek_length(void *handle, float playback_rate) {
     if (handle == nullptr) {
         return 0;

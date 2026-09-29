@@ -280,11 +280,18 @@ mod macos {
 
     /// Walk the manifest and collect `(command, keystroke)` pairs for every
     /// item whose accelerator survives [`manifest_accel_to_mac_keystroke`].
-    fn collect_menu_keystrokes(items: &[AppMenuItem], out: &mut Vec<(String, String)>) {
+    fn collect_menu_keystrokes(
+        items: &[AppMenuItem],
+        global_accels: &std::collections::HashMap<String, String>,
+        out: &mut Vec<(String, String)>,
+    ) {
         for item in items {
-            if let (Some(command), Some(accel)) =
-                (item.command.as_deref(), item.shortcut.as_deref())
-            {
+            let accel = item
+                .command
+                .as_deref()
+                .and_then(|command| global_accels.get(command))
+                .map(String::as_str);
+            if let (Some(command), Some(accel)) = (item.command.as_deref(), accel) {
                 let text_edit_command = matches!(
                     command,
                     "edit:select-all" | "edit:copy" | "edit:cut" | "edit:paste"
@@ -295,19 +302,41 @@ mod macos {
                     }
                 }
             }
-            collect_menu_keystrokes(&item.children, out);
+            collect_menu_keystrokes(&item.children, global_accels, out);
         }
+    }
+
+    /// The default profile's global key for each command. Only global keys
+    /// become menubar key equivalents: an equivalent fires whatever has focus,
+    /// so a key scoped to one editor (G is snap in the arrangement and in the
+    /// MIDI editor) must stay with the studio's own scoped handler.
+    fn default_global_accels() -> std::collections::HashMap<String, String> {
+        let global = crate::keymap::KeymapScope::Global.key();
+        crate::keymap::storage::load_builtin_profile("default")
+            .map(|profile| {
+                profile
+                    .bindings
+                    .into_iter()
+                    .filter(|binding| binding.context.as_deref() == Some(global))
+                    .filter_map(|binding| {
+                        let key = binding.keys.into_iter().next()?;
+                        Some((binding.action, key))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// GPUI key bindings that back the macOS menubar's key equivalents. Without
     /// these, `create_menu_item` finds no binding for a `RunMenuCommand` and the
-    /// dropdown shows no accelerator. Reflects the default profile's accelerators
-    /// (the shared manifest); a non-default keymap profile still dispatches via
-    /// the studio's own handler, the printed equivalent just tracks the default.
+    /// dropdown shows no accelerator. Reflects the default profile's global
+    /// keys; a non-default keymap profile still dispatches via the studio's own
+    /// handler, the printed equivalent just tracks the default.
     fn menu_key_bindings() -> Vec<KeyBinding> {
+        let global_accels = default_global_accels();
         let mut pairs: Vec<(String, String)> = Vec::new();
         for menu in &MenuManifest::load().menus {
-            collect_menu_keystrokes(&menu.items, &mut pairs);
+            collect_menu_keystrokes(&menu.items, &global_accels, &mut pairs);
         }
         pairs
             .into_iter()

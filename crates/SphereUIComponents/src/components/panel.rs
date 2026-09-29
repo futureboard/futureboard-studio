@@ -450,7 +450,9 @@ pub fn inspector_panel<'a>(
     inspector_shell(active, i18n).child(body)
 }
 
-fn inspector_shell(active: bool, i18n: I18n) -> gpui::Div {
+/// `_active`: which panel has the keyboard is no longer painted — an accent
+/// title and an accent rule down the dock's edge were loud for what they said.
+fn inspector_shell(_active: bool, i18n: I18n) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -458,11 +460,7 @@ fn inspector_shell(active: bool, i18n: I18n) -> gpui::Div {
         .h_full()
         .bg(Colors::surface_panel())
         .border_l(px(1.0))
-        .border_color(if active {
-            Colors::panel_border_focused()
-        } else {
-            Colors::border_subtle()
-        })
+        .border_color(Colors::border_subtle())
         .child(
             div()
                 .flex_shrink_0()
@@ -473,29 +471,17 @@ fn inspector_shell(active: bool, i18n: I18n) -> gpui::Div {
                 .h(px(32.0))
                 .px(px(10.0))
                 .border_b(px(1.0))
-                .border_color(if active {
-                    Colors::panel_border_focused()
-                } else {
-                    Colors::border_subtle()
-                })
+                .border_color(Colors::border_subtle())
                 .child(
                     svg()
                         .path(assets::ICON_SLIDERS_HORIZONTAL_PATH)
                         .w(px(13.0))
                         .h(px(13.0))
-                        .text_color(if active {
-                            Colors::panel_header_active()
-                        } else {
-                            Colors::text_muted()
-                        }),
+                        .text_color(Colors::text_muted()),
                 )
                 .child(
                     div()
-                        .text_color(if active {
-                            Colors::panel_header_active()
-                        } else {
-                            Colors::tab_text()
-                        })
+                        .text_color(Colors::tab_text())
                         .text_size(px(typography::DENSE_LABEL))
                         .font_weight(gpui::FontWeight::BOLD)
                         .child(i18n.tr("panel.inspector")),
@@ -2033,7 +2019,7 @@ fn instrument_section(track: &TrackState, callbacks: &InspectorCallbacks) -> gpu
 pub fn solfege_panel(
     tracks: &[TrackState],
     selected_track_id: Option<&str>,
-    active: bool,
+    _active: bool,
     pitch: Option<SolfegePitchSummary>,
 ) -> impl IntoElement {
     let selected = selected_track_id
@@ -2061,11 +2047,8 @@ pub fn solfege_panel(
         .h_full()
         .bg(Colors::surface_panel())
         .border_l(px(1.0))
-        .border_color(if active {
-            Colors::panel_border_focused()
-        } else {
-            Colors::border_subtle()
-        })
+        // No accent for the active panel; see `inspector_shell`.
+        .border_color(Colors::border_subtle())
         .child(body)
 }
 

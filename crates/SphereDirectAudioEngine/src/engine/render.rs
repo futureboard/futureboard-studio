@@ -10,6 +10,8 @@
 //! steady state. `use super::*;` pulls in the shared engine vocabulary
 //! (`SharedState`, runtime types, consts, debug-flag helpers).
 use super::*;
+use crate::audio_graph::ChainJob;
+use crate::dsp::simd;
 use crate::monitor::{ListenMode, TapStage};
 use SphereAudioProcessor::StretchBackend;
 
@@ -483,19 +485,13 @@ fn apply_fader(track: &mut RuntimeTrack, frames: usize, beat: f64, smooth: bool)
             .iter()
             .fold(0.0f32, |peak, s| peak.max(s.abs()))
     });
+    let (block_l, block_r) = (&mut track.block_l[..frames], &mut track.block_r[..frames]);
     if !smooth {
         // Offline export / tests: exact constant per-block gain (unchanged
         // behavior, deterministic bounce). Keep the smoother aligned with the
         // applied gain so a later realtime block starts without a jump.
-        for frame_idx in 0..frames {
-            let (l, r) = apply_preview_mode(
-                track.block_l[frame_idx] * target_l,
-                track.block_r[frame_idx] * target_r,
-                track.preview_mode,
-            );
-            track.block_l[frame_idx] = l;
-            track.block_r[frame_idx] = r;
-        }
+        simd::gain_stereo(block_l, block_r, target_l, target_r);
+        fold_preview_mode_block(block_l, block_r, track.preview_mode);
         track.smoothed_gain_l = target_l;
         track.smoothed_gain_r = target_r;
         log_fader_trace(track, frames, fader_trace_pre, volume, &automation);
@@ -510,17 +506,8 @@ fn apply_fader(track: &mut RuntimeTrack, frames: usize, beat: f64, smooth: bool)
     let inv = 1.0 / frames as f32;
     let inc_l = (target_l - start_l) * inv;
     let inc_r = (target_r - start_r) * inv;
-    for frame_idx in 0..frames {
-        let g_l = start_l + inc_l * frame_idx as f32;
-        let g_r = start_r + inc_r * frame_idx as f32;
-        let (l, r) = apply_preview_mode(
-            track.block_l[frame_idx] * g_l,
-            track.block_r[frame_idx] * g_r,
-            track.preview_mode,
-        );
-        track.block_l[frame_idx] = l;
-        track.block_r[frame_idx] = r;
-    }
+    simd::ramp_gain_stereo(block_l, block_r, start_l, inc_l, start_r, inc_r);
+    fold_preview_mode_block(block_l, block_r, track.preview_mode);
     track.smoothed_gain_l = target_l;
     track.smoothed_gain_r = target_r;
     log_fader_trace(track, frames, fader_trace_pre, volume, &automation);
@@ -574,16 +561,25 @@ fn log_fader_trace(
     );
 }
 
+/// [`apply_preview_mode`] over a whole block, for a block already scaled by
+/// its fader: the same arithmetic, in the same order, as applying it per frame.
+#[inline]
+fn fold_preview_mode_block(block_l: &mut [f32], block_r: &mut [f32], mode: RuntimePreviewMode) {
+    match mode {
+        RuntimePreviewMode::Stereo => {}
+        RuntimePreviewMode::Mono | RuntimePreviewMode::Mid => simd::fold_mid(block_l, block_r),
+        RuntimePreviewMode::Side => simd::fold_side(block_l, block_r),
+    }
+}
+
 #[inline]
 fn accumulate_block_meter(track: &mut RuntimeTrack, frames: usize) {
-    for frame_idx in 0..frames {
-        let l = track.block_l[frame_idx];
-        let r = track.block_r[frame_idx];
-        track.meter_peak_l = track.meter_peak_l.max(l.abs());
-        track.meter_peak_r = track.meter_peak_r.max(r.abs());
-        track.meter_sum_sq_l += l * l;
-        track.meter_sum_sq_r += r * r;
-    }
+    let (peak_l, sum_l) = simd::peak_and_sum_sq(&track.block_l[..frames]);
+    let (peak_r, sum_r) = simd::peak_and_sum_sq(&track.block_r[..frames]);
+    track.meter_peak_l = track.meter_peak_l.max(peak_l);
+    track.meter_peak_r = track.meter_peak_r.max(peak_r);
+    track.meter_sum_sq_l += sum_l;
+    track.meter_sum_sq_r += sum_r;
 }
 
 /// Sum a track's post-fader `block_*` into its output destination.
@@ -612,10 +608,8 @@ pub(crate) fn route_main_output(
         let accept = t != src_index && is_routing_type(&runtime.tracks[t].track_type);
         if accept {
             let (src, tgt) = two_mut(&mut runtime.tracks, src_index, t);
-            for f in 0..frames {
-                tgt.recv_l[f] += src.block_l[f];
-                tgt.recv_r[f] += src.block_r[f];
-            }
+            simd::add_into(&mut tgt.recv_l[..frames], &src.block_l[..frames]);
+            simd::add_into(&mut tgt.recv_r[..frames], &src.block_r[..frames]);
             return;
         }
     }
@@ -641,6 +635,14 @@ pub(crate) fn route_main_output(
 
     // Default / fallback: sum into the master output.
     let track = &runtime.tracks[src_index];
+    if channels == 2 {
+        simd::add_planar_to_interleaved_stereo(
+            &mut output[..frames * 2],
+            &track.block_l[..frames],
+            &track.block_r[..frames],
+        );
+        return;
+    }
     for f in 0..frames {
         let out = &mut output[f * channels..f * channels + channels];
         out[0] += track.block_l[f];
@@ -805,17 +807,18 @@ fn capture_monitor_taps(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process_track_block(
+/// Everything a channel does after its insert chain: multi-out, sends, fader,
+/// meter, monitor taps, PDC and routing. The chain itself runs first, in
+/// [`run_track_chains`], so that independent channels can process it in
+/// parallel while this part keeps its fixed order on the audio thread.
+fn finish_track_block(
     runtime: &mut RuntimeProject,
     track_index: usize,
     frames: usize,
     output: &mut [f32],
     channels: usize,
     beat: f64,
-    transport: RuntimeTransportContext,
 ) {
-    apply_track_chain_block(&mut runtime.tracks[track_index], frames, transport);
     // Multi-out: demux this track's bridged-instrument output channels into the
     // child "Out Ch" tracks' receive buffers (no-op unless the insert defines
     // child routes). Runs before pass 2, where the child routing tracks consume
@@ -859,8 +862,8 @@ fn process_track_block(
     route_main_output(runtime, track_index, frames, output, channels);
 }
 
-/// Keep an inaudible track's hosted instrument running, then throw the audio
-/// away.
+/// Whether an inaudible track still has to run its chain: it hosts an
+/// instrument, which must keep running while its audio is thrown away.
 ///
 /// Mute and solo silence a track's **output**, not its instrument. Skipping the
 /// chain outright meant the block's MIDI was never delivered: a note that
@@ -872,24 +875,97 @@ fn process_track_block(
 /// mid-phrase instead of restarting or staying silent.
 ///
 /// Tracks with no instrument route hold no note state, so they stay skipped and
-/// cost nothing. Realtime-safe: same work the audible path already does, plus
-/// two slice fills.
-fn render_inaudible_instrument_block(
-    runtime: &mut RuntimeProject,
-    track_index: usize,
+/// cost nothing. The pass queues an inaudible instrument's chain with the
+/// others ([`ChainJob::audible`] `false`) and clears its block afterwards.
+#[inline]
+fn hosts_instrument(track: &RuntimeTrack) -> bool {
+    track.midi_instrument_insert_ix.is_some()
+        || track.soundfont_player.is_some()
+        || track.solfege_engine.is_some()
+}
+
+/// Run the insert chain of every track in `jobs` for this block.
+///
+/// With multi-core processing on, the chains are spread over the worker pool
+/// and the calling thread; otherwise, or when the pool is busy, they run here
+/// in order. Either way each chain touches only its own track — the callers
+/// only batch tracks that do not feed each other — so the result is the same.
+fn run_track_chains(
+    tracks: &mut [RuntimeTrack],
+    jobs: &[ChainJob],
     frames: usize,
     transport: RuntimeTransportContext,
 ) {
-    let track = &mut runtime.tracks[track_index];
-    if track.midi_instrument_insert_ix.is_none()
-        && track.soundfont_player.is_none()
-        && track.solfege_engine.is_none()
-    {
-        return;
+    struct Batch {
+        tracks: *mut RuntimeTrack,
+        len: usize,
+        jobs: *const ChainJob,
+        frames: usize,
+        transport: RuntimeTransportContext,
     }
-    apply_track_chain_block(track, frames, transport);
-    track.block_l[..frames].fill(0.0);
-    track.block_r[..frames].fill(0.0);
+
+    unsafe fn run(ctx: *const (), item: usize) {
+        // SAFETY: `ctx` is the `Batch` below, alive until `dispatch` returns;
+        // `item < jobs.len()` and every job names a distinct track, so each
+        // call has the only reference to its track.
+        let batch = unsafe { &*(ctx as *const Batch) };
+        let index = unsafe { (*batch.jobs.add(item)).track_index };
+        if index < batch.len {
+            let track = unsafe { &mut *batch.tracks.add(index) };
+            apply_track_chain_block(track, batch.frames, batch.transport);
+        }
+    }
+
+    debug_assert!(
+        jobs.iter()
+            .enumerate()
+            .all(|(i, a)| jobs[..i].iter().all(|b| b.track_index != a.track_index)),
+        "a track may appear in a chain batch only once"
+    );
+    let batch = Batch {
+        tracks: tracks.as_mut_ptr(),
+        len: tracks.len(),
+        jobs: jobs.as_ptr(),
+        frames,
+        transport,
+    };
+    // SAFETY: the tracks are distinct (asserted above, guaranteed by the
+    // callers), `RuntimeTrack` is `Send` (checked below), and `batch` outlives
+    // the call.
+    let ran =
+        unsafe { crate::parallel::dispatch(jobs.len(), &batch as *const Batch as *const (), run) };
+    if !ran {
+        for job in jobs {
+            if let Some(track) = tracks.get_mut(job.track_index) {
+                apply_track_chain_block(track, frames, transport);
+            }
+        }
+    }
+}
+
+// A chain batch moves `&mut RuntimeTrack` to worker threads.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<RuntimeTrack>();
+    assert_send::<RuntimeTransportContext>();
+};
+
+/// True when `from`'s output, a send, or a multi-out child route lands in
+/// `to`'s receive buffer. Such a pair cannot share a chain batch: `to` has to
+/// wait for everything `from` sums into it.
+fn feeds_track(tracks: &[RuntimeTrack], from: usize, to: usize) -> bool {
+    let track = &tracks[from];
+    track.output_track_index == Some(to)
+        || track
+            .sends
+            .iter()
+            .any(|send| send.return_track_index == Some(to))
+        || track.inserts.iter().any(|insert| {
+            insert
+                .vsti_output_children
+                .iter()
+                .any(|child| child.dest_track_index == Some(to))
+        })
 }
 
 /// Add the source track's block (`block_*`, holding either the post-insert or
@@ -933,10 +1009,8 @@ pub(crate) fn accumulate_sends(
             continue;
         }
         let (src, tgt) = two_mut(&mut runtime.tracks, src_index, t);
-        for f in 0..frames {
-            tgt.recv_l[f] += src.block_l[f] * level;
-            tgt.recv_r[f] += src.block_r[f] * level;
-        }
+        simd::add_scaled_into(&mut tgt.recv_l[..frames], &src.block_l[..frames], level);
+        simd::add_scaled_into(&mut tgt.recv_r[..frames], &src.block_r[..frames], level);
     }
 }
 
@@ -956,6 +1030,30 @@ pub(crate) fn signalsmith_input_span(
     let in_start = (rel_start as f64 / ratio).floor() as i64;
     let in_end = ((rel_start + frames as u64) as f64 / ratio).floor() as i64;
     (in_start, (in_end - in_start).max(1) as usize)
+}
+
+/// Source frame for output frame `rel` of a warped clip, like
+/// [`crate::runtime::map_warp_source_frame`] but continuing past the last
+/// segment at its slope instead of stopping at its end.
+///
+/// The stretcher's feed runs a latency ahead of its output, so near the end of
+/// a clip it asks for positions past the last marker. Held at the end, the
+/// feed would stall there while output kept coming, and the stretcher would
+/// read the stall as a sudden, extreme slow-down of the clip's last beat.
+fn warp_stream_position(
+    rel: u64,
+    duration_samples: u64,
+    segments: &[crate::runtime::RuntimeWarpSegment],
+) -> f64 {
+    match segments.last() {
+        Some(last) if rel > last.out_end => {
+            let span = last.out_end.saturating_sub(last.out_start).max(1) as f64;
+            let slope = (last.src_end - last.src_start) / span;
+            last.src_end + slope * (rel - last.out_end) as f64
+        }
+        _ => crate::runtime::map_warp_source_frame(rel, duration_samples, false, segments)
+            .unwrap_or(0.0),
+    }
 }
 
 fn render_signalsmith_clip_segment(
@@ -1008,28 +1106,49 @@ fn render_signalsmith_clip_segment(
     // same way `signalsmith_input_span` does for a constant ratio. The local
     // time ratio (`frames / input_frames`) follows each warp segment's slope,
     // so pitch stays put while the speed changes between markers.
-    let warp_span = {
-        let clip = &runtime.clips[clip_index];
-        (!clip.warp_segments.is_empty()).then(|| {
-            let to_stream = |rel: u64| -> f64 {
-                crate::runtime::map_warp_source_frame(
-                    rel,
-                    duration_samples,
-                    false,
-                    &clip.warp_segments,
-                )
-                .unwrap_or(0.0)
-                    * output_sr
-                    / source_sr.max(1.0)
-            };
-            let in_start = to_stream(rel_start).floor() as i64;
-            let in_end = to_stream(rel_start + frames as u64).floor() as i64;
-            (in_start, (in_end - in_start).max(1) as usize)
-        })
+    //
+    // The stretcher outputs a moment only after it has read `input_latency`
+    // past it, and then takes `output_latency` more to deliver it. So while
+    // producing output frame `o` it is fed the stream up to
+    // `S(o + output_latency) + input_latency`, where `S` maps output frames to
+    // stream positions — and `output_seek` at a (re)start primes it with the
+    // stream from `S(o)` up to exactly there. Feeding from `S(o)` itself, with
+    // the pre-roll taken from *before* the play position, is what put every
+    // beat of a stretched clip a whole stretcher latency behind the metronome.
+    let (input_latency, output_latency) = runtime.clips[clip_index]
+        .stretch_processor
+        .as_ref()
+        .map(|processor| processor.io_latency())
+        .unwrap_or((0, 0));
+    let warped = !runtime.clips[clip_index].warp_segments.is_empty();
+    let stream_at = |rel: u64| -> f64 {
+        if warped {
+            warp_stream_position(
+                rel,
+                duration_samples,
+                &runtime.clips[clip_index].warp_segments,
+            ) * output_sr
+                / source_sr.max(1.0)
+        } else {
+            rel as f64 / time_ratio
+        }
     };
-    let warped = warp_span.is_some();
-    let (in_start, input_frames) =
-        warp_span.unwrap_or_else(|| signalsmith_input_span(rel_start, frames, time_ratio));
+    let feed_at = |rel: u64| -> i64 {
+        (stream_at(rel + output_latency as u64) + input_latency as f64).floor() as i64
+    };
+    let (in_start, input_frames) = if warped {
+        let in_start = feed_at(rel_start);
+        (
+            in_start,
+            (feed_at(rel_start + frames as u64) - in_start).max(1) as usize,
+        )
+    } else {
+        // The same feed for a constant ratio, tiled by the shared span helper.
+        let (start, input_frames) =
+            signalsmith_input_span(rel_start + output_latency as u64, frames, time_ratio);
+        (start + input_latency as i64, input_frames)
+    };
+    let stream_at_start = stream_at(rel_start).floor() as i64;
     let total_input = (duration_samples as f64 / time_ratio).floor() as i64;
 
     // Source-stream index → source sample position (reverse-aware). Reading the
@@ -1068,26 +1187,21 @@ fn render_signalsmith_clip_segment(
     }
 
     // On a (re)start/discontinuity, latency-align the stretcher to this playback
-    // position. `output_seek` pre-roll priming makes the *next* `process` output
-    // line up with the timeline, so a high-latency preserve-pitch backend
-    // (Signalsmith ≈120 ms) does not drift behind the rest of the mix.
-    // Zero-latency backends report `seek_input_len == 0` and just reset.
+    // position: prime it with the stream from the play position up to where
+    // this block's feed begins, so the *next* `process` output starts exactly
+    // at the play position and a high-latency preserve-pitch backend
+    // (Signalsmith ≈120 ms) plays on the grid with the rest of the mix.
+    // Zero-latency backends have nothing to prime and just reset.
     if clip.stretch_next_project_sample != Some(project_start_sample) {
-        let playback_rate = if warped {
-            (input_frames as f64 / frames.max(1) as f64) as f32
-        } else {
-            (1.0 / time_ratio.max(0.05)) as f32
-        };
-        let seek_len = processor.seek_input_len(playback_rate);
-        if seek_len > 0 {
+        let prime_start = stream_at_start;
+        let seek_len = (in_start - prime_start).max(0) as usize;
+        if input_latency + output_latency > 0 && seek_len > 0 {
             if seek_len > clip.stretch_prime_l.len() || seek_len > clip.stretch_prime_r.len() {
                 clip.stretch_next_project_sample = None;
                 return false;
             }
-            // Pre-roll = the `seek_len` source frames ending just before `in_start`
-            // (clamped/silent before the clip's source window).
             for j in 0..seek_len {
-                let stream_index = in_start - seek_len as i64 + j as i64;
+                let stream_index = prime_start + j as i64;
                 let (l, r) = sample_source_stereo(&source, source_pos_at(stream_index));
                 clip.stretch_prime_l[j] = l;
                 clip.stretch_prime_r[j] = r;
@@ -1671,111 +1785,141 @@ fn render_project_block_interleaved_core(
     if runtime.spatial.active() {
         runtime.spatial.bus.clear(frames);
     }
+    // Each pass runs in batches: first the insert chains of every track in the
+    // batch (in parallel when multi-core processing is on), then, in the fixed
+    // order, everything that sums into other channels. With multi-core off a
+    // batch is one track, which is the plain serial order.
+    let parallel = crate::parallel::is_active();
+    let mut jobs = std::mem::take(&mut runtime.audio_graph.chain_jobs);
     let pass1_indices = std::mem::take(&mut runtime.audio_graph.pass1_source_indices);
-    for &track_index in &pass1_indices {
-        let source_active = runtime
-            .audio_graph
-            .active_source_mask
-            .get(track_index)
-            .copied()
-            .unwrap_or(true)
-            || runtime.tracks[track_index].monitor_enabled
-            || !runtime.tracks[track_index].midi_block_events.is_empty();
-        if !source_active {
-            continue;
-        }
-        if effective_track_muted(&runtime.tracks[track_index], block_beat)
-            || (runtime.has_solo
-                && !runtime.tracks[track_index].solo
-                && !solo_keeps_source_audible(runtime, track_index))
-        {
-            render_inaudible_instrument_block(runtime, track_index, frames, transport);
-            continue;
-        }
-        if callback_debug_enabled()
-            && !runtime.tracks[track_index].inserts.is_empty()
-            && !runtime.tracks[track_index].callback_clip_route_log_done
-        {
-            runtime.tracks[track_index].callback_clip_route_log_done = true;
-            let track_id = runtime.tracks[track_index].id.clone();
-            let block_start = base_sample;
-            let block_end = base_sample.saturating_add(frames as u64);
-            let input_peak_l = runtime.tracks[track_index].block_l[..frames]
-                .iter()
-                .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
-            let input_peak_r = runtime.tracks[track_index].block_r[..frames]
-                .iter()
-                .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
-            let mut clip_count = 0usize;
-            let mut overlapping = 0usize;
-            let mut first_clip = String::from("none");
-            for clip in runtime
-                .clips
-                .iter()
-                .filter(|clip| clip.track_id == track_id)
+    // Reserved on the control thread for every track; this only grows a
+    // hand-built graph that skipped the planner.
+    jobs.clear();
+    jobs.reserve(pass1_indices.len());
+    // Source tracks never feed each other within a block (sends and outputs
+    // only reach routing tracks; loopback reads the previous block), so with
+    // multi-core on the whole pass is one batch.
+    let mut cursor = 0;
+    while cursor < pass1_indices.len() {
+        jobs.clear();
+        while cursor < pass1_indices.len() && (parallel || jobs.is_empty()) {
+            let track_index = pass1_indices[cursor];
+            cursor += 1;
+            let source_active = runtime
+                .audio_graph
+                .active_source_mask
+                .get(track_index)
+                .copied()
+                .unwrap_or(true)
+                || runtime.tracks[track_index].monitor_enabled
+                || !runtime.tracks[track_index].midi_block_events.is_empty();
+            if !source_active {
+                continue;
+            }
+            if effective_track_muted(&runtime.tracks[track_index], block_beat)
+                || (runtime.has_solo
+                    && !runtime.tracks[track_index].solo
+                    && !solo_keeps_source_audible(runtime, track_index))
             {
-                let clip_start = clip.start_sample;
-                let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
-                let overlaps = block_end > clip_start && block_start < clip_end;
-                if clip_count == 0 {
-                    first_clip = format!(
-                        "{} range={}..{} offset={:.3}s gain={:.3} read_rate={:.3} stretch={:.3} backend={:?} overlaps={}",
-                        clip.id,
-                        clip_start,
-                        clip_end,
-                        clip.offset_seconds,
-                        clip.gain,
-                        clip.source_read_rate,
-                        clip.effective_time_ratio,
-                        clip.stretch_backend,
-                        overlaps
-                    );
+                if hosts_instrument(&runtime.tracks[track_index]) {
+                    jobs.push(ChainJob {
+                        track_index,
+                        audible: false,
+                    });
                 }
-                clip_count += 1;
-                if overlaps {
-                    overlapping += 1;
+                continue;
+            }
+            if callback_debug_enabled()
+                && !runtime.tracks[track_index].inserts.is_empty()
+                && !runtime.tracks[track_index].callback_clip_route_log_done
+            {
+                runtime.tracks[track_index].callback_clip_route_log_done = true;
+                let track_id = runtime.tracks[track_index].id.clone();
+                let block_start = base_sample;
+                let block_end = base_sample.saturating_add(frames as u64);
+                let input_peak_l = runtime.tracks[track_index].block_l[..frames]
+                    .iter()
+                    .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+                let input_peak_r = runtime.tracks[track_index].block_r[..frames]
+                    .iter()
+                    .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+                let mut clip_count = 0usize;
+                let mut overlapping = 0usize;
+                let mut first_clip = String::from("none");
+                for clip in runtime
+                    .clips
+                    .iter()
+                    .filter(|clip| clip.track_id == track_id)
+                {
+                    let clip_start = clip.start_sample;
+                    let clip_end = clip.start_sample.saturating_add(clip.duration_samples);
+                    let overlaps = block_end > clip_start && block_start < clip_end;
+                    if clip_count == 0 {
+                        first_clip = format!(
+                            "{} range={}..{} offset={:.3}s gain={:.3} read_rate={:.3} stretch={:.3} backend={:?} overlaps={}",
+                            clip.id,
+                            clip_start,
+                            clip_end,
+                            clip.offset_seconds,
+                            clip.gain,
+                            clip.source_read_rate,
+                            clip.effective_time_ratio,
+                            clip.stretch_backend,
+                            overlaps
+                        );
+                    }
+                    clip_count += 1;
+                    if overlaps {
+                        overlapping += 1;
+                    }
+                }
+                eprintln!(
+                    "[SphereAudio callback] clipRoute track={} block={}..{} clips={} overlapping={} preInsertPeakL={:.6} preInsertPeakR={:.6} firstClip={}",
+                    track_id,
+                    block_start,
+                    block_end,
+                    clip_count,
+                    overlapping,
+                    input_peak_l,
+                    input_peak_r,
+                    first_clip
+                );
+            }
+            jobs.push(ChainJob {
+                track_index,
+                audible: true,
+            });
+        }
+        run_track_chains(&mut runtime.tracks, &jobs, frames, transport);
+        for job in &jobs {
+            let track_index = job.track_index;
+            if !job.audible {
+                let track = &mut runtime.tracks[track_index];
+                track.block_l[..frames].fill(0.0);
+                track.block_r[..frames].fill(0.0);
+                continue;
+            }
+            finish_track_block(runtime, track_index, frames, output, channels, block_beat);
+            if let Some(tap) = track_taps
+                .as_deref_mut()
+                .and_then(|taps| taps.get_mut(track_index))
+            {
+                for frame in 0..frames {
+                    tap[frame * 2] = runtime.tracks[track_index].block_l[frame];
+                    tap[frame * 2 + 1] = runtime.tracks[track_index].block_r[frame];
                 }
             }
-            eprintln!(
-                "[SphereAudio callback] clipRoute track={} block={}..{} clips={} overlapping={} preInsertPeakL={:.6} preInsertPeakR={:.6} firstClip={}",
-                track_id,
-                block_start,
-                block_end,
-                clip_count,
-                overlapping,
-                input_peak_l,
-                input_peak_r,
-                first_clip
-            );
+            // Audio Jam publish tap: this track's post-fader signal, the same one
+            // an export would capture. Atomics into a preallocated ring, and one
+            // `Option` check for every track that is not being shared.
+            publish_track_to_jam(runtime, track_index, frames, jam);
+            stage_track_to_render_capture(runtime, track_index, frames);
+            // Track loopback tap: the same post-fader signal, kept for whichever
+            // audio track reads this one as its input on the next callback. One
+            // `bool` check for every track nobody is listening to, which is almost
+            // all of them.
+            capture_track_loopback(runtime, track_index, frames);
         }
-        process_track_block(
-            runtime,
-            track_index,
-            frames,
-            output,
-            channels,
-            block_beat,
-            transport,
-        );
-        if let Some(tap) = track_taps
-            .as_deref_mut()
-            .and_then(|taps| taps.get_mut(track_index))
-        {
-            for frame in 0..frames {
-                tap[frame * 2] = runtime.tracks[track_index].block_l[frame];
-                tap[frame * 2 + 1] = runtime.tracks[track_index].block_r[frame];
-            }
-        }
-        // Audio Jam publish tap: this track's post-fader signal, the same one
-        // an export would capture. Atomics into a preallocated ring, and one
-        // `Option` check for every track that is not being shared.
-        publish_track_to_jam(runtime, track_index, frames, jam);
-        stage_track_to_render_capture(runtime, track_index, frames);
-        // Track loopback tap: the same post-fader signal, kept for whichever
-        // audio track reads this one as its input on the next callback. One
-        // `bool` check for every track nobody is listening to, which is almost
-        // all of them.
-        capture_track_loopback(runtime, track_index, frames);
     }
     runtime.audio_graph.pass1_source_indices = pass1_indices;
 
@@ -1784,62 +1928,78 @@ fn render_project_block_interleaved_core(
     // sum to the master output. Solo is ignored for routing tracks so soloing
     // a *source* track still lets its send reach the return. Order comes from
     // the precomputed topological sort in `RuntimeAudioGraph`.
+    //
+    // A batch here is a run of consecutive routing tracks none of which feeds
+    // another: a bus summing into a group waits for the bus's batch to finish.
     let pass2_indices = std::mem::take(&mut runtime.audio_graph.pass2_routing_indices);
     let mut child_channels_summed = 0usize;
-    for &track_index in &pass2_indices {
-        if effective_track_muted(&runtime.tracks[track_index], block_beat) {
-            continue;
-        }
-        // VSTi multi-out child strips are the only routing tracks that obey
-        // solo: they are the instrument's own channels, not a shared bus. A
-        // channel sounds when it is soloed itself (listen to one drum pad in
-        // isolation) or when its parent instrument track is soloed (solo the
-        // VSTi from the main track and hear all of its channels).
-        if runtime.has_solo
-            && is_vsti_output_child_track_id(&runtime.tracks[track_index].id)
-            && !runtime.tracks[track_index].solo
-            && !has_soloed_vsti_output_parent(runtime, track_index)
-        {
-            continue;
-        }
-        {
-            let track = &mut runtime.tracks[track_index];
-            track.block_l[..frames].copy_from_slice(&track.recv_l[..frames]);
-            track.block_r[..frames].copy_from_slice(&track.recv_r[..frames]);
-        }
-        process_track_block(
-            runtime,
-            track_index,
-            frames,
-            output,
-            channels,
-            block_beat,
-            transport,
-        );
-        if let Some(tap) = track_taps
-            .as_deref_mut()
-            .and_then(|taps| taps.get_mut(track_index))
-        {
-            for frame in 0..frames {
-                tap[frame * 2] = runtime.tracks[track_index].block_l[frame];
-                tap[frame * 2 + 1] = runtime.tracks[track_index].block_r[frame];
+    let mut cursor = 0;
+    while cursor < pass2_indices.len() {
+        jobs.clear();
+        while cursor < pass2_indices.len() && (parallel || jobs.is_empty()) {
+            let track_index = pass2_indices[cursor];
+            if jobs
+                .iter()
+                .any(|job| feeds_track(&runtime.tracks, job.track_index, track_index))
+            {
+                break;
             }
+            cursor += 1;
+            if effective_track_muted(&runtime.tracks[track_index], block_beat) {
+                continue;
+            }
+            // VSTi multi-out child strips are the only routing tracks that obey
+            // solo: they are the instrument's own channels, not a shared bus. A
+            // channel sounds when it is soloed itself (listen to one drum pad in
+            // isolation) or when its parent instrument track is soloed (solo the
+            // VSTi from the main track and hear all of its channels).
+            if runtime.has_solo
+                && is_vsti_output_child_track_id(&runtime.tracks[track_index].id)
+                && !runtime.tracks[track_index].solo
+                && !has_soloed_vsti_output_parent(runtime, track_index)
+            {
+                continue;
+            }
+            {
+                let track = &mut runtime.tracks[track_index];
+                track.block_l[..frames].copy_from_slice(&track.recv_l[..frames]);
+                track.block_r[..frames].copy_from_slice(&track.recv_r[..frames]);
+            }
+            jobs.push(ChainJob {
+                track_index,
+                audible: true,
+            });
         }
-        // Audio Jam publish tap: this track's post-fader signal, the same one
-        // an export would capture. Atomics into a preallocated ring, and one
-        // `Option` check for every track that is not being shared.
-        publish_track_to_jam(runtime, track_index, frames, jam);
-        stage_track_to_render_capture(runtime, track_index, frames);
-        if is_vsti_output_child_track_id(&runtime.tracks[track_index].id)
-            && (runtime.tracks[track_index]
-                .meter_peak_l
-                .max(runtime.tracks[track_index].meter_peak_r)
-                > 0.0001)
-        {
-            child_channels_summed = child_channels_summed.saturating_add(1);
+        run_track_chains(&mut runtime.tracks, &jobs, frames, transport);
+        for job in &jobs {
+            let track_index = job.track_index;
+            finish_track_block(runtime, track_index, frames, output, channels, block_beat);
+            if let Some(tap) = track_taps
+                .as_deref_mut()
+                .and_then(|taps| taps.get_mut(track_index))
+            {
+                for frame in 0..frames {
+                    tap[frame * 2] = runtime.tracks[track_index].block_l[frame];
+                    tap[frame * 2 + 1] = runtime.tracks[track_index].block_r[frame];
+                }
+            }
+            // Audio Jam publish tap: this track's post-fader signal, the same one
+            // an export would capture. Atomics into a preallocated ring, and one
+            // `Option` check for every track that is not being shared.
+            publish_track_to_jam(runtime, track_index, frames, jam);
+            stage_track_to_render_capture(runtime, track_index, frames);
+            if is_vsti_output_child_track_id(&runtime.tracks[track_index].id)
+                && (runtime.tracks[track_index]
+                    .meter_peak_l
+                    .max(runtime.tracks[track_index].meter_peak_r)
+                    > 0.0001)
+            {
+                child_channels_summed = child_channels_summed.saturating_add(1);
+            }
         }
     }
     runtime.audio_graph.pass2_routing_indices = pass2_indices;
+    runtime.audio_graph.chain_jobs = jobs;
 
     // ── Spatial bus → device ──
     let discrete_channels = mix_spatial_bus(runtime, frames, output, channels);
@@ -1892,7 +2052,18 @@ fn render_project_block_interleaved_core(
     // Every channel the mix occupies: the stereo pair, or a discrete
     // surround layout's full width.
     let mix_width = discrete_channels.unwrap_or(2).min(channels);
-    if runtime.fader_smoothing {
+    if channels == 2 && mix_width == 2 {
+        // The common stereo device: one contiguous interleaved run.
+        let out = &mut output[..frames * 2];
+        if runtime.fader_smoothing {
+            let start = runtime.smoothed_master_gain;
+            let inc = (master_volume - start) / frames as f32;
+            simd::ramp_interleaved_stereo(out, start, inc);
+        } else {
+            simd::scale(out, master_volume);
+        }
+        runtime.smoothed_master_gain = master_volume;
+    } else if runtime.fader_smoothing {
         let start = runtime.smoothed_master_gain;
         let inc = (master_volume - start) / frames as f32;
         for i in 0..frames {
@@ -2406,10 +2577,7 @@ pub fn apply_track_chain_block(
 /// block instead. Realtime-safe: a scan and, rarely, two slice fills.
 #[inline]
 pub(crate) fn silence_nonfinite_block(block_l: &mut [f32], block_r: &mut [f32]) -> bool {
-    let finite = block_l
-        .iter()
-        .chain(block_r.iter())
-        .all(|sample| sample.is_finite());
+    let finite = simd::all_finite(block_l) && simd::all_finite(block_r);
     if !finite {
         block_l.fill(0.0);
         block_r.fill(0.0);
@@ -4838,6 +5006,10 @@ mod control_room_tests;
 #[path = "solfege_pitch_tests.rs"]
 mod solfege_pitch_tests;
 
+#[cfg(test)]
+#[path = "parallel_render_tests.rs"]
+mod parallel_render_tests;
+
 /// The crossfade laws, which are the whole point of letting a clip choose one.
 ///
 /// A crossfade is a *pair* of ramps, so what matters is not the shape of one
@@ -5141,6 +5313,244 @@ mod warp_stretch_render_tests {
             energy_by_second[1] > 100.0,
             "second segment {energy_by_second:?}"
         );
+    }
+
+    /// Where each 10 ms burst of a click track lands in the rendered output,
+    /// in seconds: the energy centroid of a window around where it belongs.
+    fn burst_centres(left: &[f32], expected: &[f64]) -> Vec<f64> {
+        expected
+            .iter()
+            .map(|&at| {
+                let from = ((at - 0.2) * SR as f64).max(0.0) as usize;
+                let to = (((at + 0.2) * SR as f64) as usize).min(left.len());
+                let (mut weighted, mut total) = (0.0f64, 0.0f64);
+                for (i, v) in left[from..to].iter().enumerate() {
+                    let e = (*v as f64).powi(2);
+                    weighted += e * (from + i) as f64;
+                    total += e;
+                }
+                weighted / total.max(1e-12) / SR as f64
+            })
+            .collect()
+    }
+
+    /// Keep-Pitch Warp, with the markers in `audio_process`.
+    fn warp_stretch() -> SphereAudioProcessor::StretchParams {
+        SphereAudioProcessor::StretchParams {
+            mode: SphereAudioProcessor::StretchMode::Warp,
+            algorithm: SphereAudioProcessor::StretchAlgorithm::PreservePitch,
+            time_ratio: 1.0,
+            preserve_pitch: true,
+            target_bpm: Some(120.0),
+            ..SphereAudioProcessor::StretchParams::default()
+        }
+    }
+
+    /// Render a 4 s click track — a 10 ms, 1 kHz burst on every beat at
+    /// 120 BPM — as a `duration_beats` clip stretched by `stretch` (and
+    /// `audio_process`, for warp markers), from `start_sample`, and return the
+    /// left channel from there on.
+    fn render_click_track(
+        stretch: SphereAudioProcessor::StretchParams,
+        audio_process: Option<serde_json::Value>,
+        duration_beats: f64,
+        start_sample: u64,
+    ) -> Vec<f32> {
+        let frames = 4 * SR as usize;
+        let beat = SR as usize / 2;
+        let samples: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let in_burst = i % beat < SR as usize / 100;
+                let v = if in_burst {
+                    (i as f32 * 1_000.0 * std::f32::consts::TAU / SR as f32).sin() * 0.5
+                } else {
+                    0.0
+                };
+                [v, v]
+            })
+            .collect();
+        let mut cache: HashMap<String, Arc<ClipAudioSource>> = HashMap::new();
+        cache.insert(
+            "clicks.wav".to_string(),
+            Arc::new(ClipAudioSource::InMemory(Arc::new(AudioFileBuffer {
+                sample_rate: SR,
+                channels: 2,
+                frames,
+                samples,
+            }))),
+        );
+        let audio_process =
+            audio_process.map(|v| serde_json::from_value(v).expect("audio process"));
+        let clip = EngineClipSnapshot {
+            id: "clicks".to_string(),
+            track_id: "audio-1".to_string(),
+            asset_id: "clicks".to_string(),
+            media_path: Some("clicks.wav".to_string()),
+            start_beat: 0.0,
+            duration_beats,
+            offset_seconds: 0.0,
+            gain: 1.0,
+            muted: false,
+            ara_rendered: false,
+            fades: None,
+            stretch,
+            audio_process,
+        };
+        let render_frames = (duration_beats / 2.0 * SR as f64) as usize;
+        let snapshot = EngineProjectSnapshot {
+            spatial: Default::default(),
+            project_id: "click-stretch".to_string(),
+            project_root: None,
+            preferred_input_device: None,
+            bpm: 120.0,
+            tempo_points: Vec::new(),
+            time_signature: [4, 4],
+            sample_rate: SR,
+            tracks: vec![track("audio-1", "audio"), track("master", "master")],
+            clips: vec![clip],
+            midi_clips: Vec::new(),
+            pdc_enabled: true,
+            latency_graph_version: 1,
+            routing: EngineRoutingSnapshot {
+                master_output_device: None,
+                sample_rate: SR,
+                buffer_size: 512,
+            },
+        };
+        let mut runtime =
+            RuntimeProject::build(&snapshot, SR, &mut cache, None, true).expect("runtime");
+        assert!(runtime.clips[0].stretch_processor.is_some());
+
+        let block = 512usize;
+        let mut output = vec![0.0f32; block * 2];
+        let mut left = Vec::with_capacity(render_frames);
+        let mut sample = start_sample;
+        while (sample as usize) + block <= render_frames {
+            output.iter_mut().for_each(|v| *v = 0.0);
+            render_project_block_interleaved(
+                &mut runtime,
+                sample,
+                1.0,
+                &mut output,
+                2,
+                true,
+                4,
+                4,
+                None,
+            );
+            assert!(
+                runtime.clips[0].stretch_next_project_sample.is_some(),
+                "block at {sample} fell back to resampling"
+            );
+            left.extend(output.iter().step_by(2).copied());
+            sample += block as u64;
+        }
+        left
+    }
+
+    /// A stretched clip plays on the grid, not a stretcher-latency late.
+    ///
+    /// The stretcher needs input ahead of what it outputs. Priming it with the
+    /// audio *before* the play position and then feeding from the play
+    /// position put every beat of a Keep-Pitch clip ~100 ms behind the
+    /// metronome — from the start and after every locate.
+    #[test]
+    fn a_stretched_clip_plays_on_the_beat_from_any_start() {
+        if !SphereAudioProcessor::signalsmith_stretch_available() {
+            return; // C++ backend not built in this environment.
+        }
+        // A marker that maps beat 4 to 2 s: every beat stays where it was,
+        // but the clip streams through the stretcher.
+        let identity = serde_json::json!({
+            "speedRatio": 1.0,
+            "pitchSemitones": 0.0,
+            "preservePitch": true,
+            "mode": "warp",
+            "quality": "Phase Vocoder",
+            "sourceStartSamples": 0,
+            "sourceEndSamples": 4 * SR,
+            "warpMarkers": [
+                { "id": 1, "sourceSample": 2 * SR, "timelineBeat": 4.0, "locked": false }
+            ]
+        });
+        // From the top, and from a locate mid-clip (0.8 s, between beats).
+        for start in [0u64, (SR as u64 * 4) / 5] {
+            let left = render_click_track(warp_stretch(), Some(identity.clone()), 8.0, start);
+            let start_s = start as f64 / SR as f64;
+            let expected: Vec<f64> = (1..7)
+                .map(|beat| beat as f64 * 0.5 + 0.005 - start_s)
+                .filter(|&at| at > 0.3)
+                .collect();
+            for (want, got) in expected.iter().zip(burst_centres(&left, &expected)) {
+                assert!(
+                    (got - want).abs() < 0.004,
+                    "from {start_s:.1} s: the beat due at {want:.3} s lands at {got:.3} s"
+                );
+            }
+        }
+    }
+
+    /// Between markers the beats land where the warp map puts them: a clip
+    /// whose first two seconds of audio are squeezed into the first second
+    /// has its source beats on every quarter second there.
+    #[test]
+    fn a_warped_clip_puts_its_beats_where_the_markers_say() {
+        if !SphereAudioProcessor::signalsmith_stretch_available() {
+            return; // C++ backend not built in this environment.
+        }
+        let squeezed = serde_json::json!({
+            "speedRatio": 1.0,
+            "pitchSemitones": 0.0,
+            "preservePitch": true,
+            "mode": "warp",
+            "quality": "Phase Vocoder",
+            "sourceStartSamples": 0,
+            "sourceEndSamples": 4 * SR,
+            "warpMarkers": [
+                { "id": 1, "sourceSample": 2 * SR, "timelineBeat": 2.0, "locked": false }
+            ]
+        });
+        let left = render_click_track(warp_stretch(), Some(squeezed), 8.0, 0);
+        // Source beats 1..3 (0.5, 1.0, 1.5 s) now sit at 0.25, 0.5, 0.75 s.
+        let expected = [0.25 + 0.0025, 0.5 + 0.0025, 0.75 + 0.0025];
+        for (want, got) in expected.iter().zip(burst_centres(&left, &expected)) {
+            assert!(
+                (got - want).abs() < 0.006,
+                "the source beat due at {want:.3} s lands at {got:.3} s"
+            );
+        }
+    }
+
+    /// A clip stretched to twice its length — what Apply in the stretch
+    /// controls produces — has its beats every second, on the second, from
+    /// the top and after a locate.
+    #[test]
+    fn a_constant_stretch_keeps_its_beats_on_the_grid() {
+        if !SphereAudioProcessor::signalsmith_stretch_available() {
+            return; // C++ backend not built in this environment.
+        }
+        let doubled = SphereAudioProcessor::StretchParams {
+            mode: SphereAudioProcessor::StretchMode::Manual,
+            algorithm: SphereAudioProcessor::StretchAlgorithm::PreservePitch,
+            time_ratio: 2.0,
+            preserve_pitch: true,
+            ..SphereAudioProcessor::StretchParams::default()
+        };
+        for start in [0u64, (SR as u64 * 5) / 2] {
+            let left = render_click_track(doubled.clone(), None, 16.0, start);
+            let start_s = start as f64 / SR as f64;
+            // Each 10 ms burst is 20 ms long now.
+            let expected: Vec<f64> = (1..7)
+                .map(|beat| beat as f64 + 0.01 - start_s)
+                .filter(|&at| at > 0.3)
+                .collect();
+            for (want, got) in expected.iter().zip(burst_centres(&left, &expected)) {
+                assert!(
+                    (got - want).abs() < 0.006,
+                    "from {start_s:.1} s: the beat due at {want:.3} s lands at {got:.3} s"
+                );
+            }
+        }
     }
 }
 

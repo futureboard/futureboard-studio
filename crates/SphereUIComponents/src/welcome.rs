@@ -299,6 +299,18 @@ pub struct WelcomeWindow {
     bootstrapped: bool,
 }
 
+/// Set when the next Welcome window should open on its New Project pane
+/// rather than Start. One-shot: the window that opens takes it.
+static OPEN_NEXT_ON_NEW_PROJECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the next Welcome window to open on New Project, where the template is
+/// chosen. The studio's New Project commands end the session and land here,
+/// so every "New Project" in the app starts from the same place.
+pub fn open_next_on_new_project() {
+    OPEN_NEXT_ON_NEW_PROJECT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl WelcomeWindow {
     pub fn new(callbacks: WelcomeCallbacks, focus_handle: FocusHandle) -> Self {
         // A single small JSON read. The `missing` flags it carries are whatever
@@ -337,8 +349,14 @@ impl WelcomeWindow {
         let edition_line =
             SharedString::from(format!("{edition} · {}", crate::edition::app_version()));
 
+        let start_on_new_project =
+            OPEN_NEXT_ON_NEW_PROJECT.swap(false, std::sync::atomic::Ordering::Relaxed);
         Self {
-            active_nav: StartupNav::Start,
+            active_nav: if start_on_new_project {
+                StartupNav::NewProject
+            } else {
+                StartupNav::Start
+            },
             // The list scrolls, so it shows everything the store holds rather
             // than an arbitrary first seven.
             recent_projects: recent.entries().to_vec(),

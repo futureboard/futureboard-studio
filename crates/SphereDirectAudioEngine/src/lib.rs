@@ -46,6 +46,9 @@ mod latency_graph;
 pub mod loopback;
 pub mod monitor;
 pub mod native;
+/// Multi-core processing: the worker pool the render pass spreads track
+/// insert chains over.
+mod parallel;
 pub mod plugin_backend;
 pub mod plugin_bridge;
 pub mod recording;
@@ -83,6 +86,10 @@ pub use crate::audio_source::{
     MappedWavSource,
 };
 pub use crate::engine::{DropoutDiagnostics, DropoutProtectionMode, DropoutReason};
+/// Instruction set of the render kernels: AVX2 by default, SSE as the fallback.
+pub use crate::dsp::simd::{
+    active_level as active_simd_level, cpu_supports_avx2, set_simd_level, SimdLevel,
+};
 pub use crate::error::SphereAudioError;
 pub use crate::export::{
     arrangement_bounds_samples, beats_to_samples, export_arrangement,
@@ -105,6 +112,10 @@ pub use crate::native::{
     asio_support_enabled, AudioBackend, AudioDeviceId, AudioEngine, EngineConfig,
     EngineDebugSnapshot, EngineDeviceInfo, EngineInsertStatus, EngineStats, DEFAULT_BUFFER_SIZE,
     DEFAULT_SAMPLE_RATE,
+};
+pub use crate::parallel::{
+    auto_processing_threads, configure_multicore, multicore_status, MulticoreStatus,
+    MAX_PROCESSING_THREADS,
 };
 pub use crate::plugin_backend::PluginModuleFormat;
 /// Shared automation curve shaping — the UI lane renderer calls this so the drawn

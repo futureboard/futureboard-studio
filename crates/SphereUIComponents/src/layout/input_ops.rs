@@ -103,6 +103,10 @@ pub(super) fn inspector_name_commit_allowed(synced: Option<&str>, stored: &str) 
     synced == Some(stored)
 }
 
+/// The meters the transport's time-signature dropdown offers in one click.
+pub(super) const TIME_SIGNATURE_PRESETS: [(u16, u16); 7] =
+    [(2, 4), (3, 4), (4, 4), (5, 4), (6, 8), (7, 8), (12, 8)];
+
 /// Every accelerator that can run `command_id` (normalised) without its
 /// keystroke passing the rename field: its bindings in the active keymap
 /// (`rows`), plus the menu manifest's accelerator when it is one the macOS
@@ -246,7 +250,10 @@ impl StudioLayout {
             timeline.handle_track_rename_key(event, window, cx)
         });
         if matches!(outcome, TrackRenameKeyOutcome::PassCommand) {
-            if let Some(command) = self.shortcut_command_id(event) {
+            // The rename field sits in the arrangement's track header.
+            if let Some(command) =
+                self.shortcut_command_id(event, crate::keymap::KeymapScope::Arrangement)
+            {
                 let command = normalize_command_id(&command);
                 let chord = TrackRenameChord::of_keystroke(&event.keystroke);
                 let policy = track_rename_command_policy(&command, Some(chord));
@@ -2017,13 +2024,25 @@ impl StudioLayout {
                 let mut entries = vec![
                     ContextMenuEntry::disabled_item(format!("Time Signature: {label}"), "noop"),
                     ContextMenuEntry::Separator,
+                ];
+                // The common meters first: picking one is what the readout's
+                // dropdown is for. Anything else is "Edit…" below.
+                for (num, den) in TIME_SIGNATURE_PRESETS {
+                    entries.push(ContextMenuEntry::checked_item(
+                        format!("{num}/{den}"),
+                        format!("ts:set:{num}/{den}"),
+                        pt.numerator == num && pt.denominator == den,
+                    ));
+                }
+                entries.extend([
+                    ContextMenuEntry::Separator,
                     ContextMenuEntry::item(
                         "Add Time Signature Marker at Playhead",
                         "ts:add-marker",
                     ),
                     ContextMenuEntry::item("Edit Current Time Signature…", "ts:edit"),
                     ContextMenuEntry::Separator,
-                ];
+                ]);
                 if has_markers {
                     entries.push(ContextMenuEntry::danger_item(
                         "Clear Time Signature Markers",

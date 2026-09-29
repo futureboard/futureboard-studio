@@ -319,6 +319,7 @@ impl TimelineState {
             drag_indicator_generation: 0,
             follow_playhead: true,
             follow_playhead_suspended: false,
+            waveform_zoom: 1.0,
             auto_scroll_mode: AutoScrollMode::Page,
             arrangement_range: None,
             show_tempo_track: true,

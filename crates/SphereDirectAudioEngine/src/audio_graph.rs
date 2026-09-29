@@ -98,6 +98,19 @@ pub struct RuntimeAudioGraph {
     pub pass2_routing_indices: Vec<usize>,
     pub master_index: Option<usize>,
     pub rejected_routes: Vec<GraphRouteIssue>,
+    /// Scratch for the render pass: the tracks whose insert chains run in the
+    /// current batch. Reserved here, on the control thread, for every track,
+    /// so the callback only clears and pushes within capacity.
+    pub chain_jobs: Vec<ChainJob>,
+}
+
+/// One track whose insert chain runs in a render batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainJob {
+    pub track_index: usize,
+    /// `false` for a muted or solo-silenced instrument track: its chain still
+    /// runs, so its notes keep moving, but its block is discarded.
+    pub audible: bool,
 }
 
 pub fn is_routing_track_type(track_type: &str) -> bool {
@@ -312,6 +325,7 @@ pub fn plan_runtime_audio_graph(
         pass2_routing_indices,
         master_index,
         rejected_routes,
+        chain_jobs: Vec::with_capacity(tracks.len()),
     })
 }
 

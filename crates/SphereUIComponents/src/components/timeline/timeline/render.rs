@@ -142,6 +142,7 @@ impl Render for Timeline {
                     || this.erase_clip_drag.is_some()
                     || this.automation_drag.is_some()
                     || this.automation_marquee.is_some()
+                    || this.automation_paint.is_some()
                     || this.tempo_drag.is_some()
                     || this.song_text_drag_preview.is_some()
                     || this.pan_last_position.is_some()
@@ -643,6 +644,7 @@ impl Render for Timeline {
                     || this.automation_drag.is_some()
                     || this.automation_curve_drag.is_some()
                     || this.automation_marquee.is_some()
+                    || this.automation_paint.is_some()
                     || this.tempo_drag.is_some()
                     || this.ts_drag.is_some()
                     || this.marker_drag.is_some()
@@ -656,6 +658,7 @@ impl Render for Timeline {
                 && (this.automation_drag.is_some()
                     || this.automation_curve_drag.is_some()
                     || this.automation_marquee.is_some()
+                    || this.automation_paint.is_some()
                     || this.tempo_drag.is_some()
                     || this.ts_drag.is_some()
                     || this.marker_drag.is_some())
@@ -2656,6 +2659,7 @@ impl Render for Timeline {
                             || this.erase_clip_drag.is_some()
                             || this.automation_drag.is_some()
                             || this.automation_marquee.is_some()
+                            || this.automation_paint.is_some()
                             || this.song_text_drag_preview.is_some()
                             || this.pan_last_position.is_some()
                             || this.state.track_height_resize.is_some()
@@ -3001,6 +3005,18 @@ impl Render for Timeline {
                         state.active_tool,
                         on_select_tool.clone(),
                         on_toolbar_drag_start,
+                        state.waveform_zoom,
+                        {
+                            let target = cx.entity().clone();
+                            std::sync::Arc::new(move |steps: &i32, _window, cx| {
+                                let steps = *steps;
+                                let _ = target.update(cx, |this, cx| {
+                                    if this.state.step_waveform_zoom(steps) {
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                        },
                     )),
             )
             // 5. Vertical scrollbar (right edge, over the lane area)

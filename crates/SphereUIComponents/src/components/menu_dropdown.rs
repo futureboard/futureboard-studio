@@ -207,7 +207,7 @@ fn panel_width_for_items(items: &[MenuItem], i18n: I18n) -> f32 {
         }
 
         let label = i18n.tr_menu(&item.id, item.label.as_deref().unwrap_or(""));
-        let shortcut_chars = item.shortcut.as_deref().unwrap_or_default().chars().count() as f32;
+        let shortcut_chars = item.live_shortcut().unwrap_or_default().chars().count() as f32;
         let left_slot = if has_check {
             menu_style::CHECK_SLOT_W + 6.0
         } else {
@@ -345,7 +345,7 @@ fn menu_item_row(
 ) -> impl IntoElement {
     let enabled = item.enabled;
     let label = i18n.tr_menu(&item.id, item.label.as_deref().unwrap_or(""));
-    let shortcut = item.shortcut.clone();
+    let shortcut = item.live_shortcut();
     let is_submenu = item.kind == MenuItemKind::Submenu;
     let is_checkbox = item.kind == MenuItemKind::Checkbox;
     let is_checked = is_checkbox && item.checked;

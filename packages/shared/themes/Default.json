@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "futureboard.default",
   "name": "Futureboard Default",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "author": "Futureboard Studio",
   "appearance": "dark",
   "targets": [
@@ -10,15 +10,15 @@
   ],
   "tokens": {
     "accent": {
-      "primary": "#2FC9D6",
-      "primaryHover": "#54D8E2",
-      "hover": "#54D8E2",
-      "active": "#2FC9D62E",
-      "focus": "#2FC9D6E0",
-      "soft": "#2FC9D629",
-      "muted": "#2FC9D61A",
-      "pressed": "#1AA8B5",
-      "onAccent": "#06181B",
+      "primary": "#4D9CF8",
+      "primaryHover": "#72B1FA",
+      "hover": "#72B1FA",
+      "active": "#4D9CF82E",
+      "focus": "#4D9CF8E0",
+      "soft": "#4D9CF829",
+      "muted": "#4D9CF81A",
+      "pressed": "#3583DE",
+      "onAccent": "#07121F",
       "success": "#43D18A",
       "warning": "#E8B75C",
       "danger": "#F2645F",
@@ -29,10 +29,10 @@
     "automation": {
       "curve": "#A78BFA",
       "curveHover": "#C4B2FD",
-      "laneBg": "#14161C",
-      "laneBgSelected": "#1A1D24",
-      "laneHeaderBg": "#191B22",
-      "canvasBg": "#0E101524",
+      "laneBg": "#1E1E1E",
+      "laneBgSelected": "#232323",
+      "laneHeaderBg": "#212121",
+      "canvasBg": "#16161624",
       "canvasBgSelected": "#A78BFA14",
       "valueRegionBg": "#A78BFA0F",
       "centerLine": "#A78BFA3D",
@@ -48,8 +48,8 @@
       "normal": "#FFFFFF1F",
       "default": "#FFFFFF1F",
       "strong": "#FFFFFF33",
-      "focus": "#2FC9D6E0",
-      "accent": "#2FC9D68C",
+      "focus": "#4D9CF8E0",
+      "accent": "#4D9CF88C",
       "divider": "#FFFFFF0F",
       "panel": "#FFFFFF0D",
       "strip": "#FFFFFF12",
@@ -57,26 +57,26 @@
       "masterStrip": "#FFFFFF1F"
     },
     "button": {
-      "bg": "#22252E",
-      "bgHover": "#31353F",
-      "bgPressed": "#1A1D24",
-      "bgActive": "#1E4650",
+      "bg": "#2A2A2A",
+      "bgHover": "#383838",
+      "bgPressed": "#232323",
+      "bgActive": "#1F3654",
       "border": "#FFFFFF12",
       "borderHover": "#FFFFFF29",
-      "text": "#EBEDF2",
-      "textMuted": "#8F949F"
+      "text": "#E8E8E8",
+      "textMuted": "#8F8F8F"
     },
     "fader": {
       "rail": "#00000029",
-      "thumb": "#C8CCD4",
+      "thumb": "#CACACA",
       "tick": "#FFFFFF14",
-      "scaleText": "#8F949F",
-      "groove": "#0E1015",
+      "scaleText": "#8F8F8F",
+      "groove": "#161616",
       "thumbBorder": "#FFFFFF33"
     },
     "knob": {
-      "background": "#14161C",
-      "ring": "#2FC9D6"
+      "background": "#1E1E1E",
+      "ring": "#4D9CF8"
     },
     "meter": {
       "background": "#0000002E",
@@ -84,25 +84,25 @@
       "mid": "#E8B75C",
       "high": "#F2645F",
       "rail": "#00000024",
-      "peak": "#EBEDF2",
+      "peak": "#E8E8E8",
       "clip": "#FF2D20"
     },
     "mixer": {
-      "background": "#0E1015",
-      "masterStripBackground": "#191B22"
+      "background": "#161616",
+      "masterStripBackground": "#212121"
     },
     "panel": {
-      "border_focused": "#2FC9D68C",
-      "header_active": "#2FC9D6"
+      "border_focused": "#4D9CF88C",
+      "header_active": "#4D9CF8"
     },
     "semantic": {
       "warning": "#E8B75C"
     },
     "slot": {
-      "background": "#22252E",
+      "background": "#2A2A2A",
       "border": "#FFFFFF12",
-      "backgroundHover": "#31353F",
-      "emptyText": "#6F7480"
+      "backgroundHover": "#383838",
+      "emptyText": "#6E6E6E"
     },
     "state": {
       "hover": "#FFFFFF0F",
@@ -110,10 +110,10 @@
       "selected": "#FFFFFF1A",
       "selectedHover": "#FFFFFF24",
       "dragged": "#FFFFFF29",
-      "armed": "#2FC9D62E",
+      "armed": "#4D9CF82E",
       "recessed": "#0000001F",
-      "scrim": "#05070BA6",
-      "focusRing": "#2FC9D6E0",
+      "scrim": "#0A0A0AA6",
+      "focusRing": "#4D9CF8E0",
       "mute": "#6F9BFF",
       "solo": "#E8B75C",
       "arm": "#F2645F",
@@ -126,83 +126,83 @@
       "success": "#43D18A"
     },
     "statusbar": {
-      "background": "#14161C",
-      "text": "#8F949F",
-      "textMuted": "#6F7480",
-      "accent": "#2FC9D6",
+      "background": "#1E1E1E",
+      "text": "#8F8F8F",
+      "textMuted": "#6E6E6E",
+      "accent": "#4D9CF8",
       "warning": "#E8B75C"
     },
     "surface": {
-      "base": "#1A1D24",
-      "panel": "#22252E",
-      "panelAlt": "#14161C",
-      "panelRaised": "#2A2E38",
-      "canvas": "#0E1015",
-      "raised": "#2A2E38",
-      "input": "#0E1015",
-      "window": "#16181F",
-      "titlebar": "#14161C",
-      "sidebar": "#14161C",
-      "card": "#22252E",
-      "cardHover": "#383D48",
-      "cardSelected": "#4A4F5C",
-      "code": "#16181F",
-      "badge": "#2A2E38",
-      "hover": "#383D48",
-      "active": "#4A4F5C",
-      "controlHover": "#31353F",
-      "overlay": "#05070BA6",
-      "selected": "#4A4F5C",
-      "selectedSoft": "#414652",
-      "pressed": "#383D48",
-      "muted": "#191B22",
-      "bottomPanel": "#22252E",
-      "bottomPanelHeader": "#14161C",
-      "mixerStrip": "#22252E",
-      "mixerStripAlt": "#1E212A",
-      "mixerStripSelected": "#4A4F5C",
-      "masterStripHeader": "#16181F"
+      "base": "#232323",
+      "panel": "#2A2A2A",
+      "panelAlt": "#1E1E1E",
+      "panelRaised": "#323232",
+      "canvas": "#161616",
+      "raised": "#323232",
+      "input": "#161616",
+      "window": "#1B1B1B",
+      "titlebar": "#1E1E1E",
+      "sidebar": "#1E1E1E",
+      "card": "#2A2A2A",
+      "cardHover": "#3D3D3D",
+      "cardSelected": "#4A4A4A",
+      "code": "#1B1B1B",
+      "badge": "#323232",
+      "hover": "#3D3D3D",
+      "active": "#4A4A4A",
+      "controlHover": "#383838",
+      "overlay": "#0A0A0AA6",
+      "selected": "#4A4A4A",
+      "selectedSoft": "#444444",
+      "pressed": "#3D3D3D",
+      "muted": "#212121",
+      "bottomPanel": "#2A2A2A",
+      "bottomPanelHeader": "#1E1E1E",
+      "mixerStrip": "#2A2A2A",
+      "mixerStripAlt": "#262626",
+      "mixerStripSelected": "#4A4A4A",
+      "masterStripHeader": "#1B1B1B"
     },
     "tab": {
-      "text": "#B9BDC6",
-      "text_muted": "#8F949F",
-      "text_active": "#EBEDF2",
-      "indicator_active": "#2FC9D6",
-      "backgroundActive": "#2FC9D61A",
-      "backgroundHover": "#383D48"
+      "text": "#BDBDBD",
+      "text_muted": "#8F8F8F",
+      "text_active": "#E8E8E8",
+      "indicator_active": "#4D9CF8",
+      "backgroundActive": "#4D9CF81A",
+      "backgroundHover": "#3D3D3D"
     },
     "text": {
-      "primary": "#EBEDF2",
-      "secondary": "#B9BDC6",
-      "muted": "#8F949F",
-      "faint": "#6F7480",
-      "dim": "#828792",
-      "disabled": "#5B606B",
-      "inverse": "#0E1015"
+      "primary": "#E8E8E8",
+      "secondary": "#BDBDBD",
+      "muted": "#8F8F8F",
+      "faint": "#6E6E6E",
+      "dim": "#838383",
+      "disabled": "#5A5A5A",
+      "inverse": "#161616"
     },
     "timeline": {
       "gridMajor": "#FFFFFF1C",
       "gridMinor": "#FFFFFF0D",
       "gridBar": "#FFFFFF3D",
       "playhead": "#FF6A5A",
-      "background": "#16181F",
-      "contentBackground": "#16181F",
+      "background": "#1B1B1B",
+      "contentBackground": "#1B1B1B",
       "regionBackground": "#FFFFFF0A",
       "regionBackgroundAlt": "#FFFFFF05",
       "laneBackground": "#FFFFFF07",
       "laneAltBackground": "#00000016",
-      "selectedLaneBackground": "#2FC9D614",
+      "selectedLaneBackground": "#4D9CF814",
       "emptyBodyBackground": "#00000024",
-      "rulerBackground": "#22252E",
+      "rulerBackground": "#2A2A2A",
       "rulerTick": "#FFFFFF45",
-      "rulerText": "#D3D7DE",
-      "selection": "#2FC9D62E"
+      "rulerText": "#D2D2D2",
+      "selection": "#4D9CF82E"
     },
     "piano": {
-      "whiteKey": "#E4E6EA",
-      "blackKey": "#15171C",
-      "keySeam": "#A3A8B2",
-      "keyLabel": "#4A505C"
+      "whiteKey": "#E6E6E6",
+      "blackKey": "#161616",
+      "keySeam": "#A6A6A6",
+      "keyLabel": "#4C4C4C"
     },
     "track": {
       "audio": "#38C7B4",
@@ -210,9 +210,9 @@
       "instrument": "#5FD98C",
       "bus": "#7FA8FF",
       "return": "#43D18A",
-      "master": "#EBEDF2",
+      "master": "#E8E8E8",
       "selectedOverlay": "#FFFFFF0F",
-      "mutedOverlay": "#0E10158C"
+      "mutedOverlay": "#1616168C"
     }
   },
   "trackColors": [

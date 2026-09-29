@@ -155,8 +155,10 @@ export function createSpectrumRenderer(
     gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.DYNAMIC_DRAW)
     gl.enableVertexAttribArray(positionLocation)
     gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0)
-    gl.uniform3f(lowColorLocation, 0.29, 0.55, 0.78)
-    gl.uniform3f(highColorLocation, 0.55, 0.83, 0.96)
+    // A muted slate blue under the accent-blue curve: the analyser is the
+    // backdrop the EQ is drawn against, not a second thing competing with it.
+    gl.uniform3f(lowColorLocation, 0.3, 0.4, 0.55)
+    gl.uniform3f(highColorLocation, 0.58, 0.7, 0.88)
     gl.uniform1f(alphaLocation, 0.42)
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, count * 2)
   }

@@ -12,6 +12,12 @@
       "runtimeExecutable": "bun",
       "runtimeArgs": ["run", "--cwd", "crates/BuiltinAudioPlugins/crates/drumsampler/editor", "dev"],
       "port": 5174
+    },
+    {
+      "name": "equz8-editor",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "--cwd", "crates/BuiltinAudioPlugins/crates/equz8/editor", "preview", "--port", "5175", "--strictPort"],
+      "port": 5175
     }
   ]
 }

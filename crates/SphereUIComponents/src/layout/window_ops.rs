@@ -1739,6 +1739,7 @@ impl StudioLayout {
         let on_changed: KeymapChangedCb = Arc::new(move |manager, app| {
             let _ = studio.update(app, |layout, cx| {
                 let profile_id = manager.active_profile_id().to_string();
+                crate::keymap::set_global_keymap(manager.clone());
                 layout.keymap_manager = manager;
                 // Persist the active profile so the chosen keymap survives a
                 // restart. `update_setting` writes settings.json and notifies;
@@ -2903,7 +2904,12 @@ impl StudioLayout {
             if event.is_held {
                 return false;
             }
-            let Some(command_id) = dispatch_owner.read(cx).shortcut_command_id(event) else {
+            // The pop-out mixer is the Mixer scope wherever the studio's
+            // keyboard focus happens to be.
+            let Some(command_id) = dispatch_owner
+                .read(cx)
+                .shortcut_command_id(event, crate::keymap::KeymapScope::Mixer)
+            else {
                 return false;
             };
             let _ = dispatch_owner.update(cx, |layout, cx| {
@@ -3104,6 +3110,28 @@ impl StudioLayout {
                 });
             });
 
+        let key_owner = cx.entity().clone();
+        let dispatch_key: crate::components::midi_editor_window::MidiEditorKeyCb =
+            Arc::new(move |event, cx| {
+                if event.is_held {
+                    return false;
+                }
+                let Some(command_id) = key_owner
+                    .read(cx)
+                    .shortcut_command_id(event, crate::keymap::KeymapScope::MidiEditor)
+                else {
+                    return false;
+                };
+                // With the window open, the shared dispatcher sends `midi:*`
+                // to this window's piano roll.
+                let _ = key_owner.update(cx, |layout, cx| {
+                    let owner_bounds = layout.studio_window_bounds(cx);
+                    layout.dispatch_command_id_from_bounds(&command_id, owner_bounds, cx);
+                    cx.notify();
+                });
+                true
+            });
+
         match open_midi_editor_window(
             Some(owner_bounds),
             timeline,
@@ -3111,6 +3139,7 @@ impl StudioLayout {
             virtual_keyboard,
             on_close,
             dispatch_command,
+            dispatch_key,
             cx,
         ) {
             Ok(handle) => {
