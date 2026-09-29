@@ -75,6 +75,7 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
         equz8::ui::UI_ORIGIN => equz8::ui_param_index(param_id),
         verbspace::ui::UI_ORIGIN => verbspace::ui_param_index(param_id),
         echospace::ui::UI_ORIGIN => echospace::ui_param_index(param_id),
+        imager::ui::UI_ORIGIN => imager::ui_param_index(param_id),
         fa2a::ui::UI_ORIGIN => fa2a::ui_param_index(param_id),
         fa76::ui::UI_ORIGIN => fa76::ui_param_index(param_id),
         burnlimit::ui::UI_ORIGIN => burnlimit::ui_param_index(param_id),
@@ -122,6 +123,7 @@ mod state_mirror {
         Equz8(Box<equz8::Params>),
         Verbspace(Box<verbspace::Params>),
         Echospace(Box<echospace::Params>),
+        Imager(Box<imager::Params>),
         Fa2a(Box<fa2a::Params>),
         Fa76(Box<fa76::Params>),
         BurnLimit(Box<burnlimit::Params>),
@@ -140,6 +142,7 @@ mod state_mirror {
                 Self::Equz8(_) => equz8::ui::UI_ORIGIN,
                 Self::Verbspace(_) => verbspace::ui::UI_ORIGIN,
                 Self::Echospace(_) => echospace::ui::UI_ORIGIN,
+                Self::Imager(_) => imager::ui::UI_ORIGIN,
                 Self::Fa2a(_) => fa2a::ui::UI_ORIGIN,
                 Self::Fa76(_) => fa76::ui::UI_ORIGIN,
                 Self::BurnLimit(_) => burnlimit::ui::UI_ORIGIN,
@@ -165,6 +168,7 @@ mod state_mirror {
                 echospace::ui::UI_ORIGIN => {
                     Some(Self::Echospace(Box::new(echospace::default_params())))
                 }
+                imager::ui::UI_ORIGIN => Some(Self::Imager(Box::new(imager::default_params()))),
                 fa2a::ui::UI_ORIGIN => Some(Self::Fa2a(Box::new(fa2a::default_params()))),
                 fa76::ui::UI_ORIGIN => Some(Self::Fa76(Box::new(fa76::default_params()))),
                 burnlimit::ui::UI_ORIGIN => {
@@ -224,6 +228,7 @@ mod state_mirror {
             equz8::ui::UI_ORIGIN => equz8::ui_param_id(wire_index).is_some(),
             verbspace::ui::UI_ORIGIN => verbspace::ui_param_id(wire_index).is_some(),
             echospace::ui::UI_ORIGIN => echospace::ui_param_id(wire_index).is_some(),
+            imager::ui::UI_ORIGIN => imager::ui_param_id(wire_index).is_some(),
             fa2a::ui::UI_ORIGIN => fa2a::ui_param_id(wire_index).is_some(),
             fa76::ui::UI_ORIGIN => fa76::ui_param_id(wire_index).is_some(),
             burnlimit::ui::UI_ORIGIN => burnlimit::ui_param_id(wire_index).is_some(),
@@ -255,6 +260,9 @@ mod state_mirror {
             }
             Some(BuiltinParams::Echospace(params)) => {
                 let _ = echospace::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::Imager(params)) => {
+                let _ = imager::ipc::apply_wire_param(params, wire_index, value);
             }
             Some(BuiltinParams::Fa2a(params)) => {
                 let _ = fa2a::ipc::apply_wire_param(params, wire_index, value);
@@ -309,6 +317,9 @@ mod state_mirror {
             echospace::ui::UI_ORIGIN => echospace::ipc::EchospaceState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Echospace(Box::new(state.params))),
+            imager::ui::UI_ORIGIN => imager::ipc::ImagerState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::Imager(Box::new(state.params))),
             fa2a::ui::UI_ORIGIN => fa2a::ipc::Fa2aState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Fa2a(Box::new(state.params))),
@@ -377,6 +388,11 @@ mod state_mirror {
             }
             BuiltinParams::Echospace(params) if origin == echospace::ui::UI_ORIGIN => {
                 echospace::ipc::EchospaceState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::Imager(params) if origin == imager::ui::UI_ORIGIN => {
+                imager::ipc::ImagerState::new((**params).clone())
                     .to_json()
                     .ok()?
             }
@@ -467,6 +483,12 @@ mod state_mirror {
                     .filter_map(|(id, value)| echospace::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
+            Some(BuiltinParams::Imager(params)) if origin == imager::ui::UI_ORIGIN => {
+                imager::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| imager::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
             Some(BuiltinParams::Fa2a(params)) if origin == fa2a::ui::UI_ORIGIN => {
                 fa2a::ipc::ui_values(params)
                     .into_iter()
@@ -531,25 +553,56 @@ mod state_mirror {
     /// so it bypasses `builtin_state_apply`'s numeric path. Creates the entry
     /// at defaults if this is the first thing ever recorded for the insert.
     /// A no-op for any other plugin id.
+    ///
+    /// Returns whether the pad's file actually changed — a project reopen
+    /// reloads every pad with the name it already has, and that must not read
+    /// as an edit.
     pub fn builtin_state_set_drum_sample(
         plugin_id: &str,
         insert_id: &str,
         pad_index: usize,
         name: Option<String>,
-    ) {
+    ) -> bool {
         if origin_for_plugin_id(plugin_id) != Some(drumsampler::ui::UI_ORIGIN) {
-            return;
+            return false;
         }
         let Ok(mut states) = map().lock() else {
-            return;
+            return false;
         };
         let Some(entry) = entry_for(&mut states, insert_id, drumsampler::ui::UI_ORIGIN) else {
-            return;
+            return false;
         };
         if let BuiltinParams::DrumSampler(params) = entry {
             if let Some(pad) = params.pads.get_mut(pad_index) {
-                pad.sample_name = name;
+                if pad.sample_name != name {
+                    pad.sample_name = name;
+                    return true;
+                }
             }
+        }
+        false
+    }
+
+    /// The sample file each of a Drum Sampler insert's pads was loaded from,
+    /// as `(pad index, file name)`. Empty for any other plugin, or a slot
+    /// with no mirrored state. Drives the reload after project open or a host
+    /// respawn: a restarted DSP has its parameters replayed but no audio until
+    /// each pad's file is read and sent again.
+    pub fn builtin_drum_sample_names(plugin_id: &str, insert_id: &str) -> Vec<(u32, String)> {
+        if origin_for_plugin_id(plugin_id) != Some(drumsampler::ui::UI_ORIGIN) {
+            return Vec::new();
+        }
+        let Ok(states) = map().lock() else {
+            return Vec::new();
+        };
+        match states.get(insert_id) {
+            Some(BuiltinParams::DrumSampler(params)) => params
+                .pads
+                .iter()
+                .enumerate()
+                .filter_map(|(index, pad)| pad.sample_name.clone().map(|name| (index as u32, name)))
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -559,6 +612,7 @@ mod state_mirror {
         if let Ok(mut states) = map().lock() {
             states.remove(insert_id);
         }
+        super::drum_waveforms_remove(insert_id);
     }
 
     /// Drop everything (project close).
@@ -566,13 +620,14 @@ mod state_mirror {
         if let Ok(mut states) = map().lock() {
             states.clear();
         }
+        super::drum_waveforms_clear();
     }
 }
 
 #[cfg(feature = "builtin-plugin-editor")]
 pub use state_mirror::{
-    builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
-    builtin_state_replay, builtin_state_seed, builtin_state_set_drum_sample,
+    builtin_drum_sample_names, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
+    builtin_state_remove, builtin_state_replay, builtin_state_seed, builtin_state_set_drum_sample,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is
@@ -587,22 +642,109 @@ mod state_mirror_stubs {
     pub fn builtin_state_replay(_plugin_id: &str, _insert_id: &str) -> Vec<(u32, f32)> {
         Vec::new()
     }
-    pub fn builtin_state_remove(_insert_id: &str) {}
-    pub fn builtin_state_clear() {}
+    pub fn builtin_state_remove(insert_id: &str) {
+        super::drum_waveforms_remove(insert_id);
+    }
+    pub fn builtin_state_clear() {
+        super::drum_waveforms_clear();
+    }
+    pub fn builtin_drum_sample_names(_plugin_id: &str, _insert_id: &str) -> Vec<(u32, String)> {
+        Vec::new()
+    }
     pub fn builtin_state_set_drum_sample(
         _plugin_id: &str,
         _insert_id: &str,
         _pad_index: usize,
         _name: Option<String>,
-    ) {
+    ) -> bool {
+        false
     }
 }
 
 #[cfg(not(feature = "builtin-plugin-editor"))]
 pub use state_mirror_stubs::{
-    builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
-    builtin_state_replay, builtin_state_seed, builtin_state_set_drum_sample,
+    builtin_drum_sample_names, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
+    builtin_state_remove, builtin_state_replay, builtin_state_seed, builtin_state_set_drum_sample,
 };
+
+/// A Drum Sampler pad's loaded sample, as its editor draws it: the file, its
+/// shape and the waveform overview the host computed while decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrumPadWaveform {
+    pub name: String,
+    pub frames: u64,
+    pub channels: u32,
+    pub sample_rate: u32,
+    pub peaks: Vec<u8>,
+}
+
+/// The last successfully loaded sample per (insert, pad), kept process-wide so
+/// an editor opened — or switched to an instance — after the loads finished
+/// can still draw every pad's waveform. The host sends the overview once, with
+/// the load result; nothing else could reconstruct it without re-reading and
+/// re-decoding the file.
+mod drum_waveform_cache {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Mutex, OnceLock};
+
+    use super::DrumPadWaveform;
+
+    type Cache = HashMap<String, BTreeMap<u32, DrumPadWaveform>>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+
+    fn cache() -> &'static Mutex<Cache> {
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn store(insert_id: &str, pad_index: u32, waveform: DrumPadWaveform) {
+        if let Ok(mut cache) = cache().lock() {
+            cache
+                .entry(insert_id.to_string())
+                .or_default()
+                .insert(pad_index, waveform);
+        }
+    }
+
+    pub fn for_insert(insert_id: &str) -> Vec<(u32, DrumPadWaveform)> {
+        cache()
+            .lock()
+            .ok()
+            .and_then(|cache| {
+                cache
+                    .get(insert_id)
+                    .map(|pads| pads.iter().map(|(pad, wf)| (*pad, wf.clone())).collect())
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn remove(insert_id: &str) {
+        if let Ok(mut cache) = cache().lock() {
+            cache.remove(insert_id);
+        }
+    }
+
+    pub fn clear() {
+        if let Ok(mut cache) = cache().lock() {
+            cache.clear();
+        }
+    }
+}
+
+pub fn drum_waveform_store(insert_id: &str, pad_index: u32, waveform: DrumPadWaveform) {
+    drum_waveform_cache::store(insert_id, pad_index, waveform);
+}
+
+pub fn drum_waveforms(insert_id: &str) -> Vec<(u32, DrumPadWaveform)> {
+    drum_waveform_cache::for_insert(insert_id)
+}
+
+pub fn drum_waveforms_remove(insert_id: &str) {
+    drum_waveform_cache::remove(insert_id);
+}
+
+pub fn drum_waveforms_clear() {
+    drum_waveform_cache::clear();
+}
 
 /// Physical-pixel rect the editor view occupies inside its parent window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1040,6 +1182,7 @@ mod imp {
             equz8::ui::UI_ORIGIN => equz8::ui::Equz8Ui::resolve_ui_asset(path)?,
             verbspace::ui::UI_ORIGIN => verbspace::ui::VerbspaceUi::resolve_ui_asset(path)?,
             echospace::ui::UI_ORIGIN => echospace::ui::EchospaceUi::resolve_ui_asset(path)?,
+            imager::ui::UI_ORIGIN => imager::ui::ImagerUi::resolve_ui_asset(path)?,
             fa2a::ui::UI_ORIGIN => fa2a::ui::Fa2aUi::resolve_ui_asset(path)?,
             fa76::ui::UI_ORIGIN => fa76::ui::Fa76Ui::resolve_ui_asset(path)?,
             burnlimit::ui::UI_ORIGIN => burnlimit::ui::BurnLimitUi::resolve_ui_asset(path)?,
@@ -1068,6 +1211,7 @@ mod imp {
                 | equz8::ui::UI_ORIGIN
                 | verbspace::ui::UI_ORIGIN
                 | echospace::ui::UI_ORIGIN
+                | imager::ui::UI_ORIGIN
                 | fa2a::ui::UI_ORIGIN
                 | fa76::ui::UI_ORIGIN
                 | burnlimit::ui::UI_ORIGIN
@@ -1087,6 +1231,7 @@ mod imp {
             equz8::ui::UI_ORIGIN => equz8::ui::Equz8Ui::is_embedded(),
             verbspace::ui::UI_ORIGIN => verbspace::ui::VerbspaceUi::is_embedded(),
             echospace::ui::UI_ORIGIN => echospace::ui::EchospaceUi::is_embedded(),
+            imager::ui::UI_ORIGIN => imager::ui::ImagerUi::is_embedded(),
             fa2a::ui::UI_ORIGIN => fa2a::ui::Fa2aUi::is_embedded(),
             fa76::ui::UI_ORIGIN => fa76::ui::Fa76Ui::is_embedded(),
             burnlimit::ui::UI_ORIGIN => burnlimit::ui::BurnLimitUi::is_embedded(),
@@ -1250,7 +1395,6 @@ mod imp {
                 .unwrap_or(0)
         })
     }
-
     pub fn availability(plugin_id: &str) -> HostAvailability {
         if crate::boot::has_flag("--disable-cef") {
             return HostAvailability::RuntimeFailed("CEF is disabled by --disable-cef".to_owned());
@@ -2652,6 +2796,7 @@ mod tests {
         assert_eq!(origin_for_plugin_id("builtin:equz8"), Some("equz8"));
         assert_eq!(origin_for_plugin_id("builtin:verbspace"), Some("verbspace"));
         assert_eq!(origin_for_plugin_id("builtin:echospace"), Some("echospace"));
+        assert_eq!(origin_for_plugin_id("builtin:imager"), Some("imager"));
         assert_eq!(origin_for_plugin_id("builtin:fa2a"), Some("fa2a"));
         assert_eq!(origin_for_plugin_id("builtin:fa76"), Some("fa76"));
         assert_eq!(origin_for_plugin_id("builtin:burnlimit"), Some("burnlimit"));
@@ -2672,6 +2817,7 @@ mod tests {
         assert_eq!(origin_for_plugin_id("equz8"), Some("equz8"));
         assert_eq!(origin_for_plugin_id("verbspace"), Some("verbspace"));
         assert_eq!(origin_for_plugin_id("echospace"), Some("echospace"));
+        assert_eq!(origin_for_plugin_id("imager"), Some("imager"));
         assert_eq!(origin_for_plugin_id("fa2a"), Some("fa2a"));
         assert_eq!(origin_for_plugin_id("fa76"), Some("fa76"));
         assert_eq!(origin_for_plugin_id("burnlimit"), Some("burnlimit"));
@@ -2765,6 +2911,94 @@ mod tests {
             availability("builtin:compresser"),
             HostAvailability::NoEditorForPlugin("builtin:compresser".to_string())
         );
+    }
+
+    /// Imager's editor edits land in the mirror, persist as an `ImagerState`
+    /// blob, and replay in wire order — the three paths a project save, a
+    /// reopen, and a host respawn each take.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn imager_state_is_mirrored_persisted_and_replayed() {
+        let insert = "test-insert-imager-mirror";
+        let width = builtin_param_index("imager", "width3").expect("width3 is an Imager id");
+        let solo = builtin_param_index("builtin:imager", "soloBand").expect("soloBand is an id");
+        assert!(builtin_param_index("imager", "band1_freq").is_none());
+        builtin_state_apply("imager", insert, width, 175.0);
+        builtin_state_apply("imager", insert, solo, 2.0);
+
+        let bytes = builtin_state_bytes("imager", insert).expect("Imager owns this slot's state");
+        let json = String::from_utf8(bytes).expect("state blobs are UTF-8 JSON");
+        let state = imager::ipc::ImagerState::from_json(&json).expect("an Imager blob");
+        assert_eq!(state.params.width[2], 175.0);
+        assert_eq!(state.params.solo_band, 2);
+
+        let replay = builtin_state_replay("imager", insert);
+        assert_eq!(replay.len(), imager::UI_PARAM_IDS.len());
+        assert!(replay.contains(&(width, 175.0)));
+        assert!(builtin_state_bytes("equz8", insert).is_none());
+    }
+
+    /// The reload after project open asks the mirror which file each pad was
+    /// loaded from; only a Drum Sampler slot answers, and only for its own
+    /// loaded pads.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn drum_sample_names_list_only_the_loaded_pads() {
+        let insert = "test-insert-drum-names";
+        assert!(builtin_state_set_drum_sample(
+            "drumsampler",
+            insert,
+            2,
+            Some("snare.wav".into())
+        ));
+        assert!(builtin_state_set_drum_sample(
+            "drumsampler",
+            insert,
+            9,
+            Some("hat.wav".into())
+        ));
+        // Reloading the same file is not an edit.
+        assert!(!builtin_state_set_drum_sample(
+            "drumsampler",
+            insert,
+            9,
+            Some("hat.wav".into())
+        ));
+        assert_eq!(
+            builtin_drum_sample_names("drumsampler", insert),
+            vec![(2, "snare.wav".to_string()), (9, "hat.wav".to_string())]
+        );
+        assert!(builtin_drum_sample_names("equz8", insert).is_empty());
+        builtin_state_remove(insert);
+        assert!(builtin_drum_sample_names("drumsampler", insert).is_empty());
+    }
+
+    #[test]
+    fn drum_waveforms_are_kept_per_insert_and_dropped_with_it() {
+        let insert = "test-insert-drum-waveforms";
+        let waveform = DrumPadWaveform {
+            name: "kick.wav".into(),
+            frames: 4_800,
+            channels: 1,
+            sample_rate: 48_000,
+            peaks: vec![255, 128, 0],
+        };
+        drum_waveform_store(insert, 3, waveform.clone());
+        drum_waveform_store(
+            insert,
+            1,
+            DrumPadWaveform {
+                name: "hat.wav".into(),
+                ..waveform.clone()
+            },
+        );
+        let cached = drum_waveforms(insert);
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached[0].0, 1, "listed in pad order");
+        assert_eq!(cached[1], (3, waveform));
+        assert!(drum_waveforms("another-insert").is_empty());
+        builtin_state_remove(insert);
+        assert!(drum_waveforms(insert).is_empty());
     }
 
     /// The mirror is keyed by insert slot id, which is not unique across

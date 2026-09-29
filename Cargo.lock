@@ -4349,6 +4349,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "imager"
+version = "2026.9.27-beta1.4.1"
+dependencies = [
+ "biquad",
+ "builtin_dsp_core",
+ "builtin_ui_embed",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "imagesize"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8129,6 +8140,7 @@ dependencies = [
  "equz8",
  "fa2a",
  "fa76",
+ "imager",
  "libc",
  "mixstation",
  "napi",
@@ -8221,6 +8233,7 @@ dependencies = [
  "fbmx-runtime",
  "gpui",
  "image",
+ "imager",
  "libc",
  "log",
  "midir",

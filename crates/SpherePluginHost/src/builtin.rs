@@ -95,6 +95,13 @@ const CATALOG: &[BuiltinEntry] = &[
         has_editor: true,
     },
     BuiltinEntry {
+        stem: "imager",
+        name: "Imager",
+        category: "Utility",
+        kind: PluginKind::Effect,
+        has_editor: true,
+    },
+    BuiltinEntry {
         stem: "fa76",
         name: "FA-76",
         category: "Dynamics",
@@ -210,6 +217,7 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "equz8",
     "verbspace",
     "echospace",
+    "imager",
     "fa2a",
     "fa76",
     "burnlimit",
@@ -340,6 +348,10 @@ mod tests {
             Some("mikoplugin://echospace/index.html")
         );
         assert_eq!(
+            builtin_editor_url(&builtin_id("imager")).as_deref(),
+            Some("mikoplugin://imager/index.html")
+        );
+        assert_eq!(
             builtin_editor_url(&builtin_id("fa2a")).as_deref(),
             Some("mikoplugin://fa2a/index.html")
         );
@@ -388,6 +400,8 @@ mod tests {
         assert!(builtin_audio_bridge_supported("builtin:verbspace"));
         assert!(builtin_audio_bridge_supported("echospace"));
         assert!(builtin_audio_bridge_supported("builtin:echospace"));
+        assert!(builtin_audio_bridge_supported("imager"));
+        assert!(builtin_audio_bridge_supported("builtin:imager"));
         assert!(builtin_audio_bridge_supported("fa2a"));
         assert!(builtin_audio_bridge_supported("builtin:fa2a"));
         assert!(builtin_audio_bridge_supported("zcomp"));
@@ -431,6 +445,7 @@ mod tests {
         assert_eq!(builtin_display_name("rodharerist"), Some("Rodhareist"));
         assert_eq!(builtin_display_name("builtin:verbspace"), Some("VerbSpace"));
         assert_eq!(builtin_display_name("echospace"), Some("EchoSpace"));
+        assert_eq!(builtin_display_name("builtin:imager"), Some("Imager"));
         assert_eq!(builtin_display_name("builtin:fa2a"), Some("FA-2A"));
         assert_eq!(builtin_display_name("builtin:zcomp"), Some("Z-Comp"));
         assert_eq!(

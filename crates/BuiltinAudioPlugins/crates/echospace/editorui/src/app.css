@@ -1,68 +1,76 @@
 /*
  * EchoSpace editor palette.
  *
- * Same surface hierarchy and control language as VerbSpace (graphite planes,
- * soft borders, amber reserved for the held/override state), with a teal accent
- * that belongs to this delay rather than the Studio cyan or VerbSpace's violet.
+ * Futureboard's own default theme (`packages/shared/themes/Default.json`):
+ * neutral charcoal planes with no tint in the greys, the one Studio blue as
+ * the accent, and the theme's warning amber reserved for the held/override
+ * state. The right channel is carried in neutral grey rather than a second
+ * hue, so the editor reads as part of the app, not as its own brand.
  *
- * The knob shading is driven from tokens rather than literals so the accent is
- * the only thing that has to change between the two plugins.
+ * Every component takes its colours from these tokens, and VerbSpace uses
+ * the same set.
  */
 
 :root {
-  --base: #080d0d;
-  --panel: #0e1516;
-  --raised: #131c1d;
-  --stage-top: #101a1a;
-  --stage-bottom: #080f10;
-  --knob-face: #172122;
-  --knob-face-hi: #22302f;
+  /* surface.canvas / surface.window / surface.base / surface.panel … */
+  --base: #161616;
+  --panel: #1b1b1b;
+  --surface: #232323;
+  --surface-hi: #323232;
+  --inset: #161616;
+  --stage-top: #1a1a1a;
+  --stage-bottom: #111111;
 
-  --border: rgba(255, 255, 255, 0.06);
-  --border-strong: rgba(255, 255, 255, 0.12);
-  --track: #222e2e;
-  --grid: #1c2727;
+  --border: rgba(255, 255, 255, 0.078);
+  --border-strong: rgba(255, 255, 255, 0.2);
+  --grid: #262626;
+  --grid-strong: #333333;
 
-  --text: #e6f0ee;
-  --text-muted: #91a4a1;
-  --text-faint: #62726f;
+  --text: #e8e8e8;
+  --text-muted: #a3a3a3;
+  --text-faint: #6e6e6e;
 
-  --accent: #2fd6a6;
-  --accent-bright: #62f2c8;
-  --accent-dim: rgba(47, 214, 166, 0.34);
-  --accent-fill: rgba(47, 214, 166, 0.14);
-  --accent-text: #a6f8de;
+  /* accent.primary / accent.primaryHover / border.accent / accent.soft */
+  --accent: #4d9cf8;
+  --accent-bright: #72b1fa;
+  --accent-dim: rgba(77, 156, 248, 0.55);
+  --accent-fill: rgba(77, 156, 248, 0.16);
+  --accent-text: #72b1fa;
 
-  /* The right channel's lane in the echo display. Distinct enough from the
-     accent to read as a second channel, not as a state change. */
-  --accent-alt: #4aa8ff;
-  --accent-alt-bright: #7cc4ff;
+  /* Secondary lane: EchoSpace's right channel, VerbSpace's low band. */
+  --accent-alt: #8f8f8f;
+  --accent-alt-bright: #bdbdbd;
+  --accent-alt-dim: rgba(255, 255, 255, 0.2);
+  --accent-alt-fill: rgba(255, 255, 255, 0.06);
 
-  --overlay-scrim: rgba(8, 13, 13, 0.78);
+  /* VerbSpace's high band. */
+  --band-high: #8f8f8f;
 
-  --warn: #f0a83c;
-  --warn-dim: rgba(240, 168, 60, 0.4);
+  /* surface.overlay */
+  --overlay-scrim: rgba(10, 10, 10, 0.8);
 
-  /* Knob shading — see lib/Knob.svelte. */
-  --knob-ring-hi: #2e4342;
-  --knob-ring-lo: #101817;
-  --knob-body-hi: #243433;
-  --knob-body-mid: #16201f;
-  --knob-body-lo: #080e0e;
-  --knob-cap-hi: #365351;
-  --knob-cap-mid: #1f2d2c;
-  --knob-cap-lo: #121b1a;
-  --knob-cap-edge: #070c0c;
-  --knob-pointer: #eaf6f3;
+  /* accent.warning */
+  --warn: #e8b75c;
+  --warn-dim: rgba(232, 183, 92, 0.45);
+  --warn-fill: rgba(232, 183, 92, 0.12);
 
-  --header-height: 3rem;
-  --radius: 0.75rem;
-  --radius-sm: 0.45rem;
+  /* Dial — see lib/Knob.svelte. */
+  --knob-track: rgba(255, 255, 255, 0.08);
+  --knob-face: #262626;
+  --knob-face-hi: #3d3d3d;
+  --knob-edge: rgba(0, 0, 0, 0.6);
+  --knob-pointer: #e8e8e8;
+  --knob-sm: clamp(2.6rem, 3.9vw, 3.2rem);
+  --knob-md: clamp(3.05rem, 4.6vw, 3.85rem);
+  --knob-lg: clamp(3.8rem, 6vw, 4.9rem);
+
+  --topbar-height: 3.25rem;
+  --radius: 0.7rem;
+  --radius-sm: 0.42rem;
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
   --space-4: 1rem;
-  --knob-size: clamp(3.55rem, 5.2vw, 4.85rem);
 
   color-scheme: dark;
 }
@@ -97,8 +105,18 @@ body {
   cursor: default;
 }
 
+h2 {
+  margin: 0;
+  font: inherit;
+}
+
+p {
+  margin: 0;
+}
+
 button,
-input {
+input,
+select {
   margin: 0;
   font: inherit;
 }

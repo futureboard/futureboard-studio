@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { VerbParams } from '../bridge'
   import { decayModel, diffusionGain, levelDbAt } from '../model'
+  import { MODE_LABELS } from '../params'
 
   type Props = { params: VerbParams }
   const { params }: Props = $props()
@@ -56,16 +57,21 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, cssWidth, cssHeight)
 
-    const accent = cssVar('--accent', '#9b7dff')
-    const accentBright = cssVar('--accent-bright', '#b9a0ff')
-    const warn = cssVar('--warn', '#f0a83c')
-    const grid = cssVar('--grid', '#241f2c')
-    const faint = cssVar('--text-faint', '#6d647a')
+    const warn = cssVar('--warn', '#e8b75c')
+    const frozen = params.freeze
+    const mid = frozen ? warn : cssVar('--accent', '#4d9cf8')
+    const midBright = frozen ? warn : cssVar('--accent-bright', '#72b1fa')
+    const low = frozen ? warn : cssVar('--accent-alt-bright', '#bdbdbd')
+    const high = frozen ? warn : cssVar('--band-high', '#8f8f8f')
+    const grid = cssVar('--grid', '#262626')
+    const gridStrong = cssVar('--grid-strong', '#333333')
+    const faint = cssVar('--text-faint', '#6e6e6e')
+    const muted = cssVar('--text-muted', '#a3a3a3')
 
-    const padL = 38
-    const padR = 14
-    const padT = 14
-    const padB = 24
+    const padL = 40
+    const padR = 16
+    const padT = 50
+    const padB = 28
     const w = Math.max(cssWidth - padL - padR, 1)
     const h = Math.max(cssHeight - padT - padB, 1)
 
@@ -74,28 +80,27 @@
       padT + (Math.min(0, Math.max(FLOOR_DB, db)) / FLOOR_DB) * h
 
     // ---- grid ------------------------------------------------------------
-    ctx.font =
-      '10px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace'
+    ctx.font = '600 10px system-ui, sans-serif'
     ctx.textBaseline = 'middle'
     ctx.lineWidth = 1
 
-    for (const db of [-12, -24, -36, -48, -60]) {
+    for (const db of [0, -12, -24, -36, -48, -60]) {
       const gy = Math.round(y(db)) + 0.5
-      ctx.strokeStyle = grid
+      ctx.strokeStyle = db === -60 ? gridStrong : grid
       ctx.beginPath()
       ctx.moveTo(padL, gy)
       ctx.lineTo(padL + w, gy)
       ctx.stroke()
       ctx.fillStyle = faint
       ctx.textAlign = 'right'
-      ctx.fillText(`${db}`, padL - 6, gy)
+      ctx.fillText(db === 0 ? '0 dB' : `${db}`, padL - 7, gy)
     }
 
     const tickSec =
       windowSec <= 0.6 ? 0.1 : windowSec <= 2 ? 0.25 : windowSec <= 5 ? 1 : 2
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
-    for (let t = tickSec; t < windowSec; t += tickSec) {
+    for (let t = tickSec; t < windowSec - tickSec * 0.3; t += tickSec) {
       const gx = Math.round(x(t)) + 0.5
       ctx.strokeStyle = grid
       ctx.beginPath()
@@ -104,25 +109,32 @@
       ctx.stroke()
       ctx.fillStyle = faint
       ctx.fillText(
-        tickSec < 1 ? `${Math.round(t * 1000)}ms` : `${t.toFixed(0)}s`,
+        t < 1 ? `${Math.round(t * 1000)} ms` : `${Number(t.toFixed(2))} s`,
         gx,
-        padT + h + 5,
+        padT + h + 9,
       )
     }
 
     // ---- pre-delay gap ---------------------------------------------------
     const preSec = params.predelayMs / 1000
+    const preX = x(preSec)
     if (preSec > 0) {
-      ctx.fillStyle = alpha(faint, 0.09)
-      ctx.fillRect(padL, padT, Math.max(x(preSec) - padL, 0), h)
-      const gx = Math.round(x(preSec)) + 0.5
-      ctx.strokeStyle = alpha(faint, 0.5)
+      ctx.fillStyle = alpha(faint, 0.08)
+      ctx.fillRect(padL, padT, Math.max(preX - padL, 0), h)
+      const gx = Math.round(preX) + 0.5
+      ctx.strokeStyle = alpha(muted, 0.5)
       ctx.setLineDash([2, 3])
       ctx.beginPath()
       ctx.moveTo(gx, padT)
       ctx.lineTo(gx, padT + h)
       ctx.stroke()
       ctx.setLineDash([])
+      if (preX - padL >= 46) {
+        ctx.fillStyle = muted
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText('Pre-delay', (padL + preX) / 2, padT + h - 12)
+      }
     }
 
     // ---- band envelopes --------------------------------------------------
@@ -132,7 +144,7 @@
     // fills a spurious wedge back to the start point.
     const envelope = (rt60: number): [number, number][] => {
       const points: [number, number][] = []
-      const steps = Math.max(Math.round(w), 2)
+      const steps = Math.max(Math.round(w / 2), 2)
       for (let i = 0; i <= steps; i++) {
         const t = (i / steps) * windowSec
         if (t < preSec) continue
@@ -146,7 +158,7 @@
       return points
     }
 
-    const stroke = (points: [number, number][]) => {
+    const line = (points: [number, number][]) => {
       const path = new Path2D()
       for (const [index, [px, py]] of points.entries()) {
         if (index === 0) path.moveTo(px, py)
@@ -155,23 +167,22 @@
       return path
     }
 
-    const tailColor = params.freeze ? warn : accent
-    const tailBright = params.freeze ? warn : accentBright
-    const mid = envelope(model.midSec)
+    const midPoints = envelope(model.midSec)
 
     // Filled mid band first, so the low/high edges read on top of it.
-    if (mid.length > 1) {
-      const first = mid[0]!
-      const last = mid[mid.length - 1]!
+    if (midPoints.length > 1) {
+      const first = midPoints[0]!
+      const last = midPoints[midPoints.length - 1]!
       const region = new Path2D()
       region.moveTo(first[0], y(FLOOR_DB))
-      for (const [px, py] of mid) region.lineTo(px, py)
+      for (const [px, py] of midPoints) region.lineTo(px, py)
       region.lineTo(last[0], y(FLOOR_DB))
       region.closePath()
 
       const fill = ctx.createLinearGradient(0, padT, 0, padT + h)
-      fill.addColorStop(0, alpha(tailColor, 0.34))
-      fill.addColorStop(1, alpha(tailColor, 0.02))
+      fill.addColorStop(0, alpha(mid, 0.36))
+      fill.addColorStop(0.7, alpha(mid, 0.08))
+      fill.addColorStop(1, alpha(mid, 0.02))
       ctx.fillStyle = fill
       ctx.fill(region)
     }
@@ -180,9 +191,9 @@
     // Line arrivals and their first recirculations. Diffusion smears discrete
     // reflections into the tail, so it fades these out as it rises.
     const smear = 1 - diffusionGain(params.mode, params.diffusion) / 0.78
-    const tickAlpha = 0.1 + smear * 0.32
-    ctx.strokeStyle = alpha(tailBright, tickAlpha)
-    ctx.lineWidth = 1
+    const tickAlpha = 0.14 + smear * 0.4
+    ctx.strokeStyle = alpha(midBright, tickAlpha)
+    ctx.lineWidth = 1.25
     for (const delayMs of model.lineDelaysMs) {
       for (let k = 1; k <= 2; k++) {
         const t = preSec + (delayMs * k) / 1000
@@ -198,21 +209,29 @@
     }
 
     // ---- band outlines ---------------------------------------------------
-    ctx.lineWidth = 1
-    ctx.setLineDash([3, 3])
-    ctx.strokeStyle = alpha(tailColor, 0.55)
-    ctx.stroke(stroke(envelope(model.lowSec)))
-    ctx.stroke(stroke(envelope(model.highSec)))
+    ctx.lineJoin = 'round'
+    ctx.lineWidth = 1.5
+    ctx.strokeStyle = alpha(low, 0.9)
+    ctx.stroke(line(envelope(model.lowSec)))
+    ctx.strokeStyle = alpha(high, 0.9)
+    ctx.setLineDash([4, 3])
+    ctx.stroke(line(envelope(model.highSec)))
     ctx.setLineDash([])
 
-    ctx.lineWidth = 1.75
-    ctx.strokeStyle = tailBright
-    ctx.stroke(stroke(mid))
+    ctx.lineWidth = 2.25
+    ctx.strokeStyle = midBright
+    ctx.stroke(line(midPoints))
+
+    // Onset marker where the tail starts.
+    ctx.fillStyle = midBright
+    ctx.beginPath()
+    ctx.arc(preX, y(0), 3.5, 0, Math.PI * 2)
+    ctx.fill()
   }
 
   $effect(() => {
-    // Touch every input so the redraw re-runs when any of them changes.
-    void params
+    // Touch the layout inputs so the redraw re-runs when any of them changes;
+    // `draw` reads the parameters itself.
     void windowSec
     void cssWidth
     void cssHeight
@@ -231,10 +250,10 @@
     return () => observer.disconnect()
   })
 
-  const legend = $derived([
-    { key: 'low', label: 'LOW', sec: model.lowSec },
-    { key: 'mid', label: 'MID', sec: model.midSec },
-    { key: 'high', label: 'HIGH', sec: model.highSec },
+  const bands = $derived([
+    { key: 'low', label: 'Low', sec: model.lowSec },
+    { key: 'mid', label: 'Mid', sec: model.midSec },
+    { key: 'high', label: 'High', sec: model.highSec },
   ])
 
   function seconds(value: number): string {
@@ -246,15 +265,29 @@
 <div class="view" bind:this={host} class:frozen={params.freeze}>
   <canvas bind:this={canvas} style="width: {cssWidth}px; height: {cssHeight}px"
   ></canvas>
-  <div class="legend">
-    {#each legend as band (band.key)}
-      <div class="band">
-        <span class="band-label">{band.label}</span>
-        <span class="band-value"
-          >{seconds(band.sec)}<span class="s">s</span></span
-        >
-      </div>
-    {/each}
+  <div class="overlay">
+    <div class="title">
+      <span class="mode">{MODE_LABELS[params.mode]}</span>
+      {#if params.freeze}
+        <span class="badge">Frozen — tail holds</span>
+      {:else}
+        <span class="sub">Decay by band · modelled from the settings</span>
+      {/if}
+    </div>
+    <div class="legend" aria-label="Decay time (RT60) per band">
+      <span class="legend-title">RT60</span>
+      {#each bands as band (band.key)}
+        <div class="chip {band.key}">
+          <span class="swatch"></span>
+          <span class="key">{band.label}</span>
+          <span class="val"
+            >{seconds(band.sec)}{#if Number.isFinite(band.sec)}<span class="s"
+                >s</span
+              >{/if}</span
+          >
+        </div>
+      {/each}
+    </div>
   </div>
 </div>
 
@@ -262,7 +295,8 @@
   .view {
     position: relative;
     flex: 1;
-    min-height: 200px;
+    min-width: 0;
+    min-height: 0;
     background: linear-gradient(180deg, var(--stage-top), var(--stage-bottom));
     overflow: hidden;
   }
@@ -275,43 +309,120 @@
     display: block;
   }
 
-  .legend {
+  .overlay {
     position: absolute;
-    top: 0.65rem;
-    right: 0.75rem;
+    inset: 0.6rem 0.7rem auto 0.8rem;
     display: flex;
-    gap: 1rem;
-    padding: 0.4rem 0.7rem;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--overlay-scrim);
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-3);
     pointer-events: none;
   }
 
-  .band {
+  .title {
     display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 0.1rem;
+    align-items: baseline;
+    gap: 0.55rem;
+    min-width: 0;
+    padding-top: 0.3rem;
   }
 
-  .band-label {
-    font-size: 0.65rem;
-    font-weight: 650;
-    letter-spacing: 0.08em;
-    color: var(--text-faint);
-  }
-
-  .band-value {
-    font-size: 0.85rem;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
+  .mode {
     color: var(--text);
+    font-size: 0.82rem;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .sub {
+    overflow: hidden;
+    color: var(--text-faint);
+    font-size: 0.64rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .badge {
+    padding: 0.1rem 0.45rem;
+    border: 1px solid var(--warn-dim);
+    border-radius: 999px;
+    background: var(--warn-fill);
+    color: var(--warn);
+    font-size: 0.64rem;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+
+  .legend {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .legend-title {
+    color: var(--text-faint);
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+  }
+
+  .chip {
+    --band: var(--accent-bright);
+
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.28rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--overlay-scrim);
+    white-space: nowrap;
+  }
+
+  .chip.low {
+    --band: var(--accent-alt-bright);
+  }
+
+  .chip.high {
+    --band: var(--band-high);
+  }
+
+  .view.frozen .chip {
+    --band: var(--warn);
+  }
+
+  .chip.high .swatch {
+    height: 0;
+    border-top: 2px dashed var(--band);
+    border-radius: 0;
+    background: none;
+  }
+
+  .swatch {
+    width: 0.7rem;
+    height: 2px;
+    border-radius: 1px;
+    background: var(--band);
+  }
+
+  .key {
+    color: var(--text-faint);
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  .val {
+    color: var(--text);
+    font-size: 0.78rem;
+    font-weight: 650;
   }
 
   .s {
-    font-size: 0.65rem;
-    color: var(--text-faint);
     margin-left: 1px;
+    color: var(--text-faint);
+    font-size: 0.62rem;
   }
 </style>

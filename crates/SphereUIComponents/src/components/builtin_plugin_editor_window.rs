@@ -23,11 +23,11 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    canvas, div, img, px, size, App, AppContext, Bounds, Context, DispatchPhase, FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, Styled, StyledImage, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind,
+    canvas, div, img, px, size, App, AppContext, Bounds, Context, DispatchPhase, DragMoveEvent,
+    ExternalPaths, FileDropEvent, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Styled, StyledImage,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 
 use crate::components::builtin_plugin_editor::{
@@ -166,46 +166,125 @@ fn wire_instance_id(key: &PluginInstanceKey) -> String {
     format!("{}::{}", key.track_id, key.insert_id)
 }
 
+/// Largest audio file a drop loads.
+const MAX_IMPORTED_SAMPLE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Copy a file the user picked through the OS "Load Sample" dialog into the
-/// plugin's own Samples sandbox, deduping the name against whatever is
-/// already there. Returns the resulting bare file name — what a pad's
-/// `sample_name` and every later `futureboard.loadSample` reference by.
+/// plugin's own Samples sandbox (see [`import_sample_bytes`]).
 /// Background-thread only (filesystem I/O).
 #[cfg(feature = "native-dialogs")]
 fn import_sample_file(
     samples_dir: &std::path::Path,
     source: &std::path::Path,
 ) -> Result<String, String> {
-    use crate::components::builtin_plugin_files::{sanitize_file_name, BuiltinFileKind};
-
     let source_name = source
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| "selected file has no name".to_string())?;
-    let clean = sanitize_file_name(BuiltinFileKind::Samples, source_name)
-        .ok_or_else(|| format!("'{source_name}' is not a supported audio file name"))?;
+    let bytes =
+        std::fs::read(source).map_err(|e| format!("could not read {}: {e}", source.display()))?;
+    import_sample_bytes(samples_dir, source_name, &bytes)
+}
+
+/// Write an audio file into the plugin's own Samples sandbox as `file_name`,
+/// deduping the name against whatever is already there. A byte-identical
+/// file already in the folder is reused rather than written again, so the
+/// same sample dropped twice stays one file. Returns the resulting bare file
+/// name — what a pad's `sample_name` and every later `futureboard.loadSample`
+/// reference by. Background-thread only (filesystem I/O).
+fn import_sample_bytes(
+    samples_dir: &std::path::Path,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    use crate::components::builtin_plugin_files::{sanitize_file_name, BuiltinFileKind};
+
+    let clean = sanitize_file_name(BuiltinFileKind::Samples, file_name)
+        .ok_or_else(|| format!("'{file_name}' is not a supported audio file name"))?;
     let (stem, ext) = clean
         .rsplit_once('.')
         .map(|(stem, ext)| (stem.to_string(), ext.to_string()))
         .unwrap_or((clean.clone(), String::new()));
-    let target = (1..)
-        .map(|n| {
-            let name = if n == 1 {
-                clean.clone()
-            } else {
-                format!("{stem} {n}.{ext}")
-            };
-            samples_dir.join(name)
-        })
-        .find(|candidate| !candidate.exists())
-        .ok_or_else(|| "could not find a free file name".to_string())?;
-    std::fs::copy(source, &target)
-        .map_err(|e| format!("could not copy {}: {e}", source.display()))?;
-    target
+    for n in 1..1000 {
+        let name = if n == 1 {
+            clean.clone()
+        } else {
+            format!("{stem} {n}.{ext}")
+        };
+        let target = samples_dir.join(&name);
+        if !target.exists() {
+            std::fs::write(&target, bytes)
+                .map_err(|e| format!("could not write {}: {e}", target.display()))?;
+            return Ok(name);
+        }
+        if std::fs::read(&target).is_ok_and(|existing| existing == bytes) {
+            return Ok(name);
+        }
+    }
+    Err("could not find a free file name".to_string())
+}
+
+/// Read one dropped file into memory and store it in the Samples folder.
+/// Returns the stored name with the bytes, so the pad load that follows uses
+/// what is already in memory instead of reading the file again.
+/// Background-thread only (filesystem I/O).
+fn read_dropped_sample(
+    samples_dir: &std::path::Path,
+    source: &std::path::Path,
+) -> Result<(String, Vec<u8>), String> {
+    let source_name = source
         .file_name()
         .and_then(|n| n.to_str())
-        .map(str::to_string)
-        .ok_or_else(|| "copied file has no name".to_string())
+        .ok_or_else(|| "dropped file has no name".to_string())?;
+    let size = std::fs::metadata(source)
+        .map_err(|e| format!("could not read {source_name}: {e}"))?
+        .len();
+    if size > MAX_IMPORTED_SAMPLE_BYTES {
+        return Err(format!("{source_name} is larger than 64 MB"));
+    }
+    let bytes = std::fs::read(source).map_err(|e| format!("could not read {source_name}: {e}"))?;
+    std::fs::create_dir_all(samples_dir)
+        .map_err(|e| format!("could not create the Samples folder: {e}"))?;
+    let stored = import_sample_bytes(samples_dir, source_name, &bytes)?;
+    Ok((stored, bytes))
+}
+
+/// Revoke every OLE drop target registered under `parent` (Chromium's, on a
+/// windowed browser). OLE then walks up to the GPUI shell window, whose own
+/// target turns the drag into GPUI file-drop events. Returns how many were
+/// revoked. UI thread: CEF runs on this thread's message pump, and OLE only
+/// revokes a target from the thread that registered it.
+#[cfg(windows)]
+fn revoke_child_drop_targets(parent: u64) -> usize {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::System::Ole::RevokeDragDrop;
+    use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetPropW};
+    use windows::core::{BOOL, w};
+
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let found = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
+        // The property OLE's `RegisterDragDrop` sets on a drop target.
+        if !unsafe { GetPropW(hwnd, w!("OleDropTargetInterface")) }
+            .0
+            .is_null()
+        {
+            found.push(hwnd);
+        }
+        BOOL(1)
+    }
+
+    let mut found: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumChildWindows(
+            Some(HWND(parent as *mut std::ffi::c_void)),
+            Some(collect),
+            LPARAM(&mut found as *mut Vec<HWND> as isize),
+        );
+    }
+    found
+        .into_iter()
+        .filter(|hwnd| unsafe { RevokeDragDrop(*hwnd) }.is_ok())
+        .count()
 }
 
 /// The key `active` answers to now that its insert sits on another channel:
@@ -338,6 +417,33 @@ struct SpectrumMsg {
     bins: Vec<u8>,
 }
 
+/// Native -> React: one stereo-image frame for the bound instance (Imager).
+///
+/// The scope is quantised to signed bytes for the reason [`SpectrumMsg`]
+/// gives: 256 floats a frame would cost several kilobytes of JSON literal,
+/// and a dot on a vectorscope needs nowhere near `f32` precision. `scope`
+/// holds `(left, right)` pairs, oldest first, `±127` being full scale.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StereoImageMsg {
+    r#type: &'static str,
+    protocol_version: u32,
+    instance_id: String,
+    correlation: f32,
+    band_correlation: Vec<f32>,
+    band_level: Vec<f32>,
+    scope: Vec<i8>,
+}
+
+/// One scope sample as a signed byte, full scale at `±127`. Louder than full
+/// scale pins to the edge rather than wrapping.
+fn quantize_scope(sample: f32) -> i8 {
+    if !sample.is_finite() {
+        return 0;
+    }
+    (sample.clamp(-1.0, 1.0) * 127.0).round() as i8
+}
+
 /// Per-stage levels for the wire, or empty when the built-in has no rack.
 /// Keeps the ~30 Hz meter payload unchanged for the plugins that do not meter
 /// their own stages.
@@ -378,6 +484,41 @@ struct TransportMsg {
     r#type: &'static str,
     protocol_version: u32,
     playing: bool,
+}
+
+/// Native -> React: OS files are being dragged over the page, at `x, y` in
+/// view pixels; `active: false` once the drag leaves or ends. The page only
+/// highlights what a drop there would do.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileDragMsg {
+    r#type: &'static str,
+    protocol_version: u32,
+    active: bool,
+    x: i32,
+    y: i32,
+    count: usize,
+}
+
+/// Native -> React: OS files were dropped at `x, y`. Native keeps the files;
+/// the page answers `futureboard.placeDroppedFiles` with the pad under the
+/// point. `rejected` counts dropped files that are not samples.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileDropMsg {
+    r#type: &'static str,
+    protocol_version: u32,
+    drop_id: u64,
+    x: i32,
+    y: i32,
+    file_names: Vec<String>,
+    rejected: usize,
+}
+
+/// OS files dropped on the editor, waiting for the page to say where.
+struct PendingDrop {
+    id: u64,
+    paths: Vec<std::path::PathBuf>,
 }
 
 /// Native -> React: one kind's user-file listing (rebuilt wholesale).
@@ -499,6 +640,21 @@ struct DrumSampleLoadResultMsg {
     error: Option<String>,
     frames: u64,
     channels: u32,
+    /// The file's sample rate, so the page can show lengths in time.
+    sample_rate: u32,
+    /// Waveform overview, `0..=255` per slice. Omitted on failure.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    peaks: Vec<u8>,
+}
+
+/// Native -> React: the held output level of each Drum Sampler pad.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PadLevelsMsg {
+    r#type: &'static str,
+    protocol_version: u32,
+    instance_id: String,
+    levels: Vec<f32>,
 }
 
 /// One parameter edit inside a `futureboard.setParams` batch. `id` is the
@@ -629,6 +785,21 @@ enum InboundMsg {
         instance_id: String,
         binding_generation: u64,
         pad_index: u32,
+    },
+    /// Where the files of a `futureboard.fileDrop` go: onto consecutive pads
+    /// from `pad_index`, or — absent (a drop on the library) — only into the
+    /// Samples folder. Native reads the files itself and sends them straight
+    /// to the plug-in host; they never pass through the page. Replies like
+    /// `loadSample`, plus a Samples `futureboard.fileList`.
+    #[serde(rename = "futureboard.placeDroppedFiles", rename_all = "camelCase")]
+    PlaceDroppedFiles {
+        #[allow(dead_code)]
+        plugin_id: String,
+        instance_id: String,
+        binding_generation: u64,
+        drop_id: u64,
+        #[serde(default)]
+        pad_index: Option<u32>,
     },
     /// Ask whether TONE3000 fetch is configured (API key present). No secrets
     /// come back — only a boolean and a user-facing reason when it is not.
@@ -801,6 +972,23 @@ pub type BuiltinSpectrumSource = std::sync::Arc<
     dyn Fn(&PluginInstanceKey) -> Option<(u32, [f32; SpherePluginHost::spectrum::SPECTRUM_BINS])>,
 >;
 
+/// Polls the latest stereo-image frame for an instance's shared region, as
+/// `(publish sequence, frame)`. UI thread, ~30 Hz.
+pub type BuiltinStereoImageSource = std::sync::Arc<
+    dyn Fn(&PluginInstanceKey) -> Option<(u32, SpherePluginHost::audio_bridge::StereoImageFrame)>,
+>;
+
+/// Polls the latest per-pad levels for an instance's shared region, as
+/// `(publish sequence, levels)`. UI thread, ~30 Hz.
+pub type BuiltinPadLevelSource = std::sync::Arc<
+    dyn Fn(
+        &PluginInstanceKey,
+    ) -> Option<(
+        u32,
+        [f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS],
+    )>,
+>;
+
 /// Reads whether the DAW transport is advancing. One relaxed atomic load on the
 /// engine's shared state — safe to call every pump tick.
 pub type BuiltinTransportSource = std::sync::Arc<dyn Fn() -> bool>;
@@ -819,6 +1007,8 @@ pub struct BuiltinEditorHostOps {
     pub meter_source: Option<BuiltinMeterSource>,
     pub host_status_source: Option<BuiltinHostStatusSource>,
     pub spectrum_source: Option<BuiltinSpectrumSource>,
+    pub stereo_image_source: Option<BuiltinStereoImageSource>,
+    pub pad_level_source: Option<BuiltinPadLevelSource>,
     pub transport_source: Option<BuiltinTransportSource>,
 }
 
@@ -832,6 +1022,8 @@ impl BuiltinEditorHostOps {
             && self.meter_source.is_none()
             && self.host_status_source.is_none()
             && self.spectrum_source.is_none()
+            && self.stereo_image_source.is_none()
+            && self.pad_level_source.is_none()
             && self.transport_source.is_none()
     }
 }
@@ -985,6 +1177,11 @@ pub struct BuiltinPluginEditorWindow {
     /// frame; re-sending it would cost a `execute_javascript` round trip for a
     /// picture that has not changed.
     spectrum_seq: u32,
+    /// Sequence of the last stereo-image frame forwarded, so an unchanged one
+    /// is never re-sent.
+    stereo_image_seq: u32,
+    /// Sequence of the last pad-level set forwarded.
+    pad_levels_seq: u32,
     /// Last transport state pushed to the page. `None` until the first push, so
     /// a freshly loaded page always receives one regardless of what the
     /// transport is doing.
@@ -992,6 +1189,15 @@ pub struct BuiltinPluginEditorWindow {
     /// Cached `Documents/Futureboard Studio/<plugin>/` root, resolved and
     /// created lazily on the first file message from the page.
     files_root: Option<std::path::PathBuf>,
+    /// Last OS-file drag position posted to the page, so a pointer that has
+    /// not moved is not re-sent.
+    file_drag_at: Option<(i32, i32, usize)>,
+    /// Files dropped on the editor, waiting for `placeDroppedFiles`.
+    pending_drop: Option<PendingDrop>,
+    next_drop_id: u64,
+    /// When the windowed browser was last checked for Chromium's own drop
+    /// target (see `release_browser_drop_targets`).
+    drop_targets_checked_at: Option<Instant>,
 }
 
 impl BuiltinPluginEditorWindow {
@@ -1048,8 +1254,14 @@ impl BuiltinPluginEditorWindow {
             host_ops,
             telemetry_tick: 0,
             spectrum_seq: 0,
+            stereo_image_seq: 0,
+            pad_levels_seq: 0,
             pushed_transport_playing: None,
             files_root: None,
+            file_drag_at: None,
+            pending_drop: None,
+            next_drop_id: 1,
+            drop_targets_checked_at: None,
         }
     }
 
@@ -1087,13 +1299,6 @@ impl BuiltinPluginEditorWindow {
         let Some(active) = self.active_instance.clone() else {
             return;
         };
-        if self.host_ops.load_pad_sample.is_none() {
-            eprintln!(
-                "[plugin-bridge] loadSample dropped (bridge not wired) plugin={}",
-                self.plugin_id
-            );
-            return;
-        }
         // The read is filesystem I/O; the *host* does the decode work off
         // this thread.
         let read = self
@@ -1113,26 +1318,296 @@ impl BuiltinPluginEditorWindow {
                     false,
                     &file_name,
                     Some(&error),
-                    0,
-                    0,
+                    None,
                 );
                 return;
             }
         };
+        self.forward_pad_sample(pad_index, file_name, bytes);
+    }
+
+    /// Send a sample already in memory to the bound instance's `pad_index`
+    /// over the plug-in host IPC. Without a live host it answers the page
+    /// right away, so the pad never waits on a reply that cannot come.
+    fn forward_pad_sample(&mut self, pad_index: u32, name: String, bytes: Vec<u8>) {
+        let Some(active) = self.active_instance.clone() else {
+            return;
+        };
         eprintln!(
-            "[plugin-bridge] loadSample plugin={} instance={} pad={pad_index} file={file_name} bytes={}",
+            "[plugin-bridge] loadSample plugin={} instance={} pad={pad_index} file={name} bytes={}",
             self.plugin_id,
             active.insert_id,
             bytes.len()
         );
-        if let Some(forwarder) = self.host_ops.load_pad_sample.as_ref() {
-            forwarder(
+        match self.host_ops.load_pad_sample.as_ref() {
+            Some(forwarder) => forwarder(
                 &active,
                 BuiltinDrumSampleLoadRequest {
                     pad_index,
-                    name: file_name,
+                    name,
                     bytes,
                 },
+            ),
+            None => {
+                eprintln!(
+                    "[plugin-bridge] loadSample dropped (bridge not wired) plugin={}",
+                    self.plugin_id
+                );
+                self.notify_drum_sample_result(
+                    &active.insert_id,
+                    pad_index,
+                    false,
+                    &name,
+                    Some("the plug-in host is not running yet"),
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Post the Samples folder listing, so the page's library shows a file
+    /// native just imported.
+    fn post_samples_listing(&mut self) {
+        use crate::components::builtin_plugin_files as files;
+        let Some(root) = self.ensure_files_root() else {
+            return;
+        };
+        self.post_to_view(&FileListMsg {
+            r#type: "futureboard.fileList",
+            protocol_version: BRIDGE_PROTOCOL_VERSION,
+            kind: "samples".to_string(),
+            files: files::list_files(&root, files::BuiltinFileKind::Samples),
+        });
+    }
+
+    /// Only the Drum Sampler takes files dropped from the OS.
+    fn accepts_sample_drops(&self) -> bool {
+        self.plugin_id == "drumsampler"
+    }
+
+    /// Tell the page where an OS-file drag is (`None`: it left or ended).
+    fn post_file_drag(&mut self, at: Option<(i32, i32, usize)>) {
+        if self.file_drag_at == at {
+            return;
+        }
+        self.file_drag_at = at;
+        let (x, y, count) = at.unwrap_or_default();
+        self.post_to_view(&FileDragMsg {
+            r#type: "futureboard.fileDrag",
+            protocol_version: BRIDGE_PROTOCOL_VERSION,
+            active: at.is_some(),
+            x,
+            y,
+            count,
+        });
+    }
+
+    fn on_file_drag_move(
+        &mut self,
+        event: &DragMoveEvent<ExternalPaths>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let position = event.event.position;
+        let at = event.bounds.contains(&position).then(|| {
+            let (x, y) = self.to_view_point(position);
+            (x, y, event.drag(cx).paths().len())
+        });
+        self.post_file_drag(at);
+    }
+
+    /// OS files dropped on the browser: keep the samples among them and ask
+    /// the page which pad sits under the drop point.
+    fn on_file_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        use crate::components::builtin_plugin_files::{BuiltinFileKind, sanitize_file_name};
+        self.post_file_drag(None);
+        if self.active_instance.is_none() {
+            return;
+        }
+        let (samples, rejected): (Vec<_>, Vec<_>) =
+            paths.paths().iter().cloned().partition(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| sanitize_file_name(BuiltinFileKind::Samples, name))
+                        .is_some()
+            });
+        let (x, y) = self.to_view_point(window.mouse_position());
+        let drop_id = self.next_drop_id;
+        self.next_drop_id += 1;
+        let file_names = samples
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_string))
+            .collect();
+        eprintln!(
+            "[plugin-bridge] fileDrop plugin={} samples={} rejected={} at=({x},{y})",
+            self.plugin_id,
+            samples.len(),
+            rejected.len()
+        );
+        self.pending_drop = Some(PendingDrop {
+            id: drop_id,
+            paths: samples,
+        });
+        self.post_to_view(&FileDropMsg {
+            r#type: "futureboard.fileDrop",
+            protocol_version: BRIDGE_PROTOCOL_VERSION,
+            drop_id,
+            x,
+            y,
+            file_names,
+            rejected: rejected.len(),
+        });
+    }
+
+    /// Watches for an OS-file drag leaving the window, which no element
+    /// handler hears.
+    fn file_drag_exit_watcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.weak_entity();
+        canvas(
+            |_, _, _| (),
+            move |_bounds, _, window, _cx| {
+                let this = this.clone();
+                window.on_mouse_event(move |event: &FileDropEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Bubble && matches!(event, FileDropEvent::Exited) {
+                        let _ = this.update(cx, |this, _cx| this.post_file_drag(None));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0()
+    }
+
+    /// The page placed a drop: read each file into memory off this thread,
+    /// store it in the Samples folder, then send the bytes already in hand
+    /// straight to the plug-in host for its pad.
+    fn place_dropped_files(
+        &mut self,
+        instance_id: String,
+        binding_generation: u64,
+        drop_id: u64,
+        pad_index: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        use SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS;
+        let Some(drop) = self.pending_drop.take_if(|drop| drop.id == drop_id) else {
+            eprintln!(
+                "[plugin-bridge] placeDroppedFiles unknown drop plugin={} drop={drop_id}",
+                self.plugin_id
+            );
+            return;
+        };
+        if binding_generation != self.binding_generation {
+            eprintln!(
+                "[plugin-bridge] placeDroppedFiles stale plugin={} instance={instance_id}",
+                self.plugin_id
+            );
+            return;
+        }
+        let Some(active) = self.active_instance.clone() else {
+            return;
+        };
+        if wire_instance_id(&active) != instance_id {
+            eprintln!(
+                "[plugin-bridge] placeDroppedFiles instance mismatch plugin={} got={instance_id}",
+                self.plugin_id
+            );
+            return;
+        }
+        let Some(root) = self.ensure_files_root() else {
+            return;
+        };
+        let samples_dir =
+            root.join(crate::components::builtin_plugin_files::BuiltinFileKind::Samples.dir_name());
+        // Files past the last pad are still stored, just not loaded.
+        let targets: Vec<_> = drop
+            .paths
+            .into_iter()
+            .enumerate()
+            .map(|(offset, path)| {
+                let pad = pad_index
+                    .map(|first| first.saturating_add(offset as u32))
+                    .filter(|pad| (*pad as usize) < BUILTIN_PAD_SLOTS);
+                (pad, path)
+            })
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let loaded: Vec<_> = cx
+                .background_executor()
+                .spawn(async move {
+                    targets
+                        .into_iter()
+                        .map(|(pad, path)| {
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            (pad, name, read_dropped_sample(&samples_dir, &path))
+                        })
+                        .collect()
+                })
+                .await;
+            let _ = this.update(cx, |editor, _cx| {
+                // The page may have moved to another instance while the files
+                // were read; the stored files stand, the loads do not.
+                let still_bound = editor.binding_generation == binding_generation
+                    && editor.active_instance.as_ref() == Some(&active);
+                for (pad, name, result) in loaded {
+                    match (pad.filter(|_| still_bound), result) {
+                        (Some(pad), Ok((stored, bytes))) => {
+                            editor.forward_pad_sample(pad, stored, bytes)
+                        }
+                        (Some(pad), Err(error)) => editor.notify_drum_sample_result(
+                            &active.insert_id,
+                            pad,
+                            false,
+                            &name,
+                            Some(&error),
+                            None,
+                        ),
+                        (None, Ok(_)) => {}
+                        (None, Err(error)) => eprintln!(
+                            "[plugin-bridge] placeDroppedFiles failed file={name} error={error}"
+                        ),
+                    }
+                }
+                editor.post_samples_listing();
+            });
+        })
+        .detach();
+    }
+
+    /// A windowed browser registers Chromium's own OLE drop target, which
+    /// would hand OS file drags to the page instead of this shell. Release
+    /// it so drops reach GPUI. Re-checked twice a second, since a reload or
+    /// renderer restart can register it again.
+    #[cfg(windows)]
+    fn release_browser_drop_targets(&mut self) {
+        if OFFSCREEN_HOSTING
+            || !self.accepts_sample_drops()
+            || !matches!(self.status, Status::Attached)
+            || self
+                .drop_targets_checked_at
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
+        {
+            return;
+        }
+        self.drop_targets_checked_at = Some(Instant::now());
+        let Some(content) = self.content.as_ref() else {
+            return;
+        };
+        let revoked = revoke_child_drop_targets(content.hwnd());
+        if revoked > 0 {
+            eprintln!(
+                "[plugin-editor-window] released {revoked} browser drop target(s) plugin={}",
+                self.plugin_id
             );
         }
     }
@@ -1237,6 +1712,8 @@ impl BuiltinPluginEditorWindow {
         // Sequences are per-region, so the new instance's current frame could
         // collide with the old one's and be suppressed as "unchanged".
         self.spectrum_seq = 0;
+        self.stereo_image_seq = 0;
+        self.pad_levels_seq = 0;
         // Status lands on the *next* pump tick rather than up to a second later.
         // An editor that reads the transport tempo (EchoSpace's note divisions)
         // would otherwise open showing lengths for the wrong tempo.
@@ -1278,6 +1755,21 @@ impl BuiltinPluginEditorWindow {
             state: decode_state_bytes(descriptor.state_bytes.as_deref().map(Vec::as_slice)),
         };
         self.post_to_view(&msg);
+        // Pads that finished loading before this instance was shown: hand the
+        // page their waveforms, in the same message a fresh load produces.
+        let insert_id = active.insert_id.clone();
+        for (pad_index, waveform) in
+            crate::components::builtin_plugin_editor::drum_waveforms(&insert_id)
+        {
+            self.notify_drum_sample_result(
+                &insert_id,
+                pad_index,
+                true,
+                &waveform.name,
+                None,
+                Some(&waveform),
+            );
+        }
     }
 
     /// Disable renderer-side zoom gestures as a second layer behind CEF's
@@ -1730,7 +2222,10 @@ impl BuiltinPluginEditorWindow {
                         })
                         .await;
                     let _ = this.update(cx, |editor, _cx| match imported {
-                        Ok(file_name) => editor.load_sample_into_pad(pad_index, file_name),
+                        Ok(file_name) => {
+                            editor.load_sample_into_pad(pad_index, file_name);
+                            editor.post_samples_listing();
+                        }
                         Err(error) => {
                             eprintln!(
                                 "[plugin-bridge] browseSample import failed source={} error={error}",
@@ -1742,8 +2237,7 @@ impl BuiltinPluginEditorWindow {
                                 false,
                                 &source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
                                 Some(&error),
-                                0,
-                                0,
+                                None,
                             );
                         }
                     });
@@ -1755,6 +2249,15 @@ impl BuiltinPluginEditorWindow {
                 eprintln!(
                     "[plugin-bridge] browseSample dropped: native file dialogs are disabled in this build"
                 );
+            }
+            InboundMsg::PlaceDroppedFiles {
+                instance_id,
+                binding_generation,
+                drop_id,
+                pad_index,
+                ..
+            } => {
+                self.place_dropped_files(instance_id, binding_generation, drop_id, pad_index, cx);
             }
             InboundMsg::Tone3000Status { .. } => {
                 self.post_tone3000_status();
@@ -2050,8 +2553,7 @@ impl BuiltinPluginEditorWindow {
         ok: bool,
         name: &str,
         error: Option<&str>,
-        frames: u64,
-        channels: u32,
+        waveform: Option<&crate::components::builtin_plugin_editor::DrumPadWaveform>,
     ) {
         let Some(active) = self.active_instance.as_ref() else {
             return;
@@ -2067,8 +2569,10 @@ impl BuiltinPluginEditorWindow {
             ok,
             name: name.to_string(),
             error: error.map(str::to_string),
-            frames,
-            channels,
+            frames: waveform.map_or(0, |w| w.frames),
+            channels: waveform.map_or(0, |w| w.channels),
+            sample_rate: waveform.map_or(0, |w| w.sample_rate),
+            peaks: waveform.map(|w| w.peaks.clone()).unwrap_or_default(),
         });
     }
 
@@ -2125,6 +2629,35 @@ impl BuiltinPluginEditorWindow {
                                 .iter()
                                 .map(|db| SpherePluginHost::spectrum::quantize_db(*db))
                                 .collect(),
+                        });
+                    }
+                }
+            }
+            if let Some(source) = self.host_ops.pad_level_source.as_ref() {
+                if let Some((seq, levels)) = source(active) {
+                    if seq != self.pad_levels_seq {
+                        self.pad_levels_seq = seq;
+                        self.post_to_view(&PadLevelsMsg {
+                            r#type: "futureboard.padLevels",
+                            protocol_version: BRIDGE_PROTOCOL_VERSION,
+                            instance_id: wire_instance_id(active),
+                            levels: levels.to_vec(),
+                        });
+                    }
+                }
+            }
+            if let Some(source) = self.host_ops.stereo_image_source.as_ref() {
+                if let Some((seq, frame)) = source(active) {
+                    if seq != self.stereo_image_seq {
+                        self.stereo_image_seq = seq;
+                        self.post_to_view(&StereoImageMsg {
+                            r#type: "futureboard.stereoImage",
+                            protocol_version: BRIDGE_PROTOCOL_VERSION,
+                            instance_id: wire_instance_id(active),
+                            correlation: frame.correlation,
+                            band_correlation: frame.band_correlation.to_vec(),
+                            band_level: frame.band_level.to_vec(),
+                            scope: frame.scope.iter().copied().map(quantize_scope).collect(),
                         });
                     }
                 }
@@ -2287,6 +2820,8 @@ impl BuiltinPluginEditorWindow {
         for _ in 0..play_pause_requests {
             transport_key::claim(TransportKeySource::WebEditor, None);
         }
+        #[cfg(windows)]
+        self.release_browser_drop_targets();
         for event in host::take_view_events(self.view_id) {
             match event {
                 ViewEvent::Opened if matches!(self.status, Status::Attaching) => {
@@ -3078,13 +3613,25 @@ impl BuiltinPluginEditorWindow {
     /// Draws the latest accelerated or software frame and owns all forwarded
     /// browser input handlers.
     fn render_browser_region(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let region = div().flex_1().min_h(px(0.0)).overflow_hidden();
+        let accepts_drops = self.accepts_sample_drops();
+        let region = div()
+            .id("builtin-plugin-editor-surface")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_hidden()
+            // OS files dropped on the page arrive here, not in the browser:
+            // native reads them and hands them to the plug-in host itself.
+            .when(accepts_drops, |region| {
+                region
+                    .on_drag_move::<ExternalPaths>(cx.listener(Self::on_file_drag_move))
+                    .on_drop::<ExternalPaths>(cx.listener(Self::on_file_drop))
+                    .child(self.file_drag_exit_watcher(cx))
+            });
         if !OFFSCREEN_HOSTING {
             return region.into_any_element();
         }
 
         region
-            .id("builtin-plugin-editor-surface")
             .track_focus(&self.focus)
             .when_some(self.surface.accelerated_element(), |el, surface| {
                 el.child(surface)
@@ -3707,6 +4254,21 @@ mod tests {
         }
     }
 
+    /// Scope samples go to the page as signed bytes: full scale is ±127,
+    /// anything louder pins to the edge, and a non-finite sample is centred
+    /// rather than poisoning the frame.
+    #[test]
+    fn scope_samples_quantize_to_signed_bytes() {
+        assert_eq!(quantize_scope(0.0), 0);
+        assert_eq!(quantize_scope(1.0), 127);
+        assert_eq!(quantize_scope(-1.0), -127);
+        assert_eq!(quantize_scope(4.0), 127);
+        assert_eq!(quantize_scope(-9.0), -127);
+        assert_eq!(quantize_scope(0.5), 64);
+        assert_eq!(quantize_scope(f32::NAN), 0);
+        assert_eq!(quantize_scope(f32::NEG_INFINITY), 0);
+    }
+
     #[test]
     fn content_rect_sits_below_the_header() {
         let rect = content_rect(bounds(1000.0, 700.0), 1.0);
@@ -4293,6 +4855,122 @@ mod tests {
             host::builtin_param_index("some.external.vst3", "drive_gain"),
             None
         );
+    }
+
+    #[test]
+    fn place_dropped_files_parses_with_and_without_a_pad() {
+        let onto_pad = br#"{"type":"futureboard.placeDroppedFiles","pluginId":"drumsampler","instanceId":"t::i","bindingGeneration":3,"dropId":7,"padIndex":4}"#;
+        match serde_json::from_slice::<InboundMsg>(onto_pad).unwrap() {
+            InboundMsg::PlaceDroppedFiles {
+                drop_id,
+                pad_index,
+                binding_generation,
+                ..
+            } => {
+                assert_eq!(drop_id, 7);
+                assert_eq!(pad_index, Some(4));
+                assert_eq!(binding_generation, 3);
+            }
+            other => panic!("expected PlaceDroppedFiles, got {other:?}"),
+        }
+        let library = br#"{"type":"futureboard.placeDroppedFiles","pluginId":"drumsampler","instanceId":"t::i","bindingGeneration":3,"dropId":8,"padIndex":null}"#;
+        assert!(matches!(
+            serde_json::from_slice::<InboundMsg>(library).unwrap(),
+            InboundMsg::PlaceDroppedFiles {
+                pad_index: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn file_drop_messages_serialize_for_the_page() {
+        let drop = serde_json::to_value(FileDropMsg {
+            r#type: "futureboard.fileDrop",
+            protocol_version: BRIDGE_PROTOCOL_VERSION,
+            drop_id: 7,
+            x: 120,
+            y: 48,
+            file_names: vec!["kick.wav".into()],
+            rejected: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            drop,
+            serde_json::json!({
+                "type": "futureboard.fileDrop",
+                "protocolVersion": BRIDGE_PROTOCOL_VERSION,
+                "dropId": 7,
+                "x": 120,
+                "y": 48,
+                "fileNames": ["kick.wav"],
+                "rejected": 1,
+            })
+        );
+        let drag = serde_json::to_value(FileDragMsg {
+            r#type: "futureboard.fileDrag",
+            protocol_version: BRIDGE_PROTOCOL_VERSION,
+            active: false,
+            x: 0,
+            y: 0,
+            count: 0,
+        })
+        .unwrap();
+        assert_eq!(drag["active"], false);
+    }
+
+    #[test]
+    fn a_dropped_sample_is_stored_and_kept_in_memory() {
+        let scratch =
+            std::env::temp_dir().join(format!("fb-drum-drop-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let elsewhere = scratch.join("elsewhere");
+        let samples = scratch.join("Samples");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let kick = elsewhere.join("kick.wav");
+        std::fs::write(&kick, b"RIFF-one").unwrap();
+
+        let (stored, bytes) = read_dropped_sample(&samples, &kick).unwrap();
+        assert_eq!(stored, "kick.wav");
+        assert_eq!(bytes, b"RIFF-one");
+        assert_eq!(
+            std::fs::read(samples.join("kick.wav")).unwrap(),
+            b"RIFF-one"
+        );
+        assert!(read_dropped_sample(&samples, &elsewhere.join("missing.wav")).is_err());
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn importing_a_sample_reuses_identical_files_and_renames_different_ones() {
+        let scratch =
+            std::env::temp_dir().join(format!("fb-drum-import-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        assert_eq!(
+            import_sample_bytes(&scratch, "kick.wav", b"RIFF-one").unwrap(),
+            "kick.wav"
+        );
+        // The same bytes again are not written twice.
+        assert_eq!(
+            import_sample_bytes(&scratch, "kick.wav", b"RIFF-one").unwrap(),
+            "kick.wav"
+        );
+        // A different sound with the same name gets its own file.
+        assert_eq!(
+            import_sample_bytes(&scratch, "kick.wav", b"RIFF-two").unwrap(),
+            "kick 2.wav"
+        );
+        assert_eq!(
+            std::fs::read(scratch.join("kick 2.wav")).unwrap(),
+            b"RIFF-two"
+        );
+        assert!(import_sample_bytes(&scratch, "notes.txt", b"hi").is_err());
+        assert!(import_sample_bytes(&scratch, "../escape.wav", b"hi").is_err());
+
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]

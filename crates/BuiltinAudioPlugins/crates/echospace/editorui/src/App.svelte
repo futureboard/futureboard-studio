@@ -8,6 +8,7 @@
   } from './presets'
   import {
     DEFAULT_TEMPO_BPM,
+    MODE_HINTS,
     PARAMS,
     modeToWire,
     type Mode,
@@ -15,8 +16,10 @@
   } from './params'
   import DivisionSelect from './lib/DivisionSelect.svelte'
   import EchoView from './lib/EchoView.svelte'
+  import FilterCurve from './lib/FilterCurve.svelte'
   import Knob from './lib/Knob.svelte'
   import ModeSelect from './lib/ModeSelect.svelte'
+  import PowerButton from './lib/PowerButton.svelte'
   import PresetControl from './lib/PresetControl.svelte'
   import Toggle from './lib/Toggle.svelte'
   import logo from './assets/logo.svg'
@@ -136,79 +139,102 @@
   const monoCollapsed = $derived(params.mode === 'mono')
 </script>
 
-<div class="app">
-  <header class="chrome">
-    <div class="bar">
-      <div class="identity">
-        <img class="logo" src={logo} alt="EchoSpace" />
-        <div
-          class="link"
-          class:connected
-          title={connected ? 'Linked to DSP' : 'Preview'}
-        ></div>
-      </div>
-
-      <PresetControl
-        {preset}
-        names={FACTORY_PRESETS.map((entry) => entry.name)}
-        onchange={loadPreset}
-        onprevious={() => loadPreset((preset ?? 0) - 1)}
-        onnext={() => loadPreset((preset ?? -1) + 1)}
-      />
-
-      <div class="bar-right">
-        <Toggle
-          label="Freeze"
-          tone="warn"
-          value={params.freeze}
-          onchange={(v) => setFlag('freeze', v)}
-        />
-        <Toggle
-          label="Power"
-          value={params.power}
-          onchange={(v) => setFlag('power', v)}
-        />
-      </div>
+<div class="app" class:bypassed={!params.power}>
+  <header class="topbar">
+    <div class="brand">
+      <img class="logo" src={logo} alt="EchoSpace" />
+      <span
+        class="status"
+        class:connected
+        title={connected ? 'Linked to the DSP' : 'Preview — no DSP attached'}
+      >
+        <span class="status-dot"></span>
+        {connected ? 'Live' : 'Preview'}
+      </span>
     </div>
 
-    <div class="mode-row">
-      <ModeSelect value={params.mode} onchange={setMode} />
+    <PresetControl
+      {preset}
+      names={FACTORY_PRESETS.map((entry) => entry.name)}
+      onchange={loadPreset}
+      onprevious={() => loadPreset((preset ?? 0) - 1)}
+      onnext={() => loadPreset((preset ?? -1) + 1)}
+    />
+
+    <div class="actions">
+      <Toggle
+        label="Freeze"
+        tone="warn"
+        value={params.freeze}
+        onchange={(v) => setFlag('freeze', v)}
+      />
+      <PowerButton
+        value={params.power}
+        onchange={(v) => setFlag('power', v)}
+      />
     </div>
   </header>
 
-  <div class="body">
-    <div class="stage" class:bypassed={!params.power}>
-      <EchoView {params} {tempoBpm} />
-    </div>
+  <main class="main">
+    <section class="panel timing" aria-label="Timing">
+      <div class="panel-head">
+        <h2>Timing</h2>
+        <Toggle compact label="Tempo Sync" value={params.sync} onchange={setSync} />
+      </div>
 
-    <div class="rack">
-      <section class="group" aria-label="Timing">
-        <div class="group-head">
-          <div class="group-title">Timing</div>
-          <div class="group-flags">
-            <Toggle
-              compact
-              label="Sync"
-              value={params.sync}
-              onchange={setSync}
-            />
-            <Toggle
-              compact
-              label="Link"
-              value={params.link}
-              onchange={setLink}
-              disabled={monoCollapsed}
-            />
-          </div>
-        </div>
-        {#if params.sync}
-          <div class="group-knobs">
+      <ModeSelect value={params.mode} onchange={setMode} />
+      <p class="hint">{MODE_HINTS[params.mode]}</p>
+
+      <div class="taps">
+        <div class="tap left">
+          <span class="lane-badge">{monoCollapsed ? 'L + R' : 'L'}</span>
+          {#if params.sync}
             <DivisionSelect
               label="Left"
               value={params.divisionL}
               {tempoBpm}
               onchange={(v) => setDivision('L', v)}
             />
+          {:else}
+            <Knob
+              spec={PARAMS.timeMsL}
+              value={params.timeMsL}
+              onchange={(v) => setSide('L', v)}
+              showLabel={false}
+              size="lg"
+            />
+          {/if}
+        </div>
+
+        <button
+          type="button"
+          class="link"
+          class:active={params.link && !monoCollapsed}
+          role="switch"
+          aria-checked={params.link}
+          aria-label="Link left and right"
+          title={params.link
+            ? 'Linked — both sides move together'
+            : 'Link both sides'}
+          disabled={monoCollapsed}
+          onclick={() => setLink(!params.link)}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            {#if params.link}
+              <path d="M9.5 14.5 14.5 9.5" />
+              <path d="M11 6.5 12.6 4.9a4 4 0 0 1 5.7 5.7L16.7 12.2" />
+              <path d="M13 17.5 11.4 19.1a4 4 0 0 1-5.7-5.7L7.3 11.8" />
+            {:else}
+              <path d="M11 6.5 12.6 4.9a4 4 0 0 1 5.7 5.7L16.7 12.2" />
+              <path d="M13 17.5 11.4 19.1a4 4 0 0 1-5.7-5.7L7.3 11.8" />
+            {/if}
+          </svg>
+          <span>Link</span>
+        </button>
+
+        <div class="tap right" class:off={monoCollapsed}>
+          <span class="lane-badge">R</span>
+          {#if params.sync}
             <DivisionSelect
               label="Right"
               value={params.divisionR}
@@ -216,47 +242,59 @@
               onchange={(v) => setDivision('R', v)}
               disabled={monoCollapsed}
             />
-          </div>
-          <div class="group-note">{Math.round(tempoBpm)} BPM</div>
-        {:else}
-          <div class="group-knobs">
-            <Knob
-              spec={PARAMS.timeMsL}
-              value={params.timeMsL}
-              onchange={(v) => setSide('L', v)}
-            />
+          {:else}
             <Knob
               spec={PARAMS.timeMsR}
               value={params.timeMsR}
               onchange={(v) => setSide('R', v)}
+              showLabel={false}
+              size="lg"
+              tone="alt"
               disabled={monoCollapsed}
             />
-          </div>
-        {/if}
-      </section>
-
-      <section class="group" aria-label="Echoes">
-        <div class="group-title">Echoes</div>
-        <div class="group-knobs">
-          <Knob
-            spec={PARAMS.feedback}
-            value={params.feedback}
-            onchange={(v) => set('feedback', v)}
-            alert={params.freeze}
-            disabled={params.freeze}
-          />
-          <Knob
-            spec={PARAMS.crossFeedback}
-            value={params.crossFeedback}
-            onchange={(v) => set('crossFeedback', v)}
-            disabled={monoCollapsed}
-          />
+          {/if}
         </div>
-      </section>
+      </div>
 
-      <section class="group" aria-label="Tone">
-        <div class="group-title">Tone</div>
-        <div class="group-knobs">
+      <p class="tempo">
+        {#if params.sync}
+          Following the transport at <strong>{Math.round(tempoBpm)} BPM</strong>
+        {:else}
+          Free time — turn on Tempo Sync to lock to note lengths
+        {/if}
+      </p>
+    </section>
+
+    <section class="stage" aria-label="Echo pattern">
+      <EchoView {params} {tempoBpm} />
+    </section>
+  </main>
+
+  <section class="rack" aria-label="Controls">
+    <div class="group" role="group" aria-label="Feedback">
+      <h2 class="group-title">Feedback</h2>
+      <div class="knobs" style="--count: 2">
+        <Knob
+          spec={PARAMS.feedback}
+          value={params.feedback}
+          onchange={(v) => set('feedback', v)}
+          alert={params.freeze}
+          disabled={params.freeze}
+        />
+        <Knob
+          spec={PARAMS.crossFeedback}
+          value={params.crossFeedback}
+          onchange={(v) => set('crossFeedback', v)}
+          disabled={monoCollapsed}
+        />
+      </div>
+    </div>
+
+    <div class="group tone" role="group" aria-label="Repeat tone">
+      <h2 class="group-title">Repeat Tone</h2>
+      <div class="tone-body">
+        <FilterCurve {params} />
+        <div class="knobs" style="--count: 3">
           <Knob
             spec={PARAMS.lowCutHz}
             value={params.lowCutHz}
@@ -273,83 +311,92 @@
             onchange={(v) => set('saturation', v)}
           />
         </div>
-      </section>
-
-      <section class="group output" aria-label="Output">
-        <div class="group-title">Output</div>
-        <div class="group-knobs">
-          <Knob
-            spec={PARAMS.mix}
-            value={params.mix}
-            onchange={(v) => set('mix', v)}
-            size="clamp(3.9rem, 6.5vw, 5.1rem)"
-          />
-          <Knob
-            spec={PARAMS.outputDb}
-            value={params.outputDb}
-            onchange={(v) => set('outputDb', v)}
-          />
-        </div>
-      </section>
+      </div>
     </div>
-  </div>
+
+    <div class="group output" role="group" aria-label="Output">
+      <h2 class="group-title">Output</h2>
+      <div class="knobs" style="--count: 2">
+        <Knob
+          spec={PARAMS.mix}
+          value={params.mix}
+          onchange={(v) => set('mix', v)}
+          size="lg"
+        />
+        <Knob
+          spec={PARAMS.outputDb}
+          value={params.outputDb}
+          onchange={(v) => set('outputDb', v)}
+        />
+      </div>
+    </div>
+  </section>
 </div>
 
 <style>
   .app {
     display: grid;
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: var(--topbar-height) minmax(0, 1fr) auto;
     height: 100%;
     min-height: 0;
     background: var(--panel);
   }
 
-  .chrome {
-    display: grid;
-    grid-template-rows: var(--header-height) auto;
-    border-bottom: 1px solid var(--border);
-    background: linear-gradient(180deg, #13201f 0%, var(--panel) 100%);
-  }
+  /* ---- top bar -------------------------------------------------------- */
 
-  .bar {
+  .topbar {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
     align-items: center;
-    gap: var(--space-2) var(--space-3);
+    gap: var(--space-3);
     min-width: 0;
     padding: 0 var(--space-3) 0 var(--space-4);
+    border-bottom: 1px solid var(--border);
+    background: rgba(0, 0, 0, 0.22);
   }
 
-  .identity {
+  .brand {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
+    gap: var(--space-3);
     min-width: 0;
   }
 
   .logo {
     display: block;
-    width: clamp(7.25rem, 13vw, 10rem);
+    width: clamp(7.25rem, 12vw, 9.5rem);
     max-width: 100%;
     height: auto;
-    opacity: 0.95;
   }
 
-  .link {
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
     flex: none;
+    color: var(--text-faint);
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .status-dot {
     width: 0.4rem;
     height: 0.4rem;
     border-radius: 50%;
-    background: var(--track);
-    border: 1px solid var(--border-strong);
+    background: rgba(255, 255, 255, 0.14);
   }
 
-  .link.connected {
+  .status.connected {
+    color: var(--text-muted);
+  }
+
+  .status.connected .status-dot {
     background: var(--accent);
-    border-color: var(--accent);
   }
 
-  .bar-right {
+  .actions {
     display: flex;
     align-items: center;
     justify-content: flex-end;
@@ -357,42 +404,172 @@
     min-width: 0;
   }
 
-  .mode-row {
-    display: flex;
-    justify-content: center;
-    min-width: 0;
-    padding: 0 var(--space-3) var(--space-2);
-  }
+  /* ---- main: timing + display ---------------------------------------- */
 
-  .body {
+  .main {
     display: grid;
-    grid-template-rows: minmax(8rem, 1fr) auto;
+    grid-template-columns: minmax(15.5rem, 19.5rem) minmax(0, 1fr);
     gap: var(--space-3);
     min-height: 0;
+    padding: var(--space-3) var(--space-3) 0;
+  }
+
+  .panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    min-width: 0;
+    min-height: 0;
     padding: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  }
+
+  .panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  h2 {
+    color: var(--text-muted);
+    font-size: 0.66rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+
+  .hint {
+    min-height: 1.6em;
+    color: var(--text-faint);
+    font-size: 0.66rem;
+    line-height: 1.35;
+  }
+
+  .taps {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 2.4rem minmax(0, 1fr);
+    align-items: stretch;
+    gap: var(--space-1);
+    flex: 1;
+    min-height: 0;
+  }
+
+  .tap {
+    --lane: var(--accent-bright);
+
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    min-width: 0;
+    padding: var(--space-2) var(--space-2) var(--space-3);
+    border: 1px solid var(--border);
+    border-top: 2px solid color-mix(in srgb, var(--lane) 55%, transparent);
+    border-radius: var(--radius-sm);
+    background: var(--panel);
+  }
+
+  .tap.right {
+    --lane: var(--accent-alt-bright);
+  }
+
+  .tap.off {
+    opacity: 0.55;
+  }
+
+  .lane-badge {
+    color: var(--lane);
+    font-size: 0.7rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+  }
+
+  .link {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.2rem;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--text-faint);
+    font-size: 0.58rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+
+  .link svg {
+    width: 1.15rem;
+    height: 1.15rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+  }
+
+  .link:hover:not(:disabled) {
+    color: var(--text);
+    background: var(--surface-hi);
+  }
+
+  .link.active {
+    border-color: var(--accent-dim);
+    background: var(--accent-fill);
+    color: var(--accent-bright);
+  }
+
+  .link:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--accent-dim);
+  }
+
+  .link:disabled {
+    cursor: default;
+    opacity: 0.35;
+  }
+
+  .tempo {
+    color: var(--text-faint);
+    font-size: 0.64rem;
+    text-align: center;
+  }
+
+  .tempo strong {
+    color: var(--text-muted);
+    font-weight: 650;
   }
 
   .stage {
     display: flex;
+    min-width: 0;
     min-height: 0;
+    overflow: hidden;
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--stage-bottom);
-    overflow: hidden;
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
   }
 
-  .stage.bypassed {
-    opacity: 0.38;
-  }
+  /* ---- rack ----------------------------------------------------------- */
 
   .rack {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns:
+      minmax(0, 2fr)
+      minmax(0, 4.6fr)
+      minmax(0, 2.3fr);
+    margin: var(--space-3);
+    overflow: hidden;
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    background: var(--raised);
-    overflow: hidden;
+    background: var(--surface);
   }
 
   .group {
@@ -400,7 +577,7 @@
     flex-direction: column;
     gap: var(--space-2);
     min-width: 0;
-    padding: var(--space-3) var(--space-2) var(--space-3);
+    padding: var(--space-2) var(--space-3) var(--space-3);
   }
 
   .group + .group {
@@ -408,113 +585,74 @@
   }
 
   .group-title {
-    padding: 0 var(--space-1);
     color: var(--text-faint);
-    font-size: 0.65rem;
-    font-weight: 650;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
   }
 
-  .group-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-1);
-    min-width: 0;
-    flex-wrap: wrap;
-  }
-
-  .group-flags {
-    display: flex;
-    align-items: center;
-    gap: 0.3rem;
-    min-width: 0;
-  }
-
-  .group-note {
-    padding: 0 var(--space-1);
-    color: var(--text-faint);
-    font-size: 0.66rem;
-    font-variant-numeric: tabular-nums;
-    text-align: center;
-  }
-
-  .group-knobs {
+  .knobs {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(3.85rem, 1fr));
+    grid-template-columns: repeat(var(--count), minmax(0, 1fr));
     justify-items: center;
-    align-items: start;
-    gap: var(--space-2) var(--space-1);
+    align-items: end;
+    gap: var(--space-2);
+    min-width: 0;
+    flex: 1;
+  }
+
+  .tone-body {
+    display: grid;
+    grid-template-columns: minmax(7rem, 1fr) minmax(0, 1.5fr);
+    align-items: center;
+    gap: var(--space-3);
+    flex: 1;
     min-width: 0;
   }
 
   .output {
-    background: color-mix(in srgb, var(--accent) 6%, var(--raised));
+    background: var(--surface-hi);
   }
 
-  @media (max-width: 980px) {
+  /* Power off: the header stays live so it can be turned back on; the rest
+     reads as parked. */
+  .app.bypassed .main,
+  .app.bypassed .rack {
+    opacity: 0.42;
+  }
+
+  @media (max-width: 860px) {
+    .main {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto minmax(9rem, 1fr);
+      overflow-y: auto;
+    }
+
     .rack {
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     }
 
-    .group:nth-child(3),
-    .group:nth-child(4) {
-      border-top: 1px solid var(--border);
-    }
-
-    .group:nth-child(3) {
-      border-left: 0;
-    }
-  }
-
-  @media (max-width: 760px) {
-    .bar {
-      grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto;
-      padding-inline: var(--space-2);
-    }
-
-    .mode-row {
-      padding-inline: var(--space-2);
-    }
-
-    .body {
-      gap: var(--space-2);
-      padding: var(--space-2);
-    }
-
-    .group {
-      padding: var(--space-2);
-    }
-  }
-
-  @media (max-width: 640px) {
-    .rack {
-      grid-template-columns: 1fr;
-    }
-
-    .group + .group {
+    .group.tone {
+      grid-column: 1 / -1;
+      grid-row: 2;
       border-left: 0;
       border-top: 1px solid var(--border);
     }
-
-    .group:nth-child(3) {
-      border-left: 0;
-    }
   }
 
-  @media (max-height: 560px) {
-    .body {
+  @media (max-height: 600px) {
+    .main {
       gap: var(--space-2);
+      padding: var(--space-2) var(--space-2) 0;
+    }
+
+    .panel {
       padding: var(--space-2);
     }
 
-    .mode-row {
-      padding-bottom: var(--space-1);
+    .rack {
+      margin: var(--space-2);
     }
 
-    .group {
-      padding-block: var(--space-2);
+    .hint {
+      display: none;
     }
   }
 </style>

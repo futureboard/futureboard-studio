@@ -34,6 +34,7 @@ pub const BUILTIN_PLUGIN_CRATES: &[&str] = &[
     "equz8",
     "fa2a",
     "fa76",
+    "imager",
     "meowsyn",
     "rodharerist",
     "verbspace",

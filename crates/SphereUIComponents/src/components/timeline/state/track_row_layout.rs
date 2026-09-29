@@ -543,7 +543,7 @@ pub struct TrackZoomBase {
     pub visible: bool,
 }
 
-/// A burst of Ctrl/Cmd+Alt+wheel ticks zooming every arrangement track's
+/// A burst of Ctrl/Cmd+Shift+wheel ticks zooming every arrangement track's
 /// height. View gesture state held by the `Timeline` view, not by
 /// `TimelineState`, which is cloned and compared as document state.
 ///
@@ -677,7 +677,7 @@ impl TimelineState {
         live.next().is_none()
     }
 
-    /// One Ctrl/Cmd+Alt+wheel tick: scale every arrangement track's height by
+    /// One Ctrl/Cmd+Shift+wheel tick: scale every arrangement track's height by
     /// `tick_factor` and keep the track under `anchor_viewport_y` in place.
     ///
     /// `anchor_viewport_y` is in track-area viewport space (the transform the

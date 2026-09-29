@@ -1,47 +1,77 @@
 /*
  * VerbSpace editor palette.
  *
- * Same surface hierarchy as Equz8 (graphite planes + soft borders), with a
- * violet accent that belongs to this reverb rather than the Studio cyan.
+ * Futureboard's own default theme (`packages/shared/themes/Default.json`):
+ * neutral charcoal planes with no tint in the greys, the one Studio blue as
+ * the accent, and the theme's warning amber reserved for the held/override
+ * state. The decay display tells its three bands apart by weight and dash
+ * (low in light grey, mid in the accent, high dashed grey) rather than by
+ * extra hues, so the editor reads as part of the app, not as its own brand.
+ *
+ * Every component takes its colours from these tokens, and EchoSpace uses
+ * the same set.
  */
 
 :root {
-  --base: #0c0b10;
-  --panel: #13111a;
-  --raised: #1a1722;
-  --stage-top: #110f17;
-  --stage-bottom: #0a0910;
-  --knob-face: #1e1a27;
-  --knob-face-hi: #2a2435;
+  /* surface.canvas / surface.window / surface.base / surface.panel … */
+  --base: #161616;
+  --panel: #1b1b1b;
+  --surface: #232323;
+  --surface-hi: #323232;
+  --inset: #161616;
+  --stage-top: #1a1a1a;
+  --stage-bottom: #111111;
 
-  --border: rgba(255, 255, 255, 0.06);
-  --border-strong: rgba(255, 255, 255, 0.12);
-  --track: #2a2434;
-  --grid: #241f2e;
+  --border: rgba(255, 255, 255, 0.078);
+  --border-strong: rgba(255, 255, 255, 0.2);
+  --grid: #262626;
+  --grid-strong: #333333;
 
-  --text: #eeeaf5;
-  --text-muted: #9d93ae;
-  --text-faint: #6a6178;
+  --text: #e8e8e8;
+  --text-muted: #a3a3a3;
+  --text-faint: #6e6e6e;
 
-  --accent: #9b7dff;
-  --accent-bright: #bda6ff;
-  --accent-dim: rgba(155, 125, 255, 0.34);
-  --accent-fill: rgba(155, 125, 255, 0.14);
-  --accent-text: #d8ccff;
+  /* accent.primary / accent.primaryHover / border.accent / accent.soft */
+  --accent: #4d9cf8;
+  --accent-bright: #72b1fa;
+  --accent-dim: rgba(77, 156, 248, 0.55);
+  --accent-fill: rgba(77, 156, 248, 0.16);
+  --accent-text: #72b1fa;
 
-  --overlay-scrim: rgba(10, 9, 14, 0.78);
+  /* Secondary lane: EchoSpace's right channel, VerbSpace's low band. */
+  --accent-alt: #8f8f8f;
+  --accent-alt-bright: #bdbdbd;
+  --accent-alt-dim: rgba(255, 255, 255, 0.2);
+  --accent-alt-fill: rgba(255, 255, 255, 0.06);
 
-  --warn: #f0a83c;
-  --warn-dim: rgba(240, 168, 60, 0.4);
+  /* VerbSpace's high band. */
+  --band-high: #8f8f8f;
 
-  --header-height: 3rem;
-  --radius: 0.75rem;
-  --radius-sm: 0.45rem;
+  /* surface.overlay */
+  --overlay-scrim: rgba(10, 10, 10, 0.8);
+
+  /* accent.warning */
+  --warn: #e8b75c;
+  --warn-dim: rgba(232, 183, 92, 0.45);
+  --warn-fill: rgba(232, 183, 92, 0.12);
+
+  /* Dial — see lib/Knob.svelte. */
+  --knob-track: rgba(255, 255, 255, 0.08);
+  --knob-face: #262626;
+  --knob-face-hi: #3d3d3d;
+  --knob-edge: rgba(0, 0, 0, 0.6);
+  --knob-pointer: #e8e8e8;
+  --knob-sm: clamp(2.6rem, 3.9vw, 3.2rem);
+  --knob-md: clamp(2.9rem, 4.3vw, 3.7rem);
+  --knob-lg: clamp(3.9rem, 6.2vw, 5.1rem);
+
+  --topbar-height: 3.25rem;
+  --radius: 0.7rem;
+  --radius-sm: 0.42rem;
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
   --space-4: 1rem;
-  --knob-size: clamp(3.55rem, 5.2vw, 4.85rem);
 
   color-scheme: dark;
 }
@@ -76,8 +106,18 @@ body {
   cursor: default;
 }
 
+h2 {
+  margin: 0;
+  font: inherit;
+}
+
+p {
+  margin: 0;
+}
+
 button,
-input {
+input,
+select {
   margin: 0;
   font: inherit;
 }

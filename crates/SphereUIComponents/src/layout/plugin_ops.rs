@@ -644,22 +644,43 @@ impl StudioLayout {
                     error,
                     frames,
                     channels,
+                    sample_rate,
+                    peaks,
                 }) => {
                     eprintln!(
                         "[plugin-bridge] event BuiltinDrumSampleResult instance={plugin_instance_id} pad={pad_index} ok={ok} name={name} error={error:?}"
                     );
-                    if ok {
-                        // Every `LoadBuiltinDrumSample` command originates from a
-                        // drumsampler-bound forwarder, so this event is always
-                        // that plugin's — fold the assignment into the mirror so
-                        // it survives project save/reload.
-                        crate::components::builtin_plugin_editor::builtin_state_set_drum_sample(
+                    // Every `LoadBuiltinDrumSample` command originates from a
+                    // drumsampler-bound forwarder, so this event is always that
+                    // plugin's — fold the assignment into the mirror so it
+                    // survives project save/reload. A reload after project open
+                    // brings back the name the pad already had: not an edit.
+                    if ok
+                        && crate::components::builtin_plugin_editor::builtin_state_set_drum_sample(
                             "drumsampler",
                             &plugin_instance_id,
                             pad_index as usize,
                             Some(name.clone()),
-                        );
+                        )
+                    {
                         self.note_plugin_state_edited(cx);
+                    }
+                    let waveform =
+                        ok.then(
+                            || crate::components::builtin_plugin_editor::DrumPadWaveform {
+                                name: name.clone(),
+                                frames,
+                                channels,
+                                sample_rate,
+                                peaks,
+                            },
+                        );
+                    if let Some(waveform) = waveform.as_ref() {
+                        crate::components::builtin_plugin_editor::drum_waveform_store(
+                            &plugin_instance_id,
+                            pad_index,
+                            waveform.clone(),
+                        );
                     }
                     for handle in self.plugin_editors.builtin.values() {
                         let _ = handle.update(cx, |editor, _window, _cx| {
@@ -669,8 +690,7 @@ impl StudioLayout {
                                 ok,
                                 &name,
                                 error.as_deref(),
-                                frames,
-                                channels,
+                                waveform.as_ref(),
                             );
                         });
                     }
@@ -2660,8 +2680,9 @@ impl StudioLayout {
             BuiltinDrumSampleLoadForwarder, BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps,
             BuiltinGlobalCommandDispatcher, BuiltinHostStatusSource, BuiltinIrLoadForwarder,
             BuiltinIrLoadRequest, BuiltinMeterSource, BuiltinNamLoadForwarder,
-            BuiltinNamLoadRequest, BuiltinParamForwarder, BuiltinSpectrumSource,
-            BuiltinTransportSource, PluginInstanceKey,
+            BuiltinNamLoadRequest, BuiltinPadLevelSource, BuiltinParamForwarder,
+            BuiltinSpectrumSource, BuiltinStereoImageSource, BuiltinTransportSource,
+            PluginInstanceKey,
         };
 
         let target = PluginInstanceKey {
@@ -2819,6 +2840,24 @@ impl StudioLayout {
                         .and_then(|bridge| bridge.builtin_spectrum_frame(&key.insert_id))
                 }) as BuiltinSpectrumSource
             });
+        let stereo_image_source: Option<BuiltinStereoImageSource> =
+            bridge_runtime.clone().map(|runtime| {
+                std::sync::Arc::new(move |key: &PluginInstanceKey| {
+                    runtime
+                        .lock()
+                        .ok()
+                        .and_then(|bridge| bridge.builtin_stereo_image_frame(&key.insert_id))
+                }) as BuiltinStereoImageSource
+            });
+        let pad_level_source: Option<BuiltinPadLevelSource> =
+            bridge_runtime.clone().map(|runtime| {
+                std::sync::Arc::new(move |key: &PluginInstanceKey| {
+                    runtime
+                        .lock()
+                        .ok()
+                        .and_then(|bridge| bridge.builtin_pad_levels(&key.insert_id))
+                }) as BuiltinPadLevelSource
+            });
         let host_status_source: Option<BuiltinHostStatusSource> = bridge_runtime.map(|runtime| {
             std::sync::Arc::new(move |key: &PluginInstanceKey| {
                 runtime
@@ -2851,6 +2890,8 @@ impl StudioLayout {
             meter_source,
             host_status_source,
             spectrum_source,
+            stereo_image_source,
+            pad_level_source,
             transport_source,
         };
 
@@ -5477,6 +5518,10 @@ impl StudioLayout {
         // now that the sink is installed. Covers project open and host
         // crash/respawn.
         self.replay_builtin_insert_state(plugin_instance_id, cx);
+        // A pad's audio is not a parameter: the restarted DSP needs each
+        // sample sent again. Only here, where the DSP is new — an undo step
+        // replays parameters into a DSP whose samples are still loaded.
+        self.reload_builtin_drum_samples(plugin_instance_id, cx);
         if slot_changed {
             self.audio_bridge.project_dirty = true;
             self.schedule_audio_project_sync(cx, true, source);
@@ -5541,6 +5586,72 @@ impl StudioLayout {
                     }
                 }
                 return;
+            }
+        }
+    }
+
+    /// Send every sample a Drum Sampler insert's pads were loaded from back to
+    /// its (re)started host DSP. The DSP restarts empty — a project open or a
+    /// host respawn replays its parameters, but a pad's audio only ever
+    /// arrives as a `LoadBuiltinDrumSample`, so without this a reopened kit
+    /// shows its sample names and plays nothing. No-op for any other plugin.
+    ///
+    /// Reads each file from the plugin's Samples folder on this thread, as the
+    /// editor's own load path does; the host decodes. A missing file comes
+    /// back as a failed load, which the editor shows on that pad.
+    fn reload_builtin_drum_samples(&self, insert_id: &str, cx: &Context<Self>) {
+        use crate::components::builtin_plugin_files as files;
+        use base64::Engine as _;
+        let state = &self.timeline.read(cx).state;
+        let Some(slot) = std::iter::once(&state.master.inserts)
+            .chain(state.tracks.iter().map(|track| &track.inserts))
+            .flatten()
+            .find(|slot| slot.id == insert_id)
+        else {
+            return;
+        };
+        let Some(plugin_id) = slot.plugin_id.as_deref() else {
+            return;
+        };
+        let display_name = slot.display_name.as_str();
+        let names = crate::components::builtin_plugin_editor::builtin_drum_sample_names(
+            plugin_id, insert_id,
+        );
+        if names.is_empty() {
+            return;
+        }
+        let Some(runtime) = self.plugin_editors.bridge_runtime.as_ref() else {
+            return;
+        };
+        // The overviews being replaced belong to the DSP that is gone.
+        crate::components::builtin_plugin_editor::drum_waveforms_remove(insert_id);
+        let root = files::plugin_files_root(display_name);
+        for (pad_index, name) in names {
+            let bytes = match files::read_file_bytes(&root, files::BuiltinFileKind::Samples, &name)
+            {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!(
+                        "[PluginRestore] drum sample missing instance={insert_id} pad={pad_index} file={name} error={error}"
+                    );
+                    continue;
+                }
+            };
+            let command = SpherePluginHost::ipc::HostCommand::LoadBuiltinDrumSample {
+                plugin_instance_id: insert_id.to_string(),
+                pad_index,
+                name: name.clone(),
+                audio_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            };
+            match runtime.lock() {
+                Ok(mut bridge) => {
+                    if let Err(error) = bridge.send_raw(&command) {
+                        eprintln!(
+                            "[PluginRestore] drum sample reload send failed instance={insert_id} pad={pad_index} error={error}"
+                        );
+                    }
+                }
+                Err(_) => return,
             }
         }
     }

@@ -2484,6 +2484,14 @@ impl Render for Timeline {
             // Both axes share the factor and its sign; zoom ignores the
             // Natural Scroll preference, which only flips panning.
             let factor = wheel_zoom_factor(zoom_delta);
+            if zoom_axis == WheelZoomAxis::Waveform {
+                // Display only: no undo entry and nothing dirtied. The lanes
+                // repaint off the timeline's notify.
+                if this.state.scale_waveform_zoom(factor) {
+                    cx.notify();
+                }
+                return;
+            }
             if zoom_axis == WheelZoomAxis::Vertical {
                 // A view change like horizontal zoom: no undo entry, and every
                 // tick that changes a row marks the project view-dirty, never
@@ -3326,18 +3334,23 @@ pub(crate) enum WheelZoomAxis {
     Horizontal,
     /// The height of every arrangement track.
     Vertical,
+    /// The height of the waveforms drawn in audio clips (display only).
+    Waveform,
 }
 
 /// Map wheel modifiers onto a zoom axis, or `None` to pan.
 ///
-/// Ctrl and Cmd are one modifier here, as in the keymap. Ctrl/Cmd zooms time;
-/// adding Alt zooms track heights, whatever Shift says. Without Ctrl/Cmd the
-/// wheel pans, so Alt alone still pans.
+/// Ctrl and Cmd are one modifier here, as in the keymap. Ctrl/Cmd zooms time,
+/// Ctrl/Cmd+Shift track heights, and Ctrl/Cmd+Alt the waveforms, whatever
+/// Shift says. Without Ctrl/Cmd the wheel pans, so Alt or Shift alone still
+/// pans.
 pub(crate) fn wheel_zoom_axis(modifiers: &gpui::Modifiers) -> Option<WheelZoomAxis> {
     if !(modifiers.control || modifiers.platform) {
         return None;
     }
     Some(if modifiers.alt {
+        WheelZoomAxis::Waveform
+    } else if modifiers.shift {
         WheelZoomAxis::Vertical
     } else {
         WheelZoomAxis::Horizontal
@@ -4168,17 +4181,18 @@ mod midi_clip_draw_tests {
     }
 
     #[test]
-    fn wheel_zoom_axis_follows_ctrl_or_cmd_and_alt() {
-        use WheelZoomAxis::{Horizontal, Vertical};
+    fn wheel_zoom_axis_follows_ctrl_or_cmd_shift_and_alt() {
+        use WheelZoomAxis::{Horizontal, Vertical, Waveform};
         // (Ctrl, Cmd, Alt, Shift) -> axis; `None` pans.
         let cases = [
             ((true, false, false, false), Some(Horizontal)),
             ((false, true, false, false), Some(Horizontal)),
-            ((true, false, false, true), Some(Horizontal)),
-            ((true, false, true, false), Some(Vertical)),
-            ((false, true, true, false), Some(Vertical)),
-            ((true, false, true, true), Some(Vertical)),
-            ((true, true, true, true), Some(Vertical)),
+            ((true, false, false, true), Some(Vertical)),
+            ((false, true, false, true), Some(Vertical)),
+            ((true, false, true, false), Some(Waveform)),
+            ((false, true, true, false), Some(Waveform)),
+            ((true, false, true, true), Some(Waveform)),
+            ((true, true, true, true), Some(Waveform)),
             // Without Ctrl/Cmd the wheel pans, Alt or not.
             ((false, false, true, false), None),
             ((false, false, false, true), None),
@@ -4201,7 +4215,7 @@ mod midi_clip_draw_tests {
     /// Cmd+Alt+Shift wheel ticks zoom as the unshifted ones do.
     #[test]
     fn a_wheel_that_shift_turned_sideways_still_zooms() {
-        use WheelZoomAxis::{Horizontal, Vertical};
+        use WheelZoomAxis::Vertical;
         // Unshifted: the vertical wheel only; a sideways swipe does not zoom.
         assert_eq!(wheel_zoom_delta((0.0, 30.0), false), 30.0);
         assert_eq!(wheel_zoom_delta((30.0, 0.0), false), 0.0);
@@ -4210,9 +4224,9 @@ mod midi_clip_draw_tests {
         assert_eq!(wheel_zoom_delta((-30.0, 0.005), true), -30.0);
         // Shift where the wheel stays vertical: y still decides.
         assert_eq!(wheel_zoom_delta((5.0, -30.0), true), -30.0);
-        // Cmd+Shift zooms time, Cmd+Alt+Shift track heights; wheel up zooms
-        // in and wheel down zooms out on both.
-        for (alt, axis) in [(false, Horizontal), (true, Vertical)] {
+        // Cmd+Shift zooms track heights, Cmd+Alt+Shift the waveforms; wheel
+        // up zooms in and wheel down zooms out on both.
+        for (alt, axis) in [(false, Vertical), (true, WheelZoomAxis::Waveform)] {
             let modifiers = gpui::Modifiers {
                 platform: true,
                 alt,
@@ -4227,7 +4241,7 @@ mod midi_clip_draw_tests {
 
     /// Track zoom uses the same factor as time zoom, so wheel up grows both.
     #[test]
-    fn ctrl_alt_wheel_up_grows_track_heights_and_down_shrinks_them() {
+    fn ctrl_shift_wheel_up_grows_track_heights_and_down_shrinks_them() {
         use crate::components::timeline::timeline_state::{CreateTrackOptions, InputMonitorMode};
 
         for (delta, grows) in [(30.0, true), (-30.0, false)] {

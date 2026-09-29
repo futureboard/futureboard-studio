@@ -1,361 +1,378 @@
-import { useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   connectBridge,
-  defaultParams,
-  padParamId,
   postBrowseSample,
+  postListSamples,
+  postLoadSample,
   postParam,
-  type DrumSamplerParams,
-  type Pad,
+  postPlaceDroppedFiles,
+  type FileDrop,
+  type SampleFile,
+  type SampleInfo,
   type SampleLoadResult,
-  type WireField,
 } from './bridge'
+import {
+  FILTER_LABELS,
+  FILTER_MODES,
+  PAD_COUNT,
+  RANGE,
+  defaultKit,
+  dropPads,
+  formatDb,
+  formatHz,
+  formatMs,
+  formatPan,
+  formatPercent,
+  formatSemis,
+  noteName,
+  padParamId,
+  wireValue,
+  type FilterMode,
+  type Kit,
+  type Pad,
+  type PadField,
+} from './lib/pads'
+import { Module, Segmented, Stepper, Toggle } from './components/Controls'
+import { FilterCurve } from './components/FilterCurve'
+import { Knob, logTravel, timeTravel } from './components/Knob'
+import { PadGrid } from './components/PadGrid'
+import { SampleLibrary } from './components/SampleLibrary'
+import { WaveformEditor } from './components/WaveformEditor'
 
-const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+const EMPTY_LEVELS: number[] = Array.from({ length: PAD_COUNT }, () => 0)
+const cutoffTravel = logTravel(RANGE.cutoff[0], RANGE.cutoff[1])
+const holdTravel = timeTravel(1, RANGE.hold[1])
+const decayTravel = timeTravel(10, RANGE.decay[1])
+const attackTravel = timeTravel(0.5, RANGE.attack[1])
 
-function midiNoteName(note: number): string {
-  const octave = Math.floor(note / 12) - 1
-  return `${NOTE_NAMES[note % 12]}${octave}`
+/// Where a file drag is over: a pad, the library (import only), or anywhere
+/// else, which means the selected pad.
+type DropZone = { kind: 'pad'; index: number } | { kind: 'library' } | { kind: 'selected' }
+
+function dropZoneAt(target: EventTarget | null): DropZone {
+  const element = target instanceof Element ? target : null
+  const pad = element?.closest<HTMLElement>('[data-pad-index]')
+  if (pad) return { kind: 'pad', index: Number(pad.dataset.padIndex) }
+  if (element?.closest('[data-drop="library"]')) return { kind: 'library' }
+  return { kind: 'selected' }
 }
 
-// Choke groups get a small, distinct tag color each — never the accent cyan,
-// which stays reserved for selection/focus. Two-channel: the swatch color
-// pairs with a group number printed inside it, so color blindness never
-// hides which pads are linked.
-const CHOKE_COLORS = ['#e0925a', '#d8c15a', '#8fca6a', '#6ac0a8', '#6aa8ca', '#8a8fd6', '#b07fd0', '#d67fae']
+const dropZoneAtPoint = (x: number, y: number) => dropZoneAt(document.elementFromPoint(x, y))
 
-type KnobProps = {
-  label: string
-  value: number
-  min: number
-  max: number
-  step?: number
-  display?: (value: number) => string
-  onChange: (value: number) => void
+const sameZone = (a: DropZone, b: DropZone) =>
+  a.kind === b.kind && (a.kind !== 'pad' || (b.kind === 'pad' && a.index === b.index))
+
+function padRange(pads: number[]) {
+  const label = (index: number) => String(index + 1).padStart(2, '0')
+  if (pads.length === 1) return `Pad ${label(pads[0]!)}`
+  return `Pads ${label(pads[0]!)}–${label(pads[pads.length - 1]!)}`
 }
 
-function Knob({ label, value, min, max, step = 0.01, display, onChange }: KnobProps) {
-  const ratio = (value - min) / (max - min)
-  const angle = -135 + ratio * 270
-  return (
-    <label className="knob-control">
-      <span className="knob-label">{label}</span>
-      <span className="knob" style={{ '--knob-angle': `${angle}deg` } as CSSProperties}>
-        <span className="knob-cap">
-          <i />
-        </span>
-        <input
-          aria-label={label}
-          type="range"
-          min={min}
-          max={max}
-          step={step}
-          value={value}
-          onChange={(event) => onChange(Number(event.target.value))}
-        />
-      </span>
-      <output>{display ? display(value) : value.toFixed(step < 0.1 ? 2 : 0)}</output>
-    </label>
-  )
-}
-
-type PadCellProps = {
-  index: number
-  pad: Pad
-  selected: boolean
-  loading: boolean
-  onSelect: () => void
-  onAdjust: (field: 'gain' | 'tune', value: number) => void
-}
-
-type PadDrag = {
-  pointerId: number
-  field: 'gain' | 'tune'
-  startY: number
-  startValue: number
-  dragging: boolean
-}
-
-// Quick-tweak gestures live on the pad itself so a level or pitch nudge never
-// needs the inspector open. A button already fires `click` for both mouse and
-// keyboard (Enter/Space) activation, so selection stays on `onClick` for free
-// keyboard access; the drag path only has to detect a real drag and swallow
-// the click that follows it, never the other way around.
-function PadCell({ index, pad, selected, loading, onSelect, onAdjust }: PadCellProps) {
-  const empty = !pad.sampleName
-  const dragRef = useRef<PadDrag | null>(null)
-  const suppressClickRef = useRef(false)
-  const [adjustField, setAdjustField] = useState<'gain' | 'tune' | null>(null)
-
-  const handlePointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (event.button !== 0 || empty) return
-    const field = event.shiftKey ? 'tune' : 'gain'
-    dragRef.current = {
-      pointerId: event.pointerId,
-      field,
-      startY: event.clientY,
-      startValue: field === 'gain' ? pad.gain : pad.tune,
-      dragging: false,
-    }
-    event.currentTarget.setPointerCapture(event.pointerId)
-  }
-
-  const handlePointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    const drag = dragRef.current
-    if (!drag || drag.pointerId !== event.pointerId) return
-    const deltaY = drag.startY - event.clientY
-    if (!drag.dragging) {
-      if (Math.abs(deltaY) < 4) return
-      drag.dragging = true
-      setAdjustField(drag.field)
-    }
-    const [min, max, scale] = drag.field === 'gain' ? [-60, 12, 0.25] : [-24, 24, 0.15]
-    onAdjust(drag.field, Math.min(max, Math.max(min, drag.startValue + deltaY * scale)))
-  }
-
-  const endDrag = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    const drag = dragRef.current
-    if (!drag || drag.pointerId !== event.pointerId) return
-    dragRef.current = null
-    setAdjustField(null)
-    if (drag.dragging) suppressClickRef.current = true
-  }
-
-  const handleClick = () => {
-    if (suppressClickRef.current) {
-      suppressClickRef.current = false
-      return
-    }
-    onSelect()
-  }
-
-  const handleDoubleClick = () => {
-    if (empty) return
-    onAdjust('gain', 0)
-    onAdjust('tune', 0)
-  }
-
-  const classes = ['pad-cell']
-  if (selected) classes.push('selected')
-  if (empty) classes.push('empty')
-  if (loading) classes.push('loading')
-  return (
-    <button
-      type="button"
-      className={classes.join(' ')}
-      onClick={handleClick}
-      onDoubleClick={handleDoubleClick}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={endDrag}
-      onPointerCancel={endDrag}
-      aria-pressed={selected}
-      title={empty ? undefined : 'Drag: gain · Shift-drag: tune · Double-click: reset'}
-    >
-      <span className="pad-index">{String(index + 1).padStart(2, '0')}</span>
-      <span className="pad-name">{loading ? 'Loading…' : (pad.sampleName ?? 'Empty')}</span>
-      <span className="pad-tags">
-        {pad.choke > 0 && (
-          <i
-            className="pad-tag choke"
-            style={{ background: CHOKE_COLORS[(pad.choke - 1) % CHOKE_COLORS.length] }}
-            title={`Choke group ${pad.choke}`}
-          >
-            {pad.choke}
-          </i>
-        )}
-        {pad.mute && <i className="pad-tag mute" title="Muted">M</i>}
-        {pad.solo && <i className="pad-tag solo" title="Solo">S</i>}
-      </span>
-      {adjustField && (
-        <span className="pad-adjust">
-          <b>{adjustField === 'gain' ? 'Gain' : 'Tune'}</b>
-          {adjustField === 'gain'
-            ? `${pad.gain > 0 ? '+' : ''}${pad.gain.toFixed(1)}dB`
-            : `${pad.tune > 0 ? '+' : ''}${pad.tune}st`}
-        </span>
-      )}
-    </button>
-  )
+function levelToUnit(linear: number) {
+  if (!(linear > 0)) return 0
+  return Math.max(0, Math.min(1, (20 * Math.log10(linear) + 60) / 60))
 }
 
 function App() {
-  const [params, setParams] = useState<DrumSamplerParams>(defaultParams)
+  const [kit, setKit] = useState<Kit>(defaultKit)
   const [connected, setConnected] = useState(false)
   const [selected, setSelected] = useState(0)
-  const [loadingPad, setLoadingPad] = useState<number | null>(null)
-  const [lastError, setLastError] = useState<string | null>(null)
+  const [samples, setSamples] = useState<(SampleInfo | null)[]>(() => Array(PAD_COUNT).fill(null))
+  const [loading, setLoading] = useState<Set<number>>(() => new Set())
+  const [errors, setErrors] = useState<Map<number, string>>(() => new Map())
+  const [levels, setLevels] = useState<number[]>(EMPTY_LEVELS)
+  const [output, setOutput] = useState({ peak: 0, rms: 0 })
+  const [files, setFiles] = useState<SampleFile[] | null>(null)
+  const [drag, setDrag] = useState<{ zone: DropZone; count: number } | null>(null)
+  const [dropNote, setDropNote] = useState<string | null>(null)
 
   useEffect(
     () =>
-      connectBridge(
-        setParams,
-        setConnected,
-        (result: SampleLoadResult) => {
-          setLoadingPad((current) => (current === result.padIndex ? null : current))
-          if (result.ok) {
-            setLastError(null)
-            setParams((current) => {
-              const pads = current.pads.slice()
-              pads[result.padIndex] = { ...pads[result.padIndex], sampleName: result.name }
-              return { pads }
-            })
-          } else {
-            setLastError(`${result.name}: ${result.error ?? 'load failed'}`)
+      connectBridge({
+        onKit: (next) => {
+          setKit(next)
+          // A different instance: its waveforms arrive as load results.
+          setSamples(Array(PAD_COUNT).fill(null))
+          setErrors(new Map())
+          setLoading(new Set())
+        },
+        onConnection: (isConnected) => {
+          setConnected(isConnected)
+          if (isConnected) postListSamples()
+          else {
+            setLevels(EMPTY_LEVELS)
+            setOutput({ peak: 0, rms: 0 })
           }
         },
-      ),
+        onSampleResult: (result: SampleLoadResult) => {
+          setLoading((current) => {
+            const next = new Set(current)
+            next.delete(result.padIndex)
+            return next
+          })
+          setErrors((current) => {
+            const next = new Map(current)
+            if (result.ok) next.delete(result.padIndex)
+            else next.set(result.padIndex, `${result.name}: ${result.error ?? 'load failed'}`)
+            return next
+          })
+          if (result.ok) {
+            setSamples((current) => current.map((entry, index) => (index === result.padIndex ? result.sample : entry)))
+            setKit((current) => ({
+              ...current,
+              pads: current.pads.map((pad, index) =>
+                index === result.padIndex ? { ...pad, sampleName: result.name } : pad,
+              ),
+            }))
+          }
+        },
+        onPadLevels: setLevels,
+        onOutput: (peak, rms) => setOutput({ peak, rms }),
+        onFiles: setFiles,
+        onFileDrag: (point) =>
+          setDrag((current) => {
+            if (!point) return null
+            const zone = dropZoneAtPoint(point.x, point.y)
+            if (current && current.count === point.count && sameZone(current.zone, zone)) return current
+            return { zone, count: point.count }
+          }),
+        onFileDrop: (drop) => {
+          setDrag(null)
+          placeDropRef.current(drop)
+        },
+      }),
     [],
   )
 
-  const pad = params.pads[selected]
+  const setPadField = useCallback(<K extends PadField>(padIndex: number, field: K, value: Pad[K]) => {
+    setKit((current) => ({
+      ...current,
+      pads: current.pads.map((pad, index) => (index === padIndex ? { ...pad, [field]: value } : pad)),
+    }))
+    postParam(padParamId(padIndex, field), wireValue(field, value))
+  }, [])
 
-  const setPadField = <K extends WireField>(padIndex: number, field: K, value: Pad[K], wire: number) => {
-    setParams((current) => {
-      const pads = current.pads.slice()
-      pads[padIndex] = { ...pads[padIndex], [field]: value }
-      return { pads }
+  const setMaster = useCallback((field: 'masterGain' | 'masterTune', value: number) => {
+    setKit((current) => ({ ...current, [field]: value }))
+    postParam(field, value)
+  }, [])
+
+  const load = (fileName: string) => {
+    setLoading((current) => new Set(current).add(selected))
+    postLoadSample(selected, fileName)
+  }
+  // No loading mark here: the picker can be cancelled, and nothing reports
+  // that back. The pad updates when the load result arrives.
+  const browse = () => postBrowseSample(selected)
+
+  // Native owns OS file drags: it reports the pointer while files hover
+  // (`fileDrag`), then keeps the dropped files and asks where they go
+  // (`fileDrop`). The page only answers with the pad under the point.
+  const placeDrop = (drop: FileDrop) => {
+    const zone = dropZoneAtPoint(drop.x, drop.y)
+    if (drop.fileNames.length === 0) {
+      setDropNote('Only WAV, AIFF, FLAC or MP3 files can be loaded')
+      return
+    }
+    setDropNote(drop.rejected > 0 ? `Skipped ${drop.rejected} file(s) that are not audio` : null)
+    if (zone.kind === 'library') {
+      postPlaceDroppedFiles(drop.dropId, null)
+      return
+    }
+    // Onto consecutive pads from the drop target; past the last pad a file
+    // is only added to the Samples folder.
+    const first = zone.kind === 'pad' ? zone.index : selected
+    setLoading((current) => {
+      const next = new Set(current)
+      for (const index of dropPads(first, drop.fileNames.length)) next.add(index)
+      return next
     })
-    postParam(padParamId(padIndex, field), wire)
+    setSelected(first)
+    postPlaceDroppedFiles(drop.dropId, first)
   }
+  const placeDropRef = useRef(placeDrop)
+  placeDropRef.current = placeDrop
 
-  const changePad = <K extends WireField>(field: K, value: Pad[K], wire: number) =>
-    setPadField(selected, field, value, wire)
+  useEffect(() => {
+    if (!dropNote) return
+    const timer = window.setTimeout(() => setDropNote(null), 3000)
+    return () => window.clearTimeout(timer)
+  }, [dropNote])
 
-  // Same wire path as the Voice module's own knobs — a pad-drag nudge and an
-  // inspector-knob nudge are indistinguishable to the engine.
-  const adjustPad = (padIndex: number, field: 'gain' | 'tune', value: number) =>
-    setPadField(padIndex, field, value, value)
+  const dropTargets =
+    drag && drag.zone.kind !== 'library'
+      ? dropPads(drag.zone.kind === 'pad' ? drag.zone.index : selected, Math.max(1, drag.count))
+      : []
+  const dropHint = !drag
+    ? dropNote
+    : drag.zone.kind === 'library'
+      ? 'Drop to add to the Samples folder'
+      : `Drop to load onto ${padRange(dropTargets)}`
 
-  const browse = () => {
-    setLoadingPad(selected)
-    setLastError(null)
-    postBrowseSample(selected)
-  }
-
-  const loadedCount = params.pads.filter((entry) => entry.sampleName).length
+  const pad = kit.pads[selected]!
+  const sample = samples[selected] ?? null
+  const change = <K extends PadField>(field: K, value: Pad[K]) => setPadField(selected, field, value)
+  const loadedCount = kit.pads.filter((entry) => entry.sampleName).length
+  const padLabel = `Pad ${String(selected + 1).padStart(2, '0')}`
+  const error = errors.get(selected)
 
   return (
-    <main>
-      <div className="instrument-shell">
-        <header className="topbar">
-          <div className="brand">
-            <span>D</span>
-            <div>
-              <strong>Drum Sampler</strong>
-              <small>16-pad one-shot kit</small>
-            </div>
-          </div>
-          <div className="status">
-            <i className={connected ? 'online' : ''} />
-            <span>{connected ? 'Connected' : 'Preview'}</span>
-          </div>
-        </header>
-
-        <div className="workspace">
-          <section className="module pad-panel">
-            <header>
-              <strong>Pads</strong>
-              <small>4 × 4 kit</small>
-              <span className="pad-count">{loadedCount} / 16</span>
-            </header>
-            <div className="pad-grid" role="group" aria-label="Pads">
-              {params.pads.map((entry, index) => (
-                <PadCell
-                  key={index}
-                  index={index}
-                  pad={entry}
-                  selected={index === selected}
-                  loading={loadingPad === index}
-                  onSelect={() => setSelected(index)}
-                  onAdjust={(field, value) => adjustPad(index, field, value)}
+    <main className="app">
+      <header className="topbar">
+        <div className="brand">
+          <svg viewBox="0 0 24 24" className="brand-mark" aria-hidden="true">
+            <rect x="1" y="1" width="22" height="22" rx="6" />
+            {[0, 1, 2].flatMap((row) =>
+              [0, 1, 2].map((col) => (
+                <rect
+                  key={`${row}${col}`}
+                  x={5 + col * 5}
+                  y={5 + row * 5}
+                  width={4}
+                  height={4}
+                  rx={1}
+                  className={row === 2 && col === 0 ? 'lit' : ''}
                 />
-              ))}
+              )),
+            )}
+          </svg>
+          <h1>DRUM SAMPLER</h1>
+          <span className="brand-sub">16-pad one-shot kit</span>
+          <span
+            className={`status-dot ${connected ? 'is-live' : ''}`}
+            title={connected ? 'Linked to the insert' : 'Preview — no insert bound'}
+          />
+        </div>
+        <span className="kit-count num">
+          {loadedCount} / {PAD_COUNT} pads loaded
+        </span>
+        <div className="master">
+          <span className="cap">Master</span>
+          <Knob
+            label="Gain"
+            value={kit.masterGain}
+            min={RANGE.masterGain[0]}
+            max={RANGE.masterGain[1]}
+            step={0.1}
+            unit="dB"
+            format={formatDb}
+            defaultValue={0}
+            originAtDefault
+            size={30}
+            onChange={(v) => setMaster('masterGain', v)}
+          />
+          <Knob
+            label="Tune"
+            value={kit.masterTune}
+            min={RANGE.masterTune[0]}
+            max={RANGE.masterTune[1]}
+            step={1}
+            unit="st"
+            format={formatSemis}
+            defaultValue={0}
+            originAtDefault
+            size={30}
+            onChange={(v) => setMaster('masterTune', v)}
+          />
+          <div className="out-meter" title="Kit output" aria-label="Kit output level">
+            <span className="cap">Out</span>
+            <div className="out-meter-bar">
+              <span className="out-rms" style={{ width: `${levelToUnit(output.rms) * 100}%` }} />
+              <span className="out-peak" style={{ left: `calc(${levelToUnit(output.peak) * 100}% - 1px)` }} />
             </div>
-          </section>
+          </div>
+        </div>
+      </header>
 
-          <aside className="inspector">
-            <div className="lcd">
-              <span className="lcd-label">Pad {String(selected + 1).padStart(2, '0')}</span>
-              <strong className="lcd-value">{pad.sampleName ?? 'NO SAMPLE'}</strong>
-              {lastError && <span className="lcd-error">{lastError}</span>}
-            </div>
-
-            <button type="button" className="browse" onClick={browse} disabled={loadingPad === selected}>
-              {loadingPad === selected ? 'Loading…' : 'Browse…'}
-            </button>
-
-            <div className="module">
-              <header>
-                <strong>Voice</strong>
-                <small>Pitch &amp; level</small>
-              </header>
-              <div className="knob-row">
-                <Knob label="TUNE" value={pad.tune} min={-24} max={24} step={1} display={(v) => `${v > 0 ? '+' : ''}${v}st`} onChange={(v) => changePad('tune', v, v)} />
-                <Knob label="GAIN" value={pad.gain} min={-60} max={12} step={0.1} display={(v) => `${v.toFixed(1)}dB`} onChange={(v) => changePad('gain', v, v)} />
-                <Knob label="PAN" value={pad.pan} min={-1} max={1} step={0.01} display={(v) => (v === 0 ? 'C' : v < 0 ? `L${Math.round(-v * 100)}` : `R${Math.round(v * 100)}`)} onChange={(v) => changePad('pan', v, v)} />
-              </div>
-            </div>
-
-            <div className="module">
-              <header>
-                <strong>Envelope</strong>
-                <small>Attack &amp; release</small>
-              </header>
-              <div className="knob-row">
-                <Knob label="ATTACK" value={pad.attack} min={0} max={250} step={1} display={(v) => `${Math.round(v)}ms`} onChange={(v) => changePad('attack', v, v)} />
-                <Knob label="RELEASE" value={pad.release} min={1} max={2000} step={1} display={(v) => `${Math.round(v)}ms`} onChange={(v) => changePad('release', v, v)} />
-              </div>
-            </div>
-
-            <div className="module">
-              <header>
-                <strong>Trigger</strong>
-                <small>Note, choke &amp; mix</small>
-              </header>
-              <div className="stepper-row">
-                <label className="stepper">
-                  <span>Note</span>
-                  <div className="stepper-control">
-                    <button type="button" onClick={() => changePad('note', Math.max(0, pad.note - 1), Math.max(0, pad.note - 1))}>−</button>
-                    <output>{midiNoteName(pad.note)}</output>
-                    <button type="button" onClick={() => changePad('note', Math.min(127, pad.note + 1), Math.min(127, pad.note + 1))}>+</button>
-                  </div>
-                </label>
-                <label className="stepper">
-                  <span>Choke</span>
-                  <div className="stepper-control">
-                    <button type="button" onClick={() => changePad('choke', Math.max(0, pad.choke - 1), Math.max(0, pad.choke - 1))}>−</button>
-                    <output>
-                      {pad.choke > 0 && (
-                        <i className="choke-swatch" style={{ background: CHOKE_COLORS[(pad.choke - 1) % CHOKE_COLORS.length] }} />
-                      )}
-                      {pad.choke === 0 ? 'Off' : pad.choke}
-                    </output>
-                    <button type="button" onClick={() => changePad('choke', Math.min(8, pad.choke + 1), Math.min(8, pad.choke + 1))}>+</button>
-                  </div>
-                </label>
-              </div>
-              <div className="toggle-row">
-                <button type="button" className={pad.reverse ? 'active' : ''} aria-pressed={pad.reverse} onClick={() => changePad('reverse', !pad.reverse, pad.reverse ? 0 : 1)}>
-                  Reverse
-                </button>
-                <button type="button" className={pad.mute ? 'active mute' : ''} aria-pressed={pad.mute} onClick={() => changePad('mute', !pad.mute, pad.mute ? 0 : 1)}>
-                  Mute
-                </button>
-                <button type="button" className={pad.solo ? 'active solo' : ''} aria-pressed={pad.solo} onClick={() => changePad('solo', !pad.solo, pad.solo ? 0 : 1)}>
-                  Solo
-                </button>
-              </div>
-            </div>
-          </aside>
+      <div className="body">
+        <div className="left">
+          <PadGrid
+            pads={kit.pads}
+            samples={samples}
+            levels={levels}
+            selected={selected}
+            loading={loading}
+            errors={errors}
+            dropTargets={dropTargets}
+            onSelect={setSelected}
+            onAdjust={(index, field, value) => setPadField(index, field, value)}
+          />
+          <SampleLibrary
+            files={files}
+            current={pad.sampleName}
+            padLabel={padLabel}
+            canLoad={connected}
+            onLoad={load}
+            onBrowse={browse}
+            onRefresh={postListSamples}
+            dropActive={drag?.zone.kind === 'library'}
+          />
         </div>
 
-        <footer>
-          <span>16 pads · one-shot</span>
-          <span>MIDI follows track input</span>
-        </footer>
+        <div className="inspector">
+          <div className="inspector-head">
+            <span className="inspector-pad num">
+              {padLabel} · {noteName(pad.note)}
+            </span>
+            <strong className="inspector-name">{loading.has(selected) ? 'Loading…' : (pad.sampleName ?? 'No sample')}</strong>
+            {error && <span className="inspector-error">{error}</span>}
+          </div>
+
+          <WaveformEditor
+            pad={pad}
+            sample={sample}
+            masterTune={kit.masterTune}
+            onRegion={(edge, value) => change(edge, value)}
+          />
+
+          <div className="modules">
+            <Module title="Voice">
+              <Knob label="Tune" value={pad.tune} min={RANGE.tune[0]} max={RANGE.tune[1]} step={1} unit="st" format={formatSemis} defaultValue={0} originAtDefault onChange={(v) => change('tune', v)} />
+              <Knob label="Gain" value={pad.gain} min={RANGE.gain[0]} max={RANGE.gain[1]} step={0.1} unit="dB" format={formatDb} defaultValue={0} originAtDefault onChange={(v) => change('gain', v)} />
+              <Knob label="Pan" value={pad.pan} min={RANGE.pan[0]} max={RANGE.pan[1]} step={0.01} format={formatPan} defaultValue={0} originAtDefault onChange={(v) => change('pan', v)} />
+              <Knob label="Velocity" value={pad.velocity} min={RANGE.velocity[0]} max={RANGE.velocity[1]} step={1} unit="%" format={formatPercent} defaultValue={100} onChange={(v) => change('velocity', v)} />
+            </Module>
+
+            <Module title="Envelope" aside={<span className="module-note">{pad.decay > 0 ? 'Attack · Hold · Decay' : 'Plays to the end'}</span>}>
+              <Knob label="Attack" value={pad.attack} min={RANGE.attack[0]} max={RANGE.attack[1]} step={0.1} format={(v) => formatMs(v)} defaultValue={1} {...attackTravel} onChange={(v) => change('attack', v)} />
+              <Knob label="Hold" value={pad.hold} min={RANGE.hold[0]} max={RANGE.hold[1]} step={1} format={(v) => formatMs(v)} defaultValue={0} disabled={pad.decay <= 0} {...holdTravel} onChange={(v) => change('hold', v)} />
+              <Knob label="Decay" value={pad.decay} min={RANGE.decay[0]} max={RANGE.decay[1]} step={1} format={(v) => (v <= 0 ? 'Off' : formatMs(v))} defaultValue={0} {...decayTravel} onChange={(v) => change('decay', v)} />
+            </Module>
+
+            <Module
+              title="Filter"
+              aside={
+                <Segmented<FilterMode>
+                  label="Filter mode"
+                  value={pad.filterMode}
+                  options={FILTER_MODES.map((mode) => ({ value: mode, label: FILTER_LABELS[mode] }))}
+                  onChange={(mode) => change('filterMode', mode)}
+                />
+              }
+            >
+              <FilterCurve pad={pad} />
+              <Knob label="Cutoff" value={pad.cutoff} min={RANGE.cutoff[0]} max={RANGE.cutoff[1]} step={1} unit="Hz" format={formatHz} defaultValue={20_000} disabled={pad.filterMode === 'off'} {...cutoffTravel} onChange={(v) => change('cutoff', v)} />
+              <Knob label="Reso" value={pad.resonance} min={RANGE.resonance[0]} max={RANGE.resonance[1]} step={1} unit="%" format={formatPercent} defaultValue={0} disabled={pad.filterMode === 'off'} onChange={(v) => change('resonance', v)} />
+            </Module>
+
+            <Module title="Trigger">
+              <Stepper label="Note" value={pad.note} min={0} max={127} display={noteName} onChange={(v) => change('note', v)} />
+              <Stepper label="Choke" value={pad.choke} min={RANGE.choke[0]} max={RANGE.choke[1]} display={(v) => (v === 0 ? 'Off' : `Group ${v}`)} onChange={(v) => change('choke', v)} />
+              <div className="toggles">
+                <Toggle label="Reverse" on={pad.reverse} title="Play the region backwards" onToggle={() => change('reverse', !pad.reverse)} />
+                <Toggle label="Mute" on={pad.mute} title="Silence this pad" onToggle={() => change('mute', !pad.mute)} />
+                <Toggle label="Solo" on={pad.solo} tone="warn" title="Hear only soloed pads" onToggle={() => change('solo', !pad.solo)} />
+              </div>
+            </Module>
+          </div>
+        </div>
       </div>
+
+      {dropHint && (
+        <div className={drag ? 'drop-hint' : 'drop-hint is-note'} role="status">
+          {dropHint}
+        </div>
+      )}
     </main>
   )
 }

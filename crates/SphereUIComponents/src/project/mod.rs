@@ -1769,6 +1769,8 @@ pub fn apply_to_timeline(
     };
 
     tl.bpm = project.settings.bpm as f32;
+    // The saved Warp ratios are the ones at the saved tempo.
+    tl.warp_ratio_bpm = tl.bpm;
     tl.project_sample_rate = match project.settings.sample_rate {
         44_100 | 48_000 | 88_200 | 96_000 | 192_000 => project.settings.sample_rate,
         _ => 48_000,

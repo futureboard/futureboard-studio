@@ -639,6 +639,14 @@ pub enum HostEvent {
         frames: u64,
         #[serde(default)]
         channels: u32,
+        /// The file's own sample rate, so the editor can show lengths in time.
+        #[serde(default)]
+        sample_rate: u32,
+        /// Waveform overview for the editor: the loudest absolute sample in
+        /// each of `drumsampler::WAVEFORM_POINTS` equal slices, `0..=255`.
+        /// Empty on failure, and from a host that predates it.
+        #[serde(default)]
+        peaks: Vec<u8>,
     },
     /// The user operated a control in a host-drawn chrome strip
     /// ([`HostCommand::SetEditorChrome`]).
@@ -870,6 +878,8 @@ mod tests {
             error: None,
             frames: 4_800,
             channels: 1,
+            sample_rate: 44_100,
+            peaks: vec![0, 128, 255],
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &ev).unwrap();

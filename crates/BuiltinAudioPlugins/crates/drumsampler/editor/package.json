@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -b && vite build",
     "dev": "vite",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "test": "bun test tests"
   },
   "dependencies": {
     "@fontsource-variable/jetbrains-mono": "^5.3.0",

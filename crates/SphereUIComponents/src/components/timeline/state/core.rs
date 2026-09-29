@@ -163,6 +163,13 @@ impl SpatialMix {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineState {
     pub bpm: f32,
+    /// The BPM Warp clips' stretch ratios were last expressed at. A Warp clip
+    /// is locked to the tempo but stores a plain speed; when the BPM moves,
+    /// [`Self::reconcile_audio_clip_lengths`] rescales that speed from this
+    /// tempo to the new one so the clip keeps its bars, as a Tempo Sync clip
+    /// does through its formula. Session state, never saved: a project's
+    /// ratios are always saved at its own BPM.
+    pub warp_ratio_bpm: f32,
     /// Nominal sample rate stored with this project. The audio device may be
     /// running at a different rate while a requested reopen is deferred or when
     /// hardware falls back; runtime code reads the active engine rate separately.
@@ -364,6 +371,7 @@ impl Default for TimelineState {
     fn default() -> Self {
         Self {
             bpm: 120.0,
+            warp_ratio_bpm: 120.0,
             project_sample_rate: 48_000,
             tempo_map: TempoMap::new(),
             resolved_tempo: ResolvedTempo::default(),

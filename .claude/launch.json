@@ -10,7 +10,7 @@
     {
       "name": "drumsampler-editor",
       "runtimeExecutable": "bun",
-      "runtimeArgs": ["run", "--cwd", "crates/BuiltinAudioPlugins/crates/drumsampler/editor", "dev"],
+      "runtimeArgs": ["run", "--cwd", "crates/BuiltinAudioPlugins/crates/drumsampler/editor", "dev", "--port", "5174", "--strictPort"],
       "port": 5174
     },
     {
@@ -18,6 +18,24 @@
       "runtimeExecutable": "bun",
       "runtimeArgs": ["run", "--cwd", "crates/BuiltinAudioPlugins/crates/equz8/editor", "preview", "--port", "5175", "--strictPort"],
       "port": 5175
+    },
+    {
+      "name": "echospace-editorui",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "--cwd", "crates/BuiltinAudioPlugins/crates/echospace/editorui", "dev", "--port", "5176", "--strictPort"],
+      "port": 5176
+    },
+    {
+      "name": "verbspace-editorui",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "--cwd", "crates/BuiltinAudioPlugins/crates/verbspace/editorui", "dev", "--port", "5177", "--strictPort"],
+      "port": 5177
+    },
+    {
+      "name": "imager-editor",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "--cwd", "crates/BuiltinAudioPlugins/crates/imager/editor", "dev", "--port", "5178", "--strictPort"],
+      "port": 5178
     }
   ]
 }

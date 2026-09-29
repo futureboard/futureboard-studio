@@ -5782,18 +5782,27 @@ impl PianoRoll {
         // (zoom in) — the exponent is deliberately not negated. The scroll
         // branches below do subtract it, because panning maps wheel motion onto
         // the content origin rather than onto a scale.
-        // Alt + wheel = Zoom Y (independent of Zoom X).
-        if event.modifiers.alt && !(event.modifiers.control || event.modifiers.platform) {
+        // The arrangement's map: Ctrl/Cmd zooms time, Ctrl/Cmd+Shift the rows
+        // (the arrangement's track zoom), and Ctrl/Cmd+Alt — waveform zoom
+        // there — has no waveform to scale here, so it does nothing rather
+        // than zoom something else.
+        let zoom = event.modifiers.control || event.modifiers.platform;
+        if zoom && event.modifiers.alt {
+            return;
+        }
+        if zoom && event.modifiers.shift {
             let (_, view_h) = self.grid_view_size();
             let anchor_y = self
                 .grid_local(event.position)
                 .map(|(_, ly)| ly)
                 .unwrap_or(view_h * 0.5);
-            let factor = (1.0022_f32).powf(dy);
+            // macOS turns a Shift-held mouse wheel into a horizontal delta.
+            let delta = if dy.abs() <= 0.01 { dx } else { dy };
+            let factor = (1.0022_f32).powf(delta);
             self.zoom_row_h_around(factor, anchor_y, cx);
             return;
         }
-        if event.modifiers.control || event.modifiers.platform {
+        if zoom {
             // Zoom horizontal, anchored at the cursor. Fall back to the viewport
             // center if the grid hasn't been laid out yet (no captured bounds).
             let (view_w, _) = self.grid_view_size();

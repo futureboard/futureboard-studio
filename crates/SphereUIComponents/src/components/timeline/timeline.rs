@@ -324,7 +324,7 @@ pub struct Timeline {
     /// `region_gesture_origin`.
     marker_gesture_origin: Option<Vec<TimelineMarkerState>>,
     pan_last_position: Option<gpui::Point<gpui::Pixels>>,
-    /// The Ctrl/Cmd+Alt+wheel track-zoom burst in flight: the heights it
+    /// The Ctrl/Cmd+Shift+wheel track-zoom burst in flight: the heights it
     /// scales from. Ends on wheel idle or when anything else changes a height.
     track_zoom_session: Option<crate::components::timeline::timeline_state::TrackHeightZoomSession>,
     /// View-only floating-toolbar placement. It deliberately never enters the

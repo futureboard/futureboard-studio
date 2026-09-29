@@ -1943,6 +1943,38 @@ mod tests {
         );
     }
 
+    /// A Warp clip is locked to the tempo as well: a tempo change must leave
+    /// its bar count alone and change its speed, and changing back must give
+    /// the speed back. Before, it kept its seconds like an unlocked clip.
+    #[test]
+    fn a_warp_clip_keeps_its_bars_when_the_tempo_changes() {
+        use crate::components::timeline::timeline_state::StretchTiming;
+        let mut clip = two_second_clip("clip-warp");
+        clip.stretch = clip.stretch.with_timing(StretchTiming::Warp, 120.0);
+        let mut state = state_with_clip(clip, 120.0);
+        let before_beats = state.tracks[0].clips[0].duration_beats;
+        let before_ratio = state.tracks[0].clips[0].stretch.stretch_ratio;
+
+        state.bpm = 240.0;
+        state.reconcile_audio_clip_lengths();
+        let clip = &state.tracks[0].clips[0];
+        assert!(
+            (clip.duration_beats - before_beats).abs() < 0.05,
+            "a warped clip keeps {before_beats} beats, got {}",
+            clip.duration_beats
+        );
+        assert!(
+            (clip.stretch.stretch_ratio - before_ratio * 0.5).abs() < 1.0e-9,
+            "twice the tempo plays it twice as fast"
+        );
+
+        state.bpm = 120.0;
+        state.reconcile_audio_clip_lengths();
+        let clip = &state.tracks[0].clips[0];
+        assert!((clip.stretch.stretch_ratio - before_ratio).abs() < 1.0e-9);
+        assert!((clip.duration_beats - before_beats).abs() < 0.05);
+    }
+
     /// The drawn width and the model's bar count describe one object: after a
     /// tempo change the clip must be grabbable exactly where it is painted.
     #[test]

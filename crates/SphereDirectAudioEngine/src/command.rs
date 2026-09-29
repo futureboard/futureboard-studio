@@ -7,6 +7,9 @@ use crate::runtime::RuntimeProject;
 pub enum EngineCommand {
     /// Replace the callback's render graph with a fully prepared project.
     LoadProject(Box<RuntimeProject>),
+    /// Replace only the MIDI schedule of the running graph (a note edit).
+    /// See [`RuntimeProject::replace_midi_schedule`].
+    ReplaceMidi(Box<crate::runtime::RuntimeMidiData>),
     /// Enable or disable the sine test tone.
     SetTestTone { enabled: bool, frequency: f32 },
     /// Set master output gain (linear, 0..2).

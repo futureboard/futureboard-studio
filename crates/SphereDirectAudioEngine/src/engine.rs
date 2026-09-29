@@ -416,6 +416,58 @@ pub(crate) fn record_output_callback_timing(
     }
 }
 
+/// Identity of everything in `snapshot` except its MIDI clips, plus the build
+/// parameters a graph depends on. Two snapshots with the same key build the
+/// same graph apart from the MIDI schedule. The MIDI is taken out for the
+/// serialize and put back, so nothing is cloned.
+///
+/// Object keys are written sorted: insert params are a `HashMap`, whose order
+/// differs between two maps holding the same entries, and a key that changed
+/// with it would never match.
+fn project_structure_key(
+    snapshot: &mut EngineProjectSnapshot,
+    output_sample_rate: u32,
+    pdc_enabled: bool,
+) -> Option<String> {
+    let midi = std::mem::take(&mut snapshot.midi_clips);
+    let value = serde_json::to_value(&*snapshot);
+    snapshot.midi_clips = midi;
+    let mut key = format!("{output_sample_rate}:{pdc_enabled}:");
+    write_canonical_json(&value.ok()?, &mut key);
+    Some(key)
+}
+
+fn write_canonical_json(value: &serde_json::Value, out: &mut String) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            out.push('{');
+            for (index, (name, item)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(name.clone()).to_string());
+                out.push(':');
+                write_canonical_json(item, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
 // ── Shared state (accessed by both control and audio threads) ─────────────────
 
 pub struct SharedState {
@@ -916,6 +968,11 @@ pub struct EngineInner {
 
     // Prepared render graph shared with new streams and pushed to callbacks.
     runtime: Mutex<RuntimeProject>,
+    /// Everything but the MIDI of the last snapshot `load_project` built in
+    /// full, with the build parameters. A snapshot that matches it differs in
+    /// MIDI only, and gets its new schedule swapped in instead of a rebuild.
+    /// `None` until a full load has succeeded.
+    structure_key: Mutex<Option<String>>,
     /// The tempo map the audio thread was last *sent* — not the one the last
     /// project load happened to carry. `set_tempo_map` skips a push whose
     /// segments match this, and a fresh stream is re-seeded from it, so a
@@ -1096,6 +1153,7 @@ impl EngineInner {
             project: Mutex::new(None),
             input_state_revision: AtomicU64::new(0),
             runtime: Mutex::new(RuntimeProject::default()),
+            structure_key: Mutex::new(None),
             last_sent_tempo_map: Mutex::new(default_tempo_map),
             last_sent_time_signature_map: Mutex::new(default_time_signature_map),
             plugin_bridge_sinks: Mutex::new(Default::default()),
@@ -1678,12 +1736,45 @@ impl EngineInner {
         insert_id: String,
         sink: Option<std::sync::Arc<dyn crate::plugin_bridge::PluginBridgeSink>>,
     ) -> Result<(), SphereAudioError> {
-        if let Some(sink) = sink.as_ref() {
-            self.plugin_bridge_sinks
-                .lock()
-                .insert(insert_id.clone(), sink.clone());
-        } else {
-            self.plugin_bridge_sinks.lock().remove(&insert_id);
+        {
+            let mut sinks = self.plugin_bridge_sinks.lock();
+            // The studio re-installs every sink after each project sync — each
+            // note edit. The graph already holds an identical one (every graph
+            // load copies this map in), and re-installing it costs the audio
+            // thread a map insert, a key free and a re-resolve of every insert.
+            let unchanged = match (sink.as_ref(), sinks.get(&insert_id)) {
+                (Some(next), Some(current)) => std::sync::Arc::ptr_eq(next, current),
+                (None, None) => true,
+                _ => false,
+            };
+            if unchanged {
+                return Ok(());
+            }
+            match sink.as_ref() {
+                Some(sink) => {
+                    sinks.insert(insert_id.clone(), sink.clone());
+                }
+                None => {
+                    sinks.remove(&insert_id);
+                }
+            }
+        }
+        // The control-side graph seeds a stream opened later: it needs the
+        // sink too, or a reopened device would come up without it now that
+        // an unchanged sink is not sent again.
+        {
+            let mut mirror = self.runtime.lock();
+            match sink.as_ref() {
+                Some(sink) => {
+                    mirror
+                        .plugin_bridge_sinks
+                        .insert(insert_id.clone(), sink.clone());
+                }
+                None => {
+                    mirror.plugin_bridge_sinks.remove(&insert_id);
+                }
+            }
+            mirror.resolve_bridge_sinks();
         }
         self.send_command(EngineCommand::SetPluginBridgeSink { insert_id, sink })
     }
@@ -3173,6 +3264,31 @@ impl EngineInner {
 
     // ── Project snapshot ───────────────────────────────────────────────────
 
+    /// The MIDI-only half of [`Self::load_project`]: build the new schedule
+    /// against the running graph's tracks and swap it in on the audio thread.
+    fn replace_midi_schedule(
+        &self,
+        snapshot: EngineProjectSnapshot,
+    ) -> Result<(), SphereAudioError> {
+        let mut current_project = self.project.lock();
+        let schedule = {
+            let mut mirror = self.runtime.lock();
+            let schedule = mirror.build_midi_schedule(&snapshot);
+            // The mirror seeds a stream opened later, so it plays this too.
+            // Stored, not swapped: a swap releases notes, and the mirror
+            // shares its plug-in bridge sinks with the live graph.
+            mirror.install_midi_schedule(schedule.clone());
+            schedule
+        };
+        *current_project = Some(snapshot);
+        let result = self.send_command(EngineCommand::ReplaceMidi(Box::new(schedule)));
+        drop(current_project);
+        match result {
+            Ok(()) | Err(SphereAudioError::EngineNotOpen) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn load_project(
         &self,
         mut snapshot: EngineProjectSnapshot,
@@ -3188,6 +3304,20 @@ impl EngineInner {
             self.shared.playing.load(Ordering::Relaxed)
         );
         let output_sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
+        // A note edit changes the MIDI and nothing else. Rebuilding the whole
+        // graph for it re-read every SoundFont from disk and, at the swap,
+        // silenced every sounding note and restarted every stretcher and PDC
+        // line -- once per note drawn. Swap the schedule instead.
+        let structure_key =
+            project_structure_key(&mut snapshot, output_sample_rate, self.pdc_enabled());
+        if structure_key.is_some() && *self.structure_key.lock() == structure_key {
+            self.shared
+                .engine_state
+                .store(old_state as u8, Ordering::Relaxed);
+            return self.replace_midi_schedule(snapshot);
+        }
+        // A full build from here on; until it lands, nothing matches.
+        *self.structure_key.lock() = None;
         let previously_active_paths: Vec<String> = self
             .project
             .lock()
@@ -3460,6 +3590,9 @@ impl EngineInner {
         *self.runtime.lock() = runtime.clone();
         *current_project = Some(snapshot.clone());
         let load_result = self.send_command(EngineCommand::LoadProject(Box::new(runtime)));
+        if matches!(load_result, Ok(()) | Err(SphereAudioError::EngineNotOpen)) {
+            *self.structure_key.lock() = structure_key;
+        }
         drop(current_project);
 
         match load_result {
@@ -5466,6 +5599,7 @@ impl EngineInner {
         if transport_freeze_debug_enabled() {
             let label = match &cmd {
                 EngineCommand::LoadProject(_) => "LoadProject",
+                EngineCommand::ReplaceMidi(_) => "ReplaceMidi",
                 EngineCommand::SetTestTone { .. } => "SetTestTone",
                 EngineCommand::SetMasterVolume { .. } => "SetMasterVolume",
                 EngineCommand::SetTrackVolume { .. } => "SetTrackVolume",
@@ -5963,6 +6097,11 @@ where
                                     "[AudioEngineState] old={previous_state:?} new={swapped_state:?} source=graph_swap was_playing={was_playing}"
                                 );
                             }
+                        }
+                        EngineCommand::ReplaceMidi(mut next) => {
+                            let pos = shared.position_samples.load(Ordering::Relaxed);
+                            runtime.replace_midi_schedule(&mut next, pos);
+                            crate::graveyard::retire_midi(next);
                         }
                         EngineCommand::SetTestTone { enabled, frequency } => {
                             osc_on = enabled;
@@ -8929,4 +9068,74 @@ fn render_capture_indices(
         .iter()
         .map(|id| snapshot.tracks.iter().position(|track| &track.id == id))
         .collect()
+}
+
+#[cfg(test)]
+mod structure_key_tests {
+    use super::{project_structure_key, write_canonical_json};
+    use crate::types::{EngineMidiClipSnapshot, EngineProjectSnapshot, EngineRoutingSnapshot};
+
+    fn snapshot(bpm: f64, midi_clip_ids: &[&str]) -> EngineProjectSnapshot {
+        EngineProjectSnapshot {
+            spatial: Default::default(),
+            project_id: "structure-key".to_string(),
+            project_root: None,
+            preferred_input_device: None,
+            bpm,
+            tempo_points: Vec::new(),
+            time_signature: [4, 4],
+            sample_rate: 48_000,
+            tracks: Vec::new(),
+            clips: Vec::new(),
+            midi_clips: midi_clip_ids
+                .iter()
+                .map(|id| EngineMidiClipSnapshot {
+                    id: id.to_string(),
+                    track_id: "track-1".to_string(),
+                    start_beat: 0.0,
+                    length_beats: 4.0,
+                    notes: Vec::new(),
+                    controllers: Vec::new(),
+                    mpe: Default::default(),
+                })
+                .collect(),
+            pdc_enabled: true,
+            latency_graph_version: 0,
+            routing: EngineRoutingSnapshot {
+                master_output_device: None,
+                sample_rate: 48_000,
+                buffer_size: 256,
+            },
+        }
+    }
+
+    /// A note edit keeps the key, so it takes the MIDI-only path; anything
+    /// else about the project, or the graph's build settings, changes it.
+    #[test]
+    fn only_the_midi_is_left_out_of_the_key() {
+        let mut a = snapshot(120.0, &["clip-1"]);
+        let mut b = snapshot(120.0, &["clip-1", "clip-2"]);
+        let key = project_structure_key(&mut a, 48_000, true);
+        assert!(key.is_some());
+        assert_eq!(key, project_structure_key(&mut b, 48_000, true));
+        assert_eq!(b.midi_clips.len(), 2, "the MIDI is put back");
+
+        let mut faster = snapshot(140.0, &["clip-1"]);
+        assert_ne!(key, project_structure_key(&mut faster, 48_000, true));
+        assert_ne!(key, project_structure_key(&mut a, 44_100, true));
+        assert_ne!(key, project_structure_key(&mut a, 48_000, false));
+    }
+
+    /// Insert params are a `HashMap`: the same entries in another order must
+    /// give the same key.
+    #[test]
+    fn object_key_order_does_not_change_the_key() {
+        let one: serde_json::Value = serde_json::from_str(r#"{"b":1,"a":{"y":2,"x":[3,{"q":4,"p":5}]}}"#).unwrap();
+        let two: serde_json::Value = serde_json::from_str(r#"{"a":{"x":[3,{"p":5,"q":4}],"y":2},"b":1}"#).unwrap();
+        let (mut left, mut right) = (String::new(), String::new());
+        write_canonical_json(&one, &mut left);
+        write_canonical_json(&two, &mut right);
+        assert_eq!(left, right);
+        assert_eq!(left, r#"{"a":{"x":[3,{"p":5,"q":4}],"y":2},"b":1}"#);
+    }
 }

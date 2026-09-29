@@ -709,6 +709,14 @@ pub fn drain_commands(
                     );
                 }
             }
+            EngineCommand::ReplaceMidi(mut next) => {
+                // A note edit: only the schedule changes, so nothing is cut
+                // and nothing restarts. The replaced schedule leaves through
+                // the graveyard.
+                let pos = shared.position_samples.load(Ordering::Relaxed);
+                runtime.replace_midi_schedule(&mut next, pos);
+                crate::graveyard::retire_midi(next);
+            }
             EngineCommand::SetTestTone { enabled, frequency } => {
                 local.osc_on = enabled;
                 local.osc_freq = frequency;

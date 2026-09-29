@@ -1,0 +1,32 @@
+[package]
+name = "imager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Imager — four-band stereo width DSP core"
+
+[lib]
+name = "imager"
+# `rlib` for the host and tests; `cdylib` so it also compiles as a Built-in
+# Plugin dynamic library, like every other built-in.
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+biquad.workspace = true
+builtin-dsp-core.workspace = true
+builtin-ui-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+# Build-time only: turns `editor/dist` into the embedded asset table.
+#
+# Must stay pointed at the dependency-free `builtin_ui_embed`, never at the
+# `BuiltinAudioPlugins` umbrella — see rodharerist's manifest for why (a
+# build-dependency is a separate build unit and would rebuild every plugin
+# `cdylib` into the same output path).
+builtin-ui-embed = { workspace = true, features = ["generate"] }
+
+[lints]
+workspace = true

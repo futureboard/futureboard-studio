@@ -1973,6 +1973,139 @@ pub(crate) fn build_warp_segments(
     segments
 }
 
+/// Whether `map` is one flat tempo equal to `bpm` — the case the base-tempo
+/// clip arithmetic is exact for.
+pub(crate) fn tempo_map_is_flat_at(map: &RuntimeTempoMapSnapshot, bpm: f64) -> bool {
+    map.segments
+        .iter()
+        .all(|segment| (segment.bpm - bpm).abs() < 1.0e-9 && (segment.end_bpm - bpm).abs() < 1.0e-9)
+}
+
+/// The (clip-relative beat, source frame) pairs a tempo-locked clip is pinned
+/// by: its start and end, and for Warp every marker in between. `None` when
+/// the clip has nothing to lock to (Tempo Sync without a source tempo).
+fn tempo_locked_anchors(
+    stretch: &StretchParams,
+    markers: &[RuntimeWarpMarker],
+    clip_start_beat: f64,
+    duration_beats: f64,
+    source_start: u64,
+    source_end: u64,
+    source_sample_rate: u32,
+) -> Option<Vec<(f64, f64)>> {
+    if duration_beats <= 0.0 || source_end <= source_start {
+        return None;
+    }
+    let start = source_start as f64;
+    let end = source_end as f64;
+    let mut anchors = vec![(0.0, start)];
+    match stretch.mode {
+        StretchMode::TempoSync => {
+            let source_bpm = stretch
+                .source_bpm
+                .filter(|bpm| bpm.is_finite() && *bpm > 0.0)? as f64;
+            // The source plays its own beats one for one against the project's.
+            let frames_per_beat = 60.0 / source_bpm * source_sample_rate.max(1) as f64;
+            anchors.push((
+                duration_beats,
+                (start + duration_beats * frames_per_beat).min(end),
+            ));
+        }
+        StretchMode::Warp => {
+            for marker in markers {
+                let beat = marker.timeline_beat - clip_start_beat;
+                let frame = (marker.source_sample as f64).clamp(start, end);
+                let (last_beat, last_frame) = *anchors.last().expect("start anchor");
+                if beat > last_beat && beat < duration_beats && frame > last_frame {
+                    anchors.push((beat, frame));
+                }
+            }
+            let (_, last_frame) = *anchors.last().expect("start anchor");
+            if end > last_frame {
+                anchors.push((duration_beats, end));
+            }
+        }
+        _ => return None,
+    }
+    (anchors.len() >= 2).then_some(anchors)
+}
+
+/// Beats between extra break points inside a tempo ramp, where the output is
+/// not linear in beats. A sixteenth at 4/4 keeps the straight-line error well
+/// under a millisecond for any ramp a project holds.
+const TEMPO_RAMP_STEP_BEATS: f64 = 0.25;
+
+/// Warp segments for a tempo-locked clip under a changing tempo: each anchor
+/// and each tempo change inside the clip becomes a break point, the source
+/// position between anchors is linear in beats, and the output position comes
+/// from the tempo map. Returns the segments and the clip's output length.
+fn tempo_mapped_warp_segments(
+    map: &RuntimeTempoMapSnapshot,
+    clip_start_beat: f64,
+    duration_beats: f64,
+    start_sample: u64,
+    output_sample_rate: u32,
+    anchors: &[(f64, f64)],
+) -> Option<(Vec<RuntimeWarpSegment>, u64)> {
+    let sr = output_sample_rate.max(1) as f64;
+    let end_sample = map.samples_at_beat(clip_start_beat + duration_beats, sr);
+    let duration_samples = end_sample.checked_sub(start_sample).filter(|d| *d > 0)?;
+
+    let mut beats: Vec<f64> = anchors.iter().map(|(beat, _)| *beat).collect();
+    for segment in &map.segments {
+        for boundary in [segment.start_beat, segment.end_beat] {
+            let rel = boundary - clip_start_beat;
+            if rel.is_finite() && rel > 0.0 && rel < duration_beats {
+                beats.push(rel);
+            }
+        }
+        if (segment.end_bpm - segment.bpm).abs() > 1.0e-9 {
+            let from = segment.start_beat.max(clip_start_beat);
+            let to = segment.end_beat.min(clip_start_beat + duration_beats);
+            let mut beat = from + TEMPO_RAMP_STEP_BEATS;
+            while beat < to {
+                beats.push(beat - clip_start_beat);
+                beat += TEMPO_RAMP_STEP_BEATS;
+            }
+        }
+    }
+    beats.sort_by(f64::total_cmp);
+    beats.dedup_by(|a, b| (*a - *b).abs() < 1.0e-9);
+
+    let source_at = |beat: f64| -> f64 {
+        let next = anchors
+            .partition_point(|(b, _)| *b <= beat)
+            .min(anchors.len() - 1);
+        let (b1, f1) = anchors[next];
+        let (b0, f0) = anchors[next.saturating_sub(1)];
+        if b1 <= b0 {
+            return f1;
+        }
+        f0 + (f1 - f0) * ((beat - b0) / (b1 - b0)).clamp(0.0, 1.0)
+    };
+    let output_at = |beat: f64| -> u64 {
+        map.samples_at_beat(clip_start_beat + beat, sr)
+            .saturating_sub(start_sample)
+            .min(duration_samples)
+    };
+
+    let mut segments = Vec::with_capacity(beats.len());
+    let mut previous = (output_at(beats[0]), source_at(beats[0]));
+    for &beat in &beats[1..] {
+        let next = (output_at(beat), source_at(beat));
+        if next.0 > previous.0 && next.1 > previous.1 {
+            segments.push(RuntimeWarpSegment {
+                out_start: previous.0,
+                out_end: next.0,
+                src_start: previous.1,
+                src_end: next.1,
+            });
+            previous = next;
+        }
+    }
+    (!segments.is_empty()).then_some((segments, duration_samples))
+}
+
 /// Smallest output-per-input time ratio across a warp map, with the source
 /// measured at the output rate (the rate the stretcher is fed at). `None` for
 /// an unwarped clip. Control-thread only: sizes the stretcher's scratch.
@@ -2204,6 +2337,30 @@ pub struct RuntimeMidiTrack {
     pub active: Vec<(u8, u8)>,
     /// UI preview notes currently held independently of transport playback.
     pub preview_active: Vec<(u8, u8)>,
+}
+
+/// A project's MIDI schedule on its own: what a note edit changes, swapped
+/// into the running graph by [`RuntimeProject::replace_midi_schedule`].
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeMidiData {
+    pub midi_clips: Vec<RuntimeMidiClip>,
+    pub midi_tracks: Vec<RuntimeMidiTrack>,
+}
+
+/// Whether `events` (the unplayed part of a schedule) end the note on
+/// `channel`/`pitch` before starting it again.
+fn note_off_is_pending(events: &[RuntimeMidiEvent], channel: u8, pitch: u8) -> bool {
+    for event in events {
+        if event.channel != channel || event.pitch != pitch {
+            continue;
+        }
+        match event.kind {
+            RuntimeMidiEventKind::NoteOff => return true,
+            RuntimeMidiEventKind::NoteOn => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2585,6 +2742,12 @@ impl RuntimeProject {
             let old_fade_out = clip.fade_out_samples;
             clip.start_sample = self.tempo_map.samples_at_beat(clip.start_beat, sr);
             clip.duration_samples = ((old_duration as f64) * ratio).round().max(1.0) as u64;
+            // Warp segments are in output samples too; left alone they would
+            // end short of (or past) the rescaled clip.
+            for segment in &mut clip.warp_segments {
+                segment.out_start = ((segment.out_start as f64) * ratio).round() as u64;
+                segment.out_end = ((segment.out_end as f64) * ratio).round() as u64;
+            }
             clip.fade_in_samples = ((old_fade_in as f64) * ratio).round() as u64;
             clip.fade_out_samples = ((old_fade_out as f64) * ratio).round() as u64;
             clip.fade_in_samples = clip.fade_in_samples.min(clip.duration_samples);
@@ -2933,6 +3096,12 @@ impl RuntimeProject {
     ) -> Result<Self, GraphValidationError> {
         let output_sample_rate = output_sample_rate.max(1);
         let beats_per_second = snapshot.bpm.max(1.0) / 60.0;
+        // Audio clips are timed at the base tempo while it is the whole map;
+        // under tempo markers they are placed and, when locked to the tempo,
+        // stretched through the same map MIDI and the metronome play from.
+        let clip_tempo_map = build_project_tempo_map(snapshot);
+        let clip_tempo_map =
+            (!tempo_map_is_flat_at(&clip_tempo_map, snapshot.bpm)).then_some(&clip_tempo_map);
         let mut clips = Vec::new();
         let mut skipped_no_path = 0u32;
         let mut skipped_decode_err = 0u32;
@@ -3005,6 +3174,7 @@ impl RuntimeProject {
                 Arc::clone(&source),
                 beats_per_second,
                 output_sample_rate,
+                clip_tempo_map,
             ) else {
                 skipped_decode_err += 1;
                 continue;
@@ -3612,6 +3782,98 @@ impl RuntimeProject {
                 .iter()
                 .find(|old| old.track_id == entry.track_id && old.program == entry.program)
                 .and_then(|old| old.sent_to);
+        }
+    }
+
+    /// Build the MIDI schedule for `snapshot` against this graph's tracks, for
+    /// [`Self::replace_midi_schedule`]. Control thread only: it allocates.
+    pub fn build_midi_schedule(&self, snapshot: &EngineProjectSnapshot) -> RuntimeMidiData {
+        let tempo_map = build_project_tempo_map(snapshot);
+        let (midi_clips, mut midi_tracks) =
+            build_midi_runtime(&snapshot.midi_clips, &tempo_map, self.sample_rate);
+        for midi_track in &mut midi_tracks {
+            midi_track.track_index = self
+                .tracks
+                .iter()
+                .position(|track| track.id == midi_track.track_id);
+        }
+        RuntimeMidiData {
+            midi_clips,
+            midi_tracks,
+        }
+    }
+
+    /// Store a MIDI schedule in a graph that is not playing (the control
+    /// thread's copy). Sends nothing to any instrument.
+    pub fn install_midi_schedule(&mut self, data: RuntimeMidiData) {
+        self.midi_clips = data.midi_clips;
+        self.midi_tracks = data.midi_tracks;
+        for track_index in self
+            .midi_tracks
+            .iter()
+            .filter_map(|track| track.track_index)
+        {
+            if let Some(slot) = self.audio_graph.active_source_mask.get_mut(track_index) {
+                *slot = true;
+            }
+        }
+    }
+
+    /// Swap in a new MIDI schedule without touching anything else in the
+    /// graph: instruments, plug-ins, voices, PDC lines and stretchers all keep
+    /// running. This is the whole cost of a note edit.
+    ///
+    /// A note that is sounding right now keeps sounding when the new schedule
+    /// still ends it (its note-off comes before any new start of the same key);
+    /// otherwise — the note was deleted, moved, or shortened to before the
+    /// playhead — it is released here. `next` receives the schedule that was
+    /// playing, for the caller to retire off the audio thread.
+    ///
+    /// Realtime-safe: swaps, in-place scans, and pushes within capacities that
+    /// [`build_midi_runtime`] reserved.
+    pub fn replace_midi_schedule(&mut self, next: &mut RuntimeMidiData, position_sample: u64) {
+        std::mem::swap(&mut self.midi_clips, &mut next.midi_clips);
+        std::mem::swap(&mut self.midi_tracks, &mut next.midi_tracks);
+        for midi_track in &mut self.midi_tracks {
+            midi_track.cursor = midi_track
+                .events
+                .partition_point(|ev| ev.sample < position_sample);
+            // A track that just got its first MIDI has to join the pass.
+            if let Some(slot) = midi_track
+                .track_index
+                .and_then(|ti| self.audio_graph.active_source_mask.get_mut(ti))
+            {
+                *slot = true;
+            }
+        }
+        for old in next.midi_tracks.iter_mut() {
+            let mut released = std::mem::take(&mut old.active);
+            if let Some(new) = self
+                .midi_tracks
+                .iter_mut()
+                .find(|track| track.track_id == old.track_id)
+            {
+                let pending = &new.events[new.cursor..];
+                let active = &mut new.active;
+                released.retain(|&(channel, pitch)| {
+                    let keep = note_off_is_pending(pending, channel, pitch)
+                        && active.len() < active.capacity();
+                    if keep {
+                        active.push((channel, pitch));
+                    }
+                    !keep
+                });
+                // Keys held from the editor belong to the user, not to the
+                // schedule: they stay down.
+                for &held in &old.preview_active {
+                    if new.preview_active.len() < new.preview_active.capacity() {
+                        new.preview_active.push(held);
+                    }
+                }
+                old.preview_active.clear();
+            }
+            push_all_notes_off_for_track(self, old.track_index, &released, 0, false);
+            old.active = released;
         }
     }
 
@@ -5995,6 +6257,7 @@ mod stretch_runtime_tests {
                     test_source(sample_rate as u64),
                     beats_per_second,
                     sample_rate,
+                    None,
                 )
                 .expect("audio clip at ppq 0")
             };
@@ -6008,6 +6271,7 @@ mod stretch_runtime_tests {
                     test_source(sample_rate as u64),
                     beats_per_second,
                     sample_rate,
+                    None,
                 )
                 .expect("audio clip at ppq 1")
             };
@@ -6072,8 +6336,8 @@ mod stretch_runtime_tests {
             ..StretchParams::default()
         };
         let clip = test_clip(stretch.clone());
-        let runtime_clip =
-            build_clip_runtime(&clip, test_source(48_000), 2.0, 48_000).expect("runtime clip");
+        let runtime_clip = build_clip_runtime(&clip, test_source(48_000), 2.0, 48_000, None)
+            .expect("runtime clip");
         assert_eq!(runtime_clip.duration_samples, 96_000);
         assert_eq!(runtime_clip.stretch, stretch);
         assert!((runtime_clip.source_read_rate - 0.5).abs() < f32::EPSILON);
@@ -6083,10 +6347,110 @@ mod stretch_runtime_tests {
             ..stretch
         };
         let clip = test_clip(stretch);
-        let runtime_clip =
-            build_clip_runtime(&clip, test_source(48_000), 2.0, 48_000).expect("runtime clip");
+        let runtime_clip = build_clip_runtime(&clip, test_source(48_000), 2.0, 48_000, None)
+            .expect("runtime clip");
         assert_eq!(runtime_clip.duration_samples, 24_000);
         assert!((runtime_clip.source_read_rate - 2.0).abs() < f32::EPSILON);
+    }
+
+    /// 120 BPM for four beats, then 60.
+    fn halving_tempo_map() -> RuntimeTempoMapSnapshot {
+        TempoMap::from_points(
+            120.0,
+            vec![TempoPoint::hold(0.0, 120.0), TempoPoint::hold(4.0, 60.0)],
+        )
+        .snapshot()
+    }
+
+    #[test]
+    fn only_a_single_tempo_equal_to_the_base_counts_as_flat() {
+        assert!(tempo_map_is_flat_at(
+            &RuntimeTempoMapSnapshot::static_tempo(120.0),
+            120.0
+        ));
+        assert!(!tempo_map_is_flat_at(
+            &RuntimeTempoMapSnapshot::static_tempo(120.0),
+            100.0
+        ));
+        assert!(!tempo_map_is_flat_at(&halving_tempo_map(), 120.0));
+    }
+
+    /// A Tempo Sync clip is defined in beats, so a tempo change inside it has
+    /// to change its speed there: the half after the drop to 60 BPM plays at
+    /// half speed and takes twice as long.
+    #[test]
+    fn a_tempo_synced_clip_follows_a_tempo_change_inside_it() {
+        let map = halving_tempo_map();
+        let mut clip = test_clip(StretchParams {
+            mode: StretchMode::TempoSync,
+            algorithm: StretchAlgorithm::RePitch,
+            source_bpm: Some(120.0),
+            target_bpm: Some(120.0),
+            ..StretchParams::default()
+        });
+        clip.duration_beats = 8.0;
+        // Eight beats of a 120 BPM source: four seconds.
+        let runtime_clip = build_clip_runtime(&clip, test_source(192_000), 2.0, 48_000, Some(&map))
+            .expect("runtime clip");
+        // Four beats at 120 (two seconds), four at 60 (four seconds).
+        assert_eq!(runtime_clip.duration_samples, 288_000);
+        let source_at = |out: u64| {
+            map_warp_source_frame(
+                out,
+                runtime_clip.duration_samples,
+                false,
+                &runtime_clip.warp_segments,
+            )
+            .expect("warp segments")
+        };
+        assert!(
+            (source_at(48_000) - 48_000.0).abs() < 1.0,
+            "beat 2 at full speed"
+        );
+        assert!(
+            (source_at(96_000) - 96_000.0).abs() < 1.0,
+            "beat 4 is half the source"
+        );
+        assert!(
+            (source_at(192_000) - 144_000.0).abs() < 1.0,
+            "beat 6 at half speed"
+        );
+    }
+
+    /// The same clip on the flat base tempo keeps the one-ratio timing, with
+    /// no segments at all.
+    #[test]
+    fn a_tempo_synced_clip_on_a_flat_tempo_needs_no_segments() {
+        let mut clip = test_clip(StretchParams {
+            mode: StretchMode::TempoSync,
+            algorithm: StretchAlgorithm::RePitch,
+            source_bpm: Some(120.0),
+            target_bpm: Some(120.0),
+            ..StretchParams::default()
+        });
+        clip.duration_beats = 8.0;
+        let runtime_clip = build_clip_runtime(&clip, test_source(192_000), 2.0, 48_000, None)
+            .expect("runtime clip");
+        assert_eq!(runtime_clip.duration_samples, 192_000);
+        assert!(runtime_clip.warp_segments.is_empty());
+    }
+
+    /// Every clip is placed where the tempo map puts its beat, the one MIDI
+    /// and the metronome play from; one not locked to the tempo keeps its
+    /// wall-clock length.
+    #[test]
+    fn a_clip_after_a_tempo_change_starts_where_the_map_puts_it() {
+        let map = halving_tempo_map();
+        let mut clip = test_clip(StretchParams::default());
+        clip.start_beat = 8.0;
+        let placed = build_clip_runtime(&clip, test_source(48_000), 2.0, 48_000, Some(&map))
+            .expect("runtime clip");
+        // Two seconds for beats 0..4, four for beats 4..8.
+        assert_eq!(placed.start_sample, 288_000);
+        let flat = build_clip_runtime(&clip, test_source(48_000), 2.0, 48_000, None)
+            .expect("runtime clip");
+        assert_eq!(placed.duration_samples, flat.duration_samples);
+        assert!(placed.warp_segments.is_empty());
     }
 }
 
@@ -6365,11 +6729,15 @@ fn create_runtime_stretch_processor(
     }
 }
 
+/// `tempo_map` is `Some` only when the project's tempo is not one flat value
+/// (see [`tempo_map_is_flat_at`]); a flat map keeps the base-tempo arithmetic
+/// below exactly as it was.
 fn build_clip_runtime(
     clip: &EngineClipSnapshot,
     source: Arc<ClipAudioSource>,
     beats_per_second: f64,
     output_sample_rate: u32,
+    tempo_map: Option<&RuntimeTempoMapSnapshot>,
 ) -> Option<RuntimeClip> {
     if beats_per_second <= 0.0 || output_sample_rate == 0 {
         return None;
@@ -6480,6 +6848,44 @@ fn build_clip_runtime(
         base_duration_samples
     };
 
+    let start_sample = match tempo_map {
+        Some(map) => map.samples_at_beat(clip.start_beat.max(0.0), output_sample_rate as f64),
+        None => seconds_to_samples(start_seconds.max(0.0), output_sample_rate),
+    };
+    let warp_source_start = source_start_samples.min(source.frames() as u64);
+    let warp_source_end = if source_end_samples > source_start_samples {
+        source_end_samples.min(source.frames() as u64)
+    } else {
+        source.frames() as u64
+    };
+    // A clip locked to the tempo (Tempo Sync, Warp) is defined in beats: under
+    // a changing tempo it has to speed up and slow down with it, which one
+    // global ratio cannot do. It plays through segments built from the map.
+    let tempo_locked = tempo_map
+        .filter(|_| matches!(stretch.mode, StretchMode::TempoSync | StretchMode::Warp))
+        .and_then(|map| {
+            let anchors = tempo_locked_anchors(
+                &stretch,
+                &warp_markers,
+                clip.start_beat.max(0.0),
+                clip.duration_beats.max(0.0),
+                warp_source_start,
+                warp_source_end,
+                source.sample_rate(),
+            )?;
+            tempo_mapped_warp_segments(
+                map,
+                clip.start_beat.max(0.0),
+                clip.duration_beats.max(0.0),
+                start_sample,
+                output_sample_rate,
+                &anchors,
+            )
+        });
+    let duration_samples = tempo_locked
+        .as_ref()
+        .map_or(duration_samples, |(_, duration)| *duration);
+
     // Resolve fade durations (seconds) → output samples. Clamp so the two
     // fades never overlap or exceed the clip length.
     let (fade_in_samples, fade_out_samples) = clip
@@ -6497,19 +6903,17 @@ fn build_clip_runtime(
     let stretch_processor =
         create_runtime_stretch_processor(stretch_backend, source.sample_rate(), &stretch);
 
-    let warp_source_end = if source_end_samples > source_start_samples {
-        source_end_samples.min(source.frames() as u64)
-    } else {
-        source.frames() as u64
+    let warp_segments = match tempo_locked {
+        Some((segments, _)) => segments,
+        None => build_warp_segments(
+            &warp_markers,
+            clip.start_beat.max(0.0),
+            clip.duration_beats.max(0.0),
+            duration_samples,
+            warp_source_start,
+            warp_source_end,
+        ),
     };
-    let warp_segments = build_warp_segments(
-        &warp_markers,
-        clip.start_beat.max(0.0),
-        clip.duration_beats.max(0.0),
-        duration_samples,
-        source_start_samples.min(source.frames() as u64),
-        warp_source_end,
-    );
     // The stretcher's scratch is sized for the fastest rate it will be fed.
     // For a warped clip that is its steepest segment, not the global ratio.
     let capacity_time_ratio = warp_min_time_ratio(
@@ -6535,7 +6939,7 @@ fn build_clip_runtime(
         track_index: None, // resolved by RuntimeProject::resolve_indices
         start_beat: clip.start_beat.max(0.0),
         duration_beats: clip.duration_beats.max(0.0),
-        start_sample: seconds_to_samples(start_seconds.max(0.0), output_sample_rate),
+        start_sample,
         duration_samples,
         offset_seconds: clip.offset_seconds.max(0.0),
         gain: clip.gain.clamp(0.0, 4.0),
@@ -7930,6 +8334,68 @@ mod midi_tests {
             sink.take(),
             vec![(0xD0 | 2, 95, 0, 7), (0xE0 | 2, 0, 64, 8)]
         );
+    }
+
+    /// The schedule a note edit swaps in, resolved to the one bridged track.
+    fn schedule_of(clips: Vec<EngineMidiClipSnapshot>) -> RuntimeMidiData {
+        let tempo_map = RuntimeTempoMapSnapshot::static_tempo(120.0);
+        let (midi_clips, mut midi_tracks) = build_midi_runtime(&clips, &tempo_map, 48_000);
+        for track in &mut midi_tracks {
+            track.track_index = Some(0);
+        }
+        RuntimeMidiData {
+            midi_clips,
+            midi_tracks,
+        }
+    }
+
+    /// Drawing a note while another one sounds must not cut it: the edit
+    /// swaps the schedule and nothing is released or panicked.
+    #[test]
+    fn a_note_edit_leaves_the_sounding_note_alone() {
+        let (mut p, sink) = bridged_project();
+        p.reset_midi_playback(95_880);
+        p.schedule_midi_block(95_880, 512);
+        sink.take();
+        assert_eq!(p.midi_tracks[0].active, vec![(0, 60)]);
+
+        let mut clip = clip_with_one_note();
+        let mut added = clip.notes[0].clone();
+        added.id = 2;
+        added.pitch = 64;
+        added.start_beat = 2.0;
+        clip.notes.push(added);
+        let mut next = schedule_of(vec![clip]);
+        p.replace_midi_schedule(&mut next, 96_392);
+
+        assert!(sink.take().is_empty(), "the edit sent MIDI to the instrument");
+        assert_eq!(p.midi_tracks[0].active, vec![(0, 60)]);
+        // The old schedule is handed back for retiring.
+        assert_eq!(next.midi_tracks[0].events.len(), 2);
+
+        // The sounding note still ends where it did, and the new one plays.
+        p.schedule_midi_block(119_900, 512);
+        assert_eq!(sink.take(), vec![(0x80, 60, 0, 100)]);
+        p.schedule_midi_block(143_900, 512);
+        assert_eq!(sink.take(), vec![(0x90, 64, 100, 100)]);
+    }
+
+    /// Deleting the note that is sounding releases it at once: its note-off
+    /// left the schedule with it.
+    #[test]
+    fn deleting_a_sounding_note_releases_it() {
+        let (mut p, sink) = bridged_project();
+        p.reset_midi_playback(95_880);
+        p.schedule_midi_block(95_880, 512);
+        sink.take();
+
+        let mut clip = clip_with_one_note();
+        clip.notes.clear();
+        let mut next = schedule_of(vec![clip]);
+        p.replace_midi_schedule(&mut next, 96_392);
+
+        assert_eq!(sink.take(), vec![(0x80, 60, 0, 0)]);
+        assert!(p.midi_tracks.iter().all(|track| track.active.is_empty()));
     }
 
     #[test]

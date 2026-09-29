@@ -43,6 +43,20 @@ pub(crate) struct BridgeHost {
     /// carries its own `request_seq` / `done_seq` so serial FX chains on one
     /// track do not clobber each other's handshake.
     shared_audio: HashMap<String, Arc<SpherePluginHost::audio_bridge::SharedAudioRegion>>,
+    /// The realtime sink handed out for each region, reused while the region
+    /// is. A sink carries the freshness guard (`last_read_seq`); a new one per
+    /// engine sync started from zero and could hand the engine a block the
+    /// previous sink had already read. It also lets the engine see an
+    /// unchanged sink as unchanged and skip re-installing it.
+    audio_sinks: std::sync::Mutex<
+        HashMap<
+            String,
+            (
+                Arc<SpherePluginHost::audio_bridge::SharedAudioRegion>,
+                DirectAudio::plugin_bridge::SharedPluginBridgeSink,
+            ),
+        >,
+    >,
     /// Producer wake event shared with the host process: the audio-callback
     /// sink signals it after every `request_seq` bump so the host renders on
     /// demand instead of polling on a timer tick. One event per engine/host
@@ -216,6 +230,7 @@ impl BridgeHost {
             queued_events: VecDeque::new(),
             audio_bridge_config: None,
             shared_audio: HashMap::new(),
+            audio_sinks: std::sync::Mutex::new(HashMap::new()),
             kick,
             dead: false,
             host_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -239,6 +254,7 @@ impl BridgeHost {
         self.client.join_reader();
         self.loaded.clear();
         self.shared_audio.clear();
+        self.forget_audio_sinks();
         self.queued_events.clear();
         self.host_pid = None;
     }
@@ -263,13 +279,36 @@ impl BridgeHost {
         instance_id: &str,
     ) -> Option<DirectAudio::plugin_bridge::SharedPluginBridgeSink> {
         let region = self.shared_audio.get(instance_id)?;
-        Some(
+        let mut sinks = self.audio_sinks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_region, sink)) = sinks.get(instance_id) {
+            if Arc::ptr_eq(cached_region, region) {
+                return Some(sink.clone());
+            }
+        }
+        let sink =
             SpherePluginHost::plugin_bridge_sink::SharedRegionSink::into_shared_with_liveness(
                 region.clone(),
                 self.kick.clone(),
                 self.host_alive.clone(),
-            ),
-        )
+            );
+        sinks.insert(instance_id.to_string(), (region.clone(), sink.clone()));
+        Some(sink)
+    }
+
+    /// Drop an instance's region and the sink cached for it.
+    fn remove_shared_audio(&mut self, instance_id: &str) {
+        self.shared_audio.remove(instance_id);
+        self.audio_sinks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(instance_id);
+    }
+
+    fn forget_audio_sinks(&mut self) {
+        self.audio_sinks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// What one bridged plug-in costs and delays: `(cpu_share, latency_samples)`.
@@ -372,7 +411,7 @@ impl BridgeHost {
 
     pub fn mark_plugin_load_failed(&mut self, instance: &str) {
         self.loaded.remove(instance);
-        self.shared_audio.remove(instance);
+        self.remove_shared_audio(instance);
     }
 
     /// Stage 1: push the engine-owned sample rate / block size to the host so it
@@ -590,7 +629,7 @@ impl BridgeHost {
         );
         if prepare.is_err() {
             self.loaded.remove(&descriptor.insert_id);
-            self.shared_audio.remove(&descriptor.insert_id);
+            self.remove_shared_audio(&descriptor.insert_id);
         }
         prepare
     }
@@ -783,7 +822,7 @@ impl BridgeHost {
         eprintln!("[plugin-bridge] UnloadPlugin instance={plugin_instance_id}");
         let _ = self.client.unload_plugin(plugin_instance_id.clone());
         self.loaded.remove(&plugin_instance_id);
-        self.shared_audio.remove(&plugin_instance_id);
+        self.remove_shared_audio(&plugin_instance_id);
     }
 
     /// True while this instance id is still tracked as a loaded bridge plugin.
@@ -1019,6 +1058,27 @@ impl BridgeHost {
         instance_id: &str,
     ) -> Option<(u32, [f32; SpherePluginHost::spectrum::SPECTRUM_BINS])> {
         self.shared_audio.get(instance_id)?.bridge().spectrum()
+    }
+
+    /// Latest stereo-image frame for `instance_id`, as `(sequence, frame)`.
+    /// `None` when no region is mapped or its DSP measures no image.
+    pub fn builtin_stereo_image_frame(
+        &self,
+        instance_id: &str,
+    ) -> Option<(u32, SpherePluginHost::audio_bridge::StereoImageFrame)> {
+        self.shared_audio.get(instance_id)?.bridge().stereo_image()
+    }
+
+    /// Latest per-pad levels for `instance_id`, as `(sequence, levels)`.
+    /// `None` when no region is mapped or its DSP has no pads.
+    pub fn builtin_pad_levels(
+        &self,
+        instance_id: &str,
+    ) -> Option<(
+        u32,
+        [f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS],
+    )> {
+        self.shared_audio.get(instance_id)?.bridge().pad_levels()
     }
 
     /// Region-header status for the footer: (sample_rate, block_frames,
@@ -1638,6 +1698,24 @@ impl PluginBridgeRuntime {
     ) -> Option<(u32, [f32; SpherePluginHost::spectrum::SPECTRUM_BINS])> {
         self.host_for(instance_id)?
             .builtin_spectrum_frame(instance_id)
+    }
+
+    pub fn builtin_stereo_image_frame(
+        &self,
+        instance_id: &str,
+    ) -> Option<(u32, SpherePluginHost::audio_bridge::StereoImageFrame)> {
+        self.host_for(instance_id)?
+            .builtin_stereo_image_frame(instance_id)
+    }
+
+    pub fn builtin_pad_levels(
+        &self,
+        instance_id: &str,
+    ) -> Option<(
+        u32,
+        [f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS],
+    )> {
+        self.host_for(instance_id)?.builtin_pad_levels(instance_id)
     }
 
     pub fn builtin_host_status(&self, instance_id: &str) -> Option<(u32, u32, u32, f64)> {

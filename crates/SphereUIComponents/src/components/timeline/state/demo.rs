@@ -226,6 +226,7 @@ impl TimelineState {
 
         Self {
             bpm: 120.0,
+            warp_ratio_bpm: 120.0,
             project_sample_rate: 48_000,
             tempo_map: TempoMap::new(),
             resolved_tempo: ResolvedTempo::default(),
