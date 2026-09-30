@@ -1424,6 +1424,15 @@ impl StudioLayout {
                                                     );
                                                 }
                                                 bridge_inserts.push((id.clone(), slot_id));
+                                            } else if SpherePluginHost::builtin_audio_bridge_supported(
+                                                reg.class_id.as_deref().unwrap_or(&reg.id),
+                                            ) {
+                                                // A built-in instrument (Drum Sampler,
+                                                // ...) still lives in a plug-in host:
+                                                // without a load request its editor
+                                                // has no instance to send samples,
+                                                // params or notes to.
+                                                bridge_inserts.push((id.clone(), slot_id));
                                             }
                                         }
                                     }
