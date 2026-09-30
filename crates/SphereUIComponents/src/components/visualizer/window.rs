@@ -30,6 +30,7 @@ use super::scene::{
     self, FREQ_TICKS, LOUDNESS_GRID, LOUDNESS_PANEL, LOUDNESS_ROWS, LOUDNESS_TARGET, Layout,
     Palette, SPECTRUM_GRID_DB, STEREO_METER_CAPTION, TITLE_BAR, ViewState,
 };
+use crate::components::title_bar::begin_titlebar_drag;
 use crate::theme::{Colors, typography};
 
 const DEFAULT_SIZE: (f32, f32) = (420.0, 260.0);
@@ -291,7 +292,8 @@ impl Render for VisualizerWindow {
                     .id("visualizer-drag")
                     .absolute()
                     .size_full()
-                    .window_control_area(WindowControlArea::Drag),
+                    .window_control_area(WindowControlArea::Drag)
+                    .on_mouse_down(gpui::MouseButton::Left, begin_titlebar_drag),
             )
             .child(overlay)
             .when_some(gpu_error, |root, error| {
@@ -328,6 +330,7 @@ impl VisualizerWindow {
             .pl(px(10.0))
             .pr(px(4.0))
             .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(gpui::MouseButton::Left, begin_titlebar_drag)
             .child(
                 div()
                     .text_size(px(typography::UI_SM))
