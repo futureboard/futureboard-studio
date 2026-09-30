@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["gpu-renderer", "native-dialogs"]
-gpu-renderer = ["dep:pollster", "dep:raw-window-handle", "dep:wgpu"]
+gpu-renderer = ["dep:pollster", "dep:raw-window-handle", "dep:wgpu", "dep:windows-d3d12"]
 native-dialogs = ["dep:rfd"]
 plugin-host-bin = ["sphere-plugin-host/plugin-host-bin"]
 # Real MDX-NET stem separation via ONNX Runtime (CPU; loads onnxruntime at
@@ -118,6 +118,11 @@ rand.workspace = true
 pollster = { workspace = true, optional = true }
 raw-window-handle = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
+# Window > Visualizer: FFT for the spectrum views, EBU R128 for the loudness
+# meter. Both already in the workspace (SpherePluginHost's analyser and the
+# engine's export meter).
+rustfft.workspace = true
+ebur128.workspace = true
 # Native file dialogs (open/save/folder picker).
 rfd = { workspace = true, optional = true }
 # CRC-32/ISO-HDLC checksum for .fbproj binary format.
@@ -135,6 +140,18 @@ unicode-segmentation.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
 windows-core = { workspace = true }
+# The visualizers render with wgpu's D3D12 backend into a shared texture that
+# GPUI's D3D11 atlas imports. wgpu-hal exposes its device as `windows` 0.62
+# types, so creating that texture needs the same version (already in the lock
+# through wgpu-hal) rather than the workspace's 0.61.
+windows-d3d12 = { package = "windows", version = "0.62", optional = true, default-features = false, features = [
+    "std",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
 
 # X11 for screen-edge-independent BPM scrubbing (cursor query/warp). Works on
 # X11 and XWayland; pure Wayland falls back to window-relative deltas.

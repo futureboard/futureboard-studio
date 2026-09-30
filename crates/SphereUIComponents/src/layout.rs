@@ -2782,6 +2782,17 @@ impl StudioLayout {
                 self.open_performance_window(owner_bounds, cx)
             }
             "window:virtual-speaker" => self.open_virtual_speaker_window(owner_bounds, cx),
+            #[cfg(feature = "gpu-renderer")]
+            command
+                if crate::components::visualizer::VisualizerKind::from_command(command)
+                    .is_some() =>
+            {
+                if let Some(kind) =
+                    crate::components::visualizer::VisualizerKind::from_command(command)
+                {
+                    self.open_visualizer_window(kind, owner_bounds, cx);
+                }
+            }
             "midi:sysex-editor" | "window:sysex-editor" => {
                 self.open_sysex_editor_window(owner_bounds, cx)
             }

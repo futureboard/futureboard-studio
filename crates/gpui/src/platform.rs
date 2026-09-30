@@ -1061,6 +1061,16 @@ pub trait PlatformAtlas {
         let _ = (key, shared_handle, source_origin, size);
         Ok(None)
     }
+
+    /// The LUID of the adapter the atlas's D3D11 device runs on, packed as
+    /// `(HighPart << 32) | LowPart`, or `None` when the active renderer is not
+    /// D3D11. A producer that renders on another API (D3D12, Vulkan) must
+    /// render on this same adapter for [`Self::copy_d3d11_shared_texture`] to
+    /// open its handle.
+    #[cfg(target_os = "windows")]
+    fn d3d11_adapter_luid(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[doc(hidden)]

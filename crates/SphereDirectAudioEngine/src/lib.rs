@@ -59,6 +59,7 @@ pub mod tempo_map;
 pub mod time_signature_map;
 pub mod transport;
 pub mod types;
+pub mod visualizer_tap;
 pub mod vst2_processor;
 pub mod vst3_processor;
 
@@ -121,6 +122,7 @@ pub use crate::plugin_backend::PluginModuleFormat;
 /// Shared automation curve shaping — the UI lane renderer calls this so the drawn
 /// curve matches realtime playback and offline export exactly.
 pub use crate::runtime::automation_curve_factor;
+pub use crate::visualizer_tap::{TapRead, VisualizerTap, visualizer_tap};
 // ARA renderers are built by the app (which owns the ARA document) and installed
 // with `AudioEngine::set_ara_renderers`, so the type has to be nameable outside
 // this crate.

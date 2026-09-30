@@ -1600,6 +1600,14 @@ fn fill_output_f32_inner(
         }
     }
 
+    // Visualizer tap (Window > Visualizer), at the same point and for the same
+    // reason: the visualizers read the mix, not the monitoring chain. Atomics
+    // into a preallocated ring; one relaxed load while no visualizer is open.
+    let visualizers = crate::visualizer_tap::visualizer_tap();
+    if visualizers.is_listening() {
+        visualizers.write_interleaved(data, channels, runtime.sample_rate);
+    }
+
     // The click the stream was not meant to carry. It still reaches the device
     // and the Control Room below; it simply arrives after the tap has taken its
     // copy of the mix.
