@@ -4,28 +4,31 @@
 @theme {
   --font-sans: 'Mona Sans Variable', 'Mona Sans', ui-sans-serif, system-ui, sans-serif;
 
-  /* MixStation graphite planes — EQUZ8 shares the Futureboard editor language. */
-  --color-workspace: #0d0e11;
-  --color-panel: #14161a;
-  --color-rack: #17191e;
-  --color-slot: #1c1f25;
-  --color-well: #101216;
-  --color-floating: #1a1d23;
+  /* Soft charcoal planes, matching Futureboard's default theme: no blue tint
+     in the greys, one calm blue accent. Darkest is the analyser floor. */
+  --color-floor: #111111;
+  --color-canvas: #161616;
+  --color-window: #1b1b1b;
+  --color-bar: #1f1f1f;
+  --color-panel: #232323;
+  --color-raised: #2a2a2a;
+  --color-control: #303030;
+  --color-control-hi: #3a3a3a;
 
-  --color-ink: #eef0f4;
-  --color-ink-muted: #949aa6;
-  --color-ink-dim: #6b7280;
+  --color-ink: #e8e8e8;
+  --color-ink-2: #bdbdbd;
+  --color-ink-3: #8f8f8f;
+  --color-ink-4: #6e6e6e;
 
-  --color-hairline: #262a31;
-  --color-hairline-hi: #343941;
+  --color-line: #ffffff14;
+  --color-line-hi: #ffffff24;
 
-  --color-signal: #22d3ee;
-  --color-warn: #f0b45e;
-  --color-danger: #ef4444;
-
-  /* Pro-Q sum curve stays a cool teal signal against the analyser floor. */
-  --color-curve: #e8f7f4;
-  --color-graph-floor: #080a0e;
+  --color-accent: #4d9cf8;
+  --color-accent-hi: #72b1fa;
+  --color-on-accent: #07121f;
+  --color-warn: #e8b75c;
+  --color-danger: #f2645f;
+  --color-curve: #f2f4f7;
 }
 
 @layer base {
@@ -35,16 +38,16 @@
     width: 100%;
     min-width: 620px;
     height: 100%;
-    min-height: 500px;
+    min-height: 480px;
     margin: 0;
     overflow: hidden;
   }
 
   body {
-    background: var(--color-workspace);
+    background: var(--color-window);
     color: var(--color-ink);
     font-family: var(--font-sans);
-    font-size: 13px;
+    font-size: 12px;
     line-height: 1.35;
     -webkit-font-smoothing: antialiased;
     overscroll-behavior: none;
@@ -52,7 +55,7 @@
   }
 
   :focus-visible {
-    outline: 2px solid var(--color-signal);
+    outline: 2px solid var(--color-accent);
     outline-offset: 2px;
     border-radius: 4px;
   }
@@ -63,50 +66,42 @@
 
   button {
     font: inherit;
+    color: inherit;
   }
 
   ::-webkit-scrollbar {
-    width: 9px;
-    height: 9px;
+    width: 8px;
+    height: 8px;
   }
   ::-webkit-scrollbar-track {
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: var(--color-hairline-hi);
-    border: 2px solid var(--color-rack);
+    background: var(--color-control-hi);
     border-radius: 6px;
   }
 }
 
 @layer utilities {
-  .label-cap {
-    font-size: 9px;
-    font-weight: 650;
-    letter-spacing: 0.1em;
+  .cap {
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--color-ink-muted);
+    color: var(--color-ink-3);
     line-height: 1.2;
   }
 
-  .readout {
+  .num {
     font-variant-numeric: tabular-nums;
     font-feature-settings: 'tnum' 1;
-    font-size: 11px;
-    font-weight: 500;
-    line-height: 1.2;
     white-space: nowrap;
-    color: var(--color-ink);
-  }
-
-  .plane {
-    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.03);
   }
 }
 
-/* Graph SVG — kept as classes for the d3/SVG response stage. */
+/* ── Response graph ─────────────────────────────────────────────────────── */
 
-.response-stack {
+.graph {
   position: relative;
   width: 100%;
   height: 100%;
@@ -120,7 +115,7 @@
   width: 100%;
   height: 100%;
   pointer-events: none;
-  opacity: 0.9;
+  opacity: 0.85;
 }
 
 .response {
@@ -130,26 +125,26 @@
   width: 100%;
   height: 100%;
   touch-action: none;
-  user-select: none;
+  cursor: crosshair;
 }
 
 .grid-line {
-  stroke: rgb(150 170 195 / 0.055);
+  stroke: rgb(255 255 255 / 0.045);
   stroke-width: 1;
   vector-effect: non-scaling-stroke;
 }
 .grid-line.is-major {
-  stroke: rgb(150 170 195 / 0.11);
+  stroke: rgb(255 255 255 / 0.09);
 }
 .grid-line.is-zero {
-  stroke: color-mix(in srgb, var(--color-signal) 35%, transparent);
+  stroke: rgb(255 255 255 / 0.2);
 }
 
 .axis-freq,
 .axis-gain {
-  fill: var(--color-ink-dim);
+  fill: var(--color-ink-4);
   font-family: var(--font-sans);
-  font-size: 9px;
+  font-size: 9.5px;
   font-variant-numeric: tabular-nums;
   pointer-events: none;
 }
@@ -157,204 +152,153 @@
   text-anchor: middle;
 }
 .axis-gain {
-  text-anchor: end;
+  text-anchor: start;
 }
 
-.cursor-guide {
-  pointer-events: none;
-}
-.cursor-guide line {
-  stroke: rgb(255 255 255 / 0.14);
+.cursor-line {
+  stroke: rgb(255 255 255 / 0.12);
   stroke-width: 1;
-  stroke-dasharray: 3 4;
+  stroke-dasharray: 2 4;
   vector-effect: non-scaling-stroke;
-}
-.cursor-guide text {
-  fill: var(--color-ink-muted);
-  font-family: var(--font-sans);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  text-anchor: end;
+  pointer-events: none;
 }
 
 .band-curve {
   fill: none;
-  stroke: var(--band, var(--color-signal));
-  stroke-width: 1.15;
-  opacity: 0.28;
+  stroke: var(--band);
+  stroke-width: 1.1;
+  opacity: 0.32;
   vector-effect: non-scaling-stroke;
 }
+.band-area {
+  fill: var(--band);
+  opacity: 0.16;
+}
 .band-curve.is-selected {
-  stroke-width: 1.45;
-  opacity: 0.78;
+  stroke-width: 1.5;
+  opacity: 0.9;
 }
 .band-curve.is-dynamic-extent {
   stroke-width: 1;
   stroke-dasharray: 4 3;
-  opacity: 0.42;
+  opacity: 0.5;
 }
 
-.curve-glow {
-  fill: none;
-  stroke: var(--color-signal);
-  stroke-width: 4;
-  opacity: 0.26;
+.sum-area {
+  fill: url(#sum-fill);
 }
-.curve-line {
+.sum-glow {
+  fill: none;
+  stroke: var(--color-accent);
+  stroke-width: 5;
+  opacity: 0.18;
+}
+.sum-line {
   fill: none;
   stroke: var(--color-curve);
-  stroke-width: 2.1;
+  stroke-width: 2;
   stroke-linejoin: round;
   vector-effect: non-scaling-stroke;
-  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--color-signal) 40%, transparent));
-}
-.curve-fill {
-  opacity: 0.9;
 }
 
-.response.is-bypassed .curve-fill,
-.response.is-bypassed .curve-glow,
-.response.is-bypassed .band-curve {
-  opacity: 0.1;
+.response.is-bypassed .sum-area,
+.response.is-bypassed .sum-glow,
+.response.is-bypassed .band-curve,
+.response.is-bypassed .band-area {
+  opacity: 0.08;
 }
-.response.is-bypassed .curve-line,
-.response.is-bypassed .node {
-  opacity: 0.34;
+.response.is-bypassed .sum-line {
+  opacity: 0.3;
 }
 
 .node {
   cursor: grab;
   outline: none;
-  transform-box: fill-box;
-  transform-origin: center;
 }
 .node:active {
   cursor: grabbing;
 }
-.node.is-off {
-  opacity: 0.28;
-}
-.node.is-soloed {
-  opacity: 1;
-}
-.node.is-soloed .node-halo {
-  opacity: 0.5;
-}
 .node .node-halo {
   fill: var(--band);
   opacity: 0;
+  transition: opacity 120ms ease;
 }
-.node .node-ring {
-  fill: rgb(8 10 14 / 0.92);
-  stroke: var(--band);
-  stroke-width: 2;
+.node:hover .node-halo {
+  opacity: 0.16;
+}
+.node .node-dot {
+  fill: var(--band);
+  stroke: rgb(0 0 0 / 0.55);
+  stroke-width: 1.5;
   vector-effect: non-scaling-stroke;
 }
 .node > text {
-  fill: var(--band);
+  fill: #0b0b0b;
   font-family: var(--font-sans);
   font-size: 10px;
   font-weight: 700;
   pointer-events: none;
 }
-.node:hover .node-halo {
-  opacity: 0.18;
-}
-.node.is-selected {
-  filter: drop-shadow(0 0 7px color-mix(in srgb, var(--band) 70%, transparent));
-}
 .node.is-selected .node-halo {
-  opacity: 0.3;
+  opacity: 0.24;
 }
 .node.is-selected .node-ring {
+  fill: none;
+  stroke: var(--color-curve);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+.node.is-off .node-dot {
+  fill: var(--color-canvas);
+  stroke: var(--band);
+  stroke-dasharray: 2 2;
+}
+.node.is-off > text {
   fill: var(--band);
 }
-.node.is-selected > text {
-  fill: #071014;
+.node.is-soloed .node-halo {
+  opacity: 0.45;
+}
+.response.is-bypassed .node {
+  opacity: 0.35;
 }
 
-.node-readout {
-  pointer-events: none;
-}
-.node-readout rect {
-  fill: rgb(10 12 16 / 0.94);
-  stroke: var(--color-hairline-hi);
+.node-tag rect {
+  fill: rgb(20 20 20 / 0.94);
+  stroke: var(--color-line-hi);
   stroke-width: 1;
   vector-effect: non-scaling-stroke;
 }
-.node-readout text {
+.node-tag text {
   fill: var(--color-ink);
   font-family: var(--font-sans);
-  font-size: 10px;
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
 }
 
-.editor.is-bypassed .stage {
-  filter: saturate(0.2) brightness(0.72);
-  opacity: 0.62;
-}
-
-.editor.is-bypassed .curve-line,
-.editor.is-bypassed .curve-glow,
-.editor.is-bypassed .curve-fill,
-.editor.is-bypassed .band-curve {
-  opacity: 0.18 !important;
-}
-
-.editor.is-bypassed .node {
-  opacity: 0.28 !important;
-}
+/* ── Knob ───────────────────────────────────────────────────────────────── */
 
 .knob-track {
   fill: none;
-  stroke: rgb(255 255 255 / 0.08);
-  stroke-width: 5;
+  stroke: rgb(255 255 255 / 0.09);
   stroke-linecap: round;
 }
 .knob-fill {
   fill: none;
-  stroke: var(--control-accent);
-  stroke-width: 5;
+  stroke: var(--knob-accent, var(--color-accent));
   stroke-linecap: round;
-  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--control-accent) 65%, transparent));
 }
-.knob-default {
-  stroke: rgb(255 255 255 / 0.28);
-  stroke-width: 1.5;
-  vector-effect: non-scaling-stroke;
-}
-.knob-body {
-  stroke: rgb(255 255 255 / 0.08);
+.knob-face {
+  fill: var(--color-control);
+  stroke: rgb(0 0 0 / 0.45);
   stroke-width: 1;
-}
-.knob-cap {
-  stroke: rgb(255 255 255 / 0.05);
-  stroke-width: 1;
-}
-.knob-tick-ring {
-  fill: none;
-  stroke: rgb(255 255 255 / 0.05);
-  stroke-width: 6;
-  stroke-dasharray: 1.2 5.4;
-}
-.knob-highlight {
-  fill: none;
-  stroke: rgb(255 255 255 / 0.22);
-  stroke-width: 1.2;
-  stroke-linecap: round;
 }
 .knob-pointer {
-  stroke: #f7fbff;
-  stroke-width: 2.6;
+  stroke: var(--color-ink);
   stroke-linecap: round;
 }
-.knob-center {
-  fill: #0a0d12;
-  stroke: rgb(255 255 255 / 0.08);
-  stroke-width: 1;
-}
-.knob.is-dragging .knob-pointer {
-  stroke: #fff;
+.knob:hover .knob-face {
+  fill: var(--color-control-hi);
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -4144,6 +4144,15 @@ impl Window {
         Arc::new(D3D11ExternalImage::new(self.sprite_atlas.clone()))
     }
 
+    /// The LUID of the adapter GPUI's D3D11 renderer runs on, packed as
+    /// `(HighPart << 32) | LowPart`. A producer rendering into shared textures
+    /// with another API picks the matching adapter with it, since a shared
+    /// handle only opens on the adapter that created it.
+    #[cfg(target_os = "windows")]
+    pub fn d3d11_adapter_luid(&self) -> Option<u64> {
+        self.sprite_atlas.d3d11_adapter_luid()
+    }
+
     /// Paint a D3D11 external image into the scene at the current z-index.
     /// Returns `false` before the first shared texture update or after device
     /// loss while the atlas is waiting for a replacement frame.

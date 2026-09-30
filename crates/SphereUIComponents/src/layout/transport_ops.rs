@@ -944,6 +944,10 @@ impl StudioLayout {
             } else {
                 None
             },
+            listening: self
+                .listening_simulation
+                .filter(|settings| settings.enabled)
+                .map(|settings| format!("Virtual Speaker: {}", settings.profile.name())),
         }
     }
 

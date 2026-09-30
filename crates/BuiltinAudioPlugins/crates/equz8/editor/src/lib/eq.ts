@@ -397,6 +397,27 @@ export function sumCurvePath(
   )
 }
 
+/// One band's response as an area closed on the 0 dB line — the shaded shape
+/// under the selected band, in register with its stroked curve.
+export function bandCurveAreaPath(
+  band: Band,
+  width: number,
+  height: number,
+  sampleRate: number,
+) {
+  const coeff = bandCoefficients(band, sampleRate)
+  const zeroY = gainToY(0, height)
+  const points = sampleCurvePoints(width, height, (frequency) =>
+    magnitudeDb(coeff, frequency, sampleRate),
+  )
+  const areaBuilder = area<[number, number]>()
+    .x((point) => point[0])
+    .y0(zeroY)
+    .y1((point) => point[1])
+    .curve(curveMonotoneX)
+  return areaBuilder(points) ?? ''
+}
+
 export function bandCurvePath(
   band: Band,
   width: number,

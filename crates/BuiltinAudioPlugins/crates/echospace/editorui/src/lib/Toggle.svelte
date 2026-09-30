@@ -6,8 +6,8 @@
     /** `warn` marks a hold/override state; `accent` marks ordinary engagement. */
     tone?: 'accent' | 'warn'
     disabled?: boolean
-    /** Rack-sized: the header has room for the full control, a group header
-     *  sitting above two knobs does not. */
+    /** Panel-sized: the top bar has room for the full control, a panel
+     *  header does not. */
     compact?: boolean
   }
 
@@ -32,80 +32,90 @@
   {disabled}
   onclick={() => onchange(!value)}
 >
-  <span class="dot"></span>
+  <span class="led"></span>
   <span class="text">{label}</span>
 </button>
 
 <style>
   .toggle {
+    --tone: var(--accent);
+    --tone-dim: var(--accent-dim);
+    --tone-fill: var(--accent-fill);
+
     display: inline-flex;
     align-items: center;
     gap: 0.45rem;
-    min-height: 1.85rem;
-    padding: 0.35rem 0.85rem 0.35rem 0.7rem;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--raised);
+    min-height: 1.9rem;
+    padding: 0 0.8rem 0 0.65rem;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: var(--surface);
     color: var(--text-muted);
-    font: inherit;
-    font-size: 0.78rem;
-    font-weight: 600;
+    font-size: 0.74rem;
+    font-weight: 650;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
     cursor: pointer;
+    transition:
+      color 120ms ease,
+      border-color 120ms ease,
+      background 120ms ease;
+  }
+
+  .toggle.warn {
+    --tone: var(--warn);
+    --tone-dim: var(--warn-dim);
+    --tone-fill: var(--warn-fill);
   }
 
   .toggle.compact {
-    gap: 0.3rem;
+    gap: 0.35rem;
     min-height: 1.5rem;
-    padding: 0.2rem 0.55rem 0.2rem 0.45rem;
-    font-size: 0.68rem;
-    letter-spacing: 0.02em;
-  }
-
-  .toggle.compact .dot {
-    width: 0.4rem;
-    height: 0.4rem;
+    padding: 0 0.6rem 0 0.5rem;
+    font-size: 0.66rem;
   }
 
   .toggle:hover:not(:disabled) {
     color: var(--text);
-    border-color: var(--border-strong);
+    border-color: rgba(255, 255, 255, 0.2);
   }
 
   .toggle:focus-visible {
     outline: none;
-    box-shadow: 0 0 0 2px var(--accent-dim);
+    box-shadow: 0 0 0 2px var(--tone-dim);
   }
 
   .toggle:disabled {
     cursor: default;
-    opacity: 0.45;
+    opacity: 0.4;
   }
 
-  .dot {
-    width: 0.5rem;
-    height: 0.5rem;
+  .led {
+    flex: none;
+    width: 0.45rem;
+    height: 0.45rem;
     border-radius: 50%;
-    background: var(--track);
-    border: 1px solid var(--border-strong);
+    background: rgba(255, 255, 255, 0.12);
+    box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.6);
+  }
+
+  .toggle.compact .led {
+    width: 0.38rem;
+    height: 0.38rem;
   }
 
   .toggle.active {
+    border-color: var(--tone-dim);
+    background: var(--tone-fill);
     color: var(--text);
-    border-color: var(--accent-dim);
-  }
-
-  .toggle.accent.active .dot {
-    background: var(--accent);
-    border-color: var(--accent);
   }
 
   .toggle.warn.active {
-    border-color: var(--warn-dim);
     color: var(--warn);
   }
 
-  .toggle.warn.active .dot {
-    background: var(--warn);
-    border-color: var(--warn);
+  .toggle.active .led {
+    background: var(--tone);
+    box-shadow: none;
   }
 </style>

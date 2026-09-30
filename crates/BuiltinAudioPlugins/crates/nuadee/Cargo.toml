@@ -1,6 +1,6 @@
 [package]
 name = "nuadee"
-version = "2026.9.27-beta1.4.1"
+version = "2026.10.1-beta1.4.2"
 edition = "2024"
 
 [dependencies]

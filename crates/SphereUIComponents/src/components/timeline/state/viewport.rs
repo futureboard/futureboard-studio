@@ -38,6 +38,10 @@ impl Default for AutoScrollMode {
 /// 0.5 keeps it centered so there is equal lookahead/look-behind context.
 const CONTINUOUS_PIN_FRACTION: f32 = 0.5;
 
+/// The tallest the arrangement draws a waveform: 16× true scale (+24 dB of
+/// view), enough to read a -40 dB tail.
+pub const WAVEFORM_ZOOM_MAX: f32 = 16.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimelineTool {
     Pointer,
@@ -557,6 +561,47 @@ impl TimelineState {
         self.viewport.scroll_x = new_scroll_x;
         self.viewport.target_scroll_x = new_scroll_x;
         true
+    }
+
+    /// Step the arrangement's waveform zoom: `+1` / `-1` move one step of
+    /// √2 (two steps double the height), `0` goes back to true scale. Never
+    /// below true scale — a shrunken waveform hides nothing clip gain would
+    /// not. Returns whether it changed.
+    pub fn step_waveform_zoom(&mut self, steps: i32) -> bool {
+        let next = if steps == 0 {
+            1.0
+        } else {
+            (self.waveform_zoom * std::f32::consts::SQRT_2.powi(steps))
+                .clamp(1.0, WAVEFORM_ZOOM_MAX)
+        };
+        // Stepping back down lands on 1.0 exactly, not 0.99999.
+        let next = if (next - 1.0).abs() < 1.0e-3 {
+            1.0
+        } else {
+            next
+        };
+        let changed = (next - self.waveform_zoom).abs() > 1.0e-4;
+        self.waveform_zoom = next;
+        changed
+    }
+
+    /// Scale the waveform zoom continuously by `factor` (the Ctrl/Cmd+Alt
+    /// wheel: a mouse notch and a trackpad's small deltas alike). Same limits
+    /// as [`Self::step_waveform_zoom`], and it settles on true scale exactly
+    /// when it comes back down. Returns whether it changed.
+    pub fn scale_waveform_zoom(&mut self, factor: f32) -> bool {
+        if !factor.is_finite() || factor <= 0.0 {
+            return false;
+        }
+        let next = (self.waveform_zoom * factor).clamp(1.0, WAVEFORM_ZOOM_MAX);
+        let next = if (next - 1.0).abs() < 1.0e-3 {
+            1.0
+        } else {
+            next
+        };
+        let changed = (next - self.waveform_zoom).abs() > 1.0e-4;
+        self.waveform_zoom = next;
+        changed
     }
 
     /// Called when the user manually scrolls/drags the viewport — temporarily

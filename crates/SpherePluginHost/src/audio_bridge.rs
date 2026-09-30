@@ -45,11 +45,31 @@ pub const BRIDGE_MAGIC: u32 = 0x4642_4142;
 /// rack positions. A multi-stage built-in's internal levels cannot be derived
 /// from the strip's endpoints, so an editor that meters its own chain needs
 /// them published. Built-ins with no rack publish zeros.
-pub const BRIDGE_LAYOUT_VERSION: u32 = 9;
+/// v10 adds the stereo-image block: output correlation overall and per band,
+/// band levels, and a decimated vectorscope, with its own publish sequence.
+/// None of it can be recovered from the strip's peak/RMS words.
+/// v11 adds the per-pad level block: a drum sampler's pads each meter what
+/// they are playing, which no strip-level word can show.
+/// v12 adds the per-band reduction block: a multiband compressor takes a
+/// different amount off each band, and the single reduction word can only
+/// carry one of them.
+pub const BRIDGE_LAYOUT_VERSION: u32 = 12;
 
 /// Rack positions a built-in may publish per-stage telemetry for. Fixed so the
 /// shared region stays a plain-old-data layout.
 pub const BUILTIN_RACK_SLOTS: usize = 6;
+
+/// Bands a built-in may publish a stereo image for (Imager's crossover bands).
+pub const IMAGE_BANDS: usize = 4;
+/// Left/right pairs in one published vectorscope frame.
+pub const IMAGE_SCOPE_POINTS: usize = 128;
+
+/// Pads a built-in may publish a level for (Drum Sampler's 16).
+pub const BUILTIN_PAD_SLOTS: usize = 16;
+
+/// Bands a built-in may publish a gain reduction for (the Compressor's
+/// multiband crossover bands).
+pub const REDUCTION_BANDS: usize = 4;
 
 /// `transport_flags` bits.
 pub const TRANSPORT_FLAG_PLAYING: u32 = 1 << 0;
@@ -76,6 +96,34 @@ pub struct BuiltinMeterFrame {
     pub slot_in_peak: [f32; BUILTIN_RACK_SLOTS],
     /// Level leaving each rack position, after that stage's own output trim.
     pub slot_out_peak: [f32; BUILTIN_RACK_SLOTS],
+}
+
+/// One stereo-image frame from a built-in that analyses its own output image.
+/// Published at the analyser rate (~30 Hz) under its own sequence, like the
+/// spectrum — a scope frame is a window of samples, not a per-block level.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StereoImageFrame {
+    /// Output correlation, −1 (one side inverted) .. +1 (mono). `0.0` while
+    /// the output is too quiet to measure.
+    pub correlation: f32,
+    /// The same, per band, lowest band first.
+    pub band_correlation: [f32; IMAGE_BANDS],
+    /// Output RMS per band, linear, so a reader can tell an empty band's `0.0`
+    /// correlation from a measured one.
+    pub band_level: [f32; IMAGE_BANDS],
+    /// Decimated output samples as interleaved left/right pairs, oldest first.
+    pub scope: [f32; IMAGE_SCOPE_POINTS * 2],
+}
+
+impl Default for StereoImageFrame {
+    fn default() -> Self {
+        Self {
+            correlation: 0.0,
+            band_correlation: [0.0; IMAGE_BANDS],
+            band_level: [0.0; IMAGE_BANDS],
+            scope: [0.0; IMAGE_SCOPE_POINTS * 2],
+        }
+    }
 }
 
 /// Maximum block size (frames) the region can carry. The engine's actual block
@@ -574,6 +622,34 @@ pub struct SharedAudioBridge {
     pub spectrum_seq: AtomicU32,
     pub _pad_spectrum: AtomicU32,
 
+    // --- Stereo image (host → engine) ---
+    /// [`StereoImageFrame`] fields, `f32` bits, published at the analyser rate
+    /// by a built-in that measures its own image. See [`Self::store_stereo_image`].
+    pub image_correlation: AtomicU32,
+    pub image_band_correlation: [AtomicU32; IMAGE_BANDS],
+    pub image_band_level: [AtomicU32; IMAGE_BANDS],
+    pub image_scope: [AtomicU32; IMAGE_SCOPE_POINTS * 2],
+    /// Bumped after each published frame; `0` until the first one, which is
+    /// how a reader tells "this insert measures no image" from silence.
+    pub image_seq: AtomicU32,
+    pub _pad_image: AtomicU32,
+
+    // --- Per-pad levels (host → engine) ---
+    /// Held peak of each pad's output, linear, `f32` bits. Published per
+    /// block by a built-in with pads; see [`Self::store_pad_levels`].
+    pub pad_levels: [AtomicU32; BUILTIN_PAD_SLOTS],
+    /// Bumped after each published set; `0` until the first one.
+    pub pad_levels_seq: AtomicU32,
+    pub _pad_pad_levels: AtomicU32,
+
+    // --- Per-band gain reduction (host → engine) ---
+    /// Decibels each band is taking off, positive, `f32` bits. Published per
+    /// block by a multiband built-in; see [`Self::store_band_reduction`].
+    pub band_reduction: [AtomicU32; REDUCTION_BANDS],
+    /// Bumped after each published set; `0` until the first one.
+    pub band_reduction_seq: AtomicU32,
+    pub _pad_band_reduction: AtomicU32,
+
     // --- Lock-free rings (engine → host) ---
     pub midi: SpscRing<SharedMidiEvent, MIDI_RING_CAP>,
     pub params: SpscRing<SharedParamEvent, PARAM_RING_CAP>,
@@ -769,6 +845,94 @@ impl SharedAudioBridge {
             *out = f32::from_bits(slot.load(Ordering::Relaxed));
         }
         Some((seq, bins))
+    }
+
+    /// Publish one stereo-image frame (host producer, ~30 Hz). Not a seqlock,
+    /// for the reason [`Self::store_spectrum`] gives: a torn frame is one
+    /// analysis mixed with the next, and only ever drives a display.
+    pub fn store_stereo_image(&self, frame: &StereoImageFrame) {
+        self.image_correlation
+            .store(frame.correlation.to_bits(), Ordering::Relaxed);
+        for (slot, value) in self
+            .image_band_correlation
+            .iter()
+            .zip(frame.band_correlation)
+        {
+            slot.store(value.to_bits(), Ordering::Relaxed);
+        }
+        for (slot, value) in self.image_band_level.iter().zip(frame.band_level) {
+            slot.store(value.to_bits(), Ordering::Relaxed);
+        }
+        for (slot, value) in self.image_scope.iter().zip(frame.scope) {
+            slot.store(value.to_bits(), Ordering::Relaxed);
+        }
+        // Release: a reader that observes the new sequence also sees the frame.
+        self.image_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// Read the latest stereo-image frame with the sequence it was published
+    /// under. `None` until the host has published one.
+    pub fn stereo_image(&self) -> Option<(u32, StereoImageFrame)> {
+        let seq = self.image_seq.load(Ordering::Acquire);
+        if seq == 0 {
+            return None;
+        }
+        let load = |slot: &AtomicU32| f32::from_bits(slot.load(Ordering::Relaxed));
+        Some((
+            seq,
+            StereoImageFrame {
+                correlation: load(&self.image_correlation),
+                band_correlation: std::array::from_fn(|i| load(&self.image_band_correlation[i])),
+                band_level: std::array::from_fn(|i| load(&self.image_band_level[i])),
+                scope: std::array::from_fn(|i| load(&self.image_scope[i])),
+            },
+        ))
+    }
+
+    /// Publish one set of per-pad levels (host producer, per block). Not a
+    /// seqlock for the same reason [`Self::store_spectrum`] gives.
+    pub fn store_pad_levels(&self, levels: &[f32; BUILTIN_PAD_SLOTS]) {
+        for (slot, value) in self.pad_levels.iter().zip(levels) {
+            slot.store(value.to_bits(), Ordering::Relaxed);
+        }
+        // Release: a reader that observes the new sequence also sees the levels.
+        self.pad_levels_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// Read the latest per-pad levels with their sequence. `None` until the
+    /// host has published one — an insert without pads never does.
+    pub fn pad_levels(&self) -> Option<(u32, [f32; BUILTIN_PAD_SLOTS])> {
+        let seq = self.pad_levels_seq.load(Ordering::Acquire);
+        if seq == 0 {
+            return None;
+        }
+        Some((
+            seq,
+            std::array::from_fn(|i| f32::from_bits(self.pad_levels[i].load(Ordering::Relaxed))),
+        ))
+    }
+
+    /// Publish one set of per-band reductions (host producer, per block). Not
+    /// a seqlock for the same reason [`Self::store_spectrum`] gives.
+    pub fn store_band_reduction(&self, reduction_db: &[f32; REDUCTION_BANDS]) {
+        for (slot, value) in self.band_reduction.iter().zip(reduction_db) {
+            slot.store(value.to_bits(), Ordering::Relaxed);
+        }
+        // Release: a reader that observes the new sequence also sees the values.
+        self.band_reduction_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// Read the latest per-band reductions with their sequence. `None` until
+    /// the host has published one — an insert without bands never does.
+    pub fn band_reduction(&self) -> Option<(u32, [f32; REDUCTION_BANDS])> {
+        let seq = self.band_reduction_seq.load(Ordering::Acquire);
+        if seq == 0 {
+            return None;
+        }
+        Some((
+            seq,
+            std::array::from_fn(|i| f32::from_bits(self.band_reduction[i].load(Ordering::Relaxed))),
+        ))
     }
 
     /// Publish the transport ProcessContext for the next block (engine side).
@@ -1714,6 +1878,63 @@ mod tests {
         };
         bridge.store_builtin_meters(&racked);
         assert_eq!(bridge.builtin_meters(), Some(racked));
+    }
+
+    /// An insert that measures no image never publishes one, and a published
+    /// frame comes back field for field under a rising sequence.
+    #[test]
+    fn stereo_image_is_absent_until_published_then_round_trips() {
+        let region = SharedAudioRegion::new_in_process();
+        let bridge = region.bridge();
+        assert!(bridge.stereo_image().is_none());
+
+        let mut frame = StereoImageFrame {
+            correlation: -0.25,
+            band_correlation: [1.0, 0.5, 0.0, -1.0],
+            band_level: [0.1, 0.2, 0.3, 0.4],
+            ..StereoImageFrame::default()
+        };
+        frame.scope[0] = 0.75;
+        frame.scope[IMAGE_SCOPE_POINTS * 2 - 1] = -0.5;
+        bridge.store_stereo_image(&frame);
+        let (first, read) = bridge.stereo_image().expect("published");
+        assert_eq!(read, frame);
+
+        bridge.store_stereo_image(&StereoImageFrame::default());
+        let (second, read) = bridge.stereo_image().expect("published");
+        assert!(second > first);
+        assert_eq!(read, StereoImageFrame::default());
+    }
+
+    #[test]
+    fn band_reduction_is_absent_until_published_then_round_trips() {
+        let region = SharedAudioRegion::new_in_process();
+        let bridge = region.bridge();
+        assert!(bridge.band_reduction().is_none());
+        bridge.store_band_reduction(&[6.5, 0.0, 1.25, 0.0]);
+        let (first, read) = bridge.band_reduction().expect("published");
+        assert_eq!(read, [6.5, 0.0, 1.25, 0.0]);
+        bridge.store_band_reduction(&[0.0; REDUCTION_BANDS]);
+        let (second, read) = bridge.band_reduction().expect("published");
+        assert!(second > first);
+        assert_eq!(read, [0.0; REDUCTION_BANDS]);
+    }
+
+    #[test]
+    fn pad_levels_are_absent_until_published_then_round_trip() {
+        let region = SharedAudioRegion::new_in_process();
+        let bridge = region.bridge();
+        assert!(bridge.pad_levels().is_none());
+        let mut levels = [0.0f32; BUILTIN_PAD_SLOTS];
+        levels[0] = 0.5;
+        levels[BUILTIN_PAD_SLOTS - 1] = 0.125;
+        bridge.store_pad_levels(&levels);
+        let (first, read) = bridge.pad_levels().expect("published");
+        assert_eq!(read, levels);
+        bridge.store_pad_levels(&[0.0; BUILTIN_PAD_SLOTS]);
+        let (second, read) = bridge.pad_levels().expect("published");
+        assert!(second > first);
+        assert_eq!(read, [0.0; BUILTIN_PAD_SLOTS]);
     }
 
     #[test]

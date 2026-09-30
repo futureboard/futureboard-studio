@@ -227,6 +227,6 @@ mod tests {
             m.editor_url("builtin:equz8").as_deref(),
             Some("mikoplugin://equz8/index.html")
         );
-        assert!(m.editor_url("builtin:compresser").is_none());
+        assert!(m.editor_url("builtin:c1073").is_none());
     }
 }

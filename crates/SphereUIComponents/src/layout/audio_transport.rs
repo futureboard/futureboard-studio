@@ -14,7 +14,9 @@ use crate::components::timeline::timeline_state::{
 };
 use crate::components::timeline::Timeline;
 
-use super::engine_snapshot::{build_engine_project_snapshot, log_engine_sync_snapshot};
+use super::engine_snapshot::{
+    build_engine_project_snapshot, log_engine_sync_snapshot, volume_norm_to_linear,
+};
 use super::helpers::{smooth_meter_value, update_meter_clip, update_meter_hold};
 use super::transport_freeze_debug::{self, PlayWatchdog};
 use super::{ContextMenuRequest, ContextMenuTarget, ContextTarget, OpenPopover, StudioLayout};
@@ -1059,6 +1061,14 @@ impl StudioLayout {
             if playhead_moved {
                 let docked = self.piano_roll.clone();
                 let floating = self.piano_roll_floating.clone();
+                // Continuous scrolling, for a roll that is on screen: a hidden
+                // one repainting every frame would be all cost.
+                if self.docked_midi_editor_visible() {
+                    crate::components::piano_roll::PianoRoll::follow_playhead(&docked, cx);
+                }
+                if self.midi_editor.window.is_some() {
+                    crate::components::piano_roll::PianoRoll::follow_playhead(&floating, cx);
+                }
                 crate::components::piano_roll::PianoRoll::publish_playhead(&docked, cx);
                 crate::components::piano_roll::PianoRoll::publish_playhead(&floating, cx);
             }
@@ -1074,6 +1084,9 @@ impl StudioLayout {
             // dimmer, and only the overlay needs to hear about it.
             let docked = self.piano_roll.clone();
             let floating = self.piano_roll_floating.clone();
+            // Stopped: a pause from a user scroll ends with the take.
+            crate::components::piano_roll::PianoRoll::follow_playhead(&docked, cx);
+            crate::components::piano_roll::PianoRoll::follow_playhead(&floating, cx);
             crate::components::piano_roll::PianoRoll::publish_playhead(&docked, cx);
             crate::components::piano_roll::PianoRoll::publish_playhead(&floating, cx);
             self.tick_audio_editor(false, cx);
@@ -1653,6 +1666,7 @@ impl StudioLayout {
             "audio_load_project_count",
             self.audio_bridge.audio_load_project_count,
         );
+        let sent_controls = SentTrackControls::of(&snapshot);
         let owner = cx.entity().clone();
         cx.spawn(async move |_this, cx| {
             // On the background executor, and awaited there.
@@ -1682,7 +1696,13 @@ impl StudioLayout {
                 })
                 .await;
             let _ = owner.update(cx, |this, cx| {
-                this.complete_audio_project_sync(cx, result, signature, sync_generation);
+                this.complete_audio_project_sync(
+                    cx,
+                    result,
+                    signature,
+                    sync_generation,
+                    sent_controls,
+                );
             });
             if !crate::shutdown::ShutdownState::global().is_shutting_down() {
                 let studio_id = owner.entity_id();
@@ -1692,12 +1712,47 @@ impl StudioLayout {
         .detach();
     }
 
+    /// Re-send every live channel control that changed while a sync was in
+    /// flight. See [`SentTrackControls`].
+    fn reconcile_live_track_controls(&self, sent: &SentTrackControls, cx: &App) {
+        let Some(engine) = self.audio_bridge.engine.as_ref() else {
+            return;
+        };
+        let state = &self.timeline.read(cx).state;
+        let sent: std::collections::HashMap<&str, SentControl> = sent
+            .0
+            .iter()
+            .map(|(id, control)| (id.as_str(), *control))
+            .collect();
+        for track in &state.tracks {
+            // A track the snapshot did not carry is new since; the next sync
+            // carries all of it.
+            let Some(was) = sent.get(track.id.as_str()) else {
+                continue;
+            };
+            let now = SentControl::of_track(state, track);
+            if now.muted != was.muted {
+                let _ = engine.update_track_param(&track.id, "muted", f64::from(now.muted as u8));
+            }
+            if now.solo != was.solo {
+                let _ = engine.update_track_param(&track.id, "solo", f64::from(now.solo as u8));
+            }
+            if (now.pan - was.pan).abs() > 1.0e-6 {
+                let _ = engine.update_track_param(&track.id, "pan", f64::from(now.pan));
+            }
+            if (now.volume - was.volume).abs() > 1.0e-6 {
+                let _ = engine.update_track_param(&track.id, "volume", f64::from(now.volume));
+            }
+        }
+    }
+
     pub(super) fn complete_audio_project_sync(
         &mut self,
         cx: &mut Context<Self>,
         result: Result<(), DirectAudio::SphereAudioError>,
         signature: String,
         generation: u64,
+        sent_controls: SentTrackControls,
     ) {
         // Freshness guard: ignore a completion that belongs to a superseded sync.
         // The watchdog timeout (`timeout_audio_project_sync`) bumps the generation
@@ -1740,6 +1795,7 @@ impl StudioLayout {
                     "native-sync",
                     Some("Engine graph ready".to_string()),
                 );
+                self.reconcile_live_track_controls(&sent_controls, cx);
             }
             Err(error) => {
                 self.audio_bridge.sync_failed_count =
@@ -2170,6 +2226,22 @@ impl StudioLayout {
             if !enabled_outputs.contains(device_id) {
                 continue;
             }
+            // The track's bank and program lead its part, at the playhead: a
+            // module keeps whatever patch it was left on, so it is set up on
+            // every start, not only when the selection changed.
+            for message in track_program_messages(track) {
+                events.push(sphere_midi_service::HardwareMidiEvent {
+                    device_id: device_id.clone(),
+                    delay_seconds: 0.0,
+                    beat: playhead_beats.max(0.0) as f64,
+                    absolute_sample: state.tempo_map.samples_at_beat(
+                        playhead_beats.max(0.0) as f64,
+                        base_bpm,
+                        sample_rate as f64,
+                    ),
+                    message,
+                });
+            }
             let output_mode = track.routing.output_channel_mode();
             for clip in &track.clips {
                 if clip.muted || clip.start_beat + clip.duration_beats <= playhead_beats {
@@ -2264,6 +2336,39 @@ impl StudioLayout {
         }
 
         events
+    }
+
+    /// A track's program was chosen. A MIDI track on a hardware route has no
+    /// engine instrument to receive it, so it goes to the device now, from a
+    /// thread of its own (opening a port can block). While hardware playback
+    /// runs the port is held, and the selection goes out with the next start.
+    pub(super) fn send_track_program_to_hardware(
+        &mut self,
+        track_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let (device_id, messages) = {
+            let timeline = self.timeline.read(cx);
+            let Some(track) = timeline.state.find_track(track_id) else {
+                return;
+            };
+            let TrackOutputRouting::HardwareOutput { device_id, .. } = &track.routing.output else {
+                return;
+            };
+            (device_id.clone(), track_program_messages(track))
+        };
+        if messages.is_empty() {
+            return;
+        }
+        let _ = std::thread::Builder::new()
+            .name("midi-program-send".to_string())
+            .spawn(move || {
+                if !sphere_midi_service::send_midi_output_now(&device_id, &messages) {
+                    eprintln!(
+                        "[midi-output] program not sent device={device_id}: port busy or missing"
+                    );
+                }
+            });
     }
 
     pub(super) fn current_audio_sample_rate(&self) -> u32 {
@@ -3798,6 +3903,51 @@ impl StudioLayout {
         cx.notify();
     }
 
+    /// Change the meter in force at the playhead to `num/den` — the one the
+    /// transport readout shows. It edits the marker governing the playhead,
+    /// or the project's own meter when there is none yet, rather than adding a
+    /// marker: picking 3/4 from the readout means "this song is in 3/4".
+    pub(super) fn set_time_signature_at_playhead(
+        &mut self,
+        num: u16,
+        den: u16,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::timeline::timeline_state::{
+            TS_ALLOWED_DENOMINATORS, normalize_time_signature_denominator,
+        };
+        let den = normalize_time_signature_denominator(den);
+        if !(1..=64).contains(&num) || !TS_ALLOWED_DENOMINATORS.contains(&den) {
+            return;
+        }
+        let governing = {
+            let state = &self.timeline.read(cx).state;
+            let pt = state.time_signature_at_playhead();
+            if pt.numerator == num && pt.denominator == den {
+                return;
+            }
+            state
+                .time_signature_map
+                .points
+                .iter()
+                .any(|p| p.id == pt.id)
+                .then_some(pt.id)
+        };
+        self.edit_time_signature_state(
+            "Set Time Signature",
+            |timeline| match &governing {
+                Some(id) => {
+                    timeline.state.update_time_signature_point(id, num, den);
+                }
+                None => {
+                    timeline.state.add_time_signature_point(0.0, num, den);
+                }
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
     pub(super) fn commit_ts_edit(&mut self, cx: &mut Context<Self>) {
         if !self.tempo_edit.ts_editing {
             return;
@@ -4451,5 +4601,85 @@ mod stop_lifecycle_tests {
             },
             false
         ));
+    }
+}
+
+/// A track's bank/program selection as raw MIDI on its channel, in sending
+/// order. Empty when it chooses no program.
+fn track_program_messages(
+    track: &crate::components::timeline::timeline_state::TrackState,
+) -> Vec<Vec<u8>> {
+    let channel = track.routing.midi_channel.unwrap_or(1).clamp(1, 16) - 1;
+    track
+        .routing
+        .program
+        .messages()
+        .map(|message| {
+            let (bytes, len) = message.bytes(channel);
+            bytes[..len].to_vec()
+        })
+        .collect()
+}
+
+/// The live channel controls a project sync carried to the engine.
+///
+/// Mute, solo, pan and volume change live: a command to the running graph and
+/// no rebuild. One made while a sync is building its graph reaches the graph
+/// that sync is about to replace, and the sync then installs the value from
+/// when its snapshot was taken — so the engine plays that while the mixer
+/// shows the newer one. A solo cleared in that window stayed in effect,
+/// silencing every other channel with nothing on screen soloed, until the
+/// next solo made the mixer and the engine agree again. Opening a project
+/// saved with a solo and clearing it straight away is the easy way into it.
+///
+/// Kept per sync and compared with the mixer when the sync lands; anything that
+/// moved since is sent again, after the new graph.
+pub(super) struct SentTrackControls(Vec<(String, SentControl)>);
+
+#[derive(Clone, Copy, PartialEq)]
+struct SentControl {
+    muted: bool,
+    solo: bool,
+    pan: f32,
+    /// Linear gain, as the engine receives it.
+    volume: f32,
+}
+
+impl SentControl {
+    /// A channel's controls exactly as `build_engine_project_snapshot` sends
+    /// them.
+    fn of_track(
+        state: &crate::components::timeline::timeline_state::TimelineState,
+        track: &crate::components::timeline::timeline_state::TrackState,
+    ) -> Self {
+        Self {
+            muted: track.muted,
+            solo: track.solo,
+            pan: track.pan.clamp(-1.0, 1.0),
+            volume: volume_norm_to_linear(state.display_track_volume(track)),
+        }
+    }
+}
+
+impl SentTrackControls {
+    fn of(snapshot: &DirectAudio::types::EngineProjectSnapshot) -> Self {
+        Self(
+            snapshot
+                .tracks
+                .iter()
+                .filter(|track| track.track_type != "master")
+                .map(|track| {
+                    (
+                        track.id.clone(),
+                        SentControl {
+                            muted: track.muted,
+                            solo: track.solo,
+                            pan: track.pan,
+                            volume: track.volume,
+                        },
+                    )
+                })
+                .collect(),
+        )
     }
 }

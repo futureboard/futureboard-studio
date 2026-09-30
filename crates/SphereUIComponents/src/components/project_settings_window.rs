@@ -89,6 +89,8 @@ pub struct ProjectSettingsSnapshot {
     pub time_display_format: TimeDisplayFormat,
     /// Frame rate Timecode is counted at.
     pub timecode_rate: TimecodeRate,
+    /// Stereo, binaural, or a speaker layout, and the room it is heard in.
+    pub spatial_mix: crate::components::timeline::timeline_state::SpatialMix,
     pub track_count: usize,
 }
 
@@ -107,6 +109,7 @@ impl Default for ProjectSettingsSnapshot {
             engine_sample_rate: None,
             time_display_format: TimeDisplayFormat::default(),
             timecode_rate: TimecodeRate::default(),
+            spatial_mix: Default::default(),
             track_count: 0,
         }
     }
@@ -127,6 +130,9 @@ pub struct ProjectSettingsCallbacks {
     pub on_set_sample_rate: Arc<dyn Fn(u32, &mut App) + Send + Sync>,
     pub on_set_time_display_format: Arc<dyn Fn(TimeDisplayFormat, &mut App) + Send + Sync>,
     pub on_set_timecode_rate: Arc<dyn Fn(TimecodeRate, &mut App) + Send + Sync>,
+    pub on_set_spatial_mix: Arc<
+        dyn Fn(crate::components::timeline::timeline_state::SpatialMix, &mut App) + Send + Sync,
+    >,
     pub on_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
 }
 
@@ -136,6 +142,7 @@ enum OpenMenu {
     TimeSignature,
     KeyScale,
     TimecodeRate,
+    SpatialFormat,
 }
 
 pub struct ProjectSettingsWindow {
@@ -224,7 +231,8 @@ impl Render for ProjectSettingsWindow {
                     .child(self.tempo_section(&snapshot, cx))
                     .child(self.key_section(&snapshot, cx))
                     .child(self.timebase_section(&snapshot, cx))
-                    .child(self.audio_section(&snapshot, cx)),
+                    .child(self.audio_section(&snapshot, cx))
+                    .child(self.spatial_section(&snapshot, cx)),
             )
             .child(footer(self.callbacks.on_close.clone()));
 
@@ -517,6 +525,160 @@ impl ProjectSettingsWindow {
             }),
             frame_rate,
         ))
+    }
+
+    /// Spatial — what the mix is rendered as. Stereo keeps the pan controls;
+    /// binaural and the speaker layouts place every channel in a square room
+    /// around the listener instead, with the Mixer's room panner.
+    fn spatial_section(
+        &self,
+        snapshot: &ProjectSettingsSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        use solfege_spatialaudio::{MonitorFold, SpatialFormat};
+        let mix = snapshot.spatial_mix;
+        let format_label = |format: SpatialFormat| match format {
+            SpatialFormat::Stereo => "Stereo".to_string(),
+            SpatialFormat::Binaural => "Binaural (headphones)".to_string(),
+            SpatialFormat::Surround(layout) => format!("{} surround", layout.name()),
+        };
+        let format = self.dropdown(
+            "project-settings-spatial-format",
+            OpenMenu::SpatialFormat,
+            Some(mix.format.token()),
+            "-",
+            SpatialFormat::CHOICES
+                .iter()
+                .map(|format| SelectOption::new(format.token().to_string(), format_label(*format)))
+                .collect(),
+            false,
+            move |value, this, cx| {
+                if let Some(format) = SpatialFormat::from_token(value) {
+                    let mut next = this.snapshot.spatial_mix;
+                    next.format = format;
+                    (this.callbacks.on_set_spatial_mix)(next, cx);
+                }
+            },
+            cx,
+        );
+
+        let on_mix = self.callbacks.on_set_spatial_mix.clone();
+        let sizes: [(u32, &'static str); 4] =
+            [(2, "Small"), (3, "Medium"), (6, "Large"), (10, "Hall")];
+        let size_now = sizes
+            .iter()
+            .map(|(m, _)| *m)
+            .min_by(|a, b| {
+                (*a as f32 - mix.room.half_size_m)
+                    .abs()
+                    .total_cmp(&(*b as f32 - mix.room.half_size_m).abs())
+            })
+            .unwrap_or(3);
+        let size_row = {
+            let on_mix = on_mix.clone();
+            settings_segmented(
+                "project-settings-spatial-room",
+                &sizes,
+                size_now,
+                Arc::new(move |metres: u32, _window, cx| {
+                    let mut next = mix;
+                    next.room.half_size_m = metres as f32;
+                    on_mix(next, cx);
+                }),
+            )
+        };
+        // Reflections in tenths, so the segmented control compares exactly.
+        let reflections: [(u32, &'static str); 4] =
+            [(0, "Off"), (2, "Low"), (4, "Medium"), (6, "High")];
+        let reflections_now = reflections
+            .iter()
+            .map(|(t, _)| *t)
+            .min_by(|a, b| {
+                (*a as f32 / 10.0 - mix.room.reflections)
+                    .abs()
+                    .total_cmp(&(*b as f32 / 10.0 - mix.room.reflections).abs())
+            })
+            .unwrap_or(4);
+        let reflections_row = {
+            let on_mix = on_mix.clone();
+            settings_segmented(
+                "project-settings-spatial-reflections",
+                &reflections,
+                reflections_now,
+                Arc::new(move |tenths: u32, _window, cx| {
+                    let mut next = mix;
+                    next.room.reflections = tenths as f32 / 10.0;
+                    on_mix(next, cx);
+                }),
+            )
+        };
+        let folds: [(MonitorFold, &'static str); 2] = [
+            (MonitorFold::Binaural, "Headphones"),
+            (MonitorFold::Stereo, "Stereo speakers"),
+        ];
+        let fold_row = {
+            let on_mix = on_mix.clone();
+            settings_segmented(
+                "project-settings-spatial-fold",
+                &folds,
+                mix.fold,
+                Arc::new(move |fold: MonitorFold, _window, cx| {
+                    let mut next = mix;
+                    next.fold = fold;
+                    on_mix(next, cx);
+                }),
+            )
+        };
+
+        let hint = match mix.format {
+            SpatialFormat::Stereo => "Channels pan left and right.",
+            SpatialFormat::Binaural => {
+                "Every channel is placed in a room around the listener, for headphones. \
+                 The Mixer's pan becomes a room panner."
+            }
+            SpatialFormat::Surround(_) => {
+                "Every channel is placed in a room and panned over the speakers. \
+                 The Mixer's pan becomes a room panner."
+            }
+        };
+        let is_surround = matches!(mix.format, SpatialFormat::Surround(_));
+        section("Spatial", hint)
+            .child(settings_daw_row_with_description("Format", None, format))
+            .when(mix.is_spatial(), |section| {
+                section
+                    .child(settings_daw_row_with_description(
+                        "Room",
+                        Some(format!(
+                            "Walls {:.0} m from the listener",
+                            mix.room.half_size_m
+                        )),
+                        size_row,
+                    ))
+                    .child(settings_daw_row_with_description(
+                        "Reflections",
+                        Some(
+                            if is_surround {
+                                "When heard on headphones"
+                            } else {
+                                "What puts the sound outside your head"
+                            }
+                            .to_string(),
+                        ),
+                        reflections_row,
+                    ))
+            })
+            .when(is_surround, |section| {
+                section.child(settings_daw_row_with_description(
+                    "On two outputs",
+                    Some(
+                        "Used when the device has fewer outputs than the layout, or the \
+                         Control Room is monitoring. Master writing to the device directly \
+                         sends every speaker to its own output."
+                            .to_string(),
+                    ),
+                    fold_row,
+                ))
+            })
     }
 
     fn audio_section(

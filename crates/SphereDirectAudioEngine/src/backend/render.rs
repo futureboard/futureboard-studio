@@ -660,6 +660,7 @@ pub fn drain_commands(
                 // every insert used to happen right here, on the audio thread,
                 // in the same callback as Play.
                 runtime.bridge_editor_active = old.bridge_editor_active.clone();
+                runtime.inherit_midi_programs_sent(&old);
                 // The panic the all_notes_off above pushed into the (preserved)
                 // sinks still needs flushing through the new graph.
                 // Keep the live master-fader ramp continuous across media/control
@@ -707,6 +708,14 @@ pub fn drain_commands(
                         "[AudioEngineState] old={old_state:?} new={new_state:?} source=graph_swap was_playing={was_playing}"
                     );
                 }
+            }
+            EngineCommand::ReplaceMidi(mut next) => {
+                // A note edit: only the schedule changes, so nothing is cut
+                // and nothing restarts. The replaced schedule leaves through
+                // the graveyard.
+                let pos = shared.position_samples.load(Ordering::Relaxed);
+                runtime.replace_midi_schedule(&mut next, pos);
+                crate::graveyard::retire_midi(next);
             }
             EngineCommand::SetTestTone { enabled, frequency } => {
                 local.osc_on = enabled;
@@ -918,6 +927,11 @@ pub fn drain_commands(
             EngineCommand::SetMonitorOutput { target } => {
                 runtime.monitor.output = target;
             }
+            EngineCommand::SetListeningSimulation { settings } => {
+                if let Some(simulator) = runtime.monitor.simulator.as_deref_mut() {
+                    simulator.configure(settings);
+                }
+            }
             // Plain integers: applying ownership on this thread stores a small
             // enum and two channel pairs — no lookup, no allocation.
             EngineCommand::SetHardwareOutputOwnership {
@@ -930,6 +944,12 @@ pub fn drain_commands(
                 if let Some((left, _right)) = monitor {
                     runtime.monitor.output.left_channel = left;
                 }
+            }
+            EngineCommand::SetTrackSpatial {
+                track_index,
+                params,
+            } => {
+                runtime.update_track_spatial(track_index, params);
             }
             EngineCommand::SetTrackListen {
                 track_index,
@@ -1023,8 +1043,19 @@ pub fn drain_commands(
             EngineCommand::SetJamMultitrackPairs { pairs } => {
                 runtime.apply_jam_multitrack_pairs(&pairs);
             }
+            EngineCommand::SetRenderCapture(capture) => {
+                // Only a reference is dropped here: the control thread holds
+                // its own until this command has been drained.
+                runtime.render_capture = capture;
+            }
             EngineCommand::SetTrackPreviewMode { track_id, value } => {
                 runtime.update_track_preview_mode(&track_id, RuntimePreviewMode::from_code(value));
+            }
+            EngineCommand::SetSoundfontChannels {
+                track_index,
+                channels,
+            } => {
+                runtime.update_soundfont_channels(track_index, &channels);
             }
             EngineCommand::SetInsertParam {
                 track_id,
@@ -1338,6 +1369,8 @@ fn fill_output_f32_inner(
 
     let mut frames = 0u64;
     runtime.begin_meter_block();
+    // Bank/program selections not yet sent, playing or not.
+    runtime.flush_midi_programs();
 
     let mut end_loop_midi_reset = None;
     if transport_playing {
@@ -1415,7 +1448,13 @@ fn fill_output_f32_inner(
             } else {
                 None
             };
-            render_project_block_interleaved_with_inputs(
+            // A realtime render records this block while the transport plays:
+            // the tracks are staged inside the kernel, the master right after.
+            let capture_open = transport_playing
+                && runtime.render_capture.as_deref().is_some_and(|capture| {
+                    capture.begin_block(base_sample, frames_in_block as usize)
+                });
+            let rendered = render_project_block_interleaved_with_inputs(
                 runtime,
                 base_sample,
                 master_vol,
@@ -1427,7 +1466,17 @@ fn fill_output_f32_inner(
                 loop_bounds,
                 live_input,
                 Some(&shared.jam_bus),
-            )
+            );
+            // The graph's master after the master fader: what an offline
+            // mixdown writes. Click, test tone, audition and Control Room are
+            // added below and stay out of it.
+            if capture_open {
+                if let Some(capture) = runtime.render_capture.as_deref() {
+                    capture.stage_master_interleaved(data, channels, rendered as usize);
+                    capture.commit_block();
+                }
+            }
+            rendered
         };
         if !local.render_path_logged {
             local.render_path_logged = true;
@@ -1557,6 +1606,14 @@ fn fill_output_f32_inner(
         }
     }
 
+    // Visualizer tap (Window > Visualizer), at the same point and for the same
+    // reason: the visualizers read the mix, not the monitoring chain. Atomics
+    // into a preallocated ring; one relaxed load while no visualizer is open.
+    let visualizers = crate::visualizer_tap::visualizer_tap();
+    if visualizers.is_listening() {
+        visualizers.write_interleaved(data, channels, runtime.sample_rate);
+    }
+
     // The click the stream was not meant to carry. It still reaches the device
     // and the Control Room below; it simply arrives after the tap has taken its
     // copy of the mix.
@@ -1651,7 +1708,7 @@ fn fill_output_f32_inner(
             .position_samples
             .store(next_position, Ordering::Relaxed);
         if let Some(reset_sample) = end_loop_midi_reset {
-            runtime.reset_midi_playback(reset_sample);
+            runtime.loop_wrap_midi_playback(reset_sample, 0);
             local.reset_metronome_schedule(reset_sample, runtime.sample_rate);
         }
     }
@@ -1866,6 +1923,19 @@ pub(crate) fn run_control_room(
             None,
             transport,
         );
+    }
+
+    // ── 2b. Listening simulation (Virtual Speaker) ──────────────────────────
+    {
+        let monitor = &mut runtime.monitor;
+        if let Some(simulator) = monitor.simulator.as_deref_mut() {
+            if simulator.is_audible() {
+                simulator.process(
+                    &mut monitor.source_l[..frames],
+                    &mut monitor.source_r[..frames],
+                );
+            }
+        }
     }
 
     // ── 3. Monitor control processor (mono → dim → gain → mute) ─────────────

@@ -545,9 +545,10 @@ impl Render for PianoRoll {
             }
         }
 
-        // Toolbar is always shown; the body shows a hint when no MIDI clip is
-        // selected.
+        // Toolbar and footer are always shown; the body shows a hint when no
+        // MIDI clip is selected.
         let toolbar = self.render_toolbar(cx, clip_id.as_deref());
+        let footer = self.render_footer(cx, clip_id.as_deref());
 
         let body: gpui::AnyElement = match clip_id {
             Some(cid) => self.render_body(cx, &cid).into_any_element(),
@@ -556,7 +557,7 @@ impl Render for PianoRoll {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(11.0))
+                .text_size(px(crate::theme::typography::UI_XS))
                 .text_color(Colors::text_muted())
                 .child("Select or double-click a MIDI clip to edit")
                 .into_any_element(),
@@ -591,157 +592,235 @@ impl Render for PianoRoll {
             .on_scroll_wheel(cx.listener(Self::on_wheel))
             .child(toolbar)
             .child(body)
+            .child(footer)
     }
 }
 
+/// One row of an editor dropdown. A check marks the current choice — glyph
+/// and text weight, not colour alone. The caller attaches the click.
+fn menu_row(
+    id: impl Into<gpui::ElementId>,
+    selected: bool,
+    label: impl IntoElement,
+) -> gpui::Stateful<gpui::Div> {
+    use crate::theme::{radius, size, space, typography};
+    let hover = Colors::composite(Colors::surface_raised(), Colors::state_hover());
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::SNUG))
+        .h(px(size::ROW_DENSE))
+        .px(px(space::SNUG))
+        .rounded(px(radius::inner(radius::SURFACE, space::TIGHT)))
+        .text_size(px(typography::UI_XS))
+        .font_weight(if selected {
+            gpui::FontWeight::SEMIBOLD
+        } else {
+            gpui::FontWeight::NORMAL
+        })
+        .text_color(if selected {
+            Colors::text_primary()
+        } else {
+            Colors::text_secondary()
+        })
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover))
+        .child(
+            div()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .size(px(12.0))
+                .when(selected, |slot| {
+                    slot.child(
+                        svg()
+                            .path(assets::ICON_CHECK_PATH)
+                            .size(px(11.0))
+                            .text_color(Colors::accent_primary()),
+                    )
+                }),
+        )
+        .child(div().flex_1().min_w_0().truncate().child(label))
+}
+
+/// A quiet heading inside a dropdown.
+fn menu_heading(text: &'static str) -> gpui::AnyElement {
+    use crate::theme::{space, typography};
+    div()
+        .px(px(space::SNUG))
+        .pt(px(space::TIGHT))
+        .pb(px(space::HAIR))
+        .text_size(px(typography::DENSE_CAPTION))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(Colors::text_faint())
+        .child(text)
+        .into_any_element()
+}
+
+fn menu_separator() -> gpui::AnyElement {
+    div()
+        .h(px(1.0))
+        .my(px(crate::theme::space::TIGHT))
+        .mx(px(crate::theme::space::SNUG))
+        .bg(Colors::divider())
+        .into_any_element()
+}
+
+/// A small dot saying "this lane has data in the clip".
+fn data_dot() -> gpui::AnyElement {
+    div()
+        .flex_shrink_0()
+        .size(px(5.0))
+        .rounded(px(crate::theme::radius::PILL))
+        .bg(Colors::accent_primary())
+        .into_any_element()
+}
+
 impl PianoRoll {
+    /// A dropdown: a filled trigger that shows the current value, over a
+    /// popover of `rows`. The controller lane's opens upward, because the lane
+    /// sits at the bottom of the editor.
+    #[allow(clippy::too_many_arguments)]
     fn render_select_menu(
         &self,
         menu: PianoSelectMenu,
         id: &'static str,
+        caption: Option<&'static str>,
         label: String,
-        options: Vec<(String, bool, gpui::AnyElement)>,
+        tip: &'static str,
+        panel_w: f32,
+        fill: bool,
+        rows: Vec<gpui::AnyElement>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::Div {
+        use crate::theme::{elevation, motion, radius, size, space, typography};
         let open = self.open_select_menu == Some(menu);
-        let mut dropdown: Option<gpui::AnyElement> = None;
-        if open {
-            let mut panel = div()
+        let upward = menu == PianoSelectMenu::Lane;
+        let dropdown = open.then(|| {
+            let panel = div()
                 .absolute()
-                .top(px(26.0))
+                .when(upward, |p| p.bottom(px(size::DEFAULT + space::HAIR)))
+                .when(!upward, |p| p.top(px(size::DEFAULT + space::HAIR)))
                 .left_0()
-                .w(px(
-                    if menu == PianoSelectMenu::Grid
-                        || menu == PianoSelectMenu::Channel
-                        || menu == PianoSelectMenu::ScaleKind
-                    {
-                        168.0
-                    } else {
-                        148.0
-                    },
-                ))
-                .max_h(px(280.0))
+                .w(px(panel_w))
+                .max_h(px(360.0))
                 .id(("pr-select-menu-scroll", menu as u32))
                 .overflow_y_scroll()
                 .flex()
                 .flex_col()
-                .p(px(3.0))
-                .gap(px(1.0))
-                .rounded(px(crate::theme::radius::CONTROL))
-                .bg(Colors::surface_card())
+                .p(px(space::TIGHT))
+                .rounded(px(radius::SURFACE))
+                .bg(Colors::surface_raised())
                 .border(px(1.0))
                 .border_color(Colors::border_subtle())
-                .shadow_lg()
+                .shadow(elevation::shadow(elevation::OVERLAY))
                 .occlude()
-                .on_mouse_down(MouseButton::Left, |_, _window, cx| cx.stop_propagation());
+                .on_mouse_down(MouseButton::Left, |_, _window, cx| cx.stop_propagation())
+                .children(rows);
+            deferred(
+                panel
+                    .with_animation(
+                        ("pr-select-menu-open", menu as u32),
+                        Animation::new(Duration::from_millis(motion::MICRO_MS))
+                            .with_easing(gpui::ease_out_quint()),
+                        |this, t| this.opacity(t),
+                    )
+                    .into_any_element(),
+            )
+            .with_priority(PIANO_ROLL_MENU_PRIORITY)
+            .into_any_element()
+        });
 
-            for (i, (_text, selected, action)) in options.into_iter().enumerate() {
-                panel = panel.child(
-                    div()
-                        .id((id, i))
-                        .flex()
-                        .items_center()
-                        .h(px(20.0))
-                        .px(px(7.0))
-                        .rounded(px(crate::theme::radius::CONTROL_SM))
-                        .text_size(px(10.0))
-                        .text_color(if selected {
-                            Colors::accent_primary()
-                        } else {
-                            Colors::text_secondary()
-                        })
-                        .hover(|s| s.bg(Colors::surface_hover()))
-                        .cursor(gpui::CursorStyle::PointingHand)
-                        .child(action),
-                );
-            }
-            dropdown = Some(
-                deferred(
-                    panel
-                        .with_animation(
-                            "pr-select-menu-open",
-                            Animation::new(Duration::from_millis(90))
-                                .with_easing(pulsating_between(0.9, 1.0)),
-                            |this, delta| this.opacity(delta),
-                        )
-                        .into_any_element(),
-                )
-                .with_priority(PIANO_ROLL_MENU_PRIORITY)
-                .into_any_element(),
+        let base = Colors::surface_input();
+        let rest = if open {
+            Colors::composite(base, Colors::state_selected())
+        } else {
+            base
+        };
+        let hover = Colors::composite(rest, Colors::state_hover());
+        let trigger = div()
+            .id(id)
+            .role(gpui::Role::Button)
+            .aria_label(tip)
+            .flex()
+            .flex_row()
+            .items_center()
+            // A column-filling trigger lives in a narrow column; its padding
+            // tightens so the value keeps the room.
+            .gap(px(if fill { space::TIGHT } else { space::SNUG }))
+            .h(px(size::DEFAULT))
+            .when(fill, |t| t.w_full())
+            .pl(px(if fill { space::SNUG } else { space::BASE }))
+            .pr(px(if fill { space::TIGHT } else { space::SNUG }))
+            .rounded(px(radius::CONTROL))
+            .bg(rest)
+            .border(px(1.0))
+            .border_color(if open {
+                Colors::border_strong()
+            } else {
+                Colors::border_subtle()
+            })
+            .text_size(px(typography::UI_XS))
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(move |s| s.bg(hover))
+            .tooltip(crate::components::controls::fb_tooltip(tip))
+            .on_click(cx.listener(move |this, _ev, _w, cx| {
+                cx.stop_propagation();
+                this.open_select_menu = if this.open_select_menu == Some(menu) {
+                    None
+                } else {
+                    Some(menu)
+                };
+                cx.notify();
+            }))
+            .children(caption.map(|caption| {
+                div()
+                    .flex_shrink_0()
+                    .text_color(Colors::text_muted())
+                    .child(caption)
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(Colors::text_primary())
+                    .child(label),
+            )
+            .child(
+                svg()
+                    .path(if upward {
+                        assets::ICON_CHEVRON_UP_PATH
+                    } else {
+                        assets::ICON_CHEVRON_DOWN_PATH
+                    })
+                    .size(px(10.0))
+                    .flex_shrink_0()
+                    .text_color(Colors::text_muted()),
             );
-        }
 
         div()
             .relative()
             .flex()
+            .flex_shrink_0()
             .items_center()
+            .when(fill, |root| root.w_full())
             .occlude()
-            .child(
-                div()
-                    .id(id)
-                    .flex()
-                    .items_center()
-                    .h(px(22.0))
-                    .min_w(px(72.0))
-                    .pl(px(7.0))
-                    .pr(px(5.0))
-                    .gap(px(6.0))
-                    .rounded(px(crate::theme::radius::CONTROL_SM))
-                    .text_size(px(10.0))
-                    .text_color(if open {
-                        Colors::text_primary()
-                    } else {
-                        Colors::text_secondary()
-                    })
-                    .bg(if open {
-                        Colors::surface_hover()
-                    } else {
-                        Colors::with_alpha(Colors::text_primary(), 0.0)
-                    })
-                    .border(px(1.0))
-                    .border_color(if open {
-                        Colors::border_subtle()
-                    } else {
-                        Colors::with_alpha(Colors::text_primary(), 0.0)
-                    })
-                    .hover(|s| s.bg(Colors::surface_hover()))
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .on_click(cx.listener(move |this, _ev, _w, cx| {
-                        cx.stop_propagation();
-                        this.open_select_menu = if this.open_select_menu == Some(menu) {
-                            None
-                        } else {
-                            Some(menu)
-                        };
-                        cx.notify();
-                    }))
-                    .child(div().flex_1().truncate().child(label))
-                    .child(
-                        svg()
-                            .path(assets::ICON_CHEVRON_DOWN_PATH)
-                            .w(px(10.0))
-                            .h(px(10.0))
-                            .flex_shrink_0()
-                            .text_color(if open {
-                                Colors::text_secondary()
-                            } else {
-                                Colors::text_faint()
-                            }),
-                    ),
-            )
-            .when_some(dropdown, |root, panel| root.child(panel))
+            .child(trigger)
+            .children(dropdown)
     }
 
-    /// Compact selector for the single controller lane: a button showing the
-    /// active lane that opens a dropdown of choices (Velocity / common CCs /
-    /// pitch-bend / pressure / custom CC), plus a collapse toggle. Alt+wheel on
-    /// the button cycles lanes. Replaces the old "Lane / +Lane / −Lane" trio —
-    /// switching here only changes what the one lane shows, never the data.
+    /// The controller lane's selector: which lane the one lane at the bottom
+    /// shows (Velocity / common CCs / pitch-bend / pressure / articulations /
+    /// custom CC). Lives in the lane's own header. Alt+wheel over it cycles
+    /// lanes. Switching only changes what the lane shows, never the data.
     pub(super) fn render_lane_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::theme::{radius, size, space, typography};
         let current = self.current_lane();
-        let label = format!("Lane: {}", self.lane_name());
-        let open = self.open_select_menu == Some(PianoSelectMenu::Lane);
-        let visible = self.unified_lane_visible(cx);
         let custom = self.custom_cc;
 
         // Controller kinds that actually carry points in the clip being
@@ -793,709 +872,669 @@ impl PianoRoll {
             })
             .unwrap_or(false);
 
-        let mut dropdown: Option<gpui::AnyElement> = None;
-        if open {
-            let mut panel = div()
-                .absolute()
-                .top(px(26.0))
-                .left_0()
-                .w(px(176.0))
+        let lane_label = |text: String, data: bool| {
+            div()
                 .flex()
-                .flex_col()
-                .p(px(3.0))
-                .gap(px(1.0))
-                .rounded(px(crate::theme::radius::CONTROL))
-                .bg(Colors::surface_card())
-                .border(px(1.0))
-                .border_color(Colors::border_subtle())
-                .shadow_lg()
-                .occlude()
-                .on_mouse_down(MouseButton::Left, |_, _window, cx| cx.stop_propagation());
-            for (i, kind) in LANE_CYCLE.iter().enumerate() {
-                let kind = *kind;
-                let selected = kind == current;
-                let text = match kind {
-                    ControllerLaneKind::Velocity => "Velocity".to_string(),
-                    ControllerLaneKind::Controller(k) => cc_kind_label(k),
-                    ControllerLaneKind::Articulations => "Articulations".to_string(),
-                };
-                let lane_has_data = match kind {
-                    ControllerLaneKind::Velocity => false,
-                    ControllerLaneKind::Controller(k) => has_data(k),
-                    ControllerLaneKind::Articulations => articulation_lane_has_data,
-                };
-                panel = panel.child(
-                    div()
-                        .id(("pr-lane-opt", i))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .h(px(20.0))
-                        .px(px(7.0))
-                        .rounded(px(crate::theme::radius::CONTROL_SM))
-                        .text_size(px(10.0))
-                        .text_color(if selected {
-                            Colors::accent_primary()
-                        } else {
-                            Colors::text_secondary()
-                        })
-                        .hover(|s| s.bg(Colors::surface_hover()))
-                        .cursor(gpui::CursorStyle::PointingHand)
-                        .on_click(cx.listener(move |this, _ev, _w, cx| {
-                            cx.stop_propagation();
-                            this.set_lane(kind, cx);
-                        }))
-                        .child(text)
-                        .when(lane_has_data, |row| {
-                            row.child(
-                                div()
-                                    .size(px(4.0))
-                                    .rounded(px(crate::theme::radius::MICRO))
-                                    .bg(Colors::accent_primary())
-                                    .flex_shrink_0(),
-                            )
-                        }),
-                );
-            }
-            if !extra_kinds.is_empty() {
-                panel = panel.child(
-                    div()
-                        .h(px(1.0))
-                        .mt(px(2.0))
-                        .mb(px(2.0))
-                        .bg(Colors::divider()),
-                );
-                panel = panel.child(
-                    div()
-                        .px(px(7.0))
-                        .text_size(px(9.0))
-                        .text_color(Colors::text_faint())
-                        .child("In This Clip"),
-                );
-                for (i, kind) in extra_kinds.iter().enumerate() {
-                    let kind = *kind;
-                    let lane_kind = ControllerLaneKind::Controller(kind);
-                    let selected = lane_kind == current;
-                    panel = panel.child(
-                        div()
-                            .id(("pr-lane-extra", i))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .h(px(20.0))
-                            .px(px(7.0))
-                            .rounded(px(crate::theme::radius::CONTROL_SM))
-                            .text_size(px(10.0))
-                            .text_color(if selected {
-                                Colors::accent_primary()
-                            } else {
-                                Colors::text_secondary()
-                            })
-                            .hover(|s| s.bg(Colors::surface_hover()))
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .on_click(cx.listener(move |this, _ev, _w, cx| {
-                                cx.stop_propagation();
-                                this.set_lane(lane_kind, cx);
-                            }))
-                            .child(cc_kind_label(kind))
-                            .child(
-                                div()
-                                    .size(px(4.0))
-                                    .rounded(px(crate::theme::radius::MICRO))
-                                    .bg(Colors::accent_primary())
-                                    .flex_shrink_0(),
-                            ),
-                    );
-                }
-            }
-            // Custom CC row: − / CCnn (select) / + . Steppers keep the menu open.
-            panel = panel.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .h(px(22.0))
-                    .px(px(4.0))
-                    .mt(px(2.0))
-                    .border_t(px(1.0))
-                    .border_color(Colors::divider())
-                    .child(
-                        div()
-                            .id(("pr-lane-custom", 0usize))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(16.0))
-                            .rounded(px(crate::theme::radius::MICRO))
-                            .text_size(px(11.0))
-                            .text_color(Colors::text_secondary())
-                            .hover(|s| s.bg(Colors::surface_hover()))
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .on_click(cx.listener(|this, _ev, _w, cx| {
-                                cx.stop_propagation();
-                                this.custom_cc = this.custom_cc.saturating_sub(1);
-                                cx.notify();
-                            }))
-                            .child("−"),
-                    )
-                    .child(
-                        div()
-                            .id(("pr-lane-custom", 1usize))
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(18.0))
-                            .rounded(px(crate::theme::radius::MICRO))
-                            .text_size(px(10.0))
-                            .text_color(
-                                if current
-                                    == ControllerLaneKind::Controller(MidiControllerKind::CC(
-                                        custom,
-                                    ))
-                                {
-                                    Colors::accent_primary()
-                                } else {
-                                    Colors::text_primary()
-                                },
-                            )
-                            .hover(|s| s.bg(Colors::surface_hover()))
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .on_click(cx.listener(move |this, _ev, _w, cx| {
-                                cx.stop_propagation();
-                                this.set_lane(
-                                    ControllerLaneKind::Controller(MidiControllerKind::CC(
-                                        this.custom_cc,
-                                    )),
-                                    cx,
-                                )
-                            }))
-                            .child(format!("Custom CC{custom}")),
-                    )
-                    .child(
-                        div()
-                            .id(("pr-lane-custom", 2usize))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(16.0))
-                            .rounded(px(crate::theme::radius::MICRO))
-                            .text_size(px(11.0))
-                            .text_color(Colors::text_secondary())
-                            .hover(|s| s.bg(Colors::surface_hover()))
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .on_click(cx.listener(|this, _ev, _w, cx| {
-                                cx.stop_propagation();
-                                this.custom_cc = (this.custom_cc + 1).min(127);
-                                cx.notify();
-                            }))
-                            .child("+"),
-                    ),
-            );
-            dropdown = Some(
-                deferred(
-                    panel
-                        .with_animation(
-                            "pr-lane-menu-open",
-                            Animation::new(Duration::from_millis(90))
-                                .with_easing(pulsating_between(0.92, 1.0)),
-                            |this, delta| this.opacity(delta),
-                        )
-                        .into_any_element(),
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(space::SNUG))
+                .child(div().truncate().child(text))
+                .when(data, |row| row.child(data_dot()))
+        };
+
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        for (i, kind) in LANE_CYCLE.iter().enumerate() {
+            let kind = *kind;
+            let text = match kind {
+                ControllerLaneKind::Velocity => "Velocity".to_string(),
+                ControllerLaneKind::Controller(k) => cc_kind_label(k),
+                ControllerLaneKind::Articulations => "Articulations".to_string(),
+            };
+            let lane_has_data = match kind {
+                ControllerLaneKind::Velocity => false,
+                ControllerLaneKind::Controller(k) => has_data(k),
+                ControllerLaneKind::Articulations => articulation_lane_has_data,
+            };
+            rows.push(
+                menu_row(
+                    ("pr-lane-opt", i),
+                    kind == current,
+                    lane_label(text, lane_has_data),
                 )
-                .with_priority(PIANO_ROLL_MENU_PRIORITY)
+                .on_click(cx.listener(move |this, _ev, _w, cx| {
+                    cx.stop_propagation();
+                    this.set_lane(kind, cx);
+                }))
                 .into_any_element(),
             );
         }
-
-        div()
-            .relative()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(2.0))
-            .occlude()
-            .child(
-                div()
-                    .id("pr-lane-select")
-                    .flex()
-                    .items_center()
-                    .h(px(22.0))
-                    .min_w(px(122.0))
-                    .pl(px(7.0))
-                    .pr(px(5.0))
-                    .gap(px(6.0))
-                    .rounded(px(crate::theme::radius::CONTROL_SM))
-                    .text_size(px(10.0))
-                    .text_color(if open {
-                        Colors::text_primary()
-                    } else {
-                        Colors::text_secondary()
-                    })
-                    .bg(if open {
-                        Colors::surface_hover()
-                    } else {
-                        Colors::with_alpha(Colors::text_primary(), 0.0)
-                    })
-                    .border(px(1.0))
-                    .border_color(if open {
-                        Colors::border_subtle()
-                    } else {
-                        Colors::with_alpha(Colors::text_primary(), 0.0)
-                    })
-                    .hover(|s| s.bg(Colors::surface_hover()))
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .on_click(cx.listener(|this, _ev, _w, cx| {
+        if !extra_kinds.is_empty() {
+            rows.push(menu_separator());
+            rows.push(menu_heading("In This Clip"));
+            for (i, kind) in extra_kinds.iter().enumerate() {
+                let lane_kind = ControllerLaneKind::Controller(*kind);
+                rows.push(
+                    menu_row(
+                        ("pr-lane-extra", i),
+                        lane_kind == current,
+                        lane_label(cc_kind_label(*kind), true),
+                    )
+                    .on_click(cx.listener(move |this, _ev, _w, cx| {
                         cx.stop_propagation();
-                        this.open_select_menu =
-                            if this.open_select_menu == Some(PianoSelectMenu::Lane) {
-                                None
-                            } else {
-                                Some(PianoSelectMenu::Lane)
-                            };
-                        cx.notify();
+                        this.set_lane(lane_kind, cx);
                     }))
-                    // Alt + mouse wheel cycles lanes (Part 7 optional shortcut).
-                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
-                        if !ev.modifiers.alt {
-                            return;
-                        }
-                        let dy = match ev.delta {
-                            gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
-                            gpui::ScrollDelta::Lines(p) => p.y,
-                        };
-                        if dy != 0.0 {
-                            this.cycle_lane(if dy < 0.0 { 1 } else { -1 }, cx);
-                        }
-                    }))
-                    .child(div().flex_1().truncate().child(label))
-                    .child(
-                        svg()
-                            .path(assets::ICON_CHEVRON_DOWN_PATH)
-                            .w(px(10.0))
-                            .h(px(10.0))
-                            .flex_shrink_0()
-                            .text_color(if open {
-                                Colors::text_secondary()
-                            } else {
-                                Colors::text_faint()
-                            }),
-                    ),
-            )
-            // Collapse / expand the whole lane.
-            .child(tool_btn(
-                "pr-lane-toggle",
-                if visible { "▾" } else { "▸" },
-                !visible,
-                cx.listener(|this, _ev, _w, cx| this.toggle_lane_visible(cx)),
-            ))
-            .when_some(dropdown, |root, panel| root.child(panel))
+                    .into_any_element(),
+                );
+            }
+        }
+
+        // Custom CC: − / CCnn / +. The steppers keep the menu open.
+        let custom_selected =
+            current == ControllerLaneKind::Controller(MidiControllerKind::CC(custom));
+        let step_hover = Colors::composite(Colors::surface_raised(), Colors::state_hover());
+        let stepper = |id: usize, glyph: &'static str, label: &'static str| {
+            div()
+                .id(("pr-lane-custom", id))
+                .role(gpui::Role::Button)
+                .aria_label(label)
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .size(px(size::DENSE))
+                .rounded(px(radius::CONTROL_SM))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(step_hover))
+                .child(
+                    svg()
+                        .path(glyph)
+                        .size(px(11.0))
+                        .text_color(Colors::text_secondary()),
+                )
+        };
+        rows.push(menu_separator());
+        rows.push(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::HAIR))
+                .px(px(space::HAIR))
+                .child(
+                    stepper(0, assets::ICON_MINUS_PATH, "Previous CC").on_click(cx.listener(
+                        |this, _ev, _w, cx| {
+                            cx.stop_propagation();
+                            this.custom_cc = this.custom_cc.saturating_sub(1);
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(
+                    menu_row(
+                        ("pr-lane-custom", 1usize),
+                        custom_selected,
+                        format!("Custom CC {custom}"),
+                    )
+                    .flex_1()
+                    .text_size(px(typography::UI_XS))
+                    .on_click(cx.listener(move |this, _ev, _w, cx| {
+                        cx.stop_propagation();
+                        this.set_lane(
+                            ControllerLaneKind::Controller(MidiControllerKind::CC(this.custom_cc)),
+                            cx,
+                        )
+                    })),
+                )
+                .child(
+                    stepper(2, assets::ICON_PLUS_PATH, "Next CC").on_click(cx.listener(
+                        |this, _ev, _w, cx| {
+                            cx.stop_propagation();
+                            this.custom_cc = (this.custom_cc + 1).min(127);
+                            cx.notify();
+                        },
+                    )),
+                )
+                .into_any_element(),
+        );
+
+        self.render_select_menu(
+            PianoSelectMenu::Lane,
+            "pr-lane-select",
+            None,
+            self.lane_name(),
+            "Controller lane — Alt+wheel to cycle",
+            196.0,
+            true,
+            rows,
+            cx,
+        )
+        // Alt + mouse wheel cycles lanes.
+        .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
+            if !ev.modifiers.alt {
+                return;
+            }
+            let dy = match ev.delta {
+                gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
+                gpui::ScrollDelta::Lines(p) => p.y,
+            };
+            if dy != 0.0 {
+                cx.stop_propagation();
+                this.cycle_lane(if dy < 0.0 { 1 } else { -1 }, cx);
+            }
+        }))
     }
 
+    /// The editor's toolbar, in modules: tools · snap and grid · pitch (scale,
+    /// lock, chord) · channel · edit, then view and panels on the right. Every
+    /// icon-only control carries a tooltip; counts and live readouts live in
+    /// the footer, not here.
     pub(super) fn render_toolbar(
         &self,
         cx: &mut Context<Self>,
-        clip_id: Option<&str>,
+        _clip_id: Option<&str>,
     ) -> impl IntoElement {
-        let note_count = clip_id
-            .and_then(|cid| {
-                self.timeline
-                    .read(cx)
-                    .state
-                    .midi_clip_notes(cid)
-                    .map(|n| n.len())
-            })
-            .unwrap_or(0);
-        let sel_count = self.selection.len();
+        use crate::theme::space;
         let tool = self.tool;
         let snap_on = self.snap_on;
-        let grid_label = format!("Grid: {}", self.grid_res.label());
-        let status = self.toolbar_status(note_count, sel_count);
-        let grid_options = GridRes::ALL
+
+        let tool_button = |id: &'static str,
+                           icon: &'static str,
+                           tip: gpui::SharedString,
+                           target: PianoTool,
+                           cx: &mut Context<Self>| {
+            tool_segment(
+                id,
+                icon,
+                tip,
+                tool == target,
+                cx.listener(move |this, _, _w, cx| {
+                    this.cancel_active_gesture(cx);
+                    this.tool = target;
+                    cx.notify();
+                }),
+            )
+        };
+        let tools = tool_strip()
+            .child(tool_button(
+                "pr-select",
+                assets::ICON_MOUSE_POINTER_PATH,
+                command_tip("Select", "midi:tool-select"),
+                PianoTool::Select,
+                cx,
+            ))
+            .child(tool_button(
+                "pr-draw",
+                assets::ICON_PENCIL_PATH,
+                command_tip("Draw", "midi:tool-draw"),
+                PianoTool::Draw,
+                cx,
+            ))
+            .child(tool_button(
+                "pr-line",
+                assets::ICON_PEN_LINE_PATH,
+                command_tip("Line", "midi:tool-line"),
+                PianoTool::Line,
+                cx,
+            ))
+            .child(tool_button(
+                "pr-erase",
+                assets::ICON_ERASER_PATH,
+                "Erase".into(),
+                PianoTool::Erase,
+                cx,
+            ))
+            .child(tool_button(
+                "pr-split",
+                assets::ICON_SCISSORS_PATH,
+                "Split".into(),
+                PianoTool::Split,
+                cx,
+            ))
+            .child(tool_button(
+                "pr-mute-tool",
+                assets::ICON_VOLUME_X_PATH,
+                "Mute".into(),
+                PianoTool::Mute,
+                cx,
+            ));
+
+        // ── Grid ──
+        let grid_rows = GridRes::ALL
             .iter()
             .enumerate()
             .map(|(idx, res)| {
                 let res = *res;
-                (
-                    res.label().to_string(),
-                    res == self.grid_res,
-                    div()
-                        .id(("pr-grid-choice", idx))
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .child(res.label().to_string())
-                        .on_click(cx.listener(move |this, _ev, _w, cx| {
-                            cx.stop_propagation();
-                            this.grid_res = res;
-                            // Free mode turns snapping off; other modes re-enable it.
-                            this.snap_on = !res.is_free();
-                            this.open_select_menu = None;
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                )
+                menu_row(("pr-grid-choice", idx), res == self.grid_res, res.label())
+                    .on_click(cx.listener(move |this, _ev, _w, cx| {
+                        cx.stop_propagation();
+                        this.grid_res = res;
+                        // Free mode turns snapping off; other modes re-enable it.
+                        this.snap_on = !res.is_free();
+                        this.open_select_menu = None;
+                        cx.notify();
+                    }))
+                    .into_any_element()
             })
             .collect();
-        let channel_options = {
-            let mut opts = Vec::with_capacity(17);
-            opts.push((
-                "All Channels".to_string(),
-                self.channel_view.is_all(),
+        let grid_menu = self.render_select_menu(
+            PianoSelectMenu::Grid,
+            "pr-grid-select",
+            Some("Grid"),
+            self.grid_res.label().to_string(),
+            "Grid resolution",
+            140.0,
+            false,
+            grid_rows,
+            cx,
+        );
+
+        // ── Scale: roots as a grid, then the kinds ──
+        let root_hover = Colors::composite(Colors::surface_raised(), Colors::state_hover());
+        let root_selected = Colors::composite(Colors::surface_raised(), Colors::accent_active());
+        let roots = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(space::HAIR))
+            .px(px(space::TIGHT))
+            .pb(px(space::TIGHT))
+            .children(ScaleRoot::ALL.iter().enumerate().map(|(idx, root)| {
+                let root = *root;
+                let selected = root == self.pitch_ctx.scale.root;
                 div()
-                    .id("pr-channel-choice-all")
-                    .size_full()
+                    .id(("pr-root-choice", idx))
                     .flex()
                     .items_center()
-                    .child("All Channels")
-                    .on_click(cx.listener(|this, _ev, _w, cx| {
+                    .justify_center()
+                    .w(px(40.0))
+                    .h(px(crate::theme::size::DENSE))
+                    .rounded(px(crate::theme::radius::CONTROL_SM))
+                    .border(px(1.0))
+                    .border_color(if selected {
+                        Colors::accent_primary()
+                    } else {
+                        Colors::with_alpha(Colors::border_subtle(), 0.0)
+                    })
+                    .bg(if selected {
+                        root_selected
+                    } else {
+                        Colors::with_alpha(root_selected, 0.0)
+                    })
+                    .text_size(px(crate::theme::typography::UI_XS))
+                    .text_color(if selected {
+                        Colors::text_primary()
+                    } else {
+                        Colors::text_secondary()
+                    })
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .hover(move |s| s.bg(root_hover))
+                    // Picking a root keeps the menu open for the scale.
+                    .on_click(cx.listener(move |this, _ev, _w, cx| {
                         cx.stop_propagation();
-                        this.set_channel_view(MidiChannelMask::ALL, cx);
+                        this.pitch_ctx.scale.root = root;
+                        cx.notify();
                     }))
-                    .into_any_element(),
-            ));
-            for (idx, ch) in MidiChannel::all().enumerate() {
-                let selected = self.channel_view == MidiChannelMask::single(ch);
-                let label = format!("Channel {}", ch.ui());
-                opts.push((
-                    label.clone(),
-                    selected,
-                    div()
-                        .id(("pr-channel-choice", idx))
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .child(label)
-                        .on_click(cx.listener(move |this, _ev, _w, cx| {
-                            cx.stop_propagation();
-                            this.set_channel_view(MidiChannelMask::single(ch), cx);
-                        }))
-                        .into_any_element(),
-                ));
-            }
-            opts
-        };
-        let root_options = ScaleRoot::ALL
-            .iter()
-            .enumerate()
-            .map(|(idx, root)| {
-                let root = *root;
-                (
-                    root.label().to_string(),
-                    root == self.pitch_ctx.scale.root,
-                    div()
-                        .id(("pr-root-choice", idx))
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .child(root.label())
-                        .on_click(cx.listener(move |this, _ev, _w, cx| {
-                            cx.stop_propagation();
-                            this.pitch_ctx.scale.root = root;
-                            this.open_select_menu = None;
-                            cx.notify();
-                        }))
-                        .into_any_element(),
+                    .child(root.label())
+            }));
+        let mut scale_rows: Vec<gpui::AnyElement> =
+            vec![menu_heading("Root"), roots.into_any_element()];
+        scale_rows.push(menu_separator());
+        scale_rows.push(menu_heading("Scale"));
+        for (idx, kind) in ScaleKind::ALL.iter().enumerate() {
+            let kind = *kind;
+            scale_rows.push(
+                menu_row(
+                    ("pr-scale-choice", idx),
+                    kind == self.pitch_ctx.scale.kind,
+                    kind.label(),
                 )
-            })
-            .collect();
-        let scale_options = ScaleKind::ALL
+                .on_click(cx.listener(move |this, _ev, _w, cx| {
+                    cx.stop_propagation();
+                    this.pitch_ctx.scale.kind = kind;
+                    this.pitch_ctx.constrain = kind != ScaleKind::Chromatic;
+                    this.open_select_menu = None;
+                    cx.notify();
+                }))
+                .into_any_element(),
+            );
+        }
+        scale_rows.push(menu_separator());
+        scale_rows.push(
+            menu_row("pr-scale-snap-selection", false, "Snap Selection to Scale")
+                .on_click(cx.listener(|this, _ev, _w, cx| {
+                    cx.stop_propagation();
+                    this.open_select_menu = None;
+                    this.snap_selection_to_scale(cx);
+                }))
+                .into_any_element(),
+        );
+        let scale = self.pitch_ctx.scale;
+        let scale_label = if scale.kind == ScaleKind::Chromatic {
+            scale.kind.label().to_string()
+        } else {
+            format!("{} {}", scale.root.label(), scale.kind.label())
+        };
+        let scale_menu = self.render_select_menu(
+            PianoSelectMenu::Scale,
+            "pr-scale",
+            None,
+            scale_label,
+            "Scale guide",
+            196.0,
+            false,
+            scale_rows,
+            cx,
+        );
+        let constrain = self.pitch_ctx.constrain;
+        let lock = bar_icon_button(
+            "pr-scale-constrain",
+            if constrain {
+                assets::ICON_LOCK_PATH
+            } else {
+                assets::ICON_LOCK_OPEN_PATH
+            },
+            "Keep notes in scale".into(),
+            Some(constrain),
+            cx.listener(|this, _, _w, cx| {
+                this.pitch_ctx.constrain = !this.pitch_ctx.constrain;
+                this.open_select_menu = None;
+                cx.notify();
+            }),
+        );
+
+        // ── Chord ──
+        let chord_rows = ChordInsertKind::ALL
             .iter()
             .enumerate()
             .map(|(idx, kind)| {
                 let kind = *kind;
-                (
-                    kind.label().to_string(),
-                    kind == self.pitch_ctx.scale.kind,
-                    div()
-                        .id(("pr-scale-choice", idx))
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .child(kind.label())
-                        .on_click(cx.listener(move |this, _ev, _w, cx| {
-                            cx.stop_propagation();
-                            this.pitch_ctx.scale.kind = kind;
-                            this.pitch_ctx.constrain = kind != ScaleKind::Chromatic;
-                            this.open_select_menu = None;
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                )
+                let text = match kind {
+                    ChordInsertKind::Off => "Single Note",
+                    ChordInsertKind::Triad => "Triad",
+                    ChordInsertKind::Seventh => "Seventh",
+                };
+                menu_row(("pr-chord-choice", idx), kind == self.chord_kind, text)
+                    .on_click(cx.listener(move |this, _ev, _w, cx| {
+                        cx.stop_propagation();
+                        this.chord_kind = kind;
+                        this.open_select_menu = None;
+                        cx.notify();
+                    }))
+                    .into_any_element()
             })
             .collect();
+        let chord_menu = self.render_select_menu(
+            PianoSelectMenu::Chord,
+            "pr-chord-insert",
+            None,
+            self.chord_kind.label().to_string(),
+            "Draw chords",
+            148.0,
+            false,
+            chord_rows,
+            cx,
+        );
+
+        // ── Channel ──
+        let mut channel_rows: Vec<gpui::AnyElement> = Vec::with_capacity(21);
+        channel_rows.push(
+            menu_row(
+                "pr-channel-choice-all",
+                self.channel_view.is_all(),
+                "All Channels",
+            )
+            .on_click(cx.listener(|this, _ev, _w, cx| {
+                cx.stop_propagation();
+                this.set_channel_view(MidiChannelMask::ALL, cx);
+            }))
+            .into_any_element(),
+        );
+        for (idx, ch) in MidiChannel::all().enumerate() {
+            channel_rows.push(
+                menu_row(
+                    ("pr-channel-choice", idx),
+                    self.channel_view == MidiChannelMask::single(ch),
+                    format!("Channel {}", ch.ui()),
+                )
+                .on_click(cx.listener(move |this, _ev, _w, cx| {
+                    cx.stop_propagation();
+                    this.set_channel_view(MidiChannelMask::single(ch), cx);
+                }))
+                .into_any_element(),
+            );
+        }
+        channel_rows.push(menu_separator());
+        let assign_channel = self.active_note_channel(cx);
+        channel_rows.push(
+            menu_row(
+                "pr-channel-apply",
+                false,
+                format!("Move Selection to Ch {}", assign_channel.ui()),
+            )
+            .on_click(cx.listener(|this, _ev, _w, cx| {
+                cx.stop_propagation();
+                this.open_select_menu = None;
+                let channel = this.active_note_channel(cx);
+                this.set_selected_notes_channel(channel, cx);
+            }))
+            .into_any_element(),
+        );
+        channel_rows.push(
+            menu_row(
+                "pr-channel-output-mode",
+                self.track_output_per_note(cx),
+                "Per-Note Output",
+            )
+            .on_click(cx.listener(|this, _ev, _w, cx| {
+                cx.stop_propagation();
+                this.toggle_track_output_per_note(cx);
+            }))
+            .into_any_element(),
+        );
+        let channel_menu = self.render_select_menu(
+            PianoSelectMenu::Channel,
+            "pr-channel-view",
+            None,
+            self.channel_view_label(),
+            "Channels shown and edited",
+            196.0,
+            false,
+            channel_rows,
+            cx,
+        );
+
+        // ── Edit ──
+        let quantize = bar_text_button(
+            "pr-quantize",
+            "Quantize",
+            Some(command_tip("Quantize — hover to preview", "midi:quantize")),
+            cx.listener(|this, _, _w, cx| this.quantize_selection(cx)),
+        )
+        .on_hover(cx.listener(|this, hovered: &bool, _w, cx| {
+            this.quantize_preview = *hovered;
+            cx.notify();
+        }));
+
+        // ── View ──
+        let view = div()
+            .flex()
+            .flex_row()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(space::HAIR))
+            .child(bar_icon_button(
+                "pr-zoom-out",
+                assets::ICON_ZOOM_OUT_PATH,
+                "Zoom out".into(),
+                None,
+                cx.listener(|this, _, _w, cx| this.zoom_by(0.5, cx)),
+            ))
+            .child(bar_icon_button(
+                "pr-zoom-in",
+                assets::ICON_ZOOM_IN_PATH,
+                "Zoom in".into(),
+                None,
+                cx.listener(|this, _, _w, cx| this.zoom_by(2.0, cx)),
+            ))
+            .child(bar_icon_button(
+                "pr-fit",
+                assets::ICON_SCAN_PATH,
+                command_tip("Fit notes", "midi:fit-notes"),
+                None,
+                cx.listener(|this, _, _w, cx| {
+                    if let Some(cid) = this.editing_clip_id(cx) {
+                        this.fit_piano_roll_to_notes(cx, &cid);
+                        cx.notify();
+                    }
+                }),
+            ))
+            .child(bar_text_button(
+                "pr-c4",
+                "C4",
+                Some("Center on middle C".into()),
+                cx.listener(|this, _, _w, cx| {
+                    this.scroll_to_pitch(60);
+                    cx.notify();
+                }),
+            ));
 
         div()
             .flex()
             .flex_row()
+            .flex_shrink_0()
             .items_center()
-            .gap(px(6.0))
-            .h(px(34.0))
-            .px(px(8.0))
+            // Modules are set apart by their dividers; within one, controls
+            // sit a hair apart. The row has to fit the editor window's minimum
+            // width without clipping the panel toggles at its end.
+            .gap(px(space::HAIR))
+            .h(px(TOOLBAR_H))
+            .px(px(space::BASE))
+            .overflow_hidden()
             .border_b(px(1.0))
             .border_color(Colors::panel_border())
             .bg(Colors::surface_panel())
-            .child(
-                toolbar_group("Tools")
-                    .child(tool_btn(
-                        "pr-select",
-                        "Select",
-                        tool == PianoTool::Select,
-                        cx.listener(|this, _, _w, cx| {
-                            this.cancel_active_gesture(cx);
-                            this.tool = PianoTool::Select;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(tool_btn(
-                        "pr-draw",
-                        "Draw",
-                        tool == PianoTool::Draw,
-                        cx.listener(|this, _, _w, cx| {
-                            this.cancel_active_gesture(cx);
-                            this.tool = PianoTool::Draw;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(tool_btn(
-                        "pr-line",
-                        "Line",
-                        tool == PianoTool::Line,
-                        cx.listener(|this, _, _w, cx| {
-                            this.cancel_active_gesture(cx);
-                            this.tool = PianoTool::Line;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(tool_btn(
-                        "pr-erase",
-                        "Erase",
-                        tool == PianoTool::Erase,
-                        cx.listener(|this, _, _w, cx| {
-                            this.cancel_active_gesture(cx);
-                            this.tool = PianoTool::Erase;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(tool_btn(
-                        "pr-split",
-                        "Split",
-                        tool == PianoTool::Split,
-                        cx.listener(|this, _, _w, cx| {
-                            this.cancel_active_gesture(cx);
-                            this.tool = PianoTool::Split;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(tool_btn(
-                        "pr-mute-tool",
-                        "Mute",
-                        tool == PianoTool::Mute,
-                        cx.listener(|this, _, _w, cx| {
-                            this.cancel_active_gesture(cx);
-                            this.tool = PianoTool::Mute;
-                            cx.notify();
-                        }),
-                    )),
-            )
-            .child(
-                toolbar_group("Snap")
-                    .child(tool_btn(
-                        "pr-snap",
-                        "Snap",
-                        snap_on,
-                        cx.listener(|this, _, _w, cx| {
-                            this.snap_on = !this.snap_on;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(self.render_select_menu(
-                        PianoSelectMenu::Grid,
-                        "pr-grid-select",
-                        grid_label,
-                        grid_options,
-                        cx,
-                    )),
-            )
-            .child(
-                toolbar_group("Scale")
-                    .child(self.render_select_menu(
-                        PianoSelectMenu::ScaleRoot,
-                        "pr-scale-root",
-                        self.pitch_ctx.scale.root.label().to_string(),
-                        root_options,
-                        cx,
-                    ))
-                    .child(self.render_select_menu(
-                        PianoSelectMenu::ScaleKind,
-                        "pr-scale-kind",
-                        self.pitch_ctx.scale.kind.label().to_string(),
-                        scale_options,
-                        cx,
-                    ))
-                    .child(tool_btn(
-                        "pr-chord-insert",
-                        self.chord_kind.label(),
-                        self.chord_kind != ChordInsertKind::Off,
-                        cx.listener(|this, _, _w, cx| {
-                            this.chord_kind = this.chord_kind.cycle();
-                            this.open_select_menu = None;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(tool_btn(
-                        "pr-scale-constrain",
-                        "Lock",
-                        self.pitch_ctx.constrain,
-                        cx.listener(|this, _, _w, cx| {
-                            this.pitch_ctx.constrain = !this.pitch_ctx.constrain;
-                            this.open_select_menu = None;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(tool_btn(
-                        "pr-scale-snap-selection",
-                        "To Scale",
-                        false,
-                        cx.listener(|this, _, _w, cx| this.snap_selection_to_scale(cx)),
-                    )),
-            )
-            .child(
-                toolbar_group("Channel")
-                    .child(self.render_select_menu(
-                        PianoSelectMenu::Channel,
-                        "pr-channel-view",
-                        self.channel_view_label(),
-                        channel_options,
-                        cx,
-                    ))
-                    .child(tool_btn(
-                        "pr-channel-apply",
-                        "Set Sel",
-                        false,
-                        cx.listener(|this, _, _w, cx| {
-                            let channel = this.active_note_channel(cx);
-                            this.set_selected_notes_channel(channel, cx);
-                        }),
-                    ))
-                    .child(tool_btn(
-                        "pr-channel-output-mode",
-                        "Per-Note Out",
-                        self.track_output_per_note(cx),
-                        cx.listener(|this, _, _w, cx| this.toggle_track_output_per_note(cx)),
-                    )),
-            )
-            .child(
-                toolbar_group("Edit")
-                    .child(
-                        div()
-                            .id("pr-quantize")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(22.0))
-                            .min_w(px(24.0))
-                            .px(px(7.0))
-                            .rounded(px(crate::theme::radius::CONTROL_SM))
-                            .text_size(px(10.0))
-                            .text_color(if self.quantize_preview {
-                                Colors::text_primary()
-                            } else {
-                                Colors::text_secondary()
-                            })
-                            .bg(if self.quantize_preview {
-                                Colors::surface_hover()
-                            } else {
-                                Colors::with_alpha(Colors::text_primary(), 0.0)
-                            })
-                            .border(px(1.0))
-                            .border_color(if self.quantize_preview {
-                                Colors::border_subtle()
-                            } else {
-                                Colors::with_alpha(Colors::text_primary(), 0.0)
-                            })
-                            .hover(|s| s.bg(Colors::surface_hover()))
-                            .cursor(gpui::CursorStyle::PointingHand)
-                            .on_hover(cx.listener(|this, hovered: &bool, _w, cx| {
-                                this.quantize_preview = *hovered;
-                                cx.notify();
-                            }))
-                            .on_click(cx.listener(|this, _, _w, cx| this.quantize_selection(cx)))
-                            .child("Quantize"),
-                    )
-                    .child(tool_btn(
-                        "pr-delete",
-                        "Del",
-                        false,
-                        cx.listener(|this, _, _w, cx| this.delete_selection(cx)),
-                    ))
-                    .child(tool_btn(
-                        "pr-dup",
-                        "Dup",
-                        false,
-                        cx.listener(|this, _, _w, cx| this.duplicate_selection(false, cx)),
-                    )),
-            )
-            .child(toolbar_group("Controller").child(self.render_lane_selector(cx)))
-            .child(
-                toolbar_group("View")
-                    .child(tool_btn(
-                        "pr-fit",
-                        "Fit",
-                        false,
-                        cx.listener(|this, _, _w, cx| {
-                            if let Some(cid) = this.editing_clip_id(cx) {
-                                this.fit_piano_roll_to_notes(cx, &cid);
-                                cx.notify();
-                            }
-                        }),
-                    ))
-                    .child(tool_btn(
-                        "pr-zoom-out",
-                        "−",
-                        false,
-                        cx.listener(|this, _, _w, cx| this.zoom_by(0.5, cx)),
-                    ))
-                    .child(tool_btn(
-                        "pr-zoom-in",
-                        "+",
-                        false,
-                        cx.listener(|this, _, _w, cx| this.zoom_by(2.0, cx)),
-                    ))
-                    .child(tool_btn(
-                        "pr-c4",
-                        "C4",
-                        false,
-                        cx.listener(|this, _, _w, cx| {
-                            this.scroll_to_pitch(60);
-                            cx.notify();
-                        }),
-                    )),
-            )
-            .child(div().flex_1())
+            .child(tools)
+            .child(bar_divider())
+            .child(bar_icon_button(
+                "pr-snap",
+                assets::ICON_MAGNET_PATH,
+                command_tip("Snap to grid", "midi:toggle-snap"),
+                Some(snap_on),
+                cx.listener(|this, _, _w, cx| {
+                    this.snap_on = !this.snap_on;
+                    cx.notify();
+                }),
+            ))
+            .child(grid_menu)
+            .child(bar_divider())
+            .child(scale_menu)
+            .child(lock)
+            .child(chord_menu)
+            .child(bar_divider())
+            .child(channel_menu)
+            .child(bar_divider())
+            .child(quantize)
+            .child(div().flex_1().min_w(px(space::BASE)))
+            .child(view)
+            .child(bar_divider())
+            .child(bar_icon_button(
+                "pr-inspector",
+                assets::ICON_PANEL_RIGHT_PATH,
+                "Note inspector".into(),
+                Some(self.inspector_open),
+                cx.listener(|this, _, _w, cx| {
+                    this.inspector_open = !this.inspector_open;
+                    cx.notify();
+                }),
+            ))
+            .when_some(self.on_pop_out.clone(), |row, pop_out| {
+                row.child(bar_icon_button(
+                    "pr-pop-out",
+                    assets::ICON_POP_OUT_PATH,
+                    "Open in a window".into(),
+                    None,
+                    move |_, window, cx| pop_out(window, cx),
+                ))
+            })
+    }
+
+    /// The status footer: what the pointer or the gesture in flight is doing
+    /// on the left, the clip's counts and the window's actions on the right.
+    pub(super) fn render_footer(
+        &self,
+        cx: &mut Context<Self>,
+        clip_id: Option<&str>,
+    ) -> impl IntoElement {
+        use crate::theme::{space, typography};
+        let note_count = clip_id
+            .map(|cid| note_count_for_clip(cx, &self.timeline, cid))
+            .unwrap_or(0);
+        let selected = self.selection.len();
+        let small_button = |button: gpui::Stateful<gpui::Div>| {
+            button
+                .h(px(crate::theme::size::MICRO + space::HAIR))
+                .px(px(space::SNUG))
+                .rounded(px(crate::theme::radius::CONTROL_SM))
+        };
+        div()
+            .flex()
+            .flex_row()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(space::LOOSE))
+            .h(px(FOOTER_H))
+            .px(px(space::BASE))
+            .border_t(px(1.0))
+            .border_color(Colors::panel_border())
+            .bg(Colors::surface_panel())
+            .text_size(px(typography::DENSE_LABEL))
+            .text_color(Colors::text_muted())
             .child(
                 div()
-                    .min_w(px(132.0))
-                    .text_size(px(9.0))
-                    .text_color(Colors::text_muted())
+                    .flex_1()
+                    .min_w_0()
                     .truncate()
-                    .child(status),
+                    .child(self.pointer_status()),
             )
-            .when_some(self.on_pop_out.clone(), |row, pop_out| {
+            .when(clip_id.is_some(), |row| {
                 row.child(
                     div()
-                        .id("pr-pop-out")
-                        .px(px(6.0))
-                        .py(px(2.0))
-                        .rounded(px(crate::theme::radius::CONTROL))
-                        .text_size(px(9.0))
-                        .text_color(Colors::text_secondary())
-                        .cursor(gpui::CursorStyle::PointingHand)
-                        .hover(|s| s.bg(Colors::surface_hover()))
-                        .on_click(move |_, window, cx| pop_out(window, cx))
-                        .child("Pop out"),
+                        .flex()
+                        .flex_row()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(space::SNUG))
+                        .child(format!("{} notes", group_thousands(note_count)))
+                        .when(selected > 0, |counts| {
+                            counts.child(
+                                div()
+                                    .text_color(Colors::accent_primary())
+                                    .child(format!("{} selected", group_thousands(selected))),
+                            )
+                        }),
                 )
+            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .child(format!("Grid {}", self.grid_res.label())),
+            )
+            .when_some(self.on_export_midi.clone(), |row, export| {
+                row.child(small_button(bar_text_button(
+                    "pr-export-midi",
+                    "Export MIDI…",
+                    None,
+                    move |_, window, cx| export(window, cx),
+                )))
+            })
+            .when_some(self.on_dock.clone(), |row, dock| {
+                row.child(small_button(bar_text_button(
+                    "pr-dock",
+                    "Open in Bottom Panel",
+                    None,
+                    move |_, window, cx| dock(window, cx),
+                )))
             })
     }
 
@@ -1504,6 +1543,7 @@ impl PianoRoll {
         cx: &mut Context<Self>,
         clip_id: &str,
     ) -> impl IntoElement {
+        use crate::theme::{space, typography};
         let (view_w, view_h) = self.grid_view_size();
         let track_color = self.track_color_for_clip(cx, clip_id);
 
@@ -1556,86 +1596,7 @@ impl PianoRoll {
         let project_start = self.x_to_project_beat(0.0);
         let project_end = self.x_to_project_beat(view_w);
 
-        // Piano key lane.
-        // Label policy: show every note name when each row has enough vertical
-        // room (>= 14 px), otherwise fall back to C-only labels so the lane
-        // stays readable.
-        let row_h = self.note_row_h();
-        let show_all_labels = row_h >= 14.0;
-        let pressed_pitch = self.key_lane_pressed_pitch;
-        let scale = self.pitch_ctx.scale;
-        let scale_active = scale.kind != ScaleKind::Chromatic;
-        let keys: Vec<_> = (first_pitch..=last_pitch)
-            .map(|p| {
-                let y = self.pitch_to_y(p as u8);
-                let black = is_black(p);
-                let is_c = p.rem_euclid(12) == 0;
-                let pitch = p as u8;
-                let pressed = pressed_pitch == Some(pitch);
-                let in_scale = !scale_active || scale.contains_pitch(pitch);
-                let is_root = scale_active && pitch % 12 == scale.root.pitch_class();
-                let label_color = if !in_scale {
-                    Colors::text_faint()
-                } else if is_root || is_c {
-                    Colors::text_primary()
-                } else if black {
-                    Colors::text_muted()
-                } else {
-                    Colors::text_secondary()
-                };
-                let show_label = is_c || is_root || show_all_labels;
-                let key_bg = if pressed {
-                    Colors::accent_primary()
-                } else if !in_scale {
-                    if black {
-                        Colors::with_alpha(Colors::surface_base(), 0.42)
-                    } else {
-                        Colors::with_alpha(Colors::surface_raised(), 0.38)
-                    }
-                } else if is_root {
-                    Colors::with_alpha(Colors::accent_primary(), if black { 0.32 } else { 0.16 })
-                } else if black {
-                    Colors::surface_base()
-                } else {
-                    Colors::surface_raised()
-                };
-                div()
-                    .absolute()
-                    .top(px(y))
-                    .left_0()
-                    .w_full()
-                    .h(px(row_h))
-                    .bg(key_bg)
-                    .border_b(px(1.0))
-                    .border_color(Colors::border_subtle())
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .pr(px(5.0))
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event, _window, cx| {
-                            let pitch = this.pitch_ctx.constrain_pitch(p as u8);
-                            if midi_debug_enabled() {
-                                eprintln!("[PianoKeyPreview] down note={pitch}");
-                            }
-                            this.piano_key_drag_active = true;
-                            this.key_lane_pressed_pitch = Some(pitch);
-                            this.begin_preview_note(pitch, 100, "piano_key_down", cx);
-                            cx.notify();
-                        }),
-                    )
-                    .when(show_label, |this| {
-                        this.child(
-                            div()
-                                .text_size(px(8.0))
-                                .text_color(label_color)
-                                .child(note_name(p)),
-                        )
-                    })
-            })
-            .collect();
+        let keys = self.build_key_lane(first_pitch, last_pitch);
 
         let grid_lines = self.build_grid_lines(
             project_start,
@@ -1666,7 +1627,8 @@ impl PianoRoll {
             },
         );
         let playhead_overlay = self.playhead_overlay.clone();
-        let mut ruler = self.build_ruler(project_start, project_end);
+        let mut ruler = self.build_ruler_clip_band(track_color, view_w);
+        ruler.extend(self.build_ruler(project_start, project_end));
         ruler.extend(self.build_loop_ruler_markers(loop_region));
         // Under the editable notes and over the grid: context, not content.
         let context_notes = self.build_context_notes(cx, view_w, view_h);
@@ -1676,10 +1638,10 @@ impl PianoRoll {
         let draw_preview = self.build_draw_note_preview();
         let erase_overlay = self.build_erase_overlay();
         let note_menu = self.build_note_context_menu(cx);
+        let scrollbars = self.render_scrollbars(cx);
         // Empty clip: the musical canvas (ruler, keys, grid) stays, with one
         // quiet hint naming the gesture that actually creates a note. Nothing
-        // here is a status readout — the note/selection counts live in the
-        // toolbar.
+        // here is a status readout — the counts live in the footer.
         let grid_empty_hint = (note_count_for_clip(cx, &self.timeline, clip_id) == 0).then(|| {
             div()
                 .absolute()
@@ -1687,43 +1649,67 @@ impl PianoRoll {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(11.0))
+                .text_size(px(typography::UI_XS))
                 .text_color(Colors::text_muted())
                 .child("Draw notes with the Draw tool, or record onto this clip")
                 .into_any_element()
         });
-        let note_inspector = self.render_note_inspector(cx, clip_id);
+        let note_inspector = self
+            .inspector_open
+            .then(|| self.render_note_inspector(cx, clip_id).into_any_element());
 
         // ── Single unified controller lane ───────────────────────────────────
         // Exactly one lane is built per frame: velocity OR the active controller.
         // Switching the selector only changes which is built — the hidden lane's
         // data (note velocities / other controller points) is left untouched.
         let unified_lane_visible = self.unified_lane_visible(cx);
-        let lane_header: Option<gpui::AnyElement> = unified_lane_visible.then(|| {
-            div()
-                .h(px(LANE_H))
-                .w_full()
-                .border_t(px(1.0))
-                .border_color(Colors::panel_border())
-                .bg(Colors::surface_panel())
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(2.0))
-                .text_size(px(9.0))
-                .text_color(Colors::text_secondary())
-                .child(self.lane_name())
-                .child(
-                    div()
-                        .text_size(px(7.0))
-                        .text_color(Colors::text_faint())
-                        .child(self.lane_range()),
-                )
-                .into_any_element()
-        });
-        let lane_body: Option<gpui::AnyElement> = if !unified_lane_visible {
+        let lane_collapsed = !unified_lane_visible && !self.editing_solfege_track(cx);
+        let lane_header: Option<gpui::AnyElement> = if unified_lane_visible {
+            Some(self.render_lane_header(cx))
+        } else if lane_collapsed {
+            Some(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(LANE_COLLAPSED_H))
+                    .w_full()
+                    .px(px(space::HAIR))
+                    .border_t(px(1.0))
+                    .border_r(px(1.0))
+                    .border_color(Colors::panel_border())
+                    .bg(Colors::surface_panel())
+                    .child(
+                        bar_icon_button(
+                            "pr-lane-expand",
+                            assets::ICON_CHEVRON_UP_PATH,
+                            format!("Show {} lane", self.lane_name()).into(),
+                            None,
+                            cx.listener(|this, _ev, _w, cx| this.toggle_lane_visible(cx)),
+                        )
+                        .size(px(crate::theme::size::DENSE)),
+                    )
+                    .into_any_element(),
+            )
+        } else {
             None
+        };
+        let lane_body: Option<gpui::AnyElement> = if !unified_lane_visible {
+            lane_collapsed.then(|| {
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(LANE_COLLAPSED_H))
+                    .w_full()
+                    .px(px(space::BASE))
+                    .border_t(px(1.0))
+                    .border_color(Colors::panel_border())
+                    .bg(Colors::surface_panel())
+                    .text_size(px(typography::DENSE_LABEL))
+                    .text_color(Colors::text_faint())
+                    .child(format!("{} lane hidden", self.lane_name()))
+                    .into_any_element()
+            })
         } else if self.lane_view == PianoLaneView::Articulations {
             Some(
                 self.render_articulation_lane(cx, clip_id)
@@ -1731,6 +1717,7 @@ impl PianoRoll {
             )
         } else if self.lane_view == PianoLaneView::Velocity {
             let vel_grid = self.build_velocity_grid();
+            let vel_guides = self.build_velocity_guides();
             let vel_bars = self.build_velocity_bars(cx, clip_id, track_color);
             let velocity_gesture_overlay = self.build_velocity_gesture_overlay();
             let velocity_context_menu = self.build_velocity_context_menu(cx);
@@ -1749,7 +1736,7 @@ impl PianoRoll {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(9.0))
+                        .text_size(px(typography::DENSE_LABEL))
                         .text_color(Colors::text_faint())
                         .child("No notes — draw notes above to edit velocity")
                 });
@@ -1790,6 +1777,7 @@ impl PianoRoll {
                     )
                     .child(velocity_bounds_canvas)
                     .children(vel_grid)
+                    .children(vel_guides)
                     .children(vel_bars)
                     .children(velocity_gesture_overlay)
                     .children(velocity_empty)
@@ -1818,9 +1806,8 @@ impl PianoRoll {
         .inset_0();
 
         // Capture the key-lane viewport bounds so a window-space cursor can be
-        // hit-tested + mapped to a pitch during drag-scrub (see `on_move`). Sits
-        // behind the keys and carries no handlers, so it never intercepts the
-        // per-key mouse-down.
+        // hit-tested + mapped to a pitch (see `key_lane_pitch_at`). Sits behind
+        // the keys and carries no handlers.
         let key_lane_bounds = self.key_lane_bounds.clone();
         let key_lane_canvas = canvas(
             move |bounds, _w, _cx| {
@@ -1851,11 +1838,11 @@ impl PianoRoll {
             .child(
                 div()
                     .w(px(key_lane_width()))
+                    .flex_shrink_0()
                     .h_full()
                     .flex()
                     .flex_col()
-                    // Corner spacer so the keys line up with the grid (below the
-                    // ruler row on the right).
+                    // Corner over the keys, beside the ruler.
                     .child(
                         div()
                             .h(px(RULER_H))
@@ -1871,27 +1858,44 @@ impl PianoRoll {
                             .min_h_0()
                             .relative()
                             .overflow_hidden()
-                            .bg(Colors::surface_panel())
+                            .bg(Colors::surface_canvas())
                             .border_r(px(1.0))
                             .border_color(Colors::panel_border())
-                            // Drag-scrub (move/up) is handled by the root-level
-                            // `on_move`/`on_up` using `key_lane_bounds` captured
-                            // here — never read raw window coords as if they were
-                            // lane-local (the old bug).
+                            .cursor(gpui::CursorStyle::PointingHand)
+                            // One press handler for the whole lane, mapped
+                            // through the same key geometry the keys are drawn
+                            // with. Drag-scrub (move/up) is handled by the
+                            // root-level `on_move`/`on_up`.
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                                    let Some(raw) = this.key_lane_pitch_at(ev.position) else {
+                                        return;
+                                    };
+                                    let pitch = this.pitch_ctx.constrain_pitch(raw);
+                                    if midi_debug_enabled() {
+                                        eprintln!("[PianoKeyPreview] down note={pitch}");
+                                    }
+                                    this.piano_key_drag_active = true;
+                                    this.key_lane_pressed_pitch = Some(pitch);
+                                    this.begin_preview_note(pitch, 100, "piano_key_down", cx);
+                                    cx.notify();
+                                }),
+                            )
                             .child(key_lane_canvas)
                             .children(keys),
                     )
-                    // Single unified controller-lane header (name + range).
+                    // The controller lane's header: selector, value scale.
                     .children(lane_header),
             )
-            // Right: grid + single controller lane.
+            // Middle: ruler, grid, controller lane.
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    // Ruler header — bar/beat labels aligned to the grid below.
+                    // Ruler — bar/beat labels aligned to the grid below.
                     .child(
                         div()
                             .h(px(RULER_H))
@@ -1938,6 +1942,7 @@ impl PianoRoll {
                             .when_some(marquee_overlay, |el, overlay| el.child(overlay))
                             .children(draw_preview)
                             .when_some(erase_overlay, |el, overlay| el.child(overlay))
+                            .children(scrollbars)
                             .children(note_menu)
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_grid_down))
                             .on_mouse_down(
@@ -1948,57 +1953,270 @@ impl PianoRoll {
                     // Single unified controller lane (velocity / CC / etc).
                     .children(lane_body),
             )
-            .children(self.render_scrollbars(cx, clip_id))
-            .child(note_inspector)
+            .children(note_inspector)
     }
 
-    fn render_scrollbars(&self, cx: &Context<Self>, clip_id: &str) -> Vec<gpui::AnyElement> {
+    /// The piano keyboard beside the grid, drawn as a keyboard: white keys
+    /// run the full width and meet their neighbours halfway across a black
+    /// key's row, black keys cover [`BLACK_KEY_SHARE`] of the lane in their
+    /// own row. Every key edge is a grid row edge, so a key and its row can
+    /// never disagree. One canvas for the keys; only the names are elements.
+    pub(super) fn build_key_lane(
+        &self,
+        first_pitch: i32,
+        last_pitch: i32,
+    ) -> Vec<gpui::AnyElement> {
+        use crate::theme::typography;
+        let row_h = self.note_row_h();
+        let half = row_h * 0.5;
+        let scale = self.pitch_ctx.scale;
+        let scale_active = scale.kind != ScaleKind::Chromatic;
+        let pressed = self.key_lane_pressed_pitch;
+
+        // Resolved once here; the paint closure only fills quads. Keys out of
+        // the scale are shaded toward the canvas; the scale's root and the
+        // sounding key take the accent.
+        let white = Colors::piano_white_key();
+        let black = Colors::piano_black_key();
+        let shade = Colors::with_alpha(Colors::surface_canvas(), 0.38);
+        let white_out = Colors::composite(white, shade);
+        let black_out = Colors::composite(black, Colors::with_alpha(white, 0.10));
+        let root_wash = Colors::with_alpha(Colors::accent_primary(), 0.28);
+        let press = Colors::with_alpha(Colors::accent_primary(), 0.62);
+        let seam = Colors::piano_key_seam();
+        let key_label = Colors::piano_key_label();
+
+        let mut whites: Vec<(f32, f32, gpui::Rgba)> = Vec::new();
+        let mut blacks: Vec<(f32, f32, gpui::Rgba)> = Vec::new();
+        let mut labels: Vec<gpui::AnyElement> = Vec::new();
+        for p in first_pitch..=last_pitch {
+            let pitch = p as u8;
+            let y = self.pitch_to_y(pitch);
+            let in_scale = !scale_active || scale.contains_pitch(pitch);
+            let is_root = scale_active && pitch % 12 == scale.root.pitch_class();
+            let is_pressed = pressed == Some(pitch);
+            if is_black(p) {
+                let mut fill = if in_scale { black } else { black_out };
+                if is_root {
+                    fill = Colors::composite(fill, root_wash);
+                }
+                if is_pressed {
+                    fill = Colors::composite(fill, press);
+                }
+                blacks.push((y, row_h, fill));
+                continue;
+            }
+            // A white key reaches half a row into each black neighbour.
+            let top = y - if p < PITCH_CNT - 1 && is_black(p + 1) {
+                half
+            } else {
+                0.0
+            };
+            let bottom = y + row_h + if p > 0 && is_black(p - 1) { half } else { 0.0 };
+            let mut fill = if in_scale { white } else { white_out };
+            if is_root {
+                fill = Colors::composite(fill, root_wash);
+            }
+            if is_pressed {
+                fill = Colors::composite(fill, press);
+            }
+            whites.push((top, bottom, fill));
+
+            // Names: every C (the octave), the scale's root, the pressed key,
+            // and every white key once rows are tall enough to read them.
+            let is_c = p % 12 == 0;
+            if is_c || is_root || is_pressed || row_h >= 14.0 {
+                // Dark on the white key; the octave and the root are set in
+                // full strength and weight, the rest quieter.
+                let color = if is_c || is_root || is_pressed {
+                    key_label
+                } else {
+                    Colors::with_alpha(key_label, 0.62)
+                };
+                let center = (top + bottom) * 0.5;
+                labels.push(
+                    div()
+                        .absolute()
+                        .right(px(crate::theme::space::SNUG))
+                        .top(px(center - 6.0))
+                        .h(px(12.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(typography::DENSE_CAPTION))
+                        .font_weight(if is_c || is_root {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::NORMAL
+                        })
+                        .text_color(color)
+                        .child(note_name(p))
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let keys = canvas(
+            |_bounds, _window, _cx| (),
+            move |bounds: gpui::Bounds<gpui::Pixels>, (), window, _cx| {
+                let ox: f32 = bounds.origin.x.into();
+                let oy: f32 = bounds.origin.y.into();
+                let w: f32 = bounds.size.width.into();
+                let black_w = (w * BLACK_KEY_SHARE).round();
+                window.paint_layer(bounds, |window| {
+                    for (top, bottom, fill_color) in &whites {
+                        let rect = gpui::Bounds {
+                            origin: gpui::point(px(ox), px(oy + top)),
+                            size: gpui::size(px(w), px((bottom - top).max(0.0))),
+                        };
+                        window.paint_quad(gpui::fill(rect, *fill_color));
+                        // The seam under each white key.
+                        let line = gpui::Bounds {
+                            origin: gpui::point(px(ox), px(oy + bottom - 1.0)),
+                            size: gpui::size(px(w), px(1.0)),
+                        };
+                        window.paint_quad(gpui::fill(line, seam));
+                    }
+                    for (top, h, fill_color) in &blacks {
+                        let rect = gpui::Bounds {
+                            origin: gpui::point(px(ox), px(oy + top)),
+                            size: gpui::size(px(black_w), px(*h)),
+                        };
+                        window.paint_quad(gpui::fill(rect, *fill_color));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0()
+        .into_any_element();
+
+        let mut out = Vec::with_capacity(labels.len() + 1);
+        out.push(keys);
+        out.extend(labels);
+        out
+    }
+
+    /// The controller lane's header in the key column: the lane selector and
+    /// a hide button on top, the value scale under them.
+    fn render_lane_header(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        use crate::theme::{size, space, typography};
+        let scale_labels: Vec<gpui::AnyElement> = if self.lane_view == PianoLaneView::Velocity {
+            let (_, lane_h) = self.cc_view_size();
+            let usable = (lane_h - 8.0).max(1.0);
+            [96u8, 64, 32]
+                .into_iter()
+                .map(|value| {
+                    let y = velocity_lane_y(value, usable);
+                    div()
+                        .absolute()
+                        .right(px(space::SNUG))
+                        .top(px(y - 6.0))
+                        .h(px(12.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(typography::DENSE_CAPTION))
+                        .text_color(Colors::text_faint())
+                        .child(value.to_string())
+                        .into_any_element()
+                })
+                .collect()
+        } else {
+            vec![
+                div()
+                    .absolute()
+                    .right(px(space::SNUG))
+                    .bottom(px(space::TIGHT))
+                    .text_size(px(typography::DENSE_CAPTION))
+                    .text_color(Colors::text_faint())
+                    .child(self.lane_range())
+                    .into_any_element(),
+            ]
+        };
+        div()
+            .relative()
+            .flex_shrink_0()
+            .h(px(LANE_H))
+            .w_full()
+            .border_t(px(1.0))
+            .border_r(px(1.0))
+            .border_color(Colors::panel_border())
+            .bg(Colors::surface_panel())
+            // The selector takes the whole width so the lane's name reads.
+            .child(
+                div()
+                    .absolute()
+                    .top(px(space::TIGHT))
+                    .left(px(space::TIGHT))
+                    .right(px(space::TIGHT))
+                    .child(self.render_lane_selector(cx)),
+            )
+            .children(scale_labels)
+            // Hide sits at the foot, where the lane folds down to.
+            .child(
+                div()
+                    .absolute()
+                    .left(px(space::TIGHT))
+                    .bottom(px(space::TIGHT))
+                    .child(
+                        bar_icon_button(
+                            "pr-lane-toggle",
+                            assets::ICON_CHEVRON_DOWN_PATH,
+                            "Hide lane".into(),
+                            None,
+                            cx.listener(|this, _ev, _w, cx| this.toggle_lane_visible(cx)),
+                        )
+                        .size(px(size::DENSE)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Scroll position indicators, inside the grid along its right and
+    /// bottom edges.
+    fn render_scrollbars(&self, cx: &Context<Self>) -> Vec<gpui::AnyElement> {
+        use crate::theme::{radius, space};
+        const THICKNESS: f32 = 4.0;
         let (view_w, view_h) = self.grid_view_size();
-        let (_, clip_len) = self.clip_meta(cx, clip_id);
-        let max_x = (clip_len * self.ppb - view_w).max(0.0);
+        let max_x = self.max_scroll_x(cx);
         let max_y = self.max_scroll_y();
+        let thumb = Colors::with_alpha(Colors::text_primary(), 0.20);
         let mut bars = Vec::new();
 
         if max_y > 0.5 {
-            let track_h = view_h.max(1.0);
+            let track_h = (view_h - space::TIGHT * 2.0).max(1.0);
             // A just-created/floating editor can have a viewport shorter than
-            // the preferred scrollbar thumb. `clamp` panics when its minimum
-            // exceeds its maximum, so cap the preferred minimum to the track
-            // size before clamping.
+            // the preferred thumb. `clamp` panics when its minimum exceeds its
+            // maximum, so cap the preferred minimum to the track first.
             let min_thumb_h = 24.0_f32.min(track_h);
             let thumb_h = (track_h * (view_h / (view_h + max_y))).clamp(min_thumb_h, track_h);
             let thumb_y = ((self.scroll_y / max_y) * (track_h - thumb_h)).clamp(0.0, track_h);
             bars.push(
                 div()
                     .absolute()
-                    .right(px(3.0))
-                    .top(px(RULER_H + thumb_y))
-                    .w(px(5.0))
+                    .right(px(space::HAIR))
+                    .top(px(space::TIGHT + thumb_y))
+                    .w(px(THICKNESS))
                     .h(px(thumb_h))
-                    .rounded(px(crate::theme::radius::MICRO))
-                    .bg(Colors::with_alpha(Colors::text_faint(), 0.42))
+                    .rounded(px(radius::PILL))
+                    .bg(thumb)
                     .into_any_element(),
             );
         }
 
         if max_x > 0.5 {
-            let track_w = view_w.max(1.0);
+            let track_w = (view_w - space::TIGHT * 2.0).max(1.0);
             let min_thumb_w = 32.0_f32.min(track_w);
             let thumb_w = (track_w * (view_w / (view_w + max_x))).clamp(min_thumb_w, track_w);
             let thumb_x = ((self.scroll_x / max_x) * (track_w - thumb_w)).clamp(0.0, track_w);
             bars.push(
                 div()
                     .absolute()
-                    .left(px(key_lane_width() + thumb_x))
-                    .bottom(px(if self.unified_lane_visible(cx) {
-                        LANE_H + 3.0
-                    } else {
-                        3.0
-                    }))
+                    .left(px(space::TIGHT + thumb_x))
+                    .bottom(px(space::HAIR))
                     .w(px(thumb_w))
-                    .h(px(5.0))
-                    .rounded(px(crate::theme::radius::MICRO))
-                    .bg(Colors::with_alpha(Colors::text_faint(), 0.42))
+                    .h(px(THICKNESS))
+                    .rounded(px(radius::PILL))
+                    .bg(thumb)
                     .into_any_element(),
             );
         }
@@ -2006,9 +2224,9 @@ impl PianoRoll {
         bars
     }
 
-    /// Articulation assignment buttons for the selected notes: one compact
-    /// button per built-in articulation plus "None". Wraps across rows via
-    /// `note_button_row`. Applies to the whole selection as one undo entry.
+    /// Articulation palette for the selected notes: one chip per articulation
+    /// the instrument can play, plus "None". Applies to the whole selection as
+    /// one undo entry.
     fn articulation_assign_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         fn button_id(articulation: Option<ArticulationId>) -> &'static str {
             match articulation {
@@ -2027,14 +2245,14 @@ impl PianoRoll {
         // Solfege tracks narrow the palette to what the loaded instrument can
         // actually play; everything else keeps the full built-in vocabulary.
         let available = self.available_articulations(cx);
-        // `None` while the selection is mixed, so no button claims to be the
+        // `None` while the selection is mixed, so no chip claims to be the
         // current value.
         let current = self.uniform_selection_articulation(cx);
-        let mut buttons: Vec<gpui::AnyElement> = available
+        let mut chips: Vec<gpui::AnyElement> = available
             .iter()
             .map(|articulation| {
                 let articulation = *articulation;
-                note_toggle_button(
+                insp_chip(
                     button_id(Some(articulation)),
                     articulation.short_name(),
                     current == Some(Some(articulation)),
@@ -2045,8 +2263,8 @@ impl PianoRoll {
                 .into_any_element()
             })
             .collect();
-        buttons.push(
-            note_toggle_button(
+        chips.push(
+            insp_chip(
                 button_id(None),
                 "None",
                 current == Some(None),
@@ -2054,14 +2272,20 @@ impl PianoRoll {
             )
             .into_any_element(),
         );
-        note_button_row(buttons).into_any_element()
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(px(crate::theme::space::TIGHT))
+            .children(chips)
+            .into_any_element()
     }
 
     fn render_note_expression_inspector(
         &self,
         note: &MidiNoteState,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> Vec<gpui::AnyElement> {
         fn range(curve: &sphere_midi_service::ExpressionCurve) -> Option<(f32, f32)> {
             let mut values = curve.points.iter().map(|point| point.value);
             let first = values.next()?;
@@ -2092,310 +2316,309 @@ impl PianoRoll {
                     }
                 })
                 .unwrap_or_else(|| "None".to_string());
-            note_value_row(label, value).into_any_element()
+            insp_row(label, value, None).into_any_element()
         }
 
-        div()
-            .mt(px(3.0))
-            .pt(px(5.0))
-            .border_t(px(1.0))
-            .border_color(Colors::divider())
-            .flex()
-            .flex_col()
-            .gap(px(3.0))
-            .child(note_inspector_label("NOTE EXPRESSION"))
-            .child(row("Pitch", &note.expression.pitch, false))
-            .child(row("Pressure", &note.expression.pressure, true))
-            .child(row("Timbre", &note.expression.timbre, true))
-            .child(note_value_row(
+        vec![
+            insp_section("EXPRESSION").into_any_element(),
+            row("Pitch", &note.expression.pitch, false),
+            row("Pressure", &note.expression.pressure, true),
+            row("Timbre", &note.expression.timbre, true),
+            insp_row(
                 "Release",
                 note.expression
                     .release_velocity
                     .map(|value| format!("{:.0}%", value.clamp(0.0, 1.0) * 100.0))
                     .unwrap_or_else(|| "Default".to_string()),
-            ))
-            .child(
-                note_button_row(vec![
-                    note_action_button(
-                        "pr-expression-reset-pitch",
-                        "Reset Pitch",
-                        cx.listener(|this, _, _w, cx| {
-                            this.reset_selected_expression(Some(NoteExpressionLane::Pitch), cx)
-                        }),
-                    )
-                    .into_any_element(),
-                    note_action_button(
-                        "pr-expression-reset-pressure",
-                        "Reset Pressure",
-                        cx.listener(|this, _, _w, cx| {
-                            this.reset_selected_expression(Some(NoteExpressionLane::Pressure), cx)
-                        }),
-                    )
-                    .into_any_element(),
-                    note_action_button(
-                        "pr-expression-reset-timbre",
-                        "Reset Timbre",
-                        cx.listener(|this, _, _w, cx| {
-                            this.reset_selected_expression(Some(NoteExpressionLane::Timbre), cx)
-                        }),
-                    )
-                    .into_any_element(),
-                ])
-                .into_any_element(),
+                None,
             )
-            .child(note_action_button(
-                "pr-expression-reset-all",
-                "Reset All Expression",
-                cx.listener(|this, _, _w, cx| this.reset_selected_expression(None, cx)),
-            ))
-            .into_any_element()
+            .into_any_element(),
+            insp_action_row(vec![
+                insp_action(
+                    "pr-expression-reset-pitch",
+                    "Pitch",
+                    false,
+                    cx.listener(|this, _, _w, cx| {
+                        this.reset_selected_expression(Some(NoteExpressionLane::Pitch), cx)
+                    }),
+                )
+                .into_any_element(),
+                insp_action(
+                    "pr-expression-reset-pressure",
+                    "Pressure",
+                    false,
+                    cx.listener(|this, _, _w, cx| {
+                        this.reset_selected_expression(Some(NoteExpressionLane::Pressure), cx)
+                    }),
+                )
+                .into_any_element(),
+                insp_action(
+                    "pr-expression-reset-timbre",
+                    "Timbre",
+                    false,
+                    cx.listener(|this, _, _w, cx| {
+                        this.reset_selected_expression(Some(NoteExpressionLane::Timbre), cx)
+                    }),
+                )
+                .into_any_element(),
+            ])
+            .into_any_element(),
+            insp_action_row(vec![
+                insp_action(
+                    "pr-expression-reset-all",
+                    "Reset All Expression",
+                    false,
+                    cx.listener(|this, _, _w, cx| this.reset_selected_expression(None, cx)),
+                )
+                .into_any_element(),
+            ])
+            .into_any_element(),
+        ]
     }
 
+    /// The note inspector: the selection's real values, each with the nudge
+    /// that edits it beside it, then its articulation and the commands on it.
+    /// With nothing selected it describes the clip instead of saying nothing.
     pub(super) fn render_note_inspector(
         &self,
         cx: &mut Context<Self>,
         clip_id: &str,
     ) -> impl IntoElement {
+        use crate::theme::{size, space, typography};
         let snapshot = self.note_inspector_snapshot(cx, clip_id);
         let count = snapshot.count();
         let step = self.grid_res.beats().max(MIN_NOTE_BEATS);
         let fine_step = (step * 0.25).max(MIN_NOTE_BEATS);
 
-        let mut content: Vec<gpui::AnyElement> = Vec::new();
-        content.push(note_inspector_label("NOTE INSPECTOR").into_any_element());
+        let title = match count {
+            0 => "Clip".to_string(),
+            1 => "Note".to_string(),
+            n => format!("{} Notes", group_thousands(n)),
+        };
+        let mut content: Vec<gpui::AnyElement> = vec![
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(space::SNUG))
+                .h(px(size::DEFAULT))
+                .child(
+                    div()
+                        .text_size(px(typography::UI_SM))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(Colors::text_primary())
+                        .child(title),
+                )
+                .when(count > 0, |header| {
+                    header.child(crate::components::controls::fb_badge(
+                        snapshot.pitch_label(),
+                        Colors::accent_primary(),
+                    ))
+                })
+                .into_any_element(),
+        ];
 
         if count == 0 {
+            let (notes, lowest, highest) = {
+                let tl = self.timeline.read(cx);
+                tl.state
+                    .midi_clip_notes(clip_id)
+                    .map(|notes| {
+                        (
+                            notes.len(),
+                            notes.iter().map(|n| n.pitch).min(),
+                            notes.iter().map(|n| n.pitch).max(),
+                        )
+                    })
+                    .unwrap_or((0, None, None))
+            };
+            let length = self
+                .scope
+                .editing()
+                .map(|span| span.duration_beats)
+                .unwrap_or(0.0);
+            content.push(insp_row("Notes", group_thousands(notes), None).into_any_element());
+            content.push(
+                insp_row(
+                    "Range",
+                    match (lowest, highest) {
+                        (Some(lo), Some(hi)) if lo == hi => note_name(lo as i32),
+                        (Some(lo), Some(hi)) => {
+                            format!("{} – {}", note_name(lo as i32), note_name(hi as i32))
+                        }
+                        _ => "—".to_string(),
+                    },
+                    None,
+                )
+                .into_any_element(),
+            );
+            content.push(
+                insp_row("Length", format!("{} beats", format_beats(length)), None)
+                    .into_any_element(),
+            );
             content.push(
                 div()
-                    .text_size(px(10.0))
-                    .text_color(Colors::text_muted())
+                    .pt(px(space::BASE))
+                    .text_size(px(typography::DENSE_LABEL))
                     .line_height(px(15.0))
-                    .child("Select notes in the piano roll to edit pitch, timing, and velocity.")
+                    .text_color(Colors::text_muted())
+                    .child("Select notes to edit their pitch, timing and velocity.")
                     .into_any_element(),
             );
-        } else if count == 1 {
-            let note = &snapshot.selected[0];
-            content.push(note_value_row("Pitch", snapshot.pitch_label()).into_any_element());
-            content.push(note_value_row("Start", format_beats(note.start)).into_any_element());
-            content.push(note_value_row("Length", format_beats(note.duration)).into_any_element());
-            content.push(
-                note_value_row("End", format_beats(note.start + note.duration)).into_any_element(),
-            );
-            content.push(note_value_row("Velocity", note.velocity.to_string()).into_any_element());
-            content.push(note_value_row("Channel", note.channel.label()).into_any_element());
-            content
-                .push(note_value_row("Artic.", snapshot.articulation_label()).into_any_element());
-            // Community keeps expression in the project and shows the inline
-            // curve below, but the mutating inspector is a Professional-only
-            // editing surface.
-            if crate::edition::professional_features_available() {
-                content.push(self.render_note_expression_inspector(note, cx));
-            }
-            content.push(self.articulation_assign_row(cx));
-            content.push(
-                note_button_row(vec![
-                    note_action_button(
-                        "pr-note-chan-down",
-                        "Ch -1",
-                        cx.listener(|this, _, _w, cx| this.nudge_selected_channel(-1, cx)),
+        } else {
+            let single = snapshot.selected.first().filter(|_| count == 1).cloned();
+            let (start, end_label, end_value) = match &single {
+                Some(note) => {
+                    let origin = self.edit_origin();
+                    let tl = self.timeline.read(cx);
+                    (
+                        tl.state.format_position(origin + note.start),
+                        "End",
+                        tl.state
+                            .format_position(origin + note.start + note.duration),
                     )
-                    .into_any_element(),
-                    note_action_button(
-                        "pr-note-chan-up",
-                        "Ch +1",
-                        cx.listener(|this, _, _w, cx| this.nudge_selected_channel(1, cx)),
-                    )
-                    .into_any_element(),
-                ])
-                .into_any_element(),
-            );
+                }
+                None => (snapshot.start_label(), "Range", snapshot.end_label()),
+            };
+
+            content.push(insp_section("PITCH & TIME").into_any_element());
             content.push(
-                note_button_row(vec![
-                    note_action_button(
-                        "pr-note-pitch-down",
-                        "-1 st",
+                insp_row(
+                    "Pitch",
+                    snapshot.pitch_label(),
+                    Some(insp_stepper(
+                        "pr-note-pitch",
                         cx.listener(|this, _, _w, cx| this.nudge_selected_pitch(-1, cx)),
-                    )
-                    .into_any_element(),
-                    note_action_button(
-                        "pr-note-pitch-up",
-                        "+1 st",
                         cx.listener(|this, _, _w, cx| this.nudge_selected_pitch(1, cx)),
-                    )
-                    .into_any_element(),
-                ])
+                    )),
+                )
                 .into_any_element(),
             );
             content.push(
-                note_button_row(vec![
-                    note_action_button(
-                        "pr-note-start-down",
-                        "-Start",
+                insp_row(
+                    "Start",
+                    start,
+                    Some(insp_stepper(
+                        "pr-note-start",
                         cx.listener(move |this, _, _w, cx| this.nudge_selected_start(-step, cx)),
-                    )
-                    .into_any_element(),
-                    note_action_button(
-                        "pr-note-start-up",
-                        "+Start",
                         cx.listener(move |this, _, _w, cx| this.nudge_selected_start(step, cx)),
-                    )
-                    .into_any_element(),
-                ])
+                    )),
+                )
                 .into_any_element(),
             );
             content.push(
-                note_button_row(vec![
-                    note_action_button(
-                        "pr-note-len-down",
-                        "-Len",
+                insp_row(
+                    "Length",
+                    snapshot.length_label(),
+                    Some(insp_stepper(
+                        "pr-note-len",
                         cx.listener(move |this, _, _w, cx| {
                             this.nudge_selected_length(-fine_step, cx)
                         }),
-                    )
-                    .into_any_element(),
-                    note_action_button(
-                        "pr-note-len-up",
-                        "+Len",
                         cx.listener(move |this, _, _w, cx| {
                             this.nudge_selected_length(fine_step, cx)
                         }),
-                    )
-                    .into_any_element(),
-                ])
-                .into_any_element(),
-            );
-            content.push(
-                note_button_row(vec![
-                    note_action_button(
-                        "pr-note-vel-down",
-                        "Vel -5",
-                        cx.listener(|this, _, _w, cx| this.nudge_selected_velocity(-5, cx)),
-                    )
-                    .into_any_element(),
-                    note_action_button(
-                        "pr-note-vel-up",
-                        "Vel +5",
-                        cx.listener(|this, _, _w, cx| this.nudge_selected_velocity(5, cx)),
-                    )
-                    .into_any_element(),
-                ])
-                .into_any_element(),
-            );
-            let mute_label = if note.muted { "Unmute" } else { "Mute" };
-            content.push(
-                note_button_row(vec![note_action_button(
-                    "pr-note-mute",
-                    mute_label,
-                    cx.listener(|this, _, _w, cx| this.toggle_mute_selection(cx)),
+                    )),
                 )
-                .into_any_element()])
                 .into_any_element(),
             );
-        } else {
-            content.push(note_value_row("Selected", count.to_string()).into_any_element());
-            content.push(note_value_row("Pitch", snapshot.pitch_label()).into_any_element());
-            content.push(note_value_row("Range", snapshot.end_label()).into_any_element());
-            content.push(note_value_row("Start", snapshot.start_label()).into_any_element());
-            content.push(note_value_row("Length", snapshot.length_label()).into_any_element());
-            content.push(note_value_row("Velocity", snapshot.velocity_label()).into_any_element());
-            content.push(note_value_row("Channel", snapshot.channel_label()).into_any_element());
-            content
-                .push(note_value_row("Artic.", snapshot.articulation_label()).into_any_element());
-            content.push(self.articulation_assign_row(cx));
+            content.push(insp_row(end_label, end_value, None).into_any_element());
+
+            content.push(insp_section("PERFORMANCE").into_any_element());
             content.push(
-                note_button_row(vec![
-                    note_action_button(
-                        "pr-notes-chan-down",
-                        "Ch -1",
-                        cx.listener(|this, _, _w, cx| this.nudge_selected_channel(-1, cx)),
-                    )
-                    .into_any_element(),
-                    note_action_button(
-                        "pr-notes-chan-up",
-                        "Ch +1",
-                        cx.listener(|this, _, _w, cx| this.nudge_selected_channel(1, cx)),
-                    )
-                    .into_any_element(),
-                ])
-                .into_any_element(),
-            );
-            content.push(
-                note_button_row(vec![
-                    note_action_button(
-                        "pr-notes-trans-down",
-                        "-1 st",
-                        cx.listener(|this, _, _w, cx| this.nudge_selected_pitch(-1, cx)),
-                    )
-                    .into_any_element(),
-                    note_action_button(
-                        "pr-notes-trans-up",
-                        "+1 st",
-                        cx.listener(|this, _, _w, cx| this.nudge_selected_pitch(1, cx)),
-                    )
-                    .into_any_element(),
-                ])
-                .into_any_element(),
-            );
-            content.push(
-                note_button_row(vec![
-                    note_action_button(
-                        "pr-notes-vel-down",
-                        "Vel -5",
+                insp_row(
+                    "Velocity",
+                    snapshot.velocity_label(),
+                    Some(insp_stepper(
+                        "pr-note-vel",
                         cx.listener(|this, _, _w, cx| this.nudge_selected_velocity(-5, cx)),
-                    )
-                    .into_any_element(),
-                    note_action_button(
-                        "pr-notes-vel-up",
-                        "Vel +5",
                         cx.listener(|this, _, _w, cx| this.nudge_selected_velocity(5, cx)),
-                    )
-                    .into_any_element(),
-                ])
+                    )),
+                )
                 .into_any_element(),
             );
             content.push(
-                note_button_row(vec![
-                    note_action_button(
-                        "pr-notes-quantize",
-                        "Quantize",
-                        cx.listener(|this, _, _w, cx| this.quantize_selection(cx)),
-                    )
-                    .into_any_element(),
-                    note_action_button(
-                        "pr-notes-delete",
-                        "Delete",
-                        cx.listener(|this, _, _w, cx| this.delete_selection(cx)),
-                    )
-                    .into_any_element(),
-                ])
+                insp_row(
+                    "Channel",
+                    snapshot.channel_label(),
+                    Some(insp_stepper(
+                        "pr-note-chan",
+                        cx.listener(|this, _, _w, cx| this.nudge_selected_channel(-1, cx)),
+                        cx.listener(|this, _, _w, cx| this.nudge_selected_channel(1, cx)),
+                    )),
+                )
                 .into_any_element(),
             );
+
+            content.push(insp_section("ARTICULATION").into_any_element());
+            content.push(self.articulation_assign_row(cx));
+
+            // Community keeps expression in the project and shows the inline
+            // curve on the note, but the mutating inspector is a
+            // Professional-only editing surface.
+            if let Some(note) = &single {
+                if crate::edition::professional_features_available() {
+                    content.extend(self.render_note_expression_inspector(note, cx));
+                }
+            }
+
+            let muted = match &single {
+                Some(note) => note.muted,
+                None => self.selection_all_muted(cx),
+            };
+            content.push(insp_section("ACTIONS").into_any_element());
             content.push(
-                note_button_row(vec![
-                    note_action_button(
-                        "pr-notes-mute",
-                        "Mute",
+                insp_action_row(vec![
+                    insp_action(
+                        "pr-note-mute",
+                        if muted { "Unmute" } else { "Mute" },
+                        false,
                         cx.listener(|this, _, _w, cx| this.toggle_mute_selection(cx)),
                     )
                     .into_any_element(),
-                    note_action_button(
+                    insp_action(
                         "pr-notes-duplicate",
                         "Duplicate",
+                        false,
                         cx.listener(|this, _, _w, cx| this.duplicate_selection(false, cx)),
                     )
                     .into_any_element(),
                 ])
                 .into_any_element(),
             );
+            content.push(
+                insp_action_row(vec![
+                    insp_action(
+                        "pr-notes-quantize",
+                        "Quantize",
+                        false,
+                        cx.listener(|this, _, _w, cx| this.quantize_selection(cx)),
+                    )
+                    .into_any_element(),
+                    insp_action(
+                        "pr-notes-delete",
+                        "Delete",
+                        true,
+                        cx.listener(|this, _, _w, cx| this.delete_selection(cx)),
+                    )
+                    .into_any_element(),
+                ])
+                .into_any_element(),
+            );
         }
 
         div()
-            .w(px(216.0))
+            .id("pr-note-inspector")
+            .w(px(INSPECTOR_W))
+            .flex_shrink_0()
             .h_full()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap(px(7.0))
-            .p(px(8.0))
+            .gap(px(space::HAIR))
+            .px(px(space::LOOSE))
+            .py(px(space::BASE))
             .border_l(px(1.0))
             .border_color(Colors::panel_border())
             .bg(Colors::surface_panel())
@@ -2678,6 +2901,7 @@ impl PianoRoll {
     /// Mark positions come from [`PianoRollViewport::ruler_marks`], the single
     /// source of ruler geometry in the editor; only the styling is local.
     pub(super) fn build_ruler(&self, start_beat: f32, end_beat: f32) -> Vec<gpui::AnyElement> {
+        use crate::theme::{space, typography};
         let mut out: Vec<gpui::AnyElement> = Vec::new();
         let scale = self.window_scale;
         let tick_w = grid_render::hairline(scale);
@@ -2689,25 +2913,34 @@ impl PianoRoll {
             out.push(
                 div()
                     .absolute()
-                    .top_0()
-                    .left(px(x + 2.0))
-                    .text_size(px(8.5))
+                    .top(px(space::HAIR))
+                    .left(px(x + space::TIGHT))
+                    .text_size(px(if mark.on_bar {
+                        typography::DENSE_LABEL
+                    } else {
+                        typography::DENSE_CAPTION
+                    }))
+                    .font_weight(if mark.on_bar {
+                        gpui::FontWeight::MEDIUM
+                    } else {
+                        gpui::FontWeight::NORMAL
+                    })
                     .text_color(if mark.on_bar {
                         Colors::text_secondary()
                     } else {
-                        Colors::text_muted()
+                        Colors::text_faint()
                     })
                     .child(mark.label)
                     .into_any_element(),
             );
-            // Tick mark at the bottom of the ruler.
+            // A bar reads as a full-height rule, a beat as a short tick.
             out.push(
                 div()
                     .absolute()
                     .left(px(x))
                     .bottom_0()
                     .w(px(tick_w))
-                    .h(px(if mark.on_bar { 6.0 } else { 4.0 }))
+                    .h(px(if mark.on_bar { RULER_H } else { 5.0 }))
                     .bg(if mark.on_bar {
                         GridLineKind::Bar.color()
                     } else {
@@ -2717,6 +2950,42 @@ impl PianoRoll {
             );
         }
         out
+    }
+
+    /// The clips on the track as bands along the ruler's foot: the edited one
+    /// in its track's colour, its neighbours quiet — where the part is, at a
+    /// glance, even when its notes are scrolled out of view.
+    pub(super) fn build_ruler_clip_band(
+        &self,
+        track_color: gpui::Rgba,
+        view_w: f32,
+    ) -> Vec<gpui::AnyElement> {
+        const BAND_H: f32 = 3.0;
+        self.scope
+            .spans()
+            .iter()
+            .filter_map(|span| {
+                let x0 = self.project_beat_to_x(span.start_beat).max(0.0);
+                let x1 = self.project_beat_to_x(span.end_beat()).min(view_w);
+                if x1 <= x0 {
+                    return None;
+                }
+                Some(
+                    div()
+                        .absolute()
+                        .left(px(x0))
+                        .bottom_0()
+                        .w(px(x1 - x0))
+                        .h(px(BAND_H))
+                        .bg(if span.editable {
+                            track_color
+                        } else {
+                            Colors::with_alpha(Colors::text_faint(), 0.35)
+                        })
+                        .into_any_element(),
+                )
+            })
+            .collect()
     }
 
     /// Bar/beat vertical lines through the lane under the grid (velocity,
@@ -2968,49 +3237,49 @@ impl PianoRoll {
                     articulation,
                     inline_pitch,
                 )| {
+                    // Velocity is the fill's strength: a quiet note reads
+                    // quiet before its bar in the lane is found. Selection is
+                    // said twice — full strength and the accent edge — and
+                    // muted notes go hollow.
                     let mut fill = track_color;
                     fill.a = if erase_target {
                         0.45
                     } else if muted {
-                        // Muted notes read as hollow/dim so they stand apart from
-                        // active notes without leaving the grid.
-                        0.18
+                        0.14
                     } else if selected {
                         1.0
                     } else {
-                        0.78
+                        0.42 + 0.5 * (velocity as f32 / 127.0)
                     };
                     let border = if erase_target {
                         Colors::status_error()
                     } else if selected {
                         Colors::accent_primary()
                     } else if muted {
-                        Colors::with_alpha(Colors::text_muted(), 0.7)
+                        Colors::with_alpha(Colors::text_muted(), 0.6)
                     } else {
-                        Colors::with_alpha(track_color, 0.55)
+                        Colors::composite(
+                            track_color,
+                            Colors::with_alpha(Colors::surface_canvas(), 0.45),
+                        )
                     };
+                    let note_h = row_h - 2.0;
                     let mut note = div()
                         .id(("pr-note", id as usize))
                         .absolute()
                         .left(px(x))
                         .top(px(y + 1.0))
                         .w(px(w))
-                        .h(px(row_h - 2.0))
-                        .rounded(px(crate::theme::radius::MICRO))
+                        .h(px(note_h))
+                        // Data-sized: square below the radius' minimum side.
+                        .rounded(px(crate::theme::radius::clamped(
+                            crate::theme::radius::MICRO,
+                            w,
+                            note_h,
+                        )))
                         .bg(fill)
-                        .border(px(1.0))
+                        .border(px(if selected { 1.5 } else { 1.0 }))
                         .border_color(border)
-                        .shadow(if selected {
-                            vec![gpui::BoxShadow {
-                                color: Colors::with_alpha(Colors::accent_primary(), 0.35).into(),
-                                offset: gpui::point(px(0.0), px(0.0)),
-                                blur_radius: px(8.0),
-                                spread_radius: px(0.0),
-                                inset: false,
-                            }]
-                        } else {
-                            Vec::new()
-                        })
                         .cursor(gpui::CursorStyle::PointingHand)
                         .on_hover(cx.listener(move |this, hovered: &bool, _w, cx| {
                             this.hover_note_status = hovered.then(|| {
@@ -3071,23 +3340,28 @@ impl PianoRoll {
                     }
                     // Note-name label, shown only when the block is large enough to
                     // read so dense clips stay clean.
-                    if w >= 22.0 && row_h >= 11.0 {
+                    if w >= 24.0 && row_h >= 11.0 {
                         let label_color = if muted {
                             Colors::with_alpha(Colors::text_muted(), 0.8)
                         } else if selected {
                             Colors::text_primary()
                         } else {
-                            Colors::with_alpha(Colors::text_primary(), 0.85)
+                            Colors::with_alpha(Colors::text_primary(), 0.82)
                         };
                         note = note.child(
                             div()
                                 .absolute()
-                                .left(px(3.0))
+                                .left(px(crate::theme::space::TIGHT))
                                 .top_0()
                                 .bottom_0()
                                 .flex()
                                 .items_center()
-                                .text_size(px(8.0))
+                                .text_size(px(if row_h >= 16.0 {
+                                    crate::theme::typography::DENSE_CAPTION
+                                } else {
+                                    8.5
+                                }))
+                                .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(label_color)
                                 .child(note_name(pitch as i32)),
                         );
@@ -3129,7 +3403,7 @@ impl PianoRoll {
                                 .w(px(RESIZE_ZONE))
                                 .h_full()
                                 .cursor(gpui::CursorStyle::ResizeLeftRight)
-                                .hover(|s| s.bg(Colors::with_alpha(Colors::text_primary(), 0.35)))
+                                .hover(|s| s.bg(Colors::with_alpha(Colors::text_primary(), 0.16)))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
@@ -3145,14 +3419,45 @@ impl PianoRoll {
             .collect()
     }
 
+    /// Quiet level guides across the velocity lane, at the values the lane
+    /// header labels.
+    pub(super) fn build_velocity_guides(&self) -> Vec<gpui::AnyElement> {
+        let (_, lane_h) = self.cc_view_size();
+        let usable = (lane_h - 8.0).max(1.0);
+        [96u8, 64, 32]
+            .into_iter()
+            .map(|value| {
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(velocity_lane_y(value, usable).round()))
+                    .h(px(1.0))
+                    .bg(Colors::with_alpha(
+                        Colors::text_primary(),
+                        if value == 64 { 0.06 } else { 0.035 },
+                    ))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// One stem per note, from the lane's floor to its velocity, with a head
+    /// on top. The head sits exactly where a press sets that value
+    /// (`velocity_from_local_y`), so what is drawn is what a drag grabs.
     pub(super) fn build_velocity_bars(
         &mut self,
         cx: &mut Context<Self>,
         clip_id: &str,
         track_color: gpui::Rgba,
     ) -> Vec<gpui::AnyElement> {
-        let (view_w, _) = self.grid_view_size();
-        let geos: Vec<(u64, u8, f32, bool)> = {
+        const HIT_W: f32 = 8.0;
+        const STEM_W: f32 = 2.0;
+        const HEAD: f32 = 6.0;
+        let (view_w, lane_h) = self.cc_view_size();
+        let usable = (lane_h - 8.0).max(1.0);
+        let floor = velocity_lane_y(1, usable);
+        let geos: Vec<(u64, u8, f32, bool, bool)> = {
             let tl = self.timeline.read(cx);
             let Some(notes) = tl.state.midi_clip_notes(clip_id) else {
                 return Vec::new();
@@ -3163,28 +3468,36 @@ impl PianoRoll {
                 .filter_map(|n| {
                     let d = self.display_note(n);
                     let x = self.clip_beat_to_x(d.start);
-                    if x < -8.0 || x > view_w {
+                    if x < -HIT_W || x > view_w {
                         return None;
                     }
-                    Some((d.id, d.velocity, x, self.selection.contains(&d.id)))
+                    Some((d.id, d.velocity, x, self.selection.contains(&d.id), n.muted))
                 })
                 .collect()
         };
+        let stem_rest = Colors::with_alpha(track_color, 0.55);
+        let muted_color = Colors::with_alpha(Colors::text_muted(), 0.45);
+        let selected_color = Colors::accent_primary();
 
         geos.into_iter()
-            .map(|(id, vel, x, selected)| {
-                let bar_h = (((vel as f32 - 1.0) / 126.0) * (LANE_H - 8.0)).max(1.0);
-                let mut fill = track_color;
-                fill.a = if selected { 1.0 } else { 0.5 };
-                // Full-height invisible hit column so even low-velocity bars are
-                // easy to grab; the colored bar sits inside it at the bottom.
+            .map(|(id, vel, x, selected, muted)| {
+                let head_y = velocity_lane_y(vel, usable);
+                let (stem, head) = if selected {
+                    (selected_color, selected_color)
+                } else if muted {
+                    (muted_color, muted_color)
+                } else {
+                    (stem_rest, track_color)
+                };
+                // A full-height transparent column, so even a low velocity is
+                // easy to grab.
                 div()
                     .id(("pr-vel", id as usize))
                     .absolute()
-                    .left(px(x))
+                    .left(px(x - (HIT_W - STEM_W) * 0.5))
                     .top_0()
                     .bottom_0()
-                    .w(px(8.0))
+                    .w(px(HIT_W))
                     .cursor(gpui::CursorStyle::ResizeUpDown)
                     .on_mouse_down(
                         MouseButton::Left,
@@ -3196,12 +3509,23 @@ impl PianoRoll {
                     .child(
                         div()
                             .absolute()
-                            .left_0()
-                            .bottom(px(2.0))
-                            .w(px(6.0))
-                            .h(px(bar_h))
-                            .rounded_t(px(crate::theme::radius::MICRO))
-                            .bg(fill),
+                            .left(px((HIT_W - STEM_W) * 0.5))
+                            .top(px(head_y))
+                            .w(px(STEM_W))
+                            .h(px((floor - head_y).max(1.0)))
+                            .bg(stem),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px((HIT_W - HEAD) * 0.5))
+                            .top(px(head_y - HEAD * 0.5))
+                            .size(px(HEAD))
+                            .rounded(px(crate::theme::radius::PILL))
+                            .bg(head)
+                            .when(selected, |dot| {
+                                dot.border(px(1.0)).border_color(Colors::text_primary())
+                            }),
                     )
                     .into_any_element()
             })

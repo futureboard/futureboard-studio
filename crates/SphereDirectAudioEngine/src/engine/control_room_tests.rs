@@ -45,6 +45,7 @@ fn track(id: &str, track_type: &str) -> EngineTrackSnapshot {
     // as a deterministic signal generator through the whole graph.
     let is_audio = track_type == "audio";
     EngineTrackSnapshot {
+        midi_programs: Vec::new(),
         id: id.to_string(),
         track_type: track_type.to_string(),
         volume: 1.0,
@@ -75,6 +76,8 @@ fn track(id: &str, track_type: &str) -> EngineTrackSnapshot {
         soundfont_polyphony: 64,
         soundfont_envelope: Default::default(),
         soundfont_quality: Default::default(),
+        soundfont_mode: Default::default(),
+        soundfont_channels: Default::default(),
         solfege_engine: None,
     }
 }
@@ -93,6 +96,7 @@ fn gain_insert(id: &str, gain_db: f32) -> EngineInsertSnapshot {
 
 fn build(tracks: Vec<EngineTrackSnapshot>) -> RuntimeProject {
     let snapshot = EngineProjectSnapshot {
+        spatial: Default::default(),
         project_id: "control-room".to_string(),
         project_root: None,
         preferred_input_device: None,
@@ -848,4 +852,69 @@ fn neither_pfl_nor_afl_alters_exported_audio() {
             "{mode:?} must not enter export"
         );
     }
+}
+
+// ── Listening simulation (Virtual Speaker) ──────────────────────────────────
+
+fn simulating(
+    profile: solfege_spatialaudio::ListeningProfile,
+) -> solfege_spatialaudio::SimulationSettings {
+    solfege_spatialaudio::SimulationSettings {
+        enabled: true,
+        profile,
+        device: solfege_spatialaudio::ListeningDevice::Headphones,
+    }
+}
+
+#[test]
+fn the_listening_simulation_changes_what_the_control_room_plays() {
+    let tracks = || vec![track("audio-1", "audio"), track("master", "master")];
+    let mut plain = build(tracks());
+    let (_, dry) = render_and_monitor(&mut plain, 0.5);
+
+    let mut off = build(tracks());
+    off.monitor
+        .simulator
+        .as_deref_mut()
+        .expect("every graph builds a simulator")
+        .configure_now(solfege_spatialaudio::SimulationSettings::default());
+    let (_, untouched) = render_and_monitor(&mut off, 0.5);
+    assert_eq!(
+        untouched, dry,
+        "a simulation that is off leaves monitoring alone"
+    );
+
+    let mut phone = build(tracks());
+    phone
+        .monitor
+        .simulator
+        .as_deref_mut()
+        .expect("every graph builds a simulator")
+        .configure_now(simulating(solfege_spatialaudio::ListeningProfile::Phone));
+    let (_, simulated) = render_and_monitor(&mut phone, 0.5);
+    assert_ne!(
+        simulated, dry,
+        "the phone must be heard on the monitoring output"
+    );
+}
+
+#[test]
+fn the_listening_simulation_never_reaches_exported_audio() {
+    let tracks = || vec![track("audio-1", "audio"), track("master", "master")];
+    let mut plain = build(tracks());
+    let baseline = render_for_export(&mut plain);
+
+    let mut car = build(tracks());
+    car.monitor
+        .simulator
+        .as_deref_mut()
+        .expect("every graph builds a simulator")
+        .configure_now(simulating(solfege_spatialaudio::ListeningProfile::Car));
+    // Play a monitored block first, so the simulator has state to leak.
+    let _ = render_and_monitor(&mut car, 0.5);
+    assert_eq!(
+        render_for_export(&mut car),
+        baseline,
+        "Virtual Speaker is a monitoring stage; export taps before it"
+    );
 }

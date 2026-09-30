@@ -45,6 +45,7 @@ pub mod midi_editor_window;
 pub mod midi_export_dialog;
 pub mod midi_import_dialog;
 pub mod mixer_master_strip_view;
+pub mod mixer_meter_layer;
 pub mod mixer_panel;
 pub mod mixer_panel_view;
 pub mod mixer_render;
@@ -103,6 +104,9 @@ pub mod transport_perf_meter;
 pub mod update_dialog;
 pub mod video_player_window;
 pub mod virtual_keyboard;
+pub mod virtual_speaker_window;
+#[cfg(feature = "gpu-renderer")]
+pub mod visualizer;
 
 pub use about_window::{open_about_window, AboutWindow};
 pub use add_track_dialog::{
@@ -209,7 +213,7 @@ pub use settings_components::{
     settings_toggle, RESTART_FOOTER_TEXT,
 };
 pub use settings_dialog::{
-    open_settings_window, settings_dialog, HardwareCombo, OnSettingUpdate, SettingsDialogCallbacks,
+    open_settings_window, HardwareCombo, OnSettingUpdate, SettingsDialogCallbacks,
     SettingsDialogState, SettingsTab, SettingsWindow,
 };
 pub use sidebar::{sidebar, BrowserCallbacks, SIDEBAR_WIDTH};

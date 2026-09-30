@@ -6,7 +6,7 @@ use crate::components::mixer_panel::{
     clamp_mixer_section_height_px, mixer_render_item_count, mixer_scroll_x_for_strip_index,
     mixer_strip_index_for_channel, MixerCallbacks, MixerSplitAction, MixerSplitTarget,
     VstiOutputMeterState, MIXER_INSERT_SECTION_DEFAULT_PX, MIXER_SEND_SECTION_DEFAULT_PX,
-    STRIP_WIDTH,
+    MIXER_SUB_HEADER_H, STRIP_MIN_HEIGHT, STRIP_WIDTH,
 };
 use crate::components::mixer_tree_model::{
     ensure_timeline_mixer_tree_defaults, expand_ancestors_for_channel, MixerTreeModel,
@@ -127,6 +127,8 @@ pub(crate) struct DockedMixerPanelState<'a> {
     pub tree_sidebar_enabled: bool,
     pub viewport_width: f32,
     pub strip_available_px: f32,
+    /// The panel is shorter than one strip, so the strips scroll vertically.
+    pub body_scrolls: bool,
 }
 
 impl StudioLayout {
@@ -142,9 +144,16 @@ impl StudioLayout {
             .cached_bounds
             .map(|b| f32::from(b.size.width))
             .unwrap_or(1280.0);
-        let mixer_viewport_width = (window_w - tree_w - 90.0).max(100.0);
-        let mixer_viewport_height = (self.bottom_panel_state.height_px - 28.0 - 30.0).max(0.0);
-        let strip_available_px = mixer_viewport_height.max(STRIP_WIDTH);
+        // The pinned Master and Control Room strips and the rule before them.
+        let pinned_w = 2.0 * STRIP_WIDTH + 1.0;
+        let mixer_viewport_width = (window_w - tree_w - pinned_w).max(100.0);
+        // The dock's top rule, its tab strip and the mixer's own sub-header.
+        let chrome_h = 1.0 + crate::theme::size::COMFORTABLE + MIXER_SUB_HEADER_H;
+        let mixer_viewport_height = (self.bottom_panel_state.height_px - chrome_h).max(0.0);
+        // A strip is never laid out shorter than its sections add up to: a
+        // shorter panel scrolls the strips (see `MixerPanelView`) instead of
+        // clipping the fader and the name plate off their bottom.
+        let strip_available_px = mixer_viewport_height.max(STRIP_MIN_HEIGHT);
         let _ = cx;
         (
             mixer_viewport_width,
@@ -155,13 +164,14 @@ impl StudioLayout {
 
     /// Snapshot for the docked mixer panel entity (read-only view of mixer chrome).
     pub(crate) fn docked_mixer_panel_state(&self, cx: &gpui::App) -> DockedMixerPanelState<'_> {
-        let (viewport_width, _viewport_height, strip_available_px) =
+        let (viewport_width, viewport_height, strip_available_px) =
             self.mixer_panel_viewport_metrics(cx);
         DockedMixerPanelState {
             scroll_x: self.mixer_view.scroll_x,
             vsti_output_meters: &self.mixer_view.vsti_output_meters,
             tree_sidebar_enabled: self.mixer_view.tree_sidebar_enabled,
             viewport_width,
+            body_scrolls: viewport_height + 0.5 < strip_available_px,
             strip_available_px,
         }
     }
@@ -217,6 +227,13 @@ impl StudioLayout {
             .update(cx, |meter, cx| meter.apply(perf, cx));
 
         if self.mixer_panel_chrome_visible() {
+            // Levels move in the overlay alone; the panel repaints only for
+            // what else a playing project moves on the strips (automation).
+            if self.docked_mixer_meters_visible() {
+                let _ = self.mixer_meter_overlay.update(cx, |_, cx| cx.notify());
+            } else {
+                self.mixer_meter_layout.borrow_mut().clear();
+            }
             let _ = self
                 .mixer_panel
                 .update(cx, |panel, cx| panel.on_meter_tick(cx));
@@ -1060,6 +1077,11 @@ impl StudioLayout {
         self.external_windows.mixer.clone()
     }
 
+    /// The docked mixer is on screen, so its meter overlay paints.
+    pub(super) fn docked_mixer_meters_visible(&self) -> bool {
+        self.panels.bottom_docked && self.active_bottom_tab == crate::components::BottomTab::Mixer
+    }
+
     pub(super) fn mixer_panel_chrome_visible(&self) -> bool {
         if self.external_windows.mixer.is_some() {
             return true;
@@ -1201,7 +1223,11 @@ impl StudioLayout {
     /// Build the callback bundle used by the mixer. Every mutation lands in
     /// the same `TimelineState` instance owned by the Timeline entity, so the
     /// TrackHeader and Mixer always read identical values.
-    pub(crate) fn build_mixer_callbacks(&self, owner: Entity<Self>) -> MixerCallbacks {
+    pub(crate) fn build_mixer_callbacks(
+        &self,
+        owner: Entity<Self>,
+        cx: &gpui::App,
+    ) -> MixerCallbacks {
         let audio_engine = self.audio_bridge.engine.clone();
         let timeline_select = self.timeline.clone();
         let mixer_panel_select = self.mixer_panel.clone();
@@ -1417,6 +1443,26 @@ impl StudioLayout {
                 }
             }
         });
+
+        let audio_engine_spatial = self.audio_bridge.engine.clone();
+        let timeline_spatial = self.timeline.clone();
+        let owner_spatial = owner.clone();
+        let on_spatial_change: std::sync::Arc<
+            dyn Fn(&(String, solfege_spatialaudio::SourceParams), &mut Window, &mut gpui::App)
+                + 'static,
+        > = std::sync::Arc::new(move |(id, params), _w, cx| {
+            // Live like pan: the engine hears the move at once through
+            // `SetTrackSpatial`, with no graph rebuild per mouse-move.
+            let placed = timeline_spatial.update(cx, |t, cx| t.move_track_in_room(id, *params, cx));
+            if let (Some(params), Some(engine)) = (placed, audio_engine_spatial.as_ref()) {
+                let _ = engine.set_track_spatial(id, params);
+            }
+            StudioLayout::defer_update(&owner_spatial, cx, |this, cx| {
+                this.mark_dirty_view_only();
+                this.push_mixer_snapshot_to_window(cx);
+            });
+        });
+        let spatial_format = self.timeline.read(cx).state.spatial_mix.format;
 
         let audio_engine = self.audio_bridge.engine.clone();
         let timeline_mute = self.timeline.clone();
@@ -2212,6 +2258,8 @@ impl StudioLayout {
             on_volume_drag_preview,
             on_volume_drag_commit,
             on_pan_change,
+            on_spatial_change,
+            spatial_format,
             on_toggle_mute,
             on_toggle_solo,
             on_toggle_arm,
@@ -2650,6 +2698,7 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         volume_effective,
         volume_automation_read,
         pan,
+        spatial,
         muted,
         solo,
         armed,
@@ -2674,6 +2723,8 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         soundfont_polyphony,
         soundfont_envelope,
         soundfont_quality,
+        soundfont_mode,
+        soundfont_channels,
         solfege,
         sends,
         routing,
@@ -2699,6 +2750,7 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         volume_effective: *volume_effective,
         volume_automation_read: *volume_automation_read,
         pan: *pan,
+        spatial: *spatial,
         muted: *muted,
         solo: *solo,
         armed: *armed,
@@ -2732,6 +2784,8 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         soundfont_polyphony: *soundfont_polyphony,
         soundfont_envelope: *soundfont_envelope,
         soundfont_quality: *soundfont_quality,
+        soundfont_mode: *soundfont_mode,
+        soundfont_channels: *soundfont_channels,
         solfege: solfege.clone(),
         sends: if include_detail {
             sends.clone()

@@ -143,9 +143,33 @@ pub struct PendingViewRestore {
     pub scroll_y: f32,
 }
 
+/// The project's spatial mix settings.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SpatialMix {
+    pub format: solfege_spatialaudio::SpatialFormat,
+    /// The room a binaural mix, or a surround mix heard on headphones, is in.
+    pub room: solfege_spatialaudio::RoomSettings,
+    /// How a surround mix reaches a device with too few outputs for it.
+    pub fold: solfege_spatialaudio::MonitorFold,
+}
+
+impl SpatialMix {
+    /// Channels are placed in the room rather than panned.
+    pub fn is_spatial(&self) -> bool {
+        self.format.is_spatial()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineState {
     pub bpm: f32,
+    /// The BPM Warp clips' stretch ratios were last expressed at. A Warp clip
+    /// is locked to the tempo but stores a plain speed; when the BPM moves,
+    /// [`Self::reconcile_audio_clip_lengths`] rescales that speed from this
+    /// tempo to the new one so the clip keeps its bars, as a Tempo Sync clip
+    /// does through its formula. Session state, never saved: a project's
+    /// ratios are always saved at its own BPM.
+    pub warp_ratio_bpm: f32,
     /// Nominal sample rate stored with this project. The audio device may be
     /// running at a different rate while a requested reopen is deferred or when
     /// hardware falls back; runtime code reads the active engine rate separately.
@@ -169,6 +193,9 @@ pub struct TimelineState {
     /// Frame rate used when [`Self::time_display_format`] is
     /// [`TimeDisplayFormat::Timecode`]. Ignored by every other format.
     pub timecode_rate: TimecodeRate,
+    /// The mix's spatial format — stereo, binaural, or a speaker layout — and
+    /// the room it is heard in (v57).
+    pub spatial_mix: SpatialMix,
     /// The project's key: root and scale. `None` until someone sets one — a
     /// project has no key by default, and "C major" would be a guess.
     pub project_key: Option<MidiScale>,
@@ -235,6 +262,12 @@ pub struct TimelineState {
     /// The folder a track drag would drop into, while the pointer is over the
     /// middle of that folder's row; the insertion line hides meanwhile.
     pub drag_folder_target_id: Option<TrackId>,
+    /// Where the track-move hint was before its latest move, so it can slide
+    /// from there instead of jumping (`None`: it has just appeared).
+    pub drag_indicator_from_index: Option<usize>,
+    /// Bumped every time the drop target changes: keys the hint's one-shot
+    /// slide and flash, so each change plays once and then rests.
+    pub drag_indicator_generation: u64,
     /// True when the timeline viewport should follow the playhead during
     /// playback. Toggled off temporarily when the user manually scrolls or
     /// drags the viewport; can be re-enabled from the Follow button.
@@ -245,6 +278,11 @@ pub struct TimelineState {
     /// shows and Settings saves. UI-only, never saved.
     pub follow_playhead_suspended: bool,
     pub auto_scroll_mode: AutoScrollMode,
+    /// How tall the arrangement draws audio waveforms: a view magnification
+    /// for reading quiet material, separate from clip gain — it changes what
+    /// the waveform looks like, never what plays, and never shows clipping
+    /// that is not there. 1.0 is true scale. UI-only, never saved.
+    pub waveform_zoom: f32,
     /// Arrangement time-range selection in beats. UI-only; never marks the
     /// project or engine dirty by itself.
     pub arrangement_range: Option<TimelineRangeSelection>,
@@ -333,11 +371,13 @@ impl Default for TimelineState {
     fn default() -> Self {
         Self {
             bpm: 120.0,
+            warp_ratio_bpm: 120.0,
             project_sample_rate: 48_000,
             tempo_map: TempoMap::new(),
             resolved_tempo: ResolvedTempo::default(),
             time_signature_map: TimeSignatureMap::with_default_4_4(),
             time_display_format: TimeDisplayFormat::default(),
+            spatial_mix: SpatialMix::default(),
             timecode_rate: TimecodeRate::default(),
             project_key: None,
             markers: Vec::new(),
@@ -421,9 +461,12 @@ impl Default for TimelineState {
             drag_current_y: 0.0,
             drag_target_index: None,
             drag_folder_target_id: None,
+            drag_indicator_from_index: None,
+            drag_indicator_generation: 0,
             follow_playhead: true,
             follow_playhead_suspended: false,
             auto_scroll_mode: AutoScrollMode::Page,
+            waveform_zoom: 1.0,
             arrangement_range: None,
             // Tempo and meter are properties of every project, so both
             // conductor lanes are on by default. Neither seeds a point into its

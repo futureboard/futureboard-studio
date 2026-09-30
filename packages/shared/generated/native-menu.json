@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-09-26T18:26:32.057Z",
+  "generatedAt": "2026-09-30T05:24:52.976Z",
   "menus": [
     {
       "id": "file",
@@ -1382,6 +1382,108 @@
           "danger": false,
           "description": "Audio engine latency and PDC, plus every CPU core, memory and local drive",
           "children": []
+        },
+        {
+          "id": "window.virtual_speaker",
+          "kind": "normal",
+          "label": "Virtual Speaker",
+          "icon": "speaker",
+          "shortcut": null,
+          "command": "window:virtual-speaker",
+          "role": null,
+          "enabled": true,
+          "visible": true,
+          "checked": false,
+          "danger": false,
+          "description": "Hear the mix as it would play in a car, on a phone, through a PA or in other rooms (monitoring only)",
+          "children": []
+        },
+        {
+          "id": "window.visualizer",
+          "kind": "submenu",
+          "label": "Visualizer",
+          "icon": "activity",
+          "shortcut": null,
+          "command": null,
+          "enabled": true,
+          "visible": true,
+          "children": [
+            {
+              "id": "window.visualizer.spectrum",
+              "kind": "normal",
+              "label": "Spectrum",
+              "icon": "audio-lines",
+              "shortcut": null,
+              "command": "window:visualizer-spectrum",
+              "role": null,
+              "enabled": true,
+              "visible": true,
+              "checked": false,
+              "danger": false,
+              "description": "The master bus's frequency spectrum, with a held peak line, in a floating window",
+              "children": []
+            },
+            {
+              "id": "window.visualizer.stereo_image",
+              "kind": "normal",
+              "label": "Stereo Image",
+              "icon": "activity",
+              "shortcut": null,
+              "command": "window:visualizer-stereo-image",
+              "role": null,
+              "enabled": true,
+              "visible": true,
+              "checked": false,
+              "danger": false,
+              "description": "Vectorscope of the master bus with correlation and left/right balance",
+              "children": []
+            },
+            {
+              "id": "window.visualizer.loudness",
+              "kind": "normal",
+              "label": "Loudness",
+              "icon": "gauge",
+              "shortcut": null,
+              "command": "window:visualizer-loudness",
+              "role": null,
+              "enabled": true,
+              "visible": true,
+              "checked": false,
+              "danger": false,
+              "description": "EBU R128 loudness of the master bus: momentary, short-term, integrated, range and true peak",
+              "children": []
+            },
+            {
+              "id": "window.visualizer.oscilloscope",
+              "kind": "normal",
+              "label": "Oscilloscope",
+              "icon": "activity",
+              "shortcut": null,
+              "command": "window:visualizer-oscilloscope",
+              "role": null,
+              "enabled": true,
+              "visible": true,
+              "checked": false,
+              "danger": false,
+              "description": "The master bus's waveform, held steady on a rising zero crossing",
+              "children": []
+            },
+            {
+              "id": "window.visualizer.spectrogram",
+              "kind": "normal",
+              "label": "Spectrogram",
+              "icon": "audio-lines",
+              "shortcut": null,
+              "command": "window:visualizer-spectrogram",
+              "role": null,
+              "enabled": true,
+              "visible": true,
+              "checked": false,
+              "danger": false,
+              "description": "The master bus's spectrum over the last few seconds",
+              "children": []
+            }
+          ]
         },
         {
           "id": "window.sep.extensions",

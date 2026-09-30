@@ -264,6 +264,20 @@ pub enum HostCommand {
         name: String,
         wav_b64: String,
     },
+    /// Load a one-shot drum sample (`.wav`/`.aiff`/`.mp3`/`.flac`) into one pad
+    /// of a built-in `drumsampler` instance. `audio_b64` is the raw file,
+    /// base64-encoded like `LoadBuiltinIr` — native already owns the plug-in's
+    /// `Samples` sandbox folder, so only the bytes cross this boundary, never a
+    /// path. The host decodes on its IPC thread and hands the buffer to the
+    /// audio producer for adoption the next time that pad is triggered; it
+    /// replies [`HostEvent::BuiltinDrumSampleResult`] either way.
+    LoadBuiltinDrumSample {
+        plugin_instance_id: String,
+        pad_index: u32,
+        /// Display name (usually the file name) echoed back in the result.
+        name: String,
+        audio_b64: String,
+    },
     /// What the plug-in editor's chrome strip should show.
     ///
     /// Only the host-owned-window platforms use this. On Windows the plug-in's
@@ -608,6 +622,32 @@ pub enum HostEvent {
         #[serde(default)]
         truncated: bool,
     },
+    /// Reply to [`HostCommand::LoadBuiltinDrumSample`]. On success the pad's
+    /// buffer has been submitted and will be adopted the next time that pad is
+    /// triggered; on failure `error` carries the human-readable reason
+    /// (undecodable file, unknown instance, out-of-range pad).
+    BuiltinDrumSampleResult {
+        plugin_instance_id: String,
+        pad_index: u32,
+        ok: bool,
+        /// Display name echoed from the request.
+        name: String,
+        #[serde(default)]
+        error: Option<String>,
+        /// Frames decoded (0 on failure).
+        #[serde(default)]
+        frames: u64,
+        #[serde(default)]
+        channels: u32,
+        /// The file's own sample rate, so the editor can show lengths in time.
+        #[serde(default)]
+        sample_rate: u32,
+        /// Waveform overview for the editor: the loudest absolute sample in
+        /// each of `drumsampler::WAVEFORM_POINTS` equal slices, `0..=255`.
+        /// Empty on failure, and from a host that predates it.
+        #[serde(default)]
+        peaks: Vec<u8>,
+    },
     /// The user operated a control in a host-drawn chrome strip
     /// ([`HostCommand::SetEditorChrome`]).
     ///
@@ -806,6 +846,40 @@ mod tests {
             latency_samples: 128,
             stereo: false,
             truncated: false,
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &ev).unwrap();
+        let mut reader = Cursor::new(buf);
+        assert_eq!(read_frame::<HostEvent, _>(&mut reader).unwrap(), Some(ev));
+    }
+
+    #[test]
+    fn builtin_drum_sample_load_and_result_round_trip_through_frames() {
+        let cmd = HostCommand::LoadBuiltinDrumSample {
+            plugin_instance_id: "track1:insert4".into(),
+            pad_index: 3,
+            name: "Kick 808.wav".into(),
+            audio_b64: "UklGRgoAAABXQVZF\ngAB/AA==".replace('\n', ""),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &cmd).unwrap();
+        assert_eq!(buf.iter().filter(|b| **b == b'\n').count(), 1);
+        let mut reader = Cursor::new(buf);
+        assert_eq!(
+            read_frame::<HostCommand, _>(&mut reader).unwrap(),
+            Some(cmd)
+        );
+
+        let ev = HostEvent::BuiltinDrumSampleResult {
+            plugin_instance_id: "track1:insert4".into(),
+            pad_index: 3,
+            ok: true,
+            name: "Kick 808.wav".into(),
+            error: None,
+            frames: 4_800,
+            channels: 1,
+            sample_rate: 44_100,
+            peaks: vec![0, 128, 255],
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &ev).unwrap();

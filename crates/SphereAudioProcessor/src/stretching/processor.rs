@@ -15,11 +15,25 @@ pub trait StretchProcessor {
         0
     }
 
+    /// The backend's latency split into its two halves: `(input, output)`,
+    /// where `input` is how far past a moment (in input frames) the backend
+    /// must have read before it can output that moment, and `output` is how
+    /// long (in output frames) the result then takes to come out. A streaming
+    /// caller that wants output frame `o` to be stream position `S(o)` feeds,
+    /// while producing `o`, the input up to `S(o + output) + input`.
+    /// Default: `(0, 0)`.
+    fn io_latency(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
     /// Prime the backend so the next [`StretchProcessor::process_stereo`] output
-    /// is aligned to the sample immediately after this pre-roll, compensating the
-    /// algorithmic latency. Feed exactly the source frames ending at the intended
-    /// playback position (length from [`StretchProcessor::seek_input_len`]).
-    /// Resets internally first. Default: no-op (zero-latency backends).
+    /// starts at the *first* frame of this pre-roll, compensating the
+    /// algorithmic latency. Feed the source frames starting at the intended
+    /// playback position (length from [`StretchProcessor::seek_input_len`]);
+    /// the next `process_stereo` input continues from where the pre-roll ends,
+    /// so the feed runs that far ahead of the output from then on (see
+    /// [`StretchProcessor::io_latency`]). Resets internally first. Default:
+    /// no-op (zero-latency backends).
     fn output_seek(&mut self, _input_l: &[f32], _input_r: &[f32]) {}
 
     /// Render `output_*.len()` output samples from `input_*.len()` source

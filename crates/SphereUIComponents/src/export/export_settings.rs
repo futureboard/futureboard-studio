@@ -14,7 +14,7 @@ use sphere_encoder::{
 use DirectAudio::types::EngineProjectSnapshot;
 use DirectAudio::{
     arrangement_bounds_samples, beats_to_samples, ArrangementExportRequest, ExportNormalizeMode,
-    ExportTailMode, OfflineRenderRequest,
+    ExportTailMode, OfflineRenderRequest, RenderJob, TrackExportTarget,
 };
 
 /// Output sample-rate choice in the UI.
@@ -55,41 +55,48 @@ pub enum ExportChannelMode {
     Mono,
 }
 
+/// How a render is produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExportMode {
-    Mixdown,
-    Stems,
-    Multitrack,
+pub enum ExportRenderMode {
+    /// Rendered offline, as fast as the machine allows, at any sample rate.
+    Offline,
+    /// Recorded while the project plays through the live engine, in real
+    /// time, at the device rate: the way to capture what only plays live —
+    /// hardware inserts, external instruments, plug-ins that render
+    /// differently offline.
+    Realtime,
 }
 
-impl ExportMode {
-    /// Labels describe what the engine actually does. Stems and Multitrack use
-    /// the identical post-fader tap — they differ only in whether routing
-    /// channels (bus/return/group) get their own file — so naming them "two
-    /// render modes" would be a lie.
+impl ExportRenderMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Mixdown => "Mixdown",
-            Self::Stems => "All mixer channels",
-            Self::Multitrack => "Source tracks only",
-        }
-    }
-
-    /// Whether a batch export in this mode writes a file for `target`.
-    pub fn selects(self, target: &ExportTrackTarget) -> bool {
-        match self {
-            Self::Mixdown => false,
-            Self::Stems => true,
-            Self::Multitrack => target.include_in_multitrack,
+            Self::Offline => "Offline",
+            Self::Realtime => "Realtime",
         }
     }
 }
 
+/// Quick picks for the channel list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportChannelPreset {
+    /// Every mixer channel: tracks, buses, returns, groups.
+    All,
+    /// Only the channels that make sound of their own (not routing channels),
+    /// plus VSTi separate outputs — a multitrack set.
+    SourceTracks,
+    None,
+}
+
+/// A mixer channel the render can write a file for.
 #[derive(Debug, Clone)]
 pub struct ExportTrackTarget {
     pub id: String,
     pub name: String,
+    /// A source channel (not a bus, return or group) or a VSTi separate
+    /// output: what [`ExportChannelPreset::SourceTracks`] picks.
     pub include_in_multitrack: bool,
+    /// What kind of channel it is, for the list ("Audio", "Bus", …).
+    pub kind_label: String,
 }
 
 impl ExportChannelMode {
@@ -160,6 +167,9 @@ pub struct ExportProjectDefaults {
     /// Whether the build can encode MP3 (the `mp3` feature is compiled in).
     pub mp3_available: bool,
     pub track_targets: Vec<ExportTrackTarget>,
+    /// The running audio device's sample rate, which a realtime render is
+    /// recorded at. `0` when no device is running: realtime is unavailable.
+    pub live_sample_rate: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -175,7 +185,12 @@ pub struct ExportSettings {
     pub mp3_bitrate_kbps: u16,
     pub normalize: ExportNormalizeChoice,
     pub tail: ExportTailChoice,
-    pub mode: ExportMode,
+    /// Write the stereo mixdown (the master).
+    pub include_mixdown: bool,
+    /// Mixer channels to write a file each for, by id. Any mix of these and
+    /// the mixdown comes out of one render.
+    pub selected_tracks: Vec<String>,
+    pub render_mode: ExportRenderMode,
 }
 
 impl Default for ExportSettings {
@@ -194,7 +209,9 @@ impl Default for ExportSettings {
             // Capture reverb/delay/instrument-release tails past the last content
             // by default so exports don't hard-cut the decay.
             tail: ExportTailChoice::FixedSeconds(TAIL_FIXED_SECONDS),
-            mode: ExportMode::Mixdown,
+            include_mixdown: true,
+            selected_tracks: Vec::new(),
+            render_mode: ExportRenderMode::Offline,
         }
     }
 }
@@ -208,7 +225,13 @@ pub enum ExportSettingsError {
     UnsupportedSampleRate(u32),
     Mp3Unavailable,
     FlacUnsupportedBitDepth(u16),
-    NoTracksForBatchExport,
+    /// Neither the mixdown nor any channel is selected.
+    NothingToRender,
+    /// Realtime chosen with no audio device running.
+    RealtimeUnavailable,
+    /// Realtime chosen with a normalized mixdown: one pass cannot know the
+    /// peak it normalizes to.
+    RealtimeNormalize,
 }
 
 impl ExportSettingsError {
@@ -225,7 +248,9 @@ impl ExportSettingsError {
             Self::UnsupportedSampleRate(_) => "export.error.unsupported-sample-rate",
             Self::Mp3Unavailable => "export.error.mp3-unavailable",
             Self::FlacUnsupportedBitDepth(_) => "export.error.flac-bit-depth",
-            Self::NoTracksForBatchExport => "export.error.no-batch-tracks",
+            Self::NothingToRender => "export.error.nothing-to-render",
+            Self::RealtimeUnavailable => "export.error.realtime-unavailable",
+            Self::RealtimeNormalize => "export.error.realtime-normalize",
         }
     }
 
@@ -243,8 +268,14 @@ impl ExportSettingsError {
             Self::FlacUnsupportedBitDepth(b) => {
                 format!("FLAC supports 16-bit or 24-bit, not {b}-bit.")
             }
-            Self::NoTracksForBatchExport => {
-                "No source tracks are available for stem export.".to_string()
+            Self::NothingToRender => {
+                "Choose the mixdown, one or more channels, or both.".to_string()
+            }
+            Self::RealtimeUnavailable => {
+                "Realtime render needs a running audio device.".to_string()
+            }
+            Self::RealtimeNormalize => {
+                "A realtime render is recorded in one pass and cannot be normalized.".to_string()
             }
         }
     }
@@ -335,20 +366,70 @@ impl ExportSettings {
         Ok((start, end))
     }
 
+    /// The rate the files are written at. A realtime render records at the
+    /// device's rate, whatever the choice says.
     pub fn resolved_sample_rate(&self, defaults: &ExportProjectDefaults) -> u32 {
-        self.sample_rate.resolve(defaults.project_sample_rate)
+        match self.render_mode {
+            ExportRenderMode::Realtime => defaults.live_sample_rate,
+            ExportRenderMode::Offline => self.sample_rate.resolve(defaults.project_sample_rate),
+        }
     }
 
-    /// How many files a batch export in the current mode would write.
-    ///
-    /// Mixdown is not a batch, so it counts zero here; [`ExportEstimate`]
-    /// reports its single file separately.
-    pub fn batch_target_count(&self, defaults: &ExportProjectDefaults) -> usize {
+    /// The selected channels that exist in this project, in mixer order.
+    pub fn selected_targets<'a>(
+        &self,
+        defaults: &'a ExportProjectDefaults,
+    ) -> Vec<&'a ExportTrackTarget> {
         defaults
             .track_targets
             .iter()
-            .filter(|target| self.mode.selects(target))
-            .count()
+            .filter(|target| self.selected_tracks.iter().any(|id| *id == target.id))
+            .collect()
+    }
+
+    /// How many channel files the render writes.
+    pub fn batch_target_count(&self, defaults: &ExportProjectDefaults) -> usize {
+        self.selected_targets(defaults).len()
+    }
+
+    /// Files the render writes in all: the mixdown and the channels.
+    pub fn file_count(&self, defaults: &ExportProjectDefaults) -> usize {
+        usize::from(self.include_mixdown) + self.batch_target_count(defaults)
+    }
+
+    pub fn is_track_selected(&self, id: &str) -> bool {
+        self.selected_tracks.iter().any(|selected| selected == id)
+    }
+
+    /// Add or remove one channel.
+    pub fn toggle_track(&mut self, id: &str) {
+        if let Some(index) = self
+            .selected_tracks
+            .iter()
+            .position(|selected| selected == id)
+        {
+            self.selected_tracks.remove(index);
+        } else {
+            self.selected_tracks.push(id.to_string());
+        }
+    }
+
+    /// Replace the channel selection with a quick pick.
+    pub fn apply_channel_preset(
+        &mut self,
+        preset: ExportChannelPreset,
+        defaults: &ExportProjectDefaults,
+    ) {
+        self.selected_tracks = defaults
+            .track_targets
+            .iter()
+            .filter(|target| match preset {
+                ExportChannelPreset::All => true,
+                ExportChannelPreset::SourceTracks => target.include_in_multitrack,
+                ExportChannelPreset::None => false,
+            })
+            .map(|target| target.id.clone())
+            .collect();
     }
 
     fn sample_format(&self) -> AudioSampleFormat {
@@ -378,8 +459,14 @@ impl ExportSettings {
                 return Err(ExportSettingsError::OutputDirMissing(parent.to_path_buf()));
             }
         }
+        let realtime = self.render_mode == ExportRenderMode::Realtime;
+        if realtime && defaults.live_sample_rate == 0 {
+            return Err(ExportSettingsError::RealtimeUnavailable);
+        }
         let sr = self.resolved_sample_rate(defaults);
-        if !SUPPORTED_RATES.contains(&sr) {
+        // WAV writes any rate, so a realtime render at an unusual device rate
+        // still has a format that takes it.
+        if !SUPPORTED_RATES.contains(&sr) && !(realtime && self.format == AudioFileFormat::Wav) {
             return Err(ExportSettingsError::UnsupportedSampleRate(sr));
         }
         if self.format == AudioFileFormat::Mp3 && !defaults.mp3_available {
@@ -393,11 +480,11 @@ impl ExportSettings {
                 self.flac_bit_depth,
             ));
         }
-        // Mode-aware: Multitrack can filter every available target away, so
-        // testing "the project has tracks" would let Export stay enabled and
-        // fail later with a second, hand-written message.
-        if self.mode != ExportMode::Mixdown && self.batch_target_count(defaults) == 0 {
-            return Err(ExportSettingsError::NoTracksForBatchExport);
+        if self.file_count(defaults) == 0 {
+            return Err(ExportSettingsError::NothingToRender);
+        }
+        if realtime && self.include_mixdown && self.normalize != ExportNormalizeChoice::Off {
+            return Err(ExportSettingsError::RealtimeNormalize);
         }
         Ok(())
     }
@@ -413,11 +500,7 @@ impl ExportSettings {
         let rate = sample_rate.max(1) as f64;
         let content_frames = request.render.content_frames();
         let max_tail_frames = request.render.max_tail_frames();
-        let file_count = if self.mode == ExportMode::Mixdown {
-            1
-        } else {
-            self.batch_target_count(defaults)
-        };
+        let file_count = self.file_count(defaults);
         let uncompressed_bytes = (request.format == AudioFileFormat::Wav).then(|| {
             content_frames
                 .saturating_add(max_tail_frames)
@@ -441,6 +524,48 @@ impl ExportSettings {
             end_seconds: request.render.end_sample as f64 / rate,
             file_count,
             uncompressed_bytes,
+        })
+    }
+
+    /// Build the whole render: the mixdown to `output_path` when it is
+    /// included, and one file per selected channel in `<folder>/<base>
+    /// Stems/`, numbered in mixer order. Channels are never normalized — they
+    /// would no longer sum to the mix.
+    pub fn to_job(
+        &self,
+        snapshot: &EngineProjectSnapshot,
+        defaults: &ExportProjectDefaults,
+        base_name: &str,
+    ) -> Result<RenderJob, ExportSettingsError> {
+        let request = self.to_request(snapshot, defaults)?;
+        let folder = request
+            .output_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("{} Stems", sanitize_file_stem(base_name)));
+        let tracks = self
+            .selected_targets(defaults)
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| {
+                let mut track_request = request.clone();
+                track_request.render.normalize = ExportNormalizeMode::None;
+                track_request.output_path = folder.join(format!(
+                    "{:02} {}.{}",
+                    index + 1,
+                    sanitize_file_stem(&target.name),
+                    request.format.extension()
+                ));
+                TrackExportTarget {
+                    track_id: target.id.clone(),
+                    request: track_request,
+                }
+            })
+            .collect();
+        Ok(RenderJob {
+            mixdown: self.include_mixdown.then_some(request),
+            tracks,
         })
     }
 
@@ -504,5 +629,29 @@ impl ExportSettings {
             },
             encode_options,
         })
+    }
+}
+
+/// A file name from a user or track name: characters no file system takes
+/// become `_`, and nothing at all becomes "Track".
+pub fn sanitize_file_stem(name: &str) -> String {
+    let sanitized: String = name
+        .trim()
+        .chars()
+        .map(|character| {
+            if matches!(
+                character,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+            ) {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "Track".to_string()
+    } else {
+        sanitized
     }
 }

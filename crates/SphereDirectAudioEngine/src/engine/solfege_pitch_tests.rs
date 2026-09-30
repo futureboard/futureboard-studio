@@ -32,6 +32,7 @@ const A4_PLUS_100_CENTS_HZ: f32 = 466.163_76;
 
 fn track(id: &str, track_type: &str, solfege: bool) -> EngineTrackSnapshot {
     EngineTrackSnapshot {
+        midi_programs: Vec::new(),
         id: id.to_string(),
         track_type: track_type.to_string(),
         volume: 1.0,
@@ -58,6 +59,8 @@ fn track(id: &str, track_type: &str, solfege: bool) -> EngineTrackSnapshot {
         soundfont_polyphony: 64,
         soundfont_envelope: Default::default(),
         soundfont_quality: Default::default(),
+        soundfont_mode: Default::default(),
+        soundfont_channels: Default::default(),
         // `model_path: None` selects the built-in bowed-string physical
         // instrument, which honours `Event::Pitch` exactly as the voicebank
         // does. That is what keeps this test hermetic.
@@ -76,6 +79,7 @@ fn track(id: &str, track_type: &str, solfege: bool) -> EngineTrackSnapshot {
 
 fn snapshot(notes: Vec<EngineMidiNoteSnapshot>) -> EngineProjectSnapshot {
     EngineProjectSnapshot {
+        spatial: Default::default(),
         project_id: "solfege-pitch-test".to_string(),
         project_root: None,
         preferred_input_device: None,
@@ -88,7 +92,7 @@ fn snapshot(notes: Vec<EngineMidiNoteSnapshot>) -> EngineProjectSnapshot {
             track("master", "master", false),
         ],
         clips: Vec::new(),
-        midi_clips: vec![EngineMidiClipSnapshot {
+        midi_clips: vec![std::sync::Arc::new(EngineMidiClipSnapshot {
             id: "clip-1".to_string(),
             track_id: TRACK.to_string(),
             start_beat: 0.0,
@@ -96,7 +100,7 @@ fn snapshot(notes: Vec<EngineMidiNoteSnapshot>) -> EngineProjectSnapshot {
             notes,
             controllers: Vec::new(),
             mpe: sphere_midi_service::mpe::MpeTrackConfiguration::default(),
-        }],
+        })],
         pdc_enabled: false,
         latency_graph_version: 1,
         routing: EngineRoutingSnapshot {

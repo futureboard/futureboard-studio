@@ -32,9 +32,8 @@ struct PreviewNoteKey {
 }
 
 /// Per-instance MIDI/note state shared between the IPC thread (which queues
-/// events) and the audio producer (which drains them per block). Its mutex is
-/// only ever held for queue push/drain or one block `process()` — never across
-/// plugin load, editor attach, or any other long host operation.
+/// events) and the audio producer (which takes them per block). Behind
+/// [`VoiceShared::events`], held only to push or to hand the queue over.
 #[derive(Debug, Default)]
 struct VoiceMidiState {
     pending_events: Vec<Vst3MidiEvent>,
@@ -183,6 +182,18 @@ impl VoiceMidiState {
                 ));
                 self.tail_blocks = PREVIEW_TAIL_BLOCKS;
             }
+            // A program change maps back to VST3 `kCtrlProgramChange` (130),
+            // the program as n/127, which each bridge turns into its own
+            // form: a mapped or program-change parameter, or raw `0xC0`.
+            0xC0 => {
+                self.pending_events.push(Vst3MidiEvent::control_change(
+                    ev.sample_offset,
+                    channel,
+                    130,
+                    ev.data1.min(127) as f32 / 127.0,
+                ));
+                self.tail_blocks = PREVIEW_TAIL_BLOCKS;
+            }
             0xE0 => {
                 let bend = u16::from(ev.data1 & 0x7F) | (u16::from(ev.data2 & 0x7F) << 7);
                 self.pending_events.push(Vst3MidiEvent::control_change(
@@ -198,82 +209,126 @@ impl VoiceMidiState {
     }
 }
 
+/// What one plug-in instance shares between the host's main thread (IPC,
+/// editor windows, state) and its audio producer.
+///
+/// Two locks, so the main thread never holds up audio and audio never holds
+/// up the main thread:
+/// - `events` is the MIDI queue. It is held only to push an event or to hand
+///   the queue to the producer (a pointer swap), never across `process()`.
+/// - `render` is the producer's own: it holds it across `process()` with the
+///   events of that block. The main thread takes it only inside
+///   [`VoiceShared::suspend`], to wait out one block in flight.
+///
+/// A control call that must not overlap `process()` — `setState`, the
+/// editor's `removed()` — suspends the voice instead of holding a lock the
+/// producer waits on: the producer skips it (its input passes through) for
+/// as long as the call takes, and every other voice keeps playing.
+#[derive(Debug, Default)]
+struct VoiceShared {
+    events: Mutex<VoiceMidiState>,
+    render: Mutex<Vec<Vst3MidiEvent>>,
+    suspended: AtomicBool,
+}
+
+impl VoiceShared {
+    /// Takes the voice out of processing until the guard drops; returns once
+    /// the block in flight, if any, has finished.
+    fn suspend(&self) -> VoiceSuspended<'_> {
+        self.suspended.store(true, Ordering::SeqCst);
+        // A producer that took `render` before the flag was set is inside
+        // `process()`: this waits for it. One that takes it after this lock is
+        // released sees the flag (the lock orders the store before its load).
+        drop(self.render.lock());
+        VoiceSuspended(self)
+    }
+}
+
+struct VoiceSuspended<'a>(&'a VoiceShared);
+
+impl Drop for VoiceSuspended<'_> {
+    fn drop(&mut self) {
+        self.0.suspended.store(false, Ordering::Release);
+    }
+}
+
 /// One entry of the published block-path snapshot: a shallow processor handle
-/// (refcounted over the same C++ instance) plus the shared per-voice MIDI state.
+/// (refcounted over the same C++ instance) plus the voice's shared state.
 #[derive(Debug, Clone)]
 struct BridgeVoice {
     instance_id: String,
     processor: Vst3RuntimeProcessor,
-    midi: Arc<Mutex<VoiceMidiState>>,
+    midi: Arc<VoiceShared>,
 }
 
-/// Render one voice block. The voice mutex is held across `process()`: it both
-/// hands the drained events to the plugin atomically and serializes `process()`
-/// between the bridge producer and the legacy debug CPAL preview path. Every
-/// holder is bounded (an event push or one block render) — never plugin load or
-/// editor attach, so this cannot starve block production the way the engine
-/// mutex did.
+/// Starts a voice's block: the producer's lock and the block's events, or
+/// `None` when the voice is suspended or another renderer has it this block —
+/// never a wait. The queue is swapped in whole, so no event is copied and no
+/// buffer is allocated; the producer's cleared buffer becomes the new queue.
+fn begin_voice_block(
+    voice: &VoiceShared,
+) -> Option<parking_lot::MutexGuard<'_, Vec<Vst3MidiEvent>>> {
+    let mut block = voice.render.try_lock()?;
+    if voice.suspended.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut state = voice.events.lock();
+    std::mem::swap(&mut state.pending_events, &mut *block);
+    if block.is_empty() && state.active_notes.is_empty() {
+        state.tail_blocks = state.tail_blocks.saturating_sub(1);
+    } else {
+        state.tail_blocks = PREVIEW_TAIL_BLOCKS;
+    }
+    Some(block)
+}
+
+/// Render one voice block (legacy debug CPAL preview path). A voice it cannot
+/// take this block is left silent.
 fn render_voice(
     processor: &Vst3RuntimeProcessor,
-    midi: &Mutex<VoiceMidiState>,
+    voice: &VoiceShared,
     in_l: &[f32],
     in_r: &[f32],
     out_l: &mut [f32],
     out_r: &mut [f32],
     transport: DirectAudio::vst3_processor::RuntimeTransportContext,
 ) {
-    let mut state = midi.lock();
+    let Some(mut block) = begin_voice_block(voice) else {
+        out_l.fill(0.0);
+        out_r.fill(0.0);
+        return;
+    };
     let mut processor = processor.clone();
     // Real transport ProcessContext immediately before process() — same thread,
     // no race. The clone shares the same C++ processor via Arc.
     processor.set_process_context(&transport);
-    let _ =
-        processor.process_stereo_block_with_midi(in_l, in_r, out_l, out_r, &state.pending_events);
-    // Borrowed and cleared rather than `mem::take`n: taking handed the buffer
-    // to this frame and dropped it at the end of the block, so the next MIDI
-    // push allocated a fresh `Vec` — a malloc/free pair per block on the audio
-    // producer thread for as long as any note is held. Clearing keeps the
-    // capacity the voice already grew to.
-    let had_events = !state.pending_events.is_empty();
-    state.pending_events.clear();
-    if !had_events && state.active_notes.is_empty() {
-        state.tail_blocks = state.tail_blocks.saturating_sub(1);
-    } else {
-        state.tail_blocks = PREVIEW_TAIL_BLOCKS;
-    }
+    let _ = processor.process_stereo_block_with_midi(in_l, in_r, out_l, out_r, &block);
+    // Cleared, not dropped: it goes back into the queue next block with the
+    // capacity it has grown to.
+    block.clear();
 }
 
+/// Render one voice block for the bridge. `0` channels when the voice is
+/// suspended; the caller passes its input through for that block.
 fn render_voice_interleaved(
     processor: &Vst3RuntimeProcessor,
-    midi: &Mutex<VoiceMidiState>,
+    voice: &VoiceShared,
     in_l: &[f32],
     in_r: &[f32],
     out_interleaved: &mut [f32],
     output_channels: usize,
     transport: DirectAudio::vst3_processor::RuntimeTransportContext,
 ) -> usize {
-    let mut state = midi.lock();
+    let Some(mut block) = begin_voice_block(voice) else {
+        return 0;
+    };
     let mut processor = processor.clone();
     processor.set_process_context(&transport);
     let channels = output_channels.clamp(1, MAX_CHANNELS);
     let got_channels = processor
-        .process_main_output_block_with_midi(
-            in_l,
-            in_r,
-            out_interleaved,
-            channels,
-            &state.pending_events,
-        )
+        .process_main_output_block_with_midi(in_l, in_r, out_interleaved, channels, &block)
         .unwrap_or(0);
-    // See `render_voice`: clear, never `mem::take` — the taken buffer was
-    // dropped every block and reallocated by the next MIDI push.
-    let had_events = !state.pending_events.is_empty();
-    state.pending_events.clear();
-    if !had_events && state.active_notes.is_empty() {
-        state.tail_blocks = state.tail_blocks.saturating_sub(1);
-    } else {
-        state.tail_blocks = PREVIEW_TAIL_BLOCKS;
-    }
+    block.clear();
     got_channels.min(channels)
 }
 
@@ -366,7 +421,11 @@ impl BridgeAudioShared {
     pub fn apply_shared_midi(&self, instance_id: &str, ev: SharedMidiEvent) {
         for voice in self.snapshot().iter() {
             if voice.instance_id == instance_id {
-                voice.midi.lock().apply_shared(&ev, &voice.instance_id);
+                voice
+                    .midi
+                    .events
+                    .lock()
+                    .apply_shared(&ev, &voice.instance_id);
                 return;
             }
         }
@@ -514,7 +573,7 @@ impl BridgeAudioShared {
 #[derive(Debug)]
 struct PreviewInstance {
     processor: Vst3RuntimeProcessor,
-    midi: Arc<Mutex<VoiceMidiState>>,
+    midi: Arc<VoiceShared>,
 }
 
 #[derive(Debug)]
@@ -661,17 +720,17 @@ impl PluginHostPreviewEngine {
             .and_then(|instance| instance.processor.list_parameters())
     }
 
-    /// Restore a previously captured VST3 state. Holds the voice MIDI mutex
-    /// across `setState` so it is serialized against the audio producer's
-    /// `process()` (the same mutex `render_voice` holds per block) — the
-    /// engine bypasses the missed block via the freshness guard, which is the
-    /// correct trade for a glitch-free state swap.
+    /// Restore a previously captured VST3 state. `setState` must not overlap
+    /// `process()`, so the voice is suspended for it: the producer skips this
+    /// voice (its input passes through) until the state is in, rather than
+    /// waiting behind a call that can take a large sampler seconds — which
+    /// stalled every voice in this host, not just this one.
     pub fn set_instance_state(&self, plugin_instance_id: &str, state: &Vst3PluginState) -> bool {
         let Some(instance) = self.instances.get(plugin_instance_id) else {
             eprintln!("[plugin-host-state] set_state instance={plugin_instance_id} loaded=false");
             return false;
         };
-        let _voice_guard = instance.midi.lock();
+        let _suspended = instance.midi.suspend();
         let ok = instance.processor.set_state(state);
         eprintln!(
             "[plugin-host-state] set_state instance={plugin_instance_id} component_bytes={} controller_bytes={} ok={ok}",
@@ -782,7 +841,7 @@ impl PluginHostPreviewEngine {
             plugin_instance_id.to_string(),
             PreviewInstance {
                 processor,
-                midi: Arc::new(Mutex::new(VoiceMidiState::default())),
+                midi: Arc::new(VoiceShared::default()),
             },
         );
         self.publish_bridge_snapshot();
@@ -812,7 +871,7 @@ impl PluginHostPreviewEngine {
             plugin_instance_id.to_string(),
             PreviewInstance {
                 processor,
-                midi: Arc::new(Mutex::new(VoiceMidiState::default())),
+                midi: Arc::new(VoiceShared::default()),
             },
         );
         self.publish_bridge_snapshot();
@@ -826,9 +885,9 @@ impl PluginHostPreviewEngine {
         eprintln!("[plugin-host-registry] unload instance={plugin_instance_id}");
         let retired = self.instances.remove(plugin_instance_id);
         if let Some(instance) = &retired {
-            let mut midi = instance.midi.lock();
+            let _suspended = instance.midi.suspend();
             instance.processor.view_detach();
-            midi.panic();
+            instance.midi.events.lock().panic();
         }
         if self.instances.is_empty() {
             self.set_continuous_mode(false);
@@ -906,10 +965,11 @@ impl PluginHostPreviewEngine {
     /// Detach editor UI only — processor stays loaded and active.
     pub fn editor_detach_for_instance(&mut self, plugin_instance_id: &str) {
         if let Some(instance) = self.instances.get(plugin_instance_id) {
-            // Control path only: IPlugView::removed() can touch the same plugin
-            // internals as process(), so serialize it with the per-voice render
-            // guard instead of racing the audio producer.
-            let _voice_guard = instance.midi.lock();
+            // IPlugView::removed() can touch the same plugin internals as
+            // process(), so it must not overlap it. Suspended rather than
+            // locked: a slow `removed()` silences this voice only, instead of
+            // holding the producer — and every voice it serves — behind it.
+            let _suspended = instance.midi.suspend();
             instance.processor.view_detach();
         }
         eprintln!(
@@ -921,9 +981,9 @@ impl PluginHostPreviewEngine {
     /// Full detach + MIDI panic (unload / crash paths).
     pub fn embed_detach_for_instance(&mut self, plugin_instance_id: &str) {
         if let Some(instance) = self.instances.get(plugin_instance_id) {
-            let mut midi = instance.midi.lock();
+            let _suspended = instance.midi.suspend();
             instance.processor.view_detach();
-            midi.panic();
+            instance.midi.events.lock().panic();
         }
     }
 
@@ -951,6 +1011,21 @@ impl PluginHostPreviewEngine {
         for (id, instance) in &self.instances {
             if let Some((w, h)) = instance.processor.take_pending_shell_resize() {
                 out.push((id.clone(), w.max(1) as u32, h.max(1) as u32));
+            }
+            // The view-host path: the plug-in asking to resize its own editor
+            // (a zoom control, or Kontakt restoring its size after attach).
+            // The bridge only records the request; it is granted here, within
+            // the view's own size contract, and reported so the studio window
+            // follows. Nothing read this before, so every such request was
+            // lost and the editor kept whatever size the host last forced.
+            // Granted as asked: running the plug-in's own request through its
+            // size contract snapped a fixed-size view (whose contract is "stay
+            // at getSize") straight back to its old size, undoing a zoom.
+            if let Some((w, h)) = instance.processor.view_take_resize_request() {
+                if w > 0 && h > 0 {
+                    instance.processor.view_set_size(w, h);
+                    out.push((id.clone(), w as u32, h as u32));
+                }
             }
         }
         out
@@ -981,6 +1056,7 @@ impl PluginHostPreviewEngine {
         };
         instance
             .midi
+            .events
             .lock()
             .preview_note_on(channel, pitch, velocity);
         if forensic_trace_enabled() {
@@ -997,7 +1073,7 @@ impl PluginHostPreviewEngine {
         let Some(instance) = self.instances.get(plugin_instance_id) else {
             return;
         };
-        instance.midi.lock().preview_note_off(channel, pitch);
+        instance.midi.events.lock().preview_note_off(channel, pitch);
     }
 
     pub fn preview_control_change(
@@ -1012,6 +1088,7 @@ impl PluginHostPreviewEngine {
         };
         instance
             .midi
+            .events
             .lock()
             .preview_control_change(channel, controller, value);
     }
@@ -1021,7 +1098,7 @@ impl PluginHostPreviewEngine {
         let Some(instance) = self.instances.get(plugin_instance_id) else {
             return;
         };
-        instance.midi.lock().panic();
+        instance.midi.events.lock().panic();
     }
 
     pub fn midi_panic(&mut self, plugin_instance_id: &str) {
@@ -1054,7 +1131,7 @@ impl PluginHostPreviewEngine {
     pub fn has_active_preview(&self) -> bool {
         self.instances
             .values()
-            .any(|i| i.midi.lock().has_activity())
+            .any(|i| i.midi.events.lock().has_activity())
     }
 
     pub fn has_loaded_instances(&self) -> bool {
@@ -1239,6 +1316,38 @@ mod tests {
 
     /// The IPC preview fallback carries a 7-bit bend on controller 129; it
     /// must stay a bend (not CC 127) and centre on the unbent value.
+    #[test]
+    fn a_suspended_voice_is_skipped_without_losing_its_events() {
+        let voice = VoiceShared::default();
+        voice.events.lock().preview_note_on(0, 60, 100);
+        {
+            let _suspended = voice.suspend();
+            // The producer does not wait: it skips the voice.
+            assert!(begin_voice_block(&voice).is_none());
+            // The main thread still queues events meanwhile.
+            voice.events.lock().preview_note_off(0, 60);
+        }
+        let block = begin_voice_block(&voice).expect("resumed");
+        assert_eq!(
+            block.len(),
+            2,
+            "events queued while suspended are delivered"
+        );
+        assert!(voice.events.lock().pending_events.is_empty());
+    }
+
+    #[test]
+    fn the_event_queue_is_free_while_a_block_is_rendering() {
+        let voice = VoiceShared::default();
+        let block = begin_voice_block(&voice).expect("block");
+        // `process()` would run here, holding `render` only: the main thread
+        // can still queue a note.
+        assert!(voice.events.try_lock().is_some());
+        // A second renderer does not wait for this one either.
+        assert!(begin_voice_block(&voice).is_none());
+        drop(block);
+    }
+
     #[test]
     fn preview_control_change_keeps_pitch_bend_controller() {
         let mut state = VoiceMidiState::default();

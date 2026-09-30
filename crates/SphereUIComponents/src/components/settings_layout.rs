@@ -14,6 +14,12 @@ pub const SETTINGS_CONTENT_PAD: f32 = 14.0;
 pub const SETTINGS_LABEL_WIDTH: f32 = 132.0;
 pub const SETTINGS_ROW_GAP: f32 = 12.0;
 pub const SETTINGS_SECTION_GAP: f32 = 10.0;
+/// Preferences page geometry: the content column's side padding, the padding
+/// inside a group's plate, and the one width every dropdown has. Dropdown menus
+/// are anchored from these (see [`crate::overlay::settings_form_column`]).
+pub const PREFS_CONTENT_PAD_X: f32 = crate::theme::space::BLOCK;
+pub const PREFS_ROW_PAD_X: f32 = crate::theme::space::LOOSE;
+pub const PREFS_CONTROL_W: f32 = 240.0;
 
 fn settings_icon(path: &'static str, size: f32, color: gpui::Rgba) -> impl IntoElement {
     svg().path(path).w(px(size)).h(px(size)).text_color(color)

@@ -330,6 +330,7 @@ fn room_project(
     preferred_input_device: Option<String>,
 ) -> EngineProjectSnapshot {
     EngineProjectSnapshot {
+        spatial: Default::default(),
         project_id: "futureboard-jam".to_string(),
         project_root: None,
         preferred_input_device,
@@ -357,6 +358,7 @@ fn room_project(
 /// is running, so a routed stream is audible the moment it is published.
 fn listener_track(index: usize, listener: &Listener) -> EngineTrackSnapshot {
     EngineTrackSnapshot {
+        midi_programs: Vec::new(),
         id: format!("jam-{index}"),
         track_type: "audio".to_string(),
         volume: listener.volume,
@@ -385,6 +387,8 @@ fn listener_track(index: usize, listener: &Listener) -> EngineTrackSnapshot {
         soundfont_polyphony: 64,
         soundfont_envelope: Default::default(),
         soundfont_quality: Default::default(),
+        soundfont_mode: Default::default(),
+        soundfont_channels: Default::default(),
         solfege_engine: None,
     }
 }
@@ -397,6 +401,7 @@ fn listener_track(index: usize, listener: &Listener) -> EngineTrackSnapshot {
 /// armed — monitoring is hearing, not recording.
 fn self_monitor_track() -> EngineTrackSnapshot {
     EngineTrackSnapshot {
+        midi_programs: Vec::new(),
         id: "jam-self".to_string(),
         track_type: "audio".to_string(),
         volume: 1.0,
@@ -423,6 +428,8 @@ fn self_monitor_track() -> EngineTrackSnapshot {
         soundfont_polyphony: 64,
         soundfont_envelope: Default::default(),
         soundfont_quality: Default::default(),
+        soundfont_mode: Default::default(),
+        soundfont_channels: Default::default(),
         solfege_engine: None,
     }
 }

@@ -100,6 +100,7 @@ pub fn track_lane(
         track
             .clips
             .iter()
+            .filter(|clip| !track.is_hidden_take_clip(&clip.id))
             .map(|clip| {
                 let (left, width) = state.clip_lane_x_span(clip);
                 (left, left + width)
@@ -125,9 +126,12 @@ pub fn track_lane(
         .map(|clip| state.clip_time_axis_in(tempo.clone(), clip))
         .collect();
 
-    // Muted clips first, so a clip that plays is drawn — and hit — above the
-    // muted ones it overlaps: the active take over the takes it replaced.
-    let mut draw_order: Vec<usize> = (0..track.clips.len()).collect();
+    // Takes that are not heard live in the take lanes, not here. Of the rest,
+    // muted clips first, so a clip that plays is drawn — and hit — above the
+    // muted ones it overlaps.
+    let mut draw_order: Vec<usize> = (0..track.clips.len())
+        .filter(|&index| !track.is_hidden_take_clip(&track.clips[index].id))
+        .collect();
     draw_order.sort_by_key(|&index| !track.clips[index].muted);
 
     // Map clips — skip lanes outside the horizontal viewport.

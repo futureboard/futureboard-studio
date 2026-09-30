@@ -6,6 +6,7 @@ use crate::components::{
     BackgroundTaskToggleCb,
 };
 use crate::theme::Colors;
+use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, App, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
     Styled, Window,
@@ -27,9 +28,14 @@ pub struct StatusBarContent {
     pub left: String,
     pub audio: String,
     pub perf: Option<StatusBarPerfMetrics>,
+    /// While Virtual Speaker is on, what it is simulating: the monitoring is
+    /// not the mix as it is, and that must stay in sight.
+    pub listening: Option<String>,
 }
 
 pub type PerfMetricsToggleCb = Arc<dyn Fn(&(), &mut Window, &mut App) + 'static>;
+/// Open the Virtual Speaker window from its status pill.
+pub type ListeningOpenCb = Arc<dyn Fn(&mut Window, &mut App) + 'static>;
 
 pub fn status_bar(left: impl Into<String>, right: impl Into<String>) -> impl IntoElement {
     status_bar_inner(
@@ -37,12 +43,14 @@ pub fn status_bar(left: impl Into<String>, right: impl Into<String>) -> impl Int
             left: left.into(),
             audio: right.into(),
             perf: None,
+            listening: None,
         },
         None,
         None,
         None,
         None,
         false,
+        None,
     )
 }
 
@@ -53,6 +61,7 @@ pub fn status_bar_with_background_tasks(
     on_cancel_task: BackgroundTaskCancelCb,
     perf_popover_open: bool,
     on_toggle_perf_popover: Option<PerfMetricsToggleCb>,
+    on_open_listening: Option<ListeningOpenCb>,
 ) -> impl IntoElement {
     status_bar_inner(
         content,
@@ -61,6 +70,7 @@ pub fn status_bar_with_background_tasks(
         Some(on_cancel_task),
         on_toggle_perf_popover,
         perf_popover_open,
+        on_open_listening,
     )
 }
 
@@ -71,7 +81,12 @@ fn status_bar_inner(
     on_cancel_task: Option<BackgroundTaskCancelCb>,
     on_toggle_perf_popover: Option<PerfMetricsToggleCb>,
     perf_popover_open: bool,
+    on_open_listening: Option<ListeningOpenCb>,
 ) -> impl IntoElement {
+    let listening_pill = content
+        .listening
+        .clone()
+        .map(|label| listening_pill(label, on_open_listening).into_any_element());
     let task_button = match (tasks, on_toggle_tasks.clone()) {
         (Some(tasks), Some(on_toggle)) => {
             Some(background_task_button(tasks, on_toggle).into_any_element())
@@ -122,6 +137,7 @@ fn status_bar_inner(
                 .items_center()
                 .gap(px(6.0))
                 .overflow_hidden()
+                .children(listening_pill)
                 .children(task_button)
                 .children(perf_pill)
                 .child(
@@ -133,6 +149,35 @@ fn status_bar_inner(
         )
         .children(task_panel)
         .children(perf_panel)
+}
+
+/// Virtual Speaker is on: in the accent, so it is not mistaken for the plain
+/// mix. Clicking it opens the window to switch it off or change system.
+fn listening_pill(label: String, on_open: Option<ListeningOpenCb>) -> impl IntoElement {
+    div()
+        .id("status-virtual-speaker")
+        .h(px(18.0))
+        .max_w(px(220.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .px(px(7.0))
+        .rounded(px(crate::theme::radius::CONTROL))
+        .border(px(1.0))
+        .border_color(Colors::border_accent())
+        .bg(Colors::accent_muted())
+        .when_some(on_open, |pill, on_open| {
+            pill.cursor(gpui::CursorStyle::PointingHand)
+                .hover(|s| s.bg(Colors::surface_hover()))
+                .on_click(move |_, w, cx| on_open(w, cx))
+        })
+        .child(
+            div()
+                .truncate()
+                .text_size(px(10.0))
+                .text_color(Colors::text_primary())
+                .child(label),
+        )
 }
 
 fn perf_metrics_pill(

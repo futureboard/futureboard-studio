@@ -238,15 +238,30 @@ let latestGenerationRemoved = false
 const pending = new Map<string, number>()
 let scheduled = false
 
+/// Event the dev preview host (`src/dev/previewHost.ts`) listens for. Never
+/// dispatched in a production bundle: `import.meta.env.DEV` compiles to
+/// `false` there.
+export const DEV_POST_EVENT = 'futureboard:dev-post'
+
+/// Whether this page is the dev-server preview rather than an embedded editor.
+export const IS_BROWSER_PREVIEW =
+  import.meta.env.DEV && typeof window !== 'undefined' && window.location.protocol !== 'mikoplugin:'
+
 function post(body: unknown) {
-  if (window.location.protocol !== 'mikoplugin:') return
-  try {
-    void fetch('__bridge', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }).catch(() => {})
-  } catch {
-    // Standalone Vite preview intentionally has no native bridge.
+  if (window.location.protocol === 'mikoplugin:') {
+    try {
+      void fetch('__bridge', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }).catch(() => {})
+    } catch {
+      // Nothing to report to: the host owns the other end.
+    }
+    return
+  }
+  // `bun run dev` has no host: hand the message to the preview host instead.
+  if (import.meta.env.DEV) {
+    window.dispatchEvent(new CustomEvent(DEV_POST_EVENT, { detail: body }))
   }
 }
 

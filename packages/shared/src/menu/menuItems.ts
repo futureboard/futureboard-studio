@@ -772,6 +772,60 @@ export const APP_MENUS: AppMenuGroup[] = [
           "Audio engine latency and PDC, plus every CPU core, memory and local drive",
       },
       {
+        id: "window.virtual_speaker",
+        label: "Virtual Speaker",
+        icon: "speaker",
+        action: "window:virtual-speaker",
+        description:
+          "Hear the mix as it would play in a car, on a phone, through a PA or in other rooms (monitoring only)",
+      },
+      {
+        id: "window.visualizer",
+        type: "submenu",
+        label: "Visualizer",
+        icon: "activity",
+        children: [
+          {
+            id: "window.visualizer.spectrum",
+            label: "Spectrum",
+            icon: "audio-lines",
+            action: "window:visualizer-spectrum",
+            description:
+              "The master bus's frequency spectrum, with a held peak line, in a floating window",
+          },
+          {
+            id: "window.visualizer.stereo_image",
+            label: "Stereo Image",
+            icon: "activity",
+            action: "window:visualizer-stereo-image",
+            description:
+              "Vectorscope of the master bus with correlation and left/right balance",
+          },
+          {
+            id: "window.visualizer.loudness",
+            label: "Loudness",
+            icon: "gauge",
+            action: "window:visualizer-loudness",
+            description:
+              "EBU R128 loudness of the master bus: momentary, short-term, integrated, range and true peak",
+          },
+          {
+            id: "window.visualizer.oscilloscope",
+            label: "Oscilloscope",
+            icon: "activity",
+            action: "window:visualizer-oscilloscope",
+            description: "The master bus's waveform, held steady on a rising zero crossing",
+          },
+          {
+            id: "window.visualizer.spectrogram",
+            label: "Spectrogram",
+            icon: "audio-lines",
+            action: "window:visualizer-spectrogram",
+            description: "The master bus's spectrum over the last few seconds",
+          },
+        ],
+      },
+      {
         type: "separator",
         id: "window.sep.extensions",
       },

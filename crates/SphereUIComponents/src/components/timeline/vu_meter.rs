@@ -80,22 +80,48 @@ pub fn meter_surface(
     hold_r: f32,
     clip: bool,
 ) -> impl IntoElement {
-    let bar_w = 5.0_f32;
-    let gap = 1.0_f32;
-    let total_w = bar_w * 2.0 + gap;
-    div().w(px(total_w)).h_full().child(
+    div().w(px(STEREO_METER_WIDTH)).h_full().child(
         canvas(
             |_bounds, _window, _cx| (),
             move |bounds, _state, window, _cx| {
-                paint_meter_bar(bounds, 0.0, bar_w, level_l, hold_l, window);
-                paint_meter_bar(bounds, bar_w + gap, bar_w, level_r, hold_r, window);
-                if clip {
-                    paint_clip_cap(bounds, total_w, window);
-                }
+                paint_stereo_meter(bounds, level_l, level_r, hold_l, hold_r, clip, window);
             },
         )
         .size_full(),
     )
+}
+
+/// One channel bar of the stereo meter.
+const STEREO_METER_BAR_W: f32 = 5.0;
+/// Between the two bars.
+const STEREO_METER_GAP: f32 = 1.0;
+/// Width of [`meter_surface`] / [`paint_stereo_meter`]: two bars and the gap.
+pub const STEREO_METER_WIDTH: f32 = STEREO_METER_BAR_W * 2.0 + STEREO_METER_GAP;
+
+/// Paint the stereo meter [`meter_surface`] draws into `bounds` (window
+/// coordinates). Shared with the mixer's meter layer, which paints every
+/// visible strip's meter from one canvas without rebuilding the strips.
+pub fn paint_stereo_meter(
+    bounds: Bounds<Pixels>,
+    level_l: f32,
+    level_r: f32,
+    hold_l: f32,
+    hold_r: f32,
+    clip: bool,
+    window: &mut gpui::Window,
+) {
+    paint_meter_bar(bounds, 0.0, STEREO_METER_BAR_W, level_l, hold_l, window);
+    paint_meter_bar(
+        bounds,
+        STEREO_METER_BAR_W + STEREO_METER_GAP,
+        STEREO_METER_BAR_W,
+        level_r,
+        hold_r,
+        window,
+    );
+    if clip {
+        paint_clip_cap(bounds, STEREO_METER_WIDTH, window);
+    }
 }
 
 /// Paint a clip-indicator cap across the top of the meter (both bars) when a

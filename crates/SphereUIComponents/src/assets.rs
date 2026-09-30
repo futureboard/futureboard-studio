@@ -109,6 +109,15 @@ pub mod icons {
     pub const CHECK: &str = include_str!("../../../packages/shared/lucide/icons/check.svg");
     pub const STAR: &str = include_str!("../../../packages/shared/lucide/icons/star.svg");
     pub const NEWSPAPER: &str = include_str!("../../../packages/shared/lucide/icons/newspaper.svg");
+    pub const ERASER: &str = include_str!("../../../packages/shared/lucide/icons/eraser.svg");
+    pub const PEN_LINE: &str = include_str!("../../../packages/shared/lucide/icons/pen-line.svg");
+    pub const ZOOM_IN: &str = include_str!("../../../packages/shared/lucide/icons/zoom-in.svg");
+    pub const ZOOM_OUT: &str = include_str!("../../../packages/shared/lucide/icons/zoom-out.svg");
+    pub const SCAN: &str = include_str!("../../../packages/shared/lucide/icons/scan.svg");
+    pub const CHEVRON_UP: &str =
+        include_str!("../../../packages/shared/lucide/icons/chevron-up.svg");
+    pub const POP_OUT: &str =
+        include_str!("../../../packages/shared/lucide/icons/square-arrow-out-up-right.svg");
 
     // Tabler outline
     pub const AUTOMATION: &str =
@@ -158,6 +167,13 @@ pub const ICON_ARROW_LEFT_RIGHT_PATH: &str = "icons/arrow-left-right.svg";
 pub const ICON_MOUSE_POINTER_PATH: &str = "icons/mouse-pointer.svg";
 pub const ICON_PENCIL_PATH: &str = "icons/pencil.svg";
 pub const ICON_SCISSORS_PATH: &str = "icons/scissors.svg";
+pub const ICON_ERASER_PATH: &str = "icons/eraser.svg";
+pub const ICON_PEN_LINE_PATH: &str = "icons/pen-line.svg";
+pub const ICON_ZOOM_IN_PATH: &str = "icons/zoom-in.svg";
+pub const ICON_ZOOM_OUT_PATH: &str = "icons/zoom-out.svg";
+pub const ICON_SCAN_PATH: &str = "icons/scan.svg";
+pub const ICON_CHEVRON_UP_PATH: &str = "icons/chevron-up.svg";
+pub const ICON_POP_OUT_PATH: &str = "icons/square-arrow-out-up-right.svg";
 pub const ICON_LINK_PATH: &str = "icons/link.svg";
 pub const ICON_VOLUME_X_PATH: &str = "icons/volume-x.svg";
 pub const ICON_CLOCK_PATH: &str = "icons/clock.svg";

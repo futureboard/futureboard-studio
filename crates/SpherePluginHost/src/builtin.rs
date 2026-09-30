@@ -54,10 +54,10 @@ const CATALOG: &[BuiltinEntry] = &[
     },
     BuiltinEntry {
         stem: "compresser",
-        name: "Compresser",
+        name: "Compressor",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: false,
+        has_editor: true,
     },
     BuiltinEntry {
         stem: "fa2a",
@@ -91,6 +91,13 @@ const CATALOG: &[BuiltinEntry] = &[
         stem: "verbspace",
         name: "VerbSpace",
         category: "Reverb",
+        kind: PluginKind::Effect,
+        has_editor: true,
+    },
+    BuiltinEntry {
+        stem: "imager",
+        name: "Imager",
+        category: "Utility",
         kind: PluginKind::Effect,
         has_editor: true,
     },
@@ -139,6 +146,13 @@ const CATALOG: &[BuiltinEntry] = &[
     BuiltinEntry {
         stem: "wrapsynth",
         name: "WrapSynth",
+        category: "Instrument",
+        kind: PluginKind::Instrument,
+        has_editor: true,
+    },
+    BuiltinEntry {
+        stem: "drumsampler",
+        name: "Drum Sampler",
         category: "Instrument",
         kind: PluginKind::Instrument,
         has_editor: true,
@@ -203,14 +217,17 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "equz8",
     "verbspace",
     "echospace",
+    "imager",
     "fa2a",
     "fa76",
     "burnlimit",
     "clipper67",
     "transient",
     "wrapsynth",
+    "drumsampler",
     "zcomp",
     "mixstation",
+    "compresser",
 ];
 
 /// Whether this built-in currently has an out-of-process audio DSP runtime.
@@ -332,6 +349,10 @@ mod tests {
             Some("mikoplugin://echospace/index.html")
         );
         assert_eq!(
+            builtin_editor_url(&builtin_id("imager")).as_deref(),
+            Some("mikoplugin://imager/index.html")
+        );
+        assert_eq!(
             builtin_editor_url(&builtin_id("fa2a")).as_deref(),
             Some("mikoplugin://fa2a/index.html")
         );
@@ -359,7 +380,11 @@ mod tests {
             builtin_editor_url(&builtin_id("transient")).as_deref(),
             Some("mikoplugin://transient/index.html")
         );
-        assert!(builtin_editor_url(&builtin_id("compresser")).is_none());
+        assert_eq!(
+            builtin_editor_url(&builtin_id("compresser")).as_deref(),
+            Some("mikoplugin://compresser/index.html")
+        );
+        assert!(builtin_editor_url(&builtin_id("c1073")).is_none());
         assert!(builtin_editor_url("vst3:whatever").is_none());
     }
 
@@ -380,6 +405,8 @@ mod tests {
         assert!(builtin_audio_bridge_supported("builtin:verbspace"));
         assert!(builtin_audio_bridge_supported("echospace"));
         assert!(builtin_audio_bridge_supported("builtin:echospace"));
+        assert!(builtin_audio_bridge_supported("imager"));
+        assert!(builtin_audio_bridge_supported("builtin:imager"));
         assert!(builtin_audio_bridge_supported("fa2a"));
         assert!(builtin_audio_bridge_supported("builtin:fa2a"));
         assert!(builtin_audio_bridge_supported("zcomp"));
@@ -396,8 +423,12 @@ mod tests {
         assert!(builtin_audio_bridge_supported("builtin:transient"));
         assert!(builtin_audio_bridge_supported("wrapsynth"));
         assert!(builtin_audio_bridge_supported("builtin:wrapsynth"));
+        assert!(builtin_audio_bridge_supported("drumsampler"));
+        assert!(builtin_audio_bridge_supported("builtin:drumsampler"));
+        assert!(builtin_audio_bridge_supported("compresser"));
+        assert!(builtin_audio_bridge_supported("builtin:compresser"));
         // Catalogued, but the host has no DSP for it — must keep its old path.
-        assert!(!builtin_audio_bridge_supported("compresser"));
+        assert!(!builtin_audio_bridge_supported("c1073"));
         assert!(!builtin_audio_bridge_supported("vst3:whatever"));
     }
 
@@ -421,6 +452,7 @@ mod tests {
         assert_eq!(builtin_display_name("rodharerist"), Some("Rodhareist"));
         assert_eq!(builtin_display_name("builtin:verbspace"), Some("VerbSpace"));
         assert_eq!(builtin_display_name("echospace"), Some("EchoSpace"));
+        assert_eq!(builtin_display_name("builtin:imager"), Some("Imager"));
         assert_eq!(builtin_display_name("builtin:fa2a"), Some("FA-2A"));
         assert_eq!(builtin_display_name("builtin:zcomp"), Some("Z-Comp"));
         assert_eq!(
@@ -432,6 +464,7 @@ mod tests {
         assert_eq!(builtin_display_name("builtin:clipper67"), Some("67Clipper"));
         assert_eq!(builtin_display_name("builtin:transient"), Some("Transient"));
         assert_eq!(builtin_display_name("builtin:wrapsynth"), Some("WrapSynth"));
+        assert_eq!(builtin_display_name("compresser"), Some("Compressor"));
         assert_eq!(builtin_display_name("vst3:whatever"), None);
     }
 

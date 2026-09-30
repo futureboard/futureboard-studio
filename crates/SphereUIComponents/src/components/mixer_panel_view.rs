@@ -1,20 +1,27 @@
 //! Production mixer panel entity — region-isolated invalidation from StudioLayout.
+//!
+//! Levels are not this entity's to draw. The strips leave a slot where each
+//! meter goes and the meter layer ([`crate::components::mixer_meter_layer`])
+//! paints them from outside the bottom panel, so a meter tick repaints this
+//! panel only when something printed on a strip moves on its own — a fader
+//! following volume automation.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
-    div, px, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
-    Window,
+    div, px, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::components::mixer_master_strip_view::{
-    mixer_master_meter_signature, MixerMasterStripView,
+    mixer_master_display_signature, MixerMasterStripView,
 };
+use crate::components::mixer_meter_layer::{clip_region, ClipRegion, SharedMeterLayout};
 use crate::components::mixer_panel::{
     build_mixer_render_snapshot, collect_mixer_render_items, mixer_center_lightweight,
-    mixer_render_item_count, mixer_strip_scroller, mixer_sub_header, mixer_visible_item_range,
-    MixerRenderItem, MixerSplit, MixerSplitAction, MixerSplitDrag, VstiOutputMeterState,
+    mixer_strip_scroller, mixer_sub_header, mixer_visible_item_range, MixerRenderItem, MixerSplit,
+    MixerSplitAction, MixerSplitDrag, VstiOutputMeterState,
 };
 use crate::components::mixer_surface::render_mixer_primitives;
 use crate::components::mixer_tree_sidebar_view::MixerTreeSidebar;
@@ -28,9 +35,10 @@ pub struct MixerPanelView {
     timeline: Entity<Timeline>,
     tree_sidebar: Entity<MixerTreeSidebar>,
     master_strip: Entity<MixerMasterStripView>,
+    meter_layout: SharedMeterLayout,
     last_structure_key: u64,
-    last_meter_sig: u64,
-    last_channel_meter_sig: u64,
+    last_master_display_sig: u64,
+    last_channel_display_sig: u64,
 }
 
 impl MixerPanelView {
@@ -39,54 +47,40 @@ impl MixerPanelView {
         timeline: Entity<Timeline>,
         tree_sidebar: Entity<MixerTreeSidebar>,
         master_strip: Entity<MixerMasterStripView>,
+        meter_layout: SharedMeterLayout,
     ) -> Self {
         Self {
             owner,
             timeline,
             tree_sidebar,
             master_strip,
+            meter_layout,
             last_structure_key: u64::MAX,
-            last_meter_sig: u64::MAX,
-            last_channel_meter_sig: u64::MAX,
+            last_master_display_sig: u64::MAX,
+            last_channel_display_sig: u64::MAX,
         }
     }
 
-    /// Meter tick from the audio poll — never invalidates StudioLayout root.
+    /// Audio poll tick. The levels are the meter layer's; this repaints the
+    /// strips only when a playing project moves something else they print.
     pub fn on_meter_tick(&mut self, cx: &mut Context<Self>) {
-        let (master_sig, channel_sig, strip_count) = {
-            let timeline = self.timeline.read(cx);
-            let collapsed =
-                crate::components::timeline::timeline_state::collapsed_vsti_output_group_keys_from_tracks(
-                    &timeline.state.tracks,
-                );
-            let hidden = &timeline.state.mixer_tree.hidden_channel_ids;
+        let (master_sig, channel_sig) = {
+            let state = &self.timeline.read(cx).state;
             (
-                mixer_master_meter_signature(&timeline.state.master, &timeline.state.monitor),
-                channel_meter_signature(&timeline.state.tracks),
-                mixer_render_item_count(&timeline.state.tracks, &collapsed, hidden),
+                mixer_master_display_signature(&state.master, &state.monitor),
+                channel_display_signature(state),
             )
         };
-        let master_changed = master_sig != self.last_meter_sig;
-        let channel_changed = channel_sig != self.last_channel_meter_sig;
-
-        if !master_changed && !channel_changed {
-            return;
-        }
-
-        if master_changed {
-            self.last_meter_sig = master_sig;
+        if master_sig != self.last_master_display_sig {
+            self.last_master_display_sig = master_sig;
             let _ = self.master_strip.update(cx, |master, cx| {
-                master.on_meter_tick(master_sig, cx);
+                master.on_display_tick(master_sig, cx);
             });
         }
-
-        if channel_changed {
-            self.last_channel_meter_sig = channel_sig;
-            if strip_count > 0 {
-                crate::perf::count("mixer_meter_update_count", 1);
-                crate::perf::count("mixer_meter_repaint_count", 1);
-                cx.notify();
-            }
+        if channel_sig != self.last_channel_display_sig {
+            self.last_channel_display_sig = channel_sig;
+            crate::perf::count("mixer_automation_repaint_count", 1);
+            cx.notify();
         }
     }
 
@@ -153,6 +147,7 @@ impl MixerPanelView {
             scroll_x: chrome.scroll_x,
             viewport_width: chrome.viewport_width,
             strip_available_px: chrome.strip_available_px,
+            body_scrolls: chrome.body_scrolls,
             strip_count,
             track_count: timeline.state.tracks.len(),
             tree_enabled: chrome.tree_sidebar_enabled,
@@ -171,6 +166,7 @@ impl MixerPanelView {
         q(state.scroll_x).hash(&mut hasher);
         q(state.viewport_width).hash(&mut hasher);
         q(state.strip_available_px).hash(&mut hasher);
+        state.body_scrolls.hash(&mut hasher);
         q(split.insert_px).hash(&mut hasher);
         q(split.send_px).hash(&mut hasher);
         split.active_target.hash(&mut hasher);
@@ -191,6 +187,7 @@ struct MixerPanelViewState {
     scroll_x: f32,
     viewport_width: f32,
     strip_available_px: f32,
+    body_scrolls: bool,
     strip_count: usize,
     track_count: usize,
     tree_enabled: bool,
@@ -208,9 +205,13 @@ impl Render for MixerPanelView {
         let callbacks = self
             .owner
             .read(cx)
-            .build_mixer_callbacks(owner_entity.clone());
+            .build_mixer_callbacks(owner_entity.clone(), cx);
         let split = build_mixer_split(&self.owner, cx);
         let state = self.read_view_state(cx);
+        // The strips are rebuilding; they record their meter slots again as
+        // they lay out, and a strip gone from view must not leave its old one.
+        self.meter_layout.borrow_mut().begin_strips_build();
+        self.last_channel_display_sig = channel_display_signature(&self.timeline.read(cx).state);
 
         let structure_key = Self::structure_key(&state, &split);
         if structure_key != self.last_structure_key {
@@ -227,13 +228,22 @@ impl Render for MixerPanelView {
         let split_for_move = split.clone();
         let split_for_end = split.clone();
 
+        // A panel shorter than one strip lays the strips out at their full
+        // height and scrolls them, rather than clipping the fader and the name
+        // plate off their bottom.
+        let body_scrolls = state.body_scrolls;
+        let strip_h = state.strip_available_px;
+        let fill = move |row: gpui::Div| {
+            if body_scrolls {
+                row.flex_none().h(px(strip_h))
+            } else {
+                row.flex_1().min_h_0()
+            }
+        };
+
         let mut channel_row = if state.strip_count == 0 {
             crate::perf::count("mixer_center_paint_count", 1);
-            div()
-                .flex()
-                .flex_row()
-                .flex_1()
-                .min_h_0()
+            fill(div().flex().flex_row())
                 .child(mixer_center_lightweight(
                     state.viewport_width,
                     state.strip_available_px,
@@ -252,16 +262,14 @@ impl Render for MixerPanelView {
                 state.scroll_x,
                 state.viewport_width,
                 state.strip_available_px,
+                state.body_scrolls,
                 &split,
                 on_scroll,
                 state.gpu_decor,
+                Some(&self.meter_layout),
                 i18n,
             );
-            div()
-                .flex()
-                .flex_row()
-                .flex_1()
-                .min_h_0()
+            fill(div().flex().flex_row())
                 .child(strip_row)
                 .child(div().w(px(1.0)).h_full().bg(Colors::border_default()))
                 .child(self.master_strip.clone())
@@ -282,14 +290,37 @@ impl Render for MixerPanelView {
                 state.strip_available_px,
             );
             let primitives = render_mixer_primitives(&snapshot);
-            channel_row = div()
-                .relative()
-                .flex_1()
-                .min_h_0()
+            channel_row = fill(div().relative())
                 .child(primitives)
                 .child(channel_row.size_full());
         }
 
+        let channel_row = if body_scrolls {
+            div()
+                .id("mixer-body-scroll")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(channel_row)
+                .into_any_element()
+        } else {
+            channel_row.into_any_element()
+        };
+        // The region the meter layer may paint in: the strips and the pinned
+        // pair as far as they are on screen, never the tree sidebar or the
+        // header. It sits beside the scroller, not in it, so it stays the
+        // visible part when the strips scroll.
+        let channel_row = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(channel_row)
+            .child(clip_region(&self.meter_layout, ClipRegion::Body));
         let body = if state.tree_enabled {
             div()
                 .flex()
@@ -314,7 +345,17 @@ impl Render for MixerPanelView {
             .on_mouse_up(gpui::MouseButton::Left, move |_e, w, cx| {
                 (split_for_end.on_action)(MixerSplitAction::ResizeEnd, w, cx);
             })
-            .child(mixer_sub_header(state.track_count, i18n))
+            .child(mixer_sub_header(
+                state.track_count,
+                state.tracks.iter().filter(|track| track.solo).count(),
+                Some({
+                    let timeline = self.timeline.clone();
+                    std::sync::Arc::new(move |_window: &mut Window, cx: &mut App| {
+                        let _ = timeline.update(cx, |timeline, cx| timeline.clear_all_solos(cx));
+                    })
+                }),
+                i18n,
+            ))
             .child(body)
     }
 }
@@ -350,18 +391,18 @@ fn build_scroll_handler(
     })
 }
 
-fn channel_meter_signature(
-    tracks: &[crate::components::timeline::timeline_state::TrackState],
+/// What a playing project moves on the channel strips without anyone
+/// notifying the mixer: a fader following its volume automation. Levels are
+/// not in it — the meter layer paints those.
+fn channel_display_signature(
+    state: &crate::components::timeline::timeline_state::TimelineState,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0) as u8;
-    for track in tracks {
-        q(track.meter_level_l).hash(&mut hasher);
-        q(track.meter_level_r).hash(&mut hasher);
-        q(track.meter_peak_hold_l).hash(&mut hasher);
-        q(track.meter_peak_hold_r).hash(&mut hasher);
-        track.meter_clip.hash(&mut hasher);
+    for track in &state.tracks {
+        if track.has_active_volume_automation() {
+            ((state.display_track_volume(track) * 1000.0).round() as i32).hash(&mut hasher);
+        }
     }
     hasher.finish()
 }

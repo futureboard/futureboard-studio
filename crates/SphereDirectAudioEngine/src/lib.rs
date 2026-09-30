@@ -46,15 +46,20 @@ mod latency_graph;
 pub mod loopback;
 pub mod monitor;
 pub mod native;
+/// Multi-core processing: the worker pool the render pass spreads track
+/// insert chains over.
+mod parallel;
 pub mod plugin_backend;
 pub mod plugin_bridge;
 pub mod recording;
+pub mod render_capture;
 mod runtime;
 mod streaming_source;
 pub mod tempo_map;
 pub mod time_signature_map;
 pub mod transport;
 pub mod types;
+pub mod visualizer_tap;
 pub mod vst2_processor;
 pub mod vst3_processor;
 
@@ -68,10 +73,10 @@ pub mod vst3_processor;
 // the `SphereDirectAudioEngine` NAPI class wrap the same `EngineInner`.
 pub use crate::analysis_tap::{analysis_tap, clip_id_hash, AnalysisTap};
 pub use crate::audio_file::{
-    generate_audio_peaks, load_audio_file, load_audio_file_for_edit, probe_audio_file,
-    AudioFileBuffer, AudioFileFormat, AudioFileInfo, AudioPeak, AudioPeakFile, AudioPeakLod,
-    AUDITION_PREVIEW_SECONDS, MAX_EDIT_DECODE_BYTES, MAX_IN_MEMORY_DECODE_BYTES, PEAK_LOD_LEVELS,
-    STREAMING_WAV_THRESHOLD_BYTES,
+    generate_audio_peaks, load_audio_bytes, load_audio_file, load_audio_file_for_edit,
+    probe_audio_file, AudioFileBuffer, AudioFileFormat, AudioFileInfo, AudioPeak, AudioPeakFile,
+    AudioPeakLod, AUDITION_PREVIEW_SECONDS, MAX_EDIT_DECODE_BYTES, MAX_IN_MEMORY_DECODE_BYTES,
+    PEAK_LOD_LEVELS, STREAMING_WAV_THRESHOLD_BYTES,
 };
 pub use crate::audio_graph::{
     plan_runtime_audio_graph, AudioGraphNode, AudioGraphNodeKind, GraphRouteIssue, GraphRouteKind,
@@ -82,14 +87,19 @@ pub use crate::audio_source::{
     MappedWavSource,
 };
 pub use crate::engine::{DropoutDiagnostics, DropoutProtectionMode, DropoutReason};
+/// Instruction set of the render kernels: AVX2 by default, SSE as the fallback.
+pub use crate::dsp::simd::{
+    active_level as active_simd_level, cpu_supports_avx2, set_simd_level, SimdLevel,
+};
 pub use crate::error::SphereAudioError;
 pub use crate::export::{
     arrangement_bounds_samples, beats_to_samples, export_arrangement,
-    export_arrangement_with_bridges, export_tracks_single_pass,
-    export_tracks_single_pass_with_bridges, partial_path_for, render_offline,
-    render_offline_tracks, ArrangementExportRequest, ArrangementExportSummary, ExportCancelToken,
-    ExportError, ExportNormalizeMode, ExportProgress, ExportStage, ExportTailMode,
-    OfflineRenderRequest, OfflineRenderSummary, TrackExportTarget,
+    export_arrangement_with_bridges, export_render_job, export_render_job_with_bridges,
+    export_tracks_single_pass, export_tracks_single_pass_with_bridges, partial_path_for,
+    record_render_job, render_offline, render_offline_tracks, ArrangementExportRequest,
+    ArrangementExportSummary, ExportCancelToken, ExportError, ExportNormalizeMode, ExportProgress,
+    ExportStage, ExportTailMode, LevelReport, OfflineRenderRequest, OfflineRenderSummary,
+    RenderJob, TrackExportTarget,
 };
 pub use crate::jam_bus::{
     is_jam_device, jam_device_id, jam_stream_id, JamAudioBus, JamChannelMode, JamInputSlot,
@@ -104,10 +114,15 @@ pub use crate::native::{
     EngineDebugSnapshot, EngineDeviceInfo, EngineInsertStatus, EngineStats, DEFAULT_BUFFER_SIZE,
     DEFAULT_SAMPLE_RATE,
 };
+pub use crate::parallel::{
+    auto_processing_threads, configure_multicore, multicore_status, MulticoreStatus,
+    MAX_PROCESSING_THREADS,
+};
 pub use crate::plugin_backend::PluginModuleFormat;
 /// Shared automation curve shaping — the UI lane renderer calls this so the drawn
 /// curve matches realtime playback and offline export exactly.
 pub use crate::runtime::automation_curve_factor;
+pub use crate::visualizer_tap::{TapRead, VisualizerTap, visualizer_tap};
 // ARA renderers are built by the app (which owns the ARA document) and installed
 // with `AudioEngine::set_ara_renderers`, so the type has to be nameable outside
 // this crate.

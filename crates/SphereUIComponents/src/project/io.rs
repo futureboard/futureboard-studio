@@ -421,6 +421,21 @@ pub fn load_project(
         ProjectError::Io(error)
     })?;
     let mut project = decode_project_with_options(&bytes, allow_old_version)?;
+    // An older version's file is migrated, not just read: its original is
+    // copied aside before anything can save over it, and the project carries
+    // the report the session shows. The decode above already checked the
+    // header, so the version is there to read.
+    let version = super::format::peek_project_header(&bytes)?;
+    if version < super::format::PROJECT_VERSION {
+        let migration = super::migrate::ProjectMigration::prepare(path, version);
+        project_load_log(format_args!(
+            "migrating from v{version} to v{} backup={:?} changes={}",
+            migration.to_version,
+            migration.backup_path,
+            migration.changes.len()
+        ));
+        project.migration = Some(migration);
+    }
     resolve_project_relative_assets(&mut project, path);
     project_load_log(format_args!("loaded ok: {}", project.name));
     Ok(project)

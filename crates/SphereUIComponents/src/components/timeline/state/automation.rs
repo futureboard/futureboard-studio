@@ -76,6 +76,107 @@ impl AutomationHover {
     }
 }
 
+/// A freehand automation stroke in progress: the Pen tool dragged across a
+/// lane draws the curve under the pointer.
+#[derive(Debug, Clone)]
+pub struct AutomationPaintStroke {
+    pub track_id: String,
+    pub lane_id: String,
+    /// The track's lanes before the stroke, for its one undo entry.
+    pub undo_before: Vec<AutomationLaneState>,
+    /// The lane's points before the stroke. Each move rebuilds the lane from
+    /// these plus everything drawn so far, so drawing back over a stretch
+    /// replaces what the stroke itself put there.
+    pub base: Vec<AutomationPoint>,
+    /// `(beat, value)` in the order they were drawn.
+    pub samples: Vec<(f32, f32)>,
+}
+
+/// A lane redrawn by a freehand stroke: the points of `base` outside the
+/// span the stroke covers, plus the stroke itself.
+///
+/// Where the stroke doubled back over itself the latest pass wins. Samples
+/// closer than `min_gap` beats merge, and a sample a straight line through
+/// its neighbours already draws (within `value_tol`) is dropped, so a smooth
+/// stroke is a few points rather than one per pixel.
+pub fn paint_automation_stroke(
+    base: &[AutomationPoint],
+    samples: &[(f32, f32)],
+    min_gap: f32,
+    value_tol: f32,
+) -> Vec<AutomationPoint> {
+    if samples.is_empty() {
+        return base.to_vec();
+    }
+    let lo = samples
+        .iter()
+        .map(|s| s.0.max(0.0))
+        .fold(f32::INFINITY, f32::min);
+    let hi = samples
+        .iter()
+        .map(|s| s.0.max(0.0))
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    let mut drawn: Vec<(f32, f32, usize)> = samples
+        .iter()
+        .enumerate()
+        .map(|(order, &(beat, value))| (beat.max(0.0), value.clamp(0.0, 1.0), order))
+        .collect();
+    drawn.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut merged: Vec<(f32, f32, usize)> = Vec::with_capacity(drawn.len());
+    for sample in drawn {
+        match merged.last_mut() {
+            Some(last) if sample.0 - last.0 < min_gap => {
+                if sample.2 > last.2 {
+                    last.1 = sample.1;
+                    last.2 = sample.2;
+                }
+            }
+            _ => merged.push(sample),
+        }
+    }
+
+    let mut kept: Vec<(f32, f32)> = Vec::with_capacity(merged.len());
+    for (i, &(beat, value, _)) in merged.iter().enumerate() {
+        let (Some(&(prev_beat, prev_value)), Some(&(next_beat, next_value, _))) =
+            (kept.last(), merged.get(i + 1))
+        else {
+            kept.push((beat, value));
+            continue;
+        };
+        let span = next_beat - prev_beat;
+        let t = if span > f32::EPSILON {
+            (beat - prev_beat) / span
+        } else {
+            0.0
+        };
+        let on_line = prev_value + (next_value - prev_value) * t;
+        if (on_line - value).abs() > value_tol {
+            kept.push((beat, value));
+        }
+    }
+
+    let mut out: Vec<AutomationPoint> = base
+        .iter()
+        .filter(|p| p.beat < lo - AUTOMATION_BEAT_EPSILON || p.beat > hi + AUTOMATION_BEAT_EPSILON)
+        .cloned()
+        .map(|mut p| {
+            p.selected = false;
+            p
+        })
+        .collect();
+    out.extend(
+        kept.into_iter()
+            .map(|(beat, value)| AutomationPoint::new(beat, value)),
+    );
+    out.sort_by(|a, b| {
+        a.beat
+            .partial_cmp(&b.beat)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
 /// In-flight automation marquee (rubber-band) selection in beat/value space.
 #[derive(Debug, Clone)]
 pub struct AutomationMarquee {
@@ -734,6 +835,24 @@ impl TimelineState {
         let playhead = self.transport.playhead_beats;
         self.recompute_effective_volumes(playhead, "point_edit");
         Some(id)
+    }
+
+    /// Replace a lane's points wholesale — what a freehand stroke produces on
+    /// every move. Live edit; the caller records one undo entry on release.
+    pub fn set_automation_lane_points(
+        &mut self,
+        track_id: &str,
+        lane_id: &str,
+        points: Vec<AutomationPoint>,
+    ) -> bool {
+        let Some(lane) = self.lane_mut(track_id, lane_id) else {
+            return false;
+        };
+        lane.points = points;
+        lane.sort_points();
+        let playhead = self.transport.playhead_beats;
+        self.recompute_effective_volumes(playhead, "point_edit");
+        true
     }
 
     /// Move a point to a new beat/value (clamped + re-sorted). Committed on
@@ -1409,5 +1528,74 @@ mod marquee_and_group_tests {
     #[test]
     fn a_point_outside_the_group_moves_nothing() {
         assert!(automation_group_moves(&[(1, 0.0, 0.5)], 9, 2.0, 0.1).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod paint_stroke_tests {
+    use super::*;
+
+    fn beats(points: &[AutomationPoint]) -> Vec<f32> {
+        points.iter().map(|p| p.beat).collect()
+    }
+
+    /// A stroke replaces what it passes over and leaves the rest alone.
+    #[test]
+    fn a_stroke_replaces_the_points_under_it_only() {
+        let base = vec![
+            AutomationPoint::new(0.0, 0.2),
+            AutomationPoint::new(2.0, 0.9),
+            AutomationPoint::new(6.0, 0.4),
+        ];
+        let samples: Vec<(f32, f32)> = (0..=40).map(|i| (1.0 + i as f32 * 0.1, 0.5)).collect();
+        let out = paint_automation_stroke(&base, &samples, 0.01, 0.001);
+        assert_eq!(out.first().unwrap().beat, 0.0, "before the stroke survives");
+        assert_eq!(out.last().unwrap().beat, 6.0, "after the stroke survives");
+        assert!(!beats(&out).contains(&2.0), "the point under it is gone");
+        // A flat line is two points, not forty.
+        let drawn: Vec<&AutomationPoint> = out
+            .iter()
+            .filter(|p| p.beat >= 1.0 && p.beat <= 5.0)
+            .collect();
+        assert_eq!(drawn.len(), 2, "{:?}", beats(&out));
+    }
+
+    /// A curve keeps enough points to draw it, sorted by time.
+    #[test]
+    fn a_curved_stroke_keeps_its_shape() {
+        let samples: Vec<(f32, f32)> = (0..=100)
+            .map(|i| {
+                let beat = i as f32 * 0.04;
+                (beat, 0.5 + 0.4 * (beat * std::f32::consts::PI).sin())
+            })
+            .collect();
+        let out = paint_automation_stroke(&[], &samples, 0.01, 0.01);
+        assert!(out.len() > 6, "a sine keeps its turns: {}", out.len());
+        assert!(out.windows(2).all(|w| w[0].beat <= w[1].beat));
+        for &(beat, value) in &samples {
+            let drawn = evaluate_automation(&out, beat as f64, 0.0);
+            assert!(
+                (drawn - value).abs() < 0.03,
+                "at {beat}: drew {drawn}, wanted {value}"
+            );
+        }
+    }
+
+    /// Drawing back over a stretch: the latest pass is what stays.
+    #[test]
+    fn going_back_over_a_stretch_keeps_the_latest_pass() {
+        let mut samples: Vec<(f32, f32)> = (0..=20).map(|i| (i as f32 * 0.1, 0.2)).collect();
+        samples.extend((0..=10).rev().map(|i| (i as f32 * 0.1, 0.8)));
+        let out = paint_automation_stroke(&[], &samples, 0.05, 0.001);
+        assert!((evaluate_automation(&out, 0.5, 0.0) - 0.8).abs() < 1e-3);
+        assert!((evaluate_automation(&out, 1.9, 0.0) - 0.2).abs() < 1e-3);
+    }
+
+    /// A click is one point.
+    #[test]
+    fn a_click_is_one_point() {
+        let out = paint_automation_stroke(&[], &[(1.5, 0.7)], 0.01, 0.001);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].beat, out[0].value), (1.5, 0.7));
     }
 }

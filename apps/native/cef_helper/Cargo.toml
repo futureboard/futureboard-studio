@@ -1,6 +1,6 @@
 [package]
 name = "futureboard_cef_helper"
-version = "2026.9.27-beta1.4.1"
+version = "2026.10.1-beta1.4.2"
 edition = "2021"
 license.workspace = true
 

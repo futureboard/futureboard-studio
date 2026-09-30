@@ -7,8 +7,9 @@ the plugin library and the native CEF host serves at
 
 This is a plugin view, not an application. It has no router, no dev server
 dependency at runtime, and no network access — a strict single-file bundle is
-the deliverable. It shares its control language with the VerbSpace editor; only
-the accent, the display, and the parameter set differ.
+the deliverable. It shares its control language and palette — Futureboard's
+default theme — with the VerbSpace editor; only the display and the parameter
+set differ.
 
 ## Commands
 

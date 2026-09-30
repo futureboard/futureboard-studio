@@ -309,13 +309,11 @@ const DAW_OVERRIDES = {
 };
 
 /** @type {{ id: string; label: string; description: string; overrides?: Record<string, string|null> }[]} */
+// `default.json` is not generated: it is the hand-authored, scoped (version 2)
+// base every other profile layers on — global keys plus one block per editor.
+// Regenerating it from the flat menu manifest would drop the scopes.
+// `DEFAULT_OVERRIDES` stays only as history of how the old flat default was made.
 const PROFILES = [
-  {
-    id: "default",
-    label: "Futureboard Default",
-    description: "Default shortcuts from the application menu manifest plus extra bindings.",
-    overrides: DEFAULT_OVERRIDES,
-  },
   {
     id: "ableton",
     label: "Ableton Live",

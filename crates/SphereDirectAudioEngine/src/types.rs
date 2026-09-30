@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sphere_midi_service::mpe::MpeTrackConfiguration;
 use sphere_midi_service::NoteExpression;
-use sphere_soundfont_player::{SoundfontEnvelope, SoundfontRenderQuality};
+use sphere_soundfont_player::{
+    SoundfontChannels, SoundfontEnvelope, SoundfontPlayerMode, SoundfontRenderQuality,
+    default_channels,
+};
 use SphereAudioProcessor::StretchParams;
 
 // ── DAUx backend selection types ──────────────────────────────────────────────
@@ -283,8 +286,12 @@ pub struct EngineProjectSnapshot {
     /// MIDI clips (Phase 2). Defaulted so older snapshots without the field
     /// still deserialize. Notes are stored relative to the clip start; the
     /// runtime converts them to absolute project beats/samples at build time.
+    ///
+    /// Shared, not owned: a note edit republishes the whole project, and the
+    /// UI hands every clip that did not change to the next snapshot as the
+    /// same allocation instead of copying its notes again.
     #[serde(default)]
-    pub midi_clips: Vec<EngineMidiClipSnapshot>,
+    pub midi_clips: Vec<std::sync::Arc<EngineMidiClipSnapshot>>,
     /// Whether playback plug-in delay compensation (Global Latency Sync / PDC)
     /// is active. Carried in the snapshot so the offline exporter consumes the
     /// *same* latency-compensated graph as realtime playback instead of a
@@ -298,6 +305,36 @@ pub struct EngineProjectSnapshot {
     #[serde(default)]
     pub latency_graph_version: u64,
     pub routing: EngineRoutingSnapshot,
+    /// The mix's spatial format (stereo, binaural, a speaker layout) and each
+    /// channel's place in the square room. Defaulted: stereo, as every
+    /// snapshot before it was.
+    #[serde(default)]
+    pub spatial: EngineSpatialSnapshot,
+}
+
+/// How the mix is spatialised, and where each channel is.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSpatialSnapshot {
+    #[serde(default)]
+    pub format: solfege_spatialaudio::SpatialFormat,
+    /// The room a binaural mix, or a surround mix heard on headphones, is in.
+    #[serde(default)]
+    pub room: solfege_spatialaudio::RoomSettings,
+    /// How a surround mix reaches a device with too few outputs.
+    #[serde(default)]
+    pub fold: solfege_spatialaudio::MonitorFold,
+    /// Each channel's placement, by track id. A channel not listed is front
+    /// and centre.
+    #[serde(default)]
+    pub sources: Vec<EngineSpatialSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSpatialSource {
+    pub track_id: String,
+    pub params: solfege_spatialaudio::SourceParams,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,10 +474,47 @@ pub struct EngineTrackSnapshot {
     /// Internal synthesis oversampling for the built-in player.
     #[serde(default)]
     pub soundfont_quality: SoundfontRenderQuality,
+    /// One instrument, or sixteen parts on the MIDI channels.
+    #[serde(default)]
+    pub soundfont_mode: SoundfontPlayerMode,
+    /// The parts of a multitimbral player. Applied to the running player,
+    /// never by a graph rebuild (see `AudioEngine::load_project`).
+    #[serde(default = "default_channels")]
+    pub soundfont_channels: SoundfontChannels,
     /// Native Solfege physical/hybrid instrument wrapper. Kept optional so
     /// existing snapshots remain source-compatible and deserialize unchanged.
     #[serde(default)]
     pub solfege_engine: Option<EngineSolfegeSnapshot>,
+    /// Bank/program selections this track's instrument is to be set to, one
+    /// per MIDI channel: its own, and those of MIDI tracks that play it.
+    #[serde(default)]
+    pub midi_programs: Vec<EngineMidiProgram>,
+}
+
+/// A bank and program for one MIDI channel of a track's instrument.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineMidiProgram {
+    /// 0-based MIDI channel.
+    pub channel: u8,
+    /// Bank Select MSB (CC 0), when the format sends banks.
+    #[serde(default)]
+    pub bank_msb: Option<u8>,
+    /// Bank Select LSB (CC 32), when the format sends banks.
+    #[serde(default)]
+    pub bank_lsb: Option<u8>,
+    pub program: u8,
+}
+
+impl EngineMidiProgram {
+    pub fn sanitized(self) -> Self {
+        Self {
+            channel: self.channel.min(15),
+            bank_msb: self.bank_msb.map(|msb| msb.min(127)),
+            bank_lsb: self.bank_lsb.map(|lsb| lsb.min(127)),
+            program: self.program.min(127),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

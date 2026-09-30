@@ -1,7 +1,14 @@
 <script lang="ts">
   import type { EchoParams } from '../bridge'
-  import { echoModel, envelopeAt, filterMagnitude, tapTimes } from '../model'
-  import { DEFAULT_TEMPO_BPM, DIVISION_LABELS, MODE_HINTS } from '../params'
+  import { echoModel, filterMagnitude, tapTimes, type Lane } from '../model'
+  import {
+    DEFAULT_TEMPO_BPM,
+    DIVISION_LABELS,
+    MAX_TEMPO_BPM,
+    MIN_TEMPO_BPM,
+    MODE_LABELS,
+    clamp,
+  } from '../params'
 
   type Props = {
     params: EchoParams
@@ -16,14 +23,15 @@
   let cssHeight = $state(0)
 
   const MAX_WINDOW_SEC = 6
+  /** Tone the per-pass dulling is measured at. */
   const TONE_REF_HZ = 3000
-  const MAX_DULL = 0.5
+  const MAX_DULL = 0.55
   const FLOOR_DB = -60
   const WINDOW_FLOOR_DB = -40
   /** Number echo marks 1..N so the first hits read as a countable sequence. */
   const NUMBERED_PASSES = 4
 
-  const model = $derived(echoModel(params, -60, 64, tempoBpm))
+  const model = $derived(echoModel(params, FLOOR_DB, 64, tempoBpm))
   const times = $derived(tapTimes(params, tempoBpm))
 
   const windowSec = $derived.by(() => {
@@ -39,27 +47,26 @@
     return value || fallback
   }
 
-  function alpha(hex: string, a: number): string {
+  function rgb(hex: string): [number, number, number] | null {
     const match = /^#?([0-9a-f]{6})$/i.exec(hex.trim())
-    if (!match?.[1]) return hex
+    if (!match?.[1]) return null
     const int = parseInt(match[1], 16)
-    return `rgba(${(int >> 16) & 255}, ${(int >> 8) & 255}, ${int & 255}, ${a})`
+    return [(int >> 16) & 255, (int >> 8) & 255, int & 255]
   }
 
+  function alpha(hex: string, a: number): string {
+    const c = rgb(hex)
+    return c ? `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${a})` : hex
+  }
+
+  /** `from` pulled `t` of the way toward `to`, at alpha `a`. */
   function blend(from: string, to: string, t: number, a: number): string {
-    const parse = (hex: string) => {
-      const match = /^#?([0-9a-f]{6})$/i.exec(hex.trim())
-      return match?.[1] ? parseInt(match[1], 16) : null
-    }
-    const f = parse(from)
-    const g = parse(to)
-    if (f === null || g === null) return alpha(from, a)
-    const mix = (shift: number) => {
-      const a0 = (f >> shift) & 255
-      const b0 = (g >> shift) & 255
-      return Math.round(a0 + (b0 - a0) * Math.min(Math.max(t, 0), 1))
-    }
-    return `rgba(${mix(16)}, ${mix(8)}, ${mix(0)}, ${a})`
+    const f = rgb(from)
+    const g = rgb(to)
+    if (!f || !g) return alpha(from, a)
+    const k = Math.min(Math.max(t, 0), 1)
+    const mix = (i: number) => Math.round(f[i]! + (g[i]! - f[i]!) * k)
+    return `rgba(${mix(0)}, ${mix(1)}, ${mix(2)}, ${a})`
   }
 
   function draw() {
@@ -73,188 +80,252 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
     ctx.clearRect(0, 0, cssWidth, cssHeight)
 
-    const accent = cssVar('--accent', '#2fd6a6')
-    const accentBright = cssVar('--accent-bright', '#62f2c8')
-    const alt = cssVar('--accent-alt', '#4aa8ff')
-    const altBright = cssVar('--accent-alt-bright', '#7cc4ff')
-    const warn = cssVar('--warn', '#f0a83c')
-    const grid = cssVar('--grid', '#1c2727')
-    const faint = cssVar('--text-faint', '#62726f')
-    const dull = cssVar('--text-faint', '#62726f')
-    const text = cssVar('--text', '#e6f0ee')
+    const warn = cssVar('--warn', '#e8b75c')
+    const laneColor: Record<Lane, string> = params.freeze
+      ? { left: warn, right: warn }
+      : {
+          left: cssVar('--accent-bright', '#72b1fa'),
+          right: cssVar('--accent-alt-bright', '#bdbdbd'),
+        }
+    const grid = cssVar('--grid', '#262626')
+    const gridStrong = cssVar('--grid-strong', '#333333')
+    const faint = cssVar('--text-faint', '#6e6e6e')
+    const muted = cssVar('--text-muted', '#a3a3a3')
+    const text = cssVar('--text', '#e8e8e8')
 
-    const padL = 44
+    // Two lanes around a centre line: the left channel's repeats rise from it,
+    // the right channel's hang below it. Ping-pong reads as a zig-zag between
+    // them; stereo as two independent rhythms; mono as a mirror.
+    const padL = 30
     const padR = 16
-    const padT = 30
-    const padB = 30
+    const padT = 44
+    const padB = 28
     const w = Math.max(cssWidth - padL - padR, 1)
     const h = Math.max(cssHeight - padT - padB, 1)
-    const base = padT + h
+    const GAP = 3
+    const mid = padT + h / 2
+    const laneH = Math.max(h / 2 - GAP, 1)
+    const baseOf = (lane: Lane) => (lane === 'left' ? mid - GAP : mid + GAP)
+    const dirOf = (lane: Lane) => (lane === 'left' ? -1 : 1)
 
     const x = (t: number) => padL + (t / windowSec) * w
-    const barH = (amplitude: number) => {
+    // A full-level bar stops short of the lane's edge so its pass number
+    // still fits inside the plot.
+    const LABEL_ROOM = 13
+    const reachMax = Math.max(laneH - LABEL_ROOM, 1)
+    const reach = (amplitude: number) => {
       if (amplitude <= 0) return 0
-      const db = 20 * Math.log10(amplitude)
+      const db = 20 * Math.log10(Math.min(amplitude, 1))
       if (db <= FLOOR_DB) return 0
-      return h * (1 - db / FLOOR_DB)
+      return reachMax * (1 - db / FLOOR_DB)
     }
 
-    // ---- light time grid (no dB numbers — those read as engineering) -----
-    const tickSec =
-      windowSec <= 0.5 ? 0.1 : windowSec <= 1.5 ? 0.25 : windowSec <= 4 ? 0.5 : 1
+    // ---- lanes ----------------------------------------------------------
+    ctx.fillStyle = alpha(laneColor.left, 0.03)
+    ctx.fillRect(padL, mid - GAP - laneH, w, laneH)
+    ctx.fillStyle = alpha(laneColor.right, 0.03)
+    ctx.fillRect(padL, mid + GAP, w, laneH)
+
+    // Loudness guides, unlabelled: -20 and -40 dB in each lane.
     ctx.lineWidth = 1
-    ctx.font =
-      '10px Inter, "Segoe UI", system-ui, sans-serif'
+    ctx.strokeStyle = alpha(faint, 0.14)
+    ctx.setLineDash([2, 4])
+    for (const lane of ['left', 'right'] as const) {
+      for (const db of [-20, -40]) {
+        const gy = Math.round(baseOf(lane) + dirOf(lane) * reach(10 ** (db / 20))) + 0.5
+        ctx.beginPath()
+        ctx.moveTo(padL, gy)
+        ctx.lineTo(padL + w, gy)
+        ctx.stroke()
+      }
+    }
+    ctx.setLineDash([])
+
+    // ---- time grid ------------------------------------------------------
+    // Synced lines are note lengths, so they get the beat grid they land on;
+    // free lines get a plain time ruler.
+    ctx.font = '600 10px system-ui, sans-serif'
     ctx.textAlign = 'center'
     ctx.textBaseline = 'top'
-    for (let t = tickSec; t < windowSec; t += tickSec) {
-      const gx = Math.round(x(t)) + 0.5
-      ctx.strokeStyle = grid
+    const rulerY = padT + h + 9
+    const vline = (gx: number, color: string) => {
+      ctx.strokeStyle = color
       ctx.beginPath()
       ctx.moveTo(gx, padT)
-      ctx.lineTo(gx, base)
-      ctx.stroke()
-      ctx.fillStyle = faint
-      ctx.fillText(
-        tickSec < 1 ? `${Math.round(t * 1000)} ms` : `${t.toFixed(0)} s`,
-        gx,
-        base + 8,
-      )
-    }
-
-    // Soft loudness guides without numbers.
-    for (const db of [-18, -36]) {
-      const gy = Math.round(base - barH(10 ** (db / 20))) + 0.5
-      ctx.strokeStyle = alpha(faint, 0.12)
-      ctx.beginPath()
-      ctx.moveTo(padL, gy)
-      ctx.lineTo(padL + w, gy)
+      ctx.lineTo(gx, padT + h)
       ctx.stroke()
     }
 
-    ctx.save()
-    ctx.translate(14, padT + h / 2)
-    ctx.rotate(-Math.PI / 2)
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'middle'
-    ctx.fillStyle = faint
-    ctx.font = '650 9px system-ui, sans-serif'
-    ctx.fillText('quiet  →  loud', 0, 0)
-    ctx.restore()
-
-    ctx.strokeStyle = alpha(faint, 0.4)
-    ctx.beginPath()
-    ctx.moveTo(padL, Math.round(base) + 0.5)
-    ctx.lineTo(padL + w, Math.round(base) + 0.5)
-    ctx.stroke()
-
-    // ---- soft decay fill (shows “getting quieter”) -----------------------
-    const floor = 10 ** (FLOOR_DB / 20)
-    const fillEnvelope = (step: number, color: string) => {
-      const region = new Path2D()
-      const steps = Math.max(Math.round(w), 2)
-      let started = false
-      let lastX = padL
-      for (let i = 0; i <= steps; i++) {
-        const t = (i / steps) * windowSec
-        const a = envelopeAt(t, step, model.gain)
-        if (a < floor) break
-        const px = x(t)
-        const py = base - barH(Math.min(a, 1))
-        lastX = px
-        if (started) region.lineTo(px, py)
-        else {
-          region.moveTo(px, base)
-          region.lineTo(px, py)
-          started = true
+    if (params.sync) {
+      const bpm = Number.isFinite(tempoBpm)
+        ? clamp(tempoBpm, MIN_TEMPO_BPM, MAX_TEMPO_BPM)
+        : DEFAULT_TEMPO_BPM
+      const beat = 60 / bpm
+      const beatPx = (beat / windowSec) * w
+      if (beatPx >= 56) {
+        for (let n = 1; n * beat * 0.25 < windowSec; n++) {
+          if (n % 4 === 0) continue
+          vline(Math.round(x(n * beat * 0.25)) + 0.5, alpha(faint, 0.07))
         }
       }
-      if (!started) return
-      region.lineTo(lastX, base)
-      region.closePath()
-      ctx.fillStyle = alpha(color, 0.07)
-      ctx.fill(region)
-    }
-
-    if (params.freeze) {
-      fillEnvelope(times.left, warn)
+      const every = beatPx < 14 ? 4 : beatPx < 26 ? 2 : 1
+      for (let n = 1; n * beat < windowSec; n++) {
+        if (n % every !== 0) continue
+        const gx = Math.round(x(n * beat)) + 0.5
+        vline(gx, n % 4 === 0 ? gridStrong : grid)
+        ctx.fillStyle = n % 4 === 0 ? muted : faint
+        ctx.fillText(String(n), gx, rulerY)
+      }
+      ctx.textAlign = 'right'
+      ctx.fillStyle = faint
+      ctx.fillText('beats', padL + w, rulerY)
     } else {
-      fillEnvelope(times.left, accent)
-      if (Math.abs(times.right - times.left) > 0.0005) {
-        fillEnvelope(times.right, alt)
+      const tickSec =
+        windowSec <= 0.5 ? 0.1 : windowSec <= 1.5 ? 0.25 : windowSec <= 4 ? 0.5 : 1
+      for (let t = tickSec; t < windowSec - tickSec * 0.3; t += tickSec) {
+        const gx = Math.round(x(t)) + 0.5
+        vline(gx, grid)
+        ctx.fillStyle = faint
+        ctx.fillText(
+          t < 1 ? `${Math.round(t * 1000)} ms` : `${Number(t.toFixed(2))} s`,
+          gx,
+          rulerY,
+        )
       }
     }
 
-    // ---- original sound --------------------------------------------------
-    const dryX = Math.round(x(0)) + 0.5
-    ctx.fillStyle = alpha(text, 0.16)
-    ctx.fillRect(dryX - 4, padT + 8, 8, h - 8)
+    // Centre line.
+    ctx.strokeStyle = alpha(faint, 0.45)
+    ctx.beginPath()
+    ctx.moveTo(padL, Math.round(mid) + 0.5)
+    ctx.lineTo(padL + w, Math.round(mid) + 0.5)
+    ctx.stroke()
+
+    // Lane names.
+    ctx.font = '700 10px system-ui, sans-serif'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillStyle = laneColor.left
+    ctx.fillText('L', padL / 2, mid - GAP - laneH / 2)
+    ctx.fillStyle = laneColor.right
+    ctx.fillText('R', padL / 2, mid + GAP + laneH / 2)
+
+    // ---- the dry sound --------------------------------------------------
+    const dryX = Math.round(x(0))
     ctx.fillStyle = alpha(text, 0.85)
     ctx.beginPath()
-    ctx.roundRect(dryX - 5, padT + 4, 10, 10, 2)
+    ctx.roundRect(dryX, mid - GAP - laneH, 3, laneH * 2 + GAP * 2, 1.5)
     ctx.fill()
-    ctx.fillStyle = faint
-    ctx.font = '650 9px system-ui, sans-serif'
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'bottom'
-    ctx.fillText('Sound', dryX, padT - 4)
+    ctx.font = '600 10px system-ui, sans-serif'
+    ctx.textAlign = 'left'
+    ctx.textBaseline = 'top'
+    ctx.fillStyle = muted
+    ctx.fillText('Dry', dryX, rulerY)
 
-    // ---- echoes ----------------------------------------------------------
+    // ---- repeats --------------------------------------------------------
+    const visible = model.taps.filter((tap) => tap.time <= windowSec)
+    const byLane: Record<Lane, typeof visible> = { left: [], right: [] }
+    for (const tap of visible) byLane[tap.lane].push(tap)
+
+    // Bars thin out as the pattern gets dense, so neighbours never merge.
+    // Repeats a few pixels apart are one cluster (drawn side by side below),
+    // not a density to size every other bar by.
+    const CLUSTER_PX = 6
+    let closestPx = Infinity
+    for (const lane of ['left', 'right'] as const) {
+      const list = byLane[lane]
+      for (let i = 1; i < list.length; i++) {
+        const gapPx = ((list[i]!.time - list[i - 1]!.time) / windowSec) * w
+        if (gapPx >= CLUSTER_PX) closestPx = Math.min(closestPx, gapPx)
+      }
+    }
+    const barW = Number.isFinite(closestPx)
+      ? Math.min(Math.max(closestPx * 0.45, 3), 9)
+      : 9
+
     const perPass = filterMagnitude(params, TONE_REF_HZ)
-    const occupied = new Map<number, number>()
-    for (const tap of model.taps) {
-      if (tap.time > windowSec) continue
-      const key = Math.round(tap.time * 1000)
-      const peers = occupied.get(key) ?? 0
-      occupied.set(key, peers + 1)
+    const dullTo = faint
 
-      const baseColor =
-        tap.lane === 'left'
-          ? params.freeze
-            ? warn
-            : accentBright
-          : params.freeze
-            ? warn
-            : altBright
-      const tone = perPass ** tap.pass
-      const dulled = Math.min(1 - tone, MAX_DULL)
-      const nudge =
-        peers > 0
-          ? tap.lane === 'left'
-            ? -3
-            : 3
-          : tap.lane === 'left'
-            ? -1.5
-            : 1.5
-      const gx = Math.round(x(tap.time) + nudge) + 0.5
-      const top = base - barH(Math.min(tap.amplitude, 1))
+    // Feedback envelope behind each lane. A repeat's level depends only on
+    // its round trip, `gain^(t / spacing)`, so a lane decays at the pace of
+    // the slowest line that reaches it: its own line in stereo and mono, and
+    // in ping-pong both lines, since every other pass crosses over.
+    const spacing: Record<Lane, number> =
+      params.mode === 'pingpong'
+        ? {
+            left: Math.max(times.left, times.right),
+            right: Math.max(times.left, times.right),
+          }
+        : { left: times.left, right: times.right }
+    for (const lane of ['left', 'right'] as const) {
+      if (byLane[lane].length === 0) continue
+      const base = baseOf(lane)
+      const dir = dirOf(lane)
+      const step = spacing[lane]
+      const steps = Math.max(Math.round(w / 3), 2)
+      const region = new Path2D()
+      const edge = new Path2D()
+      region.moveTo(x(0), base)
+      for (let i = 0; i <= steps; i++) {
+        const t = (i / steps) * windowSec
+        const level = params.freeze || step <= 0 ? 1 : model.gain ** (t / step)
+        const py = base + dir * reach(level)
+        region.lineTo(x(t), py)
+        if (i === 0) edge.moveTo(x(t), py)
+        else edge.lineTo(x(t), py)
+      }
+      region.lineTo(x(windowSec), base)
+      region.closePath()
+      const fill = ctx.createLinearGradient(0, base + dir * laneH, 0, base)
+      fill.addColorStop(0, alpha(laneColor[lane], 0.1))
+      fill.addColorStop(1, alpha(laneColor[lane], 0.02))
+      ctx.fillStyle = fill
+      ctx.fill(region)
+      ctx.strokeStyle = alpha(laneColor[lane], 0.22)
+      ctx.lineWidth = 1
+      ctx.setLineDash([3, 3])
+      ctx.stroke(edge)
+      ctx.setLineDash([])
+    }
 
-      ctx.strokeStyle = blend(baseColor, dull, dulled, 0.55 + tap.amplitude * 0.4)
-      ctx.lineWidth = 6
-      ctx.lineCap = 'round'
+    const lastX: Record<Lane, number> = { left: -Infinity, right: -Infinity }
+    const clusterSize: Record<Lane, number> = { left: 0, right: 0 }
+    for (const tap of visible) {
+      const base = baseOf(tap.lane)
+      const dir = dirOf(tap.lane)
+      const length = reach(tap.amplitude)
+      if (length <= 0) continue
+
+      // Two lines landing on (nearly) the same instant in the same lane sit
+      // side by side instead of hiding one another.
+      const at = x(tap.time)
+      const peers = at - lastX[tap.lane] < CLUSTER_PX ? clusterSize[tap.lane] : 0
+      if (peers === 0) lastX[tap.lane] = at
+      clusterSize[tap.lane] = peers + 1
+      const gx = lastX[tap.lane] + peers * (barW + 1)
+
+      const dulled = Math.min(1 - perPass ** tap.pass, MAX_DULL)
+      const color = laneColor[tap.lane]
+      ctx.fillStyle = blend(color, dullTo, dulled, 0.5 + Math.min(tap.amplitude, 1) * 0.45)
       ctx.beginPath()
-      ctx.moveTo(gx, base - 1)
-      ctx.lineTo(gx, top + 3)
-      ctx.stroke()
-
-      ctx.fillStyle = blend(baseColor, dull, dulled, 0.9)
-      ctx.beginPath()
-      ctx.arc(gx, top + 1, 3, 0, Math.PI * 2)
+      if (dir < 0) {
+        ctx.roundRect(gx - barW / 2, base - length, barW, length, [barW / 2, barW / 2, 0, 0])
+      } else {
+        ctx.roundRect(gx - barW / 2, base, barW, length, [0, 0, barW / 2, barW / 2])
+      }
       ctx.fill()
 
-      if (tap.pass <= NUMBERED_PASSES && tap.amplitude > 0.08) {
-        ctx.fillStyle = alpha(text, 0.75)
+      if (tap.pass <= NUMBERED_PASSES && tap.amplitude > 0.08 && peers === 0) {
+        ctx.fillStyle = alpha(text, 0.8)
         ctx.font = '650 9px system-ui, sans-serif'
         ctx.textAlign = 'center'
-        ctx.textBaseline = 'bottom'
-        ctx.fillText(String(tap.pass), gx, top - 4)
+        ctx.textBaseline = dir < 0 ? 'bottom' : 'top'
+        ctx.fillText(String(tap.pass), gx, base + dir * (length + 3))
       }
     }
   }
 
   $effect(() => {
-    void params
-    void tempoBpm
     void windowSec
     void cssWidth
     void cssHeight
@@ -273,12 +344,11 @@
     return () => observer.disconnect()
   })
 
-  function ms(value: number): string {
-    return value >= 1 ? `${value.toFixed(2)}s` : `${Math.round(value * 1000)}ms`
+  function time(value: number): string {
+    return value >= 1 ? `${value.toFixed(2)} s` : `${Math.round(value * 1000)} ms`
   }
 
   const mono = $derived(params.mode === 'mono')
-  const story = $derived(MODE_HINTS[params.mode])
 
   /** Note name in front of a synced side's time, so the legend says *why* the
    *  spacing is what it is. Empty while the line runs on free time. */
@@ -296,32 +366,30 @@
   <canvas bind:this={canvas} style="width: {cssWidth}px; height: {cssHeight}px"
   ></canvas>
   <div class="overlay">
-    <div class="caption">
-      <span class="title">Each bar is one echo</span>
-      <span class="note">{story}</span>
+    <div class="title">
+      <span class="mode">{MODE_LABELS[params.mode]}</span>
+      {#if params.freeze}
+        <span class="badge">Frozen — repeats hold</span>
+      {:else}
+        <span class="sub">Echo pattern · modelled from the settings</span>
+      {/if}
     </div>
     <div class="legend">
-      <div class="item">
+      <div class="chip">
         <span class="swatch left"></span>
-        <div class="copy">
-          <span class="key">{mono ? 'Delay' : 'Left'}</span>
-          <span class="val">{note(params.divisionL)}{ms(times.left)}</span>
-        </div>
+        <span class="key">{mono ? 'L + R' : 'L'}</span>
+        <span class="val">{note(params.divisionL)}{time(times.left)}</span>
       </div>
       {#if !mono}
-        <div class="item">
+        <div class="chip">
           <span class="swatch right"></span>
-          <div class="copy">
-            <span class="key">Right</span>
-            <span class="val">{note(params.divisionR)}{ms(times.right)}</span>
-          </div>
+          <span class="key">R</span>
+          <span class="val">{note(params.divisionR)}{time(times.right)}</span>
         </div>
       {/if}
-      <div class="item">
-        <div class="copy">
-          <span class="key">Heard</span>
-          <span class="val">{params.freeze ? '∞' : model.passes}</span>
-        </div>
+      <div class="chip">
+        <span class="key">Repeats</span>
+        <span class="val">{params.freeze ? '∞' : model.passes}</span>
       </div>
     </div>
   </div>
@@ -331,6 +399,7 @@
   .view {
     position: relative;
     flex: 1;
+    min-width: 0;
     min-height: 0;
     background: linear-gradient(180deg, var(--stage-top), var(--stage-bottom));
     overflow: hidden;
@@ -346,58 +415,69 @@
 
   .overlay {
     position: absolute;
-    inset: 0;
+    inset: 0.6rem 0.7rem auto 0.8rem;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-3);
     pointer-events: none;
   }
 
-  .caption {
-    position: absolute;
-    left: 2.6rem;
-    bottom: 1.7rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-    max-width: min(22rem, 55%);
-    padding: 0.35rem 0.55rem;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--overlay-scrim);
-  }
-
   .title {
-    color: var(--text);
-    font-size: 0.72rem;
-    font-weight: 650;
+    display: flex;
+    align-items: baseline;
+    gap: 0.55rem;
+    min-width: 0;
+    padding-top: 0.3rem;
   }
 
-  .note {
-    color: var(--text-muted);
-    font-size: 0.62rem;
-    line-height: 1.25;
+  .mode {
+    color: var(--text);
+    font-size: 0.82rem;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .sub {
+    overflow: hidden;
+    color: var(--text-faint);
+    font-size: 0.64rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .badge {
+    padding: 0.1rem 0.45rem;
+    border: 1px solid var(--warn-dim);
+    border-radius: 999px;
+    background: var(--warn-fill);
+    color: var(--warn);
+    font-size: 0.64rem;
+    font-weight: 650;
+    white-space: nowrap;
   }
 
   .legend {
-    position: absolute;
-    top: 0.55rem;
-    right: 0.65rem;
     display: flex;
-    gap: 0.85rem;
-    padding: 0.35rem 0.55rem;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--overlay-scrim);
+    flex: none;
+    gap: 0.35rem;
   }
 
-  .item {
+  .chip {
     display: flex;
     align-items: center;
     gap: 0.35rem;
+    padding: 0.28rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--overlay-scrim);
+    white-space: nowrap;
   }
 
   .swatch {
     width: 0.45rem;
     height: 0.45rem;
-    border-radius: 50%;
+    border-radius: 2px;
   }
 
   .swatch.left {
@@ -408,24 +488,21 @@
     background: var(--accent-alt-bright);
   }
 
-  .copy {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 1px;
+  .view.frozen .swatch {
+    background: var(--warn);
   }
 
   .key {
     color: var(--text-faint);
-    font-size: 0.55rem;
-    font-weight: 650;
+    font-size: 0.6rem;
+    font-weight: 700;
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
 
   .val {
     color: var(--text);
-    font-size: 0.78rem;
-    font-weight: 600;
+    font-size: 0.74rem;
+    font-weight: 650;
   }
 </style>

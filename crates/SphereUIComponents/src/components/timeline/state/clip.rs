@@ -270,7 +270,7 @@ impl TimelineState {
         let project_bpm = self.bpm.max(1.0) as f64;
         // One map for the whole pass, and the same map the transport plays.
         let tempo = self.resolved_tempo_map();
-        let mut changed = false;
+        let mut changed = self.retime_warp_clips();
         for track in &mut self.tracks {
             for clip in &mut track.clips {
                 if !matches!(clip.clip_type, ClipType::Audio { .. }) {
@@ -285,6 +285,37 @@ impl TimelineState {
                     clip.duration_beats = beats;
                     changed = true;
                 }
+            }
+        }
+        changed
+    }
+
+    /// Carry every Warp clip's speed from [`Self::warp_ratio_bpm`] to the
+    /// current BPM, so it keeps its bar count — and its markers keep landing
+    /// on their beats — when the tempo moves. A Warp clip is locked to the
+    /// tempo; left alone its stored speed held its wall-clock length instead,
+    /// and it stopped following the tempo it was locked to. Undo restores the
+    /// BPM and comes back through here, which carries the speed back.
+    fn retime_warp_clips(&mut self) -> bool {
+        let from = self.warp_ratio_bpm;
+        let to = self.bpm.max(1.0);
+        self.warp_ratio_bpm = to;
+        if !(from.is_finite() && from > 0.0) || (from - to).abs() < 1.0e-6 {
+            return false;
+        }
+        let scale = from as f64 / to as f64;
+        let mut changed = false;
+        for clip in self
+            .tracks
+            .iter_mut()
+            .flat_map(|track| track.clips.iter_mut())
+        {
+            if matches!(clip.clip_type, ClipType::Audio { .. })
+                && clip.stretch.mode == StretchMode::Warp
+            {
+                let before = clip.stretch.stretch_ratio;
+                clip.stretch.set_stretch_ratio(before * scale);
+                changed |= clip.stretch.stretch_ratio != before;
             }
         }
         changed

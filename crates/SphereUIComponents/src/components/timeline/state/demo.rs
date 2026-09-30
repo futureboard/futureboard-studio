@@ -6,6 +6,7 @@ impl TimelineState {
     /// app entry point; never used by the real runtime default.
     pub fn demo_project() -> Self {
         let track1 = TrackState {
+            spatial: Default::default(),
             listen: ListenMode::Off,
             id: "track-1".to_string(),
             name: "Audio 1".to_string(),
@@ -90,10 +91,13 @@ impl TimelineState {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege: None,
         };
 
         let track2 = TrackState {
+            spatial: Default::default(),
             listen: ListenMode::Off,
             id: "track-2".to_string(),
             name: "Audio 2".to_string(),
@@ -149,10 +153,13 @@ impl TimelineState {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege: None,
         };
 
         let track3 = TrackState {
+            spatial: Default::default(),
             listen: ListenMode::Off,
             id: "track-3".to_string(),
             name: "Synth 3".to_string(),
@@ -218,16 +225,20 @@ impl TimelineState {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege: None,
         };
 
         Self {
             bpm: 120.0,
+            warp_ratio_bpm: 120.0,
             project_sample_rate: 48_000,
             tempo_map: TempoMap::new(),
             resolved_tempo: ResolvedTempo::default(),
             time_signature_map: TimeSignatureMap::with_default_4_4(),
             time_display_format: TimeDisplayFormat::default(),
+            spatial_mix: Default::default(),
             timecode_rate: TimecodeRate::default(),
             project_key: None,
             markers: Vec::new(),
@@ -311,8 +322,11 @@ impl TimelineState {
             drag_current_y: 0.0,
             drag_target_index: None,
             drag_folder_target_id: None,
+            drag_indicator_from_index: None,
+            drag_indicator_generation: 0,
             follow_playhead: true,
             follow_playhead_suspended: false,
+            waveform_zoom: 1.0,
             auto_scroll_mode: AutoScrollMode::Page,
             arrangement_range: None,
             show_tempo_track: true,

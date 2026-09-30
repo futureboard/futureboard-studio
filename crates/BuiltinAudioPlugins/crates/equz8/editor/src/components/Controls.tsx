@@ -1,75 +1,96 @@
 import type { ReactNode } from 'react'
-import { motion } from 'motion/react'
+import { PowerIcon } from '@phosphor-icons/react'
 
-/** Compact On/Off lamp switch — MixStation chrome language. */
-export function BypassSwitch({
-  on,
-  label,
-  accent = 'var(--color-signal)',
-  disabled = false,
-  onToggle,
-}: {
-  on: boolean
-  label: string
-  accent?: string
-  disabled?: boolean
-  onToggle: () => void
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={on}
-      aria-label={label}
-      disabled={disabled}
-      onClick={onToggle}
-      className="flex h-[22px] shrink-0 cursor-pointer items-center gap-1.5 rounded border px-1.5 text-[10px] font-semibold tracking-wide transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-40"
-      style={{
-        borderColor: on ? accent : 'var(--color-hairline-hi)',
-        color: on ? accent : 'var(--color-ink-dim)',
-        background: on ? `color-mix(in srgb, ${accent} 12%, transparent)` : 'transparent',
-      }}
-    >
-      <motion.span
-        layout
-        aria-hidden
-        className="h-1.5 w-1.5 rounded-full"
-        style={{ background: on ? accent : 'var(--color-hairline-hi)' }}
-        transition={{ type: 'spring', stiffness: 520, damping: 34 }}
-      />
-      {on ? 'On' : 'Off'}
-    </button>
-  )
-}
-
-/** Ghost icon button with a 28px hit target. */
+/// Ghost icon button, 28 px. `active` latches it: tinted fill and brighter
+/// glyph, so the state reads on two channels rather than colour alone.
 export function IconButton({
   label,
   onClick,
   children,
   active = false,
   disabled = false,
-  className = '',
 }: {
   label: string
   onClick?: () => void
   children: ReactNode
   active?: boolean
   disabled?: boolean
-  className?: string
 }) {
   return (
     <button
       type="button"
       aria-label={label}
+      aria-pressed={active}
       title={label}
       disabled={disabled}
       onClick={onClick}
-      className={`grid h-7 w-7 shrink-0 cursor-pointer place-items-center rounded transition-colors duration-150 hover:bg-white/6 hover:text-ink disabled:cursor-not-allowed disabled:opacity-30 ${
-        active ? 'text-ink' : 'text-ink-dim'
-      } ${className}`}
+      className={`grid h-7 w-7 shrink-0 cursor-pointer place-items-center rounded-md transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-30 ${
+        active
+          ? 'bg-accent/15 text-accent-hi hover:bg-accent/25'
+          : 'text-ink-3 hover:bg-white/6 hover:text-ink'
+      }`}
     >
       {children}
+    </button>
+  )
+}
+
+/// The plug-in's own power. On is the accent; off is a hollow, muted glyph.
+export function PowerButton({ on, onToggle }: { on: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      aria-label={on ? 'EQ on — click to bypass' : 'EQ bypassed — click to turn on'}
+      title={on ? 'Bypass the EQ' : 'Turn the EQ on'}
+      onClick={onToggle}
+      className={`grid h-7 w-7 shrink-0 cursor-pointer place-items-center rounded-md border transition-colors duration-150 ${
+        on
+          ? 'border-accent/60 bg-accent/15 text-accent-hi hover:bg-accent/25'
+          : 'border-line-hi text-ink-4 hover:text-ink-2'
+      }`}
+    >
+      <PowerIcon size={14} weight="bold" />
+    </button>
+  )
+}
+
+/// A small latched pill (Solo, Dynamic).
+export function Pill({
+  label,
+  on,
+  accent,
+  title,
+  disabled = false,
+  onToggle,
+  children,
+}: {
+  label: string
+  on: boolean
+  accent: string
+  title: string
+  disabled?: boolean
+  onToggle: () => void
+  children?: ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={on}
+      aria-label={label}
+      title={title}
+      disabled={disabled}
+      onClick={onToggle}
+      className="flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-md border px-2 text-[10.5px] font-semibold transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-35"
+      style={{
+        borderColor: on ? `color-mix(in srgb, ${accent} 60%, transparent)` : 'var(--color-line-hi)',
+        background: on ? `color-mix(in srgb, ${accent} 18%, transparent)` : 'transparent',
+        color: on ? accent : 'var(--color-ink-3)',
+      }}
+    >
+      {children}
+      {label}
     </button>
   )
 }

@@ -387,6 +387,8 @@ mod tests {
 
     fn track(id: &str, ty: &str, plugin_latency: u32, sends: Vec<RuntimeSend>) -> RuntimeTrack {
         RuntimeTrack {
+            spatial: None,
+            spatial_params: Default::default(),
             active_voices: 0,
             ara_renderers: Vec::new(),
             ara_l: Vec::new(),

@@ -1,6 +1,6 @@
 [package]
 name = "sphere_directaudioengine"
-version = "2026.9.25-beta1.4"
+version = "2026.10.1-beta1.4.2"
 edition = "2021"
 description = "SphereDirectAudioEngine — native Rust audio backend for Futureboard Studio"
 
@@ -70,6 +70,9 @@ serde_json.workspace = true
 
 # Plugin/audio graph integration.
 sphere-audio-processor.workspace = true
+# Per-file true peak and integrated loudness of export renders.
+ebur128.workspace = true
+solfege_spatialaudio.workspace = true
 sphere-audio-plugins.workspace = true
 sphere-midi-service.workspace = true
 sphere-encoder.workspace = true

@@ -320,6 +320,10 @@ fn build_clips(
         }
         let clip_h = row.height - pad * 2.0;
         for clip in &track.clips {
+            // Drawn in the take lanes, like the element path does.
+            if track.is_hidden_take_clip(&clip.id) {
+                continue;
+            }
             let clip_left = state.beats_to_x(clip.start_beat);
             let clip_width = state
                 .beat_span_px(clip.start_beat, clip.duration_beats)

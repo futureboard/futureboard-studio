@@ -148,6 +148,10 @@ impl PlatformAtlas for DirectXAtlas {
         }
     }
 
+    fn d3d11_adapter_luid(&self) -> Option<u64> {
+        self.0.lock().adapter_luid().ok()
+    }
+
     fn copy_d3d11_shared_texture(
         &self,
         key: &AtlasKey,
@@ -332,6 +336,15 @@ impl DirectXAtlasState {
             desc.BindFlags,
             desc.MiscFlags
         );
+    }
+
+    /// The LUID of the adapter GPUI's device runs on, `(High << 32) | Low`.
+    fn adapter_luid(&self) -> anyhow::Result<u64> {
+        use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice};
+        let dxgi_device: IDXGIDevice = self.device.cast()?;
+        let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter()? };
+        let desc = unsafe { adapter.GetDesc()? };
+        Ok(((desc.AdapterLuid.HighPart as u32 as u64) << 32) | desc.AdapterLuid.LowPart as u64)
     }
 
     /// `LUID and description of the adapter GPUI's device runs on`, or a reason

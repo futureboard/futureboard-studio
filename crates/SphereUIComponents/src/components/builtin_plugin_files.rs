@@ -21,6 +21,7 @@ pub enum BuiltinFileKind {
     Presets,
     Irs,
     Nams,
+    Samples,
 }
 
 impl BuiltinFileKind {
@@ -30,6 +31,7 @@ impl BuiltinFileKind {
             "presets" => Some(Self::Presets),
             "irs" => Some(Self::Irs),
             "nams" => Some(Self::Nams),
+            "samples" => Some(Self::Samples),
             _ => None,
         }
     }
@@ -39,6 +41,7 @@ impl BuiltinFileKind {
             Self::Presets => "presets",
             Self::Irs => "irs",
             Self::Nams => "nams",
+            Self::Samples => "samples",
         }
     }
 
@@ -47,6 +50,7 @@ impl BuiltinFileKind {
             Self::Presets => "Presets",
             Self::Irs => "IRs",
             Self::Nams => "NAMs",
+            Self::Samples => "Samples",
         }
     }
 
@@ -55,6 +59,7 @@ impl BuiltinFileKind {
             Self::Presets => &["json"],
             Self::Irs => &["wav", "aiff", "aif"],
             Self::Nams => &["nam"],
+            Self::Samples => &["wav", "aiff", "aif", "mp3", "flac"],
         }
     }
 }
@@ -83,6 +88,7 @@ pub fn ensure_plugin_dirs(root: &Path) -> io::Result<()> {
         BuiltinFileKind::Presets,
         BuiltinFileKind::Irs,
         BuiltinFileKind::Nams,
+        BuiltinFileKind::Samples,
     ] {
         fs::create_dir_all(root.join(kind.dir_name()))?;
     }
@@ -213,6 +219,10 @@ mod tests {
         assert_eq!(sanitize_file_name(Presets, "a.json"), Some("a.json".into()));
         assert_eq!(sanitize_file_name(Nams, "amp.nam"), Some("amp.nam".into()));
         assert_eq!(sanitize_file_name(Irs, "cab.wav"), Some("cab.wav".into()));
+        assert_eq!(
+            sanitize_file_name(Samples, "kick.flac"),
+            Some("kick.flac".into())
+        );
         for bad in [
             "",
             "   ",

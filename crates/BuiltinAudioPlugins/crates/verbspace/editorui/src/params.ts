@@ -98,6 +98,28 @@ export const PARAMS: Record<ParamId, ParamSpec> = {
 export const MODES = ['room', 'chamber', 'hall', 'plate', 'ambience'] as const
 export type Mode = (typeof MODES)[number]
 
+export const MODE_LABELS: Record<Mode, string> = {
+  room: 'Room',
+  chamber: 'Chamber',
+  hall: 'Hall',
+  plate: 'Plate',
+  ambience: 'Ambience',
+}
+
+/**
+ * One plain line per space, saying what the mode changes in the tank: how
+ * long its lines are (`ReverbMode::line_scale`) and how much diffusion it
+ * starts from (`ReverbMode::diffusion_bias`). `model.test.ts` holds each
+ * claim against those constants.
+ */
+export const MODE_HINTS: Record<Mode, string> = {
+  room: 'Short tank, light diffusion',
+  chamber: 'Medium tank, smoother build',
+  hall: 'Largest tank, slowest build',
+  plate: 'Small tank, densest from the start',
+  ambience: 'Smallest tank, sparsest',
+}
+
 /** Wire value for `mode`; the index in [`MODES`] is the contract. */
 export function modeToWire(mode: Mode): number {
   const index = MODES.indexOf(mode)
@@ -132,6 +154,12 @@ export function fromNorm(spec: ParamSpec, norm: number): number {
   }
   const shaped = spec.taper === 'lin' ? t : Math.pow(t, spec.taper)
   return spec.min + shaped * (spec.max - spec.min)
+}
+
+/** Unit shown next to the readout. VerbSpace's units never change with the
+ *  value; the signature matches EchoSpace's so the two share one dial. */
+export function unitFor(spec: ParamSpec, _value: number): string {
+  return spec.unit
 }
 
 /** Readout text. Frequencies switch to kHz where the four-digit form stops

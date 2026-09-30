@@ -51,6 +51,17 @@ impl TrackState {
         self.takes.iter().find(|take| take.id == take_id)
     }
 
+    /// Whether `clip_id` holds a take that is not the one heard. The clip
+    /// stays on the track — it is that take's storage — but it is drawn and
+    /// picked in the take lanes only. The track's own lane shows what plays;
+    /// an alternate drawn under the active take there reads as two clips
+    /// stacked on each other.
+    pub fn is_hidden_take_clip(&self, clip_id: &str) -> bool {
+        self.takes
+            .iter()
+            .any(|take| !take.active && take.clip_id == clip_id)
+    }
+
     /// How many takes overlap the busiest point on this track — the number the
     /// header's "Takes" badge shows. `1` means every take is its own region and
     /// nothing is being comped.
@@ -415,6 +426,11 @@ impl TimelineState {
                 changed = true;
             }
         }
+        // An alternate leaves the track's lane, so it leaves the selection
+        // too: a Delete must not remove a clip nobody can see is chosen.
+        self.selection
+            .selected_clip_ids
+            .retain(|id| !muted_clips.contains(id));
         changed
     }
 
@@ -605,6 +621,30 @@ mod tests {
         assert!(!track.take(&second).unwrap().active);
         assert!(!track.clips[0].muted);
         assert!(track.clips[1].muted);
+    }
+
+    /// The track's lane shows the take that plays; the alternate is in the
+    /// take lanes only, and is neither drawn, hit nor kept selected there.
+    #[test]
+    fn an_alternate_take_is_hidden_from_the_track_lane() {
+        let mut state = track_with_clips(&[(0.0, 8.0), (0.0, 7.5)]);
+        let id = track_id(&state);
+        let first = state
+            .register_recorded_take(&id, "clip-0", String::new())
+            .unwrap();
+        state.selection.selected_clip_ids = vec!["clip-0".to_string()];
+        state
+            .register_recorded_take(&id, "clip-1", String::new())
+            .unwrap();
+        let track = &state.tracks[0];
+        assert!(track.is_hidden_take_clip("clip-0"));
+        assert!(!track.is_hidden_take_clip("clip-1"));
+        assert!(state.selection.selected_clip_ids.is_empty());
+
+        state.set_active_take(&id, &first);
+        let track = &state.tracks[0];
+        assert!(!track.is_hidden_take_clip("clip-0"));
+        assert!(track.is_hidden_take_clip("clip-1"));
     }
 
     /// A take *is* its clip, so deleting one deletes the audio from the

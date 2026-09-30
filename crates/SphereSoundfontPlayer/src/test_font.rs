@@ -15,8 +15,12 @@ use rustysynth::SoundFont;
 /// Bank/patch of the melodic preset in [`sound_font`].
 pub const MELODIC_PRESET: (i32, i32) = (0, 0);
 /// Bank/patch of the drum preset in [`sound_font`], reachable only on the
-/// percussion channel.
+/// percussion channel. Its instrument is a stereo pair — a zone panned hard
+/// left and one hard right — in exclusive class [`DRUM_CHOKE_GROUP`], the way
+/// a General MIDI kit's hi-hats are.
 pub const DRUM_PRESET: (i32, i32) = (128, 0);
+/// The drum preset's exclusive class (choke group).
+pub const DRUM_CHOKE_GROUP: u16 = 1;
 /// Bank name reported by [`sound_font`].
 pub const BANK_NAME: &str = "Futureboard Test Bank";
 
@@ -25,10 +29,12 @@ const SAMPLE_FRAMES: usize = 2_048;
 /// SF2 requires at least 46 zero frames of separation after each sample.
 const SAMPLE_PADDING: usize = 46;
 
+const GEN_PAN: u16 = 17;
 const GEN_INSTRUMENT: u16 = 41;
 const GEN_KEY_RANGE: u16 = 43;
 const GEN_SAMPLE_ID: u16 = 53;
 const GEN_SAMPLE_MODES: u16 = 54;
+const GEN_EXCLUSIVE_CLASS: u16 = 57;
 const GEN_OVERRIDING_ROOT_KEY: u16 = 58;
 
 /// Serialized bytes of the synthetic bank.
@@ -177,22 +183,34 @@ fn pdta_list() -> Vec<u8> {
 
     let mut pgen = Vec::new();
     pgen.extend_from_slice(&generator(GEN_INSTRUMENT, 0));
-    pgen.extend_from_slice(&generator(GEN_INSTRUMENT, 0));
+    pgen.extend_from_slice(&generator(GEN_INSTRUMENT, 1));
     pgen.extend_from_slice(&generator(0, 0)); // terminator
 
     let mut inst = Vec::new();
     inst.extend_from_slice(&instrument_header("Test Instrument", 0));
-    inst.extend_from_slice(&instrument_header("EOI", 1));
+    inst.extend_from_slice(&instrument_header("Test Kit Pair", 1));
+    inst.extend_from_slice(&instrument_header("EOI", 3));
 
+    // Zone 0: the tone. Zones 1 and 2: the kit's left and right halves.
     let mut ibag = Vec::new();
     ibag.extend_from_slice(&zone(0));
     ibag.extend_from_slice(&zone(4));
+    ibag.extend_from_slice(&zone(10));
+    ibag.extend_from_slice(&zone(16));
 
     let mut igen = Vec::new();
     igen.extend_from_slice(&generator(GEN_KEY_RANGE, 0x7F00));
     igen.extend_from_slice(&generator(GEN_OVERRIDING_ROOT_KEY, 60));
     igen.extend_from_slice(&generator(GEN_SAMPLE_MODES, 1)); // loop continuously
     igen.extend_from_slice(&generator(GEN_SAMPLE_ID, 0)); // must be last in the zone
+    for pan in [-500i16, 500] {
+        igen.extend_from_slice(&generator(GEN_KEY_RANGE, 0x7F00));
+        igen.extend_from_slice(&generator(GEN_PAN, pan as u16));
+        igen.extend_from_slice(&generator(GEN_EXCLUSIVE_CLASS, DRUM_CHOKE_GROUP));
+        igen.extend_from_slice(&generator(GEN_OVERRIDING_ROOT_KEY, 60));
+        igen.extend_from_slice(&generator(GEN_SAMPLE_MODES, 1));
+        igen.extend_from_slice(&generator(GEN_SAMPLE_ID, 0));
+    }
     igen.extend_from_slice(&generator(0, 0)); // terminator
 
     let mut shdr = Vec::new();

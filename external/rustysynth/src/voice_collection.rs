@@ -30,17 +30,12 @@ impl VoiceCollection {
         region: &InstrumentRegion,
         channel: i32,
     ) -> Option<&mut Voice> {
-        // If an exclusive class is assigned to the region, find a voice with the same class.
-        // If found, reuse it to avoid playing multiple voices with the same class at a time.
-        let exclusive_class = region.get_exclusive_class();
-        if exclusive_class != 0 {
-            for i in 0..self.active_voice_count {
-                let voice = &self.voices[i];
-                if voice.exclusive_class() == exclusive_class && voice.channel() == channel {
-                    return Some(&mut self.voices[i]);
-                }
-            }
-        }
+        // Futureboard: exclusive classes are handled by `Synthesizer::note_on`,
+        // which chokes the earlier notes of a class before this note's voices
+        // start. Reusing a voice of the same class here took over the voice of
+        // this very note's other layer (a stereo pair's left side) and left the
+        // earlier note's other layers ringing.
+        let _ = (region, channel);
 
         // If the number of active voices is less than the limit, use a free one.
         if (self.active_voice_count) < self.voices.len() {

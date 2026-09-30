@@ -80,14 +80,13 @@ pub(crate) const SLOT_H: f32 = 17.0;
 pub(crate) const SEND_SLOT_H: f32 = 28.0;
 /// Output / routing row.
 pub(crate) const IO_ROW_H: f32 = 20.0;
-/// Pan knob and its readout.
+/// The pan row: the knob and its readout under it.
 ///
-/// Sized to what it holds rather than to a round number: a 30 px knob, 2 px,
-/// the readout's line box, and the section's own 4 px top and bottom. It was
-/// 44, which is 7 px short — the knob and its value were being squeezed into a
-/// box that could not fit them, and the pair sat high in the section as a
-/// result.
-pub(crate) const PAN_H: f32 = 52.0;
+/// Sized to what it holds: the section's 4 px top and bottom, the knob, 2 px,
+/// and the readout's line box.
+pub(crate) const PAN_H: f32 = 4.0 + PAN_KNOB_SIZE + 2.0 + 12.0 + 4.0;
+/// The pan knob's diameter.
+pub(crate) const PAN_KNOB_SIZE: f32 = 28.0;
 
 /// The strip's horizontal inset.
 ///
@@ -100,6 +99,8 @@ pub(crate) const PAN_H: f32 = 52.0;
 pub(crate) const STRIP_GUTTER: f32 = 3.0;
 /// Smallest fader bay that still leaves the cap somewhere to travel.
 pub(crate) const FADER_MIN_H: f32 = 86.0;
+/// The fader bay's readout row: gain and held peak, side by side.
+pub(crate) const READOUT_H: f32 = 15.0;
 /// Two rows of channel toggles.
 pub(crate) const BUTTONS_H: f32 = 34.0;
 /// The coloured name plate.
@@ -421,6 +422,311 @@ pub(crate) fn io_button(
         )
 }
 
+// ── Pan ─────────────────────────────────────────────────────────────────────
+
+/// `C`, `L34`, `R100` — the console shorthand, not a signed float. A pan is a
+/// side and an amount, and reading "-0.34" forces the eye to decode which side
+/// negative means.
+pub(crate) fn format_pan(pan: f32) -> String {
+    let amount = (pan.abs() * 100.0).round() as i32;
+    if amount == 0 {
+        "C".to_string()
+    } else if pan < 0.0 {
+        format!("L{amount}")
+    } else {
+        format!("R{amount}")
+    }
+}
+
+// ── Room panner ─────────────────────────────────────────────────────────────
+
+/// The room panner's side: square, filling the pan row's height.
+pub(crate) const ROOM_PAD_SIZE: f32 = PAN_H - 8.0;
+
+/// Drag payload for the room panner. Shift drags finely from where the pointer
+/// was when Shift went down; a plain drag places the source under the pointer.
+#[derive(Clone)]
+pub(crate) struct RoomDrag {
+    id: String,
+    /// `(pointer x, pointer y, position)` when fine dragging began.
+    anchor: std::rc::Rc<std::cell::Cell<Option<(f32, f32, solfege_spatialaudio::RoomPosition)>>>,
+}
+
+impl gpui::Render for RoomDrag {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// How far in from the pad's edge its walls are drawn, so the puck stays
+/// whole inside the pad even in a corner.
+const ROOM_PAD_INSET: f32 = 4.5;
+
+/// Map a window point inside `bounds` to the room: left wall to right wall on
+/// x, front wall at the top.
+fn room_at(bounds: gpui::Bounds<gpui::Pixels>, x: f32, y: f32) -> (f32, f32) {
+    let left = f32::from(bounds.origin.x) + ROOM_PAD_INSET;
+    let top = f32::from(bounds.origin.y) + ROOM_PAD_INSET;
+    let w = (f32::from(bounds.size.width) - 2.0 * ROOM_PAD_INSET).max(1.0);
+    let h = (f32::from(bounds.size.height) - 2.0 * ROOM_PAD_INSET).max(1.0);
+    ((x - left) / w * 2.0 - 1.0, 1.0 - (y - top) / h * 2.0)
+}
+
+/// Where a room point is drawn inside `bounds`.
+fn pad_point(
+    bounds: gpui::Bounds<gpui::Pixels>,
+    position: solfege_spatialaudio::RoomPosition,
+) -> gpui::Point<gpui::Pixels> {
+    let w = (f32::from(bounds.size.width) - 2.0 * ROOM_PAD_INSET).max(1.0);
+    let h = (f32::from(bounds.size.height) - 2.0 * ROOM_PAD_INSET).max(1.0);
+    gpui::point(
+        bounds.origin.x + px(ROOM_PAD_INSET + (position.x + 1.0) / 2.0 * w),
+        bounds.origin.y + px(ROOM_PAD_INSET + (1.0 - position.y) / 2.0 * h),
+    )
+}
+
+fn dot(window: &mut gpui::Window, at: gpui::Point<gpui::Pixels>, radius: f32, color: gpui::Rgba) {
+    let r = px(radius);
+    window.paint_quad(
+        gpui::fill(
+            gpui::Bounds {
+                origin: gpui::point(at.x - r, at.y - r),
+                size: gpui::size(r * 2.0, r * 2.0),
+            },
+            color,
+        )
+        .corner_radii(r),
+    );
+}
+
+/// A readable account of a placement, for the tooltip.
+pub(crate) fn describe_room_position(params: &solfege_spatialaudio::SourceParams) -> String {
+    let p = params.position;
+    if p.wall_radius() < 0.05 {
+        return "Centre of the room".to_string();
+    }
+    let degrees = p.azimuth().to_degrees().round() as i32;
+    let mut text = format!(
+        "{degrees}°, {}% out",
+        (p.wall_radius() * 100.0).round() as i32
+    );
+    if p.z > 0.01 {
+        text.push_str(&format!(", {}% up", (p.z * 100.0).round() as i32));
+    }
+    text
+}
+
+/// The square-room panner: the room from above, the listener at its centre,
+/// the layout's speakers on its walls, and the channel as a puck — with its
+/// two sides, for a stereo channel, either side of it.
+///
+/// Pressing places the channel under the pointer and dragging moves it;
+/// Shift drags a tenth as far, from where it is. A double-click or Alt-click
+/// puts it back front and centre.
+pub(crate) fn room_panner(
+    id: gpui::SharedString,
+    params: solfege_spatialaudio::SourceParams,
+    format: solfege_spatialaudio::SpatialFormat,
+    base: gpui::Rgba,
+    on_change: impl Fn(solfege_spatialaudio::SourceParams, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    use crate::components::fader::is_reset_click;
+    use gpui::{AppContext, StatefulInteractiveElement};
+    use solfege_spatialaudio::{RoomPosition, SourceParams, SpatialFormat};
+
+    let on_change = std::rc::Rc::new(on_change);
+    let bounds_cell: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>> =
+        Default::default();
+    let drag_id = id.to_string();
+    let place = {
+        let on_change = on_change.clone();
+        move |position: RoomPosition, window: &mut gpui::Window, cx: &mut gpui::App| {
+            on_change(
+                SourceParams {
+                    position: position.clamped(),
+                    ..params
+                },
+                window,
+                cx,
+            );
+        }
+    };
+    let place_down = place.clone();
+    let place_drag = place.clone();
+    let on_reset = on_change.clone();
+    let down_bounds = bounds_cell.clone();
+    let paint_bounds = bounds_cell;
+
+    let speakers: Vec<(RoomPosition, bool)> = match format {
+        SpatialFormat::Surround(layout) => layout
+            .speakers()
+            .iter()
+            .filter(|speaker| !speaker.lfe)
+            .map(|speaker| {
+                (
+                    solfege_spatialaudio::speaker_position(
+                        speaker.azimuth_deg,
+                        speaker.elevation_deg,
+                    ),
+                    speaker.elevation_deg >= 20.0,
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let binaural = format == SpatialFormat::Binaural;
+    let half_width = params.half_width_radians();
+    let sides = (half_width > 1.0e-3).then(|| {
+        (
+            params.position.rotated(-half_width),
+            params.position.rotated(half_width),
+        )
+    });
+
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .h(px(PAN_H))
+        .px(px(STRIP_GUTTER))
+        .border_b(px(1.0))
+        .border_color(rule())
+        .child(
+            div()
+                .id(id.clone())
+                .relative()
+                .size(px(ROOM_PAD_SIZE))
+                .rounded(px(crate::theme::radius::MICRO))
+                .bg(well(base))
+                .border(px(1.0))
+                .border_color(Colors::border_subtle())
+                .cursor(gpui::CursorStyle::Crosshair)
+                .tooltip(crate::components::controls::fb_tooltip(
+                    describe_room_position(&params),
+                ))
+                .child(
+                    gpui::canvas(
+                        move |bounds, _window, _cx| {
+                            paint_bounds.set(Some(bounds));
+                        },
+                        move |bounds, _state, window, _cx| {
+                            let centre = pad_point(bounds, RoomPosition::CENTRE);
+                            let rule = Colors::border_subtle();
+                            // Cross through the listener.
+                            window.paint_quad(gpui::fill(
+                                gpui::Bounds {
+                                    origin: gpui::point(bounds.origin.x, centre.y),
+                                    size: gpui::size(bounds.size.width, px(1.0)),
+                                },
+                                rule,
+                            ));
+                            window.paint_quad(gpui::fill(
+                                gpui::Bounds {
+                                    origin: gpui::point(centre.x, bounds.origin.y),
+                                    size: gpui::size(px(1.0), bounds.size.height),
+                                },
+                                rule,
+                            ));
+                            // The layout's speakers on the walls; the top
+                            // ring dimmer.
+                            for (position, top) in &speakers {
+                                let color = if *top {
+                                    Colors::with_alpha(Colors::text_muted(), 0.5)
+                                } else {
+                                    Colors::text_muted()
+                                };
+                                dot(window, pad_point(bounds, *position), 1.5, color);
+                            }
+                            // For headphones, the head, facing the front wall.
+                            if binaural {
+                                dot(window, centre, 3.0, Colors::text_muted());
+                                window.paint_quad(gpui::fill(
+                                    gpui::Bounds {
+                                        origin: gpui::point(centre.x - px(0.5), centre.y - px(5.0)),
+                                        size: gpui::size(px(1.0), px(2.0)),
+                                    },
+                                    Colors::text_muted(),
+                                ));
+                            }
+                            // The channel.
+                            if let Some((left, right)) = sides {
+                                let side = Colors::with_alpha(Colors::text_primary(), 0.55);
+                                dot(window, pad_point(bounds, left), 1.5, side);
+                                dot(window, pad_point(bounds, right), 1.5, side);
+                            }
+                            let puck = pad_point(bounds, params.position);
+                            dot(window, puck, 4.0, Colors::surface_base());
+                            dot(window, puck, 3.0, Colors::text_primary());
+                        },
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
+                .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
+                    if event.modifiers.alt || event.modifiers.shift || event.click_count > 1 {
+                        return;
+                    }
+                    let Some(bounds) = down_bounds.get() else {
+                        return;
+                    };
+                    let (x, y) = room_at(bounds, event.position.x.into(), event.position.y.into());
+                    place_down(RoomPosition::new(x, y, params.position.z), window, cx);
+                })
+                .on_drag(
+                    RoomDrag {
+                        id: drag_id.clone(),
+                        anchor: Default::default(),
+                    },
+                    |drag, _offset, _window, cx| cx.new(|_| drag.clone()),
+                )
+                .on_drag_move::<RoomDrag>(move |event, window, cx| {
+                    let drag = event.drag(cx);
+                    if drag.id != drag_id {
+                        return;
+                    }
+                    let px_x: f32 = event.event.position.x.into();
+                    let px_y: f32 = event.event.position.y.into();
+                    let bounds = event.bounds;
+                    let position = if event.event.modifiers.shift {
+                        let (ax, ay, from) =
+                            drag.anchor.get().unwrap_or((px_x, px_y, params.position));
+                        drag.anchor.set(Some((ax, ay, from)));
+                        let w = f32::from(bounds.size.width).max(1.0) / 2.0;
+                        let h = f32::from(bounds.size.height).max(1.0) / 2.0;
+                        RoomPosition::new(
+                            from.x + (px_x - ax) / w * 0.1,
+                            from.y - (px_y - ay) / h * 0.1,
+                            from.z,
+                        )
+                    } else {
+                        drag.anchor.set(None);
+                        let (x, y) = room_at(bounds, px_x, px_y);
+                        RoomPosition::new(x, y, params.position.z)
+                    };
+                    place_drag(position, window, cx);
+                })
+                .on_click(move |event, window, cx| {
+                    if is_reset_click(event) {
+                        on_reset(
+                            SourceParams {
+                                position: RoomPosition::FRONT,
+                                ..params
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+        )
+}
+
 // ── Name plate ──────────────────────────────────────────────────────────────
 
 /// The bottom plate: the channel's number, its name, and the one place its
@@ -436,9 +742,11 @@ pub(crate) fn name_plate(
     number: Option<usize>,
     name: impl Into<String>,
     selected: bool,
-    // The GPU primitive layer paints the plate fill for scrolling channel
-    // strips; when it does, this renders the text over it and nothing else.
-    painted_by_gpu: bool,
+    // The GPU primitive layer also paints the plate fill for scrolling
+    // channel strips. The plate paints it too — the same opaque colour — so
+    // its text can never end up on whatever happens to be drawn over that
+    // layer.
+    _painted_by_gpu: bool,
 ) -> impl IntoElement {
     let text = Colors::on_color(fill);
     div()
@@ -449,7 +757,7 @@ pub(crate) fn name_plate(
         .gap(px(3.0))
         .h(px(PLATE_H))
         .px(px(5.0))
-        .when(!painted_by_gpu, |s| s.bg(fill))
+        .bg(fill)
         .when(selected, |s| {
             s.border_t(px(2.0)).border_color(Colors::text_primary())
         })
@@ -550,6 +858,14 @@ pub(crate) fn monitor_plate_fill() -> gpui::Rgba {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pan_reads_as_a_side_and_an_amount() {
+        assert_eq!(format_pan(0.0), "C");
+        assert_eq!(format_pan(0.004), "C");
+        assert_eq!(format_pan(-0.34), "L34");
+        assert_eq!(format_pan(1.0), "R100");
+    }
 
     /// The plate picks its text from the fill, so every shipped track colour
     /// has to come out readable — this is the one place in the mixer where the

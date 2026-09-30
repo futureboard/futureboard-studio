@@ -46,6 +46,7 @@ members = [
     "crates/BuiltinAudioPlugins/crates/compresser",
     "crates/BuiltinAudioPlugins/crates/fa2a",
     "crates/BuiltinAudioPlugins/crates/echospace",
+    "crates/BuiltinAudioPlugins/crates/imager",
     "crates/BuiltinAudioPlugins/crates/fa76",
     "crates/BuiltinAudioPlugins/crates/burnLimit",
     "crates/BuiltinAudioPlugins/crates/67Clipper",
@@ -53,10 +54,12 @@ members = [
     "crates/BuiltinAudioPlugins/crates/c1073",
     "crates/BuiltinAudioPlugins/crates/meowsyn",
     "crates/BuiltinAudioPlugins/crates/wrapsynth",
+    "crates/BuiltinAudioPlugins/crates/drumsampler",
     "crates/BuiltinAudioPlugins/crates/zcomp",
     "crates/BuiltinAudioPlugins/crates/mixstation",
     "crates/BuiltinAudioPlugins/crates/rodharerist",
     "crates/BuiltinAudioPlugins/crates/verbspace",
+    "crates/solfege_spatialaudio",
     "xtask"
 ]
 
@@ -81,7 +84,7 @@ exclude = [
 
 
 [workspace.package]
-version = "2026.9.27-beta1.4.1"
+version = "2026.10.1-beta1.4.2"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -106,6 +109,7 @@ sphere-graphic-engine = { path = "crates/SphereGraphicEngine" }
 sphere-midi-service = { path = "crates/SphereMidiService", package = "SphereMidiService" }
 sphere-plugin-host = { path = "crates/SpherePluginHost", default-features = false }
 sphere-soundfont-player = { path = "crates/SphereSoundfontPlayer", package = "SphereSoundfontPlayer" }
+solfege_spatialaudio = { path = "crates/solfege_spatialaudio" }
 # Video preview/reference decoding for the arrangement Video Track. Uses OS
 # codecs (Media Foundation on Windows) — no FFmpeg/libav anywhere.
 sphere-video-player = { path = "crates/SphereVideoPlayer" }
@@ -138,6 +142,7 @@ equzx = { path = "crates/BuiltinAudioPlugins/crates/equzx" }
 compresser = { path = "crates/BuiltinAudioPlugins/crates/compresser" }
 fa2a = { path = "crates/BuiltinAudioPlugins/crates/fa2a" }
 echospace = { path = "crates/BuiltinAudioPlugins/crates/echospace" }
+imager = { path = "crates/BuiltinAudioPlugins/crates/imager" }
 fa76 = { path = "crates/BuiltinAudioPlugins/crates/fa76" }
 burnlimit = { path = "crates/BuiltinAudioPlugins/crates/burnLimit" }
 clipper67 = { path = "crates/BuiltinAudioPlugins/crates/67Clipper" }
@@ -145,6 +150,7 @@ transient = { path = "crates/BuiltinAudioPlugins/crates/Transient" }
 c1073 = { path = "crates/BuiltinAudioPlugins/crates/c1073" }
 meowsyn = { path = "crates/BuiltinAudioPlugins/crates/meowsyn" }
 wrapsynth = { path = "crates/BuiltinAudioPlugins/crates/wrapsynth" }
+drumsampler = { path = "crates/BuiltinAudioPlugins/crates/drumsampler" }
 zcomp = { path = "crates/BuiltinAudioPlugins/crates/zcomp" }
 mixstation = { path = "crates/BuiltinAudioPlugins/crates/mixstation" }
 rodharerist = { path = "crates/BuiltinAudioPlugins/crates/rodharerist" }

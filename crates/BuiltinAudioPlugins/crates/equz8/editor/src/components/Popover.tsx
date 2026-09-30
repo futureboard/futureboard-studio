@@ -117,7 +117,7 @@ export function Popover({
         visibility: placement ? 'visible' : 'hidden',
         zIndex: 1000,
       }}
-      className={`overflow-hidden rounded-lg border border-hairline-hi bg-floating shadow-2xl shadow-black/60 ${className}`}
+      className={`overflow-hidden rounded-lg border border-line-hi bg-raised shadow-2xl shadow-black/60 ${className}`}
     >
       {children}
     </motion.div>,

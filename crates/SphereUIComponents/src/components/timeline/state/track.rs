@@ -1,6 +1,9 @@
 use super::*;
 
-pub use sphere_soundfont_player::{SoundfontEnvelope, SoundfontRenderQuality};
+pub use sphere_soundfont_player::{
+    SoundfontChannel, SoundfontChannels, SoundfontEnvelope, SoundfontPlayerMode,
+    SoundfontRenderQuality,
+};
 
 /// Per-channel Listen state. Mirrors the engine's `ListenMode`; the engine
 /// stays authoritative for where each tap sits relative to the fader.
@@ -42,6 +45,10 @@ pub struct SoundfontPlayerSettingsState {
     pub polyphony: usize,
     pub envelope: SoundfontEnvelope,
     pub quality: SoundfontRenderQuality,
+    /// One instrument, or sixteen parts on the MIDI channels.
+    pub mode: SoundfontPlayerMode,
+    /// The parts of a multitimbral player, index 0 = MIDI channel 1.
+    pub channels: SoundfontChannels,
 }
 
 impl Default for SoundfontPlayerSettingsState {
@@ -54,6 +61,8 @@ impl Default for SoundfontPlayerSettingsState {
             polyphony: 64,
             envelope: SoundfontEnvelope::default(),
             quality: SoundfontRenderQuality::default(),
+            mode: SoundfontPlayerMode::default(),
+            channels: sphere_soundfont_player::default_channels(),
         }
     }
 }
@@ -66,6 +75,7 @@ impl SoundfontPlayerSettingsState {
             volume: self.volume.clamp(0.0, 1.0),
             polyphony: self.polyphony.clamp(1, 256),
             envelope: self.envelope.sanitized(),
+            channels: self.channels.map(SoundfontChannel::sanitized),
             ..self
         }
     }
@@ -229,6 +239,10 @@ pub struct TrackState {
     pub volume_automation_read: bool,
     /// Pan position in `-1.0..=1.0`. `-1.0` is hard left, `+1.0` is hard right.
     pub pan: f32,
+    /// Where this channel sits in the square room when the project's mix is
+    /// spatial (binaural or surround); the pan above applies in stereo. Saved
+    /// with the track (v57).
+    pub spatial: solfege_spatialaudio::SourceParams,
     pub muted: bool,
     pub solo: bool,
     pub armed: bool,
@@ -287,6 +301,10 @@ pub struct TrackState {
     pub soundfont_envelope: SoundfontEnvelope,
     /// Internal synthesis oversampling for the built-in player.
     pub soundfont_quality: SoundfontRenderQuality,
+    /// Single instrument, or the sixteen-part multitimbral player.
+    pub soundfont_mode: SoundfontPlayerMode,
+    /// The multitimbral player's parts, index 0 = MIDI channel 1.
+    pub soundfont_channels: SoundfontChannels,
     /// Native Solfege instrument state. Mutually exclusive with the built-in
     /// Soundfont Player and VSTi instrument insert for Instrument tracks.
     pub solfege: Option<crate::solfege::SolfegeTrackState>,
@@ -396,15 +414,21 @@ impl TimelineState {
         self.drag_current_y = y;
         self.drag_target_index = Some(origin_index.min(self.tracks.len()));
         self.drag_folder_target_id = None;
+        self.drag_indicator_from_index = None;
+        self.drag_indicator_generation = self.drag_indicator_generation.wrapping_add(1);
     }
 
     pub fn update_track_drag(&mut self, y: f32) {
         self.drag_current_y = y;
-        self.drag_folder_target_id = self.folder_drop_target_at_y(y);
-        self.drag_target_index = self
-            .drag_folder_target_id
-            .is_none()
-            .then(|| self.track_insert_index_at_y(y));
+        let folder = self.folder_drop_target_at_y(y);
+        let target = folder.is_none().then(|| self.track_insert_index_at_y(y));
+        if target != self.drag_target_index || folder != self.drag_folder_target_id {
+            // The hint slides from where it was to where it now is.
+            self.drag_indicator_from_index = self.drag_target_index.or(target);
+            self.drag_indicator_generation = self.drag_indicator_generation.wrapping_add(1);
+        }
+        self.drag_folder_target_id = folder;
+        self.drag_target_index = target;
     }
 
     pub fn clear_track_drag(&mut self) {
@@ -413,6 +437,7 @@ impl TimelineState {
         self.drag_current_y = 0.0;
         self.drag_target_index = None;
         self.drag_folder_target_id = None;
+        self.drag_indicator_from_index = None;
     }
 
     pub fn reorder_track(&mut self, track_id: &str, target_index: usize) -> bool {
@@ -489,6 +514,7 @@ impl TimelineState {
         let id = self.next_track_id();
         let track_type = options.track_type;
         self.tracks.push(TrackState {
+            spatial: Default::default(),
             listen: ListenMode::Off,
             id: id.clone(),
             name: options.name,
@@ -529,6 +555,8 @@ impl TimelineState {
             soundfont_polyphony: 64,
             soundfont_envelope: SoundfontEnvelope::default(),
             soundfont_quality: SoundfontRenderQuality::default(),
+            soundfont_mode: SoundfontPlayerMode::default(),
+            soundfont_channels: sphere_soundfont_player::default_channels(),
             solfege: None,
         });
         id
@@ -571,6 +599,23 @@ impl TimelineState {
         true
     }
 
+    /// Switch a built-in Soundfont Player between one instrument and sixteen
+    /// parts. Returns `true` if the mode changed.
+    pub fn set_track_soundfont_mode(&mut self, track_id: &str, mode: SoundfontPlayerMode) -> bool {
+        let Some(track) = self
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == track_id && t.track_type == TrackType::Instrument)
+        else {
+            return false;
+        };
+        if track.soundfont_mode == mode {
+            return false;
+        }
+        track.soundfont_mode = mode;
+        true
+    }
+
     pub fn set_track_soundfont_player_state(
         &mut self,
         track_id: &str,
@@ -590,7 +635,9 @@ impl TimelineState {
             || track.soundfont_reverb_chorus != settings.reverb_chorus
             || track.soundfont_polyphony != settings.polyphony
             || track.soundfont_envelope != settings.envelope
-            || track.soundfont_quality != settings.quality;
+            || track.soundfont_quality != settings.quality
+            || track.soundfont_mode != settings.mode
+            || track.soundfont_channels != settings.channels;
         if changed {
             track.builtin_soundfont_player = true;
             track.soundfont_path = settings.path;
@@ -600,6 +647,8 @@ impl TimelineState {
             track.soundfont_polyphony = settings.polyphony;
             track.soundfont_envelope = settings.envelope;
             track.soundfont_quality = settings.quality;
+            track.soundfont_mode = settings.mode;
+            track.soundfont_channels = settings.channels;
         }
         changed
     }
@@ -919,5 +968,36 @@ mod rename_tests {
         let id = state.create_midi_track();
         assert!(state.rename_track(&id, "Bass\tDI\n"));
         assert_eq!(state.tracks[0].name, "Bass DI");
+    }
+}
+
+#[cfg(test)]
+mod move_hint_tests {
+    use super::*;
+
+    #[test]
+    fn the_move_hint_slides_only_when_the_target_changes() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        for _ in 0..3 {
+            state.create_midi_track();
+        }
+        let row = state.track_row_layout().rows[1].height;
+        state.begin_track_drag(&state.tracks[0].id.clone(), 0, 1.0);
+        let started = state.drag_indicator_generation;
+        assert_eq!(state.drag_indicator_from_index, None);
+
+        // Still over the same gap: nothing new to show, nothing to replay.
+        state.update_track_drag(2.0);
+        assert_eq!(state.drag_indicator_generation, started);
+
+        // Down past the second track: the line moves, from where it was.
+        state.update_track_drag(row * 2.0 - 2.0);
+        assert_ne!(state.drag_target_index, Some(0));
+        assert_eq!(state.drag_indicator_from_index, Some(0));
+        assert_eq!(state.drag_indicator_generation, started + 1);
+
+        state.clear_track_drag();
+        assert_eq!(state.drag_indicator_from_index, None);
     }
 }

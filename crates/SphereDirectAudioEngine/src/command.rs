@@ -7,6 +7,9 @@ use crate::runtime::RuntimeProject;
 pub enum EngineCommand {
     /// Replace the callback's render graph with a fully prepared project.
     LoadProject(Box<RuntimeProject>),
+    /// Replace only the MIDI schedule of the running graph (a note edit).
+    /// See [`RuntimeProject::replace_midi_schedule`].
+    ReplaceMidi(Box<crate::runtime::RuntimeMidiData>),
     /// Enable or disable the sine test tone.
     SetTestTone { enabled: bool, frequency: f32 },
     /// Set master output gain (linear, 0..2).
@@ -23,6 +26,12 @@ pub enum EngineCommand {
     SetMonitorControl {
         control: crate::monitor::MonitorControl,
     },
+    /// Set the Control Room's listening simulation (Virtual Speaker): the
+    /// mix as heard in a car, on a phone, through a PA... Playback-only, like
+    /// every Control Room stage.
+    SetListeningSimulation {
+        settings: solfege_spatialaudio::SimulationSettings,
+    },
     /// Select the hardware output pair the Control Room feeds.
     SetMonitorOutput {
         target: crate::monitor::MonitorOutputTarget,
@@ -38,6 +47,12 @@ pub enum EngineCommand {
         master: Option<(u16, u16)>,
         /// The effective monitoring `(left, right)` device channels.
         monitor: Option<(u16, u16)>,
+    },
+    /// Move one channel in the spatial mix's square room. `track_index` is
+    /// resolved by the control thread; the payload is plain numbers.
+    SetTrackSpatial {
+        track_index: usize,
+        params: solfege_spatialaudio::SourceParams,
     },
     /// Set one channel's Pre/After-Fader Listen state. `track_index` is
     /// resolved by the control thread so the payload owns no allocation.
@@ -94,8 +109,19 @@ pub enum EngineCommand {
     SetJamMultitrackPairs {
         pairs: [u32; crate::jam_bus::MAX_MULTITRACK_PAIRS],
     },
+    /// Install (or remove) the realtime render capture. The control thread
+    /// keeps its own reference until the callback has taken this one, so the
+    /// callback only ever drops a reference, never the capture itself.
+    SetRenderCapture(Option<std::sync::Arc<crate::render_capture::RenderCapture>>),
     /// Set non-destructive stereo/mono/mid/side monitoring preview.
     SetTrackPreviewMode { track_id: String, value: f32 },
+    /// Set the sixteen parts of a multitimbral built-in Soundfont Player.
+    /// `track_index` is resolved by the control thread and the parts are plain
+    /// values, so applying them allocates nothing.
+    SetSoundfontChannels {
+        track_index: usize,
+        channels: sphere_soundfont_player::SoundfontChannels,
+    },
     /// Set a plugin/insert parameter.
     SetInsertParam {
         track_id: String,

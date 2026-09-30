@@ -570,6 +570,7 @@ impl StudioLayout {
             // Welcome's Create Project reaches here without `reset_project`.
             timeline.end_track_rename_for_project_change(cx);
             timeline.state.bpm = bpm;
+            timeline.state.warp_ratio_bpm = bpm;
             timeline.state.project_sample_rate = sample_rate;
             timeline.state.time_signature_num = time_signature_num;
             timeline.state.time_signature_den = time_signature_den;

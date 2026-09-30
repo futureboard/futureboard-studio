@@ -1,37 +1,27 @@
 /**
- * Native bridge for the Transient editor.
+ * Native bridge — the wire contract every built-in editor speaks.
  *
- * Same wire contract every built-in editor speaks, plus the telemetry the
- * waveform stage and meters run on: the host pushes `futureboard.meters` at
- * ~30 Hz for the bound instance, carrying the levels and the shaping amount
- * the DSP is actually applying. Nothing on this page invents a meter
- * reading.
+ * The host posts `futureboard.selectInstance` with the authoritative state,
+ * the page answers `futureboard.instanceReady`, and every gesture travels back
+ * as a batched `futureboard.setParams` tagged with the binding it was made
+ * against. The host drops a batch whose `bindingGeneration` is stale, so an
+ * edit made against a torn-down instance can never land on its replacement.
+ * Telemetry arrives on the same channel as `futureboard.meters`.
+ *
+ * Under `bun run dev` there is no host: outgoing messages are handed to the
+ * dev-only preview host (`src/dev/previewHost.ts`) instead, which answers
+ * through the same `message` listener native uses.
  */
 
 export const BRIDGE_PROTOCOL_VERSION = 1
-export const PLUGIN_ID = 'transient'
 
-/** The state blob `transient::ipc::TransientState` serializes. */
-export type TransientParams = {
-  power: boolean
-  attack: number
-  sustain: number
-  speed: number
-  mix: number
-  stereoLink: boolean
-}
-
-/**
- * One telemetry frame from the plugin host, measured on this insert.
- *
- * `gainReductionDb` is the absolute magnitude of the applied dynamic gain
- * change in dB. Levels are linear 0..1.
- */
+/// One telemetry frame measured by the DSP on this insert. Levels are linear.
 export type MeterFrame = {
   inPeak: number
   inRms: number
   outPeak: number
   outRms: number
+  /// Decibels taken off (or, for a shaper, moved), positive.
   gainReductionDb: number
   inClip: boolean
   outClip: boolean
@@ -65,22 +55,31 @@ type MetersMessage = MeterFrame & {
   instanceId: string
 }
 
+/// Event the dev preview host listens for. Never dispatched in a production
+/// bundle: `import.meta.env.DEV` is compiled to `false` there.
+export const DEV_POST_EVENT = 'futureboard:dev-post'
+
 let binding: Binding | null = null
 const pending = new Map<string, number>()
 let scheduled = false
 
 function post(body: unknown) {
-  if (window.location.protocol !== 'mikoplugin:') return
-  try {
-    void fetch('__bridge', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }).catch(() => {})
-  } catch {
-    // A standalone design preview intentionally has no native endpoint.
+  if (window.location.protocol === 'mikoplugin:') {
+    try {
+      void fetch('__bridge', { method: 'POST', body: JSON.stringify(body) }).catch(() => {})
+    } catch {
+      // Nothing to report to: the host owns the other end.
+    }
+    return
+  }
+  if (import.meta.env.DEV) {
+    window.dispatchEvent(new CustomEvent(DEV_POST_EVENT, { detail: body }))
   }
 }
 
+/// Coalesce a frame's worth of edits into one batch. A drag emits on every
+/// pointer move; the map keeps the *last* value per id, so the committed value
+/// is always sent even though the intermediate ones are not.
 function flush() {
   scheduled = false
   if (!binding || pending.size === 0) {
@@ -104,57 +103,59 @@ export function postParam(id: string, value: number) {
   requestAnimationFrame(flush)
 }
 
-const NUMERIC_KEYS = ['attack', 'sustain', 'speed', 'mix'] as const
+const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 
-function parseParams(state: unknown): TransientParams | null {
-  if (!state || typeof state !== 'object') return null
-  const candidate =
-    'params' in state ? (state as { params?: unknown }).params : state
-  if (!candidate || typeof candidate !== 'object') return null
-  const params = candidate as Record<string, unknown>
-
-  if (typeof params.power !== 'boolean') return null
-  if (typeof params.stereoLink !== 'boolean') return null
-  for (const key of NUMERIC_KEYS) {
-    const value = params[key]
-    if (typeof value !== 'number' || !Number.isFinite(value)) return null
+function meterFrame(message: MetersMessage): MeterFrame | null {
+  if (
+    !finite(message.inPeak) ||
+    !finite(message.inRms) ||
+    !finite(message.outPeak) ||
+    !finite(message.outRms) ||
+    !finite(message.gainReductionDb)
+  ) {
+    return null
   }
-  return params as unknown as TransientParams
+  return {
+    inPeak: message.inPeak,
+    inRms: message.inRms,
+    outPeak: message.outPeak,
+    outRms: message.outRms,
+    gainReductionDb: message.gainReductionDb,
+    inClip: message.inClip === true,
+    outClip: message.outClip === true,
+  }
 }
 
-export function connectBridge(
-  onParams: (params: TransientParams) => void,
-  onConnection: (connected: boolean) => void,
-  onMeters?: (frame: MeterFrame) => void,
-) {
+export function connectBridge<P>({
+  pluginId,
+  parse,
+  onParams,
+  onConnection,
+  onMeters,
+}: {
+  pluginId: string
+  /// Accept a host state blob, or `null` to keep what the page shows.
+  parse: (state: unknown) => P | null
+  onParams: (params: P) => void
+  onConnection: (connected: boolean) => void
+  onMeters: (frame: MeterFrame) => void
+}) {
   post({
     type: 'futureboard.bridgeReady',
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
     bridgeVersion: BRIDGE_PROTOCOL_VERSION,
-    pluginId: PLUGIN_ID,
+    pluginId,
   })
 
   const listener = (event: MessageEvent) => {
-    const message = event.data as
-      | SelectInstanceMessage
-      | InstanceRemovedMessage
-      | MetersMessage
-      | undefined
+    const message = event.data as SelectInstanceMessage | InstanceRemovedMessage | MetersMessage | undefined
     if (!message || typeof message !== 'object') return
 
-    // Highest-rate message by far (~30 Hz), so it is matched before the rest
-    // and never reaches the binding bookkeeping below.
+    // The ~30 Hz telemetry first, so it never reaches the binding bookkeeping.
     if (message.type === 'futureboard.meters') {
-      if (!onMeters || binding?.instanceId !== message.instanceId) return
-      onMeters({
-        inPeak: message.inPeak,
-        inRms: message.inRms,
-        outPeak: message.outPeak,
-        outRms: message.outRms,
-        gainReductionDb: message.gainReductionDb,
-        inClip: message.inClip,
-        outClip: message.outClip,
-      })
+      if (binding?.instanceId !== message.instanceId) return
+      const frame = meterFrame(message)
+      if (frame) onMeters(frame)
       return
     }
 
@@ -164,8 +165,10 @@ export function connectBridge(
         instanceId: message.instanceId,
         bindingGeneration: message.bindingGeneration,
       }
+      // Edits queued against the previous binding are abandoned, not
+      // re-tagged: they were made against different state.
       pending.clear()
-      const params = parseParams(message.state)
+      const params = parse(message.state)
       if (params) onParams(params)
       onConnection(true)
       post({
@@ -176,10 +179,7 @@ export function connectBridge(
         bindingGeneration: message.bindingGeneration,
         stateRevision: message.stateRevision,
       })
-    } else if (
-      message.type === 'futureboard.instanceRemoved' &&
-      binding?.instanceId === message.instanceId
-    ) {
+    } else if (message.type === 'futureboard.instanceRemoved' && binding?.instanceId === message.instanceId) {
       binding = null
       pending.clear()
       onConnection(false)
@@ -193,3 +193,6 @@ export function connectBridge(
     pending.clear()
   }
 }
+
+/// Whether this page is the dev-server preview rather than an embedded editor.
+export const IS_BROWSER_PREVIEW = import.meta.env.DEV && window.location.protocol !== 'mikoplugin:'

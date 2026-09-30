@@ -14,47 +14,47 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, svg, App, AppContext, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window,
+    App, AppContext, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    StatefulInteractiveElement, Styled, Window, div, px, svg,
 };
 
 use crate::assets;
 use crate::audio_connections::AudioConnectionRegistry;
 use crate::components::color_picker::{
-    color_picker_field, default_presets, ColorPickerCallbacks, ColorPickerPlacement,
-    ColorPickerState,
+    ColorPickerCallbacks, ColorPickerPlacement, ColorPickerState, color_picker_field,
+    default_presets,
 };
 use crate::components::combo_box::{combo_box_string_menu, combo_box_trigger};
 use crate::components::controls::{
-    fb_button, fb_checkbox, fb_form_row, fb_segment, fb_segmented_track, fb_shortcut_hint,
-    FbButtonKind, FbSegment,
+    FbButtonKind, FbSegment, fb_button, fb_checkbox, fb_segment, fb_segmented_track,
+    fb_shortcut_hint,
 };
 use crate::components::inspector::{
-    inspector_checkbox as shared_inspector_checkbox, inspector_hint_text, inspector_mini_button,
-    inspector_numeric_stepper, inspector_numeric_stepper_coarse,
-    inspector_numeric_stepper_with_drag_callbacks, inspector_row as shared_inspector_row,
-    inspector_section as shared_inspector_section, inspector_select, InspectorSelectOption,
+    InspectorSelectOption, inspector_checkbox as shared_inspector_checkbox, inspector_hint_text,
+    inspector_mini_button, inspector_numeric_stepper, inspector_numeric_stepper_coarse,
+    inspector_numeric_stepper_with_drag_callbacks, inspector_select,
 };
 use crate::components::inspector_kit;
 use crate::components::reorder::{
-    insert_drop_forwarder, insert_drop_target, DragRefusal, DropIndicator, DropSlot, InsertDropCb,
-    InsertDropTarget,
+    DragRefusal, DropIndicator, DropSlot, InsertDropCb, InsertDropTarget, insert_drop_forwarder,
+    insert_drop_target,
 };
 use crate::components::slider::{bipolar_slider_with_drag_callbacks, slider_with_drag_callbacks};
 use crate::components::solfege_editor::SolfegePitchSummary;
 use crate::components::text_input::{
-    text_field_with_callbacks, TextInputCallbacks, TextInputState,
+    TextInputCallbacks, TextInputState, text_field_with_callbacks,
 };
 use crate::components::timeline::timeline_state::{
-    volume, vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
     AudioClipStretchState, ClipType, InsertLoadStatus, InsertSlotState, StretchTiming,
-    TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting, TrackState, TrackType,
+    TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting, TrackState, TrackType, volume,
+    vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
 };
 use crate::i18n::I18n;
-use crate::overlay::{inspector_combo_menu_position, OverlayAnchor};
+use crate::overlay::{OverlayAnchor, inspector_combo_menu_position};
 use crate::solfege::{ModelLoadState, SolfegeModelInfo};
-use crate::theme::{space, typography, Colors};
+use crate::theme::{Colors, space, typography};
 use sphere_midi_service::mpe::{MpeOutputMode, MpeTrackConfiguration};
+use sphere_midi_service::program::{MidiPatchFormat, MidiProgramSelection, XG_DRUM_BANK_MSB};
 
 type RoutingComboToggleCb =
     Arc<dyn Fn(InspectorRoutingCombo, Option<OverlayAnchor>, &mut Window, &mut App) + 'static>;
@@ -70,6 +70,8 @@ type MidiInputCb = Arc<dyn Fn(&(String, TrackMidiInputRouting), &mut Window, &mu
 type MidiChannelCb = Arc<dyn Fn(&(String, Option<u8>), &mut Window, &mut App) + 'static>;
 type MpeConfigurationCb =
     Arc<dyn Fn(&(String, MpeTrackConfiguration), &mut Window, &mut App) + 'static>;
+type ProgramSelectionCb =
+    Arc<dyn Fn(&(String, MidiProgramSelection), &mut Window, &mut App) + 'static>;
 type InsertPairCb = Arc<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>;
 type InsertOpenCb = Arc<dyn Fn(&(String, usize, String), &mut Window, &mut App) + 'static>;
 type InsertPickerCb = Arc<dyn Fn(&(String, usize, bool), &mut Window, &mut App) + 'static>;
@@ -77,6 +79,12 @@ type InsertOutputChannelCb =
     Arc<dyn Fn(&(String, String, u8, bool), &mut Window, &mut App) + 'static>;
 type ClipF32Cb = Arc<dyn Fn(&(String, f32), &mut Window, &mut App) + 'static>;
 type ClipBoolCb = Arc<dyn Fn(&(String, bool), &mut Window, &mut App) + 'static>;
+type SpatialCb =
+    Arc<dyn Fn(&(String, solfege_spatialaudio::SourceParams), &mut Window, &mut App) + 'static>;
+type SpatialCommitCb = Arc<dyn Fn(&(String, &'static str), &mut Window, &mut App) + 'static>;
+/// One placement control's edit: the placement with the control's value in it.
+type SpatialApply =
+    fn(solfege_spatialaudio::SourceParams, f32) -> solfege_spatialaudio::SourceParams;
 /// Apply a full replacement of a clip's stretch/pitch state. One callback drives
 /// every stretch control; the inspector builds the mutated state and the layout
 /// records it as a single undo entry (see `set_clip_stretch_cb`).
@@ -146,6 +154,11 @@ pub enum InspectorRoutingCombo {
     MidiInput,
     MidiChannel,
     MidiOut,
+    /// Bank Select MSB of the track's program selection.
+    ProgramBank,
+    /// Bank Select LSB of the track's program selection.
+    ProgramBankLsb,
+    Program,
 }
 
 const ROUTING_COMBO_MENU_HEIGHT: f32 = 220.0;
@@ -165,6 +178,12 @@ pub struct InspectorCallbacks {
     pub on_pan_drag_start: StrCb,
     pub on_pan_drag_preview: StrF32Cb,
     pub on_pan_drag_commit: StrCb,
+    /// Start a gesture on a channel's placement in the spatial mix.
+    pub on_spatial_drag_start: StrCb,
+    /// A live value of that gesture: `(track_id, params)`.
+    pub on_spatial_drag_preview: SpatialCb,
+    /// Its release, recorded as one undo step: `(track_id, undo label)`.
+    pub on_spatial_drag_commit: SpatialCommitCb,
     pub on_toggle_mute: StrCb,
     pub on_toggle_solo: StrCb,
     pub on_toggle_arm: StrCb,
@@ -175,6 +194,7 @@ pub struct InspectorCallbacks {
     pub on_set_midi_input: MidiInputCb,
     pub on_set_midi_channel: MidiChannelCb,
     pub on_set_mpe_configuration: MpeConfigurationCb,
+    pub on_set_program_selection: ProgramSelectionCb,
     pub on_open_insert_picker: InsertPickerCb,
     pub on_remove_insert: InsertPairCb,
     pub on_toggle_insert_bypass: InsertPairCb,
@@ -379,6 +399,7 @@ pub fn inspector_panel<'a>(
     clip_name_callbacks: TextInputCallbacks,
     color_picker: InspectorColorPicker<'a>,
     active: bool,
+    spatial_format: solfege_spatialaudio::SpatialFormat,
     callbacks: &InspectorCallbacks,
     i18n: I18n,
 ) -> impl IntoElement {
@@ -413,6 +434,7 @@ pub fn inspector_panel<'a>(
                     name_callbacks,
                     &instrument_targets,
                     &color_picker,
+                    spatial_format,
                     callbacks,
                     i18n,
                 )
@@ -428,7 +450,9 @@ pub fn inspector_panel<'a>(
     inspector_shell(active, i18n).child(body)
 }
 
-fn inspector_shell(active: bool, i18n: I18n) -> gpui::Div {
+/// `_active`: which panel has the keyboard is no longer painted — an accent
+/// title and an accent rule down the dock's edge were loud for what they said.
+fn inspector_shell(_active: bool, i18n: I18n) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -436,11 +460,7 @@ fn inspector_shell(active: bool, i18n: I18n) -> gpui::Div {
         .h_full()
         .bg(Colors::surface_panel())
         .border_l(px(1.0))
-        .border_color(if active {
-            Colors::panel_border_focused()
-        } else {
-            Colors::border_subtle()
-        })
+        .border_color(Colors::border_subtle())
         .child(
             div()
                 .flex_shrink_0()
@@ -451,29 +471,17 @@ fn inspector_shell(active: bool, i18n: I18n) -> gpui::Div {
                 .h(px(32.0))
                 .px(px(10.0))
                 .border_b(px(1.0))
-                .border_color(if active {
-                    Colors::panel_border_focused()
-                } else {
-                    Colors::border_subtle()
-                })
+                .border_color(Colors::border_subtle())
                 .child(
                     svg()
                         .path(assets::ICON_SLIDERS_HORIZONTAL_PATH)
                         .w(px(13.0))
                         .h(px(13.0))
-                        .text_color(if active {
-                            Colors::panel_header_active()
-                        } else {
-                            Colors::text_muted()
-                        }),
+                        .text_color(Colors::text_muted()),
                 )
                 .child(
                     div()
-                        .text_color(if active {
-                            Colors::panel_header_active()
-                        } else {
-                            Colors::tab_text()
-                        })
+                        .text_color(Colors::tab_text())
                         .text_size(px(typography::DENSE_LABEL))
                         .font_weight(gpui::FontWeight::BOLD)
                         .child(i18n.tr("panel.inspector")),
@@ -484,16 +492,7 @@ fn inspector_shell(active: bool, i18n: I18n) -> gpui::Div {
 
 /// Scrollable body wrapper shared by every populated inspector view.
 fn scroll_body() -> gpui::Stateful<gpui::Div> {
-    div()
-        .id("inspector-scroll")
-        .flex_1()
-        .min_h_0()
-        .overflow_y_scroll()
-        .flex()
-        .flex_col()
-        .px(px(10.0))
-        .py(px(10.0))
-        .gap(px(12.0))
+    inspector_kit::ins_body("inspector-scroll")
 }
 
 fn no_selection(track_count: usize, i18n: I18n) -> impl IntoElement {
@@ -1299,6 +1298,72 @@ pub(crate) fn inspector_routing_combo_overlay(
             )
             .into_any_element()
         }
+        InspectorRoutingCombo::ProgramBank
+        | InspectorRoutingCombo::ProgramBankLsb
+        | InspectorRoutingCombo::Program => {
+            let selection = track.routing.program.sanitized();
+            let channel = track.routing.midi_channel.unwrap_or(1);
+            // Every choice as (label, the selection it makes).
+            let choices: Vec<(String, MidiProgramSelection)> = match open_combo {
+                InspectorRoutingCombo::ProgramBank => program_bank_options(selection)
+                    .into_iter()
+                    .map(|(label, msb)| {
+                        (
+                            label,
+                            MidiProgramSelection {
+                                bank_msb: msb,
+                                ..selection
+                            },
+                        )
+                    })
+                    .collect(),
+                InspectorRoutingCombo::ProgramBankLsb => program_bank_lsb_options(selection)
+                    .into_iter()
+                    .map(|(label, lsb)| {
+                        (
+                            label,
+                            MidiProgramSelection {
+                                bank_lsb: lsb,
+                                ..selection
+                            },
+                        )
+                    })
+                    .collect(),
+                _ => program_options(selection, channel)
+                    .into_iter()
+                    .map(|(label, program)| {
+                        (
+                            label,
+                            MidiProgramSelection {
+                                program,
+                                ..selection
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            let selected = choices
+                .iter()
+                .find(|(_, choice)| *choice == selection)
+                .map(|(label, _)| label.clone())
+                .unwrap_or_default();
+            let labels: Vec<String> = choices.iter().map(|(label, _)| label.clone()).collect();
+            let cb = callbacks.on_set_program_selection.clone();
+            let close = on_close.clone();
+            combo_box_string_menu(
+                "inspector-program-menu",
+                position,
+                &selected,
+                &labels,
+                Arc::new(move |value, window, cx| {
+                    if let Some((_, next)) = choices.iter().find(|(label, _)| *label == value) {
+                        cb(&(track_id.clone(), *next), window, cx);
+                    }
+                    close(cx);
+                }),
+            )
+            .into_any_element()
+        }
     };
 
     div()
@@ -1322,48 +1387,210 @@ fn routing_section(
     match track.track_type {
         TrackType::Audio => {
             rows = rows
-                .child(fb_form_row("Format", format_selector(track, callbacks)))
-                .child(fb_form_row(
+                .child(field_row("Format", format_selector(track, callbacks)))
+                .child(field_row(
                     "Input",
                     audio_input_selector(track, connections, callbacks),
                 ))
-                .child(fb_form_row("Output", output_selector(track, callbacks)));
+                .child(field_row("Output", output_selector(track, callbacks)));
         }
         TrackType::Instrument => {
             rows = rows
-                .child(fb_form_row(
+                .child(field_row(
                     "MIDI Input",
                     midi_input_selector(track, callbacks),
                 ))
-                .child(fb_form_row(
+                .child(field_row(
                     "MIDI Ch",
                     midi_channel_selector(track, callbacks),
                 ))
-                .child(fb_form_row("Output", output_selector(track, callbacks)));
+                .child(field_row("Output", output_selector(track, callbacks)));
         }
         TrackType::Midi => {
             rows = rows
-                .child(fb_form_row(
+                .child(field_row(
                     "MIDI Input",
                     midi_input_selector(track, callbacks),
                 ))
-                .child(fb_form_row(
+                .child(field_row(
                     "MIDI Ch",
                     midi_channel_selector(track, callbacks),
                 ))
-                .child(fb_form_row(
+                .child(field_row(
                     "MIDI Out",
                     midi_output_selector(track, instrument_targets, callbacks),
                 ));
         }
         TrackType::Bus | TrackType::Return | TrackType::Group | TrackType::Master => {
-            rows = rows.child(fb_form_row("Output", output_selector(track, callbacks)));
+            rows = rows.child(field_row("Output", output_selector(track, callbacks)));
         }
         // A Video track has no audio path, so it exposes no routing controls.
         TrackType::Video => {}
     }
 
     section_card("routing", "Routing", callbacks, rows)
+}
+
+const PATCH_FORMAT_OPTIONS: &[InspectorSelectOption<MidiPatchFormat>] = &[
+    InspectorSelectOption {
+        label: "GM",
+        value: MidiPatchFormat::Gm,
+    },
+    InspectorSelectOption {
+        label: "GS",
+        value: MidiPatchFormat::Gs,
+    },
+    InspectorSelectOption {
+        label: "XG",
+        value: MidiPatchFormat::Xg,
+    },
+];
+
+/// Bank Select MSB choices for the selection's format, as (label, MSB). A
+/// value set some other way (an imported file, a later format) stays listed.
+fn program_bank_options(selection: MidiProgramSelection) -> Vec<(String, u8)> {
+    let mut options: Vec<(String, u8)> = match selection.format {
+        MidiPatchFormat::Gm => Vec::new(),
+        MidiPatchFormat::Gs => std::iter::once(("Capital (0)".to_string(), 0))
+            .chain((1..=127).map(|msb| (format!("Variation {msb}"), msb)))
+            .collect(),
+        MidiPatchFormat::Xg => vec![
+            ("Normal Voice (0)".to_string(), 0),
+            ("SFX Voice (64)".to_string(), 64),
+            ("SFX Kit (126)".to_string(), 126),
+            ("Drum Kit (127)".to_string(), 127),
+        ],
+    };
+    if selection.format.has_banks() && !options.iter().any(|(_, msb)| *msb == selection.bank_msb) {
+        options.push((format!("MSB {}", selection.bank_msb), selection.bank_msb));
+    }
+    options
+}
+
+/// Bank Select LSB choices for the selection's format, as (label, LSB).
+fn program_bank_lsb_options(selection: MidiProgramSelection) -> Vec<(String, u8)> {
+    let mut options: Vec<(String, u8)> = match selection.format {
+        MidiPatchFormat::Gm => Vec::new(),
+        MidiPatchFormat::Gs => vec![
+            ("Default Map (0)".to_string(), 0),
+            ("SC-55 Map (1)".to_string(), 1),
+            ("SC-88 Map (2)".to_string(), 2),
+            ("SC-88Pro Map (3)".to_string(), 3),
+            ("SC-8850 Map (4)".to_string(), 4),
+        ],
+        MidiPatchFormat::Xg => (0..=127).map(|lsb| (format!("Bank {lsb}"), lsb)).collect(),
+    };
+    if selection.format.has_banks() && !options.iter().any(|(_, lsb)| *lsb == selection.bank_lsb) {
+        options.push((format!("LSB {}", selection.bank_lsb), selection.bank_lsb));
+    }
+    options
+}
+
+/// Program choices, named for the selection's format and bank on `channel`,
+/// behind a "None" that sends nothing.
+fn program_options(selection: MidiProgramSelection, channel: u8) -> Vec<(String, Option<u8>)> {
+    std::iter::once(("None".to_string(), None))
+        .chain((0..=127).map(|program| (selection.patch_name(program, channel), Some(program))))
+        .collect()
+}
+
+/// A MIDI or Instrument track's bank and program: which patch its instrument
+/// (or MIDI device) is set to, in the GM, GS or XG layout.
+fn program_section(track: &TrackState, callbacks: &InspectorCallbacks) -> impl IntoElement {
+    let selection = track.routing.program.sanitized();
+    let channel = track.routing.midi_channel.unwrap_or(1);
+    let cb = callbacks.on_set_program_selection.clone();
+    let tid = track.id.clone();
+    let format = inspector_select(
+        "inspector-program-format",
+        selection.format,
+        PATCH_FORMAT_OPTIONS,
+        false,
+        move |format, window, cx| {
+            if format == selection.format {
+                return;
+            }
+            // Each format starts on its own first bank. XG plays drums from
+            // its drum bank rather than from channel 10, so a drum channel
+            // starts there.
+            let bank_msb = if format == MidiPatchFormat::Xg && channel == 10 {
+                XG_DRUM_BANK_MSB
+            } else {
+                0
+            };
+            let next = MidiProgramSelection {
+                format,
+                bank_msb,
+                bank_lsb: 0,
+                ..selection
+            };
+            cb(&(tid.clone(), next), window, cx);
+        },
+    );
+    let combo = |id: &'static str, label: String, kind: InspectorRoutingCombo| {
+        routing_combo_trigger(
+            id,
+            label,
+            kind,
+            callbacks.open_routing_combo,
+            callbacks.on_toggle_routing_combo.clone(),
+        )
+    };
+    let label_of = |options: Vec<(String, u8)>, value: u8| {
+        options
+            .into_iter()
+            .find(|(_, v)| *v == value)
+            .map(|(label, _)| label)
+            .unwrap_or_else(|| value.to_string())
+    };
+    let program_label = selection
+        .program
+        .map(|program| selection.patch_name(program, channel))
+        .unwrap_or_else(|| "None".to_string());
+
+    let mut rows = section_rows().child(field_row("Patch Set", format));
+    if selection.format.has_banks() {
+        rows = rows
+            .child(field_row(
+                "Bank",
+                combo(
+                    "inspector-program-bank-combo",
+                    label_of(program_bank_options(selection), selection.bank_msb),
+                    InspectorRoutingCombo::ProgramBank,
+                ),
+            ))
+            .child(field_row(
+                "Bank LSB",
+                combo(
+                    "inspector-program-bank-lsb-combo",
+                    label_of(program_bank_lsb_options(selection), selection.bank_lsb),
+                    InspectorRoutingCombo::ProgramBankLsb,
+                ),
+            ));
+    }
+    rows = rows.child(field_row(
+        "Program",
+        combo(
+            "inspector-program-combo",
+            program_label,
+            InspectorRoutingCombo::Program,
+        ),
+    ));
+    let hint = match (selection.program, selection.format) {
+        (None, _) => "No program is sent; the instrument keeps its own patch.".to_string(),
+        (Some(_), MidiPatchFormat::Gm) => {
+            format!("Program Change on channel {channel}. General MIDI has no banks.")
+        }
+        (Some(_), _) => {
+            format!("Bank Select (CC 0, CC 32), then Program Change, on channel {channel}.")
+        }
+    };
+    section_card(
+        "program",
+        "Program",
+        callbacks,
+        rows.child(inspector_hint_text(hint)),
+    )
 }
 
 const MPE_MODE_OPTIONS: &[InspectorSelectOption<MpeOutputMode>] = &[
@@ -1473,10 +1700,10 @@ fn mpe_section(track: &TrackState, callbacks: &InspectorCallbacks) -> impl IntoE
         "MPE",
         callbacks,
         section_rows()
-            .child(fb_form_row("Mode", mode))
-            .child(fb_form_row("Members", members))
-            .child(fb_form_row("Member Range", member_range))
-            .child(fb_form_row("Manager Range", manager_range))
+            .child(field_row("Mode", mode))
+            .child(field_row("Members", members))
+            .child(field_row("Member Range", member_range))
+            .child(field_row("Manager Range", manager_range))
             .child(inspector_hint_text(hint)),
     )
 }
@@ -1743,52 +1970,41 @@ fn instrument_section(track: &TrackState, callbacks: &InspectorCallbacks) -> gpu
     let slot_name = if track.solfege.is_some() {
         "Solfege Engine".to_string()
     } else if slot.is_none() && track.builtin_soundfont_player {
-        "Built-in Soundfont Player".to_string()
+        match track.soundfont_mode {
+            crate::soundfont_player::SoundfontPlayerMode::Multi => {
+                "Built-in Soundfont Multi · 16 channels".to_string()
+            }
+            crate::soundfont_player::SoundfontPlayerMode::Single => {
+                "Built-in Soundfont Player".to_string()
+            }
+        }
     } else {
         plugin_slot_name(slot, "No Instrument")
     };
-    let mut section = section_rows()
-        .child(kv_row("Plugin", slot_name))
-        .child(kv_row(
-            "Format",
-            slot.map(plugin_format_label).unwrap_or("-").to_string(),
-        ))
-        .child(kv_row(
-            "State",
-            slot.map(plugin_state_label)
-                .unwrap_or_else(|| "Empty".to_string()),
-        ))
-        .child(kv_row("MIDI Input", track.routing.midi_input.label()))
-        .child(kv_row(
-            "MIDI Ch",
-            track
-                .routing
-                .midi_channel
-                .map(|ch| ch.to_string())
-                .unwrap_or_else(|| "All".to_string()),
-        ))
-        .child(kv_row("Output", track.routing.output.label()));
-
+    let mut section = section_rows();
     if let Some(slot) = slot {
         section = section
-            .child(fb_form_row(
-                "VSTi Outputs",
-                vsti_output_selector(slot, callbacks),
-            ))
             // The instrument is a chain of one, so it gets the same row every
             // effect gets: power, name, editor, bin.
-            .child(plugin_slot_row(track, slot, 0, 1, callbacks, true, 0.0));
+            .child(plugin_slot_row(track, slot, 0, 1, callbacks, true, 0.0))
+            .child(field_row("Outputs", vsti_output_selector(slot, callbacks)));
     } else if track.solfege.is_some() {
-        section = section.child(kv_row("Details", "Open the Solfege tab"));
+        section = section
+            .child(inspector_kit::ins_value_muted(slot_name))
+            .child(inspector_kit::ins_value_muted(
+                "Its voice and model are on the Solfège tab.",
+            ));
     } else if track.builtin_soundfont_player {
         let track_id = track.id.clone();
         let open = callbacks.on_open_soundfont_player.clone();
-        section = section.child(compact_action_button(
-            "soundfont-player-open",
-            "Open",
-            true,
-            move |_, w, cx| open(&track_id.clone(), w, cx),
-        ));
+        section = section
+            .child(inspector_kit::ins_value_muted(slot_name))
+            .child(compact_action_button(
+                "soundfont-player-open",
+                "Open",
+                true,
+                move |_, w, cx| open(&track_id.clone(), w, cx),
+            ));
     } else {
         let track_id = track.id.clone();
         let picker = callbacks.on_open_insert_picker.clone();
@@ -1810,7 +2026,7 @@ fn instrument_section(track: &TrackState, callbacks: &InspectorCallbacks) -> gpu
 pub fn solfege_panel(
     tracks: &[TrackState],
     selected_track_id: Option<&str>,
-    active: bool,
+    _active: bool,
     pitch: Option<SolfegePitchSummary>,
 ) -> impl IntoElement {
     let selected = selected_track_id
@@ -1838,11 +2054,8 @@ pub fn solfege_panel(
         .h_full()
         .bg(Colors::surface_panel())
         .border_l(px(1.0))
-        .border_color(if active {
-            Colors::panel_border_focused()
-        } else {
-            Colors::border_subtle()
-        })
+        // No accent for the active panel; see `inspector_shell`.
+        .border_color(Colors::border_subtle())
         .child(body)
 }
 
@@ -2268,14 +2481,16 @@ fn track_inspector(
     name_callbacks: TextInputCallbacks,
     instrument_targets: &[(String, String)],
     color_picker: &InspectorColorPicker<'_>,
+    spatial_format: solfege_spatialaudio::SpatialFormat,
     callbacks: &InspectorCallbacks,
     i18n: I18n,
 ) -> impl IntoElement {
-    let automation_points: usize = track
-        .automation_lanes
-        .iter()
-        .map(|lane| lane.points.len())
-        .sum();
+    // In a spatial mix every channel that sums into the master is placed in
+    // the room instead of panned (the engine holds its pan at centre), so its
+    // pan row gives way to the Spatial card. A channel sent to a bus still
+    // pans into that bus.
+    let in_room = spatial_format.is_spatial() && track.track_type != TrackType::Master;
+    let placed = in_room && !matches!(track.routing.output, TrackOutputRouting::Bus { .. });
     let tid = track.id.clone();
 
     // ── Volume slider + dB readout ──────────────────────────────────────
@@ -2477,35 +2692,48 @@ fn track_inspector(
 
     let type_label = track_type_label(i18n, track.track_type);
     scroll_body()
-        .child(inspector_header(
-            track_type_color(track.track_type),
-            track.name.clone(),
-            type_label.clone(),
-        ))
+        // Who this is — the track's own colour, its name, its kind — and the
+        // four switches it is played with, before any section.
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::BASE))
+                .child(inspector_kit::ins_identity(
+                    track.color,
+                    track.name.clone(),
+                    type_label,
+                ))
+                .child(state_row),
+        )
         .child(section_card(
             "track",
             &i18n.tr("inspector.section.track"),
             callbacks,
             section_rows()
-                .child(fb_form_row(
-                    i18n.tr("inspector.field.type"),
-                    inspector_kit::ins_value(type_label),
-                ))
-                .child(fb_form_row(
+                .child(field_row(
                     "Name",
                     text_field_with_callbacks(name_input, name_focused, name_callbacks),
                 ))
-                .child(fb_form_row(i18n.tr("inspector.field.volume"), volume_row))
-                .child(fb_form_row(i18n.tr("inspector.field.pan"), pan_row))
-                .child(fb_form_row("Color", color_field(color_picker)))
-                .child(fb_form_row(i18n.tr("inspector.section.state"), state_row)),
+                .child(field_row(i18n.tr("inspector.field.volume"), volume_row))
+                .when(!placed, |rows| {
+                    rows.child(field_row(i18n.tr("inspector.field.pan"), pan_row))
+                })
+                .child(field_row("Color", color_field(color_picker))),
         ))
+        .when(in_room, |this| {
+            this.child(spatial_section(track, spatial_format, placed, callbacks))
+        })
         .child(routing_section(
             track,
             connections,
             instrument_targets,
             callbacks,
         ))
+        .when(
+            matches!(track.track_type, TrackType::Midi | TrackType::Instrument),
+            |this| this.child(program_section(track, callbacks)),
+        )
         .when(
             crate::edition::professional_features_available()
                 && matches!(track.track_type, TrackType::Midi | TrackType::Instrument),
@@ -2518,23 +2746,195 @@ fn track_inspector(
             matches!(track.track_type, TrackType::Audio | TrackType::Instrument),
             |this| this.child(insert_effects_section(track, callbacks)),
         )
-        .child(section_card(
-            "contents",
-            "Contents",
+}
+
+/// The rest of a channel's placement in a spatial mix, beside the room
+/// position the Mixer's room panner sets. Rows the format cannot hear are left
+/// out: height on a flat layout, the LFE send without an LFE channel.
+fn spatial_section(
+    track: &TrackState,
+    format: solfege_spatialaudio::SpatialFormat,
+    placed: bool,
+    callbacks: &InspectorCallbacks,
+) -> impl IntoElement {
+    let title = format!("Spatial · {}", format.name());
+    if !placed {
+        return section_card(
+            "spatial",
+            title,
             callbacks,
-            section_rows()
-                .child(kv_row(
-                    i18n.tr("inspector.field.clips"),
-                    track.clips.len().to_string(),
+            section_rows().child(inspector_hint_text(
+                "Sent to a bus: the bus is placed in the room, not this channel.",
+            )),
+        )
+        .into_any_element();
+    }
+    let params = track.spatial;
+    let row = |id: &'static str,
+               undo: &'static str,
+               value: f32,
+               readout: String,
+               reset: f32,
+               apply: SpatialApply| {
+        spatial_slider(
+            &track.id,
+            id,
+            undo,
+            track.color,
+            params,
+            value,
+            readout,
+            reset,
+            apply,
+            callbacks,
+        )
+    };
+    let percent = |v: f32| format!("{}%", (v * 100.0).round() as i32);
+    section_card(
+        "spatial",
+        title,
+        callbacks,
+        section_rows()
+            .child(field_row(
+                "Position",
+                inspector_kit::ins_value(crate::components::mixer_panel::describe_room_position(
+                    &params,
+                )),
+            ))
+            .when(format.has_height(), |rows| {
+                rows.child(field_row(
+                    "Height",
+                    row(
+                        "inspector-spatial-height",
+                        "Spatial Height",
+                        params.position.z,
+                        percent(params.position.z),
+                        0.0,
+                        |mut p, v| {
+                            p.position.z = v;
+                            p
+                        },
+                    ),
                 ))
-                .child(kv_row("Inserts", track.effect_inserts().len().to_string()))
-                .child(kv_row("Sends", track.sends.len().to_string()))
-                .child(kv_row(
-                    "Automation Lanes",
-                    track.automation_lanes.len().to_string(),
+            })
+            .child(field_row(
+                "Spread",
+                row(
+                    "inspector-spatial-spread",
+                    "Spatial Spread",
+                    params.spread,
+                    percent(params.spread),
+                    0.0,
+                    |mut p, v| {
+                        p.spread = v;
+                        p
+                    },
+                ),
+            ))
+            .child(field_row(
+                "Width",
+                row(
+                    "inspector-spatial-width",
+                    "Spatial Width",
+                    params.width,
+                    format!(
+                        "±{}°",
+                        params.half_width_radians().to_degrees().round() as i32
+                    ),
+                    1.0,
+                    |mut p, v| {
+                        p.width = v;
+                        p
+                    },
+                ),
+            ))
+            .when(format.has_lfe(), |rows| {
+                rows.child(field_row(
+                    "LFE",
+                    row(
+                        "inspector-spatial-lfe",
+                        "LFE Send",
+                        params.lfe,
+                        format_send_db(params.lfe),
+                        0.0,
+                        |mut p, v| {
+                            p.lfe = v;
+                            p
+                        },
+                    ),
                 ))
-                .child(kv_row("Automation Points", automation_points.to_string())),
+            })
+            .child(inspector_hint_text(
+                "Place the channel on the Mixer's room panner.",
+            )),
+    )
+    .into_any_element()
+}
+
+/// A linear send level as the dB a console shows, `Off` at silence.
+fn format_send_db(gain: f32) -> String {
+    if gain < 0.001 {
+        "Off".to_string()
+    } else {
+        format!("{:.1} dB", 20.0 * gain.log10())
+    }
+}
+
+/// One `0..=1` placement control: a slider and its readout, on the same
+/// 48 px column as the volume readout. A drag is one undo step named `undo`;
+/// a double-click puts the value back to `reset`.
+#[allow(clippy::too_many_arguments)]
+fn spatial_slider(
+    track_id: &str,
+    id: &'static str,
+    undo: &'static str,
+    accent: gpui::Rgba,
+    params: solfege_spatialaudio::SourceParams,
+    value: f32,
+    readout: String,
+    reset: f32,
+    apply: SpatialApply,
+    callbacks: &InspectorCallbacks,
+) -> impl IntoElement {
+    let start = callbacks.on_spatial_drag_start.clone();
+    let preview = callbacks.on_spatial_drag_preview.clone();
+    let commit = callbacks.on_spatial_drag_commit.clone();
+    let (reset_start, reset_preview, reset_commit) =
+        (start.clone(), preview.clone(), commit.clone());
+    let tid_start = track_id.to_string();
+    let tid_preview = track_id.to_string();
+    let tid_commit = track_id.to_string();
+    let tid_reset = track_id.to_string();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::BASE))
+        .child(slider_with_drag_callbacks(
+            id,
+            value,
+            accent,
+            Some(move |_: &f32, w: &mut Window, cx: &mut App| start(&tid_start, w, cx)),
+            Some(move |v: &f32, w: &mut Window, cx: &mut App| {
+                preview(&(tid_preview.clone(), apply(params, *v)), w, cx)
+            }),
+            Some(move |w: &mut Window, cx: &mut App| commit(&(tid_commit.clone(), undo), w, cx)),
+            Some(move |w: &mut Window, cx: &mut App| {
+                reset_start(&tid_reset, w, cx);
+                reset_preview(&(tid_reset.clone(), apply(params, reset)), w, cx);
+                reset_commit(&(tid_reset.clone(), undo), w, cx);
+            }),
         ))
+        .child(
+            div()
+                .flex_shrink_0()
+                .flex()
+                .justify_end()
+                .min_w(px(48.0))
+                .text_size(px(typography::DENSE_LABEL))
+                .text_color(Colors::text_secondary())
+                .child(readout),
+        )
 }
 
 /// A clip-inspector section.
@@ -2547,6 +2947,12 @@ fn inspector_section(label: impl Into<String>, child: impl IntoElement) -> impl 
 }
 
 fn compact_property_row(label: impl Into<String>, child: impl IntoElement) -> impl IntoElement {
+    inspector_kit::ins_row(label, child)
+}
+
+/// Label on the left, control on the right — the one row shape every section
+/// of this panel uses.
+fn field_row(label: impl Into<String>, child: impl IntoElement) -> impl IntoElement {
     inspector_kit::ins_row(label, child)
 }
 
@@ -3224,7 +3630,6 @@ fn clip_inspector(
             .map(file_name_from_path)
             .unwrap_or_else(|| "Missing source".to_string());
         let path = clip.source_path.unwrap_or("-");
-        let gain_db = linear_gain_to_db(clip.gain);
         let muted_id = clip.clip_id.to_string();
         let mute_cb = callbacks.on_set_clip_muted.clone();
         let s = clip.stretch;
@@ -3237,67 +3642,14 @@ fn clip_inspector(
             n
         };
         let mut body = scroll_body()
-            .gap(px(10.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .w(px(4.0))
-                                    .h(px(30.0))
-                                    .rounded(px(crate::theme::radius::CONTROL))
-                                    .bg(Colors::accent_primary()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(13.0))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(Colors::text_primary())
-                                    .child(clip.name.to_string()),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .px(px(7.0))
-                                    .py(px(2.0))
-                                    .rounded(px(crate::theme::radius::CONTROL))
-                                    .bg(Colors::with_alpha(Colors::accent_primary(), 0.16))
-                                    .text_size(px(typography::DENSE_CAPTION))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(Colors::accent_primary())
-                                    .child("Audio Clip"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .pl(px(12.0))
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(10.5))
-                            .text_color(Colors::text_muted())
-                            .child(format!(
-                                "{} • {} source • Gain {:.1} dB",
-                                clip.track_name, source_duration, gain_db
-                            )),
-                    ),
-            )
+            .child(inspector_kit::ins_identity(
+                Colors::track_audio(),
+                clip.name.to_string(),
+                format!("Audio clip · {}", clip.track_name),
+            ))
             .child(inspector_section(
                 i18n.tr("inspector.section.clip"),
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
+                section_rows()
                     .child(compact_property_row(
                         "Name",
                         text_field_with_callbacks(
@@ -3305,14 +3657,7 @@ fn clip_inspector(
                             clip_name_focused,
                             clip_name_callbacks.clone(),
                         ),
-                    )),
-            ))
-            .child(inspector_section(
-                "TIMING",
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
+                    ))
                     .child(compact_property_row(
                         i18n.tr("inspector.clip.start"),
                         beat_stepper(
@@ -3341,11 +3686,8 @@ fn clip_inspector(
                     )),
             ))
             .child(inspector_section(
-                "AUDIO",
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
+                "Audio",
+                section_rows()
                     .child(compact_property_row(
                         "Muted",
                         fb_checkbox("clip-muted", "Muted", clip.muted, true, move |_, w, cx| {
@@ -3407,48 +3749,17 @@ fn clip_inspector(
                 "Time & Pitch",
                 stretch_section_body(&clip, s, clip.project_bpm, &tempo, &stretch_cb, callbacks),
             ))
-            .child(shared_inspector_section(
+            .child(inspector_section(
                 "Source",
-                None::<String>,
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
-                    .child(shared_inspector_row(
-                        "File",
-                        false,
-                        truncate_value(file_name),
-                    ))
-                    .child(shared_inspector_row(
+                section_rows()
+                    .child(compact_property_row("File", truncate_value(file_name)))
+                    .child(compact_property_row(
                         "Duration",
-                        false,
                         truncate_value(source_duration),
                     ))
-                    .child(shared_inspector_row(
+                    .child(compact_property_row(
                         "Path",
-                        false,
                         truncate_value(path.to_string()),
-                    ))
-                    .child(shared_inspector_row(
-                        "",
-                        false,
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap(px(4.0))
-                            // TODO(source-actions): reveal/replace need shell + relink callbacks.
-                            .child(compact_action_button(
-                                "clip-reveal",
-                                "Reveal",
-                                false,
-                                |_, _, _| {},
-                            ))
-                            .child(compact_action_button(
-                                "clip-replace",
-                                "Replace",
-                                false,
-                                |_, _, _| {},
-                            )),
                     )),
             ));
 
@@ -3466,30 +3777,23 @@ fn clip_inspector(
         return body;
     }
 
-    let clip_type_label = match clip.kind {
-        "Audio" => i18n.tr("inspector.clip.type.audio"),
-        "MIDI" => i18n.tr("inspector.clip.type.midi"),
-        other => other.to_string(),
+    let muted_id = clip.clip_id.to_string();
+    let mute_cb = callbacks.on_set_clip_muted.clone();
+    let (accent, kind_label) = match clip.kind {
+        "MIDI" => (Colors::track_midi(), i18n.tr("inspector.clip.type.midi")),
+        "Audio" => (Colors::track_audio(), i18n.tr("inspector.clip.type.audio")),
+        other => (Colors::text_muted(), other.to_string()),
     };
     let mut body = scroll_body()
-        .child(inspector_header(
-            Colors::accent_primary(),
+        .child(inspector_kit::ins_identity(
+            accent,
             clip.name.to_string(),
-            "Clip",
+            format!("{kind_label} · {}", clip.track_name),
         ))
-        .child(
-            inspector_kit::ins_section_container()
-                .child(inspector_kit::ins_section_header(
-                    assets::ICON_LIST_MUSIC_PATH,
-                    i18n.tr("inspector.section.clip"),
-                ))
-                .child(kv_row(i18n.tr("inspector.clip.type"), clip_type_label))
-                .child(kv_row(
-                    i18n.tr("inspector.clip.track"),
-                    clip.track_name.to_string(),
-                ))
-                .child(kv_row("Track ID", clip.track_id.to_string()))
-                .child(fb_form_row(
+        .child(inspector_section(
+            i18n.tr("inspector.section.clip"),
+            section_rows()
+                .child(field_row(
                     "Name",
                     text_field_with_callbacks(
                         clip_name_input,
@@ -3497,7 +3801,7 @@ fn clip_inspector(
                         clip_name_callbacks,
                     ),
                 ))
-                .child(fb_form_row(
+                .child(field_row(
                     i18n.tr("inspector.clip.start"),
                     beat_stepper(
                         "clip-start",
@@ -3508,7 +3812,7 @@ fn clip_inspector(
                         0.0,
                     ),
                 ))
-                .child(fb_form_row(
+                .child(field_row(
                     i18n.tr("inspector.clip.length"),
                     beat_stepper(
                         "clip-length",
@@ -3519,31 +3823,26 @@ fn clip_inspector(
                         0.25,
                     ),
                 ))
-                .child(kv_row(
+                .child(field_row(
                     "End",
-                    format!("{:.2} bt", clip.start_beat + clip.duration_beats),
+                    readonly_value(format!("{:.2} bt", clip.start_beat + clip.duration_beats)),
                 ))
-                .child(kv_row(
+                .child(field_row(
                     "Muted",
-                    if clip.muted { "Yes" } else { "No" }.to_string(),
+                    fb_checkbox("clip-muted", "Muted", clip.muted, true, move |_, w, cx| {
+                        mute_cb(&(muted_id.clone(), !clip.muted), w, cx)
+                    }),
                 )),
-        );
+        ));
 
     if clip.kind == "MIDI" {
         let bottom_id = clip_id.clone();
-        body = body.child(
-            inspector_kit::ins_section_container()
-                .child(inspector_kit::ins_section_header(
-                    assets::ICON_MUSIC_PATH,
-                    "MIDI CLIP",
-                ))
+        body = body.child(inspector_section(
+            "Notes",
+            section_rows()
                 .child(kv_row(
                     "Notes",
                     clip.note_count.unwrap_or_default().to_string(),
-                ))
-                .child(kv_row(
-                    "Local Length",
-                    format!("{:.2} bt", clip.duration_beats),
                 ))
                 .child(
                     div()
@@ -3564,14 +3863,11 @@ fn clip_inspector(
                             move |_, w, cx| open_external(&clip_id, w, cx),
                         )),
                 ),
-        );
+        ));
     } else {
-        body = body.child(
-            inspector_kit::ins_section_container()
-                .child(inspector_kit::ins_section_header(
-                    assets::ICON_AUDIO_LINES_PATH,
-                    "AUDIO CLIP",
-                ))
+        body = body.child(inspector_section(
+            "Source",
+            section_rows()
                 .child(kv_row(
                     "File",
                     clip.source_path
@@ -3591,7 +3887,7 @@ fn clip_inspector(
                         .unwrap_or_else(|| "Pending".to_string()),
                 ))
                 .child(kv_row("Gain", format!("{:.2}", clip.gain))),
-        );
+        ));
     }
 
     body
@@ -3819,12 +4115,14 @@ mod solfege_inspector_tests {
             weight_bytes: 4_096,
             usable: false,
         });
-        assert!(model
-            .accent
-            .as_ref()
-            .unwrap()
-            .summary()
-            .contains("uses the rule"));
+        assert!(
+            model
+                .accent
+                .as_ref()
+                .unwrap()
+                .summary()
+                .contains("uses the rule")
+        );
     }
 
     #[test]

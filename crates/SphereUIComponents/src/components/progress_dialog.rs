@@ -264,16 +264,6 @@ impl Render for ProgressDialogWindow {
             .font(theme::ui_font())
             .bg(Colors::surface_base())
             .overflow_hidden()
-            .rounded(px(crate::theme::radius::CONTROL))
-            .border(px(1.0))
-            .border_color(Colors::border_subtle())
-            .shadow(vec![gpui::BoxShadow {
-                color: Colors::surface_overlay().into(),
-                offset: gpui::point(px(0.0), px(6.0)),
-                blur_radius: px(20.0),
-                spread_radius: px(0.0),
-                inset: false,
-            }])
             .capture_key_down({
                 let target = target.clone();
                 move |event, window, cx| {

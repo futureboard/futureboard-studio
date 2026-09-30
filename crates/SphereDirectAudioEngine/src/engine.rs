@@ -416,6 +416,73 @@ pub(crate) fn record_output_callback_timing(
     }
 }
 
+/// Identity of everything in `snapshot` except its MIDI clips, plus the build
+/// parameters a graph depends on. Two snapshots with the same key build the
+/// same graph apart from the MIDI schedule. The MIDI is taken out for the
+/// serialize and put back, so nothing is cloned.
+///
+/// Object keys are written sorted: insert params are a `HashMap`, whose order
+/// differs between two maps holding the same entries, and a key that changed
+/// with it would never match.
+fn project_structure_key(
+    snapshot: &mut EngineProjectSnapshot,
+    output_sample_rate: u32,
+    pdc_enabled: bool,
+) -> Option<String> {
+    let midi = std::mem::take(&mut snapshot.midi_clips);
+    // A Soundfont Player's parts are applied live (see
+    // `AudioEngine::apply_soundfont_channel_changes`), so they are not structure.
+    let parts: Vec<_> = snapshot
+        .tracks
+        .iter_mut()
+        .map(|track| {
+            std::mem::replace(
+                &mut track.soundfont_channels,
+                sphere_soundfont_player::default_channels(),
+            )
+        })
+        .collect();
+    let value = serde_json::to_value(&*snapshot);
+    snapshot.midi_clips = midi;
+    for (track, parts) in snapshot.tracks.iter_mut().zip(parts) {
+        track.soundfont_channels = parts;
+    }
+    let mut key = format!("{output_sample_rate}:{pdc_enabled}:");
+    write_canonical_json(&value.ok()?, &mut key);
+    Some(key)
+}
+
+fn write_canonical_json(value: &serde_json::Value, out: &mut String) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            out.push('{');
+            for (index, (name, item)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(name.clone()).to_string());
+                out.push(':');
+                write_canonical_json(item, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
 // ── Shared state (accessed by both control and audio threads) ─────────────────
 
 pub struct SharedState {
@@ -916,6 +983,11 @@ pub struct EngineInner {
 
     // Prepared render graph shared with new streams and pushed to callbacks.
     runtime: Mutex<RuntimeProject>,
+    /// Everything but the MIDI of the last snapshot `load_project` built in
+    /// full, with the build parameters. A snapshot that matches it differs in
+    /// MIDI only, and gets its new schedule swapped in instead of a rebuild.
+    /// `None` until a full load has succeeded.
+    structure_key: Mutex<Option<String>>,
     /// The tempo map the audio thread was last *sent* — not the one the last
     /// project load happened to carry. `set_tempo_map` skips a push whose
     /// segments match this, and a fresh stream is re-seeded from it, so a
@@ -933,6 +1005,13 @@ pub struct EngineInner {
     /// would vanish on the next project sync and every live ARA binding would be
     /// destroyed behind the user's back.
     ara_renderers: Mutex<HashMap<String, Vec<crate::runtime::RuntimeAraRenderer>>>,
+    /// The realtime render being recorded and the track ids its lanes carry,
+    /// so every graph built while it runs is mapped to it. Also the control
+    /// thread's own reference to the capture (see `SetRenderCapture`).
+    render_capture: Mutex<Option<(Arc<crate::render_capture::RenderCapture>, Vec<String>)>>,
+    /// The Control Room configuration as last set, applied to every graph a
+    /// project sync builds (see [`MonitorMirror`]).
+    monitor_mirror: Mutex<MonitorMirror>,
     audio_cache: Mutex<HashMap<String, Arc<ClipAudioSource>>>,
     inactive_audio_cache_lru: Mutex<VecDeque<String>>,
 
@@ -1089,10 +1168,13 @@ impl EngineInner {
             project: Mutex::new(None),
             input_state_revision: AtomicU64::new(0),
             runtime: Mutex::new(RuntimeProject::default()),
+            structure_key: Mutex::new(None),
             last_sent_tempo_map: Mutex::new(default_tempo_map),
             last_sent_time_signature_map: Mutex::new(default_time_signature_map),
             plugin_bridge_sinks: Mutex::new(Default::default()),
             ara_renderers: Mutex::new(HashMap::new()),
+            render_capture: Mutex::new(None),
+            monitor_mirror: Mutex::new(MonitorMirror::default()),
             audio_cache: Mutex::new(HashMap::new()),
             inactive_audio_cache_lru: Mutex::new(VecDeque::new()),
             glitch_counter: Arc::new(AtomicU64::new(0)),
@@ -1669,12 +1751,45 @@ impl EngineInner {
         insert_id: String,
         sink: Option<std::sync::Arc<dyn crate::plugin_bridge::PluginBridgeSink>>,
     ) -> Result<(), SphereAudioError> {
-        if let Some(sink) = sink.as_ref() {
-            self.plugin_bridge_sinks
-                .lock()
-                .insert(insert_id.clone(), sink.clone());
-        } else {
-            self.plugin_bridge_sinks.lock().remove(&insert_id);
+        {
+            let mut sinks = self.plugin_bridge_sinks.lock();
+            // The studio re-installs every sink after each project sync — each
+            // note edit. The graph already holds an identical one (every graph
+            // load copies this map in), and re-installing it costs the audio
+            // thread a map insert, a key free and a re-resolve of every insert.
+            let unchanged = match (sink.as_ref(), sinks.get(&insert_id)) {
+                (Some(next), Some(current)) => std::sync::Arc::ptr_eq(next, current),
+                (None, None) => true,
+                _ => false,
+            };
+            if unchanged {
+                return Ok(());
+            }
+            match sink.as_ref() {
+                Some(sink) => {
+                    sinks.insert(insert_id.clone(), sink.clone());
+                }
+                None => {
+                    sinks.remove(&insert_id);
+                }
+            }
+        }
+        // The control-side graph seeds a stream opened later: it needs the
+        // sink too, or a reopened device would come up without it now that
+        // an unchanged sink is not sent again.
+        {
+            let mut mirror = self.runtime.lock();
+            match sink.as_ref() {
+                Some(sink) => {
+                    mirror
+                        .plugin_bridge_sinks
+                        .insert(insert_id.clone(), sink.clone());
+                }
+                None => {
+                    mirror.plugin_bridge_sinks.remove(&insert_id);
+                }
+            }
+            mirror.resolve_bridge_sinks();
         }
         self.send_command(EngineCommand::SetPluginBridgeSink { insert_id, sink })
     }
@@ -2305,6 +2420,7 @@ impl EngineInner {
         &self,
         source: crate::monitor::MonitorSource,
     ) -> Result<(), SphereAudioError> {
+        self.monitor_mirror.lock().source = source.clone();
         self.send_command(EngineCommand::SetMonitorSource { source })
     }
 
@@ -2314,7 +2430,17 @@ impl EngineInner {
         &self,
         control: crate::monitor::MonitorControl,
     ) -> Result<(), SphereAudioError> {
+        self.monitor_mirror.lock().control = control;
         self.send_command(EngineCommand::SetMonitorControl { control })
+    }
+
+    /// Set the Control Room's listening simulation (Virtual Speaker).
+    pub fn set_listening_simulation(
+        &self,
+        settings: solfege_spatialaudio::SimulationSettings,
+    ) -> Result<(), SphereAudioError> {
+        self.monitor_mirror.lock().simulation = settings;
+        self.send_command(EngineCommand::SetListeningSimulation { settings })
     }
 
     /// Select the hardware output pair the Control Room feeds.
@@ -2322,6 +2448,7 @@ impl EngineInner {
         &self,
         target: crate::monitor::MonitorOutputTarget,
     ) -> Result<(), SphereAudioError> {
+        self.monitor_mirror.lock().output = target.clone();
         self.send_command(EngineCommand::SetMonitorOutput { target })
     }
 
@@ -2337,6 +2464,9 @@ impl EngineInner {
         master: Option<(u16, u16)>,
         monitor: Option<(u16, u16)>,
     ) -> Result<(), SphereAudioError> {
+        self.monitor_mirror
+            .lock()
+            .set_hardware_output_ownership(owner, master, monitor);
         self.send_command(EngineCommand::SetHardwareOutputOwnership {
             owner,
             master,
@@ -2357,6 +2487,14 @@ impl EngineInner {
                 .as_ref()
                 .and_then(|p| p.tracks.iter().position(|t| t.id == track_id))
         };
+        {
+            let mut mirror = self.monitor_mirror.lock();
+            if listen == crate::monitor::ListenMode::Off {
+                mirror.listen.remove(track_id);
+            } else {
+                mirror.listen.insert(track_id.to_string(), listen);
+            }
+        }
         let Some(track_index) = track_index else {
             return Ok(());
         };
@@ -2366,9 +2504,53 @@ impl EngineInner {
         })
     }
 
+    /// Move one channel in the spatial mix's room, live. The control thread's
+    /// copies (the stored snapshot, the graph mirror) are updated too, so a
+    /// later rebuild or device reopen keeps the position.
+    pub fn set_track_spatial(
+        &self,
+        track_id: &str,
+        params: solfege_spatialaudio::SourceParams,
+    ) -> Result<(), SphereAudioError> {
+        let params = params.sanitized();
+        let track_index = {
+            let mut project = self.project.lock();
+            let Some(project) = project.as_mut() else {
+                return Ok(());
+            };
+            match project
+                .spatial
+                .sources
+                .iter_mut()
+                .find(|source| source.track_id == track_id)
+            {
+                Some(source) => source.params = params,
+                None => project
+                    .spatial
+                    .sources
+                    .push(crate::types::EngineSpatialSource {
+                        track_id: track_id.to_string(),
+                        params,
+                    }),
+            }
+            project.tracks.iter().position(|t| t.id == track_id)
+        };
+        let Some(track_index) = track_index else {
+            return Ok(());
+        };
+        self.runtime
+            .lock()
+            .update_track_spatial(track_index, params);
+        self.send_command(EngineCommand::SetTrackSpatial {
+            track_index,
+            params,
+        })
+    }
+
     /// Clear Listen on every channel — the Control Room returns to its
     /// selected source, normally the master bus.
     pub fn clear_all_listen(&self) -> Result<(), SphereAudioError> {
+        self.monitor_mirror.lock().listen.clear();
         self.send_command(EngineCommand::ClearAllListen)
     }
 
@@ -2461,6 +2643,72 @@ impl EngineInner {
     /// and starts assembling blocks into it; announcing the stream is the jam
     /// client's half, and the two are separate calls so a failure in either
     /// never leaves the other running.
+    /// Start a realtime render capture of the master and `track_ids`, in
+    /// that lane order, holding up to `capacity_frames` unread frames. It
+    /// records nothing until [`crate::render_capture::RenderCapture::set_recording`]
+    /// and the transport is playing. Replaces a capture still installed.
+    pub fn begin_render_capture(
+        &self,
+        track_ids: &[String],
+        capacity_frames: usize,
+    ) -> Result<Arc<crate::render_capture::RenderCapture>, SphereAudioError> {
+        let indices = {
+            let project = self.project.lock();
+            let snapshot = project.as_ref().ok_or_else(|| {
+                SphereAudioError::InvalidConfig("no project is loaded".to_string())
+            })?;
+            let indices = render_capture_indices(snapshot, track_ids);
+            if let Some(missing) = track_ids
+                .iter()
+                .zip(&indices)
+                .find_map(|(id, index)| index.is_none().then_some(id))
+            {
+                return Err(SphereAudioError::InvalidConfig(format!(
+                    "track '{missing}' was not found"
+                )));
+            }
+            indices
+        };
+        let sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
+        let capture = Arc::new(crate::render_capture::RenderCapture::new(
+            track_ids.len(),
+            capacity_frames,
+            sample_rate,
+        ));
+        capture.map_tracks(&indices);
+        *self.render_capture.lock() = Some((capture.clone(), track_ids.to_vec()));
+        self.runtime.lock().render_capture = Some(capture.clone());
+        match self.send_command(EngineCommand::SetRenderCapture(Some(capture.clone()))) {
+            Ok(()) => Ok(capture),
+            Err(error) => {
+                self.end_render_capture();
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove the realtime render capture. Waits (bounded) for the callback to
+    /// let go of it before this thread drops the last reference.
+    pub fn end_render_capture(&self) {
+        let Some((capture, _)) = self.render_capture.lock().take() else {
+            return;
+        };
+        capture.set_recording(false);
+        self.runtime.lock().render_capture = None;
+        let _ = self.send_command(EngineCommand::SetRenderCapture(None));
+        let _ = self.wait_for_command_barrier(std::time::Duration::from_secs(2));
+        drop(capture);
+    }
+
+    /// Frames between the transport and the master output it produces: the
+    /// plug-in delay compensation the live graph applies. A realtime render
+    /// skips this many frames from where it starts playing, as an offline
+    /// render does, so both files line up with the timeline.
+    pub fn render_latency_frames(&self) -> u64 {
+        let runtime = self.runtime.lock();
+        crate::export::live_render_latency_frames(&runtime.latency_graph, runtime.pdc_enabled)
+    }
+
     pub fn set_multitrack_jam_publish(
         &self,
         track_ids: &[String],
@@ -2700,7 +2948,7 @@ impl EngineInner {
             return self.set_master_volume(value as f32);
         }
 
-        match param_id {
+        let live = match param_id {
             "volume" => self.send_command(EngineCommand::SetTrackVolume {
                 track_id: track_id.into(),
                 value: value as f32,
@@ -2717,7 +2965,57 @@ impl EngineInner {
                 track_id: track_id.into(),
                 solo: value != 0.0,
             }),
+            _ => return self.update_track_param_other(track_id, param_id, value),
+        };
+        if live.is_ok() {
+            self.mirror_live_track_control(track_id, param_id, value);
+        }
+        live
+    }
 
+    /// Keep the control thread's copies of the graph in step with a live
+    /// volume / pan / mute / solo change.
+    ///
+    /// The command reaches only the callback's graph. The control thread's
+    /// mirror (`runtime`) is what a device reopen starts the callback from,
+    /// and the stored snapshot (`project`) is what later edits are reconciled
+    /// against; both kept the value from the last full project sync. A mute or
+    /// solo made since then came back on the next reopen — most visibly a
+    /// cleared solo returning, which silences every other channel while the
+    /// mixer shows nothing soloed.
+    fn mirror_live_track_control(&self, track_id: &str, param_id: &str, value: f64) {
+        {
+            let mut runtime = self.runtime.lock();
+            match param_id {
+                "volume" => {
+                    runtime.update_track_volume(track_id, value as f32);
+                }
+                "pan" => runtime.update_track_pan(track_id, value as f32),
+                "muted" => runtime.update_track_mute(track_id, value != 0.0),
+                "solo" => runtime.update_track_solo(track_id, value != 0.0),
+                _ => return,
+            }
+        }
+        if let Some(project) = self.project.lock().as_mut() {
+            if let Some(track) = project.tracks.iter_mut().find(|t| t.id == track_id) {
+                match param_id {
+                    "volume" => track.volume = value as f32,
+                    "pan" => track.pan = value as f32,
+                    "muted" => track.muted = value != 0.0,
+                    "solo" => track.solo = value != 0.0,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn update_track_param_other(
+        &self,
+        track_id: &str,
+        param_id: &str,
+        value: f64,
+    ) -> Result<(), SphereAudioError> {
+        match param_id {
             "previewMode" => self.send_command(EngineCommand::SetTrackPreviewMode {
                 track_id: track_id.into(),
                 value: value as f32,
@@ -2981,6 +3279,88 @@ impl EngineInner {
 
     // ── Project snapshot ───────────────────────────────────────────────────
 
+    /// The MIDI-only half of [`Self::load_project`]: build the new schedule
+    /// against the running graph's tracks and swap it in on the audio thread.
+    fn replace_midi_schedule(
+        &self,
+        snapshot: EngineProjectSnapshot,
+    ) -> Result<(), SphereAudioError> {
+        let mut current_project = self.project.lock();
+        // Built and copied outside the graph lock. The UI thread takes that
+        // lock for its meter poll every frame, so building a whole project's
+        // schedule under it froze the editor after every note drawn, for as
+        // long as the build took. Only the id lookup and the store hold it.
+        let (sample_rate, track_ids) = {
+            let mirror = self.runtime.lock();
+            (mirror.sample_rate, mirror.track_ids())
+        };
+        let mut schedule = crate::runtime::build_unresolved_midi_schedule(&snapshot, sample_rate);
+        crate::runtime::resolve_midi_schedule_tracks(&mut schedule, &track_ids);
+        let mut mirror_copy = schedule.clone();
+        {
+            let mut mirror = self.runtime.lock();
+            // `load_project` runs one at a time, so the graph cannot have been
+            // rebuilt meanwhile; if it somehow was, resolve against it now.
+            if mirror.sample_rate != sample_rate
+                || !mirror
+                    .tracks
+                    .iter()
+                    .map(|track| &track.id)
+                    .eq(track_ids.iter())
+            {
+                schedule = mirror.build_midi_schedule(&snapshot);
+                mirror_copy = schedule.clone();
+            }
+            // The mirror seeds a stream opened later, so it plays this too.
+            // Stored, not swapped: a swap releases notes, and the mirror
+            // shares its plug-in bridge sinks with the live graph.
+            mirror.install_midi_schedule(mirror_copy);
+        }
+        *current_project = Some(snapshot);
+        let result = self.send_command(EngineCommand::ReplaceMidi(Box::new(schedule)));
+        drop(current_project);
+        match result {
+            Ok(()) | Err(SphereAudioError::EngineNotOpen) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Sends the running graph the parts of every multitimbral Soundfont
+    /// Player whose parts differ from the loaded project's.
+    ///
+    /// Parts are left out of the structure key, so an edit to one never
+    /// rebuilds the graph: a rebuild would cut every sounding note to move one
+    /// channel's level. Whatever changed them — an edit, an undo, a reopened
+    /// project — they reach the player here, as a live command.
+    fn apply_soundfont_channel_changes(&self, snapshot: &EngineProjectSnapshot) {
+        let changed: Vec<(usize, sphere_soundfont_player::SoundfontChannels)> = {
+            let project = self.project.lock();
+            let Some(project) = project.as_ref() else {
+                return;
+            };
+            snapshot
+                .tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, track)| track.builtin_soundfont_player)
+                .filter_map(|(index, track)| {
+                    let previous = project.tracks.iter().find(|t| t.id == track.id)?;
+                    (previous.soundfont_channels != track.soundfont_channels)
+                        .then_some((index, track.soundfont_channels))
+                })
+                .collect()
+        };
+        for (track_index, channels) in changed {
+            self.runtime
+                .lock()
+                .update_soundfont_channels(track_index, &channels);
+            let _ = self.send_command(EngineCommand::SetSoundfontChannels {
+                track_index,
+                channels,
+            });
+        }
+    }
+
     pub fn load_project(
         &self,
         mut snapshot: EngineProjectSnapshot,
@@ -2996,6 +3376,21 @@ impl EngineInner {
             self.shared.playing.load(Ordering::Relaxed)
         );
         let output_sample_rate = self.shared.sample_rate.load(Ordering::Relaxed).max(1);
+        // A note edit changes the MIDI and nothing else. Rebuilding the whole
+        // graph for it re-read every SoundFont from disk and, at the swap,
+        // silenced every sounding note and restarted every stretcher and PDC
+        // line -- once per note drawn. Swap the schedule instead.
+        let structure_key =
+            project_structure_key(&mut snapshot, output_sample_rate, self.pdc_enabled());
+        if structure_key.is_some() && *self.structure_key.lock() == structure_key {
+            self.shared
+                .engine_state
+                .store(old_state as u8, Ordering::Relaxed);
+            self.apply_soundfont_channel_changes(&snapshot);
+            return self.replace_midi_schedule(snapshot);
+        }
+        // A full build from here on; until it lands, nothing matches.
+        *self.structure_key.lock() = None;
         let previously_active_paths: Vec<String> = self
             .project
             .lock()
@@ -3250,6 +3645,17 @@ impl EngineInner {
         // below is stored, or that mirror loses the sinks.
         runtime.plugin_bridge_sinks = self.plugin_bridge_sinks.lock().clone();
         runtime.resolve_bridge_sinks();
+        // The same for the Control Room: a rebuilt graph starts from a default
+        // monitor, and nothing re-sends the configuration after a sync — so
+        // every sync used to put Master back on the default output pair and
+        // drop the Control Room's source, level and Listen taps.
+        self.monitor_mirror.lock().apply_to(&mut runtime);
+        // A realtime render in progress records the rebuilt graph too, with
+        // its lanes mapped to where the tracks now are.
+        if let Some((capture, track_ids)) = self.render_capture.lock().as_ref() {
+            capture.map_tracks(&render_capture_indices(&snapshot, track_ids));
+            runtime.render_capture = Some(capture.clone());
+        }
         // The callback applies this graph's tempo map wholesale, so record it as
         // sent: the trailing `set_tempo_map` below then costs nothing instead of
         // rebuilding every MIDI event list on the audio thread after every sync.
@@ -3257,6 +3663,9 @@ impl EngineInner {
         *self.runtime.lock() = runtime.clone();
         *current_project = Some(snapshot.clone());
         let load_result = self.send_command(EngineCommand::LoadProject(Box::new(runtime)));
+        if matches!(load_result, Ok(()) | Err(SphereAudioError::EngineNotOpen)) {
+            *self.structure_key.lock() = structure_key;
+        }
         drop(current_project);
 
         match load_result {
@@ -5263,6 +5672,7 @@ impl EngineInner {
         if transport_freeze_debug_enabled() {
             let label = match &cmd {
                 EngineCommand::LoadProject(_) => "LoadProject",
+                EngineCommand::ReplaceMidi(_) => "ReplaceMidi",
                 EngineCommand::SetTestTone { .. } => "SetTestTone",
                 EngineCommand::SetMasterVolume { .. } => "SetMasterVolume",
                 EngineCommand::SetTrackVolume { .. } => "SetTrackVolume",
@@ -5273,13 +5683,17 @@ impl EngineInner {
                 EngineCommand::SetTrackLoopbackPublish { .. } => "SetTrackLoopbackPublish",
                 EngineCommand::SetTrackJamPublish { .. } => "SetTrackJamPublish",
                 EngineCommand::SetJamMultitrackPairs { .. } => "SetJamMultitrackPairs",
+                EngineCommand::SetRenderCapture(_) => "SetRenderCapture",
                 EngineCommand::SetTrackPreviewMode { .. } => "SetTrackPreviewMode",
+                EngineCommand::SetSoundfontChannels { .. } => "SetSoundfontChannels",
                 EngineCommand::SetInsertParam { .. } => "SetInsertParam",
                 EngineCommand::SetMonitorSource { .. } => "SetMonitorSource",
                 EngineCommand::SetMonitorControl { .. } => "SetMonitorControl",
                 EngineCommand::SetMonitorOutput { .. } => "SetMonitorOutput",
+                EngineCommand::SetListeningSimulation { .. } => "SetListeningSimulation",
                 EngineCommand::SetHardwareOutputOwnership { .. } => "SetHardwareOutputOwnership",
                 EngineCommand::SetTrackListen { .. } => "SetTrackListen",
+                EngineCommand::SetTrackSpatial { .. } => "SetTrackSpatial",
                 EngineCommand::ClearAllListen => "ClearAllListen",
                 EngineCommand::MidiPreviewNoteOn { .. } => "MidiPreviewNoteOn",
                 EngineCommand::MidiPreviewNoteOff { .. } => "MidiPreviewNoteOff",
@@ -5704,6 +6118,7 @@ where
                             // graph (the block path reads insert.bridge_sink).
                             runtime.resolve_bridge_sinks();
                             runtime.bridge_editor_active = old.bridge_editor_active.clone();
+                            runtime.inherit_midi_programs_sent(&old);
                             // The panic pushed into the preserved sinks above
                             // still needs flushing through the new graph.
                             // Keep the live master-fader ramp continuous across
@@ -5756,6 +6171,11 @@ where
                                     "[AudioEngineState] old={previous_state:?} new={swapped_state:?} source=graph_swap was_playing={was_playing}"
                                 );
                             }
+                        }
+                        EngineCommand::ReplaceMidi(mut next) => {
+                            let pos = shared.position_samples.load(Ordering::Relaxed);
+                            runtime.replace_midi_schedule(&mut next, pos);
+                            crate::graveyard::retire_midi(next);
                         }
                         EngineCommand::SetTestTone { enabled, frequency } => {
                             osc_on = enabled;
@@ -5938,6 +6358,11 @@ where
                         EngineCommand::SetMonitorOutput { target } => {
                             runtime.monitor.output = target;
                         }
+                        EngineCommand::SetListeningSimulation { settings } => {
+                            if let Some(simulator) = runtime.monitor.simulator.as_deref_mut() {
+                                simulator.configure(settings);
+                            }
+                        }
                         EngineCommand::SetHardwareOutputOwnership {
                             owner,
                             master,
@@ -5948,6 +6373,12 @@ where
                             if let Some((left, _right)) = monitor {
                                 runtime.monitor.output.left_channel = left;
                             }
+                        }
+                        EngineCommand::SetTrackSpatial {
+                            track_index,
+                            params,
+                        } => {
+                            runtime.update_track_spatial(track_index, params);
                         }
                         EngineCommand::SetTrackListen {
                             track_index,
@@ -6041,8 +6472,20 @@ where
                         EngineCommand::SetJamMultitrackPairs { pairs } => {
                             runtime.apply_jam_multitrack_pairs(&pairs);
                         }
+                        // This callback path does not record a realtime render
+                        // (the DAUx callback does); it still takes the
+                        // reference so the capture is released in step.
+                        EngineCommand::SetRenderCapture(capture) => {
+                            runtime.render_capture = capture;
+                        }
                         EngineCommand::SetTrackPreviewMode { track_id, value } => {
                             runtime.update_track_preview_mode(&track_id, RuntimePreviewMode::from_code(value));
+                        }
+                        EngineCommand::SetSoundfontChannels {
+                            track_index,
+                            channels,
+                        } => {
+                            runtime.update_soundfont_channels(track_index, &channels);
                         }
                         EngineCommand::SetInsertParam { track_id, insert_id, param_id, value } => {
                             runtime.update_insert_param(&track_id, &insert_id, &param_id, value);
@@ -6174,6 +6617,8 @@ where
                     metronome.reset_metronome_schedule(base_sample, output_sample_rate);
                 }
                 runtime.begin_meter_block();
+                // Bank/program selections not yet sent, playing or not.
+                runtime.flush_midi_programs();
 
                 // MIDI scheduling — once per block when playing.
                 let mut end_loop_midi_reset = None;
@@ -6422,7 +6867,7 @@ where
                         transport::advance_loop_position(base_sample, frames, loop_bounds);
                     shared.position_samples.store(next_position, Ordering::Relaxed);
                     if let Some(reset_sample) = end_loop_midi_reset {
-                        runtime.reset_midi_playback(reset_sample);
+                        runtime.loop_wrap_midi_playback(reset_sample, 0);
                         metronome.reset_metronome_schedule(reset_sample, output_sample_rate);
                     }
                 }
@@ -6506,6 +6951,7 @@ mod live_input_tests {
 
     fn monitored_audio_snapshot() -> EngineProjectSnapshot {
         EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "asio-routing-test".into(),
             project_root: None,
             preferred_input_device: None,
@@ -6514,6 +6960,7 @@ mod live_input_tests {
             time_signature: [4, 4],
             sample_rate: 48_000,
             tracks: vec![EngineTrackSnapshot {
+                midi_programs: Vec::new(),
                 id: "audio-1".into(),
                 track_type: "audio".into(),
                 volume: 1.0,
@@ -6540,6 +6987,8 @@ mod live_input_tests {
                 soundfont_polyphony: 64,
                 soundfont_envelope: Default::default(),
                 soundfont_quality: Default::default(),
+                soundfont_mode: Default::default(),
+                soundfont_channels: Default::default(),
                 solfege_engine: None,
             }],
             clips: Vec::new(),
@@ -6942,6 +7391,8 @@ mod bridge_insert_tests {
         let mut params = HashMap::new();
         params.insert("role".to_string(), serde_json::json!("effect"));
         RuntimeTrack {
+            spatial: None,
+            spatial_params: Default::default(),
             active_voices: 0,
             listen: crate::monitor::ListenMode::Off,
             id: "track-1".to_string(),
@@ -7208,6 +7659,7 @@ mod bridge_insert_tests {
         let tracks = vec![fast, slow];
         let audio_graph = crate::audio_graph::plan_runtime_audio_graph(&tracks).unwrap();
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks,
             audio_graph,
             pdc_enabled: true,
@@ -7294,6 +7746,7 @@ mod bridge_insert_tests {
         let tracks = vec![src, ret, master];
         let audio_graph = crate::audio_graph::plan_runtime_audio_graph(&tracks).unwrap();
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks,
             audio_graph,
             pdc_enabled: true,
@@ -7441,6 +7894,8 @@ mod bridge_insert_tests {
         }
 
         let mut track = RuntimeTrack {
+            spatial: None,
+            spatial_params: Default::default(),
             active_voices: 0,
             listen: crate::monitor::ListenMode::Off,
             id: "track-1".to_string(),
@@ -7589,6 +8044,8 @@ mod bridge_insert_tests {
         }
 
         let mut track = RuntimeTrack {
+            spatial: None,
+            spatial_params: Default::default(),
             active_voices: 0,
             listen: crate::monitor::ListenMode::Off,
             id: "track-1".to_string(),
@@ -7691,6 +8148,8 @@ mod routing_tests {
     fn track(id: &str, ty: &str, sends: Vec<RuntimeSend>) -> RuntimeTrack {
         let cap = 8;
         RuntimeTrack {
+            spatial: None,
+            spatial_params: Default::default(),
             active_voices: 0,
             listen: crate::monitor::ListenMode::Off,
             id: id.to_string(),
@@ -7798,6 +8257,7 @@ mod routing_tests {
             samples,
         })));
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             sample_rate: 48_000,
             tracks,
             clips: vec![RuntimeClip {
@@ -7955,6 +8415,7 @@ mod routing_tests {
             };
             configure(&mut clip);
             let mut p = RuntimeProject {
+                spatial: Default::default(),
                 sample_rate: 48_000,
                 tracks,
                 clips: vec![clip],
@@ -8031,6 +8492,7 @@ mod routing_tests {
                 samples: samples.clone(),
             })));
             let mut p = RuntimeProject {
+                spatial: Default::default(),
                 sample_rate: 48_000,
                 tracks,
                 clips: vec![RuntimeClip {
@@ -8176,6 +8638,7 @@ mod routing_tests {
     fn send_to_return_accumulates_scaled() {
         let frames = 4;
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![
                 track("audio", "audio", vec![send("ret", 0.5)]),
                 track("ret", "return", vec![]),
@@ -8203,6 +8666,7 @@ mod routing_tests {
         let mut pre = send("ret", 1.0);
         pre.pre_fader = true;
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![
                 track("audio", "audio", vec![pre]),
                 track("ret", "return", vec![]),
@@ -8227,6 +8691,7 @@ mod routing_tests {
     fn send_to_non_routing_target_is_rejected() {
         let frames = 4;
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![
                 track("a", "audio", vec![send("b", 1.0)]),
                 track("b", "audio", vec![]),
@@ -8246,6 +8711,7 @@ mod routing_tests {
         // "late" at index 1 sends to "early" at index 0 — valid DAG when there
         // is no back-edge. Pass-2 topo order processes late before early.
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![
                 track("early", "return", vec![]),
                 track("late", "bus", vec![send("early", 1.0)]),
@@ -8269,6 +8735,7 @@ mod routing_tests {
         // and never resolves into a live runtime send. Direct accumulate of a
         // self-cycle is still dropped by the self-target guard.
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![
                 track("early", "bus", vec![send("late", 1.0)]),
                 track("late", "return", vec![send("early", 1.0)]),
@@ -8299,6 +8766,7 @@ mod routing_tests {
         let mut a = track("a", "audio", vec![]);
         a.output_track_id = Some("bus".to_string());
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![a, track("bus", "bus", vec![])],
             ..Default::default()
         };
@@ -8325,6 +8793,7 @@ mod routing_tests {
         let frames = 4;
         let channels = 2;
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![track("a", "audio", vec![])], // output_track_id = None → master
             ..Default::default()
         };
@@ -8347,6 +8816,7 @@ mod routing_tests {
         let mut a = track("a", "audio", vec![]);
         a.output_track_id = Some("b".to_string()); // "b" is a plain audio track
         let mut p = RuntimeProject {
+            spatial: Default::default(),
             tracks: vec![a, track("b", "audio", vec![])],
             ..Default::default()
         };
@@ -8613,5 +9083,176 @@ mod engine_state_rendering_tests {
         ] {
             assert_eq!(AudioEngineState::from_u8(state as u8), state);
         }
+    }
+}
+
+/// Where each of `track_ids` is in `snapshot`, which is the order the graph
+/// built from it holds its tracks in.
+/// The Control Room configuration as last set, kept on the control thread.
+///
+/// The callback's `RuntimeMonitor` is the graph's, so it is replaced with a
+/// default one by every project sync; this is what puts the configuration back
+/// into each new graph before it is sent. Each setter records here exactly what
+/// its command does to the callback's copy.
+#[derive(Default)]
+struct MonitorMirror {
+    source: crate::monitor::MonitorSource,
+    control: crate::monitor::MonitorControl,
+    output: crate::monitor::MonitorOutputTarget,
+    hardware_owner: crate::monitor::HardwareOutputOwner,
+    master_output: Option<(u16, u16)>,
+    /// Listen taps by track id: indices move between graphs, ids do not.
+    listen: HashMap<String, crate::monitor::ListenMode>,
+    simulation: solfege_spatialaudio::SimulationSettings,
+}
+
+impl MonitorMirror {
+    /// What `SetHardwareOutputOwnership` does on the callback.
+    fn set_hardware_output_ownership(
+        &mut self,
+        owner: crate::monitor::HardwareOutputOwner,
+        master: Option<(u16, u16)>,
+        monitor: Option<(u16, u16)>,
+    ) {
+        self.hardware_owner = owner;
+        self.master_output = master;
+        if let Some((left, _right)) = monitor {
+            self.output.left_channel = left;
+        }
+    }
+
+    fn apply_to(&self, runtime: &mut RuntimeProject) {
+        runtime.monitor.source = self.source.clone();
+        runtime.monitor.control = self.control;
+        runtime.monitor.output = self.output.clone();
+        runtime.monitor.hardware_owner = self.hardware_owner;
+        runtime.monitor.master_output = self.master_output;
+        if let Some(simulator) = runtime.monitor.simulator.as_deref_mut() {
+            simulator.configure_now(self.simulation);
+        }
+        for track in runtime.tracks.iter_mut() {
+            track.listen = self
+                .listen
+                .get(&track.id)
+                .copied()
+                .unwrap_or(crate::monitor::ListenMode::Off);
+        }
+        // The source names a track by id; resolve it against this graph.
+        runtime.resolve_indices();
+    }
+}
+
+fn render_capture_indices(
+    snapshot: &EngineProjectSnapshot,
+    track_ids: &[String],
+) -> Vec<Option<usize>> {
+    track_ids
+        .iter()
+        .map(|id| snapshot.tracks.iter().position(|track| &track.id == id))
+        .collect()
+}
+
+#[cfg(test)]
+mod structure_key_tests {
+    use super::{project_structure_key, write_canonical_json};
+    use crate::types::{EngineMidiClipSnapshot, EngineProjectSnapshot, EngineRoutingSnapshot};
+
+    fn snapshot(bpm: f64, midi_clip_ids: &[&str]) -> EngineProjectSnapshot {
+        EngineProjectSnapshot {
+            spatial: Default::default(),
+            project_id: "structure-key".to_string(),
+            project_root: None,
+            preferred_input_device: None,
+            bpm,
+            tempo_points: Vec::new(),
+            time_signature: [4, 4],
+            sample_rate: 48_000,
+            tracks: Vec::new(),
+            clips: Vec::new(),
+            midi_clips: midi_clip_ids
+                .iter()
+                .map(|id| {
+                    std::sync::Arc::new(EngineMidiClipSnapshot {
+                        id: id.to_string(),
+                        track_id: "track-1".to_string(),
+                        start_beat: 0.0,
+                        length_beats: 4.0,
+                        notes: Vec::new(),
+                        controllers: Vec::new(),
+                        mpe: Default::default(),
+                    })
+                })
+                .collect(),
+            pdc_enabled: true,
+            latency_graph_version: 0,
+            routing: EngineRoutingSnapshot {
+                master_output_device: None,
+                sample_rate: 48_000,
+                buffer_size: 256,
+            },
+        }
+    }
+
+    /// A note edit keeps the key, so it takes the MIDI-only path; anything
+    /// else about the project, or the graph's build settings, changes it.
+    #[test]
+    fn only_the_midi_is_left_out_of_the_key() {
+        let mut a = snapshot(120.0, &["clip-1"]);
+        let mut b = snapshot(120.0, &["clip-1", "clip-2"]);
+        let key = project_structure_key(&mut a, 48_000, true);
+        assert!(key.is_some());
+        assert_eq!(key, project_structure_key(&mut b, 48_000, true));
+        assert_eq!(b.midi_clips.len(), 2, "the MIDI is put back");
+
+        let mut faster = snapshot(140.0, &["clip-1"]);
+        assert_ne!(key, project_structure_key(&mut faster, 48_000, true));
+        assert_ne!(key, project_structure_key(&mut a, 44_100, true));
+        assert_ne!(key, project_structure_key(&mut a, 48_000, false));
+    }
+
+    fn soundfont_track(mode: &str) -> crate::types::EngineTrackSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "id": "sf", "type": "instrument", "volume": 1.0, "pan": 0.0,
+            "muted": false, "solo": false, "armed": false,
+            "outputTrackId": null, "inserts": [],
+            "builtinSoundfontPlayer": true, "soundfontPath": "font.sf2",
+            "soundfontMode": mode,
+        }))
+        .expect("track snapshot")
+    }
+
+    /// A multitimbral player's parts are applied live, so moving one leaves
+    /// the key alone; switching the player's mode rebuilds it.
+    #[test]
+    fn soundfont_parts_are_left_out_of_the_key_and_the_mode_is_not() {
+        let mut a = snapshot(120.0, &[]);
+        a.tracks.push(soundfont_track("Multi"));
+        let key = project_structure_key(&mut a, 48_000, true);
+
+        let mut parts = a.clone();
+        parts.tracks[0].soundfont_channels[3].volume = 40;
+        parts.tracks[0].soundfont_channels[9].preset = Some((128, 0));
+        assert_eq!(key, project_structure_key(&mut parts, 48_000, true));
+        assert_eq!(
+            parts.tracks[0].soundfont_channels[3].volume, 40,
+            "the parts are put back"
+        );
+
+        let mut single = snapshot(120.0, &[]);
+        single.tracks.push(soundfont_track("Single"));
+        assert_ne!(key, project_structure_key(&mut single, 48_000, true));
+    }
+
+    /// Insert params are a `HashMap`: the same entries in another order must
+    /// give the same key.
+    #[test]
+    fn object_key_order_does_not_change_the_key() {
+        let one: serde_json::Value = serde_json::from_str(r#"{"b":1,"a":{"y":2,"x":[3,{"q":4,"p":5}]}}"#).unwrap();
+        let two: serde_json::Value = serde_json::from_str(r#"{"a":{"x":[3,{"p":5,"q":4}],"y":2},"b":1}"#).unwrap();
+        let (mut left, mut right) = (String::new(), String::new());
+        write_canonical_json(&one, &mut left);
+        write_canonical_json(&two, &mut right);
+        assert_eq!(left, right);
+        assert_eq!(left, r#"{"a":{"x":[3,{"p":5,"q":4}],"y":2},"b":1}"#);
     }
 }

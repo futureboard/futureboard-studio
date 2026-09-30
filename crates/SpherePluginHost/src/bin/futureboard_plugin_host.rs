@@ -297,14 +297,17 @@ enum BuiltinDsp {
     Equz8(equz8::Dsp),
     Verbspace(verbspace::Dsp),
     Echospace(echospace::Dsp),
+    Imager(imager::Dsp),
     Fa2a(fa2a::Dsp),
     Fa76(fa76::Dsp),
     BurnLimit(burnlimit::Dsp),
     Clipper67(clipper67::Dsp),
     Transient(transient::Dsp),
     WrapSynth(wrapsynth::Dsp),
+    DrumSampler(drumsampler::Dsp),
     Zcomp(zcomp::Dsp),
     MixStation(mixstation::Dsp),
+    Compresser(compresser::Dsp),
 }
 
 /// A built-in processor is created on the IPC thread and then owned exclusively
@@ -328,6 +331,10 @@ struct BuiltinHostProcessor {
     /// Control-side impulse-response loader (safe from the IPC thread). `None`
     /// for a built-in with no cabinet stage.
     ir_loader: Option<rodharerist::IrLoader>,
+    /// Control-side per-pad sample loaders for a built-in `drumsampler`
+    /// instance (safe from the IPC thread), indexed by pad. `None` for every
+    /// other built-in.
+    drum_pad_loaders: Option<Vec<drumsampler::PadLoader>>,
     /// Engine sample rate the DSP was built at — needed to validate a `.nam`
     /// capture's declared rate on the IPC thread.
     sample_rate: f32,
@@ -349,14 +356,17 @@ impl BuiltinHostProcessor {
             "equz8" => Some(Self::equz8(sample_rate, state_json)),
             "verbspace" => Some(Self::verbspace(sample_rate, state_json)),
             "echospace" => Some(Self::echospace(sample_rate, state_json)),
+            "imager" => Some(Self::imager(sample_rate, state_json)),
             "fa2a" => Some(Self::fa2a(sample_rate, state_json)),
             "fa76" => Some(Self::fa76(sample_rate, state_json)),
             "burnlimit" => Some(Self::burnlimit(sample_rate, state_json)),
             "clipper67" => Some(Self::clipper67(sample_rate, state_json)),
             "transient" => Some(Self::transient(sample_rate, state_json)),
             "wrapsynth" => Some(Self::wrapsynth(sample_rate, state_json)),
+            "drumsampler" => Some(Self::drumsampler(sample_rate, state_json)),
             "zcomp" => Some(Self::zcomp(sample_rate, state_json)),
             "mixstation" => Some(Self::mixstation(sample_rate, state_json)),
+            "compresser" => Some(Self::compresser(sample_rate, state_json)),
             _ => None,
         }
     }
@@ -388,6 +398,7 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader,
             ir_loader,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -416,6 +427,7 @@ impl BuiltinHostProcessor {
             // An EQ has no capture or cabinet stage to hand off into.
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -444,6 +456,7 @@ impl BuiltinHostProcessor {
             // A compressor has no capture or cabinet stage to hand off into.
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -472,6 +485,7 @@ impl BuiltinHostProcessor {
             // A compressor has no capture or cabinet stage to hand off into.
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -498,6 +512,7 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -524,6 +539,7 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -550,6 +566,7 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -578,6 +595,36 @@ impl BuiltinHostProcessor {
             // A delay has no capture or cabinet stage to hand off into.
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn imager(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = imager::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match imager::ipc::ImagerState::from_json(json) {
+                Ok(state) => {
+                    dsp.set_params(state.params);
+                    eprintln!(
+                        "[plugin-host-builtin] restored state version={}",
+                        state.version
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] state blob rejected, using defaults: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::Imager(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            // A stereo imager has no capture or cabinet stage to hand off into.
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -606,6 +653,7 @@ impl BuiltinHostProcessor {
             // A reverb has no capture or cabinet stage to hand off into.
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -626,6 +674,31 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn drumsampler(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = drumsampler::Dsp::new(sr);
+        if let Some(json) = state_json {
+            match drumsampler::ipc::DrumSamplerState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] DrumSampler state rejected: {error}");
+                }
+            }
+        }
+        let pad_loaders = (0..drumsampler::PADS)
+            .map(|pad_index| dsp.pad_loader(pad_index).expect("pad_index is within PADS"))
+            .collect();
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::DrumSampler(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: Some(pad_loaders),
             sample_rate: sr,
         }
     }
@@ -652,6 +725,7 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -681,6 +755,36 @@ impl BuiltinHostProcessor {
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
+            drum_pad_loaders: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn compresser(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = compresser::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match compresser::ipc::CompresserState::from_json(json) {
+                Ok(state) => {
+                    dsp.set_params(state.params);
+                    eprintln!(
+                        "[plugin-host-builtin] restored state version={}",
+                        state.version
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] state blob rejected, using defaults: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::Compresser(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            // A compressor has no capture or cabinet stage to hand off into.
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
             sample_rate: sr,
         }
     }
@@ -712,6 +816,13 @@ impl BuiltinHostProcessor {
                 }
             }
             BuiltinDsp::Echospace(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
+            BuiltinDsp::Imager(dsp) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
                     interleaved[i * 2] = l;
@@ -760,6 +871,13 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
+            BuiltinDsp::DrumSampler(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo();
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
             BuiltinDsp::Zcomp(dsp) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
@@ -768,6 +886,13 @@ impl BuiltinHostProcessor {
                 }
             }
             BuiltinDsp::MixStation(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
+            BuiltinDsp::Compresser(dsp) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
                     interleaved[i * 2] = l;
@@ -805,6 +930,50 @@ impl BuiltinHostProcessor {
     fn analyze_spectrum(&self) -> Option<[f32; SPECTRUM_BINS]> {
         // SAFETY: the dedicated producer thread is the sole accessor.
         unsafe { &mut *self.spectrum.get() }.analyze().copied()
+    }
+
+    /// Per-pad output levels for a built-in with pads (Drum Sampler); `None`
+    /// for every other core. Producer thread only (same contract as
+    /// `process_block`).
+    fn pad_levels(&self) -> Option<[f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS]> {
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        match unsafe { &*self.dsp.get() } {
+            BuiltinDsp::DrumSampler(dsp) => Some(dsp.pad_levels()),
+            _ => None,
+        }
+    }
+
+    /// Per-band gain reduction for a multiband built-in (the Compressor);
+    /// `None` for every other core. Published in both of the Compressor's
+    /// modes — all zeros in Single — so the editor never keeps drawing a
+    /// multiband reading the DSP has stopped producing. Producer thread only
+    /// (same contract as `process_block`).
+    fn band_reduction(&self) -> Option<[f32; SpherePluginHost::audio_bridge::REDUCTION_BANDS]> {
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        match unsafe { &*self.dsp.get() } {
+            BuiltinDsp::Compresser(dsp) => Some(dsp.band_reduction_db()),
+            _ => None,
+        }
+    }
+
+    /// The stereo-image frame the DSP has completed since the last call, for
+    /// a built-in that measures its own image; `None` otherwise, and on the
+    /// blocks between two frames. Producer thread only (same contract as
+    /// `process_block`).
+    fn take_stereo_image(&self) -> Option<SpherePluginHost::audio_bridge::StereoImageFrame> {
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        match unsafe { &mut *self.dsp.get() } {
+            BuiltinDsp::Imager(dsp) => {
+                let f = dsp.take_image_frame()?;
+                Some(SpherePluginHost::audio_bridge::StereoImageFrame {
+                    correlation: f.correlation,
+                    band_correlation: f.band_correlation,
+                    band_level: f.band_level,
+                    scope: f.scope,
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Latest telemetry frame, or `None` for a built-in that measures nothing.
@@ -922,6 +1091,39 @@ impl BuiltinHostProcessor {
                     slot_out_peak: f.slot_out_peak,
                 })
             }
+            BuiltinDsp::Imager(dsp) => {
+                let f = dsp.meter_frame();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    in_peak: f.in_peak,
+                    in_rms: f.in_rms,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    // Width only redistributes mid and side; nothing is taken
+                    // off.
+                    gain_reduction_db: 0.0,
+                    in_clip: f.in_clip,
+                    out_clip: f.out_clip,
+                    // Single fixed stage, not a user-ordered rack.
+                    slot_in_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
+            BuiltinDsp::DrumSampler(dsp) => {
+                let f = dsp.meter_frame();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    // An instrument has no audio input to meter.
+                    in_peak: 0.0,
+                    in_rms: 0.0,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    gain_reduction_db: 0.0,
+                    in_clip: false,
+                    out_clip: f.out_clip,
+                    // Its pads meter through their own block, not the rack's.
+                    slot_in_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
             BuiltinDsp::Transient(dsp) => {
                 let f = dsp.meter_frame();
                 Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
@@ -931,6 +1133,23 @@ impl BuiltinHostProcessor {
                     out_rms: f.out_rms,
                     // Transient shaping is a gain change in either direction;
                     // the frame carries its magnitude.
+                    gain_reduction_db: f.gain_reduction_db,
+                    in_clip: f.in_clip,
+                    out_clip: f.out_clip,
+                    // Single fixed stage, not a user-ordered rack.
+                    slot_in_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
+            BuiltinDsp::Compresser(dsp) => {
+                let f = dsp.meter_frame();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    in_peak: f.in_peak,
+                    in_rms: f.in_rms,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    // Multiband: the largest band's; per-band values travel
+                    // in their own block (`band_reduction`).
                     gain_reduction_db: f.gain_reduction_db,
                     in_clip: f.in_clip,
                     out_clip: f.out_clip,
@@ -963,9 +1182,12 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Clipper67(dsp) => dsp.latency_samples(),
             BuiltinDsp::Transient(dsp) => dsp.latency_samples(),
             BuiltinDsp::Echospace(dsp) => dsp.latency_samples(),
+            BuiltinDsp::Imager(dsp) => dsp.latency_samples(),
             BuiltinDsp::WrapSynth(_) => 0,
+            BuiltinDsp::DrumSampler(dsp) => dsp.latency_samples(),
             BuiltinDsp::Zcomp(dsp) => dsp.latency_samples(),
             BuiltinDsp::MixStation(dsp) => dsp.latency_samples(),
+            BuiltinDsp::Compresser(dsp) => dsp.latency_samples(),
         }
     }
 
@@ -992,6 +1214,9 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Echospace(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
+            BuiltinDsp::Imager(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
             BuiltinDsp::Fa2a(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
@@ -1010,10 +1235,16 @@ impl BuiltinHostProcessor {
             BuiltinDsp::WrapSynth(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
+            BuiltinDsp::DrumSampler(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
             BuiltinDsp::Zcomp(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::MixStation(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::Compresser(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
         }
@@ -1021,14 +1252,22 @@ impl BuiltinHostProcessor {
 
     /// Deliver one MIDI event to an instrument built-in. The event has already
     /// been routed through this exact instance's bounded shared-memory ring.
+    /// Every non-instrument built-in ignores MIDI entirely.
     fn apply_midi(&self, event: SharedMidiEvent) {
-        let BuiltinDsp::WrapSynth(dsp) = (unsafe { &mut *self.dsp.get() }) else {
-            return;
-        };
-        match event.status & 0xf0 {
-            0x90 if event.data2 > 0 => dsp.note_on(event.data1, event.data2),
-            0x80 | 0x90 => dsp.note_off(event.data1),
-            0xb0 if matches!(event.data1, 120 | 123) => dsp.all_notes_off(),
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        match unsafe { &mut *self.dsp.get() } {
+            BuiltinDsp::WrapSynth(dsp) => match event.status & 0xf0 {
+                0x90 if event.data2 > 0 => dsp.note_on(event.data1, event.data2),
+                0x80 | 0x90 => dsp.note_off(event.data1),
+                0xb0 if matches!(event.data1, 120 | 123) => dsp.all_notes_off(),
+                _ => {}
+            },
+            BuiltinDsp::DrumSampler(dsp) => match event.status & 0xf0 {
+                0x90 if event.data2 > 0 => dsp.note_on(event.data1, event.data2),
+                0x80 | 0x90 => dsp.note_off(event.data1),
+                0xb0 if matches!(event.data1, 120 | 123) => dsp.all_notes_off(),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -1176,7 +1415,7 @@ mod builtin_processor_tests {
                 "`{stem}` is bridge-enabled but has no DSP in the host"
             );
         }
-        assert!(BuiltinHostProcessor::new("compresser", 48_000, None).is_none());
+        assert!(BuiltinHostProcessor::new("c1073", 48_000, None).is_none());
     }
 
     #[test]
@@ -1226,6 +1465,126 @@ mod builtin_processor_tests {
         processor.apply_param(u32::MAX, 1.0);
         processor.apply_param(equz8::UI_PARAM_IDS.len() as u32, 1.0);
         processor.process_block(&in_l, &in_r, &mut output, 64);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    /// Drum Sampler meters its output and each pad: silent and absent-free at
+    /// rest, and the pad that was hit is the one whose level rises.
+    #[test]
+    fn drumsampler_publishes_output_and_pad_levels() {
+        let processor = BuiltinHostProcessor::drumsampler(48_000, None);
+        let loaders = processor
+            .drum_pad_loaders
+            .as_ref()
+            .expect("drum sampler has pad loaders");
+        let tone: Vec<f32> = (0..4_800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        loaders[2].submit(Box::new(drumsampler::PadBuffer {
+            samples: tone.into_boxed_slice(),
+            channels: 1,
+            frames: 4_800,
+            sample_rate: 48_000.0,
+        }));
+        let levels = processor.pad_levels().expect("pads publish levels");
+        assert!(levels.iter().all(|level| *level == 0.0));
+
+        processor.apply_midi(SharedMidiEvent {
+            status: 0x90,
+            data1: 38,
+            data2: 120,
+            ..SharedMidiEvent::default()
+        });
+        let silence = [0.0f32; 512];
+        let mut output = [0.0f32; 1_024];
+        processor.process_block(&silence, &silence, &mut output, 512);
+        assert!(output.iter().any(|sample| sample.abs() > 1.0e-3));
+
+        let levels = processor.pad_levels().expect("pads publish levels");
+        assert!(levels[2] > 0.01, "pad 3 played: {levels:?}");
+        assert!(levels.iter().enumerate().all(|(i, l)| i == 2 || *l == 0.0));
+        let meters = processor
+            .meter_frame()
+            .expect("drum sampler meters its output");
+        assert!(meters.out_peak > 0.0);
+        assert_eq!((meters.in_peak, meters.in_rms), (0.0, 0.0));
+        assert_eq!(processor.latency_samples(), 0);
+    }
+
+    /// Imager at rest passes a wide signal through; narrowing every band
+    /// folds a pure side signal away, and the wire reaches the DSP.
+    #[test]
+    fn imager_processes_and_takes_wire_params() {
+        let processor = BuiltinHostProcessor::imager(48_000, None);
+        let frames = 4_096;
+        let tone: Vec<f32> = (0..frames)
+            .map(|i| (std::f32::consts::TAU * 1_000.0 * i as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let inverted: Vec<f32> = tone.iter().map(|sample| -sample).collect();
+        let mut output = vec![0.0f32; frames * 2];
+        processor.process_block(&tone, &inverted, &mut output, frames);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(output[frames..].iter().any(|sample| sample.abs() > 0.3));
+
+        for band in 1..=imager::BAND_COUNT {
+            let index =
+                imager::ui_param_index(&format!("width{band}")).expect("width in wire table");
+            processor.apply_param(index, 0.0);
+        }
+        // Let the width smoother land before measuring.
+        processor.process_block(&tone, &inverted, &mut output, frames);
+        processor.process_block(&tone, &inverted, &mut output, frames);
+        let tail = output[frames..]
+            .iter()
+            .fold(0.0f32, |peak, s| peak.max(s.abs()));
+        assert!(tail < 0.01, "a folded side signal left {tail}");
+
+        processor.apply_param(u32::MAX, 1.0);
+        processor.apply_param(imager::UI_PARAM_IDS.len() as u32, 1.0);
+        processor.process_block(&tone, &inverted, &mut output, frames);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    /// Imager restores its state, reports no latency, meters its levels, and
+    /// publishes a stereo-image frame once its scope ring has filled — and not
+    /// again until it fills once more.
+    #[test]
+    fn imager_restores_state_and_publishes_meters_and_image() {
+        let mut params = imager::default_params();
+        params.power = false;
+        let json = imager::ipc::ImagerState::new(params)
+            .to_json()
+            .expect("state serializes");
+        let restored = BuiltinHostProcessor::imager(48_000, Some(&json));
+        let in_l = [0.25f32; 32];
+        let in_r = [-0.5f32; 32];
+        let mut output = [0.0f32; 64];
+        restored.process_block(&in_l, &in_r, &mut output, 32);
+        for i in 0..32 {
+            assert_eq!(output[i * 2], in_l[i], "restored power-off must bypass");
+            assert_eq!(output[i * 2 + 1], in_r[i], "restored power-off must bypass");
+        }
+        assert_eq!(restored.latency_samples(), 0);
+        let meters = restored.meter_frame().expect("imager meters its levels");
+        assert!(meters.in_peak > 0.4);
+
+        let fresh = BuiltinHostProcessor::imager(48_000, None);
+        assert!(fresh.take_stereo_image().is_none());
+        let tone: Vec<f32> = (0..2_048)
+            .map(|i| (std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0).sin() * 0.5)
+            .collect();
+        let mut out = vec![0.0f32; 4_096];
+        fresh.process_block(&tone, &tone, &mut out, 2_048);
+        let image = fresh
+            .take_stereo_image()
+            .expect("a full scope ring is a frame");
+        assert!(
+            image.correlation > 0.9,
+            "a mono tone reads {}",
+            image.correlation
+        );
+        assert!(fresh.take_stereo_image().is_none());
+
+        let fallback = BuiltinHostProcessor::imager(48_000, Some("not json"));
+        fallback.process_block(&in_l, &in_r, &mut output, 32);
         assert!(output.iter().all(|sample| sample.is_finite()));
     }
 
@@ -1504,6 +1863,78 @@ mod builtin_processor_tests {
         assert!(output.iter().all(|sample| sample.is_finite()));
 
         let fallback = BuiltinHostProcessor::zcomp(48_000, Some("not json"));
+        fallback.process_block(&in_l, &in_r, &mut output, 32);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    /// Single mode reports its reduction through the meter frame and zeros per
+    /// band; Multi mode reports each band, and the frame carries the largest.
+    #[test]
+    fn compresser_publishes_overall_and_per_band_reduction() {
+        let processor = BuiltinHostProcessor::compresser(48_000, None);
+        let index = |id: &str| compresser::ui_param_index(id).expect("in wire table");
+        processor.apply_param(index("thresholdDb"), -30.0);
+        processor.apply_param(index("ratio"), 8.0);
+
+        let loud = [0.75f32; 64];
+        let mut output = [0.0f32; 128];
+        for _ in 0..64 {
+            processor.process_block(&loud, &loud, &mut output, 64);
+        }
+        let frame = processor
+            .meter_frame()
+            .expect("the compressor always publishes a frame");
+        assert!(
+            frame.gain_reduction_db > 10.0,
+            "{}",
+            frame.gain_reduction_db
+        );
+        assert_eq!(processor.band_reduction(), Some([0.0; 4]));
+
+        processor.apply_param(index("mode"), 1.0);
+        processor.apply_param(index("band1ThresholdDb"), -40.0);
+        let mut low = [0.0f32; 64];
+        for block in 0..400 {
+            for (i, sample) in low.iter_mut().enumerate() {
+                let t = (block * 64 + i) as f32 / 48_000.0;
+                *sample = 0.8 * (std::f32::consts::TAU * 60.0 * t).sin();
+            }
+            processor.process_block(&low, &low, &mut output, 64);
+        }
+        let bands = processor.band_reduction().expect("per-band reduction");
+        assert!(bands[0] > 6.0, "{bands:?}");
+        assert!(bands[3] < 0.1, "{bands:?}");
+        let frame = processor.meter_frame().expect("frame");
+        assert!((frame.gain_reduction_db - bands[0]).abs() < 1.0e-6);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert_eq!(processor.latency_samples(), 0);
+    }
+
+    #[test]
+    fn compresser_restores_state_and_takes_wire_params() {
+        let mut params = compresser::default_params();
+        params.power = false;
+        let json = compresser::ipc::CompresserState::new(params)
+            .to_json()
+            .expect("state serializes");
+
+        let restored = BuiltinHostProcessor::compresser(48_000, Some(&json));
+        let in_l = [0.25f32; 32];
+        let in_r = [-0.5f32; 32];
+        let mut output = [0.0f32; 64];
+        restored.process_block(&in_l, &in_r, &mut output, 32);
+        for i in 0..32 {
+            assert_eq!(output[i * 2], in_l[i]);
+            assert_eq!(output[i * 2 + 1], in_r[i]);
+        }
+
+        restored.apply_param(compresser::ui_param_index("power").expect("power"), 1.0);
+        restored.apply_param(compresser::ui_param_index("mode").expect("mode"), 1.0);
+        restored.apply_param(compresser::UI_PARAM_IDS.len() as u32, 1.0);
+        restored.process_block(&in_l, &in_r, &mut output, 32);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+
+        let fallback = BuiltinHostProcessor::compresser(48_000, Some("not json"));
         fallback.process_block(&in_l, &in_r, &mut output, 32);
         assert!(output.iter().all(|sample| sample.is_finite()));
     }
@@ -2268,6 +2699,17 @@ fn service_audio_bridge(
         if let Some(bins) = b.analyze_spectrum() {
             bridge.store_spectrum(&bins);
         }
+        // Same cadence: the DSP only completes an image frame once per trip
+        // round its scope ring, ~30 times a second.
+        if let Some(image) = b.take_stereo_image() {
+            bridge.store_stereo_image(&image);
+        }
+        if let Some(levels) = b.pad_levels() {
+            bridge.store_pad_levels(&levels);
+        }
+        if let Some(reduction) = b.band_reduction() {
+            bridge.store_band_reduction(&reduction);
+        }
     }
     bridge.set_dsp_output_ready(dsp_ready);
     // Publish the plugin's reported latency so the engine can surface it (and,
@@ -2858,8 +3300,36 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
                             "[plugin-bridge] ResizeEditor instance={instance_id} \
                              width={width} height={height} dpi={dpi}"
                         );
-                        processor.view_set_size(width as i32, height as i32);
+                        // The plug-in's own size contract first: a view with a
+                        // minimum, stepped sizes or a fixed size is handed
+                        // what it accepts, and the studio is told so that its
+                        // window snaps to it. Handing it the raw drag size left
+                        // the plug-in drawing its own size inside a window of
+                        // another, cropped at the edges.
+                        let (granted_w, granted_h) =
+                            processor.view_constrain(width as i32, height as i32);
+                        let (granted_w, granted_h) = if granted_w > 0 && granted_h > 0 {
+                            (granted_w, granted_h)
+                        } else {
+                            (width as i32, height as i32)
+                        };
+                        processor.view_set_size(granted_w, granted_h);
                         pending_resizes.remove(&instance_id);
+                        if (granted_w as u32, granted_h as u32) != (width, height) {
+                            eprintln!(
+                                "[plugin-bridge] ResizeEditor constrained instance={instance_id} \
+                                 {width}x{height} -> {granted_w}x{granted_h}"
+                            );
+                            let _ = ipc::write_frame(
+                                &mut out,
+                                &HostEvent::EditorContentResize {
+                                    plugin_instance_id: instance_id.clone(),
+                                    width: granted_w as u32,
+                                    height: granted_h as u32,
+                                    dpi,
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -3045,12 +3515,18 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
                         return true;
                     };
                     if let Some((width, height)) = entry.second_resize {
+                        // The size the view has *now*: re-sending the one taken
+                        // at attach undid any resize the plug-in asked for
+                        // since (Kontakt restoring its size on reopen).
+                        let (width, height) = processor
+                            .view_size()
+                            .unwrap_or((width as i32, height as i32));
                         eprintln!(
                             "[PluginEditorLifecycle] second resize instance={} size={}x{}",
                             entry.instance_id, width, height
                         );
                         eprintln!("[editor-size] delayed resize = {}x{}", width, height);
-                        processor.view_set_size(width as i32, height as i32);
+                        processor.view_set_size(width, height);
                     }
                     if !platform::editor_safe_mode() {
                         if let Some(host_hwnd) = registry
@@ -3705,6 +4181,98 @@ fn dispatch(
                         latency_samples: 0,
                         stereo: false,
                         truncated: false,
+                    }
+                }
+            };
+            let _ = ipc::write_frame(out, &event);
+        }
+        HostCommand::LoadBuiltinDrumSample {
+            plugin_instance_id,
+            pad_index,
+            name,
+            audio_b64,
+        } => {
+            use base64::Engine as _;
+            // IPC thread: base64 + symphonia decode here (allocation-heavy,
+            // never on the producer thread), then hand off through the pad's
+            // wait-free cell.
+            let processor = builtin_processors
+                .lock()
+                .ok()
+                .and_then(|processors| processors.get(&plugin_instance_id).cloned());
+            let ext_hint = std::path::Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_string();
+            let result = base64::engine::general_purpose::STANDARD
+                .decode(audio_b64.as_bytes())
+                .map_err(|e| format!("sample payload is not valid base64: {e}"))
+                .and_then(|bytes| DirectAudio::load_audio_bytes(&bytes, &ext_hint))
+                .and_then(|decoded| {
+                    let loaders = match &processor {
+                        Some(p) => p.drum_pad_loaders.as_ref().ok_or_else(|| {
+                            format!("built-in DSP for {plugin_instance_id} has no drum pads")
+                        })?,
+                        None => {
+                            return Err(format!(
+                                "no built-in DSP instance loaded for {plugin_instance_id}"
+                            ));
+                        }
+                    };
+                    let loader = loaders.get(pad_index as usize).ok_or_else(|| {
+                        format!("pad_index {pad_index} out of range for {plugin_instance_id}")
+                    })?;
+                    let frames = decoded.frames;
+                    let channels = decoded.channels;
+                    let sample_rate = decoded.sample_rate;
+                    // The editor's overview, taken here while the IPC thread
+                    // still owns the buffer.
+                    let peaks = drumsampler::waveform_peaks(
+                        &decoded.samples,
+                        channels,
+                        frames,
+                        drumsampler::WAVEFORM_POINTS,
+                    );
+                    loader.submit(Box::new(drumsampler::PadBuffer {
+                        samples: decoded.samples.into_boxed_slice(),
+                        channels,
+                        frames,
+                        sample_rate: sample_rate as f32,
+                    }));
+                    Ok((frames, channels, sample_rate, peaks))
+                });
+            let event = match result {
+                Ok((frames, channels, sample_rate, peaks)) => {
+                    eprintln!(
+                        "[plugin-host-drumsampler] loaded instance={plugin_instance_id} pad={pad_index} name={name} frames={frames} channels={channels}"
+                    );
+                    HostEvent::BuiltinDrumSampleResult {
+                        plugin_instance_id,
+                        pad_index,
+                        ok: true,
+                        name,
+                        error: None,
+                        frames: frames as u64,
+                        channels: channels as u32,
+                        sample_rate,
+                        peaks,
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[plugin-host-drumsampler] load FAILED instance={plugin_instance_id} pad={pad_index} name={name} error={error}"
+                    );
+                    HostEvent::BuiltinDrumSampleResult {
+                        plugin_instance_id,
+                        pad_index,
+                        ok: false,
+                        name,
+                        error: Some(error),
+                        frames: 0,
+                        channels: 0,
+                        sample_rate: 0,
+                        peaks: Vec::new(),
                     }
                 }
             };
@@ -4978,9 +5546,8 @@ fn schedule_unified_editor_attach(
         // The window belongs to the main app, which handed us its HWND. This
         // only creates the plug-in's view and attaches it there -- no shell, no
         // titlebar, no window procedure of ours in the way.
-        let handle = processor
-            .view_attach(parent_hwnd, (w, h))
-            .map(|_| parent_hwnd);
+        let attached = processor.view_attach(parent_hwnd, (w, h));
+        let handle = attached.map(|_| parent_hwnd);
         let elapsed = started.elapsed();
         let attach_hwnd = processor.embed_attach_hwnd();
         eprintln!(
@@ -4990,8 +5557,12 @@ fn schedule_unified_editor_attach(
             plugin_instance_id,
             elapsed.as_millis()
         );
-        let (preferred_width, preferred_height) = processor
-            .view_size()
+        // The size attach settled on is the editor's real one: a plug-in that
+        // restores its own size inside attached() (Kontakt, per instance) has
+        // not applied it yet, so getSize() still says the default, and taking
+        // that one sent the default back to it as the granted size.
+        let (preferred_width, preferred_height) = attached
+            .or_else(|| processor.view_size())
             .map(|(cw, ch)| (cw.max(1) as u32, ch.max(1) as u32))
             .unwrap_or((width.max(1), height.max(1)));
         let resizable = processor.editor_resizable().unwrap_or(true);
@@ -5083,13 +5654,13 @@ fn schedule_unified_editor_attach(
                 w,
                 h
             );
-            let handle = processor
-                .view_attach(parent_hwnd, (w, h))
-                .map(|_| parent_hwnd);
+            let attached = processor.view_attach(parent_hwnd, (w, h));
+            let handle = attached.map(|_| parent_hwnd);
             let elapsed = started.elapsed();
             let attach_hwnd = processor.embed_attach_hwnd();
-            let (preferred_width, preferred_height) = processor
-                .view_size()
+            // The size attach settled on, not getSize(): see the inline path.
+            let (preferred_width, preferred_height) = attached
+                .or_else(|| processor.view_size())
                 .map(|(w, h)| (w.max(1) as u32, h.max(1) as u32))
                 .unwrap_or((width.max(1), height.max(1)));
             let resizable = processor.editor_resizable().unwrap_or(true);

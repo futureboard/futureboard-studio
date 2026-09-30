@@ -1,19 +1,26 @@
-//! StudioLayout integration for the Export Arrangement window.
+//! StudioLayout integration for the Export and Render dialogs.
 //!
 //! Builds a plain engine snapshot + defaults from current project state inside a
-//! short UI borrow, then hands them to the external export window. The window
-//! owns the background export job — StudioLayout holds only the window handle.
+//! short UI borrow, then hands them to the external Export window. The Render
+//! dialog it opens owns the background job; StudioLayout holds only the Export
+//! window's handle — and lends its transport to a realtime render.
+
+use std::sync::Arc;
 
 use gpui::{Bounds, Context};
 
 use super::engine_snapshot::{build_engine_project_snapshot_for_export, volume_norm_to_linear};
 use super::StudioLayout;
-use crate::export::{open_export_arrangement_window, ExportProjectDefaults, ExportTrackTarget};
+use crate::export::{
+    open_export_arrangement_window, ExportIntent, ExportProjectDefaults, ExportTrackTarget,
+    RealtimeTransportHooks,
+};
 
 impl StudioLayout {
     pub(super) fn open_export_arrangement_external_window(
         &mut self,
         owner_bounds: Option<Bounds<gpui::Pixels>>,
+        intent: ExportIntent,
         cx: &mut Context<Self>,
     ) {
         // Focus an already-open export window instead of spawning a second one.
@@ -114,15 +121,32 @@ impl StudioLayout {
                     track.track_type
                         != crate::components::timeline::timeline_state::TrackType::Master
                 })
-                .map(|track| ExportTrackTarget {
-                    id: track.id.clone(),
-                    name: track.name.clone(),
-                    include_in_multitrack: !track.track_type.is_routing()
-                        || crate::components::timeline::timeline_state::is_vsti_output_child_track_id(
+                .map(|track| {
+                    let vsti_output =
+                        crate::components::timeline::timeline_state::is_vsti_output_child_track_id(
                             &track.id,
-                        ),
+                        );
+                    ExportTrackTarget {
+                        id: track.id.clone(),
+                        name: track.name.clone(),
+                        include_in_multitrack: !track.track_type.is_routing() || vsti_output,
+                        kind_label: if vsti_output {
+                            "VSTi Out".to_string()
+                        } else {
+                            track_kind_label(track.track_type).to_string()
+                        },
+                    }
                 })
                 .collect(),
+            // A realtime render records at the running device's rate; with no
+            // stream there is nothing to record.
+            live_sample_rate: self
+                .audio_bridge
+                .engine
+                .as_ref()
+                .filter(|engine| engine.is_running())
+                .map(|_| sample_rate)
+                .unwrap_or(0),
         };
 
         // Default output: <project folder>/Exports/<Name>.wav when the project
@@ -148,10 +172,101 @@ impl StudioLayout {
             self.audio_bridge.engine.clone(),
             defaults,
             default_output,
+            intent,
+            Some(self.realtime_render_hooks(cx)),
             cx,
         ) {
             Ok(handle) => self.external_windows.export_arrangement = Some(handle),
             Err(err) => eprintln!("[export] failed to open export window: {err}"),
+        }
+    }
+}
+
+impl StudioLayout {
+    /// How a realtime render borrows this studio's transport.
+    fn realtime_render_hooks(&self, cx: &mut Context<Self>) -> RealtimeTransportHooks {
+        let start_owner = cx.entity().downgrade();
+        let finish_owner = start_owner.clone();
+        RealtimeTransportHooks {
+            start: Arc::new(move |start_seconds, arm, cx| {
+                start_owner
+                    .update(cx, |this, cx| {
+                        this.begin_realtime_render_transport(start_seconds, arm, cx)
+                    })
+                    .map_err(|_| "the studio is closed".to_string())?
+            }),
+            finish: Arc::new(move |cx| {
+                let _ = finish_owner.update(cx, |this, cx| this.end_realtime_render_transport(cx));
+            }),
+        }
+    }
+
+    /// Take the transport for a realtime render: stop whatever plays, turn the
+    /// loop and the click off (a render that wrapped or clicked would record
+    /// both), play from `start_seconds`, and arm the capture only once the
+    /// old playback has stopped, so none of it is recorded.
+    fn begin_realtime_render_transport(
+        &mut self,
+        start_seconds: f64,
+        arm: Box<dyn FnOnce()>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.is_recording_active(cx) {
+            return Err("stop recording before a realtime render".to_string());
+        }
+        if self.audio_bridge.sync_in_flight
+            || self.audio_bridge.project_dirty
+            || self.audio_bridge.media_dirty
+        {
+            // The live graph must be the project the dialog captured.
+            self.schedule_audio_project_sync(cx, true, "realtime_render");
+            return Err(
+                "the audio engine is still taking the latest edits; render again in a moment"
+                    .to_string(),
+            );
+        }
+        self.stop_native_playback(cx);
+        if !self.ensure_audio_stream_warm() {
+            return Err("the audio device is not running".to_string());
+        }
+        let playhead = self.timeline.read(cx).state.transport.playhead_beats;
+        let engine = self
+            .audio_bridge
+            .engine
+            .as_ref()
+            .ok_or_else(|| "no audio engine is running".to_string())?;
+        let _ = engine.set_loop(false, 0.0, 0.0);
+        let _ = engine.set_metronome_suspended(true);
+        engine
+            .seek(start_seconds)
+            .map_err(|error| error.to_string())?;
+        // The seek has to land before recording is armed, or the blocks the
+        // old position still plays would open the file.
+        let _ = engine.wait_for_command_barrier(std::time::Duration::from_millis(500));
+        arm();
+        if let Err(error) = engine.play() {
+            let _ = engine.set_metronome_suspended(false);
+            self.sync_loop_controls(cx);
+            return Err(error.to_string());
+        }
+        self.realtime_render_playhead = Some(playhead);
+        let _ = self.timeline.update(cx, |timeline, cx| {
+            timeline.state.transport.playing = true;
+            cx.notify();
+        });
+        Ok(())
+    }
+
+    /// Give the transport back after a realtime render: stopped, with the
+    /// loop and click as they were, and the playhead where it was.
+    fn end_realtime_render_transport(&mut self, cx: &mut Context<Self>) {
+        self.stop_native_playback(cx);
+        if let Some(engine) = self.audio_bridge.engine.as_ref() {
+            let _ = engine.set_metronome_suspended(false);
+        }
+        self.sync_loop_controls(cx);
+        if let Some(beat) = self.realtime_render_playhead.take() {
+            self.seek_native_playhead(cx, beat);
         }
     }
 }
@@ -174,5 +289,22 @@ fn sanitize_file_stem(name: &str) -> String {
         "Export".to_string()
     } else {
         stem
+    }
+}
+
+/// What kind of channel a track is, as the Export dialog's channel list says it.
+fn track_kind_label(
+    track_type: crate::components::timeline::timeline_state::TrackType,
+) -> &'static str {
+    use crate::components::timeline::timeline_state::TrackType;
+    match track_type {
+        TrackType::Audio => "Audio",
+        TrackType::Instrument => "Instrument",
+        TrackType::Midi => "MIDI",
+        TrackType::Bus => "Bus",
+        TrackType::Return => "Return",
+        TrackType::Group => "Folder",
+        TrackType::Master => "Master",
+        TrackType::Video => "Video",
     }
 }

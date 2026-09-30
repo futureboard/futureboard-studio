@@ -174,17 +174,19 @@ pub struct FormColumnLayout {
     pub value_width: f32,
 }
 
+/// Where the Preferences window's dropdowns sit: every one is
+/// `PREFS_CONTROL_W` wide at the right edge of its group's plate (inside the
+/// plate's 1 px border and its row padding), so the column follows the window's
+/// width alone.
 pub fn settings_form_column(window: &Window) -> FormColumnLayout {
-    const SIDEBAR: f32 = crate::components::settings_layout::SETTINGS_SIDEBAR_WIDTH;
-    const CONTENT_PAD: f32 = crate::components::settings_layout::SETTINGS_CONTENT_PAD;
-    const LABEL: f32 = crate::components::settings_layout::SETTINGS_LABEL_WIDTH;
-    const GAP: f32 = crate::components::settings_layout::SETTINGS_ROW_GAP;
+    use crate::components::settings_layout::{
+        PREFS_CONTENT_PAD_X, PREFS_CONTROL_W, PREFS_ROW_PAD_X,
+    };
     let w: f32 = window.bounds().size.width.into();
-    let left = SIDEBAR + CONTENT_PAD + LABEL + GAP;
-    let width = (w - left - CONTENT_PAD).max(120.0);
+    let left = (w - PREFS_CONTENT_PAD_X - 1.0 - PREFS_ROW_PAD_X - PREFS_CONTROL_W).max(0.0);
     FormColumnLayout {
         value_left: left,
-        value_width: width,
+        value_width: PREFS_CONTROL_W,
     }
 }
 

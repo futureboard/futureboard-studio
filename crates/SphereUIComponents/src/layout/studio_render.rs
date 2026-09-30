@@ -1023,7 +1023,20 @@ impl Render for StudioLayout {
                     // Space still belongs to whoever claimed the press.
                     crate::components::transport_key::forget_space_key_up();
                 }
+                // The surface that has the keyboard picks which keymap scope a
+                // key is looked up in — the same G is arrangement snap here
+                // and MIDI snap in the piano roll.
+                let scope = shortcut_keydown_target.read(cx).key_scope(window, cx);
+                // Tab moves focus unless the scope binds it (Automation cycles
+                // its target with Tab).
+                let tab_bound = !modifiers.shift
+                    && shortcut_keydown_target
+                        .read(cx)
+                        .keymap_manager
+                        .command_for_token("tab", scope)
+                        .is_some();
                 if event.keystroke.key.eq_ignore_ascii_case("tab")
+                    && !tab_bound
                     && !modifiers.control
                     && !modifiers.alt
                     && !modifiers.platform
@@ -1186,9 +1199,21 @@ impl Render for StudioLayout {
                         this.project_switcher.is_open = false;
                         cx.notify();
                     });
-                    return;
+                    // Escape has always cancelled whatever was in flight. A
+                    // scope that also binds it (Deselect All, Clear Automation
+                    // Selection) gets it next; otherwise it goes on to the
+                    // focused editor's own handler, as before.
+                    if shortcut_keydown_target
+                        .read(cx)
+                        .shortcut_command_id(event, scope)
+                        .is_none()
+                    {
+                        return;
+                    }
                 }
-                let command_id = shortcut_keydown_target.read(cx).shortcut_command_id(event);
+                let command_id = shortcut_keydown_target
+                    .read(cx)
+                    .shortcut_command_id(event, scope);
                 if let Some(command_id) = command_id {
                     // MIDI editor focus gate: when the docked piano roll holds
                     // keyboard focus, the A/C/V/X/Delete family belongs to it.
@@ -1209,8 +1234,15 @@ impl Render for StudioLayout {
                     }
                     // Same gate for the Solfege Pitch tab, which replaces the
                     // piano roll in the dock for a Solfege clip and owns Delete
-                    // for its pitch points.
-                    if is_midi_routable_edit_command(&normalize_command_id(&command_id))
+                    // for its pitch points — including the MIDI editor's own
+                    // Delete / Select All / Duplicate keys.
+                    let pitch_grid_edit = is_midi_routable_edit_command(&normalize_command_id(
+                        &command_id,
+                    )) || matches!(
+                        command_id.as_str(),
+                        "midi:delete-selected" | "midi:select-all" | "midi:duplicate-selected"
+                    );
+                    if pitch_grid_edit
                         && shortcut_keydown_target.read(cx).docked_midi_editor_visible()
                         && solfege_editor.read(cx).pitch_grid_is_focused(window)
                     {
@@ -1292,7 +1324,38 @@ impl Render for StudioLayout {
                         });
                     }
                     if key_debug() {
-                        eprintln!("[key] dispatched command={command_id}");
+                        eprintln!("[key] dispatched command={command_id} scope={}", scope.key());
+                    }
+                    // The key is this command's now. Letting it bubble on as
+                    // well is how Up transposed a selection twice: once by
+                    // `midi:transpose-up`, once by the piano roll's own
+                    // handler.
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    match command_id.as_str() {
+                        // Window commands need the window, which the command
+                        // dispatcher does not have.
+                        "window:minimize" => {
+                            window.minimize_window();
+                            return;
+                        }
+                        "window:toggle-fullscreen" => {
+                            window.toggle_fullscreen();
+                            return;
+                        }
+                        _ => {}
+                    }
+                    // A MIDI key pressed in the docked piano roll edits that
+                    // roll, even while the floating MIDI editor is open — the
+                    // shared dispatcher would send it to the floating one.
+                    if scope == crate::keymap::KeymapScope::MidiEditor
+                        && command_id.starts_with("midi:")
+                        && midi_editor.read(cx).is_focused(window)
+                    {
+                        let _ = midi_editor.update(cx, |roll, cx| {
+                            roll.run_menu_command(&command_id, cx);
+                        });
+                        return;
                     }
                     let _ = shortcut_keydown_target.update(cx, |this, cx| {
                         this.dispatch_command_id_from_bounds(&command_id, Some(window.bounds()), cx);
@@ -1436,6 +1499,12 @@ impl Render for StudioLayout {
             } else {
                 None
             })
+            // The docked mixer's meters, painted over the bottom panel from
+            // outside it so a meter tick never rebuilds the panel.
+            .children(
+                (show_bottom_docked && self.docked_mixer_meters_visible())
+                    .then(|| self.mixer_meter_overlay.clone()),
+            )
             .child({
                 let _s = crate::perf::PerfScope::enter("StatusBar");
                 self.status_bar.clone()

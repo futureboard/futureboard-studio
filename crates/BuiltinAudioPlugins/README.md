@@ -10,10 +10,11 @@ Wire-up into DAUx / `SphereAudioPlugins` happens in a later integration pass.
 | Crate | Role | Phase | 3rd-party DSP (license) |
 | --- | --- | --- | --- |
 | `equz8` | 8-band parametric EQ | 1 easy | [`biquad`](https://crates.io/crates/biquad) (MIT OR Apache-2.0) |
-| `compresser` | Soft-knee VCA compressor | 1 easy | `biquad` (sidechain HPF) |
+| `compresser` | Compressor — single-band, or four-band (Linkwitz–Riley crossovers) | 2 medium | `biquad` (crossovers, sidechain HPF) |
 | `fa2a` | Optical compressor (LA-2A-style) | 1 easy | `biquad` (sidechain HPF) |
 | `echospace` | Stereo / ping-pong delay | 2 medium | `biquad` (feedback HP/LP) |
 | `fa76` | FET compressor (1176-style) | 2 medium | `biquad` (sidechain HPF) |
+| `imager` | Four-band stereo width (M/S, Linkwitz-Riley crossovers) | 2 medium | `biquad` (crossovers, all-pass) |
 | `c1073` | 3-band channel EQ + drive | 3 hard | `biquad` |
 | `meowsyn` | Polyphonic soft-synth | 3 hard | [`fundsp`](https://crates.io/crates/fundsp) (MIT OR Apache-2.0) |
 
@@ -34,5 +35,5 @@ Every effect exposes:
 
 ```bash
 cargo test -p BuiltinAudioPlugins
-cargo test -p equz8 -p compresser -p fa2a -p echospace -p fa76 -p c1073 -p meowsyn
+cargo test -p equz8 -p compresser -p fa2a -p echospace -p imager -p fa76 -p c1073 -p meowsyn
 ```

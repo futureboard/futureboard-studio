@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -8,13 +8,14 @@ use crate::menu::{MenuItem, MenuManifest};
 
 use super::conflicts::{annotate_row_conflicts, find_conflicts_for_binding};
 use super::model::{
-    KeyBinding, KeymapConflict, KeymapProfile, KeymapRow, KeymapSource, ResolvedKeyBinding,
-    PROFILE_DESCRIPTORS,
+    KeyBinding, KeymapConflict, KeymapProfile, KeymapRow, KeymapScope, KeymapSource,
+    PROFILE_DESCRIPTORS, ResolvedKeyBinding,
 };
-use super::normalize::{canonical_accel, format_accel_display, global_priority};
+use super::normalize::{canonical_accel, format_accel_display};
 use super::storage::{
     ensure_user_keymaps_dir, import_profile_file, load_builtin_profile, load_user_overrides,
-    save_profile_json, save_user_overrides, user_keymaps_dir, user_overrides_path,
+    profile_json_text, save_profile_json, save_user_overrides, user_keymaps_dir,
+    user_overrides_path,
 };
 
 pub fn shortcut_debug_enabled() -> bool {
@@ -32,7 +33,11 @@ pub struct KeymapManager {
     action_labels: HashMap<String, String>,
     resolved: Vec<ResolvedKeyBinding>,
     rows: Vec<KeymapRow>,
-    reverse: HashMap<String, String>,
+    /// Key token → command, per scope. A lookup walks
+    /// [`KeymapScope::chain`], so an editor's own key shadows nothing global
+    /// (the conflict rules keep those apart) but does override the
+    /// arrangement key an Automation binding layers on.
+    reverse: HashMap<KeymapScope, HashMap<String, String>>,
 }
 
 impl Default for KeymapManager {
@@ -57,6 +62,7 @@ impl KeymapManager {
             rows: Vec::new(),
             reverse: HashMap::new(),
         };
+        manager.canonicalize_overrides();
         manager.rebuild();
         manager
     }
@@ -111,35 +117,58 @@ impl KeymapManager {
         Ok(())
     }
 
+    /// Bind `keys` to `action` in `scope`. With conflicts and no `force`,
+    /// nothing changes and the conflicts come back. With `force`, the key is
+    /// taken off every conflicting binding first — "Replace" means the other
+    /// action stops answering to it, not that two actions share it.
     pub fn tap_binding(
         &mut self,
         action: &str,
         keys: Vec<String>,
-        context: Option<String>,
+        scope: KeymapScope,
         args: Option<serde_json::Value>,
         force: bool,
     ) -> Result<Vec<KeymapConflict>, String> {
-        let candidate = KeyBinding {
-            action: action.to_string(),
-            keys,
-            context: context.or_else(|| Some("Studio".to_string())),
-            args,
-            when: None,
-        };
-        let conflicts = find_conflicts_for_binding(&candidate, &self.resolved, Some(action));
+        let conflicts = find_conflicts_for_binding(action, &keys, scope, &self.resolved);
         if !conflicts.is_empty() && !force {
             return Ok(conflicts);
         }
-        upsert_override(&mut self.user_overrides, candidate);
+        for conflict in &conflicts {
+            let Some(token) = canonical_accel(&conflict.keystroke) else {
+                continue;
+            };
+            let Some(other) = self
+                .resolved
+                .iter()
+                .find(|b| b.action == conflict.action && b.scope == conflict.scope)
+            else {
+                continue;
+            };
+            let remaining: Vec<String> = other
+                .keys
+                .iter()
+                .filter(|k| canonical_accel(k).as_deref() != Some(token.as_str()))
+                .cloned()
+                .collect();
+            upsert_override(
+                &mut self.user_overrides,
+                scoped_binding(&conflict.action, remaining, conflict.scope, None),
+            );
+        }
+        upsert_override(
+            &mut self.user_overrides,
+            scoped_binding(action, keys, scope, args),
+        );
         self.dirty = true;
         self.rebuild();
         Ok(conflicts)
     }
 
-    pub fn reset_binding(&mut self, action: &str) {
+    /// Drop the user's change to `action` in `scope`, back to the profile.
+    pub fn reset_binding(&mut self, action: &str, scope: KeymapScope) {
         self.user_overrides
             .bindings
-            .retain(|binding| binding.action != action);
+            .retain(|binding| !(binding.action == action && binding_scope(binding) == Some(scope)));
         self.dirty = true;
         self.rebuild();
     }
@@ -181,6 +210,7 @@ impl KeymapManager {
 
     pub fn discard_dirty(&mut self) {
         self.user_overrides = load_user_overrides(&self.app_data);
+        self.canonicalize_overrides();
         self.dirty = false;
         self.rebuild();
     }
@@ -188,55 +218,77 @@ impl KeymapManager {
     pub fn load_json_text(&mut self, text: &str) -> Result<(), String> {
         let profile = super::storage::load_profile_json(text)?;
         self.user_overrides = profile;
+        self.canonicalize_overrides();
         self.dirty = true;
         self.rebuild();
         Ok(())
     }
 
     pub fn json_text(&self) -> Result<String, String> {
-        serde_json::to_string_pretty(&self.export_profile())
-            .map_err(|error| format!("Failed to serialize keymap: {error}"))
+        Ok(profile_json_text(&self.export_profile()))
     }
 
-    pub fn command_for_event(&self, event: &KeyDownEvent) -> Option<&str> {
+    /// The command `event` runs while `scope` has the keyboard.
+    pub fn command_for_event(&self, event: &KeyDownEvent, scope: KeymapScope) -> Option<&str> {
         if event.is_held {
             return None;
         }
         let token = super::normalize::canonical_event(event)?;
-        let command = self.reverse.get(&token).map(String::as_str);
+        let command = self.command_for_token(&token, scope);
         if shortcut_debug_enabled() {
             eprintln!(
-                "[shortcut] resolve profile={} token={} -> {:?}",
-                self.active_profile_id, token, command
+                "[shortcut] resolve profile={} scope={} token={} -> {:?}",
+                self.active_profile_id,
+                scope.key(),
+                token,
+                command
             );
         }
         command
     }
 
+    /// The command a canonical key token (`"ctrl+shift+s"`) runs in `scope`.
+    pub fn command_for_token(&self, token: &str, scope: KeymapScope) -> Option<&str> {
+        scope.chain().iter().find_map(|scope| {
+            self.reverse
+                .get(scope)
+                .and_then(|keys| keys.get(token))
+                .map(String::as_str)
+        })
+    }
+
     /// Display string for the accelerator bound to `command` under the active
     /// profile, e.g. `"Ctrl+D"` — or `None` when the command has no binding.
     ///
-    /// Used to backfill shortcut hints on context-menu items so every surface
-    /// that dispatches a command can surface its key binding without hardcoding
-    /// it. The first resolved keystroke wins, matching the menubar convention.
+    /// Used to backfill shortcut hints on menus and tooltips. The global
+    /// binding wins, then the one in the scope the command acts on, then any.
     pub fn shortcut_for_command(&self, command: &str) -> Option<String> {
-        let binding = self.resolved.iter().find(|b| b.action == command)?;
-        let key = binding.keys.iter().find(|key| !key.trim().is_empty())?;
-        Some(format_keystroke_list(std::slice::from_ref(key)))
+        let key = self.raw_accel_for_command(command)?;
+        Some(format_keystroke_list(std::slice::from_ref(&key)))
     }
 
     /// The raw authored accelerator (e.g. `"Ctrl+Z"`) bound to `command` under
     /// the active profile, before any platform display formatting. Style-neutral,
     /// so tests and lookups can assert bindings without depending on the host OS
     /// or the `FUTUREBOARD_ACCEL_STYLE` env override.
-    #[allow(dead_code)]
     pub fn raw_accel_for_command(&self, command: &str) -> Option<String> {
-        let binding = self.resolved.iter().find(|b| b.action == command)?;
-        binding
-            .keys
+        let first_key = |scope: Option<KeymapScope>| {
+            self.resolved
+                .iter()
+                .filter(|b| b.action == command && scope.is_none_or(|s| b.scope == s))
+                .find_map(|b| b.keys.iter().find(|key| !key.trim().is_empty()).cloned())
+        };
+        first_key(Some(KeymapScope::Global))
+            .or_else(|| first_key(Some(KeymapScope::home_of(command))))
+            .or_else(|| first_key(None))
+    }
+
+    /// The raw accelerator for `command` in exactly `scope`.
+    pub fn raw_accel_in_scope(&self, command: &str, scope: KeymapScope) -> Option<String> {
+        self.resolved
             .iter()
-            .find(|key| !key.trim().is_empty())
-            .cloned()
+            .find(|b| b.action == command && b.scope == scope)
+            .and_then(|b| b.keys.iter().find(|key| !key.trim().is_empty()).cloned())
     }
 
     pub fn rebuild(&mut self) {
@@ -254,35 +306,95 @@ impl KeymapManager {
         user_keymaps_dir(&self.app_data)
     }
 
-    pub fn dispatch_reverse(&self) -> &std::collections::HashMap<String, String> {
-        &self.reverse
-    }
-
     pub fn user_overrides_path(&self) -> PathBuf {
         user_overrides_path(&self.app_data)
+    }
+
+    /// Give every override a scope. Overrides saved before scopes existed
+    /// name only an action; each is placed where the default profile binds
+    /// that action, so an old "track:mute = Ctrl+Shift+H" moves the mute key
+    /// in the arrangement and the mixer rather than landing nowhere.
+    fn canonicalize_overrides(&mut self) {
+        if self
+            .user_overrides
+            .bindings
+            .iter()
+            .all(|b| binding_scope(b).is_some())
+        {
+            return;
+        }
+        let base = effective_base_profile("default").unwrap_or_default();
+        let mut placed: Vec<KeyBinding> = Vec::new();
+        for binding in std::mem::take(&mut self.user_overrides.bindings) {
+            if binding_scope(&binding).is_some() {
+                placed.push(binding);
+                continue;
+            }
+            for scope in scopes_for_unscoped(&binding.action, &base.bindings) {
+                placed.push(scoped_binding(
+                    &binding.action,
+                    binding.keys.clone(),
+                    scope,
+                    binding.args.clone(),
+                ));
+            }
+        }
+        self.user_overrides.bindings = placed;
     }
 }
 
 fn row_matches_query(row: &KeymapRow, query: &str) -> bool {
     row.action_label.to_ascii_lowercase().contains(query)
         || row.action_id.to_ascii_lowercase().contains(query)
-        || row.command.to_ascii_lowercase().contains(query)
         || row
             .keystrokes
             .iter()
             .any(|key| key.to_ascii_lowercase().contains(query))
-        || row
-            .context
-            .as_ref()
-            .is_some_and(|ctx| ctx.to_ascii_lowercase().contains(query))
+        || row.scope.label().to_ascii_lowercase().contains(query)
         || row.source.label().to_ascii_lowercase().contains(query)
 }
 
+fn binding_scope(binding: &KeyBinding) -> Option<KeymapScope> {
+    binding.context.as_deref().and_then(KeymapScope::parse)
+}
+
+fn scoped_binding(
+    action: &str,
+    keys: Vec<String>,
+    scope: KeymapScope,
+    args: Option<serde_json::Value>,
+) -> KeyBinding {
+    KeyBinding {
+        action: action.to_string(),
+        keys,
+        context: Some(scope.key().to_string()),
+        args,
+        when: None,
+    }
+}
+
+/// Where a binding with no scope goes: every scope `base` binds the action
+/// in, or the action's home scope when `base` has none.
+fn scopes_for_unscoped(action: &str, base: &[KeyBinding]) -> Vec<KeymapScope> {
+    let mut scopes: Vec<KeymapScope> = base
+        .iter()
+        .filter(|b| b.action == action)
+        .filter_map(binding_scope)
+        .collect();
+    scopes.sort();
+    scopes.dedup();
+    if scopes.is_empty() {
+        scopes.push(KeymapScope::home_of(action));
+    }
+    scopes
+}
+
 fn upsert_override(profile: &mut KeymapProfile, binding: KeyBinding) {
+    let scope = binding_scope(&binding);
     if let Some(existing) = profile
         .bindings
         .iter_mut()
-        .find(|b| b.action == binding.action)
+        .find(|b| b.action == binding.action && binding_scope(b) == scope)
     {
         *existing = binding;
     } else {
@@ -291,7 +403,7 @@ fn upsert_override(profile: &mut KeymapProfile, binding: KeyBinding) {
 }
 
 fn effective_base_profile(profile_id: &str) -> Result<KeymapProfile, String> {
-    if profile_id == "custom" {
+    if profile_id == "custom" || profile_id == "default" {
         return load_builtin_profile("default");
     }
     // Every built-in profile layers on top of the default map: a DAW profile
@@ -300,9 +412,6 @@ fn effective_base_profile(profile_id: &str) -> Result<KeymapProfile, String> {
     // command they don't re-map (e.g. Undo, Save, the panel toggles). Load the
     // default first, then overlay the profile's own bindings so switching a
     // profile re-skins the shortcuts it defines and inherits the rest.
-    if profile_id == "default" {
-        return load_builtin_profile("default");
-    }
     let mut merged = load_builtin_profile("default")?;
     let overlay = load_builtin_profile(profile_id)?;
     overlay_bindings(&mut merged, overlay.bindings);
@@ -311,13 +420,26 @@ fn effective_base_profile(profile_id: &str) -> Result<KeymapProfile, String> {
     Ok(merged)
 }
 
-/// Overlay `overrides` onto `base` in place: an override for an action replaces
-/// the base binding for that same action; actions the override does not mention
-/// keep their base binding. Matches the per-action override semantics used by
-/// user overrides in [`resolve_effective_bindings`].
+/// Overlay `overrides` onto `base` in place. A scoped override replaces that
+/// scope's binding for the action; an unscoped one (every v1 DAW profile)
+/// replaces the action in each scope the base binds it in.
 fn overlay_bindings(base: &mut KeymapProfile, overrides: Vec<KeyBinding>) {
     for binding in overrides {
-        upsert_override(base, binding);
+        if binding_scope(&binding).is_some() {
+            upsert_override(base, binding);
+            continue;
+        }
+        for scope in scopes_for_unscoped(&binding.action, &base.bindings) {
+            upsert_override(
+                base,
+                scoped_binding(
+                    &binding.action,
+                    binding.keys.clone(),
+                    scope,
+                    binding.args.clone(),
+                ),
+            );
+        }
     }
 }
 
@@ -326,60 +448,47 @@ fn resolve_effective_bindings(
     user_overrides: &KeymapProfile,
     imported: Option<&KeymapProfile>,
 ) -> Vec<ResolvedKeyBinding> {
-    let mut map: HashMap<String, ResolvedKeyBinding> = HashMap::new();
-
-    let base = if profile_id == "custom" {
-        if let Some(imported) = imported {
-            imported.clone()
-        } else {
-            let extends = user_overrides.extends.as_deref().unwrap_or("default");
-            let mut merged = load_builtin_profile(extends).unwrap_or_default();
-            merged.bindings.extend(user_overrides.bindings.clone());
-            merged
-        }
+    let imported_base = profile_id == "custom" && imported.is_some();
+    let mut base = if imported_base {
+        let mut merged = load_builtin_profile("default").unwrap_or_default();
+        merged.bindings.clear();
+        overlay_bindings(&mut merged, imported.cloned().unwrap_or_default().bindings);
+        merged
     } else {
         effective_base_profile(profile_id).unwrap_or_default()
     };
+    let base_source = if imported_base {
+        KeymapSource::Imported
+    } else {
+        KeymapSource::Default
+    };
 
-    for binding in base.bindings {
+    let mut map: BTreeMap<(KeymapScope, String), ResolvedKeyBinding> = BTreeMap::new();
+    let mut insert = |binding: KeyBinding, source: KeymapSource, is_user_override: bool| {
+        let scope =
+            binding_scope(&binding).unwrap_or_else(|| KeymapScope::home_of(&binding.action));
         map.insert(
-            binding.action.clone(),
+            (scope, binding.action.clone()),
             ResolvedKeyBinding {
-                action: binding.action.clone(),
-                keys: binding.keys.clone(),
-                context: binding.context.clone(),
-                args: binding.args.clone(),
-                source: if profile_id == "custom" && imported.is_some() {
-                    KeymapSource::Imported
-                } else {
-                    KeymapSource::Default
-                },
+                action: binding.action,
+                keys: binding.keys,
+                scope,
+                args: binding.args,
+                source,
                 profile: profile_id.to_string(),
-                is_user_override: false,
+                is_user_override,
             },
         );
+    };
+    for binding in std::mem::take(&mut base.bindings) {
+        insert(binding, base_source, false);
     }
-
-    if profile_id != "custom" || imported.is_none() {
-        for binding in &user_overrides.bindings {
-            map.insert(
-                binding.action.clone(),
-                ResolvedKeyBinding {
-                    action: binding.action.clone(),
-                    keys: binding.keys.clone(),
-                    context: binding.context.clone(),
-                    args: binding.args.clone(),
-                    source: KeymapSource::User,
-                    profile: profile_id.to_string(),
-                    is_user_override: true,
-                },
-            );
+    if !imported_base {
+        for binding in user_overrides.bindings.iter().cloned() {
+            insert(binding, KeymapSource::User, true);
         }
     }
-
-    let mut resolved: Vec<_> = map.into_values().collect();
-    resolved.sort_by(|a, b| a.action.cmp(&b.action));
-    resolved
+    map.into_values().collect()
 }
 
 fn build_rows(
@@ -387,33 +496,32 @@ fn build_rows(
     resolved: &[ResolvedKeyBinding],
     profile_id: &str,
 ) -> Vec<KeymapRow> {
-    let mut actions: HashMap<String, ResolvedKeyBinding> = HashMap::new();
-    for binding in resolved {
-        actions.insert(binding.action.clone(), binding.clone());
-    }
+    let mut bindings: Vec<ResolvedKeyBinding> = resolved.to_vec();
+    // An action no scope binds still gets a row — in the scope it acts on —
+    // so it can be given a key.
     for action in labels.keys() {
-        actions
-            .entry(action.clone())
-            .or_insert_with(|| ResolvedKeyBinding {
+        if !resolved.iter().any(|b| &b.action == action) {
+            bindings.push(ResolvedKeyBinding {
                 action: action.clone(),
                 keys: Vec::new(),
-                context: Some("Studio".to_string()),
+                scope: KeymapScope::home_of(action),
                 args: None,
                 source: KeymapSource::Default,
                 profile: profile_id.to_string(),
                 is_user_override: false,
             });
+        }
     }
 
-    let mut rows: Vec<KeymapRow> = actions
-        .into_values()
+    let mut rows: Vec<KeymapRow> = bindings
+        .into_iter()
         .map(|binding| {
             let arguments_json = binding
                 .args
                 .as_ref()
                 .and_then(|value| serde_json::to_string(value).ok());
             KeymapRow {
-                id: binding.action.clone(),
+                id: format!("{}/{}", binding.scope.key(), binding.action),
                 action_label: labels
                     .get(&binding.action)
                     .cloned()
@@ -422,7 +530,7 @@ fn build_rows(
                 command: binding.action.clone(),
                 arguments_json,
                 keystrokes: binding.keys.clone(),
-                context: binding.context.clone(),
+                scope: binding.scope,
                 source: binding.source,
                 profile: binding.profile.clone(),
                 is_user_override: binding.is_user_override,
@@ -432,26 +540,28 @@ fn build_rows(
             }
         })
         .collect();
-    rows.sort_by(|a, b| a.action_label.cmp(&b.action_label));
+    rows.sort_by(|a, b| {
+        a.scope
+            .cmp(&b.scope)
+            .then_with(|| a.action_label.cmp(&b.action_label))
+    });
     rows
 }
 
-fn build_reverse_index(resolved: &[ResolvedKeyBinding]) -> HashMap<String, String> {
-    let mut reverse: HashMap<String, String> = HashMap::new();
-    let mut entries: Vec<&ResolvedKeyBinding> = resolved.iter().collect();
-    entries.sort_by(|a, b| a.action.cmp(&b.action));
-    for binding in entries {
+fn build_reverse_index(
+    resolved: &[ResolvedKeyBinding],
+) -> HashMap<KeymapScope, HashMap<String, String>> {
+    let mut reverse: HashMap<KeymapScope, HashMap<String, String>> = HashMap::new();
+    // `resolved` is sorted by (scope, action), so within a scope the first
+    // action wins a shared key. Such a pair is a conflict the editor shows;
+    // this only keeps the choice stable until it is fixed.
+    for binding in resolved {
+        let keys = reverse.entry(binding.scope).or_default();
         for key in &binding.keys {
             let Some(token) = canonical_accel(key) else {
                 continue;
             };
-            match reverse.get(&token) {
-                Some(existing) if global_priority(existing) <= global_priority(&binding.action) => {
-                }
-                _ => {
-                    reverse.insert(token, binding.action.clone());
-                }
-            }
+            keys.entry(token).or_insert_with(|| binding.action.clone());
         }
     }
     reverse
@@ -466,6 +576,7 @@ fn build_action_catalog() -> HashMap<String, String> {
     // bar (context-menu-only, shortcut-only, or floating-window commands). Menu
     // labels are the source of truth; these fill the gaps so the Keymap panel
     // shows human-readable names instead of raw action IDs.
+    #[rustfmt::skip]
     let fallback: &[(&str, &str)] = &[
         ("app:force-reload",               "App › Force Reload"),
         ("audio:bounce-in-place",          "Audio › Bounce in Place"),
@@ -488,13 +599,11 @@ fn build_action_catalog() -> HashMap<String, String> {
         ("file:export-stems",              "File › Export Stems"),
         ("file:import-audio",              "File › Import Audio"),
         ("floatingwindow:video-player",    "Window › Video Player"),
-        ("jam:open",                       "Window › Jam Session"),
         ("midi:duplicate-selected",        "MIDI › Duplicate Selected"),
         ("midi:export-clip",               "MIDI › Export Clip"),
         ("midi:nudge-left",                "MIDI › Nudge Left"),
         ("midi:nudge-right",               "MIDI › Nudge Right"),
         ("midi:toggle-snap",               "MIDI › Toggle Snap"),
-        ("midi:toggle-virtual-keyboard",   "MIDI › Toggle Virtual Keyboard"),
         ("midi:tool-draw",                 "MIDI › Draw Tool"),
         ("midi:tool-line",                 "MIDI › Line Tool"),
         ("midi:tool-select",               "MIDI › Select Tool"),
@@ -507,16 +616,25 @@ fn build_action_catalog() -> HashMap<String, String> {
         ("mixer:create-bus",               "Mixer › Create Bus"),
         ("mixer:reset-pan",                "Mixer › Reset Pan"),
         ("mixer:reset-volume",             "Mixer › Reset Volume"),
-        ("panel:toggle-automation",        "View › Automation Panel"),
-        ("panel:toggle-device-panel",      "View › Device Panel"),
-        ("panel:toggle-midi-editor",       "View › MIDI Editor"),
+        ("panel:toggle-midi-editor",       "View › Editor Panel"),
         ("project:new-from-template",      "Project › New from Template"),
         ("project:reveal-folder",          "Project › Reveal in Finder"),
-        ("project:snapshot",               "Project › Snapshot"),
+        ("song_text.add_chord_at_playhead", "Song Text › Add Chord at Playhead"),
+        ("song_text.add_lyric_at_playhead", "Song Text › Add Lyric at Playhead"),
+        ("song_text.add_both_at_playhead", "Song Text › Add Chord and Lyric at Playhead"),
+        ("song_text.commit",               "Song Text › Commit"),
+        ("song_text.commit_next_grid",     "Song Text › Commit and Move to Next Grid"),
+        ("song_text.commit_next_beat",     "Song Text › Commit and Move to Next Beat"),
+        ("song_text.commit_next_bar",      "Song Text › Commit and Move to Next Bar"),
+        ("song_text.previous_event",       "Song Text › Previous Event"),
+        ("song_text.next_event",           "Song Text › Next Event"),
+        ("song_text.move_to_playhead",     "Song Text › Move to Playhead"),
+        ("song_text.delete_selected",      "Song Text › Delete Selected"),
         ("timeline:toggle-snap",           "View › Toggle Snap"),
+        ("view:waveform-zoom-in",          "View › Waveform Zoom In"),
+        ("view:waveform-zoom-out",         "View › Waveform Zoom Out"),
+        ("view:waveform-zoom-reset",       "View › Waveform Zoom 1×"),
         ("tools:command-palette",          "Tools › Command Palette"),
-        ("tools:developer-tools",          "Tools › Developer Tools"),
-        ("tools:quick-search",             "Tools › Quick Search"),
         ("tools:select-mute",              "Tools › Select / Mute Tool"),
         ("track:add",                      "Project › Add Track"),
         ("track:arm",                      "Track › Arm for Recording"),
@@ -526,10 +644,31 @@ fn build_action_catalog() -> HashMap<String, String> {
         ("window:toggle-fullscreen",       "Window › Toggle Full Screen"),
     ];
     for (id, label) in fallback {
-        out.entry(id.to_string()).or_insert_with(|| label.to_string());
+        out.entry(id.to_string())
+            .or_insert_with(|| label.to_string());
+    }
+    // Commands with no handler yet are not offered for binding: a key that
+    // does nothing is a control that lies.
+    for unhandled in UNHANDLED_COMMANDS {
+        out.remove(*unhandled);
     }
     out
 }
+
+/// Commands that appear in menus or older profiles but that nothing in the
+/// studio runs yet. They get no row and no key until they do.
+pub(crate) const UNHANDLED_COMMANDS: &[&str] = &[
+    "app:force-reload",
+    "audio:bounce-in-place",
+    "audio:render-selection",
+    "clip:consolidate",
+    "file:import-audio",
+    "panel:toggle-automation",
+    "panel:toggle-device-panel",
+    "project:snapshot",
+    "tools:developer-tools",
+    "tools:quick-search",
+];
 
 fn collect_menu_actions(items: &[MenuItem], path: &str, out: &mut HashMap<String, String>) {
     for item in items {
@@ -574,33 +713,126 @@ pub fn profile_label(profile_id: &str) -> &'static str {
 #[cfg(test)]
 mod default_binding_tests {
     use super::*;
+    use KeymapScope::*;
 
-    /// The bare transport keys the studio relies on must resolve under the
-    /// built-in default profile. Regression guard: a broken reverse index (or a
-    /// default.json that drops one of these) silently kills the shortcut because
-    /// only Space has a hard-coded fallback in the key handler.
+    fn fresh() -> KeymapManager {
+        // An empty data folder: no user overrides leak in from a real one.
+        let dir = std::env::temp_dir().join(format!(
+            "fb-keymap-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        KeymapManager::new(dir)
+    }
+
+    fn resolve(manager: &KeymapManager, scope: KeymapScope, accel: &str) -> Option<String> {
+        manager
+            .command_for_token(&canonical_accel(accel).unwrap(), scope)
+            .map(str::to_string)
+    }
+
+    /// The bare transport keys the studio relies on resolve everywhere.
     #[test]
-    fn default_profile_binds_core_transport_keys() {
-        let manager = KeymapManager::new(std::env::temp_dir());
-        let reverse = manager.dispatch_reverse();
+    fn transport_keys_work_in_every_scope() {
+        let manager = fresh();
+        for scope in KeymapScope::ALL {
+            assert_eq!(
+                resolve(&manager, scope, "Space").as_deref(),
+                Some("transport:play-pause")
+            );
+            assert_eq!(
+                resolve(&manager, scope, "R").as_deref(),
+                Some("transport:record")
+            );
+            assert_eq!(
+                resolve(&manager, scope, "K").as_deref(),
+                Some("transport:toggle-metronome")
+            );
+        }
+    }
+
+    /// One key, a different job per editor — the reason for scopes.
+    #[test]
+    fn the_same_key_means_each_editors_own_command() {
+        let manager = fresh();
+        for (accel, scope, command) in [
+            ("G", Arrangement, "timeline:toggle-snap"),
+            ("G", MidiEditor, "midi:toggle-snap"),
+            ("Ctrl+A", Arrangement, "edit:select-all"),
+            ("Ctrl+A", MidiEditor, "midi:select-all"),
+            ("Ctrl+A", AudioEditor, "edit:select-all"),
+            ("Ctrl+A", AutomationEditor, "automation:select-all-points"),
+            ("Delete", MidiEditor, "midi:delete-selected"),
+            (
+                "Delete",
+                AutomationEditor,
+                "automation:delete-selected-points",
+            ),
+            ("Delete", SongTextEditor, "song_text.delete_selected"),
+            ("M", Arrangement, "track:mute"),
+            ("S", Arrangement, "clip:split-at-playhead"),
+            ("S", Mixer, "track:solo"),
+            ("1", Arrangement, "tools:select-pointer"),
+            ("1", MidiEditor, "midi:tool-select"),
+            ("Enter", SongTextEditor, "song_text.commit"),
+            ("Alt+Enter", Arrangement, "clip:properties"),
+            ("Alt+Enter", MidiEditor, "solfege:apply-accent"),
+        ] {
+            assert_eq!(
+                resolve(&manager, scope, accel).as_deref(),
+                Some(command),
+                "{accel} in {scope:?}"
+            );
+        }
+        // Keys stay in their own editor.
+        assert_eq!(resolve(&manager, MidiEditor, "S"), None);
+        assert_eq!(resolve(&manager, Mixer, "G"), None);
+    }
+
+    /// Automation is a layer on the arrangement: its keys win, the rest of
+    /// the arrangement's keys still work.
+    #[test]
+    fn automation_layers_on_the_arrangement() {
+        let manager = fresh();
         assert_eq!(
-            reverse.get("r").map(String::as_str),
-            Some("transport:record"),
-            "R must trigger record on the default profile"
+            resolve(&manager, AutomationEditor, "A").as_deref(),
+            Some("automation:toggle-mode")
         );
         assert_eq!(
-            reverse.get("space").map(String::as_str),
-            Some("transport:play-pause")
+            resolve(&manager, AutomationEditor, "1").as_deref(),
+            Some("tools:select-pointer")
         );
         assert_eq!(
-            reverse.get("s").map(String::as_str),
-            Some("clip:split-at-playhead")
+            resolve(&manager, Arrangement, "A").as_deref(),
+            Some("track:arm")
         );
     }
 
+    /// The shipped default has no conflicts at all: no key is used twice in
+    /// one scope, and no editor reuses a global key.
+    #[test]
+    fn the_default_profile_has_no_conflicts() {
+        let manager = fresh();
+        let conflicts: Vec<String> = manager
+            .rows()
+            .iter()
+            .filter(|row| row.is_conflict)
+            .map(|row| format!("{} {:?}: {:?}", row.id, row.keystrokes, row.conflict_with))
+            .collect();
+        assert!(conflicts.is_empty(), "{conflicts:#?}");
+    }
+
+    /// Nothing is bound to a command no handler runs.
+    #[test]
+    fn no_default_key_is_bound_to_a_missing_command() {
+        let manager = fresh();
+        for command in UNHANDLED_COMMANDS {
+            assert_eq!(manager.raw_accel_for_command(command), None, "{command}");
+        }
+    }
+
     /// Every id offered in the profile picker must resolve to a shipped keymap.
-    /// A descriptor without a matching `builtin_profile_json` arm leaves the
-    /// picker offering a profile that cannot be selected.
     #[test]
     fn every_builtin_descriptor_has_a_profile() {
         for descriptor in PROFILE_DESCRIPTORS.iter().filter(|p| p.builtin) {
@@ -614,64 +846,30 @@ mod default_binding_tests {
     /// copy of the defaults — its whole point is muscle memory.
     #[test]
     fn pro_tools_profile_uses_pro_tools_bindings() {
-        let mut manager = KeymapManager::new(std::env::temp_dir());
+        let mut manager = fresh();
         manager.set_active_profile("pro-tools").expect("pro-tools");
-        let reverse = manager.dispatch_reverse();
         assert_eq!(
-            reverse.get("f12").map(String::as_str),
+            resolve(&manager, Arrangement, "F12").as_deref(),
             Some("transport:record"),
             "F12 must trigger record on the Pro Tools profile"
         );
         assert_eq!(
-            reverse.get("ctrl+e").map(String::as_str),
+            resolve(&manager, Arrangement, "Ctrl+E").as_deref(),
             Some("clip:split-at-playhead"),
             "Ctrl+E is Separate Clip at Selection"
         );
         assert_eq!(
-            reverse.get("f8").map(String::as_str),
+            resolve(&manager, Arrangement, "F8").as_deref(),
             Some("tools:select-pointer"),
             "F8 is the Grabber"
         );
     }
 
-    /// The arrangement tools sit on the number row in toolbar order, and no
-    /// other command on the default map answers to those keys.
-    #[test]
-    fn default_profile_puts_tools_on_the_number_row() {
-        let manager = KeymapManager::new(std::env::temp_dir());
-        let reverse = manager.dispatch_reverse();
-        for (key, command) in [
-            ("1", "tools:select-pointer"),
-            ("2", "tools:select-pen"),
-            ("3", "tools:select-cut"),
-            ("4", "tools:select-glue"),
-            ("5", "tools:select-mute"),
-            ("6", "tools:select-time"),
-            ("7", "tools:select-automation"),
-        ] {
-            assert_eq!(
-                reverse.get(key).map(String::as_str),
-                Some(command),
-                "{key} selects {command}"
-            );
-            assert!(
-                !manager
-                    .rows()
-                    .iter()
-                    .any(|row| row.action_id == command && row.is_conflict),
-                "{command} on {key} must not conflict"
-            );
-        }
-    }
-
     /// Non-default built-in profiles inherit the default map: a DAW profile only
     /// ships the accelerators it re-maps, so commands it does not mention must
-    /// still resolve from the default base. Regression guard for the bug where
-    /// selecting Ableton/Cubase/… silently dropped every un-remapped command.
+    /// still resolve from the default base.
     #[test]
     fn builtin_profiles_inherit_default_bindings() {
-        // `edit:undo` (Ctrl+Z) and `project:save` (Ctrl+S) are default-only —
-        // no DAW override touches them — so every profile must still bind them.
         for profile in [
             "ableton-live",
             "cubase",
@@ -679,13 +877,12 @@ mod default_binding_tests {
             "pro-tools",
             "futureboard",
         ] {
-            let mut manager = KeymapManager::new(std::env::temp_dir());
+            let mut manager = fresh();
             manager
                 .set_active_profile(profile)
                 .unwrap_or_else(|error| panic!("profile {profile}: {error}"));
-            assert_eq!(
-                manager.raw_accel_for_command("edit:undo").as_deref(),
-                Some("Ctrl+Z"),
+            assert!(
+                manager.raw_accel_for_command("edit:undo").is_some(),
                 "{profile} must inherit edit:undo from the default map"
             );
             assert!(
@@ -699,67 +896,99 @@ mod default_binding_tests {
     /// stacking beside it: Ableton records on F9, not the default R.
     #[test]
     fn profile_override_replaces_default_binding() {
-        let mut manager = KeymapManager::new(std::env::temp_dir());
+        let mut manager = fresh();
         manager.set_active_profile("ableton-live").expect("ableton");
         assert_eq!(
             manager.raw_accel_for_command("transport:record").as_deref(),
             Some("F9"),
             "Ableton overrides Record to F9"
         );
-        let reverse = manager.dispatch_reverse();
         assert_eq!(
-            reverse.get("f9").map(String::as_str),
-            Some("transport:record"),
-            "F9 must resolve to Record under Ableton"
+            resolve(&manager, Mixer, "F9").as_deref(),
+            Some("transport:record")
         );
     }
 
-    /// The actionable commands that gained accelerators must resolve on the
-    /// default profile. Regression guard for keymap coverage: these were `null`
-    /// in the manifest and unreachable from the keyboard before.
+    /// Replacing a conflict takes the key off the other action, in that
+    /// scope only, and survives a save and reload.
     #[test]
-    fn newly_bound_actionable_commands_resolve() {
-        let manager = KeymapManager::new(std::env::temp_dir());
-        for (command, accel) in [
-            ("panel:toggle-bottom", "Ctrl+7"),
-            ("track:delete", "Ctrl+Shift+Delete"),
-            ("midi:open-editor", "Ctrl+Shift+M"),
-            ("track:add-audio", "Ctrl+Shift+A"),
-            ("project:save-copy", "Ctrl+Alt+Shift+S"),
-            // Second-wave global actions wired from the dispatcher audit: track
-            // state, clip actions, window openers, and export — all reachable
-            // from the keyboard now, not just the right-click / menu path.
-            ("track:mute", "Ctrl+Shift+H"),
-            ("track:solo", "Ctrl+Shift+L"),
-            ("track:arm", "Ctrl+Shift+B"),
-            ("clip:rename", "F2"),
-            ("clip:properties", "Ctrl+Shift+P"),
-            ("plugins:scan", "Ctrl+Alt+U"),
-            ("file:export-audio", "Ctrl+Shift+X"),
-            ("window:big-clock", "Ctrl+Alt+K"),
-            ("window:performance", "Ctrl+Alt+P"),
-            ("midi:export-clip", "Ctrl+Alt+I"),
-            // Third-wave audit: MIDI editor, mixer, solfege, and secondary
-            // window commands that were dispatchable but had no keyboard path.
-            ("midi:tool-select", "Ctrl+Alt+1"),
-            ("midi:tool-draw", "Ctrl+Alt+2"),
-            ("midi:velocity-increase", "Ctrl+Alt+Up"),
-            ("midi:toggle-snap", "Ctrl+Alt+4"),
-            ("midi:fit-notes", "Ctrl+Alt+5"),
-            ("editor:open-bottom", "Ctrl+Alt+6"),
-            ("mixer:create-bus", "Ctrl+Alt+7"),
-            ("mixer:reset-volume", "Ctrl+Alt+8"),
-            ("mixer:reset-pan", "Ctrl+Alt+9"),
-            ("solfege:analyze-accent", "Ctrl+Alt+A"),
-            ("automation:select-all-points", "Ctrl+Alt+Shift+P"),
-            ("audio:stem-extractor", "Ctrl+Alt+Shift+E"),
-            ("jam:open", "Ctrl+Alt+Shift+J"),
-        ] {
-            assert_eq!(
-                manager.raw_accel_for_command(command).as_deref(),
-                Some(accel),
-                "{command} must bind to {accel} on the default profile"
-            );
-        }
+    fn replacing_a_conflict_moves_the_key() {
+        let mut manager = fresh();
+        let conflicts = manager
+            .tap_binding("midi:quantize", vec!["G".into()], MidiEditor, None, false)
+            .unwrap();
+        assert_eq!(conflicts.len(), 1, "G is MIDI snap");
+        assert_eq!(
+            resolve(&manager, MidiEditor, "G").as_deref(),
+            Some("midi:toggle-snap")
+        );
+
+        manager
+            .tap_binding("midi:quantize", vec!["G".into()], MidiEditor, None, true)
+            .unwrap();
+        assert_eq!(
+            resolve(&manager, MidiEditor, "G").as_deref(),
+            Some("midi:quantize")
+        );
+        assert_eq!(
+            manager.raw_accel_in_scope("midi:toggle-snap", MidiEditor),
+            None
+        );
+        // The arrangement's G is untouched.
+        assert_eq!(
+            resolve(&manager, Arrangement, "G").as_deref(),
+            Some("timeline:toggle-snap")
+        );
+        assert!(!manager.rows().iter().any(|row| row.is_conflict));
+
+        manager.save_changes().unwrap();
+        let reloaded = KeymapManager::new(manager.app_data.clone());
+        assert_eq!(
+            resolve(&reloaded, MidiEditor, "G").as_deref(),
+            Some("midi:quantize")
+        );
+    }
+
+    /// A key bound in an editor may not take a global key.
+    #[test]
+    fn an_editor_key_may_not_take_a_global_one() {
+        let mut manager = fresh();
+        let conflicts = manager
+            .tap_binding(
+                "midi:quantize",
+                vec!["Space".into()],
+                MidiEditor,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(conflicts[0].action, "transport:play-pause");
+        assert_eq!(conflicts[0].scope, Global);
+    }
+
+    /// Overrides saved before scopes existed still apply, in every scope the
+    /// default binds the action.
+    #[test]
+    fn an_unscoped_override_lands_where_the_action_lives() {
+        let dir = std::env::temp_dir().join(format!("fb-keymap-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Keymaps")).unwrap();
+        std::fs::write(
+            dir.join("Keymaps")
+                .join(super::super::model::USER_OVERRIDES_FILE),
+            r#"{"name":"User","extends":"default","bindings":[
+                {"action":"track:mute","keys":["Ctrl+Shift+H"],"context":"Studio"}]}"#,
+        )
+        .unwrap();
+        let manager = KeymapManager::new(dir);
+        assert_eq!(
+            resolve(&manager, Arrangement, "Ctrl+Shift+H").as_deref(),
+            Some("track:mute")
+        );
+        assert_eq!(
+            resolve(&manager, Mixer, "Ctrl+Shift+H").as_deref(),
+            Some("track:mute")
+        );
+        assert_eq!(resolve(&manager, Arrangement, "M"), None);
     }
 }

@@ -4489,6 +4489,9 @@ static void view_host_release(SphereDauxVst3Processor *processor, const char *re
     processor->view_host_frame = nullptr;
   }
   processor->editor_view = nullptr;
+  // The canResize answer was for that view. A new one can be allocated at the
+  // same address and must be asked again, not handed the old answer.
+  processor->editor_resizable_view = nullptr;
   processor->view_host_attached = false;
   if (processor->editor_attach_hwnd == processor->view_host_parent) {
     // Only clear the borrowed handle, never destroy it.
@@ -4628,19 +4631,56 @@ extern "C" int sphere_daux_vst3_view_attach(SphereDauxVst3Processor *processor,
   // belongs to the host, and `embed_mode` stays false, which is what keeps the
   // legacy teardown from ever destroying it.
   processor->editor_attach_hwnd = parent;
-  processor->view_host_resize_pending.store(false, std::memory_order_release);
 
-  // Some editors settle on their real size only inside attached().
-  Steinberg::ViewRect settled{};
-  if (processor->editor_view->getSize(&settled) == Steinberg::kResultTrue) {
-    const int settled_w = daux_view_rect_width(settled);
-    const int settled_h = daux_view_rect_height(settled);
-    if (settled_w > 0 && settled_h > 0) {
-      content_w = settled_w;
-      content_h = settled_h;
-      view_host_clamp(&content_w, &content_h);
+  // The content scale again, now that the view has a parent: some editors
+  // only take it once attached (the legacy embed path did the same).
+  daux_editor_set_content_scale(processor, parent, "view_host.after_attach");
+
+  // What size the editor really is now. A plug-in that remembers its editor
+  // size (Kontakt, per instance) builds a fresh view at its default size and
+  // restores its own through resizeView *inside* attached(): that request is
+  // the truth, and it used to be thrown away here, so every reopen came back
+  // at the default size. Without one, some editors settle on their real size
+  // only inside attached(), so getSize is asked again; and one whose getSize
+  // is still stale has already sized its own root window, which then wins.
+  if (processor->view_host_resize_pending.exchange(false,
+                                                   std::memory_order_acq_rel)) {
+    content_w = processor->view_host_resize_w;
+    content_h = processor->view_host_resize_h;
+    std::fprintf(stderr, "[view-host] resize requested during attach=%dx%d\n",
+                 content_w, content_h);
+  } else {
+    Steinberg::ViewRect settled{};
+    if (processor->editor_view->getSize(&settled) == Steinberg::kResultTrue) {
+      const int settled_w = daux_view_rect_width(settled);
+      const int settled_h = daux_view_rect_height(settled);
+      if (settled_w > 0 && settled_h > 0) {
+        content_w = settled_w;
+        content_h = settled_h;
+      }
+    }
+    // A root window that merely fills the host's window says nothing about
+    // the editor: the host sized that window, not the plug-in.
+    RECT parent_client{};
+    GetClientRect(parent, &parent_client);
+    const int parent_w = parent_client.right - parent_client.left;
+    const int parent_h = parent_client.bottom - parent_client.top;
+    int root_w = 0;
+    int root_h = 0;
+    if (daux_plugin_root_window_size(parent, content_w, content_h, &root_w,
+                                     &root_h) &&
+        root_w > 0 && root_h > 0 &&
+        !(root_w == parent_w && root_h == parent_h) &&
+        (root_w != content_w || root_h != content_h)) {
+      std::fprintf(stderr,
+                   "[view-host] native root overrides stale getSize "
+                   "getSize=%dx%d root=%dx%d\n",
+                   content_w, content_h, root_w, root_h);
+      content_w = root_w;
+      content_h = root_h;
     }
   }
+  view_host_clamp(&content_w, &content_h);
 
   if (out_width) {
     *out_width = content_w;

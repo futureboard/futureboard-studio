@@ -288,21 +288,34 @@ impl Dsp {
         }
     }
 
+    /// The voice a new note takes: the same key if it still sounds, a free
+    /// voice, then the quietest releasing voice, and only then the oldest
+    /// held one. Stealing the quietest voice outright took the one a note of
+    /// the same chord had just started (its envelope is still at zero, and
+    /// every note of a block starts before any is rendered), so a sequenced
+    /// chord on a busy synth kept only its first and last notes.
     fn allocate_voice(&self, note: u8) -> usize {
         self.voices
             .iter()
             .position(|voice| voice.active && voice.note == note)
             .or_else(|| self.voices.iter().position(|voice| !voice.active))
-            .unwrap_or_else(|| {
+            .or_else(|| {
                 self.voices
                     .iter()
                     .enumerate()
+                    .filter(|(_, voice)| voice.stage == EnvStage::Release)
                     .min_by(|(_, left), (_, right)| {
                         left.env
                             .partial_cmp(&right.env)
                             .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| left.age.cmp(&right.age))
                     })
+                    .map(|(index, _)| index)
+            })
+            .unwrap_or_else(|| {
+                self.voices
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, voice)| voice.age)
                     .map_or(0, |(index, _)| index)
             })
     }
@@ -558,5 +571,34 @@ mod tests {
             dsp.voices.iter().filter(|voice| voice.active).count(),
             MAX_VOICES
         );
+    }
+
+    /// Every voice busy (the last chords still releasing), then a whole
+    /// chord in one block: every note of it sounds, instead of each new note
+    /// stealing the voice the previous one had just started.
+    #[test]
+    fn a_chord_on_a_full_synth_keeps_every_note() {
+        let mut dsp = Dsp::new(48_000.0);
+        for note in 40..(40 + MAX_VOICES as u8) {
+            dsp.note_on(note, 90);
+        }
+        for _ in 0..200 {
+            let _ = dsp.process_stereo();
+        }
+        for note in 40..48 {
+            dsp.note_off(note);
+        }
+        let chord = [60u8, 64, 67, 71, 74];
+        for &note in &chord {
+            dsp.note_on(note, 100);
+        }
+        for note in chord {
+            assert!(
+                dsp.voices
+                    .iter()
+                    .any(|voice| voice.active && voice.note == note),
+                "note {note} of the chord was stolen by the chord itself"
+            );
+        }
     }
 }

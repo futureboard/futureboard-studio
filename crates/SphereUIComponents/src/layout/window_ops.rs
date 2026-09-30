@@ -269,9 +269,18 @@ pub(crate) struct ExternalWindows {
     /// Performance Monitor — engine latency and PDC, cores, memory and drives.
     pub performance:
         Option<gpui::WindowHandle<crate::components::performance_window::PerformanceWindow>>,
+    /// Virtual Speaker — the Control Room's listening simulation.
+    pub virtual_speaker:
+        Option<gpui::WindowHandle<crate::components::virtual_speaker_window::VirtualSpeakerWindow>>,
     /// SysEx Editor — clip and marker System Exclusive messages.
     pub sysex_editor:
         Option<gpui::WindowHandle<crate::components::sysex_editor_window::SysExEditorWindow>>,
+    /// Window > Visualizer — at most one floating window per view.
+    #[cfg(feature = "gpu-renderer")]
+    pub visualizers: std::collections::HashMap<
+        crate::components::visualizer::VisualizerKind,
+        gpui::WindowHandle<crate::components::visualizer::window::VisualizerWindow>,
+    >,
 }
 
 impl StudioLayout {
@@ -355,8 +364,10 @@ impl StudioLayout {
         // references a bus.
         match edit {
             ConnectionEdit::OpenAudioDeviceSetup => {
+                // "Audio device setup" is the Audio page, not whichever page
+                // Preferences opens on.
                 let owner = self.audio_connections_window_bounds(cx);
-                self.open_settings_dialog(owner, cx);
+                self.open_settings_dialog_on_tab(owner, Some(SettingsTab::Audio), cx);
                 return;
             }
             ConnectionEdit::RequestRemove { id } => {
@@ -989,6 +1000,48 @@ impl StudioLayout {
     /// clock that has to be re-pointed is a clock somebody has to look away
     /// from. They share one view — see [`crate::components::clock_window`] —
     /// so the readings can never disagree about where the playhead is.
+    /// Open a Window > Visualizer view, or bring its window forward if it is
+    /// already open: each view is one window, so opening it twice would only
+    /// put two copies of the same reading on screen.
+    #[cfg(feature = "gpu-renderer")]
+    pub(crate) fn open_visualizer_window(
+        &mut self,
+        kind: crate::components::visualizer::VisualizerKind,
+        owner_bounds: Option<Bounds<gpui::Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = self.external_windows.visualizers.get(&kind).cloned() {
+            if handle
+                .update(cx, |_view, window, _cx| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.external_windows.visualizers.remove(&kind);
+        }
+        let owner = cx.entity().clone();
+        let on_close: Arc<
+            dyn Fn(crate::components::visualizer::VisualizerKind, &mut App) + Send + Sync,
+        > = Arc::new(move |closed, app| {
+            let _ = owner.update(app, |layout, cx| {
+                layout.external_windows.visualizers.remove(&closed);
+                cx.notify();
+            });
+        });
+        match crate::components::visualizer::window::open_visualizer_window(
+            kind,
+            owner_bounds,
+            on_close,
+            cx,
+        ) {
+            Ok(handle) => {
+                self.external_windows.visualizers.insert(kind, handle);
+            }
+            Err(error) => eprintln!("[visualizer] failed to open {}: {error}", kind.title()),
+        }
+        cx.notify();
+    }
+
     pub(crate) fn open_clock_window(
         &mut self,
         kind: crate::components::clock_window::ClockKind,
@@ -1371,19 +1424,38 @@ impl StudioLayout {
                                                     );
                                                 }
                                                 bridge_inserts.push((id.clone(), slot_id));
+                                            } else if SpherePluginHost::builtin_audio_bridge_supported(
+                                                reg.class_id.as_deref().unwrap_or(&reg.id),
+                                            ) {
+                                                // A built-in instrument (Drum Sampler,
+                                                // ...) still lives in a plug-in host:
+                                                // without a load request its editor
+                                                // has no instance to send samples,
+                                                // params or notes to.
+                                                bridge_inserts.push((id.clone(), slot_id));
                                             }
                                         }
                                     }
                                 }
                             } else if dialog.selected_kind == AddTrackKind::Instrument
-                                && dialog.instrument_mode == InstrumentMode::SoundfontPlayer
+                                && matches!(
+                                    dialog.instrument_mode,
+                                    InstrumentMode::SoundfontPlayer
+                                        | InstrumentMode::SoundfontMulti
+                                )
                             {
                                 // Built-in Soundfont Player is not a hosted plugin — it
                                 // never goes through the VST3/CLAP/AU/LV2 bridge or
                                 // plugin registry, so it gets a plain track marker
                                 // instead of an insert. Inspector shows an Open button
-                                // that opens the Soundfont Player MDI window for it.
+                                // that opens the Soundfont Player window for it.
                                 timeline.state.set_track_builtin_soundfont_player(&id, true);
+                                if dialog.instrument_mode == InstrumentMode::SoundfontMulti {
+                                    timeline.state.set_track_soundfont_mode(
+                                        &id,
+                                        crate::soundfont_player::SoundfontPlayerMode::Multi,
+                                    );
+                                }
                             } else if dialog.selected_kind == AddTrackKind::Instrument
                                 && dialog.instrument_mode == InstrumentMode::SolfegeEngine
                             {
@@ -1734,6 +1806,7 @@ impl StudioLayout {
         let on_changed: KeymapChangedCb = Arc::new(move |manager, app| {
             let _ = studio.update(app, |layout, cx| {
                 let profile_id = manager.active_profile_id().to_string();
+                crate::keymap::set_global_keymap(manager.clone());
                 layout.keymap_manager = manager;
                 // Persist the active profile so the chosen keymap survives a
                 // restart. `update_setting` writes settings.json and notifies;
@@ -2114,6 +2187,120 @@ impl StudioLayout {
         }
     }
 
+    /// The Control Room's listening simulation as it stands: on or off as
+    /// set this session (always off at launch), on the playback system and
+    /// listening device last chosen, which the settings remember.
+    pub(crate) fn listening_simulation(
+        &self,
+        cx: &gpui::App,
+    ) -> solfege_spatialaudio::SimulationSettings {
+        if let Some(settings) = self.listening_simulation {
+            return settings;
+        }
+        let playback = &self.settings.read(cx).current.playback;
+        solfege_spatialaudio::SimulationSettings {
+            enabled: false,
+            profile: solfege_spatialaudio::ListeningProfile::from_token(
+                &playback.virtual_speaker_profile,
+            )
+            .unwrap_or_default(),
+            device: solfege_spatialaudio::ListeningDevice::from_token(
+                &playback.virtual_speaker_device,
+            )
+            .unwrap_or_default(),
+        }
+    }
+
+    fn virtual_speaker_snapshot(
+        &self,
+        cx: &gpui::App,
+    ) -> crate::components::virtual_speaker_window::VirtualSpeakerSnapshot {
+        crate::components::virtual_speaker_window::VirtualSpeakerSnapshot {
+            settings: self.listening_simulation(cx),
+            control_room_in_path: self.timeline.read(cx).state.monitor.control_room_enabled,
+            engine_ready: self.audio_bridge.engine.is_some(),
+        }
+    }
+
+    /// Apply a Virtual Speaker choice: to the engine at once (the Control
+    /// Room fades between systems itself), to the settings for the next
+    /// session, and to the window.
+    pub(crate) fn set_listening_simulation(
+        &mut self,
+        settings: solfege_spatialaudio::SimulationSettings,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.listening_simulation(cx);
+        self.listening_simulation = Some(settings);
+        if let Some(engine) = self.audio_bridge.engine.as_ref() {
+            let _ = engine.set_listening_simulation(settings);
+        }
+        if before.profile != settings.profile || before.device != settings.device {
+            self.settings.update(cx, |store, cx| {
+                store.update_setting(
+                    |schema| {
+                        schema.playback.virtual_speaker_profile =
+                            settings.profile.token().to_string();
+                        schema.playback.virtual_speaker_device =
+                            settings.device.token().to_string();
+                    },
+                    cx,
+                );
+            });
+        }
+        let snapshot = self.virtual_speaker_snapshot(cx);
+        if let Some(handle) = self.external_windows.virtual_speaker.clone() {
+            if handle
+                .update(cx, |view, _window, cx| view.set_snapshot(snapshot, cx))
+                .is_err()
+            {
+                self.external_windows.virtual_speaker = None;
+            }
+        }
+        self.notify_status_bar_if_changed(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn open_virtual_speaker_window(
+        &mut self,
+        owner_bounds: Option<Bounds<gpui::Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.virtual_speaker_snapshot(cx);
+        if let Some(handle) = self.external_windows.virtual_speaker.clone() {
+            if handle
+                .update(cx, |view, window, cx| {
+                    view.set_snapshot(snapshot, cx);
+                    window.activate_window();
+                })
+                .is_ok()
+            {
+                return;
+            }
+            self.external_windows.virtual_speaker = None;
+        }
+
+        // The window hands a choice back; the Studio applies it after the
+        // window's own update has returned, never inside it.
+        let owner = cx.entity().clone();
+        let on_change: crate::components::virtual_speaker_window::SimulationChangeCb =
+            Arc::new(move |settings, app: &mut gpui::App| {
+                StudioLayout::defer_update(&owner, app, move |layout, cx| {
+                    layout.set_listening_simulation(settings, cx);
+                });
+            });
+
+        match crate::components::virtual_speaker_window::open_virtual_speaker_window(
+            owner_bounds,
+            snapshot,
+            on_change,
+            cx,
+        ) {
+            Ok(handle) => self.external_windows.virtual_speaker = Some(handle),
+            Err(err) => eprintln!("[virtual-speaker] failed to open window: {err}"),
+        }
+    }
+
     pub(super) fn open_performance_window(
         &mut self,
         owner_bounds: Option<Bounds<gpui::Pixels>>,
@@ -2202,6 +2389,7 @@ impl StudioLayout {
             engine_sample_rate,
             time_display_format: timeline.state.time_display_format,
             timecode_rate: timeline.state.timecode_rate,
+            spatial_mix: timeline.state.spatial_mix,
             track_count: timeline.state.tracks.len(),
         }
     }
@@ -2295,6 +2483,15 @@ impl StudioLayout {
                     });
                 })
             },
+            on_set_spatial_mix: {
+                let owner = owner.clone();
+                Arc::new(move |mix, cx| {
+                    StudioLayout::defer_update(&owner, cx, move |this, cx| {
+                        this.set_project_spatial_mix(mix, cx);
+                        this.push_project_settings_snapshot_to_window(cx);
+                    });
+                })
+            },
             on_set_timecode_rate: {
                 let owner = owner.clone();
                 Arc::new(move |rate, cx| {
@@ -2377,6 +2574,34 @@ impl StudioLayout {
         });
         if changed {
             self.mark_dirty();
+            cx.notify();
+        }
+    }
+
+    /// Set the mix's spatial format and room. Project state: it marks the
+    /// project dirty, which rebuilds the engine graph in the new format, and
+    /// the Mixer swaps its pan controls for room panners (or back).
+    fn set_project_spatial_mix(
+        &mut self,
+        mix: crate::components::timeline::timeline_state::SpatialMix,
+        cx: &mut Context<Self>,
+    ) {
+        let mix = crate::components::timeline::timeline_state::SpatialMix {
+            room: mix.room.sanitized(),
+            ..mix
+        };
+        let changed = self.timeline.update(cx, |timeline, cx| {
+            if timeline.state.spatial_mix == mix {
+                return false;
+            }
+            timeline.state.spatial_mix = mix;
+            cx.notify();
+            true
+        });
+        if changed {
+            self.mark_dirty();
+            let _ = self.mixer_panel.update(cx, |_, cx| cx.notify());
+            self.push_mixer_snapshot_to_window(cx);
             cx.notify();
         }
     }
@@ -2536,44 +2761,21 @@ impl StudioLayout {
         }
     }
 
-    /// A track's persisted Soundfont Player settings, so an opening window shows
-    /// the `.sf2` and preset the engine is already playing rather than an empty
-    /// panel.
-    fn soundfont_track_state(
-        &self,
-        track_id: &str,
-        cx: &App,
-    ) -> crate::components::soundfont_player_window::SoundfontPlayerTrackState {
-        use crate::components::soundfont_player_window::SoundfontPlayerTrackState;
-        let timeline = self.timeline.read(cx);
-        let Some(track) = timeline.state.find_track(track_id) else {
-            return SoundfontPlayerTrackState::default();
-        };
-        SoundfontPlayerTrackState {
-            path: track.soundfont_path.clone(),
-            preset: track.soundfont_preset,
-            volume: track.soundfont_volume,
-            reverb_chorus: track.soundfont_reverb_chorus,
-            polyphony: track.soundfont_polyphony,
-            envelope: track.soundfont_envelope,
-            quality: track.soundfont_quality,
-        }
-    }
-
-    /// Opens the built-in Soundfont Player MDI window, or focuses it (and its
-    /// document) if already open. Called from the Inspector's Open button for
-    /// an Instrument track whose `builtin_soundfont_player` marker is set.
+    /// Opens the built-in Soundfont Player window on `track_id`, or retargets
+    /// and focuses it if already open. Called from the Inspector's Open button
+    /// and the track header for an Instrument track whose
+    /// `builtin_soundfont_player` marker is set. The window reads the track
+    /// from the timeline itself, so it always shows what the track holds.
     pub(super) fn open_soundfont_player_window(
         &mut self,
         owner_bounds: Option<Bounds<gpui::Pixels>>,
         track_id: String,
         cx: &mut Context<Self>,
     ) {
-        let initial = self.soundfont_track_state(&track_id, cx);
         if let Some(handle) = self.external_windows.soundfont_player.clone() {
             let activated = handle
                 .update(cx, |window, w, cx| {
-                    window.focus_soundfont_player(track_id.clone(), initial.clone(), cx);
+                    window.focus_soundfont_player(track_id.clone(), cx);
                     w.activate_window();
                     cx.notify();
                 })
@@ -2644,7 +2846,7 @@ impl StudioLayout {
         match crate::components::soundfont_player_window::open_soundfont_player_window(
             owner_bounds,
             track_id,
-            initial,
+            self.timeline.clone(),
             on_close,
             on_update_track,
             on_preview,
@@ -2714,7 +2916,7 @@ impl StudioLayout {
         self.panels.bottom_docked = false;
 
         let snapshot = self.build_mixer_snapshot(cx);
-        let callbacks = self.build_mixer_callbacks(cx.entity().clone());
+        let callbacks = self.build_mixer_callbacks(cx.entity().clone(), cx);
         let owner = cx.entity().clone();
         let on_close: std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync> =
             std::sync::Arc::new(move |_window, cx| {
@@ -2746,7 +2948,12 @@ impl StudioLayout {
             if event.is_held {
                 return false;
             }
-            let Some(command_id) = dispatch_owner.read(cx).shortcut_command_id(event) else {
+            // The pop-out mixer is the Mixer scope wherever the studio's
+            // keyboard focus happens to be.
+            let Some(command_id) = dispatch_owner
+                .read(cx)
+                .shortcut_command_id(event, crate::keymap::KeymapScope::Mixer)
+            else {
                 return false;
             };
             let _ = dispatch_owner.update(cx, |layout, cx| {
@@ -2947,6 +3154,28 @@ impl StudioLayout {
                 });
             });
 
+        let key_owner = cx.entity().clone();
+        let dispatch_key: crate::components::midi_editor_window::MidiEditorKeyCb =
+            Arc::new(move |event, cx| {
+                if event.is_held {
+                    return false;
+                }
+                let Some(command_id) = key_owner
+                    .read(cx)
+                    .shortcut_command_id(event, crate::keymap::KeymapScope::MidiEditor)
+                else {
+                    return false;
+                };
+                // With the window open, the shared dispatcher sends `midi:*`
+                // to this window's piano roll.
+                let _ = key_owner.update(cx, |layout, cx| {
+                    let owner_bounds = layout.studio_window_bounds(cx);
+                    layout.dispatch_command_id_from_bounds(&command_id, owner_bounds, cx);
+                    cx.notify();
+                });
+                true
+            });
+
         match open_midi_editor_window(
             Some(owner_bounds),
             timeline,
@@ -2954,6 +3183,7 @@ impl StudioLayout {
             virtual_keyboard,
             on_close,
             dispatch_command,
+            dispatch_key,
             cx,
         ) {
             Ok(handle) => {

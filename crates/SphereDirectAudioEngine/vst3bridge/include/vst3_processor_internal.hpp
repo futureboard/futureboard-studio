@@ -290,7 +290,9 @@ struct SimpleEventList final : Steinberg::Vst::IEventList {
   void sort_by_sample_offset() {
     if (count <= 1)
       return;
-    std::sort(
+    // Stable: events at one offset keep the order they were queued in (a
+    // note-off before the note-on that retriggers its key).
+    std::stable_sort(
         events.begin(), events.begin() + count,
         [](const Steinberg::Vst::Event &a, const Steinberg::Vst::Event &b) {
           return a.sampleOffset < b.sampleOffset;
@@ -377,6 +379,11 @@ struct SphereDauxVst3Processor {
   /// MIDI controller → parameter mapping (queried from `controller`). Null when
   /// the plugin exposes no IMidiMapping; CC events are then ignored.
   Steinberg::IPtr<Steinberg::Vst::IMidiMapping> midi_mapping;
+  /// The parameter flagged `kIsProgramChange`, for a program change the
+  /// plug-in does not map through IMidiMapping (most instruments expose
+  /// program selection this way instead). `program_change_steps < 0`: none.
+  Steinberg::Vst::ParamID program_change_param{0};
+  Steinberg::int32 program_change_steps{-1};
   Steinberg::IPtr<Steinberg::Vst::IConnectionPoint> component_connection;
   Steinberg::IPtr<Steinberg::Vst::IConnectionPoint> controller_connection;
   bool controller_is_component{false};
@@ -1013,6 +1020,33 @@ struct SphereDauxVst3Processor {
           Steinberg::FUnknownPtr<Steinberg::Vst::IMidiMapping>(controller);
       std::fprintf(stderr, "[DAUx VST3] IMidiMapping %s\n",
                    midi_mapping ? "available" : "not exposed");
+
+      // Resolved here, on the control thread, so a program change in
+      // process() is a lookup of two fields rather than a parameter scan.
+      // The root unit's program parameter wins; any other is the fallback.
+      const Steinberg::int32 param_count = controller->getParameterCount();
+      for (Steinberg::int32 i = 0; i < param_count; ++i) {
+        Steinberg::Vst::ParameterInfo info{};
+        if (controller->getParameterInfo(i, info) != Steinberg::kResultOk ||
+            (info.flags & Steinberg::Vst::ParameterInfo::kIsProgramChange) == 0) {
+          continue;
+        }
+        // 0 is `kRootUnitId` (ivstunits.h, not included here).
+        const bool root = info.unitId == 0;
+        if (program_change_steps < 0 || root) {
+          program_change_param = info.id;
+          program_change_steps = info.stepCount;
+        }
+        if (root) {
+          break;
+        }
+      }
+      if (program_change_steps >= 0) {
+        std::fprintf(stderr,
+                     "[DAUx VST3] program change parameter id=%u steps=%d\n",
+                     static_cast<unsigned>(program_change_param),
+                     static_cast<int>(program_change_steps));
+      }
     }
 
     return true;
@@ -1082,20 +1116,33 @@ struct SphereDauxVst3Processor {
           // the VST3 controller number (not masked to 7 bits: 128/129 are
           // aftertouch / pitch bend). The block-level value wins (our
           // SimpleParamValueQueue holds a single point).
-          if (!midi_mapping) {
-            continue;
-          }
           const auto ctrl = static_cast<Steinberg::Vst::CtrlNumber>(m.pitch);
           Steinberg::Vst::ParamID pid = 0;
-          if (midi_mapping->getMidiControllerAssignment(0, ch, ctrl, pid) ==
-              Steinberg::kResultOk) {
+          auto value = static_cast<Steinberg::Vst::ParamValue>(m.velocity);
+          bool mapped =
+              midi_mapping &&
+              midi_mapping->getMidiControllerAssignment(0, ch, ctrl, pid) ==
+                  Steinberg::kResultOk;
+          // A program change the plug-in does not map: its program-change
+          // parameter, with the program number (carried as n/127) turned
+          // into that parameter's own normalized step.
+          if (!mapped && ctrl == Steinberg::Vst::kCtrlProgramChange &&
+              program_change_steps >= 0) {
+            pid = program_change_param;
+            const int program =
+                std::max(0, std::min(127, static_cast<int>(m.velocity * 127.f + 0.5f)));
+            value = program_change_steps > 0
+                        ? std::min(1.0, static_cast<double>(program) /
+                                            static_cast<double>(program_change_steps))
+                        : 0.0;
+            mapped = true;
+          }
+          if (mapped) {
             Steinberg::int32 idx = 0;
             auto *q = param_changes_obj.addParameterData(pid, idx);
             if (q) {
               Steinberg::int32 dummy = 0;
-              q->addPoint(offset,
-                          static_cast<Steinberg::Vst::ParamValue>(m.velocity),
-                          dummy);
+              q->addPoint(offset, value, dummy);
               ++cc_mapped;
             }
           }

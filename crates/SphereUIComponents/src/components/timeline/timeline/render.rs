@@ -142,6 +142,7 @@ impl Render for Timeline {
                     || this.erase_clip_drag.is_some()
                     || this.automation_drag.is_some()
                     || this.automation_marquee.is_some()
+                    || this.automation_paint.is_some()
                     || this.tempo_drag.is_some()
                     || this.song_text_drag_preview.is_some()
                     || this.pan_last_position.is_some()
@@ -325,26 +326,7 @@ impl Render for Timeline {
             std::sync::Arc::new(on_clear_all_mutes);
 
         let on_clear_all_solos = cx.listener(|this, _: &(), _window, cx| {
-            let soloed: Vec<String> = this
-                .state
-                .tracks
-                .iter()
-                .filter(|track| track.solo)
-                .map(|track| track.id.clone())
-                .collect();
-            let edit = this.begin_track_edit(TrackEditScope::tracks(soloed));
-            let cleared = this.state.clear_all_track_solos();
-            if cleared.is_empty() {
-                return;
-            }
-            this.commit_track_edit("Clear All Solos", edit, false, cx);
-            if let Some(cb) = this.on_track_param_change.as_ref() {
-                for track_id in &cleared {
-                    cb(track_id.clone(), "solo".to_string(), 0.0);
-                }
-            }
-            this.mark_control_state_changed(cx);
-            cx.notify();
+            this.clear_all_solos(cx);
         });
         let on_clear_all_solos: std::sync::Arc<dyn Fn(&(), &mut Window, &mut gpui::App) + 'static> =
             std::sync::Arc::new(on_clear_all_solos);
@@ -662,6 +644,7 @@ impl Render for Timeline {
                     || this.automation_drag.is_some()
                     || this.automation_curve_drag.is_some()
                     || this.automation_marquee.is_some()
+                    || this.automation_paint.is_some()
                     || this.tempo_drag.is_some()
                     || this.ts_drag.is_some()
                     || this.marker_drag.is_some()
@@ -675,6 +658,7 @@ impl Render for Timeline {
                 && (this.automation_drag.is_some()
                     || this.automation_curve_drag.is_some()
                     || this.automation_marquee.is_some()
+                    || this.automation_paint.is_some()
                     || this.tempo_drag.is_some()
                     || this.ts_drag.is_some()
                     || this.marker_drag.is_some())
@@ -1800,6 +1784,19 @@ impl Render for Timeline {
             .clip_clone_hint
             .as_ref()
             .and_then(|hint| clip_clone_hint_overlay(hint, state));
+        let clip_move_overlay = self
+            .clip_move_origin
+            .as_ref()
+            .zip(self.clip_drag_target_track_index)
+            .and_then(|(origin, target)| {
+                clip_move_hint_overlay(
+                    origin,
+                    target,
+                    self.clip_move_hint_from,
+                    self.clip_move_hint_generation,
+                    state,
+                )
+            });
         let chord_drop_overlay =
             crate::components::timeline::chord_track::chord_drop_clip_overlay(state);
         let plugin_drop_overlay = self
@@ -2487,6 +2484,14 @@ impl Render for Timeline {
             // Both axes share the factor and its sign; zoom ignores the
             // Natural Scroll preference, which only flips panning.
             let factor = wheel_zoom_factor(zoom_delta);
+            if zoom_axis == WheelZoomAxis::Waveform {
+                // Display only: no undo entry and nothing dirtied. The lanes
+                // repaint off the timeline's notify.
+                if this.state.scale_waveform_zoom(factor) {
+                    cx.notify();
+                }
+                return;
+            }
             if zoom_axis == WheelZoomAxis::Vertical {
                 // A view change like horizontal zoom: no undo entry, and every
                 // tick that changes a row marks the project view-dirty, never
@@ -2641,9 +2646,12 @@ impl Render for Timeline {
             .flex_1()
             .h_full()
             .bg(Colors::surface_base())
-            .border_l(px(1.0))
-            .border_r(px(1.0))
-            .border_color(Colors::border_subtle())
+            // No side borders of its own: each seam belongs to the panel
+            // beside it (the browser's right edge, the dock's left edge, the
+            // bottom panel's top edge), so every seam is one 1px line. Its own
+            // borders doubled the side seams to 2px against the bottom seam's
+            // 1px, drew a line against the window edge with a panel closed,
+            // and took 2px the viewport width never accounted for.
             .relative()
             // Every press starts a new gesture; a cancelled clip drag's
             // refusal ends here, before any clip sees the press.
@@ -2659,6 +2667,7 @@ impl Render for Timeline {
                             || this.erase_clip_drag.is_some()
                             || this.automation_drag.is_some()
                             || this.automation_marquee.is_some()
+                            || this.automation_paint.is_some()
                             || this.song_text_drag_preview.is_some()
                             || this.pan_last_position.is_some()
                             || this.state.track_height_resize.is_some()
@@ -2961,6 +2970,17 @@ impl Render for Timeline {
                     .overflow_hidden()
                     .child(overlay)
             }))
+            // Clip move across tracks: where the clips will land.
+            .children(clip_move_overlay.map(|overlay| {
+                div()
+                    .absolute()
+                    .left(px(HEADER_WIDTH))
+                    .right_0()
+                    .top(px(content_top))
+                    .bottom_0()
+                    .overflow_hidden()
+                    .child(overlay)
+            }))
             // Alt-drag clone ghost. Like the MIDI pen/file-drop previews, this
             // stays transient until the user releases the pointer.
             .children(clip_clone_overlay.map(|overlay| {
@@ -2993,6 +3013,18 @@ impl Render for Timeline {
                         state.active_tool,
                         on_select_tool.clone(),
                         on_toolbar_drag_start,
+                        state.waveform_zoom,
+                        {
+                            let target = cx.entity().clone();
+                            std::sync::Arc::new(move |steps: &i32, _window, cx| {
+                                let steps = *steps;
+                                let _ = target.update(cx, |this, cx| {
+                                    if this.state.step_waveform_zoom(steps) {
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                        },
                     )),
             )
             // 5. Vertical scrollbar (right edge, over the lane area)
@@ -3120,11 +3152,10 @@ pub(crate) fn vertical_scrollbar(
         // y minus the thumb half-height when clicking above the thumb,
         // and snap the thumb center to the click otherwise.
         let click_y: f32 = event.position.y.into();
-        // The scrollbar sits at top=RULER_HEIGHT inside the timeline.
-        // Re-derive the local y by subtracting an estimated chrome
-        // height; clamp with `max_scroll` so any over/under-estimate
-        // still yields a valid scroll position.
-        let local = (click_y - 36.0 - content_top).max(0.0);
+        // The track starts `content_top` below the timeline's own top, which
+        // is where the measured origin puts it in the window. (A fixed 36px
+        // guess here missed the chrome's real height by 40px.)
+        let local = (click_y - this.state.timeline_origin_y() - content_top).max(0.0);
         let frac = (local / track_h.max(1.0)).clamp(0.0, 1.0);
         this.state.set_scroll_immediate(
             this.state.viewport.scroll_x,
@@ -3303,18 +3334,23 @@ pub(crate) enum WheelZoomAxis {
     Horizontal,
     /// The height of every arrangement track.
     Vertical,
+    /// The height of the waveforms drawn in audio clips (display only).
+    Waveform,
 }
 
 /// Map wheel modifiers onto a zoom axis, or `None` to pan.
 ///
-/// Ctrl and Cmd are one modifier here, as in the keymap. Ctrl/Cmd zooms time;
-/// adding Alt zooms track heights, whatever Shift says. Without Ctrl/Cmd the
-/// wheel pans, so Alt alone still pans.
+/// Ctrl and Cmd are one modifier here, as in the keymap. Ctrl/Cmd zooms time,
+/// Ctrl/Cmd+Shift track heights, and Ctrl/Cmd+Alt the waveforms, whatever
+/// Shift says. Without Ctrl/Cmd the wheel pans, so Alt or Shift alone still
+/// pans.
 pub(crate) fn wheel_zoom_axis(modifiers: &gpui::Modifiers) -> Option<WheelZoomAxis> {
     if !(modifiers.control || modifiers.platform) {
         return None;
     }
     Some(if modifiers.alt {
+        WheelZoomAxis::Waveform
+    } else if modifiers.shift {
         WheelZoomAxis::Vertical
     } else {
         WheelZoomAxis::Horizontal
@@ -3636,6 +3672,191 @@ fn clip_clone_hint_overlay(
         );
 
     Some(div().absolute().inset_0().child(ghost).into_any_element())
+}
+
+/// Where a clip move across tracks will land.
+///
+/// While a clip is dragged the clips follow the pointer along their own
+/// track, but the move to another track only happens on the drop — so without
+/// this the clip sat in its old lane while the pointer was two tracks away.
+/// For every clip the drag carries, this draws:
+///
+/// * a ghost at its exact landing place — the destination track, shifted by
+///   the same number of rows the drop will shift it, at the start the drop will
+///   commit — in the destination's colour, with the target lane washed;
+/// * the clip where it is now, veiled as lifted, so the move does not read as
+///   a copy;
+/// * on the grabbed clip's ghost, what the drop will do: "Move to <track> ·
+///   <position>" (or "Move N clips to …").
+///
+/// Motion confirms each change of track and rests: the ghosts slide from the
+/// track they were over (`motion::MICRO_MS`) and flash once
+/// (`motion::SLOW_MS`). Nothing loops. On its own track the clip itself is
+/// the preview, so nothing is drawn.
+fn clip_move_hint_overlay(
+    origin: &ClipMoveOrigin,
+    target_index: usize,
+    from_index: Option<usize>,
+    generation: u64,
+    state: &TimelineState,
+) -> Option<gpui::AnyElement> {
+    let source_index = state.tracks.iter().position(|track| {
+        track
+            .clips
+            .iter()
+            .any(|clip| clip.id == origin.anchor_clip_id)
+    })?;
+    let delta = target_index as isize - source_index as isize;
+    if delta == 0 {
+        return None;
+    }
+    let max_index = state.tracks.len().saturating_sub(1) as isize;
+    let row_layout = state.track_row_layout();
+    let scroll_y = state.viewport.scroll_y;
+    let pad = 7.0;
+    let row_top = |index: usize| row_layout.row_for_index(index).map(|row| row.y - scroll_y);
+    // How far the ghosts slide in from: the rows between the track they were
+    // over and the one they are over now.
+    let slide_from = from_index
+        .and_then(|from| Some(row_top(from)? - row_top(target_index)?))
+        .unwrap_or(0.0);
+    let generation = generation as usize;
+    let slide = Duration::from_millis(crate::theme::motion::MICRO_MS);
+    let flash = Duration::from_millis(crate::theme::motion::SLOW_MS);
+    let target_track = state.tracks.get(target_index)?;
+    let color = target_track.color;
+
+    let mut veils = Vec::new();
+    let mut ghosts = Vec::new();
+    let mut lanes = Vec::new();
+    let count = origin.clips.len();
+    for snapshot in &origin.clips {
+        let Some((track_index, clip)) = state.tracks.iter().enumerate().find_map(|(i, track)| {
+            track
+                .clips
+                .iter()
+                .find(|clip| clip.id == snapshot.clip.id)
+                .map(|clip| (i, clip))
+        }) else {
+            continue;
+        };
+        let landing = (track_index as isize + delta).clamp(0, max_index) as usize;
+        let (Some(from_row), Some(to_row)) = (
+            row_layout.row_for_index(track_index),
+            row_layout.row_for_index(landing),
+        ) else {
+            continue;
+        };
+        if to_row.height <= 0.0 {
+            continue;
+        }
+        let x = state.beats_to_x(clip.start_beat).max(0.0);
+        let width = (state.beats_to_x(clip.start_beat + clip.duration_beats) - x).max(10.0);
+
+        // Lifted: the clip is leaving this lane.
+        if from_row.height > 0.0 {
+            veils.push(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(from_row.y - scroll_y + pad))
+                    .w(px(width))
+                    .h(px((from_row.height - pad * 2.0).max(8.0)))
+                    .rounded(px(crate::theme::radius::CONTROL))
+                    .bg(Colors::with_alpha(Colors::surface_base(), 0.55))
+                    .border(px(1.0))
+                    .border_color(Colors::with_alpha(Colors::text_muted(), 0.5))
+                    .into_any_element(),
+            );
+        }
+
+        let lane_color = state.tracks.get(landing).map_or(color, |t| t.color);
+        if !lanes.contains(&landing) {
+            lanes.push(landing);
+        }
+        let anchor = snapshot.clip.id == origin.anchor_clip_id;
+        let label = anchor.then(|| {
+            let what = if count > 1 {
+                format!("Move {count} clips to")
+            } else {
+                "Move to".to_string()
+            };
+            format!(
+                "{what} {} \u{00B7} {}",
+                target_track.name,
+                state.format_position(clip.start_beat)
+            )
+        });
+        let top = to_row.y - scroll_y + pad;
+        ghosts.push(
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(top))
+                .w(px(width))
+                .h(px((to_row.height - pad * 2.0).max(8.0)))
+                .rounded(px(crate::theme::radius::CONTROL))
+                .border(px(1.5))
+                .border_color(lane_color)
+                .bg(Colors::with_alpha(lane_color, 0.22))
+                .shadow_lg()
+                .overflow_hidden()
+                .children(label.map(|label| {
+                    div()
+                        .px(px(7.0))
+                        .pt(px(4.0))
+                        .truncate()
+                        .text_size(px(crate::theme::typography::DENSE_LABEL))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(Colors::text_primary())
+                        .child(label)
+                }))
+                .with_animation(
+                    ("timeline-clip-move-ghost", generation * 4096 + ghosts.len()),
+                    Animation::new(slide).with_easing(gpui::ease_out_quint()),
+                    move |this, t| this.top(px(top + slide_from * (1.0 - t))),
+                )
+                .into_any_element(),
+        );
+    }
+    if ghosts.is_empty() {
+        return None;
+    }
+
+    // The destination lanes, washed so the target reads at a glance; the
+    // wash flashes once on each change of track.
+    let washes = lanes.into_iter().filter_map(|index| {
+        let row = row_layout.row_for_index(index)?;
+        let lane_color = state.tracks.get(index)?.color;
+        Some(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(row.y - scroll_y))
+                .h(px(row.height))
+                .bg(Colors::with_alpha(lane_color, 0.08))
+                .border_t(px(1.0))
+                .border_b(px(1.0))
+                .border_color(Colors::with_alpha(lane_color, 0.45))
+                .with_animation(
+                    ("timeline-clip-move-lane", generation * 4096 + index),
+                    Animation::new(flash).with_easing(gpui::ease_out_quint()),
+                    move |this, t| this.bg(Colors::with_alpha(lane_color, 0.22 - 0.14 * t)),
+                )
+                .into_any_element(),
+        )
+    });
+
+    Some(
+        div()
+            .absolute()
+            .inset_0()
+            .children(washes)
+            .children(veils)
+            .children(ghosts)
+            .into_any_element(),
+    )
 }
 
 /// Live ghost-clip overlay for the in-flight pen MIDI clip draw. Translucent,
@@ -3960,17 +4181,18 @@ mod midi_clip_draw_tests {
     }
 
     #[test]
-    fn wheel_zoom_axis_follows_ctrl_or_cmd_and_alt() {
-        use WheelZoomAxis::{Horizontal, Vertical};
+    fn wheel_zoom_axis_follows_ctrl_or_cmd_shift_and_alt() {
+        use WheelZoomAxis::{Horizontal, Vertical, Waveform};
         // (Ctrl, Cmd, Alt, Shift) -> axis; `None` pans.
         let cases = [
             ((true, false, false, false), Some(Horizontal)),
             ((false, true, false, false), Some(Horizontal)),
-            ((true, false, false, true), Some(Horizontal)),
-            ((true, false, true, false), Some(Vertical)),
-            ((false, true, true, false), Some(Vertical)),
-            ((true, false, true, true), Some(Vertical)),
-            ((true, true, true, true), Some(Vertical)),
+            ((true, false, false, true), Some(Vertical)),
+            ((false, true, false, true), Some(Vertical)),
+            ((true, false, true, false), Some(Waveform)),
+            ((false, true, true, false), Some(Waveform)),
+            ((true, false, true, true), Some(Waveform)),
+            ((true, true, true, true), Some(Waveform)),
             // Without Ctrl/Cmd the wheel pans, Alt or not.
             ((false, false, true, false), None),
             ((false, false, false, true), None),
@@ -3993,7 +4215,7 @@ mod midi_clip_draw_tests {
     /// Cmd+Alt+Shift wheel ticks zoom as the unshifted ones do.
     #[test]
     fn a_wheel_that_shift_turned_sideways_still_zooms() {
-        use WheelZoomAxis::{Horizontal, Vertical};
+        use WheelZoomAxis::Vertical;
         // Unshifted: the vertical wheel only; a sideways swipe does not zoom.
         assert_eq!(wheel_zoom_delta((0.0, 30.0), false), 30.0);
         assert_eq!(wheel_zoom_delta((30.0, 0.0), false), 0.0);
@@ -4002,9 +4224,9 @@ mod midi_clip_draw_tests {
         assert_eq!(wheel_zoom_delta((-30.0, 0.005), true), -30.0);
         // Shift where the wheel stays vertical: y still decides.
         assert_eq!(wheel_zoom_delta((5.0, -30.0), true), -30.0);
-        // Cmd+Shift zooms time, Cmd+Alt+Shift track heights; wheel up zooms
-        // in and wheel down zooms out on both.
-        for (alt, axis) in [(false, Horizontal), (true, Vertical)] {
+        // Cmd+Shift zooms track heights, Cmd+Alt+Shift the waveforms; wheel
+        // up zooms in and wheel down zooms out on both.
+        for (alt, axis) in [(false, Vertical), (true, WheelZoomAxis::Waveform)] {
             let modifiers = gpui::Modifiers {
                 platform: true,
                 alt,
@@ -4019,7 +4241,7 @@ mod midi_clip_draw_tests {
 
     /// Track zoom uses the same factor as time zoom, so wheel up grows both.
     #[test]
-    fn ctrl_alt_wheel_up_grows_track_heights_and_down_shrinks_them() {
+    fn ctrl_shift_wheel_up_grows_track_heights_and_down_shrinks_them() {
         use crate::components::timeline::timeline_state::{CreateTrackOptions, InputMonitorMode};
 
         for (delta, grows) in [(30.0, true), (-30.0, false)] {

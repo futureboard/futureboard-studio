@@ -768,6 +768,13 @@ void SphereDauxClapProcessor::build_events(
           static_cast<uint8_t>(0xE0 | static_cast<uint8_t>(channel));
       cell.midi.data[1] = static_cast<uint8_t>(bend & 0x7F);
       cell.midi.data[2] = static_cast<uint8_t>((bend >> 7) & 0x7F);
+    } else if (src.pitch == 130) {
+      // Program change (VST3 kCtrlProgramChange), program as n/127.
+      cell.midi.data[0] =
+          static_cast<uint8_t>(0xC0 | static_cast<uint8_t>(channel));
+      cell.midi.data[1] =
+          static_cast<uint8_t>(std::min(127, static_cast<int>(normalized * 127.0 + 0.5)));
+      cell.midi.data[2] = 0;
     } else {
       cell.midi.data[0] =
           static_cast<uint8_t>(0xB0 | static_cast<uint8_t>(channel));

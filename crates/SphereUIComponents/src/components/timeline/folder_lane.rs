@@ -64,6 +64,10 @@ pub fn collapsed_folder_summary(
                 band as f32 * (band_h + BAND_GAP)
             };
         for clip in &member.clips {
+            // An alternate take is not in its own row's lane, so not here.
+            if member.is_hidden_take_clip(&clip.id) {
+                continue;
+            }
             let (left, width) = state.clip_lane_x_span(clip);
             if left + width < 0.0 || left > viewport_w {
                 continue;
@@ -71,8 +75,7 @@ pub fn collapsed_folder_summary(
             if blocks.len() >= MAX_BLOCKS {
                 break 'members;
             }
-            // A muted clip (an inactive take among them) is drawn faint, the
-            // way its own row draws it.
+            // A muted clip is drawn faint, the way its own row draws it.
             let alpha = if clip.muted || member.muted {
                 0.22
             } else {

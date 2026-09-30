@@ -251,6 +251,12 @@ pub struct Timeline {
     /// jumped to the pointer on the first move.
     clip_resize_grab_beats: f32,
     clip_drag_target_track_index: Option<usize>,
+    /// The track the move hint's ghost was over before the latest change,
+    /// so it slides from there (`None`: it has just appeared).
+    clip_move_hint_from: Option<usize>,
+    /// Bumped whenever a clip drag's target track changes: keys the ghost's
+    /// one-shot slide and flash.
+    clip_move_hint_generation: u64,
     clip_clone_drag_id: Option<String>,
     /// Pen-tool click-drag MIDI clip preview, live until mouse-up creates the clip.
     pen_clip_draw: Option<ClipDrawPreview>,
@@ -272,6 +278,8 @@ pub struct Timeline {
     automation_curve_drag: Option<crate::components::timeline::timeline_state::AutomationCurveDrag>,
     /// In-flight automation marquee (rubber-band) selection. UI-only.
     automation_marquee: Option<crate::components::timeline::timeline_state::AutomationMarquee>,
+    /// Pen-tool freehand stroke across an automation lane, while it is drawn.
+    automation_paint: Option<crate::components::timeline::timeline_state::AutomationPaintStroke>,
     /// Hovered automation point / curve segment under the cursor. UI-only; drives
     /// the per-segment highlight + hover cursor. Self-corrects on mouse-move and
     /// is cleared on hover-out, so it is never persisted or reset on gesture end.
@@ -316,7 +324,7 @@ pub struct Timeline {
     /// `region_gesture_origin`.
     marker_gesture_origin: Option<Vec<TimelineMarkerState>>,
     pan_last_position: Option<gpui::Point<gpui::Pixels>>,
-    /// The Ctrl/Cmd+Alt+wheel track-zoom burst in flight: the heights it
+    /// The Ctrl/Cmd+Shift+wheel track-zoom burst in flight: the heights it
     /// scales from. Ends on wheel idle or when anything else changes a height.
     track_zoom_session: Option<crate::components::timeline::timeline_state::TrackHeightZoomSession>,
     /// View-only floating-toolbar placement. It deliberately never enters the
@@ -392,6 +400,10 @@ pub struct Timeline {
     /// The other selected audio clips a gain or fade gesture on
     /// `clip_process_origin` carries along, as the press found them.
     clip_process_peers: Vec<ClipState>,
+    /// The track as it was before the Inspector's spatial gesture now in
+    /// flight (height, spread, width, LFE): its previews apply live and the
+    /// release records them as one undo step.
+    room_edit: Option<crate::components::timeline::timeline_state::PendingTrackEdit>,
     /// The ruler's grid-resolution dropdown is open.
     snap_menu_open: bool,
     /// Where the Smart Tool's razor line is, shared with its overlay.

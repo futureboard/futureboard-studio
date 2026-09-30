@@ -19,7 +19,7 @@
 //!   header            ← identity: icon, name, type badge
 //!   scroll body
 //!     section card    ← surface_card + border_subtle + radius::SURFACE
-//!       header        ← icon + uppercase title
+//!       title         ← (icon +) title, inside the plate
 //!       row           ← label column | control
 //!       row
 //!     section card
@@ -35,11 +35,11 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, svg, App, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    Styled, Window,
+    App, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
+    Window, div, px, svg,
 };
 
-use crate::theme::{radius, size, space, typography, Colors};
+use crate::theme::{Colors, radius, size, space, typography};
 
 // ── Metrics ──────────────────────────────────────────────────────────────────
 // Named so a tab never writes a literal, and so a density change is one edit.
@@ -58,8 +58,8 @@ pub const ROW_MIN_HEIGHT: f32 = size::DEFAULT;
 /// frame in the panel now, so it carries the breathing room the removed inner
 /// borders used to fake.
 pub const CARD_PAD: f32 = space::LOOSE;
-/// Corner of a card. Generous enough to read as a panel rather than as a box.
-pub const CARD_RADIUS: f32 = 14.0;
+/// Corner of a card: a containing surface.
+pub const CARD_RADIUS: f32 = radius::SURFACE;
 /// Gap between a card's rows.
 pub const CARD_ROW_GAP: f32 = space::SNUG;
 /// One round latching state button (M / S / I / R).
@@ -98,11 +98,61 @@ pub fn ins_body(id: &'static str) -> gpui::Stateful<gpui::Div> {
         .p(px(SECTION_PAD))
 }
 
-/// Panel identity header: what is being inspected, in one line.
+/// Panel identity header: what is being inspected.
 ///
-/// The hue rail carries track/clip identity; the badge names the kind. Both are
-/// tinted from `accent` — the caller's semantic colour — rather than from the
-/// UI accent, so selection cyan keeps meaning "selected".
+/// A colour swatch carries the object's own hue (a track's colour, a clip's
+/// kind), the name reads first, and the kind sits under it in words — so the
+/// accent cyan never has to mean "this is a track".
+pub fn ins_identity(
+    accent: gpui::Rgba,
+    title: impl Into<String>,
+    subtitle: impl Into<String>,
+) -> gpui::Div {
+    let subtitle = subtitle.into();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::BASE))
+        .flex_shrink_0()
+        .min_w_0()
+        .child(
+            div()
+                .w(px(space::TIGHT))
+                .h(px(size::COMFORTABLE))
+                .flex_shrink_0()
+                .rounded(px(radius::PILL))
+                .bg(accent),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(space::HAIR))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(typography::UI_MD))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(Colors::text_primary())
+                        .child(title.into()),
+                )
+                .when(!subtitle.is_empty(), |col| {
+                    col.child(
+                        div()
+                            .truncate()
+                            .text_size(px(typography::DENSE_LABEL))
+                            .text_color(Colors::text_muted())
+                            .child(subtitle),
+                    )
+                }),
+        )
+}
+
+/// [`ins_identity`] with an icon and a type badge, for the dock tabs that
+/// name their object by kind rather than by track (Solfège, Chords).
 pub fn ins_header(
     icon: &'static str,
     accent: gpui::Rgba,
@@ -110,21 +160,13 @@ pub fn ins_header(
     badge: impl Into<String>,
 ) -> impl IntoElement {
     let badge = badge.into();
-    let mut row = div()
+    div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(space::BASE))
         .h(px(size::PROMINENT))
         .flex_shrink_0()
-        .child(
-            div()
-                .w(px(3.0))
-                .h(px(18.0))
-                .flex_shrink_0()
-                .rounded(px(radius::PILL))
-                .bg(accent),
-        )
         .child(
             svg()
                 .path(icon)
@@ -142,154 +184,112 @@ pub fn ins_header(
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(Colors::text_primary())
                 .child(title.into()),
-        );
-    if !badge.is_empty() {
-        row = row.child(ins_badge(badge, accent));
-    }
-    row
+        )
+        .when(!badge.is_empty(), |row| row.child(ins_badge(badge, accent)))
 }
 
 // ── Sections ─────────────────────────────────────────────────────────────────
+//
+// Every section is one plate: `surface_card` on the panel, one subtle
+// hairline, the surface radius — and its title inside, at the top, in the
+// same place on every card. Value and the hairline separate the plate from
+// the panel; no rules inside it, no uppercase, no second surface.
 
-/// A section's header row: icon, uppercase title, and a hairline that runs to
-/// the card edge so a long stack of sections stays scannable at a glance.
+/// The plate every section is drawn on.
+fn plate() -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(CARD_ROW_GAP))
+        .px(px(CARD_PAD))
+        .pt(px(space::BASE))
+        .pb(px(CARD_PAD))
+        .rounded(px(CARD_RADIUS))
+        .bg(Colors::surface_card())
+        .border(px(1.0))
+        .border_color(Colors::border_subtle())
+}
+
+/// A section's title, at the top of its plate, with an optional glyph.
 pub fn ins_section_header(icon: &'static str, title: impl Into<String>) -> impl IntoElement {
+    section_title(Some(icon), title.into())
+}
+
+fn section_title(icon: Option<&'static str>, title: String) -> gpui::Div {
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(space::SNUG))
-        .h(px(size::MICRO))
+        .h(px(size::DENSE))
         .flex_shrink_0()
-        .child(
+        .min_w_0()
+        .children(icon.map(|icon| {
             svg()
                 .path(icon)
                 .w(px(ICON))
                 .h(px(ICON))
                 .flex_shrink_0()
-                .text_color(Colors::text_muted()),
-        )
+                .text_color(Colors::text_muted())
+        }))
         .child(
             div()
-                .flex_shrink_0()
+                .flex_1()
+                .min_w_0()
+                .truncate()
                 .text_size(px(typography::UI_XS))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(Colors::text_secondary())
-                .child(title.into()),
+                .child(title),
         )
-        .child(div().flex_1().h(px(1.0)).bg(Colors::border_subtle()))
 }
 
 /// A section card with a leading glyph, for the dock tabs that identify their
 /// sections by icon (Solfège, Settings).
-///
-/// Same surface as [`ins_card`] — value, not a border: the fill difference is
-/// what separates it from the panel, and an outline on top of that is a second
-/// edge saying the same thing.
 pub fn ins_section(
     icon: &'static str,
     title: impl Into<String>,
     child: impl IntoElement,
 ) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(CARD_ROW_GAP))
-        .p(px(CARD_PAD))
-        .rounded(px(CARD_RADIUS))
-        .bg(Colors::surface_card())
-        .child(ins_section_header(icon, title))
+    plate()
+        .child(section_title(Some(icon), title.into()))
         .child(div().flex().flex_col().gap(px(ROW_GAP)).child(child))
 }
 
-/// The bare section card surface, for call sites that build their children up
-/// incrementally (`section = section.child(..)`) and so cannot hand
-/// [`ins_section`] a finished child.
-///
-/// Same surface, same padding, same gap — pair it with [`ins_section_header`]
-/// as the first child.
+/// The bare plate, for call sites that build their children up one at a time
+/// (`section = section.child(..)`). Pair it with [`ins_section_header`] as the
+/// first child.
 pub fn ins_section_container() -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(CARD_ROW_GAP))
-        .p(px(CARD_PAD))
-        .rounded(px(CARD_RADIUS))
-        .bg(Colors::surface_card())
+    plate()
 }
 
-/// Section card whose header carries a trailing control (an Add button, a
-/// count, a toggle). Same surface as [`ins_section`] — the header simply has a
-/// third slot.
+/// A section card whose title carries a trailing control (an Add button, a
+/// count, a toggle).
 pub fn ins_section_with_action(
     icon: &'static str,
     title: impl Into<String>,
     action: impl IntoElement,
     child: impl IntoElement,
 ) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(CARD_ROW_GAP))
-        .p(px(CARD_PAD))
-        .rounded(px(CARD_RADIUS))
-        .bg(Colors::surface_card())
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(space::SNUG))
-                .flex_shrink_0()
-                .child(ins_section_header(icon, title))
-                .child(div().flex_shrink_0().child(action)),
-        )
+    plate()
+        .child(section_title(Some(icon), title.into()).child(div().flex_shrink_0().child(action)))
         .child(div().flex().flex_col().gap(px(ROW_GAP)).child(child))
 }
 
 // ── The card ─────────────────────────────────────────────────────────────────
 
-/// A section card: its title, its rule, and its rows.
+/// A section card: its title and its rows.
 ///
 /// ```txt
-/// ┌─────────────────────────────────────────┐
-/// │  TRACK ──────────────────────────────── │  ← title, then a rule
-/// │  Type                             Audio │  ← label left, value right
-/// │  Name        ( Audio Track 1 UwU      ) │  ← controls are pills
-/// │  Volume      ────────────●──   +00 dB   │
-/// └─────────────────────────────────────────┘
+/// ╭─────────────────────────────────────────╮
+/// │ Track                                   │  ← title, inside the plate
+/// │ Name      ( Audio Track 1             ) │  ← label | control
+/// │ Volume    ──────────●────────  -3.0 dB  │
+/// ╰─────────────────────────────────────────╯
 /// ```
-///
-/// The rule after the title is doing real work: it gives the eye a horizontal
-/// line to travel when scanning a stack of cards for a heading, and it closes
-/// the header across the full width so the title reads as belonging to the rows
-/// under it rather than floating between two cards.
 pub fn ins_card(title: impl Into<String>, body: impl IntoElement) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(CARD_ROW_GAP))
-        .p(px(CARD_PAD))
-        .rounded(px(CARD_RADIUS))
-        .bg(Colors::surface_card())
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(space::LOOSE))
-                .h(px(size::DENSE))
-                .flex_shrink_0()
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(typography::UI_XS))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(Colors::text_primary())
-                        .child(title.into().to_uppercase()),
-                )
-                .child(div().flex_1().h(px(1.0)).bg(Colors::border_subtle())),
-        )
+    plate()
+        .child(section_title(None, title.into()))
         .child(div().flex().flex_col().gap(px(CARD_ROW_GAP)).child(body))
 }
 

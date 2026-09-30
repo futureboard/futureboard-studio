@@ -69,6 +69,7 @@ pub fn prime() {
     let _ = sender();
     let _ = audio_file_sender();
     let _ = ara_sender();
+    let _ = midi_sender();
 }
 
 /// Hand a retired runtime graph to the background dropper.
@@ -87,6 +88,30 @@ pub fn retire(old: RuntimeProject) {
 #[inline]
 pub fn retire_audio_file(old: Box<AudioFileBuffer>) {
     if let Err(err) = audio_file_sender().try_send(old) {
+        drop(err.into_inner());
+    }
+}
+
+fn midi_sender() -> &'static Sender<Box<crate::runtime::RuntimeMidiData>> {
+    static GY: OnceLock<Sender<Box<crate::runtime::RuntimeMidiData>>> = OnceLock::new();
+    GY.get_or_init(|| {
+        let (tx, rx) = bounded::<Box<crate::runtime::RuntimeMidiData>>(GRAVEYARD_CAPACITY);
+        let _ = std::thread::Builder::new()
+            .name("daux-midi-graveyard".to_string())
+            .spawn(move || {
+                while let Ok(old) = rx.recv() {
+                    drop(old);
+                }
+            });
+        tx
+    })
+}
+
+/// Dispose a replaced MIDI schedule away from the realtime callback: its event
+/// lists are heap memory the callback must not free.
+#[inline]
+pub fn retire_midi(old: Box<crate::runtime::RuntimeMidiData>) {
+    if let Err(err) = midi_sender().try_send(old) {
         drop(err.into_inner());
     }
 }

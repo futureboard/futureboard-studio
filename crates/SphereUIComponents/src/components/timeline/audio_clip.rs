@@ -504,7 +504,17 @@ pub(crate) fn audio_clip_timeline_geometry(clip: &ClipState, state: &TimelineSta
 #[derive(Clone, Debug)]
 struct AudioClipProcessDrag {
     id: String,
+    /// Gain drags only: where in the control the press landed (px from its
+    /// left edge) and the gain the clip had then. The drag is relative to
+    /// them, so grabbing the control never jumps the level to the pointer.
+    start_x: f32,
+    start_gain: f32,
 }
+
+/// dB per pixel of a gain drag: 40 dB across 160 px, and a fifth of that with
+/// Shift held for fine trims.
+const GAIN_DRAG_DB_PER_PX: f32 = 0.25;
+const GAIN_DRAG_FINE_DB_PER_PX: f32 = 0.05;
 
 impl Render for AudioClipProcessDrag {
     fn render(&mut self, _w: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
@@ -533,6 +543,7 @@ fn gain_to_norm(gain: f32) -> f32 {
     }
 }
 
+#[cfg(test)]
 fn norm_to_gain(norm: f32) -> f32 {
     let norm = norm.clamp(0.0, 1.0);
     let db = if norm <= 0.5 {
@@ -613,6 +624,9 @@ fn compact_gain_control(
     }
     control
         .cursor(gpui::CursorStyle::ResizeLeftRight)
+        .tooltip(crate::components::fb_tooltip(
+            "Clip gain — drag left/right, Shift for fine, double-click for 0 dB",
+        ))
         .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
             cx.stop_propagation();
             reset_preview(
@@ -636,18 +650,34 @@ fn compact_gain_control(
         .on_drag(
             AudioClipProcessDrag {
                 id: move_id.clone(),
+                start_x: 0.0,
+                start_gain: clip.gain,
             },
-            |drag, _offset, _window, cx| cx.new(|_| drag.clone()),
+            |drag, offset, _window, cx| {
+                let started = AudioClipProcessDrag {
+                    start_x: f32::from(offset.x),
+                    ..drag.clone()
+                };
+                cx.new(|_| started)
+            },
         )
         .on_drag_move::<AudioClipProcessDrag>(
             move |event: &DragMoveEvent<AudioClipProcessDrag>, window, cx| {
-                if event.drag(cx).id != move_id {
+                let drag = event.drag(cx);
+                if drag.id != move_id {
                     return;
                 }
-                let x: f32 = event.event.position.x.into();
-                let ox: f32 = event.bounds.origin.x.into();
-                let width = f32::from(event.bounds.size.width).max(1.0);
-                let gain = norm_to_gain((x - ox) / width);
+                // Relative to the press: the level moves with the pointer
+                // from wherever it was, instead of jumping to where the
+                // pointer landed on a 62 px slider.
+                let x = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
+                let per_px = if event.event.modifiers.shift {
+                    GAIN_DRAG_FINE_DB_PER_PX
+                } else {
+                    GAIN_DRAG_DB_PER_PX
+                };
+                let db = gain_to_db(drag.start_gain) + (x - drag.start_x) * per_px;
+                let gain = db_to_gain(db);
                 on_preview(
                     &(preview_id.clone(), AudioClipProcessUpdate::Gain(gain)),
                     window,
@@ -874,7 +904,11 @@ fn fade_handle(
             },
         )
         .on_drag(
-            AudioClipProcessDrag { id: drag_id },
+            AudioClipProcessDrag {
+                id: drag_id,
+                start_x: 0.0,
+                start_gain: 0.0,
+            },
             |drag, _offset, _window, cx| cx.new(|_| drag.clone()),
         )
         .on_drag_move::<AudioClipProcessDrag>(
@@ -1907,6 +1941,38 @@ mod tests {
             (after - before).abs() < 0.05,
             "a tempo-synced clip keeps {before} beats, got {after}"
         );
+    }
+
+    /// A Warp clip is locked to the tempo as well: a tempo change must leave
+    /// its bar count alone and change its speed, and changing back must give
+    /// the speed back. Before, it kept its seconds like an unlocked clip.
+    #[test]
+    fn a_warp_clip_keeps_its_bars_when_the_tempo_changes() {
+        use crate::components::timeline::timeline_state::StretchTiming;
+        let mut clip = two_second_clip("clip-warp");
+        clip.stretch = clip.stretch.with_timing(StretchTiming::Warp, 120.0);
+        let mut state = state_with_clip(clip, 120.0);
+        let before_beats = state.tracks[0].clips[0].duration_beats;
+        let before_ratio = state.tracks[0].clips[0].stretch.stretch_ratio;
+
+        state.bpm = 240.0;
+        state.reconcile_audio_clip_lengths();
+        let clip = &state.tracks[0].clips[0];
+        assert!(
+            (clip.duration_beats - before_beats).abs() < 0.05,
+            "a warped clip keeps {before_beats} beats, got {}",
+            clip.duration_beats
+        );
+        assert!(
+            (clip.stretch.stretch_ratio - before_ratio * 0.5).abs() < 1.0e-9,
+            "twice the tempo plays it twice as fast"
+        );
+
+        state.bpm = 120.0;
+        state.reconcile_audio_clip_lengths();
+        let clip = &state.tracks[0].clips[0];
+        assert!((clip.stretch.stretch_ratio - before_ratio).abs() < 1.0e-9);
+        assert!((clip.duration_beats - before_beats).abs() < 0.05);
     }
 
     /// The drawn width and the model's bar count describe one object: after a

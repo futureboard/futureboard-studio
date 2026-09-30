@@ -1,19 +1,23 @@
-//! Arrangement export UI: settings model, the external export window, and the
-//! background export job. Rendering/encoding lives in the engine + SphereEncoder;
-//! this layer collects settings, builds a plain request + snapshot, and drives a
-//! cancellable background job without holding any GPUI borrow during the work.
+//! Arrangement export UI: the settings model, the Export dialog that chooses
+//! what to render, and the Render dialog that runs it and reports on every
+//! file. Rendering/encoding lives in the engine + SphereEncoder; this layer
+//! collects settings, builds a plain job + snapshot, and drives a cancellable
+//! background render without holding any GPUI borrow during the work.
 
 mod export_settings;
 mod export_window;
+mod render_dialog;
+mod ui_kit;
 
 pub use export_settings::{
-    ExportChannelMode, ExportEstimate, ExportMode, ExportNormalizeChoice, ExportProjectDefaults,
-    ExportRangeChoice, ExportSampleRateChoice, ExportSettings, ExportSettingsError,
-    ExportTailChoice, ExportTrackTarget,
+    ExportChannelMode, ExportChannelPreset, ExportEstimate, ExportNormalizeChoice,
+    ExportProjectDefaults, ExportRangeChoice, ExportRenderMode, ExportSampleRateChoice,
+    ExportSettings, ExportSettingsError, ExportTailChoice, ExportTrackTarget,
 };
 pub use export_window::{
-    open_export_arrangement_window, ExportArrangementWindow, ExportJobState, EXPORT_WINDOW_WIDTH,
+    open_export_arrangement_window, ExportArrangementWindow, ExportIntent, EXPORT_WINDOW_WIDTH,
 };
+pub use render_dialog::{RealtimeTransportHooks, RenderDialog};
 
 #[cfg(test)]
 mod tests {
@@ -43,6 +47,7 @@ mod tests {
             Vec::new()
         };
         EngineProjectSnapshot {
+            spatial: Default::default(),
             project_id: "p".to_string(),
             project_root: None,
             preferred_input_device: None,
@@ -51,6 +56,7 @@ mod tests {
             time_signature: [4, 4],
             sample_rate: 48_000,
             tracks: vec![EngineTrackSnapshot {
+                midi_programs: Vec::new(),
                 id: "track-1".to_string(),
                 track_type: "audio".to_string(),
                 volume: 1.0,
@@ -74,6 +80,8 @@ mod tests {
                 soundfont_polyphony: 64,
                 soundfont_envelope: Default::default(),
                 soundfont_quality: Default::default(),
+                soundfont_mode: Default::default(),
+                soundfont_channels: Default::default(),
                 solfege_engine: None,
             }],
             clips,
@@ -97,6 +105,16 @@ mod tests {
             loop_range: None,
             mp3_available: false,
             track_targets: Vec::new(),
+            live_sample_rate: 48_000,
+        }
+    }
+
+    fn target(id: &str, name: &str, source: bool) -> ExportTrackTarget {
+        ExportTrackTarget {
+            id: id.to_string(),
+            name: name.to_string(),
+            include_in_multitrack: source,
+            kind_label: if source { "Audio" } else { "Bus" }.to_string(),
         }
     }
 
@@ -112,17 +130,24 @@ mod tests {
     }
 
     #[test]
-    fn batch_export_requires_source_tracks() {
+    fn a_render_needs_the_mixdown_or_a_channel() {
         let mut settings = valid_wav();
-        settings.mode = ExportMode::Stems;
+        settings.include_mixdown = false;
         assert_eq!(
             settings.validate(&defaults()),
-            Err(ExportSettingsError::NoTracksForBatchExport)
+            Err(ExportSettingsError::NothingToRender)
         );
+        let mut d = defaults();
+        d.track_targets = vec![target("track-1", "Vox", true)];
+        settings.toggle_track("track-1");
+        assert!(settings.validate(&d).is_ok());
     }
 
+    /// One job carries the mixdown and the chosen channels together; the
+    /// channels land numbered in mixer order in `<base> Stems/`, never
+    /// normalized.
     #[test]
-    fn stem_jobs_isolate_each_source_and_name_outputs() {
+    fn one_job_carries_the_mixdown_and_the_chosen_channels() {
         let mut snapshot = snapshot_with_content(4.0);
         let mut bus = snapshot.tracks[0].clone();
         bus.id = "bus-1".to_string();
@@ -131,27 +156,54 @@ mod tests {
         snapshot.tracks.push(bus);
         let mut defaults = defaults();
         defaults.track_targets = vec![
-            ExportTrackTarget {
-                id: "track-1".to_string(),
-                name: "Lead / Vox".to_string(),
-                include_in_multitrack: true,
-            },
-            ExportTrackTarget {
-                id: "bus-1".to_string(),
-                name: "Drum Bus".to_string(),
-                include_in_multitrack: false,
-            },
+            target("track-1", "Lead / Vox", true),
+            target("bus-1", "Drum Bus", false),
         ];
-        let request = valid_wav().to_request(&snapshot, &defaults).unwrap();
-        let jobs =
-            export_window::build_batch_targets(&request, ExportMode::Stems, &defaults, "Song");
-        assert_eq!(jobs.len(), 2);
-        assert_eq!(jobs[0].track_id, "track-1");
-        assert_eq!(jobs[1].track_id, "bus-1");
-        assert!(jobs[0]
+        let mut settings = valid_wav();
+        settings.normalize = ExportNormalizeChoice::PeakDb(-1.0);
+        settings.apply_channel_preset(ExportChannelPreset::All, &defaults);
+        let job = settings.to_job(&snapshot, &defaults, "Song").unwrap();
+        assert!(job.mixdown.is_some());
+        assert_eq!(job.tracks.len(), 2);
+        assert_eq!(job.tracks[0].track_id, "track-1");
+        assert_eq!(job.tracks[1].track_id, "bus-1");
+        assert!(job.tracks[0]
             .request
             .output_path
             .ends_with(std::path::Path::new("Song Stems").join("01 Lead _ Vox.wav")));
+        assert!(job.tracks.iter().all(|t| matches!(
+            t.request.render.normalize,
+            DirectAudio::ExportNormalizeMode::None
+        )));
+
+        // Channels only: no mixdown in the job.
+        settings.include_mixdown = false;
+        settings.apply_channel_preset(ExportChannelPreset::SourceTracks, &defaults);
+        let job = settings.to_job(&snapshot, &defaults, "Song").unwrap();
+        assert!(job.mixdown.is_none());
+        assert_eq!(job.tracks.len(), 1);
+    }
+
+    /// A realtime render records at the device rate and cannot normalize.
+    #[test]
+    fn realtime_takes_the_device_rate_and_refuses_normalization() {
+        let mut d = defaults();
+        d.live_sample_rate = 44_100;
+        let mut settings = valid_wav();
+        settings.render_mode = ExportRenderMode::Realtime;
+        assert_eq!(settings.resolved_sample_rate(&d), 44_100);
+        assert!(settings.validate(&d).is_ok());
+        settings.normalize = ExportNormalizeChoice::PeakDb(-1.0);
+        assert_eq!(
+            settings.validate(&d),
+            Err(ExportSettingsError::RealtimeNormalize)
+        );
+        d.live_sample_rate = 0;
+        settings.normalize = ExportNormalizeChoice::Off;
+        assert_eq!(
+            settings.validate(&d),
+            Err(ExportSettingsError::RealtimeUnavailable)
+        );
     }
 
     #[test]
@@ -259,27 +311,22 @@ mod tests {
         assert_eq!(req.sample_format, AudioSampleFormat::I16);
     }
 
-    /// Multitrack can filter every available target away. Validation has to see
-    /// that before Export is enabled, not after the job is spawned.
+    /// The "Source tracks" pick leaves routing channels out; "All" takes them.
     #[test]
-    fn multitrack_with_no_direct_tracks_fails_validation() {
+    fn channel_presets_pick_what_they_say() {
         let mut d = defaults();
-        d.track_targets = vec![ExportTrackTarget {
-            id: "bus-1".to_string(),
-            name: "Drum Bus".to_string(),
-            include_in_multitrack: false,
-        }];
+        d.track_targets = vec![
+            target("track-1", "Vox", true),
+            target("bus-1", "Drum Bus", false),
+        ];
         let mut settings = valid_wav();
-        settings.mode = ExportMode::Multitrack;
-        assert_eq!(settings.batch_target_count(&d), 0);
-        assert_eq!(
-            settings.validate(&d),
-            Err(ExportSettingsError::NoTracksForBatchExport)
-        );
-        // Stems still takes every mixer channel, routing included.
-        settings.mode = ExportMode::Stems;
-        assert_eq!(settings.batch_target_count(&d), 1);
-        assert!(settings.validate(&d).is_ok());
+        settings.apply_channel_preset(ExportChannelPreset::SourceTracks, &d);
+        assert_eq!(settings.selected_tracks, vec!["track-1".to_string()]);
+        settings.apply_channel_preset(ExportChannelPreset::All, &d);
+        assert_eq!(settings.batch_target_count(&d), 2);
+        assert_eq!(settings.file_count(&d), 3);
+        settings.apply_channel_preset(ExportChannelPreset::None, &d);
+        assert_eq!(settings.file_count(&d), 1);
     }
 
     /// The dialog's readouts must come from the same request the engine gets.

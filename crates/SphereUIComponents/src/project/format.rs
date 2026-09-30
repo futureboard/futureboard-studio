@@ -14,7 +14,7 @@ use super::{
     ProjectSongTextEvent, ProjectSongTextEventKind, ProjectSoundfontPlayer, ProjectTake,
     ProjectTempoPoint, ProjectTimelineMarker, ProjectTimelineRegion, ProjectTrack,
     ProjectTrackAudioFormat, ProjectTrackMidiInputRouting, ProjectTrackOutputRouting,
-    ProjectTrackType, SoundfontEnvelope, SoundfontRenderQuality, TrackRouting,
+    ProjectTrackType, SoundfontEnvelope, SoundfontPlayerMode, SoundfontRenderQuality, TrackRouting,
     V33TrackInputRouting,
 };
 use crate::components::timeline::timeline_state::{
@@ -147,13 +147,25 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// fader, pan, mute and inserts act on them. In a pre-v55 file membership was
 /// only visual, and a member whose output is the main mix loads routed to its
 /// folder instead; a member routed anywhere else keeps its route.
-pub const PROJECT_VERSION: u32 = 55;
+/// v56 appends each track's bank/program selection after its MPE settings:
+/// the GM/GS/XG format tag, a program flag and value, and the bank MSB and
+/// LSB. A pre-v56 track loads with no program chosen, so nothing is sent.
+/// v57 adds the spatial mix: each track appends its place in the square room
+/// (x, y, height, spread, width, LFE), and the project writes its format, the
+/// room (half-size, reflections) and the surround fold after the tempo
+/// tensions. A pre-v57 project is a stereo mix with every track front and
+/// centre.
+/// v58 appends the built-in Soundfont Player's mode (single or sixteen parts)
+/// and its sixteen parts to the player's block. A pre-v58 player is a single
+/// instrument with every part at rest.
+pub const PROJECT_VERSION: u32 = 58;
 
-/// Minimum on-disk format version that can be loaded without data loss.
-/// Versions below this will show a warning but can still be loaded.
-/// Currently set to v33 (Video track introduction) since v32 and earlier
-/// lack Video track, modern Audio Connections, and other critical features.
-pub const MIN_SUPPORTED_VERSION: u32 = 33;
+/// Oldest on-disk format version whose migration to the current one is
+/// supported (see [`super::migrate`]): v30, which introduced arrangement
+/// folders. A file from v30 on opens migrated, with its original kept; an
+/// older one still opens as well as its decoder can, reported as outside the
+/// supported range.
+pub const MIN_SUPPORTED_VERSION: u32 = 30;
 
 /// Minimum on-disk header size: magic (8) + version (4) + reserved (4) + body_len (4).
 pub const PROJECT_HEADER_SIZE: usize = 20;
@@ -1048,7 +1060,7 @@ fn routing_output_bus_id(output: &ProjectTrackOutputRouting) -> Option<String> {
     }
 }
 
-fn encode_track(w: &mut FbWriter, t: &ProjectTrack) {
+fn encode_track(w: &mut FbWriter, t: &ProjectTrack, version: u32) {
     w.write_str(&t.id);
     w.write_str(&t.name);
     encode_track_type(w, t.track_type);
@@ -1130,6 +1142,24 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack) {
     w.write_u8(mpe.member_channels);
     w.write_f32(mpe.member_pitch_range);
     w.write_f32(mpe.manager_pitch_range);
+    // v56: bank/program selection, appended for the same reason.
+    if version >= 56 {
+        let program = t.routing.program.sanitized();
+        w.write_u8(program.format.to_tag());
+        w.write_opt_u8(&program.program);
+        w.write_u8(program.bank_msb);
+        w.write_u8(program.bank_lsb);
+    }
+    // v57: the track's place in a spatial mix's square room.
+    if version >= 57 {
+        let spatial = t.routing.spatial.sanitized();
+        w.write_f32(spatial.position.x);
+        w.write_f32(spatial.position.y);
+        w.write_f32(spatial.position.z);
+        w.write_f32(spatial.spread);
+        w.write_f32(spatial.width);
+        w.write_f32(spatial.lfe);
+    }
 }
 
 /// v28: built-in Soundfont Player instrument state. A leading flag keeps the
@@ -1161,6 +1191,19 @@ fn encode_soundfont_player(w: &mut FbWriter, soundfont: Option<&ProjectSoundfont
     w.write_f32(envelope.sustain);
     w.write_f32(envelope.release_ms);
     w.write_str(soundfont.quality.key());
+    // v58: the mode by its stable key, then each part: a preset flag, bank and
+    // patch, level and pan (the channel's CC 7 and CC 10), mute and solo.
+    w.write_str(soundfont.mode.key());
+    for channel in soundfont.channels.iter().map(|channel| channel.sanitized()) {
+        let (bank, patch) = channel.preset.unwrap_or((0, 0));
+        w.write_bool(channel.preset.is_some());
+        w.write_u32(bank.max(0) as u32);
+        w.write_u32(patch.max(0) as u32);
+        w.write_u8(channel.volume);
+        w.write_u8(channel.pan);
+        w.write_bool(channel.mute);
+        w.write_bool(channel.solo);
+    }
 }
 
 fn decode_soundfont_player(
@@ -1193,6 +1236,29 @@ fn decode_soundfont_player(
             SoundfontRenderQuality::default(),
         )
     };
+    let (mode, channels) = if version >= 58 {
+        let mode = SoundfontPlayerMode::from_key(&r.read_str()?);
+        let mut channels = sphere_soundfont_player::default_channels();
+        for channel in channels.iter_mut() {
+            let has_preset = r.read_bool()?;
+            let bank = r.read_u32()? as i32;
+            let patch = r.read_u32()? as i32;
+            *channel = sphere_soundfont_player::SoundfontChannel {
+                preset: has_preset.then_some((bank, patch)),
+                volume: r.read_u8()?,
+                pan: r.read_u8()?,
+                mute: r.read_bool()?,
+                solo: r.read_bool()?,
+            }
+            .sanitized();
+        }
+        (mode, channels)
+    } else {
+        (
+            SoundfontPlayerMode::Single,
+            sphere_soundfont_player::default_channels(),
+        )
+    };
     Ok(Some(ProjectSoundfontPlayer {
         path,
         preset_bank: has_preset.then_some(bank),
@@ -1202,6 +1268,8 @@ fn decode_soundfont_player(
         polyphony,
         envelope,
         quality,
+        mode,
+        channels,
     }))
 }
 
@@ -1472,7 +1540,13 @@ fn migrate_legacy_song_text_cue(
     }
 }
 
+/// The body in the current layout (tests build bodies to frame by hand).
+#[cfg(test)]
 fn encode_body(project: &FutureboardProject) -> Vec<u8> {
+    encode_body_versioned(project, PROJECT_VERSION)
+}
+
+fn encode_body_versioned(project: &FutureboardProject, version: u32) -> Vec<u8> {
     let mut w = FbWriter::new();
 
     // Header fields
@@ -1498,7 +1572,7 @@ fn encode_body(project: &FutureboardProject) -> Vec<u8> {
     // Tracks
     w.write_u32(project.tracks.len() as u32);
     for t in &project.tracks {
-        encode_track(&mut w, t);
+        encode_track(&mut w, t, version);
     }
 
     // Assets
@@ -1659,6 +1733,20 @@ fn encode_body(project: &FutureboardProject) -> Vec<u8> {
     w.write_u32(project.settings.tempo_points.len() as u32);
     for point in &project.settings.tempo_points {
         w.write_f32(point.tension);
+    }
+
+    // Spatial mix (v57): the format by its stable token, the room, and how a
+    // surround mix reaches a stereo device.
+    if version >= 57 {
+        let settings = &project.settings;
+        w.write_str(settings.spatial_format.token());
+        let room = settings.spatial_room.sanitized();
+        w.write_f32(room.half_size_m);
+        w.write_f32(room.reflections);
+        w.write_u8(match settings.spatial_fold {
+            solfege_spatialaudio::MonitorFold::Binaural => 0,
+            solfege_spatialaudio::MonitorFold::Stereo => 1,
+        });
     }
 
     // View section (v54+). Self-delimiting: see `encode_view_section`.
@@ -2380,12 +2468,30 @@ fn decode_audio_connection(r: &mut FbReader) -> Result<ProjectAudioConnection, P
 
 /// Encodes a `FutureboardProject` into the full `.fbproj` binary format.
 pub fn encode_project(project: &FutureboardProject) -> Vec<u8> {
-    let body = encode_body(project);
+    encode_project_versioned(project, PROJECT_VERSION)
+}
+
+/// [`encode_project`] in the byte layout of format `version`, which must be
+/// v55 or later: the fields a v55 build did not write are left out and the
+/// header says v55. Lets a test load a genuinely older file instead of a
+/// current one relabelled, which stops being the same thing the moment a
+/// version adds bytes.
+#[cfg(test)]
+pub(crate) fn encode_project_as(project: &FutureboardProject, version: u32) -> Vec<u8> {
+    assert!(
+        (55..=PROJECT_VERSION).contains(&version),
+        "encode_project_as writes v55 and later"
+    );
+    encode_project_versioned(project, version)
+}
+
+fn encode_project_versioned(project: &FutureboardProject, version: u32) -> Vec<u8> {
+    let body = encode_body_versioned(project, version);
     let checksum = crc32fast::hash(&body);
 
     let mut out = Vec::with_capacity(8 + 4 + 4 + 4 + body.len() + 4);
     out.extend_from_slice(PROJECT_MAGIC);
-    out.extend_from_slice(&PROJECT_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // reserved
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
     out.extend_from_slice(&body);
@@ -2773,6 +2879,7 @@ fn decode_stretch(r: &mut FbReader, version: u32) -> Result<AudioClipStretchStat
         dehum_harmonics,
         dehum_reduction_db,
     };
+    stretch.repair_undecided_warp_pitch();
     stretch.sanitize_in_place();
     Ok(stretch)
 }
@@ -3045,6 +3152,8 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
             midi_channel,
             midi_output_per_note,
             mpe: MpeTrackConfiguration::default(),
+            program: Default::default(),
+            spatial: Default::default(),
             sends: Vec::new(),
         }
     } else {
@@ -3151,6 +3260,29 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
             member_channels: r.read_u8()?,
             member_pitch_range: r.read_f32()?,
             manager_pitch_range: r.read_f32()?,
+        }
+        .sanitized();
+    }
+
+    // v56: bank/program selection. A pre-v56 track chooses none.
+    if version >= 56 {
+        routing.program = sphere_midi_service::program::MidiProgramSelection {
+            format: sphere_midi_service::program::MidiPatchFormat::from_tag(r.read_u8()?),
+            program: r.read_opt_u8()?,
+            bank_msb: r.read_u8()?,
+            bank_lsb: r.read_u8()?,
+        }
+        .sanitized();
+    }
+
+    // v57: the track's place in the room. A pre-v57 track is front and centre.
+    if version >= 57 {
+        let (x, y, z) = (r.read_f32()?, r.read_f32()?, r.read_f32()?);
+        routing.spatial = solfege_spatialaudio::SourceParams {
+            position: solfege_spatialaudio::RoomPosition { x, y, z },
+            spread: r.read_f32()?,
+            width: r.read_f32()?,
+            lfe: r.read_f32()?,
         }
         .sanitized();
     }
@@ -3593,6 +3725,25 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
         }
     }
 
+    // Spatial mix (v57). An unknown format token — a newer build's layout —
+    // opens as stereo rather than failing the file.
+    let (spatial_format, spatial_room, spatial_fold) = if version >= 57 {
+        let format =
+            solfege_spatialaudio::SpatialFormat::from_token(&r.read_str()?).unwrap_or_default();
+        let room = solfege_spatialaudio::RoomSettings {
+            half_size_m: r.read_f32()?,
+            reflections: r.read_f32()?,
+        }
+        .sanitized();
+        let fold = match r.read_u8()? {
+            1 => solfege_spatialaudio::MonitorFold::Stereo,
+            _ => solfege_spatialaudio::MonitorFold::Binaural,
+        };
+        (format, room, fold)
+    } else {
+        Default::default()
+    };
+
     // View section (v54+). A v53 file has none and opens on the defaults
     // described at `PROJECT_VERSION`.
     let view = if version >= 54 {
@@ -3614,6 +3765,7 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
     };
 
     Ok(FutureboardProject {
+        migration: None,
         view,
         audio_connections,
         global_lanes,
@@ -3644,6 +3796,9 @@ fn decode_body(body: &[u8], version: u32) -> Result<FutureboardProject, ProjectE
             bit_depth,
             time_display_format,
             timecode_rate,
+            spatial_format,
+            spatial_room,
+            spatial_fold,
         },
         tracks,
         mixer: ProjectMixer {
@@ -4087,15 +4242,17 @@ mod tests {
         // ARA document count, the v43 timebase pair, the v50 marker SysEx
         // count, the v51 Chord Track block (event count, collapse latch,
         // custom height), the v52 project key (root, scale), the v53 tempo
-        // tension count (no markers, so no values) and the v54 view section.
-        // A v24-v26 fixture reads none of them, so drop the whole tail before
-        // appending the legacy cue block in its place.
+        // tension count (no markers, so no values), the v57 spatial mix
+        // (format token, room, fold) and the v54 view section. A v24-v26
+        // fixture reads none of them, so drop the whole tail before appending
+        // the legacy cue block in its place.
         let v35_output_routing_bytes = 1 + 1 + 1;
         let v40_global_lane_bytes = 4 + 5;
         let v43_timebase_bytes = 1 + 1;
         let v51_chord_track_bytes = 4 + 1 + 4;
         let v52_project_key_bytes = 1 + 1;
         let v53_tempo_tension_bytes = 4;
+        let v57_spatial_bytes = 4 + project.settings.spatial_format.token().len() + 4 + 4 + 1;
         let v54_view_bytes = view_section_len(&project.view);
         body.truncate(
             body.len()
@@ -4106,6 +4263,7 @@ mod tests {
                 - v51_chord_track_bytes
                 - v52_project_key_bytes
                 - v53_tempo_tension_bytes
+                - v57_spatial_bytes
                 - v54_view_bytes,
         );
 
@@ -4909,6 +5067,16 @@ mod tests {
                 release_ms: 900.0,
             },
             quality: SoundfontRenderQuality::Ultra,
+            mode: SoundfontPlayerMode::Multi,
+            channels: {
+                let mut channels = sphere_soundfont_player::default_channels();
+                channels[3].preset = Some((128, 16));
+                channels[3].volume = 90;
+                channels[3].pan = 10;
+                channels[7].mute = true;
+                channels[12].solo = true;
+                channels
+            },
         });
 
         let mut project = FutureboardProject::new("Soundfont");
@@ -4934,6 +5102,14 @@ mod tests {
         assert!((soundfont.envelope.sustain - 0.4).abs() < 1.0e-6);
         assert!((soundfont.envelope.release_ms - 900.0).abs() < 1.0e-3);
         assert_eq!(soundfont.quality, SoundfontRenderQuality::Ultra);
+        assert_eq!(soundfont.mode, SoundfontPlayerMode::Multi);
+        assert_eq!(soundfont.channels[3].preset, Some((128, 16)));
+        assert_eq!(
+            (soundfont.channels[3].volume, soundfont.channels[3].pan),
+            (90, 10)
+        );
+        assert!(soundfont.channels[7].mute && soundfont.channels[12].solo);
+        assert_eq!(soundfont.channels[0], Default::default());
     }
 
     #[test]
@@ -4961,6 +5137,7 @@ mod tests {
             "a pre-v29 soundfont must keep its original signal path"
         );
         assert_eq!(soundfont.quality, SoundfontRenderQuality::Standard);
+        assert_eq!(soundfont.mode, SoundfontPlayerMode::Single);
     }
 
     #[test]
@@ -5388,7 +5565,7 @@ mod tests {
         // Four collapse latches plus five absent optional heights.
         body.truncate(body.len() - (4 + 5));
         let bytes = project_bytes_with_version(body, 39);
-        let decoded = decode_project(&bytes).expect("v39 loads");
+        let decoded = decode_project_with_options(&bytes, true).expect("v39 loads");
         assert_eq!(
             decoded.global_lanes,
             super::super::ProjectGlobalLanes::default()
@@ -5405,7 +5582,7 @@ mod tests {
         // v33 also stores the combined union per track, so a track-bearing
         // fixture would need the older track layout; an empty project is
         // enough to prove the section is version-gated.
-        let decoded = decode_project(&bytes).expect("v33 loads");
+        let decoded = decode_project_with_options(&bytes, true).expect("v33 loads");
         assert!(decoded.audio_connections.is_empty());
     }
 

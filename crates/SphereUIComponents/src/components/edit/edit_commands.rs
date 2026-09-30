@@ -471,6 +471,12 @@ pub enum EditCommand {
         prev: MpeTrackConfiguration,
         next: MpeTrackConfiguration,
     },
+    /// A track's bank/program selection, format included.
+    SetTrackProgramSelection {
+        track_id: String,
+        prev: sphere_midi_service::program::MidiProgramSelection,
+        next: sphere_midi_service::program::MidiProgramSelection,
+    },
     /// Rename one track: one inline header edit, committed once. `prev` is the
     /// name the track had at commit time, restored exactly on undo.
     SetTrackName {
@@ -844,6 +850,7 @@ impl EditCommand {
             EditCommand::SetTrackPan { .. } => "Set Pan",
             EditCommand::SetTrackVolumeAutomationRead { .. } => "Set Volume Automation Read",
             EditCommand::SetTrackMpeConfiguration { .. } => "Set MPE Configuration",
+            EditCommand::SetTrackProgramSelection { .. } => "Set Program",
             EditCommand::SetTrackName { .. } => "Rename Track",
             EditCommand::SetSongTextEvents { label, .. } => label,
             EditCommand::SetTempoState { label, .. } => label,
@@ -937,9 +944,13 @@ impl EditCommand {
                         restore_take(state, track_id, Some(&piece_take));
                     }
                 }
+                // Only the piece after the cut: it is what is moved or deleted
+                // next, and both pieces chosen would drag and delete as one.
                 state.selection.selected_track_id = Some(snapshot.track_id.clone());
-                state.selection.selected_clip_ids =
-                    clips.iter().map(|(_, clip)| clip.id.clone()).collect();
+                state.selection.selected_clip_ids = clips
+                    .last()
+                    .map(|(_, clip)| vec![clip.id.clone()])
+                    .unwrap_or_default();
             }
             EditCommand::DeleteTrack { snapshot } => {
                 state.delete_track(&snapshot.track.id);
@@ -1083,6 +1094,9 @@ impl EditCommand {
             }
             EditCommand::SetTrackMpeConfiguration { track_id, next, .. } => {
                 state.set_track_mpe_configuration(track_id, *next);
+            }
+            EditCommand::SetTrackProgramSelection { track_id, next, .. } => {
+                state.set_track_program_selection(track_id, *next);
             }
             EditCommand::SetTrackName { track_id, next, .. } => {
                 state.set_track_name(track_id, next);
@@ -1294,6 +1308,9 @@ impl EditCommand {
             }
             EditCommand::SetTrackMpeConfiguration { track_id, prev, .. } => {
                 state.set_track_mpe_configuration(track_id, *prev);
+            }
+            EditCommand::SetTrackProgramSelection { track_id, prev, .. } => {
+                state.set_track_program_selection(track_id, *prev);
             }
             EditCommand::SetTrackName { track_id, prev, .. } => {
                 state.set_track_name(track_id, prev);

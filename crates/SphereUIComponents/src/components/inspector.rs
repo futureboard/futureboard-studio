@@ -17,41 +17,23 @@ pub struct InspectorSelectOption<T: Copy + PartialEq + 'static> {
     pub value: T,
 }
 
+/// A section: the dock's one card, with an optional quiet line under its
+/// title.
 pub fn inspector_section(
     title: impl Into<String>,
     subtitle: Option<impl Into<String>>,
     children: impl IntoElement,
 ) -> impl IntoElement {
-    let title = title.into();
     let subtitle = subtitle.map(Into::into);
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(5.0))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(1.0))
-                .child(
-                    div()
-                        .h(px(18.0))
-                        .flex()
-                        .items_center()
-                        .text_size(px(9.5))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(Colors::text_faint())
-                        .child(title),
-                )
-                .children(subtitle.map(|text| {
-                    div()
-                        .min_w(px(0.0))
-                        .text_size(px(10.0))
-                        .text_color(Colors::text_faint())
-                        .child(text)
-                })),
-        )
-        .child(div().flex().flex_col().gap(px(3.0)).child(children))
+    crate::components::inspector_kit::ins_card(
+        title,
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(crate::theme::space::SNUG))
+            .children(subtitle.map(|text: String| inspector_hint_text(text)))
+            .child(children),
+    )
 }
 
 pub fn inspector_row(
@@ -71,7 +53,7 @@ pub fn inspector_row(
                 .w(px(106.0))
                 .flex_shrink_0()
                 .truncate()
-                .text_size(px(10.5))
+                .text_size(px(crate::theme::typography::UI_XS))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(Colors::text_muted())
                 .child(label.into()),
@@ -715,8 +697,8 @@ pub fn inspector_mini_button(
 pub fn inspector_hint_text(text: impl Into<String>) -> impl IntoElement {
     div()
         .min_w(px(0.0))
-        .pt(px(1.0))
-        .text_size(px(10.0))
-        .text_color(Colors::text_faint())
+        .text_size(px(crate::theme::typography::DENSE_LABEL))
+        .line_height(px(15.0))
+        .text_color(Colors::text_muted())
         .child(text.into())
 }

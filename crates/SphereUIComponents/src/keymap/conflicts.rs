@@ -1,29 +1,26 @@
-use super::model::{KeyBinding, KeymapConflict, ResolvedKeyBinding};
+use super::model::{KeymapConflict, KeymapScope, ResolvedKeyBinding};
 use super::normalize::canonical_accel;
 use std::collections::HashMap;
 
-pub fn contexts_overlap(a: Option<&str>, b: Option<&str>) -> bool {
-    match (
-        a.map(str::trim).filter(|s| !s.is_empty()),
-        b.map(str::trim).filter(|s| !s.is_empty()),
-    ) {
-        (None, _) | (_, None) => true,
-        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-    }
-}
-
+/// The bindings `keys` would collide with if bound to `action` in `scope`
+/// (see [`KeymapScope::collides_with`]), leaving out `action`'s own binding in
+/// that scope.
 pub fn find_conflicts_for_binding(
-    candidate: &KeyBinding,
+    action: &str,
+    keys: &[String],
+    scope: KeymapScope,
     resolved: &[ResolvedKeyBinding],
-    exclude_action: Option<&str>,
 ) -> Vec<KeymapConflict> {
     let mut out = Vec::new();
-    for key in &candidate.keys {
+    for key in keys {
         let Some(token) = canonical_accel(key) else {
             continue;
         };
         for existing in resolved {
-            if exclude_action.is_some_and(|action| action == existing.action) {
+            if existing.action == action && existing.scope == scope {
+                continue;
+            }
+            if !existing.scope.collides_with(scope) {
                 continue;
             }
             if !existing
@@ -33,14 +30,11 @@ pub fn find_conflicts_for_binding(
             {
                 continue;
             }
-            if !contexts_overlap(candidate.context.as_deref(), existing.context.as_deref()) {
-                continue;
-            }
             out.push(KeymapConflict {
                 keystroke: key.clone(),
                 action: existing.action.clone(),
                 action_label: existing.action.clone(),
-                context: existing.context.clone(),
+                scope: existing.scope,
                 source: existing.source,
             });
         }
@@ -71,15 +65,16 @@ pub fn annotate_row_conflicts(
                 continue;
             };
             for other in entries {
-                if other.action == row.action_id {
+                if other.action == row.action_id && other.scope == row.scope {
                     continue;
                 }
-                if !contexts_overlap(row.context.as_deref(), other.context.as_deref()) {
+                if !other.scope.collides_with(row.scope) {
                     continue;
                 }
                 row.is_conflict = true;
-                if !row.conflict_with.iter().any(|id| id == &other.action) {
-                    row.conflict_with.push(other.action.clone());
+                let label = format!("{} ({})", other.action, other.scope.label());
+                if !row.conflict_with.contains(&label) {
+                    row.conflict_with.push(label);
                 }
             }
         }

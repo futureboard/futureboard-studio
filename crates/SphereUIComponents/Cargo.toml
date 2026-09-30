@@ -1,6 +1,6 @@
 [package]
 name = "sphere_ui_components"
-version = "2026.9.27-beta1.4.1"
+version = "2026.10.1-beta1.4.2"
 edition = "2021"
 autobins = false
 # Bakes FUTUREBOARD_AUTH_API_URL and FUTUREBOARD_TONE3000_API_KEY; see build.rs.
@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["gpu-renderer", "native-dialogs"]
-gpu-renderer = ["dep:pollster", "dep:raw-window-handle", "dep:wgpu"]
+gpu-renderer = ["dep:pollster", "dep:raw-window-handle", "dep:wgpu", "dep:windows-d3d12"]
 native-dialogs = ["dep:rfd"]
 plugin-host-bin = ["sphere-plugin-host/plugin-host-bin"]
 # Real MDX-NET stem separation via ONNX Runtime (CPU; loads onnxruntime at
@@ -31,14 +31,17 @@ builtin-plugin-editor = [
     "dep:equz8",
     "dep:verbspace",
     "dep:echospace",
+    "dep:imager",
     "dep:fa2a",
     "dep:fa76",
     "dep:burnlimit",
     "dep:clipper67",
     "dep:transient",
     "dep:wrapsynth",
+    "dep:drumsampler",
     "dep:zcomp",
     "dep:mixstation",
+    "dep:compresser",
     "dep:builtin-ui-embed",
 ]
 
@@ -61,6 +64,7 @@ smallvec.workspace = true
 # IMPORTANT: UI components are used by the standalone `futureboard_native` app.
 # Disable Node/N-API surfaces so native builds don't try to link against `napi_*`.
 sphere_directaudioengine.workspace = true
+solfege_spatialaudio.workspace = true
 sphere-audio-processor.workspace = true
 sphere-audio-editor.workspace = true
 sphere-plugin-host.workspace = true
@@ -81,14 +85,17 @@ rodharerist = { workspace = true, optional = true }
 equz8 = { workspace = true, optional = true }
 verbspace = { workspace = true, optional = true }
 echospace = { workspace = true, optional = true }
+imager = { workspace = true, optional = true }
 fa2a = { workspace = true, optional = true }
 fa76 = { workspace = true, optional = true }
 burnlimit = { workspace = true, optional = true }
 clipper67 = { workspace = true, optional = true }
 transient = { workspace = true, optional = true }
 wrapsynth = { workspace = true, optional = true }
+drumsampler = { workspace = true, optional = true }
 zcomp = { workspace = true, optional = true }
 mixstation = { workspace = true, optional = true }
+compresser = { workspace = true, optional = true }
 builtin-ui-embed = { workspace = true, optional = true }
 # Reusable native graphics/text/window backend (DirectWrite, DWM, GDI paint).
 sphere-graphic-engine.workspace = true
@@ -111,6 +118,11 @@ rand.workspace = true
 pollster = { workspace = true, optional = true }
 raw-window-handle = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
+# Window > Visualizer: FFT for the spectrum views, EBU R128 for the loudness
+# meter. Both already in the workspace (SpherePluginHost's analyser and the
+# engine's export meter).
+rustfft.workspace = true
+ebur128.workspace = true
 # Native file dialogs (open/save/folder picker).
 rfd = { workspace = true, optional = true }
 # CRC-32/ISO-HDLC checksum for .fbproj binary format.
@@ -128,6 +140,18 @@ unicode-segmentation.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
 windows-core = { workspace = true }
+# The visualizers render with wgpu's D3D12 backend into a shared texture that
+# GPUI's D3D11 atlas imports. wgpu-hal exposes its device as `windows` 0.62
+# types, so creating that texture needs the same version (already in the lock
+# through wgpu-hal) rather than the workspace's 0.61.
+windows-d3d12 = { package = "windows", version = "0.62", optional = true, default-features = false, features = [
+    "std",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
 
 # X11 for screen-edge-independent BPM scrubbing (cursor query/warp). Works on
 # X11 and XWayland; pure Wayland falls back to window-relative deltas.

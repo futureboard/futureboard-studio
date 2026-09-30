@@ -28,32 +28,31 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    canvas, div, fill, point, px, svg, uniform_list, App, AppContext, Bounds, Div, Empty,
-    FocusHandle, InteractiveElement, IntoElement, ParentElement, Pixels, Render, Rgba, Role,
-    Stateful, StatefulInteractiveElement, Styled, Toggled, UniformListScrollHandle, Window,
+    App, AppContext, Bounds, Div, Empty, FocusHandle, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, Rgba, Role, Stateful, StatefulInteractiveElement, Styled,
+    Toggled, UniformListScrollHandle, Window, canvas, div, fill, point, px, svg, uniform_list,
 };
 
 use crate::assets;
 use crate::components::controls::{fb_shortcut_hint, fb_tooltip};
 use crate::components::file_browser::{
-    format_size, BrowserCrumb, BrowserIcon, BrowserNodeKind, BrowserVisibleNode, FileBrowserState,
-    MAX_VISUAL_DEPTH,
+    BrowserCrumb, BrowserIcon, BrowserNodeKind, BrowserTab, BrowserVisibleNode, FileBrowserState,
+    MAX_VISUAL_DEPTH, format_size,
 };
 use crate::components::scroll_thumb::vertical_scrollbar_thumb;
 use crate::components::text_input::{
-    text_field_with_callbacks, TextInputCallbacks, TextInputState,
+    TextInputCallbacks, TextInputState, text_field_with_callbacks,
 };
 use crate::components::timeline::waveform_cache;
 use crate::i18n::I18n;
-use crate::theme::{elevation, radius, size, space, typography, Colors};
+use crate::theme::{Colors, elevation, radius, size, space, typography};
 use DirectAudio::AUDITION_PREVIEW_SECONDS;
 
 pub const SIDEBAR_WIDTH: f32 = 272.0;
 
-/// Row height for every row kind. `size::ROW_DENSE` is documented in the theme
-/// as "Browser tree rows. Must stay exact" precisely because `uniform_list`
+/// Row height for every row kind. Exact and shared, because `uniform_list`
 /// derives its scroll window from one measured row.
-const ROW_H: f32 = size::ROW_DENSE;
+const ROW_H: f32 = size::ROW;
 /// Per-depth indent. Smaller than a generic file explorer so deep trees still
 /// fit the fixed sidebar width.
 const INDENT: f32 = space::LOOSE;
@@ -63,7 +62,7 @@ const DISCLOSURE_W: f32 = space::LOOSE;
 /// Horizontal inset of the row backplate inside the full-bleed row. Only the
 /// backplate rounds; the row itself stays square (DESIGN: full-width list rows).
 const PLATE_INSET_X: f32 = space::TIGHT;
-/// Vertical inset, which leaves an 18 px plate inside a 22 px row — the 16–20 px
+/// Vertical inset, which leaves a 20 px plate inside a 24 px row — the 16–20 px
 /// band, hence `radius::CONTROL_SM`.
 const PLATE_INSET_Y: f32 = space::HAIR;
 /// Content padding inside the backplate.
@@ -83,6 +82,8 @@ pub type BrowserContextCb =
     Arc<dyn Fn(&(Option<PathBuf>, f32, f32), &mut Window, &mut App) + 'static>;
 /// Toolbar action with no payload (Collapse All / Rescan / Stop preview).
 pub type BrowserActionCb = Arc<dyn Fn(&mut Window, &mut App) + 'static>;
+/// Tab strip: show a tab.
+pub type BrowserTabCb = Arc<dyn Fn(&BrowserTab, &mut Window, &mut App) + 'static>;
 
 /// Everything the sidebar can ask the layout to do.
 ///
@@ -91,6 +92,7 @@ pub type BrowserActionCb = Arc<dyn Fn(&mut Window, &mut App) + 'static>;
 /// thirteen-argument entry point.
 #[derive(Clone)]
 pub struct BrowserCallbacks {
+    pub on_select_tab: BrowserTabCb,
     pub on_toggle: ToggleNodeCb,
     pub on_select: SelectEntryCb,
     /// Breadcrumb jump: expand the ancestors of a path and select it.
@@ -175,16 +177,14 @@ pub fn sidebar(
     tree_focus: &FocusHandle,
     search_input: &TextInputState,
     search_focused: bool,
-    active: bool,
+    _active: bool,
     search_callbacks: TextInputCallbacks,
     callbacks: BrowserCallbacks,
     i18n: I18n,
 ) -> impl IntoElement {
-    let panel_border = if active {
-        Colors::panel_border_focused()
-    } else {
-        Colors::border_subtle()
-    };
+    // Which panel has the keyboard is no longer painted: an accent title and
+    // an accent rule down the column's edge were loud for what they said.
+    let panel_border = Colors::border_subtle();
 
     // ── Header ──────────────────────────────────────────────────────
     // Mirrors the Inspector dock header (32 px, DENSE_LABEL, bold) so the two
@@ -212,11 +212,7 @@ pub fn sidebar(
                 .path(assets::ICON_FOLDER_PATH)
                 .w(px(typography::UI_MD))
                 .h(px(typography::UI_MD))
-                .text_color(if active {
-                    Colors::panel_header_active()
-                } else {
-                    Colors::text_muted()
-                }),
+                .text_color(Colors::text_muted()),
         )
         .child(
             div()
@@ -226,22 +222,10 @@ pub fn sidebar(
                 .truncate()
                 .text_size(px(typography::DENSE_LABEL))
                 .font_weight(gpui::FontWeight::BOLD)
-                .text_color(if active {
-                    Colors::panel_header_active()
-                } else {
-                    Colors::tab_text()
-                })
+                .text_color(Colors::tab_text())
                 .child(i18n.tr("browser.panel.title")),
         )
         .child(fb_shortcut_hint(crate::keymap::accel_display("Ctrl+1")))
-        .child(
-            div()
-                .flex_shrink_0()
-                .font_features(tabular_figures())
-                .text_size(px(typography::DENSE_CAPTION))
-                .text_color(Colors::text_faint())
-                .child(format!("{}", state.visible_node_count())),
-        )
         .child(
             crate::components::title_bar::chrome_cluster()
                 .flex_shrink_0()
@@ -282,36 +266,48 @@ pub fn sidebar(
     let search_container = div()
         .flex_shrink_0()
         .flex()
-        .flex_row()
-        .items_center()
+        .flex_col()
         .gap(px(space::SNUG))
         .px(px(space::BASE))
-        .py(px(space::TIGHT))
+        .pt(px(space::SNUG))
+        .pb(px(space::BASE))
         .border_b(px(1.0))
         .border_color(Colors::border_subtle())
         .bg(chrome_base)
         .child(
-            svg()
-                .path(assets::ICON_SEARCH_PATH)
-                .w(px(GLYPH))
-                .h(px(GLYPH))
-                .text_color(Colors::text_muted()),
-        )
-        .child(
             div()
-                .flex_1()
-                .min_w(px(0.0))
-                .child(text_field_with_callbacks(
-                    search_input,
-                    search_focused,
-                    search_callbacks,
-                )),
-        );
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::SNUG))
+                .child(
+                    svg()
+                        .path(assets::ICON_SEARCH_PATH)
+                        .w(px(GLYPH))
+                        .h(px(GLYPH))
+                        .text_color(Colors::text_muted()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(text_field_with_callbacks(
+                            search_input,
+                            search_focused,
+                            search_callbacks,
+                        )),
+                ),
+        )
+        .child(tab_strip(state.tab, callbacks.on_select_tab.clone(), i18n));
 
     // ── Breadcrumb ──────────────────────────────────────────────────
     // Rendered only when there is a trail to show, so the panel never reserves
     // a permanently empty row.
-    let crumbs = state.breadcrumb();
+    let crumbs = if state.tab == BrowserTab::Instruments {
+        Vec::new()
+    } else {
+        state.breadcrumb()
+    };
     let breadcrumb =
         (!crumbs.is_empty()).then(|| breadcrumb_bar(&crumbs, callbacks.on_reveal.clone(), i18n));
 
@@ -402,6 +398,82 @@ pub fn sidebar(
 // ---------------------------------------------------------------------------
 // Chrome primitives
 // ---------------------------------------------------------------------------
+
+/// The tab strip: what the list below shows. The shown tab carries its name;
+/// the others are their glyph, named in a tooltip — five names do not fit the
+/// dock, and the one you are on is the one worth reading.
+fn tab_strip(active: BrowserTab, on_select: BrowserTabCb, i18n: I18n) -> impl IntoElement {
+    let track = Colors::surface_input();
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::HAIR))
+        .p(px(space::HAIR))
+        .rounded(px(radius::CONTROL))
+        .bg(track)
+        .border(px(1.0))
+        .border_color(Colors::border_subtle())
+        .children(BrowserTab::ALL.iter().enumerate().map(|(index, tab)| {
+            let tab = *tab;
+            let is_active = tab == active;
+            let label = i18n.tr_or(tab.label_key(), tab.label());
+            let rest = if is_active {
+                Colors::composite(track, Colors::state_selected())
+            } else {
+                Colors::with_alpha(track, 0.0)
+            };
+            let hover =
+                Colors::composite(if is_active { rest } else { track }, Colors::state_hover());
+            let pressed = Colors::composite(
+                if is_active { rest } else { track },
+                Colors::state_recessed(),
+            );
+            let select = on_select.clone();
+            div()
+                .id(("browser-tab", index))
+                .role(Role::Tab)
+                .aria_label(label.clone())
+                .aria_selected(is_active)
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(space::SNUG))
+                .h(px(size::DENSE))
+                .px(px(space::BASE))
+                .when(!is_active, |segment| segment.flex_1())
+                .rounded(px(radius::inner(radius::CONTROL, space::HAIR)))
+                .bg(rest)
+                .cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(hover))
+                .active(move |s| s.bg(pressed))
+                .tooltip(fb_tooltip(label.clone()))
+                .on_click(move |_e, w, cx| select(&tab, w, cx))
+                .child(
+                    svg()
+                        .path(browser_icon_path(tab.icon(), false))
+                        .flex_shrink_0()
+                        .w(px(GLYPH))
+                        .h(px(GLYPH))
+                        .text_color(if is_active {
+                            Colors::text_primary()
+                        } else {
+                            Colors::text_muted()
+                        }),
+                )
+                .when(is_active, |segment| {
+                    segment.child(
+                        div()
+                            .truncate()
+                            .text_size(px(typography::UI_XS))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(Colors::text_primary())
+                            .child(label),
+                    )
+                })
+        }))
+}
 
 /// Square icon button for the browser header.
 ///
@@ -673,9 +745,9 @@ fn group_header_row(
                 .min_w(px(0.0))
                 .overflow_hidden()
                 .truncate()
-                .text_size(px(typography::DENSE_CAPTION))
+                .text_size(px(typography::DENSE_LABEL))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::text_faint())
+                .text_color(Colors::text_muted())
                 .child(label),
         );
 
@@ -779,7 +851,7 @@ fn tree_row(
 
     let text_color = if selected {
         Colors::text_primary()
-    } else if is_folder {
+    } else if is_folder || node.icon == BrowserIcon::Instruments {
         Colors::text_secondary()
     } else if node.is_audio() || node.is_midi() || node.is_plugin_preset() || node.is_video() {
         Colors::text_muted()
@@ -870,7 +942,19 @@ fn tree_row(
                 .font_weight(label_weight)
                 .text_color(text_color)
                 .child(label.clone()),
-        );
+        )
+        .children(node.detail.clone().map(|detail| {
+            div()
+                .flex_shrink_0()
+                .text_size(px(typography::DENSE_CAPTION))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(if selected {
+                    Colors::text_secondary()
+                } else {
+                    Colors::text_faint()
+                })
+                .child(detail)
+        }));
 
     plate = plate.on_click(move |event, window, cx| {
         // Take tree focus first: without it the arrows, Enter and type-ahead
@@ -967,7 +1051,7 @@ fn browser_icon_path(icon: BrowserIcon, expanded: bool) -> &'static str {
         BrowserIcon::Favorites => assets::ICON_STAR_PATH,
         BrowserIcon::Recent => assets::ICON_CLOCK_PATH,
         BrowserIcon::Samples => assets::ICON_AUDIO_LINES_PATH,
-        BrowserIcon::Instruments => assets::ICON_CPU_PATH,
+        BrowserIcon::Instruments => assets::ICON_KEYBOARD_PATH,
         BrowserIcon::Plugins | BrowserIcon::PresetFile => assets::ICON_PLUG_PATH,
         BrowserIcon::AudioFiles | BrowserIcon::Music | BrowserIcon::AudioFile => {
             assets::ICON_MUSIC_PATH
@@ -1012,14 +1096,51 @@ fn details_pane(
 ) -> impl IntoElement {
     let label = node_label(&node.label, node.label_key, i18n);
     let audio_path = state.selected_audio_path().map(|p| p.to_path_buf());
+    let instrument = node
+        .path
+        .as_deref()
+        .and_then(|path| state.instrument_for(path));
 
     let mut meta: Vec<String> = Vec::new();
-    if !node.extension.is_empty() {
-        meta.push(node.extension.to_uppercase());
+    if instrument.is_none() {
+        if !node.extension.is_empty() {
+            meta.push(node.extension.to_uppercase());
+        }
+        if let Some(bytes) = node.size_bytes {
+            meta.push(format_size(bytes));
+        }
     }
-    if let Some(bytes) = node.size_bytes {
-        meta.push(format_size(bytes));
-    }
+    let instrument_section = instrument.map(|instrument| {
+        let about = [
+            instrument.vendor.as_str(),
+            instrument.format.as_str(),
+            instrument.category.as_str(),
+        ]
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(space::HAIR))
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(typography::DENSE_CAPTION))
+                    .text_color(Colors::text_muted())
+                    .child(about),
+            )
+            .child(
+                div()
+                    .text_size(px(typography::DENSE_CAPTION))
+                    .text_color(Colors::text_faint())
+                    .child(i18n.tr_or(
+                        "browser.instruments.hint",
+                        "Double-click, or drag onto the arrangement, to add it on a new track.",
+                    )),
+            )
+    });
 
     let header = div()
         .flex()
@@ -1154,6 +1275,7 @@ fn details_pane(
         .border_color(Colors::border_subtle())
         .bg(Colors::surface_panel_alt())
         .child(header)
+        .children(instrument_section)
         .children(audio_section)
 }
 

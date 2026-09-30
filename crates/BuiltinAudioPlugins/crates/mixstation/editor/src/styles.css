@@ -1,62 +1,62 @@
 @import 'tailwindcss';
-/* Self-hosted variable Mona Sans — inlined by the single-file build, so the
-   editor never reaches for a font CDN inside the CEF host. */
 @import '@fontsource-variable/mona-sans/wght.css';
 
 @theme {
   --font-sans: 'Mona Sans Variable', 'Mona Sans', ui-sans-serif, system-ui, sans-serif;
 
-  /* Graphite working planes: workspace -> panel -> control group -> floating. */
-  --color-workspace: #0d0e11;
-  --color-panel: #14161a;
-  --color-rack: #17191e;
-  --color-slot: #1c1f25;
-  --color-well: #101216;
-  --color-floating: #1a1d23;
+  /* Futureboard's default theme (`packages/shared/themes/Default.json`):
+     neutral charcoal planes, one blue accent, the warning amber. The same
+     tokens as every built-in editor, so they read as one family. */
+  --color-floor: #111111;
+  --color-canvas: #161616;
+  --color-window: #1b1b1b;
+  --color-bar: #1f1f1f;
+  --color-panel: #232323;
+  --color-raised: #2a2a2a;
+  --color-control: #303030;
+  --color-control-hi: #3a3a3a;
 
-  --color-ink: #eef0f4;
-  --color-ink-muted: #949aa6;
-  --color-ink-dim: #6b7280;
+  --color-ink: #e8e8e8;
+  --color-ink-2: #bdbdbd;
+  --color-ink-3: #8f8f8f;
+  --color-ink-4: #6e6e6e;
 
-  --color-hairline: #262a31;
-  --color-hairline-hi: #343941;
+  --color-line: #ffffff14;
+  --color-line-hi: #ffffff24;
 
-  /* Restrained cyan carries focus, selection and live routing. */
-  --color-signal: #22d3ee;
-  --color-warn: #f0b45e;
-  --color-danger: #ef4444;
-
-  /* Module identities. Used as a thin state rule, never as a panel wash. */
-  --color-mod-filters: #7dd3fc;
-  --color-mod-eq: #60a5fa;
-  --color-mod-comp: #f0b45e;
-  --color-mod-sat: #fb7185;
-  --color-mod-width: #38bdf8;
-  --color-mod-limiter: #a78bfa;
+  --color-accent: #4d9cf8;
+  --color-accent-hi: #72b1fa;
+  --color-on-accent: #07121f;
+  --color-warn: #e8b75c;
+  --color-danger: #f2645f;
+  --color-curve: #f2f4f7;
 }
 
 @layer base {
   html,
   body,
   #root {
+    width: 100%;
+    min-width: 900px;
     height: 100%;
+    min-height: 560px;
+    margin: 0;
+    overflow: hidden;
   }
 
   body {
-    margin: 0;
-    background: var(--color-workspace);
+    background: var(--color-window);
     color: var(--color-ink);
     font-family: var(--font-sans);
-    font-size: 13px;
-    line-height: 1.45;
+    font-size: 12px;
+    line-height: 1.35;
     -webkit-font-smoothing: antialiased;
     overscroll-behavior: none;
-    /* The editor is a bounded plugin surface, not a scrolling document. */
     user-select: none;
   }
 
   :focus-visible {
-    outline: 2px solid var(--color-signal);
+    outline: 2px solid var(--color-accent);
     outline-offset: 2px;
     border-radius: 4px;
   }
@@ -65,45 +65,62 @@
     outline-offset: 0;
   }
 
-  ::-webkit-scrollbar {
-    width: 9px;
-    height: 9px;
-  }
-  ::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  ::-webkit-scrollbar-thumb {
-    background: var(--color-hairline-hi);
-    border: 2px solid var(--color-rack);
-    border-radius: 6px;
+  button {
+    font: inherit;
+    color: inherit;
   }
 }
 
 @layer utilities {
-  .label-cap {
-    font-size: 9px;
-    font-weight: 650;
-    letter-spacing: 0.1em;
+  .cap {
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--color-ink-muted);
+    color: var(--color-ink-3);
     line-height: 1.2;
   }
 
-  /* Mona Sans has no monospace cut; tabular figures are what actually keeps
-     dB/Hz/ms readouts from twitching as values change. */
-  .readout {
+  .num {
     font-variant-numeric: tabular-nums;
     font-feature-settings: 'tnum' 1;
-    font-size: 11px;
-    font-weight: 500;
-    line-height: 1.2;
     white-space: nowrap;
-    color: var(--color-ink);
   }
+}
 
-  .plane {
-    box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.03);
-  }
+/* ── Stage ──────────────────────────────────────────────────────────────── */
+
+.stage-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* ── Knob ───────────────────────────────────────────────────────────────── */
+
+.knob-track {
+  fill: none;
+  stroke: rgb(255 255 255 / 0.09);
+  stroke-linecap: round;
+}
+.knob-fill {
+  fill: none;
+  stroke: var(--knob-accent, var(--color-accent));
+  stroke-linecap: round;
+}
+.knob-face {
+  fill: var(--color-control);
+  stroke: rgb(0 0 0 / 0.45);
+  stroke-width: 1;
+}
+.knob-pointer {
+  stroke: var(--color-ink);
+  stroke-linecap: round;
+}
+.knob:hover .knob-face {
+  fill: var(--color-control-hi);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -114,4 +131,45 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ── Plots ──────────────────────────────────────────────────────────────── */
+
+.plot-grid {
+  stroke: rgb(255 255 255 / 0.05);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.plot-grid.is-major {
+  stroke: rgb(255 255 255 / 0.1);
+}
+.plot-label {
+  fill: var(--color-ink-4);
+  font-family: var(--font-sans);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+.plot-curve {
+  fill: none;
+  stroke: var(--color-accent);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+.plot-curve.is-idle {
+  stroke: var(--color-ink-4);
+}
+.plot-reference {
+  fill: none;
+  stroke: rgb(255 255 255 / 0.16);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+  vector-effect: non-scaling-stroke;
+}
+.plot-handle {
+  cursor: grab;
+}
+.plot-handle:active {
+  cursor: grabbing;
 }

@@ -41,10 +41,16 @@
       step(-1)
     }
   }
+
+  function onWheel(event: WheelEvent) {
+    if (disabled) return
+    event.preventDefault()
+    step(event.deltaY < 0 ? 1 : -1)
+  }
 </script>
 
 <div class="division" class:disabled>
-  <div class="row">
+  <div class="row" onwheel={onWheel}>
     <button
       type="button"
       class="step"
@@ -52,7 +58,7 @@
       disabled={disabled || index === 0}
       onclick={() => step(-1)}
     >
-      ‹
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5" /></svg>
     </button>
     <label class="select">
       <span class="note">{DIVISION_LABELS[index]}</span>
@@ -76,11 +82,10 @@
       disabled={disabled || index === last}
       onclick={() => step(1)}
     >
-      ›
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" /></svg>
     </button>
   </div>
   <div class="readout">{readout}</div>
-  <div class="label">{label}</div>
 </div>
 
 <style>
@@ -88,42 +93,53 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 0.25rem;
-    min-width: 0;
+    gap: 0.35rem;
     width: 100%;
+    min-width: 0;
   }
 
   .division.disabled {
-    opacity: 0.45;
+    opacity: 0.4;
   }
 
   .row {
     display: grid;
-    grid-template-columns: 1.35rem minmax(0, 1fr) 1.35rem;
+    grid-template-columns: 1.4rem minmax(0, 1fr) 1.4rem;
     align-items: stretch;
-    width: min(100%, 7.5rem);
-    height: 1.9rem;
+    width: 100%;
+    height: 2.6rem;
     overflow: hidden;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-sm);
-    background: var(--base);
+    background: var(--inset);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.5);
   }
 
   .step {
+    display: grid;
+    place-items: center;
     color: var(--text-muted);
-    font-size: 0.95rem;
-    line-height: 1;
     cursor: pointer;
+  }
+
+  .step svg {
+    width: 0.75rem;
+    height: 0.75rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
 
   .step:hover:not(:disabled) {
     color: var(--text);
-    background: var(--raised);
+    background: var(--surface-hi);
   }
 
   .step:disabled {
     cursor: default;
-    opacity: 0.35;
+    opacity: 0.3;
   }
 
   .select {
@@ -131,16 +147,14 @@
     display: grid;
     place-items: center;
     min-width: 0;
-    border-inline: 1px solid var(--border);
   }
 
   .note {
     overflow: hidden;
     width: 100%;
-    color: var(--accent);
-    font-size: 0.76rem;
+    color: var(--lane, var(--accent-bright));
+    font-size: 1.05rem;
     font-weight: 700;
-    font-variant-numeric: tabular-nums;
     text-align: center;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -156,7 +170,7 @@
     border: 0;
     opacity: 0;
     cursor: pointer;
-    background: var(--raised);
+    background: var(--surface);
     color: var(--text);
   }
 
@@ -166,15 +180,7 @@
 
   .readout {
     color: var(--text-muted);
-    font-size: 0.7rem;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .label {
-    color: var(--text-faint);
-    font-size: 0.66rem;
-    font-weight: 650;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
+    font-size: 0.72rem;
+    font-weight: 600;
   }
 </style>

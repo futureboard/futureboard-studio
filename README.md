@@ -2,7 +2,7 @@
 
 <img width="2111" height="684" alt="Futureboard Studio banner" src="packages/assets/banner.png" />
 
-**The Community Edition of a modern open-source Digital Audio Workstation, built with Rust, GPUI, TypeScript, WebAssembly, and native audio/plugin infrastructure.**
+**Futureboard Studio Community Edition — an open-source digital audio workstation, built natively in Rust on GPUI.**
 
 [![CI](https://img.shields.io/github/actions/workflow/status/futureboard/Futureboard/ci.yml?branch=main&style=for-the-badge&label=CI&logo=github&logoColor=white&color=22c55e&labelColor=0f172a)](https://github.com/futureboard/Futureboard/actions/workflows/ci.yml)
 [![Status](https://img.shields.io/badge/status-pre--alpha-f59e0b?style=for-the-badge&labelColor=0f172a)](ARCHITECTURE.md)
@@ -11,53 +11,174 @@
 [![Translate on Crowdin](https://img.shields.io/badge/Translate-Crowdin-2e3340?style=for-the-badge&logo=crowdin&logoColor=white&labelColor=0f172a)](https://crowdin.com/project/futureboard-studio)
 
 [![Rust](https://img.shields.io/badge/Rust-2024-f97316?style=for-the-badge&logo=rust&logoColor=white&labelColor=0f172a)](https://rustup.rs)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3b82f6?style=for-the-badge&logo=typescript&logoColor=white&labelColor=0f172a)](https://www.typescriptlang.org)
-[![Bun](https://img.shields.io/badge/Bun-runtime-fbf0df?style=for-the-badge&logo=bun&logoColor=black&labelColor=0f172a)](https://bun.sh)
-[![WebAssembly](https://img.shields.io/badge/WebAssembly-DSP-7c3aed?style=for-the-badge&logo=webassembly&logoColor=white&labelColor=0f172a)](https://webassembly.org)
-
 [![GPUI](https://img.shields.io/badge/UI-GPUI-06b6d4?style=for-the-badge&labelColor=0f172a)](https://www.gpui.rs)
-[![VST3](https://img.shields.io/badge/Plugins-VST3-f97316?style=for-the-badge&labelColor=0f172a)](https://steinbergmedia.github.io/vst3_dev_portal/)
-[![CLAP](https://img.shields.io/badge/Plugins-CLAP-a855f7?style=for-the-badge&labelColor=0f172a)](https://cleveraudio.org)
-[![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Web-14b8a6?style=for-the-badge&labelColor=0f172a)](#getting-started)
+[![Plugins](https://img.shields.io/badge/Plugins-VST3%20%7C%20CLAP%20%7C%20AU-a855f7?style=for-the-badge&labelColor=0f172a)](#features)
+[![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux-14b8a6?style=for-the-badge&labelColor=0f172a)](#platform-notes)
 
-[Architecture](#architectural-overview) ·
+[Screenshots](#screenshots) ·
+[Features](#features) ·
 [Getting Started](#getting-started) ·
-[Build](#building-the-native-app) ·
+[Build & Package](#build--package) ·
+[Architecture](#architecture) ·
 [Debugging](#debugging--diagnostics) ·
 [Translations](#translations) ·
-[Contributing](#contributing) ·
-[Forks & Trademarks](#third-party-forks--trademarks)
+[Contributing](#contributing)
 
 </div>
 
+<p align="center">
+  <img src="packages/assets/new_screenshots/desktop-2626.webp" alt="Futureboard Studio: arrangement, mixer, Chord Generator and Big Clock" width="900" />
+</p>
+
+> [!WARNING]
+> **Pre-alpha.** Futureboard Studio is under active early development. Expect
+> breaking changes, missing features and project-format revisions. Do not trust
+> it with irreplaceable work; nightly builds are test snapshots only.
+
 ---
 
-## Preview
+## Screenshots
 
 <table>
   <tr>
-    <td width="25%" align="center">
-      <img src="packages/assets/preview_midi_editor.png" alt="Futureboard Studio MIDI editor" />
+    <td colspan="2" align="center">
+      <img src="packages/assets/new_screenshots/workspace.png" alt="Arrangement, browser, inspector and docked mixer" />
       <br />
-      <sub>MIDI Editor</sub>
+      <sub>Workspace — arrangement, browser, inspector and the docked mixer</sub>
     </td>
-    <td width="25%" align="center">
-      <img src="packages/assets/preview_mixer.png" alt="Futureboard Studio mixer" />
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/mixer.png" alt="Mixer window" />
       <br />
-      <sub>Mixer</sub>
+      <sub>Mixer — inserts, sends, pan, PFL/AFL, Master and Monitor</sub>
     </td>
-    <td width="25%" align="center">
-      <img src="packages/assets/preview_mainwindow.png" alt="Futureboard Studio workspace preview" />
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/audio-connections.png" alt="Audio Connections window" />
       <br />
-      <sub>Workspace</sub>
+      <sub>Audio Connections — named input and output buses</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/chord-generator.png" alt="Chord Generator" />
+      <br />
+      <sub>Chord Generator — progressions to a Chord Track or MIDI clip</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/tempo-key-finder.png" alt="Find Tempo and Key" />
+      <br />
+      <sub>Find Tempo &amp; Key — tempo map, key and chords from audio</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/audio-repair.png" alt="Audio Repair" />
+      <br />
+      <sub>Audio Repair — noise reduction, de-click, de-hum, spectral repair</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/rodhareist.png" alt="Rodhareist amp rig" />
+      <br />
+      <sub>Rodhareist — a built-in amp and effects rig</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/project-settings.png" alt="Project Settings" />
+      <br />
+      <sub>Project Settings — tempo, meter, key and timebase</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/performance-monitor.png" alt="Performance Monitor" />
+      <br />
+      <sub>Performance Monitor — engine status, callback load, dropouts</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/big-clock.png" alt="Big Clock" />
+      <br />
+      <sub>Big Clock — bars|beats|ticks, time and timecode</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/workspace-audio-connections-thai.png" alt="Workspace in Thai with Audio Connections" />
+      <br />
+      <sub>Utility windows float over the workspace</sub>
     </td>
   </tr>
 </table>
 
+<details>
+<summary><b>Localized interface (Thai)</b></summary>
+<br />
+<table>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="packages/assets/new_screenshots/workspace-thai.png" alt="Workspace in Thai" />
+      <br />
+      <sub>Workspace</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/mixer-thai.png" alt="Mixer in Thai" />
+      <br />
+      <sub>Mixer</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="packages/assets/new_screenshots/settings-thai.png" alt="Settings in Thai" />
+      <br />
+      <sub>Settings</sub>
+    </td>
+  </tr>
+</table>
+</details>
+
 ---
 
-> [!WARNING]
-> **Pre-alpha.** Under active early development — expect breaking changes, incomplete features, and no persistence guarantees. Not ready for production; don't trust it with irreplaceable projects. Nightly builds are test snapshots only.
+## Features
+
+Futureboard Studio is one native desktop application: the shell, the editors,
+the audio engine and the plug-in host are Rust. What exists today, pre-alpha:
+
+- **Arrangement** — audio, MIDI, instrument, bus, return and folder tracks;
+  clips, takes, markers, regions, tempo and time-signature tracks, automation
+  lanes, and a Chord Track.
+- **Editing** — piano roll with per-note MIDI channels and controller lanes, an
+  audio editor with time-stretch and pitch, and a spectrogram view.
+- **Mixer** — inserts, sends, bus and return routing, pan, mute/solo, PFL/AFL
+  listen, plug-in delay compensation, a Master bus and a Control Room monitor
+  path. Docked or in its own window.
+- **Audio Connections** — named mono and stereo input and output buses mapped
+  onto the audio device's channels.
+- **Plug-in hosting** — VST3, CLAP, AU (macOS) and legacy VST2, scanned and
+  run out of process, with native editor embedding and ARA 2 support.
+- **Built-in instruments and effects** — see [Built-in plug-ins](#built-in-plug-ins).
+- **Built-in Soundfont Player** — any `.sf2`, as one instrument or as sixteen
+  parts on the MIDI channels, General MIDI style.
+- **Music tools** — Chord Generator, Find Tempo &amp; Key, stem extraction and
+  audio repair (noise reduction, de-click, de-hum, spectral repair).
+- **Utility windows** — Big Clock, Performance Monitor, master-bus visualizers
+  (spectrum, stereo image, loudness, oscilloscope, spectrogram), Virtual
+  Keyboard, Project Settings.
+- **Localization** — English, Thai, Japanese, Simplified Chinese and Lao
+  catalogs, with composite fonts for mixed scripts.
+
+### Built-in plug-ins
+
+Built-in plug-ins are Rust DSP hosted by the plug-in host. Each has its own
+editor, a compiled web view embedded in the binary — the one place Futureboard
+uses web technology.
+
+| Kind        | Plug-ins                                                                   |
+| ----------- | -------------------------------------------------------------------------- |
+| Dynamics    | Compressor (single and multiband) · FA-2A · FA-76 · Z-Comp · Transient     |
+| EQ &amp; color  | EQ-Z8 · C1073 · 67Clipper · BurnLimit                                      |
+| Space       | EchoSpace · VerbSpace · Imager                                             |
+| Utility     | MixStation                                                                 |
+| Amp rig     | Rodhareist                                                                 |
+| Instruments | WrapSynth · Drum Sampler                                                   |
 
 ---
 
@@ -79,91 +200,77 @@ libclang lookup `asio-sys` needs — is part of that private tree. This reposito
 contains none of it: `xtask/src/toolchain.rs` is a stub here, and a Community
 build never compiles ASIO support.
 
-```bash
-# Public Community Edition
-cargo build -p futureboard_native
-
-# Staged, runnable Community tree in out/release/community/<platform>
-cargo xtask package --profile release --edition community --plugin all
-```
-
 Professional build and release instructions live in
 `crates/ExclusiveEdition/docs/RELEASE.md`, in the private checkout.
 
 ---
 
-## Architectural Overview
-
-Futureboard Studio is a Digital Audio Workstation whose primary maintained surface is a **native Rust application built on [GPUI](https://www.gpui.rs)** (the rendering framework behind the Zed editor), driving an in-process Rust audio engine. A secondary **web** (WASM DSP) surface shares layout and engine concepts, but the native app is the main development target.
-
-| Surface              | Path          | Stack                                | Status                 |
-| -------------------- | ------------- | ------------------------------------ | ---------------------- |
-| **Native** (primary) | `apps/native` | Rust · GPUI · direct audio engine    | Main dev target        |
-| Web                  | `apps/web`    | React · TypeScript · Vite · WASM DSP | Tracks native, may lag |
-
-### Core crates
-
-| Crate                     | Purpose                                                    |
-| ------------------------- | ---------------------------------------------------------- |
-| `SphereDirectAudioEngine` | Native low-latency engine (WASAPI · CoreAudio · ALSA)      |
-| `SphereWebAudioCore`      | Web WASM audio core — transport, graph, mixer, meters, DSP |
-| `SphereUIComponents`      | Native GPUI UI kit, styling, and layout primitives         |
-| `SpherePluginHost`        | Plugin scanning & hosting (VST3, CLAP, AU, VST2 legacy)    |
-| `SphereAudioPlugins`      | Built-in real-time DSP (EQ, compression, delay, …)         |
-
-Also: [`plugins/`](plugins/) (stock-plugin editors), [`modules/`](modules/) (noise removal, stem extraction), [`extensions/`](extensions/) (extension templates), [`packages/`](packages/) (shared fonts/icons/assets), [`external/`](external/) (vendored SDKs). See [ARCHITECTURE.md](ARCHITECTURE.md) for the full breakdown.
-
----
-
 ## Getting Started
 
-**Prerequisites:** [Bun](https://bun.sh) · [Rust](https://rustup.rs) 1.85+ (edition 2024) with the `wasm32-unknown-unknown` target · [CMake](https://cmake.org) 3.20+ · a C++ toolchain (MSVC / Xcode CLT / GCC / Clang).
+**Prerequisites**
+
+- [Rust](https://rustup.rs), stable, edition 2024 (MSVC toolchain on Windows).
+- [Bun](https://bun.sh), for the built-in plug-in editors and the repository scripts.
+- [CMake](https://cmake.org) 3.20+ and a C++ toolchain (MSVC, Xcode Command Line
+  Tools, GCC or Clang) for the plug-in SDK bridges.
 
 > [!IMPORTANT]
-> Vendored SDKs (`external/vst3sdk`, `external/clap`, …) are **git submodules** — clone with `--recursive` (or run `git submodule update --init --recursive` afterwards).
+> Vendored SDKs under `external/` are **git submodules** — clone with
+> `--recursive`, or run `git submodule update --init --recursive` afterwards.
 
 ```bash
 git clone --recursive https://github.com/futureboard/Futureboard
 cd Futureboard
-bun install                               # JS workspace dependencies
-rustup target add wasm32-unknown-unknown  # web audio core target
+bun install
 ```
 
-Run a surface:
+Run the app in development:
 
 ```bash
-bun run dev:native   # native GPUI client   (= cargo run -p futureboard_native)
-bun run dev:web      # React web app
-bun run dev:server   # collaboration server
+cargo build -p sphere-plugin-host --bins   # helper binaries the app spawns
+cargo run -p futureboard_native            # = bun run dev:native
+```
+
+The built-in plug-in editors run in an embedded Chromium (CEF). Packaging
+stages the CEF runtime for you; for a plain `cargo run` with working editors,
+install it once:
+
+```bash
+cargo run -p SphereWebView --example install_cef --features installer
 ```
 
 ---
 
-## Building the Native App
+## Build & Package
 
-The native client is a Rust binary linking the GPUI UI kit, the direct audio engine, and the plugin host (CMake + a C++ toolchain are required for the native plugin/SDK bridge). The `bun run` scripts wrap the equivalent `cargo` commands.
-
-```bash
-bun run build:native:debug   # debug    (= cargo build -p futureboard_native)
-bun run build:native         # release  (= cargo build --release -p futureboard_native)
-```
-
-The release binary is emitted to `target/release/FutureboardNative` (`.exe` on Windows).
-
-Package distributables (scripts in `packaging/native/`):
+`xtask` builds the app, its helper executables and the built-in plug-ins, and
+stages a runnable tree with the CEF runtime beside it.
 
 ```bash
-bun run bundle:native:mac       # macOS .app
-bun run bundle:native:mac:dmg   # macOS .dmg installer
-bun run bundle:native:win       # Windows portable / installer
-bun run build:all               # all surfaces (WASM + native)
+# out/release/community/<platform>
+cargo run -p xtask -- package --profile release --edition community --plugin all
+# = bun run build:native
+
+# out/dev/<platform>
+cargo run -p xtask -- package --profile dev --edition community --plugin all
+# = bun run build:native:debug
 ```
 
-#### macOS universal (Apple Silicon + Intel)
+`--plugin` takes `all`, `none`, or a comma-separated list of plug-in crates.
 
-CEF publishes `macosx64` and `macosarm64` as separate distributions — there is no
-universal one — so a universal app is produced by packaging each architecture and
-merging the two trees with `lipo`:
+Distributables:
+
+| Target  | Command                                                                      |
+| ------- | ---------------------------------------------------------------------------- |
+| Windows | `bun run bundle:native:win` — Inno Setup installer (`packaging/windows`)     |
+| macOS   | `bun run bundle:native:mac` · `bun run bundle:native:mac:dmg` (`packaging/native`) |
+| Linux   | `packaging/linux/bundle-appimage.sh` — AppImage · `packaging/aur` — AUR package |
+
+### macOS universal (Apple Silicon + Intel)
+
+CEF publishes `macosx64` and `macosarm64` as separate distributions — there is
+no universal one — so a universal app is produced by packaging each architecture
+and merging the two trees with `lipo`:
 
 ```bash
 rustup target add x86_64-apple-darwin aarch64-apple-darwin
@@ -185,52 +292,94 @@ bash packaging/native/bundle-macos-dmg.sh
 reports the architectures it shipped, and fails on a single-architecture bundle
 when `FUTUREBOARD_REQUIRE_UNIVERSAL=1` (release CI sets it). The DMG filename
 carries the architecture: `…-macos-universal.dmg`, `…-macos-arm64.dmg`, or
-`…-macos-x86_64.dmg`.
-
-Releases ship **all three**: both single-architecture packages already exist as
-a by-product of the universal merge, so bundling them separately costs no extra
-compile. Point `bundle-macos.sh` at `macos-arm64` or `macos-x64` (with distinct
-output directories, since every bundle is named `Futureboard Studio.app`) to
-produce them locally.
-
-The in-app updater ranks these: it takes the image matching the running
+`…-macos-x86_64.dmg`. The in-app updater takes the image matching the running
 architecture first, falls back to the universal one, and never installs the
 other architecture's image.
 
 ### Platform notes
 
-| Platform | Audio backend                           | Setup                                                         |
-| -------- | --------------------------------------- | ------------------------------------------------------------- |
-| Windows  | WASAPI (exclusive mode / MMCSS planned) | `rustup default stable-msvc`                                  |
-| macOS    | CoreAudio                               | `xcode-select --install`                                      |
-| Linux    | ALSA (PipeWire/JACK later)              | `sudo apt install libasound2-dev` · `sudo pacman -S alsa-lib` |
+| Platform | Audio backends                  | Setup                                                         |
+| -------- | ------------------------------- | ------------------------------------------------------------- |
+| Windows  | WASAPI (shared and exclusive) · WDM-KS | `rustup default stable-msvc`                           |
+| macOS    | CoreAudio                       | `xcode-select --install`                                      |
+| Linux    | ALSA                            | `sudo apt install libasound2-dev` · `sudo pacman -S alsa-lib` |
+
+ASIO is available in Professional Edition only.
+
+### Scripts
+
+| Script                                                                          | Runs                                                  |
+| ------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `dev:native`                                                                    | `cargo run -p futureboard_native`                     |
+| `build:native` · `build:native:debug`                                           | `xtask package` (release / dev, Community, all plug-ins) |
+| `build:plugin-editors`                                                          | Build every built-in plug-in editor bundle            |
+| `bundle:native:win` · `bundle:native:mac[:dmg]` · `installer:native:win`        | Package distributables                                |
+| `cargo:check` · `cargo:build` · `cargo:release` · `cargo:test` · `cargo:clippy` | Rust workspace passthroughs                           |
+| `cargo:fmt[:check]` · `check` · `lint` · `fmt`                                  | Formatting and combined checks                        |
 
 ---
 
-## Bun Scripts Reference
+## Architecture
 
-| Script                                                                          | Description                                   |
-| ------------------------------------------------------------------------------- | --------------------------------------------- |
-| `dev:web` · `dev:native` · `dev:server`                                         | Run a surface in dev                          |
-| `build:web` · `build:wasm` · `build:native[:debug]`                             | Production / debug builds                     |
-| `build:audio:plugins`                                                           | Check stock plugin crate + extension template |
-| `bundle:native:mac[:dmg]` · `bundle:native:win`                                 | Package distributables                        |
-| `cargo:check` · `cargo:build` · `cargo:release` · `cargo:test` · `cargo:clippy` | Rust workspace passthroughs                   |
-| `cargo:fmt[:check]` · `check` · `lint` · `fmt`                                  | Format & combined checks                      |
+The product is the native application in [`apps/native/studio`](apps/native/studio)
+(package `futureboard_native`, binary `FutureboardNative`). GPUI — the
+rendering framework behind the Zed editor — owns the shell, windows, commands
+and state; the audio engine runs in process; plug-ins run in a separate host
+process so a crashing plug-in cannot take the session down.
+
+| Crate                                                          | Purpose                                                        |
+| -------------------------------------------------------------- | -------------------------------------------------------------- |
+| [`SphereUIComponents`](crates/SphereUIComponents)              | The GPUI shell, editors, mixer, windows and theme              |
+| [`SphereDirectAudioEngine`](crates/SphereDirectAudioEngine)    | Real-time engine: graph, transport, mixing, recording, export  |
+| [`SpherePluginHost`](crates/SpherePluginHost)                  | Plug-in scanning, the out-of-process host and editor bridging  |
+| [`BuiltinAudioPlugins`](crates/BuiltinAudioPlugins)            | Built-in plug-in DSP and their embedded editors                |
+| [`SphereWebView`](crates/SphereWebView)                        | CEF host for the built-in plug-in editors                      |
+| [`SphereSoundfontPlayer`](crates/SphereSoundfontPlayer)        | The built-in SoundFont instrument                              |
+| [`SphereMidiService`](crates/SphereMidiService)                | MIDI devices, programs and MPE                                 |
+| [`SphereAudioProcessor`](crates/SphereAudioProcessor)          | Time-stretch, pitch and audio analysis                         |
+| [`Ara2Bridge`](crates/Ara2Bridge) · [`SphereAraHost`](crates/SphereAraHost) | ARA 2 hosting                                     |
+| [`gpui`](crates/gpui)                                          | The GPUI fork the app is built on                              |
+
+Other native apps share the same crates: `jamsession` (standalone Audio Jam
+client), `singer` (Solfege instrument playground) and `apakinstaller` (signed
+`.apak` package tools). See [ARCHITECTURE.md](ARCHITECTURE.md) for the full map.
+
+The only web code in the product is each built-in plug-in's editor, under
+`crates/BuiltinAudioPlugins/crates/*/editor` or `editorui`: compiled to static
+assets, embedded in the binary and shown through CEF. The earlier general-purpose
+web and Electron surfaces are retired.
+
+### Repository layout
+
+```text
+Futureboard
+├─ apps/native/    studio (the app) · jamsession · singer · apakinstaller · cef_helper
+├─ crates/         engine, UI, plug-in host, built-in plug-ins, GPUI fork, services
+├─ packages/       assets · keymaps · shared (locales, themes, menus, fonts, icons)
+├─ extensions/     extension template
+├─ external/       vendored SDKs (git submodules) and patched dependencies
+├─ packaging/      Windows · macOS · Linux · AUR packaging
+├─ scripts/        plug-in editor build, menu/keymap/locale generation, versioning
+└─ xtask/          build and package orchestration
+```
 
 ---
 
 ## Debugging & Diagnostics
 
-Several subsystems expose verbose logging and debug behavior through environment variables — set the logging variables to `1` to enable them.
+Verbose logging is opt-in through environment variables; set a logging
+variable to `1` to enable it.
 
-| Variable                          | Effect                                                       |
-| --------------------------------- | ------------------------------------------------------------ |
-| `FUTUREBOARD_PLUGIN_DEBUG`        | Insert add/set/remove/bypass mutations + engine-sync details |
-| `FUTUREBOARD_PLUGIN_VIEW_DEBUG`   | Native plugin editor lifecycle and view attachment           |
-| `FUTUREBOARD_ROUTING_DEBUG`       | Send, return, and bus routing graph diagnostics              |
-| `GPUI_DISABLE_DIRECT_COMPOSITION` | Windows composition workaround for native plugin UI          |
-| `FUTUREBOARD_PLUGIN_EDITOR_MODE`  | Plugin editor mode selection                                 |
+| Variable                          | Effect                                                         |
+| --------------------------------- | -------------------------------------------------------------- |
+| `FUTUREBOARD_PLUGIN_DEBUG`        | Insert add/set/remove/bypass mutations and engine-sync details |
+| `FUTUREBOARD_PLUGIN_VIEW_DEBUG`   | Native plug-in editor lifecycle and view attachment            |
+| `FUTUREBOARD_PLUGIN_EDITOR_MODE`  | Plug-in editor mode selection                                  |
+| `FUTUREBOARD_ROUTING_DEBUG`       | Send, return and bus routing graph                             |
+| `FUTUREBOARD_PDC_DEBUG`           | Plug-in delay compensation                                     |
+| `FUTUREBOARD_MIDI_VERBOSE`        | MIDI and plug-in bridge tracing                                |
+| `FUTUREBOARD_MIXER_GPU`           | Draw the mixer with the batched GPU painter                    |
+| `GPUI_DISABLE_DIRECT_COMPOSITION` | Windows composition workaround for native plug-in editors      |
 
 ```bash
 # bash
@@ -239,25 +388,8 @@ FUTUREBOARD_PLUGIN_VIEW_DEBUG=1 cargo run -p futureboard_native
 $env:FUTUREBOARD_PLUGIN_VIEW_DEBUG=1; cargo run -p futureboard_native
 ```
 
----
-
-## Repository Layout
-
-```text
-Futureboard
-├─ apps/         native · web
-├─ crates/       SphereDirectAudioEngine · SphereWebAudioCore · SphereUIComponents · SpherePluginHost · SphereAudioPlugins
-├─ packages/     assets · shared
-├─ plugins/      modules/      extensions/
-├─ external/     vendored SDKs
-└─ packaging/    native bundle scripts
-```
-
----
-
-## Roadmap
-
-Toward a usable native DAW foundation: a stable native GPUI shell, audio clip editing, timeline & MIDI editing, mixer routing, native plugin hosting (VST3 editor embedding, CLAP support), a project file format, automation lanes, audio export, and cross-platform packaging. See [ARCHITECTURE.md](ARCHITECTURE.md) for current status.
+Inside the app, **Window › Performance Monitor** shows the engine's backend,
+stream, latency, callback load and dropouts.
 
 ---
 
@@ -265,15 +397,19 @@ Toward a usable native DAW foundation: a stable native GPUI shell, audio clip ed
 
 Help translate Futureboard Studio through the
 [Futureboard Studio project on Crowdin](https://crowdin.com/project/futureboard-studio).
-The English source catalog and downloaded locale files live under
-`packages/shared/locales`; see the [translation guide](packages/shared/locales/translation.md)
-for the catalog format and maintainer workflow.
+The English source catalog and the locale files (`en-US`, `th-TH`, `ja-JP`,
+`zh-CN`, `lo-LA`) live under `packages/shared/locales`; see the
+[translation guide](packages/shared/locales/translation.md) for the catalog
+format and maintainer workflow.
 
 ---
 
 ## Contributing
 
-Contributions are welcome — bug reports, build testing, documentation, UI fixes, plugin-hosting and audio-engine work, and platform support. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request; UI work also follows [DESIGN.md](DESIGN.md) and [AGENTS.md](AGENTS.md).
+Contributions are welcome — bug reports, build testing, documentation, UI
+fixes, plug-in hosting, audio-engine work and platform support. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request; UI work also
+follows [DESIGN.md](DESIGN.md).
 
 ---
 

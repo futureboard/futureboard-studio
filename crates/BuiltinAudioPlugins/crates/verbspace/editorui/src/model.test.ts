@@ -10,7 +10,7 @@ import {
   levelDbAt,
   lineDelaysMs,
 } from './model'
-import { MODES, PARAMS } from './params'
+import { MODES, MODE_HINTS, PARAMS } from './params'
 import { LIB_RS, rustFloatArray, rustModeArms } from './rust'
 
 const defaults: VerbParams = {
@@ -100,5 +100,42 @@ describe('decay bands', () => {
 
   test('the envelope is -60 dB exactly one RT60 after the pre-delay', () => {
     expect(levelDbAt(0.02 + 2.4, 0.02, 2.4)).toBeCloseTo(-60, 6)
+  })
+})
+
+/**
+ * The space picker describes each mode in words. The words are only allowed
+ * to say what the constants say, so they are held against them here.
+ */
+describe('the mode hints describe the tank each mode builds', () => {
+  const byScale = [...MODES].sort(
+    (a, b) => MODE_LINE_SCALE[a] - MODE_LINE_SCALE[b],
+  )
+  const byBias = [...MODES].sort(
+    (a, b) => MODE_DIFFUSION_BIAS[a] - MODE_DIFFUSION_BIAS[b],
+  )
+
+  test('every mode has a hint', () => {
+    for (const mode of MODES) expect(MODE_HINTS[mode].length).toBeGreaterThan(0)
+  })
+
+  test('largest and smallest follow line_scale', () => {
+    expect(byScale.at(-1)).toBe('hall')
+    expect(MODE_HINTS.hall).toContain('Largest')
+    expect(byScale[0]).toBe('ambience')
+    expect(MODE_HINTS.ambience).toContain('Smallest')
+  })
+
+  test('densest and sparsest follow diffusion_bias', () => {
+    expect(byBias.at(-1)).toBe('plate')
+    expect(MODE_HINTS.plate).toContain('densest')
+    expect(byBias[0]).toBe('ambience')
+    expect(MODE_HINTS.ambience).toContain('sparsest')
+  })
+
+  test('room is shorter and less diffuse than chamber, and plate is small', () => {
+    expect(MODE_LINE_SCALE.room).toBeLessThan(MODE_LINE_SCALE.chamber)
+    expect(MODE_DIFFUSION_BIAS.room).toBeLessThan(MODE_DIFFUSION_BIAS.chamber)
+    expect(MODE_LINE_SCALE.plate).toBeLessThan(MODE_LINE_SCALE.room)
   })
 })
