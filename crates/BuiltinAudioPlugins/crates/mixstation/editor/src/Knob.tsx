@@ -1,239 +1,254 @@
-import { useEffect, useId, useRef, useState } from 'react'
-import { animate } from 'animejs'
 import {
-  clamp,
-  normalizedValue,
-  valueFromNormalized,
-  type ParamSpec,
-} from './params'
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+} from 'react'
+import { clamp } from './math'
 
-const ARC_START = -135
-const ARC_SWEEP = 270
-/** Pointer travel, in px, that spans the whole range. Shift gives 5x precision. */
-const COARSE_TRAVEL = 160
-const FINE_TRAVEL = 800
+const ANGLE_START = 135
+const ANGLE_SWEEP = 270
+/// Pixels of vertical drag for the full range; Shift divides it by five.
+const DRAG_SPAN = 200
+const WHEEL_STEP = 0.035
+const WHEEL_STEP_FINE = 0.006
 
-type Props = {
-  spec: ParamSpec
+function polar(radius: number, progress: number) {
+  const radians = ((ANGLE_START + ANGLE_SWEEP * clamp(progress, 0, 1)) * Math.PI) / 180
+  return [50 + radius * Math.cos(radians), 50 + radius * Math.sin(radians)] as const
+}
+
+function arc(from: number, to: number, radius: number) {
+  const [lo, hi] = from <= to ? [from, to] : [to, from]
+  if (hi - lo < 0.0005) return ''
+  const start = polar(radius, lo)
+  const end = polar(radius, hi)
+  const large = (hi - lo) * ANGLE_SWEEP > 180 ? 1 : 0
+  return `M ${start[0]} ${start[1]} A ${radius} ${radius} 0 ${large} 1 ${end[0]} ${end[1]}`
+}
+
+export type KnobProps = {
+  label: string
   value: number
-  accent?: string
-  size?: number
+  min: number
+  max: number
+  step: number
+  unit?: string
+  format: (value: number) => string
+  defaultValue: number
+  /// Fill from the default rather than from the minimum — for bipolar values
+  /// such as gain, where "no change" sits in the middle.
+  originAtDefault?: boolean
   disabled?: boolean
-  /** Fill outward from centre — for parameters whose neutral point is 0. */
-  bipolar?: boolean
+  disabledHint?: string
+  /// Custom value↔travel mapping (log frequency, log Q).
+  toProgress?: (value: number) => number
+  fromProgress?: (progress: number) => number
+  /// Dial diameter in px.
+  size?: number
+  accent?: string
   onChange: (value: number) => void
 }
 
-function polar(cx: number, cy: number, r: number, deg: number) {
-  const rad = ((deg - 90) * Math.PI) / 180
-  return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)] as const
-}
-
-function arcPath(cx: number, cy: number, r: number, fromDeg: number, toDeg: number) {
-  const [x0, y0] = polar(cx, cy, r, fromDeg)
-  const [x1, y1] = polar(cx, cy, r, toDeg)
-  const large = Math.abs(toDeg - fromDeg) > 180 ? 1 : 0
-  const sweep = toDeg > fromDeg ? 1 : 0
-  return `M ${x0} ${y0} A ${r} ${r} 0 ${large} ${sweep} ${x1} ${y1}`
-}
-
-export function formatValue(spec: ParamSpec, value: number) {
-  if (spec.unit === 'Hz' && value >= 1000) return `${(value / 1000).toFixed(2)} kHz`
-  const decimals = spec.step < 1 ? 1 : 0
-  const text = value.toFixed(decimals)
-  if (!spec.unit) return text
-  return spec.unit.startsWith(':') ? `${text}${spec.unit}` : `${text} ${spec.unit}`
-}
-
-/**
- * Continuous parameter control.
- *
- * Every gesture the design contract asks for is present: a visible value
- * affordance, drag with fine adjustment, wheel, full keyboard, and a
- * double-click reset to the Rust-authored default. Values are always committed
- * through `onChange`, which coalesces to the bridge — the knob holds no
- * authoritative state of its own.
- */
+/// A flat dial: a 270° track, the value arc in the band's colour and a pointer.
+/// Drag vertically (Shift for fine), wheel, arrow keys; double-click or
+/// right-click resets; click the value to type one.
 export function Knob({
-  spec,
+  label,
   value,
-  accent = 'var(--color-signal)',
+  min,
+  max,
+  step,
+  unit,
+  format,
+  defaultValue,
+  originAtDefault,
+  disabled,
+  disabledHint,
+  toProgress,
+  fromProgress,
   size = 44,
-  disabled = false,
-  bipolar = false,
+  accent,
   onChange,
-}: Props) {
-  const norm = normalizedValue(spec, value)
+}: KnobProps) {
+  const dialRef = useRef<HTMLDivElement>(null)
+  const gesture = useRef<{ y: number; progress: number; fine: boolean } | null>(null)
   const [dragging, setDragging] = useState(false)
-  const dialRef = useRef<SVGGElement | null>(null)
-  const drag = useRef({ y: 0, norm: 0 })
-  const labelId = useId()
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
 
-  const commit = (next: number) => onChange(valueFromNormalized(spec, clamp(next, 0, 1)))
+  const asProgress = useCallback(
+    (raw: number) => clamp(toProgress ? toProgress(raw) : (raw - min) / (max - min), 0, 1),
+    [max, min, toProgress],
+  )
+  const asValue = useCallback(
+    (progress: number) => {
+      const raw = fromProgress ? fromProgress(progress) : min + progress * (max - min)
+      return clamp(Math.round(raw / step) * step, min, max)
+    },
+    [fromProgress, max, min, step],
+  )
 
-  const onPointerDown = (event: React.PointerEvent<SVGSVGElement>) => {
-    if (disabled) return
+  const progress = asProgress(value)
+  const origin = originAtDefault ? asProgress(defaultValue) : 0
+  const pointerFrom = polar(12, progress)
+  const pointerTo = polar(27, progress)
+
+  // Non-passive, so the page does not scroll under a wheel-turned knob.
+  useEffect(() => {
+    const dial = dialRef.current
+    if (!dial || disabled) return
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault()
+      const amount = event.shiftKey ? WHEEL_STEP_FINE : WHEEL_STEP
+      onChange(asValue(clamp(progress + (event.deltaY < 0 ? amount : -amount), 0, 1)))
+    }
+    dial.addEventListener('wheel', onWheel, { passive: false })
+    return () => dial.removeEventListener('wheel', onWheel)
+  }, [asValue, disabled, onChange, progress])
+
+  const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (disabled || editing || event.button !== 0) return
+    event.preventDefault()
+    gesture.current = { y: event.clientY, progress, fine: event.shiftKey }
     event.currentTarget.setPointerCapture(event.pointerId)
-    drag.current = { y: event.clientY, norm }
     setDragging(true)
   }
 
-  const onPointerMove = (event: React.PointerEvent<SVGSVGElement>) => {
-    if (!dragging) return
-    const travel = event.shiftKey ? FINE_TRAVEL : COARSE_TRAVEL
-    commit(drag.current.norm + (drag.current.y - event.clientY) / travel)
+  const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const current = gesture.current
+    if (!current || disabled) return
+    // Re-anchor when Shift changes mid-drag, so switching to fine never jumps.
+    if (current.fine !== event.shiftKey) {
+      gesture.current = { y: event.clientY, progress, fine: event.shiftKey }
+      return
+    }
+    const delta = (current.y - event.clientY) / DRAG_SPAN
+    onChange(asValue(clamp(current.progress + (current.fine ? delta * 0.2 : delta), 0, 1)))
   }
 
-  const endDrag = (event: React.PointerEvent<SVGSVGElement>) => {
-    if (!dragging) return
-    event.currentTarget.releasePointerCapture(event.pointerId)
+  const endGesture = (event: ReactPointerEvent<HTMLDivElement>) => {
+    gesture.current = null
     setDragging(false)
-  }
-
-  const onKeyDown = (event: React.KeyboardEvent<SVGSVGElement>) => {
-    if (disabled) return
-    const step = event.shiftKey ? 0.002 : 0.02
-    switch (event.key) {
-      case 'ArrowUp':
-      case 'ArrowRight':
-        event.preventDefault()
-        commit(norm + step)
-        break
-      case 'ArrowDown':
-      case 'ArrowLeft':
-        event.preventDefault()
-        commit(norm - step)
-        break
-      case 'Home':
-        event.preventDefault()
-        commit(0)
-        break
-      case 'End':
-        event.preventDefault()
-        commit(1)
-        break
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
     }
   }
 
-  const reset = () => {
-    if (disabled) return
-    onChange(spec.defaultValue)
-    if (dialRef.current) {
-      animate(dialRef.current, {
-        scale: [
-          { to: 1.12, duration: 100 },
-          { to: 1, duration: 200 },
-        ],
-        ease: 'outElastic(1, .6)',
-      })
-    }
+  const commitEdit = () => {
+    const parsed = parseTyped(draft)
+    if (parsed !== null) onChange(clamp(parsed, min, max))
+    setEditing(false)
   }
 
-  useEffect(() => {
-    if (!dragging) return
-    const previous = document.body.style.cursor
-    document.body.style.cursor = 'ns-resize'
-    return () => {
-      document.body.style.cursor = previous
-    }
-  }, [dragging])
-
-  const cx = size / 2
-  const cy = size / 2
-  const r = size / 2 - 2
-  const capR = r - 5.5
-  const angle = ARC_START + norm * ARC_SWEEP
-  const centreDeg = ARC_START + ARC_SWEEP / 2
-  const fillFrom = bipolar ? centreDeg : ARC_START
-  const [tipX, tipY] = polar(cx, cy, capR - 2.5, angle)
-  const [baseX, baseY] = polar(cx, cy, capR * 0.32, angle)
+  const readout = `${format(value)}${unit ? ` ${unit}` : ''}`
 
   return (
-    <div className="flex w-[68px] shrink-0 flex-col items-center gap-1">
-      <span id={labelId} className="label-cap w-full truncate text-center">
-        {spec.label}
-      </span>
-      <svg
+    <div
+      className={`knob flex min-w-0 flex-col items-center gap-1 ${
+        disabled ? 'pointer-events-none opacity-35' : ''
+      }`}
+      style={{ '--knob-accent': accent } as CSSProperties}
+      title={disabled ? disabledHint : undefined}
+    >
+      <span className="cap">{label}</span>
+      <div
+        ref={dialRef}
+        className="cursor-ns-resize touch-none outline-none"
+        style={{ width: size, height: size }}
         role="slider"
         tabIndex={disabled ? -1 : 0}
-        aria-labelledby={labelId}
-        aria-valuemin={spec.min}
-        aria-valuemax={spec.max}
+        aria-label={label}
+        aria-valuemin={min}
+        aria-valuemax={max}
         aria-valuenow={value}
-        aria-valuetext={formatValue(spec, value)}
-        aria-disabled={disabled || undefined}
-        width={size}
-        height={size}
-        viewBox={`0 0 ${size} ${size}`}
-        className={
+        aria-valuetext={readout}
+        aria-disabled={disabled}
+        title={
           disabled
-            ? 'cursor-not-allowed touch-none opacity-40'
-            : 'cursor-ns-resize touch-none'
+            ? disabledHint
+            : `${label} — drag up/down, Shift for fine, double-click to reset`
         }
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
-        onPointerUp={endDrag}
-        onPointerCancel={endDrag}
-        onDoubleClick={reset}
-        onKeyDown={onKeyDown}
+        onPointerUp={endGesture}
+        onPointerCancel={endGesture}
+        onDoubleClick={() => !disabled && onChange(defaultValue)}
+        onContextMenu={(event) => {
+          event.preventDefault()
+          if (!disabled) onChange(defaultValue)
+        }}
+        onKeyDown={(event) => {
+          if (disabled) return
+          const amount = event.shiftKey ? WHEEL_STEP_FINE : WHEEL_STEP
+          if (event.key === 'ArrowUp' || event.key === 'ArrowRight') {
+            event.preventDefault()
+            onChange(asValue(clamp(progress + amount, 0, 1)))
+          } else if (event.key === 'ArrowDown' || event.key === 'ArrowLeft') {
+            event.preventDefault()
+            onChange(asValue(clamp(progress - amount, 0, 1)))
+          } else if (event.key === 'Home') {
+            event.preventDefault()
+            onChange(min)
+          } else if (event.key === 'End') {
+            event.preventDefault()
+            onChange(max)
+          }
+        }}
       >
-        <g ref={dialRef} style={{ transformOrigin: `${cx}px ${cy}px` }}>
-          <path
-            d={arcPath(cx, cy, r, ARC_START, ARC_START + ARC_SWEEP)}
-            fill="none"
-            stroke="var(--color-hairline-hi)"
-            strokeWidth={2.5}
-            strokeLinecap="round"
-          />
-          {Math.abs(angle - fillFrom) > 0.5 && (
-            <path
-              d={arcPath(cx, cy, r, fillFrom, angle)}
-              fill="none"
-              stroke={accent}
-              strokeWidth={2.5}
-              strokeLinecap="round"
-            />
-          )}
-          {bipolar && (
-            <line
-              x1={polar(cx, cy, r - 4.5, centreDeg)[0]}
-              y1={polar(cx, cy, r - 4.5, centreDeg)[1]}
-              x2={polar(cx, cy, r + 2.5, centreDeg)[0]}
-              y2={polar(cx, cy, r + 2.5, centreDeg)[1]}
-              stroke="var(--color-ink-dim)"
-              strokeWidth={1}
-            />
-          )}
-          <circle cx={cx} cy={cy} r={capR} fill="url(#knobCap)" />
-          <circle
-            cx={cx}
-            cy={cy}
-            r={capR}
-            fill="none"
-            stroke="rgb(255 255 255 / 0.08)"
-            strokeWidth={1}
-          />
+        <svg viewBox="0 0 100 100" className="block h-full w-full overflow-visible" aria-hidden="true">
+          <path className="knob-track" d={arc(0, 1, 44)} strokeWidth={7} />
+          <path className="knob-fill" d={arc(origin, progress, 44)} strokeWidth={7} />
+          <circle className="knob-face" cx="50" cy="50" r="31" />
           <line
-            x1={baseX}
-            y1={baseY}
-            x2={tipX}
-            y2={tipY}
-            stroke={dragging ? accent : 'var(--color-ink)'}
-            strokeWidth={1.8}
-            strokeLinecap="round"
+            className="knob-pointer"
+            x1={pointerFrom[0]}
+            y1={pointerFrom[1]}
+            x2={pointerTo[0]}
+            y2={pointerTo[1]}
+            strokeWidth={dragging ? 5 : 4}
           />
-        </g>
-        <defs>
-          <radialGradient id="knobCap" cx="50%" cy="22%" r="80%">
-            <stop offset="0%" stopColor="#3a3d45" />
-            <stop offset="55%" stopColor="#24272d" />
-            <stop offset="100%" stopColor="#15171b" />
-          </radialGradient>
-        </defs>
-      </svg>
-      <span className="readout w-full overflow-hidden text-center text-ellipsis">
-        {formatValue(spec, value)}
-      </span>
+        </svg>
+      </div>
+      {editing ? (
+        <input
+          className="num h-5 w-16 rounded border border-line-hi bg-canvas text-center text-[11px] text-ink outline-none"
+          autoFocus
+          value={draft}
+          aria-label={`${label} value`}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={commitEdit}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') commitEdit()
+            if (event.key === 'Escape') setEditing(false)
+          }}
+        />
+      ) : (
+        <button
+          type="button"
+          className="num h-5 min-w-14 cursor-text rounded px-1 text-[11px] font-medium text-ink-2 hover:bg-white/5 hover:text-ink"
+          disabled={disabled}
+          title="Click to type a value"
+          onClick={() => {
+            setDraft(String(Number(value.toFixed(2))))
+            setEditing(true)
+          }}
+        >
+          {readout}
+        </button>
+      )}
     </div>
   )
+}
+
+/// A typed value: plain numbers, and `k` for thousands ("2.5k" → 2500).
+function parseTyped(text: string): number | null {
+  const trimmed = text.trim().toLowerCase()
+  const match = /^([+-]?\d*\.?\d+)\s*(k)?/.exec(trimmed)
+  if (!match) return null
+  const base = Number(match[1])
+  if (!Number.isFinite(base)) return null
+  return match[2] ? base * 1000 : base
 }

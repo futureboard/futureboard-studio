@@ -1,42 +1,59 @@
 # 67Clipper editor
 
-Embedded editor UI for the `clipper67` built-in plugin. Svelte 5 + Vite,
-bundled to a single `dist/index.html` by `vite-plugin-singlefile`, then
-embedded into the library and served by the native CEF host at
-`mikoplugin://clipper67/index.html`.
-
-## Character
-
-Flatline-style stage: a full-height scrolling waveform (muted blue input body,
-red gain-reduction/clip overlay from the top), a floating rounded control
-panel over the bottom-left of the stage (mode pushbuttons, Threshold / Shape /
-Ceiling), thin In/Out/GR bar meters on the right, and a bottom strip for
-Mix, DC Filter, and Stereo Link. Dark charcoal surfaces, one neon-blue signal
-accent, soft red reserved for clipping. Typography is Mona Sans (variable).
-
-## Wire contract
-
-Mirrors `crates/67Clipper/src/ipc.rs` exactly:
-
-```
-power, mode, thresholdDb, shape, ceilingDb, mix, stereoLink, dcFilter
-```
-
-`mode` wire values: `clip = 0`, `hybrid = 1`, `limit = 2`. `params.ts` and
-`rust.ts` keep the editor's copy pinned to the Rust source via
-`params.test.ts`.
-
-## Develop
+Embedded CEF editor for the built-in 67Clipper (clipper and peak limiter). React + Vite +
+Tailwind, bundled to a single self-contained `dist/index.html` that is
+embedded into the plugin library and served at
+`mikoplugin://clipper67/index.html`. It shares its layout and components with
+the other dynamics editors (BurnLimit, 67Clipper, Transient) and the tokens of
+every built-in editor: Futureboard's default theme, Mona Sans, Phosphor icons.
 
 ```bash
-bun install
-bun run dev
-bun run build
-bun test
+bun install          # from the repo root — this is a workspace package
+bun run dev          # browser preview with a simulated host (see below)
+bun run build        # tsc, then the embedded single-file bundle
+bun run test         # checks the editor's copy of the Rust constants
 ```
 
-After a production build:
+After `bun run build`, rebuild the crate so the new bundle is embedded.
 
-```bash
-cargo build -p clipper67
-```
+## Debugging in a browser
+
+`bun run dev` (or the `clipper67-editorui` entry in `.claude/launch.json`) serves the
+editor to an ordinary browser. There is no Futureboard host behind it, so
+`src/dev/previewHost.ts` stands in: it answers `bridgeReady` with a
+`selectInstance`, takes the page's `setParams`, and posts `meters` at ~30 Hz
+from a synthetic drum groove run through a rough model of the plugin
+(`src/dev/simulation.ts`). The header says **Browser preview · simulated
+signal** while it runs.
+
+None of it reaches the embedded editor: `main.tsx` imports the preview host
+only under `import.meta.env.DEV`, which the production build compiles to
+`false`, and `bridge.ts` only hands messages to it on that same condition.
+To debug the real embedded page inside Futureboard instead, start the app with
+`FUTUREBOARD_PLUGIN_VIEW_DEBUG=1` and open `http://127.0.0.1:9222` in a browser:
+the CEF host then exposes Chromium's remote-debugging endpoint.
+
+## Where authority lives
+
+| Concern | Owner |
+| --- | --- |
+| parameter ids, wire order, ranges, clamping | `../src/ipc.rs` |
+| defaults, mode order, DSP, telemetry | `../src/lib.rs` |
+| layout, formatting, presets | `src/lib/params.ts`, `src/lib/presets.ts` |
+
+`tests/params.test.ts` reads the real `.rs` files and compares, so a change on
+either side that is not mirrored fails the test instead of shipping an editor
+that quietly disagrees with the DSP.
+
+## What the editor draws
+
+- **Stage** — the last ten seconds of the insert's own meter frames: input
+  peak as the grey body, output peak as the bright line, and the clip depth hanging
+  from the 0 dB line on the same scale. Threshold and
+  ceiling are drawn across it.
+- **Meters** — In, Clip and Out, with the loudest of the last ~1.2 s held
+  as the readout. Both read from the same history ring, so every frame the
+  host sent counts, however slowly the page paints.
+
+Everything shown comes from `futureboard.meters`; nothing in the embedded
+editor is simulated.

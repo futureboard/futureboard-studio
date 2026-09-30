@@ -1081,6 +1081,18 @@ impl BridgeHost {
         self.shared_audio.get(instance_id)?.bridge().pad_levels()
     }
 
+    /// Latest per-band gain reduction for `instance_id`, as `(sequence, dB)`.
+    /// `None` when no region is mapped or its DSP has no bands.
+    pub fn builtin_band_reduction(
+        &self,
+        instance_id: &str,
+    ) -> Option<(u32, [f32; SpherePluginHost::audio_bridge::REDUCTION_BANDS])> {
+        self.shared_audio
+            .get(instance_id)?
+            .bridge()
+            .band_reduction()
+    }
+
     /// Region-header status for the footer: (sample_rate, block_frames,
     /// latency_samples, tempo_bpm). `None` when no region is mapped.
     ///
@@ -1716,6 +1728,14 @@ impl PluginBridgeRuntime {
         [f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS],
     )> {
         self.host_for(instance_id)?.builtin_pad_levels(instance_id)
+    }
+
+    pub fn builtin_band_reduction(
+        &self,
+        instance_id: &str,
+    ) -> Option<(u32, [f32; SpherePluginHost::audio_bridge::REDUCTION_BANDS])> {
+        self.host_for(instance_id)?
+            .builtin_band_reduction(instance_id)
     }
 
     pub fn builtin_host_status(&self, instance_id: &str) -> Option<(u32, u32, u32, f64)> {

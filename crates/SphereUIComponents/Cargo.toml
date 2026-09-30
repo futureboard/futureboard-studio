@@ -41,6 +41,7 @@ builtin-plugin-editor = [
     "dep:drumsampler",
     "dep:zcomp",
     "dep:mixstation",
+    "dep:compresser",
     "dep:builtin-ui-embed",
 ]
 
@@ -94,6 +95,7 @@ wrapsynth = { workspace = true, optional = true }
 drumsampler = { workspace = true, optional = true }
 zcomp = { workspace = true, optional = true }
 mixstation = { workspace = true, optional = true }
+compresser = { workspace = true, optional = true }
 builtin-ui-embed = { workspace = true, optional = true }
 # Reusable native graphics/text/window backend (DirectWrite, DWM, GDI paint).
 sphere-graphic-engine.workspace = true

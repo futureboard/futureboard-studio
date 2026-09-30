@@ -2677,12 +2677,12 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) {
         use crate::components::builtin_plugin_editor_window::{
-            BuiltinDrumSampleLoadForwarder, BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps,
-            BuiltinGlobalCommandDispatcher, BuiltinHostStatusSource, BuiltinIrLoadForwarder,
-            BuiltinIrLoadRequest, BuiltinMeterSource, BuiltinNamLoadForwarder,
-            BuiltinNamLoadRequest, BuiltinPadLevelSource, BuiltinParamForwarder,
-            BuiltinSpectrumSource, BuiltinStereoImageSource, BuiltinTransportSource,
-            PluginInstanceKey,
+            BuiltinBandReductionSource, BuiltinDrumSampleLoadForwarder,
+            BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps, BuiltinGlobalCommandDispatcher,
+            BuiltinHostStatusSource, BuiltinIrLoadForwarder, BuiltinIrLoadRequest,
+            BuiltinMeterSource, BuiltinNamLoadForwarder, BuiltinNamLoadRequest,
+            BuiltinPadLevelSource, BuiltinParamForwarder, BuiltinSpectrumSource,
+            BuiltinStereoImageSource, BuiltinTransportSource, PluginInstanceKey,
         };
 
         let target = PluginInstanceKey {
@@ -2858,6 +2858,15 @@ impl StudioLayout {
                         .and_then(|bridge| bridge.builtin_pad_levels(&key.insert_id))
                 }) as BuiltinPadLevelSource
             });
+        let band_reduction_source: Option<BuiltinBandReductionSource> =
+            bridge_runtime.clone().map(|runtime| {
+                std::sync::Arc::new(move |key: &PluginInstanceKey| {
+                    runtime
+                        .lock()
+                        .ok()
+                        .and_then(|bridge| bridge.builtin_band_reduction(&key.insert_id))
+                }) as BuiltinBandReductionSource
+            });
         let host_status_source: Option<BuiltinHostStatusSource> = bridge_runtime.map(|runtime| {
             std::sync::Arc::new(move |key: &PluginInstanceKey| {
                 runtime
@@ -2892,6 +2901,7 @@ impl StudioLayout {
             spectrum_source,
             stereo_image_source,
             pad_level_source,
+            band_reduction_source,
             transport_source,
         };
 

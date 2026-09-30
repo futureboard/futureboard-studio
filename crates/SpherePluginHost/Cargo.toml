@@ -48,6 +48,7 @@ wrapsynth.workspace = true
 drumsampler.workspace = true
 zcomp.workspace = true
 mixstation.workspace = true
+compresser.workspace = true
 # Analyser FFT for the bridged-insert spectrum (src/spectrum.rs). Already a
 # workspace dependency via rodharerist / SphereAudioProcessor — no new tree.
 rustfft.workspace = true

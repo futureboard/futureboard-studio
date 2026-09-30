@@ -1699,7 +1699,11 @@ dependencies = [
 name = "compresser"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
+ "biquad",
  "builtin_dsp_core",
+ "builtin_ui_embed",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4352,7 +4356,6 @@ dependencies = [
 name = "imager"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
- "biquad",
  "builtin_dsp_core",
  "builtin_ui_embed",
  "serde",
@@ -8131,6 +8134,7 @@ dependencies = [
  "burnlimit",
  "cc",
  "clipper67",
+ "compresser",
  "cpal",
  "crossbeam-channel",
  "dirs 5.0.1",
@@ -8222,6 +8226,7 @@ dependencies = [
  "builtin_ui_embed",
  "burnlimit",
  "clipper67",
+ "compresser",
  "core-foundation-sys",
  "crc32fast",
  "dirs 5.0.1",

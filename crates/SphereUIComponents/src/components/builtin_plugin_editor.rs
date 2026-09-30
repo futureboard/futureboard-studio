@@ -85,6 +85,7 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
         drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_index(param_id),
         zcomp::ui::UI_ORIGIN => zcomp::ui_param_index(param_id),
         mixstation::ui::UI_ORIGIN => mixstation::ui_param_index(param_id),
+        compresser::ui::UI_ORIGIN => compresser::ui_param_index(param_id),
         _ => None,
     }
 }
@@ -133,6 +134,7 @@ mod state_mirror {
         DrumSampler(Box<drumsampler::Params>),
         Zcomp(Box<zcomp::Params>),
         MixStation(Box<mixstation::Params>),
+        Compresser(Box<compresser::Params>),
     }
 
     impl BuiltinParams {
@@ -152,6 +154,7 @@ mod state_mirror {
                 Self::DrumSampler(_) => drumsampler::ui::UI_ORIGIN,
                 Self::Zcomp(_) => zcomp::ui::UI_ORIGIN,
                 Self::MixStation(_) => mixstation::ui::UI_ORIGIN,
+                Self::Compresser(_) => compresser::ui::UI_ORIGIN,
             }
         }
 
@@ -189,6 +192,9 @@ mod state_mirror {
                 zcomp::ui::UI_ORIGIN => Some(Self::Zcomp(Box::new(zcomp::default_params()))),
                 mixstation::ui::UI_ORIGIN => {
                     Some(Self::MixStation(Box::new(mixstation::default_params())))
+                }
+                compresser::ui::UI_ORIGIN => {
+                    Some(Self::Compresser(Box::new(compresser::default_params())))
                 }
                 _ => None,
             }
@@ -238,6 +244,7 @@ mod state_mirror {
             drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_id(wire_index).is_some(),
             zcomp::ui::UI_ORIGIN => zcomp::ui_param_id(wire_index).is_some(),
             mixstation::ui::UI_ORIGIN => mixstation::ui_param_id(wire_index).is_some(),
+            compresser::ui::UI_ORIGIN => compresser::ui_param_id(wire_index).is_some(),
             _ => false,
         };
         if !known {
@@ -290,6 +297,9 @@ mod state_mirror {
             }
             Some(BuiltinParams::MixStation(params)) => {
                 let _ = mixstation::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::Compresser(params)) => {
+                let _ = compresser::ipc::apply_wire_param(params, wire_index, value);
             }
             None => {}
         }
@@ -347,6 +357,9 @@ mod state_mirror {
             mixstation::ui::UI_ORIGIN => mixstation::ipc::MixStationState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::MixStation(Box::new(state.params))),
+            compresser::ui::UI_ORIGIN => compresser::ipc::CompresserState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::Compresser(Box::new(state.params))),
             _ => None,
         };
         let Some(parsed) = parsed else {
@@ -438,6 +451,11 @@ mod state_mirror {
             }
             BuiltinParams::MixStation(params) if origin == mixstation::ui::UI_ORIGIN => {
                 mixstation::ipc::MixStationState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::Compresser(params) if origin == compresser::ui::UI_ORIGIN => {
+                compresser::ipc::CompresserState::new((**params).clone())
                     .to_json()
                     .ok()?
             }
@@ -542,6 +560,12 @@ mod state_mirror {
                     .into_iter()
                     .enumerate()
                     .map(|(index, value)| (index as u32, value))
+                    .collect()
+            }
+            Some(BuiltinParams::Compresser(params)) if origin == compresser::ui::UI_ORIGIN => {
+                compresser::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| compresser::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
             _ => Vec::new(),
@@ -1192,6 +1216,7 @@ mod imp {
             drumsampler::ui::UI_ORIGIN => drumsampler::ui::DrumSamplerUi::resolve_ui_asset(path)?,
             zcomp::ui::UI_ORIGIN => zcomp::ui::ZcompUi::resolve_ui_asset(path)?,
             mixstation::ui::UI_ORIGIN => mixstation::ui::MixStationUi::resolve_ui_asset(path)?,
+            compresser::ui::UI_ORIGIN => compresser::ui::CompresserUi::resolve_ui_asset(path)?,
             _ => return None,
         };
         Some(SchemeAsset {
@@ -1221,6 +1246,7 @@ mod imp {
                 | drumsampler::ui::UI_ORIGIN
                 | zcomp::ui::UI_ORIGIN
                 | mixstation::ui::UI_ORIGIN
+                | compresser::ui::UI_ORIGIN
         )
     }
 
@@ -1241,6 +1267,7 @@ mod imp {
             drumsampler::ui::UI_ORIGIN => drumsampler::ui::DrumSamplerUi::is_embedded(),
             zcomp::ui::UI_ORIGIN => zcomp::ui::ZcompUi::is_embedded(),
             mixstation::ui::UI_ORIGIN => mixstation::ui::MixStationUi::is_embedded(),
+            compresser::ui::UI_ORIGIN => compresser::ui::CompresserUi::is_embedded(),
             _ => false,
         }
     }
@@ -2908,8 +2935,8 @@ mod tests {
         // A catalogued built-in that ships no editor bundle is refused by name,
         // not reported as an empty asset table.
         assert_eq!(
-            availability("builtin:compresser"),
-            HostAvailability::NoEditorForPlugin("builtin:compresser".to_string())
+            availability("builtin:c1073"),
+            HostAvailability::NoEditorForPlugin("builtin:c1073".to_string())
         );
     }
 
@@ -2936,6 +2963,36 @@ mod tests {
         assert_eq!(replay.len(), imager::UI_PARAM_IDS.len());
         assert!(replay.contains(&(width, 175.0)));
         assert!(builtin_state_bytes("equz8", insert).is_none());
+    }
+
+    /// The Compressor's edits in both modes land in the mirror, persist as a
+    /// `CompresserState` blob, and replay mode first — a replay that set the
+    /// bands before switching mode would have them reset by the switch.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn compresser_state_is_mirrored_persisted_and_replayed() {
+        let insert = "test-insert-compresser-mirror";
+        let mode = builtin_param_index("compresser", "mode").expect("mode is an id");
+        let ratio =
+            builtin_param_index("builtin:compresser", "band2Ratio").expect("band2Ratio is an id");
+        assert!(builtin_param_index("compresser", "width3").is_none());
+        builtin_state_apply("compresser", insert, mode, 1.0);
+        builtin_state_apply("compresser", insert, ratio, 6.0);
+
+        let bytes =
+            builtin_state_bytes("compresser", insert).expect("the Compressor owns this state");
+        let json = String::from_utf8(bytes).expect("state blobs are UTF-8 JSON");
+        let state = compresser::ipc::CompresserState::from_json(&json).expect("a Compressor blob");
+        assert_eq!(state.params.mode, compresser::Mode::Multi);
+        assert_eq!(state.params.bands[1].ratio, 6.0);
+
+        let replay = builtin_state_replay("compresser", insert);
+        assert_eq!(replay.len(), compresser::UI_PARAM_IDS.len());
+        let mode_at = replay.iter().position(|(index, _)| *index == mode);
+        let ratio_at = replay.iter().position(|(index, _)| *index == ratio);
+        assert!(mode_at < ratio_at, "mode must replay before the bands");
+        assert!(replay.contains(&(ratio, 6.0)));
+        assert!(builtin_state_bytes("imager", insert).is_none());
     }
 
     /// The reload after project open asks the mirror which file each pad was
@@ -3035,7 +3092,7 @@ mod tests {
         // silently resolve against the wrong plugin's indices.
         assert!(builtin_param_index("builtin:equz8", "band3_freq").is_some());
         assert!(builtin_param_index("builtin:equz8", "not-a-param").is_none());
-        assert!(builtin_param_index("builtin:compresser", "band3_freq").is_none());
+        assert!(builtin_param_index("builtin:c1073", "band3_freq").is_none());
         assert_eq!(
             builtin_param_index("builtin:mixstation", "inputTrimDb"),
             Some(mixstation::ipc::INPUT_TRIM_INDEX)

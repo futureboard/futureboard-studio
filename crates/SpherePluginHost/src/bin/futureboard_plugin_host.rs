@@ -307,6 +307,7 @@ enum BuiltinDsp {
     DrumSampler(drumsampler::Dsp),
     Zcomp(zcomp::Dsp),
     MixStation(mixstation::Dsp),
+    Compresser(compresser::Dsp),
 }
 
 /// A built-in processor is created on the IPC thread and then owned exclusively
@@ -365,6 +366,7 @@ impl BuiltinHostProcessor {
             "drumsampler" => Some(Self::drumsampler(sample_rate, state_json)),
             "zcomp" => Some(Self::zcomp(sample_rate, state_json)),
             "mixstation" => Some(Self::mixstation(sample_rate, state_json)),
+            "compresser" => Some(Self::compresser(sample_rate, state_json)),
             _ => None,
         }
     }
@@ -758,6 +760,35 @@ impl BuiltinHostProcessor {
         }
     }
 
+    fn compresser(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = compresser::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match compresser::ipc::CompresserState::from_json(json) {
+                Ok(state) => {
+                    dsp.set_params(state.params);
+                    eprintln!(
+                        "[plugin-host-builtin] restored state version={}",
+                        state.version
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] state blob rejected, using defaults: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::Compresser(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            // A compressor has no capture or cabinet stage to hand off into.
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_rate: sr,
+        }
+    }
+
     fn process_block(&self, in_l: &[f32], in_r: &[f32], interleaved: &mut [f32], frames: usize) {
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &mut *self.dsp.get() } {
@@ -861,6 +892,13 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
+            BuiltinDsp::Compresser(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
         }
     }
 
@@ -901,6 +939,19 @@ impl BuiltinHostProcessor {
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &*self.dsp.get() } {
             BuiltinDsp::DrumSampler(dsp) => Some(dsp.pad_levels()),
+            _ => None,
+        }
+    }
+
+    /// Per-band gain reduction for a multiband built-in (the Compressor);
+    /// `None` for every other core. Published in both of the Compressor's
+    /// modes — all zeros in Single — so the editor never keeps drawing a
+    /// multiband reading the DSP has stopped producing. Producer thread only
+    /// (same contract as `process_block`).
+    fn band_reduction(&self) -> Option<[f32; SpherePluginHost::audio_bridge::REDUCTION_BANDS]> {
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        match unsafe { &*self.dsp.get() } {
+            BuiltinDsp::Compresser(dsp) => Some(dsp.band_reduction_db()),
             _ => None,
         }
     }
@@ -1090,6 +1141,23 @@ impl BuiltinHostProcessor {
                     slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
                 })
             }
+            BuiltinDsp::Compresser(dsp) => {
+                let f = dsp.meter_frame();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    in_peak: f.in_peak,
+                    in_rms: f.in_rms,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    // Multiband: the largest band's; per-band values travel
+                    // in their own block (`band_reduction`).
+                    gain_reduction_db: f.gain_reduction_db,
+                    in_clip: f.in_clip,
+                    out_clip: f.out_clip,
+                    // Single fixed stage, not a user-ordered rack.
+                    slot_in_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
             BuiltinDsp::Equz8(_)
             | BuiltinDsp::Verbspace(_)
             | BuiltinDsp::Echospace(_)
@@ -1119,6 +1187,7 @@ impl BuiltinHostProcessor {
             BuiltinDsp::DrumSampler(dsp) => dsp.latency_samples(),
             BuiltinDsp::Zcomp(dsp) => dsp.latency_samples(),
             BuiltinDsp::MixStation(dsp) => dsp.latency_samples(),
+            BuiltinDsp::Compresser(dsp) => dsp.latency_samples(),
         }
     }
 
@@ -1173,6 +1242,9 @@ impl BuiltinHostProcessor {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::MixStation(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::Compresser(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
         }
@@ -1343,7 +1415,7 @@ mod builtin_processor_tests {
                 "`{stem}` is bridge-enabled but has no DSP in the host"
             );
         }
-        assert!(BuiltinHostProcessor::new("compresser", 48_000, None).is_none());
+        assert!(BuiltinHostProcessor::new("c1073", 48_000, None).is_none());
     }
 
     #[test]
@@ -1791,6 +1863,78 @@ mod builtin_processor_tests {
         assert!(output.iter().all(|sample| sample.is_finite()));
 
         let fallback = BuiltinHostProcessor::zcomp(48_000, Some("not json"));
+        fallback.process_block(&in_l, &in_r, &mut output, 32);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    /// Single mode reports its reduction through the meter frame and zeros per
+    /// band; Multi mode reports each band, and the frame carries the largest.
+    #[test]
+    fn compresser_publishes_overall_and_per_band_reduction() {
+        let processor = BuiltinHostProcessor::compresser(48_000, None);
+        let index = |id: &str| compresser::ui_param_index(id).expect("in wire table");
+        processor.apply_param(index("thresholdDb"), -30.0);
+        processor.apply_param(index("ratio"), 8.0);
+
+        let loud = [0.75f32; 64];
+        let mut output = [0.0f32; 128];
+        for _ in 0..64 {
+            processor.process_block(&loud, &loud, &mut output, 64);
+        }
+        let frame = processor
+            .meter_frame()
+            .expect("the compressor always publishes a frame");
+        assert!(
+            frame.gain_reduction_db > 10.0,
+            "{}",
+            frame.gain_reduction_db
+        );
+        assert_eq!(processor.band_reduction(), Some([0.0; 4]));
+
+        processor.apply_param(index("mode"), 1.0);
+        processor.apply_param(index("band1ThresholdDb"), -40.0);
+        let mut low = [0.0f32; 64];
+        for block in 0..400 {
+            for (i, sample) in low.iter_mut().enumerate() {
+                let t = (block * 64 + i) as f32 / 48_000.0;
+                *sample = 0.8 * (std::f32::consts::TAU * 60.0 * t).sin();
+            }
+            processor.process_block(&low, &low, &mut output, 64);
+        }
+        let bands = processor.band_reduction().expect("per-band reduction");
+        assert!(bands[0] > 6.0, "{bands:?}");
+        assert!(bands[3] < 0.1, "{bands:?}");
+        let frame = processor.meter_frame().expect("frame");
+        assert!((frame.gain_reduction_db - bands[0]).abs() < 1.0e-6);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert_eq!(processor.latency_samples(), 0);
+    }
+
+    #[test]
+    fn compresser_restores_state_and_takes_wire_params() {
+        let mut params = compresser::default_params();
+        params.power = false;
+        let json = compresser::ipc::CompresserState::new(params)
+            .to_json()
+            .expect("state serializes");
+
+        let restored = BuiltinHostProcessor::compresser(48_000, Some(&json));
+        let in_l = [0.25f32; 32];
+        let in_r = [-0.5f32; 32];
+        let mut output = [0.0f32; 64];
+        restored.process_block(&in_l, &in_r, &mut output, 32);
+        for i in 0..32 {
+            assert_eq!(output[i * 2], in_l[i]);
+            assert_eq!(output[i * 2 + 1], in_r[i]);
+        }
+
+        restored.apply_param(compresser::ui_param_index("power").expect("power"), 1.0);
+        restored.apply_param(compresser::ui_param_index("mode").expect("mode"), 1.0);
+        restored.apply_param(compresser::UI_PARAM_IDS.len() as u32, 1.0);
+        restored.process_block(&in_l, &in_r, &mut output, 32);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+
+        let fallback = BuiltinHostProcessor::compresser(48_000, Some("not json"));
         fallback.process_block(&in_l, &in_r, &mut output, 32);
         assert!(output.iter().all(|sample| sample.is_finite()));
     }
@@ -2562,6 +2706,9 @@ fn service_audio_bridge(
         }
         if let Some(levels) = b.pad_levels() {
             bridge.store_pad_levels(&levels);
+        }
+        if let Some(reduction) = b.band_reduction() {
+            bridge.store_band_reduction(&reduction);
         }
     }
     bridge.set_dsp_output_ready(dsp_ready);

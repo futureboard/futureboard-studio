@@ -1,0 +1,134 @@
+@import 'tailwindcss';
+@import '@fontsource-variable/mona-sans/wght.css';
+
+@theme {
+  --font-sans: 'Mona Sans Variable', 'Mona Sans', ui-sans-serif, system-ui, sans-serif;
+
+  /* Futureboard's default theme (`packages/shared/themes/Default.json`):
+     neutral charcoal planes, one blue accent, the warning amber. The same
+     tokens as every built-in editor, so they read as one family. */
+  --color-floor: #111111;
+  --color-canvas: #161616;
+  --color-window: #1b1b1b;
+  --color-bar: #1f1f1f;
+  --color-panel: #232323;
+  --color-raised: #2a2a2a;
+  --color-control: #303030;
+  --color-control-hi: #3a3a3a;
+
+  --color-ink: #e8e8e8;
+  --color-ink-2: #bdbdbd;
+  --color-ink-3: #8f8f8f;
+  --color-ink-4: #6e6e6e;
+
+  --color-line: #ffffff14;
+  --color-line-hi: #ffffff24;
+
+  --color-accent: #4d9cf8;
+  --color-accent-hi: #72b1fa;
+  --color-on-accent: #07121f;
+  --color-warn: #e8b75c;
+  --color-danger: #f2645f;
+  --color-curve: #f2f4f7;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    width: 100%;
+    min-width: 620px;
+    height: 100%;
+    min-height: 480px;
+    margin: 0;
+    overflow: hidden;
+  }
+
+  body {
+    background: var(--color-window);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    line-height: 1.35;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior: none;
+    user-select: none;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  input:focus-visible {
+    outline-offset: 0;
+  }
+
+  button {
+    font: inherit;
+    color: inherit;
+  }
+}
+
+@layer utilities {
+  .cap {
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--color-ink-3);
+    line-height: 1.2;
+  }
+
+  .num {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum' 1;
+    white-space: nowrap;
+  }
+}
+
+/* ── Stage ──────────────────────────────────────────────────────────────── */
+
+.stage-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* ── Knob ───────────────────────────────────────────────────────────────── */
+
+.knob-track {
+  fill: none;
+  stroke: rgb(255 255 255 / 0.09);
+  stroke-linecap: round;
+}
+.knob-fill {
+  fill: none;
+  stroke: var(--knob-accent, var(--color-accent));
+  stroke-linecap: round;
+}
+.knob-face {
+  fill: var(--color-control);
+  stroke: rgb(0 0 0 / 0.45);
+  stroke-width: 1;
+}
+.knob-pointer {
+  stroke: var(--color-ink);
+  stroke-linecap: round;
+}
+.knob:hover .knob-face {
+  fill: var(--color-control-hi);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

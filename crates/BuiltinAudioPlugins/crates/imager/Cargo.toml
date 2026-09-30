@@ -13,7 +13,6 @@ name = "imager"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-biquad.workspace = true
 builtin-dsp-core.workspace = true
 builtin-ui-embed.workspace = true
 serde.workspace = true

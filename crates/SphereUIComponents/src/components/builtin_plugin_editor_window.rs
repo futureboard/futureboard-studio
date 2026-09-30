@@ -657,6 +657,17 @@ struct PadLevelsMsg {
     levels: Vec<f32>,
 }
 
+/// Native -> React: the decibels each band of a multiband built-in (the
+/// Compressor) is taking off, lowest band first.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BandReductionMsg {
+    r#type: &'static str,
+    protocol_version: u32,
+    instance_id: String,
+    reduction_db: Vec<f32>,
+}
+
 /// One parameter edit inside a `futureboard.setParams` batch. `id` is the
 /// editor's string param id (the `Dsp::apply_ui_param` contract); it is
 /// resolved to the plugin's u32 wire index before leaving the UI thread.
@@ -989,6 +1000,14 @@ pub type BuiltinPadLevelSource = std::sync::Arc<
     )>,
 >;
 
+/// Polls the latest per-band gain reduction for an instance's shared region,
+/// as `(publish sequence, dB)`. UI thread, ~30 Hz.
+pub type BuiltinBandReductionSource = std::sync::Arc<
+    dyn Fn(
+        &PluginInstanceKey,
+    ) -> Option<(u32, [f32; SpherePluginHost::audio_bridge::REDUCTION_BANDS])>,
+>;
+
 /// Reads whether the DAW transport is advancing. One relaxed atomic load on the
 /// engine's shared state — safe to call every pump tick.
 pub type BuiltinTransportSource = std::sync::Arc<dyn Fn() -> bool>;
@@ -1009,6 +1028,7 @@ pub struct BuiltinEditorHostOps {
     pub spectrum_source: Option<BuiltinSpectrumSource>,
     pub stereo_image_source: Option<BuiltinStereoImageSource>,
     pub pad_level_source: Option<BuiltinPadLevelSource>,
+    pub band_reduction_source: Option<BuiltinBandReductionSource>,
     pub transport_source: Option<BuiltinTransportSource>,
 }
 
@@ -1024,6 +1044,7 @@ impl BuiltinEditorHostOps {
             && self.spectrum_source.is_none()
             && self.stereo_image_source.is_none()
             && self.pad_level_source.is_none()
+            && self.band_reduction_source.is_none()
             && self.transport_source.is_none()
     }
 }
@@ -1182,6 +1203,8 @@ pub struct BuiltinPluginEditorWindow {
     stereo_image_seq: u32,
     /// Sequence of the last pad-level set forwarded.
     pad_levels_seq: u32,
+    /// Sequence of the last per-band reduction set forwarded.
+    band_reduction_seq: u32,
     /// Last transport state pushed to the page. `None` until the first push, so
     /// a freshly loaded page always receives one regardless of what the
     /// transport is doing.
@@ -1256,6 +1279,7 @@ impl BuiltinPluginEditorWindow {
             spectrum_seq: 0,
             stereo_image_seq: 0,
             pad_levels_seq: 0,
+            band_reduction_seq: 0,
             pushed_transport_playing: None,
             files_root: None,
             file_drag_at: None,
@@ -1714,6 +1738,7 @@ impl BuiltinPluginEditorWindow {
         self.spectrum_seq = 0;
         self.stereo_image_seq = 0;
         self.pad_levels_seq = 0;
+        self.band_reduction_seq = 0;
         // Status lands on the *next* pump tick rather than up to a second later.
         // An editor that reads the transport tempo (EchoSpace's note divisions)
         // would otherwise open showing lengths for the wrong tempo.
@@ -2642,6 +2667,19 @@ impl BuiltinPluginEditorWindow {
                             protocol_version: BRIDGE_PROTOCOL_VERSION,
                             instance_id: wire_instance_id(active),
                             levels: levels.to_vec(),
+                        });
+                    }
+                }
+            }
+            if let Some(source) = self.host_ops.band_reduction_source.as_ref() {
+                if let Some((seq, reduction_db)) = source(active) {
+                    if seq != self.band_reduction_seq {
+                        self.band_reduction_seq = seq;
+                        self.post_to_view(&BandReductionMsg {
+                            r#type: "futureboard.bandReduction",
+                            protocol_version: BRIDGE_PROTOCOL_VERSION,
+                            instance_id: wire_instance_id(active),
+                            reduction_db: reduction_db.to_vec(),
                         });
                     }
                 }

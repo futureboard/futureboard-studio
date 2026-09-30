@@ -5,6 +5,8 @@
 
 use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type};
 
+pub mod crossover;
+
 /// Metadata for a builtin DSP core (host integration can map this later).
 #[derive(Debug, Clone)]
 pub struct PluginDescriptor {

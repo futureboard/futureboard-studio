@@ -1,304 +1,163 @@
 import { useEffect, useRef, type RefObject } from 'react'
-import type { MeterFrame } from './bridge'
+import type { MeterHistory } from './history'
+import { clamp } from './math'
 
-type Props = {
-  metersRef: RefObject<MeterFrame | null>
-  live: boolean
-}
+const FLOOR_DB = -48
+const REDUCTION_SCALE_DB = 24
+/// A peak readout holds the loudest of the last this-many frames (~1.2 s at
+/// the ~30 Hz telemetry rate).
+const HOLD_FRAMES = 36
 
-const FLOOR_DB = -60
-const REDUCTION_RANGE_DB = 24
-/** Peak-hold dwell before the marker starts falling, in ms. */
-const PEAK_HOLD_MS = 1_200
+const levelUnit = (linear: number) =>
+  linear > 0 ? clamp((20 * Math.log10(linear) - FLOOR_DB) / -FLOOR_DB, 0, 1) : 0
 
-export function linearToDb(value: number) {
-  return 20 * Math.log10(Math.max(value, 0.000_001))
-}
-
-export function levelNorm(value: number) {
-  return Math.min(1, Math.max(0, (linearToDb(value) - FLOOR_DB) / -FLOOR_DB))
-}
-
-export function reductionNorm(value: number) {
-  return Math.min(1, Math.max(0, value / REDUCTION_RANGE_DB))
+type Key = 'in' | 'gr' | 'out'
+type Column = {
+  fill: HTMLDivElement | null
+  peak: HTMLDivElement | null
+  text: HTMLSpanElement | null
 }
 
 /**
- * Host telemetry meters.
+ * In, reduction and out as three vertical bars with held peak readouts.
  *
- * Painted from a ref inside one rAF loop and written straight to style/text, so
- * 60 Hz metering never invalidates the React tree that owns the rack. Every
- * value here comes from the bridge's `futureboard.meters` frame; with no
- * connection the meters read empty rather than inventing motion.
+ * Read from the same history ring the stage draws, so the hold sees every
+ * frame the host sent — sampling the latest frame on animation frames would
+ * miss peaks whenever the page paints slower than the telemetry arrives.
+ * Written straight to style and text, so telemetry never re-renders the
+ * editor. With no frame the bars read empty and the numbers `—`.
  */
-export function Meters({ metersRef, live }: Props) {
-  const inFill = useRef<HTMLDivElement>(null)
-  const outFill = useRef<HTMLDivElement>(null)
-  const grFill = useRef<HTMLDivElement>(null)
-  const inPeak = useRef<HTMLDivElement>(null)
-  const outPeak = useRef<HTMLDivElement>(null)
-  const inText = useRef<HTMLOutputElement>(null)
-  const outText = useRef<HTMLOutputElement>(null)
-  const grText = useRef<HTMLOutputElement>(null)
-  const inClip = useRef<HTMLButtonElement>(null)
-  const outClip = useRef<HTMLButtonElement>(null)
-  const flowIn = useRef<HTMLDivElement>(null)
-  const flowOut = useRef<HTMLDivElement>(null)
-  const liveRef = useRef(live)
-  liveRef.current = live
-
-  useEffect(() => {
-    let raf = 0
-    let lastText = 0
-    const hold = { in: 0, out: 0, inUntil: 0, outUntil: 0 }
-
-    const paint = (now: number) => {
-      const frame = liveRef.current ? metersRef.current : null
-      const input = frame ? levelNorm(frame.inPeak) : 0
-      const output = frame ? levelNorm(frame.outPeak) : 0
-      const reduction = frame ? reductionNorm(frame.gainReductionDb) : 0
-
-      if (inFill.current) inFill.current.style.transform = `scaleY(${input})`
-      if (outFill.current) outFill.current.style.transform = `scaleY(${output})`
-      if (grFill.current) grFill.current.style.transform = `scaleY(${reduction})`
-      // Horizontal signal-flow pair — same frame, read left to right.
-      if (flowIn.current) flowIn.current.style.transform = `scaleX(${input})`
-      if (flowOut.current) flowOut.current.style.transform = `scaleX(${output})`
-
-      if (input >= hold.in || now > hold.inUntil) {
-        hold.in = input
-        hold.inUntil = now + PEAK_HOLD_MS
-      }
-      if (output >= hold.out || now > hold.outUntil) {
-        hold.out = output
-        hold.outUntil = now + PEAK_HOLD_MS
-      }
-      if (inPeak.current) inPeak.current.style.bottom = `${hold.in * 100}%`
-      if (outPeak.current) outPeak.current.style.bottom = `${hold.out * 100}%`
-
-      inClip.current?.classList.toggle('is-clipping', Boolean(frame?.inClip))
-      outClip.current?.classList.toggle('is-clipping', Boolean(frame?.outClip))
-
-      // Text is the expensive part; 15 Hz stays readable and legible.
-      if (now - lastText > 66) {
-        lastText = now
-        if (inText.current) {
-          inText.current.textContent = frame ? linearToDb(frame.inPeak).toFixed(1) : '—'
-        }
-        if (outText.current) {
-          outText.current.textContent = frame ? linearToDb(frame.outPeak).toFixed(1) : '—'
-        }
-        if (grText.current) {
-          grText.current.textContent = frame ? `-${frame.gainReductionDb.toFixed(1)}` : '—'
-        }
-      }
-      raf = requestAnimationFrame(paint)
-    }
-
-    raf = requestAnimationFrame(paint)
-    return () => cancelAnimationFrame(raf)
-  }, [metersRef])
-
-  return (
-    <section
-      className="flex flex-col items-stretch gap-2.5"
-      aria-label="Host telemetry meters"
-    >
-      <div className="flex items-end justify-center gap-7">
-        <Meter
-          label="Input"
-          fillRef={inFill}
-          peakRef={inPeak}
-          textRef={inText}
-          clipRef={inClip}
-        />
-        <Meter label="Reduction" fillRef={grFill} textRef={grText} reduction />
-        <Meter
-          label="Output"
-          fillRef={outFill}
-          peakRef={outPeak}
-          textRef={outText}
-          clipRef={outClip}
-        />
-      </div>
-      <SignalFlow inRef={flowIn} outRef={flowOut} />
-    </section>
-  )
-}
-
-/**
- * A rack row's own IN→OUT meter.
- *
- * Fed by the per-stage telemetry MixStation publishes for each rack position:
- * `slotInPeak[slot]` is the level arriving at this stage and `slotOutPeak[slot]`
- * the level leaving it, after that module's output trim. When the native build
- * sends no per-stage array the bars stay dark rather than mirroring the master.
- */
-export function StageMeter({
-  metersRef,
-  slot,
-  live,
-  accent,
+export function Meters({
+  historyRef,
+  reductionLabel,
+  reductionSign = '−',
+  active,
 }: {
-  metersRef: RefObject<MeterFrame | null>
-  /** Rack position, zero-based, in chain order. */
-  slot: number
-  live: boolean
-  accent: string
+  historyRef: RefObject<MeterHistory>
+  reductionLabel: string
+  /// Prefix of the reduction readout: a minus for gain taken off, nothing for
+  /// a shaper whose reading is the size of a boost or a cut.
+  reductionSign?: string
+  active: boolean
 }) {
-  const inRef = useRef<HTMLDivElement>(null)
-  const outRef = useRef<HTMLDivElement>(null)
-  const liveRef = useRef(live)
-  liveRef.current = live
+  const columns = useRef<Record<Key, Column>>({
+    in: { fill: null, peak: null, text: null },
+    gr: { fill: null, peak: null, text: null },
+    out: { fill: null, peak: null, text: null },
+  })
+  const activeRef = useRef(active)
+  useEffect(() => {
+    activeRef.current = active
+  }, [active])
 
   useEffect(() => {
     let raf = 0
+    let drawnStamp = -1
     const paint = () => {
       raf = requestAnimationFrame(paint)
-      const frame = liveRef.current ? metersRef.current : null
-      const input = frame?.slotInPeak[slot]
-      const output = frame?.slotOutPeak[slot]
-      if (inRef.current) {
-        inRef.current.style.transform = `scaleX(${input === undefined ? 0 : levelNorm(input)})`
+      const history = historyRef.current
+      if (history.stamp === drawnStamp) return
+      drawnStamp = history.stamp
+      const c = columns.current
+      const text = (key: Key, value: string) => {
+        const node = c[key].text
+        if (node && node.textContent !== value) node.textContent = value
       }
-      if (outRef.current) {
-        outRef.current.style.transform = `scaleX(${output === undefined ? 0 : levelNorm(output)})`
+      if (history.count === 0) {
+        for (const key of ['in', 'gr', 'out'] as const) {
+          if (c[key].fill) c[key].fill!.style.transform = 'scaleY(0)'
+          if (c[key].peak) c[key].peak!.style.opacity = '0'
+          text(key, '—')
+        }
+        return
       }
+      const newest = history.indexFromNewest(0)
+      const grUnit = (db: number) => (activeRef.current ? clamp(db / REDUCTION_SCALE_DB, 0, 1) : 0)
+      const now = {
+        in: levelUnit(history.inPeak[newest]!),
+        out: levelUnit(history.outPeak[newest]!),
+        gr: grUnit(history.reduction[newest]!),
+      }
+      const held = { in: 0, out: 0, gr: 0 }
+      for (let age = 0; age < Math.min(HOLD_FRAMES, history.count); age++) {
+        const index = history.indexFromNewest(age)
+        held.in = Math.max(held.in, levelUnit(history.inPeak[index]!))
+        held.out = Math.max(held.out, levelUnit(history.outPeak[index]!))
+        held.gr = Math.max(held.gr, grUnit(history.reduction[index]!))
+      }
+      for (const key of ['in', 'gr', 'out'] as const) {
+        const column = c[key]
+        if (column.fill) column.fill.style.transform = `scaleY(${now[key]})`
+        if (column.peak) {
+          column.peak.style[key === 'gr' ? 'top' : 'bottom'] = `${held[key] * 100}%`
+          column.peak.style.opacity = held[key] > 0.001 ? '1' : '0'
+        }
+      }
+      const levelText = (unit: number) => (unit <= 0 ? '−∞' : (FLOOR_DB - unit * FLOOR_DB).toFixed(1))
+      text('in', levelText(held.in))
+      text('out', levelText(held.out))
+      const gr = held.gr * REDUCTION_SCALE_DB
+      text('gr', gr >= 0.05 ? `${reductionSign}${gr.toFixed(1)}` : '0.0')
     }
     raf = requestAnimationFrame(paint)
     return () => cancelAnimationFrame(raf)
-  }, [metersRef, slot])
+  }, [historyRef, reductionSign])
+
+  const bind = (key: Key) => ({
+    fill: (node: HTMLDivElement | null) => {
+      columns.current[key].fill = node
+    },
+    peak: (node: HTMLDivElement | null) => {
+      columns.current[key].peak = node
+    },
+    text: (node: HTMLSpanElement | null) => {
+      columns.current[key].text = node
+    },
+  })
 
   return (
-    <div className="flex shrink-0 items-center gap-2" aria-hidden>
-      <span className="label-cap">In</span>
-      <div className="flex w-24 flex-col gap-[3px]">
-        <StageBar fillRef={inRef} accent={accent} />
-        <StageBar fillRef={outRef} accent={accent} />
-      </div>
-      <span className="label-cap">Out</span>
+    <div className="flex h-full min-h-0 justify-around gap-2" aria-label="Meters">
+      <MeterColumn label="In" refs={bind('in')} tone="level" />
+      <MeterColumn label={reductionLabel} refs={bind('gr')} tone="reduction" />
+      <MeterColumn label="Out" refs={bind('out')} tone="level" />
     </div>
   )
 }
 
-function StageBar({
-  fillRef,
-  accent,
-}: {
-  fillRef: RefObject<HTMLDivElement | null>
-  accent: string
-}) {
-  return (
-    <div className="h-[3px] w-full overflow-hidden rounded-full bg-white/8">
-      <div
-        ref={fillRef}
-        className="h-full w-full origin-left"
-        style={{
-          background: `linear-gradient(90deg, color-mix(in srgb, ${accent} 55%, transparent), ${accent})`,
-          transform: 'scaleX(0)',
-        }}
-      />
-    </div>
-  )
-}
-
-/**
- * Horizontal in→out pair under the columns, restating the same frame as a
- * left-to-right signal flow. Both bars are master telemetry: this is the whole
- * chain's in and out, not a per-module
- * reading.
- */
-function SignalFlow({
-  inRef,
-  outRef,
-}: {
-  inRef: RefObject<HTMLDivElement | null>
-  outRef: RefObject<HTMLDivElement | null>
-}) {
-  return (
-    <div className="flex items-center gap-2" aria-hidden>
-      <span className="label-cap">In</span>
-      <div className="flex min-w-40 flex-1 flex-col gap-[3px]">
-        <FlowBar fillRef={inRef} />
-        <FlowBar fillRef={outRef} />
-      </div>
-      <span className="label-cap">Out</span>
-    </div>
-  )
-}
-
-function FlowBar({ fillRef }: { fillRef: RefObject<HTMLDivElement | null> }) {
-  return (
-    <div className="h-[3px] w-full overflow-hidden rounded-full bg-white/6">
-      <div
-        ref={fillRef}
-        className="h-full w-full origin-left bg-linear-to-r from-signal/55 via-signal to-danger"
-        style={{ transform: 'scaleX(0)' }}
-      />
-    </div>
-  )
-}
-
-function Meter({
+function MeterColumn({
   label,
-  fillRef,
-  peakRef,
-  textRef,
-  clipRef,
-  reduction = false,
+  refs,
+  tone,
 }: {
   label: string
-  fillRef: RefObject<HTMLDivElement | null>
-  peakRef?: RefObject<HTMLDivElement | null>
-  textRef: RefObject<HTMLOutputElement | null>
-  clipRef?: RefObject<HTMLButtonElement | null>
-  reduction?: boolean
+  refs: {
+    fill: (node: HTMLDivElement | null) => void
+    peak: (node: HTMLDivElement | null) => void
+    text: (node: HTMLSpanElement | null) => void
+  }
+  tone: 'level' | 'reduction'
 }) {
+  const reduction = tone === 'reduction'
   return (
-    <div className="flex flex-col items-center gap-1.5">
-      <span className="label-cap">{label}</span>
-      <div className="flex items-end gap-2">
-        <div className="flex items-baseline gap-1">
-          <output ref={textRef} className="readout w-[46px] text-right text-[15px] font-semibold">
-            —
-          </output>
-          {/* Units stay visually quieter than the value they qualify. */}
-          <span className="text-[10px] font-semibold text-ink-dim">dB</span>
-        </div>
+    <div className="flex min-h-0 w-12 flex-col items-center gap-1.5">
+      <span className="cap">{label}</span>
+      <div className="relative min-h-0 w-3 flex-1 overflow-hidden bg-canvas" aria-hidden="true">
         <div
-          className="relative h-11 w-2.5 overflow-hidden rounded-sm bg-white/6"
-          aria-hidden
-        >
-          <div
-            ref={fillRef}
-            className={`absolute inset-x-0 bottom-0 h-full origin-bottom ${
-              reduction
-                ? 'top-0 bottom-auto origin-top bg-warn'
-                : 'bg-linear-to-t from-signal/55 via-signal to-danger'
-            }`}
-            style={{ transform: 'scaleY(0)' }}
-          />
-          {peakRef ? (
-            <div
-              ref={peakRef}
-              className="absolute inset-x-0 h-px bg-ink"
-              style={{ bottom: '0%' }}
-            />
-          ) : null}
-        </div>
-        {clipRef ? (
-          <button
-            ref={clipRef}
-            type="button"
-            aria-label={`${label} clip indicator — click to clear`}
-            title={`${label} clip — click to clear`}
-            onClick={(event) => event.currentTarget.classList.remove('is-clipping')}
-            className="clip-dot h-2 w-2 shrink-0 cursor-pointer self-start rounded-full border border-hairline-hi bg-transparent transition-colors duration-150 [&.is-clipping]:border-danger [&.is-clipping]:bg-danger"
-          />
-        ) : (
-          <span className="w-2 shrink-0" aria-hidden />
-        )}
+          ref={refs.fill}
+          className={`absolute inset-x-0 h-full ${
+            reduction ? 'top-0 origin-top bg-accent' : 'bottom-0 origin-bottom bg-ink-3'
+          }`}
+          style={{ transform: 'scaleY(0)' }}
+        />
+        <div
+          ref={refs.peak}
+          className={`absolute inset-x-0 h-px ${reduction ? 'bg-accent-hi' : 'bg-ink'}`}
+          style={{ opacity: 0 }}
+        />
       </div>
+      <span ref={refs.text} className="num text-[11px] font-semibold text-ink-2">
+        —
+      </span>
     </div>
   )
 }

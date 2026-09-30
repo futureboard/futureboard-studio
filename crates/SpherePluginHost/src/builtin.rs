@@ -54,10 +54,10 @@ const CATALOG: &[BuiltinEntry] = &[
     },
     BuiltinEntry {
         stem: "compresser",
-        name: "Compresser",
+        name: "Compressor",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: false,
+        has_editor: true,
     },
     BuiltinEntry {
         stem: "fa2a",
@@ -227,6 +227,7 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "drumsampler",
     "zcomp",
     "mixstation",
+    "compresser",
 ];
 
 /// Whether this built-in currently has an out-of-process audio DSP runtime.
@@ -379,7 +380,11 @@ mod tests {
             builtin_editor_url(&builtin_id("transient")).as_deref(),
             Some("mikoplugin://transient/index.html")
         );
-        assert!(builtin_editor_url(&builtin_id("compresser")).is_none());
+        assert_eq!(
+            builtin_editor_url(&builtin_id("compresser")).as_deref(),
+            Some("mikoplugin://compresser/index.html")
+        );
+        assert!(builtin_editor_url(&builtin_id("c1073")).is_none());
         assert!(builtin_editor_url("vst3:whatever").is_none());
     }
 
@@ -420,8 +425,10 @@ mod tests {
         assert!(builtin_audio_bridge_supported("builtin:wrapsynth"));
         assert!(builtin_audio_bridge_supported("drumsampler"));
         assert!(builtin_audio_bridge_supported("builtin:drumsampler"));
+        assert!(builtin_audio_bridge_supported("compresser"));
+        assert!(builtin_audio_bridge_supported("builtin:compresser"));
         // Catalogued, but the host has no DSP for it — must keep its old path.
-        assert!(!builtin_audio_bridge_supported("compresser"));
+        assert!(!builtin_audio_bridge_supported("c1073"));
         assert!(!builtin_audio_bridge_supported("vst3:whatever"));
     }
 
@@ -457,6 +464,7 @@ mod tests {
         assert_eq!(builtin_display_name("builtin:clipper67"), Some("67Clipper"));
         assert_eq!(builtin_display_name("builtin:transient"), Some("Transient"));
         assert_eq!(builtin_display_name("builtin:wrapsynth"), Some("WrapSynth"));
+        assert_eq!(builtin_display_name("compresser"), Some("Compressor"));
         assert_eq!(builtin_display_name("vst3:whatever"), None);
     }
 

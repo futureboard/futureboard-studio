@@ -1,7 +1,8 @@
 //! Imager — four-band stereo width.
 //!
 //! The input is taken apart into mid (`(L + R) / 2`) and side (`(L − R) / 2`),
-//! and *both* run through the same four-way crossover: 4th-order
+//! and *both* run through the same four-way crossover
+//! ([`builtin_dsp_core::crossover::FourBandSplitter`]): 4th-order
 //! Linkwitz–Riley splits, with the all-pass each branch needs to line its
 //! phase up with the other. Each band's side is scaled by that band's width,
 //! the bands are summed, and mid/side is turned back into left/right.
@@ -17,7 +18,7 @@
 //! allocated in [`Dsp::new`]; `process_stereo` and `apply_wire_param` only do
 //! arithmetic on them.
 
-use biquad::{Biquad, Coefficients, DirectForm1, Q_BUTTERWORTH_F32, ToHertz, Type};
+use builtin_dsp_core::crossover::FourBandSplitter as BandSplitter;
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
     flush_denormal, max_filter_frequency, time_constant,
@@ -171,147 +172,6 @@ pub fn effective_crossovers(params: &Params, sample_rate: f32) -> [f32; CROSSOVE
         .map(|f| clamp(f, MIN_CROSSOVER_HZ, ceiling));
     hz.sort_by(f32::total_cmp);
     hz
-}
-
-fn coefficients(kind: Type<f32>, hz: f32, sample_rate: f32) -> Coefficients<f32> {
-    // Every caller has already clamped `hz` into the filter's range, so the
-    // only failure left is a malformed rate — which `new` rules out. A flat
-    // pass-through is still the right answer if it ever happens.
-    Coefficients::<f32>::from_params(kind, sample_rate.hz(), hz.hz(), Q_BUTTERWORTH_F32).unwrap_or(
-        Coefficients {
-            a1: 0.0,
-            a2: 0.0,
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-        },
-    )
-}
-
-/// Two identical Butterworth sections in series: one side of a 4th-order
-/// Linkwitz–Riley crossover. Its low and high outputs sum to a 2nd-order
-/// all-pass at the same frequency, which is what the compensation below leans
-/// on.
-#[derive(Debug, Clone)]
-struct Lr4 {
-    a: DirectForm1<f32>,
-    b: DirectForm1<f32>,
-}
-
-impl Lr4 {
-    fn new(coefficients: Coefficients<f32>) -> Self {
-        Self {
-            a: DirectForm1::<f32>::new(coefficients),
-            b: DirectForm1::<f32>::new(coefficients),
-        }
-    }
-
-    /// Retune in place; the running state is kept so a moved crossover does
-    /// not reset the signal through it.
-    fn retune(&mut self, coefficients: Coefficients<f32>) {
-        self.a.update_coefficients(coefficients);
-        self.b.update_coefficients(coefficients);
-    }
-
-    #[inline]
-    fn run(&mut self, x: f32) -> f32 {
-        self.b.run(self.a.run(x))
-    }
-
-    fn reset(&mut self) {
-        self.a.reset_state();
-        self.b.reset_state();
-    }
-}
-
-/// One Linkwitz–Riley split into a low and a high output.
-#[derive(Debug, Clone)]
-struct Split {
-    low: Lr4,
-    high: Lr4,
-}
-
-impl Split {
-    fn new(hz: f32, sample_rate: f32) -> Self {
-        Self {
-            low: Lr4::new(coefficients(Type::LowPass, hz, sample_rate)),
-            high: Lr4::new(coefficients(Type::HighPass, hz, sample_rate)),
-        }
-    }
-
-    fn retune(&mut self, hz: f32, sample_rate: f32) {
-        self.low
-            .retune(coefficients(Type::LowPass, hz, sample_rate));
-        self.high
-            .retune(coefficients(Type::HighPass, hz, sample_rate));
-    }
-
-    #[inline]
-    fn run(&mut self, x: f32) -> (f32, f32) {
-        (self.low.run(x), self.high.run(x))
-    }
-
-    fn reset(&mut self) {
-        self.low.reset();
-        self.high.reset();
-    }
-}
-
-/// Four bands out of one signal.
-///
-/// The middle crossover splits first; each half is split again at its own
-/// crossover. A half only carries the phase of the split it went through, so
-/// each is also passed through the all-pass of the split it did *not* — the
-/// low half through the top crossover's, the high half through the bottom's.
-/// Every band then carries the same all-pass product, and the four sum back to
-/// the input through it.
-#[derive(Debug, Clone)]
-struct BandSplitter {
-    middle: Split,
-    bottom: Split,
-    top: Split,
-    low_align: DirectForm1<f32>,
-    high_align: DirectForm1<f32>,
-}
-
-impl BandSplitter {
-    fn new(hz: [f32; CROSSOVER_COUNT], sample_rate: f32) -> Self {
-        Self {
-            bottom: Split::new(hz[0], sample_rate),
-            middle: Split::new(hz[1], sample_rate),
-            top: Split::new(hz[2], sample_rate),
-            low_align: DirectForm1::<f32>::new(coefficients(Type::AllPass, hz[2], sample_rate)),
-            high_align: DirectForm1::<f32>::new(coefficients(Type::AllPass, hz[0], sample_rate)),
-        }
-    }
-
-    fn retune(&mut self, hz: [f32; CROSSOVER_COUNT], sample_rate: f32) {
-        self.bottom.retune(hz[0], sample_rate);
-        self.middle.retune(hz[1], sample_rate);
-        self.top.retune(hz[2], sample_rate);
-        self.low_align
-            .update_coefficients(coefficients(Type::AllPass, hz[2], sample_rate));
-        self.high_align
-            .update_coefficients(coefficients(Type::AllPass, hz[0], sample_rate));
-    }
-
-    #[inline]
-    fn run(&mut self, x: f32) -> [f32; BAND_COUNT] {
-        let (low, high) = self.middle.run(x);
-        let low = self.low_align.run(low);
-        let high = self.high_align.run(high);
-        let (b0, b1) = self.bottom.run(low);
-        let (b2, b3) = self.top.run(high);
-        [b0, b1, b2, b3]
-    }
-
-    fn reset(&mut self) {
-        self.middle.reset();
-        self.bottom.reset();
-        self.top.reset();
-        self.low_align.reset_state();
-        self.high_align.reset_state();
-    }
 }
 
 /// Running left/right statistics for one correlation meter.

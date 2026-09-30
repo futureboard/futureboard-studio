@@ -50,7 +50,10 @@ pub const BRIDGE_MAGIC: u32 = 0x4642_4142;
 /// None of it can be recovered from the strip's peak/RMS words.
 /// v11 adds the per-pad level block: a drum sampler's pads each meter what
 /// they are playing, which no strip-level word can show.
-pub const BRIDGE_LAYOUT_VERSION: u32 = 11;
+/// v12 adds the per-band reduction block: a multiband compressor takes a
+/// different amount off each band, and the single reduction word can only
+/// carry one of them.
+pub const BRIDGE_LAYOUT_VERSION: u32 = 12;
 
 /// Rack positions a built-in may publish per-stage telemetry for. Fixed so the
 /// shared region stays a plain-old-data layout.
@@ -63,6 +66,10 @@ pub const IMAGE_SCOPE_POINTS: usize = 128;
 
 /// Pads a built-in may publish a level for (Drum Sampler's 16).
 pub const BUILTIN_PAD_SLOTS: usize = 16;
+
+/// Bands a built-in may publish a gain reduction for (the Compressor's
+/// multiband crossover bands).
+pub const REDUCTION_BANDS: usize = 4;
 
 /// `transport_flags` bits.
 pub const TRANSPORT_FLAG_PLAYING: u32 = 1 << 0;
@@ -635,6 +642,14 @@ pub struct SharedAudioBridge {
     pub pad_levels_seq: AtomicU32,
     pub _pad_pad_levels: AtomicU32,
 
+    // --- Per-band gain reduction (host → engine) ---
+    /// Decibels each band is taking off, positive, `f32` bits. Published per
+    /// block by a multiband built-in; see [`Self::store_band_reduction`].
+    pub band_reduction: [AtomicU32; REDUCTION_BANDS],
+    /// Bumped after each published set; `0` until the first one.
+    pub band_reduction_seq: AtomicU32,
+    pub _pad_band_reduction: AtomicU32,
+
     // --- Lock-free rings (engine → host) ---
     pub midi: SpscRing<SharedMidiEvent, MIDI_RING_CAP>,
     pub params: SpscRing<SharedParamEvent, PARAM_RING_CAP>,
@@ -894,6 +909,29 @@ impl SharedAudioBridge {
         Some((
             seq,
             std::array::from_fn(|i| f32::from_bits(self.pad_levels[i].load(Ordering::Relaxed))),
+        ))
+    }
+
+    /// Publish one set of per-band reductions (host producer, per block). Not
+    /// a seqlock for the same reason [`Self::store_spectrum`] gives.
+    pub fn store_band_reduction(&self, reduction_db: &[f32; REDUCTION_BANDS]) {
+        for (slot, value) in self.band_reduction.iter().zip(reduction_db) {
+            slot.store(value.to_bits(), Ordering::Relaxed);
+        }
+        // Release: a reader that observes the new sequence also sees the values.
+        self.band_reduction_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// Read the latest per-band reductions with their sequence. `None` until
+    /// the host has published one — an insert without bands never does.
+    pub fn band_reduction(&self) -> Option<(u32, [f32; REDUCTION_BANDS])> {
+        let seq = self.band_reduction_seq.load(Ordering::Acquire);
+        if seq == 0 {
+            return None;
+        }
+        Some((
+            seq,
+            std::array::from_fn(|i| f32::from_bits(self.band_reduction[i].load(Ordering::Relaxed))),
         ))
     }
 
@@ -1866,6 +1904,20 @@ mod tests {
         let (second, read) = bridge.stereo_image().expect("published");
         assert!(second > first);
         assert_eq!(read, StereoImageFrame::default());
+    }
+
+    #[test]
+    fn band_reduction_is_absent_until_published_then_round_trips() {
+        let region = SharedAudioRegion::new_in_process();
+        let bridge = region.bridge();
+        assert!(bridge.band_reduction().is_none());
+        bridge.store_band_reduction(&[6.5, 0.0, 1.25, 0.0]);
+        let (first, read) = bridge.band_reduction().expect("published");
+        assert_eq!(read, [6.5, 0.0, 1.25, 0.0]);
+        bridge.store_band_reduction(&[0.0; REDUCTION_BANDS]);
+        let (second, read) = bridge.band_reduction().expect("published");
+        assert!(second > first);
+        assert_eq!(read, [0.0; REDUCTION_BANDS]);
     }
 
     #[test]

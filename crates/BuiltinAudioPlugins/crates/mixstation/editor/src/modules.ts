@@ -26,8 +26,6 @@ export type RackModule = {
   enabledId: RackModuleId
   name: string
   hint: string
-  /** CSS custom property carrying the module's identity colour. */
-  accent: string
   /** Knob row, in panel order. */
   knobs: readonly NumericParamId[]
   /** This module's own output trim, applied after its stage in the Rust DSP. */
@@ -40,7 +38,6 @@ export const RACK_MODULES: readonly RackModule[] = [
     enabledId: 'filtersEnabled',
     name: 'Filters',
     hint: '24 dB/oct high and low cut',
-    accent: 'var(--color-mod-filters)',
     knobs: ['hpfHz', 'lpfHz'],
     trimId: 'filtersTrimDb',
   },
@@ -49,7 +46,6 @@ export const RACK_MODULES: readonly RackModule[] = [
     enabledId: 'eqEnabled',
     name: 'EQ',
     hint: 'Four-band with proportional-Q mids',
-    accent: 'var(--color-mod-eq)',
     knobs: ['lowGainDb', 'lowMidFreqHz', 'lowMidGainDb', 'highMidFreqHz', 'highMidGainDb', 'highGainDb'],
     trimId: 'eqTrimDb',
   },
@@ -58,7 +54,6 @@ export const RACK_MODULES: readonly RackModule[] = [
     enabledId: 'compEnabled',
     name: 'Compressor',
     hint: 'Stereo-linked, program-dependent release',
-    accent: 'var(--color-mod-comp)',
     knobs: [
       'compThresholdDb',
       'compRatio',
@@ -73,7 +68,6 @@ export const RACK_MODULES: readonly RackModule[] = [
     enabledId: 'satEnabled',
     name: 'Drive',
     hint: 'Anti-aliased asymmetric saturation',
-    accent: 'var(--color-mod-sat)',
     knobs: ['satDrivePct', 'satCharacterPct'],
     trimId: 'satTrimDb',
   },
@@ -82,7 +76,6 @@ export const RACK_MODULES: readonly RackModule[] = [
     enabledId: 'widthEnabled',
     name: 'Width',
     hint: 'Mid/side stereo image',
-    accent: 'var(--color-mod-width)',
     knobs: ['widthPct'],
     trimId: 'widthTrimDb',
   },
@@ -91,7 +84,6 @@ export const RACK_MODULES: readonly RackModule[] = [
     enabledId: 'limiterEnabled',
     name: 'Limiter',
     hint: 'Zero-latency brickwall ceiling',
-    accent: 'var(--color-mod-limiter)',
     knobs: ['limiterCeilingDb', 'limiterReleaseMs'],
     trimId: 'limiterTrimDb',
   },
