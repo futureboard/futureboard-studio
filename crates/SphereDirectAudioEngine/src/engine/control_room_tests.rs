@@ -76,6 +76,8 @@ fn track(id: &str, track_type: &str) -> EngineTrackSnapshot {
         soundfont_polyphony: 64,
         soundfont_envelope: Default::default(),
         soundfont_quality: Default::default(),
+        soundfont_mode: Default::default(),
+        soundfont_channels: Default::default(),
         solfege_engine: None,
     }
 }

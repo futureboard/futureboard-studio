@@ -1970,7 +1970,14 @@ fn instrument_section(track: &TrackState, callbacks: &InspectorCallbacks) -> gpu
     let slot_name = if track.solfege.is_some() {
         "Solfege Engine".to_string()
     } else if slot.is_none() && track.builtin_soundfont_player {
-        "Built-in Soundfont Player".to_string()
+        match track.soundfont_mode {
+            crate::soundfont_player::SoundfontPlayerMode::Multi => {
+                "Built-in Soundfont Multi · 16 channels".to_string()
+            }
+            crate::soundfont_player::SoundfontPlayerMode::Single => {
+                "Built-in Soundfont Player".to_string()
+            }
+        }
     } else {
         plugin_slot_name(slot, "No Instrument")
     };

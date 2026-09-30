@@ -195,6 +195,31 @@ impl StudioLayout {
         .detach();
     }
 
+    /// Probe the network drives off the UI thread and list the ones that
+    /// answer. A disconnected or offline drive is skipped rather than listed:
+    /// every touch of one blocks for the network's whole timeout.
+    pub(crate) fn spawn_drive_probe(&mut self, cx: &mut Context<Self>) {
+        let Some(drives) = self.file_browser.take_drives_to_probe() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let reachable = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::components::file_browser::probe_reachable_roots(
+                        drives,
+                        std::time::Duration::from_secs(2),
+                    )
+                })
+                .await;
+            let _ = this.update(cx, move |this, cx| {
+                this.file_browser.apply_drive_probe(&reachable);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Run a single-level directory scan on the GPUI background executor,
     /// then push the result back into `file_browser.index` on the UI
     /// thread. Never blocks render — this is the only place `read_dir`

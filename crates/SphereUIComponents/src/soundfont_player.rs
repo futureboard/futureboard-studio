@@ -6,9 +6,9 @@
 //! to the player crate's preloaded handle.
 
 pub use sphere_soundfont_player::{
-    SoundfontEnvelope, SoundfontPlayer, SoundfontPlayerError, SoundfontPlayerSettings,
-    SoundfontPresetInfo, SoundfontRenderQuality, DRUM_BANK, ENVELOPE_MAX_TIME_MS,
-    PERCUSSION_CHANNEL,
+    audible_channels, SoundfontChannel, SoundfontChannels, SoundfontEnvelope, SoundfontPlayer,
+    SoundfontPlayerError, SoundfontPlayerMode, SoundfontPlayerSettings, SoundfontPresetInfo,
+    SoundfontRenderQuality, DRUM_BANK, ENVELOPE_MAX_TIME_MS, PERCUSSION_CHANNEL,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

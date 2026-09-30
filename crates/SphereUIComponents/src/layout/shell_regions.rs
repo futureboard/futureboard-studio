@@ -123,6 +123,8 @@ impl StudioLayout {
         {
             self.spawn_browser_instruments_load(cx);
         }
+        // Network drives join the list once a background probe reaches them.
+        self.spawn_drive_probe(cx);
 
         // ── File browser callbacks ──────────────────────────────────────
         let on_browser_search_context: std::sync::Arc<

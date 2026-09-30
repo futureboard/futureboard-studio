@@ -28,7 +28,8 @@ use crate::latency_graph::{
 use serde_json::Value;
 use sphere_audio_plugins::{canonical_plugin_id, should_rebuild_state, AudioPluginDspState};
 use sphere_soundfont_player::{
-    SoundFont, SoundfontEnvelope, SoundfontPlayer, SoundfontPlayerSettings, SoundfontRenderQuality,
+    SoundFont, SoundfontChannels, SoundfontEnvelope, SoundfontPlayer, SoundfontPlayerMode,
+    SoundfontPlayerSettings, SoundfontRenderQuality,
 };
 use SphereAudioProcessor::{
     create_stretch_processor, effective_pitch_ratio, effective_time_ratio, resolve_backend,
@@ -82,6 +83,10 @@ pub struct RuntimeSoundfontPlayer {
     pub polyphony: usize,
     pub envelope: SoundfontEnvelope,
     pub quality: SoundfontRenderQuality,
+    pub mode: SoundfontPlayerMode,
+    /// The parts of a [`SoundfontPlayerMode::Multi`] player, reapplied to
+    /// every rebuilt synthesizer.
+    pub channels: SoundfontChannels,
     pub player: Option<SoundfontPlayer>,
 }
 
@@ -102,10 +107,21 @@ impl RuntimeSoundfontPlayer {
             polyphony: track.soundfont_polyphony.clamp(1, 256),
             envelope: track.soundfont_envelope.sanitized(),
             quality: track.soundfont_quality,
+            mode: track.soundfont_mode,
+            channels: track.soundfont_channels,
             player: None,
         };
         state.rebuild(sample_rate, None);
         Some(state)
+    }
+
+    /// Installs new parts on a multitimbral player. Allocation-free: this runs
+    /// from a control command on the audio thread.
+    pub fn set_channels(&mut self, channels: &SoundfontChannels) {
+        self.channels = *channels;
+        if let Some(player) = self.player.as_mut() {
+            player.set_channels(channels);
+        }
     }
 
     /// Output samples of delay this instrument adds — the decimation filter at
@@ -134,6 +150,7 @@ impl RuntimeSoundfontPlayer {
             // Sized for the callback block so an oversampled render never grows
             // a buffer on the audio thread.
             max_render_frames: DEFAULT_AUDIO_BLOCK_CAPACITY,
+            mode: self.mode,
         };
         let built = match sound_font {
             Some(font) => SoundfontPlayer::from_sound_font(font, settings),
@@ -142,7 +159,11 @@ impl RuntimeSoundfontPlayer {
         match built {
             Ok(mut player) => {
                 player.set_master_volume(self.volume);
-                if let Some((bank, patch)) = self.preset {
+                if self.mode == SoundfontPlayerMode::Multi {
+                    // Each channel is its own part; the player-wide preset
+                    // belongs to single mode.
+                    player.set_channels(&self.channels);
+                } else if let Some((bank, patch)) = self.preset {
                     // Every melodic channel gets the track's preset: a
                     // Futureboard MIDI track can put each note on its own
                     // channel, and only channel 1 answering the selected sound
@@ -177,6 +198,7 @@ impl std::fmt::Debug for RuntimeSoundfontPlayer {
             .field("polyphony", &self.polyphony)
             .field("envelope", &self.envelope)
             .field("quality", &self.quality)
+            .field("mode", &self.mode)
             .field("loaded", &self.player.is_some())
             .finish()
     }
@@ -201,6 +223,8 @@ impl Clone for RuntimeSoundfontPlayer {
             polyphony: self.polyphony,
             envelope: self.envelope,
             quality: self.quality,
+            mode: self.mode,
+            channels: self.channels,
             player: None,
         };
         cloned.rebuild(sample_rate, sound_font);
@@ -4866,6 +4890,17 @@ impl RuntimeProject {
 
     /// Move one channel in the room. Realtime-safe: a copy.
     #[inline]
+    /// New parts for the multitimbral Soundfont Player on `track_index`.
+    pub fn update_soundfont_channels(&mut self, track_index: usize, channels: &SoundfontChannels) {
+        if let Some(player) = self
+            .tracks
+            .get_mut(track_index)
+            .and_then(|track| track.soundfont_player.as_mut())
+        {
+            player.set_channels(channels);
+        }
+    }
+
     pub fn update_track_spatial(
         &mut self,
         track_index: usize,
@@ -6513,6 +6548,8 @@ mod pdc_reset_tests {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege_engine: None,
         }
     }
@@ -7907,6 +7944,8 @@ mod midi_tests {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege_engine: None,
         }
     }
@@ -8591,6 +8630,8 @@ mod loopback_resolve_tests {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege_engine: None,
         }
     }

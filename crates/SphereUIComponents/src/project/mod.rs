@@ -30,7 +30,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::solfege::SolfegeTrackState;
 use sphere_midi_service::NoteExpression;
 use sphere_midi_service::mpe::MpeTrackConfiguration;
-pub use sphere_soundfont_player::{SoundfontEnvelope, SoundfontRenderQuality};
+pub use sphere_soundfont_player::{
+    SoundfontChannels, SoundfontEnvelope, SoundfontPlayerMode, SoundfontRenderQuality,
+};
 
 // ── Identifiers ───────────────────────────────────────────────────────────────
 
@@ -595,6 +597,10 @@ pub struct ProjectSoundfontPlayer {
     pub envelope: SoundfontEnvelope,
     /// v29: internal synthesis oversampling.
     pub quality: SoundfontRenderQuality,
+    /// v58: one instrument, or sixteen parts.
+    pub mode: SoundfontPlayerMode,
+    /// v58: the parts of a multitimbral player.
+    pub channels: SoundfontChannels,
 }
 
 impl Default for ProjectSoundfontPlayer {
@@ -608,6 +614,8 @@ impl Default for ProjectSoundfontPlayer {
             polyphony: 64,
             envelope: SoundfontEnvelope::default(),
             quality: SoundfontRenderQuality::default(),
+            mode: SoundfontPlayerMode::default(),
+            channels: sphere_soundfont_player::default_channels(),
         }
     }
 }
@@ -1519,6 +1527,8 @@ impl From<&TimelineState> for FutureboardProject {
                         polyphony: t.soundfont_polyphony as u32,
                         envelope: t.soundfont_envelope,
                         quality: t.soundfont_quality,
+                        mode: t.soundfont_mode,
+                        channels: t.soundfont_channels,
                     }),
                     volume_automation_read: t.volume_automation_read,
                     solfege: t.solfege.as_ref().map(|state| ProjectSolfegeEngine {
@@ -2368,6 +2378,16 @@ pub fn apply_to_timeline(
                     .as_ref()
                     .map(|sf| sf.quality)
                     .unwrap_or_default(),
+                soundfont_mode: pt
+                    .soundfont
+                    .as_ref()
+                    .map(|sf| sf.mode)
+                    .unwrap_or_default(),
+                soundfont_channels: pt
+                    .soundfont
+                    .as_ref()
+                    .map(|sf| sf.channels)
+                    .unwrap_or_else(sphere_soundfont_player::default_channels),
                 takes: pt
                     .takes
                     .iter()
@@ -3208,7 +3228,7 @@ mod v33_routing_adapter_tests {
         let bytes = crate::project::format::encode_project(&FutureboardProject::new("current"));
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         assert_eq!(version, crate::project::format::PROJECT_VERSION);
-        assert_eq!(crate::project::format::PROJECT_VERSION, 57);
+        assert_eq!(crate::project::format::PROJECT_VERSION, 58);
     }
 
     // ── v35 Master / Monitor output routing ─────────────────────────────────

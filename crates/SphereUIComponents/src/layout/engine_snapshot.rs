@@ -1066,6 +1066,8 @@ fn build_engine_project_snapshot_inner(
             soundfont_polyphony: track.soundfont_polyphony,
             soundfont_envelope: track.soundfont_envelope,
             soundfont_quality: track.soundfont_quality,
+            soundfont_mode: track.soundfont_mode,
+            soundfont_channels: track.soundfont_channels,
             solfege_engine: track.solfege.as_ref().map(|state| EngineSolfegeSnapshot {
                 model_path: state.model_path.clone(),
                 instrument: state.instrument.clone(),
@@ -1118,6 +1120,8 @@ fn build_engine_project_snapshot_inner(
         soundfont_polyphony: 64,
         soundfont_envelope: Default::default(),
         soundfont_quality: Default::default(),
+        soundfont_mode: Default::default(),
+        soundfont_channels: Default::default(),
         solfege_engine: None,
     });
 
@@ -1788,6 +1792,33 @@ mod tests {
         assert!(track.builtin_soundfont_player);
         assert_eq!(track.soundfont_envelope, envelope);
         assert_eq!(track.soundfont_quality, SoundfontRenderQuality::High);
+    }
+
+    #[test]
+    fn soundfont_parts_reach_the_engine_snapshot() {
+        use crate::components::timeline::timeline_state::{
+            SoundfontPlayerMode, SoundfontPlayerSettingsState,
+        };
+
+        let (mut state, _clip) = instrument_state_with_clip();
+        let track_id = state.tracks[0].id.clone();
+        let mut settings = SoundfontPlayerSettingsState {
+            path: Some("/fonts/GM.sf2".to_string()),
+            mode: SoundfontPlayerMode::Multi,
+            ..SoundfontPlayerSettingsState::default()
+        };
+        settings.channels[9].preset = Some((128, 0));
+        settings.channels[2].mute = true;
+        settings.channels[4].pan = 20;
+        assert!(state.set_track_soundfont_player_state(&track_id, settings.clone()));
+        let snapshot = build_engine_project_snapshot(&state, 48_000, None, None);
+        let track = snapshot
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .expect("track in snapshot");
+        assert_eq!(track.soundfont_mode, SoundfontPlayerMode::Multi);
+        assert_eq!(track.soundfont_channels, settings.channels);
     }
 
     #[test]

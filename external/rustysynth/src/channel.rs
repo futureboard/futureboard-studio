@@ -99,6 +99,16 @@ impl Channel {
         }
     }
 
+    /// Futureboard: move the channel between the melodic and the drum banks.
+    /// The bank returns to the side's default, as a reset would leave it.
+    pub(crate) fn set_percussion(&mut self, percussion: bool) {
+        if self.is_percussion_channel == percussion {
+            return;
+        }
+        self.is_percussion_channel = percussion;
+        self.bank_number = if percussion { 128 } else { 0 };
+    }
+
     pub(crate) fn set_patch(&mut self, value: i32) {
         self.patch_number = value;
     }

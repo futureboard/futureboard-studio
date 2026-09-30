@@ -91,6 +91,8 @@ impl TimelineState {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege: None,
         };
 
@@ -151,6 +153,8 @@ impl TimelineState {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege: None,
         };
 
@@ -221,6 +225,8 @@ impl TimelineState {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege: None,
         };
 

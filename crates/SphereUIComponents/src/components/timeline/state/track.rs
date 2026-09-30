@@ -1,6 +1,9 @@
 use super::*;
 
-pub use sphere_soundfont_player::{SoundfontEnvelope, SoundfontRenderQuality};
+pub use sphere_soundfont_player::{
+    SoundfontChannel, SoundfontChannels, SoundfontEnvelope, SoundfontPlayerMode,
+    SoundfontRenderQuality,
+};
 
 /// Per-channel Listen state. Mirrors the engine's `ListenMode`; the engine
 /// stays authoritative for where each tap sits relative to the fader.
@@ -42,6 +45,10 @@ pub struct SoundfontPlayerSettingsState {
     pub polyphony: usize,
     pub envelope: SoundfontEnvelope,
     pub quality: SoundfontRenderQuality,
+    /// One instrument, or sixteen parts on the MIDI channels.
+    pub mode: SoundfontPlayerMode,
+    /// The parts of a multitimbral player, index 0 = MIDI channel 1.
+    pub channels: SoundfontChannels,
 }
 
 impl Default for SoundfontPlayerSettingsState {
@@ -54,6 +61,8 @@ impl Default for SoundfontPlayerSettingsState {
             polyphony: 64,
             envelope: SoundfontEnvelope::default(),
             quality: SoundfontRenderQuality::default(),
+            mode: SoundfontPlayerMode::default(),
+            channels: sphere_soundfont_player::default_channels(),
         }
     }
 }
@@ -66,6 +75,7 @@ impl SoundfontPlayerSettingsState {
             volume: self.volume.clamp(0.0, 1.0),
             polyphony: self.polyphony.clamp(1, 256),
             envelope: self.envelope.sanitized(),
+            channels: self.channels.map(SoundfontChannel::sanitized),
             ..self
         }
     }
@@ -291,6 +301,10 @@ pub struct TrackState {
     pub soundfont_envelope: SoundfontEnvelope,
     /// Internal synthesis oversampling for the built-in player.
     pub soundfont_quality: SoundfontRenderQuality,
+    /// Single instrument, or the sixteen-part multitimbral player.
+    pub soundfont_mode: SoundfontPlayerMode,
+    /// The multitimbral player's parts, index 0 = MIDI channel 1.
+    pub soundfont_channels: SoundfontChannels,
     /// Native Solfege instrument state. Mutually exclusive with the built-in
     /// Soundfont Player and VSTi instrument insert for Instrument tracks.
     pub solfege: Option<crate::solfege::SolfegeTrackState>,
@@ -541,6 +555,8 @@ impl TimelineState {
             soundfont_polyphony: 64,
             soundfont_envelope: SoundfontEnvelope::default(),
             soundfont_quality: SoundfontRenderQuality::default(),
+            soundfont_mode: SoundfontPlayerMode::default(),
+            soundfont_channels: sphere_soundfont_player::default_channels(),
             solfege: None,
         });
         id
@@ -583,6 +599,23 @@ impl TimelineState {
         true
     }
 
+    /// Switch a built-in Soundfont Player between one instrument and sixteen
+    /// parts. Returns `true` if the mode changed.
+    pub fn set_track_soundfont_mode(&mut self, track_id: &str, mode: SoundfontPlayerMode) -> bool {
+        let Some(track) = self
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == track_id && t.track_type == TrackType::Instrument)
+        else {
+            return false;
+        };
+        if track.soundfont_mode == mode {
+            return false;
+        }
+        track.soundfont_mode = mode;
+        true
+    }
+
     pub fn set_track_soundfont_player_state(
         &mut self,
         track_id: &str,
@@ -602,7 +635,9 @@ impl TimelineState {
             || track.soundfont_reverb_chorus != settings.reverb_chorus
             || track.soundfont_polyphony != settings.polyphony
             || track.soundfont_envelope != settings.envelope
-            || track.soundfont_quality != settings.quality;
+            || track.soundfont_quality != settings.quality
+            || track.soundfont_mode != settings.mode
+            || track.soundfont_channels != settings.channels;
         if changed {
             track.builtin_soundfont_player = true;
             track.soundfont_path = settings.path;
@@ -612,6 +647,8 @@ impl TimelineState {
             track.soundfont_polyphony = settings.polyphony;
             track.soundfont_envelope = settings.envelope;
             track.soundfont_quality = settings.quality;
+            track.soundfont_mode = settings.mode;
+            track.soundfont_channels = settings.channels;
         }
         changed
     }

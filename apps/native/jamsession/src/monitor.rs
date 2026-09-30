@@ -387,6 +387,8 @@ fn listener_track(index: usize, listener: &Listener) -> EngineTrackSnapshot {
         soundfont_polyphony: 64,
         soundfont_envelope: Default::default(),
         soundfont_quality: Default::default(),
+        soundfont_mode: Default::default(),
+        soundfont_channels: Default::default(),
         solfege_engine: None,
     }
 }
@@ -426,6 +428,8 @@ fn self_monitor_track() -> EngineTrackSnapshot {
         soundfont_polyphony: 64,
         soundfont_envelope: Default::default(),
         soundfont_quality: Default::default(),
+        soundfont_mode: Default::default(),
+        soundfont_channels: Default::default(),
         solfege_engine: None,
     }
 }

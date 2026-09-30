@@ -149,6 +149,8 @@ pub struct AddTrackInputChoice {
 pub enum InstrumentMode {
     Vsti,
     SoundfontPlayer,
+    /// The built-in Soundfont Player with sixteen parts, one per MIDI channel.
+    SoundfontMulti,
     SolfegeEngine,
 }
 
@@ -157,6 +159,7 @@ impl InstrumentMode {
         match self {
             Self::Vsti => "VSTi",
             Self::SoundfontPlayer => "Soundfont Player",
+            Self::SoundfontMulti => "Soundfont Multi",
             Self::SolfegeEngine => "Solfege Engine",
         }
     }
@@ -945,6 +948,7 @@ fn instrument_mode_selector(
     for (index, mode) in [
         InstrumentMode::Vsti,
         InstrumentMode::SoundfontPlayer,
+        InstrumentMode::SoundfontMulti,
         InstrumentMode::SolfegeEngine,
     ]
     .into_iter()
@@ -1526,6 +1530,11 @@ fn type_fields(
                     } else if state.instrument_mode == InstrumentMode::SoundfontPlayer {
                         locked_select_box("Built-in Soundfont Player".to_string())
                             .into_any_element()
+                    } else if state.instrument_mode == InstrumentMode::SoundfontMulti {
+                        locked_select_box(
+                            "Built-in Soundfont Player · 16 MIDI channels".to_string(),
+                        )
+                        .into_any_element()
                     } else {
                         add_track_select(
                             "add-track-solfege-model-select",
@@ -2609,7 +2618,7 @@ impl Render for AddTrackWindow {
                             InstrumentMode::Vsti => {
                                 this.state.solfege_model_path = None;
                             }
-                            InstrumentMode::SoundfontPlayer => {
+                            InstrumentMode::SoundfontPlayer | InstrumentMode::SoundfontMulti => {
                                 this.state.instrument_plugin_id = None;
                                 this.state.instrument_plugin_name = None;
                                 this.state.solfege_model_path = None;

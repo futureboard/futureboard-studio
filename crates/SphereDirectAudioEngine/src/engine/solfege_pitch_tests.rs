@@ -59,6 +59,8 @@ fn track(id: &str, track_type: &str, solfege: bool) -> EngineTrackSnapshot {
         soundfont_polyphony: 64,
         soundfont_envelope: Default::default(),
         soundfont_quality: Default::default(),
+        soundfont_mode: Default::default(),
+        soundfont_channels: Default::default(),
         // `model_path: None` selects the built-in bowed-string physical
         // instrument, which honours `Event::Pitch` exactly as the voicebank
         // does. That is what keeps this test hermetic.

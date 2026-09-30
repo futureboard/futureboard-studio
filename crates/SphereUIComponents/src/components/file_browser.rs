@@ -338,6 +338,13 @@ pub struct FileBrowserState {
     /// per-volume mounts on Unix-like systems. Enumerated cheaply at
     /// startup (Win32 `GetLogicalDrives` bitmask on Windows).
     pub root_drives: Vec<BrowserRootSection>,
+    /// Network drives (and, off Windows, mounted volumes) not listed yet. Any
+    /// of them can be disconnected or offline, and touching one then blocks
+    /// for as long as the network takes to give up — so none is listed until
+    /// a background probe has reached it (see [`probe_reachable_roots`]).
+    pub unprobed_drives: Vec<BrowserRootSection>,
+    /// Whether a probe of `unprobed_drives` is in flight.
+    pub drive_probe_running: bool,
     /// Resolved library/places roots. See [`BrowserRoots`].
     pub roots: BrowserRoots,
     /// Lazy index of expanded directories. Render reads from here; the
@@ -389,10 +396,13 @@ pub struct FileBrowserState {
 
 impl Default for FileBrowserState {
     fn default() -> Self {
+        let (root_drives, unprobed_drives) = default_root_drives();
         let mut state = Self {
             selected: None,
             expanded_paths: HashSet::new(),
-            root_drives: default_root_drives(),
+            root_drives,
+            unprobed_drives,
+            drive_probe_running: false,
             roots: BrowserRoots::resolve(),
             index: IndexCache::default(),
             project_folder: None,
@@ -1086,6 +1096,40 @@ impl FileBrowserState {
         }
     }
 
+    /// The drives to probe, handed over once: `None` when none is waiting or
+    /// a probe is already running. Pair with [`Self::apply_drive_probe`].
+    pub fn take_drives_to_probe(&mut self) -> Option<Vec<PathBuf>> {
+        if self.drive_probe_running || self.unprobed_drives.is_empty() {
+            return None;
+        }
+        self.drive_probe_running = true;
+        Some(
+            self.unprobed_drives
+                .iter()
+                .filter_map(|drive| drive.root_path.clone())
+                .collect(),
+        )
+    }
+
+    /// Lists the probed drives that answered; the rest stay off the list
+    /// until the next Rescan.
+    pub fn apply_drive_probe(&mut self, reachable: &[PathBuf]) {
+        self.drive_probe_running = false;
+        let probed = std::mem::take(&mut self.unprobed_drives);
+        for drive in probed {
+            let answered = drive
+                .root_path
+                .as_ref()
+                .is_some_and(|path| reachable.contains(path));
+            if answered && !self.root_drives.iter().any(|d| d.id == drive.id) {
+                self.root_drives.push(drive);
+            }
+        }
+        self.root_drives
+            .sort_by(|a, b| a.root_path.cmp(&b.root_path));
+        self.update_visible_nodes();
+    }
+
     /// Collapse every expanded folder/category. Group headers stay open.
     pub fn collapse_all(&mut self) {
         self.expanded_paths.clear();
@@ -1098,6 +1142,13 @@ impl FileBrowserState {
     /// the platform roots, which is the one place a user asks for that.
     pub fn invalidate_expanded(&mut self) -> Vec<PathBuf> {
         self.roots = BrowserRoots::resolve();
+        // A network drive that was offline may be back, and one that was
+        // listed may have gone: probe them all again.
+        let (root_drives, unprobed_drives) = default_root_drives();
+        self.root_drives = root_drives;
+        if !self.drive_probe_running {
+            self.unprobed_drives = unprobed_drives;
+        }
         let paths: Vec<PathBuf> = self.expanded_paths.iter().cloned().collect();
         for p in &paths {
             self.index.loaded.remove(p);
@@ -1543,8 +1594,146 @@ fn entry_icon(is_folder: bool, expanded: bool, entry: &FileBrowserEntry) -> Brow
 /// Canonicalised where the filesystem allows it, so `C:\Users\me\Music` and a
 /// junction pointing at it collapse to one entry; the raw path otherwise,
 /// because a root that cannot be resolved is still a root worth listing once.
+///
+/// Never canonicalised on the network: this runs on the UI thread on every
+/// browser update, and resolving a path on a disconnected or offline share
+/// blocks until the network gives up — the app stopped responding for that
+/// long, over and over.
 fn dedupe_key(path: &Path) -> PathBuf {
+    if is_network_path(path) {
+        return path.to_path_buf();
+    }
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Whether `path` is on a network share: a UNC path, or a drive letter that
+/// maps one. Decided without touching the share itself.
+#[cfg(target_os = "windows")]
+fn is_network_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let normalized = text.replace('/', "\\");
+    if let Some(rest) = normalized.strip_prefix("\\\\") {
+        // `\\?\C:\` and `\\.\C:` are local device paths; `\\?\UNC\` and a
+        // plain `\\server\share` are not.
+        return match rest.get(..2) {
+            Some("?\\") | Some(".\\") => rest[2..].to_ascii_uppercase().starts_with("UNC\\"),
+            _ => true,
+        };
+    }
+    let mut chars = normalized.chars();
+    match (chars.next(), chars.next()) {
+        (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => win_drives::is_remote(letter),
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_network_path(_path: &Path) -> bool {
+    // Network mounts live under the volume folders, which are only listed
+    // after a background probe; the places a user folder resolves to are
+    // local on these platforms.
+    false
+}
+
+/// Which of `roots` answer a directory listing within `timeout`. Each root is
+/// tried on its own thread, so one offline share cannot hold up the others;
+/// a thread that is still blocked when the time is up is left to finish on
+/// its own and its root counts as offline. Run off the UI thread.
+pub fn probe_reachable_roots(roots: Vec<PathBuf>, timeout: std::time::Duration) -> Vec<PathBuf> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    for root in roots {
+        let sender = sender.clone();
+        let _ = std::thread::Builder::new()
+            .name("browser-drive-probe".to_string())
+            .spawn(move || {
+                let reachable = root_is_connected(&root) && std::fs::read_dir(&root).is_ok();
+                let _ = sender.send((root, reachable));
+            });
+    }
+    drop(sender);
+    let deadline = Instant::now() + timeout;
+    let mut reachable = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match receiver.recv_timeout(left) {
+            Ok((root, true)) => reachable.push(root),
+            Ok((_, false)) => {}
+            Err(_) => break,
+        }
+    }
+    reachable.sort();
+    reachable
+}
+
+/// A mapped drive Windows remembers but has not reconnected (the red cross in
+/// Explorer) is offline without asking the server.
+#[cfg(target_os = "windows")]
+fn root_is_connected(root: &Path) -> bool {
+    let mut chars = root
+        .to_string_lossy()
+        .chars()
+        .collect::<Vec<_>>()
+        .into_iter();
+    match (chars.next(), chars.next()) {
+        (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => {
+            !win_drives::is_disconnected_mapping(letter)
+        }
+        _ => true,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn root_is_connected(_root: &Path) -> bool {
+    true
+}
+
+/// The Win32 drive queries the browser needs, declared here like
+/// `GetLogicalDrives` rather than pulling in more of the bindings crate.
+#[cfg(target_os = "windows")]
+mod win_drives {
+    /// `GetDriveTypeW`: a network drive.
+    const DRIVE_REMOTE: u32 = 4;
+    /// `GetDriveTypeW`: the root does not exist (a stale letter).
+    pub const DRIVE_NO_ROOT_DIR: u32 = 1;
+    /// `WNetGetConnectionW`: a remembered mapping that is not connected.
+    const ERROR_CONNECTION_UNAVAIL: u32 = 1201;
+
+    extern "system" {
+        fn GetDriveTypeW(root: *const u16) -> u32;
+    }
+
+    #[link(name = "mpr")]
+    extern "system" {
+        fn WNetGetConnectionW(local: *const u16, remote: *mut u16, length: *mut u32) -> u32;
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// The drive type of `X:\`. Answered by the local mount table, not the
+    /// drive, so it is safe on the UI thread.
+    pub fn drive_type(letter: char) -> u32 {
+        let root = wide(&format!("{letter}:\\"));
+        unsafe { GetDriveTypeW(root.as_ptr()) }
+    }
+
+    pub fn is_remote(letter: char) -> bool {
+        drive_type(letter) == DRIVE_REMOTE
+    }
+
+    /// Whether `X:` is a mapping Windows remembers but has not connected.
+    pub fn is_disconnected_mapping(letter: char) -> bool {
+        let local = wide(&format!("{letter}:"));
+        let mut remote = [0u16; 1024];
+        let mut length = remote.len() as u32;
+        let status =
+            unsafe { WNetGetConnectionW(local.as_ptr(), remote.as_mut_ptr(), &mut length) };
+        status == ERROR_CONNECTION_UNAVAIL
+    }
 }
 
 fn placeholder_row(dir: &Path, depth: usize, label: String, is_error: bool) -> BrowserVisibleNode {
@@ -1616,75 +1805,73 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Enumerate logical drive letters on Windows, `/` plus mounted volumes on unix.
-fn default_root_drives() -> Vec<BrowserRootSection> {
-    let mut out = Vec::new();
-    for path in enumerate_filesystem_roots() {
-        let label = drive_label(&path);
-        let id = format!("root:{}", path.display());
-        out.push(BrowserRootSection {
-            id,
-            label,
-            root_path: Some(path),
-        });
-    }
-    out
+/// The filesystem roots: `(listed now, listed once a probe reaches them)`.
+/// Drive letters on Windows (network drives probed), `/` plus the mounted
+/// volumes on unix (volumes probed).
+fn default_root_drives() -> (Vec<BrowserRootSection>, Vec<BrowserRootSection>) {
+    let section = |path: PathBuf| BrowserRootSection {
+        id: format!("root:{}", path.display()),
+        label: drive_label(&path),
+        root_path: Some(path),
+    };
+    let (local, probed) = enumerate_filesystem_roots();
+    (
+        local.into_iter().map(section).collect(),
+        probed.into_iter().map(section).collect(),
+    )
 }
 
 #[cfg(target_os = "windows")]
-fn enumerate_filesystem_roots() -> Vec<PathBuf> {
+fn enumerate_filesystem_roots() -> (Vec<PathBuf>, Vec<PathBuf>) {
     extern "system" {
         fn GetLogicalDrives() -> u32;
     }
     let mask = unsafe { GetLogicalDrives() };
     let mut drives = Vec::new();
+    let mut network = Vec::new();
     for i in 0u32..26 {
         if mask & (1 << i) != 0 {
             let letter = (b'A' + i as u8) as char;
-            drives.push(PathBuf::from(format!("{}:\\", letter)));
+            let root = PathBuf::from(format!("{}:\\", letter));
+            match win_drives::drive_type(letter) {
+                win_drives::DRIVE_NO_ROOT_DIR => {}
+                _ if win_drives::is_remote(letter) => network.push(root),
+                _ => drives.push(root),
+            }
         }
     }
-    if drives.is_empty() {
+    if drives.is_empty() && network.is_empty() {
         if let Some(home) = dirs::home_dir() {
             drives.push(home);
         }
     }
-    drives
+    (drives, network)
 }
 
 // Note: the user's home directory is surfaced separately as the friendly
 // "Home" place (see `update_visible_nodes`), so it is intentionally not
 // duplicated in the raw root list below.
 
+/// Mounted volumes are probed rather than stat'ed here: a stale network
+/// mount blocks the first call that touches it.
 #[cfg(target_os = "macos")]
-fn enumerate_filesystem_roots() -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from("/")];
-    let volumes = PathBuf::from("/Volumes");
-    if let Ok(read) = std::fs::read_dir(&volumes) {
-        for entry in read.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                roots.push(p);
-            }
-        }
+fn enumerate_filesystem_roots() -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut volumes = Vec::new();
+    if let Ok(read) = std::fs::read_dir("/Volumes") {
+        volumes.extend(read.flatten().map(|entry| entry.path()));
     }
-    roots
+    (vec![PathBuf::from("/")], volumes)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn enumerate_filesystem_roots() -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from("/")];
+fn enumerate_filesystem_roots() -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut volumes = Vec::new();
     for parent in ["/media", "/mnt", "/run/media"] {
         if let Ok(read) = std::fs::read_dir(parent) {
-            for entry in read.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    roots.push(p);
-                }
-            }
+            volumes.extend(read.flatten().map(|entry| entry.path()));
         }
     }
-    roots
+    (vec![PathBuf::from("/")], volumes)
 }
 
 fn drive_label(path: &Path) -> String {
@@ -1865,6 +2052,55 @@ fn read_pst_plugin_name(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unc_and_device_paths_are_told_apart_without_touching_them() {
+        assert!(is_network_path(Path::new(r"\\server\share\Samples")));
+        assert!(is_network_path(Path::new("//server/share")));
+        assert!(is_network_path(Path::new(r"\\?\UNC\server\share")));
+        assert!(!is_network_path(Path::new(r"\\?\C:\Windows")));
+        assert!(!is_network_path(Path::new(r"\\.\C:")));
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        assert!(!is_network_path(&PathBuf::from(format!("{system}\\"))));
+    }
+
+    #[test]
+    fn a_probe_lists_the_roots_that_answer_and_skips_the_rest() {
+        let here = std::env::temp_dir();
+        let missing = here.join("futureboard-no-such-drive-root");
+        let started = Instant::now();
+        let reachable = probe_reachable_roots(
+            vec![missing.clone(), here.clone()],
+            std::time::Duration::from_secs(2),
+        );
+        assert_eq!(reachable, vec![here]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn probed_drives_are_listed_only_when_they_answered() {
+        let mut state = FileBrowserState::default();
+        let section = |path: &str| BrowserRootSection {
+            id: format!("root:{path}"),
+            label: path.to_string(),
+            root_path: Some(PathBuf::from(path)),
+        };
+        state.unprobed_drives = vec![section("net-online"), section("net-offline")];
+        let before = state.root_drives.len();
+        let probe = state.take_drives_to_probe().expect("drives to probe");
+        assert_eq!(probe.len(), 2);
+        assert!(
+            state.take_drives_to_probe().is_none(),
+            "one probe at a time"
+        );
+        state.apply_drive_probe(&[PathBuf::from("net-online")]);
+        assert_eq!(state.root_drives.len(), before + 1);
+        assert!(state.root_drives.iter().any(|d| d.id == "root:net-online"));
+        assert!(!state.root_drives.iter().any(|d| d.id == "root:net-offline"));
+        assert!(state.unprobed_drives.is_empty());
+        assert!(state.take_drives_to_probe().is_none());
+    }
 
     fn ids(state: &FileBrowserState) -> Vec<String> {
         state.visible_nodes.iter().map(|n| n.id.clone()).collect()

@@ -14,7 +14,7 @@ use super::{
     ProjectSongTextEvent, ProjectSongTextEventKind, ProjectSoundfontPlayer, ProjectTake,
     ProjectTempoPoint, ProjectTimelineMarker, ProjectTimelineRegion, ProjectTrack,
     ProjectTrackAudioFormat, ProjectTrackMidiInputRouting, ProjectTrackOutputRouting,
-    ProjectTrackType, SoundfontEnvelope, SoundfontRenderQuality, TrackRouting,
+    ProjectTrackType, SoundfontEnvelope, SoundfontPlayerMode, SoundfontRenderQuality, TrackRouting,
     V33TrackInputRouting,
 };
 use crate::components::timeline::timeline_state::{
@@ -155,7 +155,10 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// room (half-size, reflections) and the surround fold after the tempo
 /// tensions. A pre-v57 project is a stereo mix with every track front and
 /// centre.
-pub const PROJECT_VERSION: u32 = 57;
+/// v58 appends the built-in Soundfont Player's mode (single or sixteen parts)
+/// and its sixteen parts to the player's block. A pre-v58 player is a single
+/// instrument with every part at rest.
+pub const PROJECT_VERSION: u32 = 58;
 
 /// Oldest on-disk format version whose migration to the current one is
 /// supported (see [`super::migrate`]): v30, which introduced arrangement
@@ -1188,6 +1191,19 @@ fn encode_soundfont_player(w: &mut FbWriter, soundfont: Option<&ProjectSoundfont
     w.write_f32(envelope.sustain);
     w.write_f32(envelope.release_ms);
     w.write_str(soundfont.quality.key());
+    // v58: the mode by its stable key, then each part: a preset flag, bank and
+    // patch, level and pan (the channel's CC 7 and CC 10), mute and solo.
+    w.write_str(soundfont.mode.key());
+    for channel in soundfont.channels.iter().map(|channel| channel.sanitized()) {
+        let (bank, patch) = channel.preset.unwrap_or((0, 0));
+        w.write_bool(channel.preset.is_some());
+        w.write_u32(bank.max(0) as u32);
+        w.write_u32(patch.max(0) as u32);
+        w.write_u8(channel.volume);
+        w.write_u8(channel.pan);
+        w.write_bool(channel.mute);
+        w.write_bool(channel.solo);
+    }
 }
 
 fn decode_soundfont_player(
@@ -1220,6 +1236,29 @@ fn decode_soundfont_player(
             SoundfontRenderQuality::default(),
         )
     };
+    let (mode, channels) = if version >= 58 {
+        let mode = SoundfontPlayerMode::from_key(&r.read_str()?);
+        let mut channels = sphere_soundfont_player::default_channels();
+        for channel in channels.iter_mut() {
+            let has_preset = r.read_bool()?;
+            let bank = r.read_u32()? as i32;
+            let patch = r.read_u32()? as i32;
+            *channel = sphere_soundfont_player::SoundfontChannel {
+                preset: has_preset.then_some((bank, patch)),
+                volume: r.read_u8()?,
+                pan: r.read_u8()?,
+                mute: r.read_bool()?,
+                solo: r.read_bool()?,
+            }
+            .sanitized();
+        }
+        (mode, channels)
+    } else {
+        (
+            SoundfontPlayerMode::Single,
+            sphere_soundfont_player::default_channels(),
+        )
+    };
     Ok(Some(ProjectSoundfontPlayer {
         path,
         preset_bank: has_preset.then_some(bank),
@@ -1229,6 +1268,8 @@ fn decode_soundfont_player(
         polyphony,
         envelope,
         quality,
+        mode,
+        channels,
     }))
 }
 
@@ -5026,6 +5067,16 @@ mod tests {
                 release_ms: 900.0,
             },
             quality: SoundfontRenderQuality::Ultra,
+            mode: SoundfontPlayerMode::Multi,
+            channels: {
+                let mut channels = sphere_soundfont_player::default_channels();
+                channels[3].preset = Some((128, 16));
+                channels[3].volume = 90;
+                channels[3].pan = 10;
+                channels[7].mute = true;
+                channels[12].solo = true;
+                channels
+            },
         });
 
         let mut project = FutureboardProject::new("Soundfont");
@@ -5051,6 +5102,14 @@ mod tests {
         assert!((soundfont.envelope.sustain - 0.4).abs() < 1.0e-6);
         assert!((soundfont.envelope.release_ms - 900.0).abs() < 1.0e-3);
         assert_eq!(soundfont.quality, SoundfontRenderQuality::Ultra);
+        assert_eq!(soundfont.mode, SoundfontPlayerMode::Multi);
+        assert_eq!(soundfont.channels[3].preset, Some((128, 16)));
+        assert_eq!(
+            (soundfont.channels[3].volume, soundfont.channels[3].pan),
+            (90, 10)
+        );
+        assert!(soundfont.channels[7].mute && soundfont.channels[12].solo);
+        assert_eq!(soundfont.channels[0], Default::default());
     }
 
     #[test]
@@ -5078,6 +5137,7 @@ mod tests {
             "a pre-v29 soundfont must keep its original signal path"
         );
         assert_eq!(soundfont.quality, SoundfontRenderQuality::Standard);
+        assert_eq!(soundfont.mode, SoundfontPlayerMode::Single);
     }
 
     #[test]

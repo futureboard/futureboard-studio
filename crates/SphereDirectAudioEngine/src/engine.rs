@@ -430,8 +430,23 @@ fn project_structure_key(
     pdc_enabled: bool,
 ) -> Option<String> {
     let midi = std::mem::take(&mut snapshot.midi_clips);
+    // A Soundfont Player's parts are applied live (see
+    // `AudioEngine::apply_soundfont_channel_changes`), so they are not structure.
+    let parts: Vec<_> = snapshot
+        .tracks
+        .iter_mut()
+        .map(|track| {
+            std::mem::replace(
+                &mut track.soundfont_channels,
+                sphere_soundfont_player::default_channels(),
+            )
+        })
+        .collect();
     let value = serde_json::to_value(&*snapshot);
     snapshot.midi_clips = midi;
+    for (track, parts) in snapshot.tracks.iter_mut().zip(parts) {
+        track.soundfont_channels = parts;
+    }
     let mut key = format!("{output_sample_rate}:{pdc_enabled}:");
     write_canonical_json(&value.ok()?, &mut key);
     Some(key)
@@ -3310,6 +3325,42 @@ impl EngineInner {
         }
     }
 
+    /// Sends the running graph the parts of every multitimbral Soundfont
+    /// Player whose parts differ from the loaded project's.
+    ///
+    /// Parts are left out of the structure key, so an edit to one never
+    /// rebuilds the graph: a rebuild would cut every sounding note to move one
+    /// channel's level. Whatever changed them — an edit, an undo, a reopened
+    /// project — they reach the player here, as a live command.
+    fn apply_soundfont_channel_changes(&self, snapshot: &EngineProjectSnapshot) {
+        let changed: Vec<(usize, sphere_soundfont_player::SoundfontChannels)> = {
+            let project = self.project.lock();
+            let Some(project) = project.as_ref() else {
+                return;
+            };
+            snapshot
+                .tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, track)| track.builtin_soundfont_player)
+                .filter_map(|(index, track)| {
+                    let previous = project.tracks.iter().find(|t| t.id == track.id)?;
+                    (previous.soundfont_channels != track.soundfont_channels)
+                        .then_some((index, track.soundfont_channels))
+                })
+                .collect()
+        };
+        for (track_index, channels) in changed {
+            self.runtime
+                .lock()
+                .update_soundfont_channels(track_index, &channels);
+            let _ = self.send_command(EngineCommand::SetSoundfontChannels {
+                track_index,
+                channels,
+            });
+        }
+    }
+
     pub fn load_project(
         &self,
         mut snapshot: EngineProjectSnapshot,
@@ -3335,6 +3386,7 @@ impl EngineInner {
             self.shared
                 .engine_state
                 .store(old_state as u8, Ordering::Relaxed);
+            self.apply_soundfont_channel_changes(&snapshot);
             return self.replace_midi_schedule(snapshot);
         }
         // A full build from here on; until it lands, nothing matches.
@@ -5633,6 +5685,7 @@ impl EngineInner {
                 EngineCommand::SetJamMultitrackPairs { .. } => "SetJamMultitrackPairs",
                 EngineCommand::SetRenderCapture(_) => "SetRenderCapture",
                 EngineCommand::SetTrackPreviewMode { .. } => "SetTrackPreviewMode",
+                EngineCommand::SetSoundfontChannels { .. } => "SetSoundfontChannels",
                 EngineCommand::SetInsertParam { .. } => "SetInsertParam",
                 EngineCommand::SetMonitorSource { .. } => "SetMonitorSource",
                 EngineCommand::SetMonitorControl { .. } => "SetMonitorControl",
@@ -6428,6 +6481,12 @@ where
                         EngineCommand::SetTrackPreviewMode { track_id, value } => {
                             runtime.update_track_preview_mode(&track_id, RuntimePreviewMode::from_code(value));
                         }
+                        EngineCommand::SetSoundfontChannels {
+                            track_index,
+                            channels,
+                        } => {
+                            runtime.update_soundfont_channels(track_index, &channels);
+                        }
                         EngineCommand::SetInsertParam { track_id, insert_id, param_id, value } => {
                             runtime.update_insert_param(&track_id, &insert_id, &param_id, value);
                         }
@@ -6928,6 +6987,8 @@ mod live_input_tests {
                 soundfont_polyphony: 64,
                 soundfont_envelope: Default::default(),
                 soundfont_quality: Default::default(),
+                soundfont_mode: Default::default(),
+                soundfont_channels: Default::default(),
                 solfege_engine: None,
             }],
             clips: Vec::new(),
@@ -9147,6 +9208,39 @@ mod structure_key_tests {
         assert_ne!(key, project_structure_key(&mut faster, 48_000, true));
         assert_ne!(key, project_structure_key(&mut a, 44_100, true));
         assert_ne!(key, project_structure_key(&mut a, 48_000, false));
+    }
+
+    fn soundfont_track(mode: &str) -> crate::types::EngineTrackSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "id": "sf", "type": "instrument", "volume": 1.0, "pan": 0.0,
+            "muted": false, "solo": false, "armed": false,
+            "outputTrackId": null, "inserts": [],
+            "builtinSoundfontPlayer": true, "soundfontPath": "font.sf2",
+            "soundfontMode": mode,
+        }))
+        .expect("track snapshot")
+    }
+
+    /// A multitimbral player's parts are applied live, so moving one leaves
+    /// the key alone; switching the player's mode rebuilds it.
+    #[test]
+    fn soundfont_parts_are_left_out_of_the_key_and_the_mode_is_not() {
+        let mut a = snapshot(120.0, &[]);
+        a.tracks.push(soundfont_track("Multi"));
+        let key = project_structure_key(&mut a, 48_000, true);
+
+        let mut parts = a.clone();
+        parts.tracks[0].soundfont_channels[3].volume = 40;
+        parts.tracks[0].soundfont_channels[9].preset = Some((128, 0));
+        assert_eq!(key, project_structure_key(&mut parts, 48_000, true));
+        assert_eq!(
+            parts.tracks[0].soundfont_channels[3].volume, 40,
+            "the parts are put back"
+        );
+
+        let mut single = snapshot(120.0, &[]);
+        single.tracks.push(soundfont_track("Single"));
+        assert_ne!(key, project_structure_key(&mut single, 48_000, true));
     }
 
     /// Insert params are a `HashMap`: the same entries in another order must

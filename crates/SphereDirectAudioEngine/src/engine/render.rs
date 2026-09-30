@@ -3663,6 +3663,8 @@ mod jam_input_tests {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege_engine: None,
         }
     }
@@ -4105,6 +4107,8 @@ mod live_input_monitor_tests {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege_engine: None,
         }
     }
@@ -4346,6 +4350,8 @@ mod soundfont_instrument_tests {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege_engine: None,
         }
     }
@@ -4376,6 +4382,8 @@ mod soundfont_instrument_tests {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege_engine: None,
         }
     }
@@ -4428,6 +4436,71 @@ mod soundfont_instrument_tests {
         let mut output = vec![0.0f32; FRAMES * 2];
         render_project_block_interleaved(runtime, 0, 1.0, &mut output, 2, false, 4, 4, None);
         output.iter().fold(0.0f32, |peak, s| peak.max(s.abs()))
+    }
+
+    fn multi_runtime(
+        font: &FontFile,
+        parts: sphere_soundfont_player::SoundfontChannels,
+    ) -> RuntimeProject {
+        let mut track = soundfont_track("sf-1", font, test_font::MELODIC_PRESET);
+        track.soundfont_mode = sphere_soundfont_player::SoundfontPlayerMode::Multi;
+        track.soundfont_channels = parts;
+        build_runtime(vec![track, master_track()])
+    }
+
+    fn melodic_parts() -> sphere_soundfont_player::SoundfontChannels {
+        let mut parts = sphere_soundfont_player::default_channels();
+        for part in parts.iter_mut() {
+            part.preset = Some(test_font::MELODIC_PRESET);
+        }
+        parts
+    }
+
+    #[test]
+    fn a_live_part_edit_reaches_the_running_player() {
+        let font = FontFile::new("multi-live");
+        let mut parts = melodic_parts();
+        let mut runtime = multi_runtime(&font, parts);
+        runtime.midi_preview_note_on("sf-1", 5, 60, 100);
+        assert!(
+            render_peak(&mut runtime) > 0.001,
+            "channel 6 plays its part"
+        );
+        runtime.midi_preview_all_notes_off("sf-1");
+        for _ in 0..200 {
+            render_peak(&mut runtime);
+        }
+
+        parts[5].mute = true;
+        runtime.update_soundfont_channels(0, &parts);
+        runtime.midi_preview_note_on("sf-1", 5, 60, 100);
+        assert!(
+            render_peak(&mut runtime) < 1.0e-4,
+            "a muted part stays silent"
+        );
+        runtime.midi_preview_note_on("sf-1", 0, 60, 100);
+        assert!(
+            render_peak(&mut runtime) > 0.001,
+            "the other parts still play"
+        );
+    }
+
+    #[test]
+    fn a_graph_clone_keeps_the_parts() {
+        let font = FontFile::new("multi-clone");
+        let mut parts = melodic_parts();
+        parts[3].preset = Some(test_font::DRUM_PRESET);
+        let runtime = multi_runtime(&font, parts);
+        let cloned = runtime.tracks[0]
+            .soundfont_player
+            .clone()
+            .expect("soundfont player");
+        let player = cloned.player.as_ref().expect("font loaded");
+        assert!(
+            player.is_drum_channel(3),
+            "the kit on channel 4 survives the clone"
+        );
+        assert_eq!(player.channels()[3].preset, Some(test_font::DRUM_PRESET));
     }
 
     #[test]
@@ -5164,6 +5237,8 @@ mod warp_stretch_render_tests {
             soundfont_polyphony: 64,
             soundfont_envelope: Default::default(),
             soundfont_quality: Default::default(),
+            soundfont_mode: Default::default(),
+            soundfont_channels: Default::default(),
             solfege_engine: None,
         }
     }

@@ -1429,14 +1429,24 @@ impl StudioLayout {
                                     }
                                 }
                             } else if dialog.selected_kind == AddTrackKind::Instrument
-                                && dialog.instrument_mode == InstrumentMode::SoundfontPlayer
+                                && matches!(
+                                    dialog.instrument_mode,
+                                    InstrumentMode::SoundfontPlayer
+                                        | InstrumentMode::SoundfontMulti
+                                )
                             {
                                 // Built-in Soundfont Player is not a hosted plugin — it
                                 // never goes through the VST3/CLAP/AU/LV2 bridge or
                                 // plugin registry, so it gets a plain track marker
                                 // instead of an insert. Inspector shows an Open button
-                                // that opens the Soundfont Player MDI window for it.
+                                // that opens the Soundfont Player window for it.
                                 timeline.state.set_track_builtin_soundfont_player(&id, true);
+                                if dialog.instrument_mode == InstrumentMode::SoundfontMulti {
+                                    timeline.state.set_track_soundfont_mode(
+                                        &id,
+                                        crate::soundfont_player::SoundfontPlayerMode::Multi,
+                                    );
+                                }
                             } else if dialog.selected_kind == AddTrackKind::Instrument
                                 && dialog.instrument_mode == InstrumentMode::SolfegeEngine
                             {
@@ -2742,44 +2752,21 @@ impl StudioLayout {
         }
     }
 
-    /// A track's persisted Soundfont Player settings, so an opening window shows
-    /// the `.sf2` and preset the engine is already playing rather than an empty
-    /// panel.
-    fn soundfont_track_state(
-        &self,
-        track_id: &str,
-        cx: &App,
-    ) -> crate::components::soundfont_player_window::SoundfontPlayerTrackState {
-        use crate::components::soundfont_player_window::SoundfontPlayerTrackState;
-        let timeline = self.timeline.read(cx);
-        let Some(track) = timeline.state.find_track(track_id) else {
-            return SoundfontPlayerTrackState::default();
-        };
-        SoundfontPlayerTrackState {
-            path: track.soundfont_path.clone(),
-            preset: track.soundfont_preset,
-            volume: track.soundfont_volume,
-            reverb_chorus: track.soundfont_reverb_chorus,
-            polyphony: track.soundfont_polyphony,
-            envelope: track.soundfont_envelope,
-            quality: track.soundfont_quality,
-        }
-    }
-
-    /// Opens the built-in Soundfont Player MDI window, or focuses it (and its
-    /// document) if already open. Called from the Inspector's Open button for
-    /// an Instrument track whose `builtin_soundfont_player` marker is set.
+    /// Opens the built-in Soundfont Player window on `track_id`, or retargets
+    /// and focuses it if already open. Called from the Inspector's Open button
+    /// and the track header for an Instrument track whose
+    /// `builtin_soundfont_player` marker is set. The window reads the track
+    /// from the timeline itself, so it always shows what the track holds.
     pub(super) fn open_soundfont_player_window(
         &mut self,
         owner_bounds: Option<Bounds<gpui::Pixels>>,
         track_id: String,
         cx: &mut Context<Self>,
     ) {
-        let initial = self.soundfont_track_state(&track_id, cx);
         if let Some(handle) = self.external_windows.soundfont_player.clone() {
             let activated = handle
                 .update(cx, |window, w, cx| {
-                    window.focus_soundfont_player(track_id.clone(), initial.clone(), cx);
+                    window.focus_soundfont_player(track_id.clone(), cx);
                     w.activate_window();
                     cx.notify();
                 })
@@ -2850,7 +2837,7 @@ impl StudioLayout {
         match crate::components::soundfont_player_window::open_soundfont_player_window(
             owner_bounds,
             track_id,
-            initial,
+            self.timeline.clone(),
             on_close,
             on_update_track,
             on_preview,

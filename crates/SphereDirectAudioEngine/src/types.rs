@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sphere_midi_service::mpe::MpeTrackConfiguration;
 use sphere_midi_service::NoteExpression;
-use sphere_soundfont_player::{SoundfontEnvelope, SoundfontRenderQuality};
+use sphere_soundfont_player::{
+    SoundfontChannels, SoundfontEnvelope, SoundfontPlayerMode, SoundfontRenderQuality,
+    default_channels,
+};
 use SphereAudioProcessor::StretchParams;
 
 // ── DAUx backend selection types ──────────────────────────────────────────────
@@ -471,6 +474,13 @@ pub struct EngineTrackSnapshot {
     /// Internal synthesis oversampling for the built-in player.
     #[serde(default)]
     pub soundfont_quality: SoundfontRenderQuality,
+    /// One instrument, or sixteen parts on the MIDI channels.
+    #[serde(default)]
+    pub soundfont_mode: SoundfontPlayerMode,
+    /// The parts of a multitimbral player. Applied to the running player,
+    /// never by a graph rebuild (see `AudioEngine::load_project`).
+    #[serde(default = "default_channels")]
+    pub soundfont_channels: SoundfontChannels,
     /// Native Solfege physical/hybrid instrument wrapper. Kept optional so
     /// existing snapshots remain source-compatible and deserialize unchanged.
     #[serde(default)]

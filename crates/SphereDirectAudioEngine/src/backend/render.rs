@@ -1051,6 +1051,12 @@ pub fn drain_commands(
             EngineCommand::SetTrackPreviewMode { track_id, value } => {
                 runtime.update_track_preview_mode(&track_id, RuntimePreviewMode::from_code(value));
             }
+            EngineCommand::SetSoundfontChannels {
+                track_index,
+                channels,
+            } => {
+                runtime.update_soundfont_channels(track_index, &channels);
+            }
             EngineCommand::SetInsertParam {
                 track_id,
                 insert_id,

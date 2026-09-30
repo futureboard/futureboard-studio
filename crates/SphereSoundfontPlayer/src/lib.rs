@@ -10,6 +10,7 @@
 //! never re-read the file.
 
 pub mod font_cache;
+pub mod multitimbral;
 pub mod shaping;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_font;
@@ -18,6 +19,11 @@ pub use shaping::{
     DECIMATOR_LATENCY_SAMPLES, ENVELOPE_MAX_TIME_MS, SoundfontEnvelope, SoundfontRenderQuality,
 };
 use shaping::{Decimator, GateEnvelope};
+
+pub use multitimbral::{
+    CENTER_PAN, DEFAULT_CHANNEL_VOLUME, MIDI_CHANNELS, SoundfontChannel, SoundfontChannels,
+    SoundfontPlayerMode, audible_channels, default_channels,
+};
 
 pub use rustysynth::SoundFont;
 use rustysynth::{Synthesizer, SynthesizerSettings};
@@ -167,6 +173,8 @@ pub struct SoundfontPlayerSettings {
     /// Sizes the oversampling scratch at build time so the audio path never
     /// allocates. `0` uses [`DEFAULT_MAX_RENDER_FRAMES`].
     pub max_render_frames: usize,
+    /// One instrument, or sixteen parts (see [`multitimbral`]).
+    pub mode: SoundfontPlayerMode,
 }
 
 impl Default for SoundfontPlayerSettings {
@@ -179,6 +187,7 @@ impl Default for SoundfontPlayerSettings {
             envelope: SoundfontEnvelope::default(),
             quality: SoundfontRenderQuality::default(),
             max_render_frames: 0,
+            mode: SoundfontPlayerMode::Single,
         }
     }
 }
@@ -232,6 +241,15 @@ pub struct SoundfontPlayer {
     /// The preset last applied by [`Self::select_preset_all_channels`] — the
     /// one preset this player as a whole is playing. Drives [`Self::routed_channel`].
     selected_preset: Option<(i32, i32)>,
+    mode: SoundfontPlayerMode,
+    /// [`SoundfontPlayerMode::Multi`]: each channel's part as last applied.
+    channels: SoundfontChannels,
+    /// Whether `channels` has reached the synthesizer since it was built or
+    /// reset; until then every channel is applied, not just the changed ones.
+    channels_applied: bool,
+    /// [`audible_channels`] of `channels`: a note-on for a channel outside it
+    /// is dropped.
+    audible: u16,
 }
 
 impl SoundfontPlayer {
@@ -296,6 +314,10 @@ impl SoundfontPlayer {
             sustained: [0; 16],
             hold_pedal: 0,
             selected_preset: None,
+            mode: settings.mode,
+            channels: default_channels(),
+            channels_applied: false,
+            audible: u16::MAX,
         })
     }
 
@@ -315,9 +337,14 @@ impl SoundfontPlayer {
     ///   keeps per-channel pitch bend and CC working for tracks that put each
     ///   note on its own channel.
     ///
-    /// With no preset selected the channel passes through untouched.
+    /// With no preset selected the channel passes through untouched. In
+    /// [`SoundfontPlayerMode::Multi`] every channel is its own part and keeps
+    /// its notes.
     pub fn routed_channel(&self, channel: u8) -> u8 {
         let channel = channel.min(15);
+        if self.mode == SoundfontPlayerMode::Multi {
+            return channel;
+        }
         match self.selected_preset {
             Some((bank, _)) if bank >= DRUM_BANK => PERCUSSION_CHANNEL,
             Some(_) if channel == PERCUSSION_CHANNEL => MELODIC_FALLBACK_CHANNEL,
@@ -463,6 +490,9 @@ impl SoundfontPlayer {
             return self.note_off(channel, note);
         }
         let channel = self.routed_channel(channel);
+        if !self.channel_audible(channel) {
+            return Ok(());
+        }
         self.synthesizer
             .note_on(channel.into(), note.into(), velocity.into());
         self.track_note_on(channel, note);
@@ -494,6 +524,9 @@ impl SoundfontPlayer {
     ) -> Result<(), SoundfontPlayerError> {
         validate_channel(channel)?;
         let channel = self.routed_channel(channel);
+        if command & 0xF0 == 0x90 && data2 > 0 && !self.channel_audible(channel) {
+            return Ok(());
+        }
         self.synthesizer.process_midi_message(
             channel.into(),
             command.into(),
@@ -527,6 +560,9 @@ impl SoundfontPlayer {
     /// its default bank and patch, so the player-wide preset selection is
     /// dropped with it and the caller must re-apply
     /// [`Self::select_preset_all_channels`] before the next note.
+    ///
+    /// A [`SoundfontPlayerMode::Multi`] player's parts are the player's own
+    /// state, not the synthesizer's, so they are applied again at once.
     pub fn reset(&mut self) {
         self.synthesizer.reset();
         self.selected_preset = None;
@@ -537,6 +573,111 @@ impl SoundfontPlayer {
         if let Some(decimator) = self.decimator.as_mut() {
             decimator.reset();
         }
+        if self.mode == SoundfontPlayerMode::Multi && self.channels_applied {
+            self.channels_applied = false;
+            let channels = self.channels;
+            self.set_channels(&channels);
+        }
+    }
+
+    pub fn mode(&self) -> SoundfontPlayerMode {
+        self.mode
+    }
+
+    /// Each channel's part as last applied by [`Self::set_channels`].
+    pub fn channels(&self) -> &SoundfontChannels {
+        &self.channels
+    }
+
+    #[inline]
+    fn channel_audible(&self, channel: u8) -> bool {
+        self.audible & (1 << channel.min(15)) != 0
+    }
+
+    /// Installs the sixteen parts of a [`SoundfontPlayerMode::Multi`] player,
+    /// sending only what changed: a preset as bank select + program change, a
+    /// level as CC 7, a pan as CC 10. A channel that stops sounding (muted, or
+    /// another channel soloed) releases its notes; one that starts sounding
+    /// again plays from its next note.
+    ///
+    /// Allocation-free, so it is applied from a control command drained on the
+    /// audio thread, and a part edit never rebuilds the synthesizer or cuts the
+    /// notes of the other channels. A preset the font does not have leaves the
+    /// channel on the one it had. Ignored by a single-instrument player.
+    pub fn set_channels(&mut self, channels: &SoundfontChannels) {
+        if self.mode != SoundfontPlayerMode::Multi {
+            return;
+        }
+        let force = !self.channels_applied;
+        let audible = audible_channels(channels);
+        for (index, next) in channels.iter().enumerate() {
+            let next = next.sanitized();
+            let previous = self.channels[index];
+            let channel = index as u8;
+            let mut applied = next;
+            if force || previous.preset != next.preset {
+                applied.preset = match next.preset {
+                    Some((bank, patch)) => match self.select_channel_preset(channel, bank, patch) {
+                        Ok(()) => next.preset,
+                        Err(_) if force => None,
+                        Err(_) => previous.preset,
+                    },
+                    None => None,
+                };
+            }
+            if force || previous.volume != next.volume {
+                self.synthesizer.process_midi_message(
+                    channel.into(),
+                    0xB0,
+                    0x07,
+                    next.volume.into(),
+                );
+            }
+            if force || previous.pan != next.pan {
+                self.synthesizer
+                    .process_midi_message(channel.into(), 0xB0, 0x0A, next.pan.into());
+            }
+            let bit = 1u16 << index;
+            if self.audible & bit != 0 && audible & bit == 0 {
+                self.synthesizer.note_off_all_channel(channel.into(), false);
+                self.track_all_notes_off(Some(channel));
+            }
+            self.channels[index] = applied;
+        }
+        self.audible = audible;
+        self.channels_applied = true;
+    }
+
+    /// Whether `channel` currently addresses the font's drum banks.
+    pub fn is_drum_channel(&self, channel: u8) -> bool {
+        self.synthesizer
+            .is_percussion_channel(channel.min(15).into())
+    }
+
+    /// Puts `(bank, patch)` on one channel of a [`SoundfontPlayerMode::Multi`]
+    /// player. Unlike [`Self::select_preset`] any channel can hold a drum kit:
+    /// the channel is moved to the drum banks first.
+    fn select_channel_preset(
+        &mut self,
+        channel: u8,
+        bank: i32,
+        patch: i32,
+    ) -> Result<(), SoundfontPlayerError> {
+        validate_channel(channel)?;
+        if !self.has_preset(bank, patch) {
+            return Err(SoundfontPlayerError::PresetNotFound { bank, patch });
+        }
+        let drums = bank >= DRUM_BANK;
+        self.synthesizer
+            .set_percussion_channel(channel.into(), drums);
+        let selected = if drums { bank - DRUM_BANK } else { bank };
+        self.synthesizer
+            .process_midi_message(channel.into(), 0xB0, 0x00, (selected >> 7) & 0x7F);
+        self.synthesizer
+            .process_midi_message(channel.into(), 0xB0, 0x20, selected & 0x7F);
+        self.synthesizer
+            .process_midi_message(channel.into(), 0xC0, patch, 0);
+        Ok(())
     }
 
     pub fn set_master_volume(&mut self, value: f32) {
@@ -900,6 +1041,7 @@ impl SphereSoundfontPlayerConfig {
                 _ => SoundfontRenderQuality::Standard,
             },
             max_render_frames: self.max_render_frames,
+            mode: SoundfontPlayerMode::Single,
         }
     }
 }
@@ -1236,6 +1378,285 @@ mod tests {
         left.iter()
             .chain(right.iter())
             .fold(0.0f32, |peak, sample| peak.max(sample.abs()))
+    }
+
+    fn multi_player() -> SoundfontPlayer {
+        SoundfontPlayer::from_sound_font(
+            test_font::sound_font(),
+            SoundfontPlayerSettings {
+                mode: SoundfontPlayerMode::Multi,
+                enable_reverb_and_chorus: false,
+                ..SoundfontPlayerSettings::default()
+            },
+        )
+        .expect("synthetic font loads")
+    }
+
+    fn stereo_peaks(player: &mut SoundfontPlayer, frames: usize) -> (f32, f32) {
+        let mut left = vec![0.0; frames];
+        let mut right = vec![0.0; frames];
+        player.render(&mut left, &mut right).expect("render");
+        let peak = |buffer: &[f32]| buffer.iter().fold(0.0f32, |p, s| p.max(s.abs()));
+        (peak(&left), peak(&right))
+    }
+
+    fn melodic_parts() -> SoundfontChannels {
+        let mut channels = default_channels();
+        for channel in channels.iter_mut() {
+            channel.preset = Some(test_font::MELODIC_PRESET);
+        }
+        channels
+    }
+
+    /// A kit on channel 10, reverb off so the layers stay where they are
+    /// panned.
+    fn kit_player(mode: SoundfontPlayerMode) -> SoundfontPlayer {
+        let mut player = SoundfontPlayer::from_sound_font(
+            test_font::sound_font(),
+            SoundfontPlayerSettings {
+                mode,
+                enable_reverb_and_chorus: false,
+                ..SoundfontPlayerSettings::default()
+            },
+        )
+        .expect("synthetic font loads");
+        match mode {
+            SoundfontPlayerMode::Single => player
+                .select_preset_all_channels(test_font::DRUM_PRESET.0, test_font::DRUM_PRESET.1)
+                .expect("kit selects"),
+            SoundfontPlayerMode::Multi => {
+                let mut channels = default_channels();
+                channels[3].preset = Some(test_font::DRUM_PRESET);
+                channels[9].preset = Some(test_font::DRUM_PRESET);
+                player.set_channels(&channels);
+            }
+        }
+        player
+    }
+
+    fn rendered(player: &mut SoundfontPlayer, frames: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut left = vec![0.0; frames];
+        let mut right = vec![0.0; frames];
+        player.render(&mut left, &mut right).expect("render");
+        (left, right)
+    }
+
+    fn buffer_peak(buffer: &[f32]) -> f32 {
+        buffer.iter().fold(0.0f32, |p, s| p.max(s.abs()))
+    }
+
+    /// A kit's stereo pair shares one choke group. Both halves of one hit must
+    /// sound: the group is about cutting earlier hits, not the hit's own layers.
+    #[test]
+    fn a_kit_hit_plays_every_layer_of_its_choke_group() {
+        let mut player = kit_player(SoundfontPlayerMode::Single);
+        player
+            .note_on(PERCUSSION_CHANNEL, 42, 127)
+            .expect("note on");
+        let (l, r) = stereo_peaks(&mut player, 4_096);
+        assert!(l > 0.01 && r > 0.01, "both halves of the pair: l={l} r={r}");
+    }
+
+    /// A closed hi-hat cuts the open one: every layer of the earlier hit fades
+    /// out, and the new hit plays whole.
+    #[test]
+    fn a_choke_group_cuts_every_layer_of_the_earlier_hit() {
+        let mut player = kit_player(SoundfontPlayerMode::Single);
+        player
+            .note_on(PERCUSSION_CHANNEL, 46, 127)
+            .expect("open hat");
+        let (open_l, open_r) = stereo_peaks(&mut player, 4_096);
+        player
+            .note_on(PERCUSSION_CHANNEL, 42, 20)
+            .expect("closed hat");
+        // 50 ms: well past the choke's fade.
+        let _ = stereo_peaks(&mut player, 2_205);
+        let (l, r) = stereo_peaks(&mut player, 4_096);
+        assert!(
+            l < open_l * 0.2 && r < open_r * 0.2,
+            "the open hat is cut on both sides: open=({open_l}, {open_r}) now=({l}, {r})"
+        );
+        assert!(l > 1.0e-4 && r > 1.0e-4, "the closed hat plays both halves");
+    }
+
+    /// The cut is a fade, not a step: no sample jumps the way a voice stopped
+    /// mid-cycle does.
+    #[test]
+    fn a_choked_hit_fades_out_without_a_click() {
+        let mut player = kit_player(SoundfontPlayerMode::Single);
+        player
+            .note_on(PERCUSSION_CHANNEL, 46, 127)
+            .expect("open hat");
+        let (before_l, _) = rendered(&mut player, 4_096);
+        player
+            .note_on(PERCUSSION_CHANNEL, 42, 1)
+            .expect("closed hat");
+        let (after_l, _) = rendered(&mut player, 2_048);
+        let mut previous = *before_l.last().expect("rendered");
+        assert!(
+            previous.abs() > 0.05,
+            "the open hat was sounding: {previous}"
+        );
+        let mut largest = 0.0f32;
+        for sample in after_l {
+            largest = largest.max((sample - previous).abs());
+            previous = sample;
+        }
+        assert!(largest < 0.01, "largest sample-to-sample step {largest}");
+    }
+
+    /// A choke group belongs to its channel: a kit on another channel does not
+    /// cut this one.
+    #[test]
+    fn a_choke_group_does_not_reach_another_channel() {
+        let mut player = kit_player(SoundfontPlayerMode::Multi);
+        player
+            .note_on(PERCUSSION_CHANNEL, 46, 127)
+            .expect("channel 10 hat");
+        let (open_l, _) = stereo_peaks(&mut player, 4_096);
+        player.note_on(3, 42, 20).expect("channel 4 hat");
+        let _ = stereo_peaks(&mut player, 2_205);
+        let (left, _) = rendered(&mut player, 8_192);
+        assert!(
+            buffer_peak(&left) > open_l * 0.5,
+            "channel 10's hat still rings: {} vs {open_l}",
+            buffer_peak(&left)
+        );
+    }
+
+    #[test]
+    fn a_multi_player_keeps_every_note_on_the_channel_it_arrived_on() {
+        let mut player = multi_player();
+        player.set_channels(&melodic_parts());
+        // Channel 10 plays its own part, not a reroute to channel 1.
+        player
+            .note_on(PERCUSSION_CHANNEL, 60, 100)
+            .expect("note on");
+        assert!(peak(&mut player, 2_048) > 0.01);
+        assert_eq!(
+            player.routed_channel(PERCUSSION_CHANNEL),
+            PERCUSSION_CHANNEL
+        );
+        assert!(
+            !player.is_drum_channel(PERCUSSION_CHANNEL),
+            "a melodic part on 10"
+        );
+    }
+
+    #[test]
+    fn any_channel_can_hold_a_drum_kit() {
+        let mut player = multi_player();
+        let mut channels = melodic_parts();
+        channels[3].preset = Some(test_font::DRUM_PRESET);
+        player.set_channels(&channels);
+        assert!(player.is_drum_channel(3));
+        assert_eq!(player.channels()[3].preset, Some(test_font::DRUM_PRESET));
+        player.note_on(3, 36, 100).expect("note on");
+        assert!(
+            peak(&mut player, 2_048) > 0.01,
+            "the kit on channel 4 sounds"
+        );
+        // Back to a melodic preset.
+        channels[3].preset = Some(test_font::MELODIC_PRESET);
+        player.set_channels(&channels);
+        assert!(!player.is_drum_channel(3));
+    }
+
+    #[test]
+    fn a_preset_the_font_lacks_leaves_the_channel_on_its_last_one() {
+        let mut player = multi_player();
+        let mut channels = melodic_parts();
+        player.set_channels(&channels);
+        channels[0].preset = Some((0, 99));
+        player.set_channels(&channels);
+        assert_eq!(player.channels()[0].preset, Some(test_font::MELODIC_PRESET));
+    }
+
+    #[test]
+    fn a_muted_part_drops_its_notes_and_releases_what_it_held() {
+        let mut player = multi_player();
+        let mut channels = melodic_parts();
+        player.set_channels(&channels);
+        player.note_on(1, 60, 100).expect("note on");
+        let held = peak(&mut player, 2_048);
+        assert!(held > 0.01);
+
+        channels[1].mute = true;
+        player.set_channels(&channels);
+        let _ = peak(&mut player, 44_100);
+        assert!(
+            peak(&mut player, 2_048) < held * 0.05,
+            "the held note released"
+        );
+        player.note_on(1, 64, 100).expect("note on");
+        assert!(
+            peak(&mut player, 2_048) < 1.0e-4,
+            "a new note on a muted part is dropped"
+        );
+        // Other parts play on.
+        player.note_on(2, 64, 100).expect("note on");
+        assert!(peak(&mut player, 2_048) > 0.01);
+    }
+
+    #[test]
+    fn solo_leaves_only_the_soloed_parts_sounding() {
+        let mut player = multi_player();
+        let mut channels = melodic_parts();
+        channels[4].solo = true;
+        player.set_channels(&channels);
+        player.note_on(0, 60, 100).expect("note on");
+        assert!(peak(&mut player, 2_048) < 1.0e-4);
+        player.note_on(4, 60, 100).expect("note on");
+        assert!(peak(&mut player, 2_048) > 0.01);
+    }
+
+    #[test]
+    fn level_and_pan_are_the_channels_own_controllers() {
+        let mut loud = multi_player();
+        let mut quiet = multi_player();
+        let mut channels = melodic_parts();
+        loud.set_channels(&channels);
+        channels[0].volume = 40;
+        quiet.set_channels(&channels);
+        loud.note_on(0, 60, 100).expect("note on");
+        quiet.note_on(0, 60, 100).expect("note on");
+        let (loud_l, _) = stereo_peaks(&mut loud, 4_096);
+        let (quiet_l, _) = stereo_peaks(&mut quiet, 4_096);
+        assert!(quiet_l < loud_l * 0.5, "loud={loud_l} quiet={quiet_l}");
+
+        let mut left = multi_player();
+        channels[0].volume = DEFAULT_CHANNEL_VOLUME;
+        channels[0].pan = 0;
+        left.set_channels(&channels);
+        left.note_on(0, 60, 100).expect("note on");
+        let (l, r) = stereo_peaks(&mut left, 4_096);
+        assert!(r < l * 0.2, "hard left: l={l} r={r}");
+    }
+
+    #[test]
+    fn a_reset_keeps_the_parts() {
+        let mut player = multi_player();
+        let mut channels = melodic_parts();
+        channels[6].preset = Some(test_font::DRUM_PRESET);
+        channels[2].mute = true;
+        player.set_channels(&channels);
+        player.reset();
+        assert!(player.is_drum_channel(6));
+        player.note_on(2, 60, 100).expect("note on");
+        assert!(
+            peak(&mut player, 2_048) < 1.0e-4,
+            "still muted after a reset"
+        );
+    }
+
+    #[test]
+    fn a_single_player_ignores_parts() {
+        let mut player = player();
+        let mut channels = melodic_parts();
+        channels[0].mute = true;
+        player.set_channels(&channels);
+        player.note_on(0, 60, 100).expect("note on");
+        assert!(peak(&mut player, 2_048) > 0.01);
     }
 
     #[test]

@@ -172,6 +172,27 @@ impl Synthesizer {
         }
     }
 
+    /// Futureboard: makes `channel` address the drum banks (bank select is
+    /// offset by 128, as on the percussion channel) or the melodic ones.
+    ///
+    /// General MIDI fixes the drums to [`Synthesizer::PERCUSSION_CHANNEL`]; a
+    /// multitimbral host lets any channel hold a kit. The flag survives
+    /// [`Synthesizer::reset`], which only returns the bank to the side's default.
+    pub fn set_percussion_channel(&mut self, channel: i32, percussion: bool) {
+        if !(0 <= channel && channel < self.channels.len() as i32) {
+            return;
+        }
+
+        self.channels[channel as usize].set_percussion(percussion);
+    }
+
+    /// Futureboard: whether `channel` addresses the drum banks.
+    pub fn is_percussion_channel(&self, channel: i32) -> bool {
+        0 <= channel
+            && channel < self.channels.len() as i32
+            && self.channels[channel as usize].is_percussion_channel
+    }
+
     /// Stops a note.
     ///
     /// # Arguments
@@ -232,6 +253,32 @@ impl Synthesizer {
         }
 
         let preset = &self.sound_font.presets[preset];
+
+        // Futureboard: a region's exclusive class is a choke group (a drum
+        // kit's open and closed hi-hat). Every earlier voice of the class on
+        // this channel is choked before this note's voices start, so none of
+        // this note's own layers can be caught by it.
+        for preset_region in preset.regions.iter() {
+            if !preset_region.contains(key, velocity) {
+                continue;
+            }
+            let instrument = &self.sound_font.instruments[preset_region.instrument];
+            for instrument_region in instrument.regions.iter() {
+                if !instrument_region.contains(key, velocity) {
+                    continue;
+                }
+                let exclusive_class = instrument_region.get_exclusive_class();
+                if exclusive_class == 0 {
+                    continue;
+                }
+                for voice in self.voices.get_active_voices().iter_mut() {
+                    if voice.channel() == channel && voice.exclusive_class() == exclusive_class {
+                        voice.choke();
+                    }
+                }
+            }
+        }
+
         for preset_region in preset.regions.iter() {
             if preset_region.contains(key, velocity) {
                 let instrument = &self.sound_font.instruments[preset_region.instrument];

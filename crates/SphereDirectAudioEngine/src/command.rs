@@ -115,6 +115,13 @@ pub enum EngineCommand {
     SetRenderCapture(Option<std::sync::Arc<crate::render_capture::RenderCapture>>),
     /// Set non-destructive stereo/mono/mid/side monitoring preview.
     SetTrackPreviewMode { track_id: String, value: f32 },
+    /// Set the sixteen parts of a multitimbral built-in Soundfont Player.
+    /// `track_index` is resolved by the control thread and the parts are plain
+    /// values, so applying them allocates nothing.
+    SetSoundfontChannels {
+        track_index: usize,
+        channels: sphere_soundfont_player::SoundfontChannels,
+    },
     /// Set a plugin/insert parameter.
     SetInsertParam {
         track_id: String,

@@ -13,6 +13,11 @@ use crate::soundfont_math::SoundFontMath;
 use crate::synthesizer_settings::SynthesizerSettings;
 use crate::volume_envelope::VolumeEnvelope;
 
+/// Futureboard: how long a voice cut by its exclusive class (a drum kit's
+/// choke group) takes to fade out. Short enough to read as a cut, long enough
+/// not to click.
+const CHOKE_FADE_SECONDS: f32 = 0.010;
+
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 enum VoiceState {
@@ -82,6 +87,13 @@ pub(crate) struct Voice {
     /// Time elapsed in samples
     voice_length: usize,
     min_voice_length: usize,
+
+    /// Futureboard: set when another note of the same exclusive class starts
+    /// on the channel; the voice then fades out over [`CHOKE_FADE_SECONDS`].
+    choked: bool,
+    choke_gain: f32,
+    /// How far `choke_gain` falls per block.
+    choke_step: f32,
 }
 
 impl Voice {
@@ -124,6 +136,11 @@ impl Voice {
             voice_state: VoiceState::Playing,
             voice_length: 0,
             min_voice_length: (settings.sample_rate / 500) as usize,
+            choked: false,
+            choke_gain: 1_f32,
+            choke_step: (settings.block_size as f32
+                / (settings.sample_rate as f32 * CHOKE_FADE_SECONDS))
+                .min(1_f32),
         }
     }
 
@@ -176,6 +193,8 @@ impl Voice {
 
         self.voice_state = VoiceState::Playing;
         self.voice_length = 0;
+        self.choked = false;
+        self.choke_gain = 1_f32;
     }
 
     pub(crate) fn end(&mut self) {
@@ -188,8 +207,18 @@ impl Voice {
         self.note_gain = 0_f32;
     }
 
+    /// Futureboard: cut by a note of the same exclusive class. The voice fades
+    /// out over the next blocks instead of stopping mid-cycle.
+    pub(crate) fn choke(&mut self) {
+        self.choked = true;
+    }
+
     pub(crate) fn process(&mut self, data: &[i16], channels: &[Channel]) -> bool {
         if self.note_gain < SoundFontMath::NON_AUDIBLE {
+            return false;
+        }
+
+        if self.choked && self.choke_gain <= 0_f32 {
             return false;
         }
 
@@ -244,6 +273,12 @@ impl Voice {
         if self.dynamic_volume {
             let decibels = self.mod_lfo_to_volume * self.mod_lfo.get_value();
             mix_gain *= SoundFontMath::decibels_to_linear(decibels);
+        }
+        if self.choked {
+            // The block is written with a ramp from the previous gain, so a
+            // step per block is a linear fade to silence.
+            self.choke_gain = (self.choke_gain - self.choke_step).max(0_f32);
+            mix_gain *= self.choke_gain;
         }
 
         let angle =
