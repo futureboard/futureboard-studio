@@ -42,67 +42,67 @@
 <table>
   <tr>
     <td colspan="2" align="center">
-      <img src="packages/assets/new_screenshots/workspace.png" alt="Arrangement, browser, inspector and docked mixer" />
+      <img src="packages/assets/new_screenshots/workspace.webp" alt="Arrangement, browser, inspector and docked mixer" />
       <br />
       <sub>Workspace — arrangement, browser, inspector and the docked mixer</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/mixer.png" alt="Mixer window" />
+      <img src="packages/assets/new_screenshots/mixer.webp" alt="Mixer window" />
       <br />
       <sub>Mixer — inserts, sends, pan, PFL/AFL, Master and Monitor</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/audio-connections.png" alt="Audio Connections window" />
+      <img src="packages/assets/new_screenshots/audio-connections.webp" alt="Audio Connections window" />
       <br />
       <sub>Audio Connections — named input and output buses</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/chord-generator.png" alt="Chord Generator" />
+      <img src="packages/assets/new_screenshots/chord-generator.webp" alt="Chord Generator" />
       <br />
       <sub>Chord Generator — progressions to a Chord Track or MIDI clip</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/tempo-key-finder.png" alt="Find Tempo and Key" />
+      <img src="packages/assets/new_screenshots/tempo-key-finder.webp" alt="Find Tempo and Key" />
       <br />
       <sub>Find Tempo &amp; Key — tempo map, key and chords from audio</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/audio-repair.png" alt="Audio Repair" />
+      <img src="packages/assets/new_screenshots/audio-repair.webp" alt="Audio Repair" />
       <br />
       <sub>Audio Repair — noise reduction, de-click, de-hum, spectral repair</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/rodhareist.png" alt="Rodhareist amp rig" />
+      <img src="packages/assets/new_screenshots/rodhareist.webp" alt="Rodhareist amp rig" />
       <br />
       <sub>Rodhareist — a built-in amp and effects rig</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/project-settings.png" alt="Project Settings" />
+      <img src="packages/assets/new_screenshots/project-settings.webp" alt="Project Settings" />
       <br />
       <sub>Project Settings — tempo, meter, key and timebase</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/performance-monitor.png" alt="Performance Monitor" />
+      <img src="packages/assets/new_screenshots/performance-monitor.webp" alt="Performance Monitor" />
       <br />
       <sub>Performance Monitor — engine status, callback load, dropouts</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/big-clock.png" alt="Big Clock" />
+      <img src="packages/assets/new_screenshots/big-clock.webp" alt="Big Clock" />
       <br />
       <sub>Big Clock — bars|beats|ticks, time and timecode</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/workspace-audio-connections-thai.png" alt="Workspace in Thai with Audio Connections" />
+      <img src="packages/assets/new_screenshots/workspace-audio-connections-thai.webp" alt="Workspace in Thai with Audio Connections" />
       <br />
       <sub>Utility windows float over the workspace</sub>
     </td>
@@ -115,19 +115,19 @@
 <table>
   <tr>
     <td colspan="2" align="center">
-      <img src="packages/assets/new_screenshots/workspace-thai.png" alt="Workspace in Thai" />
+      <img src="packages/assets/new_screenshots/workspace-thai.webp" alt="Workspace in Thai" />
       <br />
       <sub>Workspace</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/mixer-thai.png" alt="Mixer in Thai" />
+      <img src="packages/assets/new_screenshots/mixer-thai.webp" alt="Mixer in Thai" />
       <br />
       <sub>Mixer</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/settings-thai.png" alt="Settings in Thai" />
+      <img src="packages/assets/new_screenshots/settings-thai.webp" alt="Settings in Thai" />
       <br />
       <sub>Settings</sub>
     </td>
