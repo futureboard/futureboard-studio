@@ -23,6 +23,19 @@ pub const BUILTIN_ID_PREFIX: &str = "builtin:";
 /// literal here so the host crate does not depend on the DSP umbrella crate).
 pub const PLUGIN_URL_SCHEME: &str = "mikoplugin";
 
+/// How a built-in's editor is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinEditorKind {
+    /// No editor; the insert is edited from Studio's generic controls.
+    None,
+    /// An embeddable React bundle (`editor/` or `editorui/` — both layouts
+    /// are in use), served to CEF through `mikoplugin://<stem>`.
+    Web,
+    /// A native GPUI view drawn by Studio itself, inside the same plug-in
+    /// shell. No browser involved.
+    Native,
+}
+
 /// One entry in the curated built-in catalog.
 struct BuiltinEntry {
     /// Library / plugin id stem (also the `mikoplugin://<stem>` origin).
@@ -30,9 +43,7 @@ struct BuiltinEntry {
     name: &'static str,
     category: &'static str,
     kind: PluginKind,
-    /// Whether the plugin ships an embeddable React editor (`editor/` or
-    /// `editorui/` — both bundle layouts are in use).
-    has_editor: bool,
+    editor: BuiltinEditorKind,
 }
 
 /// The curated built-in catalog. Mirrors the workspace members under
@@ -43,119 +54,133 @@ const CATALOG: &[BuiltinEntry] = &[
         name: "Rodhareist",
         category: "Multi-FX",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "equz8",
         name: "EQ-Z8",
         category: "EQ",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "compresser",
         name: "Compressor",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "fa2a",
         name: "FA-2A",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "zcomp",
         name: "Z-Comp",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "mixstation",
         name: "MixStation",
         category: "Effect",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "echospace",
         name: "EchoSpace",
         category: "Delay",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "verbspace",
         name: "VerbSpace",
         category: "Reverb",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "imager",
         name: "Imager",
         category: "Utility",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "fa76",
         name: "FA-76",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "burnlimit",
         name: "BurnLimit",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "clipper67",
         name: "67Clipper",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "transient",
         name: "Transient",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "c1073",
         name: "C1073",
         category: "EQ",
         kind: PluginKind::Effect,
-        has_editor: false,
+        editor: BuiltinEditorKind::None,
     },
     BuiltinEntry {
         stem: "meowsyn",
         name: "MeowSyn",
         category: "Instrument",
         kind: PluginKind::Instrument,
-        has_editor: false,
+        editor: BuiltinEditorKind::None,
     },
     BuiltinEntry {
         stem: "wrapsynth",
         name: "WrapSynth",
         category: "Instrument",
         kind: PluginKind::Instrument,
-        has_editor: true,
+        editor: BuiltinEditorKind::Web,
     },
     BuiltinEntry {
         stem: "drumsampler",
         name: "Drum Sampler",
         category: "Instrument",
         kind: PluginKind::Instrument,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
+        stem: "quicksampler",
+        name: "Quick Sampler",
+        category: "Instrument",
+        kind: PluginKind::Instrument,
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
+        stem: "slicer",
+        name: "Slicer",
+        category: "Instrument",
+        kind: PluginKind::Instrument,
+        editor: BuiltinEditorKind::Native,
     },
 ];
 
@@ -228,6 +253,8 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "zcomp",
     "mixstation",
     "compresser",
+    "quicksampler",
+    "slicer",
 ];
 
 /// Whether this built-in currently has an out-of-process audio DSP runtime.
@@ -246,19 +273,33 @@ pub fn builtin_display_name(id: &str) -> Option<&'static str> {
         .map(|entry| entry.name)
 }
 
+/// How the built-in `id` (either identifier form) draws its editor, or `None`
+/// when `id` is not a built-in.
+pub fn builtin_editor_kind(id: &str) -> Option<BuiltinEditorKind> {
+    let stem = resolve_builtin_stem(id)?;
+    CATALOG
+        .iter()
+        .find(|entry| entry.stem == stem)
+        .map(|entry| entry.editor)
+}
+
 /// The `mikoplugin://<stem>/index.html` editor URL for a built-in id, or `None`
-/// when the id is not a built-in or that built-in ships no editor.
+/// when the id is not a built-in or that built-in ships no web editor.
 pub fn builtin_editor_url(id: &str) -> Option<String> {
     let stem = builtin_stem(id)?;
     let entry = CATALOG.iter().find(|e| e.stem == stem)?;
-    entry
-        .has_editor
+    (entry.editor == BuiltinEditorKind::Web)
         .then(|| format!("{PLUGIN_URL_SCHEME}://{stem}/index.html"))
 }
 
-/// Whether a built-in id has an embeddable editor.
+/// Whether a built-in id has an editor of either kind.
 pub fn builtin_has_editor(id: &str) -> bool {
-    builtin_editor_url(id).is_some()
+    builtin_editor_kind(id).is_some_and(|kind| kind != BuiltinEditorKind::None)
+}
+
+/// Whether a built-in's editor is a native (GPUI) view rather than a web page.
+pub fn builtin_has_native_editor(id: &str) -> bool {
+    builtin_editor_kind(id) == Some(BuiltinEditorKind::Native)
 }
 
 /// Build the built-in catalog as `RegistryPlugin` rows the existing UI consumes.

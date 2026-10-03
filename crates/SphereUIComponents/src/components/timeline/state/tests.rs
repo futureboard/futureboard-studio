@@ -1934,14 +1934,16 @@ mod audio_clip_split_tests {
     }
 
     #[test]
-    fn stretch_tool_drag_changes_the_ratio_and_keeps_the_source_window() {
+    fn stretch_tool_drag_fits_the_clip_to_the_tempo_and_keeps_the_source_window() {
         let (mut state, id) = state_with_decoded_clip();
         assert!(state.stretch_clip_edge(&id, ClipEdge::Right, 16.0));
         let (_, clip) = state.find_clip(&id).unwrap();
         assert!((clip.duration_beats - 16.0).abs() < 1e-3);
-        assert_eq!(clip.stretch.timing(), StretchTiming::Speed);
+        // 4 s of audio over 16 beats is audio at 240 BPM, locked to the tempo.
+        assert_eq!(clip.stretch.timing(), StretchTiming::Tempo);
         assert!(clip.stretch.keeps_pitch());
-        assert!((clip.stretch.stretch_ratio - 2.0).abs() < 1e-6);
+        assert!((clip.stretch.bpm_source.unwrap() - 240.0).abs() < 1e-6);
+        assert!((clip.stretch.effective_time_ratio(120.0) - 2.0).abs() < 1e-6);
         assert_eq!(clip.stretch.source_start_samples, 0);
         assert_eq!(clip.stretch.source_end_samples, 192_000);
         // The model and the drawing agree on the new length.
@@ -1952,7 +1954,102 @@ mod audio_clip_split_tests {
         let (_, clip) = state.find_clip(&id).unwrap();
         assert!((clip.start_beat - 12.0).abs() < 1e-3);
         assert!((clip.start_beat + clip.duration_beats - 16.0).abs() < 1e-3);
-        assert!((clip.stretch.stretch_ratio - 0.5).abs() < 1e-6);
+        assert!((clip.stretch.bpm_source.unwrap() - 60.0).abs() < 1e-6);
+        assert!((clip.stretch.effective_time_ratio(120.0) - 0.5).abs() < 1e-6);
+    }
+
+    /// A clip fitted by the Stretch tool holds its bars through tempo changes —
+    /// a new base tempo, and a tempo change inside it — instead of keeping the
+    /// speed it was dragged to.
+    #[test]
+    fn a_stretched_clip_keeps_its_bars_when_the_tempo_changes() {
+        let (mut state, id) = state_with_decoded_clip();
+        assert!(state.stretch_clip_edge(&id, ClipEdge::Right, 16.0));
+        state.bpm = 90.0;
+        state.reconcile_audio_clip_lengths();
+        assert!((state.clip_duration_beats(&id).unwrap() - 16.0).abs() < 1e-3);
+        state.add_tempo_point(6.0, 150.0);
+        state.reconcile_audio_clip_lengths();
+        assert!((state.clip_duration_beats(&id).unwrap() - 16.0).abs() < 1e-3);
+    }
+
+    /// Under a tempo change the drag lands exactly on the beat it was dragged
+    /// to: the fitted length does not depend on the tempo at all.
+    #[test]
+    fn a_stretch_drag_under_a_tempo_map_lands_on_its_beat() {
+        let (mut state, id) = state_with_decoded_clip();
+        state.add_tempo_point(2.0, 75.0);
+        state.reconcile_audio_clip_lengths();
+        assert!(state.stretch_clip_edge(&id, ClipEdge::Right, 11.0));
+        assert!((state.clip_duration_beats(&id).unwrap() - 11.0).abs() < 1e-3);
+        assert!(!state.reconcile_audio_clip_lengths());
+    }
+
+    #[test]
+    fn setting_a_clips_tempo_fits_it_and_sizes_it_in_beats() {
+        let (mut state, id) = state_with_decoded_clip();
+        // 4 s of audio at 90 BPM is 6 of its beats.
+        assert!(state.fit_clip_to_source_bpm(&id, 90.0));
+        let (_, clip) = state.find_clip(&id).unwrap();
+        assert_eq!(clip.stretch.timing(), StretchTiming::Tempo);
+        assert!((clip.duration_beats - 6.0).abs() < 1e-3);
+        assert!(!state.reconcile_audio_clip_lengths());
+        // And stays 6 beats at any project tempo.
+        state.bpm = 140.0;
+        state.reconcile_audio_clip_lengths();
+        assert!((state.clip_duration_beats(&id).unwrap() - 6.0).abs() < 1e-3);
+    }
+
+    /// A Tempo clip with no tempo of its own plays its seconds, as the engine
+    /// does, so it is measured through the tempo map like an unstretched clip.
+    #[test]
+    fn a_tempo_clip_without_a_tempo_is_measured_in_seconds() {
+        let (mut state, id) = state_with_decoded_clip();
+        let stretch = state
+            .clip_stretch(&id)
+            .unwrap()
+            .with_timing(StretchTiming::Tempo, 120.0);
+        assert!(stretch.bpm_source.is_none());
+        state.set_clip_stretch(&id, stretch);
+        state.add_tempo_point(0.0, 60.0);
+        state.reconcile_audio_clip_lengths();
+        // 4 s at 60 BPM is 4 beats, not the 8 the base 120 BPM would give.
+        assert!((state.clip_duration_beats(&id).unwrap() - 4.0).abs() < 1e-3);
+    }
+
+    /// A trim measures the source it keeps through the tempo map, the way the
+    /// engine plays it — not at a fixed `60 / bpm`.
+    #[test]
+    fn an_edge_trim_under_a_tempo_change_keeps_the_audio_the_engine_plays() {
+        let (mut state, id) = state_with_decoded_clip();
+        // 60 BPM from the start: the 4 s clip is 4 beats.
+        state.add_tempo_point(0.0, 60.0);
+        state.reconcile_audio_clip_lengths();
+        assert!((state.clip_duration_beats(&id).unwrap() - 4.0).abs() < 1e-3);
+        assert!(state.resize_clip(&id, ClipEdge::Right, 2.0));
+        let (_, clip) = state.find_clip(&id).unwrap();
+        // Two beats at 60 BPM are 2 s: 96 000 frames, not the 48 000 of 120 BPM.
+        assert_eq!(clip.stretch.source_end_samples, 96_000);
+        assert!((clip.duration_beats - 2.0).abs() < 1e-3);
+        assert!(!state.reconcile_audio_clip_lengths());
+
+        // The left edge reveals and trims through the same map.
+        assert!(state.resize_clip(&id, ClipEdge::Left, 1.0));
+        let (_, clip) = state.find_clip(&id).unwrap();
+        assert_eq!(clip.stretch.source_start_samples, 48_000);
+        assert!((clip.duration_beats - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_source_frame_lands_on_the_beat_it_plays_at() {
+        let (mut state, id) = state_with_decoded_clip();
+        assert!(state.fit_clip_to_source_bpm(&id, 120.0));
+        // At 120 BPM audio, frame 48 000 (1 s) is two of its beats in.
+        assert!((state.clip_beat_at_source_frame(&id, 48_000) - 2.0).abs() < 1e-6);
+        state.bpm = 60.0;
+        state.reconcile_audio_clip_lengths();
+        // Locked to the tempo: still its second beat.
+        assert!((state.clip_beat_at_source_frame(&id, 48_000) - 2.0).abs() < 1e-6);
     }
 
     #[test]

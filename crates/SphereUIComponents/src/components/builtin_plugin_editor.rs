@@ -83,6 +83,8 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
         transient::ui::UI_ORIGIN => transient::ui_param_index(param_id),
         wrapsynth::ui::UI_ORIGIN => wrapsynth::ui_param_index(param_id),
         drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_index(param_id),
+        quicksampler::ui::UI_ORIGIN => quicksampler::ui_param_index(param_id),
+        slicer::ui::UI_ORIGIN => slicer::ui_param_index(param_id),
         zcomp::ui::UI_ORIGIN => zcomp::ui_param_index(param_id),
         mixstation::ui::UI_ORIGIN => mixstation::ui_param_index(param_id),
         compresser::ui::UI_ORIGIN => compresser::ui_param_index(param_id),
@@ -132,6 +134,8 @@ mod state_mirror {
         Transient(Box<transient::Params>),
         WrapSynth(Box<wrapsynth::Params>),
         DrumSampler(Box<drumsampler::Params>),
+        QuickSampler(Box<quicksampler::Params>),
+        Slicer(Box<slicer::Params>),
         Zcomp(Box<zcomp::Params>),
         MixStation(Box<mixstation::Params>),
         Compresser(Box<compresser::Params>),
@@ -152,6 +156,8 @@ mod state_mirror {
                 Self::Transient(_) => transient::ui::UI_ORIGIN,
                 Self::WrapSynth(_) => wrapsynth::ui::UI_ORIGIN,
                 Self::DrumSampler(_) => drumsampler::ui::UI_ORIGIN,
+                Self::QuickSampler(_) => quicksampler::ui::UI_ORIGIN,
+                Self::Slicer(_) => slicer::ui::UI_ORIGIN,
                 Self::Zcomp(_) => zcomp::ui::UI_ORIGIN,
                 Self::MixStation(_) => mixstation::ui::UI_ORIGIN,
                 Self::Compresser(_) => compresser::ui::UI_ORIGIN,
@@ -189,6 +195,10 @@ mod state_mirror {
                 drumsampler::ui::UI_ORIGIN => {
                     Some(Self::DrumSampler(Box::new(drumsampler::default_params())))
                 }
+                quicksampler::ui::UI_ORIGIN => {
+                    Some(Self::QuickSampler(Box::new(quicksampler::default_params())))
+                }
+                slicer::ui::UI_ORIGIN => Some(Self::Slicer(Box::new(slicer::default_params()))),
                 zcomp::ui::UI_ORIGIN => Some(Self::Zcomp(Box::new(zcomp::default_params()))),
                 mixstation::ui::UI_ORIGIN => {
                     Some(Self::MixStation(Box::new(mixstation::default_params())))
@@ -242,6 +252,8 @@ mod state_mirror {
             transient::ui::UI_ORIGIN => transient::ui_param_id(wire_index).is_some(),
             wrapsynth::ui::UI_ORIGIN => wrapsynth::ui_param_id(wire_index).is_some(),
             drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_id(wire_index).is_some(),
+            quicksampler::ui::UI_ORIGIN => quicksampler::ui_param_id(wire_index).is_some(),
+            slicer::ui::UI_ORIGIN => slicer::ui_param_id(wire_index).is_some(),
             zcomp::ui::UI_ORIGIN => zcomp::ui_param_id(wire_index).is_some(),
             mixstation::ui::UI_ORIGIN => mixstation::ui_param_id(wire_index).is_some(),
             compresser::ui::UI_ORIGIN => compresser::ui_param_id(wire_index).is_some(),
@@ -291,6 +303,12 @@ mod state_mirror {
             }
             Some(BuiltinParams::DrumSampler(params)) => {
                 let _ = drumsampler::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::QuickSampler(params)) => {
+                let _ = quicksampler::ipc::apply_wire_param(&mut params.sampler, wire_index, value);
+            }
+            Some(BuiltinParams::Slicer(params)) => {
+                let _ = slicer::ipc::apply_wire_param(&mut params.slicer, wire_index, value);
             }
             Some(BuiltinParams::Zcomp(params)) => {
                 let _ = zcomp::ipc::apply_wire_param(params, wire_index, value);
@@ -351,6 +369,12 @@ mod state_mirror {
             drumsampler::ui::UI_ORIGIN => drumsampler::ipc::DrumSamplerState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::DrumSampler(Box::new(state.params))),
+            quicksampler::ui::UI_ORIGIN => quicksampler::ipc::QuickSamplerState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::QuickSampler(Box::new(state.params))),
+            slicer::ui::UI_ORIGIN => slicer::ipc::SlicerState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::Slicer(Box::new(state.params))),
             zcomp::ui::UI_ORIGIN => zcomp::ipc::ZcompState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Zcomp(Box::new(state.params))),
@@ -444,6 +468,16 @@ mod state_mirror {
                     .to_json()
                     .ok()?
             }
+            BuiltinParams::QuickSampler(params) if origin == quicksampler::ui::UI_ORIGIN => {
+                quicksampler::ipc::QuickSamplerState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::Slicer(params) if origin == slicer::ui::UI_ORIGIN => {
+                slicer::ipc::SlicerState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
             BuiltinParams::Zcomp(params) if origin == zcomp::ui::UI_ORIGIN => {
                 zcomp::ipc::ZcompState::new((**params).clone())
                     .to_json()
@@ -476,7 +510,35 @@ mod state_mirror {
         let Ok(states) = map().lock() else {
             return Vec::new();
         };
-        match states.get(insert_id) {
+        replay_values(states.get(insert_id), origin)
+    }
+
+    /// The plug-in's defaults as `(wire index, raw value)` pairs: what a
+    /// freshly built host DSP already holds, so a replay can skip them.
+    pub fn builtin_default_replay(plugin_id: &str) -> Vec<(u32, f32)> {
+        let Some(origin) = origin_for_plugin_id(plugin_id) else {
+            return Vec::new();
+        };
+        replay_values(BuiltinParams::defaults(origin).as_ref(), origin)
+    }
+
+    /// `values` without the pairs `baseline` already holds — what a DSP at
+    /// `baseline` needs to reach `values`. A 64-pad Drum Sampler has over a
+    /// thousand parameters; sending only the changed ones keeps a replay
+    /// well inside the engine's command queue.
+    pub fn builtin_replay_changes(
+        values: Vec<(u32, f32)>,
+        baseline: &[(u32, f32)],
+    ) -> Vec<(u32, f32)> {
+        let held: HashMap<u32, f32> = baseline.iter().copied().collect();
+        values
+            .into_iter()
+            .filter(|(index, value)| held.get(index).is_none_or(|held| held != value))
+            .collect()
+    }
+
+    fn replay_values(params: Option<&BuiltinParams>, origin: &str) -> Vec<(u32, f32)> {
+        match params {
             Some(BuiltinParams::Rodhareist(params)) if origin == rodharerist::ui::UI_ORIGIN => {
                 rodharerist::ui_values(params)
                     .into_iter()
@@ -549,6 +611,20 @@ mod state_mirror {
                     .filter_map(|(id, value)| drumsampler::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
+            Some(BuiltinParams::QuickSampler(params)) if origin == quicksampler::ui::UI_ORIGIN => {
+                quicksampler::ipc::ui_values(&params.sampler)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (_, value))| (index as u32, value))
+                    .collect()
+            }
+            Some(BuiltinParams::Slicer(params)) if origin == slicer::ui::UI_ORIGIN => {
+                slicer::ipc::ui_values(&params.slicer)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (_, value))| (index as u32, value))
+                    .collect()
+            }
             Some(BuiltinParams::Zcomp(params)) if origin == zcomp::ui::UI_ORIGIN => {
                 zcomp::ipc::ui_values(params)
                     .into_iter()
@@ -572,61 +648,145 @@ mod state_mirror {
         }
     }
 
-    /// Record which sample a `drumsampler` pad has loaded, so it survives
+    /// Record which sample a built-in sampler's slot has loaded — a Drum
+    /// Sampler pad, or a Quick Sampler's one sample (slot 0) — so it survives
     /// project save/reload. Not a wire param (a file name is not an `f32`),
     /// so it bypasses `builtin_state_apply`'s numeric path. Creates the entry
     /// at defaults if this is the first thing ever recorded for the insert.
-    /// A no-op for any other plugin id.
+    /// A no-op for any plugin without samples.
     ///
     /// Returns whether the pad's file actually changed — a project reopen
     /// reloads every pad with the name it already has, and that must not read
     /// as an edit.
-    pub fn builtin_state_set_drum_sample(
+    pub fn builtin_state_set_sample(
         plugin_id: &str,
         insert_id: &str,
         pad_index: usize,
         name: Option<String>,
     ) -> bool {
-        if origin_for_plugin_id(plugin_id) != Some(drumsampler::ui::UI_ORIGIN) {
+        let Some(origin) = origin_for_plugin_id(plugin_id) else {
+            return false;
+        };
+        if origin != drumsampler::ui::UI_ORIGIN
+            && origin != quicksampler::ui::UI_ORIGIN
+            && origin != slicer::ui::UI_ORIGIN
+        {
             return false;
         }
         let Ok(mut states) = map().lock() else {
             return false;
         };
-        let Some(entry) = entry_for(&mut states, insert_id, drumsampler::ui::UI_ORIGIN) else {
-            return false;
-        };
-        if let BuiltinParams::DrumSampler(params) = entry {
-            if let Some(pad) = params.pads.get_mut(pad_index) {
-                if pad.sample_name != name {
-                    pad.sample_name = name;
-                    return true;
-                }
+        let slot = match entry_for(&mut states, insert_id, origin) {
+            Some(BuiltinParams::DrumSampler(params)) => params
+                .pads
+                .get_mut(pad_index)
+                .map(|pad| &mut pad.sample_name),
+            Some(BuiltinParams::QuickSampler(params)) if pad_index == 0 => {
+                Some(&mut params.sample_name)
             }
+            Some(BuiltinParams::Slicer(params)) if pad_index == 0 => Some(&mut params.sample_name),
+            _ => None,
+        };
+        match slot {
+            Some(slot) if *slot != name => {
+                *slot = name;
+                true
+            }
+            _ => false,
         }
-        false
     }
 
-    /// The sample file each of a Drum Sampler insert's pads was loaded from,
-    /// as `(pad index, file name)`. Empty for any other plugin, or a slot
-    /// with no mirrored state. Drives the reload after project open or a host
-    /// respawn: a restarted DSP has its parameters replayed but no audio until
-    /// each pad's file is read and sent again.
-    pub fn builtin_drum_sample_names(plugin_id: &str, insert_id: &str) -> Vec<(u32, String)> {
-        if origin_for_plugin_id(plugin_id) != Some(drumsampler::ui::UI_ORIGIN) {
+    /// The sample file each slot of a built-in sampler was loaded from, as
+    /// `(slot, file name)`: a Drum Sampler's pads, a Quick Sampler's or a
+    /// Slicer's one sample. Empty for any other plugin, or a slot with no mirrored state.
+    /// Drives the reload after project open or a host respawn: a restarted
+    /// DSP has its parameters replayed but no audio until each file is read
+    /// and sent again.
+    pub fn builtin_sample_names(plugin_id: &str, insert_id: &str) -> Vec<(u32, String)> {
+        let Some(origin) = origin_for_plugin_id(plugin_id) else {
             return Vec::new();
-        }
+        };
         let Ok(states) = map().lock() else {
             return Vec::new();
         };
         match states.get(insert_id) {
-            Some(BuiltinParams::DrumSampler(params)) => params
-                .pads
-                .iter()
-                .enumerate()
-                .filter_map(|(index, pad)| pad.sample_name.clone().map(|name| (index as u32, name)))
+            Some(BuiltinParams::DrumSampler(params)) if origin == drumsampler::ui::UI_ORIGIN => {
+                params
+                    .pads
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, pad)| {
+                        pad.sample_name.clone().map(|name| (index as u32, name))
+                    })
+                    .collect()
+            }
+            Some(BuiltinParams::QuickSampler(params)) if origin == quicksampler::ui::UI_ORIGIN => {
+                params
+                    .sample_name
+                    .clone()
+                    .map(|name| (0, name))
+                    .into_iter()
+                    .collect()
+            }
+            Some(BuiltinParams::Slicer(params)) if origin == slicer::ui::UI_ORIGIN => params
+                .sample_name
+                .clone()
+                .map(|name| (0, name))
+                .into_iter()
                 .collect(),
             _ => Vec::new(),
+        }
+    }
+
+    /// A Quick Sampler insert's mirrored params, or `None` when the slot holds
+    /// none (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_quick_sampler_params(insert_id: &str) -> Option<quicksampler::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::QuickSampler(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A Drum Sampler insert's mirrored params, or `None` when the slot holds
+    /// none (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_drum_sampler_params(insert_id: &str) -> Option<drumsampler::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::DrumSampler(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// The output buses a multi-out built-in insert is using (bus 0 being
+    /// its main output), or `None` for an insert with one output. For the
+    /// Drum Sampler: every output a pad is sent to, besides Main — the
+    /// outputs that need a mixer strip of their own.
+    pub fn builtin_used_output_buses(insert_id: &str) -> Option<Vec<u8>> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::DrumSampler(params) => {
+                let mut buses: Vec<u8> = params
+                    .pads
+                    .iter()
+                    .map(|pad| pad.output)
+                    .filter(|output| *output > 0)
+                    .collect();
+                buses.sort_unstable();
+                buses.dedup();
+                Some(buses)
+            }
+            _ => None,
+        }
+    }
+
+    /// A Slicer insert's mirrored params, or `None` when the slot holds none
+    /// (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_slicer_params(insert_id: &str) -> Option<slicer::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Slicer(params) => Some((**params).clone()),
+            _ => None,
         }
     }
 
@@ -650,8 +810,10 @@ mod state_mirror {
 
 #[cfg(feature = "builtin-plugin-editor")]
 pub use state_mirror::{
-    builtin_drum_sample_names, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
-    builtin_state_remove, builtin_state_replay, builtin_state_seed, builtin_state_set_drum_sample,
+    builtin_default_replay, builtin_drum_sampler_params, builtin_quick_sampler_params,
+    builtin_replay_changes, builtin_sample_names, builtin_slicer_params, builtin_state_apply,
+    builtin_state_bytes, builtin_state_clear, builtin_state_remove, builtin_state_replay,
+    builtin_state_seed, builtin_state_set_sample, builtin_used_output_buses,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is
@@ -666,16 +828,25 @@ mod state_mirror_stubs {
     pub fn builtin_state_replay(_plugin_id: &str, _insert_id: &str) -> Vec<(u32, f32)> {
         Vec::new()
     }
+    pub fn builtin_default_replay(_plugin_id: &str) -> Vec<(u32, f32)> {
+        Vec::new()
+    }
+    pub fn builtin_replay_changes(
+        values: Vec<(u32, f32)>,
+        _baseline: &[(u32, f32)],
+    ) -> Vec<(u32, f32)> {
+        values
+    }
     pub fn builtin_state_remove(insert_id: &str) {
         super::drum_waveforms_remove(insert_id);
     }
     pub fn builtin_state_clear() {
         super::drum_waveforms_clear();
     }
-    pub fn builtin_drum_sample_names(_plugin_id: &str, _insert_id: &str) -> Vec<(u32, String)> {
+    pub fn builtin_sample_names(_plugin_id: &str, _insert_id: &str) -> Vec<(u32, String)> {
         Vec::new()
     }
-    pub fn builtin_state_set_drum_sample(
+    pub fn builtin_state_set_sample(
         _plugin_id: &str,
         _insert_id: &str,
         _pad_index: usize,
@@ -687,8 +858,8 @@ mod state_mirror_stubs {
 
 #[cfg(not(feature = "builtin-plugin-editor"))]
 pub use state_mirror_stubs::{
-    builtin_drum_sample_names, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
-    builtin_state_remove, builtin_state_replay, builtin_state_seed, builtin_state_set_drum_sample,
+    builtin_sample_names, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
+    builtin_state_remove, builtin_state_replay, builtin_state_seed, builtin_state_set_sample,
 };
 
 /// A Drum Sampler pad's loaded sample, as its editor draws it: the file, its
@@ -3002,32 +3173,122 @@ mod tests {
     #[test]
     fn drum_sample_names_list_only_the_loaded_pads() {
         let insert = "test-insert-drum-names";
-        assert!(builtin_state_set_drum_sample(
+        assert!(builtin_state_set_sample(
             "drumsampler",
             insert,
             2,
             Some("snare.wav".into())
         ));
-        assert!(builtin_state_set_drum_sample(
+        assert!(builtin_state_set_sample(
             "drumsampler",
             insert,
             9,
             Some("hat.wav".into())
         ));
         // Reloading the same file is not an edit.
-        assert!(!builtin_state_set_drum_sample(
+        assert!(!builtin_state_set_sample(
             "drumsampler",
             insert,
             9,
             Some("hat.wav".into())
         ));
         assert_eq!(
-            builtin_drum_sample_names("drumsampler", insert),
+            builtin_sample_names("drumsampler", insert),
             vec![(2, "snare.wav".to_string()), (9, "hat.wav".to_string())]
         );
-        assert!(builtin_drum_sample_names("equz8", insert).is_empty());
+        assert!(builtin_sample_names("equz8", insert).is_empty());
         builtin_state_remove(insert);
-        assert!(builtin_drum_sample_names("drumsampler", insert).is_empty());
+        assert!(builtin_sample_names("drumsampler", insert).is_empty());
+    }
+
+    /// A Quick Sampler insert keeps its params and its one sample in the
+    /// mirror: an edit folds in, the blob it saves restores them, and a
+    /// restarted host is replayed every param and reloaded the sample.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn quick_sampler_state_round_trips_through_the_mirror() {
+        let insert = "test-insert-quick-sampler";
+        let cutoff = builtin_param_index("quicksampler", "cutoff").expect("cutoff");
+        builtin_state_apply("quicksampler", insert, cutoff, 750.0);
+        assert!(builtin_state_set_sample(
+            "quicksampler",
+            insert,
+            0,
+            Some("808.wav".into())
+        ));
+        assert!(
+            !builtin_state_set_sample("quicksampler", insert, 3, Some("other.wav".into())),
+            "a Quick Sampler has one slot"
+        );
+        assert_eq!(
+            builtin_sample_names("quicksampler", insert),
+            vec![(0, "808.wav".to_string())]
+        );
+        let params = builtin_quick_sampler_params(insert).expect("mirrored");
+        assert_eq!(params.sampler.cutoff_hz, 750.0);
+
+        let blob = builtin_state_bytes("quicksampler", insert).expect("saved");
+        builtin_state_remove(insert);
+        builtin_state_seed("quicksampler", insert, &blob);
+        let restored = builtin_quick_sampler_params(insert).expect("restored");
+        assert_eq!(restored, params);
+        let replay = builtin_state_replay("quicksampler", insert);
+        assert_eq!(replay.len(), quicksampler::ipc::PARAM_COUNT);
+        assert!(replay.contains(&(cutoff, 750.0)));
+        builtin_state_remove(insert);
+    }
+
+    /// A Slicer insert keeps its cut and its sample in the mirror, and a
+    /// restarted host is replayed every param.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn slicer_state_round_trips_through_the_mirror() {
+        let insert = "insert-slicer-mirror";
+        let count = builtin_param_index("slicer", "sliceCount").expect("sliceCount");
+        let second = builtin_param_index("slicer", "slice1").expect("slice1");
+        builtin_state_apply("slicer", insert, count, 2.0);
+        builtin_state_apply("slicer", insert, second, 0.5);
+        assert!(builtin_state_set_sample(
+            "slicer",
+            insert,
+            0,
+            Some("break.wav".into())
+        ));
+        assert_eq!(
+            builtin_sample_names("slicer", insert),
+            vec![(0, "break.wav".to_string())]
+        );
+        let params = builtin_slicer_params(insert).expect("mirrored");
+        assert_eq!(params.slicer.points(), &[0.0, 0.5]);
+
+        let blob = builtin_state_bytes("slicer", insert).expect("saved");
+        builtin_state_remove(insert);
+        builtin_state_seed("slicer", insert, &blob);
+        assert_eq!(builtin_slicer_params(insert).expect("restored"), params);
+        assert_eq!(
+            builtin_state_replay("slicer", insert).len(),
+            slicer::ipc::PARAM_COUNT
+        );
+        builtin_state_remove(insert);
+    }
+
+    /// A 64-pad kit replays only what differs from what its DSP holds — a
+    /// handful of edits, not its whole table, which would overflow the
+    /// engine's command queue.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn a_drum_kit_replays_only_its_changes() {
+        let insert = "test-insert-drum-replay";
+        let gain = builtin_param_index("drumsampler", "pad40Gain").expect("pad40Gain");
+        let output = builtin_param_index("drumsampler", "pad2Output").expect("pad2Output");
+        builtin_state_apply("drumsampler", insert, gain, -9.0);
+        builtin_state_apply("drumsampler", insert, output, 3.0);
+        let full = builtin_state_replay("drumsampler", insert);
+        assert_eq!(full.len(), drumsampler::ipc::PARAM_COUNT);
+        assert!(full.len() > 1_000);
+        let changes = builtin_replay_changes(full, &builtin_default_replay("drumsampler"));
+        assert_eq!(changes, vec![(output, 3.0), (gain, -9.0)]);
+        builtin_state_remove(insert);
     }
 
     #[test]

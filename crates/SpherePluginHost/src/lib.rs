@@ -60,9 +60,9 @@ pub mod state_touch;
 mod types;
 
 pub use builtin::{
-    builtin_audio_bridge_supported, builtin_catalog, builtin_display_name, builtin_editor_url,
-    builtin_id, is_builtin_id, is_builtin_ref, resolve_builtin_stem, with_builtins,
-    BUILTIN_ID_PREFIX,
+    builtin_audio_bridge_supported, builtin_catalog, builtin_display_name, builtin_editor_kind,
+    builtin_editor_url, builtin_has_native_editor, builtin_id, is_builtin_id, is_builtin_ref,
+    resolve_builtin_stem, with_builtins, BuiltinEditorKind, BUILTIN_ID_PREFIX,
 };
 pub use editor_quirk::{
     detect_plugin_editor_runtime, match_quirk, PluginEditorHostMode, PluginEditorQuirk,

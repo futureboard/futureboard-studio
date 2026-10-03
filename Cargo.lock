@@ -6733,6 +6733,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "quicksampler"
+version = "2026.10.1-beta1.4.2"
+dependencies = [
+ "builtin_dsp_core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7880,6 +7889,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "slicer"
+version = "2026.10.1-beta1.4.2"
+dependencies = [
+ "quicksampler",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "slotmap"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8151,11 +8169,13 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "parking_lot",
+ "quicksampler",
  "rodharerist",
  "rusqlite",
  "rustfft",
  "serde",
  "serde_json",
+ "slicer",
  "sphere_directaudioengine",
  "transient",
  "verbspace",
@@ -8247,6 +8267,7 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
  "pollster 0.4.0",
+ "quicksampler",
  "rand 0.9.4",
  "raw-window-handle",
  "rfd",
@@ -8256,6 +8277,7 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
+ "slicer",
  "smallvec",
  "solfege-model",
  "solfege_spatialaudio",

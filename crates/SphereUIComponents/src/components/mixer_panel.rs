@@ -52,10 +52,9 @@ use crate::components::reorder::{
 use crate::components::sidebar::BrowserDragItem;
 use crate::components::timeline::timeline_state::{
     is_vsti_output_child_track_id, volume, vsti_output_bus_flat_range,
-    vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
-    vsti_output_child_insert_id, GroupTree, InsertLoadStatus, InsertSlotState, ListenMode,
-    MasterBusState, MonitorBusState, SendSlotState, TrackOutputRouting, TrackState, TrackType,
-    MASTER_TRACK_ID,
+    vsti_output_child_channels_for_bus_layout, vsti_output_child_insert_id, GroupTree,
+    InsertLoadStatus, InsertSlotState, ListenMode, MasterBusState, MonitorBusState, SendSlotState,
+    TrackOutputRouting, TrackState, TrackType, MASTER_TRACK_ID,
 };
 use crate::components::timeline::vu_meter::meter_surface;
 use crate::i18n::I18n;
@@ -499,7 +498,7 @@ fn strip_top_row(
 /// so the visible sub-strips line up 1:1 with the model child tracks and the
 /// engine routes.
 fn vsti_output_bus_strips(slot: &InsertSlotState) -> Vec<u8> {
-    vsti_output_bus_strip_indices(&slot.output_bus_channel_counts)
+    slot.output_strip_indices()
 }
 
 /// Human-readable label for a VSTi output bus strip, reflecting the real bus

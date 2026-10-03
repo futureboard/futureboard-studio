@@ -837,6 +837,13 @@ impl StudioLayout {
                 let clip_fades = selected_clip_id
                     .as_deref()
                     .and_then(|clip_id| self.timeline.read(cx).state.clip_fade_summary(clip_id));
+                // The meter where the clip starts, for its lengths in bars.
+                let clip_beats_per_bar = selected_clip_id.as_deref().and_then(|clip_id| {
+                    let state = &self.timeline.read(cx).state;
+                    state
+                        .find_clip(clip_id)
+                        .map(|(_, clip)| state.beats_per_bar_at_beat(clip.start_beat as f64))
+                });
                 crate::components::panel::inspector_panel(
                     &tracks,
                     &inspector_audio_connections,
@@ -850,6 +857,9 @@ impl StudioLayout {
                     )
                     .map(|mut summary| {
                         summary.fades = clip_fades;
+                        if let Some(beats_per_bar) = clip_beats_per_bar {
+                            summary.beats_per_bar = beats_per_bar;
+                        }
                         summary
                     }),
                     stretch_tempo,

@@ -105,11 +105,7 @@ impl StretchTempoState {
         let pending = job.pending_fit_project;
         job.finding = false;
         job.error = if detection.low_confidence {
-            Some(if pending {
-                "Low confidence. Pick a BPM or use Match Project, then Fit Project.".to_string()
-            } else {
-                "Low confidence. Pick a BPM or use Match Project.".to_string()
-            })
+            Some("Not sure of the tempo. Pick a candidate, or drag Source to set it.".to_string())
         } else {
             None
         };
@@ -438,19 +434,26 @@ impl StudioLayout {
             }
 
             if pending_fit_project {
-                let _ = next.fit_to_project_tempo(project_bpm);
+                next = next.fitted_to_source_bpm(bpm, project_bpm);
             }
             if prev == next {
                 return false;
             }
             let prev_len = timeline.state.clip_duration_beats(clip_id).unwrap_or(0.0);
-            let old_ratio = prev.effective_time_ratio(project_bpm);
-            let new_ratio = next.effective_time_ratio(project_bpm);
-            let next_len = if old_ratio > 1e-6 && (old_ratio - new_ratio).abs() > 1e-9 {
-                (prev_len as f64 * (new_ratio / old_ratio)) as f32
-            } else {
-                prev_len
-            };
+            // The length the clip plays at, through the tempo map; the ratio
+            // change only scales it while the source is still undecoded.
+            let next_len = timeline
+                .state
+                .audio_clip_beats_with_stretch(clip_id, &next)
+                .unwrap_or_else(|| {
+                    let old_ratio = prev.effective_time_ratio(project_bpm);
+                    let new_ratio = next.effective_time_ratio(project_bpm);
+                    if old_ratio > 1e-6 && (old_ratio - new_ratio).abs() > 1e-9 {
+                        (prev_len as f64 * (new_ratio / old_ratio)) as f32
+                    } else {
+                        prev_len
+                    }
+                });
             timeline.state.set_clip_stretch(clip_id, next.clone());
             if (next_len - prev_len).abs() > 1e-4 {
                 timeline.state.set_clip_length(clip_id, next_len);

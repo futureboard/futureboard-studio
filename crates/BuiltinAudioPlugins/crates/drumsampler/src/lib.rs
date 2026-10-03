@@ -1,4 +1,4 @@
-//! Drum Sampler - a realtime-safe 16-pad one-shot drum instrument.
+//! Drum Sampler - a realtime-safe 64-pad one-shot drum instrument.
 //!
 //! Each pad plays a region of a user-loaded sample on its own mapped MIDI
 //! note, through its own attack/hold/decay envelope and state-variable
@@ -30,7 +30,18 @@ use std::sync::Arc;
 pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
 
 pub const PLUGIN_ID: &str = "futureboard.drumsampler";
-pub const PADS: usize = 16;
+/// The catalog name, which also names its folder of user files.
+pub const PLUGIN_NAME: &str = "Drum Sampler";
+/// Pads in a kit: four banks of sixteen.
+pub const PADS: usize = 64;
+/// Pads per bank — what the editor shows at once.
+pub const BANK_PADS: usize = 16;
+/// Stereo outputs a kit can play through: Main, then Out 2 … Out 16. A
+/// pad's [`Pad::output`] picks one; the host carries them all, and Studio
+/// gives each output a pad uses its own mixer channel.
+pub const OUTPUTS: usize = 16;
+/// Interleaved channels of the multi-output render: two per output.
+pub const OUTPUT_CHANNELS: usize = OUTPUTS * 2;
 pub const MAX_VOICES: usize = 32;
 /// Fixed fade applied when one pad chokes another in the same group - short
 /// enough to read as an instant cutoff (closed hat stopping an open hat)
@@ -228,6 +239,10 @@ pub struct Pad {
     /// Time from full level to −60 dB. `0` plays the region out untouched.
     #[serde(default)]
     pub decay_ms: f32,
+    /// The output the pad plays through: 0 is Main, 1 … 15 are Out 2 …
+    /// Out 16. Older projects, which had only Main, open on Main.
+    #[serde(default)]
+    pub output: u8,
 }
 
 fn full_region_end() -> f32 {
@@ -263,12 +278,16 @@ pub fn default_pad(index: usize) -> Pad {
         velocity_sensitivity: default_velocity_sensitivity(),
         hold_ms: 0.0,
         decay_ms: 0.0,
+        output: 0,
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Params {
+    /// Every pad. Saved as a list; a kit saved with fewer pads (the 16-pad
+    /// releases) opens with the rest at their defaults.
+    #[serde(with = "pad_list")]
     pub pads: [Pad; PADS],
     /// Whole-kit level, applied before the output soft clip.
     #[serde(default)]
@@ -276,6 +295,27 @@ pub struct Params {
     /// Whole-kit pitch, added to every pad's own tune.
     #[serde(default)]
     pub master_tune: f32,
+}
+
+/// The pads travel as a list (serde has no arrays this long). A shorter list
+/// fills the remaining pads with their defaults; a longer one is cut.
+mod pad_list {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{PADS, Pad, default_pad};
+
+    pub fn serialize<S: Serializer>(pads: &[Pad; PADS], serializer: S) -> Result<S::Ok, S::Error> {
+        pads.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[Pad; PADS], D::Error> {
+        let mut saved = Vec::<Pad>::deserialize(deserializer)?.into_iter();
+        Ok(std::array::from_fn(|index| {
+            saved.next().unwrap_or_else(|| default_pad(index))
+        }))
+    }
 }
 
 pub fn default_params() -> Params {
@@ -847,13 +887,48 @@ impl Instrument for Dsp {
     }
 
     fn process_stereo(&mut self) -> (f32, f32) {
+        let mut buses = [0.0; OUTPUT_CHANNELS];
+        self.render_buses(&mut buses);
+        // Every output folded back into one stereo pair.
+        let (left, right) = buses
+            .chunks_exact(2)
+            .fold((0.0, 0.0), |(l, r), pair| (l + pair[0], r + pair[1]));
+        self.finish_frame(left, right)
+    }
+}
+
+impl Dsp {
+    /// Renders `frames` frames into `interleaved` as [`OUTPUT_CHANNELS`]
+    /// channels: output `o` on channels `2·o` and `2·o + 1`, each through
+    /// the master gain and the soft clip. Realtime-safe: the per-frame bus
+    /// sums live on the stack.
+    pub fn process_block_multi(&mut self, interleaved: &mut [f32], frames: usize) {
+        let frames = frames.min(interleaved.len() / OUTPUT_CHANNELS);
+        let mut buses = [0.0; OUTPUT_CHANNELS];
+        for frame in interleaved.chunks_exact_mut(OUTPUT_CHANNELS).take(frames) {
+            self.render_buses(&mut buses);
+            let (mut left, mut right) = (0.0, 0.0);
+            for (out, pair) in frame.chunks_exact_mut(2).zip(buses.chunks_exact(2)) {
+                out[0] = soft_clip(pair[0] * self.master_gain);
+                out[1] = soft_clip(pair[1] * self.master_gain);
+                left += pair[0];
+                right += pair[1];
+            }
+            // The meters read the whole kit, wherever it plays.
+            self.finish_frame(left, right);
+        }
+    }
+
+    /// One frame of every sounding pad, each summed onto its output's pair
+    /// in `buses`, before the master gain. Advances the voices and the pad
+    /// meters.
+    fn render_buses(&mut self, buses: &mut [f32; OUTPUT_CHANNELS]) {
+        buses.fill(0.0);
         let any_solo = self.params.pads.iter().any(|pad| pad.solo);
         let release = self.meter_release;
         for peak in &mut self.pad_peak {
             *peak = flush_denormal(*peak * release);
         }
-        let mut left = 0.0;
-        let mut right = 0.0;
         for voice in &mut self.voices {
             if !voice.active {
                 continue;
@@ -890,9 +965,16 @@ impl Instrument for Dsp {
             if magnitude > self.pad_peak[pad_index] {
                 self.pad_peak[pad_index] = magnitude;
             }
-            left += l;
-            right += r;
+            let bus = (pad.output as usize).min(OUTPUTS - 1) * 2;
+            buses[bus] += l;
+            buses[bus + 1] += r;
         }
+    }
+
+    /// The kit's stereo sum through the master gain and soft clip, and the
+    /// output meters that follow it.
+    fn finish_frame(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let release = self.meter_release;
         let out_l = soft_clip(left * self.master_gain);
         let out_r = soft_clip(right * self.master_gain);
 
@@ -992,6 +1074,35 @@ mod tests {
         assert!(out.iter().all(|(l, r)| l.is_finite() && r.is_finite()));
         assert!(peak(&out) > 0.01);
         assert_eq!(dsp.process_stereo(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn each_pad_plays_through_its_own_output() {
+        let mut dsp = Dsp::new(RATE);
+        load(&mut dsp, 0, buffer_with_tone(4_800, RATE));
+        load(&mut dsp, 1, buffer_with_tone(4_800, RATE));
+        edit(&mut dsp, |params| params.pads[1].output = 3);
+        dsp.note_on(36, 127);
+        dsp.note_on(37, 127);
+        let frames = 1_000;
+        let mut out = vec![0.0; frames * OUTPUT_CHANNELS];
+        dsp.process_block_multi(&mut out, frames);
+        let channel_peak = |channel: usize| {
+            out.chunks_exact(OUTPUT_CHANNELS)
+                .fold(0.0_f32, |peak, frame| peak.max(frame[channel].abs()))
+        };
+        // Pad 1 on Main (channels 1/2), pad 2 on Out 4 (channels 7/8).
+        assert!(channel_peak(0) > 0.01 && channel_peak(1) > 0.01);
+        assert!(channel_peak(6) > 0.01 && channel_peak(7) > 0.01);
+        for silent in (2..6).chain(8..OUTPUT_CHANNELS) {
+            assert_eq!(channel_peak(silent), 0.0, "channel {}", silent + 1);
+        }
+        // The stereo render folds every output back together.
+        let mut folded = Dsp::new(RATE);
+        load(&mut folded, 1, buffer_with_tone(4_800, RATE));
+        edit(&mut folded, |params| params.pads[1].output = 3);
+        folded.note_on(37, 127);
+        assert!(peak(&render(&mut folded, 1_000)) > 0.01);
     }
 
     #[test]
@@ -1238,7 +1349,8 @@ mod tests {
         let legacy_pad = r#"{"note":36,"tuneSemitones":0.0,"gainDb":0.0,"pan":0.0,
             "chokeGroup":0,"attackMs":1.0,"releaseMs":60.0,"reverse":false,
             "muted":false,"solo":false,"sampleName":"kick.wav"}"#;
-        let pads = vec![legacy_pad; PADS].join(",");
+        // The first release had sixteen pads.
+        let pads = vec![legacy_pad; 16].join(",");
         let json = format!(r#"{{"version":1,"params":{{"pads":[{pads}]}}}}"#);
         let state = ipc::DrumSamplerState::from_json(&json).expect("legacy state decodes");
         let pad = &state.params.pads[0];
@@ -1248,5 +1360,8 @@ mod tests {
         assert_eq!(pad.velocity_sensitivity, 100.0);
         assert_eq!(pad.decay_ms, 0.0);
         assert_eq!(state.params.master_gain_db, 0.0);
+        // The pads it did not have open at their defaults, on their notes.
+        assert_eq!(state.params.pads[16].sample_name, None);
+        assert_eq!(state.params.pads[63].note, 36 + 63);
     }
 }

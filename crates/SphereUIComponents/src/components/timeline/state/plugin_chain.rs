@@ -84,10 +84,11 @@ pub fn vsti_output_child_channels_for_bus(bus_index: u8) -> (u8, u8) {
 }
 
 /// Maximum flat output channels the bridge carries (mirrors the engine's
-/// `MAX_CHANNELS` / C++ `kMaxBridgeChannels`). Output buses whose flat channels
-/// fall entirely past this cap are dropped by the bridge and cannot be heard, so
-/// the host does not create silent strips for them.
-pub const VSTI_MAX_BRIDGE_CHANNELS: u8 = 16;
+/// `MAX_CHANNELS` / C++ `kMaxBridgeChannels`, both 32 since the bridge's
+/// layout v5). Output buses whose flat channels fall entirely past this cap
+/// are dropped by the bridge and cannot be heard, so the host does not create
+/// silent strips for them.
+pub const VSTI_MAX_BRIDGE_CHANNELS: u8 = 32;
 
 /// Given the real per-bus output channel counts (bus-by-bus order, as the bridge
 /// flattens them), return the `(start_channel_1based, channel_count)` of
@@ -318,6 +319,14 @@ pub struct InsertSlotState {
     /// duplication. Empty = unknown (falls back to legacy stereo pairing). Not
     /// persisted — re-detected from the host on every load via `ProcessingPrepared`.
     pub output_bus_channel_counts: Vec<u8>,
+    /// The output buses in use, for a plug-in that says which: only these
+    /// get child mixer strips, and an output none uses has none — so a
+    /// multi-out built-in (the Drum Sampler) grows a strip the moment a pad
+    /// is sent to a new output, with nothing to set up first. A bus 0 left
+    /// out stays on the parent track. `None` (every VST3, VST2, CLAP and
+    /// AU) gives every bus in the layout a strip, as before. Not
+    /// persisted: derived from the plug-in's own state.
+    pub active_output_buses: Option<Vec<u8>>,
     /// Mixer-only view flag for this instrument's VSTi multi-out group: when
     /// `true` the child bus strips are hidden from the mixer (collapsed). This is
     /// a pure VIEW concern — it never changes audio routing, never removes child
@@ -344,6 +353,17 @@ pub struct InsertSlotState {
 }
 
 impl InsertSlotState {
+    /// Output indices that get child mixer strips: the layout's
+    /// ([`vsti_output_bus_strip_indices`]), narrowed to the buses in use when
+    /// the plug-in says which ([`Self::active_output_buses`]).
+    pub fn output_strip_indices(&self) -> Vec<u8> {
+        let mut indices = vsti_output_bus_strip_indices(&self.output_bus_channel_counts);
+        if let Some(active) = &self.active_output_buses {
+            indices.retain(|bus| active.contains(bus));
+        }
+        indices
+    }
+
     pub fn empty(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -362,6 +382,7 @@ impl InsertSlotState {
             parameters: Vec::new(),
             enabled_audio_output_channels: Vec::new(),
             output_bus_channel_counts: Vec::new(),
+            active_output_buses: None,
             multiout_collapsed: false,
             pending_open_editor: false,
             vst3_state: None,
@@ -396,6 +417,7 @@ impl InsertSlotState {
             host_pid: None,
             // Re-detected from the new instance when it prepares.
             output_bus_channel_counts: Vec::new(),
+            active_output_buses: None,
             pending_open_editor: false,
             ..self.clone()
         }
@@ -1591,6 +1613,35 @@ impl TimelineState {
         collapsed_vsti_output_group_keys_from_tracks(&self.tracks)
     }
 
+    /// Records which output buses a plug-in is using (see
+    /// [`InsertSlotState::active_output_buses`]) and, once its layout is
+    /// known, gives each a child strip and drops the rest. Before the host
+    /// has reported the layout the strips are left alone, so a project's
+    /// saved strips survive its reload. `true` when anything changed.
+    pub fn set_insert_active_output_buses(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        buses: Option<Vec<u8>>,
+    ) -> bool {
+        let Some(slot) = self
+            .insert_slots_mut(track_id)
+            .and_then(|slots| slots.iter_mut().find(|slot| slot.id == insert_id))
+        else {
+            return false;
+        };
+        if slot.active_output_buses == buses {
+            return false;
+        }
+        slot.active_output_buses = buses;
+        if slot.output_bus_channel_counts.is_empty() {
+            return true;
+        }
+        let plugin_name = slot.display_name.clone();
+        self.ensure_vsti_output_child_tracks(track_id, insert_id, 0, &plugin_name, true);
+        true
+    }
+
     pub fn auto_enable_detected_insert_outputs(
         &mut self,
         track_id: &str,
@@ -1616,8 +1667,7 @@ impl TimelineState {
             }
         }
         let plugin_name = slot.display_name.clone();
-        let can_create_child_strips =
-            !vsti_output_bus_strip_indices(&slot.output_bus_channel_counts).is_empty();
+        let can_create_child_strips = !slot.output_strip_indices().is_empty();
         changed |= self.ensure_vsti_output_child_tracks(
             track_id,
             insert_id,
@@ -1651,7 +1701,7 @@ impl TimelineState {
             return false;
         };
         let output_bus_channel_counts = slot.output_bus_channel_counts.clone();
-        let bus_indices_for_layout = vsti_output_bus_strip_indices(&output_bus_channel_counts);
+        let bus_indices_for_layout = slot.output_strip_indices();
         let multiout_capable = !bus_indices_for_layout.is_empty();
         let selected_path = if multiout_capable && user_multiout_enabled {
             "multiout_child_channels"
@@ -1923,8 +1973,8 @@ mod bridge_hosted_module_tests {
 #[cfg(test)]
 mod vsti_output_bus_layout_tests {
     use super::{
-        vsti_output_bus_flat_range, vsti_output_bus_strip_indices,
-        vsti_output_child_channels_for_bus_layout,
+        InsertSlotState, VSTI_MAX_BRIDGE_CHANNELS, vsti_output_bus_flat_range,
+        vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
     };
 
     #[test]
@@ -2030,11 +2080,24 @@ mod vsti_output_bus_layout_tests {
 
     #[test]
     fn buses_past_the_bridge_channel_cap_are_dropped() {
-        // 18 mono buses → only the first 16 flat channels can be carried.
-        let counts = [1u8; 18];
+        // 34 mono buses → only the first 32 flat channels can be carried.
+        let counts = [1u8; 34];
         let indices = vsti_output_bus_strip_indices(&counts);
-        assert_eq!(indices.len(), 16);
-        assert_eq!(*indices.last().unwrap(), 15);
+        assert_eq!(indices.len(), VSTI_MAX_BRIDGE_CHANNELS as usize);
+        assert_eq!(*indices.last().unwrap(), 31);
+        // Sixteen stereo buses fill the bridge exactly: all are carried.
+        assert_eq!(vsti_output_bus_strip_indices(&[2u8; 16]).len(), 16);
+    }
+
+    #[test]
+    fn only_the_outputs_in_use_get_strips_when_the_plugin_says_which() {
+        let mut slot = InsertSlotState::empty("drums");
+        slot.output_bus_channel_counts = vec![2; 16];
+        assert_eq!(slot.output_strip_indices().len(), 16, "VST3: every bus");
+        slot.active_output_buses = Some(vec![2, 5]);
+        assert_eq!(slot.output_strip_indices(), vec![2, 5]);
+        slot.active_output_buses = Some(Vec::new());
+        assert!(slot.output_strip_indices().is_empty(), "all on Main");
     }
 
     #[test]

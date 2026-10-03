@@ -45,6 +45,17 @@ impl Default for PluginCatalogState {
     }
 }
 
+/// Opens a built-in's native editor window: its `open_*_editor` function.
+#[cfg(feature = "builtin-plugin-editor")]
+type NativeEditorOpener<E> = fn(
+    Option<gpui::Bounds<gpui::Pixels>>,
+    crate::components::builtin_plugin_editor_window::PluginInstanceKey,
+    crate::components::native_plugin_shell::ShellIdentity,
+    crate::components::builtin_plugin_editor_window::BuiltinEditorHostOps,
+    std::sync::Arc<dyn Fn(&mut Window, &mut App)>,
+    &mut App,
+) -> Result<gpui::WindowHandle<E>, String>;
+
 /// Plugin-editor window handles owned by the studio — the GPUI-hosted editor
 /// shells, the native external-bridge editor sessions, the shared bridge
 /// runtime, and editor opens deferred while an insert runtime was still loading.
@@ -68,6 +79,26 @@ pub(crate) struct PluginEditorWindows {
         gpui::WindowHandle<
             crate::components::builtin_plugin_editor_window::BuiltinPluginEditorWindow,
         >,
+    >,
+    /// Open native (GPUI) Quick Sampler editors, keyed by insert id — one
+    /// window per insert. See `open_native_builtin_editor`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub quick_sampler: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::quick_sampler_window::QuickSamplerEditorWindow>,
+    >,
+    /// Open native Drum Sampler editors, keyed by insert id, like
+    /// `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub drum_sampler: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::drum_sampler_window::DrumSamplerEditorWindow>,
+    >,
+    /// Open native Slicer editors, keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub slicer: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::slicer_window::SlicerEditorWindow>,
     >,
     /// Native main-owned external-bridge editor shells, keyed by
     /// `(track_id, plugin_instance_id)`.
@@ -650,14 +681,17 @@ impl StudioLayout {
                     eprintln!(
                         "[plugin-bridge] event BuiltinDrumSampleResult instance={plugin_instance_id} pad={pad_index} ok={ok} name={name} error={error:?}"
                     );
-                    // Every `LoadBuiltinDrumSample` command originates from a
-                    // drumsampler-bound forwarder, so this event is always that
-                    // plugin's — fold the assignment into the mirror so it
-                    // survives project save/reload. A reload after project open
-                    // brings back the name the pad already had: not an edit.
+                    // A Drum Sampler pad or a Quick Sampler's sample: the
+                    // insert's own plugin says which. Fold the assignment into
+                    // the mirror so it survives project save/reload. A reload
+                    // after project open brings back the name the slot
+                    // already had: not an edit.
+                    let sampler_plugin_id = self
+                        .slot_plugin_id_by_insert(&plugin_instance_id, cx)
+                        .unwrap_or_else(|| "drumsampler".to_string());
                     if ok
-                        && crate::components::builtin_plugin_editor::builtin_state_set_drum_sample(
-                            "drumsampler",
+                        && crate::components::builtin_plugin_editor::builtin_state_set_sample(
+                            &sampler_plugin_id,
                             &plugin_instance_id,
                             pad_index as usize,
                             Some(name.clone()),
@@ -681,6 +715,44 @@ impl StudioLayout {
                             pad_index,
                             waveform.clone(),
                         );
+                    }
+                    #[cfg(feature = "builtin-plugin-editor")]
+                    if let Some(handle) = self
+                        .plugin_editors
+                        .quick_sampler
+                        .get(&plugin_instance_id)
+                        .copied()
+                    {
+                        let _ = handle.update(cx, |editor, _window, cx| {
+                            editor.notify_sample_result(ok, &name, error.as_deref());
+                            cx.notify();
+                        });
+                    }
+                    #[cfg(feature = "builtin-plugin-editor")]
+                    if let Some(handle) = self
+                        .plugin_editors
+                        .drum_sampler
+                        .get(&plugin_instance_id)
+                        .copied()
+                    {
+                        let _ = handle.update(cx, |editor, _window, cx| {
+                            editor.notify_pad_sample_result(
+                                pad_index as usize,
+                                ok,
+                                &name,
+                                error.as_deref(),
+                                cx,
+                            );
+                        });
+                    }
+                    #[cfg(feature = "builtin-plugin-editor")]
+                    if let Some(handle) =
+                        self.plugin_editors.slicer.get(&plugin_instance_id).copied()
+                    {
+                        let _ = handle.update(cx, |editor, _window, cx| {
+                            editor.notify_sample_result(ok, &name, error.as_deref());
+                            cx.notify();
+                        });
                     }
                     for handle in self.plugin_editors.builtin.values() {
                         let _ = handle.update(cx, |editor, _window, _cx| {
@@ -837,6 +909,20 @@ impl StudioLayout {
                             // Record the real per-bus output layout BEFORE building
                             // child strips so multi-out plugins get one strip per
                             // real bus (mono→stereo) instead of paired flat channels.
+                            // A multi-out built-in names the outputs its pads
+                            // use; only those get strips.
+                            #[cfg(feature = "builtin-plugin-editor")]
+                            if let Some(buses) =
+                                crate::components::builtin_plugin_editor::builtin_used_output_buses(
+                                    &plugin_instance_id,
+                                )
+                            {
+                                timeline.state.set_insert_active_output_buses(
+                                    &track_id,
+                                    &plugin_instance_id,
+                                    Some(buses),
+                                );
+                            }
                             let layout_changed = timeline.state.set_insert_output_bus_layout(
                                 &track_id,
                                 &plugin_instance_id,
@@ -2730,6 +2816,9 @@ impl StudioLayout {
                         cx.defer(move |cx| {
                             let _ = studio.update(cx, |layout, cx| {
                                 layout.note_plugin_state_edited(cx);
+                                // A pad sent to another output: give it a
+                                // mixer strip, or retire an unused one.
+                                layout.sync_builtin_output_strips(cx);
                             });
                         });
                     },
@@ -2890,6 +2979,33 @@ impl StudioLayout {
                     cx.notify();
                 });
             }));
+        // An instrument editor's keyboard: the engine's plug-in preview, the
+        // route the piano roll uses, so the note sounds through this insert.
+        let preview_note: Option<
+            crate::components::builtin_plugin_editor_window::BuiltinPreviewNote,
+        > = self.audio_bridge.engine.clone().map(|engine| {
+            std::sync::Arc::new(
+                move |key: &PluginInstanceKey,
+                      channel: u8,
+                      pitch: u8,
+                      velocity: Option<u8>,
+                      _cx: &mut App| {
+                    let (track, insert) = (key.track_id.clone(), key.insert_id.clone());
+                    let result = match velocity {
+                        Some(velocity) => {
+                            engine.plugin_preview_note_on(track, insert, channel, pitch, velocity)
+                        }
+                        None => engine.plugin_preview_note_off(track, insert, channel, pitch),
+                    };
+                    if let Err(error) = result {
+                        eprintln!(
+                            "[BuiltinPluginEditor] preview note failed insert={} error={error}",
+                            key.insert_id
+                        );
+                    }
+                },
+            ) as crate::components::builtin_plugin_editor_window::BuiltinPreviewNote
+        });
         let host_ops = BuiltinEditorHostOps {
             forward_param,
             dispatch_global_command,
@@ -2903,7 +3019,24 @@ impl StudioLayout {
             pad_level_source,
             band_reduction_source,
             transport_source,
+            preview_note,
         };
+
+        // A native (GPUI) editor: drawn by Studio in the native plug-in
+        // shell, one window per insert — no browser.
+        #[cfg(feature = "builtin-plugin-editor")]
+        if SpherePluginHost::builtin_has_native_editor(plugin_id) {
+            self.open_native_builtin_editor(
+                plugin_id,
+                target,
+                &instances,
+                display_name,
+                host_ops,
+                window,
+                cx,
+            );
+            return;
+        }
 
         // Focus the existing shared window and rebind it to this instance,
         // rather than creating a second browser for the same plugin_id.
@@ -2950,11 +3083,199 @@ impl StudioLayout {
         }
     }
 
+    /// Open (or focus and rebind) the native editor of a built-in insert.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[allow(clippy::too_many_arguments)]
+    fn open_native_builtin_editor(
+        &mut self,
+        plugin_id: &str,
+        target: crate::components::builtin_plugin_editor_window::PluginInstanceKey,
+        instances: &[crate::components::builtin_plugin_editor_window::PluginInstanceDescriptor],
+        display_name: String,
+        host_ops: crate::components::builtin_plugin_editor_window::BuiltinEditorHostOps,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::native_plugin_shell::ShellIdentity;
+        let identity = instances
+            .iter()
+            .find(|instance| instance.instance_key == target)
+            .map(|instance| ShellIdentity {
+                plugin_name: display_name.clone(),
+                track_name: instance.track_name.clone(),
+                insert_number: instance.insert_number,
+            })
+            .unwrap_or(ShellIdentity {
+                plugin_name: display_name,
+                track_name: String::new(),
+                insert_number: 1,
+            });
+
+        let opened = match SpherePluginHost::resolve_builtin_stem(plugin_id) {
+            Some(slicer::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.slicer,
+                crate::components::slicer_window::open_slicer_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(drumsampler::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.drum_sampler,
+                crate::components::drum_sampler_window::open_drum_sampler_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            _ => self.open_native_editor(
+                |windows| &mut windows.quick_sampler,
+                crate::components::quick_sampler_window::open_quick_sampler_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+        };
+        if let Err(error) = opened {
+            eprintln!("[NativePluginEditor] open FAILED plugin={plugin_id} err={error}");
+        }
+    }
+
+    /// Focus the native editor already open on `target`'s insert (rebinding
+    /// it), or open one with `open` and keep it in the map `windows` picks.
+    /// Closing it drops it from that map.
+    #[cfg(feature = "builtin-plugin-editor")]
+    fn open_native_editor<E>(
+        &mut self,
+        windows: fn(
+            &mut PluginEditorWindows,
+        ) -> &mut std::collections::HashMap<String, gpui::WindowHandle<E>>,
+        open: NativeEditorOpener<E>,
+        (target, identity, host_ops): (
+            crate::components::builtin_plugin_editor_window::PluginInstanceKey,
+            crate::components::native_plugin_shell::ShellIdentity,
+            crate::components::builtin_plugin_editor_window::BuiltinEditorHostOps,
+        ),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String>
+    where
+        E: crate::components::native_plugin_shell::NativeBuiltinEditor + 'static,
+    {
+        if let Some(handle) = windows(&mut self.plugin_editors)
+            .get(&target.insert_id)
+            .copied()
+        {
+            let result = handle.update(cx, |editor, window, cx| {
+                editor.rebind_insert(target.clone(), identity.clone(), host_ops.clone(), cx);
+                window.activate_window();
+            });
+            if result.is_ok() {
+                return Ok(());
+            }
+            windows(&mut self.plugin_editors).remove(&target.insert_id);
+        }
+
+        let insert_id = target.insert_id.clone();
+        let studio = cx.weak_entity();
+        let on_close: std::sync::Arc<dyn Fn(&mut Window, &mut App)> =
+            std::sync::Arc::new(move |_window, app| {
+                let insert_id = insert_id.clone();
+                let studio = studio.clone();
+                // The studio is not borrowed here, but the editor window is:
+                // defer so the map edit runs outside its update.
+                app.defer(move |app| {
+                    let _ = studio.update(app, |layout, _cx| {
+                        windows(&mut layout.plugin_editors).remove(&insert_id);
+                    });
+                });
+            });
+        let insert_id = target.insert_id.clone();
+        let handle = open(
+            Some(window.bounds()),
+            target,
+            identity,
+            host_ops,
+            on_close,
+            cx,
+        )?;
+        windows(&mut self.plugin_editors).insert(insert_id, handle);
+        Ok(())
+    }
+
+    /// Gives every multi-out built-in insert a mixer strip for each output
+    /// its pads use, and retires the strips of outputs none uses — so a pad
+    /// sent to Out 5 is heard on its own channel at once, with no channel
+    /// made beforehand. The outputs come from the state mirror; the strips
+    /// reach the engine with the next project sync.
+    pub(super) fn sync_builtin_output_strips(&mut self, cx: &mut Context<Self>) {
+        #[cfg(feature = "builtin-plugin-editor")]
+        {
+            let changed = self.timeline.update(cx, |timeline, _cx| {
+                let inserts: Vec<(String, String)> = timeline
+                    .state
+                    .tracks
+                    .iter()
+                    .flat_map(|track| {
+                        track
+                            .inserts
+                            .iter()
+                            .map(move |slot| (track.id.clone(), slot.id.clone()))
+                    })
+                    .collect();
+                let mut changed = false;
+                for (track_id, insert_id) in inserts {
+                    let Some(buses) =
+                        crate::components::builtin_plugin_editor::builtin_used_output_buses(
+                            &insert_id,
+                        )
+                    else {
+                        continue;
+                    };
+                    changed |= timeline.state.set_insert_active_output_buses(
+                        &track_id,
+                        &insert_id,
+                        Some(buses),
+                    );
+                }
+                changed
+            });
+            if changed {
+                self.schedule_audio_project_sync(cx, true, "builtin_output_strips");
+                cx.notify();
+            }
+        }
+        #[cfg(not(feature = "builtin-plugin-editor"))]
+        let _ = cx;
+    }
+
     /// Refresh every open shared built-in editor's instance tabs from current
     /// project state. Call after any insert/track add/remove/rename/reorder
     /// (spec: the tabs must reflect the live project, not a stale snapshot
     /// taken at open time). Cheap no-op when no built-in editor is open.
     pub(super) fn refresh_builtin_editor_sidebars(&mut self, cx: &mut Context<Self>) {
+        // An undo or a reload may have moved pads between outputs.
+        self.sync_builtin_output_strips(cx);
+        // Native editors read the mirror directly: an undo or a reload that
+        // changed it shows up here.
+        #[cfg(feature = "builtin-plugin-editor")]
+        {
+            let editors: Vec<_> = self
+                .plugin_editors
+                .quick_sampler
+                .values()
+                .copied()
+                .collect();
+            for handle in editors {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let slicers: Vec<_> = self.plugin_editors.slicer.values().copied().collect();
+            for handle in slicers {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let drums: Vec<_> = self.plugin_editors.drum_sampler.values().copied().collect();
+            for handle in drums {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+        }
         if self.plugin_editors.builtin.is_empty() {
             return;
         }
@@ -5527,11 +5848,11 @@ impl StudioLayout {
         // replay the mirrored/persisted state through the live param channel
         // now that the sink is installed. Covers project open and host
         // crash/respawn.
-        self.replay_builtin_insert_state(plugin_instance_id, cx);
+        self.replay_builtin_insert_state(plugin_instance_id, None, cx);
         // A pad's audio is not a parameter: the restarted DSP needs each
         // sample sent again. Only here, where the DSP is new — an undo step
         // replays parameters into a DSP whose samples are still loaded.
-        self.reload_builtin_drum_samples(plugin_instance_id, cx);
+        self.reload_builtin_samples(plugin_instance_id, cx);
         if slot_changed {
             self.audio_bridge.project_dirty = true;
             self.schedule_audio_project_sync(cx, true, source);
@@ -5545,7 +5866,15 @@ impl StudioLayout {
     /// channel as live editor edits: engine command → callback thread → SPSC
     /// ring → host producer). No-op for VST3 inserts, missing engine, or an
     /// insert with no mirrored/persisted state (host defaults already match).
-    pub(super) fn replay_builtin_insert_state(&self, plugin_instance_id: &str, cx: &Context<Self>) {
+    /// Rebuilds a built-in's host DSP from the mirror, sending only what
+    /// differs from `baseline` — what the DSP holds now: its defaults when
+    /// it was just built (`None`), or the state an undo is leaving.
+    pub(super) fn replay_builtin_insert_state(
+        &self,
+        plugin_instance_id: &str,
+        baseline: Option<Vec<(u32, f32)>>,
+        cx: &Context<Self>,
+    ) {
         use crate::components::builtin_plugin_editor as host;
         let Some(engine) = self.audio_bridge.engine.as_ref() else {
             return;
@@ -5572,7 +5901,11 @@ impl StudioLayout {
                 if let Some(blob) = slot.vst3_state.as_deref() {
                     host::builtin_state_seed(plugin_id, &slot.id, blob);
                 }
-                let values = host::builtin_state_replay(plugin_id, &slot.id);
+                let baseline = baseline.unwrap_or_else(|| host::builtin_default_replay(plugin_id));
+                let values = host::builtin_replay_changes(
+                    host::builtin_state_replay(plugin_id, &slot.id),
+                    &baseline,
+                );
                 if values.is_empty() {
                     return;
                 }
@@ -5600,16 +5933,31 @@ impl StudioLayout {
         }
     }
 
-    /// Send every sample a Drum Sampler insert's pads were loaded from back to
-    /// its (re)started host DSP. The DSP restarts empty — a project open or a
-    /// host respawn replays its parameters, but a pad's audio only ever
-    /// arrives as a `LoadBuiltinDrumSample`, so without this a reopened kit
-    /// shows its sample names and plays nothing. No-op for any other plugin.
+    /// Send every sample a built-in sampler was loaded with — a Drum Sampler's
+    /// pads, a Quick Sampler's one sample — back to its (re)started host DSP.
+    /// The DSP restarts empty — a project open or a host respawn replays its
+    /// parameters, but audio only ever arrives as a `LoadBuiltinDrumSample`,
+    /// so without this a reopened sampler shows its sample names and plays
+    /// nothing. No-op for any other plugin.
     ///
     /// Reads each file from the plugin's Samples folder on this thread, as the
     /// editor's own load path does; the host decodes. A missing file comes
     /// back as a failed load, which the editor shows on that pad.
-    fn reload_builtin_drum_samples(&self, insert_id: &str, cx: &Context<Self>) {
+    /// The plug-in id an insert slot holds, on any track or the master.
+    pub(super) fn slot_plugin_id_by_insert(
+        &self,
+        insert_id: &str,
+        cx: &Context<Self>,
+    ) -> Option<String> {
+        let state = &self.timeline.read(cx).state;
+        std::iter::once(&state.master.inserts)
+            .chain(state.tracks.iter().map(|track| &track.inserts))
+            .flatten()
+            .find(|slot| slot.id == insert_id)
+            .and_then(|slot| slot.plugin_id.clone())
+    }
+
+    fn reload_builtin_samples(&self, insert_id: &str, cx: &Context<Self>) {
         use crate::components::builtin_plugin_files as files;
         use base64::Engine as _;
         let state = &self.timeline.read(cx).state;
@@ -5624,9 +5972,8 @@ impl StudioLayout {
             return;
         };
         let display_name = slot.display_name.as_str();
-        let names = crate::components::builtin_plugin_editor::builtin_drum_sample_names(
-            plugin_id, insert_id,
-        );
+        let names =
+            crate::components::builtin_plugin_editor::builtin_sample_names(plugin_id, insert_id);
         if names.is_empty() {
             return;
         }

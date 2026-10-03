@@ -1255,6 +1255,7 @@ fn project_insert_to_timeline(pi: &ProjectInsert) -> InsertSlotState {
                 enabled_audio_output_channels: pi.enabled_audio_output_channels.clone(),
                 // Re-detected from the host on ProcessingPrepared after load.
                 output_bus_channel_counts: Vec::new(),
+                active_output_buses: None,
                 multiout_collapsed: pi.multiout_collapsed,
                 pending_open_editor: false,
                 vst3_state: (!plugin.state.state_bytes.is_empty())

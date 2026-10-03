@@ -192,7 +192,7 @@ fn import_sample_file(
 /// same sample dropped twice stays one file. Returns the resulting bare file
 /// name — what a pad's `sample_name` and every later `futureboard.loadSample`
 /// reference by. Background-thread only (filesystem I/O).
-fn import_sample_bytes(
+pub(crate) fn import_sample_bytes(
     samples_dir: &std::path::Path,
     file_name: &str,
     bytes: &[u8],
@@ -228,7 +228,7 @@ fn import_sample_bytes(
 /// Returns the stored name with the bytes, so the pad load that follows uses
 /// what is already in memory instead of reading the file again.
 /// Background-thread only (filesystem I/O).
-fn read_dropped_sample(
+pub(crate) fn read_dropped_sample(
     samples_dir: &std::path::Path,
     source: &std::path::Path,
 ) -> Result<(String, Vec<u8>), String> {
@@ -1012,6 +1012,13 @@ pub type BuiltinBandReductionSource = std::sync::Arc<
 /// engine's shared state — safe to call every pump tick.
 pub type BuiltinTransportSource = std::sync::Arc<dyn Fn() -> bool>;
 
+/// Plays a note on an instrument insert from its editor's keyboard, through
+/// the engine's plug-in preview path — the same route the piano roll uses,
+/// so the sound is the insert's own. `Some(velocity)` presses, `None`
+/// releases. UI thread.
+pub type BuiltinPreviewNote =
+    std::sync::Arc<dyn Fn(&PluginInstanceKey, u8, u8, Option<u8>, &mut gpui::App)>;
+
 /// Everything the shared editor window can do against the live host, injected
 /// by `plugin_ops.rs` (the owner of the engine handle and bridge runtime this
 /// window deliberately does not hold). Any member may be `None` while the
@@ -1030,6 +1037,7 @@ pub struct BuiltinEditorHostOps {
     pub pad_level_source: Option<BuiltinPadLevelSource>,
     pub band_reduction_source: Option<BuiltinBandReductionSource>,
     pub transport_source: Option<BuiltinTransportSource>,
+    pub preview_note: Option<BuiltinPreviewNote>,
 }
 
 impl BuiltinEditorHostOps {
@@ -1046,6 +1054,7 @@ impl BuiltinEditorHostOps {
             && self.pad_level_source.is_none()
             && self.band_reduction_source.is_none()
             && self.transport_source.is_none()
+            && self.preview_note.is_none()
     }
 }
 

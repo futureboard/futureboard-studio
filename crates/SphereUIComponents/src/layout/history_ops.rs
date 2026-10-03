@@ -186,10 +186,15 @@ impl StudioLayout {
             return;
         };
         if SpherePluginHost::builtin_audio_bridge_supported(&plugin_id) {
+            // What the DSP holds now, so only the step's changes are sent.
+            let before = crate::components::builtin_plugin_editor::builtin_state_replay(
+                &plugin_id, insert_id,
+            );
             crate::components::builtin_plugin_editor::builtin_state_seed(
                 &plugin_id, insert_id, &state,
             );
-            self.replay_builtin_insert_state(insert_id, cx);
+            let baseline = (!before.is_empty()).then_some(before);
+            self.replay_builtin_insert_state(insert_id, baseline, cx);
             self.refresh_builtin_editor_sidebars(cx);
         } else if let Some(runtime) = self.plugin_editors.bridge_runtime.clone() {
             if let Ok(mut runtime) = runtime.lock() {

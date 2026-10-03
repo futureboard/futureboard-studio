@@ -55,6 +55,8 @@ members = [
     "crates/BuiltinAudioPlugins/crates/meowsyn",
     "crates/BuiltinAudioPlugins/crates/wrapsynth",
     "crates/BuiltinAudioPlugins/crates/drumsampler",
+    "crates/BuiltinAudioPlugins/crates/quicksampler",
+    "crates/BuiltinAudioPlugins/crates/slicer",
     "crates/BuiltinAudioPlugins/crates/zcomp",
     "crates/BuiltinAudioPlugins/crates/mixstation",
     "crates/BuiltinAudioPlugins/crates/rodharerist",
@@ -151,6 +153,8 @@ c1073 = { path = "crates/BuiltinAudioPlugins/crates/c1073" }
 meowsyn = { path = "crates/BuiltinAudioPlugins/crates/meowsyn" }
 wrapsynth = { path = "crates/BuiltinAudioPlugins/crates/wrapsynth" }
 drumsampler = { path = "crates/BuiltinAudioPlugins/crates/drumsampler" }
+quicksampler = { path = "crates/BuiltinAudioPlugins/crates/quicksampler" }
+slicer = { path = "crates/BuiltinAudioPlugins/crates/slicer" }
 zcomp = { path = "crates/BuiltinAudioPlugins/crates/zcomp" }
 mixstation = { path = "crates/BuiltinAudioPlugins/crates/mixstation" }
 rodharerist = { path = "crates/BuiltinAudioPlugins/crates/rodharerist" }

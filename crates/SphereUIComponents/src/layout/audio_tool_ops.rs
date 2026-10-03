@@ -166,26 +166,22 @@ impl StudioLayout {
             AudioToolCommand::AddWarpMarkers { clip_id, frames } => {
                 let _ = self.timeline.update(cx, |timeline, cx| {
                     timeline.begin_inspector_clip_gesture(&clip_id);
-                    let start = timeline
-                        .state
-                        .find_clip(&clip_id)
-                        .map(|(_, clip)| clip.start_beat as f64)
-                        .unwrap_or(0.0);
-                    let spb = timeline.state.seconds_per_beat() as f64;
-                    let sr = timeline
-                        .state
-                        .find_clip(&clip_id)
-                        .map(|(_, clip)| clip.stretch.original_sample_rate.max(1) as f64)
-                        .unwrap_or(48_000.0);
+                    // Each marker starts on the beat its audio plays at now:
+                    // from the window start, through the clip's stretch and
+                    // the tempo map, the way the engine places it.
+                    let beats: Vec<f64> = frames
+                        .iter()
+                        .map(|frame| timeline.state.clip_beat_at_source_frame(&clip_id, *frame))
+                        .collect();
                     if let Some(mut stretch) = timeline.state.clip_stretch(&clip_id).cloned() {
                         stretch.warp_markers = frames
                             .into_iter()
+                            .zip(beats)
                             .enumerate()
-                            .map(|(index, source_sample)| WarpMarker {
+                            .map(|(index, (source_sample, timeline_beat))| WarpMarker {
                                 id: index as u64 + 1,
                                 source_sample,
-                                timeline_beat: start
-                                    + (source_sample as f64 / sr) / spb.max(1.0e-6),
+                                timeline_beat,
                                 locked: false,
                             })
                             .collect();
@@ -216,11 +212,9 @@ impl StudioLayout {
             AudioToolCommand::UseOriginalBpm { clip_id, bpm } => {
                 let _ = self.timeline.update(cx, |timeline, cx| {
                     timeline.begin_inspector_clip_gesture(&clip_id);
-                    if let Some(mut stretch) = timeline.state.clip_stretch(&clip_id).cloned() {
-                        stretch.bpm_source = Some(bpm);
-                        stretch.dirty = true;
-                        let _ = timeline.state.set_clip_stretch(&clip_id, stretch);
-                    }
+                    // The clip's tempo fits it to the project's: it plays one
+                    // of its beats per project beat, and its length follows.
+                    let _ = timeline.state.fit_clip_to_source_bpm(&clip_id, bpm as f64);
                     if timeline.commit_inspector_clip_gesture(&clip_id, cx) {
                         timeline.mark_media_changed(cx);
                     }

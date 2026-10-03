@@ -1,0 +1,19 @@
+[package]
+name = "quicksampler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Quick Sampler - one audio file played across the keyboard"
+
+[lib]
+name = "quicksampler"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+builtin-dsp-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -39,6 +39,8 @@ builtin-plugin-editor = [
     "dep:transient",
     "dep:wrapsynth",
     "dep:drumsampler",
+    "dep:quicksampler",
+    "dep:slicer",
     "dep:zcomp",
     "dep:mixstation",
     "dep:compresser",
@@ -93,6 +95,8 @@ clipper67 = { workspace = true, optional = true }
 transient = { workspace = true, optional = true }
 wrapsynth = { workspace = true, optional = true }
 drumsampler = { workspace = true, optional = true }
+quicksampler = { workspace = true, optional = true }
+slicer = { workspace = true, optional = true }
 zcomp = { workspace = true, optional = true }
 mixstation = { workspace = true, optional = true }
 compresser = { workspace = true, optional = true }

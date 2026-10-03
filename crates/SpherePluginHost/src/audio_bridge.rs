@@ -53,7 +53,10 @@ pub const BRIDGE_MAGIC: u32 = 0x4642_4142;
 /// v12 adds the per-band reduction block: a multiband compressor takes a
 /// different amount off each band, and the single reduction word can only
 /// carry one of them.
-pub const BRIDGE_LAYOUT_VERSION: u32 = 12;
+/// v13 widens the per-pad level block to 64 pads (the Drum Sampler's four
+/// banks) and the param ring to 4096 events, so a whole 64-pad kit replays
+/// through it at once.
+pub const BRIDGE_LAYOUT_VERSION: u32 = 13;
 
 /// Rack positions a built-in may publish per-stage telemetry for. Fixed so the
 /// shared region stays a plain-old-data layout.
@@ -64,8 +67,8 @@ pub const IMAGE_BANDS: usize = 4;
 /// Left/right pairs in one published vectorscope frame.
 pub const IMAGE_SCOPE_POINTS: usize = 128;
 
-/// Pads a built-in may publish a level for (Drum Sampler's 16).
-pub const BUILTIN_PAD_SLOTS: usize = 16;
+/// Pads a built-in may publish a level for (Drum Sampler's 64).
+pub const BUILTIN_PAD_SLOTS: usize = 64;
 
 /// Bands a built-in may publish a gain reduction for (the Compressor's
 /// multiband crossover bands).
@@ -144,7 +147,7 @@ pub const AUDIO_BUF_LEN: usize = MAX_BLOCK_FRAMES * MAX_CHANNELS;
 /// MIDI ring capacity (power of two).
 pub const MIDI_RING_CAP: usize = 1024;
 /// Parameter-automation ring capacity (power of two).
-pub const PARAM_RING_CAP: usize = 1024;
+pub const PARAM_RING_CAP: usize = 4096;
 
 /// `dsp_output_state` values.
 pub const DSP_OUTPUT_PENDING: u32 = 0;
@@ -636,7 +639,9 @@ pub struct SharedAudioBridge {
 
     // --- Per-pad levels (host → engine) ---
     /// Held peak of each pad's output, linear, `f32` bits. Published per
-    /// block by a built-in with pads; see [`Self::store_pad_levels`].
+    /// block by a built-in with pads; see [`Self::store_pad_levels`]. A
+    /// Slicer publishes its sounding playheads here instead, packed as
+    /// `slicer::telemetry` describes.
     pub pad_levels: [AtomicU32; BUILTIN_PAD_SLOTS],
     /// Bumped after each published set; `0` until the first one.
     pub pad_levels_seq: AtomicU32,

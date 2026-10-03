@@ -47,7 +47,7 @@ use crate::components::text_input::{
 use crate::components::timeline::timeline_state::{
     AudioClipStretchState, ClipType, InsertLoadStatus, InsertSlotState, StretchTiming,
     TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting, TrackState, TrackType, volume,
-    vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
+    vsti_output_child_channels_for_bus_layout,
 };
 use crate::i18n::I18n;
 use crate::overlay::{OverlayAnchor, inspector_combo_menu_position};
@@ -276,6 +276,9 @@ pub struct SelectedClipSummary<'a> {
     /// The fades the clip plays (a crossfade's on an overlapped edge) and
     /// whether its track is ARA-rendered. `None` until the owner resolves it.
     pub fades: Option<crate::components::timeline::timeline_state::ClipFadeSummary>,
+    /// Beats in a bar where the clip starts, for lengths shown in bars. 4
+    /// until the owner resolves it.
+    pub beats_per_bar: f64,
 }
 
 /// What the Inspector is currently editing. Resolved fresh from the live
@@ -822,7 +825,7 @@ fn vsti_output_dropdown(
     // whole pair, so a single tick gives full left+right sound (a mono bus
     // reports a duplicated pair). Bus 0 is Main 1/2, already shown above.
     let bus_counts = &slot.output_bus_channel_counts;
-    for bus_index in vsti_output_bus_strip_indices(bus_counts) {
+    for bus_index in slot.output_strip_indices() {
         if bus_index == 0 {
             continue;
         }
@@ -3145,7 +3148,7 @@ fn truncate_value(text: impl Into<String>) -> impl IntoElement {
 //
 // Two questions, asked in order, each answered by one control:
 //
-//   1. What decides how long this clip plays?   Off · Speed · Tempo · Warp
+//   1. What decides how long this clip plays?   Off · Speed · Fit · Warp
 //   2. Does its pitch follow the speed?         Keep pitch · Tape
 //
 // plus a transpose wherever pitch is decoupled from speed. Everything else the
@@ -3224,12 +3227,68 @@ fn stretch_segments<T: Copy + PartialEq + 'static>(
         }))
 }
 
-/// The Tempo timing's source-BPM block: the value, how it was found, and the
-/// one-click corrections for the classic half/double-time mistake.
+/// "8 bars", "7 bars 2 beats", "6.37 beats": a fitted clip's length, in the
+/// bars it lands on when it is whole beats.
+fn fitted_length_label(beats: f64, beats_per_bar: f64) -> String {
+    let whole = beats.round();
+    if (beats - whole).abs() > 0.005 {
+        return format!("{beats:.2} beats");
+    }
+    let count = |n: f64, one: &str, many: &str| {
+        if (n - 1.0).abs() < 1.0e-9 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let per_bar = if beats_per_bar.is_finite() && beats_per_bar > 0.0 {
+        beats_per_bar
+    } else {
+        4.0
+    };
+    let bars = (whole / per_bar + 1.0e-9).floor();
+    let rest = ((whole - bars * per_bar) * 100.0).round() / 100.0;
+    match (bars > 0.0, rest > 0.0) {
+        (false, _) => count(rest, "beat", "beats"),
+        (true, false) => count(bars, "bar", "bars"),
+        (true, true) => format!(
+            "{} {}",
+            count(bars, "bar", "bars"),
+            count(rest, "beat", "beats")
+        ),
+    }
+}
+
+/// How a fitted clip's own tempo plays against the project's, and a hint at
+/// the classic half/double-time misreading when the speed change is that
+/// large.
+fn fitted_speed_hint(source_bpm: f64, project_bpm: f64) -> String {
+    let speed = project_bpm / source_bpm.max(1.0e-6);
+    let change = if (speed - 1.0).abs() < 0.005 {
+        "at its own speed".to_string()
+    } else if speed > 1.0 {
+        format!("{:.0}% faster", (speed - 1.0) * 100.0)
+    } else {
+        format!("{:.0}% slower", (1.0 - speed) * 100.0)
+    };
+    let octave = if !(0.74..=1.35).contains(&speed) {
+        " Half or double time? Try ÷2 or ×2."
+    } else {
+        ""
+    };
+    format!("Fitted to {project_bpm:.1} BPM, playing {change}.{octave}")
+}
+
+/// The Fit timing: the clip's own tempo (detected, typed, or set by its
+/// length), the half/double-time corrections, and the length it fits to.
+/// Every one of them is the same edit — a new source tempo — and the clip
+/// follows the project tempo from there.
+#[allow(clippy::too_many_arguments)]
 fn stretch_tempo_rows(
     clip_id: &str,
     s: &AudioClipStretchState,
     project_bpm: f64,
+    beats_per_bar: f64,
     tempo: &StretchTempoUiSnapshot,
     cb: &ClipStretchCb,
     callbacks: &InspectorCallbacks,
@@ -3259,9 +3318,7 @@ fn stretch_tempo_rows(
     } else if let Some(error) = tempo.error.as_ref() {
         Some(error.clone())
     } else if let Some(source) = s.bpm_source {
-        Some(format!(
-            "Plays at the project tempo: {source:.1} → {project_bpm:.1} BPM."
-        ))
+        Some(fitted_speed_hint(source, project_bpm))
     } else {
         Some("Detect the clip's tempo, or drag the value to set it.".to_string())
     };
@@ -3290,6 +3347,26 @@ fn stretch_tempo_rows(
                 bpm * 2.0 <= 999.0,
                 "clip-stretch-bpm-double".into(),
             ))
+    });
+    // The length it fits to. Scrubbing it sets the tempo that makes the clip
+    // exactly that many whole beats.
+    let fit_length = s.fitted_beats().map(|beats| {
+        let s = s.clone();
+        clip_stretch_stepper(
+            "clip-stretch-fit-beats",
+            clip_id,
+            beats,
+            fitted_length_label(beats, beats_per_bar),
+            1.0,
+            4096.0,
+            1.0,
+            false,
+            callbacks,
+            move |beats| match s.source_bpm_for_beats(beats.round().max(1.0), project_bpm) {
+                Some(bpm) => s.fitted_to_source_bpm(bpm, project_bpm),
+                None => s.clone(),
+            },
+        )
     });
     // Candidates are offered only when detection could not decide on its own —
     // a confident result has already been applied.
@@ -3342,6 +3419,7 @@ fn stretch_tempo_rows(
                 )),
         ))
         .children(halve_double.map(|row| compact_property_row("", row)))
+        .children(fit_length.map(|row| compact_property_row("Fit to", row)))
         .children(candidates.map(|row| compact_property_row("Candidates", row)))
         .children(status.map(inspector_hint_text))
 }
@@ -3465,13 +3543,22 @@ fn stretch_section_body(
                         ),
                     ))
                     .child(inspector_hint_text(
-                        "Over 100% plays longer and slower. Or drag a clip edge with the Stretch tool (T).",
+                        "Over 100% plays longer and slower. To lock a clip to the bars, choose Fit.",
                     ))
                     .into_any_element(),
             )
         }
         StretchTiming::Tempo => Some(
-            stretch_tempo_rows(&clip_id, s, project_bpm, tempo, cb, callbacks).into_any_element(),
+            stretch_tempo_rows(
+                &clip_id,
+                s,
+                project_bpm,
+                clip.beats_per_bar,
+                tempo,
+                cb,
+                callbacks,
+            )
+            .into_any_element(),
         ),
         StretchTiming::Warp => Some(stretch_warp_rows(&clip_id, s, callbacks).into_any_element()),
     };
@@ -4219,5 +4306,43 @@ mod stretch_inspector_tests {
             stretch_length_summary(&s, 120.0, None).as_deref(),
             Some("0:04.00 → 0:08.00")
         );
+    }
+
+    #[test]
+    fn a_fitted_length_reads_in_bars_of_the_clips_meter() {
+        assert_eq!(fitted_length_label(32.0, 4.0), "8 bars");
+        assert_eq!(fitted_length_label(4.0, 4.0), "1 bar");
+        assert_eq!(fitted_length_label(30.0, 4.0), "7 bars 2 beats");
+        assert_eq!(fitted_length_label(29.0, 4.0), "7 bars 1 beat");
+        assert_eq!(fitted_length_label(3.0, 4.0), "3 beats");
+        assert_eq!(fitted_length_label(12.0, 3.0), "4 bars");
+        assert_eq!(fitted_length_label(31.7, 4.0), "31.70 beats");
+    }
+
+    #[test]
+    fn the_speed_hint_flags_a_likely_half_or_double_time_reading() {
+        assert_eq!(
+            fitted_speed_hint(124.88, 180.0),
+            "Fitted to 180.0 BPM, playing 44% faster. Half or double time? Try ÷2 or ×2."
+        );
+        assert_eq!(
+            fitted_speed_hint(118.0, 120.0),
+            "Fitted to 120.0 BPM, playing 2% faster."
+        );
+        assert_eq!(
+            fitted_speed_hint(120.0, 120.0),
+            "Fitted to 120.0 BPM, playing at its own speed."
+        );
+    }
+
+    /// Scrubbing "Fit to" sets the tempo that makes the clip that many beats.
+    #[test]
+    fn fitting_to_a_length_sets_the_source_tempo() {
+        // Four seconds of audio fitted to 8 beats is 120 BPM.
+        let s = decoded(48_000 * 4).fitted_to_source_bpm(100.0, 120.0);
+        let bpm = s.source_bpm_for_beats(8.0, 120.0).unwrap();
+        let fitted = s.fitted_to_source_bpm(bpm, 120.0);
+        assert!((fitted.bpm_source.unwrap() - 120.0).abs() < 1.0e-9);
+        assert!((fitted.fitted_beats().unwrap() - 8.0).abs() < 1.0e-9);
     }
 }

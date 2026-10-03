@@ -22,6 +22,12 @@ pub mod combo_box;
 pub mod command_palette;
 pub mod context_menu;
 pub mod controls;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod drum_sampler_menu;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod drum_sampler_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod drum_sampler_window;
 pub mod edit;
 mod editor_panel;
 mod effect_editor_tab_view;
@@ -60,6 +66,7 @@ pub(crate) use mixer_window::{external_mixer_debug, external_mixer_debug_enabled
 pub mod gpu_editor_diagnostics;
 pub mod inspector_kit;
 pub mod native_editor_shell;
+pub mod native_plugin_shell;
 pub mod numeric_edit;
 pub mod panel;
 mod performance_overlay;
@@ -78,6 +85,10 @@ pub mod plugin_shell_text;
 pub mod progress_dialog;
 pub mod project_settings_window;
 pub mod project_switcher;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod quick_sampler_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod quick_sampler_window;
 pub mod reorder;
 pub mod routing_matrix_window;
 pub mod scroll_thumb;
@@ -85,6 +96,10 @@ pub mod settings_components;
 pub mod settings_dialog;
 pub mod settings_layout;
 mod sidebar;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod slicer_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod slicer_window;
 pub mod slider;
 pub mod solfege_editor;
 pub mod song_text_panel;

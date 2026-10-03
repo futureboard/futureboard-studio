@@ -56,6 +56,7 @@ mod engine_snapshot_pitch_tests;
 mod export_ops;
 mod frame_diagnostics;
 mod helpers;
+pub(crate) use helpers::reveal_path;
 mod history_ops;
 mod input_ops;
 mod inspector_ops;
@@ -100,8 +101,7 @@ use frame_diagnostics::FrameDiagnostics;
 use helpers::{
     FocusContext, edit_command_debug, find_clip_summary, is_midi_routable_edit_command,
     is_supported_audio_ext, is_tap_tempo_command, is_text_input_key, key_debug,
-    normalize_command_id, reveal_path, should_handle_global_transport_shortcut,
-    transport_command_from_id,
+    normalize_command_id, should_handle_global_transport_shortcut, transport_command_from_id,
 };
 use project_ops::LifecycleAction;
 pub use studio_state::{

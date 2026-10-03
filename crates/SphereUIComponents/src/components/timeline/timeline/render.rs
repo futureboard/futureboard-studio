@@ -2087,8 +2087,14 @@ impl Render for Timeline {
                 // The Stretch tool turns an audio clip's edge into a time
                 // stretch (same audio, new length); every other tool trims.
                 let stretching = this.state.active_tool == TimelineTool::Time;
-                let stretched =
-                    stretching && this.state.stretch_clip_edge(&drag.clip_id, drag.edge, beat);
+                // A stretch fits the clip to the tempo, so its edge lands on
+                // the grid — whole bars and beats — unless Shift frees it.
+                let stretched = stretching && {
+                    let edge = this
+                        .state
+                        .snap_beats_with_bypass(beat, event.event.modifiers.shift);
+                    this.state.stretch_clip_edge(&drag.clip_id, drag.edge, edge)
+                };
                 if !stretched {
                     this.state.resize_clip_with_bypass(
                         &drag.clip_id,

@@ -305,6 +305,8 @@ enum BuiltinDsp {
     Transient(transient::Dsp),
     WrapSynth(wrapsynth::Dsp),
     DrumSampler(drumsampler::Dsp),
+    QuickSampler(quicksampler::Dsp),
+    Slicer(slicer::Dsp),
     Zcomp(zcomp::Dsp),
     MixStation(mixstation::Dsp),
     Compresser(compresser::Dsp),
@@ -335,6 +337,10 @@ struct BuiltinHostProcessor {
     /// instance (safe from the IPC thread), indexed by pad. `None` for every
     /// other built-in.
     drum_pad_loaders: Option<Vec<drumsampler::PadLoader>>,
+    /// Control-side sample loader for a built-in `quicksampler` or `slicer`
+    /// instance (safe from the IPC thread) — the Slicer plays through Quick
+    /// Sampler's voices. `None` for every other built-in.
+    sample_loader: Option<quicksampler::SampleLoader>,
     /// Engine sample rate the DSP was built at — needed to validate a `.nam`
     /// capture's declared rate on the IPC thread.
     sample_rate: f32,
@@ -347,6 +353,17 @@ unsafe impl Send for BuiltinHostProcessor {}
 unsafe impl Sync for BuiltinHostProcessor {}
 
 impl BuiltinHostProcessor {
+    /// Interleaved channels this processor renders per frame: a stereo pair,
+    /// or a multi-out instrument's every output. Producer thread (it reads the
+    /// DSP's kind only, which never changes after construction).
+    fn output_channels(&self) -> usize {
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        match unsafe { &*self.dsp.get() } {
+            BuiltinDsp::DrumSampler(_) => drumsampler::OUTPUT_CHANNELS,
+            _ => 2,
+        }
+    }
+
     /// Build the DSP for a built-in catalog stem, or `None` when the host has
     /// no core for it. The caller turns `None` into a load failure rather than
     /// publishing a silent instance.
@@ -364,6 +381,8 @@ impl BuiltinHostProcessor {
             "transient" => Some(Self::transient(sample_rate, state_json)),
             "wrapsynth" => Some(Self::wrapsynth(sample_rate, state_json)),
             "drumsampler" => Some(Self::drumsampler(sample_rate, state_json)),
+            "quicksampler" => Some(Self::quicksampler(sample_rate, state_json)),
+            "slicer" => Some(Self::slicer(sample_rate, state_json)),
             "zcomp" => Some(Self::zcomp(sample_rate, state_json)),
             "mixstation" => Some(Self::mixstation(sample_rate, state_json)),
             "compresser" => Some(Self::compresser(sample_rate, state_json)),
@@ -399,6 +418,7 @@ impl BuiltinHostProcessor {
             nam_loader,
             ir_loader,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -428,6 +448,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -457,6 +478,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -486,6 +508,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -513,6 +536,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -540,6 +564,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -567,6 +592,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -596,6 +622,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -625,6 +652,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -654,6 +682,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -675,6 +704,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -699,6 +729,53 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: Some(pad_loaders),
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn quicksampler(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = quicksampler::Dsp::new(sr);
+        if let Some(json) = state_json {
+            match quicksampler::ipc::QuickSamplerState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] QuickSampler state rejected: {error}");
+                }
+            }
+        }
+        let sample_loader = Some(dsp.sample_loader());
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::QuickSampler(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader,
+            sample_rate: sr,
+        }
+    }
+
+    fn slicer(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = slicer::Dsp::new(sr);
+        if let Some(json) = state_json {
+            match slicer::ipc::SlicerState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] Slicer state rejected: {error}");
+                }
+            }
+        }
+        let sample_loader = Some(dsp.sample_loader());
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::Slicer(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader,
             sample_rate: sr,
         }
     }
@@ -726,6 +803,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -756,6 +834,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -785,6 +864,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -871,13 +951,12 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
-            BuiltinDsp::DrumSampler(dsp) => {
-                for i in 0..frames {
-                    let (l, r) = dsp.process_stereo();
-                    interleaved[i * 2] = l;
-                    interleaved[i * 2 + 1] = r;
-                }
-            }
+            // Multi-out: every pad on its own output's pair, 32 channels.
+            BuiltinDsp::DrumSampler(dsp) => dsp.process_block_multi(interleaved, frames),
+            // Renders whole blocks: its voices run as a block loop, and a
+            // sample submitted since the last block is adopted at its start.
+            BuiltinDsp::QuickSampler(dsp) => dsp.process_block(interleaved, frames),
+            BuiltinDsp::Slicer(dsp) => dsp.process_block(interleaved, frames),
             BuiltinDsp::Zcomp(dsp) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
@@ -932,13 +1011,23 @@ impl BuiltinHostProcessor {
         unsafe { &mut *self.spectrum.get() }.analyze().copied()
     }
 
-    /// Per-pad output levels for a built-in with pads (Drum Sampler); `None`
-    /// for every other core. Producer thread only (same contract as
+    /// Per-pad output levels for a built-in with pads (Drum Sampler), or a
+    /// Slicer's sounding playheads in the same block (`slicer::telemetry`);
+    /// `None` for every other core. Producer thread only (same contract as
     /// `process_block`).
     fn pad_levels(&self) -> Option<[f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS]> {
+        use SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS;
+        const _: () = assert!(drumsampler::PADS == BUILTIN_PAD_SLOTS);
+        const _: () = assert!(slicer::telemetry::SLOTS <= BUILTIN_PAD_SLOTS);
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &*self.dsp.get() } {
             BuiltinDsp::DrumSampler(dsp) => Some(dsp.pad_levels()),
+            // The Slicer's playheads take the front of the block.
+            BuiltinDsp::Slicer(dsp) => {
+                let mut block = [0.0; BUILTIN_PAD_SLOTS];
+                block[..slicer::telemetry::SLOTS].copy_from_slice(&dsp.telemetry());
+                Some(block)
+            }
             _ => None,
         }
     }
@@ -1108,6 +1197,36 @@ impl BuiltinHostProcessor {
                     slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
                 })
             }
+            BuiltinDsp::QuickSampler(dsp) => {
+                let f = dsp.meter_frame();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    // An instrument has no audio input to meter.
+                    in_peak: 0.0,
+                    in_rms: 0.0,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    gain_reduction_db: 0.0,
+                    in_clip: false,
+                    out_clip: f.out_clip,
+                    slot_in_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
+            BuiltinDsp::Slicer(dsp) => {
+                let f = dsp.meter_frame();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    // An instrument has no audio input to meter.
+                    in_peak: 0.0,
+                    in_rms: 0.0,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    gain_reduction_db: 0.0,
+                    in_clip: false,
+                    out_clip: f.out_clip,
+                    slot_in_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
             BuiltinDsp::DrumSampler(dsp) => {
                 let f = dsp.meter_frame();
                 Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
@@ -1185,6 +1304,8 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Imager(dsp) => dsp.latency_samples(),
             BuiltinDsp::WrapSynth(_) => 0,
             BuiltinDsp::DrumSampler(dsp) => dsp.latency_samples(),
+            BuiltinDsp::QuickSampler(dsp) => dsp.latency_samples(),
+            BuiltinDsp::Slicer(dsp) => dsp.latency_samples(),
             BuiltinDsp::Zcomp(dsp) => dsp.latency_samples(),
             BuiltinDsp::MixStation(dsp) => dsp.latency_samples(),
             BuiltinDsp::Compresser(dsp) => dsp.latency_samples(),
@@ -1238,6 +1359,12 @@ impl BuiltinHostProcessor {
             BuiltinDsp::DrumSampler(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
+            BuiltinDsp::QuickSampler(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::Slicer(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
             BuiltinDsp::Zcomp(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
@@ -1268,8 +1395,50 @@ impl BuiltinHostProcessor {
                 0xb0 if matches!(event.data1, 120 | 123) => dsp.all_notes_off(),
                 _ => {}
             },
+            // A melodic instrument: channels, sustain and pitch bend count.
+            BuiltinDsp::QuickSampler(dsp) => {
+                let channel = event.status & 0x0f;
+                match event.status & 0xf0 {
+                    0x90 if event.data2 > 0 => {
+                        dsp.note_on_channel(channel, event.data1, event.data2)
+                    }
+                    0x80 | 0x90 => dsp.note_off_channel(channel, event.data1),
+                    0xb0 => dsp.control_change(channel, event.data1, event.data2),
+                    0xe0 => dsp.pitch_bend(
+                        channel,
+                        u16::from(event.data1 & 0x7f) | (u16::from(event.data2 & 0x7f) << 7),
+                    ),
+                    _ => {}
+                }
+            }
+            // One slice per key; the same channel handling as Quick Sampler.
+            BuiltinDsp::Slicer(dsp) => {
+                let channel = event.status & 0x0f;
+                match event.status & 0xf0 {
+                    0x90 if event.data2 > 0 => {
+                        dsp.note_on_channel(channel, event.data1, event.data2)
+                    }
+                    0x80 | 0x90 => dsp.note_off_channel(channel, event.data1),
+                    0xb0 => dsp.control_change(channel, event.data1, event.data2),
+                    0xe0 => dsp.pitch_bend(
+                        channel,
+                        u16::from(event.data1 & 0x7f) | (u16::from(event.data2 & 0x7f) << 7),
+                    ),
+                    _ => {}
+                }
+            }
             _ => {}
         }
+    }
+}
+
+/// A built-in's output buses, as channel counts: one stereo bus for most,
+/// one per output for a multi-out instrument. Must agree with
+/// [`BuiltinHostProcessor::output_channels`].
+fn builtin_output_buses(stem: &str) -> Vec<u32> {
+    match stem {
+        "drumsampler" => vec![2; drumsampler::OUTPUTS],
+        _ => vec![2],
     }
 }
 
@@ -1507,6 +1676,141 @@ mod builtin_processor_tests {
         assert!(meters.out_peak > 0.0);
         assert_eq!((meters.in_peak, meters.in_rms), (0.0, 0.0));
         assert_eq!(processor.latency_samples(), 0);
+    }
+
+    /// Quick Sampler: a submitted sample plays from the next block on a MIDI
+    /// note, a wire edit reaches it, and persisted state is applied at build.
+    #[test]
+    fn quicksampler_plays_a_submitted_sample_and_takes_wire_params() {
+        let mut saved = quicksampler::default_params();
+        saved.sampler.root_note = 48;
+        let json = quicksampler::ipc::QuickSamplerState::new(saved)
+            .to_json()
+            .unwrap();
+        let processor = BuiltinHostProcessor::quicksampler(48_000, Some(&json));
+        let tone: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let sample = quicksampler::SampleData::from_interleaved(&tone, 1, 48_000).unwrap();
+        processor
+            .sample_loader
+            .as_ref()
+            .expect("quick sampler has a sample loader")
+            .submit(Some(std::sync::Arc::new(sample)));
+        let silence = [0.0f32; 512];
+        let mut output = [0.0f32; 1_024];
+        // The first block adopts the sample; the note sounds in the next.
+        processor.process_block(&silence, &silence, &mut output, 512);
+        processor.apply_midi(SharedMidiEvent {
+            status: 0x90,
+            data1: 48,
+            data2: 120,
+            ..SharedMidiEvent::default()
+        });
+        processor.process_block(&silence, &silence, &mut output, 512);
+        assert!(output.iter().any(|sample| sample.abs() > 0.05));
+        let meters = processor.meter_frame().expect("meters its output");
+        assert!(meters.out_peak > 0.0);
+
+        let volume = quicksampler::ui_param_index("volume").unwrap();
+        processor.apply_param(volume, 0.0);
+        processor.process_block(&silence, &silence, &mut output, 512);
+        assert!(output.iter().all(|sample| *sample == 0.0));
+        assert_eq!(processor.latency_samples(), 0);
+    }
+
+    /// Drum Sampler: it renders all its outputs interleaved, a pad sounds on
+    /// the output it is set to, and the buses it reports add up to the
+    /// channels it renders.
+    #[test]
+    fn drumsampler_renders_every_output() {
+        let mut saved = drumsampler::default_params();
+        saved.pads[0].output = 2;
+        let json = drumsampler::ipc::DrumSamplerState::new(saved)
+            .to_json()
+            .unwrap();
+        let processor = BuiltinHostProcessor::drumsampler(48_000, Some(&json));
+        let channels = processor.output_channels();
+        assert_eq!(channels, drumsampler::OUTPUT_CHANNELS);
+        assert_eq!(
+            builtin_output_buses("drumsampler").iter().sum::<u32>() as usize,
+            channels
+        );
+        assert_eq!(builtin_output_buses("quicksampler"), vec![2]);
+        let tone: Vec<f32> = (0..4_800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        processor.drum_pad_loaders.as_ref().unwrap()[0].submit(Box::new(drumsampler::PadBuffer {
+            samples: tone.into_boxed_slice(),
+            channels: 1,
+            frames: 4_800,
+            sample_rate: 48_000.0,
+        }));
+        processor.apply_midi(SharedMidiEvent {
+            status: 0x90,
+            data1: 36,
+            data2: 120,
+            ..SharedMidiEvent::default()
+        });
+        let silence = [0.0f32; 256];
+        let mut output = vec![0.0f32; 256 * channels];
+        processor.process_block(&silence, &silence, &mut output, 256);
+        let peak = |channel: usize| {
+            output
+                .chunks_exact(channels)
+                .fold(0.0_f32, |peak, frame| peak.max(frame[channel].abs()))
+        };
+        assert!(peak(4) > 0.01, "Out 3 is channels 5/6");
+        assert_eq!(peak(0), 0.0, "nothing on Main");
+    }
+
+    /// Slicer: persisted slices are applied at build, a submitted sample
+    /// plays one slice per key from the first key, and the wire reaches it.
+    #[test]
+    fn slicer_plays_a_slice_per_key_and_takes_wire_params() {
+        let mut saved = slicer::default_params();
+        saved.slicer =
+            slicer::slicing::with_points(saved.slicer, &slicer::slicing::equal_points(2), 0.0);
+        let json = slicer::ipc::SlicerState::new(saved).to_json().unwrap();
+        let processor = BuiltinHostProcessor::slicer(48_000, Some(&json));
+        // A silent first half and a loud second one.
+        let audio: Vec<f32> = (0..48_000)
+            .map(|i| if i < 24_000 { 0.0 } else { 0.5 })
+            .collect();
+        let sample = quicksampler::SampleData::from_interleaved(&audio, 1, 48_000).unwrap();
+        processor
+            .sample_loader
+            .as_ref()
+            .expect("slicer has a sample loader")
+            .submit(Some(std::sync::Arc::new(sample)));
+        let silence = [0.0f32; 512];
+        let mut output = [0.0f32; 1_024];
+        processor.process_block(&silence, &silence, &mut output, 512);
+        let note_on = |pitch: u8| SharedMidiEvent {
+            status: 0x90,
+            data1: pitch,
+            data2: 127,
+            ..SharedMidiEvent::default()
+        };
+        processor.apply_midi(note_on(slicer::DEFAULT_FIRST_KEY));
+        processor.process_block(&silence, &silence, &mut output, 512);
+        assert!(output.iter().all(|sample| sample.abs() < 1.0e-6));
+        processor.apply_midi(note_on(slicer::DEFAULT_FIRST_KEY + 1));
+        processor.process_block(&silence, &silence, &mut output, 512);
+        assert!(output.iter().any(|sample| sample.abs() > 0.2));
+        assert!(processor.meter_frame().expect("meters").out_peak > 0.0);
+        // The editor is told which slice sounds, and where, whatever sent
+        // the note.
+        let block = processor.pad_levels().expect("telemetry");
+        let heads = slicer::telemetry::decode(
+            block
+                .first_chunk::<{ slicer::telemetry::SLOTS }>()
+                .expect("the playheads lead the block"),
+        );
+        assert_eq!(heads.len(), 1, "{heads:?}");
+        assert_eq!(heads[0].note, slicer::DEFAULT_FIRST_KEY + 1);
+        assert!(heads[0].position > 0.5, "{heads:?}");
+
+        let volume = slicer::ui_param_index("volume").unwrap();
+        processor.apply_param(volume, 0.0);
+        processor.process_block(&silence, &silence, &mut output, 512);
+        assert!(output.iter().all(|sample| *sample == 0.0));
     }
 
     /// Imager at rest passes a wide signal through; narrowing every band
@@ -2559,7 +2863,7 @@ fn service_audio_bridge(
         b.capture_spectrum(&in_l[..frames], &in_r[..frames]);
     }
     let output_channels = match runtime {
-        BlockRuntime::Builtin(_) => 2,
+        BlockRuntime::Builtin(builtin) => builtin.output_channels().min(MAX_CHANNELS),
         BlockRuntime::Vst3 => dsp
             .main_audio_output_channel_count_for_instance(plugin_instance_id)
             .unwrap_or_else(|| bridge.plugin_output_channels())
@@ -2580,7 +2884,7 @@ fn service_audio_bridge(
                 &mut interleaved[..len],
                 frames,
             );
-            2
+            output_channels
         }
         BlockRuntime::Vst3 => {
             // Real transport ProcessContext published by the engine for this block.
@@ -3955,10 +4259,25 @@ fn dispatch(
             let _ = ipc::write_frame(
                 out,
                 &HostEvent::PluginLoaded {
-                    plugin_instance_id,
+                    plugin_instance_id: plugin_instance_id.clone(),
                     name,
                 },
             );
+            // A multi-out built-in reports its outputs the way a multi-bus
+            // VST3 does, so Studio can give each output its own mixer channel.
+            let buses = builtin_output_buses(stem);
+            if buses.len() > 1 {
+                let _ = ipc::write_frame(
+                    out,
+                    &HostEvent::ProcessingPrepared {
+                        plugin_instance_id,
+                        sample_rate,
+                        max_block_size,
+                        output_channels: buses.iter().sum(),
+                        output_bus_channels: buses,
+                    },
+                );
+            }
         }
         HostCommand::LoadAudioUnit {
             plugin_instance_id,
@@ -4210,6 +4529,32 @@ fn dispatch(
                 .map_err(|e| format!("sample payload is not valid base64: {e}"))
                 .and_then(|bytes| DirectAudio::load_audio_bytes(&bytes, &ext_hint))
                 .and_then(|decoded| {
+                    // One sample, for a Quick Sampler or a Slicer: slot 0 is
+                    // its only one.
+                    if let Some(loader) = processor.as_ref().and_then(|p| p.sample_loader.as_ref())
+                    {
+                        if pad_index != 0 {
+                            return Err(format!(
+                                "slot {pad_index} out of range for {plugin_instance_id}"
+                            ));
+                        }
+                        let (frames, channels, sample_rate) =
+                            (decoded.frames, decoded.channels, decoded.sample_rate);
+                        let peaks = drumsampler::waveform_peaks(
+                            &decoded.samples,
+                            channels,
+                            frames,
+                            drumsampler::WAVEFORM_POINTS,
+                        );
+                        let sample = quicksampler::SampleData::from_interleaved(
+                            &decoded.samples,
+                            channels,
+                            sample_rate,
+                        )
+                        .ok_or_else(|| "the file holds no audio".to_string())?;
+                        loader.submit(Some(std::sync::Arc::new(sample)));
+                        return Ok((frames, channels, sample_rate, peaks));
+                    }
                     let loaders = match &processor {
                         Some(p) => p.drum_pad_loaders.as_ref().ok_or_else(|| {
                             format!("built-in DSP for {plugin_instance_id} has no drum pads")
