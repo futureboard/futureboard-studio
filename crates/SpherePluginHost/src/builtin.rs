@@ -159,7 +159,7 @@ const CATALOG: &[BuiltinEntry] = &[
         name: "WrapSynth",
         category: "Instrument",
         kind: PluginKind::Instrument,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "drumsampler",

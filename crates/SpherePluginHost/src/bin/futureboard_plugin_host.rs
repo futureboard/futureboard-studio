@@ -4032,6 +4032,38 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
     }
 }
 
+/// Empties one sample slot of a built-in sampler: a Quick Sampler's or a
+/// Slicer's only sample (slot 0), or one Drum Sampler pad. The audio thread
+/// adopts the silence the way it adopts a new sample. Answers like a load:
+/// `(frames, channels, sample_rate, peaks)`, all empty.
+fn clear_builtin_sample(
+    processor: Option<&BuiltinHostProcessor>,
+    pad_index: u32,
+    plugin_instance_id: &str,
+) -> Result<(usize, usize, u32, Vec<u8>), String> {
+    let Some(processor) = processor else {
+        return Err(format!(
+            "no built-in DSP instance loaded for {plugin_instance_id}"
+        ));
+    };
+    if let Some(loader) = processor.sample_loader.as_ref() {
+        if pad_index != 0 {
+            return Err(format!(
+                "slot {pad_index} out of range for {plugin_instance_id}"
+            ));
+        }
+        loader.submit(None);
+        return Ok((0, 0, 0, Vec::new()));
+    }
+    let loader = processor
+        .drum_pad_loaders
+        .as_ref()
+        .and_then(|loaders| loaders.get(pad_index as usize))
+        .ok_or_else(|| format!("pad_index {pad_index} out of range for {plugin_instance_id}"))?;
+    loader.submit(Box::new(drumsampler::PadBuffer::empty()));
+    Ok((0, 0, 0, Vec::new()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch(
     cmd: HostCommand,
@@ -4524,69 +4556,75 @@ fn dispatch(
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_string();
-            let result = base64::engine::general_purpose::STANDARD
-                .decode(audio_b64.as_bytes())
-                .map_err(|e| format!("sample payload is not valid base64: {e}"))
-                .and_then(|bytes| DirectAudio::load_audio_bytes(&bytes, &ext_hint))
-                .and_then(|decoded| {
-                    // One sample, for a Quick Sampler or a Slicer: slot 0 is
-                    // its only one.
-                    if let Some(loader) = processor.as_ref().and_then(|p| p.sample_loader.as_ref())
-                    {
-                        if pad_index != 0 {
-                            return Err(format!(
-                                "slot {pad_index} out of range for {plugin_instance_id}"
-                            ));
+            // No audio at all: the editor is clearing the slot.
+            let result = if audio_b64.is_empty() {
+                clear_builtin_sample(processor.as_deref(), pad_index, &plugin_instance_id)
+            } else {
+                base64::engine::general_purpose::STANDARD
+                    .decode(audio_b64.as_bytes())
+                    .map_err(|e| format!("sample payload is not valid base64: {e}"))
+                    .and_then(|bytes| DirectAudio::load_audio_bytes(&bytes, &ext_hint))
+                    .and_then(|decoded| {
+                        // One sample, for a Quick Sampler or a Slicer: slot 0 is
+                        // its only one.
+                        if let Some(loader) =
+                            processor.as_ref().and_then(|p| p.sample_loader.as_ref())
+                        {
+                            if pad_index != 0 {
+                                return Err(format!(
+                                    "slot {pad_index} out of range for {plugin_instance_id}"
+                                ));
+                            }
+                            let (frames, channels, sample_rate) =
+                                (decoded.frames, decoded.channels, decoded.sample_rate);
+                            let peaks = drumsampler::waveform_peaks(
+                                &decoded.samples,
+                                channels,
+                                frames,
+                                drumsampler::WAVEFORM_POINTS,
+                            );
+                            let sample = quicksampler::SampleData::from_interleaved(
+                                &decoded.samples,
+                                channels,
+                                sample_rate,
+                            )
+                            .ok_or_else(|| "the file holds no audio".to_string())?;
+                            loader.submit(Some(std::sync::Arc::new(sample)));
+                            return Ok((frames, channels, sample_rate, peaks));
                         }
-                        let (frames, channels, sample_rate) =
-                            (decoded.frames, decoded.channels, decoded.sample_rate);
+                        let loaders = match &processor {
+                            Some(p) => p.drum_pad_loaders.as_ref().ok_or_else(|| {
+                                format!("built-in DSP for {plugin_instance_id} has no drum pads")
+                            })?,
+                            None => {
+                                return Err(format!(
+                                    "no built-in DSP instance loaded for {plugin_instance_id}"
+                                ));
+                            }
+                        };
+                        let loader = loaders.get(pad_index as usize).ok_or_else(|| {
+                            format!("pad_index {pad_index} out of range for {plugin_instance_id}")
+                        })?;
+                        let frames = decoded.frames;
+                        let channels = decoded.channels;
+                        let sample_rate = decoded.sample_rate;
+                        // The editor's overview, taken here while the IPC thread
+                        // still owns the buffer.
                         let peaks = drumsampler::waveform_peaks(
                             &decoded.samples,
                             channels,
                             frames,
                             drumsampler::WAVEFORM_POINTS,
                         );
-                        let sample = quicksampler::SampleData::from_interleaved(
-                            &decoded.samples,
+                        loader.submit(Box::new(drumsampler::PadBuffer {
+                            samples: decoded.samples.into_boxed_slice(),
                             channels,
-                            sample_rate,
-                        )
-                        .ok_or_else(|| "the file holds no audio".to_string())?;
-                        loader.submit(Some(std::sync::Arc::new(sample)));
-                        return Ok((frames, channels, sample_rate, peaks));
-                    }
-                    let loaders = match &processor {
-                        Some(p) => p.drum_pad_loaders.as_ref().ok_or_else(|| {
-                            format!("built-in DSP for {plugin_instance_id} has no drum pads")
-                        })?,
-                        None => {
-                            return Err(format!(
-                                "no built-in DSP instance loaded for {plugin_instance_id}"
-                            ));
-                        }
-                    };
-                    let loader = loaders.get(pad_index as usize).ok_or_else(|| {
-                        format!("pad_index {pad_index} out of range for {plugin_instance_id}")
-                    })?;
-                    let frames = decoded.frames;
-                    let channels = decoded.channels;
-                    let sample_rate = decoded.sample_rate;
-                    // The editor's overview, taken here while the IPC thread
-                    // still owns the buffer.
-                    let peaks = drumsampler::waveform_peaks(
-                        &decoded.samples,
-                        channels,
-                        frames,
-                        drumsampler::WAVEFORM_POINTS,
-                    );
-                    loader.submit(Box::new(drumsampler::PadBuffer {
-                        samples: decoded.samples.into_boxed_slice(),
-                        channels,
-                        frames,
-                        sample_rate: sample_rate as f32,
-                    }));
-                    Ok((frames, channels, sample_rate, peaks))
-                });
+                            frames,
+                            sample_rate: sample_rate as f32,
+                        }));
+                        Ok((frames, channels, sample_rate, peaks))
+                    })
+            };
             let event = match result {
                 Ok((frames, channels, sample_rate, peaks)) => {
                     eprintln!(

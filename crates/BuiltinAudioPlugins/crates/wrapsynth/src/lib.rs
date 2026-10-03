@@ -26,6 +26,8 @@ pub enum Waveform {
 }
 
 impl Waveform {
+    pub const ALL: [Waveform; 4] = [Self::Saw, Self::Square, Self::Triangle, Self::Sine];
+
     pub fn to_wire(self) -> f32 {
         match self {
             Self::Saw => 0.0,
@@ -45,7 +47,7 @@ impl Waveform {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Params {
     pub power: bool,
@@ -494,8 +496,11 @@ fn soft_clip(sample: f32) -> f32 {
     sample / (1.0 + sample.abs())
 }
 
+/// One oscillator's sample at `phase` (0..1) of its cycle: `wave` warped
+/// and blended toward its partner shape by `position`. The editor draws the
+/// oscillator with this same function.
 #[inline]
-fn wavetable(phase: f32, wave: Waveform, position: f32) -> f32 {
+pub fn wavetable(phase: f32, wave: Waveform, position: f32) -> f32 {
     let warped = phase.powf(0.45 + position * 1.55);
     let primary = waveform_sample(warped, wave);
     let secondary = waveform_sample(

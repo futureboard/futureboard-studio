@@ -100,6 +100,13 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::slicer_window::SlicerEditorWindow>,
     >,
+    /// Open native WrapSynth editors, keyed by insert id, like
+    /// `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub wrap_synth: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::wrap_synth_window::WrapSynthEditorWindow>,
+    >,
     /// Native main-owned external-bridge editor shells, keyed by
     /// `(track_id, plugin_instance_id)`.
     pub bridge: std::collections::HashMap<(String, String), BridgeEditorSession>,
@@ -689,26 +696,27 @@ impl StudioLayout {
                     let sampler_plugin_id = self
                         .slot_plugin_id_by_insert(&plugin_instance_id, cx)
                         .unwrap_or_else(|| "drumsampler".to_string());
+                    // An empty name: the slot was cleared.
+                    let cleared = name.is_empty();
                     if ok
                         && crate::components::builtin_plugin_editor::builtin_state_set_sample(
                             &sampler_plugin_id,
                             &plugin_instance_id,
                             pad_index as usize,
-                            Some(name.clone()),
+                            (!cleared).then(|| name.clone()),
                         )
                     {
                         self.note_plugin_state_edited(cx);
                     }
-                    let waveform =
-                        ok.then(
-                            || crate::components::builtin_plugin_editor::DrumPadWaveform {
-                                name: name.clone(),
-                                frames,
-                                channels,
-                                sample_rate,
-                                peaks,
-                            },
-                        );
+                    let waveform = (ok && !cleared).then(|| {
+                        crate::components::builtin_plugin_editor::DrumPadWaveform {
+                            name: name.clone(),
+                            frames,
+                            channels,
+                            sample_rate,
+                            peaks,
+                        }
+                    });
                     if let Some(waveform) = waveform.as_ref() {
                         crate::components::builtin_plugin_editor::drum_waveform_store(
                             &plugin_instance_id,
@@ -3126,6 +3134,13 @@ impl StudioLayout {
                 window,
                 cx,
             ),
+            Some(wrapsynth::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.wrap_synth,
+                crate::components::wrap_synth_window::open_wrap_synth_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
             _ => self.open_native_editor(
                 |windows| &mut windows.quick_sampler,
                 crate::components::quick_sampler_window::open_quick_sampler_editor,
@@ -3273,6 +3288,10 @@ impl StudioLayout {
             }
             let drums: Vec<_> = self.plugin_editors.drum_sampler.values().copied().collect();
             for handle in drums {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let synths: Vec<_> = self.plugin_editors.wrap_synth.values().copied().collect();
+            for handle in synths {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
         }

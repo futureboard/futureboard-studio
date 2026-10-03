@@ -152,9 +152,43 @@ pub fn ui_values(params: &Params) -> Vec<(&'static str, f32)> {
     ]
 }
 
+/// The wire edits that turn `old` into `new`, as `(index, value)`.
+pub fn wire_diff(old: &Params, new: &Params) -> Vec<(u32, f32)> {
+    ui_values(old)
+        .into_iter()
+        .zip(ui_values(new))
+        .filter(|((_, before), (_, after))| before != after)
+        .filter_map(|(_, (id, value))| ui_param_index(id).map(|index| (index, value)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_diff_carries_only_what_changed() {
+        let old = default_params();
+        assert!(wire_diff(&old, &old).is_empty());
+        let new = Params {
+            cutoff_hz: 900.0,
+            osc_b_wave: Waveform::Sine,
+            ..old
+        };
+        let diff = wire_diff(&old, &new);
+        assert_eq!(
+            diff,
+            vec![
+                (ui_param_index("oscBWave").unwrap(), 3.0),
+                (ui_param_index("cutoffHz").unwrap(), 900.0),
+            ]
+        );
+        let mut applied = old;
+        for (index, value) in diff {
+            assert!(apply_wire_param(&mut applied, index, value));
+        }
+        assert_eq!(applied, new);
+    }
 
     #[test]
     fn ids_round_trip_and_updates_clamp() {

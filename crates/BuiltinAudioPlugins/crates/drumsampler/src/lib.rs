@@ -83,6 +83,18 @@ pub struct PadBuffer {
     pub sample_rate: f32,
 }
 
+impl PadBuffer {
+    /// No audio: submitted to clear a pad, which then plays nothing.
+    pub fn empty() -> Self {
+        Self {
+            samples: Box::default(),
+            channels: 1,
+            frames: 0,
+            sample_rate: 48_000.0,
+        }
+    }
+}
+
 /// Control-thread <-> audio-thread hand-off for one pad's sample buffer.
 ///
 /// Thread contract mirrors `rodharerist`'s `IrLoader`: exactly one control
@@ -819,7 +831,11 @@ impl Instrument for Dsp {
             return;
         };
         self.pads[pad_index].adopt_pending();
-        let Some(buffer) = self.pads[pad_index].buffer.as_ref() else {
+        let Some(buffer) = self.pads[pad_index]
+            .buffer
+            .as_ref()
+            .filter(|buffer| buffer.frames > 0)
+        else {
             return;
         };
         // Scalars only: `Pad` also carries `sample_name` (a `String`), which
@@ -1063,6 +1079,15 @@ mod tests {
         dsp.note_on(36, 110);
         let (l, r) = dsp.process_stereo();
         assert_eq!((l, r), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_cleared_pad_falls_silent() {
+        let mut dsp = Dsp::new(RATE);
+        load(&mut dsp, 0, buffer_with_tone(4_800, RATE));
+        load(&mut dsp, 0, PadBuffer::empty());
+        dsp.note_on(36, 127);
+        assert_eq!(peak(&render(&mut dsp, 1_000)), 0.0);
     }
 
     #[test]

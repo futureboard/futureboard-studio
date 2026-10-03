@@ -37,7 +37,8 @@ use crate::components::builtin_plugin_editor_window::{
 use crate::components::builtin_plugin_files::{self as files, BuiltinFileKind};
 use crate::components::context_menu::context_menu_overlay;
 use crate::components::drum_sampler_menu::{
-    DrumMenuTarget, command, free_output, menu_entries, next_empty_pad, paste_settings, reset_pad,
+    DrumMenuTarget, cleared_pad, command, free_output, menu_entries, next_empty_pad,
+    paste_settings, reset_pad,
 };
 use crate::components::drum_sampler_panel::{
     DRAG_SLOP_PX, DrumSamplerCallbacks, DrumSamplerPanelState, DrumView, EDGE_GRAB_PX, FaderPress,
@@ -336,6 +337,15 @@ impl DrumSamplerEditorWindow {
         );
     }
 
+    /// Empties pad `index`: its settings back at their defaults now, and its
+    /// sample dropped by the host, whose answer clears the name.
+    fn clear_pad(&mut self, index: usize, cx: &mut Context<Self>) {
+        let pad = cleared_pad(index, &self.panel.params.pads[index]);
+        self.set_pad(index, pad, cx);
+        self.send_to_pad(index, String::new(), Vec::new());
+        cx.notify();
+    }
+
     /// Loads a file from the Samples folder onto the selected pad.
     fn load_file(&mut self, name: String, cx: &mut Context<Self>) {
         let index = self.panel.selected;
@@ -594,6 +604,7 @@ impl DrumSamplerEditorWindow {
                         }
                     }
                     command::RESET => self.set_pad(index, reset_pad(index, &pad), cx),
+                    command::CLEAR => self.clear_pad(index, cx),
                     command::OWN_OUTPUT => {
                         if pad.output == 0 {
                             if let Some(output) = free_output(&self.panel.params, index) {

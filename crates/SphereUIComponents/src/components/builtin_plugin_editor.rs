@@ -459,7 +459,7 @@ mod state_mirror {
                     .ok()?
             }
             BuiltinParams::WrapSynth(params) if origin == wrapsynth::ui::UI_ORIGIN => {
-                wrapsynth::ipc::WrapSynthState::new((**params).clone())
+                wrapsynth::ipc::WrapSynthState::new(**params)
                     .to_json()
                     .ok()?
             }
@@ -780,6 +780,16 @@ mod state_mirror {
         }
     }
 
+    /// A WrapSynth insert's mirrored params, or `None` when the slot holds
+    /// none (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_wrapsynth_params(insert_id: &str) -> Option<wrapsynth::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::WrapSynth(params) => Some(**params),
+            _ => None,
+        }
+    }
+
     /// A Slicer insert's mirrored params, or `None` when the slot holds none
     /// (a fresh insert plays the defaults). Read by its native editor.
     pub fn builtin_slicer_params(insert_id: &str) -> Option<slicer::Params> {
@@ -814,6 +824,7 @@ pub use state_mirror::{
     builtin_replay_changes, builtin_sample_names, builtin_slicer_params, builtin_state_apply,
     builtin_state_bytes, builtin_state_clear, builtin_state_remove, builtin_state_replay,
     builtin_state_seed, builtin_state_set_sample, builtin_used_output_buses,
+    builtin_wrapsynth_params,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is
