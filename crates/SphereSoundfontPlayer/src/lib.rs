@@ -615,6 +615,23 @@ impl SoundfontPlayer {
             let previous = self.channels[index];
             let channel = index as u8;
             let mut applied = next;
+            if !force && previous.preset != next.preset {
+                // Exclusive classes (a kit's choke groups, e.g. open/closed
+                // hi-hat) are instrument-region numbers scoped to whatever
+                // preset is on the channel. Swapping the kit without
+                // releasing first leaves any still-ringing voice from the
+                // old kit stranded: `Synthesizer::note_on` only chokes active
+                // voices whose class matches the *new* preset's region for
+                // the incoming note, so an old voice whose class number means
+                // something else now (or nothing) is never silenced. Across a
+                // few hits those orphaned voices stack with the new kit's own
+                // and can drive the mix well past unity gain. Releasing here
+                // — the same way a muted channel is released below — keeps
+                // a kit switch from ever leaving two generations of voices
+                // sounding together.
+                self.synthesizer.note_off_all_channel(channel.into(), false);
+                self.track_all_notes_off(Some(channel));
+            }
             if force || previous.preset != next.preset {
                 applied.preset = match next.preset {
                     Some((bank, patch)) => match self.select_channel_preset(channel, bank, patch) {
@@ -1503,6 +1520,49 @@ mod tests {
             previous = sample;
         }
         assert!(largest < 0.01, "largest sample-to-sample step {largest}");
+    }
+
+    /// The bug this covers: switching a channel's kit mid-playback (e.g. a
+    /// drum part swapped for another while a hit is still ringing) never
+    /// released the old kit's voices. The new kit's notes do not share the
+    /// old kit's exclusive classes, so `Synthesizer::note_on`'s choke never
+    /// matches them, and the old voices kept looping forever alongside the
+    /// new ones — stacking without bound and driving the mix well past what
+    /// either kit alone would produce.
+    #[test]
+    fn switching_a_channels_kit_releases_its_still_ringing_notes() {
+        let mut player = multi_player();
+        let mut channels = default_channels();
+        channels[3].preset = Some(test_font::DRUM_PRESET);
+        player.set_channels(&channels);
+        player.note_on(3, 60, 100).expect("drum hit on, held");
+        // Let the (looping, never-decaying) drum voices settle in.
+        peak(&mut player, 2_048);
+
+        // Swap the channel's kit without ever sending a note off for the
+        // held hit — exactly what a live kit switch during playback does.
+        channels[3].preset = Some(test_font::MELODIC_PRESET);
+        player.set_channels(&channels);
+        player.note_on(3, 60, 100).expect("melodic note on");
+
+        // Long enough for a release to fully decay. The synthetic bank loops
+        // every zone forever, so if the old drum voices were never released
+        // this never settles no matter how long we render.
+        peak(&mut player, 4_096);
+        let settled = peak(&mut player, 16_384);
+
+        let mut reference = multi_player();
+        let mut reference_channels = default_channels();
+        reference_channels[3].preset = Some(test_font::MELODIC_PRESET);
+        reference.set_channels(&reference_channels);
+        reference.note_on(3, 60, 100).expect("reference note on");
+        let reference_peak = peak(&mut reference, 16_384);
+
+        assert!(
+            settled < reference_peak * 1.5,
+            "a kit switch must release the old kit's still-ringing notes: \
+             settled={settled} reference={reference_peak}"
+        );
     }
 
     /// A choke group belongs to its channel: a kit on another channel does not

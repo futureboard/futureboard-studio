@@ -54,7 +54,9 @@ const CATALOG: &[BuiltinEntry] = &[
         name: "Rodhareist",
         category: "Multi-FX",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        // Native GPUI editor (see `sphere_ui_components::components::rodhareist_window`) —
+        // the old CEF/React `editorui/` bundle was removed.
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "equz8",
@@ -374,10 +376,6 @@ mod tests {
     #[test]
     fn editors_are_limited_to_builtins_that_ship_one() {
         assert_eq!(
-            builtin_editor_url(&builtin_id("rodharerist")).as_deref(),
-            Some("mikoplugin://rodharerist/index.html")
-        );
-        assert_eq!(
             builtin_editor_url(&builtin_id("equz8")).as_deref(),
             Some("mikoplugin://equz8/index.html")
         );
@@ -427,6 +425,17 @@ mod tests {
         );
         assert!(builtin_editor_url(&builtin_id("c1073")).is_none());
         assert!(builtin_editor_url("vst3:whatever").is_none());
+    }
+
+    #[test]
+    fn rodharerist_is_native_not_web() {
+        assert!(builtin_editor_url(&builtin_id("rodharerist")).is_none());
+        assert_eq!(
+            builtin_editor_kind(&builtin_id("rodharerist")),
+            Some(BuiltinEditorKind::Native)
+        );
+        assert!(builtin_has_native_editor("rodharerist"));
+        assert!(builtin_has_editor("rodharerist"));
     }
 
     #[test]
