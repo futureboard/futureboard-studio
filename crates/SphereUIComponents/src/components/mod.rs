@@ -136,6 +136,10 @@ pub mod virtual_keyboard;
 pub mod virtual_speaker_window;
 #[cfg(feature = "gpu-renderer")]
 pub mod visualizer;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod wrap_synth_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod wrap_synth_window;
 
 pub use about_window::{open_about_window, AboutWindow};
 pub use add_track_dialog::{

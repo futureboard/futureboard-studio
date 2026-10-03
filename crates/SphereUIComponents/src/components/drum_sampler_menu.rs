@@ -30,6 +30,7 @@ pub mod command {
     pub const COPY: &str = "copy";
     pub const PASTE: &str = "paste";
     pub const RESET: &str = "reset";
+    pub const CLEAR: &str = "clear";
     pub const OWN_OUTPUT: &str = "own-output";
     pub const FIRST_OUTPUT: &str = "first-output";
     pub const MUTE: &str = "mute";
@@ -77,6 +78,15 @@ pub fn reset_pad(index: usize, pad: &Pad) -> Pad {
         note: pad.note,
         sample_name: pad.sample_name.clone(),
         output: pad.output,
+        ..drumsampler::default_pad(index)
+    }
+}
+
+/// Pad `index` emptied: no sample, every setting back at its default,
+/// still on its own note.
+pub fn cleared_pad(index: usize, pad: &Pad) -> Pad {
+    Pad {
+        note: pad.note,
         ..drumsampler::default_pad(index)
     }
 }
@@ -198,6 +208,11 @@ fn pad_entries(
             ContextMenuEntry::disabled_item("Paste Settings", command::PASTE)
         },
         ContextMenuEntry::item("Reset Settings", command::RESET),
+        if has_sample {
+            ContextMenuEntry::item("Clear Pad", command::CLEAR)
+        } else {
+            ContextMenuEntry::disabled_item("Clear Pad", command::CLEAR)
+        },
         ContextMenuEntry::Separator,
         own,
         if pad.output == 0 {
@@ -279,6 +294,23 @@ mod tests {
     }
 
     #[test]
+    fn clearing_keeps_only_the_note() {
+        let mut pad = drumsampler::default_pad(4);
+        pad.note = 60;
+        pad.gain_db = -9.0;
+        pad.output = 5;
+        pad.muted = true;
+        pad.sample_name = Some("tom.wav".into());
+        let cleared = cleared_pad(4, &pad);
+        assert_eq!(cleared.note, 60);
+        assert_eq!(cleared.sample_name, None);
+        assert_eq!(
+            (cleared.gain_db, cleared.output, cleared.muted),
+            (0.0, 0, false)
+        );
+    }
+
+    #[test]
     fn the_next_empty_pad_wraps_round_the_kit() {
         let mut params = drumsampler::default_params();
         params.pads[5].sample_name = Some("a.wav".into());
@@ -294,6 +326,10 @@ mod tests {
         let panel = DrumSamplerPanelState::default();
         let entries = menu_entries(&panel, &DrumMenuTarget::Pad(0), false);
         assert_eq!(command_of(&entries, command::PLAY).map(|c| c.1), Some(true));
+        assert_eq!(
+            command_of(&entries, command::CLEAR).map(|c| c.1),
+            Some(true)
+        );
         assert_eq!(
             command_of(&entries, command::PASTE).map(|c| c.1),
             Some(true)
