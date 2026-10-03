@@ -100,6 +100,12 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::slicer_window::SlicerEditorWindow>,
     >,
+    /// Open native Rodhareist editors, keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub rodhareist: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::rodhareist_window::RodhareistEditorWindow>,
+    >,
     /// Open native WrapSynth editors, keyed by insert id, like
     /// `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
@@ -645,6 +651,17 @@ impl StudioLayout {
                             );
                         });
                     }
+                    #[cfg(feature = "builtin-plugin-editor")]
+                    if let Some(handle) = self
+                        .plugin_editors
+                        .rodhareist
+                        .get(&plugin_instance_id)
+                        .copied()
+                    {
+                        let _ = handle.update(cx, |editor, _window, cx| {
+                            editor.notify_nam_capture_result(ok, &name, error.as_deref(), cx);
+                        });
+                    }
                 }
                 ClientEvent::Host(HostEvent::BuiltinIrResult {
                     plugin_instance_id,
@@ -671,6 +688,17 @@ impl StudioLayout {
                                 stereo,
                                 truncated,
                             );
+                        });
+                    }
+                    #[cfg(feature = "builtin-plugin-editor")]
+                    if let Some(handle) = self
+                        .plugin_editors
+                        .rodhareist
+                        .get(&plugin_instance_id)
+                        .copied()
+                    {
+                        let _ = handle.update(cx, |editor, _window, cx| {
+                            editor.notify_ir_load_result(ok, &name, error.as_deref(), frames, cx);
                         });
                     }
                 }
@@ -3130,6 +3158,13 @@ impl StudioLayout {
             Some(drumsampler::ui::UI_ORIGIN) => self.open_native_editor(
                 |windows| &mut windows.drum_sampler,
                 crate::components::drum_sampler_window::open_drum_sampler_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(rodharerist::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.rodhareist,
+                crate::components::rodhareist_window::open_rodhareist_editor,
                 (target, identity, host_ops),
                 window,
                 cx,

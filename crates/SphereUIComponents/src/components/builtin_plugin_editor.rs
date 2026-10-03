@@ -758,6 +758,16 @@ mod state_mirror {
         }
     }
 
+    /// A Rodhareist insert's mirrored params, or `None` when the slot holds
+    /// none (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_rodhareist_params(insert_id: &str) -> Option<rodharerist::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Rodhareist(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
     /// The output buses a multi-out built-in insert is using (bus 0 being
     /// its main output), or `None` for an insert with one output. For the
     /// Drum Sampler: every output a pad is sent to, besides Main — the
@@ -821,10 +831,10 @@ mod state_mirror {
 #[cfg(feature = "builtin-plugin-editor")]
 pub use state_mirror::{
     builtin_default_replay, builtin_drum_sampler_params, builtin_quick_sampler_params,
-    builtin_replay_changes, builtin_sample_names, builtin_slicer_params, builtin_state_apply,
-    builtin_state_bytes, builtin_state_clear, builtin_state_remove, builtin_state_replay,
-    builtin_state_seed, builtin_state_set_sample, builtin_used_output_buses,
-    builtin_wrapsynth_params,
+    builtin_replay_changes, builtin_rodhareist_params, builtin_sample_names,
+    builtin_slicer_params, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
+    builtin_state_remove, builtin_state_replay, builtin_state_seed, builtin_state_set_sample,
+    builtin_used_output_buses, builtin_wrapsynth_params,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is

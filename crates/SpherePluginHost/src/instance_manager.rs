@@ -219,10 +219,9 @@ mod tests {
     #[test]
     fn editor_url_resolves_for_builtins_with_ui() {
         let m = InstanceManager::new();
-        assert_eq!(
-            m.editor_url(ROD).as_deref(),
-            Some("mikoplugin://rodharerist/index.html")
-        );
+        // Rodhareist's editor is native now (no CEF/React bundle); `equz8`
+        // still ships a web editor.
+        assert!(m.editor_url(ROD).is_none());
         assert_eq!(
             m.editor_url("builtin:equz8").as_deref(),
             Some("mikoplugin://equz8/index.html")
