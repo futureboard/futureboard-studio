@@ -19,12 +19,11 @@
 //!   routes the result back here through [`Self::notify_ir_load_result`] /
 //!   [`Self::notify_nam_capture_result`].
 //!
-//! Every card (`rodhareist_panel_dynamics`, `rodhareist_panel_drive_amp`,
-//! `rodhareist_panel_cab_capture`, `rodhareist_panel_modulation`,
-//! `rodhareist_panel_timefx`) is a pure presentational function taking plain
-//! values and closures — this window is the only thing that knows about
-//! `rodharerist::Params` and the host ops. [`rodhareist_panel`] in this
-//! module composes them.
+//! The view (`rodhareist_panel`, over the block model in
+//! `rodhareist_blocks`) is pure: it reads this window's params and hands
+//! edits back through the `*_cb` builders here — this window is the only
+//! thing that knows about the host ops. Factory presets come from
+//! `rodharerist::factory_presets` and load as ordinary wire edits.
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -36,7 +35,7 @@ use gpui::{
     ParentElement, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
     WindowKind,
 };
-use rodharerist::{EqModel, Params};
+use rodharerist::Params;
 
 use crate::components::builtin_plugin_editor_window::{
     BuiltinEditorHostOps, BuiltinIrLoadRequest, BuiltinNamLoadRequest, PluginInstanceKey,
@@ -44,12 +43,12 @@ use crate::components::builtin_plugin_editor_window::{
 use crate::components::native_plugin_shell::{
     native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
-use crate::components::rodhareist_panel::rodhareist_panel;
+use crate::components::rodhareist_panel::{rodhareist_panel, ChainFocus};
 
-pub const RODHAREIST_WINDOW_WIDTH: f32 = 1_180.0;
-pub const RODHAREIST_WINDOW_HEIGHT: f32 = 860.0;
-pub const RODHAREIST_WINDOW_MIN_WIDTH: f32 = 860.0;
-pub const RODHAREIST_WINDOW_MIN_HEIGHT: f32 = 560.0;
+pub const RODHAREIST_WINDOW_WIDTH: f32 = 1_280.0;
+pub const RODHAREIST_WINDOW_HEIGHT: f32 = 880.0;
+pub const RODHAREIST_WINDOW_MIN_WIDTH: f32 = 1_040.0;
+pub const RODHAREIST_WINDOW_MIN_HEIGHT: f32 = 680.0;
 
 /// `next` as wire edits against `current`: every wire id whose value
 /// differs, mapped to its wire index. Generic over the *entire* parameter
@@ -63,6 +62,67 @@ pub(crate) fn wire_diff(current: &Params, next: &Params) -> Vec<(u32, f32)> {
         .filter(|(id, value)| before.get(id) != Some(value))
         .filter_map(|(id, value)| rodharerist::ui_param_index(id).map(|index| (index, value)))
         .collect()
+}
+
+/// The insert's input and output levels (linear) for the signal-path
+/// meters, read from the host's meter frame on the shell's timer.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct IoMeter {
+    pub in_peak: f32,
+    pub in_rms: f32,
+    pub out_peak: f32,
+    pub out_rms: f32,
+    pub in_clip: bool,
+    pub out_clip: bool,
+}
+
+impl IoMeter {
+    /// Whether the reading moved enough to be worth a redraw.
+    fn poll(
+        &mut self,
+        source: Option<&crate::components::builtin_plugin_editor_window::BuiltinMeterSource>,
+        key: &PluginInstanceKey,
+    ) -> bool {
+        let next = source
+            .and_then(|source| source(key))
+            .map(|f| IoMeter {
+                in_peak: f.in_peak.clamp(0.0, 2.0),
+                in_rms: f.in_rms.clamp(0.0, 2.0),
+                out_peak: f.out_peak.clamp(0.0, 2.0),
+                out_rms: f.out_rms.clamp(0.0, 2.0),
+                in_clip: f.in_clip,
+                out_clip: f.out_clip,
+            })
+            .unwrap_or_default();
+        let moved = (next.in_peak - self.in_peak).abs() > 0.004
+            || (next.in_rms - self.in_rms).abs() > 0.004
+            || (next.out_peak - self.out_peak).abs() > 0.004
+            || (next.out_rms - self.out_rms).abs() > 0.004
+            || next.in_clip != self.in_clip
+            || next.out_clip != self.out_clip;
+        if moved {
+            *self = next;
+        }
+        moved
+    }
+}
+
+/// The factory preset `params` were loaded from: the bank entry equal to
+/// them, ignoring the global power and input trim a preset load keeps.
+fn matching_preset(params: &Params) -> Option<usize> {
+    rodharerist::factory_presets()
+        .iter()
+        .position(|preset| preset_applied(params, &preset.params) == *params)
+}
+
+/// `preset` as loaded over `current`: everything from the preset except the
+/// insert's power and input trim, which belong to the player's rig, not the
+/// tone.
+fn preset_applied(current: &Params, preset: &Params) -> Params {
+    let mut next = preset.clone();
+    next.power = current.power;
+    next.input_trim_db = current.input_trim_db;
+    next
 }
 
 /// A file load in flight for the Cabinet IR or the NAM Capture slot.
@@ -87,6 +147,13 @@ pub struct RodhareistEditorWindow {
     ir_status: LoadStatus,
     nam_status: LoadStatus,
     meter: ShellMeter,
+    io: IoMeter,
+    /// The factory preset last loaded, or matched on open. Shown as
+    /// "edited" once the params move away from it.
+    preset: Option<usize>,
+    /// The chain slot the block editor shows. Editor-local view state —
+    /// never saved, never sent to the plug-in.
+    chain_focus: Option<ChainFocus>,
     /// Cleared when the window closes, ending the meter timer.
     alive: Rc<Cell<bool>>,
 }
@@ -110,9 +177,13 @@ impl RodhareistEditorWindow {
             ir_status: LoadStatus::default(),
             nam_status: LoadStatus::default(),
             meter: ShellMeter::default(),
+            io: IoMeter::default(),
+            preset: None,
+            chain_focus: None,
             alive: Rc::new(Cell::new(true)),
         };
         window.sync_from_mirror(cx);
+        window.preset = matching_preset(&window.params);
         window.start_meter(cx);
         window
     }
@@ -143,10 +214,15 @@ impl RodhareistEditorWindow {
             self.key = key;
             self.ir_status = LoadStatus::default();
             self.nam_status = LoadStatus::default();
+            self.chain_focus = None;
+            self.preset = None;
         }
         self.identity = identity;
         self.host_ops = host_ops;
         self.sync_from_mirror(cx);
+        if self.preset.is_none() {
+            self.preset = matching_preset(&self.params);
+        }
     }
 
     /// Sends what changed between the window's params and `next` as wire
@@ -163,51 +239,177 @@ impl RodhareistEditorWindow {
         cx.notify();
     }
 
-    /// Builds a closure for a knob/trim change: applies `apply` to a clone of
-    /// the current params and forwards the diff. Handed to the pure
-    /// `rodhareist_panel_*` card functions as their `on_*` callbacks.
-    pub(crate) fn knob_cb(
+    /// Slider handler for one wire parameter: maps the slider's 0..1
+    /// position onto `min..max` and forwards the edit.
+    pub(crate) fn slider_cb(
         &self,
         cx: &Context<Self>,
-        apply: impl Fn(&mut Params, f32) + 'static,
+        id: &'static str,
+        min: f32,
+        max: f32,
     ) -> impl Fn(&f32, &mut Window, &mut App) + 'static {
         let entity = cx.entity().clone();
-        move |value: &f32, _window, app: &mut App| {
-            let value = *value;
+        move |norm: &f32, _window, app: &mut App| {
+            let value = min + norm.clamp(0.0, 1.0) * (max - min);
+            let _ = entity.update(app, |this, cx| this.set_wire(id, value, cx));
+        }
+    }
+
+    /// Double-click reset for one wire parameter: back to the plug-in's
+    /// default value.
+    pub(crate) fn reset_cb(
+        &self,
+        cx: &Context<Self>,
+        id: &'static str,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |_window, app: &mut App| {
+            let default = wire_value(&rodharerist::default_params(), id);
+            let _ = entity.update(app, |this, cx| this.set_wire(id, default, cx));
+        }
+    }
+
+    /// Click handler that sets one wire parameter (a model, a mic type).
+    pub(crate) fn set_cb(
+        &self,
+        cx: &Context<Self>,
+        id: &'static str,
+        value: f32,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |_event, _window, app: &mut App| {
+            let _ = entity.update(app, |this, cx| this.set_wire(id, value, cx));
+        }
+    }
+
+    /// Click handler that flips one on/off wire parameter.
+    pub(crate) fn toggle_cb(
+        &self,
+        cx: &Context<Self>,
+        id: &'static str,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |_event, _window, app: &mut App| {
             let _ = entity.update(app, |this, cx| {
-                let mut next = this.params.clone();
-                apply(&mut next, value);
+                let on = wire_value(&this.params, id) >= 0.5;
+                this.set_wire(id, if on { 0.0 } else { 1.0 }, cx);
+            });
+        }
+    }
+
+    fn set_wire(&mut self, id: &str, value: f32, cx: &mut Context<Self>) {
+        let mut next = self.params.clone();
+        if rodharerist::apply_to_params(&mut next, id, value) {
+            self.set_params(next, cx);
+        }
+    }
+
+    /// Click handler that loads factory preset `index` — every parameter it
+    /// changes goes out as a normal wire edit, so it saves and undoes like
+    /// any other edit.
+    pub(crate) fn load_preset_cb(
+        &self,
+        cx: &Context<Self>,
+        index: usize,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |_event, _window, app: &mut App| {
+            let _ = entity.update(app, |this, cx| {
+                let Some(preset) = rodharerist::factory_presets().get(index) else {
+                    return;
+                };
+                let next = preset_applied(&this.params, &preset.params);
+                this.preset = Some(index);
+                this.chain_focus = None;
                 this.set_params(next, cx);
             });
         }
     }
 
-    /// Builds a closure for a toggle/stepper click: applies `apply` to a
-    /// clone of the current params and forwards the diff.
-    pub(crate) fn click_cb(
+    /// Click handler for the sticky clip indicators.
+    pub(crate) fn clear_clip_cb(
+        &self,
+        cx: &Context<Self>,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |_event, _window, app: &mut App| {
+            let _ = entity.update(app, |this, cx| {
+                if let (Some(forward), Some(index)) = (
+                    this.host_ops.forward_param.clone(),
+                    rodharerist::ui_param_index("clear_clip"),
+                ) {
+                    forward(&this.key, index, 1.0, cx);
+                }
+            });
+        }
+    }
+
+    /// The loaded factory preset and whether the params have moved off it.
+    pub(crate) fn preset_status(&self) -> Option<(usize, bool)> {
+        let index = self.preset?;
+        let preset = rodharerist::factory_presets().get(index)?;
+        Some((
+            index,
+            preset_applied(&self.params, &preset.params) != self.params,
+        ))
+    }
+
+    pub(crate) fn io_meter(&self) -> IoMeter {
+        self.io
+    }
+
+    /// The host's tempo, read-only — the plug-in follows the transport.
+    pub(crate) fn host_tempo(&self) -> Option<f64> {
+        self.host_ops
+            .host_status_source
+            .as_ref()
+            .and_then(|source| source(&self.key))
+            .map(|(_rate, _block, _latency, tempo)| tempo as f64)
+            .filter(|tempo| *tempo > 0.0)
+    }
+
+    /// Click handler that points the block editor at `focus`.
+    pub(crate) fn focus_cb(
+        &self,
+        cx: &Context<Self>,
+        focus: ChainFocus,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |_event, _window, app: &mut App| {
+            let _ = entity.update(app, |this, cx| {
+                this.chain_focus = Some(focus);
+                cx.notify();
+            });
+        }
+    }
+
+    /// Click handler for a chain edit (add, move, remove a block): forwards
+    /// the param diff like [`Self::click_cb`], then keeps the editor on the
+    /// slot the edit lands on.
+    pub(crate) fn chain_edit_cb(
         &self,
         cx: &Context<Self>,
         apply: impl Fn(&mut Params) + 'static,
+        then: ChainFocus,
     ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
         let entity = cx.entity().clone();
         move |_event, _window, app: &mut App| {
             let _ = entity.update(app, |this, cx| {
                 let mut next = this.params.clone();
                 apply(&mut next);
+                this.chain_focus = Some(then);
                 this.set_params(next, cx);
             });
         }
     }
 
+    pub(crate) fn chain_focus(&self) -> Option<ChainFocus> {
+        self.chain_focus
+    }
+
     /// A clone of the current params, for the pure panel functions to read.
     pub(crate) fn params_snapshot(&self) -> Params {
         self.params.clone()
-    }
-
-    pub(crate) fn host_ops_forward_param(
-        &self,
-    ) -> Option<crate::components::builtin_plugin_editor_window::BuiltinParamForwarder> {
-        self.host_ops.forward_param.clone()
     }
 
     pub(crate) fn ir_loaded_info(&self) -> Option<(String, f32)> {
@@ -308,7 +510,8 @@ impl RodhareistEditorWindow {
         }
         #[cfg(not(feature = "native-dialogs"))]
         {
-            self.ir_status.error = Some("Native file dialogs are unavailable in this build.".into());
+            self.ir_status.error =
+                Some("Native file dialogs are unavailable in this build.".into());
             cx.notify();
         }
     }
@@ -442,7 +645,10 @@ impl RodhareistEditorWindow {
                 cx.background_executor().timer(SHELL_METER_INTERVAL).await;
                 let keep = this.update(cx, |this, cx| {
                     let key = this.key.clone();
-                    if this.meter.poll(this.host_ops.meter_source.as_ref(), &key) {
+                    let source = this.host_ops.meter_source.as_ref();
+                    let shell_moved = this.meter.poll(source, &key);
+                    let io_moved = this.io.poll(source, &key);
+                    if shell_moved || io_moved {
                         cx.notify();
                     }
                 });
@@ -473,8 +679,8 @@ impl Render for RodhareistEditorWindow {
             self.focused_once = true;
             self.focus_handle.focus(window, cx);
         }
-        let entity = cx.entity().clone();
         let on_close = self.on_close.clone();
+        let alive = self.alive.clone();
         let content = rodhareist_panel(self, cx);
 
         div()
@@ -486,8 +692,12 @@ impl Render for RodhareistEditorWindow {
                 &self.identity,
                 self.meter,
                 move |window, cx| {
-                    let _ = entity.update(cx, |_this, _cx| {});
+                    // Stop the meter timer, drop the window from Studio's
+                    // map, then actually close it — `on_close` alone only
+                    // forgets the handle and leaves the OS window open.
+                    alive.set(false);
                     on_close(window, cx);
+                    window.remove_window();
                 },
                 content,
             ))
@@ -527,14 +737,13 @@ pub fn open_rodhareist_editor(
     .map_err(|error| error.to_string())
 }
 
-/// Display label for an [`EqModel`] — shared by the dynamics card and
-/// anything else that needs to name the EQ slot's current voicing.
-pub(crate) fn eq_model_label(model: EqModel) -> &'static str {
-    match model {
-        EqModel::Studio => "Studio EQ",
-        EqModel::Vintage => "Vintage EQ",
-        EqModel::Modern => "Modern EQ",
-    }
+/// One wire parameter's current value.
+pub(crate) fn wire_value(params: &Params, id: &str) -> f32 {
+    rodharerist::ui_values(params)
+        .into_iter()
+        .find(|(wire, _)| *wire == id)
+        .map(|(_, value)| value)
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -557,6 +766,36 @@ mod tests {
         let (index, value) = diff[0];
         assert_eq!(index, rodharerist::ui_param_index("amp_gain").unwrap());
         assert_eq!(value, after.amp_gain);
+    }
+
+    /// Loading a preset sends only the wire edits `wire_diff` finds; replaying
+    /// them must rebuild the preset exactly, or part of it would never reach
+    /// the DSP (a field missing from the wire table, say).
+    #[test]
+    fn every_factory_preset_arrives_whole_over_the_wire() {
+        for start in [rodharerist::default_params(), {
+            let mut p = rodharerist::factory_presets()[0].params.clone();
+            p.input_trim_db = 3.0;
+            p.power = false;
+            p
+        }] {
+            for preset in rodharerist::factory_presets() {
+                let target = preset_applied(&start, &preset.params);
+                let mut replayed = start.clone();
+                for (index, value) in wire_diff(&start, &target) {
+                    let id = rodharerist::ui_param_id(index).expect("wire index has an id");
+                    assert!(
+                        rodharerist::apply_to_params(&mut replayed, id, value),
+                        "{id}"
+                    );
+                }
+                assert_eq!(replayed, target, "{} did not arrive whole", preset.name);
+                assert_eq!(
+                    matching_preset(&target).map(|i| rodharerist::factory_presets()[i].id),
+                    Some(preset.id)
+                );
+            }
+        }
     }
 
     #[test]
