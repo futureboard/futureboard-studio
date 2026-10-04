@@ -1,618 +1,1388 @@
-//! Rodhareist's native editor — the shell that composes every card.
+//! Rodhareist's native editor view.
 //!
-//! Owns no state of its own: [`rodhareist_panel`] takes the editor window
-//! (for its params and the `knob_cb`/`click_cb` closure builders) and lays
-//! out, top to bottom:
+//! Laid out after the Rodhareist plug-in design reference, inside the shared
+//! native plug-in shell:
 //!
-//! 1. the header — power, global input/output trim, a clear-clip button;
-//! 2. the signal chain rack — the order stages actually run in
-//!    (`Params::stage_order`), with up/down/remove per slot and a row of
-//!    "add" buttons for stages not yet in the chain;
-//! 3. every stage's card, built by the `rodhareist_panel_*` modules.
+//! ```txt
+//! ┌ preset bar ─ preset name ············ power · trims · host tempo ┐
+//! ├ presets ┬ signal path: INPUT meter · IN ─●─●─●─ OUT · MAIN meter ┤
+//! │ (bank)  ├ EDIT: categories │ models │ parameter sliders          ┤
+//! └─────────┴─────────────────────────────────────────────────────────┘
+//! ```
 //!
-//! The rack and the cards are deliberately independent: a stage can sit in
-//! the chain bypassed (its own `*_on` flag off) or have its knobs edited
-//! while not in the chain at all — exactly like unplugging a pedal rather
-//! than stepping on it.
+//! Owns no plug-in state: everything here reads the window's [`Params`] and
+//! hands back wire edits through the window's `*_cb` builders. The design's
+//! second path (a split) and editable tempo are not drawn: the DSP has one
+//! serial path, and tempo follows the host transport.
+//!
+//! The colours are the plug-in's own identity, scoped to this editor's
+//! bounds (DESIGN.md, "Built-in plugin editor signature"); Studio chrome
+//! around it keeps the theme tokens.
+
+use std::collections::HashMap;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, AnyElement, App, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, Window,
+    div, px, relative, svg, AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
+    Rgba, StatefulInteractiveElement, Styled,
 };
-use rodharerist::{AmpModel, CabModel, DelayModel, DriveModel, ModModel, Params, StageKind, WahModel};
+use rodharerist::{CabModel, Params, StageKind, ToneEngineKind};
 
-use crate::components::controls::{fb_badge, fb_button, fb_stepper_button, FbButtonKind};
-use crate::components::knob::knob_bipolar;
-use crate::components::rodhareist_panel_cab_capture::{cab_card, nam_card};
-use crate::components::rodhareist_panel_drive_amp::{amp_card, drive_card};
-use crate::components::rodhareist_panel_dynamics::{comp_card, eq_card, gate_card};
-use crate::components::rodhareist_panel_modulation::{mod_card, wah_card};
-use crate::components::rodhareist_panel_timefx::{delay_card, reverb_card};
-use crate::components::rodhareist_window::RodhareistEditorWindow;
-use crate::theme::{radius, space, typography, Colors};
+use crate::components::controls::fb_tooltip;
+use crate::components::rodhareist_blocks::{self as blocks, Category, ParamSpec, Tint};
+use crate::components::rodhareist_window::{IoMeter, RodhareistEditorWindow};
+use crate::components::slider::slider_with_reset;
 
-const KNOB_SIZE: f32 = 34.0;
+/// The plug-in's palette and proportions, from the design reference.
+mod pal {
+    use gpui::{rgb, rgba, Rgba};
 
-fn stage_label(kind: StageKind) -> &'static str {
-    match kind {
-        StageKind::Gate => "Gate",
-        StageKind::Drive => "Drive A",
-        StageKind::Amp => "Amp",
-        StageKind::Mod => "Mod A",
-        StageKind::Delay => "Delay A",
-        StageKind::Reverb => "Reverb",
-        StageKind::Cab => "Cabinet",
-        StageKind::Comp => "Comp A",
-        StageKind::Eq => "EQ A",
-        StageKind::Wah => "Wah",
-        StageKind::Drive2 => "Drive B",
-        StageKind::Mod2 => "Mod B",
-        StageKind::Delay2 => "Delay B",
-        StageKind::Eq2 => "EQ B",
-        StageKind::Comp2 => "Comp B",
+    pub fn bg() -> Rgba {
+        rgb(0x0d0e12)
+    }
+    pub fn panel() -> Rgba {
+        rgb(0x14161b)
+    }
+    pub fn path_bg() -> Rgba {
+        rgb(0x11131a)
+    }
+    pub fn column() -> Rgba {
+        rgb(0x101217)
+    }
+    pub fn header() -> Rgba {
+        rgb(0x181b21)
+    }
+    pub fn node() -> Rgba {
+        rgb(0x191c23)
+    }
+    pub fn hover() -> Rgba {
+        rgb(0x21242c)
+    }
+    pub fn pressed() -> Rgba {
+        rgb(0x0f1014)
+    }
+    pub fn picked() -> Rgba {
+        rgb(0x2a2d32)
+    }
+    pub fn meter_bg() -> Rgba {
+        rgb(0x1c1f26)
+    }
+    pub fn wire() -> Rgba {
+        rgb(0x343842)
+    }
+    pub fn port() -> Rgba {
+        rgb(0x3a3e47)
+    }
+    pub fn line() -> Rgba {
+        rgba(0xffffff12)
+    }
+    pub fn line_strong() -> Rgba {
+        rgba(0xffffff17)
+    }
+    pub fn text() -> Rgba {
+        rgb(0xd9d6cf)
+    }
+    pub fn muted() -> Rgba {
+        rgb(0x8d9096)
+    }
+    pub fn dim() -> Rgba {
+        rgb(0x6f7278)
+    }
+    pub fn bypassed() -> Rgba {
+        rgb(0x2e3136)
+    }
+    pub fn amber() -> Rgba {
+        rgb(0xe7a838)
+    }
+    pub fn amber_ring() -> Rgba {
+        rgba(0xe7a83833)
+    }
+    pub fn teal() -> Rgba {
+        rgb(0x4fc3c4)
+    }
+    pub fn neutral() -> Rgba {
+        rgb(0xb9b4a8)
+    }
+    pub fn on_accent() -> Rgba {
+        rgb(0x14110a)
+    }
+    pub fn green() -> Rgba {
+        rgb(0x4fb87d)
+    }
+    pub fn red() -> Rgba {
+        rgb(0xd65a4a)
+    }
+
+    pub const R_PANEL: f32 = 18.0;
+    pub const R_NODE: f32 = 14.0;
+    pub const R_CONTROL: f32 = 12.0;
+    pub const R_ROW: f32 = 10.0;
+    pub const R_PORT: f32 = 9.0;
+}
+
+fn tint(t: Tint) -> Rgba {
+    match t {
+        Tint::Amber => pal::amber(),
+        Tint::Teal => pal::teal(),
+        Tint::Neutral => pal::neutral(),
     }
 }
 
-/// Every stage not currently in `order`, in `StageKind::ALL` order — what
-/// the "add" row offers.
-fn stages_not_in_chain(order: &[Option<StageKind>]) -> Vec<StageKind> {
-    StageKind::ALL
+/// Which chain slot the edit panel shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChainFocus {
+    /// The block in this chain position.
+    Block(StageKind),
+    /// An empty position, waiting for a block.
+    Empty(usize),
+}
+
+/// What the editor actually shows: the requested focus while it still
+/// matches the chain, else the first block (or the first slot of an empty
+/// chain) — so an undo or preset that removes the focused block never
+/// leaves the editor pointing at nothing.
+fn resolve_focus(order: &[Option<StageKind>], requested: Option<ChainFocus>) -> ChainFocus {
+    match requested {
+        Some(ChainFocus::Block(kind)) if order.contains(&Some(kind)) => ChainFocus::Block(kind),
+        Some(ChainFocus::Empty(slot)) if order.get(slot) == Some(&None) => ChainFocus::Empty(slot),
+        _ => order
+            .iter()
+            .flatten()
+            .next()
+            .map(|kind| ChainFocus::Block(*kind))
+            .unwrap_or(ChainFocus::Empty(0)),
+    }
+}
+
+/// The stage of `category` that picking it should put in `slot`: the one
+/// already there, else the first instance not yet on the path.
+fn stage_for(order: &[Option<StageKind>], slot: usize, category: Category) -> Option<StageKind> {
+    if let Some(Some(kind)) = order.get(slot) {
+        if Category::of(*kind) == category {
+            return Some(*kind);
+        }
+    }
+    category
+        .kinds()
         .iter()
         .copied()
-        .filter(|kind| !order.iter().any(|slot| *slot == Some(*kind)))
-        .collect()
+        .find(|kind| !order.contains(&Some(*kind)))
 }
 
-fn header(window: &RodhareistEditorWindow, params: &Params, cx: &Context<RodhareistEditorWindow>) -> AnyElement {
-    let power_on = params.power;
+fn focus_slot(order: &[Option<StageKind>], focus: ChainFocus) -> usize {
+    match focus {
+        ChainFocus::Block(kind) => order.iter().position(|s| *s == Some(kind)).unwrap_or(0),
+        ChainFocus::Empty(slot) => slot,
+    }
+}
+
+fn caption(text: impl Into<gpui::SharedString>) -> gpui::Div {
     div()
+        .text_size(px(11.0))
+        .text_color(pal::muted())
+        .child(text.into())
+}
+
+/// A pressable row with the design's hover/press layers.
+fn row_button(id: impl Into<gpui::ElementId>, rest: Rgba) -> gpui::Stateful<gpui::Div> {
+    let hover = if rest.a == 0.0 { pal::hover() } else { rest };
+    div()
+        .id(id)
         .flex()
-        .flex_row()
         .items_center()
-        .flex_wrap()
-        .gap(px(space::LOOSE))
-        .p(px(space::LOOSE))
-        .border_b(px(1.0))
-        .border_color(Colors::border_subtle())
-        .child(fb_button(
-            "rodhareist-power",
-            if power_on { "On" } else { "Bypassed" },
-            if power_on {
-                FbButtonKind::Primary
-            } else {
-                FbButtonKind::Default
-            },
-            true,
-            window.click_cb(cx, |p| p.power = !p.power),
-        ))
-        .child(trim_knob(
-            "rodhareist-input-trim",
-            "Input",
-            params.input_trim_db,
-            window.knob_cb(cx, |p, v| p.input_trim_db = v),
-        ))
-        .child(trim_knob(
-            "rodhareist-output-trim",
-            "Output",
-            params.output_trim_db,
-            window.knob_cb(cx, |p, v| p.output_trim_db = v),
-        ))
-        .child(div().flex_1())
-        .child(fb_button(
-            "rodhareist-clear-clip",
-            "Clear Clip",
-            FbButtonKind::Ghost,
-            true,
-            {
-                let entity = cx.entity().clone();
-                move |_event, _window, app: &mut App| {
-                    let _ = entity.update(app, |this, cx| {
-                        if let (Some(forward), Some(index)) = (
-                            this_host_forward(this),
-                            rodharerist::ui_param_index("clear_clip"),
-                        ) {
-                            forward(this.key(), index, 1.0, cx);
-                        }
-                    });
-                }
-            },
-        ))
-        .into_any_element()
+        .rounded(px(pal::R_ROW))
+        .bg(rest)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover))
+        .active(|s| s.bg(pal::pressed()))
 }
 
-/// `forward_param`, read through the window without borrowing it mutably —
-/// a tiny indirection so the clear-clip click above can call it from inside
-/// an `entity.update` closure that already holds `&mut this`.
-fn this_host_forward(
-    this: &RodhareistEditorWindow,
-) -> Option<crate::components::builtin_plugin_editor_window::BuiltinParamForwarder> {
-    this.host_ops_forward_param()
+fn clear() -> Rgba {
+    gpui::rgba(0x00000000)
 }
 
-fn trim_knob(
-    id: &'static str,
+// ── Preset bar ──────────────────────────────────────────────────────────────
+
+fn power_button(
+    id: impl Into<gpui::ElementId>,
+    on: bool,
+    color: Rgba,
     label: &'static str,
-    value: f32,
-    on_change: impl Fn(&f32, &mut Window, &mut App) + 'static,
+    on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     div()
+        .id(id)
         .flex()
-        .flex_col()
         .items_center()
-        .gap(px(space::HAIR))
-        .child(knob_bipolar(
-            id,
-            value,
-            -24.0,
-            24.0,
-            KNOB_SIZE,
-            Colors::accent_primary(),
-            None,
-            0.0,
-            on_change,
-        ))
+        .justify_center()
+        .flex_shrink_0()
+        .size(px(32.0))
+        .rounded_full()
+        .bg(rgb_node_button())
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(|s| s.bg(pal::hover()))
+        .active(|s| s.bg(pal::pressed()))
+        .tooltip(fb_tooltip(label))
+        .on_click(on_click)
         .child(
-            div()
-                .text_size(px(typography::DENSE_CAPTION))
-                .text_color(Colors::text_muted())
-                .child(format!("{label} {value:+.1} dB")),
+            svg()
+                .path(crate::assets::ICON_POWER_PATH)
+                .size(px(16.0))
+                .text_color(if on { color } else { pal::dim() }),
         )
         .into_any_element()
 }
 
-fn rack(window: &RodhareistEditorWindow, params: &Params, cx: &Context<RodhareistEditorWindow>) -> AnyElement {
-    let order = params.stage_order;
-    let slots: Vec<(usize, StageKind)> = order
-        .iter()
-        .enumerate()
-        .filter_map(|(index, slot)| slot.map(|kind| (index, kind)))
-        .collect();
+fn rgb_node_button() -> Rgba {
+    gpui::rgb(0x1e2128)
+}
 
-    let mut row = div()
+fn trim_control(
+    window: &RodhareistEditorWindow,
+    values: &HashMap<&'static str, f32>,
+    id: &'static str,
+    label: &'static str,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    let Some(spec) = blocks::trim_spec(id, label) else {
+        return div().into_any_element();
+    };
+    let value = values.get(id).copied().unwrap_or(0.0);
+    div()
         .flex()
         .flex_row()
-        .flex_wrap()
         .items_center()
-        .gap(px(space::SNUG));
-    for (position, (slot_index, kind)) in slots.iter().enumerate() {
-        let slot_index = *slot_index;
-        let can_move_left = position > 0;
-        let can_move_right = position + 1 < slots.len();
-        let left_target = slots.get(position.wrapping_sub(1)).map(|(i, _)| *i);
-        let right_target = slots.get(position + 1).map(|(i, _)| *i);
-        row = row.child(
+        .gap(px(8.0))
+        .child(caption(label))
+        .child(div().w(px(96.0)).child(slider_with_reset(
+            format!("rodhareist-{id}"),
+            norm(value, &spec),
+            pal::amber(),
+            window.slider_cb(cx, spec.id, spec.min, spec.max),
+            Some(window.reset_cb(cx, spec.id)),
+        )))
+        .child(
+            div()
+                .w(px(60.0))
+                .text_size(px(12.0))
+                .text_color(pal::text())
+                .child(blocks::format_value(value, &spec)),
+        )
+        .into_any_element()
+}
+
+fn preset_bar(
+    window: &RodhareistEditorWindow,
+    p: &Params,
+    values: &HashMap<&'static str, f32>,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    let bank = rodharerist::factory_presets();
+    let (name, edited) = match window.preset_status() {
+        Some((index, edited)) => (bank[index].name, edited),
+        None => ("No preset", false),
+    };
+    let tempo = window
+        .host_tempo()
+        .map(|bpm| format!("{bpm:.1}"))
+        .unwrap_or_else(|| "—".to_string());
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .h(px(48.0))
+        .px(px(16.0))
+        .gap(px(12.0))
+        .border_b(px(1.0))
+        .border_color(pal::line())
+        .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(space::HAIR))
-                .px(px(space::SNUG))
-                .py(px(space::HAIR))
-                .rounded(px(radius::CONTROL))
+                .gap(px(8.0))
+                .w(px(320.0))
+                .h(px(34.0))
+                .px(px(12.0))
+                .rounded(px(pal::R_CONTROL))
+                .bg(pal::panel())
                 .border(px(1.0))
-                .border_color(Colors::border_subtle())
-                .bg(Colors::surface_card())
-                .child(fb_badge((position + 1).to_string(), Colors::text_faint()))
+                .border_color(pal::line_strong())
                 .child(
                     div()
-                        .text_size(px(typography::DENSE_CAPTION))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(15.0))
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(Colors::text_primary())
-                        .child(stage_label(*kind)),
+                        .text_color(if window.preset_status().is_some() {
+                            pal::text()
+                        } else {
+                            pal::muted()
+                        })
+                        .child(name),
                 )
-                .when_some(left_target.filter(|_| can_move_left), |el, other| {
-                    el.child(fb_stepper_button(
-                        ("rodhareist-rack-left", slot_index),
-                        "\u{2039}",
-                        window.click_cb(cx, move |p| {
-                            p.stage_order.swap(slot_index, other);
-                        }),
-                    ))
-                })
-                .when_some(right_target.filter(|_| can_move_right), |el, other| {
-                    el.child(fb_stepper_button(
-                        ("rodhareist-rack-right", slot_index),
-                        "\u{203a}",
-                        window.click_cb(cx, move |p| {
-                            p.stage_order.swap(slot_index, other);
-                        }),
-                    ))
-                })
-                .child(fb_stepper_button(
-                    ("rodhareist-rack-remove", slot_index),
-                    "\u{d7}",
-                    window.click_cb(cx, move |p| {
-                        p.stage_order[slot_index] = None;
-                    }),
-                )),
+                .when(edited, |el| el.child(caption("EDITED"))),
+        )
+        .child(div().flex_1())
+        .child(trim_control(window, values, "input_trim", "IN", cx))
+        .child(trim_control(window, values, "output_trim", "OUT", cx))
+        .child(caption("TEMPO"))
+        .child(
+            div()
+                .id("rodhareist-tempo")
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(72.0))
+                .h(px(34.0))
+                .rounded(px(pal::R_CONTROL))
+                .border(px(1.0))
+                .border_color(pal::line_strong())
+                .text_size(px(14.0))
+                .text_color(pal::text())
+                .tooltip(fb_tooltip("Host tempo — follows the transport"))
+                .child(tempo),
+        )
+        .child(power_button(
+            "rodhareist-power",
+            p.power,
+            pal::amber(),
+            if p.power {
+                "Rodhareist on — click to bypass"
+            } else {
+                "Rodhareist bypassed — click to turn on"
+            },
+            window.toggle_cb(cx, "power"),
+        ))
+        .into_any_element()
+}
+
+// ── Preset browser ──────────────────────────────────────────────────────────
+
+fn preset_browser(
+    window: &RodhareistEditorWindow,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    let bank = rodharerist::factory_presets();
+    let active = window.preset_status().map(|(index, _)| index);
+    let mut list = div()
+        .id("rodhareist-preset-list")
+        .flex_1()
+        .min_h(px(0.0))
+        .overflow_y_scroll()
+        .py(px(3.0));
+    for (index, preset) in bank.iter().enumerate() {
+        let on = active == Some(index);
+        list = list.child(
+            row_button(
+                ("rodhareist-preset", index),
+                if on { pal::amber() } else { clear() },
+            )
+            .mx(px(6.0))
+            .my(px(3.0))
+            .h(px(32.0))
+            .px(px(12.0))
+            .gap(px(6.0))
+            .on_click(window.load_preset_cb(cx, index))
+            .child(
+                div()
+                    .w(px(30.0))
+                    .flex_shrink_0()
+                    .text_size(px(11.0))
+                    .text_color(if on { pal::on_accent() } else { pal::muted() })
+                    .child(preset.id),
+            )
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(14.0))
+                    .text_color(if on { pal::on_accent() } else { pal::text() })
+                    .child(preset.name),
+            ),
         );
     }
+    div()
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .w(px(232.0))
+        .min_h(px(0.0))
+        .rounded(px(pal::R_PANEL))
+        .bg(pal::panel())
+        .border(px(1.0))
+        .border_color(pal::line())
+        .overflow_hidden()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .flex_shrink_0()
+                .h(px(32.0))
+                .px(px(12.0))
+                .border_b(px(1.0))
+                .border_color(pal::line())
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(pal::text())
+                        .child("PRESETS"),
+                )
+                .child(caption(bank.len().to_string())),
+        )
+        .child(list)
+        .into_any_element()
+}
 
-    let missing = stages_not_in_chain(&order);
-    let mut add_row = div()
+// ── Signal path ─────────────────────────────────────────────────────────────
+
+/// -48..0 dBFS onto 0..1, the meter scale the labels print.
+fn meter_fraction(level: f32) -> f32 {
+    if level <= 1.0e-6 {
+        return 0.0;
+    }
+    ((20.0 * level.log10() + 48.0) / 48.0).clamp(0.0, 1.0)
+}
+
+/// One vertical level bar: RMS fill, coloured by how hot it runs, with the
+/// peak as a hairline. Square, so the top pixel is the value.
+fn level_bar(rms: f32, peak: f32) -> AnyElement {
+    let fill = meter_fraction(rms);
+    let peak = meter_fraction(peak);
+    let color = if fill > 0.9 {
+        pal::red()
+    } else if fill > 0.72 {
+        pal::amber()
+    } else {
+        pal::green()
+    };
+    div()
+        .relative()
+        .w(px(8.0))
+        .h_full()
+        .bg(pal::meter_bg())
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .bottom_0()
+                .w_full()
+                .h(relative(fill))
+                .bg(color),
+        )
+        .when(peak > 0.0, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .w_full()
+                    .h(px(2.0))
+                    .bottom(relative(peak))
+                    .bg(pal::text()),
+            )
+        })
+        .into_any_element()
+}
+
+fn meter_scale() -> AnyElement {
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .justify_between()
+        .h_full()
+        .text_size(px(9.0))
+        .text_color(pal::muted());
+    for mark in ["0", "-12", "-24", "-36", "-48"] {
+        col = col.child(mark);
+    }
+    col.into_any_element()
+}
+
+fn meter_column(
+    window: &RodhareistEditorWindow,
+    label: &'static str,
+    rms: f32,
+    peak: f32,
+    clip: bool,
+    scale_left: bool,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    let bars = div()
         .flex()
         .flex_row()
-        .flex_wrap()
+        .gap(px(4.0))
+        .flex_1()
+        .min_h(px(0.0))
+        .when(scale_left, |el| el.child(meter_scale()))
+        .child(level_bar(rms, peak))
+        .when(!scale_left, |el| el.child(meter_scale()));
+    div()
+        .flex()
+        .flex_col()
         .items_center()
-        .gap(px(space::TIGHT));
-    for kind in missing {
-        add_row = add_row.child(fb_button(
-            ("rodhareist-rack-add", kind as usize),
-            format!("+ {}", stage_label(kind)),
-            FbButtonKind::Ghost,
+        .flex_shrink_0()
+        .gap(px(6.0))
+        .w(px(54.0))
+        .child(caption(label))
+        .child(bars)
+        .child(
+            div()
+                .id(("rodhareist-clip", scale_left as usize))
+                .px(px(6.0))
+                .rounded(px(4.0))
+                .text_size(px(9.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .bg(if clip { pal::red() } else { pal::meter_bg() })
+                .text_color(if clip { pal::on_accent() } else { pal::dim() })
+                .cursor(gpui::CursorStyle::PointingHand)
+                .tooltip(fb_tooltip(if clip {
+                    "Clipped — click to clear"
+                } else {
+                    "Clip indicator"
+                }))
+                .on_click(window.clear_clip_cb(cx))
+                .child("CLIP"),
+        )
+        .into_any_element()
+}
+
+fn port(label: &'static str) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .w(px(36.0))
+        .h(px(26.0))
+        .rounded(px(pal::R_PORT))
+        .border(px(1.0))
+        .border_color(pal::port())
+        .text_size(px(10.0))
+        .text_color(pal::muted())
+        .child(label)
+        .into_any_element()
+}
+
+fn wire_segment() -> AnyElement {
+    div()
+        .flex_1()
+        .min_w(px(4.0))
+        .h(px(2.0))
+        .bg(pal::wire())
+        .into_any_element()
+}
+
+fn path_node(
+    window: &RodhareistEditorWindow,
+    p: &Params,
+    slot: usize,
+    kind: StageKind,
+    selected: bool,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    let category = Category::of(kind);
+    let accent = tint(category.tint());
+    let on = blocks::is_on(p, kind);
+    let model = blocks::model_name(p, kind).unwrap_or("No amp");
+    let mut glow = accent;
+    glow.a = 0.14;
+    let node = div()
+        .id(("rodhareist-node", slot))
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(44.0))
+        .rounded(px(pal::R_NODE))
+        .bg(pal::node())
+        .text_size(px(11.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(if on { accent } else { pal::dim() })
+        .when(selected, |el| {
+            el.border(px(2.0))
+                .border_color(pal::amber())
+                .shadow(vec![gpui::BoxShadow {
+                    color: pal::amber_ring().into(),
+                    offset: gpui::point(px(0.0), px(0.0)),
+                    blur_radius: px(0.0),
+                    spread_radius: px(4.0),
+                    inset: false,
+                }])
+        })
+        .when(!selected, |el| {
+            el.border(px(1.0))
+                .border_color(if on { accent } else { pal::bypassed() })
+                .when(on, |el| {
+                    el.shadow(vec![gpui::BoxShadow {
+                        color: glow.into(),
+                        offset: gpui::point(px(0.0), px(0.0)),
+                        blur_radius: px(16.0),
+                        spread_radius: px(0.0),
+                        inset: false,
+                    }])
+                })
+        })
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(|s| s.bg(pal::hover()))
+        .tooltip(fb_tooltip(format!(
+            "Slot {} · {}: {}{}",
+            slot + 1,
+            blocks::block_name(kind),
+            model,
+            if on { "" } else { " (bypassed)" }
+        )))
+        .on_click(window.focus_cb(cx, ChainFocus::Block(kind)))
+        .child(category.glyph());
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .flex_shrink_0()
+        .gap(px(4.0))
+        .w(px(56.0))
+        .child(node)
+        .child(
+            div()
+                .text_size(px(11.0))
+                .whitespace_nowrap()
+                .text_color(if on { pal::text() } else { pal::dim() })
+                .child(blocks::block_name(kind)),
+        )
+        .into_any_element()
+}
+
+/// An empty chain position: a socket on the wire.
+fn path_socket(
+    window: &RodhareistEditorWindow,
+    slot: usize,
+    selected: bool,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    div()
+        .id(("rodhareist-socket", slot))
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        // Hit area wider than the socket; the label row keeps it on the
+        // nodes' wire line.
+        .w(px(22.0))
+        .h(px(44.0))
+        .cursor(gpui::CursorStyle::PointingHand)
+        .tooltip(fb_tooltip(format!(
+            "Slot {} · empty — click to add a block",
+            slot + 1
+        )))
+        .on_click(window.focus_cb(cx, ChainFocus::Empty(slot)))
+        .child(
+            div()
+                .size(px(12.0))
+                .rounded_full()
+                .bg(pal::path_bg())
+                .border(px(if selected { 2.0 } else { 1.0 }))
+                .border_color(if selected { pal::amber() } else { pal::port() }),
+        )
+        .into_any_element()
+}
+
+fn signal_path(
+    window: &RodhareistEditorWindow,
+    p: &Params,
+    focus: ChainFocus,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    let io: IoMeter = window.io_meter();
+    // The wire runs at the node centre; empty sockets and the ports sit on
+    // it via the same 44 px row, with the node labels hanging below.
+    let mut lane = div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .min_w(px(0.0))
+        .child(div().h(px(44.0)).flex().items_center().child(port("IN")));
+    for (slot, entry) in p.stage_order.iter().enumerate() {
+        lane = lane.child(
+            div()
+                .h(px(44.0))
+                .flex_1()
+                .min_w(px(4.0))
+                .flex()
+                .items_center()
+                .child(wire_segment()),
+        );
+        lane = lane.child(match entry {
+            Some(kind) => path_node(
+                window,
+                p,
+                slot,
+                *kind,
+                focus == ChainFocus::Block(*kind),
+                cx,
+            ),
+            None => path_socket(window, slot, focus == ChainFocus::Empty(slot), cx),
+        });
+    }
+    lane = lane
+        .child(
+            div()
+                .h(px(44.0))
+                .w(px(20.0))
+                .flex()
+                .items_center()
+                .child(wire_segment()),
+        )
+        .child(div().h(px(44.0)).flex().items_center().child(port("OUT")));
+
+    let routing = div()
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap(px(14.0))
+        .flex_1()
+        .min_w(px(0.0))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(caption("PATH"))
+                .child(caption(format!(
+                    "{} of {} slots",
+                    p.stage_order.iter().flatten().count(),
+                    rodharerist::PATH_SLOTS
+                ))),
+        )
+        .child(lane);
+
+    div()
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .gap(px(16.0))
+        .h(px(170.0))
+        .px(px(18.0))
+        .py(px(14.0))
+        .rounded(px(pal::R_PANEL))
+        .bg(pal::path_bg())
+        .border(px(1.0))
+        .border_color(pal::line())
+        .child(meter_column(
+            window, "INPUT", io.in_rms, io.in_peak, io.in_clip, true, cx,
+        ))
+        .child(routing)
+        .child(meter_column(
+            window,
+            "MAIN",
+            io.out_rms,
+            io.out_peak,
+            io.out_clip,
+            false,
+            cx,
+        ))
+        .into_any_element()
+}
+
+// ── Edit panel ──────────────────────────────────────────────────────────────
+
+fn category_column(
+    window: &RodhareistEditorWindow,
+    p: &Params,
+    focus: ChainFocus,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    let order = p.stage_order;
+    let slot = focus_slot(&order, focus);
+    let current = match focus {
+        ChainFocus::Block(kind) => Some(Category::of(kind)),
+        ChainFocus::Empty(_) => None,
+    };
+    let mut col = div()
+        .id("rodhareist-categories")
+        .flex_shrink_0()
+        .w(px(188.0))
+        .h_full()
+        .overflow_y_scroll()
+        .py(px(8.0))
+        .bg(pal::column())
+        .border_r(px(1.0))
+        .border_color(pal::line());
+    for (index, category) in Category::ALL.iter().copied().enumerate() {
+        let active = current == Some(category);
+        let accent = tint(category.tint());
+        let target = stage_for(&order, slot, category);
+        let enabled = active || target.is_some();
+        let mut row = row_button(
+            ("rodhareist-category", index),
+            if active { accent } else { clear() },
+        )
+        .mx(px(8.0))
+        .my(px(4.0))
+        .h(px(36.0))
+        .px(px(18.0))
+        .gap(px(12.0))
+        .child(div().size(px(8.0)).rounded_full().bg(if active {
+            pal::on_accent()
+        } else {
+            accent
+        }))
+        .child(
+            div()
+                .text_size(px(14.0))
+                .text_color(if active {
+                    pal::on_accent()
+                } else if enabled {
+                    pal::text()
+                } else {
+                    pal::dim()
+                })
+                .child(category.name()),
+        );
+        row = match target {
+            Some(kind) if !active => row
+                .tooltip(fb_tooltip(match focus {
+                    ChainFocus::Empty(_) => {
+                        format!("Add {} to slot {}", blocks::block_name(kind), slot + 1)
+                    }
+                    ChainFocus::Block(_) => {
+                        format!("Replace this block with {}", blocks::block_name(kind))
+                    }
+                }))
+                .on_click(window.chain_edit_cb(
+                    cx,
+                    move |p| p.stage_order[slot] = Some(kind),
+                    ChainFocus::Block(kind),
+                )),
+            None if !active => row.tooltip(fb_tooltip(format!(
+                "Every {} block is already on the path",
+                category.name()
+            ))),
+            _ => row,
+        };
+        col = col.child(row);
+    }
+    col.into_any_element()
+}
+
+fn model_column(
+    window: &RodhareistEditorWindow,
+    p: &Params,
+    focus: ChainFocus,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    let col = div()
+        .id("rodhareist-models")
+        .flex_shrink_0()
+        .w(px(224.0))
+        .h_full()
+        .overflow_y_scroll()
+        .py(px(8.0))
+        .bg(pal::column())
+        .border_r(px(1.0))
+        .border_color(pal::line());
+    let ChainFocus::Block(kind) = focus else {
+        return col
+            .child(
+                div()
+                    .px(px(18.0))
+                    .py(px(10.0))
+                    .text_size(px(13.0))
+                    .text_color(pal::muted())
+                    .child("Pick a category to add a block to this slot."),
+            )
+            .into_any_element();
+    };
+    let accent = tint(Category::of(kind).tint());
+    let (list, selected) = blocks::models(p, kind);
+    let mut col = col;
+    for (index, model) in list.into_iter().enumerate() {
+        let active = selected == Some(index);
+        let mut row = row_button(
+            ("rodhareist-model", index),
+            if active { pal::picked() } else { clear() },
+        )
+        .relative()
+        .mx(px(8.0))
+        .my(px(4.0))
+        .h(px(36.0))
+        .px(px(18.0))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(15.0))
+                .text_color(if active { accent } else { pal::text() })
+                .child(model.label),
+        )
+        .when(active, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(3.0))
+                    .bg(accent),
+            )
+        });
+        if !model.wire_id.is_empty() && !active {
+            row = row.on_click(window.set_cb(cx, model.wire_id, model.value));
+        }
+        col = col.child(row);
+    }
+    col.into_any_element()
+}
+
+fn norm(value: f32, spec: &ParamSpec) -> f32 {
+    ((value - spec.min) / (spec.max - spec.min)).clamp(0.0, 1.0)
+}
+
+fn param_row(
+    window: &RodhareistEditorWindow,
+    spec: ParamSpec,
+    value: f32,
+    accent: Rgba,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(24.0))
+        .h(px(42.0))
+        .when(spec.inactive, |el| el.opacity(0.4))
+        .child(
+            div()
+                .w(px(110.0))
+                .flex_shrink_0()
+                .text_size(px(14.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(pal::text())
+                .child(spec.label),
+        )
+        .child(div().flex_1().min_w(px(0.0)).child(slider_with_reset(
+            format!("rodhareist-param-{}", spec.id),
+            norm(value, &spec),
+            accent,
+            window.slider_cb(cx, spec.id, spec.min, spec.max),
+            Some(window.reset_cb(cx, spec.id)),
+        )))
+        .child(
+            div()
+                .w(px(84.0))
+                .flex_shrink_0()
+                .flex()
+                .justify_end()
+                .text_size(px(13.0))
+                .text_color(accent)
+                .child(blocks::format_value(value, &spec)),
+        )
+        .into_any_element()
+}
+
+/// A row of choice chips (microphone type).
+fn chip_row(
+    window: &RodhareistEditorWindow,
+    label: &'static str,
+    choices: Vec<blocks::ModelChoice>,
+    selected: Option<usize>,
+    accent: Rgba,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    let mut chips = div().flex().flex_row().gap(px(8.0));
+    for (index, choice) in choices.into_iter().enumerate() {
+        let active = selected == Some(index);
+        let mut chip = row_button(
+            ("rodhareist-chip", index),
+            if active { pal::picked() } else { clear() },
+        )
+        .h(px(30.0))
+        .px(px(14.0))
+        .border(px(1.0))
+        .border_color(if active { accent } else { pal::line_strong() })
+        .text_size(px(13.0))
+        .text_color(if active { accent } else { pal::text() })
+        .child(choice.label);
+        if !active {
+            chip = chip.on_click(window.set_cb(cx, choice.wire_id, choice.value));
+        }
+        chips = chips.child(chip);
+    }
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(24.0))
+        .h(px(42.0))
+        .child(
+            div()
+                .w(px(110.0))
+                .flex_shrink_0()
+                .text_size(px(14.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(pal::text())
+                .child(label),
+        )
+        .child(chips)
+        .into_any_element()
+}
+
+/// A file slot (IR or NAM capture): its load button and what is loaded.
+#[allow(clippy::too_many_arguments)]
+fn load_row(
+    id: &'static str,
+    label: &'static str,
+    button: &'static str,
+    loaded: Option<String>,
+    loading: bool,
+    error: Option<String>,
+    accent: Rgba,
+    on_load: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let status = if loading {
+        ("Loading…".to_string(), pal::muted())
+    } else if let Some(error) = error {
+        (error, pal::red())
+    } else if let Some(name) = loaded {
+        (name, accent)
+    } else {
+        ("Nothing loaded".to_string(), pal::muted())
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(24.0))
+        .h(px(42.0))
+        .child(
+            div()
+                .w(px(110.0))
+                .flex_shrink_0()
+                .text_size(px(14.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(pal::text())
+                .child(label),
+        )
+        .child(
+            row_button(id, clear())
+                .flex_shrink_0()
+                .h(px(30.0))
+                .px(px(14.0))
+                .border(px(1.0))
+                .border_color(pal::line_strong())
+                .text_size(px(13.0))
+                .text_color(pal::text())
+                .when(!loading, |el| el.on_click(on_load))
+                .child(button),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(13.0))
+                .text_color(status.1)
+                .child(status.0),
+        )
+        .into_any_element()
+}
+
+fn slot_action(
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    enabled: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(28.0))
+        .rounded(px(pal::R_ROW))
+        .tooltip(fb_tooltip(label))
+        .when(enabled, |el| {
+            el.cursor(gpui::CursorStyle::PointingHand)
+                .hover(|s| s.bg(pal::hover()))
+                .active(|s| s.bg(pal::pressed()))
+                .on_click(on_click)
+        })
+        .child(svg().path(icon).size(px(14.0)).text_color(if enabled {
+            pal::muted()
+        } else {
+            pal::bypassed()
+        }))
+        .into_any_element()
+}
+
+fn param_column(
+    window: &RodhareistEditorWindow,
+    p: &Params,
+    values: &HashMap<&'static str, f32>,
+    focus: ChainFocus,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .h(px(40.0))
+        .px(px(24.0))
+        .gap(px(12.0))
+        .border_b(px(1.0))
+        .border_color(pal::line())
+        .bg(pal::header());
+    let ChainFocus::Block(kind) = focus else {
+        let ChainFocus::Empty(slot) = focus else {
+            unreachable!()
+        };
+        return div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.0))
+            .child(
+                header.child(
+                    div()
+                        .text_size(px(14.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(pal::text())
+                        .child(format!("Slot {} — empty", slot + 1)),
+                ),
+            )
+            .into_any_element();
+    };
+
+    let category = Category::of(kind);
+    let accent = tint(category.tint());
+    let on = blocks::is_on(p, kind);
+    let slot = focus_slot(&p.stage_order, focus);
+    let last = rodharerist::PATH_SLOTS - 1;
+    let title = format!(
+        "{} — {}",
+        blocks::block_name(kind),
+        blocks::model_name(p, kind).unwrap_or("No amp")
+    );
+    let header = header
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(14.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(pal::text())
+                .child(title),
+        )
+        .child(slot_action(
+            "rodhareist-block-left",
+            "icons/chevron-left.svg",
+            "Move block earlier in the path",
+            slot > 0,
+            window.chain_edit_cb(
+                cx,
+                move |p| p.stage_order.swap(slot, slot.saturating_sub(1)),
+                ChainFocus::Block(kind),
+            ),
+        ))
+        .child(slot_action(
+            "rodhareist-block-right",
+            "icons/chevron-right.svg",
+            "Move block later in the path",
+            slot < last,
+            window.chain_edit_cb(
+                cx,
+                move |p| p.stage_order.swap(slot, (slot + 1).min(last)),
+                ChainFocus::Block(kind),
+            ),
+        ))
+        .child(slot_action(
+            "rodhareist-block-remove",
+            "icons/x.svg",
+            "Remove block from the path",
             true,
-            window.click_cb(cx, move |p| {
-                if let Some(slot) = p.stage_order.iter_mut().find(|slot| slot.is_none()) {
-                    *slot = Some(kind);
-                }
-            }),
+            window.chain_edit_cb(
+                cx,
+                move |p| p.stage_order[slot] = None,
+                ChainFocus::Empty(slot),
+            ),
+        ))
+        .child(caption(if on { "ON" } else { "BYPASSED" }))
+        .child(power_button(
+            "rodhareist-block-power",
+            on,
+            accent,
+            if on { "Bypass block" } else { "Enable block" },
+            window.toggle_cb(cx, blocks::enable_id(kind)),
+        ));
+
+    let mut rows = div()
+        .id("rodhareist-params")
+        .flex_1()
+        .min_h(px(0.0))
+        .overflow_y_scroll()
+        .pt(px(12.0))
+        .pb(px(16.0))
+        .px(px(32.0))
+        .when(!on, |el| el.opacity(0.5));
+    if kind == StageKind::Cab {
+        rows = rows.child(chip_row(
+            window,
+            "Microphone",
+            blocks::mic_choices(),
+            blocks::mic_index(p),
+            accent,
+            cx,
+        ));
+        if p.cab_model == CabModel::Ir {
+            rows = rows.child(load_row(
+                "rodhareist-load-ir",
+                "Impulse",
+                "Load IR…",
+                window
+                    .ir_loaded_info()
+                    .map(|(name, secs)| format!("{name} ({secs:.2} s)")),
+                window.ir_loading(),
+                window.ir_error(),
+                accent,
+                window.load_ir_cb(cx),
+            ));
+        }
+    }
+    if kind == StageKind::Amp && p.tone_engine == ToneEngineKind::NamCapture {
+        rows = rows.child(load_row(
+            "rodhareist-load-nam",
+            "Capture",
+            "Load Capture…",
+            window.nam_loaded_info(),
+            window.nam_loading(),
+            window.nam_error(),
+            accent,
+            window.load_nam_cb(cx),
+        ));
+    }
+    for spec in blocks::params(p, kind) {
+        let value = values.get(spec.id).copied().unwrap_or(spec.min);
+        rows = rows.child(param_row(window, spec, value, accent, cx));
+    }
+    if kind == StageKind::Amp && p.tone_engine == ToneEngineKind::NamCapture {
+        rows = rows.child(chip_row(
+            window,
+            "Loudness",
+            vec![
+                blocks::ModelChoice {
+                    label: "Raw",
+                    wire_id: "nam_loudness_norm",
+                    value: 0.0,
+                },
+                blocks::ModelChoice {
+                    label: "Normalized",
+                    wire_id: "nam_loudness_norm",
+                    value: 1.0,
+                },
+            ],
+            Some(p.nam_loudness_norm as usize),
+            accent,
+            cx,
         ));
     }
 
     div()
         .flex()
         .flex_col()
-        .gap(px(space::SNUG))
-        .p(px(space::LOOSE))
-        .border_b(px(1.0))
-        .border_color(Colors::border_subtle())
-        .child(
-            div()
-                .text_size(px(typography::DENSE_CAPTION))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::text_faint())
-                .child("SIGNAL CHAIN"),
-        )
-        .child(row)
-        .child(add_row)
+        .flex_1()
+        .min_w(px(0.0))
+        .child(header)
+        .child(rows)
         .into_any_element()
 }
 
-/// Every stage's card, in a wrapped grid below the rack. Always shown
-/// regardless of chain membership, so a stage's knobs stay editable while it
-/// is unplugged.
-fn cards(window: &RodhareistEditorWindow, p: &Params, cx: &Context<RodhareistEditorWindow>) -> AnyElement {
-    let b = &p.stage_b;
+fn edit_panel(
+    window: &RodhareistEditorWindow,
+    p: &Params,
+    values: &HashMap<&'static str, f32>,
+    focus: ChainFocus,
+    cx: &Context<RodhareistEditorWindow>,
+) -> AnyElement {
     div()
         .flex()
-        .flex_row()
-        .flex_wrap()
-        .items_start()
-        .gap(px(space::LOOSE))
-        .p(px(space::LOOSE))
-        .child(gate_card(
-            p.gate_on,
-            p.gate_thresh_db,
-            window.click_cb(cx, |p| p.gate_on = !p.gate_on),
-            window.knob_cb(cx, |p, v| p.gate_thresh_db = v),
-        ))
-        .child(comp_card(
-            "Compressor A",
-            "comp-a",
-            p.comp_on,
-            p.comp_thresh_db,
-            p.comp_ratio,
-            p.comp_attack_ms,
-            p.comp_release_ms,
-            p.comp_makeup_db,
-            window.click_cb(cx, |p| p.comp_on = !p.comp_on),
-            window.knob_cb(cx, |p, v| p.comp_thresh_db = v),
-            window.knob_cb(cx, |p, v| p.comp_ratio = v),
-            window.knob_cb(cx, |p, v| p.comp_attack_ms = v),
-            window.knob_cb(cx, |p, v| p.comp_release_ms = v),
-            window.knob_cb(cx, |p, v| p.comp_makeup_db = v),
-        ))
-        .child(comp_card(
-            "Compressor B",
-            "comp-b",
-            b.comp_on,
-            b.comp_thresh_db,
-            b.comp_ratio,
-            b.comp_attack_ms,
-            b.comp_release_ms,
-            b.comp_makeup_db,
-            window.click_cb(cx, |p| p.stage_b.comp_on = !p.stage_b.comp_on),
-            window.knob_cb(cx, |p, v| p.stage_b.comp_thresh_db = v),
-            window.knob_cb(cx, |p, v| p.stage_b.comp_ratio = v),
-            window.knob_cb(cx, |p, v| p.stage_b.comp_attack_ms = v),
-            window.knob_cb(cx, |p, v| p.stage_b.comp_release_ms = v),
-            window.knob_cb(cx, |p, v| p.stage_b.comp_makeup_db = v),
-        ))
-        .child(drive_card(
-            "Drive A",
-            "drive-a",
-            p.drive_on,
-            p.drive_model,
-            p.drive_gain,
-            p.drive_tone,
-            p.drive_level,
-            window.click_cb(cx, |p| p.drive_on = !p.drive_on),
-            window.click_cb(cx, |p| p.drive_model = step_drive_model(p.drive_model, -1)),
-            window.click_cb(cx, |p| p.drive_model = step_drive_model(p.drive_model, 1)),
-            window.knob_cb(cx, |p, v| p.drive_gain = v),
-            window.knob_cb(cx, |p, v| p.drive_tone = v),
-            window.knob_cb(cx, |p, v| p.drive_level = v),
-        ))
-        .child(drive_card(
-            "Drive B",
-            "drive-b",
-            b.drive_on,
-            b.drive_model,
-            b.drive_gain,
-            b.drive_tone,
-            b.drive_level,
-            window.click_cb(cx, |p| p.stage_b.drive_on = !p.stage_b.drive_on),
-            window.click_cb(cx, |p| {
-                p.stage_b.drive_model = step_drive_model(p.stage_b.drive_model, -1)
-            }),
-            window.click_cb(cx, |p| {
-                p.stage_b.drive_model = step_drive_model(p.stage_b.drive_model, 1)
-            }),
-            window.knob_cb(cx, |p, v| p.stage_b.drive_gain = v),
-            window.knob_cb(cx, |p, v| p.stage_b.drive_tone = v),
-            window.knob_cb(cx, |p, v| p.stage_b.drive_level = v),
-        ))
-        .child(amp_card(
-            p.amp_on,
-            p.amp_model,
-            p.tone_engine,
-            p.amp_gain,
-            p.amp_bass,
-            p.amp_middle,
-            p.amp_treble,
-            p.amp_presence,
-            p.amp_master,
-            window.click_cb(cx, |p| p.amp_on = !p.amp_on),
-            window.click_cb(cx, |p| p.amp_model = step_amp_model(p.amp_model, -1)),
-            window.click_cb(cx, |p| p.amp_model = step_amp_model(p.amp_model, 1)),
-            window.click_cb(cx, |p| p.tone_engine = step_tone_engine(p.tone_engine, -1)),
-            window.click_cb(cx, |p| p.tone_engine = step_tone_engine(p.tone_engine, 1)),
-            window.knob_cb(cx, |p, v| p.amp_gain = v),
-            window.knob_cb(cx, |p, v| p.amp_bass = v),
-            window.knob_cb(cx, |p, v| p.amp_middle = v),
-            window.knob_cb(cx, |p, v| p.amp_treble = v),
-            window.knob_cb(cx, |p, v| p.amp_presence = v),
-            window.knob_cb(cx, |p, v| p.amp_master = v),
-        ))
-        .child(cab_card(
-            p.cab_on,
-            p.cab_model,
-            p.mic_model,
-            p.cab_mic,
-            p.cab_dist,
-            window.ir_loaded_info(),
-            window.ir_loading(),
-            window.ir_error(),
-            window.click_cb(cx, |p| p.cab_on = !p.cab_on),
-            window.click_cb(cx, |p| p.cab_model = step_cab_model(p.cab_model, -1)),
-            window.click_cb(cx, |p| p.cab_model = step_cab_model(p.cab_model, 1)),
-            window.click_cb(cx, |p| p.mic_model = step_mic_model(p.mic_model, -1)),
-            window.click_cb(cx, |p| p.mic_model = step_mic_model(p.mic_model, 1)),
-            window.knob_cb(cx, |p, v| p.cab_mic = v),
-            window.knob_cb(cx, |p, v| p.cab_dist = v),
-            window.load_ir_cb(cx),
-        ))
-        .child(nam_card(
-            p.nam_input_trim_db,
-            p.nam_output_trim_db,
-            p.nam_mix,
-            p.nam_loudness_norm,
-            p.nam_slim_size,
-            window.nam_loaded_info(),
-            window.nam_loading(),
-            window.nam_error(),
-            window.knob_cb(cx, |p, v| p.nam_input_trim_db = v),
-            window.knob_cb(cx, |p, v| p.nam_output_trim_db = v),
-            window.knob_cb(cx, |p, v| p.nam_mix = v),
-            window.click_cb(cx, |p| p.nam_loudness_norm = !p.nam_loudness_norm),
-            window.knob_cb(cx, |p, v| p.nam_slim_size = v),
-            window.load_nam_cb(cx),
-        ))
-        .child(eq_card(
-            "EQ A",
-            "eq-a",
-            p.eq_on,
-            p.eq_model,
-            p.eq_low_gain_db,
-            p.eq_mid1_freq_hz,
-            p.eq_mid1_gain_db,
-            p.eq_mid2_freq_hz,
-            p.eq_mid2_gain_db,
-            p.eq_high_gain_db,
-            window.click_cb(cx, |p| p.eq_on = !p.eq_on),
-            window.click_cb(cx, |p| p.eq_model = step_eq_model(p.eq_model, -1)),
-            window.click_cb(cx, |p| p.eq_model = step_eq_model(p.eq_model, 1)),
-            window.knob_cb(cx, |p, v| p.eq_low_gain_db = v),
-            window.knob_cb(cx, |p, v| p.eq_mid1_freq_hz = v),
-            window.knob_cb(cx, |p, v| p.eq_mid1_gain_db = v),
-            window.knob_cb(cx, |p, v| p.eq_mid2_freq_hz = v),
-            window.knob_cb(cx, |p, v| p.eq_mid2_gain_db = v),
-            window.knob_cb(cx, |p, v| p.eq_high_gain_db = v),
-        ))
-        .child(eq_card(
-            "EQ B",
-            "eq-b",
-            b.eq_on,
-            b.eq_model,
-            b.eq_low_gain_db,
-            b.eq_mid1_freq_hz,
-            b.eq_mid1_gain_db,
-            b.eq_mid2_freq_hz,
-            b.eq_mid2_gain_db,
-            b.eq_high_gain_db,
-            window.click_cb(cx, |p| p.stage_b.eq_on = !p.stage_b.eq_on),
-            window.click_cb(cx, |p| p.stage_b.eq_model = step_eq_model(p.stage_b.eq_model, -1)),
-            window.click_cb(cx, |p| p.stage_b.eq_model = step_eq_model(p.stage_b.eq_model, 1)),
-            window.knob_cb(cx, |p, v| p.stage_b.eq_low_gain_db = v),
-            window.knob_cb(cx, |p, v| p.stage_b.eq_mid1_freq_hz = v),
-            window.knob_cb(cx, |p, v| p.stage_b.eq_mid1_gain_db = v),
-            window.knob_cb(cx, |p, v| p.stage_b.eq_mid2_freq_hz = v),
-            window.knob_cb(cx, |p, v| p.stage_b.eq_mid2_gain_db = v),
-            window.knob_cb(cx, |p, v| p.stage_b.eq_high_gain_db = v),
-        ))
-        .child(mod_card(
-            "Mod A",
-            "mod-a",
-            p.mod_on,
-            p.mod_model,
-            p.chorus_rate,
-            p.chorus_depth,
-            p.chorus_mix,
-            window.click_cb(cx, |p| p.mod_on = !p.mod_on),
-            window.click_cb(cx, |p| p.mod_model = step_mod_model(p.mod_model, -1)),
-            window.click_cb(cx, |p| p.mod_model = step_mod_model(p.mod_model, 1)),
-            window.knob_cb(cx, |p, v| p.chorus_rate = v),
-            window.knob_cb(cx, |p, v| p.chorus_depth = v),
-            window.knob_cb(cx, |p, v| p.chorus_mix = v),
-        ))
-        .child(mod_card(
-            "Mod B",
-            "mod-b",
-            b.mod_on,
-            b.mod_model,
-            b.chorus_rate,
-            b.chorus_depth,
-            b.chorus_mix,
-            window.click_cb(cx, |p| p.stage_b.mod_on = !p.stage_b.mod_on),
-            window.click_cb(cx, |p| p.stage_b.mod_model = step_mod_model(p.stage_b.mod_model, -1)),
-            window.click_cb(cx, |p| p.stage_b.mod_model = step_mod_model(p.stage_b.mod_model, 1)),
-            window.knob_cb(cx, |p, v| p.stage_b.chorus_rate = v),
-            window.knob_cb(cx, |p, v| p.stage_b.chorus_depth = v),
-            window.knob_cb(cx, |p, v| p.stage_b.chorus_mix = v),
-        ))
-        .child(wah_card(
-            p.wah_on,
-            p.wah_model,
-            p.wah_pos,
-            p.wah_res,
-            p.wah_sens,
-            window.click_cb(cx, |p| p.wah_on = !p.wah_on),
-            window.click_cb(cx, |p| p.wah_model = step_wah_model(p.wah_model, -1)),
-            window.click_cb(cx, |p| p.wah_model = step_wah_model(p.wah_model, 1)),
-            window.knob_cb(cx, |p, v| p.wah_pos = v),
-            window.knob_cb(cx, |p, v| p.wah_res = v),
-            window.knob_cb(cx, |p, v| p.wah_sens = v),
-        ))
-        .child(delay_card(
-            "Delay A",
-            "delay-a",
-            p.delay_on,
-            p.delay_model,
-            p.delay_time_ms,
-            p.delay_fb,
-            p.delay_mix,
-            p.delay_tone,
-            window.click_cb(cx, |p| p.delay_on = !p.delay_on),
-            window.click_cb(cx, |p| p.delay_model = step_delay_model(p.delay_model, -1)),
-            window.click_cb(cx, |p| p.delay_model = step_delay_model(p.delay_model, 1)),
-            window.knob_cb(cx, |p, v| p.delay_time_ms = v),
-            window.knob_cb(cx, |p, v| p.delay_fb = v),
-            window.knob_cb(cx, |p, v| p.delay_mix = v),
-            window.knob_cb(cx, |p, v| p.delay_tone = v),
-        ))
-        .child(delay_card(
-            "Delay B",
-            "delay-b",
-            b.delay_on,
-            b.delay_model,
-            b.delay_time_ms,
-            b.delay_fb,
-            b.delay_mix,
-            b.delay_tone,
-            window.click_cb(cx, |p| p.stage_b.delay_on = !p.stage_b.delay_on),
-            window.click_cb(cx, |p| {
-                p.stage_b.delay_model = step_delay_model(p.stage_b.delay_model, -1)
-            }),
-            window.click_cb(cx, |p| {
-                p.stage_b.delay_model = step_delay_model(p.stage_b.delay_model, 1)
-            }),
-            window.knob_cb(cx, |p, v| p.stage_b.delay_time_ms = v),
-            window.knob_cb(cx, |p, v| p.stage_b.delay_fb = v),
-            window.knob_cb(cx, |p, v| p.stage_b.delay_mix = v),
-            window.knob_cb(cx, |p, v| p.stage_b.delay_tone = v),
-        ))
-        .child(reverb_card(
-            p.reverb_on,
-            p.reverb_model,
-            p.reverb_decay_s,
-            p.reverb_mix,
-            p.reverb_shimmer,
-            window.click_cb(cx, |p| p.reverb_on = !p.reverb_on),
-            window.click_cb(cx, |p| p.reverb_model = step_reverb_model(p.reverb_model, -1)),
-            window.click_cb(cx, |p| p.reverb_model = step_reverb_model(p.reverb_model, 1)),
-            window.knob_cb(cx, |p, v| p.reverb_decay_s = v),
-            window.knob_cb(cx, |p, v| p.reverb_mix = v),
-            window.knob_cb(cx, |p, v| p.reverb_shimmer = v),
-        ))
+        .flex_col()
+        .flex_1()
+        .min_h(px(0.0))
+        .rounded(px(pal::R_PANEL))
+        .bg(pal::panel())
+        .border(px(1.0))
+        .border_color(pal::line())
+        .overflow_hidden()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .h(px(32.0))
+                .border_b(px(1.0))
+                .border_color(pal::line())
+                .bg(pal::header())
+                .text_size(px(12.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(pal::text())
+                .child("EDIT"),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h(px(0.0))
+                .child(category_column(window, p, focus, cx))
+                .child(model_column(window, p, focus, cx))
+                .child(param_column(window, p, values, focus, cx)),
+        )
         .into_any_element()
 }
 
-fn step_drive_model(current: DriveModel, delta: i32) -> DriveModel {
-    step_enum(DriveModel::ALL, current, delta)
-}
-fn step_amp_model(current: AmpModel, delta: i32) -> AmpModel {
-    step_enum(AmpModel::ALL, current, delta)
-}
-fn step_cab_model(current: CabModel, delta: i32) -> CabModel {
-    step_enum(CabModel::ALL, current, delta)
-}
-fn step_mic_model(current: rodharerist::MicModel, delta: i32) -> rodharerist::MicModel {
-    step_enum(rodharerist::MicModel::ALL, current, delta)
-}
-fn step_mod_model(current: ModModel, delta: i32) -> ModModel {
-    step_enum(ModModel::ALL, current, delta)
-}
-fn step_wah_model(current: WahModel, delta: i32) -> WahModel {
-    step_enum(WahModel::ALL, current, delta)
-}
-fn step_eq_model(current: rodharerist::EqModel, delta: i32) -> rodharerist::EqModel {
-    step_enum(rodharerist::EqModel::ALL, current, delta)
-}
-fn step_reverb_model(current: rodharerist::ReverbModel, delta: i32) -> rodharerist::ReverbModel {
-    step_enum(rodharerist::ReverbModel::ALL, current, delta)
-}
-fn step_delay_model(current: DelayModel, delta: i32) -> DelayModel {
-    step_enum(DelayModel::ALL, current, delta)
-}
-fn step_tone_engine(
-    current: rodharerist::ToneEngineKind,
-    delta: i32,
-) -> rodharerist::ToneEngineKind {
-    const ALL: [rodharerist::ToneEngineKind; 3] = [
-        rodharerist::ToneEngineKind::Classic,
-        rodharerist::ToneEngineKind::NamCapture,
-        rodharerist::ToneEngineKind::Bypass,
-    ];
-    step_enum(&ALL, current, delta)
-}
-
-fn step_enum<T: Copy + PartialEq>(all: &[T], current: T, delta: i32) -> T {
-    let len = all.len() as i32;
-    if len == 0 {
-        return current;
-    }
-    let index = all.iter().position(|v| *v == current).unwrap_or(0) as i32;
-    let next = ((index + delta) % len + len) % len;
-    all[next as usize]
-}
-
-/// The whole editor body: header, rack, cards — scrollable, since the full
-/// rig does not fit a modest window at once.
+/// The whole editor body.
 pub(crate) fn rodhareist_panel(
     window: &RodhareistEditorWindow,
     cx: &Context<RodhareistEditorWindow>,
 ) -> AnyElement {
-    let params = window.params_snapshot();
+    let p = window.params_snapshot();
+    let values: HashMap<&'static str, f32> = rodharerist::ui_values(&p).into_iter().collect();
+    let focus = resolve_focus(&p.stage_order, window.chain_focus());
     div()
-        .id("rodhareist-panel-scroll")
         .flex()
         .flex_col()
         .size_full()
-        .overflow_y_scroll()
-        .child(header(window, &params, cx))
-        .child(rack(window, &params, cx))
-        .child(cards(window, &params, cx))
+        .bg(pal::bg())
+        .text_color(pal::text())
+        .child(preset_bar(window, &p, &values, cx))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h(px(0.0))
+                .gap(px(12.0))
+                .p(px(12.0))
+                .child(preset_browser(window, cx))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
+                        .gap(px(12.0))
+                        .child(signal_path(window, &p, focus, cx))
+                        .child(edit_panel(window, &p, &values, focus, cx)),
+                ),
+        )
         .into_any_element()
 }
 
@@ -621,20 +1391,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stages_not_in_chain_excludes_every_placed_kind() {
+    fn focus_falls_back_when_its_block_leaves_the_path() {
         let mut order = [None; rodharerist::PATH_SLOTS];
-        order[0] = Some(StageKind::Gate);
-        order[1] = Some(StageKind::Amp);
-        let missing = stages_not_in_chain(&order);
-        assert!(!missing.contains(&StageKind::Gate));
-        assert!(!missing.contains(&StageKind::Amp));
-        assert!(missing.contains(&StageKind::Wah));
-        assert_eq!(missing.len(), StageKind::COUNT - 2);
+        order[2] = Some(StageKind::Amp);
+        order[5] = Some(StageKind::Cab);
+        assert_eq!(
+            resolve_focus(&order, Some(ChainFocus::Block(StageKind::Cab))),
+            ChainFocus::Block(StageKind::Cab)
+        );
+        assert_eq!(
+            resolve_focus(&order, Some(ChainFocus::Block(StageKind::Wah))),
+            ChainFocus::Block(StageKind::Amp)
+        );
+        assert_eq!(
+            resolve_focus(&order, Some(ChainFocus::Empty(3))),
+            ChainFocus::Empty(3)
+        );
+        assert_eq!(
+            resolve_focus(&[None; rodharerist::PATH_SLOTS], None),
+            ChainFocus::Empty(0)
+        );
     }
 
     #[test]
-    fn step_enum_wraps_both_directions() {
-        assert_eq!(step_drive_model(DriveModel::Screamer, -1), DriveModel::CopperFuzz);
-        assert_eq!(step_drive_model(DriveModel::CopperFuzz, 1), DriveModel::Screamer);
+    fn picking_a_category_uses_a_free_instance() {
+        let mut order = [None; rodharerist::PATH_SLOTS];
+        order[0] = Some(StageKind::Drive);
+        // Slot 0 already holds Drive A: picking Drive keeps it.
+        assert_eq!(
+            stage_for(&order, 0, Category::Drive),
+            Some(StageKind::Drive)
+        );
+        // Another slot gets the free second instance.
+        assert_eq!(
+            stage_for(&order, 3, Category::Drive),
+            Some(StageKind::Drive2)
+        );
+        order[1] = Some(StageKind::Drive2);
+        assert_eq!(stage_for(&order, 3, Category::Drive), None);
+        assert_eq!(stage_for(&order, 3, Category::Amp), Some(StageKind::Amp));
+    }
+
+    #[test]
+    fn the_meter_spans_forty_eight_decibels() {
+        assert_eq!(meter_fraction(0.0), 0.0);
+        assert_eq!(meter_fraction(1.0), 1.0);
+        assert!((meter_fraction(0.063) - 0.5).abs() < 0.01);
     }
 }
