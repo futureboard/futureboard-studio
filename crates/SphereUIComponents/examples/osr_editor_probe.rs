@@ -49,7 +49,11 @@ fn run() {
             .expect("failed to transfer the browser process application"),
     }
 
-    let plugin_id = "rodharerist";
+    // `FUTUREBOARD_PROBE_PLUGIN=equz8` probes another built-in's editor.
+    let plugin_id: &'static str = std::env::var("FUTUREBOARD_PROBE_PLUGIN")
+        .ok()
+        .map(|id| &*Box::leak(id.into_boxed_str()))
+        .unwrap_or("rodharerist");
     println!("[probe] availability={}", host::availability(plugin_id));
     if let Err(error) = host::init_at_boot() {
         println!("[probe] FAILED init_at_boot: {error}");
@@ -124,6 +128,16 @@ fn run() {
             "[probe] click landed at page coordinates {position:?} (sent {:?})",
             (CLICK_X, CLICK_Y)
         );
+    }
+
+    // `FUTUREBOARD_PROBE_FRAME_OUT=<path>` saves the last painted frame as
+    // raw BGRA, named `<path>.<width>x<height>.bgra`, for visual inspection.
+    if let Some(out) = std::env::var_os("FUTUREBOARD_PROBE_FRAME_OUT") {
+        let saved = host::with_view_frame(view_id, |bytes, w, h| {
+            let path = format!("{}.{w}x{h}.bgra", out.to_string_lossy());
+            std::fs::write(&path, bytes).map(|_| path)
+        });
+        println!("[probe] frame dump {saved:?}");
     }
 
     host::close_view(view_id);
@@ -209,6 +223,8 @@ const LISTENER_SCRIPT: &str = r#"
     innerWidth: innerWidth,
     innerHeight: innerHeight,
     visualScale: visualViewport ? visualViewport.scale : null,
+    webgl: !!document.createElement("canvas").getContext("webgl"),
+    canvas2d: !!document.createElement("canvas").getContext("2d"),
   });
   console.log("[cef-diagnostic] probe listeners installed");
 })();
@@ -247,6 +263,13 @@ fn drive_input(view_id: host::ViewId, stage: InputStage) -> InputStage {
         InputStage::WaitingForBridge | InputStage::Done => return stage,
         InputStage::InstallListeners => {
             host::send_to_view(view_id, LISTENER_SCRIPT);
+            // `FUTUREBOARD_PROBE_SCRIPT=<file.js>` runs extra page script once
+            // the bridge is up — e.g. to post synthetic analyser frames.
+            if let Some(script) = std::env::var_os("FUTUREBOARD_PROBE_SCRIPT")
+                .and_then(|path| std::fs::read_to_string(path).ok())
+            {
+                host::send_to_view(view_id, &script);
+            }
             // `execute_javascript` is asynchronous; an event sent on the very
             // next tick can beat the listeners into the document and be missed.
             return InputStage::Settle(6);
