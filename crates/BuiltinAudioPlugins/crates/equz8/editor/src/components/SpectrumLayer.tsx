@@ -1,6 +1,10 @@
-import { useEffect, useRef, type RefObject } from 'react'
+import { useEffect, useRef, useState, type RefObject } from 'react'
 import type { SpectrumFrame } from '../bridge'
-import { createSpectrumRenderer, type SpectrumRenderer } from '../lib/spectrumGl'
+import {
+  createSpectrum2dRenderer,
+  createSpectrumRenderer,
+  type SpectrumRenderer,
+} from '../lib/spectrumGl'
 
 export type SpectrumLayerProps = {
   /// Live handle on the newest frame, written by the bridge listener. A ref and
@@ -13,7 +17,8 @@ export type SpectrumLayerProps = {
   visible: boolean
 }
 
-/// The analyser overlay: a WebGL canvas sitting under the response SVG.
+/// The analyser overlay: a WebGL canvas sitting under the response SVG, or a
+/// Canvas 2D one where this runtime cannot create WebGL.
 ///
 /// The redraw is driven by rAF, so the browser parks it entirely while the
 /// editor window is hidden rather than burning frames nobody sees.
@@ -28,6 +33,10 @@ export function SpectrumLayer({ frameRef, visible }: SpectrumLayerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const rendererRef = useRef<SpectrumRenderer | null>(null)
   const visibleRef = useRef(visible)
+  /// Which backend draws. Starts on WebGL; drops to 2D for good if WebGL
+  /// cannot be created. The canvas is keyed on this, so the fallback gets a
+  /// fresh element — one that tried WebGL may refuse a 2D context.
+  const [backend, setBackend] = useState<'webgl' | '2d'>('webgl')
 
   /// Mirrored into a ref so the rAF loop can read it without the effect below
   /// re-running — rebuilding the GL context to flip a boolean would drop the
@@ -39,10 +48,16 @@ export function SpectrumLayer({ frameRef, visible }: SpectrumLayerProps) {
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
-    const renderer = createSpectrumRenderer(canvas)
-    // No WebGL in this runtime: leave the canvas blank rather than falling back
-    // to a drawing that is not the measured signal.
-    if (!renderer) return
+    const renderer =
+      backend === 'webgl' ? createSpectrumRenderer(canvas) : createSpectrum2dRenderer(canvas)
+    if (!renderer) {
+      // No WebGL here: redraw the same measured data with Canvas 2D.
+      if (backend === 'webgl') {
+        console.warn('[equz8] WebGL unavailable; analyser falls back to Canvas 2D')
+        setBackend('2d')
+      }
+      return
+    }
     rendererRef.current = renderer
 
     // `undefined` is "nothing drawn yet", which is distinct from the `null`
@@ -78,9 +93,9 @@ export function SpectrumLayer({ frameRef, visible }: SpectrumLayerProps) {
       rendererRef.current = null
     }
     // `frameRef` is a stable ref object owned by the editor root, so this
-    // effect runs once: the GL context is built on mount and torn down on
-    // unmount, never in between.
-  }, [frameRef])
+    // effect runs once per backend: the context is built on mount (or on the
+    // one switch to 2D) and torn down on unmount, never in between.
+  }, [frameRef, backend])
 
-  return <canvas ref={canvasRef} className="spectrum" aria-hidden="true" />
+  return <canvas key={backend} ref={canvasRef} className="spectrum" aria-hidden="true" />
 }

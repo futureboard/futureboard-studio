@@ -44,6 +44,42 @@ void main() {
 }
 `
 
+/// Walk a frame's bins as graph geometry: `x` is 0..1 across the graph on the
+/// SVG's own log frequency scale, `height` is 0..1 up from the floor (already
+/// limited to `HEIGHT_SCALE`). Shared by both renderers so they draw the same
+/// shape from the same data.
+function forEachBin(
+  frame: SpectrumFrame,
+  visit: (index: number, x: number, height: number) => void,
+) {
+  const count = frame.bins.length
+  const span = Math.log(frame.maxHz / frame.minHz)
+  const range = frame.ceilDb - frame.floorDb
+  for (let i = 0; i < count; i += 1) {
+    // Centre of the band this bin covers, mapped through the graph's own
+    // frequency scale so the overlay lines up with the curve above it.
+    const hz = frame.minHz * Math.exp((span * (i + 0.5)) / count)
+    const x = freqToProgress(Math.min(Math.max(hz, MIN_FREQ), MAX_FREQ))
+    // Byte back to dB, then dB to a 0..1 height on the published scale.
+    const db = frame.floorDb + (frame.bins[i]! / 255) * range
+    const level = (db - frame.floorDb) / range
+    visit(i, x, level * HEIGHT_SCALE)
+  }
+}
+
+/// Size a canvas's backing store to its laid-out size in device pixels.
+/// Returns whether it changed (which also clears the canvas).
+function fitCanvas(canvas: HTMLCanvasElement) {
+  const rect = canvas.getBoundingClientRect()
+  const dpr = window.devicePixelRatio || 1
+  const width = Math.max(1, Math.round(rect.width * dpr))
+  const height = Math.max(1, Math.round(rect.height * dpr))
+  if (canvas.width === width && canvas.height === height) return false
+  canvas.width = width
+  canvas.height = height
+  return true
+}
+
 function compile(gl: WebGLRenderingContext, type: number, source: string) {
   const shader = gl.createShader(type)
   if (!shader) return null
@@ -62,8 +98,10 @@ export type SpectrumRenderer = {
   dispose: () => void
 }
 
-/// Build a renderer over `canvas`, or `null` when WebGL is unavailable — the
-/// caller then simply shows no analyser rather than failing the editor.
+/// Build a WebGL renderer over `canvas`, or `null` when WebGL is unavailable
+/// (no GPU access, GPU process down, software WebGL disabled). The caller then
+/// falls back to [`createSpectrum2dRenderer`] on a fresh canvas — a canvas
+/// that ever handed out a WebGL context can no longer give a 2D one.
 export function createSpectrumRenderer(
   canvas: HTMLCanvasElement,
 ): SpectrumRenderer | null {
@@ -111,14 +149,7 @@ export function createSpectrumRenderer(
   let vertices = new Float32Array(0)
 
   const resize = () => {
-    const rect = canvas.getBoundingClientRect()
-    const dpr = window.devicePixelRatio || 1
-    const width = Math.max(1, Math.round(rect.width * dpr))
-    const height = Math.max(1, Math.round(rect.height * dpr))
-    if (canvas.width === width && canvas.height === height) return
-    canvas.width = width
-    canvas.height = height
-    gl.viewport(0, 0, width, height)
+    if (fitCanvas(canvas)) gl.viewport(0, 0, canvas.width, canvas.height)
   }
 
   const draw = (frame: SpectrumFrame | null) => {
@@ -131,24 +162,13 @@ export function createSpectrumRenderer(
     const needed = count * 4
     if (vertices.length !== needed) vertices = new Float32Array(needed)
 
-    const span = Math.log(frame.maxHz / frame.minHz)
-    const range = frame.ceilDb - frame.floorDb
-    for (let i = 0; i < count; i += 1) {
-      // Centre of the band this bin covers, mapped through the graph's own
-      // frequency scale so the overlay lines up with the curve above it.
-      const hz = frame.minHz * Math.exp((span * (i + 0.5)) / count)
-      const x = freqToProgress(Math.min(Math.max(hz, MIN_FREQ), MAX_FREQ)) * 2 - 1
-      // Byte back to dB, then dB to a 0..1 height on the published scale.
-      const db = frame.floorDb + (frame.bins[i]! / 255) * range
-      const level = (db - frame.floorDb) / range
-      const top = -1 + level * HEIGHT_SCALE * 2
-
+    forEachBin(frame, (i, x, height) => {
       const base = i * 4
-      vertices[base] = x
+      vertices[base] = x * 2 - 1
       vertices[base + 1] = -1
-      vertices[base + 2] = x
-      vertices[base + 3] = top
-    }
+      vertices[base + 2] = x * 2 - 1
+      vertices[base + 3] = -1 + height * 2
+    })
 
     gl.useProgram(program)
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer)
@@ -170,6 +190,50 @@ export function createSpectrumRenderer(
     // window can be opened and closed repeatedly in one session, and browsers
     // cap the number of live WebGL contexts.
     gl.getExtension('WEBGL_lose_context')?.loseContext()
+  }
+
+  return { draw, resize, dispose }
+}
+
+/// Canvas 2D renderer for the same overlay, for runtimes where WebGL cannot be
+/// created — e.g. a Linux machine whose user cannot open the GPU render node,
+/// where Chromium has no hardware GL and no longer falls back to software
+/// WebGL. Draws the identical measured shape and colours; it is only slower,
+/// which at ~30 Hz and a few hundred bins does not matter.
+export function createSpectrum2dRenderer(canvas: HTMLCanvasElement): SpectrumRenderer | null {
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return null
+
+  const resize = () => {
+    fitCanvas(canvas)
+  }
+
+  const draw = (frame: SpectrumFrame | null) => {
+    resize()
+    const { width, height } = canvas
+    ctx.clearRect(0, 0, width, height)
+    if (!frame || frame.bins.length === 0) return
+
+    ctx.beginPath()
+    ctx.moveTo(0, height)
+    forEachBin(frame, (_i, x, level) => {
+      ctx.lineTo(x * width, height - level * height)
+    })
+    ctx.lineTo(width, height)
+    ctx.closePath()
+
+    // Same ramp as the shader: slate low, lighter high, base faded out.
+    const fill = ctx.createLinearGradient(0, height, 0, 0)
+    fill.addColorStop(0, 'rgba(77, 102, 140, 0)')
+    fill.addColorStop(0.22, 'rgba(98, 124, 163, 0.42)')
+    fill.addColorStop(0.74, 'rgba(148, 179, 224, 0.42)')
+    fill.addColorStop(1, 'rgba(148, 179, 224, 0.42)')
+    ctx.fillStyle = fill
+    ctx.fill()
+  }
+
+  const dispose = () => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
   }
 
   return { draw, resize, dispose }
