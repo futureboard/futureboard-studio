@@ -11322,6 +11322,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "ureq 3.3.0",
+ "windows-sys 0.61.2",
  "zip 2.4.2",
 ]
 

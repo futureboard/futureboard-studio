@@ -187,6 +187,7 @@ pub fn build_plugins(
         .arg("--message-format=json-render-diagnostics")
         .args(["--profile", profile])
         .args(["--target-dir", edition.target_dir()]);
+    crate::jobs::apply(&mut command, Some(profile), &[]);
     for package in packages {
         command.args(["--package", package]);
     }

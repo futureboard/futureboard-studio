@@ -131,6 +131,7 @@ fn build(profile: &str, target: Option<&str>) -> Result<PathBuf> {
         .args(["--bin", JAM_BINARY])
         .args(["--profile", profile])
         .args(["--target-dir", TARGET_DIR]);
+    crate::jobs::apply(&mut command, Some(profile), &[]);
     if let Some(target) = target {
         command.args(["--target", target]);
     }

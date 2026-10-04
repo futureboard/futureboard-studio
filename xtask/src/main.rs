@@ -19,6 +19,7 @@
 mod cargo_build;
 mod cef;
 mod jam;
+mod jobs;
 mod metadata;
 mod package;
 mod platform;
@@ -248,6 +249,7 @@ fn run_cargo_alias(alias: &str, forwarded: &[String]) -> Result<(), ExitCode> {
     eprintln!("[xtask] cargo {} {}", alias, forwarded.join(" "));
     let mut command = Command::new(&cargo);
     command.arg(alias).args(forwarded).current_dir(root);
+    jobs::apply(&mut command, None, forwarded);
 
     // Cargo does not expose an alias' `--target-dir` as CARGO_TARGET_DIR to
     // build scripts. Crashpad uses that variable when it places its handler,
