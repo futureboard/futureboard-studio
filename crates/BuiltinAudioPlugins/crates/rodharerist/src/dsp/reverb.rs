@@ -34,6 +34,9 @@ const SIZE_HEADROOM: f32 = 1.6;
 const MAX_PREDELAY_S: f32 = 0.060;
 
 const FIXED_GAIN: f32 = 0.015;
+/// Loop gain of the shimmer regeneration at 100 % shimmer, independent of
+/// decay. Below unity so the octave voice sustains and fades, never grows.
+const SHIMMER_LOOP_GAIN: f32 = 0.85;
 const SCALE_DAMP: f32 = 0.4;
 /// Per-voicing tuning. A model switch re-targets these; nothing reallocates.
 #[derive(Debug, Clone, Copy)]
@@ -494,6 +497,9 @@ impl PlateReverb {
             wet_r += comb.process(input_r, read_len, feedback, damp1, damp2);
         }
 
+        // The comb sum, before diffusion: the shimmer's tap (see below).
+        let combs_l = wet_l;
+        let combs_r = wet_r;
         for allpass in &mut self.allpass_l {
             wet_l = allpass.process(wet_l, diffusion);
         }
@@ -509,13 +515,25 @@ impl PlateReverb {
         // and scaled well below unity so the second loop can only sustain, not
         // run away, on top of the comb bank's own sub-unity feedback.
         if shimmer > 1.0e-4 {
-            let up_l = self.shimmer_l.process(wet_l);
-            let up_r = self.shimmer_r.process(wet_r);
             // This is a second feedback loop around the already-regenerating
-            // comb bank, so its small-signal gain must remain conservative.
-            // tanh bounds pathological buildup without hard-clipping the tail.
-            let fb_l = (up_l * shimmer * FIXED_GAIN * 0.75).tanh();
-            let fb_r = (up_r * shimmer * FIXED_GAIN * 0.75).tanh();
+            // comb bank, so its gain has to be bounded, not just its samples:
+            // with a fixed carry the loop passed unity above ~30 % shimmer and
+            // the tail ran away to +40 dBFS (tanh caps each sample, not the
+            // gain). The tap is the comb sum, not the diffused output: the
+            // Freeverb-style diffusers are not unity-gain (up to
+            // (1+g)/(1-g) per stage), while the comb sum is bounded by
+            // `COMBS / (1 - feedback)` — the damping filter only lowers gain
+            // above DC — and the octave shifter's crossfade by sqrt(2).
+            // Dividing the carry by that bound holds the loop at or under
+            // `shimmer * SHIMMER_LOOP_GAIN` at every decay: the octave voice
+            // sustains and fades, never grows.
+            let up_l = self.shimmer_l.process(combs_l);
+            let up_r = self.shimmer_r.process(combs_r);
+            let bound =
+                COMB_TUNINGS.len() as f32 * std::f32::consts::SQRT_2 / (1.0 - feedback).max(1.0e-3);
+            let carry = shimmer * SHIMMER_LOOP_GAIN / bound;
+            let fb_l = (up_l * carry).tanh();
+            let fb_r = (up_r * carry).tanh();
             self.shimmer_fb_l = if fb_l.is_finite() { fb_l } else { 0.0 };
             self.shimmer_fb_r = if fb_r.is_finite() { fb_r } else { 0.0 };
         } else {
@@ -524,5 +542,52 @@ impl PlateReverb {
         }
 
         (mix(left, wet_l, mix_amount), mix(right, wet_r, mix_amount))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One 0.3 s note into the wet signal, then silence: the peak, and the
+    /// loudest sample of the last second.
+    fn peak_and_tail(decay_s: f32, shimmer: f32) -> (f32, f32) {
+        let sr = 48_000.0;
+        let mut reverb = PlateReverb::new(sr);
+        reverb.configure(ReverbModel::Shimmer, decay_s, 100.0, shimmer);
+        reverb.reset();
+        let (mut peak, mut tail) = (0.0f32, 0.0f32);
+        for i in 0..(sr as usize * 8) {
+            let t = i as f32 / sr;
+            let x = if t < 0.3 {
+                0.5 * (t * 196.0 * std::f32::consts::TAU).sin()
+            } else {
+                0.0
+            };
+            let (l, r) = reverb.process(x, x);
+            peak = peak.max(l.abs()).max(r.abs());
+            if t > 7.0 {
+                tail = tail.max(l.abs()).max(r.abs());
+            }
+        }
+        (peak, tail)
+    }
+
+    #[test]
+    fn shimmer_never_runs_away() {
+        // Every corner of the decay x shimmer range used to be checked by ear;
+        // above ~30 % shimmer the regeneration loop passed unity gain and the
+        // tail sat at +40 dBFS forever.
+        for decay in [0.5, 4.0, 8.5, 15.0] {
+            for shimmer in [30.0, 62.0, 100.0] {
+                let (peak, tail) = peak_and_tail(decay, shimmer);
+                assert!(peak < 1.0, "decay {decay} shimmer {shimmer}: peak {peak}");
+                let (_, dry_tail) = peak_and_tail(decay, 0.0);
+                assert!(
+                    tail < dry_tail.max(1.0e-4) * 20.0,
+                    "decay {decay} shimmer {shimmer}: tail {tail} does not decay"
+                );
+            }
+        }
     }
 }
