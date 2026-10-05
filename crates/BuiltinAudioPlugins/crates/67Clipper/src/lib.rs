@@ -12,9 +12,11 @@ use builtin_dsp_core::{
 use serde::{Deserialize, Serialize};
 
 pub mod ipc;
+pub mod presets;
 pub mod ui;
 
 pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 pub const PLUGIN_ID: &str = "futureboard.clipper67";
 
@@ -104,6 +106,46 @@ pub fn default_params() -> Params {
         stereo_link: true,
         dc_filter: true,
     }
+}
+
+/// The clipper's waveshaper: `x` through a curve `shape` percent soft, from
+/// a hard clip at 0 to a tanh knee at 100, never past full scale.
+#[inline]
+pub fn clip_curve(x: f32, shape: f32) -> f32 {
+    let softness = clamp(shape, 0.0, 100.0) / 100.0;
+    if softness <= 0.001 {
+        x.clamp(-INTERNAL_CEILING, INTERNAL_CEILING)
+    } else {
+        let drive = 1.0 + (1.0 - softness) * 15.0;
+        (x * drive).tanh() / drive.tanh()
+    }
+}
+
+/// The steady-state output peak, in dBFS, of a peak held at `input_db`: the
+/// threshold's drive, the mode's clip and peak gain once its envelope has
+/// settled, the ceiling, then the dry blend. Bypassed, the output is the
+/// input.
+pub fn transfer_db(params: &Params, input_db: f32) -> f32 {
+    if !params.power {
+        return input_db;
+    }
+    let dry = db_to_linear(input_db);
+    let driven = dry * db_to_linear(-params.threshold_db);
+    let wet = match params.mode {
+        Mode::Clip => clip_curve(driven, params.shape),
+        Mode::Hybrid => {
+            let clipped = clip_curve(driven, params.shape);
+            if clipped <= HYBRID_CATCH_THRESHOLD {
+                clipped
+            } else {
+                clipped * (HYBRID_CATCH_THRESHOLD / clipped).sqrt()
+            }
+        }
+        Mode::Limit => driven.min(INTERNAL_CEILING),
+    };
+    let wet = wet * db_to_linear(params.ceiling_db);
+    let amount = clamp(params.mix, 0.0, 100.0) / 100.0;
+    linear_to_db(mix(dry, wet, amount).max(1.0e-9))
 }
 
 pub fn descriptor() -> PluginDescriptor {
@@ -410,13 +452,7 @@ impl Dsp {
 
     #[inline]
     fn shape_clip(x: f32, shape: f32) -> f32 {
-        let softness = clamp(shape, 0.0, 100.0) / 100.0;
-        if softness <= 0.001 {
-            x.clamp(-INTERNAL_CEILING, INTERNAL_CEILING)
-        } else {
-            let drive = 1.0 + (1.0 - softness) * 15.0;
-            (x * drive).tanh() / drive.tanh()
-        }
+        clip_curve(x, shape)
     }
 
     #[inline]
@@ -681,6 +717,43 @@ mod tests {
         for mode in [Mode::Clip, Mode::Hybrid, Mode::Limit] {
             assert!(dsp.apply_ui_param("mode", mode.to_wire()));
             assert_eq!(dsp.params().mode, mode);
+        }
+    }
+
+    /// The output peak of a steady 1 kHz tone held at `input_db`, once the
+    /// envelopes have settled.
+    fn settled_peak_db(dsp: &mut Dsp, input_db: f32) -> f32 {
+        let amplitude = db_to_linear(input_db);
+        let rate = 48_000.0;
+        let mut peak = 0.0f32;
+        for n in 0..48_000 {
+            let x = (std::f32::consts::TAU * 1_000.0 * n as f32 / rate).sin() * amplitude;
+            let (l, _) = dsp.process_stereo(x, x);
+            if n >= 36_000 {
+                peak = peak.max(l.abs());
+            }
+        }
+        linear_to_db(peak.max(1.0e-9))
+    }
+
+    /// The curve the editor draws is the peak a steady tone comes out at, in
+    /// every mode.
+    #[test]
+    fn the_transfer_curve_is_what_a_steady_tone_comes_out_at() {
+        for mode in [Mode::Clip, Mode::Hybrid, Mode::Limit] {
+            for input in [-18.0, -6.0, -1.0] {
+                let mut params = default_params();
+                params.mode = mode;
+                params.dc_filter = false;
+                let mut dsp = Dsp::new(48_000.0);
+                dsp.set_params(params.clone());
+                let measured = settled_peak_db(&mut dsp, input);
+                let drawn = transfer_db(&params, input);
+                assert!(
+                    (measured - drawn).abs() < 0.5,
+                    "{mode:?} at {input} dB: measured {measured}, drawn {drawn}"
+                );
+            }
         }
     }
 }

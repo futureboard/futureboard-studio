@@ -15,22 +15,12 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 biquad.workspace = true
 builtin-dsp-core.workspace = true
-builtin-ui-embed.workspace = true
 nam-rs.workspace = true
 # Partitioned FFT convolution for the cabinet IR engine (see src/dsp/ir.rs).
 # Already a workspace dependency (SphereAudioProcessor) — no new tree.
 rustfft.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[build-dependencies]
-# Build-time only: turns `editorui/dist` into the embedded asset table.
-#
-# This must stay pointed at the dependency-free `builtin_ui_embed`, never at the
-# `BuiltinAudioPlugins` umbrella: a build-dependency is a separate build unit,
-# and pulling the umbrella in here rebuilt all eight plugin `cdylib`s a second
-# time into the same `.dll` paths, causing intermittent LNK1104 link races.
-builtin-ui-embed = { workspace = true, features = ["generate"] }
 
 [lints]
 workspace = true

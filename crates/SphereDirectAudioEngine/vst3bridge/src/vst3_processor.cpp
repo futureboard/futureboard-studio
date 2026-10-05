@@ -2617,6 +2617,29 @@ daux_vst3_create_impl(const char *plugin_path, const char *class_id,
     }
   }
 
+  // Hand the separate controller the component's state, as the SDK's own
+  // PlugProvider does on setup. Some controllers build the model their editor
+  // reads only here: Roland Cloud's synths dereference null inside
+  // IPlugView::attached() when a host skips it. A restore later repeats it
+  // with the saved state (sphere_daux_vst3_set_state).
+  if (instance->controller && !instance->controller_is_component) {
+    Steinberg::MemoryStream state;
+    const auto get_res = instance->component->getState(&state);
+    if (get_res == Steinberg::kResultOk) {
+      state.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+      const auto sync_res = instance->controller->setComponentState(&state);
+      std::fprintf(stderr,
+                   "[DAUx VST3] controller synced to component state "
+                   "result=0x%x\n",
+                   static_cast<unsigned>(sync_res));
+    } else {
+      std::fprintf(stderr,
+                   "[DAUx VST3] component getState for controller sync "
+                   "result=0x%x (skipped)\n",
+                   static_cast<unsigned>(get_res));
+    }
+  }
+
   instance->plugin_path = plugin_path ? plugin_path : "";
 
   instance->deferred_sample_rate = sample_rate;

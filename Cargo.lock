@@ -1252,7 +1252,6 @@ name = "burnlimit"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
  "builtin_dsp_core",
- "builtin_ui_embed",
  "serde",
  "serde_json",
 ]
@@ -1583,7 +1582,6 @@ name = "clipper67"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
  "builtin_dsp_core",
- "builtin_ui_embed",
  "serde",
  "serde_json",
 ]
@@ -1716,7 +1714,6 @@ version = "2026.10.1-beta1.4.2"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
- "builtin_ui_embed",
  "serde",
  "serde_json",
 ]
@@ -2614,7 +2611,6 @@ name = "drumsampler"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
  "builtin_dsp_core",
- "builtin_ui_embed",
  "serde",
  "serde_json",
 ]
@@ -2911,7 +2907,6 @@ name = "fa2a"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
  "builtin_dsp_core",
- "builtin_ui_embed",
  "serde",
  "serde_json",
 ]
@@ -2921,7 +2916,6 @@ name = "fa76"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
  "builtin_dsp_core",
- "builtin_ui_embed",
  "serde",
  "serde_json",
 ]
@@ -4371,7 +4365,6 @@ name = "imager"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
  "builtin_dsp_core",
- "builtin_ui_embed",
  "serde",
  "serde_json",
 ]
@@ -5187,7 +5180,6 @@ name = "mixstation"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
  "builtin_dsp_core",
- "builtin_ui_embed",
  "serde",
  "serde_json",
 ]
@@ -7260,7 +7252,6 @@ version = "2026.10.1-beta1.4.2"
 dependencies = [
  "biquad",
  "builtin_dsp_core",
- "builtin_ui_embed",
  "nam-rs",
  "rustfft",
  "serde",
@@ -9440,7 +9431,6 @@ name = "transient"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
  "builtin_dsp_core",
- "builtin_ui_embed",
  "serde",
  "serde_json",
 ]
@@ -11253,7 +11243,6 @@ name = "wrapsynth"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
  "builtin_dsp_core",
- "builtin_ui_embed",
  "serde",
  "serde_json",
 ]
@@ -11563,7 +11552,6 @@ name = "zcomp"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
  "builtin_dsp_core",
- "builtin_ui_embed",
  "serde",
  "serde_json",
 ]

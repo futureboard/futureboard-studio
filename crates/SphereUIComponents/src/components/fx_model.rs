@@ -244,6 +244,14 @@ pub enum Unit {
     Cents,
     /// A depth either side, in cents.
     CentsDepth,
+    /// Microseconds.
+    Us,
+    /// A compression ratio, `n:1`.
+    Ratio,
+    /// A bare number, no unit.
+    Plain,
+    /// A sidechain filter in Hz, off at or below the threshold given.
+    CutHz(f32),
 }
 
 /// One knob: which param, its label, range, taper and readout.
@@ -342,6 +350,7 @@ impl KnobSpec {
 /// value behind that the readout cannot show.
 pub fn round_for(unit: Unit, value: f32) -> f32 {
     let step = match unit {
+        Unit::Ms if value < 1.0 => 0.01,
         Unit::Ms if value < 10.0 => 0.1,
         Unit::Ms => 1.0,
         Unit::Sec if value < 10.0 => 0.01,
@@ -356,6 +365,9 @@ pub fn round_for(unit: Unit, value: f32) -> f32 {
         Unit::Db => 0.1,
         Unit::Times => 0.01,
         Unit::Division | Unit::Semitones | Unit::Cents | Unit::CentsDepth => 1.0,
+        Unit::Us | Unit::Plain | Unit::CutHz(_) => 1.0,
+        Unit::Ratio if value < 10.0 => 0.1,
+        Unit::Ratio => 0.5,
     };
     (value / step).round() * step
 }
@@ -363,6 +375,7 @@ pub fn round_for(unit: Unit, value: f32) -> f32 {
 pub fn format_value(unit: Unit, value: f32) -> String {
     match unit {
         Unit::Ms if value >= 1_000.0 => format!("{:.2} s", value / 1_000.0),
+        Unit::Ms if value < 1.0 => format!("{value:.2} ms"),
         Unit::Ms if value < 10.0 => format!("{value:.1} ms"),
         Unit::Ms => format!("{value:.0} ms"),
         Unit::Sec if value.is_infinite() => "∞".to_string(),
@@ -381,6 +394,12 @@ pub fn format_value(unit: Unit, value: f32) -> String {
         Unit::Cents if value.abs() < 0.5 => "0 ¢".to_string(),
         Unit::Cents => format!("{value:+.0} ¢"),
         Unit::CentsDepth => format!("±{value:.0} ¢"),
+        Unit::Us => format!("{value:.0} µs"),
+        Unit::Ratio if value < 10.0 => format!("{value:.1}:1"),
+        Unit::Ratio => format!("{value:.0}:1"),
+        Unit::Plain => format!("{value:.0}"),
+        Unit::CutHz(off) if value <= off => "Off".to_string(),
+        Unit::CutHz(_) => format_value(Unit::Hz, value),
         Unit::Division => echospace::DIVISION_LABELS
             .get(value.round().clamp(0.0, echospace::MAX_DIVISION_WIRE) as usize)
             .copied()
@@ -575,5 +594,12 @@ mod tests {
         assert_eq!(format_value(Unit::Db, 0.01), "0.0 dB");
         assert_eq!(format_value(Unit::Division, 9.0), "1/8.");
         assert_eq!(format_value(Unit::Sec, f32::INFINITY), "∞");
+        assert_eq!(format_value(Unit::Ms, 0.25), "0.25 ms");
+        assert_eq!(round_for(Unit::Ms, 0.013), 0.01);
+        assert_eq!(format_value(Unit::Ratio, 4.0), "4.0:1");
+        assert_eq!(format_value(Unit::Ratio, 20.0), "20:1");
+        assert_eq!(format_value(Unit::CutHz(20.0), 0.0), "Off");
+        assert_eq!(format_value(Unit::CutHz(20.0), 90.0), "90 Hz");
+        assert_eq!(format_value(Unit::Us, 400.0), "400 µs");
     }
 }

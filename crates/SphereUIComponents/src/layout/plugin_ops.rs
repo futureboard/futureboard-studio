@@ -134,6 +134,28 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::white_sharp_window::WhiteSharpWindow>,
     >,
+    /// Open native dynamics editors — FA-2A, FA-76, Z-Comp, BurnLimit,
+    /// 67Clipper and Transient share one window type — keyed by insert id,
+    /// like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub dynamics: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::dyn_panel::DynEditorWindow>,
+    >,
+    /// Open native Compressor and Imager editors (one window type for both),
+    /// keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub bands: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::band_panel::BandEditorWindow>,
+    >,
+    /// Open native MixStation editors, keyed by insert id, like
+    /// `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub mix_station: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::mix_station_panel::MixStationWindow>,
+    >,
     /// Native main-owned external-bridge editor shells, keyed by
     /// `(track_id, plugin_instance_id)`.
     pub bridge: std::collections::HashMap<(String, String), BridgeEditorSession>,
@@ -3232,6 +3254,69 @@ impl StudioLayout {
                 window,
                 cx,
             ),
+            Some(fa2a::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.dynamics,
+                crate::components::dyn_panel::open_fa2a_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(fa76::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.dynamics,
+                crate::components::dyn_panel::open_fa76_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(zcomp::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.dynamics,
+                crate::components::dyn_panel::open_zcomp_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(burnlimit::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.dynamics,
+                crate::components::dyn_panel::open_burnlimit_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(clipper67::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.dynamics,
+                crate::components::dyn_panel::open_clipper67_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(transient::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.dynamics,
+                crate::components::dyn_panel::open_transient_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(compresser::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.bands,
+                crate::components::band_panel::open_compresser_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(imager::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.bands,
+                crate::components::band_panel::open_imager_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(mixstation::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.mix_station,
+                crate::components::mix_station_panel::open_mixstation_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
             _ => self.open_native_editor(
                 |windows| &mut windows.quick_sampler,
                 crate::components::quick_sampler_window::open_quick_sampler_editor,
@@ -3395,6 +3480,18 @@ impl StudioLayout {
             }
             let tuners: Vec<_> = self.plugin_editors.white_sharp.values().copied().collect();
             for handle in tuners {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let dynamics: Vec<_> = self.plugin_editors.dynamics.values().copied().collect();
+            for handle in dynamics {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let bands: Vec<_> = self.plugin_editors.bands.values().copied().collect();
+            for handle in bands {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let racks: Vec<_> = self.plugin_editors.mix_station.values().copied().collect();
+            for handle in racks {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
         }

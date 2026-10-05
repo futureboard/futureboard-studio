@@ -834,6 +834,96 @@ mod state_mirror {
         }
     }
 
+    /// An FA-2A insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_fa2a_params(insert_id: &str) -> Option<fa2a::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Fa2a(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// An FA-76 insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_fa76_params(insert_id: &str) -> Option<fa76::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Fa76(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A Z-Comp insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_zcomp_params(insert_id: &str) -> Option<zcomp::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Zcomp(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A BurnLimit insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_burnlimit_params(insert_id: &str) -> Option<burnlimit::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::BurnLimit(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A 67Clipper insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_clipper67_params(insert_id: &str) -> Option<clipper67::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Clipper67(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A Transient insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_transient_params(insert_id: &str) -> Option<transient::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Transient(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A Compressor insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_compresser_params(insert_id: &str) -> Option<compresser::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Compresser(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// An Imager insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_imager_params(insert_id: &str) -> Option<imager::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Imager(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A MixStation insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_mixstation_params(insert_id: &str) -> Option<mixstation::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::MixStation(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
     /// A WhiteSharp insert's mirrored params, like
     /// [`builtin_verbspace_params`].
     pub fn builtin_whitesharp_params(insert_id: &str) -> Option<whitesharp::Params> {
@@ -925,12 +1015,15 @@ mod state_mirror {
 
 #[cfg(feature = "builtin-plugin-editor")]
 pub use state_mirror::{
+    builtin_burnlimit_params, builtin_clipper67_params, builtin_compresser_params,
     builtin_default_replay, builtin_drum_sampler_params, builtin_echospace_params,
-    builtin_equz8_params, builtin_equzx_params, builtin_quick_sampler_params,
+    builtin_equz8_params, builtin_equzx_params, builtin_fa2a_params, builtin_fa76_params,
+    builtin_imager_params, builtin_mixstation_params, builtin_quick_sampler_params,
     builtin_replay_changes, builtin_rodhareist_params, builtin_sample_names, builtin_slicer_params,
     builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
-    builtin_state_replay, builtin_state_seed, builtin_state_set_sample, builtin_used_output_buses,
-    builtin_verbspace_params, builtin_whitesharp_params, builtin_wrapsynth_params,
+    builtin_state_replay, builtin_state_seed, builtin_state_set_sample, builtin_transient_params,
+    builtin_used_output_buses, builtin_verbspace_params, builtin_whitesharp_params,
+    builtin_wrapsynth_params, builtin_zcomp_params,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is
@@ -1486,69 +1579,21 @@ mod imp {
     ///
     /// This is the isolation boundary: an origin that is not a known built-in
     /// returns `None`, so one plugin's editor can never read another's assets.
-    /// Runs on CEF's IO thread — it only indexes static tables.
-    fn resolve_asset(origin: &str, path: &str) -> Option<SchemeAsset> {
-        use builtin_ui_embed::EmbeddedPluginUi;
-        let asset = match origin {
-            rodharerist::ui::UI_ORIGIN => rodharerist::ui::RodhareistUi::resolve_ui_asset(path)?,
-            imager::ui::UI_ORIGIN => imager::ui::ImagerUi::resolve_ui_asset(path)?,
-            fa2a::ui::UI_ORIGIN => fa2a::ui::Fa2aUi::resolve_ui_asset(path)?,
-            fa76::ui::UI_ORIGIN => fa76::ui::Fa76Ui::resolve_ui_asset(path)?,
-            burnlimit::ui::UI_ORIGIN => burnlimit::ui::BurnLimitUi::resolve_ui_asset(path)?,
-            clipper67::ui::UI_ORIGIN => clipper67::ui::Clipper67Ui::resolve_ui_asset(path)?,
-            transient::ui::UI_ORIGIN => transient::ui::TransientUi::resolve_ui_asset(path)?,
-            wrapsynth::ui::UI_ORIGIN => wrapsynth::ui::WrapSynthUi::resolve_ui_asset(path)?,
-            drumsampler::ui::UI_ORIGIN => drumsampler::ui::DrumSamplerUi::resolve_ui_asset(path)?,
-            zcomp::ui::UI_ORIGIN => zcomp::ui::ZcompUi::resolve_ui_asset(path)?,
-            mixstation::ui::UI_ORIGIN => mixstation::ui::MixStationUi::resolve_ui_asset(path)?,
-            compresser::ui::UI_ORIGIN => compresser::ui::CompresserUi::resolve_ui_asset(path)?,
-            _ => return None,
-        };
-        Some(SchemeAsset {
-            bytes: asset.bytes,
-            mime_type: asset.mime_type,
-        })
+    /// Every built-in editor is native GPUI now and none embeds a bundle, so
+    /// no origin resolves. Runs on CEF's IO thread.
+    fn resolve_asset(_origin: &str, _path: &str) -> Option<SchemeAsset> {
+        None
     }
 
-    /// Whether this build links a built-in's editor at all. Distinct from
-    /// [`has_embedded_ui`]: an origin can be hosted here yet carry an empty
-    /// asset table when its bundle was never built, and the two cases get
-    /// different `HostAvailability` errors.
-    fn hosts_editor(origin: &str) -> bool {
-        matches!(
-            origin,
-            rodharerist::ui::UI_ORIGIN
-                | imager::ui::UI_ORIGIN
-                | fa2a::ui::UI_ORIGIN
-                | fa76::ui::UI_ORIGIN
-                | burnlimit::ui::UI_ORIGIN
-                | clipper67::ui::UI_ORIGIN
-                | transient::ui::UI_ORIGIN
-                | wrapsynth::ui::UI_ORIGIN
-                | drumsampler::ui::UI_ORIGIN
-                | zcomp::ui::UI_ORIGIN
-                | mixstation::ui::UI_ORIGIN
-                | compresser::ui::UI_ORIGIN
-        )
+    /// Whether this build links a built-in's editor bundle at all. None does:
+    /// every built-in editor is a native view, opened without CEF.
+    fn hosts_editor(_origin: &str) -> bool {
+        false
     }
 
     /// Whether a built-in plugin has embedded editor assets to serve.
-    fn has_embedded_ui(origin: &str) -> bool {
-        match origin {
-            rodharerist::ui::UI_ORIGIN => rodharerist::ui::RodhareistUi::is_embedded(),
-            imager::ui::UI_ORIGIN => imager::ui::ImagerUi::is_embedded(),
-            fa2a::ui::UI_ORIGIN => fa2a::ui::Fa2aUi::is_embedded(),
-            fa76::ui::UI_ORIGIN => fa76::ui::Fa76Ui::is_embedded(),
-            burnlimit::ui::UI_ORIGIN => burnlimit::ui::BurnLimitUi::is_embedded(),
-            clipper67::ui::UI_ORIGIN => clipper67::ui::Clipper67Ui::is_embedded(),
-            transient::ui::UI_ORIGIN => transient::ui::TransientUi::is_embedded(),
-            wrapsynth::ui::UI_ORIGIN => wrapsynth::ui::WrapSynthUi::is_embedded(),
-            drumsampler::ui::UI_ORIGIN => drumsampler::ui::DrumSamplerUi::is_embedded(),
-            zcomp::ui::UI_ORIGIN => zcomp::ui::ZcompUi::is_embedded(),
-            mixstation::ui::UI_ORIGIN => mixstation::ui::MixStationUi::is_embedded(),
-            compresser::ui::UI_ORIGIN => compresser::ui::CompresserUi::is_embedded(),
-            _ => false,
-        }
+    fn has_embedded_ui(_origin: &str) -> bool {
+        false
     }
 
     /// React->native bridge inbound queue, keyed by scheme origin (the same
@@ -3207,24 +3252,20 @@ mod tests {
 
     #[cfg(feature = "builtin-plugin-editor")]
     #[test]
-    fn builtins_with_an_editor_are_hostable_and_the_rest_are_not() {
-        // These embed a UI in any build that ran their build script against a
-        // built dist; either way they must never be `NotCompiledIn` here.
-        // (The EQs and the time effects draw natively and are no longer
-        // CEF-hosted.)
+    fn no_builtin_is_hosted_in_cef() {
+        // Every built-in editor draws natively; a CEF open is refused by name,
+        // not reported as an empty asset table.
         for id in [
             "builtin:rodharerist",
             "builtin:imager",
             "builtin:mixstation",
+            "builtin:c1073",
         ] {
-            assert_ne!(availability(id), HostAvailability::NotCompiledIn);
+            assert_eq!(
+                availability(id),
+                HostAvailability::NoEditorForPlugin(id.to_string())
+            );
         }
-        // A catalogued built-in that ships no editor bundle is refused by name,
-        // not reported as an empty asset table.
-        assert_eq!(
-            availability("builtin:c1073"),
-            HostAvailability::NoEditorForPlugin("builtin:c1073".to_string())
-        );
     }
 
     /// Imager's editor edits land in the mirror, persist as an `ImagerState`

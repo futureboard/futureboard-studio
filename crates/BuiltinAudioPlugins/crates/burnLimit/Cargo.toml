@@ -14,15 +14,8 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 builtin-dsp-core.workspace = true
-builtin-ui-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[build-dependencies]
-# Build-time only: `build.rs` compiles the editor into Cargo's OUT_DIR, then
-# turns that bundle into the embedded asset table. Keep this pointed at the
-# dependency-free generator, never the `BuiltinAudioPlugins` umbrella.
-builtin-ui-embed = { workspace = true, features = ["generate"] }
 
 [lints]
 workspace = true

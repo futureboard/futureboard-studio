@@ -18,13 +18,17 @@ use gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
 };
 
+use crate::components::band_model::BandKind;
 use crate::components::builtin_plugin_editor::builtin_state_seed;
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
+use crate::components::dyn_model::DynKind;
 use crate::components::eq_model::{EqKind, EqParams, Placement, Shape};
 use crate::components::eq_window::EqEditorWindow;
 use crate::components::fx_model::{presets, FxKind, FxParams};
 use crate::components::fx_window::{fx_window_size, FxEditorWindow};
+use crate::components::mix_station_panel::MixStationModel;
 use crate::components::native_plugin_shell::ShellIdentity;
+use crate::components::plugin_kit::{KitModel, KitWindow};
 use crate::components::white_sharp_window::{WhiteSharpWindow, WHITESHARP_WINDOW_SIZE};
 
 /// One view to render.
@@ -185,6 +189,78 @@ pub fn scenes() -> Vec<Scene> {
             width: WHITESHARP_WINDOW_SIZE.0,
             height: WHITESHARP_WINDOW_SIZE.1,
             open: whitesharp_scene,
+        },
+        Scene {
+            name: "fa2a",
+            width: DynKind::Fa2a.window_size().0,
+            height: DynKind::Fa2a.window_size().1,
+            open: fa2a_scene,
+        },
+        Scene {
+            name: "fa76",
+            width: DynKind::Fa76.window_size().0,
+            height: DynKind::Fa76.window_size().1,
+            open: fa76_scene,
+        },
+        Scene {
+            name: "zcomp",
+            width: DynKind::Zcomp.window_size().0,
+            height: DynKind::Zcomp.window_size().1,
+            open: zcomp_scene,
+        },
+        Scene {
+            name: "burnlimit",
+            width: DynKind::BurnLimit.window_size().0,
+            height: DynKind::BurnLimit.window_size().1,
+            open: burnlimit_scene,
+        },
+        Scene {
+            name: "clipper67",
+            width: DynKind::Clipper.window_size().0,
+            height: DynKind::Clipper.window_size().1,
+            open: clipper67_scene,
+        },
+        Scene {
+            name: "transient",
+            width: DynKind::Transient.window_size().0,
+            height: DynKind::Transient.window_size().1,
+            open: transient_scene,
+        },
+        Scene {
+            name: "compressor-single",
+            width: BandKind::Comp.window_size().0,
+            height: BandKind::Comp.window_size().1,
+            open: compressor_single,
+        },
+        Scene {
+            name: "compressor-multi",
+            width: BandKind::Comp.window_size().0,
+            height: BandKind::Comp.window_size().1,
+            open: compressor_multi,
+        },
+        Scene {
+            name: "imager",
+            width: BandKind::Imager.window_size().0,
+            height: BandKind::Imager.window_size().1,
+            open: imager_scene,
+        },
+        Scene {
+            name: "imager-stereoize",
+            width: BandKind::Imager.window_size().0,
+            height: BandKind::Imager.window_size().1,
+            open: imager_stereoize,
+        },
+        Scene {
+            name: "mixstation",
+            width: MixStationModel.window_size().0,
+            height: MixStationModel.window_size().1,
+            open: mixstation_scene,
+        },
+        Scene {
+            name: "mixstation-empty",
+            width: MixStationModel.window_size().0,
+            height: MixStationModel.window_size().1,
+            open: mixstation_empty,
         },
         Scene {
             name: "rodhareist",
@@ -356,6 +432,309 @@ fn whitesharp_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
         })
     })?;
     Ok(handle.into())
+}
+
+// ── Dynamics, band and rack scenes ────────────────────────────────────────
+
+/// A meter reading at telemetry frame `t`: a phrase swelling and easing
+/// every few seconds, with up to `reduction_db` taken off at its loudest —
+/// synthetic, for previews only.
+fn preview_frame(t: u32, reduction_db: f32) -> SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+    let phase = t as f32 * 0.09;
+    let swell = 0.5 + 0.5 * phase.sin() * (phase * 0.37).cos();
+    let hit = if t % 11 == 0 { 0.25 } else { 0.0 };
+    let level = |db: f32| 10f32.powf(db / 20.0);
+    let in_db = -22.0 + 16.0 * swell + hit * 8.0;
+    let reduction = (reduction_db * (swell + hit).min(1.0)).max(0.0);
+    let out_db = in_db - reduction + reduction_db * 0.25;
+    SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+        in_peak: level(in_db),
+        in_rms: level(in_db - 8.0),
+        out_peak: level(out_db),
+        out_rms: level(out_db - 8.0),
+        gain_reduction_db: reduction,
+        slot_in_peak: [0.18, 0.2, 0.22, 0.16, 0.2, 0.24],
+        slot_out_peak: [0.2, 0.22, 0.16, 0.2, 0.24, 0.3],
+        ..Default::default()
+    }
+}
+
+/// A stereo image like a mix: a strong centre and some width.
+fn preview_image() -> SpherePluginHost::audio_bridge::StereoImageFrame {
+    use SpherePluginHost::audio_bridge::IMAGE_SCOPE_POINTS;
+    let mut frame = SpherePluginHost::audio_bridge::StereoImageFrame {
+        correlation: 0.62,
+        band_correlation: [0.96, 0.71, 0.48, 0.33],
+        band_level: [0.2, 0.15, 0.08, 0.03],
+        ..Default::default()
+    };
+    for i in 0..IMAGE_SCOPE_POINTS {
+        let a = i as f32 * 0.37;
+        let mid = 0.18 * a.sin() + 0.05 * (a * 3.1).sin();
+        let side = 0.07 * (a * 1.7).cos();
+        frame.scope[2 * i] = mid + side;
+        frame.scope[2 * i + 1] = mid - side;
+    }
+    frame
+}
+
+/// Band reductions like a busy mix bus.
+const PREVIEW_BAND_REDUCTION: [f32; 4] = [2.5, 4.0, 1.2, 3.1];
+
+/// Host ops whose meters move with [`preview_frame`].
+fn kit_host_ops(reduction_db: f32) -> BuiltinEditorHostOps {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TICK: AtomicU32 = AtomicU32::new(300);
+    BuiltinEditorHostOps {
+        meter_source: Some(Arc::new(move |_| {
+            Some(preview_frame(
+                TICK.fetch_add(1, Ordering::Relaxed),
+                reduction_db,
+            ))
+        })),
+        stereo_image_source: Some(Arc::new(|_| Some((1, preview_image())))),
+        band_reduction_source: Some(Arc::new(|_| Some((1, PREVIEW_BAND_REDUCTION)))),
+        ..preview_host_ops()
+    }
+}
+
+/// Seeds `json` for `plugin` and opens `model`'s editor on it, with ten
+/// seconds of history already drawn.
+#[allow(clippy::too_many_arguments)]
+fn open_kit<M: KitModel>(
+    options: WindowOptions,
+    cx: &mut App,
+    model: M,
+    plugin: &'static str,
+    insert: &'static str,
+    json: std::result::Result<String, serde_json::Error>,
+    reduction_db: f32,
+    then: impl FnOnce(&mut crate::components::plugin_kit::KitEditor<M>) + 'static,
+) -> Result<AnyWindowHandle> {
+    if let Ok(json) = json {
+        seed(plugin, insert, json);
+    }
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let window = KitWindow::new(
+                model,
+                key(insert),
+                identity(model.title()),
+                kit_host_ops(reduction_db),
+                no_close(),
+                cx,
+            );
+            {
+                let mut live = window.live().borrow_mut();
+                for t in 0..300 {
+                    live.show(preview_frame(t, reduction_db));
+                }
+                live.show_image(preview_image());
+                live.show_bands(Some(preview_spectrum()), Some(PREVIEW_BAND_REDUCTION));
+            }
+            window.editor().update(cx, |editor, cx| {
+                then(editor);
+                cx.notify();
+            });
+            window
+        })
+    })?;
+    Ok(handle.into())
+}
+
+fn dyn_preset(kind: DynKind, name: &str) -> crate::components::dyn_model::DynParams {
+    crate::components::dyn_model::presets(kind)
+        .iter()
+        .find(|preset| preset.name == name)
+        .map(|preset| preset.params.clone())
+        .unwrap_or_else(|| crate::components::dyn_model::DynParams::defaults(kind))
+}
+
+fn dyn_json(
+    params: &crate::components::dyn_model::DynParams,
+) -> std::result::Result<String, serde_json::Error> {
+    use crate::components::dyn_model::DynParams;
+    match params.clone() {
+        DynParams::Fa2a(p) => fa2a::ipc::Fa2aState::new(p).to_json(),
+        DynParams::Fa76(p) => fa76::ipc::Fa76State::new(p).to_json(),
+        DynParams::Zcomp(p) => zcomp::ipc::ZcompState::new(p).to_json(),
+        DynParams::BurnLimit(p) => burnlimit::ipc::BurnLimitState::new(p).to_json(),
+        DynParams::Clipper(p) => clipper67::ipc::Clipper67State::new(p).to_json(),
+        DynParams::Transient(p) => transient::ipc::TransientState::new(p).to_json(),
+    }
+}
+
+fn open_dyn(
+    options: WindowOptions,
+    cx: &mut App,
+    kind: DynKind,
+    preset: &str,
+    reduction_db: f32,
+) -> Result<AnyWindowHandle> {
+    let params = dyn_preset(kind, preset);
+    open_kit(
+        options,
+        cx,
+        kind,
+        kind.key(),
+        kind.key(),
+        dyn_json(&params),
+        reduction_db,
+        |_| {},
+    )
+}
+
+fn fa2a_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_dyn(options, cx, DynKind::Fa2a, "Vocal Level", 6.0)
+}
+
+fn fa76_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_dyn(options, cx, DynKind::Fa76, "Vocal Catch", 9.0)
+}
+
+fn zcomp_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_dyn(options, cx, DynKind::Zcomp, "Vocal Catch", 5.0)
+}
+
+fn burnlimit_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_dyn(options, cx, DynKind::BurnLimit, "Loud Punch", 4.0)
+}
+
+fn clipper67_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_dyn(options, cx, DynKind::Clipper, "Hybrid Glue", 3.0)
+}
+
+fn transient_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_dyn(options, cx, DynKind::Transient, "Punch Up", 4.0)
+}
+
+fn band_preset(kind: BandKind, name: &str) -> crate::components::band_model::BandParams {
+    crate::components::band_model::presets(kind)
+        .iter()
+        .find(|preset| preset.name == name)
+        .map(|preset| preset.params.clone())
+        .unwrap_or_else(|| crate::components::band_model::BandParams::defaults(kind))
+}
+
+fn open_band(
+    options: WindowOptions,
+    cx: &mut App,
+    kind: BandKind,
+    insert: &'static str,
+    preset: &str,
+) -> Result<AnyWindowHandle> {
+    use crate::components::band_model::BandParams;
+    let (plugin, json) = match band_preset(kind, preset) {
+        BandParams::Comp(p) => (
+            "compresser",
+            compresser::ipc::CompresserState::new(p).to_json(),
+        ),
+        BandParams::Imager(p) => ("imager", imager::ipc::ImagerState::new(p).to_json()),
+    };
+    open_kit(options, cx, kind, plugin, insert, json, 5.0, |_| {})
+}
+
+fn compressor_single(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_band(
+        options,
+        cx,
+        BandKind::Comp,
+        "compressor-single",
+        "Vocal Smooth",
+    )
+}
+
+fn compressor_multi(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_band(
+        options,
+        cx,
+        BandKind::Comp,
+        "compressor-multi",
+        "Multiband Master",
+    )
+}
+
+fn open_imager(
+    options: WindowOptions,
+    cx: &mut App,
+    insert: &'static str,
+    preset: &str,
+    scope: crate::components::plugin_live::ScopeMode,
+) -> Result<AnyWindowHandle> {
+    let crate::components::band_model::BandParams::Imager(p) =
+        band_preset(BandKind::Imager, preset)
+    else {
+        unreachable!("an Imager preset is Imager params");
+    };
+    let json = imager::ipc::ImagerState::new(p).to_json();
+    open_kit(
+        options,
+        cx,
+        BandKind::Imager,
+        "imager",
+        insert,
+        json,
+        5.0,
+        move |editor| {
+            editor.ui.scope = scope;
+            editor.ui.link_bands = true;
+        },
+    )
+}
+
+fn imager_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::plugin_live::ScopeMode;
+    open_imager(
+        options,
+        cx,
+        "imager",
+        "Master Polish",
+        ScopeMode::PolarSample,
+    )
+}
+
+fn imager_stereoize(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::plugin_live::ScopeMode;
+    open_imager(
+        options,
+        cx,
+        "imager-stereoize",
+        "Natural Space",
+        ScopeMode::PolarLevel,
+    )
+}
+
+fn open_mix(
+    options: WindowOptions,
+    cx: &mut App,
+    insert: &'static str,
+    preset: &str,
+    select: Option<u8>,
+) -> Result<AnyWindowHandle> {
+    let params = crate::components::mix_station_model::presets()
+        .iter()
+        .find(|p| p.name == preset)
+        .map(|p| p.params.clone())
+        .unwrap_or_else(mixstation::default_params);
+    let json = mixstation::ipc::MixStationState::new(params).to_json();
+    open_kit(
+        options,
+        cx,
+        MixStationModel,
+        "mixstation",
+        insert,
+        json,
+        3.0,
+        move |editor| editor.ui.selected = select,
+    )
+}
+
+fn mixstation_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_mix(options, cx, "mixstation", "Mix Bus Polish", Some(2))
+}
+
+fn mixstation_empty(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_mix(options, cx, "mixstation-empty", "Empty Rack", None)
 }
 
 // ── VerbSpace and EchoSpace scenes ─────────────────────────────────────────

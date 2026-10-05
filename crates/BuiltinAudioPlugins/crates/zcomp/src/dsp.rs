@@ -539,27 +539,13 @@ impl GainCell {
     /// "over-easy" term that only reaches the dialled ratio well past the knee.
     #[inline]
     fn target_gr_db(&self, level_db: f32) -> f32 {
-        let over = level_db - self.threshold_db;
-        let half_knee = self.knee_db * 0.5;
-        let curved = if over <= -half_knee {
-            return 0.0;
-        } else if over >= half_knee || self.knee_db <= 1.0e-4 {
-            over.max(0.0)
-        } else {
-            let t = over + half_knee;
-            t * t / (2.0 * self.knee_db)
-        };
-
-        let ratio = if self.over_easy_db > 0.0 {
-            // Saturating rise: half the dialled ratio at `over_easy_db` of
-            // overshoot, asymptotically all of it. No transcendental needed.
-            let t = curved / (curved + self.over_easy_db);
-            1.0 + (self.ratio - 1.0) * t
-        } else {
-            self.ratio
-        };
-
-        curved * (1.0 - 1.0 / ratio)
+        curve_reduction_db(
+            level_db,
+            self.threshold_db,
+            self.ratio,
+            self.knee_db,
+            self.over_easy_db,
+        )
     }
 
     /// Detector level for one channel, returning `(detector, sidechain)`.
@@ -654,6 +640,41 @@ impl GainCell {
             sidechain_right: sc_r,
         }
     }
+}
+
+/// The gain cell's static curve: decibels taken off a detector level of
+/// `level_db`. Quadratic soft knee (Giannoulis/Reiss) with an optional
+/// optical "over-easy" term that only reaches the dialled ratio well past the
+/// knee. Positive.
+#[inline]
+pub fn curve_reduction_db(
+    level_db: f32,
+    threshold_db: f32,
+    ratio: f32,
+    knee_db: f32,
+    over_easy_db: f32,
+) -> f32 {
+    let over = level_db - threshold_db;
+    let half_knee = knee_db * 0.5;
+    let curved = if over <= -half_knee {
+        return 0.0;
+    } else if over >= half_knee || knee_db <= 1.0e-4 {
+        over.max(0.0)
+    } else {
+        let t = over + half_knee;
+        t * t / (2.0 * knee_db)
+    };
+
+    let ratio = if over_easy_db > 0.0 {
+        // Saturating rise: half the dialled ratio at `over_easy_db` of
+        // overshoot, asymptotically all of it. No transcendental needed.
+        let t = curved / (curved + over_easy_db);
+        1.0 + (ratio - 1.0) * t
+    } else {
+        ratio
+    };
+
+    curved * (1.0 - 1.0 / ratio)
 }
 
 /// One-pole parameter smoother: keeps gain and mix moves click-free.

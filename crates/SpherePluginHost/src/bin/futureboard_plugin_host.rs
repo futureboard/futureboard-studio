@@ -21,7 +21,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -146,6 +146,10 @@ fn raise_default_thread_stack_for_plugin_editors() {
     }
 }
 
+/// Where the host writes its protocol: the pipe to Studio, kept apart from
+/// the process's stdout (`plugin_host_lifecycle::take_protocol_stdout`).
+type IpcOut = Box<dyn Write>;
+
 fn main() {
     #[cfg(target_os = "linux")]
     raise_default_thread_stack_for_plugin_editors();
@@ -192,7 +196,12 @@ fn main() {
         std::process::exit(code);
     }
 
-    let mut out = io::stdout();
+    // Before any plug-in is loaded: what a plug-in prints must never reach
+    // the protocol pipe.
+    let mut out: IpcOut = match SpherePluginHost::plugin_host_lifecycle::take_protocol_stdout() {
+        Some(pipe) => Box::new(pipe),
+        None => Box::new(io::stdout()),
+    };
     let _ = ipc::write_frame(
         &mut out,
         &HostEvent::Ready {
@@ -212,6 +221,9 @@ fn main() {
 
     run_ipc_loop(out, shutdown);
     platform::com_uninit();
+    // Every editor is closed and every plug-in released by now; end the
+    // process without running the plug-in modules' own unload code.
+    SpherePluginHost::plugin_host_lifecycle::exit_now(0);
 }
 
 /// Announce the runtime-ownership policy this host enforces. The external
@@ -3506,7 +3518,7 @@ fn run_audio_producer(
     diagnostics.report();
 }
 
-fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
+fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
     // Commands are read on a dedicated thread so the STA/message-pump thread
     // never blocks on stdin (spec Part 9). Each received command kicks the UI
     // thread out of its message wait so IPC latency stays low even while the
@@ -4252,7 +4264,7 @@ fn dispatch(
     region_slots: &SharedAudioRegions,
     builtin_processors: &SharedBuiltinProcessors,
     au_processors: &SharedAuProcessors,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     match cmd {
         HostCommand::Hello {
@@ -5627,7 +5639,7 @@ fn drain_plugin_load_results(
     pending_plugin_loads: &mut HashMap<String, PendingPluginLoad>,
     load_result_rx: &crossbeam_channel::Receiver<PluginLoadResult>,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     while let Ok(result) = load_result_rx.try_recv() {
         let Some(pending) = pending_plugin_loads.remove(&result.plugin_instance_id) else {
@@ -5666,7 +5678,7 @@ fn finalize_plugin_load(
     max_block_size: u32,
     loaded: &mut LoadedRegistry,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     let Some(processor) = result.processor else {
         let error = result
@@ -5729,7 +5741,7 @@ fn finalize_plugin_load(
 fn expire_plugin_load_requests(
     pending_plugin_loads: &mut HashMap<String, PendingPluginLoad>,
     _load_result_rx: &crossbeam_channel::Receiver<PluginLoadResult>,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     let now = Instant::now();
     let timed_out: Vec<PendingPluginLoad> = pending_plugin_loads
@@ -5884,7 +5896,7 @@ fn schedule_unified_editor_attach(
     pending_editor_attaches: &mut HashMap<String, PendingEditorAttach>,
     attach_result_tx: &crossbeam_channel::Sender<EditorAttachResult>,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     // The actual window ownership is decided by the C++ embed layer from
     // FUTUREBOARD_PLUGIN_EDITOR_MODE (default "detached" = host-owned top-level
@@ -6280,7 +6292,7 @@ fn drain_editor_attach_results(
     pending_editor_attaches: &mut HashMap<String, PendingEditorAttach>,
     attach_result_rx: &crossbeam_channel::Receiver<EditorAttachResult>,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     while let Ok(result) = attach_result_rx.try_recv() {
         let Some(pending) = pending_editor_attaches.remove(&result.plugin_instance_id) else {
@@ -6312,7 +6324,7 @@ fn finalize_editor_attach(
     registry: &mut Registry,
     delayed_redraws: &mut Vec<DelayedGpuRedraw>,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     if let Some(error) = result.error {
         eprintln!(
@@ -6459,7 +6471,7 @@ fn expire_editor_attach_requests(
     pending_editor_attaches: &mut HashMap<String, PendingEditorAttach>,
     _attach_result_rx: &crossbeam_channel::Receiver<EditorAttachResult>,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     let now = Instant::now();
     let timed_out: Vec<PendingEditorAttach> = pending_editor_attaches
@@ -6515,7 +6527,7 @@ fn expire_editor_attach_requests(
     }
 }
 
-fn emit_attach_failed(out: &mut io::Stdout, plugin_instance_id: &str, error: &str) {
+fn emit_attach_failed(out: &mut IpcOut, plugin_instance_id: &str, error: &str) {
     let _ = ipc::write_frame(
         out,
         &HostEvent::EditorAttachFailed {

@@ -7,9 +7,10 @@
 //! matched exhaustively in ~150 places). Built-ins are identified by a
 //! `builtin:` id prefix via [`is_builtin_id`] / [`RegistryPlugin::is_builtin`].
 //!
-//! Each built-in with a React editor is served to CEF through the shared
-//! `mikoplugin://<plugin>/index.html` scheme; [`builtin_editor_url`] builds it.
-//! This module is pure data + string mapping — no DSP crate dependency, so the
+//! Every built-in editor is a native GPUI view today. The `Web` kind and the
+//! shared `mikoplugin://<plugin>/index.html` scheme [`builtin_editor_url`]
+//! builds remain for a built-in that ships an embedded editor bundle; none
+//! does now. This module is pure data + string mapping — no DSP crate dependency, so the
 //! host crate stays lean.
 
 use crate::plugin_db::PluginScanStatus;
@@ -80,28 +81,28 @@ const CATALOG: &[BuiltinEntry] = &[
         name: "Compressor",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "fa2a",
         name: "FA-2A",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "zcomp",
         name: "Z-Comp",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "mixstation",
         name: "MixStation",
         category: "Effect",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "echospace",
@@ -129,35 +130,35 @@ const CATALOG: &[BuiltinEntry] = &[
         name: "Imager",
         category: "Utility",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "fa76",
         name: "FA-76",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "burnlimit",
         name: "BurnLimit",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "clipper67",
         name: "67Clipper",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "transient",
         name: "Transient",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "c1073",
@@ -392,45 +393,18 @@ mod tests {
         }
     }
 
+    /// Every built-in editor is native now: none is served to CEF.
     #[test]
-    fn editors_are_limited_to_builtins_that_ship_one() {
-        assert_eq!(
-            builtin_editor_url(&builtin_id("imager")).as_deref(),
-            Some("mikoplugin://imager/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("fa2a")).as_deref(),
-            Some("mikoplugin://fa2a/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("zcomp")).as_deref(),
-            Some("mikoplugin://zcomp/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("mixstation")).as_deref(),
-            Some("mikoplugin://mixstation/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("fa76")).as_deref(),
-            Some("mikoplugin://fa76/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("burnlimit")).as_deref(),
-            Some("mikoplugin://burnlimit/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("clipper67")).as_deref(),
-            Some("mikoplugin://clipper67/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("transient")).as_deref(),
-            Some("mikoplugin://transient/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("compresser")).as_deref(),
-            Some("mikoplugin://compresser/index.html")
-        );
-        assert!(builtin_editor_url(&builtin_id("c1073")).is_none());
+    fn no_builtin_ships_a_web_editor() {
+        for plugin in builtin_catalog(0) {
+            assert!(builtin_editor_url(&plugin.id).is_none(), "{}", plugin.name);
+            assert_ne!(
+                builtin_editor_kind(&plugin.id),
+                Some(BuiltinEditorKind::Web),
+                "{}",
+                plugin.name
+            );
+        }
         assert!(builtin_editor_url("vst3:whatever").is_none());
     }
 
@@ -445,11 +419,25 @@ mod tests {
         assert!(builtin_has_editor("rodharerist"));
     }
 
-    /// The EQs and the time effects draw natively now: no CEF route to fall
-    /// back on.
+    /// The effects draw natively now: no CEF route to fall back on.
     #[test]
-    fn the_eqs_and_time_effects_are_native_not_web() {
-        for stem in ["equz8", "equzx", "verbspace", "echospace", "whitesharp"] {
+    fn the_effects_are_native_not_web() {
+        for stem in [
+            "equz8",
+            "equzx",
+            "verbspace",
+            "echospace",
+            "whitesharp",
+            "fa2a",
+            "fa76",
+            "zcomp",
+            "burnlimit",
+            "clipper67",
+            "transient",
+            "compresser",
+            "imager",
+            "mixstation",
+        ] {
             assert!(builtin_editor_url(&builtin_id(stem)).is_none(), "{stem}");
             assert_eq!(
                 builtin_editor_kind(&builtin_id(stem)),
