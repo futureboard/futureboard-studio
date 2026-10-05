@@ -49,7 +49,7 @@ fn run() {
             .expect("failed to transfer the browser process application"),
     }
 
-    // `FUTUREBOARD_PROBE_PLUGIN=equz8` probes another built-in's editor.
+    // `FUTUREBOARD_PROBE_PLUGIN=imager` probes another built-in's editor.
     let plugin_id: &'static str = std::env::var("FUTUREBOARD_PROBE_PLUGIN")
         .ok()
         .map(|id| &*Box::leak(id.into_boxed_str()))

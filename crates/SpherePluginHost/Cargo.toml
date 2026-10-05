@@ -35,6 +35,7 @@ cpal.workspace = true
 sphere_directaudioengine = { path = "../SphereDirectAudioEngine", default-features = false }
 builtin-dsp-core.workspace = true
 equz8.workspace = true
+equzx.workspace = true
 rodharerist.workspace = true
 verbspace.workspace = true
 echospace.workspace = true

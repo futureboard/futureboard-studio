@@ -63,7 +63,17 @@ const CATALOG: &[BuiltinEntry] = &[
         name: "EQ-Z8",
         category: "EQ",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        // Native GPUI editor (see `sphere_ui_components::components::eq_window`) —
+        // the old CEF/React `editor/` bundle was removed.
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
+        stem: "equzx",
+        name: "EQ-ZX",
+        category: "EQ",
+        kind: PluginKind::Effect,
+        // Native GPUI editor, shared with EQ-Z8 (`eq_window`).
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "compresser",
@@ -98,14 +108,14 @@ const CATALOG: &[BuiltinEntry] = &[
         name: "EchoSpace",
         category: "Delay",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "verbspace",
         name: "VerbSpace",
         category: "Reverb",
         kind: PluginKind::Effect,
-        editor: BuiltinEditorKind::Web,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "imager",
@@ -242,6 +252,7 @@ pub fn is_builtin_ref(id: &str) -> bool {
 pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "rodharerist",
     "equz8",
+    "equzx",
     "verbspace",
     "echospace",
     "imager",
@@ -376,18 +387,6 @@ mod tests {
     #[test]
     fn editors_are_limited_to_builtins_that_ship_one() {
         assert_eq!(
-            builtin_editor_url(&builtin_id("equz8")).as_deref(),
-            Some("mikoplugin://equz8/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("verbspace")).as_deref(),
-            Some("mikoplugin://verbspace/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("echospace")).as_deref(),
-            Some("mikoplugin://echospace/index.html")
-        );
-        assert_eq!(
             builtin_editor_url(&builtin_id("imager")).as_deref(),
             Some("mikoplugin://imager/index.html")
         );
@@ -436,6 +435,22 @@ mod tests {
         );
         assert!(builtin_has_native_editor("rodharerist"));
         assert!(builtin_has_editor("rodharerist"));
+    }
+
+    /// The EQs and the time effects draw natively now: no CEF route to fall
+    /// back on.
+    #[test]
+    fn the_eqs_and_time_effects_are_native_not_web() {
+        for stem in ["equz8", "equzx", "verbspace", "echospace"] {
+            assert!(builtin_editor_url(&builtin_id(stem)).is_none(), "{stem}");
+            assert_eq!(
+                builtin_editor_kind(&builtin_id(stem)),
+                Some(BuiltinEditorKind::Native)
+            );
+            assert!(builtin_has_native_editor(stem));
+            assert!(builtin_audio_bridge_supported(stem));
+        }
+        assert_eq!(builtin_display_name("builtin:equzx"), Some("EQ-ZX"));
     }
 
     #[test]

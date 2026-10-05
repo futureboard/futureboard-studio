@@ -295,6 +295,7 @@ type LoadedRegistry = HashMap<String, LoadedPlugin>;
 enum BuiltinDsp {
     Rodhareist(rodharerist::Dsp),
     Equz8(equz8::Dsp),
+    Equzx(equzx::Dsp),
     Verbspace(verbspace::Dsp),
     Echospace(echospace::Dsp),
     Imager(imager::Dsp),
@@ -371,6 +372,7 @@ impl BuiltinHostProcessor {
         match stem {
             "rodharerist" => Some(Self::rodhareist(sample_rate, state_json)),
             "equz8" => Some(Self::equz8(sample_rate, state_json)),
+            "equzx" => Some(Self::equzx(sample_rate, state_json)),
             "verbspace" => Some(Self::verbspace(sample_rate, state_json)),
             "echospace" => Some(Self::echospace(sample_rate, state_json)),
             "imager" => Some(Self::imager(sample_rate, state_json)),
@@ -443,6 +445,36 @@ impl BuiltinHostProcessor {
         }
         Self {
             dsp: UnsafeCell::new(BuiltinDsp::Equz8(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            // An EQ has no capture or cabinet stage to hand off into.
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn equzx(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = equzx::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match equzx::ipc::EquzxState::from_json(json) {
+                Ok(state) => {
+                    dsp.set_params(state.params);
+                    eprintln!(
+                        "[plugin-host-builtin] restored state version={}",
+                        state.version
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] state blob rejected, using defaults: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::Equzx(dsp)),
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             // An EQ has no capture or cabinet stage to hand off into.
             nam_loader: None,
@@ -888,6 +920,13 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
+            BuiltinDsp::Equzx(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
             BuiltinDsp::Verbspace(dsp) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
@@ -1278,6 +1317,7 @@ impl BuiltinHostProcessor {
                 })
             }
             BuiltinDsp::Equz8(_)
+            | BuiltinDsp::Equzx(_)
             | BuiltinDsp::Verbspace(_)
             | BuiltinDsp::Echospace(_)
             | BuiltinDsp::WrapSynth(_) => None,
@@ -1293,7 +1333,7 @@ impl BuiltinHostProcessor {
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &*self.dsp.get() } {
             BuiltinDsp::Rodhareist(dsp) => dsp.latency_samples(),
-            BuiltinDsp::Equz8(_) => 0,
+            BuiltinDsp::Equz8(_) | BuiltinDsp::Equzx(_) => 0,
             BuiltinDsp::Verbspace(dsp) => dsp.latency_samples(),
             BuiltinDsp::Fa2a(dsp) => dsp.latency_samples(),
             BuiltinDsp::Fa76(dsp) => dsp.latency_samples(),
@@ -1327,6 +1367,9 @@ impl BuiltinHostProcessor {
             }
             // Already the compact wire form the DSP consumes — no id lookup.
             BuiltinDsp::Equz8(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::Equzx(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::Verbspace(dsp) => {
@@ -1892,6 +1935,50 @@ mod builtin_processor_tests {
         assert!(output.iter().all(|sample| sample.is_finite()));
     }
 
+    /// EQ-ZX hosted like EQ-Z8: a fresh insert passes audio through flat, a
+    /// band switched on over the wire changes it, power off bypasses,
+    /// restored state applies, and it reports no latency and no meter frame.
+    #[test]
+    fn equzx_processes_restores_and_takes_wire_params() {
+        let processor = BuiltinHostProcessor::new("equzx", 48_000, None).expect("hosted");
+        let in_l = [0.3f32; 64];
+        let in_r = [-0.3f32; 64];
+        let mut output = [0.0f32; 128];
+        processor.process_block(&in_l, &in_r, &mut output, 64);
+        for i in 0..64 {
+            assert!((output[i * 2] - in_l[i]).abs() < 1.0e-6, "empty EQ is flat");
+        }
+
+        // A 12 dB low cut over the wire: DC is cut, so the output falls.
+        let band = |field| equzx::ipc::band_wire_index(0, field);
+        processor.apply_param(band(equzx::ipc::BAND_TYPE), 0.0);
+        processor.apply_param(band(equzx::ipc::BAND_FREQ), 2_000.0);
+        processor.apply_param(band(equzx::ipc::BAND_ENABLED), 1.0);
+        for _ in 0..20 {
+            processor.process_block(&in_l, &in_r, &mut output, 64);
+        }
+        assert!(output[126].abs() < 0.05, "the low cut takes out DC");
+
+        let power = equzx::ui_param_index("power").expect("power in wire table");
+        processor.apply_param(power, 0.0);
+        processor.process_block(&in_l, &in_r, &mut output, 64);
+        assert_eq!(output[0], in_l[0], "power-off must bypass");
+        processor.apply_param(u32::MAX, 1.0);
+        processor.apply_param(equzx::UI_PARAM_IDS.len() as u32, 1.0);
+
+        let mut params = equzx::default_params();
+        params.power = false;
+        let json = equzx::ipc::EquzxState::new(params).to_json().unwrap();
+        let restored = BuiltinHostProcessor::equzx(48_000, Some(&json));
+        restored.process_block(&in_l, &in_r, &mut output, 64);
+        assert_eq!(output[1], in_r[0], "restored power-off must bypass");
+        assert_eq!(restored.latency_samples(), 0);
+        assert!(restored.meter_frame().is_none());
+        let fallback = BuiltinHostProcessor::equzx(48_000, Some("not json"));
+        fallback.process_block(&in_l, &in_r, &mut output, 64);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
     #[test]
     fn equz8_restores_state_and_reports_no_latency_or_meters() {
         let mut params = equz8::default_params();
@@ -2011,8 +2098,10 @@ mod builtin_processor_tests {
         processor.apply_param(time_l, 40.0);
         processor.apply_param(time_r, 40.0);
 
-        let in_l = [0.3f32; 64];
-        let in_r = [-0.3f32; 64];
+        // A tone, alike on both sides: the default ping-pong sums its input
+        // to mono, and the tone stage's low cut takes out DC.
+        let in_l: [f32; 64] = std::array::from_fn(|i| (i as f32 * 0.7).sin() * 0.3);
+        let in_r = in_l;
         let mut output = [0.0f32; 128];
         for _ in 0..16 {
             processor.process_block(&in_l, &in_r, &mut output, 64);

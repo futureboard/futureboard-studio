@@ -19,8 +19,9 @@
 
 use biquad::{Biquad, DirectForm1};
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    flush_denormal, linear_to_db, make_eq_biquad, make_eq_coefficients, time_constant,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, biquad_response_db, clamp,
+    db_to_linear, flush_denormal, linear_to_db, make_eq_biquad, make_eq_coefficients,
+    time_constant,
 };
 use serde::{Deserialize, Serialize};
 
@@ -398,6 +399,75 @@ fn section_count(band: &BandParams) -> usize {
     }
     let order = (band.slope / 6.0).round().max(2.0) as usize;
     (order / 2).clamp(1, MAX_SECTIONS)
+}
+
+/// What `band` does to a sine at `freq_hz`, in dB, with its gain at
+/// `gain_db`: the same sections [`Dsp`] builds for it — a Butterworth cascade
+/// for a cut, one section otherwise — so a drawn curve is the curve that
+/// plays. 0 dB for a band that is switched off. Control/UI side only.
+pub fn band_response_at_gain_db(
+    band: &BandParams,
+    gain_db: f32,
+    freq_hz: f32,
+    sample_rate: f32,
+) -> f32 {
+    if !band.active {
+        return 0.0;
+    }
+    let count = section_count(band);
+    let order = count * 2;
+    (0..count)
+        .map(|section| {
+            let q = if band.band_type.is_cut() {
+                butterworth_q(order, section)
+            } else {
+                band.q
+            };
+            make_eq_coefficients(
+                band.band_type.section_kind(),
+                band.freq,
+                gain_db,
+                q,
+                sample_rate,
+            )
+            .map_or(0.0, |coefficients| {
+                biquad_response_db(&coefficients, freq_hz, sample_rate)
+            })
+        })
+        .sum()
+}
+
+/// [`band_response_at_gain_db`] at the band's own gain.
+pub fn band_response_db(band: &BandParams, freq_hz: f32, sample_rate: f32) -> f32 {
+    band_response_at_gain_db(band, band.gain_db, freq_hz, sample_rate)
+}
+
+/// Whether any switched-on band acts on the mid or the side alone, which
+/// splits the response into a mid and a side curve.
+pub fn uses_mid_side(params: &Params) -> bool {
+    params
+        .bands
+        .iter()
+        .any(|band| band.active && band.channel != BandChannel::Stereo)
+}
+
+/// The EQ's response at `freq_hz`, in dB, for the part of the image
+/// `channel` names, output gain included: a mid curve is every stereo and
+/// mid band, a side curve every stereo and side band, and a stereo curve
+/// (all bands stereo) every band. What the insert plays with no band moving
+/// dynamically.
+pub fn response_db(params: &Params, channel: BandChannel, freq_hz: f32, sample_rate: f32) -> f32 {
+    params
+        .bands
+        .iter()
+        .filter(|band| match channel {
+            BandChannel::Stereo => true,
+            BandChannel::Mid => band.channel.on_path_a(),
+            BandChannel::Side => band.channel.on_path_b(),
+        })
+        .map(|band| band_response_db(band, freq_hz, sample_rate))
+        .sum::<f32>()
+        + params.output_db
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -855,6 +925,54 @@ mod tests {
     #[test]
     fn descriptor_id() {
         assert_eq!(descriptor().id, PLUGIN_ID);
+    }
+
+    /// The curves the editor draws are what plays: a mono sine (pure mid)
+    /// through the running DSP lands on the mid curve — steep cut cascade,
+    /// mid and stereo bands included, the side-only band ignored.
+    #[test]
+    fn the_drawn_response_is_what_plays() {
+        let mut params = default_params();
+        params.bands[0] = BandParams {
+            active: true,
+            band_type: BandType::LowCut,
+            freq: 180.0,
+            slope: 48.0,
+            ..flat_band()
+        };
+        params.bands[1] = enabled_bell(1_000.0, 6.0, 1.4);
+        params.bands[2] = BandParams {
+            channel: BandChannel::Mid,
+            ..enabled_bell(3_000.0, -5.0, 2.0)
+        };
+        params.bands[3] = BandParams {
+            active: true,
+            band_type: BandType::HighShelf,
+            channel: BandChannel::Side,
+            freq: 6_000.0,
+            gain_db: 9.0,
+            q: 0.7,
+            ..flat_band()
+        };
+        params.output_db = 1.5;
+        assert!(uses_mid_side(&params));
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(params.clone());
+        for hz in [123.0, 257.0, 1_013.0, 3_011.0, 9_007.0] {
+            let heard = linear_to_db(level_at(&mut dsp, hz));
+            let drawn = response_db(&params, BandChannel::Mid, hz, 48_000.0);
+            assert!(
+                (heard - drawn).abs() < 0.3,
+                "{hz} Hz: heard {heard} drawn {drawn}"
+            );
+        }
+        // The side curve carries the shelf, the mid curve does not.
+        let side = response_db(&params, BandChannel::Side, 12_000.0, 48_000.0);
+        let mid = response_db(&params, BandChannel::Mid, 12_000.0, 48_000.0);
+        assert!(side - mid > 7.0, "side {side} mid {mid}");
+        // 48 dB/oct: an octave under the corner is about 48 dB down.
+        let octave_under = band_response_db(&params.bands[0], 90.0, 48_000.0);
+        assert!((octave_under + 48.0).abs() < 3.0, "{octave_under}");
     }
 
     #[test]

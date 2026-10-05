@@ -6,6 +6,7 @@
 use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type};
 
 pub mod crossover;
+pub mod delay;
 
 /// Metadata for a builtin DSP core (host integration can map this later).
 #[derive(Debug, Clone)]
@@ -299,6 +300,24 @@ pub fn make_eq_coefficients(
     Coefficients::<f32>::from_params(filter_type, fs.hz(), f0.hz(), q).ok()
 }
 
+/// The magnitude, in dB, of the biquad `coefficients` at `freq_hz` — what a
+/// filter built from them does to a sine at that frequency. For drawing a
+/// curve from the very coefficients the audio path runs; never called there.
+pub fn biquad_response_db(coefficients: &Coefficients<f32>, freq_hz: f32, sample_rate: f32) -> f32 {
+    let w = std::f64::consts::TAU * f64::from(freq_hz) / f64::from(sample_rate.max(1.0));
+    let (cos1, sin1) = (w.cos(), w.sin());
+    let (cos2, sin2) = ((2.0 * w).cos(), (2.0 * w).sin());
+    let c = coefficients;
+    // H(z) = (b0 + b1 z⁻¹ + b2 z⁻²) / (1 + a1 z⁻¹ + a2 z⁻²) at z = e^{jw}.
+    let num_re = f64::from(c.b0) + f64::from(c.b1) * cos1 + f64::from(c.b2) * cos2;
+    let num_im = -(f64::from(c.b1) * sin1 + f64::from(c.b2) * sin2);
+    let den_re = 1.0 + f64::from(c.a1) * cos1 + f64::from(c.a2) * cos2;
+    let den_im = -(f64::from(c.a1) * sin1 + f64::from(c.a2) * sin2);
+    let power =
+        (num_re * num_re + num_im * num_im) / (den_re * den_re + den_im * den_im).max(1e-30);
+    (10.0 * power.max(1e-30).log10()) as f32
+}
+
 /// Build a `biquad` DirectForm1 from common EQ band kinds.
 pub fn make_eq_biquad(
     kind: &str,
@@ -313,6 +332,28 @@ pub fn make_eq_biquad(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn biquad_response_matches_the_filter_it_describes() {
+        let sr = 48_000.0;
+        let bell = make_eq_coefficients("bell", 1_000.0, 6.0, 1.0, sr).unwrap();
+        assert!((biquad_response_db(&bell, 1_000.0, sr) - 6.0).abs() < 0.05);
+        assert!(biquad_response_db(&bell, 20.0, sr).abs() < 0.1);
+        let low_cut = make_eq_coefficients("highpass", 1_000.0, 0.0, 0.707, sr).unwrap();
+        assert!((biquad_response_db(&low_cut, 1_000.0, sr) + 3.0).abs() < 0.1);
+        assert!(biquad_response_db(&low_cut, 100.0, sr) < -35.0);
+        // The same sine through the running filter.
+        let mut filter = DirectForm1::<f32>::new(bell);
+        let step = std::f32::consts::TAU * 1_000.0 / sr;
+        let mut peak = 0.0f32;
+        for i in 0..20_000 {
+            let y = filter.run((i as f32 * step).sin());
+            if i > 10_000 {
+                peak = peak.max(y.abs());
+            }
+        }
+        assert!((linear_to_db(peak) - biquad_response_db(&bell, 1_000.0, sr)).abs() < 0.1);
+    }
 
     #[test]
     fn compressor_reduces_hot_signal() {

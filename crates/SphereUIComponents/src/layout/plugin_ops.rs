@@ -113,6 +113,20 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::wrap_synth_window::WrapSynthEditorWindow>,
     >,
+    /// Open native EQ-Z8 and EQ-ZX editors (one window type for both),
+    /// keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub eq: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::eq_window::EqEditorWindow>,
+    >,
+    /// Open native VerbSpace and EchoSpace editors (one window type for
+    /// both), keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub fx: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::fx_window::FxEditorWindow>,
+    >,
     /// Native main-owned external-bridge editor shells, keyed by
     /// `(track_id, plugin_instance_id)`.
     pub bridge: std::collections::HashMap<(String, String), BridgeEditorSession>,
@@ -3176,6 +3190,34 @@ impl StudioLayout {
                 window,
                 cx,
             ),
+            Some(equz8::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.eq,
+                crate::components::eq_window::open_equz8_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(equzx::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.eq,
+                crate::components::eq_window::open_equzx_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(verbspace::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.fx,
+                crate::components::fx_window::open_verbspace_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(echospace::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.fx,
+                crate::components::fx_window::open_echospace_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
             _ => self.open_native_editor(
                 |windows| &mut windows.quick_sampler,
                 crate::components::quick_sampler_window::open_quick_sampler_editor,
@@ -3327,6 +3369,14 @@ impl StudioLayout {
             }
             let synths: Vec<_> = self.plugin_editors.wrap_synth.values().copied().collect();
             for handle in synths {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let eqs: Vec<_> = self.plugin_editors.eq.values().copied().collect();
+            for handle in eqs {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let fxs: Vec<_> = self.plugin_editors.fx.values().copied().collect();
+            for handle in fxs {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
         }

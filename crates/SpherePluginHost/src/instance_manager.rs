@@ -219,12 +219,15 @@ mod tests {
     #[test]
     fn editor_url_resolves_for_builtins_with_ui() {
         let m = InstanceManager::new();
-        // Rodhareist's editor is native now (no CEF/React bundle); `equz8`
-        // still ships a web editor.
+        // Rodhareist's, the EQs' and the time effects' editors are native now
+        // (no CEF bundle); Imager still ships a web editor.
         assert!(m.editor_url(ROD).is_none());
+        assert!(m.editor_url("builtin:equz8").is_none());
+        assert!(m.editor_url("builtin:equzx").is_none());
+        assert!(m.editor_url("builtin:verbspace").is_none());
         assert_eq!(
-            m.editor_url("builtin:equz8").as_deref(),
-            Some("mikoplugin://equz8/index.html")
+            m.editor_url("builtin:imager").as_deref(),
+            Some("mikoplugin://imager/index.html")
         );
         assert!(m.editor_url("builtin:c1073").is_none());
     }

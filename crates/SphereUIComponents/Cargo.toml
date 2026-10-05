@@ -11,11 +11,26 @@ license.workspace = true
 name = "sphere_ui_components"
 path = "src/lib.rs"
 
+[[bin]]
+name = "preview"
+path = "src/bin/preview.rs"
+required-features = ["ui-preview"]
+
 [features]
 default = ["gpu-renderer", "native-dialogs"]
 gpu-renderer = ["dep:pollster", "dep:raw-window-handle", "dep:wgpu", "dep:windows-d3d12"]
 native-dialogs = ["dep:rfd"]
 plugin-host-bin = ["sphere-plugin-host/plugin-host-bin"]
+# Offscreen PNG renders of native views (`src/bin/preview.rs`): reads frames
+# back from GPUI's renderer, which needs gpui's test-support surface. A
+# developer tool; the app never enables it.
+ui-preview = [
+    "builtin-plugin-editor",
+    "gpui/test-support",
+    "dep:gpui_windows",
+    "gpui_windows?/test-support",
+    "dep:raw-window-handle",
+]
 # Real MDX-NET stem separation via ONNX Runtime (CPU; loads onnxruntime at
 # runtime via ORT_DYLIB_PATH). GPU EPs are opt-in below.
 stem-onnx = ["sphere-audio-processor/stem-onnx"]
@@ -29,6 +44,7 @@ builtin-plugin-editor = [
     "dep:sphere-webview",
     "dep:rodharerist",
     "dep:equz8",
+    "dep:equzx",
     "dep:verbspace",
     "dep:echospace",
     "dep:imager",
@@ -85,6 +101,7 @@ sphere-ara-host.workspace = true
 sphere-webview = { workspace = true, optional = true, features = ["cef-runtime"] }
 rodharerist = { workspace = true, optional = true }
 equz8 = { workspace = true, optional = true }
+equzx = { workspace = true, optional = true }
 verbspace = { workspace = true, optional = true }
 echospace = { workspace = true, optional = true }
 imager = { workspace = true, optional = true }
@@ -143,6 +160,8 @@ unicode-segmentation.workspace = true
 # editor ownership). Same workspace version the app already links transitively.
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
+# The preview binary's platform (`ui-preview` only).
+gpui_windows = { workspace = true, optional = true }
 windows-core = { workspace = true }
 # The visualizers render with wgpu's D3D12 backend into a shared texture that
 # GPUI's D3D11 atlas imports. wgpu-hal exposes its device as `windows` 0.62

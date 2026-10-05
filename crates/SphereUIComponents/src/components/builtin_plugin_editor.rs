@@ -73,6 +73,7 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
     match origin_for_plugin_id(plugin_id)? {
         rodharerist::ui::UI_ORIGIN => rodharerist::ui_param_index(param_id),
         equz8::ui::UI_ORIGIN => equz8::ui_param_index(param_id),
+        equzx::ui::UI_ORIGIN => equzx::ui_param_index(param_id),
         verbspace::ui::UI_ORIGIN => verbspace::ui_param_index(param_id),
         echospace::ui::UI_ORIGIN => echospace::ui_param_index(param_id),
         imager::ui::UI_ORIGIN => imager::ui_param_index(param_id),
@@ -124,6 +125,7 @@ mod state_mirror {
     enum BuiltinParams {
         Rodhareist(Box<rodharerist::Params>),
         Equz8(Box<equz8::Params>),
+        Equzx(Box<equzx::Params>),
         Verbspace(Box<verbspace::Params>),
         Echospace(Box<echospace::Params>),
         Imager(Box<imager::Params>),
@@ -146,6 +148,7 @@ mod state_mirror {
             match self {
                 Self::Rodhareist(_) => rodharerist::ui::UI_ORIGIN,
                 Self::Equz8(_) => equz8::ui::UI_ORIGIN,
+                Self::Equzx(_) => equzx::ui::UI_ORIGIN,
                 Self::Verbspace(_) => verbspace::ui::UI_ORIGIN,
                 Self::Echospace(_) => echospace::ui::UI_ORIGIN,
                 Self::Imager(_) => imager::ui::UI_ORIGIN,
@@ -171,6 +174,7 @@ mod state_mirror {
                     Some(Self::Rodhareist(Box::new(rodharerist::default_params())))
                 }
                 equz8::ui::UI_ORIGIN => Some(Self::Equz8(Box::new(equz8::default_params()))),
+                equzx::ui::UI_ORIGIN => Some(Self::Equzx(Box::new(equzx::default_params()))),
                 verbspace::ui::UI_ORIGIN => {
                     Some(Self::Verbspace(Box::new(verbspace::default_params())))
                 }
@@ -242,6 +246,7 @@ mod state_mirror {
         let known = match origin {
             rodharerist::ui::UI_ORIGIN => rodharerist::ui_param_id(wire_index).is_some(),
             equz8::ui::UI_ORIGIN => equz8::ui_param_id(wire_index).is_some(),
+            equzx::ui::UI_ORIGIN => equzx::ui_param_id(wire_index).is_some(),
             verbspace::ui::UI_ORIGIN => verbspace::ui_param_id(wire_index).is_some(),
             echospace::ui::UI_ORIGIN => echospace::ui_param_id(wire_index).is_some(),
             imager::ui::UI_ORIGIN => imager::ui_param_id(wire_index).is_some(),
@@ -273,6 +278,9 @@ mod state_mirror {
             }
             Some(BuiltinParams::Equz8(params)) => {
                 let _ = equz8::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::Equzx(params)) => {
+                let _ = equzx::ipc::apply_wire_param(params, wire_index, value);
             }
             Some(BuiltinParams::Verbspace(params)) => {
                 let _ = verbspace::ipc::apply_wire_param(params, wire_index, value);
@@ -339,6 +347,9 @@ mod state_mirror {
             equz8::ui::UI_ORIGIN => equz8::ipc::Equz8State::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Equz8(Box::new(state.params))),
+            equzx::ui::UI_ORIGIN => equzx::ipc::EquzxState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::Equzx(Box::new(state.params))),
             verbspace::ui::UI_ORIGIN => verbspace::ipc::VerbspaceState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Verbspace(Box::new(state.params))),
@@ -415,6 +426,11 @@ mod state_mirror {
             }
             BuiltinParams::Equz8(params) if origin == equz8::ui::UI_ORIGIN => {
                 equz8::ipc::Equz8State::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::Equzx(params) if origin == equzx::ui::UI_ORIGIN => {
+                equzx::ipc::EquzxState::new((**params).clone())
                     .to_json()
                     .ok()?
             }
@@ -549,6 +565,12 @@ mod state_mirror {
                 equz8::ipc::ui_values(params)
                     .into_iter()
                     .filter_map(|(id, value)| equz8::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
+            Some(BuiltinParams::Equzx(params)) if origin == equzx::ui::UI_ORIGIN => {
+                equzx::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| equzx::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
             Some(BuiltinParams::Verbspace(params)) if origin == verbspace::ui::UI_ORIGIN => {
@@ -768,6 +790,45 @@ mod state_mirror {
         }
     }
 
+    /// An EQ-Z8 insert's mirrored params, or `None` when the slot holds none
+    /// (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_equz8_params(insert_id: &str) -> Option<equz8::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Equz8(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A VerbSpace insert's mirrored params, or `None` when the slot holds
+    /// none (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_verbspace_params(insert_id: &str) -> Option<verbspace::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Verbspace(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// An EchoSpace insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_echospace_params(insert_id: &str) -> Option<echospace::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Echospace(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// An EQ-ZX insert's mirrored params, like [`builtin_equz8_params`].
+    pub fn builtin_equzx_params(insert_id: &str) -> Option<equzx::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Equzx(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
     /// The output buses a multi-out built-in insert is using (bus 0 being
     /// its main output), or `None` for an insert with one output. For the
     /// Drum Sampler: every output a pad is sent to, besides Main — the
@@ -830,11 +891,12 @@ mod state_mirror {
 
 #[cfg(feature = "builtin-plugin-editor")]
 pub use state_mirror::{
-    builtin_default_replay, builtin_drum_sampler_params, builtin_quick_sampler_params,
-    builtin_replay_changes, builtin_rodhareist_params, builtin_sample_names,
-    builtin_slicer_params, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
-    builtin_state_remove, builtin_state_replay, builtin_state_seed, builtin_state_set_sample,
-    builtin_used_output_buses, builtin_wrapsynth_params,
+    builtin_default_replay, builtin_drum_sampler_params, builtin_echospace_params,
+    builtin_equz8_params, builtin_equzx_params, builtin_quick_sampler_params,
+    builtin_replay_changes, builtin_rodhareist_params, builtin_sample_names, builtin_slicer_params,
+    builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
+    builtin_state_replay, builtin_state_seed, builtin_state_set_sample, builtin_used_output_buses,
+    builtin_verbspace_params, builtin_wrapsynth_params,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is
@@ -1395,9 +1457,6 @@ mod imp {
         use builtin_ui_embed::EmbeddedPluginUi;
         let asset = match origin {
             rodharerist::ui::UI_ORIGIN => rodharerist::ui::RodhareistUi::resolve_ui_asset(path)?,
-            equz8::ui::UI_ORIGIN => equz8::ui::Equz8Ui::resolve_ui_asset(path)?,
-            verbspace::ui::UI_ORIGIN => verbspace::ui::VerbspaceUi::resolve_ui_asset(path)?,
-            echospace::ui::UI_ORIGIN => echospace::ui::EchospaceUi::resolve_ui_asset(path)?,
             imager::ui::UI_ORIGIN => imager::ui::ImagerUi::resolve_ui_asset(path)?,
             fa2a::ui::UI_ORIGIN => fa2a::ui::Fa2aUi::resolve_ui_asset(path)?,
             fa76::ui::UI_ORIGIN => fa76::ui::Fa76Ui::resolve_ui_asset(path)?,
@@ -1425,9 +1484,6 @@ mod imp {
         matches!(
             origin,
             rodharerist::ui::UI_ORIGIN
-                | equz8::ui::UI_ORIGIN
-                | verbspace::ui::UI_ORIGIN
-                | echospace::ui::UI_ORIGIN
                 | imager::ui::UI_ORIGIN
                 | fa2a::ui::UI_ORIGIN
                 | fa76::ui::UI_ORIGIN
@@ -1446,9 +1502,6 @@ mod imp {
     fn has_embedded_ui(origin: &str) -> bool {
         match origin {
             rodharerist::ui::UI_ORIGIN => rodharerist::ui::RodhareistUi::is_embedded(),
-            equz8::ui::UI_ORIGIN => equz8::ui::Equz8Ui::is_embedded(),
-            verbspace::ui::UI_ORIGIN => verbspace::ui::VerbspaceUi::is_embedded(),
-            echospace::ui::UI_ORIGIN => echospace::ui::EchospaceUi::is_embedded(),
             imager::ui::UI_ORIGIN => imager::ui::ImagerUi::is_embedded(),
             fa2a::ui::UI_ORIGIN => fa2a::ui::Fa2aUi::is_embedded(),
             fa76::ui::UI_ORIGIN => fa76::ui::Fa76Ui::is_embedded(),
@@ -3074,6 +3127,8 @@ mod tests {
             "rodharerist",
             "builtin:equz8",
             "equz8",
+            "builtin:equzx",
+            "equzx",
             "builtin:mixstation",
             "mixstation",
         ] {
@@ -3121,7 +3176,12 @@ mod tests {
     fn builtins_with_an_editor_are_hostable_and_the_rest_are_not() {
         // These embed a UI in any build that ran their build script against a
         // built dist; either way they must never be `NotCompiledIn` here.
-        for id in ["builtin:rodharerist", "builtin:equz8", "builtin:mixstation"] {
+        // (The EQs draw natively and are no longer CEF-hosted.)
+        for id in [
+            "builtin:rodharerist",
+            "builtin:verbspace",
+            "builtin:mixstation",
+        ] {
             assert_ne!(availability(id), HostAvailability::NotCompiledIn);
         }
         // A catalogued built-in that ships no editor bundle is refused by name,

@@ -32,6 +32,7 @@ pub const BUILTIN_PLUGIN_CRATES: &[&str] = &[
     "compresser",
     "echospace",
     "equz8",
+    "equzx",
     "fa2a",
     "fa76",
     "imager",
@@ -69,7 +70,7 @@ pub struct PluginArtifact {
 }
 
 /// Bundle directory names a plugin's editor UI may live under. Both spellings
-/// are in use (`rodharerist/editorui`, `equz8/editor`), and each plugin's
+/// are in use (`burnLimit/editorui`, `imager/editor`), and each plugin's
 /// `build.rs` points the asset generator at its own one.
 const EDITOR_UI_DIRS: &[&str] = &["editorui", "editor"];
 
