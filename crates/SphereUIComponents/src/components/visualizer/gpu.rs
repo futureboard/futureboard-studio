@@ -115,7 +115,12 @@ pub struct GpuContext {
 }
 
 thread_local! {
-    static CONTEXT: RefCell<Option<Result<Rc<GpuContext>, String>>> = const { RefCell::new(None) };
+    /// Lives as long as the process and is never dropped: GPUI's Windows
+    /// platform ends in `ExitProcess`, which runs thread-local destructors, and
+    /// dropping a wgpu queue there touches wgpu's own thread-locals after they
+    /// are gone — the process aborts on its way out. The OS reclaims it.
+    static CONTEXT: std::mem::ManuallyDrop<RefCell<Option<Result<Rc<GpuContext>, String>>>> =
+        const { std::mem::ManuallyDrop::new(RefCell::new(None)) };
 }
 
 /// The shared context, created on first use. `adapter_luid` is GPUI's D3D11
@@ -327,6 +332,16 @@ impl GpuContext {
 
 /// The adapter to render on, and whether shared textures work on it.
 fn pick_adapter(adapter_luid: Option<u64>) -> Result<(wgpu::Adapter, bool), String> {
+    // D3D12 only on Windows: it is what the shared-texture path needs, and
+    // its WARP adapter covers the fallback. Letting the GL backend start as
+    // well left a GL context in the thread-local `CONTEXT`, whose teardown
+    // at process exit panics inside wgpu-hal's WGL code and aborts.
+    #[cfg(target_os = "windows")]
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    #[cfg(not(target_os = "windows"))]
     let instance = wgpu::Instance::default();
     #[cfg(target_os = "windows")]
     if let Some(luid) = adapter_luid {

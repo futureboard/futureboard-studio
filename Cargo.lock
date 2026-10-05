@@ -8240,6 +8240,7 @@ dependencies = [
  "sphere_directaudioengine",
  "transient",
  "verbspace",
+ "whitesharp",
  "windows 0.61.3",
  "wrapsynth",
  "zcomp",
@@ -8356,6 +8357,7 @@ dependencies = [
  "unicode-segmentation",
  "verbspace",
  "wgpu",
+ "whitesharp",
  "windows 0.61.3",
  "windows 0.62.2",
  "windows-core 0.61.2",
@@ -10437,6 +10439,16 @@ dependencies = [
  "home",
  "rustix 0.38.44",
  "winsafe",
+]
+
+[[package]]
+name = "whitesharp"
+version = "2026.10.1-beta1.4.2"
+dependencies = [
+ "biquad",
+ "builtin_dsp_core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -118,6 +118,13 @@ const CATALOG: &[BuiltinEntry] = &[
         editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
+        stem: "whitesharp",
+        name: "WhiteSharp",
+        category: "Pitch",
+        kind: PluginKind::Effect,
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
         stem: "imager",
         name: "Imager",
         category: "Utility",
@@ -255,6 +262,7 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "equzx",
     "verbspace",
     "echospace",
+    "whitesharp",
     "imager",
     "fa2a",
     "fa76",
@@ -441,7 +449,7 @@ mod tests {
     /// back on.
     #[test]
     fn the_eqs_and_time_effects_are_native_not_web() {
-        for stem in ["equz8", "equzx", "verbspace", "echospace"] {
+        for stem in ["equz8", "equzx", "verbspace", "echospace", "whitesharp"] {
             assert!(builtin_editor_url(&builtin_id(stem)).is_none(), "{stem}");
             assert_eq!(
                 builtin_editor_kind(&builtin_id(stem)),

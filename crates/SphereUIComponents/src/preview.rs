@@ -25,6 +25,7 @@ use crate::components::eq_window::EqEditorWindow;
 use crate::components::fx_model::{presets, FxKind, FxParams};
 use crate::components::fx_window::{fx_window_size, FxEditorWindow};
 use crate::components::native_plugin_shell::ShellIdentity;
+use crate::components::white_sharp_window::{WhiteSharpWindow, WHITESHARP_WINDOW_SIZE};
 
 /// One view to render.
 pub struct Scene {
@@ -180,6 +181,12 @@ pub fn scenes() -> Vec<Scene> {
             open: echospace_ambient,
         },
         Scene {
+            name: "whitesharp",
+            width: WHITESHARP_WINDOW_SIZE.0,
+            height: WHITESHARP_WINDOW_SIZE.1,
+            open: whitesharp_scene,
+        },
+        Scene {
             name: "rodhareist",
             width: 1_280.0,
             height: 880.0,
@@ -306,6 +313,46 @@ fn open_eq(
             );
             then(&mut editor, cx);
             editor
+        })
+    })?;
+    Ok(handle.into())
+}
+
+// ── WhiteSharp ─────────────────────────────────────────────────────────────
+
+fn whitesharp_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let mut params = whitesharp::default_params();
+    params.key = 2;
+    params.scale = whitesharp::Scale::Major;
+    params.retune_ms = 12.0;
+    params.humanize = 25.0;
+    params.input_type = whitesharp::InputType::Soprano;
+    params.bypass_mask = 1 << 11; // B
+    params.remove_mask = 1 << 4; // E
+    params.vibrato_shape = whitesharp::VibratoShape::Sine;
+    if let Ok(json) = whitesharp::ipc::WhiteSharpState::new(params).to_json() {
+        seed("whitesharp", "whitesharp", json);
+    }
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let window = WhiteSharpWindow::new(
+                key("whitesharp"),
+                identity("WhiteSharp"),
+                preview_host_ops(),
+                no_close(),
+                cx,
+            );
+            // A voice 22 cents sharp of A, being pulled down onto it —
+            // synthetic, for previews only.
+            window
+                .live()
+                .borrow_mut()
+                .show(whitesharp::telemetry::Reading {
+                    input: Some(69.22),
+                    output: Some(69.0),
+                    target: Some(69),
+                });
+            window
         })
     })?;
     Ok(handle.into())

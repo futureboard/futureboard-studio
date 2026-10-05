@@ -239,6 +239,11 @@ pub enum Unit {
     Times,
     /// A note division, by its index into `echospace::DIVISION_LABELS`.
     Division,
+    /// Whole semitones.
+    Semitones,
+    Cents,
+    /// A depth either side, in cents.
+    CentsDepth,
 }
 
 /// One knob: which param, its label, range, taper and readout.
@@ -256,7 +261,7 @@ pub struct KnobSpec {
     pub centre: f32,
 }
 
-const fn spec(
+pub(crate) const fn spec(
     id: &'static str,
     label: &'static str,
     min: f32,
@@ -342,12 +347,15 @@ pub fn round_for(unit: Unit, value: f32) -> f32 {
         Unit::Sec if value < 10.0 => 0.01,
         Unit::Sec => 0.1,
         Unit::Hz if value < 1.0 => 0.01,
+        // The readout shows tenths below 10 Hz; a whole-hertz step would
+        // snap a 5.5 Hz rate to 6.
+        Unit::Hz if value < 10.0 => 0.1,
         Unit::Hz if value < 1_000.0 => 1.0,
         Unit::Hz => 10.0,
         Unit::Percent => 1.0,
         Unit::Db => 0.1,
         Unit::Times => 0.01,
-        Unit::Division => 1.0,
+        Unit::Division | Unit::Semitones | Unit::Cents | Unit::CentsDepth => 1.0,
     };
     (value / step).round() * step
 }
@@ -368,6 +376,11 @@ pub fn format_value(unit: Unit, value: f32) -> String {
         Unit::Db if value.abs() < 0.05 => "0.0 dB".to_string(),
         Unit::Db => format!("{value:+.1} dB"),
         Unit::Times => format!("{value:.2}×"),
+        Unit::Semitones if value.abs() < 0.5 => "0 st".to_string(),
+        Unit::Semitones => format!("{value:+.0} st"),
+        Unit::Cents if value.abs() < 0.5 => "0 ¢".to_string(),
+        Unit::Cents => format!("{value:+.0} ¢"),
+        Unit::CentsDepth => format!("±{value:.0} ¢"),
         Unit::Division => echospace::DIVISION_LABELS
             .get(value.round().clamp(0.0, echospace::MAX_DIVISION_WIRE) as usize)
             .copied()

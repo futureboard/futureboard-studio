@@ -15,6 +15,7 @@ Wire-up into DAUx / `SphereAudioPlugins` happens in a later integration pass.
 | `fa2a` | Optical compressor (LA-2A-style) | 1 easy | `biquad` (sidechain HPF) |
 | `echospace` | Stereo / ping-pong / mono delay with wow, ducking and diffusion (native editor shared with `verbspace`) | 2 medium | `biquad` (tone stage HP/LP) |
 | `verbspace` | 16-line FDN reverb with early reflections and three-band decay (native editor) | 3 hard | `biquad` (wet cuts) |
+| `whitesharp` | Realtime pitch correction (Auto mode): YIN tracking, key/scale targets, stereo TD-PSOLA (native editor, wgpu pitch graph) | 3 hard | `biquad` (detector decimation) |
 | `fa76` | FET compressor (1176-style) | 2 medium | `biquad` (sidechain HPF) |
 | `imager` | Four-band stereo width (M/S, Linkwitz-Riley crossovers) | 2 medium | `biquad` (crossovers, all-pass) |
 | `c1073` | 3-band channel EQ + drive | 3 hard | `biquad` |
@@ -37,5 +38,5 @@ Every effect exposes:
 
 ```bash
 cargo test -p BuiltinAudioPlugins
-cargo test -p equz8 -p compresser -p fa2a -p echospace -p verbspace -p imager -p fa76 -p c1073 -p meowsyn
+cargo test -p equz8 -p compresser -p fa2a -p echospace -p verbspace -p whitesharp -p imager -p fa76 -p c1073 -p meowsyn
 ```

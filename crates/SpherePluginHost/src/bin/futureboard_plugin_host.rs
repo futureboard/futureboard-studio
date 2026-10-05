@@ -297,6 +297,7 @@ enum BuiltinDsp {
     Equz8(equz8::Dsp),
     Equzx(equzx::Dsp),
     Verbspace(verbspace::Dsp),
+    WhiteSharp(Box<whitesharp::Dsp>),
     Echospace(echospace::Dsp),
     Imager(imager::Dsp),
     Fa2a(fa2a::Dsp),
@@ -374,6 +375,7 @@ impl BuiltinHostProcessor {
             "equz8" => Some(Self::equz8(sample_rate, state_json)),
             "equzx" => Some(Self::equzx(sample_rate, state_json)),
             "verbspace" => Some(Self::verbspace(sample_rate, state_json)),
+            "whitesharp" => Some(Self::whitesharp(sample_rate, state_json)),
             "echospace" => Some(Self::echospace(sample_rate, state_json)),
             "imager" => Some(Self::imager(sample_rate, state_json)),
             "fa2a" => Some(Self::fa2a(sample_rate, state_json)),
@@ -719,6 +721,30 @@ impl BuiltinHostProcessor {
         }
     }
 
+    fn whitesharp(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = whitesharp::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match whitesharp::ipc::WhiteSharpState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] WhiteSharp state rejected: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::WhiteSharp(Box::new(dsp))),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            // Pitch correction loads nothing from disk.
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
     fn wrapsynth(sample_rate: u32, state_json: Option<&str>) -> Self {
         let sr = sample_rate.max(1) as f32;
         let mut dsp = wrapsynth::Dsp::new(sr);
@@ -934,6 +960,13 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
+            BuiltinDsp::WhiteSharp(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
             BuiltinDsp::Echospace(dsp) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
@@ -1058,6 +1091,7 @@ impl BuiltinHostProcessor {
         use SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS;
         const _: () = assert!(drumsampler::PADS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(slicer::telemetry::SLOTS <= BUILTIN_PAD_SLOTS);
+        const _: () = assert!(whitesharp::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &*self.dsp.get() } {
             BuiltinDsp::DrumSampler(dsp) => Some(dsp.pad_levels()),
@@ -1067,6 +1101,8 @@ impl BuiltinHostProcessor {
                 block[..slicer::telemetry::SLOTS].copy_from_slice(&dsp.telemetry());
                 Some(block)
             }
+            // WhiteSharp's newest pitch readings fill it (`whitesharp::telemetry`).
+            BuiltinDsp::WhiteSharp(dsp) => Some(dsp.telemetry()),
             _ => None,
         }
     }
@@ -1319,6 +1355,7 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Equz8(_)
             | BuiltinDsp::Equzx(_)
             | BuiltinDsp::Verbspace(_)
+            | BuiltinDsp::WhiteSharp(_)
             | BuiltinDsp::Echospace(_)
             | BuiltinDsp::WrapSynth(_) => None,
         }
@@ -1335,6 +1372,8 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Rodhareist(dsp) => dsp.latency_samples(),
             BuiltinDsp::Equz8(_) | BuiltinDsp::Equzx(_) => 0,
             BuiltinDsp::Verbspace(dsp) => dsp.latency_samples(),
+            // The pitch shifter's fixed delay for the input type.
+            BuiltinDsp::WhiteSharp(dsp) => dsp.latency_samples(),
             BuiltinDsp::Fa2a(dsp) => dsp.latency_samples(),
             BuiltinDsp::Fa76(dsp) => dsp.latency_samples(),
             BuiltinDsp::BurnLimit(dsp) => dsp.latency_samples(),
@@ -1373,6 +1412,9 @@ impl BuiltinHostProcessor {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::Verbspace(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::WhiteSharp(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::Echospace(dsp) => {
@@ -2081,6 +2123,46 @@ mod builtin_processor_tests {
         let fallback = BuiltinHostProcessor::verbspace(48_000, Some("not json"));
         fallback.process_block(&in_l, &in_r, &mut output, 32);
         assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    /// WhiteSharp runs behind a fixed delay it reports for compensation,
+    /// restores its params, and publishes the pitch it hears in the level
+    /// block the editor's graph reads.
+    #[test]
+    fn whitesharp_restores_state_reports_latency_and_publishes_pitch() {
+        let mut params = whitesharp::default_params();
+        params.input_type = whitesharp::InputType::Soprano;
+        params.retune_ms = 0.0;
+        let json = whitesharp::ipc::WhiteSharpState::new(params)
+            .to_json()
+            .expect("state serializes");
+        let processor = BuiltinHostProcessor::whitesharp(48_000, Some(&json));
+        let latency = processor.latency_samples();
+        assert!(latency > 0 && latency < 48_000 / 20, "latency {latency}");
+
+        // A sharp A4 across many blocks.
+        let mut phase = 0.0f32;
+        let mut output = [0.0f32; 256];
+        for _ in 0..200 {
+            let block: [f32; 128] = std::array::from_fn(|_| {
+                phase = (phase + 445.0 / 48_000.0).fract();
+                (std::f32::consts::TAU * phase).sin() * 0.3
+            });
+            processor.process_block(&block, &block, &mut output, 128);
+            assert!(output.iter().all(|s| s.is_finite()));
+        }
+        let block = processor.pad_levels().expect("WhiteSharp publishes pitch");
+        let (count, readings) =
+            whitesharp::telemetry::decode(block.first_chunk().expect("64 slots"));
+        assert!(count > 0);
+        let newest = readings[whitesharp::telemetry::POINTS - 1];
+        assert!((newest.input.expect("voiced") - 69.2).abs() < 0.1);
+        assert_eq!(newest.target, Some(69));
+
+        // The input type is a wire edit like any other, and moves the delay.
+        let input_type = whitesharp::ui_param_index("inputType").expect("in the wire table");
+        processor.apply_param(input_type, whitesharp::InputType::LowMale.to_wire());
+        assert!(processor.latency_samples() > latency);
     }
 
     /// Like the reverb, a delay's output outlives its input: the check that

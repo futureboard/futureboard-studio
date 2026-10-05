@@ -39,6 +39,7 @@ pub const BUILTIN_PLUGIN_CRATES: &[&str] = &[
     "meowsyn",
     "rodharerist",
     "verbspace",
+    "whitesharp",
     "wrapsynth",
 ];
 

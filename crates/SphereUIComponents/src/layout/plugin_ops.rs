@@ -127,6 +127,13 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::fx_window::FxEditorWindow>,
     >,
+    /// Open native WhiteSharp editors, keyed by insert id, like
+    /// `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub white_sharp: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::white_sharp_window::WhiteSharpWindow>,
+    >,
     /// Native main-owned external-bridge editor shells, keyed by
     /// `(track_id, plugin_instance_id)`.
     pub bridge: std::collections::HashMap<(String, String), BridgeEditorSession>,
@@ -3218,6 +3225,13 @@ impl StudioLayout {
                 window,
                 cx,
             ),
+            Some(whitesharp::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.white_sharp,
+                crate::components::white_sharp_window::open_whitesharp_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
             _ => self.open_native_editor(
                 |windows| &mut windows.quick_sampler,
                 crate::components::quick_sampler_window::open_quick_sampler_editor,
@@ -3377,6 +3391,10 @@ impl StudioLayout {
             }
             let fxs: Vec<_> = self.plugin_editors.fx.values().copied().collect();
             for handle in fxs {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let tuners: Vec<_> = self.plugin_editors.white_sharp.values().copied().collect();
+            for handle in tuners {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
         }

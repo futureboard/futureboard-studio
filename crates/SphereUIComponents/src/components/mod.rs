@@ -100,6 +100,14 @@ pub mod fx_model;
 pub mod fx_panel;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod fx_window;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod white_sharp_meter;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod white_sharp_model;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod white_sharp_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod white_sharp_window;
 pub mod quick_sampler_panel;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod quick_sampler_window;
