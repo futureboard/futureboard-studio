@@ -196,6 +196,12 @@ struct SphereDauxClapProcessor {
   int event_count{0};
   clap_input_events_t in_events{};
   clap_output_events_t out_events{};
+  /// Notes and MIDI the plug-in pushed to `out_events` this block, as MIDI
+  /// bytes. Cleared before each process(); drained right after it by
+  /// `sphere_daux_clap_take_output_midi` on the same thread.
+  static constexpr int kMaxOutputMidi = 256;
+  std::array<SphereDauxMidiOutEvent, kMaxOutputMidi> output_midi{};
+  int output_midi_count{0};
 
   // ── Transport ────────────────────────────────────────────────────────────
   clap_event_transport_t transport{};

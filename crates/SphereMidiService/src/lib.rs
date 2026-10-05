@@ -67,6 +67,8 @@ pub enum MidiInputSource {
     PianoRollPreview,
     VirtualKeyboard,
     DawRemote,
+    /// MIDI a hosted plug-in produced, taken by another track as its input.
+    PluginOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -810,7 +812,10 @@ impl Drop for HardwareMidiInput {
     }
 }
 
-pub(crate) fn decode_midi_bytes(bytes: &[u8]) -> Option<MidiInputEvent> {
+/// One MIDI 1.0 channel message as a [`MidiInputEvent`], or `None` for what
+/// it does not model (system messages, a truncated message). Used for
+/// hardware input and for the MIDI hosted plug-ins produce.
+pub fn decode_midi_bytes(bytes: &[u8]) -> Option<MidiInputEvent> {
     if bytes.is_empty() {
         return None;
     }

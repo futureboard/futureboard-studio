@@ -429,6 +429,12 @@ pub fn inspector_panel<'a>(
                     .filter(|track| track.track_type == TrackType::Instrument)
                     .map(|track| (track.id.clone(), track.name.clone()))
                     .collect();
+                let midi_input_label = midi_input_combo_label(&t.routing.midi_input, |id| {
+                    tracks
+                        .iter()
+                        .find(|track| track.id == id)
+                        .map(|track| track.name.clone())
+                });
                 track_inspector(
                     t,
                     connections,
@@ -436,6 +442,7 @@ pub fn inspector_panel<'a>(
                     name_focused,
                     name_callbacks,
                     &instrument_targets,
+                    midi_input_label,
                     &color_picker,
                     spatial_format,
                     callbacks,
@@ -949,11 +956,20 @@ fn parse_audio_format_option(label: &str) -> TrackAudioFormat {
     }
 }
 
-fn midi_input_combo_label(routing: &TrackMidiInputRouting) -> String {
+/// The MIDI Input trigger's text. `track_name` resolves a plug-in source's
+/// live name; a source that is gone reads as missing rather than as an id.
+fn midi_input_combo_label(
+    routing: &TrackMidiInputRouting,
+    track_name: impl Fn(&str) -> Option<String>,
+) -> String {
     match routing {
         TrackMidiInputRouting::AllInputs => "All".to_string(),
         TrackMidiInputRouting::None => "None".to_string(),
         TrackMidiInputRouting::MidiDevice { device_id } => device_id.clone(),
+        TrackMidiInputRouting::PluginOutput { track_id } => match track_name(track_id) {
+            Some(name) => format!("VSTi - {name}"),
+            None => "VSTi - Missing track".to_string(),
+        },
     }
 }
 
@@ -963,10 +979,98 @@ fn midi_channel_combo_label(channel: Option<u8>) -> String {
         .unwrap_or_else(|| "All".to_string())
 }
 
-fn midi_input_options(detected: &[String]) -> Vec<String> {
-    let mut options = vec!["All".to_string(), "None".to_string()];
-    options.extend(detected.iter().cloned());
-    options
+/// Menu value for a MIDI input routing: what a tree row is matched and
+/// chosen by. Prefixed, so a device and a track can share a name.
+fn midi_input_value(routing: &TrackMidiInputRouting) -> String {
+    match routing {
+        TrackMidiInputRouting::None => "none".to_string(),
+        TrackMidiInputRouting::AllInputs => "all".to_string(),
+        TrackMidiInputRouting::MidiDevice { device_id } => format!("device:{device_id}"),
+        TrackMidiInputRouting::PluginOutput { track_id } => format!("vsti:{track_id}"),
+    }
+}
+
+fn parse_midi_input_value(value: &str) -> TrackMidiInputRouting {
+    if let Some(device_id) = value.strip_prefix("device:") {
+        return TrackMidiInputRouting::MidiDevice {
+            device_id: device_id.to_string(),
+        };
+    }
+    if let Some(track_id) = value.strip_prefix("vsti:") {
+        return TrackMidiInputRouting::PluginOutput {
+            track_id: track_id.to_string(),
+        };
+    }
+    match value {
+        "all" => TrackMidiInputRouting::AllInputs,
+        _ => TrackMidiInputRouting::None,
+    }
+}
+
+/// The MIDI Input menu as a tree: None, then the hardware and virtual ports
+/// under MIDI Devices, then the tracks whose plug-in MIDI this track can take
+/// under VSTi. A current choice that is no longer offered (an unplugged port,
+/// a deleted track) stays listed as missing so the menu shows what is set.
+pub(crate) fn midi_input_tree(
+    current: &TrackMidiInputRouting,
+    detected: &[String],
+    plugin_sources: &[(String, String)],
+) -> Vec<crate::components::combo_box::TreeMenuNode> {
+    use crate::components::combo_box::{MenuGlyph, TreeMenuNode};
+    let routing_leaf = |label: String, routing: TrackMidiInputRouting| {
+        TreeMenuNode::leaf(label, midi_input_value(&routing), MenuGlyph::None)
+    };
+    let mut devices = vec![routing_leaf(
+        "All MIDI Inputs".to_string(),
+        TrackMidiInputRouting::AllInputs,
+    )];
+    devices.extend(detected.iter().map(|name| {
+        routing_leaf(
+            name.clone(),
+            TrackMidiInputRouting::MidiDevice {
+                device_id: name.clone(),
+            },
+        )
+    }));
+    if let TrackMidiInputRouting::MidiDevice { device_id } = current {
+        if !detected.contains(device_id) {
+            devices.push(routing_leaf(
+                format!("Missing - {device_id}"),
+                current.clone(),
+            ));
+        }
+    }
+    let mut plugins: Vec<TreeMenuNode> = plugin_sources
+        .iter()
+        .map(|(track_id, label)| {
+            routing_leaf(
+                label.clone(),
+                TrackMidiInputRouting::PluginOutput {
+                    track_id: track_id.clone(),
+                },
+            )
+        })
+        .collect();
+    if let TrackMidiInputRouting::PluginOutput { track_id } = current {
+        if !plugin_sources.iter().any(|(id, _)| id == track_id) {
+            plugins.push(routing_leaf("Missing track".to_string(), current.clone()));
+        }
+    }
+    vec![
+        routing_leaf("None".to_string(), TrackMidiInputRouting::None),
+        TreeMenuNode::branch(
+            "MIDI Devices",
+            MenuGlyph::Svg(crate::assets::ICON_KEYBOARD_PATH),
+            devices,
+            "No MIDI inputs enabled",
+        ),
+        TreeMenuNode::branch(
+            "VSTi",
+            MenuGlyph::Svg(crate::assets::ICON_PLUG_PATH),
+            plugins,
+            "No other track has a plug-in",
+        ),
+    ]
 }
 
 fn midi_channel_options() -> Vec<String> {
@@ -1034,16 +1138,6 @@ fn midi_output_combo_label(
     }
 }
 
-fn parse_midi_input_option(label: &str) -> TrackMidiInputRouting {
-    match label {
-        "All" => TrackMidiInputRouting::AllInputs,
-        "None" => TrackMidiInputRouting::None,
-        device => TrackMidiInputRouting::MidiDevice {
-            device_id: device.to_string(),
-        },
-    }
-}
-
 fn parse_midi_channel_option(label: &str) -> Option<u8> {
     if label == "All" {
         None
@@ -1082,10 +1176,10 @@ fn routing_combo_trigger(
     ))
 }
 
-fn midi_input_selector(track: &TrackState, callbacks: &InspectorCallbacks) -> impl IntoElement {
+fn midi_input_selector(label: String, callbacks: &InspectorCallbacks) -> impl IntoElement {
     routing_combo_trigger(
         "inspector-midi-input-combo",
-        midi_input_combo_label(&track.routing.midi_input),
+        label,
         InspectorRoutingCombo::MidiInput,
         callbacks.open_routing_combo,
         callbacks.on_toggle_routing_combo.clone(),
@@ -1142,6 +1236,9 @@ pub(crate) fn inspector_routing_combo_overlay(
     // `device_registry` cache (same source Settings → MIDI renders from).
     detected_midi_inputs: Vec<String>,
     detected_midi_outputs: Vec<String>,
+    // Tracks whose plug-in MIDI this track may take as input, as
+    // `(track_id, label)`; see `TimelineState::plugin_midi_sources_for`.
+    plugin_midi_sources: Vec<(String, String)>,
 ) -> impl IntoElement {
     let position =
         inspector_combo_menu_position(anchor, INSPECTOR_WIDTH, ROUTING_COMBO_MENU_HEIGHT, window);
@@ -1236,17 +1333,21 @@ pub(crate) fn inspector_routing_combo_overlay(
             .map(|slot| vsti_output_dropdown(track, slot, callbacks, position).into_any_element())
             .unwrap_or_else(|| div().into_any_element()),
         InspectorRoutingCombo::MidiInput => {
-            let selected = midi_input_combo_label(&track.routing.midi_input);
-            let options = midi_input_options(&detected_midi_inputs);
+            let selected = midi_input_value(&track.routing.midi_input);
+            let nodes = midi_input_tree(
+                &track.routing.midi_input,
+                &detected_midi_inputs,
+                &plugin_midi_sources,
+            );
             let cb = callbacks.on_set_midi_input.clone();
             let close = on_close.clone();
-            combo_box_string_menu(
+            crate::components::combo_box::combo_box_tree_menu(
                 "inspector-midi-input-menu",
                 position,
                 &selected,
-                &options,
+                nodes,
                 Arc::new(move |value, window, cx| {
-                    let routing = parse_midi_input_option(&value);
+                    let routing = parse_midi_input_value(&value);
                     cb(&(track_id.clone(), routing), window, cx);
                     close(cx);
                 }),
@@ -1383,6 +1484,7 @@ fn routing_section(
     track: &TrackState,
     connections: &AudioConnectionRegistry,
     instrument_targets: &[(String, String)],
+    midi_input_label: String,
     callbacks: &InspectorCallbacks,
 ) -> impl IntoElement {
     let mut rows = section_rows();
@@ -1401,7 +1503,7 @@ fn routing_section(
             rows = rows
                 .child(field_row(
                     "MIDI Input",
-                    midi_input_selector(track, callbacks),
+                    midi_input_selector(midi_input_label, callbacks),
                 ))
                 .child(field_row(
                     "MIDI Ch",
@@ -1413,7 +1515,7 @@ fn routing_section(
             rows = rows
                 .child(field_row(
                     "MIDI Input",
-                    midi_input_selector(track, callbacks),
+                    midi_input_selector(midi_input_label, callbacks),
                 ))
                 .child(field_row(
                     "MIDI Ch",
@@ -2483,6 +2585,7 @@ fn track_inspector(
     name_focused: bool,
     name_callbacks: TextInputCallbacks,
     instrument_targets: &[(String, String)],
+    midi_input_label: String,
     color_picker: &InspectorColorPicker<'_>,
     spatial_format: solfege_spatialaudio::SpatialFormat,
     callbacks: &InspectorCallbacks,
@@ -2731,6 +2834,7 @@ fn track_inspector(
             track,
             connections,
             instrument_targets,
+            midi_input_label,
             callbacks,
         ))
         .when(
@@ -4112,6 +4216,62 @@ mod input_routing_tests {
 /// The Architecture row must describe the engine Studio builds, not the
 /// sections the loader read on the way there. These run without a GPUI window
 /// because `solfege_runtime_architecture` is a pure string function.
+#[cfg(test)]
+mod midi_input_menu_tests {
+    use super::*;
+    use crate::components::combo_box::TreeMenuNodeKind;
+
+    fn leaf_values(node: &crate::components::combo_box::TreeMenuNode) -> Vec<String> {
+        match &node.kind {
+            TreeMenuNodeKind::Leaf { value } => vec![value.clone()],
+            TreeMenuNodeKind::Branch { children, .. } => {
+                children.iter().flat_map(leaf_values).collect()
+            }
+        }
+    }
+
+    /// Every choice the menu offers comes back as the routing it shows, and
+    /// a device and a track with the same name stay apart.
+    #[test]
+    fn menu_values_round_trip_and_never_collide() {
+        let routings = [
+            TrackMidiInputRouting::None,
+            TrackMidiInputRouting::AllInputs,
+            TrackMidiInputRouting::MidiDevice {
+                device_id: "Drums".to_string(),
+            },
+            TrackMidiInputRouting::PluginOutput {
+                track_id: "Drums".to_string(),
+            },
+        ];
+        for routing in &routings {
+            assert_eq!(&parse_midi_input_value(&midi_input_value(routing)), routing);
+        }
+        assert_ne!(
+            midi_input_value(&routings[2]),
+            midi_input_value(&routings[3])
+        );
+    }
+
+    /// The tree is None, then the ports under MIDI Devices, then the plug-in
+    /// sources under VSTi; a choice no longer offered stays listed.
+    #[test]
+    fn the_tree_groups_devices_and_plugins_and_keeps_a_missing_choice() {
+        let current = TrackMidiInputRouting::PluginOutput {
+            track_id: "track-gone".to_string(),
+        };
+        let nodes = midi_input_tree(
+            &current,
+            &["Studio 24c MIDI In".to_string()],
+            &[("track-2".to_string(), "Arp - Pigments".to_string())],
+        );
+        let labels: Vec<&str> = nodes.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(labels, ["None", "MIDI Devices", "VSTi"]);
+        assert_eq!(leaf_values(&nodes[1]), ["all", "device:Studio 24c MIDI In"]);
+        assert_eq!(leaf_values(&nodes[2]), ["vsti:track-2", "vsti:track-gone"]);
+    }
+}
+
 #[cfg(test)]
 mod solfege_inspector_tests {
     use super::*;

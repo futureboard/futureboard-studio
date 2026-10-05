@@ -322,22 +322,60 @@ const clap_event_header_t *CLAP_ABI in_events_get(
 
 bool CLAP_ABI out_events_try_push(const clap_output_events_t *list,
                                   const clap_event_header_t *event) {
+  auto *p =
+      static_cast<SphereDauxClapProcessor *>(list ? list->ctx : nullptr);
+  if (!p || !event || event->space_id != CLAP_CORE_EVENT_SPACE_ID) {
+    return false;
+  }
   // A parameter value or the end of a gesture coming *out* of the plug-in is
   // its GUI (or a preset it loaded) changing its own state. Noted with one
   // atomic store — this runs on the audio thread — so the host can report
   // the saved state as possibly stale.
-  if (event && event->space_id == CLAP_CORE_EVENT_SPACE_ID &&
-      (event->type == CLAP_EVENT_PARAM_VALUE ||
-       event->type == CLAP_EVENT_PARAM_GESTURE_END)) {
-    if (auto *p = static_cast<SphereDauxClapProcessor *>(list ? list->ctx
-                                                              : nullptr)) {
-      p->state_touched.store(true, std::memory_order_release);
-    }
+  if (event->type == CLAP_EVENT_PARAM_VALUE ||
+      event->type == CLAP_EVENT_PARAM_GESTURE_END) {
+    p->state_touched.store(true, std::memory_order_release);
+    // Not routed anywhere: reporting failure is honest.
+    return false;
   }
-  // Plug-in-produced events (parameter gestures, note output) are not routed
-  // anywhere yet. Reporting failure is honest: accepting them would claim the
-  // host delivered something it dropped.
-  return false;
+  // Notes and MIDI are kept, as MIDI bytes, for the host to offer to other
+  // tracks. Anything else (note end, expressions, sysex) is not delivered.
+  if (p->output_midi_count >= SphereDauxClapProcessor::kMaxOutputMidi) {
+    return false;
+  }
+  SphereDauxMidiOutEvent out{};
+  out.sample_offset = event->time;
+  switch (event->type) {
+  case CLAP_EVENT_NOTE_ON:
+  case CLAP_EVENT_NOTE_OFF: {
+    const auto *note = reinterpret_cast<const clap_event_note_t *>(event);
+    if (note->key < 0 || note->key > 127) {
+      return false;
+    }
+    const int channel = note->channel < 0 ? 0 : (note->channel & 0x0F);
+    const int velocity = std::max(
+        0, std::min(127, static_cast<int>(std::lround(note->velocity * 127.0))));
+    const bool on = event->type == CLAP_EVENT_NOTE_ON;
+    out.status = static_cast<unsigned char>((on ? 0x90 : 0x80) | channel);
+    out.data1 = static_cast<unsigned char>(note->key);
+    // Velocity 0 would read as a note-off in MIDI 1.0.
+    out.data2 = static_cast<unsigned char>(on ? std::max(1, velocity) : velocity);
+    break;
+  }
+  case CLAP_EVENT_MIDI: {
+    const auto *midi = reinterpret_cast<const clap_event_midi_t *>(event);
+    if ((midi->data[0] & 0x80) == 0 || midi->data[0] >= 0xF0) {
+      return false;
+    }
+    out.status = midi->data[0];
+    out.data1 = static_cast<unsigned char>(midi->data[1] & 0x7F);
+    out.data2 = static_cast<unsigned char>(midi->data[2] & 0x7F);
+    break;
+  }
+  default:
+    return false;
+  }
+  p->output_midi[p->output_midi_count++] = out;
+  return true;
 }
 
 // ── State streams ───────────────────────────────────────────────────────────
@@ -865,6 +903,7 @@ bool SphereDauxClapProcessor::process_planar(
   process.audio_outputs_count = static_cast<uint32_t>(output_buffers.size());
   process.in_events = &in_events;
   process.out_events = &out_events;
+  output_midi_count = 0;
 
   const clap_process_status status = plugin->process(plugin, &process);
   if (status == CLAP_PROCESS_ERROR) {
@@ -1156,6 +1195,20 @@ int sphere_daux_clap_process_main_output_block_with_midi(
 
 int sphere_daux_clap_event_input_bus_count(SphereDauxClapProcessor *p) {
   return p ? p->event_input_bus_count : 0;
+}
+
+int sphere_daux_clap_take_output_midi(SphereDauxClapProcessor *p,
+                                      SphereDauxMidiOutEvent *out,
+                                      int max_count) {
+  if (!p || !out || max_count <= 0) {
+    return 0;
+  }
+  const int n = std::min(p->output_midi_count, max_count);
+  for (int i = 0; i < n; ++i) {
+    out[i] = p->output_midi[i];
+  }
+  p->output_midi_count = 0;
+  return n;
 }
 
 int sphere_daux_clap_audio_input_bus_count(SphereDauxClapProcessor *p) {

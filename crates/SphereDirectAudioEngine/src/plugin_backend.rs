@@ -73,7 +73,9 @@ pub(crate) mod backend {
     use super::PluginModuleFormat;
     use crate::clap_processor::{ffi as clap, SphereDauxClapProcessor};
     use crate::vst2_processor::{ffi as vst2, SphereDauxVst2Processor};
-    use crate::vst3_processor::{ffi as vst3, SphereDauxVst3Processor, Vst3MidiEvent};
+    use crate::vst3_processor::{
+        ffi as vst3, PluginMidiOutEvent, SphereDauxVst3Processor, Vst3MidiEvent,
+    };
     use std::os::raw::{c_char, c_double, c_float};
 
     /// Reinterpret the shared opaque handle as a VST2 instance. Sound because
@@ -143,6 +145,7 @@ pub(crate) mod backend {
             event_count: i32,
         ) -> i32;
         fn event_input_bus_count() -> i32;
+        fn take_output_midi(out: *mut PluginMidiOutEvent, max_count: i32) -> i32;
         fn audio_input_bus_count() -> i32;
         fn audio_output_bus_count() -> i32;
         fn main_audio_input_channel_count() -> i32;

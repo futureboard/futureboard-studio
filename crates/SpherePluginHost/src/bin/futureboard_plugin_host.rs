@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use builtin_dsp_core::{Instrument, StereoEffect};
 use SpherePluginHost::au_host::{AuHostProcessor, AuTransport};
 use SpherePluginHost::audio_bridge::{
-    bridge_kick_event_name, BridgeKickEvent, SharedAudioRegion, SharedMidiEvent, AUDIO_BUF_LEN,
-    MAX_BLOCK_FRAMES, MAX_CHANNELS,
+    bridge_kick_event_name, bridge_midi_out_event_name, BridgeKickEvent, SharedAudioRegion,
+    SharedMidiEvent, AUDIO_BUF_LEN, MAX_BLOCK_FRAMES, MAX_CHANNELS,
 };
 use SpherePluginHost::ipc::{self, EditorChromeCommand, HostCommand, HostEvent, PROTOCOL_VERSION};
 use SpherePluginHost::native_editor::{self, EmbedRegion};
@@ -2973,6 +2973,7 @@ fn service_audio_bridge(
     dsp: &BridgeAudioShared,
     runtime: BlockRuntime<'_>,
     plugin_instance_id: &str,
+    midi_out_event: Option<&BridgeKickEvent>,
 ) {
     let bridge = region.bridge();
     let req = bridge.request_seq.load(Ordering::Acquire);
@@ -3082,7 +3083,9 @@ fn service_audio_bridge(
                 playing: bt.playing,
                 recording: bt.recording,
             };
-            let produced = dsp.render_single_voice_interleaved(
+            let mut midi_out =
+                [DirectAudio::vst3_processor::PluginMidiOutEvent::default(); OUTPUT_MIDI_PER_BLOCK];
+            let (produced, midi_count) = dsp.render_single_voice_interleaved(
                 plugin_instance_id,
                 frames,
                 &in_l[..frames],
@@ -3090,7 +3093,9 @@ fn service_audio_bridge(
                 &mut interleaved[..len],
                 output_channels,
                 transport,
+                &mut midi_out,
             );
+            forward_output_midi(bridge, &midi_out[..midi_count], midi_out_event);
             if produced > 0 {
                 produced.min(output_channels)
             } else {
@@ -3444,6 +3449,39 @@ impl ProducerDiagnostics {
 /// are committed on use) and takes the whole class of failure off the table.
 const AUDIO_PRODUCER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// MIDI a plug-in may produce in one block. Its bridge keeps at most 256.
+const OUTPUT_MIDI_PER_BLOCK: usize = 256;
+
+/// Hand the MIDI an instance produced this block to the studio through the
+/// region's `midi_out` ring, then wake it. Producer thread, after render:
+/// wait-free ring pushes and one event signal, and nothing at all for a block
+/// that produced no MIDI.
+fn forward_output_midi(
+    bridge: &SpherePluginHost::audio_bridge::SharedAudioBridge,
+    events: &[DirectAudio::vst3_processor::PluginMidiOutEvent],
+    midi_out_event: Option<&BridgeKickEvent>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    for event in events {
+        // A full ring means the studio has stopped draining; drop the rest
+        // of this block rather than wait on it.
+        if !bridge.midi_out.try_push(SharedMidiEvent {
+            sample_offset: event.sample_offset,
+            status: event.status,
+            data1: event.data1,
+            data2: event.data2,
+            _pad: 0,
+        }) {
+            break;
+        }
+    }
+    if let Some(event) = midi_out_event {
+        event.set();
+    }
+}
+
 fn run_audio_producer(
     regions: SharedAudioRegions,
     builtins: SharedBuiltinProcessors,
@@ -3451,6 +3489,7 @@ fn run_audio_producer(
     dsp: Arc<BridgeAudioShared>,
     shutdown: Arc<AtomicBool>,
     kick: Option<BridgeKickEvent>,
+    midi_out_event: Option<BridgeKickEvent>,
 ) {
     boost_audio_producer_thread();
     let mut diagnostics = ProducerDiagnostics::default();
@@ -3495,7 +3534,13 @@ fn run_audio_producer(
                 (None, Some(au)) => BlockRuntime::Au(au.as_ref()),
                 (None, None) => BlockRuntime::Vst3,
             };
-            service_audio_bridge(region.as_ref(), &dsp, runtime, instance_id);
+            service_audio_bridge(
+                region.as_ref(),
+                &dsp,
+                runtime,
+                instance_id,
+                midi_out_event.as_ref(),
+            );
             if region.bridge().done_seq.load(Ordering::Relaxed) != before {
                 diagnostics.record(region.bridge());
             }
@@ -3597,6 +3642,18 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
                 }
             }
         });
+        // Raised after a block's plug-in MIDI output lands in its region's
+        // `midi_out` ring, so the studio picks it up at once.
+        let midi_out_event = parse_parent_pid().and_then(|parent_pid| {
+            let name = bridge_midi_out_event_name(parent_pid, std::process::id());
+            BridgeKickEvent::create_named(&name)
+                .map_err(|error| {
+                    eprintln!(
+                        "[plugin-host-audio] midi-out event create failed name={name} error={error}"
+                    )
+                })
+                .ok()
+        });
         std::thread::Builder::new()
             .name("plugin-host-audio".into())
             // `service_audio_bridge` alone puts 272 KiB of fixed-size block
@@ -3607,7 +3664,17 @@ fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
             // thread entry, aborting the whole host process before any plugin
             // was even loaded. Ask for a stack that is not a coincidence.
             .stack_size(AUDIO_PRODUCER_STACK_BYTES)
-            .spawn(move || run_audio_producer(slots, builtins, audio_units, dsp, shutdown, kick))
+            .spawn(move || {
+                run_audio_producer(
+                    slots,
+                    builtins,
+                    audio_units,
+                    dsp,
+                    shutdown,
+                    kick,
+                    midi_out_event,
+                )
+            })
             .expect("spawn plugin-host audio producer");
     }
 

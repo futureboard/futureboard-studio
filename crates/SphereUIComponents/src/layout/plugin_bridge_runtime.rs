@@ -89,6 +89,37 @@ pub(crate) fn bridge_enabled() -> bool {
     plugin_host_bridge_enabled()
 }
 
+/// Rung when any plug-in host reports MIDI its plug-ins produced. One bell for
+/// every host, made before the first one exists, so the Studio's drain task
+/// can wait on it from startup. See [`PluginBridgeRuntime::drain_output_midi`].
+pub(crate) fn plugin_midi_output_doorbell() -> Arc<sphere_midi_service::MidiInputDoorbell> {
+    static BELL: std::sync::OnceLock<Arc<sphere_midi_service::MidiInputDoorbell>> =
+        std::sync::OnceLock::new();
+    BELL.get_or_init(Default::default).clone()
+}
+
+/// Wait on a host's MIDI-output event and ring the shared doorbell for each
+/// signal, until the host is gone. A kernel wait rather than a timer, so a
+/// note an arpeggiator plays reaches its target without a timer tick's delay.
+fn spawn_midi_output_waiter(
+    event: SpherePluginHost::audio_bridge::BridgeKickEvent,
+    host_alive: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("plugin-midi-out".into())
+        .spawn(move || {
+            let bell = plugin_midi_output_doorbell();
+            while host_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                if event.wait(250) {
+                    bell.ring();
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("[plugin-bridge] midi-out waiter spawn failed: {error}");
+    }
+}
+
 pub(super) fn legacy_in_process_enabled() -> bool {
     SpherePluginHost::plugin_host_client::legacy_in_process_enabled()
 }
@@ -223,6 +254,18 @@ impl BridgeHost {
                 None
             }
         };
+        let host_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let midi_out_name = SpherePluginHost::audio_bridge::bridge_midi_out_event_name(
+            std::process::id(),
+            client.pid(),
+        );
+        match SpherePluginHost::audio_bridge::BridgeKickEvent::create_named(&midi_out_name) {
+            Ok(event) => spawn_midi_output_waiter(event, host_alive.clone()),
+            Err(error) => eprintln!(
+                "[plugin-bridge] midi-out event create failed name={midi_out_name} \
+                 error={error}; plug-in MIDI output is read on the next bridge poll"
+            ),
+        }
         Ok(Self {
             client,
             host_pid,
@@ -233,7 +276,7 @@ impl BridgeHost {
             audio_sinks: std::sync::Mutex::new(HashMap::new()),
             kick,
             dead: false,
-            host_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            host_alive,
         })
     }
 
@@ -293,6 +336,28 @@ impl BridgeHost {
             );
         sinks.insert(instance_id.to_string(), (region.clone(), sink.clone()));
         Some(sink)
+    }
+
+    /// Pop everything this host's plug-ins produced on their `midi_out` rings,
+    /// as `(source track id, event)`. The Studio's control thread is each
+    /// ring's one consumer. Instances not (or no longer) loaded are drained
+    /// and dropped, so a stale burst never plays later.
+    fn drain_output_midi(
+        &self,
+        out: &mut Vec<(String, SpherePluginHost::audio_bridge::SharedMidiEvent)>,
+    ) {
+        for (instance_id, region) in &self.shared_audio {
+            let ring = &region.bridge().midi_out;
+            let track_id = self
+                .loaded
+                .get(instance_id)
+                .map(|loaded| loaded.descriptor.track_id.as_str());
+            while let Some(event) = ring.try_pop() {
+                if let Some(track_id) = track_id {
+                    out.push((track_id.to_string(), event));
+                }
+            }
+        }
     }
 
     /// Drop an instance's region and the sink cached for it.
@@ -1278,6 +1343,18 @@ impl PluginBridgeRuntime {
 
     pub fn instance_load(&self, instance_id: &str) -> Option<(Option<f32>, u32)> {
         self.host_for(instance_id)?.instance_load(instance_id)
+    }
+
+    /// The MIDI every hosted plug-in produced since the last call, as
+    /// `(source track id, event)` in arrival order per instance.
+    pub fn drain_output_midi(
+        &self,
+    ) -> Vec<(String, SpherePluginHost::audio_bridge::SharedMidiEvent)> {
+        let mut out = Vec::new();
+        for host in self.hosts.values() {
+            host.drain_output_midi(&mut out);
+        }
+        out
     }
 
     pub fn loaded_descriptor(&self, instance: &str) -> Option<BridgeLoadedPlugin> {

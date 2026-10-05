@@ -66,6 +66,26 @@ SPHERE_DAUX_CLAP_API int sphere_daux_clap_process_main_output_block_with_midi(
 SPHERE_DAUX_CLAP_API int
 sphere_daux_clap_event_input_bus_count(SphereDauxClapProcessor *processor);
 
+#ifndef SPHERE_DAUX_MIDI_OUT_EVENT_DEFINED
+#define SPHERE_DAUX_MIDI_OUT_EVENT_DEFINED
+/// One MIDI 1.0 message a plug-in produced during process(), as raw bytes.
+/// Same type as the VST3 and VST2 bridges'.
+typedef struct SphereDauxMidiOutEvent {
+  unsigned int sample_offset;
+  unsigned char status;
+  unsigned char data1;
+  unsigned char data2;
+  unsigned char reserved;
+} SphereDauxMidiOutEvent;
+#endif
+
+/// Copy the notes and MIDI the plug-in pushed to `out_events` during the last
+/// process call into `out` (at most `max_count`), oldest first, and clear
+/// them. Call on the thread that calls process(), right after it.
+SPHERE_DAUX_CLAP_API int
+sphere_daux_clap_take_output_midi(SphereDauxClapProcessor *processor,
+                                  SphereDauxMidiOutEvent *out, int max_count);
+
 SPHERE_DAUX_CLAP_API int
 sphere_daux_clap_audio_input_bus_count(SphereDauxClapProcessor *processor);
 SPHERE_DAUX_CLAP_API int

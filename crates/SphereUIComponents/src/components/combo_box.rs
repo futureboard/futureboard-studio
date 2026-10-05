@@ -397,3 +397,315 @@ pub fn combo_box_icon_menu(
                 }))
         }))
 }
+
+/// One node of a [`combo_box_tree_menu`].
+#[derive(Clone)]
+pub struct TreeMenuNode {
+    pub label: String,
+    pub glyph: MenuGlyph,
+    pub kind: TreeMenuNodeKind,
+}
+
+#[derive(Clone)]
+pub enum TreeMenuNodeKind {
+    /// A choice. Choosing it hands `value` to the caller; it is also what the
+    /// selected row is matched by, so two rows may read the same.
+    Leaf { value: String },
+    /// A heading over its children. Clicking it folds or unfolds them.
+    /// `empty` is the line shown in place of children when there are none.
+    Branch {
+        children: Vec<TreeMenuNode>,
+        empty: String,
+    },
+}
+
+impl TreeMenuNode {
+    pub fn leaf(label: impl Into<String>, value: impl Into<String>, glyph: MenuGlyph) -> Self {
+        Self {
+            label: label.into(),
+            glyph,
+            kind: TreeMenuNodeKind::Leaf {
+                value: value.into(),
+            },
+        }
+    }
+
+    pub fn branch(
+        label: impl Into<String>,
+        glyph: MenuGlyph,
+        children: Vec<TreeMenuNode>,
+        empty: impl Into<String>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            glyph,
+            kind: TreeMenuNodeKind::Branch {
+                children,
+                empty: empty.into(),
+            },
+        }
+    }
+}
+
+/// Which branches of one tree menu the user folded. Element state, so a menu
+/// remembers it while it stays open and nothing outside it has to.
+#[derive(Default)]
+struct TreeMenuState {
+    folded: HashSet<String>,
+}
+
+/// Indent per tree level, in logical pixels: a row's chevron and its gap, so a
+/// child's glyph lines up under its parent's.
+const TREE_INDENT: f32 = 14.0;
+
+/// A menu whose choices are grouped under headings that fold, for a choice
+/// that comes from more than one kind of source.
+pub fn combo_box_tree_menu(
+    id: impl Into<gpui::ElementId>,
+    position: crate::overlay::OverlayPosition,
+    selected: &str,
+    nodes: Vec<TreeMenuNode>,
+    on_select: Arc<dyn Fn(String, &mut Window, &mut App) + 'static>,
+) -> impl IntoElement {
+    TreeMenu {
+        id: id.into(),
+        position,
+        selected: selected.to_string(),
+        nodes,
+        on_select,
+    }
+}
+
+#[derive(gpui::IntoElement)]
+struct TreeMenu {
+    id: gpui::ElementId,
+    position: crate::overlay::OverlayPosition,
+    selected: String,
+    nodes: Vec<TreeMenuNode>,
+    on_select: Arc<dyn Fn(String, &mut Window, &mut App) + 'static>,
+}
+
+impl gpui::RenderOnce for TreeMenu {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let state = window.use_keyed_state(self.id.clone(), cx, |_, _| TreeMenuState::default());
+        let folded = state.read(cx).folded.clone();
+        let mut rows = Vec::new();
+        let walk = TreeWalk {
+            selected: &self.selected,
+            folded: &folded,
+            state: &state,
+            on_select: &self.on_select,
+        };
+        walk.rows(&self.nodes, 0, "", &mut rows);
+        let left: f32 = self.position.x.into();
+        let top: f32 = self.position.y.into();
+        let width: f32 = self.position.width.map(|w| w.into()).unwrap_or(120.0);
+        let max_h: f32 = self.position.max_height.map(|h| h.into()).unwrap_or(148.0);
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(width))
+            .max_h(px(max_h))
+            .rounded(px(crate::theme::radius::CONTROL))
+            .border(px(1.0))
+            .border_color(Colors::border_subtle())
+            .bg(Colors::surface_card())
+            .shadow(vec![gpui::BoxShadow {
+                color: Colors::surface_overlay().into(),
+                offset: gpui::point(px(0.0), px(6.0)),
+                blur_radius: px(18.0),
+                spread_radius: px(0.0),
+                inset: false,
+            }])
+            .p(px(4.0))
+            .id(self.id)
+            .overflow_y_scroll()
+            .occlude()
+            .children(rows)
+    }
+}
+
+/// What every row of one tree menu shares while it is flattened.
+struct TreeWalk<'a> {
+    selected: &'a str,
+    folded: &'a HashSet<String>,
+    state: &'a gpui::Entity<TreeMenuState>,
+    on_select: &'a Arc<dyn Fn(String, &mut Window, &mut App) + 'static>,
+}
+
+impl TreeWalk<'_> {
+    /// Flatten `nodes` into menu rows, depth first, skipping folded branches.
+    /// `path` names the branch being walked so two headings that read the
+    /// same fold independently.
+    fn rows(
+        &self,
+        nodes: &[TreeMenuNode],
+        depth: usize,
+        path: &str,
+        rows: &mut Vec<gpui::AnyElement>,
+    ) {
+        let indent = px(8.0 + TREE_INDENT * depth as f32);
+        for node in nodes {
+            let index = rows.len();
+            match &node.kind {
+                TreeMenuNodeKind::Leaf { value } => {
+                    rows.push(self.leaf(node, value, index, indent));
+                }
+                TreeMenuNodeKind::Branch { children, empty } => {
+                    let key = format!("{path}/{}", node.label);
+                    let open = !self.folded.contains(&key);
+                    rows.push(self.heading(node, &key, open, children.len(), index, indent));
+                    if !open {
+                        continue;
+                    }
+                    if children.is_empty() {
+                        rows.push(
+                            div()
+                                .min_h(px(22.0))
+                                .w_full()
+                                .pl(px(8.0 + TREE_INDENT * (depth + 1) as f32))
+                                .pr(px(8.0))
+                                .flex()
+                                .items_center()
+                                .text_size(px(10.0))
+                                .text_color(Colors::text_faint())
+                                .child(empty.clone())
+                                .into_any_element(),
+                        );
+                    } else {
+                        self.rows(children, depth + 1, &key, rows);
+                    }
+                }
+            }
+        }
+    }
+
+    fn leaf(
+        &self,
+        node: &TreeMenuNode,
+        value: &str,
+        index: usize,
+        indent: gpui::Pixels,
+    ) -> gpui::AnyElement {
+        let active = value == self.selected;
+        let tint = if active {
+            Colors::accent_primary()
+        } else {
+            Colors::text_muted()
+        };
+        let value = value.to_string();
+        let on_select = self.on_select.clone();
+        div()
+            .id(("combo-box-tree-row", index))
+            .min_h(px(25.0))
+            .w_full()
+            .rounded(px(crate::theme::radius::CONTROL))
+            .pl(indent)
+            .pr(px(8.0))
+            .py(px(4.0))
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .bg(if active {
+                Colors::accent_muted()
+            } else {
+                gpui::transparent_black().into()
+            })
+            .text_size(px(10.5))
+            .font_weight(if active {
+                gpui::FontWeight::SEMIBOLD
+            } else {
+                gpui::FontWeight::NORMAL
+            })
+            .text_color(if active {
+                Colors::text_primary()
+            } else {
+                Colors::text_secondary()
+            })
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(|s| s.bg(Colors::surface_control_hover()))
+            .on_click(move |_, window, cx| on_select(value.clone(), window, cx))
+            .child(render_glyph(&node.glyph, tint))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .truncate()
+                    .child(node.label.clone()),
+            )
+            .children(active.then(|| {
+                svg()
+                    .path(assets::ICON_CHECK_PATH)
+                    .w(px(11.0))
+                    .h(px(11.0))
+                    .flex_shrink_0()
+                    .text_color(Colors::accent_primary())
+            }))
+            .into_any_element()
+    }
+
+    fn heading(
+        &self,
+        node: &TreeMenuNode,
+        key: &str,
+        open: bool,
+        count: usize,
+        index: usize,
+        indent: gpui::Pixels,
+    ) -> gpui::AnyElement {
+        let state = self.state.clone();
+        let key = key.to_string();
+        div()
+            .id(("combo-box-tree-row", index))
+            .h(px(24.0))
+            .w_full()
+            .rounded(px(crate::theme::radius::CONTROL))
+            .pl(indent)
+            .pr(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .text_size(px(10.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(Colors::text_muted())
+            .cursor(gpui::CursorStyle::PointingHand)
+            .hover(|s| s.bg(Colors::surface_control_hover()))
+            .on_click(move |_, _, cx| {
+                state.update(cx, |s, cx| {
+                    if !s.folded.remove(&key) {
+                        s.folded.insert(key.clone());
+                    }
+                    cx.notify();
+                });
+            })
+            .child(
+                svg()
+                    .path(if open {
+                        assets::ICON_CHEVRON_DOWN_PATH
+                    } else {
+                        assets::ICON_CHEVRON_RIGHT_PATH
+                    })
+                    .w(px(9.0))
+                    .h(px(9.0))
+                    .flex_shrink_0()
+                    .text_color(Colors::text_faint()),
+            )
+            .child(render_glyph(&node.glyph, Colors::text_muted()))
+            .child(
+                div()
+                    .min_w(px(0.0))
+                    .flex_1()
+                    .truncate()
+                    .child(node.label.clone()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_weight(gpui::FontWeight::NORMAL)
+                    .text_color(Colors::text_faint())
+                    .child(count.to_string()),
+            )
+            .into_any_element()
+    }
+}

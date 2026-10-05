@@ -56,7 +56,10 @@ pub const BRIDGE_MAGIC: u32 = 0x4642_4142;
 /// v13 widens the per-pad level block to 64 pads (the Drum Sampler's four
 /// banks) and the param ring to 4096 events, so a whole 64-pad kit replays
 /// through it at once.
-pub const BRIDGE_LAYOUT_VERSION: u32 = 13;
+/// v14 adds the `midi_out` ring (host → Studio): MIDI a plug-in produces —
+/// an arpeggiator's notes, an instrument's MIDI thru — which other tracks can
+/// take as their MIDI input.
+pub const BRIDGE_LAYOUT_VERSION: u32 = 14;
 
 /// Rack positions a built-in may publish per-stage telemetry for. Fixed so the
 /// shared region stays a plain-old-data layout.
@@ -659,6 +662,13 @@ pub struct SharedAudioBridge {
     pub midi: SpscRing<SharedMidiEvent, MIDI_RING_CAP>,
     pub params: SpscRing<SharedParamEvent, PARAM_RING_CAP>,
 
+    // --- Lock-free ring (host → Studio) ---
+    /// MIDI the plug-in produced, as raw bytes with the frame it fell on.
+    /// The host's producer thread pushes after each block and signals
+    /// [`bridge_midi_out_event_name`]; the Studio's control thread is the one
+    /// consumer. A full ring drops the newest events rather than block.
+    pub midi_out: SpscRing<SharedMidiEvent, MIDI_RING_CAP>,
+
     // --- Audio buffers ---
     pub audio_in: SharedAudioBuffer,
     pub audio_out: SharedAudioBuffer,
@@ -1127,6 +1137,15 @@ impl Drop for SharedAudioRegion {
 /// wakeups.
 pub fn bridge_kick_event_name(engine_pid: u32, host_pid: u32) -> String {
     format!("Local\\FutureboardAudioBridgeKick-{engine_pid}__{host_pid}")
+}
+
+/// Name of the named auto-reset event the host signals after it pushes to a
+/// region's [`SharedAudioBridge::midi_out`], so the Studio drains plug-in MIDI
+/// output when it arrives instead of on a timer. Scoped like
+/// [`bridge_kick_event_name`] to one engine/host process pair; one event
+/// covers every region of that host.
+pub fn bridge_midi_out_event_name(engine_pid: u32, host_pid: u32) -> String {
+    format!("Local\\FutureboardAudioBridgeMidiOut-{engine_pid}__{host_pid}")
 }
 
 /// Named cross-process wake event for the block handshake.

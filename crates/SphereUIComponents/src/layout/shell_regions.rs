@@ -629,6 +629,34 @@ impl StudioLayout {
             .iter()
             .find(|t| Some(t.id.as_str()) == selected_track_id.as_deref())?;
         let combo_audio_connections = self.timeline.read(cx).state.audio_connections.clone();
+        let plugin_midi_sources: Vec<(String, String)> =
+            if combo == crate::components::panel::InspectorRoutingCombo::MidiInput {
+                self.timeline
+                    .read(cx)
+                    .state
+                    .plugin_midi_sources_for(&track.id)
+                    .into_iter()
+                    .map(|source| {
+                        let plugin = source
+                            .instrument_insert()
+                            .filter(|insert| insert.plugin_id.is_some())
+                            .or_else(|| {
+                                source
+                                    .inserts
+                                    .iter()
+                                    .find(|insert| insert.plugin_id.is_some())
+                            })
+                            .map(|insert| insert.display_name.clone());
+                        let label = match plugin {
+                            Some(plugin) => format!("{} - {plugin}", source.name),
+                            None => source.name.clone(),
+                        };
+                        (source.id.clone(), label)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let close = Arc::new({
             let this = cx.entity().clone();
             move |cx: &mut gpui::App| {
@@ -654,6 +682,7 @@ impl StudioLayout {
                 instrument_targets,
                 detected_midi_inputs,
                 detected_midi_outputs,
+                plugin_midi_sources,
             )
             .into_any_element(),
         )

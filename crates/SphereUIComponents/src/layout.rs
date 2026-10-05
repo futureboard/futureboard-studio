@@ -1307,6 +1307,7 @@ impl StudioLayout {
 
         Self::spawn_audio_poll(cx);
         Self::spawn_hardware_midi_input_poll(cx);
+        Self::spawn_plugin_midi_output_poll(cx);
 
         let studio_entity = cx.entity();
         {

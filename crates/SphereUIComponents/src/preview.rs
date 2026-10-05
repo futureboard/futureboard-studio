@@ -257,6 +257,12 @@ pub fn scenes() -> Vec<Scene> {
             open: mixstation_scene,
         },
         Scene {
+            name: "midi-input-tree",
+            width: 320.0,
+            height: 420.0,
+            open: midi_input_tree,
+        },
+        Scene {
             name: "mixstation-empty",
             width: MixStationModel.window_size().0,
             height: MixStationModel.window_size().1,
@@ -735,6 +741,55 @@ fn mixstation_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
 
 fn mixstation_empty(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     open_mix(options, cx, "mixstation-empty", "Empty Rack", None)
+}
+
+// ── Inspector MIDI Input menu ───────────────────────────────────────────────
+
+/// The Inspector's MIDI Input menu, open, with the ports from a real rig and
+/// two tracks whose plug-ins it can take MIDI from; the second is chosen.
+struct MidiInputTreePreview;
+
+impl gpui::Render for MidiInputTreePreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+        use crate::components::timeline::timeline_state::TrackMidiInputRouting;
+        use gpui::{div, ParentElement, Styled};
+        let current = TrackMidiInputRouting::PluginOutput {
+            track_id: "track-3".to_string(),
+        };
+        let devices: Vec<String> = [
+            "Studio 24c MIDI In",
+            "Springbeats vMIDI1",
+            "Springbeats vMIDI2",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let sources = [
+            ("track-2".to_string(), "Lead - Serum 2".to_string()),
+            ("track-3".to_string(), "Drums - EZdrummer 3".to_string()),
+        ];
+        let nodes = crate::components::panel::midi_input_tree(&current, &devices, &sources);
+        div()
+            .size_full()
+            .bg(crate::theme::Colors::surface_panel())
+            .child(crate::components::combo_box::combo_box_tree_menu(
+                "preview-midi-input-menu",
+                crate::overlay::OverlayPosition {
+                    x: px(16.0),
+                    y: px(16.0),
+                    width: Some(px(240.0)),
+                    max_height: Some(px(380.0)),
+                },
+                "vsti:track-3",
+                nodes,
+                Arc::new(|_, _, _| {}),
+            ))
+    }
+}
+
+fn midi_input_tree(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| cx.new(|_| MidiInputTreePreview))?;
+    Ok(handle.into())
 }
 
 // ── VerbSpace and EchoSpace scenes ─────────────────────────────────────────
