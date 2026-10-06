@@ -1,0 +1,214 @@
+/* WhiteSharp (whitesharp.tsx): the native white_sharp_panel.rs layout in the
+   page's tokens. */
+
+.ws-caption {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+}
+
+/* Settings: the voice and the key along the top, knobs at the right. */
+.ws-settings-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.ws-setting {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ws-cluster {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ws-picker {
+  flex-shrink: 0;
+  max-width: 100%;
+}
+
+.ws-fill {
+  flex: 1;
+}
+
+.ws-formant {
+  display: flex;
+  align-items: center;
+  height: 26px;
+  font-size: 13px;
+}
+
+.ws-knobs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* The meter, its readout centred over it and its scale under it. */
+.ws-meter-card .pe-card-head {
+  position: relative;
+}
+
+.ws-readout {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: pre;
+}
+
+.ws-meter {
+  height: 52px;
+  border-radius: 0;
+}
+
+.ws-scale {
+  position: relative;
+  height: 14px;
+  margin: -6px 10px 0;
+}
+
+.ws-scale span {
+  position: absolute;
+  width: 32px;
+  margin-left: -16px;
+  text-align: center;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* Correction: Retune Speed at the centre. */
+.ws-correction-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 12px 24px;
+}
+
+.ws-flex {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.ws-big .knob {
+  gap: 4px;
+}
+
+.ws-big .knob-caption,
+.ws-big .knob-text {
+  font-size: 12px;
+}
+
+.ws-big .knob-caption {
+  color: var(--text-secondary);
+}
+
+.ws-hero .knob-caption,
+.ws-hero .knob-text {
+  font-size: 13px;
+}
+
+/* A control with nothing to do: greyed, and it does not turn. */
+.ws-idle {
+  opacity: 0.38;
+  pointer-events: none;
+}
+
+/* Keyboard edit. */
+.ws-keyhead {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.ws-keyhead .segments {
+  letter-spacing: 0;
+  text-transform: none;
+  font-weight: 400;
+}
+
+.ws-keys {
+  position: relative;
+  height: 96px;
+}
+
+.ws-key {
+  position: absolute;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 0 0 8px;
+  border: 1px solid var(--surface-window);
+  border-radius: 0 0 var(--r-sm) var(--r-sm);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text-secondary);
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.ws-key small {
+  font-size: 9px;
+  font-weight: 400;
+}
+
+.ws-key.white.in {
+  background: var(--text-primary);
+}
+
+.ws-key.white.out {
+  background: color-mix(in srgb, var(--text-secondary) 45%, transparent);
+}
+
+.ws-key.white.removed {
+  background: color-mix(in srgb, var(--text-secondary) 14%, transparent);
+}
+
+.ws-key.black.in {
+  background: var(--text-muted);
+}
+
+.ws-key.black.out {
+  background: var(--surface-window);
+}
+
+.ws-key.black.removed {
+  background: var(--surface-canvas);
+}
+
+.ws-key.bypassed {
+  background: color-mix(in srgb, var(--warning) 85%, transparent);
+}
+
+.ws-key.light {
+  color: var(--surface-canvas);
+}
+
+.ws-key:hover {
+  filter: brightness(1.08);
+}
+
+/* The live lights paint over the keys and let clicks through. */
+.ws-lights {
+  position: absolute;
+  inset: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  pointer-events: none;
+}

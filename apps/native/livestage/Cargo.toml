@@ -36,6 +36,10 @@ ui-preview = ["gui", "sphere_ui_components/ui-preview", "gpui/test-support", "de
 livestage-engine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The server's web UI: the page's embedded assets, and a blocking WebSocket
+# (plain ws on the local network; no TLS, no async runtime).
+builtin-ui-embed.workspace = true
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # The preview demo addresses FA-76 parameters by name.
 fa76 = { workspace = true, optional = true }
 
@@ -45,6 +49,9 @@ sphere_ui_components = { workspace = true, optional = true, features = [
     "gpu-renderer",
     "builtin-plugin-editor",
 ] }
+
+[build-dependencies]
+builtin-ui-embed = { workspace = true, features = ["generate"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_windows = { workspace = true, optional = true }

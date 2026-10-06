@@ -16,8 +16,11 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use builtin_dsp_core::spectrum::SpectrumAnalyzer;
+
 use crate::builtin_fx::BuiltinFx;
 use crate::ring::SampleRing;
+use crate::telemetry::InsertTelemetry;
 
 /// Largest block the graph processes at once. A device callback larger than
 /// this is processed in pieces.
@@ -105,26 +108,39 @@ pub enum InsertDsp {
 /// One insert's effect and its live controls. Shared by successive graphs.
 pub struct InsertCell {
     dsp: UnsafeCell<InsertDsp>,
+    /// What arrives at a built-in, for its editor's analyser. Fed only while
+    /// [`InsertTelemetry::watched`].
+    analyzer: UnsafeCell<Option<SpectrumAnalyzer>>,
     pub bypass: AtomicBool,
     /// Wire parameter changes waiting for the next block.
     params: crossbeam_channel::Receiver<(u32, f32)>,
+    pub telemetry: InsertTelemetry,
 }
 
-// SAFETY: `dsp` is touched only by the audio thread (exactly one graph is
-// live there at a time), or by the control thread before the cell is first
-// published. Everything else is atomics and a channel.
+// SAFETY: `dsp` and `analyzer` are touched only by the audio thread (exactly
+// one graph is live there at a time), or by the control thread before the
+// cell is first published. Everything else is atomics and a channel.
 unsafe impl Sync for InsertCell {}
 unsafe impl Send for InsertCell {}
 
 impl InsertCell {
     /// The cell, and the sender its parameter changes go through.
-    pub fn new(dsp: InsertDsp, bypass: bool) -> (Arc<Self>, crossbeam_channel::Sender<(u32, f32)>) {
+    pub fn new(
+        dsp: InsertDsp,
+        bypass: bool,
+        sample_rate: u32,
+    ) -> (Arc<Self>, crossbeam_channel::Sender<(u32, f32)>) {
         let (tx, rx) = crossbeam_channel::bounded(1024);
+        // Allocated here, on the control thread, never on the audio one.
+        let analyzer = matches!(dsp, InsertDsp::Builtin(_))
+            .then(|| SpectrumAnalyzer::new(sample_rate.max(1) as f32));
         (
             Arc::new(Self {
                 dsp: UnsafeCell::new(dsp),
+                analyzer: UnsafeCell::new(analyzer),
                 bypass: AtomicBool::new(bypass),
                 params: rx,
+                telemetry: InsertTelemetry::default(),
             }),
             tx,
         )
@@ -145,7 +161,20 @@ impl InsertCell {
             return;
         }
         match dsp {
-            InsertDsp::Builtin(fx) => fx.process(left, right),
+            InsertDsp::Builtin(fx) => {
+                if self.telemetry.is_watched() {
+                    // SAFETY: see the type's contract.
+                    let analyzer = unsafe { &mut *self.analyzer.get() }.as_mut();
+                    let analyzer = analyzer.map(|a| {
+                        a.push_block(left, right);
+                        a
+                    });
+                    fx.process(left, right);
+                    self.telemetry.publish(fx, analyzer);
+                } else {
+                    fx.process(left, right);
+                }
+            }
             #[cfg(feature = "external-plugins")]
             InsertDsp::External(external) => external.process(left, right),
         }

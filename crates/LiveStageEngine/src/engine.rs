@@ -112,6 +112,11 @@ pub enum Command {
         index: u32,
         value: f32,
     },
+    /// Several wire values at once, in order: a preset, an A/B swap.
+    SetInsertParams {
+        insert: Id,
+        values: Vec<(u32, f32)>,
+    },
     SetOutputPatch {
         patches: Vec<OutputPatch>,
     },
@@ -297,6 +302,22 @@ impl LiveEngine {
             .get(&insert)
             .cloned()
             .unwrap_or(InsertState::Ready)
+    }
+
+    /// Whether a built-in insert measures itself for an editor (see
+    /// [`crate::telemetry`]). An insert rebuilt since (a new sample rate)
+    /// starts unwatched: callers set it again.
+    pub fn watch_insert(&self, insert: Id, watch: bool) {
+        if let Some(entry) = self.inserts.get(&insert) {
+            entry.cell.telemetry.watched.store(watch, Ordering::Relaxed);
+        }
+    }
+
+    /// What a watched insert measured since the last call.
+    pub fn insert_telemetry(&self, insert: Id) -> Option<crate::telemetry::TelemetryFrame> {
+        self.inserts
+            .get(&insert)
+            .map(|entry| entry.cell.telemetry.take())
     }
 
     pub fn last_recording(&self) -> Option<&RecordingSummary> {
@@ -572,6 +593,21 @@ impl LiveEngine {
                     let _ = entry.params.try_send((index, value));
                 }
             }
+            Command::SetInsertParams { insert, values } => {
+                match &mut self.insert_slot_mut(insert)?.plugin {
+                    InsertPlugin::Builtin { params, .. } => {
+                        params.extend(values.iter().copied());
+                    }
+                    InsertPlugin::External { .. } => {
+                        return Err("third-party parameters are set in its editor".to_string());
+                    }
+                }
+                if let Some(entry) = self.inserts.get(&insert) {
+                    for change in values {
+                        let _ = entry.params.try_send(change);
+                    }
+                }
+            }
             Command::SetOutputPatch { patches } => {
                 self.session.outputs = patches;
                 self.rebuild();
@@ -731,7 +767,7 @@ impl LiveEngine {
                 return Err(format!("{name}: this build runs built-in effects only"));
             }
         };
-        let (cell, params) = InsertCell::new(dsp, slot.bypass);
+        let (cell, params) = InsertCell::new(dsp, slot.bypass, self.sample_rate);
         self.inserts.insert(slot.id, InsertEntry { cell, params });
         Ok(())
     }

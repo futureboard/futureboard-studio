@@ -1,0 +1,15 @@
+# LiveStage service settings. The root filesystem is read-only: put changes in
+# /data/livestage/livestage.conf instead (same variables), which wins.
+
+# The session (mix) and where takes are recorded: both on the data partition.
+#LIVESTAGE_SESSION="/data/livestage/show.json"
+#LIVESTAGE_RECORDINGS="/data/livestage/recordings"
+
+# The web UI's address. 0.0.0.0 is every network interface: anyone who can
+# reach this machine on the network can control the mixer. 127.0.0.1 keeps it
+# to this machine.
+#LIVESTAGE_HTTP="0.0.0.0:8730"
+
+# More livestage-server arguments, for example:
+#   --output "hw:CARD=USB" --input "hw:CARD=USB" --rate 48000 --buffer 128
+#LIVESTAGE_ARGS=""

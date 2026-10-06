@@ -1232,6 +1232,7 @@ name = "builtin_dsp_core"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
  "biquad",
+ "rustfft",
 ]
 
 [[package]]
@@ -4852,6 +4853,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 name = "livestage"
 version = "2026.10.1-beta1.4.2"
 dependencies = [
+ "builtin_ui_embed",
  "fa76",
  "gpui",
  "gpui_linux",
@@ -4862,6 +4864,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sphere_ui_components",
+ "tungstenite",
  "windows-sys 0.61.2",
 ]
 

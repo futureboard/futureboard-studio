@@ -1,0 +1,39 @@
+#!/sbin/openrc-run
+# LiveStage: the headless mixer and its web UI.
+#
+# Settings: /etc/conf.d/livestage, overridden by /data/livestage/livestage.conf
+# when it exists (the root filesystem is read-only; /data is not).
+
+name="LiveStage"
+description="LiveStage live mixer and its web UI"
+
+[ -r /data/livestage/livestage.conf ] && . /data/livestage/livestage.conf
+
+: "${LIVESTAGE_SESSION:=/data/livestage/show.json}"
+: "${LIVESTAGE_RECORDINGS:=/data/livestage/recordings}"
+: "${LIVESTAGE_HTTP:=0.0.0.0:8730}"
+
+supervisor="supervise-daemon"
+command="/usr/bin/livestage-server"
+# shellcheck disable=SC2086
+command_args="--session ${LIVESTAGE_SESSION} --record-dir ${LIVESTAGE_RECORDINGS} --http ${LIVESTAGE_HTTP} --daemon ${LIVESTAGE_ARGS}"
+command_user="livestage:audio"
+directory="/data/livestage"
+output_log="/var/log/livestage.log"
+error_log="/var/log/livestage.log"
+# A crash in the middle of a show restarts the mixer, again and again.
+respawn_delay=2
+respawn_max=0
+# SIGTERM closes the take being recorded and saves the session.
+retry="TERM/15/KILL/5"
+
+depend() {
+	need localmount
+	use net mdev hwdrivers
+	after livestage-data avahi-daemon
+}
+
+start_pre() {
+	checkpath -d -m 0755 -o livestage:audio /data/livestage "${LIVESTAGE_RECORDINGS}" &&
+		checkpath -f -m 0640 -o livestage:audio /var/log/livestage.log
+}

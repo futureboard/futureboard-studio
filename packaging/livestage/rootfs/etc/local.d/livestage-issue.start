@@ -1,0 +1,31 @@
+#!/bin/sh
+# The console's login banner says where the web UI is. /etc/issue points
+# here: the root filesystem is read-only.
+port=8730
+[ -r /etc/conf.d/livestage ] && . /etc/conf.d/livestage
+[ -r /data/livestage/livestage.conf ] && . /data/livestage/livestage.conf
+[ -n "$LIVESTAGE_HTTP" ] && port=${LIVESTAGE_HTTP##*:}
+
+# Give DHCP a moment if it has not answered yet.
+tries=0
+while [ $tries -lt 10 ] && [ -z "$(ip -4 -o addr show scope global 2>/dev/null)" ]; do
+	sleep 1
+	tries=$((tries + 1))
+done
+
+{
+	echo
+	echo "  LiveStage - \\n (\\l)"
+	echo
+	addresses=$(ip -4 -o addr show scope global 2>/dev/null | awk '{ split($4, a, "/"); print a[1] }')
+	if [ -n "$addresses" ]; then
+		for address in $addresses; do
+			echo "  Web UI:  http://$address:$port/"
+		done
+	else
+		echo "  No network address. Connect a cable and reboot, or set one in"
+		echo "  /etc/network/interfaces."
+	fi
+	echo "           http://$(hostname).local:$port/"
+	echo
+} >/run/issue

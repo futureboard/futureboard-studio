@@ -1,0 +1,12 @@
+# /etc/inittab for the LiveStage appliance
+
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+# Two consoles: the banner on tty1 says where the web UI is.
+tty1::respawn:/sbin/getty 38400 tty1
+tty2::respawn:/sbin/getty 38400 tty2
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/openrc shutdown

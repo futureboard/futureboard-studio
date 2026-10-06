@@ -1,0 +1,240 @@
+/* The band editors (band.tsx): the Compressor and the Imager, laid out as
+   the native band_panel.rs / imager_panel.rs. The editor may sit in a
+   narrow pane rather than a narrow screen, so it answers to its own width. */
+
+.bd {
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.bd-mode {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.bd-caption {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.bd-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* The display beside its column: the Compressor's meters and output, the
+   Imager's scope. */
+.bd-main {
+  display: flex;
+  gap: 10px;
+  min-width: 0;
+}
+
+.bd-display {
+  flex: 1 1 0;
+  min-height: 260px;
+}
+
+.bd-transfer {
+  cursor: ew-resize;
+}
+
+.bd-aside {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 0 0 250px;
+  min-width: 0;
+}
+
+.bd-scope-column {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 0 0 310px;
+  min-width: 0;
+}
+
+.bd-scope {
+  flex: 1 1 auto;
+  min-height: 200px;
+}
+
+.bd-imager-main .bd-display {
+  min-height: 300px;
+}
+
+.bd-scope-modes {
+  align-self: flex-start;
+}
+
+.bd-notice {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 16px);
+  padding: 4px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-window);
+  color: var(--text-secondary);
+  font-size: 10px;
+  text-align: center;
+  pointer-events: none;
+}
+
+/* A framed readout: meters, correlation. */
+.bd-well {
+  flex-shrink: 0;
+  padding: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-surface);
+  background: var(--surface-panel);
+  box-sizing: border-box;
+}
+
+.pe-canvas.bd-bare {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  flex-shrink: 0;
+}
+
+.bd-fill {
+  width: 100%;
+  height: 100%;
+}
+
+.bd-bottom {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+
+.bd-band.soloed {
+  border-color: color-mix(in srgb, var(--warning) 60%, transparent);
+}
+
+/* Knobs at the native pitch (58 + 4), so a band card holds three a row. */
+.pe-knobs.bd-knobs {
+  gap: 8px 4px;
+}
+
+.bd-switches {
+  display: flex;
+  gap: 4px;
+}
+
+.bd-reduction {
+  height: 22px;
+}
+
+/* A small switch pill: on lights it in its `--tone`. */
+.bd-pill {
+  align-self: flex-start;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r-sm);
+  background: var(--surface-canvas);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.bd-pill:hover {
+  border-color: var(--border-strong);
+}
+
+.bd-pill.on {
+  border-color: color-mix(in srgb, var(--tone) 60%, transparent);
+  background: color-mix(in srgb, var(--tone) 16%, transparent);
+  color: var(--tone);
+}
+
+/* The Imager's strips. */
+.bd-strip {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.bd-fader-column {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.bd-fader.live {
+  cursor: ns-resize;
+}
+
+/* The bar is 6 px; its centre mark reaches 2 px past it either side. */
+.bd-correlation {
+  margin: 0 -2px;
+}
+
+.bd-width {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.bd-strip-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.bd-global {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.bd-global-flags {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.bd-disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+@container (max-width: 720px) {
+  .bd-main {
+    flex-direction: column;
+  }
+
+  .bd-aside,
+  .bd-scope-column {
+    flex: none;
+  }
+
+  .bd-display,
+  .bd-imager-main .bd-display {
+    flex: none;
+    min-height: 240px;
+  }
+
+  .bd-scope {
+    flex: none;
+    height: 220px;
+  }
+}

@@ -1,4 +1,11 @@
 {
   "version": "0.0.1",
-  "configurations": []
+  "configurations": [
+    {
+      "name": "livestage-webui",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "--cwd", "apps/native/livestage/webui", "dev", "--port", "5173", "--strictPort"],
+      "port": 5173
+    }
+  ]
 }

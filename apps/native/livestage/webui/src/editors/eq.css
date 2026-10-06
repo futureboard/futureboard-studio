@@ -1,0 +1,327 @@
+/* EQ-Z8 / EQ-ZX (eq.tsx): the native eq_panel.rs layout in the page's
+   tokens — the graph toolbar, the plot with its dB column and frequency row,
+   the band strip and the band editor's cards. */
+
+.eq-root {
+  min-width: 0;
+  outline: none;
+}
+
+.eq-caption {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+/* What the graph shows, on a row of its own above it. */
+.eq-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  margin-left: 30px;
+}
+
+.eq-view {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ── The graph ── */
+
+.eq-graph {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.eq-plot-row {
+  display: flex;
+  height: clamp(220px, 42vh, 440px);
+  min-height: 180px;
+}
+
+.eq-db {
+  position: relative;
+  width: 30px;
+  flex-shrink: 0;
+}
+
+.eq-db span {
+  position: absolute;
+  right: 4px;
+  margin-top: -6px;
+  font-size: 10px;
+  line-height: 12px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.eq-db span.zero {
+  color: var(--text-secondary);
+}
+
+.eq-plot {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  cursor: crosshair;
+  user-select: none;
+}
+
+.eq-plot.dragging {
+  cursor: grabbing;
+}
+
+/* A data canvas: square edges, as the native plot. */
+.eq-plot .pe-canvas {
+  position: absolute;
+  inset: 0;
+  border-radius: 0;
+}
+
+.eq-freq {
+  position: relative;
+  height: 16px;
+  margin-left: 30px;
+}
+
+.eq-freq span {
+  position: absolute;
+  top: 2px;
+  width: 24px;
+  margin-left: -12px;
+  text-align: center;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* A band's numbered node. Hit-testing is by distance (eq_graph.rs), so
+   the nodes never take the pointer themselves. */
+.eq-node {
+  position: absolute;
+  box-sizing: border-box;
+  width: 18px;
+  height: 18px;
+  margin: -9px 0 0 -9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.eq-node.off {
+  border-style: dashed;
+}
+
+.eq-readout {
+  position: absolute;
+  top: 6px;
+  left: 8px;
+  padding: 1px 6px;
+  border-radius: var(--r-micro);
+  background: color-mix(in srgb, var(--surface-window) 88%, transparent);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.eq-hint {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 10px;
+  display: flex;
+  justify-content: center;
+  padding: 0 8px;
+  pointer-events: none;
+}
+
+.eq-hint span {
+  padding: 4px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--surface-window) 92%, transparent);
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+/* ── The band strip ── */
+
+.eq-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.eq-cell {
+  position: relative;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 96px;
+  padding: 4px 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-sm);
+  background: var(--surface-panel);
+  cursor: pointer;
+  user-select: none;
+}
+
+.eq-cell:hover {
+  background: var(--surface-control-hover);
+}
+
+.eq-cell.selected {
+  border-color: var(--border-normal);
+  background: color-mix(in srgb, var(--surface-panel), #ffffff 10%);
+}
+
+.eq-cell.off {
+  opacity: 0.55;
+}
+
+/* The selection marker: a leading-edge accent, never a border. */
+.eq-cell.selected::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: var(--accent);
+}
+
+.eq-cell-top {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.eq-cell-num {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.eq-cell-shape {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.eq-badge {
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.eq-lamp {
+  box-sizing: border-box;
+  flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  border: 1px solid;
+  border-radius: 50%;
+}
+
+.eq-cell-bottom {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.eq-strip-count {
+  padding: 0 6px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* ── The band editor ── */
+
+.eq-band-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.eq-band-name {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.eq-remove {
+  height: 24px;
+  padding: 0 10px;
+}
+
+.eq-solo.on {
+  background: color-mix(in srgb, var(--state-solo) 20%, transparent);
+  border-color: var(--state-solo);
+  color: var(--state-solo);
+}
+
+.eq-choices {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.eq-slope {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.eq-dyn-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-height: 28px;
+}
+
+.pe-check.eq-disabled {
+  cursor: default;
+  color: var(--text-disabled);
+}
+
+.eq-off-knob {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.eq-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+@media (max-width: 640px) {
+  .eq-toolbar {
+    margin-left: 0;
+  }
+
+  .eq-plot-row {
+    height: 240px;
+  }
+}

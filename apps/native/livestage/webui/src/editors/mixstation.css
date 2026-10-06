@@ -1,0 +1,361 @@
+/* MixStation (mixstation.tsx): the native panel's three columns — signal
+   path, selected module, input/output — in the page's tokens. */
+
+.ms-main {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  align-items: stretch;
+}
+
+.ms-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-surface);
+  min-width: 0;
+}
+
+.ms-caption {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-faint);
+}
+
+.ms-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.ms-spacer {
+  flex: 1;
+}
+
+/* ── The signal path ── */
+
+.ms-chain {
+  flex: 0 0 250px;
+  width: 250px;
+}
+
+.ms-chain-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.ms-flow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-faint);
+}
+
+.ms-flow > span {
+  width: 18px;
+  height: 1px;
+  background: var(--border-strong);
+}
+
+.ms-rack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ms-rack-empty {
+  padding: 12px 0;
+}
+
+.ms-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 44px;
+  flex-shrink: 0;
+  padding: 0 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-canvas);
+  cursor: pointer;
+}
+
+.ms-row.selected {
+  background: var(--surface-raised);
+  border-color: var(--border-normal);
+}
+
+.ms-row.target {
+  border-color: var(--accent);
+}
+
+.ms-grip {
+  width: 14px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 12px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.ms-grip:active {
+  cursor: grabbing;
+}
+
+.ms-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.ms-row-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ms-row-name.live {
+  color: var(--text-primary);
+}
+
+.pe-canvas.ms-stage {
+  height: 8px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.ms-pill {
+  flex-shrink: 0;
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r-sm);
+  background: var(--surface-canvas);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.ms-pill:hover {
+  border-color: var(--border-strong);
+}
+
+.ms-pill.on {
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent-hover);
+}
+
+.ms-add-box {
+  position: relative;
+}
+
+.ms-add {
+  width: 100%;
+  height: 30px;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.ms-add:hover {
+  background: var(--surface-hover);
+}
+
+.ms-add.full {
+  color: var(--text-disabled);
+}
+
+.ms-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 4px);
+  left: 0;
+  width: max(100%, 300px);
+  max-width: calc(100vw - 32px);
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: var(--surface-overlay);
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r);
+  box-shadow: 0 8px 24px #0006;
+}
+
+.ms-menu-head {
+  padding: 4px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-faint);
+}
+
+.ms-menu-item {
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+  text-align: left;
+}
+
+.ms-menu-item:hover:not(.disabled) {
+  background: var(--surface-hover);
+}
+
+.ms-menu-item.disabled {
+  color: var(--text-disabled);
+}
+
+/* ── The selected module ── */
+
+.ms-column {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.ms-empty {
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  min-height: 240px;
+}
+
+.ms-empty-title {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.ms-module-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ms-module-title {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 140px;
+}
+
+.ms-module-title strong {
+  font-size: 13px;
+}
+
+.ms-module-head .button {
+  height: 26px;
+  padding: 0 10px;
+}
+
+.pe-canvas.ms-display {
+  flex: 1;
+  min-height: 260px;
+}
+
+.ms-notice {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 12px;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.ms-notice > span {
+  padding: 4px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: color-mix(in srgb, var(--surface-window) 92%, transparent);
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
+.ms-controls {
+  flex-shrink: 0;
+}
+
+.ms-knobs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.ms-knobs.idle {
+  opacity: 0.6;
+}
+
+.ms-divider {
+  align-self: center;
+  width: 1px;
+  height: 56px;
+  margin: 0 6px;
+  background: var(--border-subtle);
+}
+
+/* ── Input and output ── */
+
+.ms-io {
+  flex: 0 0 170px;
+  width: 170px;
+  align-items: center;
+}
+
+.pe-canvas.ms-meters {
+  flex: 1;
+  width: 100%;
+  min-height: 160px;
+  border: 0;
+  background: transparent;
+}
+
+@media (max-width: 860px) {
+  .ms-main {
+    flex-wrap: wrap;
+  }
+
+  .ms-chain,
+  .ms-column {
+    flex: 1 1 100%;
+    width: auto;
+  }
+
+  /* The trims flank the meters in a row under the module. */
+  .ms-io {
+    flex: 1 1 100%;
+    width: auto;
+    flex-direction: row;
+    justify-content: center;
+  }
+
+  .pe-canvas.ms-meters {
+    flex: 0 1 200px;
+    height: 160px;
+  }
+
+  .pe-canvas.ms-display {
+    min-height: 220px;
+  }
+}

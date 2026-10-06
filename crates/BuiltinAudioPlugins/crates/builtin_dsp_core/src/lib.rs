@@ -7,6 +7,7 @@ use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type};
 
 pub mod crossover;
 pub mod delay;
+pub mod spectrum;
 
 /// Metadata for a builtin DSP core (host integration can map this later).
 #[derive(Debug, Clone)]

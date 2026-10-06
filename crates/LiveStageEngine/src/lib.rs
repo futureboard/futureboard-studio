@@ -24,6 +24,7 @@ pub mod graph;
 pub mod recorder;
 pub mod ring;
 pub mod session;
+pub mod telemetry;
 
 pub use engine::{Command, EngineStatus, InsertState, LiveEngine, StripLevels};
 pub use session::*;

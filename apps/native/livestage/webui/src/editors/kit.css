@@ -1,0 +1,241 @@
+/* The built-in editor frame (kit.tsx): the native plug-in shell's layout in
+   the page's tokens. Family editors add their own files next to this one. */
+
+.pe {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--surface-window);
+}
+
+.pe-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--surface-titlebar);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.pe-title {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.2;
+  min-width: 120px;
+  margin-right: 8px;
+}
+
+.pe-title strong {
+  font-size: 14px;
+}
+
+.pe-title span {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.pe-presets {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.pe-preset-select {
+  width: 200px;
+  height: 30px;
+  font-size: 13px;
+}
+
+.pe-ab button {
+  min-width: 34px;
+  justify-content: center;
+}
+
+.pe-notice {
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.pe-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  min-width: 0;
+}
+
+.pe-off .pe-body .pe-canvas,
+.pe-off .pe-body .pe-knob {
+  opacity: 0.6;
+}
+
+.pe-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+
+.pe-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex-basis: 0;
+  padding: 10px 12px 12px;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-surface);
+  min-width: 0;
+}
+
+.pe-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 18px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.pe-card-head > :last-child:not(:first-child) {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+
+.pe-knob {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 58px;
+}
+
+.pe-knob .knob {
+  gap: 3px;
+}
+
+.knob-caption {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.pe-knob .knob-text {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.pe-knobs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  align-items: flex-start;
+}
+
+.pe-choice button {
+  height: 28px;
+  min-width: 36px;
+  justify-content: center;
+}
+
+.pe-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.pe-check input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+.pe-toggle {
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r-sm);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.pe-toggle:hover {
+  border-color: var(--border-strong);
+}
+
+.pe-toggle.on {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.pe-canvas {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  border-radius: var(--r);
+  background: var(--surface-canvas);
+  border: 1px solid var(--border-subtle);
+  overflow: hidden;
+  touch-action: none;
+}
+
+.pe-canvas > canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.pe-tag {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+.pe-tag.right {
+  left: auto;
+  right: 8px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.pe-note {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+@media (max-width: 640px) {
+  .pe-head {
+    gap: 6px;
+    padding: 8px 10px;
+  }
+
+  .pe-preset-select {
+    width: 150px;
+  }
+
+  .pe-body {
+    padding: 8px;
+  }
+}

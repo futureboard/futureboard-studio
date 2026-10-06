@@ -1,0 +1,15 @@
+
+LiveStage appliance (Alpine Linux)
+
+  rc-service livestage restart | stop | start   the mixer
+  tail -f /var/log/livestage.log                its log
+  livestage-server --list-devices               audio interfaces
+  aplay -l                                      ALSA cards
+
+  Settings:      /data/livestage/livestage.conf  (see /etc/conf.d/livestage)
+  Session:       /data/livestage/show.json
+  Recordings:    /data/livestage/recordings
+
+  The system is read-only. To change it: mount -o remount,rw /
+  Set a root password first thing: passwd (with / mounted read-write)
+
