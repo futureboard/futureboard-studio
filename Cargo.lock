@@ -4851,6 +4851,49 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 [[package]]
 name = "livestage"
 version = "2026.10.1-beta1.4.2"
+dependencies = [
+ "fa76",
+ "gpui",
+ "gpui_linux",
+ "gpui_windows",
+ "libc",
+ "livestage-engine",
+ "raw-window-handle",
+ "serde",
+ "serde_json",
+ "sphere_ui_components",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "livestage-engine"
+version = "2026.10.1-beta1.4.2"
+dependencies = [
+ "builtin_dsp_core",
+ "burnlimit",
+ "clipper67",
+ "compresser",
+ "cpal",
+ "crossbeam-channel",
+ "echospace",
+ "equz8",
+ "equzx",
+ "fa2a",
+ "fa76",
+ "imager",
+ "mixstation",
+ "parking_lot",
+ "rodharerist",
+ "serde",
+ "serde_json",
+ "sphere-encoder",
+ "sphere-plugin-host",
+ "sphere_directaudioengine",
+ "transient",
+ "verbspace",
+ "whitesharp",
+ "zcomp",
+]
 
 [[package]]
 name = "lock_api"

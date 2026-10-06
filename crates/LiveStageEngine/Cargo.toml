@@ -1,0 +1,50 @@
+[package]
+name = "livestage-engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "LiveStage: a live mixer and effects rack — device I/O, patching, channel strips, inserts and recording, without a GUI."
+
+[lib]
+name = "livestage_engine"
+
+[features]
+default = ["external-plugins"]
+# Third-party effects (VST3 / VST2 / CLAP / AU) run in Futureboard's plug-in
+# host process over the shared-memory bridge. Off for the headless Linux
+# server, which runs the built-in effects only: the host crate links the
+# engine's native plug-in bridges, and those need a desktop (GTK) to build.
+external-plugins = ["dep:sphere-plugin-host", "dep:sphere_directaudioengine"]
+
+[dependencies]
+cpal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+# Default features only (WAV + FLAC, pure Rust): no MP3, no native encoder.
+sphere-encoder = { path = "../SphereEncoder" }
+
+builtin-dsp-core.workspace = true
+equz8.workspace = true
+equzx.workspace = true
+compresser.workspace = true
+fa2a.workspace = true
+fa76.workspace = true
+zcomp.workspace = true
+burnlimit.workspace = true
+clipper67.workspace = true
+transient.workspace = true
+imager.workspace = true
+mixstation.workspace = true
+verbspace.workspace = true
+echospace.workspace = true
+whitesharp.workspace = true
+rodharerist.workspace = true
+
+sphere-plugin-host = { workspace = true, optional = true }
+sphere_directaudioengine = { workspace = true, optional = true }
+
+[lints]
+workspace = true

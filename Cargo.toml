@@ -30,6 +30,7 @@ members = [
     "crates/SphereWebView",
     "crates/SphereJamClient",
     "crates/SphereAraHost",
+    "crates/LiveStageEngine",
 
     # Vendored ARA 2 bindings, trimmed to the host-side crates Futureboard uses.
     # See `crates/Ara2Bridge/VENDORING.md` for provenance and local changes.
@@ -111,6 +112,7 @@ sphere-encoder = { path = "crates/SphereEncoder", features = ["mp3"] }
 sphere-graphic-engine = { path = "crates/SphereGraphicEngine" }
 sphere-midi-service = { path = "crates/SphereMidiService", package = "SphereMidiService" }
 sphere-plugin-host = { path = "crates/SpherePluginHost", default-features = false }
+livestage-engine = { path = "crates/LiveStageEngine", default-features = false }
 sphere-soundfont-player = { path = "crates/SphereSoundfontPlayer", package = "SphereSoundfontPlayer" }
 solfege_spatialaudio = { path = "crates/solfege_spatialaudio" }
 # Video preview/reference decoding for the arrangement Video Track. Uses OS
