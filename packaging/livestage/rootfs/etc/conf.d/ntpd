@@ -1,0 +1,2 @@
+# Keep the clock right, so recordings are named with the right date.
+NTPD_OPTS="-N -p pool.ntp.org"

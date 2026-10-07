@@ -35,8 +35,10 @@ cpal.workspace = true
 sphere_directaudioengine = { path = "../SphereDirectAudioEngine", default-features = false }
 builtin-dsp-core.workspace = true
 equz8.workspace = true
+equzx.workspace = true
 rodharerist.workspace = true
 verbspace.workspace = true
+whitesharp.workspace = true
 echospace.workspace = true
 imager.workspace = true
 fa2a.workspace = true
@@ -44,8 +46,11 @@ fa76.workspace = true
 burnlimit.workspace = true
 clipper67.workspace = true
 transient.workspace = true
+waygate.workspace = true
 wrapsynth.workspace = true
 drumsampler.workspace = true
+quicksampler.workspace = true
+slicer.workspace = true
 zcomp.workspace = true
 mixstation.workspace = true
 compresser.workspace = true
@@ -60,7 +65,10 @@ libc.workspace = true
 # host binary. The main app already pulls the same workspace `windows` version
 # transitively, so this adds no new toolchain surface.
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Shell"] }
+windows = { workspace = true, features = ["Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Shell"] }
+# The C runtime's descriptor table, to move a plug-in's `printf` off the
+# protocol pipe (`plugin_host_lifecycle::take_protocol_stdout`).
+libc.workspace = true
 
 [build-dependencies]
 cc.workspace = true

@@ -67,6 +67,34 @@ pub fn knob(
     )
 }
 
+/// [`knob`] at `size`, whose reset gesture returns to `default_value` rather
+/// than to `min` — for a control that rests at the top of its range (a filter
+/// cutoff, a sample's end point).
+#[allow(clippy::too_many_arguments)]
+pub fn knob_with_default(
+    id: impl Into<gpui::SharedString>,
+    value: f32,
+    min: f32,
+    max: f32,
+    size: f32,
+    accent: gpui::Rgba,
+    default_value: f32,
+    on_change: impl Fn(&f32, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    render_knob(
+        id.into(),
+        value,
+        min,
+        max,
+        size,
+        accent,
+        false,
+        None,
+        default_value,
+        on_change,
+    )
+}
+
 /// Render a bipolar knob centred on zero: the arc runs from 12 o'clock to the
 /// value, left for negative, right for positive. Pan uses this.
 #[allow(clippy::too_many_arguments)]

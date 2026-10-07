@@ -324,6 +324,80 @@ impl DirectXRenderer {
             return Ok(());
         }
         let _frame = gpui::osr_profile::span(gpui::osr_profile::Stage::CompositorFrame);
+        self.encode(scene, background_appearance)?;
+        self.present()
+    }
+
+    /// Draws `scene` into the swap chain's back buffer without presenting
+    /// it, then copies the buffer back to the CPU as an RGBA image — what the
+    /// window would show for this scene, read without capturing the screen.
+    /// The next `draw` clears and redraws the buffer, so presenting stays
+    /// untouched.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn render_to_image(&mut self, scene: &Scene) -> Result<image::RgbaImage> {
+        self.encode(scene, WindowBackgroundAppearance::Opaque)?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let source = resources
+            .render_target
+            .as_ref()
+            .context("missing render target")?;
+        let (width, height) = (self.width, self.height);
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let mut staging = None;
+        unsafe {
+            devices
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut staging))
+                .context("Creating readback texture")?;
+        }
+        let staging = staging.context("readback texture missing")?;
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        unsafe {
+            devices.device_context.CopyResource(&staging, source);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            devices
+                .device_context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .context("Mapping readback texture")?;
+            let row_bytes = width as usize * 4;
+            for row in 0..height as usize {
+                let source_row = std::slice::from_raw_parts(
+                    (mapped.pData as *const u8).add(row * mapped.RowPitch as usize),
+                    row_bytes,
+                );
+                let target = &mut pixels[row * row_bytes..(row + 1) * row_bytes];
+                // BGRA in the buffer; an opaque frame, whatever the alpha
+                // the blend left behind.
+                for (out, bgra) in target.chunks_exact_mut(4).zip(source_row.chunks_exact(4)) {
+                    out.copy_from_slice(&[bgra[2], bgra[1], bgra[0], 255]);
+                }
+            }
+            devices.device_context.Unmap(&staging, 0);
+        }
+        image::RgbaImage::from_raw(width, height, pixels).context("Building the frame image")
+    }
+
+    /// Clears the back buffer and draws every batch of `scene` into it.
+    fn encode(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<()> {
         self.pre_draw(&match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
@@ -372,7 +446,7 @@ impl DirectXRenderer {
                 )
             })?;
         }
-        self.present()
+        Ok(())
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {

@@ -1,7 +1,9 @@
 use gpui::{App, Context};
 
 use crate::components;
-use crate::components::timeline::timeline_state::{MidiChannel, TrackMidiInputRouting, TrackType};
+use crate::components::timeline::timeline_state::{
+    InputMonitorMode, MidiChannel, TrackMidiInputRouting, TrackType,
+};
 use sphere_midi_service::{
     HardwareMidiInputMessage, MidiInputEvent, MidiInputRouteStatus, MidiInputRouter,
     MidiInputSource, MidiInputTarget, VirtualKeyboardEvent,
@@ -485,6 +487,97 @@ impl StudioLayout {
         }
     }
 
+    /// Route the MIDI hosted plug-ins produced since the last drain to the
+    /// tracks that take it as their input. Returns whether anything arrived.
+    pub(super) fn drain_plugin_midi_output(&mut self, cx: &mut Context<Self>) -> bool {
+        // Never wait on the pool here: a busy pool leaves the events in their
+        // rings for the next wake or bridge poll.
+        let drained = match self
+            .plugin_editors
+            .bridge_runtime
+            .as_ref()
+            .map(|runtime| runtime.try_lock())
+        {
+            Some(Ok(bridge)) => bridge.drain_output_midi(),
+            _ => return false,
+        };
+        if drained.is_empty() {
+            return false;
+        }
+        for (source_track_id, raw) in drained {
+            let bytes = [raw.status, raw.data1, raw.data2];
+            let Some(event) = sphere_midi_service::decode_midi_bytes(&bytes) else {
+                continue;
+            };
+            let channel = match &event {
+                MidiInputEvent::NoteOn { channel, .. }
+                | MidiInputEvent::NoteOff { channel, .. }
+                | MidiInputEvent::ControlChange { channel, .. }
+                | MidiInputEvent::PitchBend { channel, .. }
+                | MidiInputEvent::ChannelPressure { channel, .. }
+                | MidiInputEvent::PolyPressure { channel, .. } => Some(*channel),
+                MidiInputEvent::AllNotesOff | MidiInputEvent::Panic => None,
+            };
+            for resolved in self.resolve_plugin_midi_targets(&source_track_id, channel, cx) {
+                let status = self.route_midi_input_event_with_capture(
+                    MidiInputSource::PluginOutput,
+                    resolved.target.clone(),
+                    event.clone(),
+                    Some(&resolved.capture_track_id),
+                    None,
+                    cx,
+                );
+                if hardware_midi_debug() {
+                    eprintln!(
+                        "[MIDI input] plug-in on {source_track_id} event={event:?} -> track={} \
+                         instance={:?} status={status:?}",
+                        resolved.target.track_id, resolved.target.plugin_instance_id
+                    );
+                }
+            }
+        }
+        true
+    }
+
+    /// Tracks that take `source_track_id`'s plug-in MIDI as their input and
+    /// are listening: armed, selected, or monitoring their input. Unlike
+    /// hardware input there is no fallback to the selected track — this MIDI
+    /// only ever goes where it was routed.
+    fn resolve_plugin_midi_targets(
+        &self,
+        source_track_id: &str,
+        channel: Option<u8>,
+        cx: &App,
+    ) -> Vec<ResolvedMidiInputTarget> {
+        let state = &self.timeline.read(cx).state;
+        let selected = state.selection.selected_track_id.as_deref();
+        state
+            .tracks
+            .iter()
+            .filter(|track| {
+                is_keyboard_target_candidate(track)
+                    && track.id != source_track_id
+                    && matches!(
+                        &track.routing.midi_input,
+                        TrackMidiInputRouting::PluginOutput { track_id } if track_id == source_track_id
+                    )
+                    && channel.is_none_or(|ch| {
+                        track
+                            .routing
+                            .midi_input_filter
+                            .accepts(MidiChannel::from_raw(ch))
+                    })
+                    && (track.armed
+                        || selected == Some(track.id.as_str())
+                        || track.input_monitor != InputMonitorMode::Off)
+            })
+            .filter_map(|track| hardware_midi_target_for_track(state, track))
+            // A MIDI track routed straight back into the source's instrument
+            // would feed it its own output.
+            .filter(|resolved| resolved.target.track_id != source_track_id)
+            .collect()
+    }
+
     fn resolve_hardware_midi_targets(
         &self,
         device_id: &str,
@@ -716,6 +809,7 @@ fn track_accepts_hardware_midi(
         TrackMidiInputRouting::MidiDevice {
             device_id: route_id,
         } => route_id == device_id || route_id == device_name,
+        TrackMidiInputRouting::PluginOutput { .. } => false,
     }
 }
 

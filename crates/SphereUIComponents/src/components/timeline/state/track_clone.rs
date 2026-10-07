@@ -392,6 +392,7 @@ pub(super) fn restored_slots(
                     host_pid: live.host_pid,
                     parameters: live.parameters.clone(),
                     output_bus_channel_counts: live.output_bus_channel_counts.clone(),
+                    active_output_buses: live.active_output_buses.clone(),
                     ..slot.clone()
                 },
                 None => slot.clone(),

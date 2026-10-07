@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use DirectAudio::vst3_processor::{Vst3MidiEvent, Vst3PluginState, Vst3RuntimeProcessor};
+use DirectAudio::vst3_processor::{
+    PluginMidiOutEvent, Vst3MidiEvent, Vst3PluginState, Vst3RuntimeProcessor,
+};
 
 use crate::audio_bridge::{SharedMidiEvent, MAX_CHANNELS};
 
@@ -308,8 +310,11 @@ fn render_voice(
     block.clear();
 }
 
-/// Render one voice block for the bridge. `0` channels when the voice is
-/// suspended; the caller passes its input through for that block.
+/// Render one voice block for the bridge, and move the MIDI the plug-in
+/// produced in it into `midi_out`. Returns `(channels, midi events)`; `0`
+/// channels when the voice is suspended, and the caller passes its input
+/// through for that block.
+#[allow(clippy::too_many_arguments)]
 fn render_voice_interleaved(
     processor: &Vst3RuntimeProcessor,
     voice: &VoiceShared,
@@ -318,9 +323,10 @@ fn render_voice_interleaved(
     out_interleaved: &mut [f32],
     output_channels: usize,
     transport: DirectAudio::vst3_processor::RuntimeTransportContext,
-) -> usize {
+    midi_out: &mut [PluginMidiOutEvent],
+) -> (usize, usize) {
     let Some(mut block) = begin_voice_block(voice) else {
-        return 0;
+        return (0, 0);
     };
     let mut processor = processor.clone();
     processor.set_process_context(&transport);
@@ -328,8 +334,11 @@ fn render_voice_interleaved(
     let got_channels = processor
         .process_main_output_block_with_midi(in_l, in_r, out_interleaved, channels, &block)
         .unwrap_or(0);
+    // Still under the voice's render lock: the bridge clears this list at
+    // the start of the next process call.
+    let midi = processor.take_output_midi(midi_out);
     block.clear();
-    got_channels.min(channels)
+    (got_channels.min(channels), midi)
 }
 
 /// Block-path handle for the audio producer thread. Replaces taking the whole
@@ -497,6 +506,9 @@ impl BridgeAudioShared {
         }
     }
 
+    /// Render one block for a single insert instance into the interleaved
+    /// bridge buffer, and move the MIDI the plug-in produced in it into
+    /// `midi_out`. Returns `(channels, midi events)`.
     #[allow(clippy::too_many_arguments)]
     pub fn render_single_voice_interleaved(
         &self,
@@ -507,7 +519,8 @@ impl BridgeAudioShared {
         out_interleaved: &mut [f32],
         output_channels: usize,
         transport: DirectAudio::vst3_processor::RuntimeTransportContext,
-    ) -> usize {
+        midi_out: &mut [PluginMidiOutEvent],
+    ) -> (usize, usize) {
         let channels = output_channels.clamp(1, MAX_CHANNELS);
         let n = frames
             .min(in_l.len())
@@ -515,7 +528,7 @@ impl BridgeAudioShared {
             .min(out_interleaved.len() / channels);
         out_interleaved[..n * channels].fill(0.0);
         if !self.dsp_ready() {
-            return 0;
+            return (0, 0);
         }
         let voices = self.snapshot();
         if let Some(voice) = voices.iter().find(|v| v.instance_id == instance_id) {
@@ -527,9 +540,10 @@ impl BridgeAudioShared {
                 &mut out_interleaved[..n * channels],
                 channels,
                 transport,
+                midi_out,
             )
         } else {
-            0
+            (0, 0)
         }
     }
 

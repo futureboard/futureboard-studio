@@ -14,18 +14,8 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 builtin-dsp-core.workspace = true
-builtin-ui-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[build-dependencies]
-# Build-time only: turns `editor/dist` into the embedded asset table.
-#
-# Must stay pointed at the dependency-free `builtin_ui_embed`, never at the
-# `BuiltinAudioPlugins` umbrella — see rodharerist's manifest for why (a
-# build-dependency is a separate build unit and would rebuild every plugin
-# `cdylib` into the same output path).
-builtin-ui-embed = { workspace = true, features = ["generate"] }
 
 [lints]
 workspace = true

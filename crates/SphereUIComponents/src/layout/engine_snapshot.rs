@@ -1,9 +1,8 @@
 use crate::components::plugin_picker::STUB_PLUGIN_ID;
 use crate::components::timeline::timeline_state::{
-    self, vsti_output_bus_flat_range, vsti_output_bus_strip_indices,
-    vsti_output_child_channels_for_bus_layout, vsti_output_child_track_id, ClipState, ClipType,
-    InsertSlotState, MidiControllerKind, StretchMode, TimelineState, TrackState, TrackType,
-    MASTER_TRACK_ID,
+    self, ClipState, ClipType, InsertSlotState, MASTER_TRACK_ID, MidiControllerKind, StretchMode,
+    TimelineState, TrackState, TrackType, vsti_output_bus_flat_range,
+    vsti_output_child_channels_for_bus_layout, vsti_output_child_track_id,
 };
 
 use DirectAudio::types::{
@@ -830,7 +829,7 @@ fn vsti_output_children_json(slot: &InsertSlotState) -> serde_json::Value {
     let bus_counts = &slot.output_bus_channel_counts;
     // Mirror `ensure_vsti_output_child_tracks` exactly so child track ids line up:
     // child routes are created only from declared multi-output capability data.
-    let bus_indices = vsti_output_bus_strip_indices(bus_counts);
+    let bus_indices = slot.output_strip_indices();
     serde_json::Value::Array(
         bus_indices
             .into_iter()

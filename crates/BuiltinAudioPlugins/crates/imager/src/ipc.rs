@@ -8,8 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BAND_COUNT, MAX_CROSSOVER_HZ, MAX_OUTPUT_DB, MAX_WIDTH, MIN_CROSSOVER_HZ, MIN_OUTPUT_DB,
-    Params, SOLO_NONE, clamp, default_params,
+    BAND_COUNT, MAX_CROSSOVER_HZ, MAX_OUTPUT_DB, MAX_STEREOIZE, MAX_WIDTH, MIN_CROSSOVER_HZ,
+    MIN_OUTPUT_DB, Params, SOLO_NONE, StereoizeMode, clamp, default_params,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -25,8 +25,15 @@ pub const WIDTH_3_INDEX: u32 = 6;
 pub const WIDTH_4_INDEX: u32 = 7;
 pub const SOLO_INDEX: u32 = 8;
 pub const OUTPUT_INDEX: u32 = 9;
+pub const STEREOIZE_1_INDEX: u32 = 10;
+pub const STEREOIZE_2_INDEX: u32 = 11;
+pub const STEREOIZE_3_INDEX: u32 = 12;
+pub const STEREOIZE_4_INDEX: u32 = 13;
+pub const STEREOIZE_MODE_INDEX: u32 = 14;
+pub const RECOVER_SIDES_INDEX: u32 = 15;
+pub const MULTIBAND_INDEX: u32 = 16;
 
-pub const PARAM_COUNT: usize = 10;
+pub const PARAM_COUNT: usize = 17;
 
 /// Wire index *is* the position in this table; the editor and the host both
 /// resolve through it, so the order is part of the persisted contract. Append
@@ -42,6 +49,13 @@ pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = [
     "width4",
     "soloBand",
     "outputDb",
+    "stereoize1",
+    "stereoize2",
+    "stereoize3",
+    "stereoize4",
+    "stereoizeMode",
+    "recoverSides",
+    "multiband",
 ];
 
 /// Inclusive `(min, max)` for every continuous parameter, indexed by wire
@@ -59,6 +73,13 @@ const RANGES: [(f32, f32); PARAM_COUNT] = [
     (0.0, MAX_WIDTH),                            // width4
     (SOLO_NONE as f32, (BAND_COUNT - 1) as f32), // soloBand
     (MIN_OUTPUT_DB, MAX_OUTPUT_DB),              // outputDb
+    (0.0, MAX_STEREOIZE),                        // stereoize1
+    (0.0, MAX_STEREOIZE),                        // stereoize2
+    (0.0, MAX_STEREOIZE),                        // stereoize3
+    (0.0, MAX_STEREOIZE),                        // stereoize4
+    (0.0, 1.0),                                  // stereoizeMode
+    (0.0, 0.0),                                  // recoverSides
+    (0.0, 0.0),                                  // multiband
 ];
 
 #[inline]
@@ -136,6 +157,10 @@ pub fn sanitize_params(params: &mut Params) {
         };
         *width = clamp_wire(WIDTH_1_INDEX + index as u32, value);
     }
+    for (index, amount) in params.stereoize.iter_mut().enumerate() {
+        let value = if amount.is_finite() { *amount } else { 0.0 };
+        *amount = clamp_wire(STEREOIZE_1_INDEX + index as u32, value);
+    }
     params.solo_band = params.solo_band.clamp(SOLO_NONE, BAND_COUNT as i32 - 1);
     params.output_db = if params.output_db.is_finite() {
         clamp_wire(OUTPUT_INDEX, params.output_db)
@@ -161,6 +186,12 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
         }
         SOLO_INDEX => params.solo_band = wire_to_solo(value),
         OUTPUT_INDEX => params.output_db = clamp_wire(index, value),
+        STEREOIZE_1_INDEX..=STEREOIZE_4_INDEX => {
+            params.stereoize[(index - STEREOIZE_1_INDEX) as usize] = clamp_wire(index, value)
+        }
+        STEREOIZE_MODE_INDEX => params.stereoize_mode = StereoizeMode::from_wire(value),
+        RECOVER_SIDES_INDEX => params.recover_sides = value >= 0.5,
+        MULTIBAND_INDEX => params.multiband = value >= 0.5,
         _ => return false,
     }
     true
@@ -188,6 +219,13 @@ pub fn ui_values(params: &Params) -> Vec<(&'static str, f32)> {
         ("width4", params.width[3]),
         ("soloBand", params.solo_band as f32),
         ("outputDb", params.output_db),
+        ("stereoize1", params.stereoize[0]),
+        ("stereoize2", params.stereoize[1]),
+        ("stereoize3", params.stereoize[2]),
+        ("stereoize4", params.stereoize[3]),
+        ("stereoizeMode", params.stereoize_mode.to_wire()),
+        ("recoverSides", f32::from(params.recover_sides)),
+        ("multiband", f32::from(params.multiband)),
     ]
 }
 
@@ -237,6 +275,10 @@ mod tests {
         saved.width = [0.0, 80.0, 140.0, 200.0];
         saved.solo_band = 3;
         saved.output_db = -3.5;
+        saved.stereoize = [0.0, 25.0, 60.0, 100.0];
+        saved.stereoize_mode = StereoizeMode::Two;
+        saved.recover_sides = true;
+        saved.multiband = false;
 
         let mut rebuilt = default_params();
         for (id, value) in ui_values(&saved) {
@@ -250,6 +292,10 @@ mod tests {
         assert_eq!(rebuilt.width, saved.width);
         assert_eq!(rebuilt.solo_band, 3);
         assert_eq!(rebuilt.output_db, -3.5);
+        assert_eq!(rebuilt.stereoize, saved.stereoize);
+        assert_eq!(rebuilt.stereoize_mode, StereoizeMode::Two);
+        assert!(rebuilt.recover_sides);
+        assert!(!rebuilt.multiband);
     }
 
     #[test]

@@ -1,0 +1,16 @@
+
+LiveStage appliance (Alpine Linux)
+
+  livestage-setup                               name, network, Wi-Fi, interface, password
+  rc-service livestage restart | stop | start   the mixer
+  tail -f /var/log/livestage.log                its log
+  livestage-server --list-devices               audio interfaces
+  aplay -l                                      ALSA cards
+
+  Setup:         /data/system/setup.conf  (livestage-setup writes it)
+  Settings:      /data/livestage/livestage.conf  (see /etc/conf.d/livestage)
+  Session:       /data/livestage/show.json
+  Recordings:    /data/livestage/recordings
+
+  The system is read-only. To change it: mount -o remount,rw /
+

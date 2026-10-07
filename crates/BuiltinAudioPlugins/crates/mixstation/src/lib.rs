@@ -10,13 +10,15 @@ use serde::{Deserialize, Serialize};
 
 pub mod dsp;
 pub mod ipc;
+pub mod presets;
 pub mod ui;
 
 pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 use dsp::{
-    DcBlocker, Filters, Limiter, Saturator, SmoothedGain, StripCompressor, proportional_q,
-    saturation_active, stereo_width,
+    DcBlocker, Filters, LIMITER_KNEE_DB, Limiter, Saturator, SmoothedGain, StripCompressor,
+    compressor_curve_db, proportional_q, saturate, saturation_active, soft_over_db, stereo_width,
 };
 
 pub const PLUGIN_ID: &str = "futureboard.mixstation";
@@ -151,6 +153,82 @@ pub fn default_params() -> Params {
         width_trim_db: 0.0,
         limiter_trim_db: 0.0,
     }
+}
+
+/// The compressor's knee, in dB.
+pub const COMP_KNEE_DB: f32 = 6.0;
+/// The EQ's fixed shelf corners, in Hz.
+pub const LOW_SHELF_HZ: f32 = 100.0;
+pub const HIGH_SHELF_HZ: f32 = 10_000.0;
+
+/// Tunes the cuts and the EQ to `p` at `sample_rate`, as the strip runs them.
+fn configure_filters(filters: &mut Filters, p: &Params, sample_rate: f32) {
+    filters.set_high_pass(sample_rate, p.hpf_hz, HPF_OPEN_HZ);
+    filters.set_low_pass(sample_rate, p.lpf_hz, LPF_OPEN_HZ);
+    filters.eq[0].set_low_shelf(sample_rate, LOW_SHELF_HZ, p.low_gain_db);
+    filters.eq[1].set_peak(
+        sample_rate,
+        p.low_mid_freq_hz,
+        p.low_mid_gain_db,
+        proportional_q(p.low_mid_gain_db),
+    );
+    filters.eq[2].set_peak(
+        sample_rate,
+        p.high_mid_freq_hz,
+        p.high_mid_gain_db,
+        proportional_q(p.high_mid_gain_db),
+    );
+    filters.eq[3].set_high_shelf(sample_rate, HIGH_SHELF_HZ, p.high_gain_db);
+}
+
+/// The Filters module's gain at each of `frequencies`, in dB, at
+/// `sample_rate`: the two cuts as the strip runs them.
+pub fn filter_response_db(p: &Params, sample_rate: f32, frequencies: &[f32]) -> Vec<f32> {
+    let mut filters = Filters::new();
+    configure_filters(&mut filters, p, sample_rate);
+    frequencies
+        .iter()
+        .map(|hz| filters.cuts_db(sample_rate, *hz))
+        .collect()
+}
+
+/// The EQ module's gain at each of `frequencies`, in dB, at `sample_rate`.
+pub fn eq_response_db(p: &Params, sample_rate: f32, frequencies: &[f32]) -> Vec<f32> {
+    let mut filters = Filters::new();
+    configure_filters(&mut filters, p, sample_rate);
+    frequencies
+        .iter()
+        .map(|hz| filters.eq_db(sample_rate, *hz))
+        .collect()
+}
+
+/// The compressor's steady-state output, in dB, for a level held at
+/// `input_db`: its static curve plus makeup.
+pub fn comp_transfer_db(p: &Params, input_db: f32) -> f32 {
+    input_db
+        + compressor_curve_db(input_db, p.comp_threshold_db, p.comp_ratio, COMP_KNEE_DB)
+        + p.comp_makeup_db
+}
+
+/// The limiter's steady-state output peak, in dB, for a peak held at
+/// `input_db`: the knee into the ceiling, never past it.
+pub fn limiter_transfer_db(p: &Params, input_db: f32) -> f32 {
+    (input_db + soft_over_db(input_db - p.limiter_ceiling_db, LIMITER_KNEE_DB))
+        .min(p.limiter_ceiling_db)
+}
+
+/// The Drive module's waveshaper: what one sample `x` becomes.
+pub fn drive_curve(p: &Params, x: f32) -> f32 {
+    saturate(
+        x,
+        p.sat_drive_pct * SATURATION_DRIVE_SCALE,
+        p.sat_character_pct * 0.01,
+    )
+}
+
+/// What the Width module makes of a hard-panned pair `(left, right)`.
+pub fn width_of(p: &Params, left: f32, right: f32) -> (f32, f32) {
+    stereo_width(left, right, p.width_pct * 0.01)
 }
 
 const fn param(
@@ -442,26 +520,13 @@ impl Dsp {
         let p = &self.params;
         self.input_gain.set_db(p.input_trim_db);
         self.output_gain.set_db(p.output_trim_db);
-        self.filters
-            .set_high_pass(self.sample_rate, p.hpf_hz, HPF_OPEN_HZ);
-        self.filters
-            .set_low_pass(self.sample_rate, p.lpf_hz, LPF_OPEN_HZ);
-        self.filters.eq[0].set_low_shelf(self.sample_rate, 100.0, p.low_gain_db);
-        self.filters.eq[1].set_peak(
-            self.sample_rate,
-            p.low_mid_freq_hz,
-            p.low_mid_gain_db,
-            proportional_q(p.low_mid_gain_db),
+        configure_filters(&mut self.filters, p, self.sample_rate);
+        self.compressor.set_curve(
+            p.comp_threshold_db,
+            p.comp_ratio,
+            COMP_KNEE_DB,
+            p.comp_makeup_db,
         );
-        self.filters.eq[2].set_peak(
-            self.sample_rate,
-            p.high_mid_freq_hz,
-            p.high_mid_gain_db,
-            proportional_q(p.high_mid_gain_db),
-        );
-        self.filters.eq[3].set_high_shelf(self.sample_rate, 10_000.0, p.high_gain_db);
-        self.compressor
-            .set_curve(p.comp_threshold_db, p.comp_ratio, 6.0, p.comp_makeup_db);
         self.compressor
             .set_timing(p.comp_attack_ms * 0.001, p.comp_release_ms * 0.001);
         self.saturation_drive = p.sat_drive_pct * SATURATION_DRIVE_SCALE;
@@ -1063,5 +1128,38 @@ mod tests {
             let (l, r) = dsp.process_stereo(x, -x * 0.37);
             assert!(l.is_finite() && r.is_finite());
         }
+    }
+
+    #[test]
+    fn the_module_curves_follow_the_strip() {
+        let mut p = default_params();
+        p.hpf_hz = 100.0;
+        p.lpf_hz = 10_000.0;
+        let cuts = filter_response_db(&p, 48_000.0, &[100.0, 1_000.0, 10_000.0]);
+        assert!((cuts[0] + 3.0).abs() < 0.3, "{cuts:?}");
+        assert!(cuts[1].abs() < 0.3, "{cuts:?}");
+        assert!((cuts[2] + 3.0).abs() < 0.5, "{cuts:?}");
+        // Parked at their open ends, the cuts are out of the path.
+        let parked = Params {
+            hpf_hz: 20.0,
+            lpf_hz: 20_000.0,
+            ..default_params()
+        };
+        let open = filter_response_db(&parked, 48_000.0, &[20.0, 19_000.0]);
+        assert!(open.iter().all(|db| db.abs() < 1.0e-3), "{open:?}");
+
+        p.low_mid_freq_hz = 400.0;
+        p.low_mid_gain_db = 6.0;
+        let eq = eq_response_db(&p, 48_000.0, &[400.0, 5_000.0]);
+        assert!((eq[0] - 6.0).abs() < 0.3, "{eq:?}");
+        assert!(eq[1].abs() < 0.3, "{eq:?}");
+
+        p.comp_threshold_db = -20.0;
+        p.comp_makeup_db = 2.0;
+        assert!((comp_transfer_db(&p, -40.0) - -38.0).abs() < 1.0e-4);
+        assert!(comp_transfer_db(&p, 0.0) < -10.0);
+        p.limiter_ceiling_db = -1.0;
+        assert!(limiter_transfer_db(&p, 6.0) <= -1.0);
+        assert!((limiter_transfer_db(&p, -20.0) - -20.0).abs() < 1.0e-4);
     }
 }

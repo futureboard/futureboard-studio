@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "VerbSpace — feedback-delay-network algorithmic reverb DSP core"
+description = "VerbSpace — algorithmic stereo reverb DSP core"
 
 [lib]
 name = "verbspace"
@@ -15,18 +15,8 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 biquad.workspace = true
 builtin-dsp-core.workspace = true
-builtin-ui-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[build-dependencies]
-# Build-time only: turns `editorui/dist` into the embedded asset table.
-#
-# Must stay pointed at the dependency-free `builtin_ui_embed`, never at the
-# `BuiltinAudioPlugins` umbrella — see rodharerist's manifest for why (a
-# build-dependency is a separate build unit and would rebuild every plugin
-# `cdylib` into the same output path).
-builtin-ui-embed = { workspace = true, features = ["generate"] }
 
 [lints]
 workspace = true

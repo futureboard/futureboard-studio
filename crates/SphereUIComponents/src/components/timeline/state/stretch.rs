@@ -98,7 +98,9 @@ impl StretchTiming {
         match self {
             StretchTiming::Off => "Off",
             StretchTiming::Speed => "Speed",
-            StretchTiming::Tempo => "Tempo",
+            // Fitted to the tempo: the clip plays its own beats on the
+            // project's, wherever the tempo goes.
+            StretchTiming::Tempo => "Fit",
             StretchTiming::Warp => "Warp",
         }
     }
@@ -217,560 +219,52 @@ pub struct TempoDetectionResult {
 /// `clip.stretch.source_bpm`; instead it surfaces candidates and waits for the
 /// user to pick or confirm (spec Fix 1/8).
 const TEMPO_LOW_CONFIDENCE: f32 = 0.35;
-/// Additive weight of the project-tempo soft prior (spec Fix 5).
-const TEMPO_PROJECT_PRIOR_WEIGHT: f32 = 0.15;
-/// A candidate within this fraction of the project tempo counts as "near
-/// project" for the promotion rule (spec Fix 5: ±3%).
-const TEMPO_PROJECT_NEAR_TOLERANCE: f32 = 0.03;
-/// A near-project candidate is promoted above the raw winner only when its raw
-/// score is at least this fraction of the best raw score (spec Fix 5: ±20%).
-const TEMPO_PROJECT_NEAR_SCORE_MARGIN: f32 = 0.80;
-/// Decisive bonus that lets a strong near-project candidate outrank a slightly
-/// stronger raw candidate without forcing the project tempo (spec Fix 5).
-const TEMPO_PROJECT_NEAR_PROMOTION: f32 = 0.25;
-/// Coarse BPM step swept across the whole search range (spec Fix 4).
-const TEMPO_COARSE_STEP_BPM: f32 = 0.25;
-/// Fine BPM step swept across the project-tempo neighbourhood (spec Fix 4).
-const TEMPO_FINE_STEP_BPM: f32 = 0.1;
-/// Half-width of the project-tempo neighbourhood scanned at the fine step
-/// (spec Fix 4: project_bpm ± 15%).
-const TEMPO_PROJECT_PRIOR_SPAN: f32 = 0.15;
-const TEMPO_ANALYSIS_RATE: f32 = 11_025.0;
-const TEMPO_FRAME: usize = 512;
-const TEMPO_HOP: usize = 256;
-/// Preferred analysis-window length around the strongest region (spec Fix 2:
-/// 16–32 s); the window is capped at [`TEMPO_MAX_ANALYSIS_SECONDS`].
-const TEMPO_PREFERRED_ANALYSIS_SECONDS: f32 = 24.0;
-const TEMPO_MAX_ANALYSIS_SECONDS: f32 = 60.0;
+/// Clips up to this many beats long are read as loops. See
+/// [`whole_bar_tempo`].
+const TEMPO_LOOP_MAX_BEATS: f32 = 128.0;
+/// Furthest a loop's measured tempo is moved to make it a whole number of
+/// bars. The measurement itself is good to about a tenth of a BPM.
+const TEMPO_LOOP_SNAP_BPM: f32 = 0.3;
 
-fn remove_dc(samples: &[f32]) -> Vec<f32> {
-    if samples.is_empty() {
-        return Vec::new();
-    }
-    let mean = samples
-        .iter()
-        .copied()
-        .filter(|s| s.is_finite())
-        .sum::<f32>()
-        / samples.len() as f32;
-    samples
-        .iter()
-        .map(|s| if s.is_finite() { *s - mean } else { 0.0 })
-        .collect()
-}
-
-fn normalize_peak_safe(samples: &[f32]) -> Vec<f32> {
-    let peak = samples
-        .iter()
-        .copied()
-        .filter(|s| s.is_finite())
-        .map(f32::abs)
-        .fold(0.0_f32, f32::max);
-    if peak <= f32::EPSILON {
-        return samples.to_vec();
-    }
-    samples
-        .iter()
-        .map(|s| (s / peak).clamp(-1.0, 1.0))
-        .collect()
-}
-
-fn downsample_mono(samples: &[f32], source_rate: f32, target_rate: f32) -> Vec<f32> {
-    if samples.is_empty() || source_rate <= 0.0 || target_rate <= 0.0 {
-        return Vec::new();
-    }
-    let step = (source_rate / target_rate).round().max(1.0) as usize;
-    samples.iter().step_by(step).copied().collect()
-}
-
-fn rms_frame(frame: &[f32]) -> f32 {
-    if frame.is_empty() {
-        return 0.0;
-    }
-    let sum = frame.iter().map(|s| s * s).sum::<f32>();
-    (sum / frame.len() as f32).sqrt()
-}
-
-/// Spectral-flux-style onset envelope (spec Fix 3): per-frame RMS energy →
-/// positive energy flux → adaptive local-mean subtraction (half-wave rectified)
-/// → light smoothing → peak normalisation. Frames whose energy is far below the
-/// loudest frame are ignored so silence/near-silence does not generate spurious
-/// onsets. `local_mean_window` is the moving-average length (in frames, ~1 s)
-/// used as the adaptive threshold.
-fn build_onset_envelope(
-    samples: &[f32],
-    frame: usize,
-    hop: usize,
-    local_mean_window: usize,
-) -> Vec<f32> {
-    if samples.len() < frame {
-        return Vec::new();
-    }
-    let energy: Vec<f32> = samples.windows(frame).step_by(hop).map(rms_frame).collect();
-    let n = energy.len();
-    if n < 4 {
-        return Vec::new();
-    }
-
-    let energy_peak = energy.iter().copied().fold(0.0_f32, f32::max);
-    let energy_floor = energy_peak * 0.02;
-
-    // Positive energy flux (onset emphasis).
-    let mut flux = vec![0.0_f32; n];
-    for i in 1..n {
-        flux[i] = if energy[i] < energy_floor {
-            0.0
-        } else {
-            (energy[i] - energy[i - 1]).max(0.0)
-        };
-    }
-
-    // Subtract a local moving average (adaptive threshold) and half-wave rectify.
-    let window = local_mean_window.max(3);
-    let mut onset = vec![0.0_f32; n];
-    for i in 0..n {
-        let start = i.saturating_sub(window / 2);
-        let end = (i + window / 2 + 1).min(n);
-        let local_mean = flux[start..end].iter().sum::<f32>() / (end - start).max(1) as f32;
-        onset[i] = (flux[i] - local_mean).max(0.0);
-    }
-
-    // Light smoothing (3 frames) to stabilise the peaks before autocorrelation.
-    let smooth = 3usize;
-    let smoothed: Vec<f32> = (0..n)
-        .map(|i| {
-            let start = i.saturating_sub(smooth / 2);
-            let end = (i + smooth / 2 + 1).min(n);
-            onset[start..end].iter().sum::<f32>() / (end - start).max(1) as f32
-        })
-        .collect();
-
-    let peak = smoothed.iter().copied().fold(0.0_f32, f32::max);
-    if peak <= f32::EPSILON {
-        return smoothed;
-    }
-    smoothed.into_iter().map(|v| v / peak).collect()
-}
-
-fn autocorrelation_score(envelope: &[f32], lag: usize) -> f32 {
-    if lag == 0 || lag >= envelope.len() {
-        return 0.0;
-    }
-    let mut score = 0.0_f32;
-    for i in lag..envelope.len() {
-        score += envelope[i] * envelope[i - lag];
-    }
-    score / (envelope.len() - lag).max(1) as f32
-}
-
-fn lag_from_bpm(bpm: f32, env_rate: f32) -> f32 {
-    60.0 * env_rate / bpm.max(f32::EPSILON)
-}
-
-fn interpolated_autocorr_score(envelope: &[f32], lag: f32) -> f32 {
-    let center = lag.floor() as usize;
-    if center == 0 || center >= envelope.len() {
-        return 0.0;
-    }
-    let frac = lag - center as f32;
-    let s1 = autocorrelation_score(envelope, center);
-    if center + 1 < envelope.len() {
-        let s2 = autocorrelation_score(envelope, center + 1);
-        s1 * (1.0 - frac) + s2 * frac
-    } else {
-        s1
-    }
-}
-
-/// Multi-beat comb autocorrelation (spec Fix 4): rewards a lag that is also
-/// reinforced two and three beats later. This suppresses weak single-lag matches
-/// and spurious half/double-tempo peaks, helping the true musical period win.
-fn comb_autocorr_score(envelope: &[f32], lag: f32) -> f32 {
-    let s1 = interpolated_autocorr_score(envelope, lag);
-    let s2 = interpolated_autocorr_score(envelope, lag * 2.0);
-    let s3 = interpolated_autocorr_score(envelope, lag * 3.0);
-    s1 + 0.5 * s2 + 0.25 * s3
-}
-
-fn tempo_family_ratios() -> [(f32, TempoRelation); 9] {
-    [
-        (0.5, TempoRelation::Half),
-        (2.0, TempoRelation::Double),
-        (2.0 / 3.0, TempoRelation::TwoThirds),
-        (1.5, TempoRelation::ThreeHalves),
-        (4.0 / 3.0, TempoRelation::FourThirds),
-        (0.75, TempoRelation::ThreeQuarters),
-        (5.0 / 6.0, TempoRelation::FourThirds),
-        (6.0 / 5.0, TempoRelation::ThreeHalves),
-        (1.0, TempoRelation::Raw),
-    ]
-}
-
-fn expand_tempo_family(
-    base_bpm: f32,
-    base_score: f32,
-    min_bpm: f32,
-    max_bpm: f32,
-) -> Vec<TempoCandidate> {
-    let mut out = Vec::new();
-    for (ratio, relation) in tempo_family_ratios() {
-        let bpm = base_bpm * ratio;
-        if bpm >= min_bpm && bpm <= max_bpm {
-            let penalty = if ratio < 0.66 || ratio > 1.51 {
-                0.92
-            } else {
-                1.0
-            };
-            out.push(TempoCandidate {
-                bpm,
-                confidence: base_score * penalty,
-                relation,
-            });
-        }
-    }
-    out
-}
-
-fn merge_tempo_candidates(
-    candidates: Vec<TempoCandidate>,
-    min_bpm: f32,
-    max_bpm: f32,
-) -> Vec<TempoCandidate> {
-    let mut merged: Vec<TempoCandidate> = Vec::new();
-    for candidate in candidates {
-        if candidate.bpm < min_bpm || candidate.bpm > max_bpm || !candidate.confidence.is_finite() {
-            continue;
-        }
-        if let Some(existing) = merged
-            .iter_mut()
-            .find(|c| (c.bpm - candidate.bpm).abs() < 0.6)
-        {
-            if candidate.confidence > existing.confidence {
-                *existing = candidate;
-            }
-        } else {
-            merged.push(candidate);
-        }
-    }
-    merged.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    merged
-}
-
-/// Soft, additive project-tempo prior (spec Fix 5):
-/// `exp(-|log2(bpm / project)| * 8) * weight`. Peaks at the project tempo and
-/// decays quickly with octave distance, so it nudges ranking without forcing the
-/// project tempo onto unrelated material.
-fn project_prior_bonus(bpm: f32, project_bpm: f32) -> f32 {
-    if project_bpm <= 0.0 || bpm <= 0.0 {
-        return 0.0;
-    }
-    let octave_dist = (bpm / project_bpm).log2().abs();
-    (-octave_dist * 8.0).exp() * TEMPO_PROJECT_PRIOR_WEIGHT
-}
-
-/// Dense BPM→score scan of the onset envelope. Sweeping by BPM (not by integer
-/// autocorrelation lag) resolves tempi that fall *between* coarse lags — e.g.
-/// 118 vs 124 near a 120 project tempo — and a finer pass over the project
-/// neighbourhood makes the true tempo reliably resolvable (spec Fix 4).
-struct TempoScan {
-    bpms: Vec<f32>,
-    /// Scores normalised so the strongest bin == 1.0.
-    scores: Vec<f32>,
-    /// `(peak - mean) / peak` over the raw scan, 0..1 — how much the best tempo
-    /// stands out from the field. Drives the reported detection confidence.
-    salience: f32,
-}
-
-impl TempoScan {
-    fn score_at(&self, bpm: f32) -> f32 {
-        let mut best = 0usize;
-        let mut best_dist = f32::MAX;
-        for (i, b) in self.bpms.iter().enumerate() {
-            let d = (b - bpm).abs();
-            if d < best_dist {
-                best_dist = d;
-                best = i;
-            }
-        }
-        self.scores.get(best).copied().unwrap_or(0.0)
-    }
-
-    fn best_in_range(&self, lo: f32, hi: f32) -> Option<(f32, f32)> {
-        let mut out: Option<(f32, f32)> = None;
-        for (b, s) in self.bpms.iter().zip(self.scores.iter()) {
-            if *b >= lo && *b <= hi && out.is_none_or(|(_, best)| *s > best) {
-                out = Some((*b, *s));
-            }
-        }
-        out
-    }
-}
-
-fn scan_tempo_scores(
-    envelope: &[f32],
-    env_rate: f32,
-    min_bpm: f32,
-    max_bpm: f32,
-    project_bpm: Option<f32>,
-) -> TempoScan {
-    let slow_debias =
-        |bpm: f32| 0.85 + 0.15 * ((bpm - min_bpm) / (max_bpm - min_bpm).max(1.0)).clamp(0.0, 1.0);
-    let score_bpm = |bpm: f32| {
-        comb_autocorr_score(envelope, lag_from_bpm(bpm, env_rate)).max(0.0) * slow_debias(bpm)
-    };
-
-    let mut points: Vec<(f32, f32)> = Vec::new();
-    let mut bpm = min_bpm;
-    while bpm <= max_bpm + 1e-3 {
-        points.push((bpm, score_bpm(bpm)));
-        bpm += TEMPO_COARSE_STEP_BPM;
-    }
-    // Fine pass over the project neighbourhood (spec Fix 4: project ± 15%).
-    if let Some(p) = project_bpm.filter(|p| p.is_finite() && *p > 0.0) {
-        let lo = (p * (1.0 - TEMPO_PROJECT_PRIOR_SPAN)).max(min_bpm);
-        let hi = (p * (1.0 + TEMPO_PROJECT_PRIOR_SPAN)).min(max_bpm);
-        let mut b = lo;
-        while b <= hi + 1e-3 {
-            points.push((b, score_bpm(b)));
-            b += TEMPO_FINE_STEP_BPM;
-        }
-    }
-    points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let peak = points.iter().map(|(_, s)| *s).fold(0.0_f32, f32::max);
-    let mean = if points.is_empty() {
-        0.0
-    } else {
-        points.iter().map(|(_, s)| *s).sum::<f32>() / points.len() as f32
-    };
-    let salience = if peak > f32::EPSILON {
-        ((peak - mean) / peak).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let norm = peak.max(f32::EPSILON);
-    TempoScan {
-        bpms: points.iter().map(|(b, _)| *b).collect(),
-        scores: points.iter().map(|(_, s)| s / norm).collect(),
-        salience,
-    }
-}
-
-/// Non-maximum-suppressed local peaks of the dense scan, strongest first.
-fn pick_tempo_peaks(scan: &TempoScan) -> Vec<TempoCandidate> {
-    let mut order: Vec<usize> = (0..scan.scores.len()).collect();
-    order.sort_by(|a, b| {
-        scan.scores[*b]
-            .partial_cmp(&scan.scores[*a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut peaks: Vec<TempoCandidate> = Vec::new();
-    for i in order {
-        let bpm = scan.bpms[i];
-        let score = scan.scores[i];
-        if score < 0.15 {
-            break;
-        }
-        // Suppress neighbours within 2 BPM so peaks are distinct tempi.
-        if peaks.iter().any(|p| (p.bpm - bpm).abs() < 2.0) {
-            continue;
-        }
-        peaks.push(TempoCandidate {
-            bpm,
-            confidence: score,
-            relation: TempoRelation::Raw,
-        });
-        if peaks.len() >= 8 {
-            break;
-        }
-    }
-    peaks
-}
-
-/// Build the picker's alternative chips, always surfacing project-relative
-/// options (project tempo, half/double, and the best candidate within ±2/5/10%)
-/// when a project tempo exists, so a near-project tempo such as 118 against a
-/// 120 project is never hidden (spec Fix 6).
-fn build_tempo_alternatives(
-    selected_bpm: f32,
-    candidates: &[TempoCandidate],
-    scan: &TempoScan,
-    project_bpm: Option<f32>,
-    min_bpm: f32,
-    max_bpm: f32,
-) -> Vec<f32> {
-    let mut out: Vec<f32> = Vec::new();
-    let in_range = |bpm: f32| bpm.is_finite() && bpm >= min_bpm && bpm <= max_bpm;
-
-    if in_range(selected_bpm) {
-        out.push(selected_bpm);
-    }
-    for c in candidates.iter().take(6) {
-        if in_range(c.bpm) {
-            out.push(c.bpm);
-        }
-    }
-    if let Some(p) = project_bpm.filter(|p| p.is_finite() && *p > 0.0) {
-        for bpm in [p, p * 0.5, p * 2.0] {
-            if in_range(bpm) {
-                out.push(bpm);
-            }
-        }
-        for tol in [0.02_f32, 0.05, 0.10] {
-            if let Some((bpm, _)) = scan.best_in_range(p * (1.0 - tol), p * (1.0 + tol)) {
-                if in_range(bpm) {
-                    out.push(bpm);
-                }
-            }
-        }
-    }
-
-    out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    out.dedup_by(|a, b| (*a - *b).abs() < 0.6);
-    out.truncate(8);
-    out
-}
-
-/// Pick the strongest, longest, non-silent analysis window for offline tempo
-/// detection (spec Fix 2). Skips leading near-silence (relative −22 dB / absolute
-/// −45 dBFS floor), then slides a preferred-length window to find the
-/// highest-energy region so a weak intro is never weighted like the hook. Caps at
-/// ~60 s and prefers ~24 s; short clips fall back to their full non-silent span.
-pub fn prepare_mono_for_tempo_analysis(samples: &[f32], sample_rate: f32) -> (Vec<f32>, f32) {
-    if samples.is_empty() || sample_rate <= 0.0 {
-        return (Vec::new(), 0.0);
-    }
-    let max_samples = (sample_rate * TEMPO_MAX_ANALYSIS_SECONDS).round() as usize;
-    let preferred =
-        ((sample_rate * TEMPO_PREFERRED_ANALYSIS_SECONDS).round() as usize).clamp(1, max_samples);
-
-    // Coarse RMS envelope over ~93 ms blocks to locate strong vs silent regions.
-    let block = ((sample_rate * 0.093).round() as usize).max(1);
-    let blocks: Vec<f32> = samples.chunks(block).map(rms_frame).collect();
-    let peak_rms = blocks.iter().copied().fold(0.0_f32, f32::max);
-    if peak_rms <= f32::EPSILON {
-        let end = samples.len().min(max_samples);
-        return (samples[..end].to_vec(), end as f32 / sample_rate);
-    }
-
-    // Skip leading near-silence: ~8% of peak RMS, with an absolute −45 dBFS floor.
-    let abs_floor = 10f32.powf(-45.0 / 20.0);
-    let active_threshold = (peak_rms * 0.08).max(abs_floor);
-    let first_active = blocks
-        .iter()
-        .position(|&r| r >= active_threshold)
-        .unwrap_or(0);
-
-    // Slide a preferred-length window over the active region; keep the loudest.
-    let pref_blocks = (preferred / block).max(1);
-    let mut prefix = Vec::with_capacity(blocks.len() + 1);
-    prefix.push(0.0_f32);
-    for &r in &blocks {
-        prefix.push(prefix.last().copied().unwrap_or(0.0) + r * r);
-    }
-    let mut best_start_block = first_active;
-    let mut best_energy = f32::MIN;
-    let mut start_block = first_active;
-    while start_block < blocks.len() {
-        let end_block = (start_block + pref_blocks).min(blocks.len());
-        let energy = prefix[end_block] - prefix[start_block];
-        if energy > best_energy {
-            best_energy = energy;
-            best_start_block = start_block;
-        }
-        if end_block >= blocks.len() {
-            break;
-        }
-        start_block += (pref_blocks / 2).max(1);
-    }
-
-    let start = (best_start_block * block).min(samples.len());
-    let end = samples.len().min(start + max_samples);
-    let slice = if end > start {
-        &samples[start..end]
-    } else {
-        samples
-    };
-    let duration = slice.len() as f32 / sample_rate;
-    (slice.to_vec(), duration)
-}
-
-/// Choose the most musically useful BPM among scored candidates, using project
-/// tempo as a soft prior when confidence scores are close.
-pub fn choose_musical_bpm_candidate(
-    raw_candidates: &[TempoCandidate],
-    project_bpm: Option<f32>,
-    min_bpm: f32,
-    max_bpm: f32,
-) -> Option<TempoDetectionResult> {
-    let candidates = merge_tempo_candidates(raw_candidates.to_vec(), min_bpm, max_bpm);
-    if candidates.is_empty() {
+/// The tempo that makes a clip of `seconds` exactly a whole number of 4/4
+/// bars, when it is within [`TEMPO_LOOP_SNAP_BPM`] of the measured `bpm`.
+///
+/// A loop is cut on its bar lines, so its length knows its tempo more
+/// precisely than any onset analysis: an 8-bar loop at 123.37 BPM is 15.563
+/// seconds, and a tempo a tenth of a BPM off drifts a sixteenth over the
+/// loop. Only short clips are read this way — across a whole song the bar
+/// counts are so close together that one is always near.
+fn whole_bar_tempo(bpm: f32, seconds: f32) -> Option<f32> {
+    if !(bpm > 0.0 && seconds > 0.0) {
         return None;
     }
-    let best_raw = candidates
-        .iter()
-        .map(|c| c.confidence)
-        .fold(0.0_f32, f32::max);
-    let project = project_bpm.filter(|bpm| bpm.is_finite() && *bpm > 0.0);
-
-    // Rank by `raw_score + project_prior_bonus`, with a decisive promotion for a
-    // strong candidate within ±3% of the project tempo (spec Fix 5). The prior
-    // only nudges; it never forces the project tempo onto a weak near candidate.
-    let mut selected_idx = 0usize;
-    let mut selected_final = f32::MIN;
-    let mut reason = "highest confidence".to_string();
-    for (i, candidate) in candidates.iter().enumerate() {
-        let mut final_score = candidate.confidence;
-        let mut promoted = false;
-        if let Some(p) = project {
-            final_score += project_prior_bonus(candidate.bpm, p);
-            let dist = (candidate.bpm - p).abs() / p;
-            if dist <= TEMPO_PROJECT_NEAR_TOLERANCE
-                && candidate.confidence >= best_raw * TEMPO_PROJECT_NEAR_SCORE_MARGIN
-            {
-                final_score += TEMPO_PROJECT_NEAR_PROMOTION;
-                promoted = true;
-            }
-        }
-        if final_score > selected_final {
-            selected_final = final_score;
-            selected_idx = i;
-            reason = if promoted {
-                format!(
-                    "near project tempo ({:.1} BPM) with a competitive score",
-                    project.unwrap_or(0.0)
-                )
-            } else if project.is_some() && candidate.confidence < best_raw - f32::EPSILON {
-                "project-prior weighted".to_string()
-            } else {
-                "highest confidence".to_string()
-            };
-        }
+    let beats = seconds * bpm / 60.0;
+    if beats > TEMPO_LOOP_MAX_BEATS {
+        return None;
     }
-    let selected = candidates[selected_idx].clone();
-
-    let mut alternatives: Vec<f32> = candidates.iter().take(10).map(|c| c.bpm).collect();
-    alternatives.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    alternatives.dedup_by(|a, b| (*a - *b).abs() < 0.35);
-
-    let confidence = selected.confidence.clamp(0.0, 1.0);
-    Some(TempoDetectionResult {
-        bpm: selected.bpm,
-        confidence,
-        low_confidence: confidence < TEMPO_LOW_CONFIDENCE,
-        alternatives,
-        candidates,
-        selection_reason: reason,
-    })
+    let bars = (beats / 4.0).round().max(1.0);
+    let fitted = bars * 4.0 * 60.0 / seconds;
+    ((fitted - bpm).abs() <= TEMPO_LOOP_SNAP_BPM).then_some(fitted)
 }
 
-/// Lightweight offline tempo detector for UI analysis jobs. Callers should run
-/// this on a background worker after decoding/mixing a clip to mono; it is not
-/// a realtime DSP function.
+/// Offline tempo detector for the Inspector's Detect and Auto Find. Callers
+/// run it on a background worker after decoding the clip's window to mono; it
+/// is not a realtime DSP function.
+///
+/// The measuring is [`SphereAudioProcessor::estimate_bpm_candidates`], the
+/// same analysis as the Find Tempo & Key window, so the two never disagree.
+/// What this adds is the choice a fit needs:
+///
+/// * **The octave nearest the project tempo.** Half and double time are the
+///   same pulse counted at another level; the one closest to the project
+///   needs the least stretch, so it is the one the clip is fitted at. ÷2 and
+///   ×2 in the Inspector correct it.
+/// * **Whole bars for a loop** (see [`whole_bar_tempo`]).
+///
+/// Tempos that are not half or double the measured one are only ever offered
+/// when the audio itself supports them. Deriving 3:2 or 4:3 readings from the
+/// winner and scoring them as if they had been measured is what read loops at
+/// tempos like 124.88 against a 180 BPM project.
 pub fn detect_tempo_from_mono(
     samples: &[f32],
     sample_rate: f32,
@@ -781,82 +275,63 @@ pub fn detect_tempo_from_mono(
     if samples.len() < 4 || sample_rate <= 0.0 || min_bpm <= 0.0 || max_bpm <= min_bpm {
         return None;
     }
+    let measured =
+        SphereAudioProcessor::estimate_bpm_candidates(samples, sample_rate, min_bpm, max_bpm);
+    let best = *measured.first()?;
+    let project = project_bpm.filter(|bpm| bpm.is_finite() && *bpm > 0.0);
+    let stretch_from_project = |bpm: f32| project.map_or(0.0, |p| (bpm / p).log2().abs());
+    let (octave_bpm, relation) = [
+        (1.0_f32, TempoRelation::Raw),
+        (0.5, TempoRelation::Half),
+        (2.0, TempoRelation::Double),
+    ]
+    .into_iter()
+    .map(|(ratio, relation)| (best.bpm * ratio, relation))
+    .filter(|(bpm, _)| *bpm >= min_bpm && *bpm <= max_bpm)
+    .min_by(|a, b| stretch_from_project(a.0).total_cmp(&stretch_from_project(b.0)))
+    .unwrap_or((best.bpm, TempoRelation::Raw));
 
-    let (windowed, _duration) = prepare_mono_for_tempo_analysis(samples, sample_rate);
-    if windowed.len() < TEMPO_FRAME * 4 {
-        return None;
-    }
+    let seconds = samples.len() as f32 / sample_rate;
+    let bar_fit = whole_bar_tempo(octave_bpm, seconds);
+    let bpm = bar_fit.unwrap_or(octave_bpm);
 
-    let mono = normalize_peak_safe(&remove_dc(&windowed));
-    let analysis_rate = TEMPO_ANALYSIS_RATE.min(sample_rate).max(1.0);
-    let downsampled = downsample_mono(&mono, sample_rate, analysis_rate);
-    if downsampled.len() < TEMPO_FRAME * 4 {
-        return None;
+    let mut candidates: Vec<TempoCandidate> = measured
+        .iter()
+        .map(|c| TempoCandidate {
+            bpm: c.bpm,
+            confidence: c.confidence,
+            relation: TempoRelation::Raw,
+        })
+        .collect();
+    if candidates.iter().all(|c| (c.bpm - bpm).abs() >= 0.05) {
+        candidates.insert(
+            0,
+            TempoCandidate {
+                bpm,
+                confidence: best.confidence,
+                relation,
+            },
+        );
     }
+    let mut alternatives: Vec<f32> = candidates.iter().map(|c| c.bpm).collect();
+    alternatives.sort_by(f32::total_cmp);
+    alternatives.dedup_by(|a, b| (*a - *b).abs() < 0.05);
 
-    let env_rate = analysis_rate / TEMPO_HOP as f32;
-    // ~1 s adaptive-threshold window for the onset envelope.
-    let local_mean_window = (env_rate).round().max(3.0) as usize;
-    let envelope = build_onset_envelope(&downsampled, TEMPO_FRAME, TEMPO_HOP, local_mean_window);
-    if envelope.len() < 8 {
-        return None;
-    }
-    if envelope.iter().map(|v| v * v).sum::<f32>() <= f32::EPSILON {
-        return None;
-    }
-
-    // Dense BPM scan (+ fine project neighbourhood) → local-maxima candidates.
-    let scan = scan_tempo_scores(&envelope, env_rate, min_bpm, max_bpm, project_bpm);
-    if scan.bpms.is_empty() {
-        return None;
-    }
-    let raw_peaks = pick_tempo_peaks(&scan);
-    if raw_peaks.is_empty() {
-        return None;
-    }
-
-    let mut all_candidates: Vec<TempoCandidate> = Vec::new();
-    all_candidates.extend(raw_peaks.iter().take(8).cloned());
-    for peak in raw_peaks.iter().take(6) {
-        all_candidates.extend(expand_tempo_family(
-            peak.bpm,
-            peak.confidence,
-            min_bpm,
-            max_bpm,
-        ));
-    }
-    // Always seed project tempo and its half/double as candidates so they can be
-    // selected/promoted and always appear among alternatives (spec Fix 5/6).
-    if let Some(project) =
-        project_bpm.filter(|bpm| bpm.is_finite() && *bpm >= min_bpm && *bpm <= max_bpm)
-    {
-        for bpm in [project, project * 0.5, project * 2.0] {
-            if bpm >= min_bpm && bpm <= max_bpm {
-                all_candidates.push(TempoCandidate {
-                    bpm,
-                    confidence: scan.score_at(bpm),
-                    relation: TempoRelation::ProjectPrior,
-                });
-            }
-        }
-    }
-
-    let mut result = choose_musical_bpm_candidate(&all_candidates, project_bpm, min_bpm, max_bpm)?;
-    result.alternatives = build_tempo_alternatives(
-        result.bpm,
-        &result.candidates,
-        &scan,
-        project_bpm,
-        min_bpm,
-        max_bpm,
-    );
-    // Report confidence as candidate strength × how much the best tempo stands
-    // out (salience). A flat, ambiguous scan → low confidence → the UI requires
-    // the user to pick instead of auto-committing (spec Fix 1/8).
-    let reported = (result.confidence * scan.salience).clamp(0.0, 1.0);
-    result.confidence = reported;
-    result.low_confidence = reported < TEMPO_LOW_CONFIDENCE;
-    Some(result)
+    let confidence = best.confidence.clamp(0.0, 1.0);
+    let selection_reason = match (relation, bar_fit.is_some()) {
+        (TempoRelation::Raw, false) => "strongest pulse".to_string(),
+        (TempoRelation::Raw, true) => "strongest pulse, whole bars".to_string(),
+        (_, false) => "octave nearest the project tempo".to_string(),
+        (_, true) => "octave nearest the project tempo, whole bars".to_string(),
+    };
+    Some(TempoDetectionResult {
+        bpm,
+        confidence,
+        low_confidence: confidence < TEMPO_LOW_CONFIDENCE,
+        alternatives,
+        candidates,
+        selection_reason,
+    })
 }
 
 /// Unique BPM alternatives suitable for a compact picker.
@@ -1475,8 +950,85 @@ impl AudioClipStretchState {
     /// Whether the project tempo owns this clip's *bar count* rather than its
     /// wall-clock length. Tempo Sync and Warp are defined in beats; every other
     /// mode is defined in seconds.
+    ///
+    /// A Tempo Sync clip with no tempo of its own has nothing to lock to: the
+    /// engine plays it one to one in seconds, so it is measured in seconds
+    /// here too, or the clip would be drawn one length and heard another.
     pub fn follows_project_tempo(&self) -> bool {
-        matches!(self.mode, StretchMode::TempoSync | StretchMode::Warp)
+        match self.mode {
+            StretchMode::Warp => true,
+            StretchMode::TempoSync => self.valid_source_bpm().is_some(),
+            _ => false,
+        }
+    }
+
+    fn valid_source_bpm(&self) -> Option<f64> {
+        self.bpm_source.filter(|bpm| bpm.is_finite() && *bpm > 0.0)
+    }
+
+    /// Seconds of source audio in the clip's window, or `None` while the
+    /// window has not been decoded.
+    pub fn source_window_seconds(&self) -> Option<f64> {
+        let rate = self.source_sample_rate();
+        let len = self.source_len_samples();
+        (rate > 0 && len > 0).then(|| len as f64 / rate as f64)
+    }
+
+    /// The tempo the clip's audio must be at for its window to span `beats`
+    /// once it is fitted to the project tempo: `beats × 60 / window seconds`.
+    ///
+    /// A clip fitted to the tempo plays one of its own beats per project beat
+    /// wherever the project tempo goes, so its length in beats is
+    /// `window seconds × source BPM / 60` under any tempo map — this is that
+    /// equation solved for the source BPM. Kept to the stretch the engine
+    /// accepts at `project_bpm`. `None` while the window is undecoded.
+    pub fn source_bpm_for_beats(&self, beats: f64, project_bpm: f64) -> Option<f64> {
+        let seconds = self.source_window_seconds()?;
+        if !(beats.is_finite() && beats > 0.0 && project_bpm.is_finite() && project_bpm > 0.0) {
+            return None;
+        }
+        let bpm = beats * 60.0 / seconds;
+        Some(bpm.clamp(project_bpm * Self::MIN_RATIO, project_bpm * Self::MAX_RATIO))
+    }
+
+    /// Length in beats of the clip once fitted to the tempo, from its own
+    /// tempo: `window seconds × source BPM / 60`, under any tempo map.
+    pub fn fitted_beats(&self) -> Option<f64> {
+        Some(self.source_window_seconds()? * self.valid_source_bpm()? / 60.0)
+    }
+
+    /// Next state fitted to the project tempo with `source_bpm` as the clip's
+    /// own tempo: Tempo timing, keeping the clip's pitch choice, so the clip
+    /// follows every tempo change from now on.
+    ///
+    /// A Warp clip is already locked to the tempo by its markers; it only
+    /// records the tempo, and keeps its markers.
+    pub fn fitted_to_source_bpm(&self, source_bpm: f64, project_bpm: f64) -> Self {
+        let mut next = match self.mode {
+            StretchMode::Warp | StretchMode::TempoSync => self.clone(),
+            _ => self.with_timing(StretchTiming::Tempo, project_bpm),
+        };
+        if !(source_bpm.is_finite() && source_bpm > 0.0) {
+            return next;
+        }
+        let project_bpm = if project_bpm.is_finite() && project_bpm > 0.0 {
+            project_bpm
+        } else {
+            source_bpm
+        };
+        let source_bpm =
+            source_bpm.clamp(project_bpm * Self::MIN_RATIO, project_bpm * Self::MAX_RATIO);
+        next.bpm_source = Some(source_bpm);
+        if next.mode == StretchMode::TempoSync {
+            next.bpm_target = Some(project_bpm);
+            next.set_stretch_ratio(Self::source_bpm_to_project_bpm_ratio(
+                source_bpm,
+                project_bpm,
+            ));
+        }
+        next.clip_timeline_duration_beats = 0.0;
+        next.dirty = true;
+        next
     }
 
     /// Time-stretch ratio actually used for playback / clip length, resolving
@@ -2023,6 +1575,34 @@ mod tests {
     }
 
     #[test]
+    fn the_source_tempo_for_a_length_is_the_beats_over_the_window() {
+        let mut s = manual_clip(192_000);
+        s.original_sample_rate = 48_000;
+        s.project_sample_rate = 48_000;
+        // 4 s over 8 beats: 120 BPM audio.
+        approx(s.source_bpm_for_beats(8.0, 100.0).unwrap(), 120.0);
+        // Held to the stretch the engine accepts.
+        approx(
+            s.source_bpm_for_beats(10_000.0, 100.0).unwrap(),
+            100.0 * AudioClipStretchState::MAX_RATIO,
+        );
+        let fitted = s.fitted_to_source_bpm(120.0, 100.0);
+        assert_eq!(fitted.timing(), StretchTiming::Tempo);
+        approx(fitted.fitted_beats().unwrap(), 8.0);
+        approx(fitted.effective_time_ratio(100.0), 1.2);
+    }
+
+    #[test]
+    fn a_warp_clip_only_records_a_fitted_tempo() {
+        let mut s = manual_clip(192_000);
+        s.mode = StretchMode::Warp;
+        let fitted = s.fitted_to_source_bpm(120.0, 100.0);
+        assert_eq!(fitted.mode, StretchMode::Warp);
+        assert_eq!(fitted.bpm_source, Some(120.0));
+        approx(fitted.stretch_ratio, s.stretch_ratio);
+    }
+
+    #[test]
     fn set_stretch_ratio_clamps_to_bounds() {
         let mut s = manual_clip(1000);
         s.set_stretch_ratio(1000.0);
@@ -2106,102 +1686,101 @@ mod tests {
         assert!(!s.transient_preserve);
     }
 
+    /// A drum loop: kick on every beat, snare on 2 and 4, closed hats on
+    /// eighths, over a sustained bass note.
+    fn drum_loop(bpm: f32, seconds: f32, sample_rate: f32) -> Vec<f32> {
+        let n = (sample_rate * seconds) as usize;
+        let beat = 60.0 / bpm;
+        let mut state = 7u32;
+        let mut noise = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sample_rate;
+                let in_beat = t % beat;
+                let beat_index = (t / beat) as usize;
+                let in_eighth = t % (beat * 0.5);
+                let kick =
+                    (-in_beat * 30.0).exp() * (2.0 * std::f32::consts::PI * 55.0 * in_beat).sin();
+                let snare = if beat_index % 2 == 1 {
+                    (-in_beat * 25.0).exp() * noise() * 0.6
+                } else {
+                    0.0
+                };
+                let hat = (-in_eighth * 120.0).exp() * noise() * 0.25;
+                let bass = 0.5 * (2.0 * std::f32::consts::PI * 41.2 * t).sin();
+                kick + snare + hat + bass
+            })
+            .collect()
+    }
+
+    const DETECT_RATE: f32 = 22_050.0;
+
     #[test]
     fn detect_tempo_from_mono_finds_simple_pulse() {
-        let sample_rate = 11_025.0;
-        let seconds = 8.0;
-        let mut samples = vec![0.0; (sample_rate * seconds) as usize];
-        let beat = (sample_rate * 0.5) as usize;
-        for i in (0..samples.len()).step_by(beat) {
-            for j in 0..128 {
-                if let Some(sample) = samples.get_mut(i + j) {
-                    *sample = 1.0 - (j as f32 / 128.0);
-                }
-            }
-        }
+        let samples = drum_loop(120.0, 20.0, DETECT_RATE);
         let result =
-            detect_tempo_from_mono(&samples, sample_rate, 60.0, 200.0, Some(120.0)).unwrap();
-        assert!(
-            (result.bpm - 120.0).abs() < 8.0,
-            "expected ~120 BPM, got {:?}",
-            result
-        );
-        assert!(result
-            .alternatives
-            .iter()
-            .any(|b| (*b - 120.0).abs() < 10.0));
+            detect_tempo_from_mono(&samples, DETECT_RATE, 60.0, 200.0, Some(120.0)).unwrap();
+        assert!((result.bpm - 120.0).abs() <= 0.1, "{result:?}");
+        assert!(!result.low_confidence, "{result:?}");
+    }
+
+    /// The project tempo picks the octave, never a tempo the audio is not at:
+    /// a 118 BPM loop in a 120 BPM project is 118.
+    #[test]
+    fn a_tempo_near_the_project_is_not_pulled_onto_it() {
+        let samples = drum_loop(118.0, 20.0, DETECT_RATE);
+        let result =
+            detect_tempo_from_mono(&samples, DETECT_RATE, 60.0, 200.0, Some(120.0)).unwrap();
+        assert!((result.bpm - 118.0).abs() <= 0.1, "{result:?}");
+    }
+
+    /// No 3:2 or 3:4 reading of the pulse is invented: a loop at 166 BPM in a
+    /// 180 BPM project reads 166 (once read as 124.88 = 166.5 × 3/4).
+    #[test]
+    fn related_tempos_are_measured_not_derived() {
+        let samples = drum_loop(166.0, 20.0, DETECT_RATE);
+        let result =
+            detect_tempo_from_mono(&samples, DETECT_RATE, 60.0, 200.0, Some(180.0)).unwrap();
+        assert!((result.bpm - 166.0).abs() <= 0.15, "{result:?}");
+    }
+
+    /// Half and double time are the same pulse; the clip is fitted at the one
+    /// nearest the project, which needs the least stretch.
+    #[test]
+    fn the_octave_nearest_the_project_is_chosen() {
+        let samples = drum_loop(87.0, 20.0, DETECT_RATE);
+        let fast =
+            detect_tempo_from_mono(&samples, DETECT_RATE, 60.0, 200.0, Some(170.0)).unwrap();
+        assert!((fast.bpm - 174.0).abs() <= 0.2, "{fast:?}");
+        let slow =
+            detect_tempo_from_mono(&samples, DETECT_RATE, 60.0, 200.0, Some(90.0)).unwrap();
+        assert!((slow.bpm - 87.0).abs() <= 0.1, "{slow:?}");
+    }
+
+    /// A loop cut on its bar lines is read at the tempo that makes it whole
+    /// bars, finer than onsets can measure.
+    #[test]
+    fn a_loop_is_read_at_whole_bars() {
+        let bpm = 123.37_f32;
+        let seconds = 32.0 * 60.0 / bpm;
+        let samples = drum_loop(bpm, seconds, DETECT_RATE);
+        let result =
+            detect_tempo_from_mono(&samples, DETECT_RATE, 60.0, 200.0, Some(120.0)).unwrap();
+        let beats = samples.len() as f32 / DETECT_RATE * result.bpm / 60.0;
+        assert!((beats - 32.0).abs() < 1.0e-3, "{beats} beats: {result:?}");
     }
 
     #[test]
-    fn choose_musical_bpm_prefers_project_when_scores_close() {
-        let candidates = vec![
-            TempoCandidate {
-                bpm: 107.67,
-                confidence: 0.81,
-                relation: TempoRelation::Raw,
-            },
-            TempoCandidate {
-                bpm: 127.0,
-                confidence: 0.77,
-                relation: TempoRelation::ThreeHalves,
-            },
-        ];
-        let result = choose_musical_bpm_candidate(&candidates, Some(127.0), 60.0, 200.0).unwrap();
-        assert!((result.bpm - 127.0).abs() < 0.5);
-    }
-
-    #[test]
-    fn choose_musical_bpm_keeps_best_raw_when_project_candidate_weak() {
-        let candidates = vec![
-            TempoCandidate {
-                bpm: 107.0,
-                confidence: 0.81,
-                relation: TempoRelation::Raw,
-            },
-            TempoCandidate {
-                bpm: 127.0,
-                confidence: 0.40,
-                relation: TempoRelation::ThreeHalves,
-            },
-        ];
-        let result = choose_musical_bpm_candidate(&candidates, Some(127.0), 60.0, 200.0).unwrap();
-        assert!((result.bpm - 107.0).abs() < 0.5);
-    }
-
-    #[test]
-    fn choose_musical_bpm_doubles_slow_candidate_near_project() {
-        let candidates = vec![
-            TempoCandidate {
-                bpm: 63.5,
-                confidence: 0.70,
-                relation: TempoRelation::Half,
-            },
-            TempoCandidate {
-                bpm: 127.0,
-                confidence: 0.68,
-                relation: TempoRelation::Double,
-            },
-        ];
-        let result = choose_musical_bpm_candidate(&candidates, Some(127.0), 60.0, 200.0).unwrap();
-        assert!((result.bpm - 127.0).abs() < 1.0);
-    }
-
-    #[test]
-    fn choose_musical_bpm_corrects_common_drift_via_six_fifths() {
-        let candidates = vec![
-            TempoCandidate {
-                bpm: 107.67,
-                confidence: 0.81,
-                relation: TempoRelation::Raw,
-            },
-            TempoCandidate {
-                bpm: 129.2,
-                confidence: 0.76,
-                relation: TempoRelation::ThreeHalves,
-            },
-        ];
-        let result = choose_musical_bpm_candidate(&candidates, Some(127.0), 60.0, 200.0).unwrap();
-        assert!((result.bpm - 129.2).abs() < 1.0 || (result.bpm - 127.0).abs() < 2.0);
+    fn whole_bars_never_move_a_tempo_far() {
+        // 10 s at 120 BPM is 20 beats = 5 bars exactly.
+        assert_eq!(whole_bar_tempo(120.1, 10.0), Some(120.0));
+        // 4.5 bars: no whole bar count is near.
+        assert_eq!(whole_bar_tempo(108.0, 10.0), None);
+        // A whole song is not a loop.
+        assert_eq!(whole_bar_tempo(120.1, 200.0), None);
     }
 
     #[test]
@@ -2220,68 +1799,6 @@ mod tests {
         );
     }
 
-    // ── Auto Find BPM fixes (spec Fix 5/6/8, acceptance tests) ──────────────
-
-    #[test]
-    fn project_prior_promotes_strong_near_candidate_over_raw_top() {
-        // Fix 10 case 1: raw top 124 @ 1.0 vs 118 @ 0.88, project 120. 118 is
-        // within ±3% of project and within 20% of the top score, so it outranks
-        // 124 even though 124 scored slightly higher raw.
-        let candidates = vec![
-            TempoCandidate {
-                bpm: 124.0,
-                confidence: 1.0,
-                relation: TempoRelation::Raw,
-            },
-            TempoCandidate {
-                bpm: 118.0,
-                confidence: 0.88,
-                relation: TempoRelation::Raw,
-            },
-        ];
-        let result = choose_musical_bpm_candidate(&candidates, Some(120.0), 60.0, 200.0).unwrap();
-        assert!(
-            (result.bpm - 118.0).abs() < 0.5,
-            "expected ~118 promoted, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn project_prior_keeps_raw_top_when_near_candidate_is_weak() {
-        // Fix 10 case 2: raw top 124 @ 1.0 vs 118 @ 0.40, project 120. 118 is
-        // below the 20% margin, so the confident 124 stays selected.
-        let candidates = vec![
-            TempoCandidate {
-                bpm: 124.0,
-                confidence: 1.0,
-                relation: TempoRelation::Raw,
-            },
-            TempoCandidate {
-                bpm: 118.0,
-                confidence: 0.40,
-                relation: TempoRelation::Raw,
-            },
-        ];
-        let result = choose_musical_bpm_candidate(&candidates, Some(120.0), 60.0, 200.0).unwrap();
-        assert!(
-            (result.bpm - 124.0).abs() < 0.5,
-            "expected 124 retained, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn project_prior_bonus_peaks_at_project_and_decays() {
-        let exact = project_prior_bonus(120.0, 120.0);
-        let near = project_prior_bonus(118.0, 120.0);
-        let octave = project_prior_bonus(60.0, 120.0);
-        approx(exact as f64, TEMPO_PROJECT_PRIOR_WEIGHT as f64);
-        assert!(near < exact && near > octave);
-        assert!(
-            octave < 0.001,
-            "an octave away should be negligible: {octave}"
-        );
-    }
-
     #[test]
     fn manual_source_bpm_drives_fit_project_ratio() {
         // Fix 10 case 4: user types 118, project 120 → ratio 118/120 = 0.98333.
@@ -2290,57 +1807,5 @@ mod tests {
         assert!(s.fit_to_project_tempo(120.0));
         approx(s.stretch_ratio, 118.0 / 120.0);
         approx(s.stretch_ratio, 0.983_333_333_333_333_3);
-    }
-
-    #[test]
-    fn alternatives_always_surface_project_neighbourhood() {
-        // Fix 10 case 5 / Fix 6: with a scan peaking at 118 and project 120, the
-        // alternatives must include both the true tempo (118) and the project (120).
-        let scan = TempoScan {
-            bpms: vec![110.0, 114.0, 118.0, 120.0, 122.0, 126.0, 140.0],
-            scores: vec![0.30, 0.60, 1.00, 0.55, 0.50, 0.20, 0.40],
-            salience: 0.7,
-        };
-        let candidates = vec![TempoCandidate {
-            bpm: 118.0,
-            confidence: 1.0,
-            relation: TempoRelation::Raw,
-        }];
-        let alts = build_tempo_alternatives(118.0, &candidates, &scan, Some(120.0), 60.0, 200.0);
-        assert!(
-            alts.iter().any(|b| (*b - 118.0).abs() < 1.0),
-            "alternatives should include the detected tempo 118: {alts:?}"
-        );
-        assert!(
-            alts.iter().any(|b| (*b - 120.0).abs() < 1.0),
-            "alternatives should include the project tempo 120: {alts:?}"
-        );
-    }
-
-    #[test]
-    fn detect_118_pulse_against_120_project_surfaces_real_tempo() {
-        // End-to-end: a clean 118 BPM pulse in a 120 BPM project must either be
-        // detected near 118 or expose 118 and 120 as alternatives (spec acceptance).
-        let sample_rate = 11_025.0;
-        let seconds = 18.0;
-        let mut samples = vec![0.0; (sample_rate * seconds) as usize];
-        let beat = (sample_rate * 60.0 / 118.0) as usize; // 118 BPM
-        for i in (0..samples.len()).step_by(beat) {
-            for j in 0..128 {
-                if let Some(sample) = samples.get_mut(i + j) {
-                    *sample = 1.0 - (j as f32 / 128.0);
-                }
-            }
-        }
-        let result =
-            detect_tempo_from_mono(&samples, sample_rate, 60.0, 200.0, Some(120.0)).unwrap();
-        let near_118 = (result.bpm - 118.0).abs() < 4.0
-            || result.alternatives.iter().any(|b| (*b - 118.0).abs() < 3.0);
-        let has_project = result.alternatives.iter().any(|b| (*b - 120.0).abs() < 2.0);
-        assert!(near_118, "expected 118 detected or offered: {result:?}");
-        assert!(
-            has_project,
-            "expected project 120 among alternatives: {result:?}"
-        );
     }
 }

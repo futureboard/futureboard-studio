@@ -271,6 +271,9 @@ pub enum HostCommand {
     /// path. The host decodes on its IPC thread and hands the buffer to the
     /// audio producer for adoption the next time that pad is triggered; it
     /// replies [`HostEvent::BuiltinDrumSampleResult`] either way.
+    ///
+    /// An empty `name` and `audio_b64` clears the slot instead; the reply
+    /// echoes the empty name.
     LoadBuiltinDrumSample {
         plugin_instance_id: String,
         pad_index: u32,

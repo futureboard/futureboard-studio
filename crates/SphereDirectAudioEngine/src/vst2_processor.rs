@@ -15,7 +15,7 @@ pub struct SphereDauxVst2Processor {
 /// Raw VST2 bridge entry points, mirroring `vst3_processor::ffi`.
 pub(crate) mod ffi {
     use super::SphereDauxVst2Processor;
-    use crate::vst3_processor::Vst3MidiEvent;
+    use crate::vst3_processor::{PluginMidiOutEvent, Vst3MidiEvent};
     use std::os::raw::{c_char, c_double, c_float};
 
     extern "C" {
@@ -65,6 +65,11 @@ pub(crate) mod ffi {
         ) -> i32;
         pub(crate) fn sphere_daux_vst2_event_input_bus_count(
             processor: *mut SphereDauxVst2Processor,
+        ) -> i32;
+        pub(crate) fn sphere_daux_vst2_take_output_midi(
+            processor: *mut SphereDauxVst2Processor,
+            out: *mut PluginMidiOutEvent,
+            max_count: i32,
         ) -> i32;
         pub(crate) fn sphere_daux_vst2_audio_input_bus_count(
             processor: *mut SphereDauxVst2Processor,
@@ -302,6 +307,7 @@ pub(crate) mod ffi {
         sphere_daux_vst2_set_param as set_param,
         sphere_daux_vst2_set_process_context as set_process_context,
         sphere_daux_vst2_set_state as set_state, sphere_daux_vst2_state_free as state_free,
+        sphere_daux_vst2_take_output_midi as take_output_midi,
         sphere_daux_vst2_take_pending_shell_resize as take_pending_shell_resize,
         sphere_daux_vst2_take_state_touched as take_state_touched,
         sphere_daux_vst2_view_attach as view_attach,

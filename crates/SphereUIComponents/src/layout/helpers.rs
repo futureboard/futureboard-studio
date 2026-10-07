@@ -234,13 +234,14 @@ pub(super) fn find_clip_summary<'a>(
                 project_bpm,
                 selection_duration_beats,
                 fades: None,
+                beats_per_bar: 4.0,
             });
         }
     }
     None
 }
 
-pub(super) fn reveal_path(path: &std::path::Path) {
+pub(crate) fn reveal_path(path: &std::path::Path) {
     #[cfg(target_os = "windows")]
     {
         if path.is_file() {

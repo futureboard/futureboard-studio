@@ -7,6 +7,14 @@
 //! phase up with the other. Each band's side is scaled by that band's width,
 //! the bands are summed, and mid/side is turned back into left/right.
 //!
+//! Each band can also be *stereoized* — side made from its own mid, for
+//! material with too little width to widen — in one of two characters: a
+//! short Haas delay (I), or an all-pass decorrelator that smears rather than
+//! combs (II). Either only ever adds side, so the mono sum is untouched. And
+//! *Recover Sides* puts the side a narrowed band loses back into its mid,
+//! decorrelated so it does not comb against what is there, instead of
+//! letting it vanish.
+//!
 //! Splitting mid as well as side is what makes the plugin transparent at rest:
 //! the two see the identical phase response, so with every width at 100 % the
 //! output is the input through one shared all-pass — no comb, no level change,
@@ -19,6 +27,7 @@
 //! arithmetic on them.
 
 use builtin_dsp_core::crossover::FourBandSplitter as BandSplitter;
+use builtin_dsp_core::delay::{Allpass, DelayRing};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
     flush_denormal, max_filter_frequency, time_constant,
@@ -26,11 +35,13 @@ use builtin_dsp_core::{
 use serde::{Deserialize, Serialize};
 
 pub mod ipc;
+pub mod presets;
 pub mod ui;
 
 /// Editor-facing parameter id table, re-exported at the crate root so the host
 /// resolves ids the same way for every built-in (`<plugin>::ui_param_index`).
 pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 pub const PLUGIN_ID: &str = "futureboard.imager";
 
@@ -45,6 +56,61 @@ pub const DEFAULT_CROSSOVERS_HZ: [f32; CROSSOVER_COUNT] = [120.0, 1_000.0, 6_000
 /// as it came in, 200 doubles its side.
 pub const MAX_WIDTH: f32 = 200.0;
 pub const DEFAULT_WIDTH: f32 = 100.0;
+
+/// Stereoize amount ceiling, in percent.
+pub const MAX_STEREOIZE: f32 = 100.0;
+/// Side a band's stereoize makes at 100 %, against its mid.
+const STEREOIZE_DEPTH: f32 = 0.8;
+/// Stereoize I: the Haas delay each band's side is taken from, lowest band
+/// first — longer for the lows, whose periods are longer.
+const HAAS_MS: [f32; BAND_COUNT] = [14.0, 11.0, 8.0, 5.0];
+/// Stereoize II: the decorrelating all-pass chain, and how much each band
+/// scales it.
+const DECORRELATOR_MS: [f32; 3] = [4.3, 7.9, 12.1];
+const DECORRELATOR_SCALE: [f32; BAND_COUNT] = [1.6, 1.0, 0.6, 0.35];
+const DECORRELATOR_GAIN: f32 = 0.6;
+/// Recover Sides: the shorter chain the recovered side passes through.
+const RECOVER_MS: [f32; 2] = [3.1, 5.3];
+const RECOVER_GAIN: f32 = 0.5;
+/// The longest delay any band's decorrelators need, in milliseconds.
+const MAX_HAAS_MS: f32 = 16.0;
+
+/// How a band's stereoize makes side from mid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StereoizeMode {
+    /// A short Haas delay: bold, a little comb-coloured on each side.
+    #[default]
+    One,
+    /// An all-pass decorrelator: smoother, more diffuse.
+    Two,
+}
+
+impl StereoizeMode {
+    pub const ALL: [StereoizeMode; 2] = [StereoizeMode::One, StereoizeMode::Two];
+
+    pub const fn to_wire(self) -> f32 {
+        match self {
+            Self::One => 0.0,
+            Self::Two => 1.0,
+        }
+    }
+
+    pub fn from_wire(value: f32) -> Self {
+        if value.round() >= 1.0 {
+            Self::Two
+        } else {
+            Self::One
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::One => "I",
+            Self::Two => "II",
+        }
+    }
+}
 
 /// `solo_band` value meaning every band is heard.
 pub const SOLO_NONE: i32 = -1;
@@ -85,6 +151,23 @@ pub struct Params {
     /// Band heard alone, or [`SOLO_NONE`].
     pub solo_band: i32,
     pub output_db: f32,
+    /// Per-band stereoize amount in percent, lowest band first. A blob saved
+    /// before stereoize existed loads with none.
+    #[serde(default)]
+    pub stereoize: [f32; BAND_COUNT],
+    #[serde(default)]
+    pub stereoize_mode: StereoizeMode,
+    /// Put the side a narrowed band loses back into its mid.
+    #[serde(default)]
+    pub recover_sides: bool,
+    /// Off, the crossovers are out of play: every band takes the first
+    /// band's settings, and the plugin works on the signal whole.
+    #[serde(default = "multiband_default")]
+    pub multiband: bool,
+}
+
+const fn multiband_default() -> bool {
+    true
 }
 
 pub fn default_params() -> Params {
@@ -94,6 +177,10 @@ pub fn default_params() -> Params {
         width: [DEFAULT_WIDTH; BAND_COUNT],
         solo_band: SOLO_NONE,
         output_db: 0.0,
+        stereoize: [0.0; BAND_COUNT],
+        stereoize_mode: StereoizeMode::One,
+        recover_sides: false,
+        multiband: true,
     }
 }
 
@@ -115,6 +202,16 @@ pub fn descriptor() -> PluginDescriptor {
             default_value: DEFAULT_WIDTH,
             min: 0.0,
             max: MAX_WIDTH,
+            unit: "%",
+        }
+    }
+    const fn stereoize(id: &'static str, name: &'static str) -> ParamDescriptor {
+        ParamDescriptor {
+            id,
+            name,
+            default_value: 0.0,
+            min: 0.0,
+            max: MAX_STEREOIZE,
             unit: "%",
         }
     }
@@ -151,6 +248,34 @@ pub fn descriptor() -> PluginDescriptor {
             min: MIN_OUTPUT_DB,
             max: MAX_OUTPUT_DB,
             unit: "dB",
+        },
+        stereoize("stereoize1", "Stereoize 1"),
+        stereoize("stereoize2", "Stereoize 2"),
+        stereoize("stereoize3", "Stereoize 3"),
+        stereoize("stereoize4", "Stereoize 4"),
+        ParamDescriptor {
+            id: "stereoizeMode",
+            name: "Stereoize Mode",
+            default_value: 0.0,
+            min: 0.0,
+            max: 1.0,
+            unit: "enum",
+        },
+        ParamDescriptor {
+            id: "recoverSides",
+            name: "Recover Sides",
+            default_value: 0.0,
+            min: 0.0,
+            max: 1.0,
+            unit: "bool",
+        },
+        ParamDescriptor {
+            id: "multiband",
+            name: "Multiband",
+            default_value: 1.0,
+            min: 0.0,
+            max: 1.0,
+            unit: "bool",
         },
     ];
     PluginDescriptor {
@@ -263,12 +388,72 @@ pub struct MeterFrame {
     pub out_clip: bool,
 }
 
+/// One band's decorrelators: where its stereoize and recovered side come
+/// from.
+#[derive(Debug, Clone)]
+struct BandSpread {
+    /// Stereoize I: the band's mid, delayed.
+    haas: DelayRing,
+    haas_samples: f32,
+    /// Stereoize II: the band's mid, smeared.
+    chain: [Allpass; 3],
+    /// Recover Sides: the lost side, smeared.
+    recover: [Allpass; 2],
+}
+
+impl BandSpread {
+    fn new(band: usize, sample_rate: f32) -> Self {
+        let scale = DECORRELATOR_SCALE[band];
+        Self {
+            haas: DelayRing::for_ms(MAX_HAAS_MS, sample_rate),
+            haas_samples: HAAS_MS[band] * 0.001 * sample_rate,
+            chain: DECORRELATOR_MS.map(|ms| Allpass::for_ms(ms * scale, sample_rate)),
+            recover: RECOVER_MS.map(|ms| Allpass::for_ms(ms * scale, sample_rate)),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.haas.clear();
+        for stage in &mut self.chain {
+            stage.clear();
+        }
+        for stage in &mut self.recover {
+            stage.clear();
+        }
+    }
+
+    /// Side made from `mid` by each mode, `(I, II)`. Both run every sample,
+    /// so a mode switch lands on settled state rather than a cold buffer.
+    #[inline]
+    fn stereoize(&mut self, mid: f32) -> (f32, f32) {
+        self.haas.push(mid);
+        let haas = self.haas.read_linear(self.haas_samples);
+        let smeared = self
+            .chain
+            .iter_mut()
+            .fold(mid, |x, stage| stage.process(x, DECORRELATOR_GAIN));
+        (haas, smeared)
+    }
+
+    #[inline]
+    fn recover(&mut self, lost: f32) -> f32 {
+        self.recover
+            .iter_mut()
+            .fold(lost, |x, stage| stage.process(x, RECOVER_GAIN))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Dsp {
     sample_rate: f32,
     params: Params,
     mid: BandSplitter,
     side: BandSplitter,
+    spread: [BandSpread; BAND_COUNT],
+    /// Per band, gliding toward the stereoize amount (0–1) and the recover
+    /// switch (0 or 1).
+    stereoize_gain: [f32; BAND_COUNT],
+    recover_gain: f32,
 
     /// Side gain per band, gliding toward `params.width`.
     width_gain: [f32; BAND_COUNT],
@@ -300,6 +485,9 @@ impl Dsp {
             sample_rate: sr,
             mid: BandSplitter::new(hz, sr),
             side: BandSplitter::new(hz, sr),
+            spread: std::array::from_fn(|band| BandSpread::new(band, sr)),
+            stereoize_gain: [0.0; BAND_COUNT],
+            recover_gain: 0.0,
             width_gain: params.width.map(|w| w / 100.0),
             output_gain: 1.0,
             output_target: 1.0,
@@ -331,7 +519,9 @@ impl Dsp {
         self.params = params;
         ipc::sanitize_params(&mut self.params);
         self.retune();
-        self.width_gain = self.params.width.map(|w| w / 100.0);
+        self.width_gain = std::array::from_fn(|band| self.band_width(band));
+        self.stereoize_gain = std::array::from_fn(|band| self.band_stereoize(band));
+        self.recover_gain = f32::from(self.params.recover_sides);
         self.output_target = db_to_linear(self.params.output_db);
         self.output_gain = self.output_target;
     }
@@ -404,6 +594,23 @@ impl Dsp {
         }
     }
 
+    /// The band whose settings `band` plays: itself, or the first band when
+    /// multiband is off.
+    #[inline]
+    fn source_band(&self, band: usize) -> usize {
+        if self.params.multiband { band } else { 0 }
+    }
+
+    #[inline]
+    fn band_width(&self, band: usize) -> f32 {
+        self.params.width[self.source_band(band)] * 0.01
+    }
+
+    #[inline]
+    fn band_stereoize(&self, band: usize) -> f32 {
+        self.params.stereoize[self.source_band(band)] / MAX_STEREOIZE
+    }
+
     fn retune(&mut self) {
         let hz = effective_crossovers(&self.params, self.sample_rate);
         self.mid.retune(hz, self.sample_rate);
@@ -439,6 +646,9 @@ impl StereoEffect for Dsp {
     fn reset(&mut self) {
         self.mid.reset();
         self.side.reset();
+        for spread in &mut self.spread {
+            spread.clear();
+        }
         self.correlation.reset();
         for band in &mut self.band_correlation {
             band.reset();
@@ -461,6 +671,9 @@ impl StereoEffect for Dsp {
         let hz = effective_crossovers(&self.params, sr);
         self.mid = BandSplitter::new(hz, sr);
         self.side = BandSplitter::new(hz, sr);
+        // Off the audio path: a rate change rebuilds the decorrelators at
+        // lengths for the new rate.
+        self.spread = std::array::from_fn(|band| BandSpread::new(band, sr));
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
@@ -477,21 +690,42 @@ impl StereoEffect for Dsp {
         let side = self.side.run(0.5 * (left - right));
 
         let glide = 1.0 - self.smooth_coeff;
-        let solo = self.params.solo_band;
+        // A solo picks a band of a split; with no split there is none.
+        let solo = if self.params.multiband {
+            self.params.solo_band
+        } else {
+            SOLO_NONE
+        };
+        let second_mode = self.params.stereoize_mode == StereoizeMode::Two;
+        let recover_target = f32::from(self.params.recover_sides);
+        self.recover_gain += (recover_target - self.recover_gain) * glide;
         let mut mid_out = 0.0;
         let mut side_out = 0.0;
         for band in 0..BAND_COUNT {
-            let target = self.params.width[band] * 0.01;
-            let gain = &mut self.width_gain[band];
-            *gain += (target - *gain) * glide;
-            let band_side = side[band] * *gain;
+            let width_target = self.band_width(band);
+            let stereoize_target = self.band_stereoize(band);
+            let width = &mut self.width_gain[band];
+            *width += (width_target - *width) * glide;
+            let width = *width;
+            let amount = &mut self.stereoize_gain[band];
+            *amount += (stereoize_target - *amount) * glide;
+            let amount = *amount;
+
+            let (haas, smeared) = self.spread[band].stereoize(mid[band]);
+            let made = if second_mode { smeared } else { haas };
+            let band_side = side[band] * width + made * amount * STEREOIZE_DEPTH;
+            // What narrowing takes off, back in the middle.
+            let lost = side[band] * (1.0 - width).max(0.0);
+            let recovered = self.spread[band].recover(lost) * self.recover_gain;
+            let band_mid = mid[band] + recovered;
+
             self.band_correlation[band].push(
-                mid[band] + band_side,
-                mid[band] - band_side,
+                band_mid + band_side,
+                band_mid - band_side,
                 self.correlation_coeff,
             );
             if solo < 0 || solo == band as i32 {
-                mid_out += mid[band];
+                mid_out += band_mid;
                 side_out += band_side;
             }
         }
@@ -771,6 +1005,115 @@ mod tests {
             let (l, r) = dsp.process_stereo(x, -x);
             assert!(l.is_finite() && r.is_finite());
         }
+    }
+
+    /// A steady mono tone through a band's stereoize, as `(mid, side)` RMS.
+    fn mid_side_rms(dsp: &mut Dsp, hz: f32) -> (f32, f32) {
+        dsp.reset();
+        let warm = (RATE * 0.25) as usize;
+        let window = (RATE * 0.25) as usize;
+        let (mut mid, mut side) = (0.0f64, 0.0f64);
+        for i in 0..warm + window {
+            let s = 0.5 * (std::f32::consts::TAU * hz * i as f32 / RATE).sin();
+            let (l, r) = dsp.process_stereo(s, s);
+            if i >= warm {
+                mid += f64::from(0.5 * (l + r)).powi(2);
+                side += f64::from(0.5 * (l - r)).powi(2);
+            }
+        }
+        let rms = |sum: f64| (sum / window as f64).sqrt() as f32;
+        (rms(mid), rms(side))
+    }
+
+    /// Stereoize gives a mono source width and leaves its mono sum alone, in
+    /// either character.
+    #[test]
+    fn stereoize_widens_mono_without_touching_the_mono_sum() {
+        for mode in StereoizeMode::ALL {
+            let mut dsp = Dsp::new(RATE);
+            let (dry_mid, dry_side) = mid_side_rms(&mut dsp, 2_000.0);
+            assert!(dry_side < 1.0e-4, "a mono source starts with no side");
+            let mut params = default_params();
+            params.stereoize = [0.0, 0.0, MAX_STEREOIZE, 0.0];
+            params.stereoize_mode = mode;
+            dsp.set_params(params);
+            let (mid, side) = mid_side_rms(&mut dsp, 2_000.0);
+            assert!(side > 0.1, "{mode:?}: stereoize made only {side} of side");
+            assert!(
+                (mid - dry_mid).abs() < 0.005,
+                "{mode:?}: mid moved {dry_mid} → {mid}"
+            );
+            // Another band's range keeps its mono image.
+            let (_, low_side) = mid_side_rms(&mut dsp, 60.0);
+            assert!(
+                low_side < 0.02,
+                "{mode:?}: 60 Hz picked up {low_side} of side"
+            );
+        }
+    }
+
+    /// Narrowing with Recover Sides keeps the side's energy, moved into the
+    /// middle; without it, it is gone.
+    #[test]
+    fn recover_sides_puts_a_narrowed_side_back_in_the_middle() {
+        let level = |recover: bool| {
+            let mut dsp = Dsp::new(RATE);
+            let mut params = default_params();
+            params.width = [0.0; BAND_COUNT];
+            params.recover_sides = recover;
+            dsp.set_params(params);
+            let mut energy = (0.0f64, 0.0f64);
+            for i in 0..(RATE as usize) {
+                let s = 0.5 * (std::f32::consts::TAU * 400.0 * i as f32 / RATE).sin();
+                let (l, r) = dsp.process_stereo(s, -s);
+                if i > 12_000 {
+                    energy.0 += f64::from(0.5 * (l + r)).powi(2);
+                    energy.1 += f64::from(0.5 * (l - r)).powi(2);
+                }
+            }
+            energy
+        };
+        let (lost_mid, lost_side) = level(false);
+        let (kept_mid, kept_side) = level(true);
+        assert!(
+            lost_mid < 1.0e-3 && lost_side < 1.0e-3,
+            "{lost_mid}/{lost_side}"
+        );
+        assert!(kept_side < 1.0e-3, "recovered side stays out of the side");
+        // A pure side tone of 0.5 has mean square 0.125 per sample.
+        let expected = 0.125 * (RATE as f64 - 12_000.0);
+        assert!(
+            (kept_mid / expected - 1.0).abs() < 0.1,
+            "recovered {kept_mid} of {expected}"
+        );
+    }
+
+    /// With the split off, every band plays the first band's settings and a
+    /// solo has no band to pick.
+    #[test]
+    fn single_band_works_the_whole_signal() {
+        let mut dsp = Dsp::new(RATE);
+        let mut params = default_params();
+        params.multiband = false;
+        params.width = [0.0, MAX_WIDTH, MAX_WIDTH, MAX_WIDTH];
+        params.solo_band = 3;
+        dsp.set_params(params);
+        for hz in [80.0, 1_500.0, 12_000.0] {
+            let (l, r) = sine_gain(&mut dsp, hz, 0.5, -0.5);
+            assert!(l < 0.01 && r < 0.01, "{hz} Hz side survived as {l}/{r}");
+            let (l, _) = sine_gain(&mut dsp, hz, 0.4, 0.4);
+            assert!((l - 0.4).abs() < 0.01, "{hz} Hz mid came out at {l}");
+        }
+    }
+
+    #[test]
+    fn a_blob_from_before_stereoize_loads_as_it_sounded() {
+        let old = r#"{"version":1,"params":{"power":true,"crossoverHz":[120.0,1000.0,6000.0],"width":[50.0,100.0,120.0,140.0],"soloBand":-1,"outputDb":0.0}}"#;
+        let state = ipc::ImagerState::from_json(old).expect("an old blob still loads");
+        assert_eq!(state.params.stereoize, [0.0; BAND_COUNT]);
+        assert!(!state.params.recover_sides);
+        assert!(state.params.multiband);
+        assert_eq!(state.params.width[3], 140.0);
     }
 
     #[test]

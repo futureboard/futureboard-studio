@@ -67,6 +67,23 @@ impl Biquad {
         }
     }
 
+    /// The section's gain at `frequency`, in dB, at `sample_rate`. Evaluated
+    /// in double precision so a curve stays smooth at the bottom octaves.
+    pub fn magnitude_db(&self, sample_rate: f32, frequency: f32) -> f32 {
+        let w = std::f64::consts::TAU * f64::from(frequency) / f64::from(sample_rate.max(1.0));
+        let (cos1, sin1) = (w.cos(), w.sin());
+        let (cos2, sin2) = ((2.0 * w).cos(), (2.0 * w).sin());
+        let (b0, b1, b2) = (f64::from(self.b0), f64::from(self.b1), f64::from(self.b2));
+        let (a1, a2) = (f64::from(self.a1), f64::from(self.a2));
+        let num_re = b0 + b1 * cos1 + b2 * cos2;
+        let num_im = -(b1 * sin1 + b2 * sin2);
+        let den_re = 1.0 + a1 * cos1 + a2 * cos2;
+        let den_im = -(a1 * sin1 + a2 * sin2);
+        let power =
+            (num_re * num_re + num_im * num_im) / (den_re * den_re + den_im * den_im).max(1.0e-30);
+        (10.0 * power.max(1.0e-30).log10()) as f32
+    }
+
     fn set_normalized(&mut self, b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) {
         let inverse = 1.0 / a0;
         self.b0 = b0 * inverse;
@@ -230,6 +247,35 @@ impl Filters {
         for (stage, q) in self.low_pass.iter_mut().zip(BUTTERWORTH_4_Q) {
             stage.set_low_pass(sample_rate, frequency, q);
         }
+    }
+
+    /// The two cuts' combined gain at `frequency`, in dB; a cut parked open
+    /// is out of the path and adds nothing.
+    pub fn cuts_db(&self, sample_rate: f32, frequency: f32) -> f32 {
+        let mut db = 0.0;
+        if self.high_pass_active {
+            db += self
+                .high_pass
+                .iter()
+                .map(|s| s.magnitude_db(sample_rate, frequency))
+                .sum::<f32>();
+        }
+        if self.low_pass_active {
+            db += self
+                .low_pass
+                .iter()
+                .map(|s| s.magnitude_db(sample_rate, frequency))
+                .sum::<f32>();
+        }
+        db
+    }
+
+    /// The four EQ bands' combined gain at `frequency`, in dB.
+    pub fn eq_db(&self, sample_rate: f32, frequency: f32) -> f32 {
+        self.eq
+            .iter()
+            .map(|s| s.magnitude_db(sample_rate, frequency))
+            .sum()
     }
 
     #[inline]
@@ -559,16 +605,25 @@ impl StripCompressor {
     /// Static curve, returning reduction in dB (zero or negative).
     #[inline]
     fn curve_gain_db(&self, level_db: f32) -> f32 {
-        let over = level_db - self.threshold_db;
-        let half_knee = self.knee_db * 0.5;
-        if over <= -half_knee {
-            0.0
-        } else if over >= half_knee {
-            (1.0 / self.ratio - 1.0) * over
-        } else {
-            let t = over + half_knee;
-            (1.0 / self.ratio - 1.0) * (t * t) / (2.0 * self.knee_db.max(1.0e-6))
-        }
+        compressor_curve_db(level_db, self.threshold_db, self.ratio, self.knee_db)
+    }
+}
+
+/// The strip compressor's static curve: the gain, in dB (zero or negative),
+/// at a detector level of `level_db`, through a quadratic knee `knee_db`
+/// wide.
+#[inline]
+pub fn compressor_curve_db(level_db: f32, threshold_db: f32, ratio: f32, knee_db: f32) -> f32 {
+    let over = level_db - threshold_db;
+    let half_knee = knee_db * 0.5;
+    let slope = 1.0 / ratio.max(1.0) - 1.0;
+    if over <= -half_knee {
+        0.0
+    } else if over >= half_knee {
+        slope * over
+    } else {
+        let t = over + half_knee;
+        slope * (t * t) / (2.0 * knee_db.max(1.0e-6))
     }
 }
 
@@ -603,7 +658,7 @@ pub struct Limiter {
 }
 
 /// Reduction begins this far below the ceiling.
-const LIMITER_KNEE_DB: f32 = 1.5;
+pub const LIMITER_KNEE_DB: f32 = 1.5;
 /// Hold window as a fraction of the release control, capped for fast settings.
 const LIMITER_HOLD_FRACTION: f32 = 0.25;
 const LIMITER_HOLD_MAX_SECONDS: f32 = 0.010;
@@ -684,7 +739,7 @@ impl Limiter {
 /// Infinite-ratio reduction in dB for an input `over_db` above the ceiling,
 /// eased through a quadratic knee.
 #[inline]
-fn soft_over_db(over_db: f32, knee_db: f32) -> f32 {
+pub fn soft_over_db(over_db: f32, knee_db: f32) -> f32 {
     let half_knee = knee_db * 0.5;
     if over_db <= -half_knee {
         0.0

@@ -7,17 +7,19 @@
 //! points, embedded-UI table) is layered on separately.
 
 mod dsp;
+pub mod presets;
 mod state;
 pub mod ui;
 mod wire;
 
 pub use dsp::{
-    AmpModel, CabModel, DelayModel, DriveModel, Dsp, IR_PARTITION_SAMPLES, IrInfo, IrLoadError,
-    IrLoader, MAX_IR_SECONDS, MicModel, ModModel, NAM_BLOCK_SAMPLES, NamCaptureInfo, NamLoadError,
-    NamLoader, PATH_SLOTS, PLUGIN_ID, Params, PreparedIrRuntime, PreparedNamRuntime, ReverbModel,
-    StageBParams, StageKind, ToneEngineKind, WahModel, apply_to_params, default_params, descriptor,
-    prepare_ir_runtime, prepare_nam_runtime, ui_values,
+    AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel, IR_PARTITION_SAMPLES, IrInfo,
+    IrLoadError, IrLoader, MAX_IR_SECONDS, MicModel, ModModel, NAM_BLOCK_SAMPLES, NamCaptureInfo,
+    NamLoadError, NamLoader, PATH_SLOTS, PLUGIN_ID, Params, PreparedIrRuntime, PreparedNamRuntime,
+    ReverbModel, StageBParams, StageKind, ToneEngineKind, WahModel, apply_to_params,
+    default_params, descriptor, prepare_ir_runtime, prepare_nam_runtime, ui_values,
 };
+pub use presets::{FactoryPreset, factory_presets};
 pub use state::{RodhareistState, SCHEMA_VERSION};
 pub use wire::{UI_PARAM_IDS, ui_param_id, ui_param_index};
 

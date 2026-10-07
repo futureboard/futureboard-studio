@@ -508,6 +508,9 @@ fn beat_to_local_x(beat: f32, pixels_per_beat: f32, scroll_x: f32) -> f32 {
     beat * pixels_per_beat.max(0.0001) - scroll_x
 }
 
+/// Pointer travel below which a press on a note is a click, not a move.
+const NOTE_CLICK_SLOP_PX: f32 = 3.0;
+
 fn snap_beat_to_step(beat: f32, step: f32) -> f32 {
     if step <= 0.0 {
         beat.max(0.0)
@@ -989,6 +992,10 @@ enum PianoDrag {
         /// snapping for this drag without touching the persistent `snap_on`
         /// toggle. Checked continuously, not just at mouse-down.
         unsnap: bool,
+        /// A Shift-press on a note that was already selected: the note leaves
+        /// the selection if the press ends without a move, which keeps
+        /// Shift-click a selection toggle while Shift-drag moves freely.
+        deselect_on_click: Option<u64>,
     },
     /// Resize notes from a right-edge handle. If the grabbed note is part of a
     /// multi-selection, every selected note receives the same duration delta.
@@ -3339,7 +3346,7 @@ impl PianoRoll {
         let shift = event.modifiers.shift;
         let ctrl = event.modifiers.control || event.modifiers.platform;
         let clone_on_commit = event.modifiers.alt;
-        if shift || ctrl {
+        if ctrl {
             // Toggle this note in/out of the selection — no drag.
             if self.selection.contains(&id) {
                 self.selection.remove(&id);
@@ -3349,7 +3356,17 @@ impl PianoRoll {
             cx.notify();
             return;
         }
-        if !self.selection.contains(&id) {
+        // Shift adds the note to the selection and starts a free move: the
+        // drag ignores the grid for as long as Shift is held. A Shift-click
+        // that never moves still toggles the note, on release.
+        let mut deselect_on_click = None;
+        if shift {
+            if self.selection.contains(&id) {
+                deselect_on_click = Some(id);
+            } else {
+                self.selection.insert(id);
+            }
+        } else if !self.selection.contains(&id) {
             self.selection = HashSet::from([id]);
         }
         let Some(clip_id) = self.editing_clip_id(cx) else {
@@ -3374,7 +3391,8 @@ impl PianoRoll {
             grab_pitch,
             anchor_start,
             clone_on_commit,
-            unsnap: false,
+            unsnap: shift,
+            deselect_on_click,
         };
         // Audition the grabbed pitch immediately; on_move switches it as the
         // drag changes pitch, on_up / cancel stops it.
@@ -4463,9 +4481,18 @@ impl PianoRoll {
                 anchor_start,
                 clone_on_commit,
                 unsnap,
+                deselect_on_click,
                 ..
             } => {
-                if dx_beats.abs() < 0.0001 && dpitch == 0 {
+                // A press that moved less than a few pixels is a click: with
+                // Shift held the drag is unsnapped, and a hand's jitter would
+                // otherwise nudge the notes off the grid.
+                let moved_px = dx_beats.abs() * self.ppb.max(0.0001);
+                if moved_px < NOTE_CLICK_SLOP_PX && dpitch == 0 {
+                    if let Some(id) = deselect_on_click {
+                        self.selection.remove(&id);
+                        cx.notify();
+                    }
                     return;
                 }
                 let pitch_ctx = self.pitch_ctx;

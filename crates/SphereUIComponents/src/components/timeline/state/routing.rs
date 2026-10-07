@@ -109,7 +109,15 @@ impl TrackAudioFormat {
 pub enum TrackMidiInputRouting {
     None,
     AllInputs,
-    MidiDevice { device_id: String },
+    MidiDevice {
+        device_id: String,
+    },
+    /// The MIDI the plug-ins on another track produce: an arpeggiator's
+    /// notes, an instrument's MIDI thru. Never matched by hardware input, so
+    /// "All MIDI Inputs" does not pick it up and a source cannot feed itself.
+    PluginOutput {
+        track_id: String,
+    },
 }
 
 impl TrackMidiInputRouting {
@@ -118,6 +126,8 @@ impl TrackMidiInputRouting {
             Self::None => "None".to_string(),
             Self::AllInputs => "All MIDI Inputs".to_string(),
             Self::MidiDevice { device_id } => device_id.clone(),
+            // Callers that know the track list resolve the source's name.
+            Self::PluginOutput { track_id } => format!("VSTi - {track_id}"),
         }
     }
 }
@@ -466,6 +476,47 @@ impl TimelineState {
                 }
                 t.routing.midi_input = midi_input;
                 return true;
+            }
+        }
+        false
+    }
+
+    /// Tracks whose plug-in MIDI output `track_id` may take as its MIDI input:
+    /// every other Instrument or MIDI track with a plug-in on it, except one
+    /// that already takes its input, directly or through others, from
+    /// `track_id`. Routing that one back would loop notes between the two.
+    pub fn plugin_midi_sources_for(&self, track_id: &str) -> Vec<&TrackState> {
+        self.tracks
+            .iter()
+            .filter(|source| {
+                source.id != track_id
+                    && matches!(source.track_type, TrackType::Instrument | TrackType::Midi)
+                    && source
+                        .inserts
+                        .iter()
+                        .any(|insert| insert.plugin_id.is_some())
+                    && !self.plugin_midi_reaches(&source.id, track_id)
+            })
+            .collect()
+    }
+
+    /// Whether `from` takes plug-in MIDI from `to`, directly or along a chain
+    /// of such routes.
+    fn plugin_midi_reaches(&self, from: &str, to: &str) -> bool {
+        let mut current = from;
+        // A chain longer than the track list has repeated a track.
+        for _ in 0..self.tracks.len() {
+            let Some(track) = self.tracks.iter().find(|t| t.id == current) else {
+                return false;
+            };
+            match &track.routing.midi_input {
+                TrackMidiInputRouting::PluginOutput { track_id } => {
+                    if track_id == to {
+                        return true;
+                    }
+                    current = track_id;
+                }
+                _ => return false,
             }
         }
         false
@@ -1031,6 +1082,56 @@ mod tests {
         assert!(child.sends.iter().any(|send| {
             send.id == created_send_id && send.target_track_id == created_return_id
         }));
+    }
+
+    /// A track can take plug-in MIDI from any other track with a plug-in on
+    /// it, but never from itself, an empty track, or one that already takes
+    /// its own MIDI from this track (directly or through a chain).
+    #[test]
+    fn plugin_midi_sources_exclude_self_empty_tracks_and_loops() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let synth = create_track(&mut state, TrackType::Instrument, "Synth");
+        let arp = create_track(&mut state, TrackType::Instrument, "Arp");
+        let bass = create_track(&mut state, TrackType::Midi, "Bass");
+        let empty = create_track(&mut state, TrackType::Instrument, "Empty");
+        let audio = create_track(&mut state, TrackType::Audio, "Vox");
+        for (track_id, slot) in [(&synth, 0), (&arp, 1), (&bass, 2), (&audio, 3)] {
+            let track = state.tracks.iter_mut().find(|t| t.id == *track_id).unwrap();
+            let mut insert = InsertSlotState::empty(format!("insert-{slot}"));
+            insert.plugin_id = Some(format!("plugin-{slot}"));
+            track.inserts.push(insert);
+        }
+        let ids = |sources: Vec<&TrackState>| -> Vec<String> {
+            sources.into_iter().map(|t| t.id.clone()).collect()
+        };
+
+        assert_eq!(
+            ids(state.plugin_midi_sources_for(&synth)),
+            vec![arp.clone(), bass.clone()],
+            "not itself, not the empty instrument, not the audio track"
+        );
+
+        // Bass takes Arp; Synth takes Bass. Arp may then not take Synth or
+        // Bass (both lead back to it), but Synth's other options stand.
+        state.set_track_midi_input(
+            &bass,
+            TrackMidiInputRouting::PluginOutput {
+                track_id: arp.clone(),
+            },
+        );
+        state.set_track_midi_input(
+            &synth,
+            TrackMidiInputRouting::PluginOutput {
+                track_id: bass.clone(),
+            },
+        );
+        assert!(ids(state.plugin_midi_sources_for(&arp)).is_empty());
+        assert_eq!(
+            ids(state.plugin_midi_sources_for(&synth)),
+            vec![arp.clone(), bass.clone()]
+        );
+        let _ = empty;
     }
 
     #[test]

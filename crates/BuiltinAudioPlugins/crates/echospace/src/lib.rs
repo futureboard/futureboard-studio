@@ -1,32 +1,73 @@
-//! EchoSpace — stereo / ping-pong delay with filtered feedback.
+//! EchoSpace — stereo, ping-pong and mono delay.
 //!
-//! Phase 2 (medium). Feedback tone controls use the MIT/Apache [`biquad`]
-//! crate. Delay lines are preallocated ring buffers (no realtime heap growth).
+//! ```txt
+//!              ┌──────────── feedback · cross (normalised, smoothed) ─────────────┐
+//! input ─ duck ┴→ + → low cut → high cut → diffusion → saturation → line ──┬──→ wet
+//! sense                                                                       │
+//!   └──────────────────────────────── ducks the wet ─────────────────────────┘
+//! ```
+//!
+//! The tone stage sits on the write path, the way a tape loop's record head
+//! does: the first repeat already carries the cuts and the drive, and every
+//! pass after it a little more.
+//!
+//! A time change never clicks and never warbles: the line keeps reading at
+//! its old length while a second read head fades in at the new one, which
+//! is also how a synced delay follows a tempo change. Wow and flutter move
+//! the heads with a cubic read; every gain is smoothed. The rings are sized
+//! for the longest delay at the current rate, so nothing allocates after
+//! construction.
 
-use biquad::{Biquad, DirectForm1};
+use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_2, TAU};
+
+use biquad::{Biquad, Coefficients, DirectForm1};
+use builtin_dsp_core::delay::{Allpass, DelayRing, Smoothed, smoothing_step};
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    make_eq_biquad, mix,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, biquad_response_db, clamp,
+    db_to_linear, make_eq_coefficients,
 };
 use serde::{Deserialize, Serialize};
 
 pub mod ipc;
+pub mod presets;
 pub mod ui;
 
 /// Editor-facing parameter id table, re-exported at the crate root so the host
 /// resolves ids the same way for every built-in (`<plugin>::ui_param_index`).
 pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 pub const PLUGIN_ID: &str = "futureboard.echospace";
 
 /// Longest delay either line can be set to. The rings are sized for this at the
-/// current sample rate, so a time edit only moves a read offset.
+/// current sample rate, so a time edit only moves a read head.
 pub const MAX_DELAY_MS: f32 = 4_000.0;
 
-/// Feedback ceiling. The delay line is a feedback loop: at exactly 1.0 it never
-/// decays, and with the cross-feed sum below it can only be held short of unity
-/// by the saturator — which the user is allowed to turn off.
-const MAX_FEEDBACK: f32 = 0.9995;
+/// Peak swing of a read head at `modDepth` 100 %.
+const MAX_MOD_MS: f32 = 3.0;
+
+/// Fastest wow `modRateHz` reaches.
+pub const MAX_MOD_RATE_HZ: f32 = 8.0;
+pub const DEFAULT_MOD_RATE_HZ: f32 = 0.8;
+
+/// How long a read head takes to fade over to a new delay time.
+const FADE_MS: f32 = 45.0;
+
+/// Time constant of every smoothed control.
+const SMOOTH_MS: f32 = 20.0;
+
+/// Loop gain while frozen: just under unity, which holds a phrase for
+/// minutes without ever building.
+const FREEZE_GAIN: f32 = 0.9999;
+
+/// The diffusion allpasses on each side's write path. Their delay is taken
+/// off the line's, so the repeats land on time however much they smear.
+const DIFFUSER_MS: [[f32; 2]; 2] = [[2.7, 4.9], [3.1, 5.3]];
+const MAX_DIFFUSION_GAIN: f32 = 0.62;
+
+/// The ducker's follower.
+const DUCK_ATTACK_MS: f32 = 3.0;
+const DUCK_RELEASE_MS: f32 = 150.0;
 
 /// Tempo window a synced delay time is derived from. The transport publishes a
 /// real tempo every block, but a region read before the engine's first publish —
@@ -100,17 +141,31 @@ pub fn division_ms(division: u8, tempo_bpm: f32) -> f32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DelayMode {
+    /// Each side repeats on its own, with `crossFeedback` bleeding between.
     Stereo,
+    /// The input, summed to mono, starts on the left and bounces: left after
+    /// `timeMsL`, right `timeMsR` after that, and so on.
     PingPong,
+    /// One line at `timeMsL`, on both sides.
     Mono,
 }
 
 impl DelayMode {
+    pub const ALL: [Self; 3] = [Self::Stereo, Self::PingPong, Self::Mono];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Stereo => "stereo",
             Self::PingPong => "pingpong",
             Self::Mono => "mono",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stereo => "Stereo",
+            Self::PingPong => "Ping-Pong",
+            Self::Mono => "Mono",
         }
     }
 
@@ -138,21 +193,38 @@ impl DelayMode {
             _ => Self::PingPong,
         }
     }
+
+    /// Whether the right line runs at all.
+    pub fn uses_right_time(self) -> bool {
+        self != Self::Mono
+    }
+
+    /// Whether `crossFeedback` does anything.
+    pub fn uses_cross(self) -> bool {
+        self != Self::Mono
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Params {
     pub power: bool,
     pub mode: DelayMode,
     pub time_ms_l: f32,
     pub time_ms_r: f32,
+    /// Share of each repeat fed back, in percent; below 100 so the loop
+    /// always decays.
     pub feedback: f32,
+    /// Share of the feedback that crosses to the other side, in percent. The
+    /// two paths are normalised, so this moves the repeats, never their level.
     pub cross_feedback: f32,
     pub low_cut_hz: f32,
     pub high_cut_hz: f32,
+    /// Tape-style drive on the write path, in percent.
     pub saturation: f32,
+    /// Dry/wet balance, in percent, on an equal-power law.
     pub mix: f32,
+    /// Wet-path trim, in decibels.
     pub output_db: f32,
     pub freeze: bool,
     /// Derive both delay times from the host tempo and the divisions below,
@@ -172,17 +244,39 @@ pub struct Params {
     /// to the other as well.
     #[serde(default)]
     pub link: bool,
+    /// Wow and flutter on the read heads, in percent of [`MAX_MOD_MS`].
+    #[serde(default)]
+    pub mod_depth: f32,
+    #[serde(default = "default_mod_rate_hz")]
+    pub mod_rate_hz: f32,
+    /// How far the repeats dip while the input plays, in percent.
+    #[serde(default)]
+    pub duck: f32,
+    /// Smear added on every pass, in percent.
+    #[serde(default)]
+    pub diffusion: f32,
+    /// Wet-path stereo width, in percent (100 = unchanged).
+    #[serde(default = "default_width")]
+    pub width: f32,
 }
 
-/// Serde fallbacks for the tempo-sync fields, which projects written before
-/// EchoSpace had them do not carry. Without these the whole blob would be
-/// rejected and the insert would silently open at factory settings.
+/// Serde fallbacks for fields that projects written before EchoSpace had them
+/// do not carry. Without these the whole blob would be rejected and the insert
+/// would silently open at factory settings.
 fn default_division_l() -> u8 {
     DEFAULT_DIVISION_L
 }
 
 fn default_division_r() -> u8 {
     DEFAULT_DIVISION_R
+}
+
+fn default_mod_rate_hz() -> f32 {
+    DEFAULT_MOD_RATE_HZ
+}
+
+fn default_width() -> f32 {
+    100.0
 }
 
 pub fn default_params() -> Params {
@@ -203,6 +297,11 @@ pub fn default_params() -> Params {
         division_l: DEFAULT_DIVISION_L,
         division_r: DEFAULT_DIVISION_R,
         link: false,
+        mod_depth: 0.0,
+        mod_rate_hz: DEFAULT_MOD_RATE_HZ,
+        duck: 0.0,
+        diffusion: 0.0,
+        width: 100.0,
     }
 }
 
@@ -364,44 +463,336 @@ pub fn descriptor() -> PluginDescriptor {
                 max: 1.0,
                 unit: "bool",
             },
+            ParamDescriptor {
+                id: "modDepth",
+                name: "Mod Depth",
+                default_value: 0.0,
+                min: 0.0,
+                max: 100.0,
+                unit: "%",
+            },
+            ParamDescriptor {
+                id: "modRateHz",
+                name: "Mod Rate",
+                default_value: DEFAULT_MOD_RATE_HZ,
+                min: 0.05,
+                max: MAX_MOD_RATE_HZ,
+                unit: "Hz",
+            },
+            ParamDescriptor {
+                id: "duck",
+                name: "Duck",
+                default_value: 0.0,
+                min: 0.0,
+                max: 100.0,
+                unit: "%",
+            },
+            ParamDescriptor {
+                id: "diffusion",
+                name: "Diffusion",
+                default_value: 0.0,
+                min: 0.0,
+                max: 100.0,
+                unit: "%",
+            },
+            ParamDescriptor {
+                id: "width",
+                name: "Width",
+                default_value: 100.0,
+                min: 0.0,
+                max: 200.0,
+                unit: "%",
+            },
         ],
     }
 }
 
-#[derive(Debug, Clone)]
-struct DelayLine {
-    buffer: Vec<f32>,
-    write: usize,
+// ── Shared by the DSP and the editor ─────────────────────────────────────────
+
+/// Coefficients of the write path's two cuts.
+fn cut_coefficients(params: &Params, sample_rate: f32) -> [Option<Coefficients<f32>>; 2] {
+    let guard = sample_rate * 0.45;
+    [
+        make_eq_coefficients(
+            "highpass",
+            clamp(params.low_cut_hz, 20.0, guard),
+            0.0,
+            0.707,
+            sample_rate,
+        ),
+        make_eq_coefficients(
+            "lowpass",
+            clamp(params.high_cut_hz, 200.0, guard),
+            0.0,
+            0.707,
+            sample_rate,
+        ),
+    ]
 }
 
-impl DelayLine {
-    fn new(capacity: usize) -> Self {
+/// What one pass through the tone stage does at `hz`, in decibels.
+pub fn tone_response_db(params: &Params, hz: f32, sample_rate: f32) -> f32 {
+    cut_coefficients(params, sample_rate)
+        .iter()
+        .flatten()
+        .map(|c| biquad_response_db(c, hz, sample_rate))
+        .sum()
+}
+
+/// Loop gain per pass: `feedback`, or just under unity while frozen.
+pub fn loop_gain(params: &Params) -> f32 {
+    if params.freeze {
+        FREEZE_GAIN
+    } else {
+        clamp(params.feedback / 100.0, 0.0, 0.98)
+    }
+}
+
+/// One repeat, as the editor draws it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Echo {
+    /// After the dry signal.
+    pub at_ms: f32,
+    /// Linear level against the dry signal, at 1 kHz.
+    pub gain: f32,
+    pub right: bool,
+    /// Round trips; 1 is the first repeat.
+    pub pass: u32,
+}
+
+/// The repeats a centred hit produces, down to `floor_db`: when each lands,
+/// on which side and how loud — following the same routing and gains the
+/// DSP runs (wow, diffusion and saturation aside). Sorted by arrival, at most
+/// `max_echoes` long, so a frozen or near-unity loop still ends.
+pub fn echo_pattern(
+    params: &Params,
+    tempo_bpm: f32,
+    sample_rate: f32,
+    floor_db: f32,
+    max_echoes: usize,
+) -> Vec<Echo> {
+    let times = [
+        params.effective_time_ms_l(tempo_bpm),
+        params.effective_time_ms_r(tempo_bpm),
+    ];
+    let tone = db_to_linear(tone_response_db(params, 1_000.0, sample_rate));
+    let fb = loop_gain(params);
+    let cross = if params.mode.uses_cross() {
+        clamp(params.cross_feedback / 100.0, 0.0, 1.0)
+    } else {
+        0.0
+    };
+    let norm = fb / (1.0 + cross);
+    let floor = db_to_linear(floor_db);
+    // Paths are pruned well under the floor, not at it: two that land
+    // together can sum above it.
+    let keep = floor * 0.01;
+
+    // Signal waiting to come out of a line: (line, written at ms, gain).
+    let mut pending: Vec<(usize, f32, f32, u32)> = match params.mode {
+        DelayMode::Stereo => vec![(0, 0.0, tone, 1), (1, 0.0, tone, 1)],
+        DelayMode::PingPong | DelayMode::Mono => vec![(0, 0.0, tone, 1)],
+    };
+    let mut echoes = Vec::new();
+    while let Some(index) = pending
+        .iter()
+        .enumerate()
+        .min_by(|a, b| (a.1.1 + times[a.1.0]).total_cmp(&(b.1.1 + times[b.1.0])))
+        .map(|(i, _)| i)
+    {
+        if echoes.len() >= max_echoes {
+            break;
+        }
+        let (line, written, gain, pass) = pending.swap_remove(index);
+        let at = written + times[line];
+        if gain >= floor {
+            if params.mode == DelayMode::Mono {
+                echoes.push(Echo {
+                    at_ms: at,
+                    gain,
+                    right: false,
+                    pass,
+                });
+                echoes.push(Echo {
+                    at_ms: at,
+                    gain,
+                    right: true,
+                    pass,
+                });
+            } else {
+                echoes.push(Echo {
+                    at_ms: at,
+                    gain,
+                    right: line == 1,
+                    pass,
+                });
+            }
+        }
+        // Where this tap goes next, by the DSP's routing.
+        let (own, other) = match params.mode {
+            DelayMode::Stereo => (norm, norm * cross),
+            DelayMode::PingPong => (norm * cross, norm),
+            DelayMode::Mono => (fb, 0.0),
+        };
+        for (target, share) in [(line, own), (1 - line, other)] {
+            let next = gain * share * tone;
+            if next < keep || share == 0.0 {
+                continue;
+            }
+            // Two paths landing together are one repeat, as the line hears it.
+            if let Some(merged) = pending
+                .iter_mut()
+                .find(|p| p.0 == target && (p.1 - at).abs() < 0.05)
+            {
+                merged.2 += next;
+            } else {
+                pending.push((target, at, next, pass + 1));
+            }
+        }
+        if pending.len() > max_echoes * 4 {
+            break;
+        }
+    }
+    echoes
+}
+
+// ── Building blocks ──────────────────────────────────────────────────────────
+
+/// One side's line with two read heads, so a new delay time fades in
+/// instead of jumping.
+#[derive(Debug, Clone)]
+struct Line {
+    ring: DelayRing,
+    /// The length being read, in samples, before the diffusers' share.
+    current: f32,
+    /// The length fading in, while `fade` runs from 0 to 1.
+    next: f32,
+    fade: Option<f32>,
+}
+
+impl Line {
+    fn new(capacity_ms: f32, sample_rate: f32, delay: f32) -> Self {
         Self {
-            buffer: vec![0.0; capacity.max(1)],
-            write: 0,
+            ring: DelayRing::for_ms(capacity_ms, sample_rate),
+            current: delay,
+            next: delay,
+            fade: None,
         }
     }
 
     fn clear(&mut self) {
-        self.buffer.fill(0.0);
-        self.write = 0;
+        self.ring.clear();
     }
 
+    /// Reads the line toward `target`, `swing` samples off it.
     #[inline]
-    fn read(&self, delay_samples: usize) -> f32 {
-        let len = self.buffer.len();
-        let idx = (self.write + len - (delay_samples.min(len - 1))) % len;
-        self.buffer[idx]
+    fn read(&mut self, target: f32, swing: f32, fade_step: f32) -> f32 {
+        if self.fade.is_none() && (target - self.current).abs() > 0.5 {
+            self.next = target;
+            self.fade = Some(0.0);
+        }
+        let Some(progress) = self.fade else {
+            return self.ring.read_cubic(self.current + swing);
+        };
+        let progress = progress + fade_step;
+        if progress >= 1.0 {
+            self.current = self.next;
+            self.fade = None;
+            return self.ring.read_cubic(self.current + swing);
+        }
+        self.fade = Some(progress);
+        // Raised-cosine weights summing to one: a time nudge (the two reads
+        // nearly alike) neither dips nor bumps.
+        let w = 0.5 - 0.5 * (progress * std::f32::consts::PI).cos();
+        let old = self.ring.read_cubic(self.current + swing);
+        let new = self.ring.read_cubic(self.next + swing);
+        old + (new - old) * w
     }
+}
 
-    #[inline]
-    fn write_sample(&mut self, sample: f32) {
-        self.buffer[self.write] = sample;
-        self.write += 1;
-        if self.write >= self.buffer.len() {
-            self.write = 0;
+/// One side's tone stage: cuts, diffusers.
+#[derive(Debug, Clone)]
+struct Tone {
+    low_cut: Option<DirectForm1<f32>>,
+    high_cut: Option<DirectForm1<f32>>,
+    diffusers: [Allpass; 2],
+}
+
+impl Tone {
+    fn clear(&mut self) {
+        for filter in [self.low_cut.as_mut(), self.high_cut.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            filter.reset_state();
+        }
+        for ap in self.diffusers.iter_mut() {
+            ap.clear();
         }
     }
+
+    #[inline]
+    fn filter(&mut self, x: f32) -> f32 {
+        let mut y = x;
+        if let Some(f) = self.low_cut.as_mut() {
+            y = f.run(y);
+        }
+        if let Some(f) = self.high_cut.as_mut() {
+            y = f.run(y);
+        }
+        y
+    }
+}
+
+/// A pair of quadrature oscillators: slow wow and a faster flutter.
+#[derive(Debug, Clone, Copy)]
+struct Wobble {
+    wow: (f32, f32),
+    flutter: (f32, f32),
+}
+
+impl Wobble {
+    fn at_phase(phase: f32) -> Self {
+        Self {
+            wow: (phase.sin(), phase.cos()),
+            flutter: ((phase * 2.3).sin(), (phase * 2.3).cos()),
+        }
+    }
+
+    #[inline]
+    fn rotate(osc: &mut (f32, f32), step: (f32, f32)) {
+        let (s, c) = *osc;
+        *osc = (s * step.0 + c * step.1, c * step.0 - s * step.1);
+    }
+
+    /// The next swing, −1 to 1.
+    #[inline]
+    fn next(&mut self, wow_step: (f32, f32), flutter_step: (f32, f32)) -> f32 {
+        Self::rotate(&mut self.wow, wow_step);
+        Self::rotate(&mut self.flutter, flutter_step);
+        0.85 * self.wow.0 + 0.15 * self.flutter.0
+    }
+
+    fn renormalise(&mut self) {
+        for osc in [&mut self.wow, &mut self.flutter] {
+            let norm = 1.5 - 0.5 * (osc.0 * osc.0 + osc.1 * osc.1);
+            osc.0 *= norm;
+            osc.1 *= norm;
+        }
+    }
+}
+
+/// Tape-style drive with unit slope at rest: quiet repeats pass untouched,
+/// loud ones round off. Its slope never exceeds one, so it can only take
+/// gain out of the loop.
+#[inline]
+fn saturate(x: f32, amount: f32) -> f32 {
+    if amount <= 1.0e-4 {
+        return x;
+    }
+    let drive = 1.0 + 3.0 * amount;
+    let shaped = (x * drive).tanh() / drive;
+    x + (shaped - x) * (amount * 4.0).min(1.0)
 }
 
 #[derive(Debug, Clone)]
@@ -411,45 +802,89 @@ pub struct Dsp {
     /// Latest transport tempo, republished by the host each block. Only the
     /// synced delay times read it; the free times ignore it entirely.
     tempo_bpm: f32,
-    delay_l: DelayLine,
-    delay_r: DelayLine,
-    delay_samples_l: usize,
-    delay_samples_r: usize,
-    hpf_l: Option<DirectForm1<f32>>,
-    hpf_r: Option<DirectForm1<f32>>,
-    lpf_l: Option<DirectForm1<f32>>,
-    lpf_r: Option<DirectForm1<f32>>,
-    output_gain: f32,
+    lines: [Line; 2],
+    tones: [Tone; 2],
+    wobbles: [Wobble; 2],
+    /// Line lengths the heads head for, in samples, net of the diffusers.
+    targets: [f32; 2],
+    /// The diffusers' delay per side, taken off the line's.
+    diffuser_samples: [f32; 2],
+    fade_step: f32,
+    smooth_step: f32,
+    wow_step: (f32, f32),
+    flutter_step: (f32, f32),
+    duck_attack: f32,
+    duck_release: f32,
+    duck_env: f32,
+    feedback: Smoothed,
+    cross: Smoothed,
+    input_gain: Smoothed,
+    /// 1 while frozen: the tone stage is bypassed so the loop holds.
+    freeze_mix: Smoothed,
+    diffusion: Smoothed,
+    drive: Smoothed,
+    swing: Smoothed,
+    duck_depth: Smoothed,
+    mid_gain: Smoothed,
+    side_gain: Smoothed,
+    dry_gain: Smoothed,
+    wet_gain: Smoothed,
+    output_gain: Smoothed,
+    wobble_tick: u32,
+    /// Nothing has played since construction or the last reset, so a retune
+    /// lands at once rather than gliding.
+    fresh: bool,
 }
 
 impl Dsp {
-    /// Ring length for the longest reachable delay at `sample_rate`.
-    ///
-    /// Derived from the rate rather than a fixed sample count: a constant sized
-    /// for 48 kHz silently caps `timeMs` at 2 s once the engine runs at 96 kHz,
-    /// so the editor would offer 4 s that the DSP could not deliver.
-    fn ring_capacity(sample_rate: f32) -> usize {
-        ((sample_rate * MAX_DELAY_MS * 0.001).ceil() as usize).max(2) + 2
-    }
-
     pub fn new(sample_rate: f32) -> Self {
         let sr = sample_rate.max(1.0);
-        let capacity = Self::ring_capacity(sr);
+        let capacity = MAX_DELAY_MS + MAX_MOD_MS * 2.0 + 2.0;
+        let diffusers =
+            |side: usize| std::array::from_fn(|i| Allpass::for_ms(DIFFUSER_MS[side][i], sr));
+        let tone = |side: usize| Tone {
+            low_cut: None,
+            high_cut: None,
+            diffusers: diffusers(side),
+        };
+        let tones = [tone(0), tone(1)];
+        let diffuser_samples = std::array::from_fn(|side| {
+            tones[side].diffusers.iter().map(|ap| ap.len() as f32).sum()
+        });
         let mut dsp = Self {
             sample_rate: sr,
             params: default_params(),
             tempo_bpm: DEFAULT_TEMPO_BPM,
-            delay_l: DelayLine::new(capacity),
-            delay_r: DelayLine::new(capacity),
-            delay_samples_l: 1,
-            delay_samples_r: 1,
-            hpf_l: None,
-            hpf_r: None,
-            lpf_l: None,
-            lpf_r: None,
-            output_gain: 1.0,
+            lines: [Line::new(capacity, sr, 2.0), Line::new(capacity, sr, 2.0)],
+            tones,
+            wobbles: [Wobble::at_phase(0.0), Wobble::at_phase(FRAC_PI_2)],
+            targets: [2.0; 2],
+            diffuser_samples,
+            fade_step: 1.0 / (FADE_MS * 0.001 * sr),
+            smooth_step: smoothing_step(SMOOTH_MS, sr),
+            wow_step: (1.0, 0.0),
+            flutter_step: (1.0, 0.0),
+            duck_attack: smoothing_step(DUCK_ATTACK_MS, sr),
+            duck_release: smoothing_step(DUCK_RELEASE_MS, sr),
+            duck_env: 0.0,
+            feedback: Smoothed::at(0.0),
+            cross: Smoothed::at(0.0),
+            input_gain: Smoothed::at(1.0),
+            freeze_mix: Smoothed::at(0.0),
+            diffusion: Smoothed::at(0.0),
+            drive: Smoothed::at(0.0),
+            swing: Smoothed::at(0.0),
+            duck_depth: Smoothed::at(0.0),
+            mid_gain: Smoothed::at(FRAC_1_SQRT_2),
+            side_gain: Smoothed::at(FRAC_1_SQRT_2),
+            dry_gain: Smoothed::at(1.0),
+            wet_gain: Smoothed::at(0.0),
+            output_gain: Smoothed::at(1.0),
+            wobble_tick: 0,
+            fresh: true,
         };
-        dsp.apply_params();
+        dsp.rebuild_filters();
+        dsp.retune();
         dsp
     }
 
@@ -458,22 +893,27 @@ impl Dsp {
     }
 
     pub fn set_params(&mut self, params: Params) {
+        let rebuild = params.low_cut_hz != self.params.low_cut_hz
+            || params.high_cut_hz != self.params.high_cut_hz;
         self.params = params;
         ipc::sanitize_params(&mut self.params);
-        self.apply_params();
+        if rebuild {
+            self.rebuild_filters();
+        }
+        self.retune();
     }
 
     /// Publish the block's transport tempo. Called from the host producer
     /// before `process_stereo`, so it must stay allocation-free: it is a
-    /// compare plus, at most, the same two integer conversions a time edit
-    /// already does, and only while a synced line is actually reading it.
+    /// compare plus, at most, the same retune a time edit does, and only
+    /// while a synced line is actually reading it.
     pub fn set_tempo_bpm(&mut self, tempo_bpm: f32) {
         if !tempo_bpm.is_finite() || (tempo_bpm - self.tempo_bpm).abs() < 1.0e-4 {
             return;
         }
         self.tempo_bpm = tempo_bpm;
         if self.params.sync {
-            self.apply_scalars();
+            self.retune();
         }
     }
 
@@ -484,26 +924,17 @@ impl Dsp {
     /// Apply a compact wire update already resolved by the UI/control thread.
     ///
     /// The audio path never parses JSON or looks up string parameter ids. Every
-    /// arm below only recomputes derived scalars or biquad coefficients, so this
-    /// stays allocation-free and safe to call from the producer thread between
-    /// blocks.
+    /// arm below only retargets smoothed values or retunes the two cuts, so
+    /// this stays allocation-free and safe to call from the producer thread
+    /// between blocks.
     pub fn apply_wire_param(&mut self, wire_index: u32, value: f32) -> bool {
         if !ipc::apply_wire_param(&mut self.params, wire_index, value) {
             return false;
         }
-        match wire_index {
-            ipc::LOW_CUT_INDEX | ipc::HIGH_CUT_INDEX => self.rebuild_filters(),
-            ipc::TIME_L_INDEX
-            | ipc::TIME_R_INDEX
-            | ipc::OUTPUT_INDEX
-            | ipc::SYNC_INDEX
-            | ipc::DIVISION_L_INDEX
-            | ipc::DIVISION_R_INDEX
-            | ipc::LINK_INDEX => self.apply_scalars(),
-            // Feedback, cross, saturation, mix, mode and the two flags are read
-            // straight off `params` in `process_stereo`; nothing to recompute.
-            _ => {}
+        if matches!(wire_index, ipc::LOW_CUT_INDEX | ipc::HIGH_CUT_INDEX) {
+            self.rebuild_filters();
         }
+        self.retune();
         true
     }
 
@@ -521,83 +952,113 @@ impl Dsp {
         0
     }
 
-    fn apply_params(&mut self) {
-        self.apply_scalars();
-        self.rebuild_filters();
+    /// The length each line reads at — what the heads are heading for —
+    /// in samples, net of the diffusers.
+    fn line_targets(&self) -> [f32; 2] {
+        let times = [
+            self.params.effective_time_ms_l(self.tempo_bpm),
+            self.params.effective_time_ms_r(self.tempo_bpm),
+        ];
+        let max =
+            self.lines[0].ring.max_cubic_delay() - MAX_MOD_MS * 0.001 * self.sample_rate - 2.0;
+        std::array::from_fn(|side| {
+            clamp(
+                times[side] * 0.001 * self.sample_rate - self.diffuser_samples[side],
+                2.0,
+                max,
+            )
+        })
     }
 
-    fn apply_scalars(&mut self) {
-        let max_delay = self.delay_l.buffer.len().saturating_sub(2).max(1);
-        let time_l = self.params.effective_time_ms_l(self.tempo_bpm);
-        let time_r = self.params.effective_time_ms_r(self.tempo_bpm);
-        self.delay_samples_l = ((time_l * 0.001 * self.sample_rate) as usize).clamp(1, max_delay);
-        self.delay_samples_r = ((time_r * 0.001 * self.sample_rate) as usize).clamp(1, max_delay);
-        self.output_gain = db_to_linear(self.params.output_db);
+    /// Hands every smoothed value its new target from `params`.
+    fn retune(&mut self) {
+        let p = &self.params;
+        let sr = self.sample_rate;
+        self.targets = self.line_targets();
+        self.feedback.target = loop_gain(p);
+        self.cross.target = if p.mode.uses_cross() {
+            clamp(p.cross_feedback / 100.0, 0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.input_gain.target = if p.freeze { 0.0 } else { 1.0 };
+        self.freeze_mix.target = if p.freeze { 1.0 } else { 0.0 };
+        self.diffusion.target = clamp(p.diffusion / 100.0, 0.0, 1.0) * MAX_DIFFUSION_GAIN;
+        self.drive.target = clamp(p.saturation / 100.0, 0.0, 1.0);
+        self.swing.target = clamp(p.mod_depth / 100.0, 0.0, 1.0) * MAX_MOD_MS * 0.001 * sr;
+        let duck = clamp(p.duck / 100.0, 0.0, 1.0);
+        self.duck_depth.target = 16.0 * duck * duck;
+        let width = clamp(p.width / 100.0, 0.0, 2.0);
+        self.mid_gain.target = (2.0 - width).sqrt() * FRAC_1_SQRT_2;
+        self.side_gain.target = width.sqrt() * FRAC_1_SQRT_2;
+        let mix = clamp(p.mix / 100.0, 0.0, 1.0);
+        self.dry_gain.target = (mix * FRAC_PI_2).cos();
+        self.wet_gain.target = (mix * FRAC_PI_2).sin();
+        self.output_gain.target = db_to_linear(p.output_db);
+        let rate = clamp(p.mod_rate_hz, 0.0, MAX_MOD_RATE_HZ);
+        let step = |hz: f32| {
+            let w = TAU * hz / sr;
+            (w.cos(), w.sin())
+        };
+        self.wow_step = step(rate);
+        self.flutter_step = step(rate * 5.3);
+        if self.fresh {
+            self.snap();
+        }
+    }
+
+    /// Lands every gliding value on its target, and both heads on their
+    /// lengths.
+    fn snap(&mut self) {
+        for smoothed in [
+            &mut self.feedback,
+            &mut self.cross,
+            &mut self.input_gain,
+            &mut self.freeze_mix,
+            &mut self.diffusion,
+            &mut self.drive,
+            &mut self.swing,
+            &mut self.duck_depth,
+            &mut self.mid_gain,
+            &mut self.side_gain,
+            &mut self.dry_gain,
+            &mut self.wet_gain,
+            &mut self.output_gain,
+        ] {
+            smoothed.settle();
+        }
+        for (line, target) in self.lines.iter_mut().zip(self.targets) {
+            line.current = target;
+            line.next = target;
+            line.fade = None;
+        }
     }
 
     fn rebuild_filters(&mut self) {
-        let hpf = make_eq_biquad(
-            "highpass",
-            self.params.low_cut_hz,
-            0.0,
-            0.707,
-            self.sample_rate,
-        );
-        self.hpf_l = hpf;
-        self.hpf_r = hpf;
-        let lpf = make_eq_biquad(
-            "lowpass",
-            self.params.high_cut_hz.min(self.sample_rate * 0.45),
-            0.0,
-            0.707,
-            self.sample_rate,
-        );
-        self.lpf_l = lpf;
-        self.lpf_r = lpf;
-    }
-
-    #[inline]
-    fn saturate(sample: f32, amount: f32) -> f32 {
-        if amount <= 0.0 {
-            return sample;
+        let [low, high] = cut_coefficients(&self.params, self.sample_rate);
+        for tone in self.tones.iter_mut() {
+            for (filter, coefficients) in [(&mut tone.low_cut, low), (&mut tone.high_cut, high)] {
+                match (filter.as_mut(), coefficients) {
+                    // Retuned in place: a sweep keeps the repeats running.
+                    (Some(f), Some(c)) => f.update_coefficients(c),
+                    (_, c) => *filter = c.map(DirectForm1::<f32>::new),
+                }
+            }
         }
-        let drive = 1.0 + amount * 6.0;
-        (sample * drive).tanh() / drive.tanh().max(0.001)
-    }
-
-    #[inline]
-    fn filter_feedback(
-        sample: f32,
-        hpf: &mut Option<DirectForm1<f32>>,
-        lpf: &mut Option<DirectForm1<f32>>,
-    ) -> f32 {
-        let mut x = sample;
-        if let Some(f) = hpf.as_mut() {
-            x = f.run(x);
-        }
-        if let Some(f) = lpf.as_mut() {
-            x = f.run(x);
-        }
-        x
     }
 }
 
 impl StereoEffect for Dsp {
     fn reset(&mut self) {
-        self.delay_l.clear();
-        self.delay_r.clear();
-        if let Some(f) = self.hpf_l.as_mut() {
-            f.reset_state();
+        for line in self.lines.iter_mut() {
+            line.clear();
         }
-        if let Some(f) = self.hpf_r.as_mut() {
-            f.reset_state();
+        for tone in self.tones.iter_mut() {
+            tone.clear();
         }
-        if let Some(f) = self.lpf_l.as_mut() {
-            f.reset_state();
-        }
-        if let Some(f) = self.lpf_r.as_mut() {
-            f.reset_state();
-        }
+        self.duck_env = 0.0;
+        self.fresh = true;
+        self.snap();
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
@@ -605,66 +1066,97 @@ impl StereoEffect for Dsp {
         if (sr - self.sample_rate).abs() < f32::EPSILON {
             return;
         }
-        let capacity = Self::ring_capacity(sr);
-        self.sample_rate = sr;
-        self.delay_l = DelayLine::new(capacity);
-        self.delay_r = DelayLine::new(capacity);
-        self.apply_params();
+        let (params, tempo) = (self.params.clone(), self.tempo_bpm);
+        *self = Self::new(sr);
+        self.tempo_bpm = tempo;
+        self.set_params(params);
+        self.reset();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
         if !self.params.power {
             return (left, right);
         }
+        self.fresh = false;
+        let smooth = self.smooth_step;
+        let mode = self.params.mode;
 
-        let delayed_l = self.delay_l.read(self.delay_samples_l);
-        let delayed_r = self.delay_r.read(self.delay_samples_r);
-
-        let fb = if self.params.freeze {
-            MAX_FEEDBACK
-        } else {
-            self.params.feedback / 100.0
-        };
-        let xfb = self.params.cross_feedback / 100.0;
-        let sat = self.params.saturation / 100.0;
-        // Normalising by the cross amount keeps the round-trip gain at `fb`
-        // however much of it is routed across. Summing the two paths at full
-        // strength reaches 1.96 at the maximum settings, and with saturation at
-        // 0 — which the user is free to do — nothing else bounds the line.
-        let fb_norm = fb / (1.0 + xfb);
-
-        let (in_l, in_r) = match self.params.mode {
-            DelayMode::Mono => {
-                let m = (left + right) * 0.5;
-                (m, m)
+        // Read heads, wobbling.
+        let swing = self.swing.next(smooth);
+        let mut taps = [0.0f32; 2];
+        for side in 0..2 {
+            let wobble = self.wobbles[side].next(self.wow_step, self.flutter_step) * swing;
+            taps[side] = self.lines[side].read(self.targets[side], wobble, self.fade_step);
+        }
+        self.wobble_tick += 1;
+        if self.wobble_tick >= 64 {
+            self.wobble_tick = 0;
+            for wobble in self.wobbles.iter_mut() {
+                wobble.renormalise();
             }
-            DelayMode::Stereo | DelayMode::PingPong => (left, right),
+        }
+
+        // Feedback routing, normalised so cross-feed moves the repeats
+        // without changing the loop's level.
+        let fb = self.feedback.next(smooth);
+        let cross = self.cross.next(smooth);
+        let norm = fb / (1.0 + cross);
+        let input_gain = self.input_gain.next(smooth);
+        let mono_in = (left + right) * 0.5;
+        let (writes, wet) = match mode {
+            DelayMode::Stereo => (
+                [
+                    left * input_gain + (taps[0] + cross * taps[1]) * norm,
+                    right * input_gain + (taps[1] + cross * taps[0]) * norm,
+                ],
+                (taps[0], taps[1]),
+            ),
+            DelayMode::PingPong => (
+                [
+                    mono_in * input_gain + (taps[1] + cross * taps[0]) * norm,
+                    (taps[0] + cross * taps[1]) * norm,
+                ],
+                (taps[0], taps[1]),
+            ),
+            DelayMode::Mono => (
+                [mono_in * input_gain + taps[0] * fb, 0.0],
+                (taps[0], taps[0]),
+            ),
         };
 
-        let mut fb_l = (delayed_l + delayed_r * xfb) * fb_norm;
-        let mut fb_r = (delayed_r + delayed_l * xfb) * fb_norm;
-        if self.params.mode == DelayMode::PingPong {
-            // Swap cross paths for classic ping-pong bounce.
-            std::mem::swap(&mut fb_l, &mut fb_r);
+        // Tone stage on the write path, bypassed while frozen.
+        let freeze_mix = self.freeze_mix.next(smooth);
+        let diffusion = self.diffusion.next(smooth);
+        let drive = self.drive.next(smooth);
+        for side in 0..2 {
+            let tone = &mut self.tones[side];
+            let raw = writes[side];
+            let mut x = tone.filter(raw);
+            x += (raw - x) * freeze_mix;
+            for ap in tone.diffusers.iter_mut() {
+                x = ap.process(x, diffusion);
+            }
+            self.lines[side].ring.push(saturate(x, drive));
         }
 
-        fb_l = Self::filter_feedback(fb_l, &mut self.hpf_l, &mut self.lpf_l);
-        fb_r = Self::filter_feedback(fb_r, &mut self.hpf_r, &mut self.lpf_r);
-        fb_l = Self::saturate(fb_l, sat);
-        fb_r = Self::saturate(fb_r, sat);
-
-        if !self.params.freeze {
-            self.delay_l.write_sample(in_l + fb_l);
-            self.delay_r.write_sample(in_r + fb_r);
+        // Duck: the repeats step back while the input plays.
+        let level = left.abs().max(right.abs());
+        let rate = if level > self.duck_env {
+            self.duck_attack
         } else {
-            self.delay_l.write_sample(fb_l);
-            self.delay_r.write_sample(fb_r);
-        }
+            self.duck_release
+        };
+        self.duck_env += (level - self.duck_env) * rate;
+        let duck = 1.0 / (1.0 + self.duck_depth.next(smooth) * self.duck_env);
 
-        let wet_l = delayed_l * self.output_gain;
-        let wet_r = delayed_r * self.output_gain;
-        let amount = self.params.mix / 100.0;
-        (mix(left, wet_l, amount), mix(right, wet_r, amount))
+        let mid = (wet.0 + wet.1) * FRAC_1_SQRT_2 * self.mid_gain.next(smooth);
+        let side = (wet.0 - wet.1) * FRAC_1_SQRT_2 * self.side_gain.next(smooth);
+        let wet_gain = self.wet_gain.next(smooth) * self.output_gain.next(smooth) * duck;
+        let dry = self.dry_gain.next(smooth);
+        (
+            left * dry + (mid + side) * wet_gain,
+            right * dry + (mid - side) * wet_gain,
+        )
     }
 }
 
@@ -672,11 +1164,91 @@ impl StereoEffect for Dsp {
 mod tests {
     use super::*;
 
+    const SR: f32 = 48_000.0;
+
+    /// Wet only, tone stage wide open and clean: what the routing alone does.
+    fn plain(mode: DelayMode) -> Params {
+        Params {
+            mode,
+            mix: 100.0,
+            low_cut_hz: 20.0,
+            high_cut_hz: 20_000.0,
+            saturation: 0.0,
+            cross_feedback: 0.0,
+            ..default_params()
+        }
+    }
+
+    fn dsp_with(params: Params) -> Dsp {
+        let mut dsp = Dsp::new(SR);
+        dsp.set_params(params);
+        dsp.reset();
+        dsp
+    }
+
+    fn impulse_response(dsp: &mut Dsp, frames: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut left = Vec::with_capacity(frames);
+        let mut right = Vec::with_capacity(frames);
+        for n in 0..frames {
+            let x = if n == 0 { 1.0 } else { 0.0 };
+            let (l, r) = dsp.process_stereo(x, x);
+            assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+            left.push(l);
+            right.push(r);
+        }
+        (left, right)
+    }
+
+    /// Length of the 1 kHz test burst, and where its envelope peaks.
+    const BURST: usize = 480;
+    const BURST_PEAK_MS: f32 = 5.0;
+
+    /// The response to a Hann-windowed 1 kHz burst: each repeat comes back
+    /// as a burst whose height is the repeat's level at 1 kHz — the level
+    /// [`echo_pattern`] draws — whatever the cuts do to an impulse's shape.
+    fn burst_response(dsp: &mut Dsp, frames: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut left = Vec::with_capacity(frames);
+        let mut right = Vec::with_capacity(frames);
+        for n in 0..frames {
+            let x = if n < BURST {
+                let window = 0.5 - 0.5 * (TAU * n as f32 / BURST as f32).cos();
+                window * (TAU * 1_000.0 * n as f32 / SR).sin()
+            } else {
+                0.0
+            };
+            let (l, r) = dsp.process_stereo(x, x);
+            left.push(l);
+            right.push(r);
+        }
+        (left, right)
+    }
+
+    /// The highest point of a burst arriving `at_ms` after the input's.
+    fn burst_level(signal: &[f32], at_ms: f32) -> f32 {
+        let centre = ((at_ms + BURST_PEAK_MS) * 0.001 * SR) as usize;
+        (centre.saturating_sub(120)..(centre + 120).min(signal.len()))
+            .map(|i| signal[i].abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// Where the impulse response peaks near `at_ms`, and how high.
+    fn peak_near(signal: &[f32], at_ms: f32) -> (f32, f32) {
+        let centre = (at_ms * 0.001 * SR) as usize;
+        let (index, value) = (centre.saturating_sub(48)..(centre + 48).min(signal.len()))
+            .map(|i| (i, signal[i].abs()))
+            .fold(
+                (0, 0.0f32),
+                |best, now| if now.1 > best.1 { now } else { best },
+            );
+        (index as f32 / SR * 1000.0, value)
+    }
+
     #[test]
     fn descriptor_ids_are_unique_and_match_defaults() {
         let d = descriptor();
         assert_eq!(d.id, PLUGIN_ID);
         assert_eq!(d.category, PluginCategory::Effect);
+        assert_eq!(d.params.len(), ipc::PARAM_COUNT);
 
         let mut ids: Vec<_> = d.params.iter().map(|p| p.id).collect();
         let count = ids.len();
@@ -710,90 +1282,116 @@ mod tests {
 
     #[test]
     fn bypass_when_power_off() {
-        let mut dsp = Dsp::new(48_000.0);
         let mut params = default_params();
         params.power = false;
-        dsp.set_params(params);
+        let mut dsp = dsp_with(params);
         assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
     }
 
     #[test]
-    fn delay_produces_echo() {
-        let mut dsp = Dsp::new(48_000.0);
+    fn mix_at_zero_is_the_dry_signal() {
         let mut params = default_params();
-        params.time_ms_l = 10.0;
-        params.time_ms_r = 10.0;
-        params.feedback = 0.0;
-        params.mix = 100.0;
-        params.mode = DelayMode::Stereo;
-        dsp.set_params(params);
-
-        // Impulse
-        let _ = dsp.process_stereo(1.0, 1.0);
-        let mut heard = 0.0f32;
-        for _ in 0..480 {
-            let (l, _) = dsp.process_stereo(0.0, 0.0);
-            heard = heard.max(l.abs());
+        params.mix = 0.0;
+        let mut dsp = dsp_with(params);
+        for n in 0..9_600 {
+            let x = (n as f32 * 0.05).sin() * 0.5;
+            let (l, r) = dsp.process_stereo(x, -x);
+            assert!((l - x).abs() < 1.0e-6 && (r + x).abs() < 1.0e-6);
         }
-        assert!(heard > 0.1);
+    }
+
+    /// Every repeat lands where the editor draws it, at the level it draws.
+    #[test]
+    fn the_repeats_land_where_the_pattern_says() {
+        for mode in DelayMode::ALL {
+            let mut params = plain(mode);
+            params.time_ms_l = 120.0;
+            params.time_ms_r = 190.0;
+            params.feedback = 60.0;
+            params.cross_feedback = 40.0;
+            let mut dsp = dsp_with(params.clone());
+            let (left, right) = impulse_response(&mut dsp, (SR * 1.2) as usize);
+            dsp.reset();
+            let (burst_l, burst_r) = burst_response(&mut dsp, (SR * 1.2) as usize);
+            let pattern = echo_pattern(&params, DEFAULT_TEMPO_BPM, SR, -30.0, 64);
+            assert!(pattern.len() >= 4, "{mode:?}: too few repeats drawn");
+            for echo in pattern.iter().filter(|e| e.at_ms < 1_150.0) {
+                let side = if echo.right { &right } else { &left };
+                let (at, _) = peak_near(side, echo.at_ms);
+                let level = burst_level(if echo.right { &burst_r } else { &burst_l }, echo.at_ms);
+                assert!(
+                    (at - echo.at_ms).abs() < 0.2,
+                    "{mode:?}: repeat {} drawn at {} ms, heard at {at} ms",
+                    echo.pass,
+                    echo.at_ms
+                );
+                assert!(
+                    (level - echo.gain).abs() < 0.02 + echo.gain * 0.06,
+                    "{mode:?}: repeat {} at {} ms drawn {} heard {level}",
+                    echo.pass,
+                    echo.at_ms,
+                    echo.gain
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ping_pong_starts_left_and_bounces() {
+        let mut params = plain(DelayMode::PingPong);
+        params.time_ms_l = 100.0;
+        params.time_ms_r = 100.0;
+        params.feedback = 50.0;
+        let mut dsp = dsp_with(params);
+        let (left, right) = burst_response(&mut dsp, (SR * 0.35) as usize);
+        assert!(burst_level(&left, 100.0) > 0.95 && burst_level(&right, 100.0) < 0.01);
+        assert!(burst_level(&right, 200.0) > 0.47 && burst_level(&left, 200.0) < 0.01);
+        assert!(burst_level(&left, 300.0) > 0.23);
     }
 
     /// The echo must land at the requested time, not at whatever the ring
-    /// happens to be long enough for. Sizing the buffer with a fixed sample
-    /// count silently capped this at 2 s once the engine ran at 96 kHz.
+    /// happens to be long enough for, at every rate.
     #[test]
     fn the_longest_delay_is_reachable_at_every_rate() {
         for &sr in &[44_100.0f32, 48_000.0, 96_000.0, 192_000.0] {
             let mut dsp = Dsp::new(sr);
-            let mut params = default_params();
+            let mut params = plain(DelayMode::Stereo);
             params.time_ms_l = MAX_DELAY_MS;
             params.time_ms_r = MAX_DELAY_MS;
             params.feedback = 0.0;
-            params.mix = 100.0;
-            params.mode = DelayMode::Stereo;
             dsp.set_params(params);
+            dsp.reset();
 
             let expected = (MAX_DELAY_MS * 0.001 * sr) as usize;
             let _ = dsp.process_stereo(1.0, 1.0);
-
-            // Nothing before the tap...
             let mut early = 0.0f32;
             for _ in 0..(expected - 16) {
                 let (l, _) = dsp.process_stereo(0.0, 0.0);
                 early = early.max(l.abs());
             }
             assert!(early < 1.0e-4, "echo arrived early at {sr} Hz: {early}");
-
-            // ...and the impulse right at it.
             let mut heard = 0.0f32;
             for _ in 0..32 {
                 let (l, _) = dsp.process_stereo(0.0, 0.0);
-                heard = heard.max(l.abs());
+                heard += l;
             }
-            assert!(heard > 0.5, "no echo at {sr} Hz after {expected} samples");
+            assert!(heard > 0.8, "no echo at {sr} Hz after {expected} samples");
         }
     }
 
-    /// Feedback and cross-feed used to be summed at full strength, so the
-    /// round-trip gain reached 1.96 at the maximum settings. The saturator hid
-    /// it until saturation was turned off, and then the line grew without
-    /// bound.
     #[test]
-    fn maximum_cross_feedback_stays_bounded_without_saturation() {
-        for mode in [DelayMode::Stereo, DelayMode::PingPong, DelayMode::Mono] {
-            let mut dsp = Dsp::new(48_000.0);
-            let mut params = default_params();
-            params.mode = mode;
+    fn maximum_feedback_stays_bounded_in_every_mode() {
+        for mode in DelayMode::ALL {
+            let mut params = plain(mode);
             params.time_ms_l = 120.0;
             params.time_ms_r = 180.0;
             params.feedback = 98.0;
             params.cross_feedback = 100.0;
-            params.saturation = 0.0;
-            params.mix = 100.0;
-            dsp.set_params(params);
-
+            params.diffusion = 100.0;
+            params.mod_depth = 100.0;
+            let mut dsp = dsp_with(params);
             let mut peak = 0.0f32;
-            for n in 0..(48_000 * 20) {
+            for n in 0..(48_000 * 12) {
                 let x = if n < 4_800 {
                     (n as f32 * 0.02).sin() * 0.7
                 } else {
@@ -803,52 +1401,86 @@ mod tests {
                 assert!(l.is_finite() && r.is_finite(), "{mode:?} diverged at {n}");
                 peak = peak.max(l.abs()).max(r.abs());
             }
-            assert!(peak < 8.0, "{mode:?} ran away: peak {peak}");
+            assert!(peak < 2.0, "{mode:?} ran away: peak {peak}");
         }
     }
 
     /// Cross-feed changes where the repeats go, not how loud the loop is.
     #[test]
     fn cross_feedback_does_not_change_the_loop_gain() {
-        let tail_peak = |cross: f32| {
-            let mut dsp = Dsp::new(48_000.0);
-            let mut params = default_params();
-            params.mode = DelayMode::Stereo;
+        let tail_energy = |cross: f32| {
+            let mut params = plain(DelayMode::Stereo);
             params.time_ms_l = 100.0;
             params.time_ms_r = 100.0;
-            params.feedback = 90.0;
+            params.feedback = 80.0;
             params.cross_feedback = cross;
-            params.saturation = 0.0;
-            params.mix = 100.0;
-            dsp.set_params(params);
-
-            let _ = dsp.process_stereo(1.0, 1.0);
-            let mut peak = 0.0f32;
-            for _ in 0..(48_000 * 3) {
-                let (l, r) = dsp.process_stereo(0.0, 0.0);
-                peak = peak.max(l.abs()).max(r.abs());
-            }
-            peak
+            let mut dsp = dsp_with(params);
+            let (left, right) = impulse_response(&mut dsp, 48_000 * 2);
+            left.iter()
+                .chain(&right)
+                .skip(9_600)
+                .map(|x| x * x)
+                .sum::<f32>()
         };
-        let none = tail_peak(0.0);
-        let full = tail_peak(100.0);
-        assert!(none > 0.1 && full > 0.1, "no tail to compare");
-        assert!(
-            (none - full).abs() < none * 0.25,
-            "loop gain moved with cross-feed: {none} vs {full}"
-        );
+        let none = tail_energy(0.0);
+        let full = tail_energy(100.0);
+        assert!(none > 0.01, "no tail to compare");
+        assert!((none - full).abs() < none * 0.05, "{none} vs {full}");
+    }
+
+    /// The old saturator gained up to 7x at rest, so a quiet repeat came back
+    /// louder than it went in; this one only ever takes level off.
+    #[test]
+    fn saturation_never_adds_gain() {
+        for amount in [0.0f32, 0.1, 0.5, 1.0] {
+            for x in [-1.5f32, -0.6, -0.01, 0.0, 0.003, 0.2, 0.9, 2.0] {
+                assert!(saturate(x, amount).abs() <= x.abs() + 1.0e-6);
+            }
+            assert!((saturate(0.001, amount) - 0.001).abs() < 1.0e-5);
+        }
+        assert!(saturate(1.0, 1.0) < 0.5);
+    }
+
+    /// Turning the time knob crossfades between two heads: no step, and no
+    /// pitch smear.
+    #[test]
+    fn a_time_change_does_not_click() {
+        let mut params = plain(DelayMode::Stereo);
+        params.time_ms_l = 300.0;
+        params.time_ms_r = 300.0;
+        params.feedback = 50.0;
+        let mut dsp = dsp_with(params);
+        let mut previous = 0.0f32;
+        let mut steady = 0.0f32;
+        let mut changed = 0.0f32;
+        for n in 0..(48_000 * 2) {
+            let x = (n as f32 * TAU * 330.0 / SR).sin() * 0.4;
+            if n == 48_000 {
+                assert!(dsp.apply_ui_param("timeMsL", 1_100.0));
+            }
+            if n == 52_000 {
+                assert!(dsp.apply_ui_param("timeMsL", 450.0));
+            }
+            let (l, _) = dsp.process_stereo(x, x);
+            let step = (l - previous).abs();
+            previous = l;
+            if (24_000..48_000).contains(&n) {
+                steady = steady.max(step);
+            } else if n >= 48_000 {
+                changed = changed.max(step);
+            }
+        }
+        assert!(changed < steady * 1.5, "{changed} against {steady}");
     }
 
     #[test]
     fn freeze_holds_the_repeats_after_the_input_stops() {
-        let mut dsp = Dsp::new(48_000.0);
         let mut params = default_params();
         params.mix = 100.0;
         params.time_ms_l = 250.0;
         params.time_ms_r = 250.0;
         params.feedback = 40.0;
-        dsp.set_params(params);
-
+        let mut dsp = dsp_with(params);
         for n in 0..24_000 {
             let x = (n as f32 * 0.03).sin() * 0.5;
             let _ = dsp.process_stereo(x, x);
@@ -867,17 +1499,57 @@ mod tests {
         }
         assert!(early > 1.0e-4, "nothing in the line to freeze");
         assert!(
-            late > early * 0.25,
+            late > early * 0.5,
             "freeze decayed away: early {early}, late {late}"
+        );
+    }
+
+    /// While the input plays the repeats step back; when it stops they return.
+    #[test]
+    fn ducking_clears_room_for_the_input() {
+        let level_of = |duck: f32| {
+            let mut params = plain(DelayMode::Stereo);
+            params.time_ms_l = 50.0;
+            params.time_ms_r = 50.0;
+            params.feedback = 70.0;
+            params.duck = duck;
+            let mut dsp = dsp_with(params);
+            let mut playing = 0.0f32;
+            let mut after = 0.0f32;
+            for n in 0..(48_000 * 2) {
+                let x = if n < 48_000 {
+                    (n as f32 * TAU * 200.0 / SR).sin() * 0.5
+                } else {
+                    0.0
+                };
+                let (l, _) = dsp.process_stereo(x, x);
+                // Wet only: take the dry back out.
+                if (24_000..48_000).contains(&n) {
+                    playing = playing.max(l.abs());
+                } else if (76_000..78_000).contains(&n) {
+                    after = after.max(l.abs());
+                }
+            }
+            (playing, after)
+        };
+        let (open_playing, open_after) = level_of(0.0);
+        let (ducked_playing, ducked_after) = level_of(100.0);
+        assert!(
+            ducked_playing < open_playing * 0.3,
+            "{ducked_playing} vs {open_playing}"
+        );
+        assert!(
+            ducked_after > open_after * 0.7,
+            "{ducked_after} vs {open_after}"
         );
     }
 
     #[test]
     fn reset_clears_the_repeats() {
-        let mut dsp = Dsp::new(48_000.0);
-        let mut params = default_params();
-        params.mix = 100.0;
-        dsp.set_params(params);
+        let mut dsp = dsp_with(Params {
+            mix: 100.0,
+            ..default_params()
+        });
         for _ in 0..4_800 {
             let _ = dsp.process_stereo(0.5, -0.5);
         }
@@ -888,17 +1560,17 @@ mod tests {
 
     #[test]
     fn sample_rate_change_keeps_taps_inside_the_new_rings() {
-        let mut dsp = Dsp::new(192_000.0);
         let mut params = default_params();
         params.time_ms_l = MAX_DELAY_MS;
         params.time_ms_r = MAX_DELAY_MS;
         params.mix = 100.0;
+        params.mod_depth = 100.0;
+        let mut dsp = Dsp::new(192_000.0);
         dsp.set_params(params);
         dsp.set_sample_rate(44_100.0);
-
-        let capacity = dsp.delay_l.buffer.len();
-        assert!(dsp.delay_samples_l < capacity);
-        assert!(dsp.delay_samples_r < capacity);
+        assert_eq!(dsp.params().time_ms_l, MAX_DELAY_MS, "the params survive");
+        let capacity = dsp.lines[0].ring.max_cubic_delay();
+        assert!(dsp.targets[0] + MAX_MOD_MS * 0.001 * 44_100.0 < capacity);
         for _ in 0..4_410 {
             let (l, r) = dsp.process_stereo(0.3, -0.3);
             assert!(l.is_finite() && r.is_finite());
@@ -910,40 +1582,44 @@ mod tests {
     /// holds.
     #[test]
     fn a_synced_line_takes_its_delay_from_the_tempo() {
-        let mut dsp = Dsp::new(48_000.0);
-        let mut params = default_params();
+        let mut params = plain(DelayMode::Stereo);
         params.time_ms_l = 12.0;
         params.time_ms_r = 12.0;
+        params.feedback = 0.0;
         params.sync = true;
         params.division_l = DIVISION_LABELS.iter().position(|l| *l == "1/4").unwrap() as u8;
         params.division_r = params.division_l;
-        dsp.set_params(params);
+        let mut dsp = dsp_with(params);
         dsp.set_tempo_bpm(120.0);
-
+        dsp.reset();
         // A quarter note at 120 BPM is 500 ms.
-        assert_eq!(dsp.delay_samples_l, 24_000);
-        assert_eq!(dsp.delay_samples_r, 24_000);
+        let (left, _) = impulse_response(&mut dsp, 30_000);
+        assert!(peak_near(&left, 500.0).1 > 0.5);
+        assert!((peak_near(&left, 500.0).0 - 500.0).abs() < 0.1);
 
         // Half the tempo, twice the spacing — without any parameter edit.
         dsp.set_tempo_bpm(60.0);
-        assert_eq!(dsp.delay_samples_l, 48_000);
+        dsp.reset();
+        let (left, _) = impulse_response(&mut dsp, 50_000);
+        assert!((peak_near(&left, 1_000.0).0 - 1_000.0).abs() < 0.1);
 
         // ...and switching sync off returns the line to the time the control
         // was holding all along.
         assert!(dsp.apply_ui_param("sync", 0.0));
-        assert_eq!(dsp.delay_samples_l, 576);
+        dsp.reset();
+        let (left, _) = impulse_response(&mut dsp, 2_000);
+        assert!((peak_near(&left, 12.0).0 - 12.0).abs() < 0.1);
     }
 
     #[test]
     fn a_free_line_ignores_the_tempo() {
-        let mut dsp = Dsp::new(48_000.0);
         let mut params = default_params();
         params.time_ms_l = 250.0;
         params.sync = false;
-        dsp.set_params(params);
-        let before = dsp.delay_samples_l;
+        let mut dsp = dsp_with(params);
+        let before = dsp.targets;
         dsp.set_tempo_bpm(174.0);
-        assert_eq!(dsp.delay_samples_l, before);
+        assert_eq!(dsp.targets, before);
         assert_eq!(dsp.tempo_bpm(), 174.0);
     }
 
@@ -952,14 +1628,13 @@ mod tests {
     /// delay.
     #[test]
     fn a_nonsense_tempo_cannot_break_the_delay_line() {
-        let mut dsp = Dsp::new(48_000.0);
         let mut params = default_params();
         params.sync = true;
-        dsp.set_params(params);
+        let mut dsp = dsp_with(params);
         for bpm in [0.0, -240.0, f32::NAN, f32::INFINITY, 1.0e12] {
             dsp.set_tempo_bpm(bpm);
-            assert!(dsp.delay_samples_l >= 1);
-            assert!(dsp.delay_samples_l < dsp.delay_l.buffer.len());
+            assert!(dsp.targets[0] >= 2.0);
+            assert!(dsp.targets[0] < dsp.lines[0].ring.max_cubic_delay());
             let (l, r) = dsp.process_stereo(0.4, -0.4);
             assert!(l.is_finite() && r.is_finite(), "diverged at {bpm} BPM");
         }
@@ -977,7 +1652,7 @@ mod tests {
                 dsp.set_params(params);
                 dsp.set_tempo_bpm(bpm);
                 assert!(
-                    dsp.delay_samples_l >= 1 && dsp.delay_samples_l < dsp.delay_l.buffer.len(),
+                    dsp.targets[0] >= 2.0 && dsp.targets[0] < dsp.lines[0].ring.max_cubic_delay(),
                     "division {division} at {bpm} BPM left the ring"
                 );
                 let ms = division_ms(division, bpm);
@@ -991,8 +1666,17 @@ mod tests {
         let mut dsp = Dsp::new(48_000.0);
         assert!(dsp.apply_wire_param(ipc::TIME_L_INDEX, 500.0));
         assert_eq!(dsp.params().time_ms_l, 500.0);
-        assert_eq!(dsp.delay_samples_l, 24_000);
+        assert!(dsp.apply_wire_param(ipc::DUCK_INDEX, 40.0));
+        assert_eq!(dsp.params().duck, 40.0);
         assert!(!dsp.apply_wire_param(u32::MAX, 0.0));
         assert!(!dsp.apply_wire_param(ipc::TIME_L_INDEX, f32::NAN));
+    }
+
+    #[test]
+    fn the_tone_the_editor_draws_is_the_tone_that_plays() {
+        let params = default_params();
+        assert!(tone_response_db(&params, 1_000.0, SR).abs() < 0.5);
+        assert!(tone_response_db(&params, 40.0, SR) < -20.0);
+        assert!(tone_response_db(&params, 18_000.0, SR) < -9.0);
     }
 }

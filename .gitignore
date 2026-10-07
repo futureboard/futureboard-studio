@@ -61,6 +61,9 @@ apps/electron/out/
 *.dll
 *.exe
 *.d
+# Not dependency files: the LiveStage appliance's OpenRC directories
+# (conf.d, init.d, local.d).
+!packaging/livestage/rootfs/etc/*.d/
 *.o
 *.a
 *.so

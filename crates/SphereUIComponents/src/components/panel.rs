@@ -47,7 +47,7 @@ use crate::components::text_input::{
 use crate::components::timeline::timeline_state::{
     AudioClipStretchState, ClipType, InsertLoadStatus, InsertSlotState, StretchTiming,
     TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting, TrackState, TrackType, volume,
-    vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
+    vsti_output_child_channels_for_bus_layout,
 };
 use crate::i18n::I18n;
 use crate::overlay::{OverlayAnchor, inspector_combo_menu_position};
@@ -276,6 +276,9 @@ pub struct SelectedClipSummary<'a> {
     /// The fades the clip plays (a crossfade's on an overlapped edge) and
     /// whether its track is ARA-rendered. `None` until the owner resolves it.
     pub fades: Option<crate::components::timeline::timeline_state::ClipFadeSummary>,
+    /// Beats in a bar where the clip starts, for lengths shown in bars. 4
+    /// until the owner resolves it.
+    pub beats_per_bar: f64,
 }
 
 /// What the Inspector is currently editing. Resolved fresh from the live
@@ -426,6 +429,12 @@ pub fn inspector_panel<'a>(
                     .filter(|track| track.track_type == TrackType::Instrument)
                     .map(|track| (track.id.clone(), track.name.clone()))
                     .collect();
+                let midi_input_label = midi_input_combo_label(&t.routing.midi_input, |id| {
+                    tracks
+                        .iter()
+                        .find(|track| track.id == id)
+                        .map(|track| track.name.clone())
+                });
                 track_inspector(
                     t,
                     connections,
@@ -433,6 +442,7 @@ pub fn inspector_panel<'a>(
                     name_focused,
                     name_callbacks,
                     &instrument_targets,
+                    midi_input_label,
                     &color_picker,
                     spatial_format,
                     callbacks,
@@ -822,7 +832,7 @@ fn vsti_output_dropdown(
     // whole pair, so a single tick gives full left+right sound (a mono bus
     // reports a duplicated pair). Bus 0 is Main 1/2, already shown above.
     let bus_counts = &slot.output_bus_channel_counts;
-    for bus_index in vsti_output_bus_strip_indices(bus_counts) {
+    for bus_index in slot.output_strip_indices() {
         if bus_index == 0 {
             continue;
         }
@@ -946,11 +956,20 @@ fn parse_audio_format_option(label: &str) -> TrackAudioFormat {
     }
 }
 
-fn midi_input_combo_label(routing: &TrackMidiInputRouting) -> String {
+/// The MIDI Input trigger's text. `track_name` resolves a plug-in source's
+/// live name; a source that is gone reads as missing rather than as an id.
+fn midi_input_combo_label(
+    routing: &TrackMidiInputRouting,
+    track_name: impl Fn(&str) -> Option<String>,
+) -> String {
     match routing {
         TrackMidiInputRouting::AllInputs => "All".to_string(),
         TrackMidiInputRouting::None => "None".to_string(),
         TrackMidiInputRouting::MidiDevice { device_id } => device_id.clone(),
+        TrackMidiInputRouting::PluginOutput { track_id } => match track_name(track_id) {
+            Some(name) => format!("VSTi - {name}"),
+            None => "VSTi - Missing track".to_string(),
+        },
     }
 }
 
@@ -960,10 +979,98 @@ fn midi_channel_combo_label(channel: Option<u8>) -> String {
         .unwrap_or_else(|| "All".to_string())
 }
 
-fn midi_input_options(detected: &[String]) -> Vec<String> {
-    let mut options = vec!["All".to_string(), "None".to_string()];
-    options.extend(detected.iter().cloned());
-    options
+/// Menu value for a MIDI input routing: what a tree row is matched and
+/// chosen by. Prefixed, so a device and a track can share a name.
+fn midi_input_value(routing: &TrackMidiInputRouting) -> String {
+    match routing {
+        TrackMidiInputRouting::None => "none".to_string(),
+        TrackMidiInputRouting::AllInputs => "all".to_string(),
+        TrackMidiInputRouting::MidiDevice { device_id } => format!("device:{device_id}"),
+        TrackMidiInputRouting::PluginOutput { track_id } => format!("vsti:{track_id}"),
+    }
+}
+
+fn parse_midi_input_value(value: &str) -> TrackMidiInputRouting {
+    if let Some(device_id) = value.strip_prefix("device:") {
+        return TrackMidiInputRouting::MidiDevice {
+            device_id: device_id.to_string(),
+        };
+    }
+    if let Some(track_id) = value.strip_prefix("vsti:") {
+        return TrackMidiInputRouting::PluginOutput {
+            track_id: track_id.to_string(),
+        };
+    }
+    match value {
+        "all" => TrackMidiInputRouting::AllInputs,
+        _ => TrackMidiInputRouting::None,
+    }
+}
+
+/// The MIDI Input menu as a tree: None, then the hardware and virtual ports
+/// under MIDI Devices, then the tracks whose plug-in MIDI this track can take
+/// under VSTi. A current choice that is no longer offered (an unplugged port,
+/// a deleted track) stays listed as missing so the menu shows what is set.
+pub(crate) fn midi_input_tree(
+    current: &TrackMidiInputRouting,
+    detected: &[String],
+    plugin_sources: &[(String, String)],
+) -> Vec<crate::components::combo_box::TreeMenuNode> {
+    use crate::components::combo_box::{MenuGlyph, TreeMenuNode};
+    let routing_leaf = |label: String, routing: TrackMidiInputRouting| {
+        TreeMenuNode::leaf(label, midi_input_value(&routing), MenuGlyph::None)
+    };
+    let mut devices = vec![routing_leaf(
+        "All MIDI Inputs".to_string(),
+        TrackMidiInputRouting::AllInputs,
+    )];
+    devices.extend(detected.iter().map(|name| {
+        routing_leaf(
+            name.clone(),
+            TrackMidiInputRouting::MidiDevice {
+                device_id: name.clone(),
+            },
+        )
+    }));
+    if let TrackMidiInputRouting::MidiDevice { device_id } = current {
+        if !detected.contains(device_id) {
+            devices.push(routing_leaf(
+                format!("Missing - {device_id}"),
+                current.clone(),
+            ));
+        }
+    }
+    let mut plugins: Vec<TreeMenuNode> = plugin_sources
+        .iter()
+        .map(|(track_id, label)| {
+            routing_leaf(
+                label.clone(),
+                TrackMidiInputRouting::PluginOutput {
+                    track_id: track_id.clone(),
+                },
+            )
+        })
+        .collect();
+    if let TrackMidiInputRouting::PluginOutput { track_id } = current {
+        if !plugin_sources.iter().any(|(id, _)| id == track_id) {
+            plugins.push(routing_leaf("Missing track".to_string(), current.clone()));
+        }
+    }
+    vec![
+        routing_leaf("None".to_string(), TrackMidiInputRouting::None),
+        TreeMenuNode::branch(
+            "MIDI Devices",
+            MenuGlyph::Svg(crate::assets::ICON_KEYBOARD_PATH),
+            devices,
+            "No MIDI inputs enabled",
+        ),
+        TreeMenuNode::branch(
+            "VSTi",
+            MenuGlyph::Svg(crate::assets::ICON_PLUG_PATH),
+            plugins,
+            "No other track has a plug-in",
+        ),
+    ]
 }
 
 fn midi_channel_options() -> Vec<String> {
@@ -1031,16 +1138,6 @@ fn midi_output_combo_label(
     }
 }
 
-fn parse_midi_input_option(label: &str) -> TrackMidiInputRouting {
-    match label {
-        "All" => TrackMidiInputRouting::AllInputs,
-        "None" => TrackMidiInputRouting::None,
-        device => TrackMidiInputRouting::MidiDevice {
-            device_id: device.to_string(),
-        },
-    }
-}
-
 fn parse_midi_channel_option(label: &str) -> Option<u8> {
     if label == "All" {
         None
@@ -1079,10 +1176,10 @@ fn routing_combo_trigger(
     ))
 }
 
-fn midi_input_selector(track: &TrackState, callbacks: &InspectorCallbacks) -> impl IntoElement {
+fn midi_input_selector(label: String, callbacks: &InspectorCallbacks) -> impl IntoElement {
     routing_combo_trigger(
         "inspector-midi-input-combo",
-        midi_input_combo_label(&track.routing.midi_input),
+        label,
         InspectorRoutingCombo::MidiInput,
         callbacks.open_routing_combo,
         callbacks.on_toggle_routing_combo.clone(),
@@ -1139,6 +1236,9 @@ pub(crate) fn inspector_routing_combo_overlay(
     // `device_registry` cache (same source Settings → MIDI renders from).
     detected_midi_inputs: Vec<String>,
     detected_midi_outputs: Vec<String>,
+    // Tracks whose plug-in MIDI this track may take as input, as
+    // `(track_id, label)`; see `TimelineState::plugin_midi_sources_for`.
+    plugin_midi_sources: Vec<(String, String)>,
 ) -> impl IntoElement {
     let position =
         inspector_combo_menu_position(anchor, INSPECTOR_WIDTH, ROUTING_COMBO_MENU_HEIGHT, window);
@@ -1233,17 +1333,21 @@ pub(crate) fn inspector_routing_combo_overlay(
             .map(|slot| vsti_output_dropdown(track, slot, callbacks, position).into_any_element())
             .unwrap_or_else(|| div().into_any_element()),
         InspectorRoutingCombo::MidiInput => {
-            let selected = midi_input_combo_label(&track.routing.midi_input);
-            let options = midi_input_options(&detected_midi_inputs);
+            let selected = midi_input_value(&track.routing.midi_input);
+            let nodes = midi_input_tree(
+                &track.routing.midi_input,
+                &detected_midi_inputs,
+                &plugin_midi_sources,
+            );
             let cb = callbacks.on_set_midi_input.clone();
             let close = on_close.clone();
-            combo_box_string_menu(
+            crate::components::combo_box::combo_box_tree_menu(
                 "inspector-midi-input-menu",
                 position,
                 &selected,
-                &options,
+                nodes,
                 Arc::new(move |value, window, cx| {
-                    let routing = parse_midi_input_option(&value);
+                    let routing = parse_midi_input_value(&value);
                     cb(&(track_id.clone(), routing), window, cx);
                     close(cx);
                 }),
@@ -1380,6 +1484,7 @@ fn routing_section(
     track: &TrackState,
     connections: &AudioConnectionRegistry,
     instrument_targets: &[(String, String)],
+    midi_input_label: String,
     callbacks: &InspectorCallbacks,
 ) -> impl IntoElement {
     let mut rows = section_rows();
@@ -1398,7 +1503,7 @@ fn routing_section(
             rows = rows
                 .child(field_row(
                     "MIDI Input",
-                    midi_input_selector(track, callbacks),
+                    midi_input_selector(midi_input_label, callbacks),
                 ))
                 .child(field_row(
                     "MIDI Ch",
@@ -1410,7 +1515,7 @@ fn routing_section(
             rows = rows
                 .child(field_row(
                     "MIDI Input",
-                    midi_input_selector(track, callbacks),
+                    midi_input_selector(midi_input_label, callbacks),
                 ))
                 .child(field_row(
                     "MIDI Ch",
@@ -2480,6 +2585,7 @@ fn track_inspector(
     name_focused: bool,
     name_callbacks: TextInputCallbacks,
     instrument_targets: &[(String, String)],
+    midi_input_label: String,
     color_picker: &InspectorColorPicker<'_>,
     spatial_format: solfege_spatialaudio::SpatialFormat,
     callbacks: &InspectorCallbacks,
@@ -2728,6 +2834,7 @@ fn track_inspector(
             track,
             connections,
             instrument_targets,
+            midi_input_label,
             callbacks,
         ))
         .when(
@@ -3145,7 +3252,7 @@ fn truncate_value(text: impl Into<String>) -> impl IntoElement {
 //
 // Two questions, asked in order, each answered by one control:
 //
-//   1. What decides how long this clip plays?   Off · Speed · Tempo · Warp
+//   1. What decides how long this clip plays?   Off · Speed · Fit · Warp
 //   2. Does its pitch follow the speed?         Keep pitch · Tape
 //
 // plus a transpose wherever pitch is decoupled from speed. Everything else the
@@ -3224,12 +3331,68 @@ fn stretch_segments<T: Copy + PartialEq + 'static>(
         }))
 }
 
-/// The Tempo timing's source-BPM block: the value, how it was found, and the
-/// one-click corrections for the classic half/double-time mistake.
+/// "8 bars", "7 bars 2 beats", "6.37 beats": a fitted clip's length, in the
+/// bars it lands on when it is whole beats.
+fn fitted_length_label(beats: f64, beats_per_bar: f64) -> String {
+    let whole = beats.round();
+    if (beats - whole).abs() > 0.005 {
+        return format!("{beats:.2} beats");
+    }
+    let count = |n: f64, one: &str, many: &str| {
+        if (n - 1.0).abs() < 1.0e-9 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let per_bar = if beats_per_bar.is_finite() && beats_per_bar > 0.0 {
+        beats_per_bar
+    } else {
+        4.0
+    };
+    let bars = (whole / per_bar + 1.0e-9).floor();
+    let rest = ((whole - bars * per_bar) * 100.0).round() / 100.0;
+    match (bars > 0.0, rest > 0.0) {
+        (false, _) => count(rest, "beat", "beats"),
+        (true, false) => count(bars, "bar", "bars"),
+        (true, true) => format!(
+            "{} {}",
+            count(bars, "bar", "bars"),
+            count(rest, "beat", "beats")
+        ),
+    }
+}
+
+/// How a fitted clip's own tempo plays against the project's, and a hint at
+/// the classic half/double-time misreading when the speed change is that
+/// large.
+fn fitted_speed_hint(source_bpm: f64, project_bpm: f64) -> String {
+    let speed = project_bpm / source_bpm.max(1.0e-6);
+    let change = if (speed - 1.0).abs() < 0.005 {
+        "at its own speed".to_string()
+    } else if speed > 1.0 {
+        format!("{:.0}% faster", (speed - 1.0) * 100.0)
+    } else {
+        format!("{:.0}% slower", (1.0 - speed) * 100.0)
+    };
+    let octave = if !(0.74..=1.35).contains(&speed) {
+        " Half or double time? Try ÷2 or ×2."
+    } else {
+        ""
+    };
+    format!("Fitted to {project_bpm:.1} BPM, playing {change}.{octave}")
+}
+
+/// The Fit timing: the clip's own tempo (detected, typed, or set by its
+/// length), the half/double-time corrections, and the length it fits to.
+/// Every one of them is the same edit — a new source tempo — and the clip
+/// follows the project tempo from there.
+#[allow(clippy::too_many_arguments)]
 fn stretch_tempo_rows(
     clip_id: &str,
     s: &AudioClipStretchState,
     project_bpm: f64,
+    beats_per_bar: f64,
     tempo: &StretchTempoUiSnapshot,
     cb: &ClipStretchCb,
     callbacks: &InspectorCallbacks,
@@ -3259,9 +3422,7 @@ fn stretch_tempo_rows(
     } else if let Some(error) = tempo.error.as_ref() {
         Some(error.clone())
     } else if let Some(source) = s.bpm_source {
-        Some(format!(
-            "Plays at the project tempo: {source:.1} → {project_bpm:.1} BPM."
-        ))
+        Some(fitted_speed_hint(source, project_bpm))
     } else {
         Some("Detect the clip's tempo, or drag the value to set it.".to_string())
     };
@@ -3290,6 +3451,26 @@ fn stretch_tempo_rows(
                 bpm * 2.0 <= 999.0,
                 "clip-stretch-bpm-double".into(),
             ))
+    });
+    // The length it fits to. Scrubbing it sets the tempo that makes the clip
+    // exactly that many whole beats.
+    let fit_length = s.fitted_beats().map(|beats| {
+        let s = s.clone();
+        clip_stretch_stepper(
+            "clip-stretch-fit-beats",
+            clip_id,
+            beats,
+            fitted_length_label(beats, beats_per_bar),
+            1.0,
+            4096.0,
+            1.0,
+            false,
+            callbacks,
+            move |beats| match s.source_bpm_for_beats(beats.round().max(1.0), project_bpm) {
+                Some(bpm) => s.fitted_to_source_bpm(bpm, project_bpm),
+                None => s.clone(),
+            },
+        )
     });
     // Candidates are offered only when detection could not decide on its own —
     // a confident result has already been applied.
@@ -3342,6 +3523,7 @@ fn stretch_tempo_rows(
                 )),
         ))
         .children(halve_double.map(|row| compact_property_row("", row)))
+        .children(fit_length.map(|row| compact_property_row("Fit to", row)))
         .children(candidates.map(|row| compact_property_row("Candidates", row)))
         .children(status.map(inspector_hint_text))
 }
@@ -3465,13 +3647,22 @@ fn stretch_section_body(
                         ),
                     ))
                     .child(inspector_hint_text(
-                        "Over 100% plays longer and slower. Or drag a clip edge with the Stretch tool (T).",
+                        "Over 100% plays longer and slower. To lock a clip to the bars, choose Fit.",
                     ))
                     .into_any_element(),
             )
         }
         StretchTiming::Tempo => Some(
-            stretch_tempo_rows(&clip_id, s, project_bpm, tempo, cb, callbacks).into_any_element(),
+            stretch_tempo_rows(
+                &clip_id,
+                s,
+                project_bpm,
+                clip.beats_per_bar,
+                tempo,
+                cb,
+                callbacks,
+            )
+            .into_any_element(),
         ),
         StretchTiming::Warp => Some(stretch_warp_rows(&clip_id, s, callbacks).into_any_element()),
     };
@@ -4026,6 +4217,62 @@ mod input_routing_tests {
 /// sections the loader read on the way there. These run without a GPUI window
 /// because `solfege_runtime_architecture` is a pure string function.
 #[cfg(test)]
+mod midi_input_menu_tests {
+    use super::*;
+    use crate::components::combo_box::TreeMenuNodeKind;
+
+    fn leaf_values(node: &crate::components::combo_box::TreeMenuNode) -> Vec<String> {
+        match &node.kind {
+            TreeMenuNodeKind::Leaf { value } => vec![value.clone()],
+            TreeMenuNodeKind::Branch { children, .. } => {
+                children.iter().flat_map(leaf_values).collect()
+            }
+        }
+    }
+
+    /// Every choice the menu offers comes back as the routing it shows, and
+    /// a device and a track with the same name stay apart.
+    #[test]
+    fn menu_values_round_trip_and_never_collide() {
+        let routings = [
+            TrackMidiInputRouting::None,
+            TrackMidiInputRouting::AllInputs,
+            TrackMidiInputRouting::MidiDevice {
+                device_id: "Drums".to_string(),
+            },
+            TrackMidiInputRouting::PluginOutput {
+                track_id: "Drums".to_string(),
+            },
+        ];
+        for routing in &routings {
+            assert_eq!(&parse_midi_input_value(&midi_input_value(routing)), routing);
+        }
+        assert_ne!(
+            midi_input_value(&routings[2]),
+            midi_input_value(&routings[3])
+        );
+    }
+
+    /// The tree is None, then the ports under MIDI Devices, then the plug-in
+    /// sources under VSTi; a choice no longer offered stays listed.
+    #[test]
+    fn the_tree_groups_devices_and_plugins_and_keeps_a_missing_choice() {
+        let current = TrackMidiInputRouting::PluginOutput {
+            track_id: "track-gone".to_string(),
+        };
+        let nodes = midi_input_tree(
+            &current,
+            &["Studio 24c MIDI In".to_string()],
+            &[("track-2".to_string(), "Arp - Pigments".to_string())],
+        );
+        let labels: Vec<&str> = nodes.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(labels, ["None", "MIDI Devices", "VSTi"]);
+        assert_eq!(leaf_values(&nodes[1]), ["all", "device:Studio 24c MIDI In"]);
+        assert_eq!(leaf_values(&nodes[2]), ["vsti:track-2", "vsti:track-gone"]);
+    }
+}
+
+#[cfg(test)]
 mod solfege_inspector_tests {
     use super::*;
 
@@ -4219,5 +4466,43 @@ mod stretch_inspector_tests {
             stretch_length_summary(&s, 120.0, None).as_deref(),
             Some("0:04.00 → 0:08.00")
         );
+    }
+
+    #[test]
+    fn a_fitted_length_reads_in_bars_of_the_clips_meter() {
+        assert_eq!(fitted_length_label(32.0, 4.0), "8 bars");
+        assert_eq!(fitted_length_label(4.0, 4.0), "1 bar");
+        assert_eq!(fitted_length_label(30.0, 4.0), "7 bars 2 beats");
+        assert_eq!(fitted_length_label(29.0, 4.0), "7 bars 1 beat");
+        assert_eq!(fitted_length_label(3.0, 4.0), "3 beats");
+        assert_eq!(fitted_length_label(12.0, 3.0), "4 bars");
+        assert_eq!(fitted_length_label(31.7, 4.0), "31.70 beats");
+    }
+
+    #[test]
+    fn the_speed_hint_flags_a_likely_half_or_double_time_reading() {
+        assert_eq!(
+            fitted_speed_hint(124.88, 180.0),
+            "Fitted to 180.0 BPM, playing 44% faster. Half or double time? Try ÷2 or ×2."
+        );
+        assert_eq!(
+            fitted_speed_hint(118.0, 120.0),
+            "Fitted to 120.0 BPM, playing 2% faster."
+        );
+        assert_eq!(
+            fitted_speed_hint(120.0, 120.0),
+            "Fitted to 120.0 BPM, playing at its own speed."
+        );
+    }
+
+    /// Scrubbing "Fit to" sets the tempo that makes the clip that many beats.
+    #[test]
+    fn fitting_to_a_length_sets_the_source_tempo() {
+        // Four seconds of audio fitted to 8 beats is 120 BPM.
+        let s = decoded(48_000 * 4).fitted_to_source_bpm(100.0, 120.0);
+        let bpm = s.source_bpm_for_beats(8.0, 120.0).unwrap();
+        let fitted = s.fitted_to_source_bpm(bpm, 120.0);
+        assert!((fitted.bpm_source.unwrap() - 120.0).abs() < 1.0e-9);
+        assert!((fitted.fitted_beats().unwrap() - 8.0).abs() < 1.0e-9);
     }
 }

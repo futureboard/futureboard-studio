@@ -7,10 +7,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Mode, Params, clamp, default_params};
+use crate::{Mode, Oversampling, Params, clamp, default_params};
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const STATE_VERSION: u32 = 1;
+/// 2: `thresholdDb` became the clip level (it was a drive into a curve
+/// normalised to the ceiling); `inputDb`, `oversampling` and `delta` added.
+pub const STATE_VERSION: u32 = 2;
 
 pub const POWER_INDEX: u32 = 0;
 pub const MODE_INDEX: u32 = 1;
@@ -20,8 +22,11 @@ pub const CEILING_INDEX: u32 = 4;
 pub const MIX_INDEX: u32 = 5;
 pub const STEREO_LINK_INDEX: u32 = 6;
 pub const DC_FILTER_INDEX: u32 = 7;
+pub const INPUT_INDEX: u32 = 8;
+pub const OVERSAMPLING_INDEX: u32 = 9;
+pub const DELTA_INDEX: u32 = 10;
 
-pub const PARAM_COUNT: usize = 8;
+pub const PARAM_COUNT: usize = 11;
 
 /// Wire index *is* the position in this table; the editor and the host both
 /// resolve through it, so the order is part of the persisted contract. Append
@@ -35,6 +40,9 @@ pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = [
     "mix",
     "stereoLink",
     "dcFilter",
+    "inputDb",
+    "oversampling",
+    "delta",
 ];
 
 /// Inclusive `(min, max)` for every continuous parameter, indexed by wire
@@ -42,14 +50,17 @@ pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = [
 /// own arms in [`apply_wire_param`]. Single source of truth for clamping, so
 /// [`sanitize_params`] and the wire path cannot drift apart.
 const RANGES: [(f32, f32); PARAM_COUNT] = [
-    (0.0, 0.0),   // power
-    (0.0, 0.0),   // mode
-    (-24.0, 0.0), // thresholdDb
-    (0.0, 100.0), // shape
-    (-6.0, 0.0),  // ceilingDb
-    (0.0, 100.0), // mix
-    (0.0, 0.0),   // stereoLink
-    (0.0, 0.0),   // dcFilter
+    (0.0, 0.0),    // power
+    (0.0, 0.0),    // mode
+    (-24.0, 0.0),  // thresholdDb
+    (0.0, 100.0),  // shape
+    (-6.0, 0.0),   // ceilingDb
+    (0.0, 100.0),  // mix
+    (0.0, 0.0),    // stereoLink
+    (0.0, 0.0),    // dcFilter
+    (-12.0, 24.0), // inputDb
+    (0.0, 0.0),    // oversampling
+    (0.0, 0.0),    // delta
 ];
 
 #[inline]
@@ -77,8 +88,29 @@ impl Clipper67State {
         serde_json::to_string(self)
     }
 
+    /// Parses a saved state, bringing an older one forward (see
+    /// [`migrate`]).
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        let mut state: Self = serde_json::from_str(json)?;
+        if state.version < STATE_VERSION {
+            migrate(&mut state.params, state.version);
+            state.version = STATE_VERSION;
+        }
+        sanitize_params(&mut state.params);
+        Ok(state)
+    }
+}
+
+/// Bring params saved at state `version` to the current meaning.
+///
+/// Version 1's `thresholdDb` drove the signal into a curve normalised to the
+/// ceiling (−6 meant 6 dB of drive with the peaks landing on the ceiling).
+/// The same push is now the input gain, with the clip level left at the
+/// ceiling.
+pub fn migrate(params: &mut Params, version: u32) {
+    if version < 2 {
+        params.input_db = -params.threshold_db;
+        params.threshold_db = 0.0;
     }
 }
 
@@ -106,6 +138,7 @@ pub fn sanitize_params(params: &mut Params) {
     params.shape = clamp_wire(SHAPE_INDEX, params.shape);
     params.ceiling_db = clamp_wire(CEILING_INDEX, params.ceiling_db);
     params.mix = clamp_wire(MIX_INDEX, params.mix);
+    params.input_db = clamp_wire(INPUT_INDEX, params.input_db);
 }
 
 /// Apply one compact UI/control update. Allocation-free and total: invalid
@@ -124,6 +157,9 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
         MIX_INDEX => params.mix = clamp_wire(index, value),
         STEREO_LINK_INDEX => params.stereo_link = value >= 0.5,
         DC_FILTER_INDEX => params.dc_filter = value >= 0.5,
+        INPUT_INDEX => params.input_db = clamp_wire(index, value),
+        OVERSAMPLING_INDEX => params.oversampling = Oversampling::from_wire(value),
+        DELTA_INDEX => params.delta = value >= 0.5,
         _ => return false,
     }
     true
@@ -149,6 +185,9 @@ pub fn ui_values(params: &Params) -> Vec<(&'static str, f32)> {
         ("mix", params.mix),
         ("stereoLink", f32::from(params.stereo_link)),
         ("dcFilter", f32::from(params.dc_filter)),
+        ("inputDb", params.input_db),
+        ("oversampling", params.oversampling.to_wire()),
+        ("delta", f32::from(params.delta)),
     ]
 }
 
@@ -222,11 +261,61 @@ mod tests {
         assert_eq!(params.shape, 100.0);
     }
 
+    /// A version-1 project (before the input gain existed, when the
+    /// threshold was the drive) loads with the same push as input gain and
+    /// the clip level at the ceiling.
+    #[test]
+    fn a_version_one_state_migrates() {
+        let json = r#"{"version":1,"params":{"power":true,"mode":"hybrid","thresholdDb":-8.0,
+            "shape":60.0,"ceilingDb":-0.3,"mix":100.0,"stereoLink":true,"dcFilter":true}}"#;
+        let state = Clipper67State::from_json(json).unwrap();
+        assert_eq!(state.version, STATE_VERSION);
+        assert_eq!(state.params.mode, Mode::Hybrid);
+        assert_eq!(state.params.input_db, 8.0);
+        assert_eq!(state.params.threshold_db, 0.0);
+        assert_eq!(state.params.shape, 60.0);
+        assert_eq!(state.params.oversampling, default_params().oversampling);
+        assert!(!state.params.delta);
+
+        // The current version loads as saved.
+        let mut params = default_params();
+        params.threshold_db = -4.0;
+        params.input_db = 3.0;
+        params.oversampling = Oversampling::X8;
+        let json = Clipper67State::new(params).to_json().unwrap();
+        let state = Clipper67State::from_json(&json).unwrap();
+        assert_eq!(state.params.threshold_db, -4.0);
+        assert_eq!(state.params.input_db, 3.0);
+        assert_eq!(state.params.oversampling, Oversampling::X8);
+    }
+
+    #[test]
+    fn appended_params_take_wire_values() {
+        let mut params = default_params();
+        assert!(apply_ui_param(&mut params, "inputDb", 40.0));
+        assert_eq!(params.input_db, 24.0);
+        assert!(apply_ui_param(&mut params, "oversampling", 0.0));
+        assert_eq!(params.oversampling, Oversampling::X1);
+        assert!(apply_ui_param(&mut params, "oversampling", 9.0));
+        assert_eq!(params.oversampling, Oversampling::X8);
+        assert!(apply_ui_param(&mut params, "delta", 1.0));
+        assert!(params.delta);
+        // The original eight keep their wire indices.
+        assert_eq!(ui_param_index("dcFilter"), Some(7));
+        assert_eq!(ui_param_index("inputDb"), Some(INPUT_INDEX));
+    }
+
     #[test]
     fn mode_wire_values_round_trip() {
         for mode in [Mode::Clip, Mode::Hybrid, Mode::Limit] {
             assert_eq!(Mode::from_wire(mode.to_wire()), mode);
             assert_eq!(Mode::parse(mode.as_str()), Some(mode));
+        }
+        for oversampling in Oversampling::ALL {
+            assert_eq!(
+                Oversampling::from_wire(oversampling.to_wire()),
+                oversampling
+            );
         }
     }
 }

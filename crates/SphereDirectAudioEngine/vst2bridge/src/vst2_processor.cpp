@@ -334,19 +334,46 @@ intptr_t vst2_audio_master(AEffect *effect, int32_t opcode, int32_t index,
     if (feature == "sendVstEvents" || feature == "sendVstMidiEvent" ||
         feature == "sendVstTimeInfo" || feature == "sizeWindow" ||
         feature == "startStopProcess" || feature == "supplyIdle" ||
-        feature == "shellCategory") {
+        feature == "shellCategory" || feature == "receiveVstEvents" ||
+        feature == "receiveVstMidiEvent") {
       return 1;
     }
-    // Explicitly unsupported: offline processing, file selectors, MIDI output
-    // routing. Answering -1 stops plug-ins from probing further.
+    // Explicitly unsupported: offline processing, file selectors. Answering
+    // -1 stops plug-ins from probing further.
     return -1;
   }
 
-  case audioMasterProcessEvents:
-    // Plug-in MIDI output. Not routed anywhere yet — accepting it silently
-    // would claim a feature the engine does not implement, so report
-    // unsupported.
-    return 0;
+  case audioMasterProcessEvents: {
+    // Plug-in MIDI output, sent from inside processReplacing. Kept as MIDI
+    // bytes for the host to offer to other tracks; sysex is not delivered.
+    auto *p = processor_for(effect);
+    const auto *list = static_cast<const VstEvents *>(ptr);
+    if (!p || !list) {
+      return 0;
+    }
+    for (int32_t i = 0; i < list->numEvents; ++i) {
+      const VstEvent *e = list->events[i];
+      if (!e || e->type != kVstMidiType) {
+        continue;
+      }
+      if (p->output_midi_count >= SphereDauxVst2Processor::kMaxOutputMidi) {
+        break;
+      }
+      const auto *m = reinterpret_cast<const VstMidiEvent *>(e);
+      const auto status = static_cast<unsigned char>(m->midiData[0]);
+      if ((status & 0x80) == 0 || status >= 0xF0) {
+        continue;
+      }
+      SphereDauxMidiOutEvent out{};
+      out.sample_offset =
+          static_cast<unsigned int>(std::max<int32_t>(0, m->deltaFrames));
+      out.status = status;
+      out.data1 = static_cast<unsigned char>(m->midiData[1] & 0x7F);
+      out.data2 = static_cast<unsigned char>(m->midiData[2] & 0x7F);
+      p->output_midi[p->output_midi_count++] = out;
+    }
+    return 1;
+  }
 
   default:
     return 0;
@@ -696,6 +723,7 @@ bool SphereDauxVst2Processor::process_planar(
                   sizeof(float) * static_cast<size_t>(frames));
   }
 
+  output_midi_count = 0;
   effect->processReplacing(effect, input_channels.data(),
                            output_channels.data(),
                            static_cast<int32_t>(frames));
@@ -916,6 +944,18 @@ int sphere_daux_vst2_process_main_output_block_with_midi(
 
 int sphere_daux_vst2_event_input_bus_count(SphereDauxVst2Processor *p) {
   return p ? p->event_input_bus_count : 0;
+}
+
+int sphere_daux_vst2_take_output_midi(SphereDauxVst2Processor *p,
+                                      SphereDauxMidiOutEvent *out,
+                                      int max_count) {
+  if (!p || !out || max_count <= 0)
+    return 0;
+  const int n = std::min(p->output_midi_count, max_count);
+  for (int i = 0; i < n; ++i)
+    out[i] = p->output_midi[i];
+  p->output_midi_count = 0;
+  return n;
 }
 
 int sphere_daux_vst2_audio_input_bus_count(SphereDauxVst2Processor *p) {

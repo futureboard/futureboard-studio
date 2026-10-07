@@ -5,6 +5,7 @@
   "workspaces": {
     "packages": [
       "apps/*",
+      "apps/native/livestage/webui",
       "packages/*",
       "crates/*",
       "extensions/template",
@@ -37,6 +38,7 @@
       "eslint-plugin-react-hooks": "^7.1.1",
       "eslint-plugin-react-refresh": "^0.5.3",
       "globals": "^17.7.0",
+      "lucide-react": "^1.52.0",
       "react": "^19.2.8",
       "react-dom": "^19.2.8",
       "react-router-dom": "^7.18.1",
@@ -60,6 +62,7 @@
     "cargo:fmt:check": "cargo fmt --all -- --check",
     "cargo:clean": "cargo clean",
     "build:plugin-editors": "bun run scripts/build.ts",
+    "build:livestage-web": "bun run --cwd apps/native/livestage/webui build",
     "build:native": "cargo run -p xtask -- package --profile release --edition community --plugin all",
     "build:native:debug": "cargo run -p xtask -- package --profile dev --edition community --plugin all",
     "bundle:native:mac": "bash packaging/native/bundle-macos.sh",

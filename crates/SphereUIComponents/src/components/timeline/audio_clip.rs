@@ -998,7 +998,7 @@ fn stretch_badge(clip: &ClipState, state: &TimelineState) -> Option<StretchBadge
         StretchTiming::Off => None,
         StretchTiming::Tempo => Some(match stretch.bpm_source {
             Some(source_bpm) => format!("{source_bpm:.0}→{:.0}", state.bpm),
-            None => "Tempo ?".to_string(),
+            None => "Fit ?".to_string(),
         }),
         StretchTiming::Speed => {
             let ratio = stretch.effective_time_ratio(state.bpm as f64);

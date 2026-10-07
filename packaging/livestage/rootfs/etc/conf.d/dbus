@@ -1,0 +1,3 @@
+# /etc is read-only: a fresh machine id per boot, on /run (/etc/machine-id
+# points there). D-Bus is here for avahi (livestage.local) only.
+machine_id="/run/machine-id"

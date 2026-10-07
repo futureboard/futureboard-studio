@@ -7,7 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DelayMode, MAX_DELAY_MS, MAX_DIVISION_WIRE, Params, clamp, default_params};
+use crate::{
+    DelayMode, MAX_DELAY_MS, MAX_DIVISION_WIRE, MAX_MOD_RATE_HZ, Params, clamp, default_params,
+};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const STATE_VERSION: u32 = 1;
@@ -28,8 +30,13 @@ pub const SYNC_INDEX: u32 = 12;
 pub const DIVISION_L_INDEX: u32 = 13;
 pub const DIVISION_R_INDEX: u32 = 14;
 pub const LINK_INDEX: u32 = 15;
+pub const MOD_DEPTH_INDEX: u32 = 16;
+pub const MOD_RATE_INDEX: u32 = 17;
+pub const DUCK_INDEX: u32 = 18;
+pub const DIFFUSION_INDEX: u32 = 19;
+pub const WIDTH_INDEX: u32 = 20;
 
-pub const PARAM_COUNT: usize = 16;
+pub const PARAM_COUNT: usize = 21;
 
 /// Wire index *is* the position in this table; the editor and the host both
 /// resolve through it, so the order is part of the persisted contract. Append
@@ -51,6 +58,11 @@ pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = [
     "divisionL",
     "divisionR",
     "link",
+    "modDepth",
+    "modRateHz",
+    "duck",
+    "diffusion",
+    "width",
 ];
 
 /// Inclusive `(min, max)` for every continuous parameter, indexed by wire
@@ -74,6 +86,11 @@ const RANGES: [(f32, f32); PARAM_COUNT] = [
     (0.0, MAX_DIVISION_WIRE), // divisionL
     (0.0, MAX_DIVISION_WIRE), // divisionR
     (0.0, 0.0),               // link
+    (0.0, 100.0),             // modDepth
+    (0.05, MAX_MOD_RATE_HZ),  // modRateHz
+    (0.0, 100.0),             // duck
+    (0.0, 100.0),             // diffusion
+    (0.0, 200.0),             // width
 ];
 
 #[inline]
@@ -156,6 +173,11 @@ pub fn sanitize_params(params: &mut Params) {
     params.output_db = clamp_wire(OUTPUT_INDEX, params.output_db);
     params.division_l = params.division_l.min(MAX_DIVISION_WIRE as u8);
     params.division_r = params.division_r.min(MAX_DIVISION_WIRE as u8);
+    params.mod_depth = clamp_wire(MOD_DEPTH_INDEX, params.mod_depth);
+    params.mod_rate_hz = clamp_wire(MOD_RATE_INDEX, params.mod_rate_hz);
+    params.duck = clamp_wire(DUCK_INDEX, params.duck);
+    params.diffusion = clamp_wire(DIFFUSION_INDEX, params.diffusion);
+    params.width = clamp_wire(WIDTH_INDEX, params.width);
     apply_link(params);
 }
 
@@ -209,6 +231,11 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
         SATURATION_INDEX => params.saturation = clamp_wire(index, value),
         MIX_INDEX => params.mix = clamp_wire(index, value),
         OUTPUT_INDEX => params.output_db = clamp_wire(index, value),
+        MOD_DEPTH_INDEX => params.mod_depth = clamp_wire(index, value),
+        MOD_RATE_INDEX => params.mod_rate_hz = clamp_wire(index, value),
+        DUCK_INDEX => params.duck = clamp_wire(index, value),
+        DIFFUSION_INDEX => params.diffusion = clamp_wire(index, value),
+        WIDTH_INDEX => params.width = clamp_wire(index, value),
         _ => return false,
     }
     true
@@ -222,8 +249,9 @@ pub fn apply_ui_param(params: &mut Params, id: &str, value: f32) -> bool {
     apply_wire_param(params, index, value)
 }
 
-/// Every parameter as `(id, raw value)`, in wire order. Drives project replay
-/// and the descriptor-vs-defaults check.
+/// Every parameter as `(id, raw value)`, in wire order but for `link`, which
+/// goes last. Drives project replay, the editor's edits and the
+/// descriptor-vs-defaults check.
 pub fn ui_values(params: &Params) -> Vec<(&'static str, f32)> {
     vec![
         ("power", f32::from(params.power)),
@@ -241,6 +269,11 @@ pub fn ui_values(params: &Params) -> Vec<(&'static str, f32)> {
         ("sync", f32::from(params.sync)),
         ("divisionL", f32::from(params.division_l)),
         ("divisionR", f32::from(params.division_r)),
+        ("modDepth", params.mod_depth),
+        ("modRateHz", params.mod_rate_hz),
+        ("duck", params.duck),
+        ("diffusion", params.diffusion),
+        ("width", params.width),
         // Replayed last, after both sides carry their own restored values.
         // `link` only ever pulls right onto left, and a blob that had it lit was
         // sanitized with the two sides already equal, so this is a no-op on a
@@ -263,14 +296,18 @@ mod tests {
     }
 
     /// `ui_values` is what project replay pushes back through the wire, so a
-    /// missing or misordered entry would silently drop a parameter on reload.
+    /// missing entry would silently drop a parameter on reload. `link` is the
+    /// one exception to wire order: it must land after both sides.
     #[test]
-    fn ui_values_covers_every_id_in_wire_order() {
+    fn ui_values_covers_every_id_with_link_last() {
         let values = ui_values(&default_params());
         assert_eq!(values.len(), PARAM_COUNT);
-        for (index, (id, _)) in values.iter().enumerate() {
-            assert_eq!(*id, UI_PARAM_IDS[index]);
-        }
+        assert_eq!(values.last().map(|(id, _)| *id), Some("link"));
+        let mut ids: Vec<_> = values.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        let mut expected = UI_PARAM_IDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(ids, expected);
     }
 
     #[test]
@@ -415,6 +452,12 @@ mod tests {
         assert!(!decoded.params.link);
         assert_eq!(decoded.params.division_l, crate::DEFAULT_DIVISION_L);
         assert_eq!(decoded.params.division_r, crate::DEFAULT_DIVISION_R);
+        // ...and so do the controls added with the rebuilt engine.
+        assert_eq!(decoded.params.mod_depth, 0.0);
+        assert_eq!(decoded.params.duck, 0.0);
+        assert_eq!(decoded.params.diffusion, 0.0);
+        assert_eq!(decoded.params.width, 100.0);
+        assert_eq!(decoded.params.mod_rate_hz, crate::DEFAULT_MOD_RATE_HZ);
     }
 
     /// `link` is an invariant, not just a flag, so a hand-edited blob that

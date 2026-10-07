@@ -1,0 +1,51 @@
+#!/sbin/openrc-run
+# The image is small; the disk it is written to usually is not. On the first
+# boot from a bigger disk, grow the data partition (the last one) to the end
+# of it, so recordings get the whole disk. Does nothing once it has.
+
+description="Grow the LiveStage data partition to fill its disk"
+
+depend() {
+	need root
+	before localmount
+}
+
+start() {
+	local part name num disk dname disk_size start size free
+	part=$(findfs LABEL=lsdata 2>/dev/null) || {
+		ewarn "No data partition (LABEL=lsdata)"
+		return 0
+	}
+	name=${part#/dev/}
+	num=$(cat "/sys/class/block/$name/partition" 2>/dev/null) || return 0
+	dname=$(basename "$(readlink -f "/sys/class/block/$name/..")")
+	disk="/dev/$dname"
+	disk_size=$(cat "/sys/class/block/$dname/size")
+	start=$(cat "/sys/class/block/$name/start")
+	size=$(cat "/sys/class/block/$name/size")
+	# Sectors past the partition, less the 33 the backup GPT keeps at the end.
+	free=$((disk_size - start - size - 33))
+	[ "$free" -gt 32768 ] || return 0
+
+	ebegin "Growing the data partition to the end of $disk"
+	# The image's backup GPT sits where the image ended; move it to the real
+	# end of the disk first, then extend the last partition into the space.
+	sfdisk --force --no-reread --no-tell-kernel --relocate gpt-bak-std "$disk" >/dev/null 2>&1 &&
+		echo ", +" | sfdisk --force --no-reread --no-tell-kernel -N "$num" "$disk" >/dev/null 2>&1 &&
+		partx -u -n "$num" "$disk" || {
+		eend 1 "Could not grow the partition on $disk"
+		return 0
+	}
+	# partx re-adds the partition to the kernel, which drops its device node;
+	# this early in boot nothing makes it again unless asked.
+	mdev -s 2>/dev/null
+	local tries=0
+	while [ ! -b "$part" ] && [ $tries -lt 20 ]; do
+		sleep 0.1
+		tries=$((tries + 1))
+	done
+	e2fsck -fy "$part" >/dev/null 2>&1
+	# e2fsck exits 1 when it fixed something; only 4 and up is a failure.
+	[ $? -lt 4 ] && resize2fs "$part" >/dev/null 2>&1
+	eend $? "Could not grow $part"
+}

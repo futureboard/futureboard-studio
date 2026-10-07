@@ -849,6 +849,29 @@ impl StudioLayout {
         .detach();
     }
 
+    /// Plug-in MIDI output gets the same treatment: each host signals a
+    /// kernel event when a block's MIDI lands in its rings, a waiter thread
+    /// rings [`super::plugin_bridge_runtime::plugin_midi_output_doorbell`], and this
+    /// task routes what arrived to the tracks that take it as their input.
+    pub(super) fn spawn_plugin_midi_output_poll(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let doorbell = super::plugin_bridge_runtime::plugin_midi_output_doorbell();
+            loop {
+                doorbell.wait().await;
+                if crate::shutdown::ShutdownState::global().is_shutting_down() {
+                    break;
+                }
+                if this
+                    .update(cx, |this, cx| this.drain_plugin_midi_output(cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
     pub(super) fn poll_native_audio(&mut self, cx: &mut Context<Self>) -> bool {
         if crate::shutdown::ShutdownState::global().is_shutting_down() {
             return false;
@@ -864,6 +887,9 @@ impl StudioLayout {
             self.engine_sync.bridge_reconciled_at = Instant::now();
             self.reconcile_open_plugin_editors(cx);
             self.poll_plugin_bridge_runtime(cx);
+            // Normally drained the moment a host signals it; this catches a
+            // host whose wake event could not be made.
+            self.drain_plugin_midi_output(cx);
             // Drive native main-owned editor shells: honor OS close + forward resizes.
             self.drive_bridge_editors(cx);
             // The plug-in editor windows' titlebar strips: what they show comes

@@ -5,17 +5,20 @@
 
 use biquad::{Biquad, DirectForm1};
 use builtin_dsp_core::{
-    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
-    flush_denormal, linear_to_db, make_eq_biquad, make_eq_coefficients, mix, time_constant,
+    ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, biquad_response_db, clamp,
+    db_to_linear, flush_denormal, linear_to_db, make_eq_biquad, make_eq_coefficients, mix,
+    time_constant,
 };
 use serde::{Deserialize, Serialize};
 
 pub mod ipc;
+pub mod presets;
 pub mod ui;
 
 /// Editor-facing parameter id table, re-exported at the crate root so the host
 /// resolves ids the same way for every built-in (`<plugin>::ui_param_index`).
 pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 pub const PLUGIN_ID: &str = "futureboard.equz8";
 pub const BAND_COUNT: usize = 8;
@@ -179,6 +182,48 @@ pub fn default_params() -> Params {
         ],
         solo_band: ipc::SOLO_NONE,
     }
+}
+
+/// What `band` does to a sine at `freq_hz`, in dB, with its gain at
+/// `gain_db` — built from the coefficients [`Dsp`] runs, so a drawn curve is
+/// the curve that plays. 0 dB for a band that is switched off. Control/UI
+/// side only.
+pub fn band_response_at_gain_db(
+    band: &BandParams,
+    gain_db: f32,
+    freq_hz: f32,
+    sample_rate: f32,
+) -> f32 {
+    if !band.active {
+        return 0.0;
+    }
+    make_eq_coefficients(
+        band.band_type.as_str(),
+        band.freq,
+        gain_db,
+        band.q,
+        sample_rate,
+    )
+    .map_or(0.0, |coefficients| {
+        biquad_response_db(&coefficients, freq_hz, sample_rate)
+    })
+}
+
+/// [`band_response_at_gain_db`] at the band's own gain.
+pub fn band_response_db(band: &BandParams, freq_hz: f32, sample_rate: f32) -> f32 {
+    band_response_at_gain_db(band, band.gain_db, freq_hz, sample_rate)
+}
+
+/// The whole EQ's wet response at `freq_hz`, in dB: every band in series,
+/// then the output gain. What the insert plays at full mix with no band
+/// moving dynamically.
+pub fn response_db(params: &Params, freq_hz: f32, sample_rate: f32) -> f32 {
+    params
+        .bands
+        .iter()
+        .map(|band| band_response_db(band, freq_hz, sample_rate))
+        .sum::<f32>()
+        + params.output_db
 }
 
 pub fn descriptor() -> PluginDescriptor {
@@ -723,6 +768,38 @@ mod tests {
         assert!(
             far > hot,
             "out-of-band content must stay closer to unity than the cut band: far={far} hot={hot}"
+        );
+    }
+
+    /// The curve the editor draws is the curve that plays: a sine through the
+    /// running DSP lands where `response_db` says, at every band type.
+    #[test]
+    fn the_drawn_response_is_what_plays() {
+        let mut params = default_params();
+        for band in &mut params.bands {
+            band.active = true;
+        }
+        params.bands[2].gain_db = 5.0;
+        params.bands[4].gain_db = -7.0;
+        params.bands[1].gain_db = 3.0;
+        params.bands[6].gain_db = -4.0;
+        params.output_db = -2.0;
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(params.clone());
+        // Off the sample rate's divisors, so the sampled peak sweeps the
+        // whole cycle rather than landing on the same few phases.
+        for hz in [41.0, 123.0, 257.0, 1_517.0, 4_111.0, 11_003.0] {
+            let heard = linear_to_db(level_at(&mut dsp, hz));
+            let drawn = response_db(&params, hz, 48_000.0);
+            assert!(
+                (heard - drawn).abs() < 0.25,
+                "{hz} Hz: heard {heard} drawn {drawn}"
+            );
+        }
+        // A switched-off band draws flat.
+        assert_eq!(
+            band_response_db(&default_params().bands[3], 750.0, 48_000.0),
+            0.0
         );
     }
 

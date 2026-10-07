@@ -1,0 +1,143 @@
+/* The dynamics editors (dynamics.tsx): a row of displays over a row of
+   control cards, as the native dyn_panel lays them out. */
+
+.dyn-displays {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* A display column: its share of the row by flex-grow, never narrower than
+   its min-width (set inline, capped at the row's width for a phone). */
+.dyn-col {
+  display: flex;
+  flex-direction: column;
+  flex-basis: 0;
+  height: 320px;
+  min-width: 0;
+}
+
+.dyn-col > .pe-canvas {
+  flex: 1;
+}
+
+/* The VU sits inset in a canvas-coloured well; the face paints its own
+   rounded paper. */
+.dyn-well {
+  display: flex;
+  flex: 1;
+  padding: 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-canvas);
+  min-height: 0;
+}
+
+/* The In / reduction / Out bay: a fixed-width panel. */
+.dyn-meters {
+  flex: 0 0 150px;
+  width: 150px;
+}
+
+.dyn-meters .dyn-well {
+  padding: 8px;
+  background: var(--surface-panel);
+}
+
+.dyn-well > .pe-canvas {
+  flex: 1;
+}
+
+.dyn-bare {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+
+/* The passing notice along a display's bottom edge. */
+.dyn-notice {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  max-width: calc(100% - 24px);
+  padding: 4px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-size: 10px;
+  text-align: center;
+  pointer-events: none;
+}
+
+.dyn-cluster {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.dyn-cluster.tight {
+  gap: 4px;
+}
+
+.dyn-cluster.top {
+  align-items: flex-start;
+}
+
+.dyn-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.dyn-stack.hair {
+  gap: 2px;
+}
+
+/* A segmented choice is as wide as its labels, not its column. */
+.dyn-stack > .segments {
+  align-self: flex-start;
+}
+
+.dyn-caption {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-faint);
+}
+
+.dyn-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* Segments split a track equally, as the native segmented track does. */
+.dyn-track {
+  display: flex;
+}
+
+.dyn-track button {
+  flex: 1 1 0;
+  justify-content: center;
+  padding: 0 8px;
+}
+
+/* A knob the setting leaves nothing to do: greyed, its value replaced by
+   why. */
+.dyn-idle {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+@media (max-width: 640px) {
+  .dyn-col {
+    height: 240px;
+  }
+
+  .dyn-meters {
+    flex-grow: 1;
+  }
+}

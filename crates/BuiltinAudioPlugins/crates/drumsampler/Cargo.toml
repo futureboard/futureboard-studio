@@ -12,12 +12,8 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 builtin-dsp-core.workspace = true
-builtin-ui-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[build-dependencies]
-builtin-ui-embed = { workspace = true, features = ["generate"] }
 
 [lints]
 workspace = true

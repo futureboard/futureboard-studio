@@ -103,6 +103,19 @@ impl Vst3MidiEvent {
     }
 }
 
+/// One MIDI 1.0 message a plug-in produced during a process call, as raw
+/// bytes (`SphereDauxMidiOutEvent` in all three bridges). `data2` is 0 for a
+/// one-data-byte message.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PluginMidiOutEvent {
+    pub sample_offset: u32,
+    pub status: u8,
+    pub data1: u8,
+    pub data2: u8,
+    pub reserved: u8,
+}
+
 /// Transport snapshot handed to a plugin's VST3 `ProcessContext` for one block.
 ///
 /// Built on the audio thread (in-process) or the bridge producer thread (host)
@@ -166,7 +179,7 @@ pub(crate) struct SphereDauxVst3Processor {
 /// Wrapped in a module so `vst2_processor::backend` can name them while they
 /// stay crate-private; call sites go through that dispatch layer, never here.
 pub(crate) mod ffi {
-    use super::{SphereDauxVst3Processor, Vst3MidiEvent};
+    use super::{PluginMidiOutEvent, SphereDauxVst3Processor, Vst3MidiEvent};
     use std::os::raw::{c_char, c_double, c_float};
 
     extern "C" {
@@ -216,6 +229,11 @@ pub(crate) mod ffi {
         ) -> i32;
         pub(crate) fn sphere_daux_vst3_event_input_bus_count(
             processor: *mut SphereDauxVst3Processor,
+        ) -> i32;
+        pub(crate) fn sphere_daux_vst3_take_output_midi(
+            processor: *mut SphereDauxVst3Processor,
+            out: *mut PluginMidiOutEvent,
+            max_count: i32,
         ) -> i32;
         pub(crate) fn sphere_daux_vst3_audio_input_bus_count(
             processor: *mut SphereDauxVst3Processor,
@@ -485,6 +503,7 @@ pub(crate) mod ffi {
         sphere_daux_vst3_set_param as set_param,
         sphere_daux_vst3_set_process_context as set_process_context,
         sphere_daux_vst3_set_state as set_state, sphere_daux_vst3_state_free as state_free,
+        sphere_daux_vst3_take_output_midi as take_output_midi,
         sphere_daux_vst3_take_pending_shell_resize as take_pending_shell_resize,
         sphere_daux_vst3_take_state_touched as take_state_touched,
         sphere_daux_vst3_view_attach as view_attach,
@@ -916,6 +935,22 @@ impl Vst3RuntimeProcessor {
     #[inline]
     pub fn event_input_bus_count(&self) -> i32 {
         self.inner.event_input_bus_count
+    }
+
+    /// Move the MIDI the plug-in produced during the last process call into
+    /// `out`, returning how many were written. Call on the thread that runs
+    /// process, right after it: the bridge clears its list on the next block.
+    /// Allocation-free; 0 for a plug-in that emits no MIDI.
+    #[inline]
+    pub fn take_output_midi(&self, out: &mut [PluginMidiOutEvent]) -> usize {
+        if self.inner.raw.is_null() || out.is_empty() {
+            return 0;
+        }
+        let max = out.len().min(i32::MAX as usize) as i32;
+        let written = unsafe {
+            backend::take_output_midi(self.inner.format, self.inner.raw, out.as_mut_ptr(), max)
+        };
+        written.clamp(0, max) as usize
     }
 
     #[inline]

@@ -10,12 +10,74 @@ use super::cc_lane_render::{self, CcHandle, CcLaneSnapshot};
 /// stroke. Small enough that the written curve matches the pointer path at any
 /// drag speed, large enough that free (unsnapped) drawing does not mint a point
 /// per pixel.
-const CC_PAINT_SAMPLE_PX: f32 = 2.0;
+/// Resolution of a freehand CC stroke: one possible point per tick at 960
+/// ticks per quarter note, the resolution MIDI is recorded at. Measured in
+/// beats, so it does not coarsen as the editor zooms out.
+pub(super) const CC_DRAW_TICKS_PER_BEAT: f32 = 960.0;
+
+/// Values a controller lane can actually send: 128 for a CC or pressure,
+/// 16 384 for pitch bend. Two drawn samples that quantize to the same value
+/// are one point.
+fn controller_value_steps(kind: MidiControllerKind) -> f32 {
+    match kind {
+        MidiControllerKind::PitchBend => 16_383.0,
+        _ => 127.0,
+    }
+}
+
+/// The points one freehand segment writes, from `(from_beat, from_value)` to
+/// `(to_beat, to_value)`: the value at every tick between them, kept only
+/// where it changes at the controller's resolution, and always at both ends
+/// so the stroke starts and stops exactly under the pointer.
+///
+/// A curve drawn this way is as fine as a recorded one — a point on every
+/// tick the value moves — without a lane full of repeated values where the
+/// stroke is flat.
+pub(super) fn freehand_cc_samples(
+    from_beat: f32,
+    from_value: f32,
+    to_beat: f32,
+    to_value: f32,
+    value_steps: f32,
+) -> Vec<(f32, f32)> {
+    let quantize = |value: f32| (value.clamp(0.0, 1.0) * value_steps).round();
+    let first_tick = (from_beat * CC_DRAW_TICKS_PER_BEAT).round() as i64;
+    let last_tick = (to_beat * CC_DRAW_TICKS_PER_BEAT).round() as i64;
+    if first_tick == last_tick {
+        return vec![(first_tick as f32 / CC_DRAW_TICKS_PER_BEAT, to_value)];
+    }
+    let direction = if last_tick > first_tick { 1 } else { -1 };
+    let span = (to_beat - from_beat).abs().max(f32::EPSILON);
+    let ticks = (last_tick - first_tick).abs();
+    let mut samples = Vec::new();
+    let mut last_level = f32::NAN;
+    for step in 0..=ticks {
+        let tick = first_tick + step * direction;
+        let beat = tick as f32 / CC_DRAW_TICKS_PER_BEAT;
+        let t = ((beat - from_beat).abs() / span).clamp(0.0, 1.0);
+        let value = from_value + (to_value - from_value) * t;
+        let level = quantize(value);
+        let at_end = step == 0 || step == ticks;
+        if at_end || level != last_level {
+            samples.push((beat, level / value_steps));
+            last_level = level;
+        }
+    }
+    // Keep the beats ascending, the order the lane stores them in.
+    if direction < 0 {
+        samples.reverse();
+    }
+    samples
+}
 const CC_POINT_MERGE_EPS: f32 = 1.0e-3;
 
 /// Radius of a CC point handle, in lane pixels. Kept under [`CC_HIT_R`] so a
 /// handle is never larger than the area that grabs it.
 const HANDLE_R: f32 = 4.0;
+
+/// Closest two unselected point handles are drawn, in lane pixels: a little
+/// more than a handle's width, so drawn handles never touch.
+const CC_HANDLE_MIN_SPACING: f32 = 2.0 * HANDLE_R + 4.0;
 
 /// Grab radius around a CC point, in lane pixels. The 8 px handle sits inside
 /// a 16 px target — the same "draw small, hit big" split as `size::hit_target`.
@@ -204,10 +266,12 @@ impl PianoRoll {
     ///
     /// A mouse move can cover tens of pixels, so sampling only the event
     /// position leaves holes: the drawn line jumps from dot to dot and reads as
-    /// stepped rather than drawn. Walking the segment at [`CC_PAINT_SAMPLE_PX`]
-    /// intervals produces a continuous curve at any drag speed, and the whole
-    /// segment is written inside **one** timeline update so a fast drag costs one
-    /// notify per mouse event rather than one per sample.
+    /// stepped rather than drawn. The segment is walked tick by tick at
+    /// [`CC_DRAW_TICKS_PER_BEAT`] (see [`freehand_cc_samples`]), free of the
+    /// note grid: a CC curve is continuous data, and a grid-snapped brush left
+    /// only a sparse row of marks. The whole segment is written inside **one**
+    /// timeline update so a fast drag costs one notify per mouse event rather
+    /// than one per sample.
     pub(super) fn cc_paint_stroke_to(
         &mut self,
         lx: f32,
@@ -219,10 +283,6 @@ impl PianoRoll {
             return;
         };
         let kind = self.active_cc;
-        let unsnap = match &self.drag {
-            PianoDrag::CcPaint { unsnap, .. } => *unsnap,
-            _ => false,
-        };
         let last = match &self.drag {
             PianoDrag::CcPaint { last, .. } => *last,
             _ => None,
@@ -234,53 +294,21 @@ impl PianoRoll {
         // written is the one under the pointer.
         let value_at = |y: f32| Self::controller_value_for_y(y, cc_h);
 
-        // One sample per CC_PAINT_SAMPLE_PX of travel, always including both
-        // endpoints so the stroke starts and ends exactly under the cursor.
-        let dx = lx - from_x;
-        let dy = ly - from_y;
-        let distance = (dx * dx + dy * dy).sqrt();
-        let steps = (distance / CC_PAINT_SAMPLE_PX).ceil().max(1.0) as i32;
-
-        let step_beats = self.step_beats();
-        let tol = (step_beats * 0.5).max(1.0e-3);
-        // Free drawing has no grid to collapse samples onto, so thin by beat
-        // distance instead — otherwise a wide drag would mint one point per
-        // sample and bloat the lane far past any useful CC resolution.
-        let min_gap = if unsnap || step_beats <= 0.0 {
-            (self.x_to_clip_beat(CC_PAINT_SAMPLE_PX) - self.x_to_clip_beat(0.0)).abs()
-        } else {
-            0.0
-        }
-        .max(CC_POINT_MERGE_EPS);
-
-        let mut edits: Vec<(f32, f32)> = Vec::with_capacity(steps as usize + 1);
-        let mut last_beat: Option<f32> = None;
-        for i in 0..=steps {
-            let t = i as f32 / steps as f32;
-            let x = from_x + dx * t;
-            let y = from_y + dy * t;
-            let beat = self.clamp_cc_beat(self.snap_beats_live(self.x_to_clip_beat(x), unsnap));
-            // Collapse samples that resolve to the same target (snapped strokes
-            // land many pixels on one grid line).
-            if let Some(previous) = last_beat {
-                if (beat - previous).abs() <= min_gap {
-                    // Still let the newest value win at that position.
-                    if let Some(entry) = edits.last_mut() {
-                        entry.1 = value_at(y);
-                    }
-                    continue;
-                }
-            }
-            last_beat = Some(beat);
-            edits.push((beat, value_at(y)));
-        }
+        let from_beat = self.clamp_cc_beat(self.x_to_clip_beat(from_x));
+        let to_beat = self.clamp_cc_beat(self.x_to_clip_beat(lx));
+        let edits = freehand_cc_samples(
+            from_beat,
+            value_at(from_y),
+            to_beat,
+            value_at(ly),
+            controller_value_steps(kind),
+        );
 
         let cursor_value = value_at(ly);
         self.drag_value_status = Some(format!(
-            "{}: {}{}",
+            "{}: {}",
             cc_kind_label(kind),
             controller_display_value(kind, cursor_value),
-            if unsnap { " · free" } else { "" }
         ));
 
         let existing = self
@@ -288,10 +316,9 @@ impl PianoRoll {
             .read(cx)
             .state
             .controller_points_snapshot(&clip_id, kind);
-        // Snapped strokes should clear the whole grid interval they traverse;
-        // freehand strokes use their screen-space sample spacing so a vertical
-        // brush still replaces the point directly under the cursor.
-        let replace_epsilon = if unsnap { min_gap } else { tol };
+        // The stroke owns every tick it crosses; half a tick either side lets
+        // a vertical brush replace the point directly under the cursor.
+        let replace_epsilon = 0.5 / CC_DRAW_TICKS_PER_BEAT;
         let points = replace_cc_paint_segment(existing, &edits, erase, replace_epsilon);
 
         self.timeline.update(cx, |tl, tcx| {
@@ -1022,15 +1049,26 @@ impl PianoRoll {
                 samples.push(Self::controller_y_for_value(value, cc_h));
             }
 
+            // A freehand curve holds a point on every tick its value moves —
+            // far closer together than a handle is wide. Handles that would
+            // overlap the last one drawn are left out so the curve reads as a
+            // line, not a bead chain; a selected point is always shown, and
+            // hit-testing still sees every point.
+            let mut last_drawn_x = f32::NEG_INFINITY;
             for p in &points {
                 let x = self.clip_beat_to_x(p.beat);
                 if x < -HANDLE_R || x > view_w + HANDLE_R {
                     continue;
                 }
+                let selected = self.cc_selection.contains(&p.id);
+                if !selected && x - last_drawn_x < CC_HANDLE_MIN_SPACING {
+                    continue;
+                }
+                last_drawn_x = x;
                 handles.push(CcHandle {
                     x,
                     y: Self::controller_y_for_value(p.value, cc_h),
-                    selected: self.cc_selection.contains(&p.id),
+                    selected,
                 });
             }
         }
@@ -1387,6 +1425,71 @@ impl PianoRoll {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn on_ticks(samples: &[(f32, f32)]) -> bool {
+        samples.iter().all(|(beat, _)| {
+            let ticks = beat * CC_DRAW_TICKS_PER_BEAT;
+            (ticks - ticks.round()).abs() < 1.0e-2
+        })
+    }
+
+    #[test]
+    fn a_freehand_ramp_writes_every_value_on_its_own_tick() {
+        let samples = freehand_cc_samples(0.0, 0.0, 1.0, 1.0, 127.0);
+        // All 128 CC values, each where it is first reached, plus the tick the
+        // stroke ends on; all on 960-PPQ ticks.
+        assert_eq!(samples.len(), 129);
+        assert!(on_ticks(&samples));
+        assert!(samples.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert_eq!(samples.first(), Some(&(0.0, 0.0)));
+        assert_eq!(samples.last(), Some(&(1.0, 1.0)));
+        // Finer than any note grid: consecutive values a few ticks apart.
+        let gap = samples[2].0 - samples[1].0;
+        assert!(gap < 0.01, "points {gap} beats apart");
+    }
+
+    #[test]
+    fn a_flat_freehand_stroke_keeps_only_its_ends() {
+        let samples = freehand_cc_samples(1.0, 0.5, 5.0, 0.5, 127.0);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].0, 1.0);
+        assert_eq!(samples[1].0, 5.0);
+    }
+
+    #[test]
+    fn a_backwards_stroke_is_stored_in_beat_order() {
+        let samples = freehand_cc_samples(2.0, 1.0, 1.0, 0.0, 127.0);
+        assert!(samples.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert_eq!(samples.first(), Some(&(1.0, 0.0)));
+        assert_eq!(samples.last(), Some(&(2.0, 1.0)));
+    }
+
+    #[test]
+    fn a_vertical_stroke_is_one_point_with_the_newest_value() {
+        let samples = freehand_cc_samples(1.0, 0.2, 1.0002, 0.9, 127.0);
+        assert_eq!(samples, vec![(1.0, 0.9)]);
+    }
+
+    #[test]
+    fn pitch_bend_draws_at_its_own_finer_resolution() {
+        let cc = freehand_cc_samples(
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            controller_value_steps(MidiControllerKind::CC(1)),
+        );
+        let bend = freehand_cc_samples(
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            controller_value_steps(MidiControllerKind::PitchBend),
+        );
+        // One point per tick across the beat for a 14-bit bend.
+        assert_eq!(bend.len(), 961);
+        assert!(bend.len() > cc.len());
+    }
 
     #[test]
     fn reverse_paint_replaces_the_previous_horizontal_segment() {

@@ -1,0 +1,22 @@
+[package]
+name = "waygate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "WayGate — noise gate / ducker DSP core"
+
+[lib]
+name = "waygate"
+# `rlib` for the umbrella crate / tests; `cdylib` so it also compiles as a
+# Built-in Plugin dynamic library, like every other built-in.
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+biquad.workspace = true
+builtin-dsp-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

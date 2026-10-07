@@ -217,16 +217,18 @@ mod tests {
     }
 
     #[test]
-    fn editor_url_resolves_for_builtins_with_ui() {
+    fn no_builtin_resolves_a_web_editor_url() {
         let m = InstanceManager::new();
-        assert_eq!(
-            m.editor_url(ROD).as_deref(),
-            Some("mikoplugin://rodharerist/index.html")
-        );
-        assert_eq!(
-            m.editor_url("builtin:equz8").as_deref(),
-            Some("mikoplugin://equz8/index.html")
-        );
-        assert!(m.editor_url("builtin:c1073").is_none());
+        // Every built-in editor is native now; none has a CEF bundle.
+        for id in [
+            ROD,
+            "builtin:equz8",
+            "builtin:verbspace",
+            "builtin:imager",
+            "builtin:mixstation",
+            "builtin:c1073",
+        ] {
+            assert!(m.editor_url(id).is_none(), "{id}");
+        }
     }
 }

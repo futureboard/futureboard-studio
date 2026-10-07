@@ -1,0 +1,36 @@
+#!/sbin/openrc-run
+# The settings the console's setup (tty1) saves in /data/system/setup.conf:
+# the machine's name, its network and its time zone. The system is
+# read-only, so they are written to /run, where /etc/hostname, /etc/hosts,
+# /etc/network/interfaces and /etc/localtime point.
+#
+# Before the first setup (or without /data), the defaults: "livestage", DHCP
+# on every wired port, UTC.
+
+description="Apply the LiveStage setup: name, network, time zone"
+
+depend() {
+	need localmount
+	after livestage-data
+	before hostname net networking avahi-daemon ntpd syslog livestage
+}
+
+start() {
+	local summary
+	ebegin "Applying the LiveStage setup"
+	if summary=$(/usr/bin/livestage-setup --boot 2>&1); then
+		eend 0
+		einfo "$summary"
+		return 0
+	fi
+	eend 1 "$summary"
+	# Still reachable: DHCP on the first port, the default name.
+	ewarn "Falling back to DHCP on eth0"
+	mkdir -p /run/network
+	printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n' \
+		>/run/network/interfaces
+	echo livestage >/run/hostname
+	printf '127.0.0.1\tlivestage localhost\n::1\t\tlivestage localhost\n' >/run/hosts
+	[ -e /run/localtime ] || ln -s /usr/share/zoneinfo/UTC /run/localtime
+	return 0
+}

@@ -8,6 +8,8 @@ description = "Shared realtime-safe helpers for BuiltinAudioPlugins DSP cores"
 
 [dependencies]
 biquad.workspace = true
+# The insert analyser (`spectrum`).
+rustfft.workspace = true
 
 [lints]
 workspace = true

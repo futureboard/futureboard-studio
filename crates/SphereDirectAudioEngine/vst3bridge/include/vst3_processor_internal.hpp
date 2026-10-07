@@ -434,6 +434,11 @@ struct SphereDauxVst3Processor {
   SimpleParamChanges param_changes_obj; // reused per process call
   SimpleEventList input_events_obj;     // reused per process call
   int event_input_bus_count{0};
+  /// What the plug-in adds on its event output bus during process(). Reset
+  /// each block in prepare_process_io; drained right after process() through
+  /// sphere_daux_vst3_take_output_midi on the same thread.
+  SimpleEventList output_events_obj;
+  int event_output_bus_count{0};
   ComponentHandlerImpl component_handler; // installed on IEditController
   /// Raised when the controller reports an edit (`performEdit`, `endEdit`) or
   /// that its values changed (`restartComponent` with `kParamValuesChanged` /
@@ -802,6 +807,21 @@ struct SphereDauxVst3Processor {
             stderr,
             "[SphereVST3] activate event input bus FAILED (result=%d)\n",
             (int)ev_res);
+      }
+    }
+    // An arpeggiator, a chord generator or an instrument with MIDI thru
+    // reports an event output bus. Activated so its notes reach the host,
+    // which offers them to other tracks as a MIDI input.
+    event_output_bus_count =
+        component->getBusCount(Steinberg::Vst::kEvent, Steinberg::Vst::kOutput);
+    if (event_output_bus_count > 0) {
+      const auto ev_res = component->activateBus(
+          Steinberg::Vst::kEvent, Steinberg::Vst::kOutput, 0, true);
+      std::fprintf(stderr,
+                   "[SphereVST3] eventOutputBusCount=%d activate result=%d\n",
+                   event_output_bus_count, (int)ev_res);
+      if (ev_res != Steinberg::kResultOk) {
+        event_output_bus_count = 0;
       }
     }
 
@@ -1186,6 +1206,9 @@ struct SphereDauxVst3Processor {
         (param_changes_obj.count > 0) ? &param_changes_obj : nullptr;
     process_data.inputEvents =
         (input_events_obj.count > 0) ? &input_events_obj : nullptr;
+    output_events_obj.reset();
+    process_data.outputEvents =
+        event_output_bus_count > 0 ? &output_events_obj : nullptr;
   }
 
   /// Add or update a parameter change in the pending queue.

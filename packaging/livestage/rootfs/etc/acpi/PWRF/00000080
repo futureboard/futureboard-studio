@@ -1,0 +1,4 @@
+#!/bin/sh
+# The power button shuts down cleanly: LiveStage closes the take it is
+# recording and saves the session first.
+exec /sbin/poweroff

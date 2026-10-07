@@ -2617,6 +2617,29 @@ daux_vst3_create_impl(const char *plugin_path, const char *class_id,
     }
   }
 
+  // Hand the separate controller the component's state, as the SDK's own
+  // PlugProvider does on setup. Some controllers build the model their editor
+  // reads only here: Roland Cloud's synths dereference null inside
+  // IPlugView::attached() when a host skips it. A restore later repeats it
+  // with the saved state (sphere_daux_vst3_set_state).
+  if (instance->controller && !instance->controller_is_component) {
+    Steinberg::MemoryStream state;
+    const auto get_res = instance->component->getState(&state);
+    if (get_res == Steinberg::kResultOk) {
+      state.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr);
+      const auto sync_res = instance->controller->setComponentState(&state);
+      std::fprintf(stderr,
+                   "[DAUx VST3] controller synced to component state "
+                   "result=0x%x\n",
+                   static_cast<unsigned>(sync_res));
+    } else {
+      std::fprintf(stderr,
+                   "[DAUx VST3] component getState for controller sync "
+                   "result=0x%x (skipped)\n",
+                   static_cast<unsigned>(get_res));
+    }
+  }
+
   instance->plugin_path = plugin_path ? plugin_path : "";
 
   instance->deferred_sample_rate = sample_rate;
@@ -3080,6 +3103,98 @@ sphere_daux_vst3_event_input_bus_count(SphereDauxVst3Processor *processor) {
   if (!processor)
     return 0;
   return processor->event_input_bus_count;
+}
+
+namespace {
+unsigned char midi_7bit(double normalized) {
+  const double v = std::round(normalized * 127.0);
+  return static_cast<unsigned char>(std::max(0.0, std::min(127.0, v)));
+}
+
+/// One VST3 output event as MIDI 1.0 bytes; false for an event with no MIDI
+/// form (note expression, chords, sysex, quarter frames).
+bool vst3_event_to_midi(const Steinberg::Vst::Event &e,
+                        SphereDauxMidiOutEvent &out) {
+  out = {};
+  out.sample_offset =
+      static_cast<unsigned int>(std::max<Steinberg::int32>(0, e.sampleOffset));
+  switch (e.type) {
+  case Steinberg::Vst::Event::kNoteOnEvent: {
+    const auto ch = static_cast<unsigned char>(e.noteOn.channel & 0x0F);
+    out.status = static_cast<unsigned char>(0x90 | ch);
+    out.data1 = static_cast<unsigned char>(e.noteOn.pitch & 0x7F);
+    // Velocity 0 is a note-off in MIDI 1.0; a VST3 note-on never means that.
+    out.data2 = std::max<unsigned char>(1, midi_7bit(e.noteOn.velocity));
+    return true;
+  }
+  case Steinberg::Vst::Event::kNoteOffEvent: {
+    const auto ch = static_cast<unsigned char>(e.noteOff.channel & 0x0F);
+    out.status = static_cast<unsigned char>(0x80 | ch);
+    out.data1 = static_cast<unsigned char>(e.noteOff.pitch & 0x7F);
+    out.data2 = midi_7bit(e.noteOff.velocity);
+    return true;
+  }
+  case Steinberg::Vst::Event::kPolyPressureEvent: {
+    const auto ch = static_cast<unsigned char>(e.polyPressure.channel & 0x0F);
+    out.status = static_cast<unsigned char>(0xA0 | ch);
+    out.data1 = static_cast<unsigned char>(e.polyPressure.pitch & 0x7F);
+    out.data2 = midi_7bit(e.polyPressure.pressure);
+    return true;
+  }
+  case Steinberg::Vst::Event::kLegacyMIDICCOutEvent: {
+    const auto &cc = e.midiCCOut;
+    const auto ch = static_cast<unsigned char>(cc.channel & 0x0F);
+    const auto value = static_cast<unsigned char>(cc.value & 0x7F);
+    const auto value2 = static_cast<unsigned char>(cc.value2 & 0x7F);
+    if (cc.controlNumber <= 127) {
+      out.status = static_cast<unsigned char>(0xB0 | ch);
+      out.data1 = cc.controlNumber;
+      out.data2 = value;
+      return true;
+    }
+    switch (cc.controlNumber) {
+    case Steinberg::Vst::kAfterTouch:
+      out.status = static_cast<unsigned char>(0xD0 | ch);
+      out.data1 = value;
+      return true;
+    case Steinberg::Vst::kPitchBend:
+      out.status = static_cast<unsigned char>(0xE0 | ch);
+      out.data1 = value;  // LSB
+      out.data2 = value2; // MSB
+      return true;
+    case Steinberg::Vst::kCtrlProgramChange:
+      out.status = static_cast<unsigned char>(0xC0 | ch);
+      out.data1 = value;
+      return true;
+    case Steinberg::Vst::kCtrlPolyPressure:
+      out.status = static_cast<unsigned char>(0xA0 | ch);
+      out.data1 = value;
+      out.data2 = value2;
+      return true;
+    default:
+      return false;
+    }
+  }
+  default:
+    return false;
+  }
+}
+} // namespace
+
+extern "C" int
+sphere_daux_vst3_take_output_midi(SphereDauxVst3Processor *processor,
+                                  SphereDauxMidiOutEvent *out, int max_count) {
+  if (!processor || !out || max_count <= 0)
+    return 0;
+  auto &list = processor->output_events_obj;
+  int written = 0;
+  for (int i = 0; i < list.count && written < max_count; ++i) {
+    if (vst3_event_to_midi(list.events[i], out[written])) {
+      ++written;
+    }
+  }
+  list.reset();
+  return written;
 }
 
 extern "C" int

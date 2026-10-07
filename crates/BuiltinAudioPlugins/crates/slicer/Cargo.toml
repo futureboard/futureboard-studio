@@ -1,0 +1,19 @@
+[package]
+name = "slicer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Slicer - one audio file cut into slices, one slice per key"
+
+[lib]
+name = "slicer"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+quicksampler.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

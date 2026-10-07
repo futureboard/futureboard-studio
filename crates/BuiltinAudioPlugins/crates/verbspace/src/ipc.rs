@@ -4,13 +4,18 @@
 //! them to compact indices before publishing edits to an audio-side bounded
 //! queue; [`Dsp::apply_wire_param`](crate::Dsp::apply_wire_param) consumes the
 //! numeric form without allocation, serialization, locking, or string lookup.
+//!
+//! Version 2 (the rebuilt DSP) appended `bassFreqHz`, `dampFreqHz`,
+//! `earlyLate` and `wetOnly`, widened `size` to 0–100 and `bassMult` to
+//! 0.2–3, and turned `mode` into a label the DSP no longer reads. A version-1
+//! blob still loads: the appended fields take their defaults.
 
 use serde::{Deserialize, Serialize};
 
 use crate::{MAX_PREDELAY_MS, Params, ReverbMode, clamp, default_params};
 
-pub const PROTOCOL_VERSION: u32 = 1;
-pub const STATE_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+pub const STATE_VERSION: u32 = 2;
 
 pub const POWER_INDEX: u32 = 0;
 pub const MODE_INDEX: u32 = 1;
@@ -28,8 +33,12 @@ pub const WIDTH_INDEX: u32 = 12;
 pub const MIX_INDEX: u32 = 13;
 pub const OUTPUT_INDEX: u32 = 14;
 pub const FREEZE_INDEX: u32 = 15;
+pub const BASS_FREQ_INDEX: u32 = 16;
+pub const DAMP_FREQ_INDEX: u32 = 17;
+pub const EARLY_LATE_INDEX: u32 = 18;
+pub const WET_ONLY_INDEX: u32 = 19;
 
-pub const PARAM_COUNT: usize = 16;
+pub const PARAM_COUNT: usize = 20;
 
 /// Wire index *is* the position in this table; the editor and the host both
 /// resolve through it, so the order is part of the persisted contract. Append
@@ -51,6 +60,10 @@ pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = [
     "mix",
     "outputDb",
     "freeze",
+    "bassFreqHz",
+    "dampFreqHz",
+    "earlyLate",
+    "wetOnly",
 ];
 
 /// Inclusive `(min, max)` for every continuous parameter, indexed by wire
@@ -61,11 +74,11 @@ const RANGES: [(f32, f32); PARAM_COUNT] = [
     (0.0, 0.0),             // power
     (0.0, 0.0),             // mode
     (0.0, MAX_PREDELAY_MS), // predelayMs
-    (10.0, 100.0),          // size
+    (0.0, 100.0),           // size
     (0.1, 20.0),            // decaySec
     (0.0, 100.0),           // diffusion
     (0.0, 100.0),           // damping
-    (0.2, 2.0),             // bassMult
+    (0.2, 3.0),             // bassMult
     (0.0, 100.0),           // modDepth
     (0.05, 5.0),            // modRateHz
     (20.0, 1_000.0),        // lowCutHz
@@ -74,6 +87,10 @@ const RANGES: [(f32, f32); PARAM_COUNT] = [
     (0.0, 100.0),           // mix
     (-24.0, 12.0),          // outputDb
     (0.0, 0.0),             // freeze
+    (50.0, 1_000.0),        // bassFreqHz
+    (1_000.0, 16_000.0),    // dampFreqHz
+    (0.0, 100.0),           // earlyLate
+    (0.0, 0.0),             // wetOnly
 ];
 
 #[inline]
@@ -139,11 +156,18 @@ pub fn sanitize_params(params: &mut Params) {
     params.width = clamp_wire(WIDTH_INDEX, params.width);
     params.mix = clamp_wire(MIX_INDEX, params.mix);
     params.output_db = clamp_wire(OUTPUT_INDEX, params.output_db);
+    params.bass_freq_hz = clamp_wire(BASS_FREQ_INDEX, params.bass_freq_hz);
+    params.damp_freq_hz = clamp_wire(DAMP_FREQ_INDEX, params.damp_freq_hz);
+    params.early_late = clamp_wire(EARLY_LATE_INDEX, params.early_late);
 }
 
 /// Apply one compact UI/control update. Allocation-free and total: invalid
 /// indices are rejected, non-finite values are rejected, and every continuous
 /// value is clamped to its declared range.
+///
+/// `mode` only stores the label: loading a type's space is the editor's
+/// explicit act ([`ReverbMode::starting_point`]), sent as ordinary edits, so
+/// replaying a project or a preset diff never has a hidden side effect.
 pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
     if !value.is_finite() || index as usize >= PARAM_COUNT {
         return false;
@@ -152,6 +176,7 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
         POWER_INDEX => params.power = value >= 0.5,
         MODE_INDEX => params.mode = ReverbMode::from_wire(value),
         FREEZE_INDEX => params.freeze = value >= 0.5,
+        WET_ONLY_INDEX => params.wet_only = value >= 0.5,
         PREDELAY_INDEX => params.predelay_ms = clamp_wire(index, value),
         SIZE_INDEX => params.size = clamp_wire(index, value),
         DECAY_INDEX => params.decay_sec = clamp_wire(index, value),
@@ -165,6 +190,9 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
         WIDTH_INDEX => params.width = clamp_wire(index, value),
         MIX_INDEX => params.mix = clamp_wire(index, value),
         OUTPUT_INDEX => params.output_db = clamp_wire(index, value),
+        BASS_FREQ_INDEX => params.bass_freq_hz = clamp_wire(index, value),
+        DAMP_FREQ_INDEX => params.damp_freq_hz = clamp_wire(index, value),
+        EARLY_LATE_INDEX => params.early_late = clamp_wire(index, value),
         _ => return false,
     }
     true
@@ -198,6 +226,10 @@ pub fn ui_values(params: &Params) -> Vec<(&'static str, f32)> {
         ("mix", params.mix),
         ("outputDb", params.output_db),
         ("freeze", f32::from(params.freeze)),
+        ("bassFreqHz", params.bass_freq_hz),
+        ("dampFreqHz", params.damp_freq_hz),
+        ("earlyLate", params.early_late),
+        ("wetOnly", f32::from(params.wet_only)),
     ]
 }
 
@@ -211,6 +243,33 @@ mod tests {
         for (index, id) in UI_PARAM_IDS.iter().enumerate() {
             assert_eq!(ui_param_index(id), Some(index as u32));
             assert_eq!(ui_param_id(index as u32), Some(*id));
+        }
+    }
+
+    /// The first sixteen ids are persisted in version-1 projects and
+    /// automation: they must never move.
+    #[test]
+    fn version_one_wire_indices_are_unchanged() {
+        let v1 = [
+            "power",
+            "mode",
+            "predelayMs",
+            "size",
+            "decaySec",
+            "diffusion",
+            "damping",
+            "bassMult",
+            "modDepth",
+            "modRateHz",
+            "lowCutHz",
+            "highCutHz",
+            "width",
+            "mix",
+            "outputDb",
+            "freeze",
+        ];
+        for (index, id) in v1.iter().enumerate() {
+            assert_eq!(ui_param_index(id), Some(index as u32), "{id}");
         }
     }
 
@@ -229,6 +288,7 @@ mod tests {
     fn state_round_trips() {
         let mut params = default_params();
         assert!(apply_ui_param(&mut params, "decaySec", 7.5));
+        assert!(apply_ui_param(&mut params, "earlyLate", 12.0));
         assert!(apply_ui_param(
             &mut params,
             "mode",
@@ -237,8 +297,50 @@ mod tests {
         let json = VerbspaceState::new(params).to_json().unwrap();
         let decoded = VerbspaceState::from_json(&json).unwrap();
         assert_eq!(decoded.params.decay_sec, 7.5);
+        assert_eq!(decoded.params.early_late, 12.0);
         assert_eq!(decoded.params.mode, ReverbMode::Plate);
         assert_eq!(decoded.version, STATE_VERSION);
+    }
+
+    /// A project saved before the rebuild has none of the appended fields:
+    /// it loads, keeps every value it had, and the new ones take defaults.
+    #[test]
+    fn a_version_one_blob_still_loads() {
+        let json = r#"{"version":1,"params":{"power":true,"mode":"room","predelayMs":8.0,
+            "size":32.0,"decaySec":0.55,"diffusion":58.0,"damping":55.0,"bassMult":0.95,
+            "modDepth":12.0,"modRateHz":0.45,"lowCutHz":120.0,"highCutHz":11000.0,
+            "width":95.0,"mix":22.0,"outputDb":-1.5,"freeze":false}}"#;
+        let state = VerbspaceState::from_json(json).unwrap();
+        assert_eq!(state.version, 1);
+        assert_eq!(state.params.mode, ReverbMode::Room);
+        assert_eq!(state.params.size, 32.0);
+        assert_eq!(state.params.decay_sec, 0.55);
+        assert_eq!(state.params.output_db, -1.5);
+        let defaults = default_params();
+        assert_eq!(state.params.bass_freq_hz, defaults.bass_freq_hz);
+        assert_eq!(state.params.damp_freq_hz, defaults.damp_freq_hz);
+        assert_eq!(state.params.early_late, defaults.early_late);
+        assert!(!state.params.wet_only);
+    }
+
+    #[test]
+    fn mode_is_a_label_on_the_wire() {
+        let mut params = default_params();
+        let before = params.clone();
+        assert!(apply_ui_param(
+            &mut params,
+            "mode",
+            ReverbMode::Room.to_wire()
+        ));
+        assert_eq!(params.mode, ReverbMode::Room);
+        assert_eq!(
+            Params {
+                mode: before.mode,
+                ..params
+            },
+            before,
+            "a mode edit moved another param"
+        );
     }
 
     #[test]
@@ -248,6 +350,8 @@ mod tests {
         assert_eq!(params.decay_sec, 20.0);
         assert!(apply_ui_param(&mut params, "mix", -5.0));
         assert_eq!(params.mix, 0.0);
+        assert!(apply_ui_param(&mut params, "dampFreqHz", 40_000.0));
+        assert_eq!(params.damp_freq_hz, 16_000.0);
     }
 
     #[test]
@@ -269,22 +373,18 @@ mod tests {
         params.size = 900.0;
         params.high_cut_hz = 96_000.0;
         params.bass_mult = 40.0;
+        params.bass_freq_hz = 0.0;
         sanitize_params(&mut params);
         assert_eq!(params.decay_sec, 0.1);
         assert_eq!(params.size, 100.0);
         assert_eq!(params.high_cut_hz, 20_000.0);
-        assert_eq!(params.bass_mult, 2.0);
+        assert_eq!(params.bass_mult, 3.0);
+        assert_eq!(params.bass_freq_hz, 50.0);
     }
 
     #[test]
     fn mode_wire_values_round_trip() {
-        for mode in [
-            ReverbMode::Room,
-            ReverbMode::Chamber,
-            ReverbMode::Hall,
-            ReverbMode::Plate,
-            ReverbMode::Ambience,
-        ] {
+        for mode in ReverbMode::ALL {
             assert_eq!(ReverbMode::from_wire(mode.to_wire()), mode);
             assert_eq!(ReverbMode::parse(mode.as_str()), Some(mode));
         }

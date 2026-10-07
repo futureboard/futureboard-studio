@@ -23,7 +23,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::{Artifact, Message};
 
 use crate::platform::{Edition, host_target};
-use crate::toolchain;
+use crate::{jobs, toolchain};
 
 /// The Futureboard workspace root (xtask lives at `<root>/xtask`).
 fn workspace_root() -> PathBuf {
@@ -115,6 +115,7 @@ pub fn build(
         .args(["--profile", profile])
         .arg("--target-dir")
         .arg(&target_dir);
+    jobs::apply(&mut command, Some(profile), &[]);
 
     if target_triple.contains("windows") && target_triple.contains("msvc") {
         // The pinned CEF SDK defaults its wrapper to /MT, while the prebuilt

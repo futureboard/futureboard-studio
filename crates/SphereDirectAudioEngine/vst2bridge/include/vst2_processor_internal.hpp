@@ -136,6 +136,12 @@ struct SphereDauxVst2Processor {
   std::vector<unsigned char> events_block;
   std::array<VstMidiEvent, kMaxMidiEvents> midi_events{};
   int midi_event_count{0};
+  /// MIDI the plug-in sent back through `audioMasterProcessEvents` this
+  /// block. Cleared before each processReplacing; drained right after it by
+  /// `sphere_daux_vst2_take_output_midi` on the same thread.
+  static constexpr int kMaxOutputMidi = 256;
+  std::array<SphereDauxMidiOutEvent, kMaxOutputMidi> output_midi{};
+  int output_midi_count{0};
 
   // ── Transport ────────────────────────────────────────────────────────────
   // Written by set_process_context (control thread, once per block) and read by

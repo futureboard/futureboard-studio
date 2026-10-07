@@ -1053,6 +1053,11 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow().sprite_atlas()
     }
 
+    #[cfg(feature = "test-support")]
+    fn render_to_image(&self, scene: &Scene) -> Result<image::RgbaImage> {
+        self.state.renderer.borrow_mut().render_to_image(scene)
+    }
+
     fn get_raw_handle(&self) -> HWND {
         self.0.hwnd
     }

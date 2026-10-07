@@ -2773,11 +2773,26 @@ pub(crate) fn apply_external_bridge_insert_block(
             0
         } else {
             insert.scratch_multi.resize(needed, 0.0);
-            let (got, channels) =
+            let (got, _) =
                 sink.read_output_multichannel(&mut insert.scratch_multi[..needed], frames);
-            let _ = channels;
-            insert.scratch_l[..got].fill(0.0);
-            insert.scratch_r[..got].fill(0.0);
+            // A plug-in whose main output has no child strip of its own (a
+            // multi-out built-in giving strips only to the extra outputs its
+            // pads use) keeps that output on the parent track; otherwise the
+            // parent gets nothing, and bus 0 plays on its child like the rest.
+            let main_on_parent = !insert
+                .vsti_output_children
+                .iter()
+                .any(|child| child.bus_index == 0);
+            if main_on_parent {
+                let right = if channels > 1 { 1 } else { 0 };
+                for i in 0..got {
+                    insert.scratch_l[i] = insert.scratch_multi[i * channels];
+                    insert.scratch_r[i] = insert.scratch_multi[i * channels + right];
+                }
+            } else {
+                insert.scratch_l[..got].fill(0.0);
+                insert.scratch_r[..got].fill(0.0);
+            }
             got
         }
     };

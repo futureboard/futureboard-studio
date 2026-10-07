@@ -67,6 +67,29 @@ SPHERE_DAUX_VST3_API int sphere_daux_vst3_process_main_output_block_with_midi(
 SPHERE_DAUX_VST3_API int
 sphere_daux_vst3_event_input_bus_count(SphereDauxVst3Processor *processor);
 
+#ifndef SPHERE_DAUX_MIDI_OUT_EVENT_DEFINED
+#define SPHERE_DAUX_MIDI_OUT_EVENT_DEFINED
+/// One MIDI 1.0 message a plug-in produced during process(), as raw bytes.
+/// Shared by the VST3, VST2 and CLAP bridges so the host forwards one shape.
+/// `data2` is 0 for one-data-byte messages (program change, channel
+/// pressure).
+typedef struct SphereDauxMidiOutEvent {
+  unsigned int sample_offset;
+  unsigned char status;
+  unsigned char data1;
+  unsigned char data2;
+  unsigned char reserved;
+} SphereDauxMidiOutEvent;
+#endif
+
+/// Copy the MIDI the plug-in emitted on its event output bus during the last
+/// process call into `out` (at most `max_count`), oldest first, and clear it.
+/// Returns how many were written. Call on the thread that calls process(),
+/// right after it; 0 for a plug-in with no event output bus.
+SPHERE_DAUX_VST3_API int
+sphere_daux_vst3_take_output_midi(SphereDauxVst3Processor *processor,
+                                  SphereDauxMidiOutEvent *out, int max_count);
+
 SPHERE_DAUX_VST3_API unsigned long long
 sphere_daux_vst3_process_count(SphereDauxVst3Processor *processor);
 

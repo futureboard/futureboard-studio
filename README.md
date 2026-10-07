@@ -8,6 +8,7 @@
 [![Status](https://img.shields.io/badge/status-pre--alpha-f59e0b?style=for-the-badge&labelColor=0f172a)](ARCHITECTURE.md)
 [![License](https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge&labelColor=0f172a)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-38bdf8?style=for-the-badge&labelColor=0f172a)](CONTRIBUTING.md)
+[![Join our Discord](https://img.shields.io/badge/Join%20our-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/Mx2BWRmwSA)
 [![Translate on Crowdin](https://img.shields.io/badge/Translate-Crowdin-2e3340?style=for-the-badge&logo=crowdin&logoColor=white&labelColor=0f172a)](https://crowdin.com/project/futureboard-studio)
 
 [![Rust](https://img.shields.io/badge/Rust-2024-f97316?style=for-the-badge&logo=rust&logoColor=white&labelColor=0f172a)](https://rustup.rs)
@@ -42,67 +43,67 @@
 <table>
   <tr>
     <td colspan="2" align="center">
-      <img src="packages/assets/new_screenshots/workspace.png" alt="Arrangement, browser, inspector and docked mixer" />
+      <img src="packages/assets/new_screenshots/workspace.webp" alt="Arrangement, browser, inspector and docked mixer" />
       <br />
       <sub>Workspace — arrangement, browser, inspector and the docked mixer</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/mixer.png" alt="Mixer window" />
+      <img src="packages/assets/new_screenshots/mixer.webp" alt="Mixer window" />
       <br />
       <sub>Mixer — inserts, sends, pan, PFL/AFL, Master and Monitor</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/audio-connections.png" alt="Audio Connections window" />
+      <img src="packages/assets/new_screenshots/audio-connections.webp" alt="Audio Connections window" />
       <br />
       <sub>Audio Connections — named input and output buses</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/chord-generator.png" alt="Chord Generator" />
+      <img src="packages/assets/new_screenshots/chord-generator.webp" alt="Chord Generator" />
       <br />
       <sub>Chord Generator — progressions to a Chord Track or MIDI clip</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/tempo-key-finder.png" alt="Find Tempo and Key" />
+      <img src="packages/assets/new_screenshots/tempo-key-finder.webp" alt="Find Tempo and Key" />
       <br />
       <sub>Find Tempo &amp; Key — tempo map, key and chords from audio</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/audio-repair.png" alt="Audio Repair" />
+      <img src="packages/assets/new_screenshots/audio-repair.webp" alt="Audio Repair" />
       <br />
       <sub>Audio Repair — noise reduction, de-click, de-hum, spectral repair</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/rodhareist.png" alt="Rodhareist amp rig" />
+      <img src="packages/assets/new_screenshots/rodhareist.webp" alt="Rodhareist amp rig" />
       <br />
       <sub>Rodhareist — a built-in amp and effects rig</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/project-settings.png" alt="Project Settings" />
+      <img src="packages/assets/new_screenshots/project-settings.webp" alt="Project Settings" />
       <br />
       <sub>Project Settings — tempo, meter, key and timebase</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/performance-monitor.png" alt="Performance Monitor" />
+      <img src="packages/assets/new_screenshots/performance-monitor.webp" alt="Performance Monitor" />
       <br />
       <sub>Performance Monitor — engine status, callback load, dropouts</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/big-clock.png" alt="Big Clock" />
+      <img src="packages/assets/new_screenshots/big-clock.webp" alt="Big Clock" />
       <br />
       <sub>Big Clock — bars|beats|ticks, time and timecode</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/workspace-audio-connections-thai.png" alt="Workspace in Thai with Audio Connections" />
+      <img src="packages/assets/new_screenshots/workspace-audio-connections-thai.webp" alt="Workspace in Thai with Audio Connections" />
       <br />
       <sub>Utility windows float over the workspace</sub>
     </td>
@@ -115,19 +116,19 @@
 <table>
   <tr>
     <td colspan="2" align="center">
-      <img src="packages/assets/new_screenshots/workspace-thai.png" alt="Workspace in Thai" />
+      <img src="packages/assets/new_screenshots/workspace-thai.webp" alt="Workspace in Thai" />
       <br />
       <sub>Workspace</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/mixer-thai.png" alt="Mixer in Thai" />
+      <img src="packages/assets/new_screenshots/mixer-thai.webp" alt="Mixer in Thai" />
       <br />
       <sub>Mixer</sub>
     </td>
     <td width="50%" align="center">
-      <img src="packages/assets/new_screenshots/settings-thai.png" alt="Settings in Thai" />
+      <img src="packages/assets/new_screenshots/settings-thai.webp" alt="Settings in Thai" />
       <br />
       <sub>Settings</sub>
     </td>
@@ -171,14 +172,14 @@ Built-in plug-ins are Rust DSP hosted by the plug-in host. Each has its own
 editor, a compiled web view embedded in the binary — the one place Futureboard
 uses web technology.
 
-| Kind        | Plug-ins                                                                   |
-| ----------- | -------------------------------------------------------------------------- |
-| Dynamics    | Compressor (single and multiband) · FA-2A · FA-76 · Z-Comp · Transient     |
-| EQ &amp; color  | EQ-Z8 · C1073 · 67Clipper · BurnLimit                                      |
-| Space       | EchoSpace · VerbSpace · Imager                                             |
-| Utility     | MixStation                                                                 |
-| Amp rig     | Rodhareist                                                                 |
-| Instruments | WrapSynth · Drum Sampler                                                   |
+| Kind           | Plug-ins                                                               |
+| -------------- | ---------------------------------------------------------------------- |
+| Dynamics       | Compressor (single and multiband) · FA-2A · FA-76 · Z-Comp · Transient |
+| EQ &amp; color | EQ-Z8 · C1073 · 67Clipper · BurnLimit                                  |
+| Space          | EchoSpace · VerbSpace · Imager                                         |
+| Utility        | MixStation                                                             |
+| Amp rig        | Rodhareist                                                             |
+| Instruments    | WrapSynth · Drum Sampler                                               |
 
 ---
 
@@ -260,11 +261,11 @@ cargo run -p xtask -- package --profile dev --edition community --plugin all
 
 Distributables:
 
-| Target  | Command                                                                      |
-| ------- | ---------------------------------------------------------------------------- |
-| Windows | `bun run bundle:native:win` — Inno Setup installer (`packaging/windows`)     |
+| Target  | Command                                                                            |
+| ------- | ---------------------------------------------------------------------------------- |
+| Windows | `bun run bundle:native:win` — Inno Setup installer (`packaging/windows`)           |
 | macOS   | `bun run bundle:native:mac` · `bun run bundle:native:mac:dmg` (`packaging/native`) |
-| Linux   | `packaging/linux/bundle-appimage.sh` — AppImage · `packaging/aur` — AUR package |
+| Linux   | `packaging/linux/bundle-appimage.sh` — AppImage · `packaging/aur` — AUR package    |
 
 ### macOS universal (Apple Silicon + Intel)
 
@@ -298,24 +299,24 @@ other architecture's image.
 
 ### Platform notes
 
-| Platform | Audio backends                  | Setup                                                         |
-| -------- | ------------------------------- | ------------------------------------------------------------- |
-| Windows  | WASAPI (shared and exclusive) · WDM-KS | `rustup default stable-msvc`                           |
-| macOS    | CoreAudio                       | `xcode-select --install`                                      |
-| Linux    | ALSA                            | `sudo apt install libasound2-dev` · `sudo pacman -S alsa-lib` |
+| Platform | Audio backends                         | Setup                                                         |
+| -------- | -------------------------------------- | ------------------------------------------------------------- |
+| Windows  | WASAPI (shared and exclusive) · WDM-KS | `rustup default stable-msvc`                                  |
+| macOS    | CoreAudio                              | `xcode-select --install`                                      |
+| Linux    | ALSA                                   | `sudo apt install libasound2-dev` · `sudo pacman -S alsa-lib` |
 
 ASIO is available in Professional Edition only.
 
 ### Scripts
 
-| Script                                                                          | Runs                                                  |
-| ------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `dev:native`                                                                    | `cargo run -p futureboard_native`                     |
+| Script                                                                          | Runs                                                     |
+| ------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `dev:native`                                                                    | `cargo run -p futureboard_native`                        |
 | `build:native` · `build:native:debug`                                           | `xtask package` (release / dev, Community, all plug-ins) |
-| `build:plugin-editors`                                                          | Build every built-in plug-in editor bundle            |
-| `bundle:native:win` · `bundle:native:mac[:dmg]` · `installer:native:win`        | Package distributables                                |
-| `cargo:check` · `cargo:build` · `cargo:release` · `cargo:test` · `cargo:clippy` | Rust workspace passthroughs                           |
-| `cargo:fmt[:check]` · `check` · `lint` · `fmt`                                  | Formatting and combined checks                        |
+| `build:plugin-editors`                                                          | Build every built-in plug-in editor bundle               |
+| `bundle:native:win` · `bundle:native:mac[:dmg]` · `installer:native:win`        | Package distributables                                   |
+| `cargo:check` · `cargo:build` · `cargo:release` · `cargo:test` · `cargo:clippy` | Rust workspace passthroughs                              |
+| `cargo:fmt[:check]` · `check` · `lint` · `fmt`                                  | Formatting and combined checks                           |
 
 ---
 
@@ -327,18 +328,18 @@ rendering framework behind the Zed editor — owns the shell, windows, commands
 and state; the audio engine runs in process; plug-ins run in a separate host
 process so a crashing plug-in cannot take the session down.
 
-| Crate                                                          | Purpose                                                        |
-| -------------------------------------------------------------- | -------------------------------------------------------------- |
-| [`SphereUIComponents`](crates/SphereUIComponents)              | The GPUI shell, editors, mixer, windows and theme              |
-| [`SphereDirectAudioEngine`](crates/SphereDirectAudioEngine)    | Real-time engine: graph, transport, mixing, recording, export  |
-| [`SpherePluginHost`](crates/SpherePluginHost)                  | Plug-in scanning, the out-of-process host and editor bridging  |
-| [`BuiltinAudioPlugins`](crates/BuiltinAudioPlugins)            | Built-in plug-in DSP and their embedded editors                |
-| [`SphereWebView`](crates/SphereWebView)                        | CEF host for the built-in plug-in editors                      |
-| [`SphereSoundfontPlayer`](crates/SphereSoundfontPlayer)        | The built-in SoundFont instrument                              |
-| [`SphereMidiService`](crates/SphereMidiService)                | MIDI devices, programs and MPE                                 |
-| [`SphereAudioProcessor`](crates/SphereAudioProcessor)          | Time-stretch, pitch and audio analysis                         |
-| [`Ara2Bridge`](crates/Ara2Bridge) · [`SphereAraHost`](crates/SphereAraHost) | ARA 2 hosting                                     |
-| [`gpui`](crates/gpui)                                          | The GPUI fork the app is built on                              |
+| Crate                                                                       | Purpose                                                       |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| [`SphereUIComponents`](crates/SphereUIComponents)                           | The GPUI shell, editors, mixer, windows and theme             |
+| [`SphereDirectAudioEngine`](crates/SphereDirectAudioEngine)                 | Real-time engine: graph, transport, mixing, recording, export |
+| [`SpherePluginHost`](crates/SpherePluginHost)                               | Plug-in scanning, the out-of-process host and editor bridging |
+| [`BuiltinAudioPlugins`](crates/BuiltinAudioPlugins)                         | Built-in plug-in DSP and their embedded editors               |
+| [`SphereWebView`](crates/SphereWebView)                                     | CEF host for the built-in plug-in editors                     |
+| [`SphereSoundfontPlayer`](crates/SphereSoundfontPlayer)                     | The built-in SoundFont instrument                             |
+| [`SphereMidiService`](crates/SphereMidiService)                             | MIDI devices, programs and MPE                                |
+| [`SphereAudioProcessor`](crates/SphereAudioProcessor)                       | Time-stretch, pitch and audio analysis                        |
+| [`Ara2Bridge`](crates/Ara2Bridge) · [`SphereAraHost`](crates/SphereAraHost) | ARA 2 hosting                                                 |
+| [`gpui`](crates/gpui)                                                       | The GPUI fork the app is built on                             |
 
 Other native apps share the same crates: `jamsession` (standalone Audio Jam
 client), `singer` (Solfege instrument playground) and `apakinstaller` (signed

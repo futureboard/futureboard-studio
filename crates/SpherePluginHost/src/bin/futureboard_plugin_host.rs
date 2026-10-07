@@ -21,7 +21,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use builtin_dsp_core::{Instrument, StereoEffect};
 use SpherePluginHost::au_host::{AuHostProcessor, AuTransport};
 use SpherePluginHost::audio_bridge::{
-    bridge_kick_event_name, BridgeKickEvent, SharedAudioRegion, SharedMidiEvent, AUDIO_BUF_LEN,
-    MAX_BLOCK_FRAMES, MAX_CHANNELS,
+    bridge_kick_event_name, bridge_midi_out_event_name, BridgeKickEvent, SharedAudioRegion,
+    SharedMidiEvent, AUDIO_BUF_LEN, MAX_BLOCK_FRAMES, MAX_CHANNELS,
 };
 use SpherePluginHost::ipc::{self, EditorChromeCommand, HostCommand, HostEvent, PROTOCOL_VERSION};
 use SpherePluginHost::native_editor::{self, EmbedRegion};
@@ -146,6 +146,10 @@ fn raise_default_thread_stack_for_plugin_editors() {
     }
 }
 
+/// Where the host writes its protocol: the pipe to Studio, kept apart from
+/// the process's stdout (`plugin_host_lifecycle::take_protocol_stdout`).
+type IpcOut = Box<dyn Write>;
+
 fn main() {
     #[cfg(target_os = "linux")]
     raise_default_thread_stack_for_plugin_editors();
@@ -192,7 +196,12 @@ fn main() {
         std::process::exit(code);
     }
 
-    let mut out = io::stdout();
+    // Before any plug-in is loaded: what a plug-in prints must never reach
+    // the protocol pipe.
+    let mut out: IpcOut = match SpherePluginHost::plugin_host_lifecycle::take_protocol_stdout() {
+        Some(pipe) => Box::new(pipe),
+        None => Box::new(io::stdout()),
+    };
     let _ = ipc::write_frame(
         &mut out,
         &HostEvent::Ready {
@@ -212,6 +221,9 @@ fn main() {
 
     run_ipc_loop(out, shutdown);
     platform::com_uninit();
+    // Every editor is closed and every plug-in released by now; end the
+    // process without running the plug-in modules' own unload code.
+    SpherePluginHost::plugin_host_lifecycle::exit_now(0);
 }
 
 /// Announce the runtime-ownership policy this host enforces. The external
@@ -295,7 +307,9 @@ type LoadedRegistry = HashMap<String, LoadedPlugin>;
 enum BuiltinDsp {
     Rodhareist(rodharerist::Dsp),
     Equz8(equz8::Dsp),
+    Equzx(equzx::Dsp),
     Verbspace(verbspace::Dsp),
+    WhiteSharp(Box<whitesharp::Dsp>),
     Echospace(echospace::Dsp),
     Imager(imager::Dsp),
     Fa2a(fa2a::Dsp),
@@ -303,8 +317,11 @@ enum BuiltinDsp {
     BurnLimit(burnlimit::Dsp),
     Clipper67(clipper67::Dsp),
     Transient(transient::Dsp),
+    WayGate(waygate::Dsp),
     WrapSynth(wrapsynth::Dsp),
     DrumSampler(drumsampler::Dsp),
+    QuickSampler(quicksampler::Dsp),
+    Slicer(slicer::Dsp),
     Zcomp(zcomp::Dsp),
     MixStation(mixstation::Dsp),
     Compresser(compresser::Dsp),
@@ -335,6 +352,10 @@ struct BuiltinHostProcessor {
     /// instance (safe from the IPC thread), indexed by pad. `None` for every
     /// other built-in.
     drum_pad_loaders: Option<Vec<drumsampler::PadLoader>>,
+    /// Control-side sample loader for a built-in `quicksampler` or `slicer`
+    /// instance (safe from the IPC thread) — the Slicer plays through Quick
+    /// Sampler's voices. `None` for every other built-in.
+    sample_loader: Option<quicksampler::SampleLoader>,
     /// Engine sample rate the DSP was built at — needed to validate a `.nam`
     /// capture's declared rate on the IPC thread.
     sample_rate: f32,
@@ -347,6 +368,17 @@ unsafe impl Send for BuiltinHostProcessor {}
 unsafe impl Sync for BuiltinHostProcessor {}
 
 impl BuiltinHostProcessor {
+    /// Interleaved channels this processor renders per frame: a stereo pair,
+    /// or a multi-out instrument's every output. Producer thread (it reads the
+    /// DSP's kind only, which never changes after construction).
+    fn output_channels(&self) -> usize {
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        match unsafe { &*self.dsp.get() } {
+            BuiltinDsp::DrumSampler(_) => drumsampler::OUTPUT_CHANNELS,
+            _ => 2,
+        }
+    }
+
     /// Build the DSP for a built-in catalog stem, or `None` when the host has
     /// no core for it. The caller turns `None` into a load failure rather than
     /// publishing a silent instance.
@@ -354,7 +386,9 @@ impl BuiltinHostProcessor {
         match stem {
             "rodharerist" => Some(Self::rodhareist(sample_rate, state_json)),
             "equz8" => Some(Self::equz8(sample_rate, state_json)),
+            "equzx" => Some(Self::equzx(sample_rate, state_json)),
             "verbspace" => Some(Self::verbspace(sample_rate, state_json)),
+            "whitesharp" => Some(Self::whitesharp(sample_rate, state_json)),
             "echospace" => Some(Self::echospace(sample_rate, state_json)),
             "imager" => Some(Self::imager(sample_rate, state_json)),
             "fa2a" => Some(Self::fa2a(sample_rate, state_json)),
@@ -362,8 +396,11 @@ impl BuiltinHostProcessor {
             "burnlimit" => Some(Self::burnlimit(sample_rate, state_json)),
             "clipper67" => Some(Self::clipper67(sample_rate, state_json)),
             "transient" => Some(Self::transient(sample_rate, state_json)),
+            "waygate" => Some(Self::waygate(sample_rate, state_json)),
             "wrapsynth" => Some(Self::wrapsynth(sample_rate, state_json)),
             "drumsampler" => Some(Self::drumsampler(sample_rate, state_json)),
+            "quicksampler" => Some(Self::quicksampler(sample_rate, state_json)),
+            "slicer" => Some(Self::slicer(sample_rate, state_json)),
             "zcomp" => Some(Self::zcomp(sample_rate, state_json)),
             "mixstation" => Some(Self::mixstation(sample_rate, state_json)),
             "compresser" => Some(Self::compresser(sample_rate, state_json)),
@@ -399,6 +436,7 @@ impl BuiltinHostProcessor {
             nam_loader,
             ir_loader,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -428,6 +466,37 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn equzx(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = equzx::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match equzx::ipc::EquzxState::from_json(json) {
+                Ok(state) => {
+                    dsp.set_params(state.params);
+                    eprintln!(
+                        "[plugin-host-builtin] restored state version={}",
+                        state.version
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] state blob rejected, using defaults: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::Equzx(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            // An EQ has no capture or cabinet stage to hand off into.
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -457,6 +526,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -486,6 +556,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -513,6 +584,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -540,6 +612,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -567,6 +640,37 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn waygate(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        // Built here, on the IPC thread: the lookahead lines are allocated
+        // now, never on the producer.
+        let mut dsp = waygate::Dsp::new(sr);
+        if let Some(json) = state_json {
+            match waygate::ipc::WayGateState::from_json(json) {
+                Ok(state) => {
+                    dsp.set_params(state.params);
+                    eprintln!(
+                        "[plugin-host-builtin] restored state version={}",
+                        state.version
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] state blob rejected, using defaults: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::WayGate(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -596,6 +700,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -625,6 +730,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -654,6 +760,31 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn whitesharp(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = whitesharp::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match whitesharp::ipc::WhiteSharpState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] WhiteSharp state rejected: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::WhiteSharp(Box::new(dsp))),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            // Pitch correction loads nothing from disk.
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -675,6 +806,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -699,6 +831,53 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: Some(pad_loaders),
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn quicksampler(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = quicksampler::Dsp::new(sr);
+        if let Some(json) = state_json {
+            match quicksampler::ipc::QuickSamplerState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] QuickSampler state rejected: {error}");
+                }
+            }
+        }
+        let sample_loader = Some(dsp.sample_loader());
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::QuickSampler(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader,
+            sample_rate: sr,
+        }
+    }
+
+    fn slicer(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = slicer::Dsp::new(sr);
+        if let Some(json) = state_json {
+            match slicer::ipc::SlicerState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] Slicer state rejected: {error}");
+                }
+            }
+        }
+        let sample_loader = Some(dsp.sample_loader());
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::Slicer(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader,
             sample_rate: sr,
         }
     }
@@ -726,6 +905,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -756,6 +936,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -785,6 +966,7 @@ impl BuiltinHostProcessor {
             nam_loader: None,
             ir_loader: None,
             drum_pad_loaders: None,
+            sample_loader: None,
             sample_rate: sr,
         }
     }
@@ -808,7 +990,21 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
+            BuiltinDsp::Equzx(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
             BuiltinDsp::Verbspace(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
+            BuiltinDsp::WhiteSharp(dsp) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
                     interleaved[i * 2] = l;
@@ -864,6 +1060,13 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
+            BuiltinDsp::WayGate(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
             BuiltinDsp::WrapSynth(dsp) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo();
@@ -871,13 +1074,12 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
-            BuiltinDsp::DrumSampler(dsp) => {
-                for i in 0..frames {
-                    let (l, r) = dsp.process_stereo();
-                    interleaved[i * 2] = l;
-                    interleaved[i * 2 + 1] = r;
-                }
-            }
+            // Multi-out: every pad on its own output's pair, 32 channels.
+            BuiltinDsp::DrumSampler(dsp) => dsp.process_block_multi(interleaved, frames),
+            // Renders whole blocks: its voices run as a block loop, and a
+            // sample submitted since the last block is adopted at its start.
+            BuiltinDsp::QuickSampler(dsp) => dsp.process_block(interleaved, frames),
+            BuiltinDsp::Slicer(dsp) => dsp.process_block(interleaved, frames),
             BuiltinDsp::Zcomp(dsp) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
@@ -932,13 +1134,26 @@ impl BuiltinHostProcessor {
         unsafe { &mut *self.spectrum.get() }.analyze().copied()
     }
 
-    /// Per-pad output levels for a built-in with pads (Drum Sampler); `None`
-    /// for every other core. Producer thread only (same contract as
+    /// Per-pad output levels for a built-in with pads (Drum Sampler), or a
+    /// Slicer's sounding playheads in the same block (`slicer::telemetry`);
+    /// `None` for every other core. Producer thread only (same contract as
     /// `process_block`).
     fn pad_levels(&self) -> Option<[f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS]> {
+        use SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS;
+        const _: () = assert!(drumsampler::PADS == BUILTIN_PAD_SLOTS);
+        const _: () = assert!(slicer::telemetry::SLOTS <= BUILTIN_PAD_SLOTS);
+        const _: () = assert!(whitesharp::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &*self.dsp.get() } {
             BuiltinDsp::DrumSampler(dsp) => Some(dsp.pad_levels()),
+            // The Slicer's playheads take the front of the block.
+            BuiltinDsp::Slicer(dsp) => {
+                let mut block = [0.0; BUILTIN_PAD_SLOTS];
+                block[..slicer::telemetry::SLOTS].copy_from_slice(&dsp.telemetry());
+                Some(block)
+            }
+            // WhiteSharp's newest pitch readings fill it (`whitesharp::telemetry`).
+            BuiltinDsp::WhiteSharp(dsp) => Some(dsp.telemetry()),
             _ => None,
         }
     }
@@ -1108,6 +1323,36 @@ impl BuiltinHostProcessor {
                     slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
                 })
             }
+            BuiltinDsp::QuickSampler(dsp) => {
+                let f = dsp.meter_frame();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    // An instrument has no audio input to meter.
+                    in_peak: 0.0,
+                    in_rms: 0.0,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    gain_reduction_db: 0.0,
+                    in_clip: false,
+                    out_clip: f.out_clip,
+                    slot_in_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
+            BuiltinDsp::Slicer(dsp) => {
+                let f = dsp.meter_frame();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    // An instrument has no audio input to meter.
+                    in_peak: 0.0,
+                    in_rms: 0.0,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    gain_reduction_db: 0.0,
+                    in_clip: false,
+                    out_clip: f.out_clip,
+                    slot_in_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
             BuiltinDsp::DrumSampler(dsp) => {
                 let f = dsp.meter_frame();
                 Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
@@ -1141,6 +1386,24 @@ impl BuiltinHostProcessor {
                     slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
                 })
             }
+            BuiltinDsp::WayGate(dsp) => {
+                let f = dsp.meter_frame();
+                // A single stage: the rack blocks carry the key and the
+                // detector's state instead (`waygate::KEY_SLOT`).
+                let (slot_in_peak, slot_out_peak) = f.rack_slots();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    in_peak: f.in_peak,
+                    in_rms: f.in_rms,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    // What the gate is taking off: the range while closed.
+                    gain_reduction_db: f.gain_reduction_db,
+                    in_clip: f.in_clip,
+                    out_clip: f.out_clip,
+                    slot_in_peak,
+                    slot_out_peak,
+                })
+            }
             BuiltinDsp::Compresser(dsp) => {
                 let f = dsp.meter_frame();
                 Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
@@ -1159,7 +1422,9 @@ impl BuiltinHostProcessor {
                 })
             }
             BuiltinDsp::Equz8(_)
+            | BuiltinDsp::Equzx(_)
             | BuiltinDsp::Verbspace(_)
+            | BuiltinDsp::WhiteSharp(_)
             | BuiltinDsp::Echospace(_)
             | BuiltinDsp::WrapSynth(_) => None,
         }
@@ -1174,17 +1439,23 @@ impl BuiltinHostProcessor {
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &*self.dsp.get() } {
             BuiltinDsp::Rodhareist(dsp) => dsp.latency_samples(),
-            BuiltinDsp::Equz8(_) => 0,
+            BuiltinDsp::Equz8(_) | BuiltinDsp::Equzx(_) => 0,
             BuiltinDsp::Verbspace(dsp) => dsp.latency_samples(),
+            // The pitch shifter's fixed delay for the input type.
+            BuiltinDsp::WhiteSharp(dsp) => dsp.latency_samples(),
             BuiltinDsp::Fa2a(dsp) => dsp.latency_samples(),
             BuiltinDsp::Fa76(dsp) => dsp.latency_samples(),
             BuiltinDsp::BurnLimit(dsp) => dsp.latency_samples(),
             BuiltinDsp::Clipper67(dsp) => dsp.latency_samples(),
             BuiltinDsp::Transient(dsp) => dsp.latency_samples(),
+            // The lookahead, bypassed or not.
+            BuiltinDsp::WayGate(dsp) => dsp.latency_samples(),
             BuiltinDsp::Echospace(dsp) => dsp.latency_samples(),
             BuiltinDsp::Imager(dsp) => dsp.latency_samples(),
             BuiltinDsp::WrapSynth(_) => 0,
             BuiltinDsp::DrumSampler(dsp) => dsp.latency_samples(),
+            BuiltinDsp::QuickSampler(dsp) => dsp.latency_samples(),
+            BuiltinDsp::Slicer(dsp) => dsp.latency_samples(),
             BuiltinDsp::Zcomp(dsp) => dsp.latency_samples(),
             BuiltinDsp::MixStation(dsp) => dsp.latency_samples(),
             BuiltinDsp::Compresser(dsp) => dsp.latency_samples(),
@@ -1208,7 +1479,13 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Equz8(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
+            BuiltinDsp::Equzx(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
             BuiltinDsp::Verbspace(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::WhiteSharp(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::Echospace(dsp) => {
@@ -1232,10 +1509,19 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Transient(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
+            BuiltinDsp::WayGate(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
             BuiltinDsp::WrapSynth(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::DrumSampler(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::QuickSampler(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::Slicer(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::Zcomp(dsp) => {
@@ -1268,8 +1554,50 @@ impl BuiltinHostProcessor {
                 0xb0 if matches!(event.data1, 120 | 123) => dsp.all_notes_off(),
                 _ => {}
             },
+            // A melodic instrument: channels, sustain and pitch bend count.
+            BuiltinDsp::QuickSampler(dsp) => {
+                let channel = event.status & 0x0f;
+                match event.status & 0xf0 {
+                    0x90 if event.data2 > 0 => {
+                        dsp.note_on_channel(channel, event.data1, event.data2)
+                    }
+                    0x80 | 0x90 => dsp.note_off_channel(channel, event.data1),
+                    0xb0 => dsp.control_change(channel, event.data1, event.data2),
+                    0xe0 => dsp.pitch_bend(
+                        channel,
+                        u16::from(event.data1 & 0x7f) | (u16::from(event.data2 & 0x7f) << 7),
+                    ),
+                    _ => {}
+                }
+            }
+            // One slice per key; the same channel handling as Quick Sampler.
+            BuiltinDsp::Slicer(dsp) => {
+                let channel = event.status & 0x0f;
+                match event.status & 0xf0 {
+                    0x90 if event.data2 > 0 => {
+                        dsp.note_on_channel(channel, event.data1, event.data2)
+                    }
+                    0x80 | 0x90 => dsp.note_off_channel(channel, event.data1),
+                    0xb0 => dsp.control_change(channel, event.data1, event.data2),
+                    0xe0 => dsp.pitch_bend(
+                        channel,
+                        u16::from(event.data1 & 0x7f) | (u16::from(event.data2 & 0x7f) << 7),
+                    ),
+                    _ => {}
+                }
+            }
             _ => {}
         }
+    }
+}
+
+/// A built-in's output buses, as channel counts: one stereo bus for most,
+/// one per output for a multi-out instrument. Must agree with
+/// [`BuiltinHostProcessor::output_channels`].
+fn builtin_output_buses(stem: &str) -> Vec<u32> {
+    match stem {
+        "drumsampler" => vec![2; drumsampler::OUTPUTS],
+        _ => vec![2],
     }
 }
 
@@ -1509,6 +1837,141 @@ mod builtin_processor_tests {
         assert_eq!(processor.latency_samples(), 0);
     }
 
+    /// Quick Sampler: a submitted sample plays from the next block on a MIDI
+    /// note, a wire edit reaches it, and persisted state is applied at build.
+    #[test]
+    fn quicksampler_plays_a_submitted_sample_and_takes_wire_params() {
+        let mut saved = quicksampler::default_params();
+        saved.sampler.root_note = 48;
+        let json = quicksampler::ipc::QuickSamplerState::new(saved)
+            .to_json()
+            .unwrap();
+        let processor = BuiltinHostProcessor::quicksampler(48_000, Some(&json));
+        let tone: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let sample = quicksampler::SampleData::from_interleaved(&tone, 1, 48_000).unwrap();
+        processor
+            .sample_loader
+            .as_ref()
+            .expect("quick sampler has a sample loader")
+            .submit(Some(std::sync::Arc::new(sample)));
+        let silence = [0.0f32; 512];
+        let mut output = [0.0f32; 1_024];
+        // The first block adopts the sample; the note sounds in the next.
+        processor.process_block(&silence, &silence, &mut output, 512);
+        processor.apply_midi(SharedMidiEvent {
+            status: 0x90,
+            data1: 48,
+            data2: 120,
+            ..SharedMidiEvent::default()
+        });
+        processor.process_block(&silence, &silence, &mut output, 512);
+        assert!(output.iter().any(|sample| sample.abs() > 0.05));
+        let meters = processor.meter_frame().expect("meters its output");
+        assert!(meters.out_peak > 0.0);
+
+        let volume = quicksampler::ui_param_index("volume").unwrap();
+        processor.apply_param(volume, 0.0);
+        processor.process_block(&silence, &silence, &mut output, 512);
+        assert!(output.iter().all(|sample| *sample == 0.0));
+        assert_eq!(processor.latency_samples(), 0);
+    }
+
+    /// Drum Sampler: it renders all its outputs interleaved, a pad sounds on
+    /// the output it is set to, and the buses it reports add up to the
+    /// channels it renders.
+    #[test]
+    fn drumsampler_renders_every_output() {
+        let mut saved = drumsampler::default_params();
+        saved.pads[0].output = 2;
+        let json = drumsampler::ipc::DrumSamplerState::new(saved)
+            .to_json()
+            .unwrap();
+        let processor = BuiltinHostProcessor::drumsampler(48_000, Some(&json));
+        let channels = processor.output_channels();
+        assert_eq!(channels, drumsampler::OUTPUT_CHANNELS);
+        assert_eq!(
+            builtin_output_buses("drumsampler").iter().sum::<u32>() as usize,
+            channels
+        );
+        assert_eq!(builtin_output_buses("quicksampler"), vec![2]);
+        let tone: Vec<f32> = (0..4_800).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        processor.drum_pad_loaders.as_ref().unwrap()[0].submit(Box::new(drumsampler::PadBuffer {
+            samples: tone.into_boxed_slice(),
+            channels: 1,
+            frames: 4_800,
+            sample_rate: 48_000.0,
+        }));
+        processor.apply_midi(SharedMidiEvent {
+            status: 0x90,
+            data1: 36,
+            data2: 120,
+            ..SharedMidiEvent::default()
+        });
+        let silence = [0.0f32; 256];
+        let mut output = vec![0.0f32; 256 * channels];
+        processor.process_block(&silence, &silence, &mut output, 256);
+        let peak = |channel: usize| {
+            output
+                .chunks_exact(channels)
+                .fold(0.0_f32, |peak, frame| peak.max(frame[channel].abs()))
+        };
+        assert!(peak(4) > 0.01, "Out 3 is channels 5/6");
+        assert_eq!(peak(0), 0.0, "nothing on Main");
+    }
+
+    /// Slicer: persisted slices are applied at build, a submitted sample
+    /// plays one slice per key from the first key, and the wire reaches it.
+    #[test]
+    fn slicer_plays_a_slice_per_key_and_takes_wire_params() {
+        let mut saved = slicer::default_params();
+        saved.slicer =
+            slicer::slicing::with_points(saved.slicer, &slicer::slicing::equal_points(2), 0.0);
+        let json = slicer::ipc::SlicerState::new(saved).to_json().unwrap();
+        let processor = BuiltinHostProcessor::slicer(48_000, Some(&json));
+        // A silent first half and a loud second one.
+        let audio: Vec<f32> = (0..48_000)
+            .map(|i| if i < 24_000 { 0.0 } else { 0.5 })
+            .collect();
+        let sample = quicksampler::SampleData::from_interleaved(&audio, 1, 48_000).unwrap();
+        processor
+            .sample_loader
+            .as_ref()
+            .expect("slicer has a sample loader")
+            .submit(Some(std::sync::Arc::new(sample)));
+        let silence = [0.0f32; 512];
+        let mut output = [0.0f32; 1_024];
+        processor.process_block(&silence, &silence, &mut output, 512);
+        let note_on = |pitch: u8| SharedMidiEvent {
+            status: 0x90,
+            data1: pitch,
+            data2: 127,
+            ..SharedMidiEvent::default()
+        };
+        processor.apply_midi(note_on(slicer::DEFAULT_FIRST_KEY));
+        processor.process_block(&silence, &silence, &mut output, 512);
+        assert!(output.iter().all(|sample| sample.abs() < 1.0e-6));
+        processor.apply_midi(note_on(slicer::DEFAULT_FIRST_KEY + 1));
+        processor.process_block(&silence, &silence, &mut output, 512);
+        assert!(output.iter().any(|sample| sample.abs() > 0.2));
+        assert!(processor.meter_frame().expect("meters").out_peak > 0.0);
+        // The editor is told which slice sounds, and where, whatever sent
+        // the note.
+        let block = processor.pad_levels().expect("telemetry");
+        let heads = slicer::telemetry::decode(
+            block
+                .first_chunk::<{ slicer::telemetry::SLOTS }>()
+                .expect("the playheads lead the block"),
+        );
+        assert_eq!(heads.len(), 1, "{heads:?}");
+        assert_eq!(heads[0].note, slicer::DEFAULT_FIRST_KEY + 1);
+        assert!(heads[0].position > 0.5, "{heads:?}");
+
+        let volume = slicer::ui_param_index("volume").unwrap();
+        processor.apply_param(volume, 0.0);
+        processor.process_block(&silence, &silence, &mut output, 512);
+        assert!(output.iter().all(|sample| *sample == 0.0));
+    }
+
     /// Imager at rest passes a wide signal through; narrowing every band
     /// folds a pure side signal away, and the wire reaches the DSP.
     #[test]
@@ -1585,6 +2048,50 @@ mod builtin_processor_tests {
 
         let fallback = BuiltinHostProcessor::imager(48_000, Some("not json"));
         fallback.process_block(&in_l, &in_r, &mut output, 32);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    /// EQ-ZX hosted like EQ-Z8: a fresh insert passes audio through flat, a
+    /// band switched on over the wire changes it, power off bypasses,
+    /// restored state applies, and it reports no latency and no meter frame.
+    #[test]
+    fn equzx_processes_restores_and_takes_wire_params() {
+        let processor = BuiltinHostProcessor::new("equzx", 48_000, None).expect("hosted");
+        let in_l = [0.3f32; 64];
+        let in_r = [-0.3f32; 64];
+        let mut output = [0.0f32; 128];
+        processor.process_block(&in_l, &in_r, &mut output, 64);
+        for i in 0..64 {
+            assert!((output[i * 2] - in_l[i]).abs() < 1.0e-6, "empty EQ is flat");
+        }
+
+        // A 12 dB low cut over the wire: DC is cut, so the output falls.
+        let band = |field| equzx::ipc::band_wire_index(0, field);
+        processor.apply_param(band(equzx::ipc::BAND_TYPE), 0.0);
+        processor.apply_param(band(equzx::ipc::BAND_FREQ), 2_000.0);
+        processor.apply_param(band(equzx::ipc::BAND_ENABLED), 1.0);
+        for _ in 0..20 {
+            processor.process_block(&in_l, &in_r, &mut output, 64);
+        }
+        assert!(output[126].abs() < 0.05, "the low cut takes out DC");
+
+        let power = equzx::ui_param_index("power").expect("power in wire table");
+        processor.apply_param(power, 0.0);
+        processor.process_block(&in_l, &in_r, &mut output, 64);
+        assert_eq!(output[0], in_l[0], "power-off must bypass");
+        processor.apply_param(u32::MAX, 1.0);
+        processor.apply_param(equzx::UI_PARAM_IDS.len() as u32, 1.0);
+
+        let mut params = equzx::default_params();
+        params.power = false;
+        let json = equzx::ipc::EquzxState::new(params).to_json().unwrap();
+        let restored = BuiltinHostProcessor::equzx(48_000, Some(&json));
+        restored.process_block(&in_l, &in_r, &mut output, 64);
+        assert_eq!(output[1], in_r[0], "restored power-off must bypass");
+        assert_eq!(restored.latency_samples(), 0);
+        assert!(restored.meter_frame().is_none());
+        let fallback = BuiltinHostProcessor::equzx(48_000, Some("not json"));
+        fallback.process_block(&in_l, &in_r, &mut output, 64);
         assert!(output.iter().all(|sample| sample.is_finite()));
     }
 
@@ -1692,6 +2199,63 @@ mod builtin_processor_tests {
         assert!(output.iter().all(|sample| sample.is_finite()));
     }
 
+    /// WhiteSharp runs behind a fixed delay it reports for compensation,
+    /// restores its params, and publishes the pitch it hears in the level
+    /// block the editor's graph reads.
+    #[test]
+    fn whitesharp_restores_state_reports_latency_and_publishes_pitch() {
+        let mut params = whitesharp::default_params();
+        params.input_type = whitesharp::InputType::Soprano;
+        params.retune_ms = 0.0;
+        let json = whitesharp::ipc::WhiteSharpState::new(params)
+            .to_json()
+            .expect("state serializes");
+        let processor = BuiltinHostProcessor::whitesharp(48_000, Some(&json));
+        let latency = processor.latency_samples();
+        assert!(latency > 0 && latency < 48_000 / 20, "latency {latency}");
+
+        // A sharp A4 across many blocks.
+        let mut phase = 0.0f32;
+        let mut output = [0.0f32; 256];
+        for _ in 0..200 {
+            let block: [f32; 128] = std::array::from_fn(|_| {
+                phase = (phase + 445.0 / 48_000.0).fract();
+                (std::f32::consts::TAU * phase).sin() * 0.3
+            });
+            processor.process_block(&block, &block, &mut output, 128);
+            assert!(output.iter().all(|s| s.is_finite()));
+        }
+        let block = processor.pad_levels().expect("WhiteSharp publishes pitch");
+        let (count, readings) =
+            whitesharp::telemetry::decode(block.first_chunk().expect("64 slots"));
+        assert!(count > 0);
+        let newest = readings[whitesharp::telemetry::POINTS - 1];
+        assert!((newest.input.expect("voiced") - 69.2).abs() < 0.1);
+        assert_eq!(newest.target, Some(69));
+
+        // The input type is a wire edit like any other, and moves the delay.
+        let input_type = whitesharp::ui_param_index("inputType").expect("in the wire table");
+        processor.apply_param(input_type, whitesharp::InputType::LowMale.to_wire());
+        assert!(processor.latency_samples() > latency);
+
+        // So is the latency mode: Live reports the live path's two samples,
+        // which the block loop republishes for the engine's PDC refresh.
+        let mode = whitesharp::ui_param_index("latency").expect("in the wire table");
+        processor.apply_param(mode, whitesharp::LatencyMode::Live.to_wire());
+        assert_eq!(processor.latency_samples(), whitesharp::splice::LATENCY);
+        processor.process_block(&[0.0; 128], &[0.0; 128], &mut output, 128);
+        assert!(output.iter().all(|s| s.is_finite()));
+        processor.apply_param(mode, whitesharp::LatencyMode::Quality.to_wire());
+        assert_eq!(
+            processor.latency_samples(),
+            whitesharp::latency_samples_for(
+                48_000.0,
+                whitesharp::InputType::LowMale,
+                whitesharp::LatencyMode::Quality
+            )
+        );
+    }
+
     /// Like the reverb, a delay's output outlives its input: the check that
     /// matters is that repeats keep arriving across block boundaries, which a
     /// per-block DSP rebuild would silence after the first one.
@@ -1707,8 +2271,10 @@ mod builtin_processor_tests {
         processor.apply_param(time_l, 40.0);
         processor.apply_param(time_r, 40.0);
 
-        let in_l = [0.3f32; 64];
-        let in_r = [-0.3f32; 64];
+        // A tone, alike on both sides: the default ping-pong sums its input
+        // to mono, and the tone stage's low cut takes out DC.
+        let in_l: [f32; 64] = std::array::from_fn(|i| (i as f32 * 0.7).sin() * 0.3);
+        let in_r = in_l;
         let mut output = [0.0f32; 128];
         for _ in 0..16 {
             processor.process_block(&in_l, &in_r, &mut output, 64);
@@ -2226,13 +2792,15 @@ mod builtin_processor_tests {
             .expect("clipper67 always publishes a frame");
         assert!(quiet.gain_reduction_db < 1.0);
 
-        // Alternating polarity so the optional DC blocker cannot erase the tone.
-        let mut loud = [0.0f32; 64];
+        // A 1 kHz tone: in band for the oversampling filters, and a whole
+        // number of cycles per block.
+        let mut loud = [0.0f32; 48];
         for (i, sample) in loud.iter_mut().enumerate() {
-            *sample = if i % 2 == 0 { 0.9 } else { -0.9 };
+            *sample = (std::f32::consts::TAU * i as f32 / 48.0).sin() * 0.9;
         }
-        for _ in 0..128 {
-            processor.process_block(&loud, &loud, &mut output, 64);
+        let mut output = [0.0f32; 96];
+        for _ in 0..170 {
+            processor.process_block(&loud, &loud, &mut output, 48);
         }
         let frame = processor
             .meter_frame()
@@ -2243,6 +2811,12 @@ mod builtin_processor_tests {
             frame.gain_reduction_db
         );
         assert!(frame.in_rms > 0.0);
+        // The default 4× filters plus Limit's 1 ms lookahead, for the
+        // host's delay compensation.
+        assert_eq!(
+            processor.latency_samples(),
+            clipper67::TAPS_PER_PHASE + clipper67::lookahead_samples(48_000.0)
+        );
     }
 
     #[test]
@@ -2254,24 +2828,45 @@ mod builtin_processor_tests {
             .expect("state serializes");
 
         let restored = BuiltinHostProcessor::clipper67(48_000, Some(&json));
-        let in_l = [0.25f32; 32];
-        let in_r = [-0.5f32; 32];
-        let mut output = [0.0f32; 64];
-        restored.process_block(&in_l, &in_r, &mut output, 32);
-        for i in 0..32 {
-            assert_eq!(output[i * 2], in_l[i], "restored power-off must bypass");
-            assert_eq!(output[i * 2 + 1], in_r[i], "restored power-off must bypass");
+        // Oversampling delays the output; bypass keeps that delay.
+        let latency = restored.latency_samples();
+        assert_eq!(latency, clipper67::TAPS_PER_PHASE);
+        let frames = latency + 32;
+        let in_l = vec![0.25f32; frames];
+        let in_r = vec![-0.5f32; frames];
+        let mut output = vec![0.0f32; frames * 2];
+        restored.process_block(&in_l, &in_r, &mut output, frames);
+        for i in 0..latency {
+            assert_eq!(output[i * 2], 0.0, "bypass must preserve host latency");
+            assert_eq!(output[i * 2 + 1], 0.0, "bypass must preserve host latency");
+        }
+        for i in latency..frames {
+            assert_eq!(
+                output[i * 2],
+                in_l[i - latency],
+                "restored power-off must bypass after latency"
+            );
+            assert_eq!(
+                output[i * 2 + 1],
+                in_r[i - latency],
+                "restored power-off must bypass after latency"
+            );
         }
         let frame = restored.meter_frame().expect("frame is published");
         assert_eq!(frame.gain_reduction_db, 0.0);
 
+        // 1× in Clip mode is the zero-latency setting.
+        let oversampling = clipper67::ui_param_index("oversampling").expect("in wire table");
+        restored.apply_param(oversampling, clipper67::Oversampling::X1.to_wire());
+        assert_eq!(restored.latency_samples(), 0);
+
         restored.apply_param(u32::MAX, 1.0);
         restored.apply_param(clipper67::UI_PARAM_IDS.len() as u32, 1.0);
-        restored.process_block(&in_l, &in_r, &mut output, 32);
+        restored.process_block(&in_l, &in_r, &mut output, frames);
         assert!(output.iter().all(|sample| sample.is_finite()));
 
         let fallback = BuiltinHostProcessor::clipper67(48_000, Some("not json"));
-        fallback.process_block(&in_l, &in_r, &mut output, 32);
+        fallback.process_block(&in_l, &in_r, &mut output, frames);
         assert!(output.iter().all(|sample| sample.is_finite()));
     }
 
@@ -2335,6 +2930,85 @@ mod builtin_processor_tests {
         let fallback = BuiltinHostProcessor::transient(48_000, Some("not json"));
         fallback.process_block(&in_l, &in_r, &mut output, 32);
         assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    /// A quiet input leaves the gate shut — the frame says so, with the range
+    /// as its reduction — and a loud one opens it, with the key and the
+    /// detector's state in the rack blocks the editors read.
+    #[test]
+    fn waygate_publishes_the_gate_through_the_host_frame() {
+        let processor = BuiltinHostProcessor::waygate(48_000, None);
+        let threshold = waygate::ui_param_index("thresholdDb").expect("in wire table");
+        let range = waygate::ui_param_index("rangeDb").expect("in wire table");
+        processor.apply_param(threshold, -30.0);
+        processor.apply_param(range, -24.0);
+
+        let quiet = [0.001f32; 64];
+        let mut output = [0.0f32; 128];
+        processor.process_block(&quiet, &quiet, &mut output, 64);
+        let closed = processor.meter_frame().expect("the gate meters itself");
+        assert!((closed.gain_reduction_db - 24.0).abs() < 1.0e-3);
+        assert_eq!(closed.slot_out_peak[waygate::KEY_SLOT], 0.0);
+        let expected = 0.001 * 10f32.powf(-24.0 / 20.0);
+        assert!((output[127] - expected).abs() < 1.0e-7, "{}", output[127]);
+
+        let loud = [0.5f32; 64];
+        for _ in 0..8 {
+            processor.process_block(&loud, &loud, &mut output, 64);
+        }
+        let open = processor.meter_frame().expect("the gate meters itself");
+        assert_eq!(open.gain_reduction_db, 0.0);
+        assert_eq!(open.slot_out_peak[waygate::KEY_SLOT], 1.0);
+        assert!(open.slot_in_peak[waygate::KEY_SLOT] > 0.4);
+        assert_eq!(output[127], 0.5);
+        assert_eq!(processor.latency_samples(), 0);
+
+        let lookahead = waygate::ui_param_index("lookaheadMs").expect("in wire table");
+        processor.apply_param(lookahead, 5.0);
+        assert_eq!(processor.latency_samples(), 240);
+    }
+
+    #[test]
+    fn waygate_restores_state_and_takes_wire_params() {
+        let mut params = waygate::default_params();
+        params.power = false;
+        params.lookahead_ms = 2.0;
+        let json = waygate::ipc::WayGateState::new(params)
+            .to_json()
+            .expect("state serializes");
+
+        let restored = BuiltinHostProcessor::waygate(48_000, Some(&json));
+        // Bypassed, the lookahead's delay stays: 2 ms is 96 samples.
+        assert_eq!(restored.latency_samples(), 96);
+        let in_l = [0.25f32; 128];
+        let in_r = [-0.5f32; 128];
+        let mut output = [0.0f32; 256];
+        restored.process_block(&in_l, &in_r, &mut output, 128);
+        for i in 0..128 {
+            let (l, r) = if i < 96 {
+                (0.0, 0.0)
+            } else {
+                (in_l[i], in_r[i])
+            };
+            assert_eq!(output[i * 2], l, "restored power-off must bypass, delayed");
+            assert_eq!(
+                output[i * 2 + 1],
+                r,
+                "restored power-off must bypass, delayed"
+            );
+        }
+        let frame = restored.meter_frame().expect("frame is published");
+        assert_eq!(frame.gain_reduction_db, 0.0);
+
+        restored.apply_param(u32::MAX, 1.0);
+        restored.apply_param(waygate::UI_PARAM_IDS.len() as u32, 1.0);
+        restored.process_block(&in_l, &in_r, &mut output, 128);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+
+        let fallback = BuiltinHostProcessor::waygate(48_000, Some("not json"));
+        fallback.process_block(&in_l, &in_r, &mut output, 128);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert_eq!(fallback.latency_samples(), 0);
     }
 }
 
@@ -2486,6 +3160,7 @@ fn service_audio_bridge(
     dsp: &BridgeAudioShared,
     runtime: BlockRuntime<'_>,
     plugin_instance_id: &str,
+    midi_out_event: Option<&BridgeKickEvent>,
 ) {
     let bridge = region.bridge();
     let req = bridge.request_seq.load(Ordering::Acquire);
@@ -2559,7 +3234,7 @@ fn service_audio_bridge(
         b.capture_spectrum(&in_l[..frames], &in_r[..frames]);
     }
     let output_channels = match runtime {
-        BlockRuntime::Builtin(_) => 2,
+        BlockRuntime::Builtin(builtin) => builtin.output_channels().min(MAX_CHANNELS),
         BlockRuntime::Vst3 => dsp
             .main_audio_output_channel_count_for_instance(plugin_instance_id)
             .unwrap_or_else(|| bridge.plugin_output_channels())
@@ -2580,7 +3255,7 @@ fn service_audio_bridge(
                 &mut interleaved[..len],
                 frames,
             );
-            2
+            output_channels
         }
         BlockRuntime::Vst3 => {
             // Real transport ProcessContext published by the engine for this block.
@@ -2595,7 +3270,9 @@ fn service_audio_bridge(
                 playing: bt.playing,
                 recording: bt.recording,
             };
-            let produced = dsp.render_single_voice_interleaved(
+            let mut midi_out =
+                [DirectAudio::vst3_processor::PluginMidiOutEvent::default(); OUTPUT_MIDI_PER_BLOCK];
+            let (produced, midi_count) = dsp.render_single_voice_interleaved(
                 plugin_instance_id,
                 frames,
                 &in_l[..frames],
@@ -2603,7 +3280,9 @@ fn service_audio_bridge(
                 &mut interleaved[..len],
                 output_channels,
                 transport,
+                &mut midi_out,
             );
+            forward_output_midi(bridge, &midi_out[..midi_count], midi_out_event);
             if produced > 0 {
                 produced.min(output_channels)
             } else {
@@ -2957,6 +3636,39 @@ impl ProducerDiagnostics {
 /// are committed on use) and takes the whole class of failure off the table.
 const AUDIO_PRODUCER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
+/// MIDI a plug-in may produce in one block. Its bridge keeps at most 256.
+const OUTPUT_MIDI_PER_BLOCK: usize = 256;
+
+/// Hand the MIDI an instance produced this block to the studio through the
+/// region's `midi_out` ring, then wake it. Producer thread, after render:
+/// wait-free ring pushes and one event signal, and nothing at all for a block
+/// that produced no MIDI.
+fn forward_output_midi(
+    bridge: &SpherePluginHost::audio_bridge::SharedAudioBridge,
+    events: &[DirectAudio::vst3_processor::PluginMidiOutEvent],
+    midi_out_event: Option<&BridgeKickEvent>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    for event in events {
+        // A full ring means the studio has stopped draining; drop the rest
+        // of this block rather than wait on it.
+        if !bridge.midi_out.try_push(SharedMidiEvent {
+            sample_offset: event.sample_offset,
+            status: event.status,
+            data1: event.data1,
+            data2: event.data2,
+            _pad: 0,
+        }) {
+            break;
+        }
+    }
+    if let Some(event) = midi_out_event {
+        event.set();
+    }
+}
+
 fn run_audio_producer(
     regions: SharedAudioRegions,
     builtins: SharedBuiltinProcessors,
@@ -2964,6 +3676,7 @@ fn run_audio_producer(
     dsp: Arc<BridgeAudioShared>,
     shutdown: Arc<AtomicBool>,
     kick: Option<BridgeKickEvent>,
+    midi_out_event: Option<BridgeKickEvent>,
 ) {
     boost_audio_producer_thread();
     let mut diagnostics = ProducerDiagnostics::default();
@@ -3008,7 +3721,13 @@ fn run_audio_producer(
                 (None, Some(au)) => BlockRuntime::Au(au.as_ref()),
                 (None, None) => BlockRuntime::Vst3,
             };
-            service_audio_bridge(region.as_ref(), &dsp, runtime, instance_id);
+            service_audio_bridge(
+                region.as_ref(),
+                &dsp,
+                runtime,
+                instance_id,
+                midi_out_event.as_ref(),
+            );
             if region.bridge().done_seq.load(Ordering::Relaxed) != before {
                 diagnostics.record(region.bridge());
             }
@@ -3031,7 +3750,7 @@ fn run_audio_producer(
     diagnostics.report();
 }
 
-fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
+fn run_ipc_loop(mut out: IpcOut, shutdown: Arc<AtomicBool>) {
     // Commands are read on a dedicated thread so the STA/message-pump thread
     // never blocks on stdin (spec Part 9). Each received command kicks the UI
     // thread out of its message wait so IPC latency stays low even while the
@@ -3110,6 +3829,18 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
                 }
             }
         });
+        // Raised after a block's plug-in MIDI output lands in its region's
+        // `midi_out` ring, so the studio picks it up at once.
+        let midi_out_event = parse_parent_pid().and_then(|parent_pid| {
+            let name = bridge_midi_out_event_name(parent_pid, std::process::id());
+            BridgeKickEvent::create_named(&name)
+                .map_err(|error| {
+                    eprintln!(
+                        "[plugin-host-audio] midi-out event create failed name={name} error={error}"
+                    )
+                })
+                .ok()
+        });
         std::thread::Builder::new()
             .name("plugin-host-audio".into())
             // `service_audio_bridge` alone puts 272 KiB of fixed-size block
@@ -3120,7 +3851,17 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
             // thread entry, aborting the whole host process before any plugin
             // was even loaded. Ask for a stack that is not a coincidence.
             .stack_size(AUDIO_PRODUCER_STACK_BYTES)
-            .spawn(move || run_audio_producer(slots, builtins, audio_units, dsp, shutdown, kick))
+            .spawn(move || {
+                run_audio_producer(
+                    slots,
+                    builtins,
+                    audio_units,
+                    dsp,
+                    shutdown,
+                    kick,
+                    midi_out_event,
+                )
+            })
             .expect("spawn plugin-host audio producer");
     }
 
@@ -3728,6 +4469,38 @@ fn run_ipc_loop(mut out: io::Stdout, shutdown: Arc<AtomicBool>) {
     }
 }
 
+/// Empties one sample slot of a built-in sampler: a Quick Sampler's or a
+/// Slicer's only sample (slot 0), or one Drum Sampler pad. The audio thread
+/// adopts the silence the way it adopts a new sample. Answers like a load:
+/// `(frames, channels, sample_rate, peaks)`, all empty.
+fn clear_builtin_sample(
+    processor: Option<&BuiltinHostProcessor>,
+    pad_index: u32,
+    plugin_instance_id: &str,
+) -> Result<(usize, usize, u32, Vec<u8>), String> {
+    let Some(processor) = processor else {
+        return Err(format!(
+            "no built-in DSP instance loaded for {plugin_instance_id}"
+        ));
+    };
+    if let Some(loader) = processor.sample_loader.as_ref() {
+        if pad_index != 0 {
+            return Err(format!(
+                "slot {pad_index} out of range for {plugin_instance_id}"
+            ));
+        }
+        loader.submit(None);
+        return Ok((0, 0, 0, Vec::new()));
+    }
+    let loader = processor
+        .drum_pad_loaders
+        .as_ref()
+        .and_then(|loaders| loaders.get(pad_index as usize))
+        .ok_or_else(|| format!("pad_index {pad_index} out of range for {plugin_instance_id}"))?;
+    loader.submit(Box::new(drumsampler::PadBuffer::empty()));
+    Ok((0, 0, 0, Vec::new()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch(
     cmd: HostCommand,
@@ -3745,7 +4518,7 @@ fn dispatch(
     region_slots: &SharedAudioRegions,
     builtin_processors: &SharedBuiltinProcessors,
     au_processors: &SharedAuProcessors,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     match cmd {
         HostCommand::Hello {
@@ -3955,10 +4728,25 @@ fn dispatch(
             let _ = ipc::write_frame(
                 out,
                 &HostEvent::PluginLoaded {
-                    plugin_instance_id,
+                    plugin_instance_id: plugin_instance_id.clone(),
                     name,
                 },
             );
+            // A multi-out built-in reports its outputs the way a multi-bus
+            // VST3 does, so Studio can give each output its own mixer channel.
+            let buses = builtin_output_buses(stem);
+            if buses.len() > 1 {
+                let _ = ipc::write_frame(
+                    out,
+                    &HostEvent::ProcessingPrepared {
+                        plugin_instance_id,
+                        sample_rate,
+                        max_block_size,
+                        output_channels: buses.iter().sum(),
+                        output_bus_channels: buses,
+                    },
+                );
+            }
         }
         HostCommand::LoadAudioUnit {
             plugin_instance_id,
@@ -4205,43 +4993,75 @@ fn dispatch(
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_string();
-            let result = base64::engine::general_purpose::STANDARD
-                .decode(audio_b64.as_bytes())
-                .map_err(|e| format!("sample payload is not valid base64: {e}"))
-                .and_then(|bytes| DirectAudio::load_audio_bytes(&bytes, &ext_hint))
-                .and_then(|decoded| {
-                    let loaders = match &processor {
-                        Some(p) => p.drum_pad_loaders.as_ref().ok_or_else(|| {
-                            format!("built-in DSP for {plugin_instance_id} has no drum pads")
-                        })?,
-                        None => {
-                            return Err(format!(
-                                "no built-in DSP instance loaded for {plugin_instance_id}"
-                            ));
+            // No audio at all: the editor is clearing the slot.
+            let result = if audio_b64.is_empty() {
+                clear_builtin_sample(processor.as_deref(), pad_index, &plugin_instance_id)
+            } else {
+                base64::engine::general_purpose::STANDARD
+                    .decode(audio_b64.as_bytes())
+                    .map_err(|e| format!("sample payload is not valid base64: {e}"))
+                    .and_then(|bytes| DirectAudio::load_audio_bytes(&bytes, &ext_hint))
+                    .and_then(|decoded| {
+                        // One sample, for a Quick Sampler or a Slicer: slot 0 is
+                        // its only one.
+                        if let Some(loader) =
+                            processor.as_ref().and_then(|p| p.sample_loader.as_ref())
+                        {
+                            if pad_index != 0 {
+                                return Err(format!(
+                                    "slot {pad_index} out of range for {plugin_instance_id}"
+                                ));
+                            }
+                            let (frames, channels, sample_rate) =
+                                (decoded.frames, decoded.channels, decoded.sample_rate);
+                            let peaks = drumsampler::waveform_peaks(
+                                &decoded.samples,
+                                channels,
+                                frames,
+                                drumsampler::WAVEFORM_POINTS,
+                            );
+                            let sample = quicksampler::SampleData::from_interleaved(
+                                &decoded.samples,
+                                channels,
+                                sample_rate,
+                            )
+                            .ok_or_else(|| "the file holds no audio".to_string())?;
+                            loader.submit(Some(std::sync::Arc::new(sample)));
+                            return Ok((frames, channels, sample_rate, peaks));
                         }
-                    };
-                    let loader = loaders.get(pad_index as usize).ok_or_else(|| {
-                        format!("pad_index {pad_index} out of range for {plugin_instance_id}")
-                    })?;
-                    let frames = decoded.frames;
-                    let channels = decoded.channels;
-                    let sample_rate = decoded.sample_rate;
-                    // The editor's overview, taken here while the IPC thread
-                    // still owns the buffer.
-                    let peaks = drumsampler::waveform_peaks(
-                        &decoded.samples,
-                        channels,
-                        frames,
-                        drumsampler::WAVEFORM_POINTS,
-                    );
-                    loader.submit(Box::new(drumsampler::PadBuffer {
-                        samples: decoded.samples.into_boxed_slice(),
-                        channels,
-                        frames,
-                        sample_rate: sample_rate as f32,
-                    }));
-                    Ok((frames, channels, sample_rate, peaks))
-                });
+                        let loaders = match &processor {
+                            Some(p) => p.drum_pad_loaders.as_ref().ok_or_else(|| {
+                                format!("built-in DSP for {plugin_instance_id} has no drum pads")
+                            })?,
+                            None => {
+                                return Err(format!(
+                                    "no built-in DSP instance loaded for {plugin_instance_id}"
+                                ));
+                            }
+                        };
+                        let loader = loaders.get(pad_index as usize).ok_or_else(|| {
+                            format!("pad_index {pad_index} out of range for {plugin_instance_id}")
+                        })?;
+                        let frames = decoded.frames;
+                        let channels = decoded.channels;
+                        let sample_rate = decoded.sample_rate;
+                        // The editor's overview, taken here while the IPC thread
+                        // still owns the buffer.
+                        let peaks = drumsampler::waveform_peaks(
+                            &decoded.samples,
+                            channels,
+                            frames,
+                            drumsampler::WAVEFORM_POINTS,
+                        );
+                        loader.submit(Box::new(drumsampler::PadBuffer {
+                            samples: decoded.samples.into_boxed_slice(),
+                            channels,
+                            frames,
+                            sample_rate: sample_rate as f32,
+                        }));
+                        Ok((frames, channels, sample_rate, peaks))
+                    })
+            };
             let event = match result {
                 Ok((frames, channels, sample_rate, peaks)) => {
                     eprintln!(
@@ -5073,7 +5893,7 @@ fn drain_plugin_load_results(
     pending_plugin_loads: &mut HashMap<String, PendingPluginLoad>,
     load_result_rx: &crossbeam_channel::Receiver<PluginLoadResult>,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     while let Ok(result) = load_result_rx.try_recv() {
         let Some(pending) = pending_plugin_loads.remove(&result.plugin_instance_id) else {
@@ -5112,7 +5932,7 @@ fn finalize_plugin_load(
     max_block_size: u32,
     loaded: &mut LoadedRegistry,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     let Some(processor) = result.processor else {
         let error = result
@@ -5175,7 +5995,7 @@ fn finalize_plugin_load(
 fn expire_plugin_load_requests(
     pending_plugin_loads: &mut HashMap<String, PendingPluginLoad>,
     _load_result_rx: &crossbeam_channel::Receiver<PluginLoadResult>,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     let now = Instant::now();
     let timed_out: Vec<PendingPluginLoad> = pending_plugin_loads
@@ -5330,7 +6150,7 @@ fn schedule_unified_editor_attach(
     pending_editor_attaches: &mut HashMap<String, PendingEditorAttach>,
     attach_result_tx: &crossbeam_channel::Sender<EditorAttachResult>,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     // The actual window ownership is decided by the C++ embed layer from
     // FUTUREBOARD_PLUGIN_EDITOR_MODE (default "detached" = host-owned top-level
@@ -5726,7 +6546,7 @@ fn drain_editor_attach_results(
     pending_editor_attaches: &mut HashMap<String, PendingEditorAttach>,
     attach_result_rx: &crossbeam_channel::Receiver<EditorAttachResult>,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     while let Ok(result) = attach_result_rx.try_recv() {
         let Some(pending) = pending_editor_attaches.remove(&result.plugin_instance_id) else {
@@ -5758,7 +6578,7 @@ fn finalize_editor_attach(
     registry: &mut Registry,
     delayed_redraws: &mut Vec<DelayedGpuRedraw>,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     if let Some(error) = result.error {
         eprintln!(
@@ -5905,7 +6725,7 @@ fn expire_editor_attach_requests(
     pending_editor_attaches: &mut HashMap<String, PendingEditorAttach>,
     _attach_result_rx: &crossbeam_channel::Receiver<EditorAttachResult>,
     preview: &SharedPluginHostPreview,
-    out: &mut io::Stdout,
+    out: &mut IpcOut,
 ) {
     let now = Instant::now();
     let timed_out: Vec<PendingEditorAttach> = pending_editor_attaches
@@ -5961,7 +6781,7 @@ fn expire_editor_attach_requests(
     }
 }
 
-fn emit_attach_failed(out: &mut io::Stdout, plugin_instance_id: &str, error: &str) {
+fn emit_attach_failed(out: &mut IpcOut, plugin_instance_id: &str, error: &str) {
     let _ = ipc::write_frame(
         out,
         &HostEvent::EditorAttachFailed {

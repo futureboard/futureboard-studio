@@ -381,7 +381,13 @@ pub enum ProjectTrackAudioFormat {
 pub enum ProjectTrackMidiInputRouting {
     None,
     AllInputs,
-    MidiDevice { device_id: String },
+    MidiDevice {
+        device_id: String,
+    },
+    /// v59: the MIDI another track's plug-ins produce.
+    PluginOutput {
+        track_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1255,6 +1261,7 @@ fn project_insert_to_timeline(pi: &ProjectInsert) -> InsertSlotState {
                 enabled_audio_output_channels: pi.enabled_audio_output_channels.clone(),
                 // Re-detected from the host on ProcessingPrepared after load.
                 output_bus_channel_counts: Vec::new(),
+                active_output_buses: None,
                 multiout_collapsed: pi.multiout_collapsed,
                 pending_open_editor: false,
                 vst3_state: (!plugin.state.state_bytes.is_empty())
@@ -2800,6 +2807,9 @@ fn timeline_midi_input_to_project(
         T::MidiDevice { device_id } => ProjectTrackMidiInputRouting::MidiDevice {
             device_id: device_id.clone(),
         },
+        T::PluginOutput { track_id } => ProjectTrackMidiInputRouting::PluginOutput {
+            track_id: track_id.clone(),
+        },
     }
 }
 
@@ -2840,6 +2850,11 @@ fn project_routing_to_timeline(
         ProjectTrackMidiInputRouting::MidiDevice { device_id } => {
             TrackMidiInputRouting::MidiDevice {
                 device_id: device_id.clone(),
+            }
+        }
+        ProjectTrackMidiInputRouting::PluginOutput { track_id } => {
+            TrackMidiInputRouting::PluginOutput {
+                track_id: track_id.clone(),
             }
         }
     };
@@ -3228,7 +3243,7 @@ mod v33_routing_adapter_tests {
         let bytes = crate::project::format::encode_project(&FutureboardProject::new("current"));
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         assert_eq!(version, crate::project::format::PROJECT_VERSION);
-        assert_eq!(crate::project::format::PROJECT_VERSION, 58);
+        assert_eq!(crate::project::format::PROJECT_VERSION, 59);
     }
 
     // ── v35 Master / Monitor output routing ─────────────────────────────────
@@ -3504,6 +3519,34 @@ mod v33_routing_adapter_tests {
         let restored = loaded.audio_connections.get(&connection).expect("bus");
         assert_eq!(restored.binding(0).unwrap().physical_port_id.port_index, 2);
         assert_eq!(restored.binding(1).unwrap().physical_port_id.port_index, 3);
+    }
+
+    /// v59: a track taking another track's plug-in MIDI keeps that source.
+    #[test]
+    fn v59_round_trips_a_plugin_midi_input() {
+        use crate::components::timeline::timeline_state::{TimelineState, TrackMidiInputRouting};
+
+        let mut tl = TimelineState::default();
+        let source = tl.create_audio_track();
+        let listener = tl.create_audio_track();
+        let routing = TrackMidiInputRouting::PluginOutput {
+            track_id: source.clone(),
+        };
+        tl.set_track_midi_input(&listener, routing.clone());
+
+        let bytes = crate::project::format::encode_project(&FutureboardProject::from(&tl));
+        let reopened = crate::project::format::decode_project(&bytes).expect("decode");
+        let mut loaded = TimelineState::default();
+        apply_to_timeline(&reopened, &mut loaded);
+
+        assert_eq!(
+            loaded
+                .find_track(&listener)
+                .expect("track")
+                .routing
+                .midi_input,
+            routing
+        );
     }
 
     /// An id with no matching connection is reported and left unassigned — it

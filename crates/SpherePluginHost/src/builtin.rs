@@ -7,9 +7,10 @@
 //! matched exhaustively in ~150 places). Built-ins are identified by a
 //! `builtin:` id prefix via [`is_builtin_id`] / [`RegistryPlugin::is_builtin`].
 //!
-//! Each built-in with a React editor is served to CEF through the shared
-//! `mikoplugin://<plugin>/index.html` scheme; [`builtin_editor_url`] builds it.
-//! This module is pure data + string mapping — no DSP crate dependency, so the
+//! Every built-in editor is a native GPUI view today. The `Web` kind and the
+//! shared `mikoplugin://<plugin>/index.html` scheme [`builtin_editor_url`]
+//! builds remain for a built-in that ships an embedded editor bundle; none
+//! does now. This module is pure data + string mapping — no DSP crate dependency, so the
 //! host crate stays lean.
 
 use crate::plugin_db::PluginScanStatus;
@@ -23,6 +24,19 @@ pub const BUILTIN_ID_PREFIX: &str = "builtin:";
 /// literal here so the host crate does not depend on the DSP umbrella crate).
 pub const PLUGIN_URL_SCHEME: &str = "mikoplugin";
 
+/// How a built-in's editor is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinEditorKind {
+    /// No editor; the insert is edited from Studio's generic controls.
+    None,
+    /// An embeddable React bundle (`editor/` or `editorui/` — both layouts
+    /// are in use), served to CEF through `mikoplugin://<stem>`.
+    Web,
+    /// A native GPUI view drawn by Studio itself, inside the same plug-in
+    /// shell. No browser involved.
+    Native,
+}
+
 /// One entry in the curated built-in catalog.
 struct BuiltinEntry {
     /// Library / plugin id stem (also the `mikoplugin://<stem>` origin).
@@ -30,9 +44,7 @@ struct BuiltinEntry {
     name: &'static str,
     category: &'static str,
     kind: PluginKind,
-    /// Whether the plugin ships an embeddable React editor (`editor/` or
-    /// `editorui/` — both bundle layouts are in use).
-    has_editor: bool,
+    editor: BuiltinEditorKind,
 }
 
 /// The curated built-in catalog. Mirrors the workspace members under
@@ -43,119 +55,160 @@ const CATALOG: &[BuiltinEntry] = &[
         name: "Rodhareist",
         category: "Multi-FX",
         kind: PluginKind::Effect,
-        has_editor: true,
+        // Native GPUI editor (see `sphere_ui_components::components::rodhareist_window`) —
+        // the old CEF/React `editorui/` bundle was removed.
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "equz8",
         name: "EQ-Z8",
         category: "EQ",
         kind: PluginKind::Effect,
-        has_editor: true,
+        // Native GPUI editor (see `sphere_ui_components::components::eq_window`) —
+        // the old CEF/React `editor/` bundle was removed.
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
+        stem: "equzx",
+        name: "EQ-ZX",
+        category: "EQ",
+        kind: PluginKind::Effect,
+        // Native GPUI editor, shared with EQ-Z8 (`eq_window`).
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "compresser",
         name: "Compressor",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "fa2a",
         name: "FA-2A",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "zcomp",
         name: "Z-Comp",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "mixstation",
         name: "MixStation",
         category: "Effect",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "echospace",
         name: "EchoSpace",
         category: "Delay",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "verbspace",
         name: "VerbSpace",
         category: "Reverb",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
+        stem: "whitesharp",
+        name: "WhiteSharp",
+        category: "Pitch",
+        kind: PluginKind::Effect,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "imager",
         name: "Imager",
         category: "Utility",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "fa76",
         name: "FA-76",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "burnlimit",
         name: "BurnLimit",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "clipper67",
         name: "67Clipper",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "transient",
         name: "Transient",
         category: "Dynamics",
         kind: PluginKind::Effect,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
+        stem: "waygate",
+        name: "WayGate",
+        category: "Dynamics",
+        kind: PluginKind::Effect,
+        // Native GPUI editor (`sphere_ui_components::components::gate_panel`).
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "c1073",
         name: "C1073",
         category: "EQ",
         kind: PluginKind::Effect,
-        has_editor: false,
+        editor: BuiltinEditorKind::None,
     },
     BuiltinEntry {
         stem: "meowsyn",
         name: "MeowSyn",
         category: "Instrument",
         kind: PluginKind::Instrument,
-        has_editor: false,
+        editor: BuiltinEditorKind::None,
     },
     BuiltinEntry {
         stem: "wrapsynth",
         name: "WrapSynth",
         category: "Instrument",
         kind: PluginKind::Instrument,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
         stem: "drumsampler",
         name: "Drum Sampler",
         category: "Instrument",
         kind: PluginKind::Instrument,
-        has_editor: true,
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
+        stem: "quicksampler",
+        name: "Quick Sampler",
+        category: "Instrument",
+        kind: PluginKind::Instrument,
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
+        stem: "slicer",
+        name: "Slicer",
+        category: "Instrument",
+        kind: PluginKind::Instrument,
+        editor: BuiltinEditorKind::Native,
     },
 ];
 
@@ -215,19 +268,24 @@ pub fn is_builtin_ref(id: &str) -> bool {
 pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "rodharerist",
     "equz8",
+    "equzx",
     "verbspace",
     "echospace",
+    "whitesharp",
     "imager",
     "fa2a",
     "fa76",
     "burnlimit",
     "clipper67",
     "transient",
+    "waygate",
     "wrapsynth",
     "drumsampler",
     "zcomp",
     "mixstation",
     "compresser",
+    "quicksampler",
+    "slicer",
 ];
 
 /// Whether this built-in currently has an out-of-process audio DSP runtime.
@@ -246,19 +304,33 @@ pub fn builtin_display_name(id: &str) -> Option<&'static str> {
         .map(|entry| entry.name)
 }
 
+/// How the built-in `id` (either identifier form) draws its editor, or `None`
+/// when `id` is not a built-in.
+pub fn builtin_editor_kind(id: &str) -> Option<BuiltinEditorKind> {
+    let stem = resolve_builtin_stem(id)?;
+    CATALOG
+        .iter()
+        .find(|entry| entry.stem == stem)
+        .map(|entry| entry.editor)
+}
+
 /// The `mikoplugin://<stem>/index.html` editor URL for a built-in id, or `None`
-/// when the id is not a built-in or that built-in ships no editor.
+/// when the id is not a built-in or that built-in ships no web editor.
 pub fn builtin_editor_url(id: &str) -> Option<String> {
     let stem = builtin_stem(id)?;
     let entry = CATALOG.iter().find(|e| e.stem == stem)?;
-    entry
-        .has_editor
+    (entry.editor == BuiltinEditorKind::Web)
         .then(|| format!("{PLUGIN_URL_SCHEME}://{stem}/index.html"))
 }
 
-/// Whether a built-in id has an embeddable editor.
+/// Whether a built-in id has an editor of either kind.
 pub fn builtin_has_editor(id: &str) -> bool {
-    builtin_editor_url(id).is_some()
+    builtin_editor_kind(id).is_some_and(|kind| kind != BuiltinEditorKind::None)
+}
+
+/// Whether a built-in's editor is a native (GPUI) view rather than a web page.
+pub fn builtin_has_native_editor(id: &str) -> bool {
+    builtin_editor_kind(id) == Some(BuiltinEditorKind::Native)
 }
 
 /// Build the built-in catalog as `RegistryPlugin` rows the existing UI consumes.
@@ -330,62 +402,61 @@ mod tests {
         }
     }
 
+    /// Every built-in editor is native now: none is served to CEF.
     #[test]
-    fn editors_are_limited_to_builtins_that_ship_one() {
-        assert_eq!(
-            builtin_editor_url(&builtin_id("rodharerist")).as_deref(),
-            Some("mikoplugin://rodharerist/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("equz8")).as_deref(),
-            Some("mikoplugin://equz8/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("verbspace")).as_deref(),
-            Some("mikoplugin://verbspace/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("echospace")).as_deref(),
-            Some("mikoplugin://echospace/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("imager")).as_deref(),
-            Some("mikoplugin://imager/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("fa2a")).as_deref(),
-            Some("mikoplugin://fa2a/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("zcomp")).as_deref(),
-            Some("mikoplugin://zcomp/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("mixstation")).as_deref(),
-            Some("mikoplugin://mixstation/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("fa76")).as_deref(),
-            Some("mikoplugin://fa76/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("burnlimit")).as_deref(),
-            Some("mikoplugin://burnlimit/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("clipper67")).as_deref(),
-            Some("mikoplugin://clipper67/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("transient")).as_deref(),
-            Some("mikoplugin://transient/index.html")
-        );
-        assert_eq!(
-            builtin_editor_url(&builtin_id("compresser")).as_deref(),
-            Some("mikoplugin://compresser/index.html")
-        );
-        assert!(builtin_editor_url(&builtin_id("c1073")).is_none());
+    fn no_builtin_ships_a_web_editor() {
+        for plugin in builtin_catalog(0) {
+            assert!(builtin_editor_url(&plugin.id).is_none(), "{}", plugin.name);
+            assert_ne!(
+                builtin_editor_kind(&plugin.id),
+                Some(BuiltinEditorKind::Web),
+                "{}",
+                plugin.name
+            );
+        }
         assert!(builtin_editor_url("vst3:whatever").is_none());
+    }
+
+    #[test]
+    fn rodharerist_is_native_not_web() {
+        assert!(builtin_editor_url(&builtin_id("rodharerist")).is_none());
+        assert_eq!(
+            builtin_editor_kind(&builtin_id("rodharerist")),
+            Some(BuiltinEditorKind::Native)
+        );
+        assert!(builtin_has_native_editor("rodharerist"));
+        assert!(builtin_has_editor("rodharerist"));
+    }
+
+    /// The effects draw natively now: no CEF route to fall back on.
+    #[test]
+    fn the_effects_are_native_not_web() {
+        for stem in [
+            "equz8",
+            "equzx",
+            "verbspace",
+            "echospace",
+            "whitesharp",
+            "fa2a",
+            "fa76",
+            "zcomp",
+            "burnlimit",
+            "clipper67",
+            "transient",
+            "waygate",
+            "compresser",
+            "imager",
+            "mixstation",
+        ] {
+            assert!(builtin_editor_url(&builtin_id(stem)).is_none(), "{stem}");
+            assert_eq!(
+                builtin_editor_kind(&builtin_id(stem)),
+                Some(BuiltinEditorKind::Native)
+            );
+            assert!(builtin_has_native_editor(stem));
+            assert!(builtin_audio_bridge_supported(stem));
+        }
+        assert_eq!(builtin_display_name("builtin:equzx"), Some("EQ-ZX"));
     }
 
     #[test]
@@ -421,6 +492,8 @@ mod tests {
         assert!(builtin_audio_bridge_supported("builtin:clipper67"));
         assert!(builtin_audio_bridge_supported("transient"));
         assert!(builtin_audio_bridge_supported("builtin:transient"));
+        assert!(builtin_audio_bridge_supported("waygate"));
+        assert!(builtin_audio_bridge_supported("builtin:waygate"));
         assert!(builtin_audio_bridge_supported("wrapsynth"));
         assert!(builtin_audio_bridge_supported("builtin:wrapsynth"));
         assert!(builtin_audio_bridge_supported("drumsampler"));
@@ -463,6 +536,7 @@ mod tests {
         assert_eq!(builtin_display_name("builtin:burnlimit"), Some("BurnLimit"));
         assert_eq!(builtin_display_name("builtin:clipper67"), Some("67Clipper"));
         assert_eq!(builtin_display_name("builtin:transient"), Some("Transient"));
+        assert_eq!(builtin_display_name("waygate"), Some("WayGate"));
         assert_eq!(builtin_display_name("builtin:wrapsynth"), Some("WrapSynth"));
         assert_eq!(builtin_display_name("compresser"), Some("Compressor"));
         assert_eq!(builtin_display_name("vst3:whatever"), None);

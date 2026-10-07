@@ -661,16 +661,14 @@ impl StudioLayout {
                         return;
                     }
                     let prev_len = timeline.state.clip_duration_beats(&clip_id).unwrap_or(0.0);
-                    let old_ratio = prev.effective_time_ratio(project_bpm);
-                    let new_ratio = next.effective_time_ratio(project_bpm);
-                    let explicit_next_len = next.clip_timeline_duration_beats;
-                    let next_len = if explicit_next_len > 0.0 {
-                        explicit_next_len as f32
-                    } else if old_ratio > 1e-6 && (old_ratio - new_ratio).abs() > 1e-9 {
-                        (prev_len as f64 * (new_ratio / old_ratio)) as f32
-                    } else {
-                        prev_len
-                    };
+                    let next_len = stretched_clip_length(
+                        &timeline.state,
+                        &clip_id,
+                        &prev,
+                        &next,
+                        prev_len,
+                        project_bpm,
+                    );
                     timeline.state.set_clip_stretch(&clip_id, next);
                     if (next_len - prev_len).abs() > 1e-4 {
                         timeline.state.set_clip_length(&clip_id, next_len);
@@ -700,20 +698,13 @@ impl StudioLayout {
                     }
                     let changed_field = stretch_commit_field(&prev, &next);
                     let prev_len = t.state.clip_duration_beats(&clip_id).unwrap_or(0.0);
-                    // Couple the clip's timeline length to the time-stretch ratio
-                    // so the visual, audible, and exported lengths stay equal
-                    // (spec §10). Only the ratio component scales length; toggles
-                    // like reverse/fade leave it unchanged.
+                    // Couple the clip's timeline length to what it plays so the
+                    // visual, audible, and exported lengths stay equal (spec
+                    // §10).
                     let old_ratio = prev.effective_time_ratio(project_bpm);
                     let new_ratio = next.effective_time_ratio(project_bpm);
-                    let explicit_next_len = next.clip_timeline_duration_beats;
-                    let next_len = if explicit_next_len > 0.0 {
-                        explicit_next_len as f32
-                    } else if old_ratio > 1e-6 && (old_ratio - new_ratio).abs() > 1e-9 {
-                        (prev_len as f64 * (new_ratio / old_ratio)) as f32
-                    } else {
-                        prev_len
-                    };
+                    let next_len =
+                        stretched_clip_length(&t.state, &clip_id, &prev, &next, prev_len, project_bpm);
                     if clip_dsp_debug_enabled() {
                         eprintln!(
                             "[clip-dsp][inspector-commit] clip_id={} field={} old_ratio={:.3} new_ratio={:.3} old_duration={:.3} new_duration={:.3} snapshot_rebuild=true speed_ratio={:.6} pitch_shift={:+.2} pitch_ratio={:.4} preserve_pitch={}",
@@ -768,7 +759,8 @@ impl StudioLayout {
             let clip_id = clip_id.clone();
             StudioLayout::defer_update(&owner, cx, move |this, cx| {
                 this.stretch_tempo.clear_error(&clip_id);
-                this.spawn_clip_tempo_detection(&clip_id, false, cx);
+                // A found tempo fits the clip to the project at once.
+                this.spawn_clip_tempo_detection(&clip_id, true, cx);
             });
         })
     }
@@ -1033,9 +1025,7 @@ impl StudioLayout {
                                     .copied()
                                     .max()
                                     .unwrap_or(2) as u32;
-                            let multiout_capable =
-                                !vsti_output_bus_strip_indices(&slot.output_bus_channel_counts)
-                                    .is_empty();
+                            let multiout_capable = !slot.output_strip_indices().is_empty();
                             Some((plugin_name, output_channels, multiout_capable))
                         };
                         let Some((plugin_name, output_channels, multiout_capable)) = ensure_args
@@ -1551,5 +1541,35 @@ impl TrackToggle {
             TrackToggle::Arm => "Record Arm",
             TrackToggle::Input => "Input Monitor",
         }
+    }
+}
+
+/// A clip's length after a stretch edit from `prev` to `next`.
+///
+/// An explicit length the Inspector asked for wins. Otherwise the length is
+/// derived from what the clip will play, through the tempo map from its start
+/// (see `TimelineState::audio_clip_beats_with_stretch`). Scaling the old length
+/// by the ratio change is the fallback only while the source is undecoded: it
+/// is exact at a constant tempo and nowhere else.
+fn stretched_clip_length(
+    state: &crate::components::timeline::timeline_state::TimelineState,
+    clip_id: &str,
+    prev: &AudioClipStretchState,
+    next: &AudioClipStretchState,
+    prev_len: f32,
+    project_bpm: f64,
+) -> f32 {
+    if next.clip_timeline_duration_beats > 0.0 {
+        return next.clip_timeline_duration_beats as f32;
+    }
+    if let Some(length) = state.audio_clip_beats_with_stretch(clip_id, next) {
+        return length;
+    }
+    let old_ratio = prev.effective_time_ratio(project_bpm);
+    let new_ratio = next.effective_time_ratio(project_bpm);
+    if old_ratio > 1e-6 && (old_ratio - new_ratio).abs() > 1e-9 {
+        (prev_len as f64 * (new_ratio / old_ratio)) as f32
+    } else {
+        prev_len
     }
 }

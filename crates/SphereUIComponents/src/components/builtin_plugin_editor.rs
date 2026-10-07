@@ -73,7 +73,9 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
     match origin_for_plugin_id(plugin_id)? {
         rodharerist::ui::UI_ORIGIN => rodharerist::ui_param_index(param_id),
         equz8::ui::UI_ORIGIN => equz8::ui_param_index(param_id),
+        equzx::ui::UI_ORIGIN => equzx::ui_param_index(param_id),
         verbspace::ui::UI_ORIGIN => verbspace::ui_param_index(param_id),
+        whitesharp::ui::UI_ORIGIN => whitesharp::ui_param_index(param_id),
         echospace::ui::UI_ORIGIN => echospace::ui_param_index(param_id),
         imager::ui::UI_ORIGIN => imager::ui_param_index(param_id),
         fa2a::ui::UI_ORIGIN => fa2a::ui_param_index(param_id),
@@ -81,8 +83,11 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
         burnlimit::ui::UI_ORIGIN => burnlimit::ui_param_index(param_id),
         clipper67::ui::UI_ORIGIN => clipper67::ui_param_index(param_id),
         transient::ui::UI_ORIGIN => transient::ui_param_index(param_id),
+        waygate::ui::UI_ORIGIN => waygate::ui_param_index(param_id),
         wrapsynth::ui::UI_ORIGIN => wrapsynth::ui_param_index(param_id),
         drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_index(param_id),
+        quicksampler::ui::UI_ORIGIN => quicksampler::ui_param_index(param_id),
+        slicer::ui::UI_ORIGIN => slicer::ui_param_index(param_id),
         zcomp::ui::UI_ORIGIN => zcomp::ui_param_index(param_id),
         mixstation::ui::UI_ORIGIN => mixstation::ui_param_index(param_id),
         compresser::ui::UI_ORIGIN => compresser::ui_param_index(param_id),
@@ -122,7 +127,9 @@ mod state_mirror {
     enum BuiltinParams {
         Rodhareist(Box<rodharerist::Params>),
         Equz8(Box<equz8::Params>),
+        Equzx(Box<equzx::Params>),
         Verbspace(Box<verbspace::Params>),
+        WhiteSharp(Box<whitesharp::Params>),
         Echospace(Box<echospace::Params>),
         Imager(Box<imager::Params>),
         Fa2a(Box<fa2a::Params>),
@@ -130,8 +137,11 @@ mod state_mirror {
         BurnLimit(Box<burnlimit::Params>),
         Clipper67(Box<clipper67::Params>),
         Transient(Box<transient::Params>),
+        WayGate(Box<waygate::Params>),
         WrapSynth(Box<wrapsynth::Params>),
         DrumSampler(Box<drumsampler::Params>),
+        QuickSampler(Box<quicksampler::Params>),
+        Slicer(Box<slicer::Params>),
         Zcomp(Box<zcomp::Params>),
         MixStation(Box<mixstation::Params>),
         Compresser(Box<compresser::Params>),
@@ -142,7 +152,9 @@ mod state_mirror {
             match self {
                 Self::Rodhareist(_) => rodharerist::ui::UI_ORIGIN,
                 Self::Equz8(_) => equz8::ui::UI_ORIGIN,
+                Self::Equzx(_) => equzx::ui::UI_ORIGIN,
                 Self::Verbspace(_) => verbspace::ui::UI_ORIGIN,
+                Self::WhiteSharp(_) => whitesharp::ui::UI_ORIGIN,
                 Self::Echospace(_) => echospace::ui::UI_ORIGIN,
                 Self::Imager(_) => imager::ui::UI_ORIGIN,
                 Self::Fa2a(_) => fa2a::ui::UI_ORIGIN,
@@ -150,8 +162,11 @@ mod state_mirror {
                 Self::BurnLimit(_) => burnlimit::ui::UI_ORIGIN,
                 Self::Clipper67(_) => clipper67::ui::UI_ORIGIN,
                 Self::Transient(_) => transient::ui::UI_ORIGIN,
+                Self::WayGate(_) => waygate::ui::UI_ORIGIN,
                 Self::WrapSynth(_) => wrapsynth::ui::UI_ORIGIN,
                 Self::DrumSampler(_) => drumsampler::ui::UI_ORIGIN,
+                Self::QuickSampler(_) => quicksampler::ui::UI_ORIGIN,
+                Self::Slicer(_) => slicer::ui::UI_ORIGIN,
                 Self::Zcomp(_) => zcomp::ui::UI_ORIGIN,
                 Self::MixStation(_) => mixstation::ui::UI_ORIGIN,
                 Self::Compresser(_) => compresser::ui::UI_ORIGIN,
@@ -165,8 +180,12 @@ mod state_mirror {
                     Some(Self::Rodhareist(Box::new(rodharerist::default_params())))
                 }
                 equz8::ui::UI_ORIGIN => Some(Self::Equz8(Box::new(equz8::default_params()))),
+                equzx::ui::UI_ORIGIN => Some(Self::Equzx(Box::new(equzx::default_params()))),
                 verbspace::ui::UI_ORIGIN => {
                     Some(Self::Verbspace(Box::new(verbspace::default_params())))
+                }
+                whitesharp::ui::UI_ORIGIN => {
+                    Some(Self::WhiteSharp(Box::new(whitesharp::default_params())))
                 }
                 echospace::ui::UI_ORIGIN => {
                     Some(Self::Echospace(Box::new(echospace::default_params())))
@@ -183,12 +202,17 @@ mod state_mirror {
                 transient::ui::UI_ORIGIN => {
                     Some(Self::Transient(Box::new(transient::default_params())))
                 }
+                waygate::ui::UI_ORIGIN => Some(Self::WayGate(Box::new(waygate::default_params()))),
                 wrapsynth::ui::UI_ORIGIN => {
                     Some(Self::WrapSynth(Box::new(wrapsynth::default_params())))
                 }
                 drumsampler::ui::UI_ORIGIN => {
                     Some(Self::DrumSampler(Box::new(drumsampler::default_params())))
                 }
+                quicksampler::ui::UI_ORIGIN => {
+                    Some(Self::QuickSampler(Box::new(quicksampler::default_params())))
+                }
+                slicer::ui::UI_ORIGIN => Some(Self::Slicer(Box::new(slicer::default_params()))),
                 zcomp::ui::UI_ORIGIN => Some(Self::Zcomp(Box::new(zcomp::default_params()))),
                 mixstation::ui::UI_ORIGIN => {
                     Some(Self::MixStation(Box::new(mixstation::default_params())))
@@ -232,7 +256,9 @@ mod state_mirror {
         let known = match origin {
             rodharerist::ui::UI_ORIGIN => rodharerist::ui_param_id(wire_index).is_some(),
             equz8::ui::UI_ORIGIN => equz8::ui_param_id(wire_index).is_some(),
+            equzx::ui::UI_ORIGIN => equzx::ui_param_id(wire_index).is_some(),
             verbspace::ui::UI_ORIGIN => verbspace::ui_param_id(wire_index).is_some(),
+            whitesharp::ui::UI_ORIGIN => whitesharp::ui_param_id(wire_index).is_some(),
             echospace::ui::UI_ORIGIN => echospace::ui_param_id(wire_index).is_some(),
             imager::ui::UI_ORIGIN => imager::ui_param_id(wire_index).is_some(),
             fa2a::ui::UI_ORIGIN => fa2a::ui_param_id(wire_index).is_some(),
@@ -240,8 +266,11 @@ mod state_mirror {
             burnlimit::ui::UI_ORIGIN => burnlimit::ui_param_id(wire_index).is_some(),
             clipper67::ui::UI_ORIGIN => clipper67::ui_param_id(wire_index).is_some(),
             transient::ui::UI_ORIGIN => transient::ui_param_id(wire_index).is_some(),
+            waygate::ui::UI_ORIGIN => waygate::ui_param_id(wire_index).is_some(),
             wrapsynth::ui::UI_ORIGIN => wrapsynth::ui_param_id(wire_index).is_some(),
             drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_id(wire_index).is_some(),
+            quicksampler::ui::UI_ORIGIN => quicksampler::ui_param_id(wire_index).is_some(),
+            slicer::ui::UI_ORIGIN => slicer::ui_param_id(wire_index).is_some(),
             zcomp::ui::UI_ORIGIN => zcomp::ui_param_id(wire_index).is_some(),
             mixstation::ui::UI_ORIGIN => mixstation::ui_param_id(wire_index).is_some(),
             compresser::ui::UI_ORIGIN => compresser::ui_param_id(wire_index).is_some(),
@@ -262,8 +291,14 @@ mod state_mirror {
             Some(BuiltinParams::Equz8(params)) => {
                 let _ = equz8::ipc::apply_wire_param(params, wire_index, value);
             }
+            Some(BuiltinParams::Equzx(params)) => {
+                let _ = equzx::ipc::apply_wire_param(params, wire_index, value);
+            }
             Some(BuiltinParams::Verbspace(params)) => {
                 let _ = verbspace::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::WhiteSharp(params)) => {
+                let _ = whitesharp::ipc::apply_wire_param(params, wire_index, value);
             }
             Some(BuiltinParams::Echospace(params)) => {
                 let _ = echospace::ipc::apply_wire_param(params, wire_index, value);
@@ -286,11 +321,20 @@ mod state_mirror {
             Some(BuiltinParams::Transient(params)) => {
                 let _ = transient::ipc::apply_wire_param(params, wire_index, value);
             }
+            Some(BuiltinParams::WayGate(params)) => {
+                let _ = waygate::ipc::apply_wire_param(params, wire_index, value);
+            }
             Some(BuiltinParams::WrapSynth(params)) => {
                 let _ = wrapsynth::ipc::apply_wire_param(params, wire_index, value);
             }
             Some(BuiltinParams::DrumSampler(params)) => {
                 let _ = drumsampler::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::QuickSampler(params)) => {
+                let _ = quicksampler::ipc::apply_wire_param(&mut params.sampler, wire_index, value);
+            }
+            Some(BuiltinParams::Slicer(params)) => {
+                let _ = slicer::ipc::apply_wire_param(&mut params.slicer, wire_index, value);
             }
             Some(BuiltinParams::Zcomp(params)) => {
                 let _ = zcomp::ipc::apply_wire_param(params, wire_index, value);
@@ -321,9 +365,15 @@ mod state_mirror {
             equz8::ui::UI_ORIGIN => equz8::ipc::Equz8State::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Equz8(Box::new(state.params))),
+            equzx::ui::UI_ORIGIN => equzx::ipc::EquzxState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::Equzx(Box::new(state.params))),
             verbspace::ui::UI_ORIGIN => verbspace::ipc::VerbspaceState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Verbspace(Box::new(state.params))),
+            whitesharp::ui::UI_ORIGIN => whitesharp::ipc::WhiteSharpState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::WhiteSharp(Box::new(state.params))),
             echospace::ui::UI_ORIGIN => echospace::ipc::EchospaceState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Echospace(Box::new(state.params))),
@@ -345,12 +395,21 @@ mod state_mirror {
             transient::ui::UI_ORIGIN => transient::ipc::TransientState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Transient(Box::new(state.params))),
+            waygate::ui::UI_ORIGIN => waygate::ipc::WayGateState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::WayGate(Box::new(state.params))),
             wrapsynth::ui::UI_ORIGIN => wrapsynth::ipc::WrapSynthState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::WrapSynth(Box::new(state.params))),
             drumsampler::ui::UI_ORIGIN => drumsampler::ipc::DrumSamplerState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::DrumSampler(Box::new(state.params))),
+            quicksampler::ui::UI_ORIGIN => quicksampler::ipc::QuickSamplerState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::QuickSampler(Box::new(state.params))),
+            slicer::ui::UI_ORIGIN => slicer::ipc::SlicerState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::Slicer(Box::new(state.params))),
             zcomp::ui::UI_ORIGIN => zcomp::ipc::ZcompState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Zcomp(Box::new(state.params))),
@@ -394,8 +453,18 @@ mod state_mirror {
                     .to_json()
                     .ok()?
             }
+            BuiltinParams::Equzx(params) if origin == equzx::ui::UI_ORIGIN => {
+                equzx::ipc::EquzxState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
             BuiltinParams::Verbspace(params) if origin == verbspace::ui::UI_ORIGIN => {
                 verbspace::ipc::VerbspaceState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::WhiteSharp(params) if origin == whitesharp::ui::UI_ORIGIN => {
+                whitesharp::ipc::WhiteSharpState::new((**params).clone())
                     .to_json()
                     .ok()?
             }
@@ -434,13 +503,28 @@ mod state_mirror {
                     .to_json()
                     .ok()?
             }
+            BuiltinParams::WayGate(params) if origin == waygate::ui::UI_ORIGIN => {
+                waygate::ipc::WayGateState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
             BuiltinParams::WrapSynth(params) if origin == wrapsynth::ui::UI_ORIGIN => {
-                wrapsynth::ipc::WrapSynthState::new((**params).clone())
+                wrapsynth::ipc::WrapSynthState::new(**params)
                     .to_json()
                     .ok()?
             }
             BuiltinParams::DrumSampler(params) if origin == drumsampler::ui::UI_ORIGIN => {
                 drumsampler::ipc::DrumSamplerState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::QuickSampler(params) if origin == quicksampler::ui::UI_ORIGIN => {
+                quicksampler::ipc::QuickSamplerState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::Slicer(params) if origin == slicer::ui::UI_ORIGIN => {
+                slicer::ipc::SlicerState::new((**params).clone())
                     .to_json()
                     .ok()?
             }
@@ -476,7 +560,35 @@ mod state_mirror {
         let Ok(states) = map().lock() else {
             return Vec::new();
         };
-        match states.get(insert_id) {
+        replay_values(states.get(insert_id), origin)
+    }
+
+    /// The plug-in's defaults as `(wire index, raw value)` pairs: what a
+    /// freshly built host DSP already holds, so a replay can skip them.
+    pub fn builtin_default_replay(plugin_id: &str) -> Vec<(u32, f32)> {
+        let Some(origin) = origin_for_plugin_id(plugin_id) else {
+            return Vec::new();
+        };
+        replay_values(BuiltinParams::defaults(origin).as_ref(), origin)
+    }
+
+    /// `values` without the pairs `baseline` already holds — what a DSP at
+    /// `baseline` needs to reach `values`. A 64-pad Drum Sampler has over a
+    /// thousand parameters; sending only the changed ones keeps a replay
+    /// well inside the engine's command queue.
+    pub fn builtin_replay_changes(
+        values: Vec<(u32, f32)>,
+        baseline: &[(u32, f32)],
+    ) -> Vec<(u32, f32)> {
+        let held: HashMap<u32, f32> = baseline.iter().copied().collect();
+        values
+            .into_iter()
+            .filter(|(index, value)| held.get(index).is_none_or(|held| held != value))
+            .collect()
+    }
+
+    fn replay_values(params: Option<&BuiltinParams>, origin: &str) -> Vec<(u32, f32)> {
+        match params {
             Some(BuiltinParams::Rodhareist(params)) if origin == rodharerist::ui::UI_ORIGIN => {
                 rodharerist::ui_values(params)
                     .into_iter()
@@ -489,10 +601,22 @@ mod state_mirror {
                     .filter_map(|(id, value)| equz8::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
+            Some(BuiltinParams::Equzx(params)) if origin == equzx::ui::UI_ORIGIN => {
+                equzx::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| equzx::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
             Some(BuiltinParams::Verbspace(params)) if origin == verbspace::ui::UI_ORIGIN => {
                 verbspace::ipc::ui_values(params)
                     .into_iter()
                     .filter_map(|(id, value)| verbspace::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
+            Some(BuiltinParams::WhiteSharp(params)) if origin == whitesharp::ui::UI_ORIGIN => {
+                whitesharp::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| whitesharp::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
             Some(BuiltinParams::Echospace(params)) if origin == echospace::ui::UI_ORIGIN => {
@@ -537,6 +661,12 @@ mod state_mirror {
                     .filter_map(|(id, value)| transient::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
+            Some(BuiltinParams::WayGate(params)) if origin == waygate::ui::UI_ORIGIN => {
+                waygate::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| waygate::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
             Some(BuiltinParams::WrapSynth(params)) if origin == wrapsynth::ui::UI_ORIGIN => {
                 wrapsynth::ipc::ui_values(params)
                     .into_iter()
@@ -547,6 +677,20 @@ mod state_mirror {
                 drumsampler::ipc::ui_values(params)
                     .into_iter()
                     .filter_map(|(id, value)| drumsampler::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
+            Some(BuiltinParams::QuickSampler(params)) if origin == quicksampler::ui::UI_ORIGIN => {
+                quicksampler::ipc::ui_values(&params.sampler)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (_, value))| (index as u32, value))
+                    .collect()
+            }
+            Some(BuiltinParams::Slicer(params)) if origin == slicer::ui::UI_ORIGIN => {
+                slicer::ipc::ui_values(&params.slicer)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (_, value))| (index as u32, value))
                     .collect()
             }
             Some(BuiltinParams::Zcomp(params)) if origin == zcomp::ui::UI_ORIGIN => {
@@ -572,61 +716,314 @@ mod state_mirror {
         }
     }
 
-    /// Record which sample a `drumsampler` pad has loaded, so it survives
+    /// Record which sample a built-in sampler's slot has loaded — a Drum
+    /// Sampler pad, or a Quick Sampler's one sample (slot 0) — so it survives
     /// project save/reload. Not a wire param (a file name is not an `f32`),
     /// so it bypasses `builtin_state_apply`'s numeric path. Creates the entry
     /// at defaults if this is the first thing ever recorded for the insert.
-    /// A no-op for any other plugin id.
+    /// A no-op for any plugin without samples.
     ///
     /// Returns whether the pad's file actually changed — a project reopen
     /// reloads every pad with the name it already has, and that must not read
     /// as an edit.
-    pub fn builtin_state_set_drum_sample(
+    pub fn builtin_state_set_sample(
         plugin_id: &str,
         insert_id: &str,
         pad_index: usize,
         name: Option<String>,
     ) -> bool {
-        if origin_for_plugin_id(plugin_id) != Some(drumsampler::ui::UI_ORIGIN) {
+        let Some(origin) = origin_for_plugin_id(plugin_id) else {
+            return false;
+        };
+        if origin != drumsampler::ui::UI_ORIGIN
+            && origin != quicksampler::ui::UI_ORIGIN
+            && origin != slicer::ui::UI_ORIGIN
+        {
             return false;
         }
         let Ok(mut states) = map().lock() else {
             return false;
         };
-        let Some(entry) = entry_for(&mut states, insert_id, drumsampler::ui::UI_ORIGIN) else {
-            return false;
-        };
-        if let BuiltinParams::DrumSampler(params) = entry {
-            if let Some(pad) = params.pads.get_mut(pad_index) {
-                if pad.sample_name != name {
-                    pad.sample_name = name;
-                    return true;
-                }
+        let slot = match entry_for(&mut states, insert_id, origin) {
+            Some(BuiltinParams::DrumSampler(params)) => params
+                .pads
+                .get_mut(pad_index)
+                .map(|pad| &mut pad.sample_name),
+            Some(BuiltinParams::QuickSampler(params)) if pad_index == 0 => {
+                Some(&mut params.sample_name)
             }
+            Some(BuiltinParams::Slicer(params)) if pad_index == 0 => Some(&mut params.sample_name),
+            _ => None,
+        };
+        match slot {
+            Some(slot) if *slot != name => {
+                *slot = name;
+                true
+            }
+            _ => false,
         }
-        false
     }
 
-    /// The sample file each of a Drum Sampler insert's pads was loaded from,
-    /// as `(pad index, file name)`. Empty for any other plugin, or a slot
-    /// with no mirrored state. Drives the reload after project open or a host
-    /// respawn: a restarted DSP has its parameters replayed but no audio until
-    /// each pad's file is read and sent again.
-    pub fn builtin_drum_sample_names(plugin_id: &str, insert_id: &str) -> Vec<(u32, String)> {
-        if origin_for_plugin_id(plugin_id) != Some(drumsampler::ui::UI_ORIGIN) {
+    /// The sample file each slot of a built-in sampler was loaded from, as
+    /// `(slot, file name)`: a Drum Sampler's pads, a Quick Sampler's or a
+    /// Slicer's one sample. Empty for any other plugin, or a slot with no mirrored state.
+    /// Drives the reload after project open or a host respawn: a restarted
+    /// DSP has its parameters replayed but no audio until each file is read
+    /// and sent again.
+    pub fn builtin_sample_names(plugin_id: &str, insert_id: &str) -> Vec<(u32, String)> {
+        let Some(origin) = origin_for_plugin_id(plugin_id) else {
             return Vec::new();
-        }
+        };
         let Ok(states) = map().lock() else {
             return Vec::new();
         };
         match states.get(insert_id) {
-            Some(BuiltinParams::DrumSampler(params)) => params
-                .pads
-                .iter()
-                .enumerate()
-                .filter_map(|(index, pad)| pad.sample_name.clone().map(|name| (index as u32, name)))
+            Some(BuiltinParams::DrumSampler(params)) if origin == drumsampler::ui::UI_ORIGIN => {
+                params
+                    .pads
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, pad)| {
+                        pad.sample_name.clone().map(|name| (index as u32, name))
+                    })
+                    .collect()
+            }
+            Some(BuiltinParams::QuickSampler(params)) if origin == quicksampler::ui::UI_ORIGIN => {
+                params
+                    .sample_name
+                    .clone()
+                    .map(|name| (0, name))
+                    .into_iter()
+                    .collect()
+            }
+            Some(BuiltinParams::Slicer(params)) if origin == slicer::ui::UI_ORIGIN => params
+                .sample_name
+                .clone()
+                .map(|name| (0, name))
+                .into_iter()
                 .collect(),
             _ => Vec::new(),
+        }
+    }
+
+    /// A Quick Sampler insert's mirrored params, or `None` when the slot holds
+    /// none (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_quick_sampler_params(insert_id: &str) -> Option<quicksampler::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::QuickSampler(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A Drum Sampler insert's mirrored params, or `None` when the slot holds
+    /// none (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_drum_sampler_params(insert_id: &str) -> Option<drumsampler::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::DrumSampler(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A Rodhareist insert's mirrored params, or `None` when the slot holds
+    /// none (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_rodhareist_params(insert_id: &str) -> Option<rodharerist::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Rodhareist(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// An EQ-Z8 insert's mirrored params, or `None` when the slot holds none
+    /// (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_equz8_params(insert_id: &str) -> Option<equz8::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Equz8(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A VerbSpace insert's mirrored params, or `None` when the slot holds
+    /// none (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_verbspace_params(insert_id: &str) -> Option<verbspace::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Verbspace(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// An FA-2A insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_fa2a_params(insert_id: &str) -> Option<fa2a::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Fa2a(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// An FA-76 insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_fa76_params(insert_id: &str) -> Option<fa76::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Fa76(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A Z-Comp insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_zcomp_params(insert_id: &str) -> Option<zcomp::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Zcomp(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A BurnLimit insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_burnlimit_params(insert_id: &str) -> Option<burnlimit::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::BurnLimit(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A 67Clipper insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_clipper67_params(insert_id: &str) -> Option<clipper67::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Clipper67(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A Transient insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_transient_params(insert_id: &str) -> Option<transient::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Transient(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A WayGate insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_waygate_params(insert_id: &str) -> Option<waygate::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::WayGate(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A Compressor insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_compresser_params(insert_id: &str) -> Option<compresser::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Compresser(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// An Imager insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_imager_params(insert_id: &str) -> Option<imager::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Imager(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A MixStation insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_mixstation_params(insert_id: &str) -> Option<mixstation::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::MixStation(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A WhiteSharp insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_whitesharp_params(insert_id: &str) -> Option<whitesharp::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::WhiteSharp(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// An EchoSpace insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_echospace_params(insert_id: &str) -> Option<echospace::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Echospace(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// An EQ-ZX insert's mirrored params, like [`builtin_equz8_params`].
+    pub fn builtin_equzx_params(insert_id: &str) -> Option<equzx::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Equzx(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// The output buses a multi-out built-in insert is using (bus 0 being
+    /// its main output), or `None` for an insert with one output. For the
+    /// Drum Sampler: every output a pad is sent to, besides Main — the
+    /// outputs that need a mixer strip of their own.
+    pub fn builtin_used_output_buses(insert_id: &str) -> Option<Vec<u8>> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::DrumSampler(params) => {
+                let mut buses: Vec<u8> = params
+                    .pads
+                    .iter()
+                    .map(|pad| pad.output)
+                    .filter(|output| *output > 0)
+                    .collect();
+                buses.sort_unstable();
+                buses.dedup();
+                Some(buses)
+            }
+            _ => None,
+        }
+    }
+
+    /// A WrapSynth insert's mirrored params, or `None` when the slot holds
+    /// none (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_wrapsynth_params(insert_id: &str) -> Option<wrapsynth::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::WrapSynth(params) => Some(**params),
+            _ => None,
+        }
+    }
+
+    /// A Slicer insert's mirrored params, or `None` when the slot holds none
+    /// (a fresh insert plays the defaults). Read by its native editor.
+    pub fn builtin_slicer_params(insert_id: &str) -> Option<slicer::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Slicer(params) => Some((**params).clone()),
+            _ => None,
         }
     }
 
@@ -650,8 +1047,15 @@ mod state_mirror {
 
 #[cfg(feature = "builtin-plugin-editor")]
 pub use state_mirror::{
-    builtin_drum_sample_names, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
-    builtin_state_remove, builtin_state_replay, builtin_state_seed, builtin_state_set_drum_sample,
+    builtin_burnlimit_params, builtin_clipper67_params, builtin_compresser_params,
+    builtin_default_replay, builtin_drum_sampler_params, builtin_echospace_params,
+    builtin_equz8_params, builtin_equzx_params, builtin_fa2a_params, builtin_fa76_params,
+    builtin_imager_params, builtin_mixstation_params, builtin_quick_sampler_params,
+    builtin_replay_changes, builtin_rodhareist_params, builtin_sample_names, builtin_slicer_params,
+    builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
+    builtin_state_replay, builtin_state_seed, builtin_state_set_sample, builtin_transient_params,
+    builtin_used_output_buses, builtin_verbspace_params, builtin_waygate_params,
+    builtin_whitesharp_params, builtin_wrapsynth_params, builtin_zcomp_params,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is
@@ -666,16 +1070,25 @@ mod state_mirror_stubs {
     pub fn builtin_state_replay(_plugin_id: &str, _insert_id: &str) -> Vec<(u32, f32)> {
         Vec::new()
     }
+    pub fn builtin_default_replay(_plugin_id: &str) -> Vec<(u32, f32)> {
+        Vec::new()
+    }
+    pub fn builtin_replay_changes(
+        values: Vec<(u32, f32)>,
+        _baseline: &[(u32, f32)],
+    ) -> Vec<(u32, f32)> {
+        values
+    }
     pub fn builtin_state_remove(insert_id: &str) {
         super::drum_waveforms_remove(insert_id);
     }
     pub fn builtin_state_clear() {
         super::drum_waveforms_clear();
     }
-    pub fn builtin_drum_sample_names(_plugin_id: &str, _insert_id: &str) -> Vec<(u32, String)> {
+    pub fn builtin_sample_names(_plugin_id: &str, _insert_id: &str) -> Vec<(u32, String)> {
         Vec::new()
     }
-    pub fn builtin_state_set_drum_sample(
+    pub fn builtin_state_set_sample(
         _plugin_id: &str,
         _insert_id: &str,
         _pad_index: usize,
@@ -687,8 +1100,8 @@ mod state_mirror_stubs {
 
 #[cfg(not(feature = "builtin-plugin-editor"))]
 pub use state_mirror_stubs::{
-    builtin_drum_sample_names, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
-    builtin_state_remove, builtin_state_replay, builtin_state_seed, builtin_state_set_drum_sample,
+    builtin_sample_names, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
+    builtin_state_remove, builtin_state_replay, builtin_state_seed, builtin_state_set_sample,
 };
 
 /// A Drum Sampler pad's loaded sample, as its editor draws it: the file, its
@@ -1198,78 +1611,21 @@ mod imp {
     ///
     /// This is the isolation boundary: an origin that is not a known built-in
     /// returns `None`, so one plugin's editor can never read another's assets.
-    /// Runs on CEF's IO thread — it only indexes static tables.
-    fn resolve_asset(origin: &str, path: &str) -> Option<SchemeAsset> {
-        use builtin_ui_embed::EmbeddedPluginUi;
-        let asset = match origin {
-            rodharerist::ui::UI_ORIGIN => rodharerist::ui::RodhareistUi::resolve_ui_asset(path)?,
-            equz8::ui::UI_ORIGIN => equz8::ui::Equz8Ui::resolve_ui_asset(path)?,
-            verbspace::ui::UI_ORIGIN => verbspace::ui::VerbspaceUi::resolve_ui_asset(path)?,
-            echospace::ui::UI_ORIGIN => echospace::ui::EchospaceUi::resolve_ui_asset(path)?,
-            imager::ui::UI_ORIGIN => imager::ui::ImagerUi::resolve_ui_asset(path)?,
-            fa2a::ui::UI_ORIGIN => fa2a::ui::Fa2aUi::resolve_ui_asset(path)?,
-            fa76::ui::UI_ORIGIN => fa76::ui::Fa76Ui::resolve_ui_asset(path)?,
-            burnlimit::ui::UI_ORIGIN => burnlimit::ui::BurnLimitUi::resolve_ui_asset(path)?,
-            clipper67::ui::UI_ORIGIN => clipper67::ui::Clipper67Ui::resolve_ui_asset(path)?,
-            transient::ui::UI_ORIGIN => transient::ui::TransientUi::resolve_ui_asset(path)?,
-            wrapsynth::ui::UI_ORIGIN => wrapsynth::ui::WrapSynthUi::resolve_ui_asset(path)?,
-            drumsampler::ui::UI_ORIGIN => drumsampler::ui::DrumSamplerUi::resolve_ui_asset(path)?,
-            zcomp::ui::UI_ORIGIN => zcomp::ui::ZcompUi::resolve_ui_asset(path)?,
-            mixstation::ui::UI_ORIGIN => mixstation::ui::MixStationUi::resolve_ui_asset(path)?,
-            compresser::ui::UI_ORIGIN => compresser::ui::CompresserUi::resolve_ui_asset(path)?,
-            _ => return None,
-        };
-        Some(SchemeAsset {
-            bytes: asset.bytes,
-            mime_type: asset.mime_type,
-        })
+    /// Every built-in editor is native GPUI now and none embeds a bundle, so
+    /// no origin resolves. Runs on CEF's IO thread.
+    fn resolve_asset(_origin: &str, _path: &str) -> Option<SchemeAsset> {
+        None
     }
 
-    /// Whether this build links a built-in's editor at all. Distinct from
-    /// [`has_embedded_ui`]: an origin can be hosted here yet carry an empty
-    /// asset table when its bundle was never built, and the two cases get
-    /// different `HostAvailability` errors.
-    fn hosts_editor(origin: &str) -> bool {
-        matches!(
-            origin,
-            rodharerist::ui::UI_ORIGIN
-                | equz8::ui::UI_ORIGIN
-                | verbspace::ui::UI_ORIGIN
-                | echospace::ui::UI_ORIGIN
-                | imager::ui::UI_ORIGIN
-                | fa2a::ui::UI_ORIGIN
-                | fa76::ui::UI_ORIGIN
-                | burnlimit::ui::UI_ORIGIN
-                | clipper67::ui::UI_ORIGIN
-                | transient::ui::UI_ORIGIN
-                | wrapsynth::ui::UI_ORIGIN
-                | drumsampler::ui::UI_ORIGIN
-                | zcomp::ui::UI_ORIGIN
-                | mixstation::ui::UI_ORIGIN
-                | compresser::ui::UI_ORIGIN
-        )
+    /// Whether this build links a built-in's editor bundle at all. None does:
+    /// every built-in editor is a native view, opened without CEF.
+    fn hosts_editor(_origin: &str) -> bool {
+        false
     }
 
     /// Whether a built-in plugin has embedded editor assets to serve.
-    fn has_embedded_ui(origin: &str) -> bool {
-        match origin {
-            rodharerist::ui::UI_ORIGIN => rodharerist::ui::RodhareistUi::is_embedded(),
-            equz8::ui::UI_ORIGIN => equz8::ui::Equz8Ui::is_embedded(),
-            verbspace::ui::UI_ORIGIN => verbspace::ui::VerbspaceUi::is_embedded(),
-            echospace::ui::UI_ORIGIN => echospace::ui::EchospaceUi::is_embedded(),
-            imager::ui::UI_ORIGIN => imager::ui::ImagerUi::is_embedded(),
-            fa2a::ui::UI_ORIGIN => fa2a::ui::Fa2aUi::is_embedded(),
-            fa76::ui::UI_ORIGIN => fa76::ui::Fa76Ui::is_embedded(),
-            burnlimit::ui::UI_ORIGIN => burnlimit::ui::BurnLimitUi::is_embedded(),
-            clipper67::ui::UI_ORIGIN => clipper67::ui::Clipper67Ui::is_embedded(),
-            transient::ui::UI_ORIGIN => transient::ui::TransientUi::is_embedded(),
-            wrapsynth::ui::UI_ORIGIN => wrapsynth::ui::WrapSynthUi::is_embedded(),
-            drumsampler::ui::UI_ORIGIN => drumsampler::ui::DrumSamplerUi::is_embedded(),
-            zcomp::ui::UI_ORIGIN => zcomp::ui::ZcompUi::is_embedded(),
-            mixstation::ui::UI_ORIGIN => mixstation::ui::MixStationUi::is_embedded(),
-            compresser::ui::UI_ORIGIN => compresser::ui::CompresserUi::is_embedded(),
-            _ => false,
-        }
+    fn has_embedded_ui(_origin: &str) -> bool {
+        false
     }
 
     /// React->native bridge inbound queue, keyed by scheme origin (the same
@@ -2829,6 +3185,7 @@ mod tests {
         assert_eq!(origin_for_plugin_id("builtin:burnlimit"), Some("burnlimit"));
         assert_eq!(origin_for_plugin_id("builtin:clipper67"), Some("clipper67"));
         assert_eq!(origin_for_plugin_id("builtin:transient"), Some("transient"));
+        assert_eq!(origin_for_plugin_id("builtin:waygate"), Some("waygate"));
         assert_eq!(
             origin_for_plugin_id("builtin:mixstation"),
             Some("mixstation")
@@ -2850,6 +3207,7 @@ mod tests {
         assert_eq!(origin_for_plugin_id("burnlimit"), Some("burnlimit"));
         assert_eq!(origin_for_plugin_id("clipper67"), Some("clipper67"));
         assert_eq!(origin_for_plugin_id("transient"), Some("transient"));
+        assert_eq!(origin_for_plugin_id("waygate"), Some("waygate"));
         assert_eq!(origin_for_plugin_id("mixstation"), Some("mixstation"));
         assert_eq!(
             origin_for_plugin_id("rodharerist"),
@@ -2882,6 +3240,8 @@ mod tests {
             "rodharerist",
             "builtin:equz8",
             "equz8",
+            "builtin:equzx",
+            "equzx",
             "builtin:mixstation",
             "mixstation",
         ] {
@@ -2926,18 +3286,20 @@ mod tests {
 
     #[cfg(feature = "builtin-plugin-editor")]
     #[test]
-    fn builtins_with_an_editor_are_hostable_and_the_rest_are_not() {
-        // These embed a UI in any build that ran their build script against a
-        // built dist; either way they must never be `NotCompiledIn` here.
-        for id in ["builtin:rodharerist", "builtin:equz8", "builtin:mixstation"] {
-            assert_ne!(availability(id), HostAvailability::NotCompiledIn);
-        }
-        // A catalogued built-in that ships no editor bundle is refused by name,
+    fn no_builtin_is_hosted_in_cef() {
+        // Every built-in editor draws natively; a CEF open is refused by name,
         // not reported as an empty asset table.
-        assert_eq!(
-            availability("builtin:c1073"),
-            HostAvailability::NoEditorForPlugin("builtin:c1073".to_string())
-        );
+        for id in [
+            "builtin:rodharerist",
+            "builtin:imager",
+            "builtin:mixstation",
+            "builtin:c1073",
+        ] {
+            assert_eq!(
+                availability(id),
+                HostAvailability::NoEditorForPlugin(id.to_string())
+            );
+        }
     }
 
     /// Imager's editor edits land in the mirror, persist as an `ImagerState`
@@ -2995,6 +3357,34 @@ mod tests {
         assert!(builtin_state_bytes("imager", insert).is_none());
     }
 
+    /// WayGate's edits land in the mirror, persist as a `WayGateState` blob,
+    /// replay in wire order, and are what its native editor reads back.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn waygate_state_is_mirrored_persisted_and_replayed() {
+        let insert = "test-insert-waygate-mirror";
+        let threshold =
+            builtin_param_index("waygate", "thresholdDb").expect("thresholdDb is an id");
+        let mode = builtin_param_index("builtin:waygate", "mode").expect("mode is an id");
+        assert!(builtin_param_index("waygate", "attack").is_none());
+        builtin_state_apply("waygate", insert, threshold, -33.0);
+        builtin_state_apply("waygate", insert, mode, 1.0);
+
+        let bytes = builtin_state_bytes("waygate", insert).expect("WayGate owns this state");
+        let json = String::from_utf8(bytes).expect("state blobs are UTF-8 JSON");
+        let state = waygate::ipc::WayGateState::from_json(&json).expect("a WayGate blob");
+        assert_eq!(state.params.threshold_db, -33.0);
+        assert_eq!(state.params.mode, waygate::Mode::Duck);
+
+        let replay = builtin_state_replay("waygate", insert);
+        assert_eq!(replay.len(), waygate::UI_PARAM_IDS.len());
+        assert!(replay.contains(&(threshold, -33.0)));
+        let mirrored = builtin_waygate_params(insert).expect("the editor reads it back");
+        assert_eq!(mirrored.threshold_db, -33.0);
+        assert!(builtin_state_bytes("transient", insert).is_none());
+        assert!(builtin_transient_params(insert).is_none());
+    }
+
     /// The reload after project open asks the mirror which file each pad was
     /// loaded from; only a Drum Sampler slot answers, and only for its own
     /// loaded pads.
@@ -3002,32 +3392,122 @@ mod tests {
     #[test]
     fn drum_sample_names_list_only_the_loaded_pads() {
         let insert = "test-insert-drum-names";
-        assert!(builtin_state_set_drum_sample(
+        assert!(builtin_state_set_sample(
             "drumsampler",
             insert,
             2,
             Some("snare.wav".into())
         ));
-        assert!(builtin_state_set_drum_sample(
+        assert!(builtin_state_set_sample(
             "drumsampler",
             insert,
             9,
             Some("hat.wav".into())
         ));
         // Reloading the same file is not an edit.
-        assert!(!builtin_state_set_drum_sample(
+        assert!(!builtin_state_set_sample(
             "drumsampler",
             insert,
             9,
             Some("hat.wav".into())
         ));
         assert_eq!(
-            builtin_drum_sample_names("drumsampler", insert),
+            builtin_sample_names("drumsampler", insert),
             vec![(2, "snare.wav".to_string()), (9, "hat.wav".to_string())]
         );
-        assert!(builtin_drum_sample_names("equz8", insert).is_empty());
+        assert!(builtin_sample_names("equz8", insert).is_empty());
         builtin_state_remove(insert);
-        assert!(builtin_drum_sample_names("drumsampler", insert).is_empty());
+        assert!(builtin_sample_names("drumsampler", insert).is_empty());
+    }
+
+    /// A Quick Sampler insert keeps its params and its one sample in the
+    /// mirror: an edit folds in, the blob it saves restores them, and a
+    /// restarted host is replayed every param and reloaded the sample.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn quick_sampler_state_round_trips_through_the_mirror() {
+        let insert = "test-insert-quick-sampler";
+        let cutoff = builtin_param_index("quicksampler", "cutoff").expect("cutoff");
+        builtin_state_apply("quicksampler", insert, cutoff, 750.0);
+        assert!(builtin_state_set_sample(
+            "quicksampler",
+            insert,
+            0,
+            Some("808.wav".into())
+        ));
+        assert!(
+            !builtin_state_set_sample("quicksampler", insert, 3, Some("other.wav".into())),
+            "a Quick Sampler has one slot"
+        );
+        assert_eq!(
+            builtin_sample_names("quicksampler", insert),
+            vec![(0, "808.wav".to_string())]
+        );
+        let params = builtin_quick_sampler_params(insert).expect("mirrored");
+        assert_eq!(params.sampler.cutoff_hz, 750.0);
+
+        let blob = builtin_state_bytes("quicksampler", insert).expect("saved");
+        builtin_state_remove(insert);
+        builtin_state_seed("quicksampler", insert, &blob);
+        let restored = builtin_quick_sampler_params(insert).expect("restored");
+        assert_eq!(restored, params);
+        let replay = builtin_state_replay("quicksampler", insert);
+        assert_eq!(replay.len(), quicksampler::ipc::PARAM_COUNT);
+        assert!(replay.contains(&(cutoff, 750.0)));
+        builtin_state_remove(insert);
+    }
+
+    /// A Slicer insert keeps its cut and its sample in the mirror, and a
+    /// restarted host is replayed every param.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn slicer_state_round_trips_through_the_mirror() {
+        let insert = "insert-slicer-mirror";
+        let count = builtin_param_index("slicer", "sliceCount").expect("sliceCount");
+        let second = builtin_param_index("slicer", "slice1").expect("slice1");
+        builtin_state_apply("slicer", insert, count, 2.0);
+        builtin_state_apply("slicer", insert, second, 0.5);
+        assert!(builtin_state_set_sample(
+            "slicer",
+            insert,
+            0,
+            Some("break.wav".into())
+        ));
+        assert_eq!(
+            builtin_sample_names("slicer", insert),
+            vec![(0, "break.wav".to_string())]
+        );
+        let params = builtin_slicer_params(insert).expect("mirrored");
+        assert_eq!(params.slicer.points(), &[0.0, 0.5]);
+
+        let blob = builtin_state_bytes("slicer", insert).expect("saved");
+        builtin_state_remove(insert);
+        builtin_state_seed("slicer", insert, &blob);
+        assert_eq!(builtin_slicer_params(insert).expect("restored"), params);
+        assert_eq!(
+            builtin_state_replay("slicer", insert).len(),
+            slicer::ipc::PARAM_COUNT
+        );
+        builtin_state_remove(insert);
+    }
+
+    /// A 64-pad kit replays only what differs from what its DSP holds — a
+    /// handful of edits, not its whole table, which would overflow the
+    /// engine's command queue.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn a_drum_kit_replays_only_its_changes() {
+        let insert = "test-insert-drum-replay";
+        let gain = builtin_param_index("drumsampler", "pad40Gain").expect("pad40Gain");
+        let output = builtin_param_index("drumsampler", "pad2Output").expect("pad2Output");
+        builtin_state_apply("drumsampler", insert, gain, -9.0);
+        builtin_state_apply("drumsampler", insert, output, 3.0);
+        let full = builtin_state_replay("drumsampler", insert);
+        assert_eq!(full.len(), drumsampler::ipc::PARAM_COUNT);
+        assert!(full.len() > 1_000);
+        let changes = builtin_replay_changes(full, &builtin_default_replay("drumsampler"));
+        assert_eq!(changes, vec![(output, 3.0), (gain, -9.0)]);
+        builtin_state_remove(insert);
     }
 
     #[test]

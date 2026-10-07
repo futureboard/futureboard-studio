@@ -18,10 +18,12 @@ use serde::{Deserialize, Serialize};
 
 pub mod dsp;
 pub mod ipc;
+pub mod presets;
 pub mod ui;
 
-pub use dsp::{CellFrame, ModelCoeffs, model_coeffs};
+pub use dsp::{CellFrame, ModelCoeffs, curve_reduction_db, model_coeffs};
 pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 use dsp::{GainCell, Smoothed};
 
@@ -206,6 +208,21 @@ pub fn default_params() -> Params {
         auto_release: true,
         sc_listen: false,
     }
+}
+
+/// The steady-state output level, in dBFS, of a level held at `input_db`:
+/// the circuit's static curve against its own threshold, ratio and knee,
+/// then makeup and the dry blend. Bypassed, the output is the input.
+pub fn transfer_db(params: &Params, input_db: f32) -> f32 {
+    if !params.power {
+        return input_db;
+    }
+    let c = model_coeffs(params);
+    let gr = curve_reduction_db(input_db, c.threshold_db, c.ratio, c.knee_db, c.over_easy_db);
+    let dry = builtin_dsp_core::db_to_linear(input_db);
+    let wet = dry * builtin_dsp_core::db_to_linear(params.makeup_db - gr);
+    let amount = builtin_dsp_core::clamp(params.mix, 0.0, 100.0) / 100.0;
+    builtin_dsp_core::linear_to_db(builtin_dsp_core::mix(dry, wet, amount).max(1.0e-9))
 }
 
 pub fn descriptor() -> PluginDescriptor {

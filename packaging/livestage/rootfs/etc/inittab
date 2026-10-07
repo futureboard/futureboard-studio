@@ -1,0 +1,13 @@
+# /etc/inittab for the LiveStage appliance
+
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+# tty1: the setup on the first boot, then the machine's status (where the web
+# UI is, the mixer, the network). tty2 (Alt+F2): a login shell.
+tty1::respawn:/usr/bin/livestage-setup --console
+tty2::respawn:/sbin/getty 38400 tty2
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/openrc shutdown

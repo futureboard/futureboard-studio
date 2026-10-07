@@ -25,21 +25,19 @@
 //! target without pushing its peaks past the ceiling — zero everywhere means
 //! the committed values are already the measured ones.
 //!
-//! The preset table lives in the editor (`editorui/src/data.ts`) and is the
-//! single source of truth, so this reads the resolved presets as JSON rather
-//! than keeping a second copy that would drift:
+//! It renders the bank the editor's preset browser loads,
+//! `rodharerist::factory_presets()` — there is no second copy to drift:
 //!
 //! ```text
-//! bun run --cwd crates/BuiltinAudioPlugins/crates/rodharerist/editorui presets:json > /tmp/presets.json
-//! cargo run -p rodharerist --example preset_audit --release -- /tmp/presets.json
+//! cargo run -p rodharerist --example preset_audit --release
+//! cargo run -p rodharerist --example preset_audit --release -- --map
 //! ```
 
 use std::f32::consts::TAU;
 
 use builtin_dsp_core::StereoEffect;
-use rodharerist::{Dsp, apply_to_params, default_params};
+use rodharerist::{AmpModel, CabModel, Dsp, MicModel, PATH_SLOTS, StageKind, default_params};
 use rustfft::{FftPlanner, num_complex::Complex};
-use serde_json::Value;
 
 const SR: f32 = 48_000.0;
 /// Long enough for a reverb tail and a few delay repeats to establish.
@@ -56,175 +54,6 @@ const TARGET_RMS_DB: f32 = -14.0;
 /// on a normal DI, so the trim is held down to respect it even if that leaves
 /// the preset quieter than the target.
 const PEAK_CEILING_DB: f32 = -1.5;
-
-/// Editor category → the `path_slot_*` value the bridge sends (`StageKind`).
-fn stage_index(category: &str) -> Option<f32> {
-    Some(match category {
-        "dyn" => 0.0,
-        "dist" => 1.0,
-        "amp" => 2.0,
-        "mod" => 3.0,
-        "delay" => 4.0,
-        "verb" => 5.0,
-        "cab" => 6.0,
-        "comp" => 7.0,
-        "eq" => 8.0,
-        "wah" => 9.0,
-        _ => return None,
-    })
-}
-
-/// Editor category → the `*_on` param id (the bridge's `postEnabled` node ids).
-fn enable_id(category: &str) -> Option<&'static str> {
-    Some(match category {
-        "dyn" => "gate_on",
-        "comp" => "comp_on",
-        "wah" => "wah_on",
-        "dist" => "drive_on",
-        "amp" => "amp_on",
-        "eq" => "eq_on",
-        "mod" => "mod_on",
-        "delay" => "delay_on",
-        "verb" => "reverb_on",
-        "cab" => "cab_on",
-        _ => return None,
-    })
-}
-
-/// Model selects, mirroring `bridge.ts` `postModel`. Returns the wire param and
-/// the model's index within its Rust enum's `ALL` order.
-fn model_param(category: &str, model: &str) -> Option<(&'static str, f32)> {
-    let table: (&'static str, &[&str]) = match category {
-        "amp" => match model {
-            "bypass" => return Some(("tone_engine", 2.0)),
-            "nam_capture" => return Some(("tone_engine", 1.0)),
-            _ => (
-                "amp_model",
-                &[
-                    "mandarin", "plexi", "twin", "topboost", "recto", "jcm", "slate", "bassman",
-                ],
-            ),
-        },
-        "dist" => (
-            "drive_model",
-            &[
-                "screamer",
-                "minotaur",
-                "rat",
-                "breaker",
-                "fuzz",
-                "centurion",
-                "ds_one",
-                "super_drive",
-                "metal_core",
-                "tight_rift",
-            ],
-        ),
-        "cab" => (
-            "cab_model",
-            &[
-                "vintage_cab",
-                "american_2x12",
-                "tweed_1x12",
-                "modern_412",
-                "open_back",
-                "vintage_212",
-                "oversized_412",
-                "bass_cabinet",
-                "brit_412",
-                "uber_412",
-                "slo_412",
-                "ir",
-            ],
-        ),
-        "mod" => (
-            "mod_model",
-            &[
-                "chorus",
-                "phaser",
-                "flanger",
-                "tremolo",
-                "molam_swirl",
-                "phin_vibe",
-                "khaen_swirl",
-                "bi_lam",
-                "isan_jet",
-            ],
-        ),
-        "wah" => ("wah_model", &["cry_wah", "touch_wah"]),
-        "verb" => ("reverb_model", &["plate", "room", "hall", "shimmer"]),
-        "delay" => (
-            "delay_model",
-            &["tape", "digital", "analog", "ping_pong", "dual"],
-        ),
-        // Single-algorithm stages (gate/comp/eq) have no model select.
-        _ => return None,
-    };
-    let (param, ids) = table;
-    let index = ids.iter().position(|&id| id == model)?;
-    Some((param, index as f32))
-}
-
-/// Apply one resolved preset exactly the way the editor's preset load does:
-/// path slots, per-stage model, enables, then the knob values.
-fn dsp_for(preset: &Value) -> Dsp {
-    let mut p = default_params();
-    let mut set = |id: &str, value: f32| {
-        assert!(apply_to_params(&mut p, id, value), "unrouted id `{id}`");
-    };
-
-    let path: Vec<&str> = preset["path"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-    for slot in 0..10 {
-        let value = path.get(slot).and_then(|c| stage_index(c)).unwrap_or(-1.0);
-        set(&format!("path_slot_{slot}"), value);
-    }
-    if let Some(enabled) = preset["enabled"].as_object() {
-        for (category, on) in enabled {
-            if let Some(id) = enable_id(category) {
-                set(
-                    id,
-                    if on.as_bool().unwrap_or(true) {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                );
-            }
-        }
-    }
-    if let Some(models) = preset["stageModels"].as_object() {
-        for (category, model) in models {
-            let Some(model) = model.as_str() else {
-                continue;
-            };
-            if let Some((param, value)) = model_param(category, model) {
-                set(param, value);
-            }
-        }
-    }
-    // The preset's own output level, applied exactly where the editor applies
-    // it (`applySnapshotToDsp` posts the snapshot's globals).
-    set(
-        "output_trim",
-        preset["outputTrim"].as_f64().unwrap_or(0.0) as f32,
-    );
-    if let Some(values) = preset["values"].as_object() {
-        for (id, value) in values {
-            let Some(value) = value.as_f64() else {
-                continue;
-            };
-            // `cab_mic_type` is the editor's name for the mic model select.
-            set(id, value as f32);
-        }
-    }
-
-    let mut dsp = Dsp::new(SR);
-    dsp.set_params(p);
-    dsp
-}
 
 /// A deterministic stand-in for a DI'd guitar: an open-position chord struck
 /// repeatedly, each string a decaying harmonic stack with a little pick noise.
@@ -346,18 +175,18 @@ fn band_energy(spectrum: &[f32], lo: f32, hi: f32) -> f32 {
 /// Amp models in `AmpModel::ALL` order, with the cab each one is normally
 /// paired with in the bank — the map has to include the cab, because a preset
 /// is never auditioned without one.
-const AMP_MAP: [(&str, &str); 11] = [
-    ("mandarin", "vintage_212"),
-    ("plexi", "brit_412"),
-    ("twin", "american_2x12"),
-    ("topboost", "open_back"),
-    ("recto", "oversized_412"),
-    ("jcm", "brit_412"),
-    ("slate", "slo_412"),
-    ("bassman", "tweed_1x12"),
-    ("boutique", "vintage_212"),
-    ("invader", "uber_412"),
-    ("tweed_combo", "tweed_1x12"),
+const AMP_MAP: [(AmpModel, CabModel); 11] = [
+    (AmpModel::Mandarin, CabModel::Vintage2x12),
+    (AmpModel::Plexi, CabModel::Brit4x12),
+    (AmpModel::Twin, CabModel::American2x12),
+    (AmpModel::TopBoost, CabModel::OpenBack),
+    (AmpModel::Recto, CabModel::Oversized4x12),
+    (AmpModel::Jcm, CabModel::Brit4x12),
+    (AmpModel::Slate, CabModel::Slo4x12),
+    (AmpModel::Bassman, CabModel::Tweed1x12),
+    (AmpModel::Boutique, CabModel::Vintage2x12),
+    (AmpModel::Invader, CabModel::Uber4x12),
+    (AmpModel::TweedCombo, CabModel::Tweed1x12),
 ];
 
 /// Where each amp model actually sits on its Gain and Master travel, measured
@@ -380,27 +209,27 @@ fn print_amp_map(input: &[f32]) {
 
     for (amp, cab) in AMP_MAP {
         for master in masters {
-            print!("{:<10} {:<7.0}", amp, master);
+            print!("{:<10} {:<7.0}", format!("{amp:?}"), master);
             for gain in gains {
-                let preset = serde_json::json!({
-                    "id": amp,
-                    "name": amp,
-                    "path": ["amp", "cab"],
-                    "enabled": { "amp": true, "cab": true },
-                    "stageModels": { "amp": amp, "cab": cab },
-                    "values": {
-                        "amp_gain": gain,
-                        "amp_bass": 5.0,
-                        "amp_middle": 5.0,
-                        "amp_treble": 5.0,
-                        "amp_presence": 5.0,
-                        "amp_master": master,
-                        "cab_mic_type": 0.0,
-                        "cab_mic": 40.0,
-                        "cab_dist": 25.0,
-                    },
-                });
-                let mut dsp = dsp_for(&preset);
+                let mut p = default_params();
+                p.stage_order = [None; PATH_SLOTS];
+                p.stage_order[0] = Some(StageKind::Amp);
+                p.stage_order[1] = Some(StageKind::Cab);
+                p.amp_on = true;
+                p.cab_on = true;
+                p.amp_model = amp;
+                p.cab_model = cab;
+                p.amp_gain = gain;
+                p.amp_bass = 5.0;
+                p.amp_middle = 5.0;
+                p.amp_treble = 5.0;
+                p.amp_presence = 5.0;
+                p.amp_master = master;
+                p.mic_model = MicModel::Dynamic;
+                p.cab_mic = 40.0;
+                p.cab_dist = 25.0;
+                let mut dsp = Dsp::new(SR);
+                dsp.set_params(p);
                 let out: Vec<f32> = input
                     .iter()
                     .map(|&x| dsp.process_stereo(x, x).0)
@@ -419,16 +248,11 @@ fn print_amp_map(input: &[f32]) {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("usage: preset_audit <presets.json | --map>");
-        std::process::exit(2);
-    });
-    if path == "--map" {
+    if std::env::args().nth(1).as_deref() == Some("--map") {
         print_amp_map(&test_signal());
         return;
     }
-    let text = std::fs::read_to_string(&path).expect("read presets json");
-    let presets: Vec<Value> = serde_json::from_str(&text).expect("parse presets json");
+    let presets = rodharerist::factory_presets();
 
     let input = test_signal();
     let dry = &input[SETTLE..];
@@ -453,8 +277,9 @@ fn main() {
     }
 
     let mut rows = Vec::new();
-    for preset in &presets {
-        let mut dsp = dsp_for(preset);
+    for preset in presets {
+        let mut dsp = Dsp::new(SR);
+        dsp.set_params(preset.params.clone());
         let out: Vec<f32> = input
             .iter()
             .map(|&x| dsp.process_stereo(x, x).0)
@@ -463,7 +288,7 @@ fn main() {
         assert!(
             out.iter().all(|x| x.is_finite()),
             "`{}` produced a non-finite sample",
-            preset["id"]
+            preset.id
         );
         let spec = spectrum(&out);
         let low = band_energy(&spec, 80.0, 250.0);
@@ -473,8 +298,8 @@ fn main() {
         let out_rms = rms(&out);
         let out_peak = out.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
         rows.push(Row {
-            id: preset["id"].as_str().unwrap_or("?").to_string(),
-            name: preset["name"].as_str().unwrap_or("?").to_string(),
+            id: preset.id.to_string(),
+            name: preset.name.to_string(),
             rms_db: db(out_rms),
             peak_db: db(out_peak),
             crest_db: db(out_peak / out_rms.max(1.0e-9)),
@@ -482,7 +307,7 @@ fn main() {
             low: low / total * 100.0,
             mid: mid / total * 100.0,
             high: high / total * 100.0,
-            path_len: preset["path"].as_array().map_or(0, |a| a.len()),
+            path_len: preset.params.stage_order.iter().flatten().count(),
         });
     }
 

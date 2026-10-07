@@ -158,7 +158,9 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// v58 appends the built-in Soundfont Player's mode (single or sixteen parts)
 /// and its sixteen parts to the player's block. A pre-v58 player is a single
 /// instrument with every part at rest.
-pub const PROJECT_VERSION: u32 = 58;
+/// v59 adds MIDI input tag 3, the MIDI another track's plug-ins produce,
+/// followed by that track's id. No earlier file holds it.
+pub const PROJECT_VERSION: u32 = 59;
 
 /// Oldest on-disk format version whose migration to the current one is
 /// supported (see [`super::migrate`]): v30, which introduced arrangement
@@ -1049,6 +1051,10 @@ fn encode_track_midi_input_routing(w: &mut FbWriter, input: &ProjectTrackMidiInp
         ProjectTrackMidiInputRouting::MidiDevice { device_id } => {
             w.write_u8(2);
             w.write_str(device_id);
+        }
+        ProjectTrackMidiInputRouting::PluginOutput { track_id } => {
+            w.write_u8(3);
+            w.write_str(track_id);
         }
     }
 }
@@ -3101,6 +3107,9 @@ fn decode_track_midi_input_routing(
         1 => ProjectTrackMidiInputRouting::AllInputs,
         2 => ProjectTrackMidiInputRouting::MidiDevice {
             device_id: r.read_str()?,
+        },
+        3 => ProjectTrackMidiInputRouting::PluginOutput {
+            track_id: r.read_str()?,
         },
         t => {
             return Err(ProjectError::Corrupted(format!(

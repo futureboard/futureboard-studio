@@ -1,0 +1,4 @@
+# Read the clock at boot; never write it back (/etc/adjtime is read-only).
+clock="UTC"
+clock_hctosys="YES"
+clock_systohc="NO"

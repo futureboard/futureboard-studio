@@ -65,6 +65,26 @@ SPHERE_DAUX_VST2_API int sphere_daux_vst2_process_main_output_block_with_midi(
 SPHERE_DAUX_VST2_API int
 sphere_daux_vst2_event_input_bus_count(SphereDauxVst2Processor *processor);
 
+#ifndef SPHERE_DAUX_MIDI_OUT_EVENT_DEFINED
+#define SPHERE_DAUX_MIDI_OUT_EVENT_DEFINED
+/// One MIDI 1.0 message a plug-in produced during process(), as raw bytes.
+/// Same type as the VST3 and CLAP bridges'.
+typedef struct SphereDauxMidiOutEvent {
+  unsigned int sample_offset;
+  unsigned char status;
+  unsigned char data1;
+  unsigned char data2;
+  unsigned char reserved;
+} SphereDauxMidiOutEvent;
+#endif
+
+/// Copy the MIDI the plug-in sent through `audioMasterProcessEvents` during
+/// the last process call into `out` (at most `max_count`), oldest first, and
+/// clear it. Call on the thread that calls process(), right after it.
+SPHERE_DAUX_VST2_API int
+sphere_daux_vst2_take_output_midi(SphereDauxVst2Processor *processor,
+                                  SphereDauxMidiOutEvent *out, int max_count);
+
 /// VST2 has no bus concept: these report `numInputs`/`numOutputs` folded into
 /// stereo-width buses so the multi-out mixer strips line up with VST3.
 SPHERE_DAUX_VST2_API int

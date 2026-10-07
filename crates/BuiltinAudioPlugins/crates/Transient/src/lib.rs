@@ -12,17 +12,19 @@ use builtin_dsp_core::{
 use serde::{Deserialize, Serialize};
 
 pub mod ipc;
+pub mod presets;
 pub mod ui;
 
 pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
+pub use presets::{FactoryPreset, factory_presets};
 
 pub const PLUGIN_ID: &str = "futureboard.transient";
 
 const CLIP_THRESHOLD: f32 = 1.0;
 const RMS_WINDOW_SECONDS: f32 = 0.300;
 const PEAK_FALL_SECONDS: f32 = 0.400;
-/// Peak shaping depth at ±100% attack / sustain.
-const MAX_SHAPE_DB: f32 = 18.0;
+/// Peak shaping depth at ±100% attack / sustain, in dB.
+pub const MAX_SHAPE_DB: f32 = 18.0;
 const FAST_ATTACK_SEC: f32 = 0.000_2;
 const FAST_RELEASE_BASE_SEC: f32 = 0.010;
 const SLOW_ATTACK_BASE_SEC: f32 = 0.020;

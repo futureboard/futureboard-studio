@@ -118,19 +118,57 @@ impl ClipState {
         }
     }
 
-    /// Source frames this audio clip consumes per second of timeline, at a
-    /// constant project tempo of `60 / seconds_per_beat`. Off clips read 1:1;
-    /// a clip stretched to twice its length reads half as fast.
-    fn source_frames_per_timeline_second(&self, seconds_per_beat: f32) -> f64 {
+    /// Source frames this audio clip consumes per second it plays. Off clips
+    /// read 1:1; a clip stretched to twice its length reads half as fast.
+    fn source_frames_per_played_second(&self, project_bpm: f64) -> f64 {
         let rate = self.stretch.source_sample_rate().max(1) as f64;
-        let project_bpm = 60.0 / seconds_per_beat.max(f32::EPSILON) as f64;
-        let ratio = self.stretch.effective_time_ratio(project_bpm);
+        let ratio = self.stretch.effective_time_ratio(project_bpm.max(1.0));
         let ratio = if ratio.is_finite() && ratio > 1.0e-6 {
             ratio
         } else {
             1.0
         };
         rate / ratio
+    }
+
+    /// Seconds this clip plays between two timeline beats (negative when `to`
+    /// is before `from`).
+    ///
+    /// The one beat ↔ time conversion every source-window edit goes through,
+    /// and the one the engine plays by. A clip locked to the tempo (Tempo Sync
+    /// / Warp) is measured at the project tempo — its stretch ratio already
+    /// folds the tempo in, and the engine pins its source beats to the
+    /// project's under any tempo map. Every other clip plays a fixed
+    /// wall-clock length, so its seconds come from the tempo map. A fixed
+    /// `60 / bpm` here is what put trims, stretches and the engine out of step
+    /// as soon as the project had a tempo change.
+    pub(crate) fn played_seconds_between(
+        &self,
+        from_beat: f64,
+        to_beat: f64,
+        tempo: &DirectAudio::TempoMap,
+        project_bpm: f64,
+    ) -> f64 {
+        if self.stretch.follows_project_tempo() {
+            return (to_beat - from_beat) * 60.0 / project_bpm.max(1.0);
+        }
+        tempo.seconds_at_beat(to_beat.max(0.0)) - tempo.seconds_at_beat(from_beat.max(0.0))
+    }
+
+    /// Timeline beat `seconds` of playing after `from_beat` (before it when
+    /// negative). Inverse of [`Self::played_seconds_between`].
+    pub(crate) fn beat_after_played_seconds(
+        &self,
+        from_beat: f64,
+        seconds: f64,
+        tempo: &DirectAudio::TempoMap,
+        project_bpm: f64,
+    ) -> f64 {
+        if self.stretch.follows_project_tempo() {
+            return (from_beat + seconds * project_bpm.max(1.0) / 60.0).max(0.0);
+        }
+        let at = tempo.seconds_at_beat(from_beat.max(0.0)) + seconds;
+        tempo.beat_at_seconds(at.max(0.0)).max(0.0)
     }
 
     /// Whether an edge trim can move this clip's source window. Warp clips pin
@@ -158,19 +196,26 @@ impl ClipState {
     /// field ([`TimelineState::set_clip_length`]), so both trim identically.
     pub(crate) fn reconcile_audio_trim_to_length(
         &mut self,
-        seconds_per_beat: f32,
+        tempo: &DirectAudio::TempoMap,
+        project_bpm: f64,
         min_len_beats: f32,
     ) {
         if !self.audio_trim_follows_length() {
             return;
         }
-        let frames_per_second = self.source_frames_per_timeline_second(seconds_per_beat);
+        let frames_per_second = self.source_frames_per_played_second(project_bpm);
+        let start_beat = self.start_beat.max(0.0) as f64;
+        let played = self
+            .played_seconds_between(
+                start_beat,
+                start_beat + self.duration_beats.max(0.0) as f64,
+                tempo,
+                project_bpm,
+            )
+            .max(0.0);
         let source_start = self.stretch.source_start_samples;
-        let source_end = source_start.saturating_add(
-            ((self.duration_beats as f64 * seconds_per_beat as f64) * frames_per_second)
-                .round()
-                .max(0.0) as u64,
-        );
+        let source_end =
+            source_start.saturating_add((played * frames_per_second).round().max(0.0) as u64);
         self.stretch.apply_trim(source_start, source_end);
         if self.stretch.original_duration_samples > 0 {
             self.stretch.source_end_samples = self
@@ -178,9 +223,9 @@ impl ClipState {
                 .source_end_samples
                 .min(self.stretch.original_duration_samples);
             let source_len = self.stretch.source_end_samples.saturating_sub(source_start);
-            self.duration_beats = ((source_len as f64 / frames_per_second)
-                / seconds_per_beat as f64)
-                .max(min_len_beats as f64) as f32;
+            let played = source_len as f64 / frames_per_second;
+            let end_beat = self.beat_after_played_seconds(start_beat, played, tempo, project_bpm);
+            self.duration_beats = (end_beat - start_beat).max(min_len_beats as f64) as f32;
         }
     }
 }
@@ -232,12 +277,22 @@ fn audio_clip_beats_for_seconds(
     tempo: &DirectAudio::TempoMap,
     project_bpm: f64,
 ) -> f64 {
-    if clip.stretch.follows_project_tempo() {
-        return seconds * project_bpm.max(1.0) / 60.0;
-    }
     let start_beat = clip.start_beat.max(0.0) as f64;
-    let start_seconds = tempo.seconds_at_beat(start_beat);
-    (tempo.beat_at_seconds(start_seconds + seconds.max(0.0)) - start_beat).max(0.0)
+    (clip.beat_after_played_seconds(start_beat, seconds.max(0.0), tempo, project_bpm) - start_beat)
+        .max(0.0)
+}
+
+/// The length `clip` should have from what it plays, or `None` while its
+/// source window is undecoded. Shared by the whole-project pass and by a
+/// single clip's stretch edit, so both land on the same length.
+fn derived_audio_clip_beats(
+    clip: &ClipState,
+    tempo: &DirectAudio::TempoMap,
+    project_bpm: f64,
+) -> Option<f32> {
+    let seconds = clip.stretch.played_seconds_for_project_bpm(project_bpm)?;
+    let beats = audio_clip_beats_for_seconds(clip, seconds, tempo, project_bpm) as f32;
+    Some(beats.max(MIN_AUDIO_CLIP_BEATS))
 }
 
 impl TimelineState {
@@ -276,11 +331,9 @@ impl TimelineState {
                 if !matches!(clip.clip_type, ClipType::Audio { .. }) {
                     continue;
                 }
-                let Some(seconds) = clip.stretch.played_seconds_for_project_bpm(project_bpm) else {
+                let Some(beats) = derived_audio_clip_beats(clip, &tempo, project_bpm) else {
                     continue;
                 };
-                let beats = audio_clip_beats_for_seconds(clip, seconds, &tempo, project_bpm) as f32;
-                let beats = beats.max(MIN_AUDIO_CLIP_BEATS);
                 if (clip.duration_beats - beats).abs() > 1.0e-4 {
                     clip.duration_beats = beats;
                     changed = true;
@@ -400,7 +453,7 @@ impl TimelineState {
             // The split point's time into the clip comes through the tempo map,
             // the axis the waveform is drawn on, so under tempo automation the
             // halves meet on the audio under the razor line.
-            let frames_per_second = clip.source_frames_per_timeline_second(self.seconds_per_beat());
+            let frames_per_second = clip.source_frames_per_played_second(self.bpm as f64);
             let split_seconds = self.clip_local_seconds_at_beat(clip, split_beat as f64);
             let split_samples = (split_seconds * frames_per_second).round().max(0.0) as u64;
             let source_start = clip.stretch.source_start_samples;
@@ -528,7 +581,8 @@ impl TimelineState {
     /// back to the raw [`Self::set_clip_length`] behaviour. Returns `true` when
     /// anything changed. UI-mutating only — the caller records undo / marks dirty.
     pub fn set_clip_length_trimming(&mut self, clip_id: &str, duration_beats: f32) -> bool {
-        let seconds_per_beat = self.seconds_per_beat();
+        let project_bpm = self.bpm.max(1.0) as f64;
+        let tempo = self.resolved_tempo_map();
         let project_rate = self.project_sample_rate;
         for track in &mut self.tracks {
             if let Some(clip) = track.clips.iter_mut().find(|clip| clip.id == clip_id) {
@@ -550,7 +604,7 @@ impl TimelineState {
                     clip.stretch.source_end_samples,
                 );
                 clip.duration_beats = duration_beats;
-                clip.reconcile_audio_trim_to_length(seconds_per_beat, min_len);
+                clip.reconcile_audio_trim_to_length(&tempo, project_bpm, min_len);
                 return (before.0 - clip.duration_beats).abs() > 0.0001
                     || before.1 != clip.stretch.source_start_samples
                     || before.2 != clip.stretch.source_end_samples;
@@ -598,6 +652,65 @@ impl TimelineState {
 
     /// Replace a clip's stretch/pitch state. Returns `true` when it changed.
     /// UI-mutating only — the caller marks the project dirty / records undo.
+    /// The length clip `clip_id` would have with `stretch`, derived from what
+    /// it would play, or `None` while its source is undecoded.
+    ///
+    /// A stretch edit's new length, through the tempo map from the clip's
+    /// start: scaling the old length by the ratio change is only right while
+    /// the tempo never changes.
+    pub fn audio_clip_beats_with_stretch(
+        &self,
+        clip_id: &str,
+        stretch: &AudioClipStretchState,
+    ) -> Option<f32> {
+        let (_, clip) = self.find_clip(clip_id)?;
+        if !matches!(clip.clip_type, ClipType::Audio { .. }) {
+            return None;
+        }
+        let mut probe = clip.clone();
+        probe.stretch = stretch.clone();
+        derived_audio_clip_beats(&probe, &self.resolved_tempo_map(), self.bpm.max(1.0) as f64)
+    }
+
+    /// Timeline beat clip `clip_id` plays source frame `frame` at: from the
+    /// start of its window, through its stretch and the tempo map. A frame
+    /// before the window maps to the clip start. `0.0` for an unknown clip.
+    pub fn clip_beat_at_source_frame(&self, clip_id: &str, frame: u64) -> f64 {
+        let Some((_, clip)) = self.find_clip(clip_id) else {
+            return 0.0;
+        };
+        let project_bpm = self.bpm.max(1.0) as f64;
+        let frames_per_second = clip.source_frames_per_played_second(project_bpm);
+        let into = frame.saturating_sub(clip.stretch.source_start_samples) as f64;
+        clip.beat_after_played_seconds(
+            clip.start_beat.max(0.0) as f64,
+            into / frames_per_second.max(f64::MIN_POSITIVE),
+            &self.resolved_tempo_map(),
+            project_bpm,
+        )
+    }
+
+    /// Fit clip `clip_id` to the project tempo with `source_bpm` as the tempo
+    /// its audio is at, and give it the length that makes. See
+    /// [`AudioClipStretchState::fitted_to_source_bpm`]. Returns `true` when
+    /// anything changed; the caller records the undo step.
+    pub fn fit_clip_to_source_bpm(&mut self, clip_id: &str, source_bpm: f64) -> bool {
+        let project_bpm = self.bpm.max(1.0) as f64;
+        let Some(prev) = self.clip_stretch(clip_id).cloned() else {
+            return false;
+        };
+        if !(source_bpm.is_finite() && source_bpm > 0.0) {
+            return false;
+        }
+        let next = prev.fitted_to_source_bpm(source_bpm, project_bpm);
+        let length = self.audio_clip_beats_with_stretch(clip_id, &next);
+        let mut changed = self.set_clip_stretch(clip_id, next);
+        if let Some(length) = length {
+            changed |= self.set_clip_length(clip_id, length);
+        }
+        changed
+    }
+
     pub fn set_clip_stretch(&mut self, clip_id: &str, stretch: AudioClipStretchState) -> bool {
         let mut stretch = stretch;
         stretch.sanitize_in_place();
@@ -821,13 +934,14 @@ impl TimelineState {
 
     /// Stretch an audio clip by dragging one edge to `new_edge_beat` — the
     /// Stretch tool's gesture. The source window stays exactly as it is and
-    /// the stretch ratio changes so that window fills the new length; the
-    /// opposite edge stays fixed.
+    /// fills the new length; the opposite edge stays fixed.
     ///
-    /// A clip that was not already speed-stretched becomes a Speed clip and
-    /// keeps its pitch choice (an `Off` or Tempo clip keeps pitch). A Warp clip
-    /// stays Warp and its markers scale with it, so they stay on the audio
-    /// they were placed on.
+    /// The clip is fitted to the tempo: the drag sets the tempo its audio is
+    /// at (see [`AudioClipStretchState::source_bpm_for_beats`]) and the clip
+    /// becomes a Tempo clip, keeping its pitch choice. It then holds its bar
+    /// count through every tempo change, including changes inside it, instead
+    /// of freezing the speed it was dragged to. A Warp clip stays Warp and its
+    /// markers scale with it, so they stay on the audio they were placed on.
     ///
     /// UI-mutating only — the caller records the undo step on drop. Returns
     /// `true` when the gesture applies (an audio clip with a decoded source
@@ -862,18 +976,28 @@ impl TimelineState {
         .max(MIN_AUDIO_CLIP_BEATS);
 
         let source_seconds = source_len as f64 / rate as f64;
-        let requested_ratio = requested_len as f64 * seconds_per_beat as f64 / source_seconds;
-        let mut next = match clip.stretch.timing() {
-            StretchTiming::Speed | StretchTiming::Warp => clip.stretch.clone(),
-            StretchTiming::Off | StretchTiming::Tempo => {
-                clip.stretch.with_timing(StretchTiming::Speed, project_bpm)
-            }
+        let mut next = if clip.stretch.mode == StretchMode::Warp {
+            // Warp keeps its own speed; it plays its window at the project
+            // tempo, `seconds × ratio` long.
+            let mut next = clip.stretch.clone();
+            next.set_stretch_ratio(requested_len as f64 * seconds_per_beat as f64 / source_seconds);
+            next.clip_timeline_duration_beats = 0.0;
+            next
+        } else {
+            let Some(source_bpm) = clip
+                .stretch
+                .source_bpm_for_beats(requested_len as f64, project_bpm)
+            else {
+                return false;
+            };
+            clip.stretch.fitted_to_source_bpm(source_bpm, project_bpm)
         };
-        next.set_stretch_ratio(requested_ratio);
-        next.clip_timeline_duration_beats = 0.0;
-        // The ratio is clamped, so derive the length from what was accepted.
-        let new_len = (source_seconds * next.stretch_ratio / seconds_per_beat as f64)
-            .max(MIN_AUDIO_CLIP_BEATS as f64) as f32;
+        // The stretch is bounded, so derive the length from what was accepted.
+        let new_len = match next.fitted_beats() {
+            Some(beats) if next.mode == StretchMode::TempoSync => beats,
+            _ => source_seconds * next.stretch_ratio / seconds_per_beat as f64,
+        }
+        .max(MIN_AUDIO_CLIP_BEATS as f64) as f32;
         let new_start = match edge {
             ClipEdge::Right => old_start,
             ClipEdge::Left => (old_end - new_len).max(0.0),
@@ -925,7 +1049,8 @@ impl TimelineState {
             self.snap_beats_with_bypass(new_edge_beat, bypass_snap)
                 .max(0.0)
         };
-        let seconds_per_beat = self.seconds_per_beat();
+        let project_bpm = self.bpm.max(1.0) as f64;
+        let tempo = self.resolved_tempo_map();
         let project_rate = self.project_sample_rate;
         let Some(track) = self
             .tracks
@@ -967,7 +1092,7 @@ impl TimelineState {
                 // Right-edge drag = source trim: keep source_start, follow the new
                 // length with source_end (clamped to media). Shared with the
                 // inspector Length field so both crop/reveal, never stretch.
-                clip.reconcile_audio_trim_to_length(seconds_per_beat, min_len);
+                clip.reconcile_audio_trim_to_length(&tempo, project_bpm, min_len);
             }
             ClipEdge::Left => {
                 let old_start = clip.start_beat;
@@ -981,11 +1106,18 @@ impl TimelineState {
                 // stretching the waveform (spec §4). Stretched clips reveal
                 // through their ratio.
                 let trims_source = clip.audio_trim_follows_length();
-                let frames_per_second = clip.source_frames_per_timeline_second(seconds_per_beat);
+                let frames_per_second = clip.source_frames_per_played_second(project_bpm);
                 if trims_source {
-                    let max_reveal_beats = clip.stretch.source_start_samples as f64
-                        / (frames_per_second * seconds_per_beat as f64).max(f64::MIN_POSITIVE);
-                    let min_new_start = (old_start as f64 - max_reveal_beats).max(0.0) as f32;
+                    // The audio before the window plays for this long; the
+                    // left edge can reveal no further back than that.
+                    let max_reveal_seconds = clip.stretch.source_start_samples as f64
+                        / frames_per_second.max(f64::MIN_POSITIVE);
+                    let min_new_start = clip.beat_after_played_seconds(
+                        old_start as f64,
+                        -max_reveal_seconds,
+                        &tempo,
+                        project_bpm,
+                    ) as f32;
                     new_start = new_start.max(min_new_start);
                 }
                 // Trimming from the left must not push the earliest note < 0.
@@ -1004,9 +1136,12 @@ impl TimelineState {
                 clip.start_beat = new_start;
                 clip.duration_beats = (old_right - new_start).max(min_len);
                 if trims_source {
-                    let trim_delta_samples = ((new_start - old_start) as f64
-                        * seconds_per_beat as f64
-                        * frames_per_second)
+                    let trim_delta_samples = (clip.played_seconds_between(
+                        old_start as f64,
+                        new_start as f64,
+                        &tempo,
+                        project_bpm,
+                    ) * frames_per_second)
                         .round() as i64;
                     let current_start = clip.stretch.source_start_samples as i64;
                     let next_start = (current_start + trim_delta_samples).max(0) as u64;

@@ -22,6 +22,12 @@ pub mod combo_box;
 pub mod command_palette;
 pub mod context_menu;
 pub mod controls;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod drum_sampler_menu;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod drum_sampler_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod drum_sampler_window;
 pub mod edit;
 mod editor_panel;
 mod effect_editor_tab_view;
@@ -60,6 +66,7 @@ pub(crate) use mixer_window::{external_mixer_debug, external_mixer_debug_enabled
 pub mod gpu_editor_diagnostics;
 pub mod inspector_kit;
 pub mod native_editor_shell;
+pub mod native_plugin_shell;
 pub mod numeric_edit;
 pub mod panel;
 mod performance_overlay;
@@ -78,13 +85,71 @@ pub mod plugin_shell_text;
 pub mod progress_dialog;
 pub mod project_settings_window;
 pub mod project_switcher;
+#[cfg(feature = "builtin-plugin-editor")]
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod eq_graph;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod eq_model;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod eq_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod eq_window;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod fx_model;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod fx_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod fx_window;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod white_sharp_meter;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod white_sharp_model;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod white_sharp_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod white_sharp_window;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod band_model;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod band_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod imager_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod dyn_model;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod dyn_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod gate_model;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod gate_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod mix_station_model;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod mix_station_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod plugin_kit;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod plugin_live;
+pub mod quick_sampler_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod quick_sampler_window;
 pub mod reorder;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod rodhareist_blocks;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod rodhareist_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod rodhareist_window;
 pub mod routing_matrix_window;
 pub mod scroll_thumb;
 pub mod settings_components;
 pub mod settings_dialog;
 pub mod settings_layout;
 mod sidebar;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod slicer_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod slicer_window;
 pub mod slider;
 pub mod solfege_editor;
 pub mod song_text_panel;
@@ -107,6 +172,10 @@ pub mod virtual_keyboard;
 pub mod virtual_speaker_window;
 #[cfg(feature = "gpu-renderer")]
 pub mod visualizer;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod wrap_synth_panel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod wrap_synth_window;
 
 pub use about_window::{open_about_window, AboutWindow};
 pub use add_track_dialog::{

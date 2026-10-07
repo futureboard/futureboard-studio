@@ -1,0 +1,122 @@
+/* EchoSpace and VerbSpace (fx.tsx): the native time-effect editor's toolbar,
+   twin displays and knob cards (fx_panel.rs), in the page's tokens. */
+
+.fx-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  min-width: 0;
+}
+
+.fx-caption {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+.fx-off {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The two displays share a row 3:2 and stack on a narrow screen. */
+.fx-displays {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+
+.fx-display {
+  display: flex;
+  flex-direction: column;
+  flex-basis: 0;
+  min-width: min(100%, 220px);
+}
+
+.fx-plot {
+  height: 260px;
+  min-height: 150px;
+}
+
+.fx-tags {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  right: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.fx-tag {
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.fx-notice {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 14px;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.fx-notice span {
+  padding: 4px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-titlebar);
+  color: var(--text-secondary);
+  font-size: 10px;
+  text-align: center;
+}
+
+.fx-axis {
+  position: relative;
+  height: 16px;
+  overflow: hidden;
+}
+
+.fx-axis span {
+  position: absolute;
+  top: 2px;
+  width: 40px;
+  margin-left: -20px;
+  text-align: center;
+  font-size: 10px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* A knob card is never narrower than its knobs (fx_panel::section), and
+   never wider than the screen. */
+.fx-card {
+  min-width: min(100%, calc(var(--fx-knobs) * 68px + 16px));
+}
+
+.fx-idle {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.fx-idle .knob svg {
+  cursor: default;
+}
+
+@media (max-width: 640px) {
+  .fx-plot {
+    height: 180px;
+  }
+}

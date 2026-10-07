@@ -30,6 +30,7 @@ members = [
     "crates/SphereWebView",
     "crates/SphereJamClient",
     "crates/SphereAraHost",
+    "crates/LiveStageEngine",
 
     # Vendored ARA 2 bindings, trimmed to the host-side crates Futureboard uses.
     # See `crates/Ara2Bridge/VENDORING.md` for provenance and local changes.
@@ -51,14 +52,18 @@ members = [
     "crates/BuiltinAudioPlugins/crates/burnLimit",
     "crates/BuiltinAudioPlugins/crates/67Clipper",
     "crates/BuiltinAudioPlugins/crates/Transient",
+    "crates/BuiltinAudioPlugins/crates/waygate",
     "crates/BuiltinAudioPlugins/crates/c1073",
     "crates/BuiltinAudioPlugins/crates/meowsyn",
     "crates/BuiltinAudioPlugins/crates/wrapsynth",
     "crates/BuiltinAudioPlugins/crates/drumsampler",
+    "crates/BuiltinAudioPlugins/crates/quicksampler",
+    "crates/BuiltinAudioPlugins/crates/slicer",
     "crates/BuiltinAudioPlugins/crates/zcomp",
     "crates/BuiltinAudioPlugins/crates/mixstation",
     "crates/BuiltinAudioPlugins/crates/rodharerist",
     "crates/BuiltinAudioPlugins/crates/verbspace",
+    "crates/BuiltinAudioPlugins/crates/whitesharp",
     "crates/solfege_spatialaudio",
     "xtask"
 ]
@@ -108,6 +113,7 @@ sphere-encoder = { path = "crates/SphereEncoder", features = ["mp3"] }
 sphere-graphic-engine = { path = "crates/SphereGraphicEngine" }
 sphere-midi-service = { path = "crates/SphereMidiService", package = "SphereMidiService" }
 sphere-plugin-host = { path = "crates/SpherePluginHost", default-features = false }
+livestage-engine = { path = "crates/LiveStageEngine", default-features = false }
 sphere-soundfont-player = { path = "crates/SphereSoundfontPlayer", package = "SphereSoundfontPlayer" }
 solfege_spatialaudio = { path = "crates/solfege_spatialaudio" }
 # Video preview/reference decoding for the arrangement Video Track. Uses OS
@@ -147,14 +153,18 @@ fa76 = { path = "crates/BuiltinAudioPlugins/crates/fa76" }
 burnlimit = { path = "crates/BuiltinAudioPlugins/crates/burnLimit" }
 clipper67 = { path = "crates/BuiltinAudioPlugins/crates/67Clipper" }
 transient = { path = "crates/BuiltinAudioPlugins/crates/Transient" }
+waygate = { path = "crates/BuiltinAudioPlugins/crates/waygate" }
 c1073 = { path = "crates/BuiltinAudioPlugins/crates/c1073" }
 meowsyn = { path = "crates/BuiltinAudioPlugins/crates/meowsyn" }
 wrapsynth = { path = "crates/BuiltinAudioPlugins/crates/wrapsynth" }
 drumsampler = { path = "crates/BuiltinAudioPlugins/crates/drumsampler" }
+quicksampler = { path = "crates/BuiltinAudioPlugins/crates/quicksampler" }
+slicer = { path = "crates/BuiltinAudioPlugins/crates/slicer" }
 zcomp = { path = "crates/BuiltinAudioPlugins/crates/zcomp" }
 mixstation = { path = "crates/BuiltinAudioPlugins/crates/mixstation" }
 rodharerist = { path = "crates/BuiltinAudioPlugins/crates/rodharerist" }
 verbspace = { path = "crates/BuiltinAudioPlugins/crates/verbspace" }
+whitesharp = { path = "crates/BuiltinAudioPlugins/crates/whitesharp" }
 
 # MIT/Apache-2.0 DSP libraries used by BuiltinAudioPlugins.
 biquad = "0.6"

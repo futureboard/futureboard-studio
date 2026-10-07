@@ -91,6 +91,9 @@ pub use SpherePluginHost::plugin_host_client;
 pub use SpherePluginHost::plugin_host_lifecycle;
 pub use SpherePluginHost::plugin_host_main_window;
 pub use SpherePluginHost::process_manager::PluginHostProcessManager;
+/// Offscreen PNG previews of native views, for `bin/preview.rs`.
+#[cfg(feature = "ui-preview")]
+pub mod preview;
 pub mod splash;
 pub mod startup;
 pub mod theme;
