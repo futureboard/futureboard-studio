@@ -8,6 +8,7 @@
 [![Status](https://img.shields.io/badge/status-pre--alpha-f59e0b?style=for-the-badge&labelColor=0f172a)](ARCHITECTURE.md)
 [![License](https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge&labelColor=0f172a)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-38bdf8?style=for-the-badge&labelColor=0f172a)](CONTRIBUTING.md)
+[![Join our Discord](https://img.shields.io/badge/Join%20our-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/Mx2BWRmwSA)
 [![Translate on Crowdin](https://img.shields.io/badge/Translate-Crowdin-2e3340?style=for-the-badge&logo=crowdin&logoColor=white&labelColor=0f172a)](https://crowdin.com/project/futureboard-studio)
 
 [![Rust](https://img.shields.io/badge/Rust-2024-f97316?style=for-the-badge&logo=rust&logoColor=white&labelColor=0f172a)](https://rustup.rs)
@@ -171,14 +172,14 @@ Built-in plug-ins are Rust DSP hosted by the plug-in host. Each has its own
 editor, a compiled web view embedded in the binary — the one place Futureboard
 uses web technology.
 
-| Kind        | Plug-ins                                                                   |
-| ----------- | -------------------------------------------------------------------------- |
-| Dynamics    | Compressor (single and multiband) · FA-2A · FA-76 · Z-Comp · Transient     |
-| EQ &amp; color  | EQ-Z8 · C1073 · 67Clipper · BurnLimit                                      |
-| Space       | EchoSpace · VerbSpace · Imager                                             |
-| Utility     | MixStation                                                                 |
-| Amp rig     | Rodhareist                                                                 |
-| Instruments | WrapSynth · Drum Sampler                                                   |
+| Kind           | Plug-ins                                                               |
+| -------------- | ---------------------------------------------------------------------- |
+| Dynamics       | Compressor (single and multiband) · FA-2A · FA-76 · Z-Comp · Transient |
+| EQ &amp; color | EQ-Z8 · C1073 · 67Clipper · BurnLimit                                  |
+| Space          | EchoSpace · VerbSpace · Imager                                         |
+| Utility        | MixStation                                                             |
+| Amp rig        | Rodhareist                                                             |
+| Instruments    | WrapSynth · Drum Sampler                                               |
 
 ---
 
@@ -260,11 +261,11 @@ cargo run -p xtask -- package --profile dev --edition community --plugin all
 
 Distributables:
 
-| Target  | Command                                                                      |
-| ------- | ---------------------------------------------------------------------------- |
-| Windows | `bun run bundle:native:win` — Inno Setup installer (`packaging/windows`)     |
+| Target  | Command                                                                            |
+| ------- | ---------------------------------------------------------------------------------- |
+| Windows | `bun run bundle:native:win` — Inno Setup installer (`packaging/windows`)           |
 | macOS   | `bun run bundle:native:mac` · `bun run bundle:native:mac:dmg` (`packaging/native`) |
-| Linux   | `packaging/linux/bundle-appimage.sh` — AppImage · `packaging/aur` — AUR package |
+| Linux   | `packaging/linux/bundle-appimage.sh` — AppImage · `packaging/aur` — AUR package    |
 
 ### macOS universal (Apple Silicon + Intel)
 
@@ -298,24 +299,24 @@ other architecture's image.
 
 ### Platform notes
 
-| Platform | Audio backends                  | Setup                                                         |
-| -------- | ------------------------------- | ------------------------------------------------------------- |
-| Windows  | WASAPI (shared and exclusive) · WDM-KS | `rustup default stable-msvc`                           |
-| macOS    | CoreAudio                       | `xcode-select --install`                                      |
-| Linux    | ALSA                            | `sudo apt install libasound2-dev` · `sudo pacman -S alsa-lib` |
+| Platform | Audio backends                         | Setup                                                         |
+| -------- | -------------------------------------- | ------------------------------------------------------------- |
+| Windows  | WASAPI (shared and exclusive) · WDM-KS | `rustup default stable-msvc`                                  |
+| macOS    | CoreAudio                              | `xcode-select --install`                                      |
+| Linux    | ALSA                                   | `sudo apt install libasound2-dev` · `sudo pacman -S alsa-lib` |
 
 ASIO is available in Professional Edition only.
 
 ### Scripts
 
-| Script                                                                          | Runs                                                  |
-| ------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `dev:native`                                                                    | `cargo run -p futureboard_native`                     |
+| Script                                                                          | Runs                                                     |
+| ------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `dev:native`                                                                    | `cargo run -p futureboard_native`                        |
 | `build:native` · `build:native:debug`                                           | `xtask package` (release / dev, Community, all plug-ins) |
-| `build:plugin-editors`                                                          | Build every built-in plug-in editor bundle            |
-| `bundle:native:win` · `bundle:native:mac[:dmg]` · `installer:native:win`        | Package distributables                                |
-| `cargo:check` · `cargo:build` · `cargo:release` · `cargo:test` · `cargo:clippy` | Rust workspace passthroughs                           |
-| `cargo:fmt[:check]` · `check` · `lint` · `fmt`                                  | Formatting and combined checks                        |
+| `build:plugin-editors`                                                          | Build every built-in plug-in editor bundle               |
+| `bundle:native:win` · `bundle:native:mac[:dmg]` · `installer:native:win`        | Package distributables                                   |
+| `cargo:check` · `cargo:build` · `cargo:release` · `cargo:test` · `cargo:clippy` | Rust workspace passthroughs                              |
+| `cargo:fmt[:check]` · `check` · `lint` · `fmt`                                  | Formatting and combined checks                           |
 
 ---
 
@@ -327,18 +328,18 @@ rendering framework behind the Zed editor — owns the shell, windows, commands
 and state; the audio engine runs in process; plug-ins run in a separate host
 process so a crashing plug-in cannot take the session down.
 
-| Crate                                                          | Purpose                                                        |
-| -------------------------------------------------------------- | -------------------------------------------------------------- |
-| [`SphereUIComponents`](crates/SphereUIComponents)              | The GPUI shell, editors, mixer, windows and theme              |
-| [`SphereDirectAudioEngine`](crates/SphereDirectAudioEngine)    | Real-time engine: graph, transport, mixing, recording, export  |
-| [`SpherePluginHost`](crates/SpherePluginHost)                  | Plug-in scanning, the out-of-process host and editor bridging  |
-| [`BuiltinAudioPlugins`](crates/BuiltinAudioPlugins)            | Built-in plug-in DSP and their embedded editors                |
-| [`SphereWebView`](crates/SphereWebView)                        | CEF host for the built-in plug-in editors                      |
-| [`SphereSoundfontPlayer`](crates/SphereSoundfontPlayer)        | The built-in SoundFont instrument                              |
-| [`SphereMidiService`](crates/SphereMidiService)                | MIDI devices, programs and MPE                                 |
-| [`SphereAudioProcessor`](crates/SphereAudioProcessor)          | Time-stretch, pitch and audio analysis                         |
-| [`Ara2Bridge`](crates/Ara2Bridge) · [`SphereAraHost`](crates/SphereAraHost) | ARA 2 hosting                                     |
-| [`gpui`](crates/gpui)                                          | The GPUI fork the app is built on                              |
+| Crate                                                                       | Purpose                                                       |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| [`SphereUIComponents`](crates/SphereUIComponents)                           | The GPUI shell, editors, mixer, windows and theme             |
+| [`SphereDirectAudioEngine`](crates/SphereDirectAudioEngine)                 | Real-time engine: graph, transport, mixing, recording, export |
+| [`SpherePluginHost`](crates/SpherePluginHost)                               | Plug-in scanning, the out-of-process host and editor bridging |
+| [`BuiltinAudioPlugins`](crates/BuiltinAudioPlugins)                         | Built-in plug-in DSP and their embedded editors               |
+| [`SphereWebView`](crates/SphereWebView)                                     | CEF host for the built-in plug-in editors                     |
+| [`SphereSoundfontPlayer`](crates/SphereSoundfontPlayer)                     | The built-in SoundFont instrument                             |
+| [`SphereMidiService`](crates/SphereMidiService)                             | MIDI devices, programs and MPE                                |
+| [`SphereAudioProcessor`](crates/SphereAudioProcessor)                       | Time-stretch, pitch and audio analysis                        |
+| [`Ara2Bridge`](crates/Ara2Bridge) · [`SphereAraHost`](crates/SphereAraHost) | ARA 2 hosting                                                 |
+| [`gpui`](crates/gpui)                                                       | The GPUI fork the app is built on                             |
 
 Other native apps share the same crates: `jamsession` (standalone Audio Jam
 client), `singer` (Solfege instrument playground) and `apakinstaller` (signed
