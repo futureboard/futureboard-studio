@@ -270,6 +270,16 @@ impl FxEditorWindow {
         self.set_params(next, cx);
     }
 
+    /// Loads VerbSpace space type `mode`'s starting point: the space knobs
+    /// move to the type's values, as ordinary wire edits that save and undo
+    /// like any other. The DSP never reads the mode itself.
+    pub(crate) fn load_verb_type(&mut self, mode: verbspace::ReverbMode, cx: &mut Context<Self>) {
+        if let FxParams::Verb(p) = &self.params {
+            let next = FxParams::Verb(mode.starting_point(p));
+            self.set_params(next, cx);
+        }
+    }
+
     pub(crate) fn toggle(&mut self, id: &str, cx: &mut Context<Self>) {
         let on = self.params.flag(id);
         self.set_value(id, if on { 0.0 } else { 1.0 }, cx);
@@ -565,7 +575,7 @@ pub const FX_WINDOW_MIN_HEIGHT: f32 = 520.0;
 pub fn fx_window_size(kind: FxKind) -> (f32, f32) {
     match kind {
         // Wide enough for every knob card on one row.
-        FxKind::Verb => (980.0, 600.0),
+        FxKind::Verb => (1_160.0, 600.0),
         FxKind::Echo => (1_040.0, 620.0),
     }
 }

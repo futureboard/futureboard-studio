@@ -66,7 +66,7 @@ impl KitModel for DynKind {
             DynParams::Fa76(_) => "FET limiting amplifier".into(),
             DynParams::Zcomp(p) => format!("Multi-circuit dynamics · {}", p.model.display_name()),
             DynParams::BurnLimit(_) => "Loudness maximizer".into(),
-            DynParams::Clipper(_) => "Clipper and peak limiter".into(),
+            DynParams::Clipper(_) => "Oversampled clipper and peak limiter".into(),
             DynParams::Transient(_) => "Attack and sustain shaper".into(),
         }
     }
@@ -267,7 +267,11 @@ fn transfer(e: &KitEditor<DynKind>) -> gpui::Div {
             format!("{:.1} dB · {:.1}:1", c.threshold_db, c.ratio)
         }
         DynParams::BurnLimit(p) => format!("Ceiling {:.1} dB", p.ceiling_db),
-        DynParams::Clipper(p) => format!("Ceiling {:.1} dB", p.ceiling_db),
+        DynParams::Clipper(p) => format!(
+            "Clip {:.1} dB · {}",
+            clipper67::clip_level_db(p),
+            p.oversampling.label()
+        ),
         _ => String::new(),
     };
     let curve = canvas(
@@ -365,6 +369,14 @@ fn paint_transfer(
         match params {
             DynParams::Zcomp(_) => dashed(window, (x_at(db), y0), (x_at(db), y0 + h), 1.0, color),
             _ => dashed(window, (x0, y_at(db)), (x0 + w, y_at(db)), 1.0, color),
+        }
+    }
+    // A clipper threshold under its ceiling is where it clips.
+    if let DynParams::Clipper(p) = params {
+        if p.threshold_db < p.ceiling_db {
+            let db = p.threshold_db;
+            let color = Colors::with_alpha(Colors::accent_primary(), 0.7);
+            dashed(window, (x0, y_at(db)), (x0 + w, y_at(db)), 1.0, color);
         }
     }
 
@@ -536,6 +548,28 @@ fn vu_switch(e: &KitEditor<DynKind>, cx: &mut Cx<DynKind>, captioned: bool) -> A
         .into_any_element()
 }
 
+/// 67Clipper's oversampling choice, in wire order.
+const CLIPPER_OVERSAMPLING: [&str; 4] = [
+    clipper67::Oversampling::X1.label(),
+    clipper67::Oversampling::X2.label(),
+    clipper67::Oversampling::X4.label(),
+    clipper67::Oversampling::X8.label(),
+];
+
+/// What the clipper's settings cost in delay: the filters' fixed taps and
+/// the lookahead, as `clipper67::latency_for` adds them.
+fn clipper_latency_hint(p: &clipper67::Params) -> String {
+    let filters = p.oversampling.factor() > 1;
+    let lookahead = p.mode.looks_ahead();
+    let ms = clipper67::LOOKAHEAD_SECONDS * 1_000.0;
+    match (filters, lookahead) {
+        (false, false) => "Zero latency".to_string(),
+        (false, true) => format!("Latency {ms:.0} ms lookahead"),
+        (true, false) => format!("Latency {} samples", clipper67::TAPS_PER_PHASE),
+        (true, true) => format!("Latency {} samples + {ms:.0} ms", clipper67::TAPS_PER_PHASE),
+    }
+}
+
 fn controls(e: &KitEditor<DynKind>, cx: &mut Cx<DynKind>) -> AnyElement {
     let row = div()
         .flex()
@@ -687,29 +721,58 @@ fn controls(e: &KitEditor<DynKind>, cx: &mut Cx<DynKind>) -> AnyElement {
                         .child(options),
                 ))
         }
-        DynParams::Clipper(_) => {
+        DynParams::Clipper(p) => {
+            let limiting = p.mode == clipper67::Mode::Limit;
+            let latency = clipper_latency_hint(p);
             let mode = mode_card(e, cx, "MODE");
-            let options = div()
+            // Input pushes, Threshold says where it clips, Shape how round.
+            let shape = knob_for(e, cx, "shape", HERO_KNOB, limiting.then_some("Limit"));
+            let clipping = div()
+                .flex()
+                .flex_col()
+                .gap(px(space::HAIR))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap(px(space::TIGHT))
+                        .child(hero(e, cx, "inputDb"))
+                        .child(hero(e, cx, "thresholdDb"))
+                        .child(shape),
+                )
+                .child(hint("Unity under the knee · Shape 0 % hard, 100 % soft"));
+            let labels = CLIPPER_OVERSAMPLING;
+            let selected = e.value("oversampling").round().clamp(0.0, 3.0) as usize;
+            let quality = div()
                 .flex()
                 .flex_col()
                 .gap(px(space::SNUG))
+                .child(choice(
+                    e,
+                    cx,
+                    "clipper-os",
+                    &labels,
+                    Some(selected),
+                    |this, index, cx| this.set_value("oversampling", index as f32, cx),
+                ))
+                .child(hint(latency))
                 .child(flag(e, cx, "dcFilter", "DC Filter", true))
-                .child(flag(e, cx, "stereoLink", "Stereo Link", true));
-            let clipping = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(space::TIGHT))
-                .child(hero(e, cx, "thresholdDb"))
-                .child(hero(e, cx, "shape"))
-                .child(hint("0 % hard · 100 % soft"));
+                .child(flag(e, cx, "stereoLink", "Stereo Link", true))
+                .child(flag(e, cx, "delta", "Delta (what is clipped)", true));
+            let quality_w = crate::components::plugin_kit::track_width(&labels);
             row.children(mode)
-                .child(card("CLIPPING", 2.0, 2.0 * KNOB_PITCH + 130.0, clipping))
+                .child(card("DRIVE · CLIP", 3.0, 3.0 * KNOB_PITCH + 60.0, clipping))
                 .child(knob_card(
                     "OUTPUT",
                     vec![k(e, cx, "ceilingDb"), k(e, cx, "mix")],
                 ))
-                .child(card("OPTIONS", 1.0, 140.0, options))
+                .child(card(
+                    "OVERSAMPLING",
+                    1.0,
+                    quality_w + 2.0 * space::BASE + 2.0,
+                    quality,
+                ))
         }
         DynParams::Transient(_) => row
             .child(knob_card(
@@ -758,18 +821,20 @@ fn markers(params: &DynParams) -> Vec<Marker> {
             label: format!("Ceiling {:.1} dB", p.ceiling_db),
             color: Colors::accent_warning(),
         }],
-        DynParams::Clipper(p) => vec![
-            Marker {
+        // The threshold only marks a level when it sits under the ceiling.
+        DynParams::Clipper(p) => (p.threshold_db < p.ceiling_db)
+            .then(|| Marker {
                 db: p.threshold_db,
                 label: format!("Threshold {:.1} dB", p.threshold_db),
                 color: Colors::accent_primary(),
-            },
-            Marker {
+            })
+            .into_iter()
+            .chain([Marker {
                 db: p.ceiling_db,
                 label: format!("Ceiling {:.1} dB", p.ceiling_db),
                 color: Colors::accent_warning(),
-            },
-        ],
+            }])
+            .collect(),
         _ => Vec::new(),
     }
 }

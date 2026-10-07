@@ -54,6 +54,7 @@ builtin-plugin-editor = [
     "dep:burnlimit",
     "dep:clipper67",
     "dep:transient",
+    "dep:waygate",
     "dep:wrapsynth",
     "dep:drumsampler",
     "dep:quicksampler",
@@ -112,6 +113,7 @@ fa76 = { workspace = true, optional = true }
 burnlimit = { workspace = true, optional = true }
 clipper67 = { workspace = true, optional = true }
 transient = { workspace = true, optional = true }
+waygate = { workspace = true, optional = true }
 wrapsynth = { workspace = true, optional = true }
 drumsampler = { workspace = true, optional = true }
 quicksampler = { workspace = true, optional = true }

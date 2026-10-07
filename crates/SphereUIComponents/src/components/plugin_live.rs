@@ -45,10 +45,16 @@ const NEEDLE_TAU_SEC: f32 = 0.3 / 4.6;
 pub const VU_REFERENCE_DBFS: f32 = -18.0;
 
 #[derive(Debug, Clone, Copy, Default)]
-struct HistoryPoint {
-    in_db: f32,
-    out_db: f32,
-    reduction_db: f32,
+pub(crate) struct HistoryPoint {
+    pub(crate) in_db: f32,
+    pub(crate) out_db: f32,
+    pub(crate) reduction_db: f32,
+    /// Rack position 0's input level. A single-stage built-in may carry its
+    /// own reading there: WayGate's key (`waygate::KEY_SLOT`).
+    pub(crate) slot_in_db: f32,
+    /// Whether rack position 0's output level is lit: WayGate's detector
+    /// state.
+    pub(crate) slot_lit: bool,
 }
 
 fn to_db(level: f32) -> f32 {
@@ -197,6 +203,8 @@ impl Live {
             in_db: to_db(frame.in_peak),
             out_db: to_db(frame.out_peak),
             reduction_db: frame.gain_reduction_db.max(0.0),
+            slot_in_db: to_db(frame.slot_in_peak[0]),
+            slot_lit: frame.slot_out_peak[0] >= 0.5,
         };
         self.write = (self.write + 1) % HISTORY;
         self.count = (self.count + 1).min(HISTORY);
@@ -242,8 +250,19 @@ impl Live {
         self.history[(self.write + HISTORY - 1 - age) % HISTORY]
     }
 
+    /// How many history points there are, up to [`HISTORY`].
+    pub(crate) fn history_len(&self) -> usize {
+        self.count
+    }
+
+    /// The history point `age` frames before the newest, for a family's own
+    /// history painter.
+    pub(crate) fn history_at(&self, age: usize) -> HistoryPoint {
+        self.point(age)
+    }
+
     /// The highest of a reading over the hold window.
-    fn held(&self, read: impl Fn(&HistoryPoint) -> f32) -> f32 {
+    pub(crate) fn held(&self, read: impl Fn(&HistoryPoint) -> f32) -> f32 {
         (0..self.count.min(HOLD_FRAMES))
             .map(|age| read(&self.point(age)))
             .fold(f32::NEG_INFINITY, f32::max)

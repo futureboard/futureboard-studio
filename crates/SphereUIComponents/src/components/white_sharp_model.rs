@@ -49,8 +49,8 @@ pub fn value(params: &Params, id: &str) -> f32 {
 // ── Presets ─────────────────────────────────────────────────────────────────
 
 /// What a preset sets: the correction *style*. The key, the scale, the
-/// removed and bypassed notes, the input type, tuning and levels belong to
-/// the song and the singer, and stay as they are.
+/// removed and bypassed notes, the input type, tuning, levels and latency
+/// mode belong to the song, the singer and the rig, and stay as they are.
 pub const STYLE_IDS: [&str; 15] = [
     "retuneMs",
     "humanize",
@@ -169,6 +169,7 @@ mod tests {
         song.scale = whitesharp::Scale::Minor;
         song.remove_mask = 0b101;
         song.input_type = whitesharp::InputType::Soprano;
+        song.latency = whitesharp::LatencyMode::Live;
         let hard = presets()
             .iter()
             .position(|p| p.name == "Hard Tune")
@@ -179,6 +180,7 @@ mod tests {
         assert_eq!(applied.scale, whitesharp::Scale::Minor);
         assert_eq!(applied.remove_mask, 0b101);
         assert_eq!(applied.input_type, whitesharp::InputType::Soprano);
+        assert_eq!(applied.latency, whitesharp::LatencyMode::Live);
         assert_eq!(matching_preset(&applied), Some(hard));
         // Changing the song keeps the preset recognised; the style does not.
         assert_eq!(matching_preset(&with(&applied, "key", 2.0)), Some(hard));

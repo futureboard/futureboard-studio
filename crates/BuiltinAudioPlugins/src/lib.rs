@@ -32,6 +32,7 @@ pub use fa76;
 pub use meowsyn;
 pub use mixstation;
 pub use transient;
+pub use waygate;
 pub use wrapsynth;
 pub use zcomp;
 
@@ -49,6 +50,7 @@ pub fn focus_descriptors() -> Vec<PluginDescriptor> {
         burnlimit::descriptor(),
         clipper67::descriptor(),
         transient::descriptor(),
+        waygate::descriptor(),
         c1073::descriptor(),
         meowsyn::descriptor(),
         wrapsynth::descriptor(),
@@ -75,6 +77,7 @@ mod tests {
         assert!(ids.contains(&burnlimit::PLUGIN_ID));
         assert!(ids.contains(&clipper67::PLUGIN_ID));
         assert!(ids.contains(&transient::PLUGIN_ID));
+        assert!(ids.contains(&waygate::PLUGIN_ID));
         assert!(ids.contains(&c1073::PLUGIN_ID));
         assert!(ids.contains(&meowsyn::PLUGIN_ID));
         assert!(ids.contains(&wrapsynth::PLUGIN_ID));
@@ -93,6 +96,7 @@ mod tests {
         let mut channel = c1073::Dsp::new(48_000.0);
         let mut ultimate = zcomp::Dsp::new(48_000.0);
         let mut strip = mixstation::Dsp::new(48_000.0);
+        let mut gate = waygate::Dsp::new(48_000.0);
 
         for dsp in [
             &mut eq as &mut dyn StereoEffect,
@@ -103,6 +107,7 @@ mod tests {
             &mut channel,
             &mut ultimate,
             &mut strip,
+            &mut gate,
         ] {
             let (l, r) = dsp.process_stereo(0.2, -0.1);
             assert!(l.is_finite() && r.is_finite());

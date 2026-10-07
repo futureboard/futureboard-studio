@@ -26,6 +26,7 @@ use crate::components::eq_model::{EqKind, EqParams, Placement, Shape};
 use crate::components::eq_window::EqEditorWindow;
 use crate::components::fx_model::{presets, FxKind, FxParams};
 use crate::components::fx_window::{fx_window_size, FxEditorWindow};
+use crate::components::gate_panel::WayGateModel;
 use crate::components::mix_station_panel::MixStationModel;
 use crate::components::native_plugin_shell::ShellIdentity;
 use crate::components::plugin_kit::{KitModel, KitWindow};
@@ -191,6 +192,12 @@ pub fn scenes() -> Vec<Scene> {
             open: whitesharp_scene,
         },
         Scene {
+            name: "whitesharp-live",
+            width: WHITESHARP_WINDOW_SIZE.0,
+            height: WHITESHARP_WINDOW_SIZE.1,
+            open: whitesharp_live_scene,
+        },
+        Scene {
             name: "fa2a",
             width: DynKind::Fa2a.window_size().0,
             height: DynKind::Fa2a.window_size().1,
@@ -225,6 +232,18 @@ pub fn scenes() -> Vec<Scene> {
             width: DynKind::Transient.window_size().0,
             height: DynKind::Transient.window_size().1,
             open: transient_scene,
+        },
+        Scene {
+            name: "waygate",
+            width: WayGateModel.window_size().0,
+            height: WayGateModel.window_size().1,
+            open: waygate_scene,
+        },
+        Scene {
+            name: "waygate-duck",
+            width: WayGateModel.window_size().0,
+            height: WayGateModel.window_size().1,
+            open: waygate_duck_scene,
         },
         Scene {
             name: "compressor-single",
@@ -403,7 +422,22 @@ fn open_eq(
 // ── WhiteSharp ─────────────────────────────────────────────────────────────
 
 fn whitesharp_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    whitesharp_window(options, cx, whitesharp::LatencyMode::Quality)
+}
+
+/// The same insert on the live path: no added delay, formant controls
+/// unavailable.
+fn whitesharp_live_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    whitesharp_window(options, cx, whitesharp::LatencyMode::Live)
+}
+
+fn whitesharp_window(
+    options: WindowOptions,
+    cx: &mut App,
+    latency: whitesharp::LatencyMode,
+) -> Result<AnyWindowHandle> {
     let mut params = whitesharp::default_params();
+    params.latency = latency;
     params.key = 2;
     params.scale = whitesharp::Scale::Major;
     params.retune_ms = 12.0;
@@ -612,6 +646,118 @@ fn clipper67_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHand
 
 fn transient_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     open_dyn(options, cx, DynKind::Transient, "Punch Up", 4.0)
+}
+
+/// Ten seconds of WayGate telemetry, measured by running the real DSP at
+/// `params` over a synthetic tom track: a hit every 0.75 s, ringing out,
+/// over a bed of kit bleed. One frame per ~33 ms block, as the host
+/// publishes them.
+fn waygate_frames(
+    params: &waygate::Params,
+) -> Arc<Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame>> {
+    use waygate::StereoEffect;
+    const SR: f32 = 48_000.0;
+    const BLOCK: usize = 1_600;
+    let mut dsp = waygate::Dsp::new(SR);
+    dsp.set_params(params.clone());
+    let mut seed = 0x2545_f491u32;
+    let mut noise = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as f32 / u32::MAX as f32 * 2.0 - 1.0
+    };
+    let mut frames = Vec::with_capacity(300);
+    for block in 0..300 {
+        for n in 0..BLOCK {
+            let i = block * BLOCK + n;
+            let since_hit = (i % 36_000) as f32 / SR;
+            // Every fourth "hit" is the next tom's bleed: loud enough to sit
+            // in the hysteresis band, too quiet to open the gate.
+            let velocity = if (i / 36_000) % 4 == 3 { 0.022 } else { 0.7 };
+            let tom = velocity
+                * (-since_hit / 0.07).exp()
+                * (std::f32::consts::TAU * 110.0 * since_hit).sin();
+            let bleed = 0.006 * noise();
+            let x = tom + bleed;
+            dsp.process_stereo(x, x);
+        }
+        let f = dsp.meter_frame();
+        let (slot_in_peak, slot_out_peak) = f.rack_slots();
+        frames.push(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+            in_peak: f.in_peak,
+            in_rms: f.in_rms,
+            out_peak: f.out_peak,
+            out_rms: f.out_rms,
+            gain_reduction_db: f.gain_reduction_db,
+            in_clip: f.in_clip,
+            out_clip: f.out_clip,
+            slot_in_peak,
+            slot_out_peak,
+        });
+    }
+    Arc::new(frames)
+}
+
+fn open_waygate(
+    options: WindowOptions,
+    cx: &mut App,
+    insert: &'static str,
+    params: waygate::Params,
+) -> Result<AnyWindowHandle> {
+    if let Ok(json) = waygate::ipc::WayGateState::new(params.clone()).to_json() {
+        seed("waygate", insert, json);
+    }
+    let frames = waygate_frames(&params);
+    let source = frames.clone();
+    let tick = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let host_ops = BuiltinEditorHostOps {
+        meter_source: Some(Arc::new(move |_| {
+            let at = tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            source.get(at % source.len()).copied()
+        })),
+        ..preview_host_ops()
+    };
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let window = KitWindow::new(
+                WayGateModel,
+                key(insert),
+                identity("WayGate"),
+                host_ops,
+                no_close(),
+                cx,
+            );
+            {
+                let mut live = window.live().borrow_mut();
+                for frame in frames.iter() {
+                    live.show(*frame);
+                }
+            }
+            window
+        })
+    })?;
+    Ok(handle.into())
+}
+
+fn waygate_preset(name: &str) -> waygate::Params {
+    waygate::factory_presets()
+        .into_iter()
+        .find(|preset| preset.name == name)
+        .map_or_else(waygate::default_params, |preset| preset.params)
+}
+
+fn waygate_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_waygate(options, cx, "waygate", waygate_preset("Tom"))
+}
+
+fn waygate_duck_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let params = waygate::Params {
+        mode: waygate::Mode::Duck,
+        range_db: -12.0,
+        ..waygate_preset("Vocal")
+    };
+    open_waygate(options, cx, "waygate-duck", params)
 }
 
 fn band_preset(kind: BandKind, name: &str) -> crate::components::band_model::BandParams {

@@ -809,11 +809,12 @@ fn segment_position(index: usize, count: usize) -> FbSegment {
 }
 
 /// The width a segmented track needs for labels: segments split a track
-/// equally, so each is as wide as the widest label.
+/// equally, so each is as wide as the widest label, and never narrower than
+/// `fb_segment`'s own 44 px minimum.
 pub(crate) fn track_width<S: AsRef<str>>(labels: &[S]) -> f32 {
     let widest = labels
         .iter()
-        .map(|label| (label.as_ref().chars().count() as f32 * 8.0 + 2.0 * space::BASE).max(40.0))
+        .map(|label| (label.as_ref().chars().count() as f32 * 8.0 + 2.0 * space::BASE).max(44.0))
         .fold(0.0f32, f32::max);
     widest * labels.len() as f32 + 2.0 * space::TIGHT + 2.0
 }

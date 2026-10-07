@@ -1,0 +1,116 @@
+/* WayGate's editor (gate.tsx): a row of displays over a row of control
+   cards, as the native gate_panel lays them out. */
+
+.gate-displays {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* A display column: its share of the row by flex-grow, never narrower than
+   its min-width (set inline, capped at the row's width for a phone). */
+.gate-col {
+  display: flex;
+  flex-direction: column;
+  flex-basis: 0;
+  height: 320px;
+  min-width: 0;
+}
+
+.gate-col > .pe-canvas {
+  flex: 1;
+}
+
+/* The meter bay: a fixed-width panel of four columns. */
+.gate-meters {
+  flex: 0 0 200px;
+  width: 200px;
+}
+
+.gate-well {
+  display: flex;
+  flex: 1;
+  padding: 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-panel);
+  min-height: 0;
+}
+
+.gate-well > .pe-canvas {
+  flex: 1;
+}
+
+.gate-bare {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+
+/* The passing notice along a display's bottom edge. */
+.gate-notice {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  max-width: calc(100% - 24px);
+  padding: 4px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-size: 10px;
+  text-align: center;
+  pointer-events: none;
+}
+
+.gate-cluster {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.gate-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.gate-stack.hair {
+  gap: 2px;
+}
+
+/* A segmented choice is as wide as its labels, not its column. */
+.gate-stack > .segments {
+  align-self: flex-start;
+}
+
+.gate-hint {
+  max-width: 160px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* Segments split a track equally, as the native segmented track does. */
+.gate-track {
+  display: flex;
+}
+
+.gate-track button {
+  flex: 1 1 0;
+  justify-content: center;
+  padding: 0 8px;
+}
+
+@media (max-width: 640px) {
+  .gate-col {
+    height: 240px;
+  }
+
+  .gate-meters {
+    flex-grow: 1;
+  }
+}

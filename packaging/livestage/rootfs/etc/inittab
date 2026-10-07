@@ -4,8 +4,9 @@
 ::sysinit:/sbin/openrc boot
 ::wait:/sbin/openrc default
 
-# Two consoles: the banner on tty1 says where the web UI is.
-tty1::respawn:/sbin/getty 38400 tty1
+# tty1: the setup on the first boot, then the machine's status (where the web
+# UI is, the mixer, the network). tty2 (Alt+F2): a login shell.
+tty1::respawn:/usr/bin/livestage-setup --console
 tty2::respawn:/sbin/getty 38400 tty2
 
 ::ctrlaltdel:/sbin/reboot

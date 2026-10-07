@@ -227,7 +227,8 @@ pub fn presets(kind: DynKind) -> Arc<Vec<KitPreset<DynParams>>> {
 }
 
 /// `preset` as it would play here: power stays as it is, and Z-Comp's
-/// SC Listen — a listening aid, not a sound — stays off.
+/// SC Listen — a listening aid, not a sound — stays off. 67Clipper keeps its
+/// oversampling (a latency choice) and Delta (a listening aid).
 pub fn preset_applied(current: &DynParams, preset: &DynParams) -> DynParams {
     if current.kind() != preset.kind() {
         return current.clone();
@@ -235,6 +236,9 @@ pub fn preset_applied(current: &DynParams, preset: &DynParams) -> DynParams {
     let next = preset.with("power", if current.power() { 1.0 } else { 0.0 });
     match &next {
         DynParams::Zcomp(_) => next.with("scListen", current.value("scListen")),
+        DynParams::Clipper(_) => next
+            .with("oversampling", current.value("oversampling"))
+            .with("delta", current.value("delta")),
         _ => next,
     }
 }
@@ -279,6 +283,7 @@ pub fn knob(kind: DynKind, id: &str) -> Option<KnobSpec> {
         (BurnLimit, "ceilingDb") => ("Ceiling", Taper::Linear, Unit::Db),
         (BurnLimit, "releaseMs") => ("Release", Taper::Log, Unit::Ms),
         (BurnLimit, "lookaheadMs") => ("Lookahead", Taper::Linear, Unit::Ms),
+        (Clipper, "inputDb") => ("Input", Taper::Linear, Unit::Db),
         (Clipper, "thresholdDb") => ("Threshold", Taper::Linear, Unit::Db),
         (Clipper, "shape") => ("Shape", Taper::Linear, Unit::Percent),
         (Clipper, "ceilingDb") => ("Ceiling", Taper::Linear, Unit::Db),
@@ -295,6 +300,7 @@ pub fn knob(kind: DynKind, id: &str) -> Option<KnobSpec> {
         (Fa2a, "gainDb" | "outputTrimDb")
             | (Zcomp, "makeupDb")
             | (BurnLimit, "gainDb")
+            | (Clipper, "inputDb")
             | (Transient, "attack" | "sustain")
     );
     Some(knob)
@@ -337,7 +343,7 @@ pub fn knob_ids(kind: DynKind) -> &'static [&'static str] {
             "mix",
         ],
         DynKind::BurnLimit => &["gainDb", "ceilingDb", "releaseMs", "lookaheadMs", "mix"],
-        DynKind::Clipper => &["thresholdDb", "shape", "ceilingDb", "mix"],
+        DynKind::Clipper => &["inputDb", "thresholdDb", "shape", "ceilingDb", "mix"],
         DynKind::Transient => &["attack", "sustain", "speed", "mix"],
     }
 }
@@ -378,9 +384,9 @@ pub fn choice_hint(params: &DynParams) -> &'static str {
             burnlimit::Style::Clip => "Near-hard 0.2 dB knee, 0.05 ms attack",
         },
         DynParams::Clipper(p) => match p.mode {
-            clipper67::Mode::Clip => "Soft clipper only",
-            clipper67::Mode::Hybrid => "Clipper plus peak gain reduction",
-            clipper67::Mode::Limit => "Clipper plus the strongest peak gain reduction",
+            clipper67::Mode::Clip => "Clips at the threshold, untouched below the knee",
+            clipper67::Mode::Hybrid => "Clips 3 dB past the knee, 1 ms limiter beyond",
+            clipper67::Mode::Limit => "1 ms lookahead peak limiter at the threshold",
         },
         DynParams::Transient(_) => "",
     }
@@ -453,6 +459,18 @@ mod tests {
     }
 
     #[test]
+    fn a_clipper_preset_keeps_oversampling_and_delta() {
+        let live = DynParams::defaults(DynKind::Clipper)
+            .with("oversampling", clipper67::Oversampling::X1.to_wire())
+            .with("delta", 1.0);
+        for preset in presets(DynKind::Clipper).iter() {
+            let applied = preset_applied(&live, &preset.params);
+            assert_eq!(applied.value("oversampling"), 0.0, "{}", preset.name);
+            assert_eq!(applied.value("delta"), 1.0, "{}", preset.name);
+        }
+    }
+
+    #[test]
     fn every_knob_round_trips_through_its_taper() {
         for kind in DynKind::ALL {
             for id in knob_ids(kind) {
@@ -488,7 +506,7 @@ mod tests {
     fn transfer_curves_rest_on_unity_below_the_action() {
         // Far under every threshold, the static curves pass the level as is.
         let quiet = -70.0;
-        for kind in [DynKind::Zcomp, DynKind::BurnLimit] {
+        for kind in [DynKind::Zcomp, DynKind::BurnLimit, DynKind::Clipper] {
             let params = DynParams::defaults(kind);
             let out = params.transfer_db(quiet).unwrap();
             assert!((out - quiet).abs() < 0.2, "{kind:?}: {out}");

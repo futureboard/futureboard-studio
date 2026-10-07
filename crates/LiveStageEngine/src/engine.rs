@@ -535,9 +535,14 @@ impl LiveEngine {
             }
             Command::AddInsert {
                 strip,
-                plugin,
+                mut plugin,
                 index,
             } => {
+                if let InsertPlugin::Builtin { stem, params } = &mut plugin {
+                    for &(param, value) in crate::builtin_fx::stage_defaults(stem) {
+                        params.entry(param).or_insert(value);
+                    }
+                }
                 let id = self.session.allocate_id();
                 let slot = InsertSlot {
                     id,

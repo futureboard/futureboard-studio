@@ -190,7 +190,13 @@ pub fn open(
     let (out_channels, out_format) =
         pick_config(&output, false, sample_rate).map_err(|e| format!("{output_name}: {e}"))?;
 
-    let input = find_device(&host, settings.input_device.as_deref(), true);
+    // One ALSA device both ways (`hw:CARD=USB,DEV=0`): the output's handle
+    // already holds its capture side open, so looking it up again finds the
+    // card busy. Record through the same handle.
+    let input = match settings.input_device.as_deref() {
+        Some(name) if cfg!(target_os = "linux") && name == output_name => Some(output.clone()),
+        name => find_device(&host, name, true),
+    };
     let input_config = input
         .as_ref()
         .map(|device| pick_config(device, true, sample_rate))

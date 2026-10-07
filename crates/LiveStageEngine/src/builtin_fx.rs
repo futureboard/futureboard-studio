@@ -57,6 +57,11 @@ pub const BUILTIN_EFFECTS: &[BuiltinEffectInfo] = &[
         category: "Dynamics",
     },
     BuiltinEffectInfo {
+        stem: "waygate",
+        name: "WayGate",
+        category: "Dynamics",
+    },
+    BuiltinEffectInfo {
         stem: "clipper67",
         name: "67Clipper",
         category: "Dynamics",
@@ -106,6 +111,29 @@ pub fn display_name(stem: &str) -> Option<&'static str> {
     effect_info(stem).map(|info| info.name)
 }
 
+/// Wire values a *new* insert of `stem` starts with on stage, where they
+/// differ from the effect's own defaults: written into the insert's stored
+/// params when it is added, so every editor shows them and a session saved
+/// before keeps what it had. WhiteSharp starts on its live path — a singer
+/// hears it in the monitors, where its Quality delay would be heard.
+/// 67Clipper starts at 1× oversampling: LiveStage compensates no delay, and
+/// Clip mode at 1× has none.
+pub fn stage_defaults(stem: &str) -> &'static [(u32, f32)] {
+    const WHITESHARP: &[(u32, f32)] = &[(
+        whitesharp::ipc::LATENCY_INDEX,
+        whitesharp::LatencyMode::Live.to_wire(),
+    )];
+    const CLIPPER67: &[(u32, f32)] = &[(
+        clipper67::ipc::OVERSAMPLING_INDEX,
+        clipper67::Oversampling::X1.to_wire(),
+    )];
+    match stem {
+        "whitesharp" => WHITESHARP,
+        "clipper67" => CLIPPER67,
+        _ => &[],
+    }
+}
+
 /// One parameter of a built-in effect, addressed by its wire index: what a
 /// remote control without the native editor needs to draw a control for it.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -153,6 +181,7 @@ pub fn builtin_params(stem: &str) -> Vec<BuiltinParam> {
         "fa76" => params_of!(fa76::descriptor, fa76::ipc::ui_param_index),
         "zcomp" => params_of!(zcomp::descriptor, zcomp::ipc::ui_param_index),
         "transient" => params_of!(transient::descriptor, transient::ipc::ui_param_index),
+        "waygate" => params_of!(waygate::descriptor, waygate::ipc::ui_param_index),
         "clipper67" => params_of!(clipper67::descriptor, clipper67::ipc::ui_param_index),
         "burnlimit" => params_of!(burnlimit::descriptor, burnlimit::ipc::ui_param_index),
         "mixstation" => params_of!(mixstation::descriptor, mixstation::ipc::ui_param_index),
@@ -236,6 +265,7 @@ pub fn builtin_spec(stem: &str) -> Option<BuiltinSpec> {
             transient::ipc::UI_PARAM_IDS,
             transient::ipc::ui_values
         ),
+        "waygate" => spec_of!(waygate, waygate::ipc::UI_PARAM_IDS, waygate::ipc::ui_values),
         "clipper67" => spec_of!(
             clipper67,
             clipper67::ipc::UI_PARAM_IDS,
@@ -300,6 +330,7 @@ pub enum BuiltinFx {
     Fa76(fa76::Dsp),
     Zcomp(zcomp::Dsp),
     Transient(transient::Dsp),
+    WayGate(waygate::Dsp),
     Clipper67(clipper67::Dsp),
     BurnLimit(burnlimit::Dsp),
     MixStation(mixstation::Dsp),
@@ -321,6 +352,7 @@ macro_rules! with_dsp {
             BuiltinFx::Fa76($dsp) => $body,
             BuiltinFx::Zcomp($dsp) => $body,
             BuiltinFx::Transient($dsp) => $body,
+            BuiltinFx::WayGate($dsp) => $body,
             BuiltinFx::Clipper67($dsp) => $body,
             BuiltinFx::BurnLimit($dsp) => $body,
             BuiltinFx::MixStation($dsp) => $body,
@@ -346,6 +378,7 @@ impl BuiltinFx {
             "fa76" => Self::Fa76(fa76::Dsp::new(sr)),
             "zcomp" => Self::Zcomp(zcomp::Dsp::new(sr)),
             "transient" => Self::Transient(transient::Dsp::new(sr)),
+            "waygate" => Self::WayGate(waygate::Dsp::new(sr)),
             "clipper67" => Self::Clipper67(clipper67::Dsp::new(sr)),
             "burnlimit" => Self::BurnLimit(burnlimit::Dsp::new(sr)),
             "mixstation" => Self::MixStation(mixstation::Dsp::new(sr)),
@@ -388,6 +421,9 @@ impl BuiltinFx {
                 let _ = dsp.apply_wire_param(index, value);
             }
             Self::Transient(dsp) => {
+                let _ = dsp.apply_wire_param(index, value);
+            }
+            Self::WayGate(dsp) => {
                 let _ = dsp.apply_wire_param(index, value);
             }
             Self::Clipper67(dsp) => {
@@ -458,6 +494,24 @@ impl BuiltinFx {
             Self::Zcomp(dsp) => frame!(dsp.meter_frame(), f => f.gain_reduction_db),
             // Shaping goes either way; the frame carries its size.
             Self::Transient(dsp) => frame!(dsp.meter_frame(), f => f.gain_reduction_db),
+            // The gate's attenuation as reduction; a single stage, so the
+            // rack blocks carry the key and the detector's state
+            // (`waygate::KEY_SLOT`), as in Studio's host.
+            Self::WayGate(dsp) => {
+                let f = dsp.meter_frame();
+                let (slot_in_peak, slot_out_peak) = f.rack_slots();
+                LevelFrame {
+                    in_peak: f.in_peak,
+                    in_rms: f.in_rms,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    gain_reduction_db: f.gain_reduction_db,
+                    in_clip: f.in_clip,
+                    out_clip: f.out_clip,
+                    slot_in_peak,
+                    slot_out_peak,
+                }
+            }
             Self::Clipper67(dsp) => frame!(dsp.meter_frame(), f => f.gain_reduction_db),
             Self::BurnLimit(dsp) => frame!(dsp.meter_frame(), f => f.gain_reduction_db),
             // Multiband: the largest band's; the bands come apart in
@@ -535,6 +589,24 @@ pub struct ImageFrameRef {
 mod tests {
     use super::*;
 
+    /// A new WhiteSharp on stage starts on its live path; its stage default
+    /// is a real wire value of a real parameter.
+    #[test]
+    fn whitesharp_starts_live_on_stage() {
+        let spec = builtin_spec("whitesharp").expect("whitesharp spec");
+        for &(index, value) in stage_defaults("whitesharp") {
+            assert!((index as usize) < spec.ids.len());
+            assert_ne!(spec.defaults[index as usize], value, "not a default");
+        }
+        let mut dsp = whitesharp::Dsp::new(48_000.0);
+        assert!(dsp.latency_samples() > 1_000, "Quality by itself");
+        for &(index, value) in stage_defaults("whitesharp") {
+            assert!(dsp.apply_wire_param(index, value));
+        }
+        assert_eq!(dsp.latency_samples(), whitesharp::splice::LATENCY);
+        assert!(stage_defaults("fa76").is_empty());
+    }
+
     /// Every catalog entry builds, processes a block to finite samples, and
     /// takes a wire parameter without panicking.
     #[test]
@@ -554,6 +626,23 @@ mod tests {
             );
         }
         assert!(BuiltinFx::new("not-an-effect", 48_000).is_none());
+    }
+
+    /// With no delay compensation on stage, a new 67Clipper starts at zero
+    /// latency (Studio's default oversamples, and reports its delay).
+    #[test]
+    fn the_clipper_starts_without_latency_on_stage() {
+        let Some(BuiltinFx::Clipper67(mut dsp)) = BuiltinFx::new("clipper67", 48_000) else {
+            panic!("clipper67 builds");
+        };
+        assert!(dsp.latency_samples() > 0, "4× by itself");
+        let spec = builtin_spec("clipper67").expect("spec");
+        for &(index, value) in stage_defaults("clipper67") {
+            assert_eq!(spec.ids[index as usize], "oversampling");
+            assert_ne!(spec.defaults[index as usize], value, "not a default");
+            assert!(dsp.apply_wire_param(index, value));
+        }
+        assert_eq!(dsp.latency_samples(), 0);
     }
 
     /// Every effect describes its parameters, each on a distinct wire index
@@ -606,5 +695,28 @@ mod tests {
             }
         }
         assert!(builtin_spec("not-an-effect").is_none());
+    }
+
+    /// WayGate's frame: shut, it reports its range as reduction; open, the
+    /// key and the detector's state ride the rack blocks the editors read.
+    #[test]
+    fn waygate_reports_its_range_key_and_state() {
+        let mut fx = BuiltinFx::new("waygate", 48_000).unwrap();
+        fx.apply_wire_param(waygate::ipc::RANGE_INDEX, -30.0);
+        let mut left = vec![0.001f32; 256];
+        let mut right = left.clone();
+        fx.process(&mut left, &mut right);
+        let shut = fx.level_frame().expect("the gate meters itself");
+        assert!((shut.gain_reduction_db - 30.0).abs() < 1.0e-3);
+        assert_eq!(shut.slot_out_peak[waygate::KEY_SLOT], 0.0);
+
+        let mut left = vec![0.5f32; 256];
+        let mut right = left.clone();
+        fx.process(&mut left, &mut right);
+        let open = fx.level_frame().expect("the gate meters itself");
+        assert_eq!(open.gain_reduction_db, 0.0);
+        assert_eq!(open.slot_out_peak[waygate::KEY_SLOT], 1.0);
+        assert!(open.slot_in_peak[waygate::KEY_SLOT] > 0.4);
+        assert_eq!(left[255], 0.5);
     }
 }

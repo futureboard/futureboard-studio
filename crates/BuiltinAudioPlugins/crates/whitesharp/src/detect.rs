@@ -38,6 +38,15 @@ pub fn hop_seconds(sample_rate: f32) -> f32 {
     (decimation * hop) as f32 / sample_rate.max(1.0)
 }
 
+/// The [`Detector::centre_lag`] and [`Detector::hop_samples`] of a detector
+/// at `sample_rate` ranged down to `lowest_hz`, without building one.
+pub fn timing(sample_rate: f32, lowest_hz: f32) -> (usize, usize) {
+    let (decimation, hop) = steps(sample_rate);
+    let rate = sample_rate / decimation as f32;
+    let tau_max = ((rate / lowest_hz).ceil() as usize).max(4);
+    (tau_max * decimation, hop * decimation)
+}
+
 /// One estimate.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Estimate {

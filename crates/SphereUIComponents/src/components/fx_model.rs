@@ -192,13 +192,15 @@ pub fn presets(kind: FxKind) -> Arc<Vec<Preset>> {
 }
 
 /// `preset` as it would play here: a preset carries no listening state, so
-/// power and freeze stay as they are.
+/// power and freeze (and VerbSpace's Wet Only routing) stay as they are.
 pub fn preset_applied(current: &FxParams, preset: &FxParams) -> FxParams {
     let mut next = preset.clone();
     match (&mut next, current) {
         (FxParams::Verb(next), FxParams::Verb(current)) => {
             next.power = current.power;
             next.freeze = current.freeze;
+            // Wet Only is how the insert is routed (a send bus), not a sound.
+            next.wet_only = current.wet_only;
         }
         (FxParams::Echo(next), FxParams::Echo(current)) => {
             next.power = current.power;
@@ -423,6 +425,9 @@ pub fn knob(kind: FxKind, id: &str) -> Option<KnobSpec> {
         (FxKind::Verb, "diffusion") => ("Diffusion", Taper::Linear, Unit::Percent),
         (FxKind::Verb, "damping") => ("Damping", Taper::Linear, Unit::Percent),
         (FxKind::Verb, "bassMult") => ("Bass", Taper::Log, Unit::Times),
+        (FxKind::Verb, "bassFreqHz") => ("Bass Freq", Taper::Log, Unit::Hz),
+        (FxKind::Verb, "dampFreqHz") => ("Damp Freq", Taper::Log, Unit::Hz),
+        (FxKind::Verb, "earlyLate") => ("Early/Late", Taper::Linear, Unit::Percent),
         (FxKind::Verb, "modDepth") => ("Depth", Taper::Linear, Unit::Percent),
         (FxKind::Verb, "modRateHz") => ("Rate", Taper::Log, Unit::Hz),
         (FxKind::Echo, "timeMsL") => ("Time L", Taper::Log, Unit::Ms),
@@ -540,6 +545,9 @@ mod tests {
                     "diffusion",
                     "damping",
                     "bassMult",
+                    "bassFreqHz",
+                    "dampFreqHz",
+                    "earlyLate",
                     "modDepth",
                     "modRateHz",
                     "lowCutHz",

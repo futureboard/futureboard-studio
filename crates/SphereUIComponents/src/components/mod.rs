@@ -119,6 +119,10 @@ pub mod dyn_model;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod dyn_panel;
 #[cfg(feature = "builtin-plugin-editor")]
+pub mod gate_model;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod gate_panel;
+#[cfg(feature = "builtin-plugin-editor")]
 pub mod mix_station_model;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod mix_station_panel;

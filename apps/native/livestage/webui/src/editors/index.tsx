@@ -8,6 +8,7 @@ import { editors as band } from './band.tsx'
 import { editors as dynamics } from './dynamics.tsx'
 import { editors as eq } from './eq.tsx'
 import { editors as fx } from './fx.tsx'
+import { editors as gate } from './gate.tsx'
 import type { Editor, EditorComponent } from './kit.tsx'
 import { Card, EditorShell, KitKnob, ParamCheck, ParamChoice, useEditor } from './kit.tsx'
 import type { KnobSpec, Unit } from './knobspec.ts'
@@ -17,6 +18,7 @@ import { editors as whitesharp } from './whitesharp.tsx'
 
 const REGISTRY: Record<string, EditorComponent> = {
   ...dynamics,
+  ...gate,
   ...band,
   ...mixstation,
   ...eq,

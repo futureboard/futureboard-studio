@@ -39,6 +39,32 @@ const SCALES: readonly (readonly [string, readonly number[]])[] = [
 
 /** InputType::ALL in wire order. */
 const INPUT_TYPES = ['Soprano', 'Alto/Tenor', 'Low Male', 'Instrument', 'Bass Inst.']
+/** The lowest pitch each input type tracks (InputType::range_hz). */
+const INPUT_LOWEST_HZ = [150, 90, 60, 50, 30]
+
+/** LatencyMode::ALL in wire order. */
+const LATENCY_MODES: readonly (readonly [number, string])[] = [
+  [0, 'Quality'],
+  [1, 'Live'],
+]
+const LIVE = 1
+
+/** The delay the insert runs at, in samples (latency_samples_for, with
+ *  detect::timing and Shifter::latency_for_input): Live is the splice
+ *  path's fixed two; Quality is three of the input type's longest periods
+ *  plus the detector's lag. f32 like the crate, so the sample counts agree. */
+function latencySamples(sr: number, inputType: number, live: boolean): number {
+  if (live) return 2
+  const f = Math.fround
+  const lowest = INPUT_LOWEST_HZ[inputType] ?? 90
+  const decimation = Math.max(1, Math.round(f(sr / 12000)))
+  const rate = f(sr / decimation)
+  const hop = Math.max(1, Math.round(f(f(rate * 4) * 0.001))) * decimation
+  const centreLag = Math.max(4, Math.ceil(f(rate / lowest))) * decimation
+  const unvoiced = Math.max(16, Math.round(f(sr * 0.005)))
+  const p = Math.max(Math.min(f(sr / lowest), f(sr / 30)), unvoiced)
+  return Math.ceil(3 * p) + centreLag + hop + 4
+}
 
 /** VibratoShape::ALL in wire order. */
 const VIBRATO_SHAPES: readonly (readonly [number, string])[] = [
@@ -87,7 +113,7 @@ const KNOBS: Record<string, KnobSpec> = {
 /** What a preset sets is the correction *style* (STYLE_IDS); the key, the
  *  scale, the note lists, the input type, tuning and levels belong to the
  *  song and the singer, so a preset leaves them as they are. */
-const SONG_IDS = ['key', 'scale', 'inputType', 'detune', 'tracking', 'removeMask', 'bypassMask', 'mix', 'outputDb']
+const SONG_IDS = ['key', 'scale', 'inputType', 'detune', 'tracking', 'removeMask', 'bypassMask', 'mix', 'outputDb', 'latency']
 
 const SIDE_KNOB = 52
 /** Retune Speed is the control the whole plug-in turns on. */
@@ -358,6 +384,11 @@ function WhiteSharp(props: { editor: Editor }) {
   const bypassMask = Math.round(editor.value('bypassMask')) & ALL_NOTES
   const classic = editor.flag('classic')
   const shape = Math.round(editor.value('vibratoShape'))
+  const latency = Math.round(editor.value('latency')) === LIVE ? LIVE : 0
+  // The live path has no grains to reshape: formant correction and throat
+  // need Quality's lookahead, so they show as unavailable in Live.
+  const shapes = latency !== LIVE
+  const delayMs = (latencySamples(editor.sampleRate, inputType, latency === LIVE) * 1000) / editor.sampleRate
 
   // A new key or scale starts from its own notes: lists made for the old
   // one would mark the wrong ones.
@@ -390,6 +421,17 @@ function WhiteSharp(props: { editor: Editor }) {
     <EditorShell editor={editor} title="WhiteSharp" subtitle="Auto pitch correction" keep={SONG_IDS} className="ws">
       <Card className="ws-settings">
         <div className="ws-settings-row">
+          <Setting title="LATENCY">
+            <div className="ws-cluster">
+              <Choice
+                value={latency}
+                options={LATENCY_MODES}
+                onChange={(v) => editor.set('latency', v)}
+                title="Quality: formant control, delayed. Live: no added delay, formants follow the pitch."
+              />
+              <span className="ws-delay">{delayMs < 1 ? delayMs.toFixed(2) : delayMs.toFixed(1)} ms</span>
+            </div>
+          </Setting>
           <Setting title="INPUT TYPE">
             <Picker
               value={inputType}
@@ -414,13 +456,20 @@ function WhiteSharp(props: { editor: Editor }) {
             <Picker value={scale} options={SCALES.map(([name]) => name)} width={150} title="Scale" onChange={setScale} />
           </Setting>
           <span className="ws-fill" />
-          <Setting title="FORMANT">
-            <div className="ws-formant">
-              <ParamCheck editor={editor} id="formant" label="Keep formants" />
+          <Setting title={shapes ? 'FORMANT' : 'FORMANT · QUALITY ONLY'}>
+            <div className={`ws-formant${shapes ? '' : ' ws-idle'}`}>
+              {shapes ? (
+                <ParamCheck editor={editor} id="formant" label="Keep formants" />
+              ) : (
+                <label className="pe-check">
+                  <input type="checkbox" checked={false} disabled readOnly />
+                  <span>Keep formants</span>
+                </label>
+              )}
             </div>
           </Setting>
           <div className="ws-knobs">
-            <WsKnob editor={editor} id="throat" />
+            <WsKnob editor={editor} id="throat" why={shapes ? null : 'Quality'} />
             <WsKnob editor={editor} id="transpose" />
             <WsKnob editor={editor} id="detune" />
             <WsKnob editor={editor} id="tracking" />

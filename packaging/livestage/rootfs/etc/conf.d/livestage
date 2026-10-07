@@ -1,5 +1,7 @@
-# LiveStage service settings. The root filesystem is read-only: put changes in
-# /data/livestage/livestage.conf instead (same variables), which wins.
+# LiveStage service settings. The root filesystem is read-only: the console's
+# setup (tty1) saves the web UI's address in /data/system/setup.conf, and
+# hand-made changes go in /data/livestage/livestage.conf (same variables),
+# which wins over both.
 
 # The session (mix) and where takes are recorded: both on the data partition.
 #LIVESTAGE_SESSION="/data/livestage/show.json"

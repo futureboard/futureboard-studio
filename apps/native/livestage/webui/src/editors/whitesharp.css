@@ -44,6 +44,14 @@
   font-size: 13px;
 }
 
+/* The latency mode's delay, as the insert reports it. */
+.ws-delay {
+  min-width: 52px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
 .ws-knobs {
   display: flex;
   flex-wrap: wrap;

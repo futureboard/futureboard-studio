@@ -46,6 +46,7 @@ fa76.workspace = true
 burnlimit.workspace = true
 clipper67.workspace = true
 transient.workspace = true
+waygate.workspace = true
 wrapsynth.workspace = true
 drumsampler.workspace = true
 quicksampler.workspace = true

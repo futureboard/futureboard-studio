@@ -1,7 +1,0 @@
-auto lo
-iface lo inet loopback
-
-# Wired network by DHCP. On a desk with no DHCP server, set a static address
-# here (remount / read-write first: mount -o remount,rw /).
-auto eth0
-iface eth0 inet dhcp

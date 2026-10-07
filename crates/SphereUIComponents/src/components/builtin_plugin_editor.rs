@@ -83,6 +83,7 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
         burnlimit::ui::UI_ORIGIN => burnlimit::ui_param_index(param_id),
         clipper67::ui::UI_ORIGIN => clipper67::ui_param_index(param_id),
         transient::ui::UI_ORIGIN => transient::ui_param_index(param_id),
+        waygate::ui::UI_ORIGIN => waygate::ui_param_index(param_id),
         wrapsynth::ui::UI_ORIGIN => wrapsynth::ui_param_index(param_id),
         drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_index(param_id),
         quicksampler::ui::UI_ORIGIN => quicksampler::ui_param_index(param_id),
@@ -136,6 +137,7 @@ mod state_mirror {
         BurnLimit(Box<burnlimit::Params>),
         Clipper67(Box<clipper67::Params>),
         Transient(Box<transient::Params>),
+        WayGate(Box<waygate::Params>),
         WrapSynth(Box<wrapsynth::Params>),
         DrumSampler(Box<drumsampler::Params>),
         QuickSampler(Box<quicksampler::Params>),
@@ -160,6 +162,7 @@ mod state_mirror {
                 Self::BurnLimit(_) => burnlimit::ui::UI_ORIGIN,
                 Self::Clipper67(_) => clipper67::ui::UI_ORIGIN,
                 Self::Transient(_) => transient::ui::UI_ORIGIN,
+                Self::WayGate(_) => waygate::ui::UI_ORIGIN,
                 Self::WrapSynth(_) => wrapsynth::ui::UI_ORIGIN,
                 Self::DrumSampler(_) => drumsampler::ui::UI_ORIGIN,
                 Self::QuickSampler(_) => quicksampler::ui::UI_ORIGIN,
@@ -199,6 +202,7 @@ mod state_mirror {
                 transient::ui::UI_ORIGIN => {
                     Some(Self::Transient(Box::new(transient::default_params())))
                 }
+                waygate::ui::UI_ORIGIN => Some(Self::WayGate(Box::new(waygate::default_params()))),
                 wrapsynth::ui::UI_ORIGIN => {
                     Some(Self::WrapSynth(Box::new(wrapsynth::default_params())))
                 }
@@ -262,6 +266,7 @@ mod state_mirror {
             burnlimit::ui::UI_ORIGIN => burnlimit::ui_param_id(wire_index).is_some(),
             clipper67::ui::UI_ORIGIN => clipper67::ui_param_id(wire_index).is_some(),
             transient::ui::UI_ORIGIN => transient::ui_param_id(wire_index).is_some(),
+            waygate::ui::UI_ORIGIN => waygate::ui_param_id(wire_index).is_some(),
             wrapsynth::ui::UI_ORIGIN => wrapsynth::ui_param_id(wire_index).is_some(),
             drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_id(wire_index).is_some(),
             quicksampler::ui::UI_ORIGIN => quicksampler::ui_param_id(wire_index).is_some(),
@@ -315,6 +320,9 @@ mod state_mirror {
             }
             Some(BuiltinParams::Transient(params)) => {
                 let _ = transient::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::WayGate(params)) => {
+                let _ = waygate::ipc::apply_wire_param(params, wire_index, value);
             }
             Some(BuiltinParams::WrapSynth(params)) => {
                 let _ = wrapsynth::ipc::apply_wire_param(params, wire_index, value);
@@ -387,6 +395,9 @@ mod state_mirror {
             transient::ui::UI_ORIGIN => transient::ipc::TransientState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Transient(Box::new(state.params))),
+            waygate::ui::UI_ORIGIN => waygate::ipc::WayGateState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::WayGate(Box::new(state.params))),
             wrapsynth::ui::UI_ORIGIN => wrapsynth::ipc::WrapSynthState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::WrapSynth(Box::new(state.params))),
@@ -489,6 +500,11 @@ mod state_mirror {
             }
             BuiltinParams::Transient(params) if origin == transient::ui::UI_ORIGIN => {
                 transient::ipc::TransientState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::WayGate(params) if origin == waygate::ui::UI_ORIGIN => {
+                waygate::ipc::WayGateState::new((**params).clone())
                     .to_json()
                     .ok()?
             }
@@ -643,6 +659,12 @@ mod state_mirror {
                 transient::ipc::ui_values(params)
                     .into_iter()
                     .filter_map(|(id, value)| transient::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
+            Some(BuiltinParams::WayGate(params)) if origin == waygate::ui::UI_ORIGIN => {
+                waygate::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| waygate::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
             Some(BuiltinParams::WrapSynth(params)) if origin == wrapsynth::ui::UI_ORIGIN => {
@@ -894,6 +916,16 @@ mod state_mirror {
         }
     }
 
+    /// A WayGate insert's mirrored params, like
+    /// [`builtin_verbspace_params`].
+    pub fn builtin_waygate_params(insert_id: &str) -> Option<waygate::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::WayGate(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
     /// A Compressor insert's mirrored params, like
     /// [`builtin_verbspace_params`].
     pub fn builtin_compresser_params(insert_id: &str) -> Option<compresser::Params> {
@@ -1022,8 +1054,8 @@ pub use state_mirror::{
     builtin_replay_changes, builtin_rodhareist_params, builtin_sample_names, builtin_slicer_params,
     builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
     builtin_state_replay, builtin_state_seed, builtin_state_set_sample, builtin_transient_params,
-    builtin_used_output_buses, builtin_verbspace_params, builtin_whitesharp_params,
-    builtin_wrapsynth_params, builtin_zcomp_params,
+    builtin_used_output_buses, builtin_verbspace_params, builtin_waygate_params,
+    builtin_whitesharp_params, builtin_wrapsynth_params, builtin_zcomp_params,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is
@@ -3153,6 +3185,7 @@ mod tests {
         assert_eq!(origin_for_plugin_id("builtin:burnlimit"), Some("burnlimit"));
         assert_eq!(origin_for_plugin_id("builtin:clipper67"), Some("clipper67"));
         assert_eq!(origin_for_plugin_id("builtin:transient"), Some("transient"));
+        assert_eq!(origin_for_plugin_id("builtin:waygate"), Some("waygate"));
         assert_eq!(
             origin_for_plugin_id("builtin:mixstation"),
             Some("mixstation")
@@ -3174,6 +3207,7 @@ mod tests {
         assert_eq!(origin_for_plugin_id("burnlimit"), Some("burnlimit"));
         assert_eq!(origin_for_plugin_id("clipper67"), Some("clipper67"));
         assert_eq!(origin_for_plugin_id("transient"), Some("transient"));
+        assert_eq!(origin_for_plugin_id("waygate"), Some("waygate"));
         assert_eq!(origin_for_plugin_id("mixstation"), Some("mixstation"));
         assert_eq!(
             origin_for_plugin_id("rodharerist"),
@@ -3321,6 +3355,34 @@ mod tests {
         assert!(mode_at < ratio_at, "mode must replay before the bands");
         assert!(replay.contains(&(ratio, 6.0)));
         assert!(builtin_state_bytes("imager", insert).is_none());
+    }
+
+    /// WayGate's edits land in the mirror, persist as a `WayGateState` blob,
+    /// replay in wire order, and are what its native editor reads back.
+    #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn waygate_state_is_mirrored_persisted_and_replayed() {
+        let insert = "test-insert-waygate-mirror";
+        let threshold =
+            builtin_param_index("waygate", "thresholdDb").expect("thresholdDb is an id");
+        let mode = builtin_param_index("builtin:waygate", "mode").expect("mode is an id");
+        assert!(builtin_param_index("waygate", "attack").is_none());
+        builtin_state_apply("waygate", insert, threshold, -33.0);
+        builtin_state_apply("waygate", insert, mode, 1.0);
+
+        let bytes = builtin_state_bytes("waygate", insert).expect("WayGate owns this state");
+        let json = String::from_utf8(bytes).expect("state blobs are UTF-8 JSON");
+        let state = waygate::ipc::WayGateState::from_json(&json).expect("a WayGate blob");
+        assert_eq!(state.params.threshold_db, -33.0);
+        assert_eq!(state.params.mode, waygate::Mode::Duck);
+
+        let replay = builtin_state_replay("waygate", insert);
+        assert_eq!(replay.len(), waygate::UI_PARAM_IDS.len());
+        assert!(replay.contains(&(threshold, -33.0)));
+        let mirrored = builtin_waygate_params(insert).expect("the editor reads it back");
+        assert_eq!(mirrored.threshold_db, -33.0);
+        assert!(builtin_state_bytes("transient", insert).is_none());
+        assert!(builtin_transient_params(insert).is_none());
     }
 
     /// The reload after project open asks the mirror which file each pad was

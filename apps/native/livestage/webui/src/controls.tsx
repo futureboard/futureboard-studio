@@ -342,6 +342,49 @@ export function Meter(props: { strip: string; tap?: 'output' | 'input' }) {
   )
 }
 
+/** A short horizontal level bar, both sides' louder one: enough to see at a
+ *  glance whether a strip has signal, in a table row. */
+export function LevelBar(props: { strip: string; tap?: 'output' | 'input'; title?: string }) {
+  const canvas = useRef<HTMLCanvasElement>(null)
+  const tap = props.tap ?? 'output'
+  useEffect(() => {
+    const element = canvas.current
+    if (!element) return
+    const context = element.getContext('2d')
+    if (!context) return
+    const width = 44
+    const height = 6
+    const ratio = window.devicePixelRatio || 1
+    element.width = width * ratio
+    element.height = height * ratio
+    context.setTransform(ratio, 0, 0, ratio, 0, 0)
+    const styles = getComputedStyle(document.documentElement)
+    const color = (name: string) => styles.getPropertyValue(name).trim()
+    const lit = [color('--meter-low'), color('--meter-mid'), color('--meter-high')]
+    const track = color('--surface-input')
+    const draw: Draw = (now) => {
+      const meter = meters.get(props.strip)
+      const level = meter ? meterFraction(Math.max(meter[tap][0], meter[tap][1])) : 0
+      const clipAt = meter ? (tap === 'output' ? meter.outputClip : meter.inputClip) : -Infinity
+      context.fillStyle = track
+      context.fillRect(0, 0, width, height)
+      const zone = now - clipAt < CLIP_HOLD_MS ? 2 : level <= GREEN_TOP ? 0 : level <= YELLOW_TOP ? 1 : 2
+      context.fillStyle = lit[zone]
+      context.fillRect(0, 0, Math.round(level * width), height)
+    }
+    drawers.add(draw)
+    if (!running) {
+      running = true
+      lastFrame = 0
+      requestAnimationFrame(frame)
+    }
+    return () => {
+      drawers.delete(draw)
+    }
+  }, [props.strip, tap])
+  return <canvas ref={canvas} className="level-bar" style={{ width: 44, height: 6 }} title={props.title} />
+}
+
 export function Latch(props: {
   on: boolean
   kind: 'mute' | 'solo' | 'arm' | 'plain'

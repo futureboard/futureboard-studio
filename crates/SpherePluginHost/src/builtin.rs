@@ -161,6 +161,14 @@ const CATALOG: &[BuiltinEntry] = &[
         editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
+        stem: "waygate",
+        name: "WayGate",
+        category: "Dynamics",
+        kind: PluginKind::Effect,
+        // Native GPUI editor (`sphere_ui_components::components::gate_panel`).
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
         stem: "c1073",
         name: "C1073",
         category: "EQ",
@@ -270,6 +278,7 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "burnlimit",
     "clipper67",
     "transient",
+    "waygate",
     "wrapsynth",
     "drumsampler",
     "zcomp",
@@ -434,6 +443,7 @@ mod tests {
             "burnlimit",
             "clipper67",
             "transient",
+            "waygate",
             "compresser",
             "imager",
             "mixstation",
@@ -482,6 +492,8 @@ mod tests {
         assert!(builtin_audio_bridge_supported("builtin:clipper67"));
         assert!(builtin_audio_bridge_supported("transient"));
         assert!(builtin_audio_bridge_supported("builtin:transient"));
+        assert!(builtin_audio_bridge_supported("waygate"));
+        assert!(builtin_audio_bridge_supported("builtin:waygate"));
         assert!(builtin_audio_bridge_supported("wrapsynth"));
         assert!(builtin_audio_bridge_supported("builtin:wrapsynth"));
         assert!(builtin_audio_bridge_supported("drumsampler"));
@@ -524,6 +536,7 @@ mod tests {
         assert_eq!(builtin_display_name("builtin:burnlimit"), Some("BurnLimit"));
         assert_eq!(builtin_display_name("builtin:clipper67"), Some("67Clipper"));
         assert_eq!(builtin_display_name("builtin:transient"), Some("Transient"));
+        assert_eq!(builtin_display_name("waygate"), Some("WayGate"));
         assert_eq!(builtin_display_name("builtin:wrapsynth"), Some("WrapSynth"));
         assert_eq!(builtin_display_name("compresser"), Some("Compressor"));
         assert_eq!(builtin_display_name("vst3:whatever"), None);

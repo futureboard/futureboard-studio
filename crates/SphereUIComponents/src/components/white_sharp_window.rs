@@ -225,6 +225,19 @@ impl WhiteSharpEditor {
         .detach();
     }
 
+    /// The rate the insert's host runs at, for the latency readout; a
+    /// nominal 48 kHz where no host reports one (LiveStage, previews) —
+    /// the readout in milliseconds barely moves with the rate.
+    pub(crate) fn sample_rate(&self) -> f32 {
+        self.host_ops
+            .host_status_source
+            .as_ref()
+            .and_then(|source| source(&self.key))
+            .map(|(rate, ..)| rate as f32)
+            .filter(|rate| *rate > 0.0)
+            .unwrap_or(48_000.0)
+    }
+
     pub(crate) fn notice(&self) -> Option<&str> {
         self.notice
             .as_ref()

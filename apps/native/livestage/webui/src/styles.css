@@ -1633,74 +1633,263 @@ svg {
   border-top: 1px solid var(--border-subtle);
 }
 
-.matrix-scroll {
-  overflow-x: auto;
+/* ── Patch: three routings, each at the full size of the window ─────────── */
+
+.patch {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
 }
 
-.matrix {
+.patch-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px 0;
+}
+
+.tab-count {
+  min-width: 20px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.tabs button.on .tab-count {
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+}
+
+.tab-count.armed {
+  background: color-mix(in srgb, var(--state-arm) 18%, var(--surface-raised));
+  color: var(--state-arm);
+}
+
+.patch-page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin: 12px 16px 16px;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-surface);
+  overflow: hidden;
+}
+
+.patch-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 16px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.patch-head h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.patch-head p {
+  margin: 2px 0 0;
+  max-width: 640px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.patch-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* The one scroll owner: both directions, headers and names pinned. */
+.patch-grid {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.patch-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex: 1;
+  padding: 32px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.matrix,
+.record-table {
   border-collapse: separate;
-  border-spacing: 4px;
-  margin: -4px;
+  border-spacing: 0;
 }
 
-.matrix th {
+.record-table {
+  width: 100%;
+}
+
+.matrix th,
+.matrix td {
+  padding: 3px;
   font-weight: 400;
 }
 
-.matrix thead th {
-  font-size: 11px;
+.matrix thead th,
+.record-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  height: 34px;
+  background: var(--surface-panel);
+  border-bottom: 1px solid var(--border-subtle);
   color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 400;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.matrix thead th {
+  min-width: 40px;
   text-align: center;
-  padding-bottom: 2px;
+}
+
+/* An input or output something is patched to: a mark under its number. */
+.matrix thead th.used {
+  color: var(--text-secondary);
+  box-shadow: inset 0 -2px 0 var(--accent-soft);
+}
+
+.matrix thead th.hot {
+  color: var(--accent);
+}
+
+.matrix thead th.matrix-corner,
+.record-table thead th.matrix-corner {
+  left: 0;
+  z-index: 3;
+  padding: 0 12px 0 16px;
+  text-align: left;
+  border-right: 1px solid var(--border-subtle);
+}
+
+.matrix-corner-unit {
+  float: right;
+  color: var(--text-faint);
 }
 
 .matrix-row {
   position: sticky;
   left: 0;
   z-index: 1;
-  min-width: 170px;
-  max-width: 220px;
-  padding-right: 12px;
+  min-width: 220px;
+  max-width: 280px;
+  padding: 6px 12px 6px 16px !important;
   background: var(--surface-panel);
+  border-right: 1px solid var(--border-subtle);
   text-align: left;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
-.matrix-row svg {
-  vertical-align: -2px;
-  margin-right: 4px;
+.matrix-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.matrix-name svg {
+  flex: none;
   color: var(--text-muted);
 }
 
-.matrix tbody tr:hover .matrix-row {
+.matrix-label {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.matrix-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.matrix-route {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* A meter: square, its lit edge is the value. */
+.level-bar {
+  display: block;
+  flex: none;
+}
+
+.matrix tbody tr:hover .matrix-row,
+.record-table tbody tr:hover .matrix-row {
+  background: var(--surface-control-hover);
+}
+
+.matrix tbody tr:hover .matrix-label,
+.record-table tbody tr:hover .matrix-label {
   color: var(--accent);
 }
 
+.matrix tr.group-start > *,
+.record-table tr.group-start > * {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.matrix td {
+  vertical-align: middle;
+}
+
 .matrix-st {
-  padding-left: 8px;
+  padding-left: 10px !important;
 }
 
 .cell {
   display: grid;
   place-items: center;
-  width: 30px;
-  height: 26px;
+  width: 34px;
+  height: 30px;
   padding: 0;
   border: 1px solid var(--border-subtle);
   background: var(--surface-input);
-  border-radius: var(--r-sm);
+  border-radius: var(--r);
   color: var(--on-accent);
 }
 
 .cell.wide {
-  width: 46px;
+  width: 52px;
+}
+
+/* The crosshair: the row and the column under the pointer. */
+.matrix tbody tr:hover .cell,
+.cell.hot {
+  border-color: var(--border-strong);
 }
 
 .cell:hover {
-  border-color: var(--accent);
+  border-color: var(--accent) !important;
   background: var(--accent-muted);
 }
 
@@ -1711,6 +1900,65 @@ svg {
 
 .cell.lit:hover {
   background: var(--accent-hover);
+}
+
+.record-table thead th {
+  padding: 0 12px;
+  text-align: left;
+}
+
+.record-table td {
+  padding: 6px 12px;
+  white-space: nowrap;
+}
+
+.record-source,
+.record-width {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.record-file {
+  width: 100%;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.faint {
+  color: var(--text-faint);
+}
+
+/* Record arm: the arm hue on fill, border and dot together. */
+.arm {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r);
+  background: var(--surface-raised);
+}
+
+.arm:hover {
+  border-color: var(--border-strong);
+}
+
+.arm-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--state-arm) 55%, transparent);
+}
+
+.arm.on {
+  background: color-mix(in srgb, var(--state-arm) 18%, var(--surface-raised));
+  border-color: color-mix(in srgb, var(--state-arm) 55%, transparent);
+}
+
+.arm.on .arm-dot {
+  background: var(--state-arm);
+  border-color: var(--state-arm);
 }
 
 .field {
@@ -1813,6 +2061,28 @@ svg {
 
   .page {
     padding: 12px;
+  }
+
+  .patch-bar {
+    padding: 8px 8px 0;
+  }
+
+  .patch-page {
+    margin: 8px;
+  }
+
+  .patch-head {
+    padding: 12px;
+  }
+
+  .matrix-row {
+    min-width: 132px;
+    max-width: 160px;
+    padding-left: 10px !important;
+  }
+
+  .matrix-corner-unit {
+    display: none;
   }
 }
 

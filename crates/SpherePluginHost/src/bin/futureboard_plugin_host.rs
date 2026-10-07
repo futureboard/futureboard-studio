@@ -317,6 +317,7 @@ enum BuiltinDsp {
     BurnLimit(burnlimit::Dsp),
     Clipper67(clipper67::Dsp),
     Transient(transient::Dsp),
+    WayGate(waygate::Dsp),
     WrapSynth(wrapsynth::Dsp),
     DrumSampler(drumsampler::Dsp),
     QuickSampler(quicksampler::Dsp),
@@ -395,6 +396,7 @@ impl BuiltinHostProcessor {
             "burnlimit" => Some(Self::burnlimit(sample_rate, state_json)),
             "clipper67" => Some(Self::clipper67(sample_rate, state_json)),
             "transient" => Some(Self::transient(sample_rate, state_json)),
+            "waygate" => Some(Self::waygate(sample_rate, state_json)),
             "wrapsynth" => Some(Self::wrapsynth(sample_rate, state_json)),
             "drumsampler" => Some(Self::drumsampler(sample_rate, state_json)),
             "quicksampler" => Some(Self::quicksampler(sample_rate, state_json)),
@@ -634,6 +636,36 @@ impl BuiltinHostProcessor {
         }
         Self {
             dsp: UnsafeCell::new(BuiltinDsp::Transient(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn waygate(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        // Built here, on the IPC thread: the lookahead lines are allocated
+        // now, never on the producer.
+        let mut dsp = waygate::Dsp::new(sr);
+        if let Some(json) = state_json {
+            match waygate::ipc::WayGateState::from_json(json) {
+                Ok(state) => {
+                    dsp.set_params(state.params);
+                    eprintln!(
+                        "[plugin-host-builtin] restored state version={}",
+                        state.version
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] state blob rejected, using defaults: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::WayGate(dsp)),
             spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
             nam_loader: None,
             ir_loader: None,
@@ -1028,6 +1060,13 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
+            BuiltinDsp::WayGate(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
             BuiltinDsp::WrapSynth(dsp) => {
                 for i in 0..frames {
                     let (l, r) = dsp.process_stereo();
@@ -1347,6 +1386,24 @@ impl BuiltinHostProcessor {
                     slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
                 })
             }
+            BuiltinDsp::WayGate(dsp) => {
+                let f = dsp.meter_frame();
+                // A single stage: the rack blocks carry the key and the
+                // detector's state instead (`waygate::KEY_SLOT`).
+                let (slot_in_peak, slot_out_peak) = f.rack_slots();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    in_peak: f.in_peak,
+                    in_rms: f.in_rms,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    // What the gate is taking off: the range while closed.
+                    gain_reduction_db: f.gain_reduction_db,
+                    in_clip: f.in_clip,
+                    out_clip: f.out_clip,
+                    slot_in_peak,
+                    slot_out_peak,
+                })
+            }
             BuiltinDsp::Compresser(dsp) => {
                 let f = dsp.meter_frame();
                 Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
@@ -1391,6 +1448,8 @@ impl BuiltinHostProcessor {
             BuiltinDsp::BurnLimit(dsp) => dsp.latency_samples(),
             BuiltinDsp::Clipper67(dsp) => dsp.latency_samples(),
             BuiltinDsp::Transient(dsp) => dsp.latency_samples(),
+            // The lookahead, bypassed or not.
+            BuiltinDsp::WayGate(dsp) => dsp.latency_samples(),
             BuiltinDsp::Echospace(dsp) => dsp.latency_samples(),
             BuiltinDsp::Imager(dsp) => dsp.latency_samples(),
             BuiltinDsp::WrapSynth(_) => 0,
@@ -1448,6 +1507,9 @@ impl BuiltinHostProcessor {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::Transient(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::WayGate(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::WrapSynth(dsp) => {
@@ -2175,6 +2237,23 @@ mod builtin_processor_tests {
         let input_type = whitesharp::ui_param_index("inputType").expect("in the wire table");
         processor.apply_param(input_type, whitesharp::InputType::LowMale.to_wire());
         assert!(processor.latency_samples() > latency);
+
+        // So is the latency mode: Live reports the live path's two samples,
+        // which the block loop republishes for the engine's PDC refresh.
+        let mode = whitesharp::ui_param_index("latency").expect("in the wire table");
+        processor.apply_param(mode, whitesharp::LatencyMode::Live.to_wire());
+        assert_eq!(processor.latency_samples(), whitesharp::splice::LATENCY);
+        processor.process_block(&[0.0; 128], &[0.0; 128], &mut output, 128);
+        assert!(output.iter().all(|s| s.is_finite()));
+        processor.apply_param(mode, whitesharp::LatencyMode::Quality.to_wire());
+        assert_eq!(
+            processor.latency_samples(),
+            whitesharp::latency_samples_for(
+                48_000.0,
+                whitesharp::InputType::LowMale,
+                whitesharp::LatencyMode::Quality
+            )
+        );
     }
 
     /// Like the reverb, a delay's output outlives its input: the check that
@@ -2713,13 +2792,15 @@ mod builtin_processor_tests {
             .expect("clipper67 always publishes a frame");
         assert!(quiet.gain_reduction_db < 1.0);
 
-        // Alternating polarity so the optional DC blocker cannot erase the tone.
-        let mut loud = [0.0f32; 64];
+        // A 1 kHz tone: in band for the oversampling filters, and a whole
+        // number of cycles per block.
+        let mut loud = [0.0f32; 48];
         for (i, sample) in loud.iter_mut().enumerate() {
-            *sample = if i % 2 == 0 { 0.9 } else { -0.9 };
+            *sample = (std::f32::consts::TAU * i as f32 / 48.0).sin() * 0.9;
         }
-        for _ in 0..128 {
-            processor.process_block(&loud, &loud, &mut output, 64);
+        let mut output = [0.0f32; 96];
+        for _ in 0..170 {
+            processor.process_block(&loud, &loud, &mut output, 48);
         }
         let frame = processor
             .meter_frame()
@@ -2730,6 +2811,12 @@ mod builtin_processor_tests {
             frame.gain_reduction_db
         );
         assert!(frame.in_rms > 0.0);
+        // The default 4× filters plus Limit's 1 ms lookahead, for the
+        // host's delay compensation.
+        assert_eq!(
+            processor.latency_samples(),
+            clipper67::TAPS_PER_PHASE + clipper67::lookahead_samples(48_000.0)
+        );
     }
 
     #[test]
@@ -2741,24 +2828,45 @@ mod builtin_processor_tests {
             .expect("state serializes");
 
         let restored = BuiltinHostProcessor::clipper67(48_000, Some(&json));
-        let in_l = [0.25f32; 32];
-        let in_r = [-0.5f32; 32];
-        let mut output = [0.0f32; 64];
-        restored.process_block(&in_l, &in_r, &mut output, 32);
-        for i in 0..32 {
-            assert_eq!(output[i * 2], in_l[i], "restored power-off must bypass");
-            assert_eq!(output[i * 2 + 1], in_r[i], "restored power-off must bypass");
+        // Oversampling delays the output; bypass keeps that delay.
+        let latency = restored.latency_samples();
+        assert_eq!(latency, clipper67::TAPS_PER_PHASE);
+        let frames = latency + 32;
+        let in_l = vec![0.25f32; frames];
+        let in_r = vec![-0.5f32; frames];
+        let mut output = vec![0.0f32; frames * 2];
+        restored.process_block(&in_l, &in_r, &mut output, frames);
+        for i in 0..latency {
+            assert_eq!(output[i * 2], 0.0, "bypass must preserve host latency");
+            assert_eq!(output[i * 2 + 1], 0.0, "bypass must preserve host latency");
+        }
+        for i in latency..frames {
+            assert_eq!(
+                output[i * 2],
+                in_l[i - latency],
+                "restored power-off must bypass after latency"
+            );
+            assert_eq!(
+                output[i * 2 + 1],
+                in_r[i - latency],
+                "restored power-off must bypass after latency"
+            );
         }
         let frame = restored.meter_frame().expect("frame is published");
         assert_eq!(frame.gain_reduction_db, 0.0);
 
+        // 1× in Clip mode is the zero-latency setting.
+        let oversampling = clipper67::ui_param_index("oversampling").expect("in wire table");
+        restored.apply_param(oversampling, clipper67::Oversampling::X1.to_wire());
+        assert_eq!(restored.latency_samples(), 0);
+
         restored.apply_param(u32::MAX, 1.0);
         restored.apply_param(clipper67::UI_PARAM_IDS.len() as u32, 1.0);
-        restored.process_block(&in_l, &in_r, &mut output, 32);
+        restored.process_block(&in_l, &in_r, &mut output, frames);
         assert!(output.iter().all(|sample| sample.is_finite()));
 
         let fallback = BuiltinHostProcessor::clipper67(48_000, Some("not json"));
-        fallback.process_block(&in_l, &in_r, &mut output, 32);
+        fallback.process_block(&in_l, &in_r, &mut output, frames);
         assert!(output.iter().all(|sample| sample.is_finite()));
     }
 
@@ -2822,6 +2930,85 @@ mod builtin_processor_tests {
         let fallback = BuiltinHostProcessor::transient(48_000, Some("not json"));
         fallback.process_block(&in_l, &in_r, &mut output, 32);
         assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    /// A quiet input leaves the gate shut — the frame says so, with the range
+    /// as its reduction — and a loud one opens it, with the key and the
+    /// detector's state in the rack blocks the editors read.
+    #[test]
+    fn waygate_publishes_the_gate_through_the_host_frame() {
+        let processor = BuiltinHostProcessor::waygate(48_000, None);
+        let threshold = waygate::ui_param_index("thresholdDb").expect("in wire table");
+        let range = waygate::ui_param_index("rangeDb").expect("in wire table");
+        processor.apply_param(threshold, -30.0);
+        processor.apply_param(range, -24.0);
+
+        let quiet = [0.001f32; 64];
+        let mut output = [0.0f32; 128];
+        processor.process_block(&quiet, &quiet, &mut output, 64);
+        let closed = processor.meter_frame().expect("the gate meters itself");
+        assert!((closed.gain_reduction_db - 24.0).abs() < 1.0e-3);
+        assert_eq!(closed.slot_out_peak[waygate::KEY_SLOT], 0.0);
+        let expected = 0.001 * 10f32.powf(-24.0 / 20.0);
+        assert!((output[127] - expected).abs() < 1.0e-7, "{}", output[127]);
+
+        let loud = [0.5f32; 64];
+        for _ in 0..8 {
+            processor.process_block(&loud, &loud, &mut output, 64);
+        }
+        let open = processor.meter_frame().expect("the gate meters itself");
+        assert_eq!(open.gain_reduction_db, 0.0);
+        assert_eq!(open.slot_out_peak[waygate::KEY_SLOT], 1.0);
+        assert!(open.slot_in_peak[waygate::KEY_SLOT] > 0.4);
+        assert_eq!(output[127], 0.5);
+        assert_eq!(processor.latency_samples(), 0);
+
+        let lookahead = waygate::ui_param_index("lookaheadMs").expect("in wire table");
+        processor.apply_param(lookahead, 5.0);
+        assert_eq!(processor.latency_samples(), 240);
+    }
+
+    #[test]
+    fn waygate_restores_state_and_takes_wire_params() {
+        let mut params = waygate::default_params();
+        params.power = false;
+        params.lookahead_ms = 2.0;
+        let json = waygate::ipc::WayGateState::new(params)
+            .to_json()
+            .expect("state serializes");
+
+        let restored = BuiltinHostProcessor::waygate(48_000, Some(&json));
+        // Bypassed, the lookahead's delay stays: 2 ms is 96 samples.
+        assert_eq!(restored.latency_samples(), 96);
+        let in_l = [0.25f32; 128];
+        let in_r = [-0.5f32; 128];
+        let mut output = [0.0f32; 256];
+        restored.process_block(&in_l, &in_r, &mut output, 128);
+        for i in 0..128 {
+            let (l, r) = if i < 96 {
+                (0.0, 0.0)
+            } else {
+                (in_l[i], in_r[i])
+            };
+            assert_eq!(output[i * 2], l, "restored power-off must bypass, delayed");
+            assert_eq!(
+                output[i * 2 + 1],
+                r,
+                "restored power-off must bypass, delayed"
+            );
+        }
+        let frame = restored.meter_frame().expect("frame is published");
+        assert_eq!(frame.gain_reduction_db, 0.0);
+
+        restored.apply_param(u32::MAX, 1.0);
+        restored.apply_param(waygate::UI_PARAM_IDS.len() as u32, 1.0);
+        restored.process_block(&in_l, &in_r, &mut output, 128);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+
+        let fallback = BuiltinHostProcessor::waygate(48_000, Some("not json"));
+        fallback.process_block(&in_l, &in_r, &mut output, 128);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert_eq!(fallback.latency_samples(), 0);
     }
 }
 

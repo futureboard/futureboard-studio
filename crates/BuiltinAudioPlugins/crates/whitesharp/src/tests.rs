@@ -396,3 +396,394 @@ fn created_vibrato_is_off_by_default() {
     assert_eq!(default_params().vibrato_shape, VibratoShape::None);
     assert!(!default_params().classic);
 }
+
+// ── Live latency ────────────────────────────────────────────────────────────
+
+fn live(mut params: Params) -> Params {
+    params.latency = LatencyMode::Live;
+    params
+}
+
+/// A sine at `hz(t)` under a 5 Hz swell between 40 % and 100 % of `level`,
+/// through `dsp`: the input and the output's left side.
+fn swell(dsp: &mut Dsp, seconds: f32, level: f32, hz: impl Fn(f32) -> f32) -> (Vec<f32>, Vec<f32>) {
+    let frames = (SR * seconds) as usize;
+    let (mut input, mut output) = (Vec::with_capacity(frames), Vec::with_capacity(frames));
+    let mut phase = 0.0f32;
+    for n in 0..frames {
+        let t = n as f32 / SR;
+        phase = (phase + hz(t) / SR).fract();
+        let envelope = 0.7 - 0.3 * (std::f32::consts::TAU * 5.0 * t).cos();
+        let x = (std::f32::consts::TAU * phase).sin() * level * envelope;
+        let (l, r) = dsp.process_stereo(x, x);
+        assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+        input.push(x);
+        output.push(l);
+    }
+    (input, output)
+}
+
+/// The frequency of `signal` between `from` and `to` seconds, from its
+/// rising zero crossings, placed between samples.
+fn crossing_hz(signal: &[f32], from: f32, to: f32) -> f32 {
+    let (start, end) = ((from * SR) as usize, (to * SR) as usize);
+    let mut crossings = Vec::new();
+    for n in start.max(1)..end.min(signal.len()) {
+        let (a, b) = (signal[n - 1], signal[n]);
+        if a < 0.0 && b >= 0.0 {
+            crossings.push(n as f32 - 1.0 + a / (a - b));
+        }
+    }
+    assert!(crossings.len() > 10, "{} crossings", crossings.len());
+    let span = crossings[crossings.len() - 1] - crossings[0];
+    (crossings.len() - 1) as f32 * SR / span
+}
+
+/// How far `output`'s envelope lags `input`'s, in samples: the peak of the
+/// cross-correlation of their 10 ms power envelopes, a lag at a time.
+fn envelope_lag(input: &[f32], output: &[f32], from: f32, max_lag: usize) -> usize {
+    let envelope = |s: &[f32]| -> Vec<f32> {
+        let window = (SR * 0.01) as usize;
+        let mut sum = 0.0f32;
+        let mut out = Vec::with_capacity(s.len());
+        for n in 0..s.len() {
+            sum += s[n] * s[n];
+            if n >= window {
+                sum -= s[n - window] * s[n - window];
+            }
+            out.push(sum.max(0.0) / window as f32);
+        }
+        out
+    };
+    let (a, b) = (envelope(input), envelope(output));
+    let start = (from * SR) as usize;
+    let end = a.len() - max_lag;
+    let mean = |s: &[f32]| s.iter().sum::<f32>() / s.len() as f32;
+    let (ma, mb) = (mean(&a[start..end]), mean(&b[start..]));
+    let mut best = (0, f32::MIN);
+    for lag in 0..=max_lag {
+        let score: f32 = (start..end).map(|n| (a[n] - ma) * (b[n + lag] - mb)).sum();
+        if score > best.1 {
+            best = (lag, score);
+        }
+    }
+    best.0
+}
+
+/// The largest step between neighbouring samples from `from` seconds on.
+fn largest_step(signal: &[f32], from: f32) -> f32 {
+    signal[(from * SR) as usize..]
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(0.0, f32::max)
+}
+
+#[test]
+fn the_latency_table_matches_the_dsp_in_both_modes() {
+    for &sr in &[44_100.0f32, 48_000.0, 96_000.0] {
+        let mut dsp = Dsp::new(sr);
+        for mode in LatencyMode::ALL {
+            assert!(dsp.apply_ui_param("latency", mode.to_wire()));
+            for input in InputType::ALL {
+                assert!(dsp.apply_ui_param("inputType", input.to_wire()));
+                assert_eq!(
+                    dsp.latency_samples(),
+                    latency_samples_for(sr, input, mode),
+                    "{mode:?} {input:?} @ {sr}"
+                );
+                if mode == LatencyMode::Live {
+                    assert_eq!(dsp.latency_samples(), splice::LATENCY);
+                }
+            }
+        }
+    }
+    for input in InputType::ALL {
+        let quality = latency_samples_for(SR, input, LatencyMode::Quality);
+        let live = latency_samples_for(SR, input, LatencyMode::Live);
+        eprintln!(
+            "latency @48k {input:?}: quality {quality} smp ({:.2} ms), live {live} smp ({:.3} ms)",
+            quality as f32 * 1_000.0 / SR,
+            live as f32 * 1_000.0 / SR
+        );
+    }
+}
+
+#[test]
+fn a_state_saved_before_the_latency_mode_loads_as_quality() {
+    let json = ipc::WhiteSharpState::default().to_json().unwrap();
+    let old = json.replace(",\"latency\":\"quality\"", "");
+    assert_ne!(old, json, "the field is written as expected");
+    let state = ipc::WhiteSharpState::from_json(&old).unwrap();
+    assert_eq!(state.params.latency, LatencyMode::Quality);
+    assert_eq!(default_params().latency, LatencyMode::Quality);
+}
+
+#[test]
+fn live_mode_puts_a_sine_on_its_note_without_a_hidden_delay() {
+    // 30 cents sharp of A3: pulled down onto 220 Hz.
+    for (sung, target) in [(57.3f32, 57.0f32), (56.7, 57.0)] {
+        let mut params = default_params();
+        params.retune_ms = 0.0;
+        let mut dsp = dsp_with(live(params.clone()));
+        let (input, output) = swell(&mut dsp, 1.6, 0.5, |_| hz_of(sung));
+        let heard = crossing_hz(&output, 0.6, 1.5);
+        let cents = 1_200.0 * (heard / hz_of(target)).log2();
+        assert!(cents.abs() < 3.0, "sang {sung}: {heard} Hz ({cents:+.1} c)");
+        // 30 cents is a splice every 1/0.017 periods: about 6 here.
+        let (_, splices) = dsp.live_head();
+        assert!(splices >= 3, "only {splices} splices");
+
+        // Aligned with the input to within a period of it: the envelope
+        // comes out when it went in.
+        let period = SR / hz_of(sung);
+        let lag = envelope_lag(&input, &output, 0.4, 4_800);
+        eprintln!(
+            "live sang {sung}: {heard:.2} Hz ({cents:+.2} c), envelope lag {lag} smp, period {period:.0}, {splices} splices"
+        );
+        assert!(
+            (lag as f32) <= period + SR * 0.0005,
+            "sang {sung}: envelope {lag} samples late, period {period}"
+        );
+
+        // The measure itself: Quality comes out at its reported latency.
+        let mut quality = dsp_with(params);
+        let (input, output) = swell(&mut quality, 1.6, 0.5, |_| hz_of(sung));
+        let lag = envelope_lag(&input, &output, 0.4, 4_800) as f32;
+        let reported = quality.latency_samples() as f32;
+        eprintln!("quality sang {sung}: envelope lag {lag} smp, reported {reported}");
+        assert!(
+            (lag - reported).abs() < SR * 0.002,
+            "quality lag {lag} vs reported {reported}"
+        );
+    }
+}
+
+#[test]
+fn live_mode_head_delay_per_input_type() {
+    // A note in each type's range, a third of a semitone flat (raised) and
+    // sharp (lowered); the head's delay over the held part.
+    for (input, note) in [
+        (InputType::Soprano, 69.0f32),
+        (InputType::AltoTenor, 57.0),
+        (InputType::LowMale, 45.0),
+        (InputType::Instrument, 57.0),
+        (InputType::BassInstrument, 33.0),
+    ] {
+        for offset in [-0.33f32, 0.33] {
+            let mut params = default_params();
+            params.retune_ms = 0.0;
+            params.input_type = input;
+            let mut dsp = dsp_with(live(params));
+            let hz = hz_of(note + offset);
+            let frames = (SR * 1.5) as usize;
+            let (mut sum, mut worst, mut count) = (0.0f64, 0.0f64, 0usize);
+            let mut phase = 0.0f32;
+            let mut output = Vec::with_capacity(frames);
+            for n in 0..frames {
+                phase = (phase + hz / SR).fract();
+                let x = (1..5)
+                    .map(|k| (std::f32::consts::TAU * phase * k as f32).sin() / k as f32)
+                    .sum::<f32>()
+                    * 0.25;
+                let (l, _) = dsp.process_stereo(x, x);
+                output.push(l);
+                if n as f32 > SR * 0.5 {
+                    let (delay, _) = dsp.live_head();
+                    sum += delay;
+                    worst = worst.max(delay);
+                    count += 1;
+                }
+            }
+            let mean = sum / count as f64;
+            let period = f64::from(SR / hz);
+            let heard = pitch_of(&output, 0.5, 1.5);
+            eprintln!(
+                "live {input:?} {:.0} Hz {offset:+}: head mean {:.2} ms, max {:.2} ms (period {:.2} ms), heard {heard:.2}",
+                hz,
+                mean * 1_000.0 / f64::from(SR),
+                worst * 1_000.0 / f64::from(SR),
+                period * 1_000.0 / f64::from(SR),
+            );
+            assert!(
+                (heard - note).abs() < 0.05,
+                "{input:?} {offset}: heard {heard}"
+            );
+            assert!(
+                worst <= 1.5 * period + 2.0 * splice::LATENCY as f64 + 64.0,
+                "{input:?} {offset}: head {worst} for a period of {period}"
+            );
+        }
+    }
+}
+
+#[test]
+fn live_mode_snaps_to_the_scale_and_transposes() {
+    let mut params = default_params();
+    params.retune_ms = 0.0;
+    params.scale = Scale::Major;
+    // C# + 30 c in C major goes to D; with D removed, to C.
+    let mut dsp = dsp_with(live(params.clone()));
+    let out = sing(&mut dsp, 1.0, |_| hz_of(61.3));
+    let heard = pitch_of(&out, 0.5, 1.0);
+    assert!((heard - 62.0).abs() < 0.05, "heard {heard}");
+    params.remove_mask = 1 << 2;
+    let mut dsp = dsp_with(live(params));
+    let out = sing(&mut dsp, 1.0, |_| hz_of(61.3));
+    let heard = pitch_of(&out, 0.5, 1.0);
+    assert!((heard - 60.0).abs() < 0.05, "heard {heard}");
+
+    for transpose in [-12.0f32, -5.0, 7.0, 12.0] {
+        let mut params = default_params();
+        params.retune_ms = 0.0;
+        params.transpose = transpose;
+        let mut dsp = dsp_with(live(params));
+        let out = sing(&mut dsp, 1.0, |_| hz_of(57.0));
+        let heard = pitch_of(&out, 0.5, 1.0);
+        assert!(
+            (heard - (57.0 + transpose)).abs() < 0.06,
+            "{transpose}: {heard}"
+        );
+    }
+}
+
+#[test]
+fn live_splices_do_not_click() {
+    // A pure sine: any discontinuity stands out against its smooth slope.
+    for (sung, transpose) in [(57.4f32, 0.0f32), (56.6, 0.0), (57.0, 7.0), (57.0, -5.0)] {
+        let mut params = default_params();
+        params.retune_ms = 0.0;
+        params.transpose = transpose;
+        let mut dsp = dsp_with(live(params));
+        let level = 0.5;
+        let (_, output) = swell(&mut dsp, 1.5, level, |_| hz_of(sung));
+        let (_, splices) = dsp.live_head();
+        assert!(splices > 5, "{sung} {transpose}: {splices} splices");
+        // The steepest a sine of this level gets, at the faster of the
+        // pitch sung and the pitch played.
+        let fastest = hz_of(sung).max(hz_of(sung.round() + transpose));
+        let slope = std::f32::consts::TAU * fastest / SR * level;
+        let step = largest_step(&output, 0.3);
+        eprintln!(
+            "live {sung} {transpose:+}: largest step {:.3} of the sine's slope, {splices} splices",
+            step / slope
+        );
+        assert!(
+            step <= 1.15 * slope,
+            "{sung} {transpose:+}: step {step} against a slope of {slope}"
+        );
+    }
+}
+
+#[test]
+fn live_mode_passes_an_uncorrected_voice_through_two_samples_late() {
+    let mut params = live(default_params());
+    params.bypass_mask = scale::ALL_NOTES;
+    let mut dsp = dsp_with(params);
+    assert_eq!(dsp.latency_samples(), 2);
+    let (input, output) = swell(&mut dsp, 1.0, 0.5, |_| 440.0);
+    let worst = (2..output.len())
+        .map(|n| (output[n] - input[n - 2]).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst < 1.0e-5, "off by {worst}");
+
+    let mut params = live(default_params());
+    params.power = false;
+    let mut dsp = dsp_with(params);
+    for n in 0..2_000usize {
+        let x = (n as f32 * 0.07).sin();
+        let (l, _) = dsp.process_stereo(x, -x);
+        if n >= 2 {
+            assert!((l - ((n - 2) as f32 * 0.07).sin()).abs() < 1.0e-6);
+        }
+    }
+}
+
+#[test]
+fn live_mode_passes_noise_at_its_own_level() {
+    let mut dsp = dsp_with(live(default_params()));
+    let mut seed = 7u32;
+    let (mut input, mut output) = (0.0f32, 0.0f32);
+    for n in 0..48_000 {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let x = ((seed >> 9) as f32 / (1u32 << 23) as f32 - 0.5) * 0.5;
+        let (l, _) = dsp.process_stereo(x, x);
+        assert!(l.is_finite());
+        if n > 12_000 {
+            input += x * x;
+            output += l * l;
+        }
+    }
+    let db = 10.0 * (output / input).log10();
+    assert!(db.abs() < 1.0, "noise came out at {db:+.1} dB");
+}
+
+#[test]
+fn switching_the_latency_mode_mid_note_crossfades() {
+    let mut params = default_params();
+    params.retune_ms = 0.0;
+    let mut dsp = dsp_with(params);
+    let level = 0.5;
+    let hz = hz_of(57.3);
+    let mut phase = 0.0f32;
+    let mut output = Vec::new();
+    let mut live = false;
+    for n in 0..(SR as usize * 2) {
+        if n > 0 && n % (SR as usize / 5) == 0 {
+            live = !live;
+            let mode = if live {
+                LatencyMode::Live
+            } else {
+                LatencyMode::Quality
+            };
+            assert!(dsp.apply_ui_param("latency", mode.to_wire()));
+            let expected = latency_samples_for(SR, InputType::AltoTenor, mode);
+            assert_eq!(dsp.latency_samples(), expected);
+        }
+        phase = (phase + hz / SR).fract();
+        let x = (std::f32::consts::TAU * phase).sin() * level;
+        let (l, r) = dsp.process_stereo(x, x);
+        assert!(l.is_finite() && r.is_finite());
+        output.push(l);
+    }
+    // Two copies of the voice at different delays, faded by power: at
+    // most √2 of the level, and of its slope.
+    let slope = std::f32::consts::TAU * hz / SR * level;
+    let step = largest_step(&output, 0.1);
+    eprintln!(
+        "mode switching: largest step {:.3} of the sine's slope",
+        step / slope
+    );
+    assert!(
+        step <= 1.5 * slope,
+        "step {step} against a slope of {slope}"
+    );
+    let peak = output.iter().fold(0.0f32, |p, x| p.max(x.abs()));
+    assert!(peak <= 1.45 * level, "peak {peak}");
+}
+
+#[test]
+fn live_mode_stays_finite_at_every_setting_and_rate() {
+    for &sr in &[44_100.0f32, 96_000.0] {
+        for input in InputType::ALL {
+            let mut dsp = Dsp::new(sr);
+            let mut params = live(default_params());
+            params.input_type = input;
+            params.retune_ms = 0.0;
+            params.transpose = 24.0;
+            params.vibrato_db = 12.0;
+            params.vibrato_shape = VibratoShape::Square;
+            params.vibrato_delay_ms = 0.0;
+            params.vibrato_amp = 100.0;
+            dsp.set_params(params);
+            let mut peak = 0.0f32;
+            for n in 0..(sr as usize / 2) {
+                let t = n as f32 / sr;
+                let x = (std::f32::consts::TAU * (110.0 + 300.0 * t) * t).sin() * 0.8;
+                let (l, r) = dsp.process_stereo(x, x);
+                assert!(l.is_finite() && r.is_finite());
+                peak = peak.max(l.abs()).max(r.abs());
+            }
+            assert!(peak < 4.0, "{input:?} @ {sr}: peak {peak}");
+        }
+    }
+}

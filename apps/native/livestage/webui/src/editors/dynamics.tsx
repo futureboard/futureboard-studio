@@ -69,7 +69,7 @@ function subtitle(kind: Kind, e: Editor): string {
     case 'burnlimit':
       return 'Loudness maximizer'
     case 'clipper67':
-      return 'Clipper and peak limiter'
+      return 'Oversampled clipper and peak limiter'
     case 'transient':
       return 'Attack and sustain shaper'
   }
@@ -120,6 +120,7 @@ const KNOBS: Record<Kind, Record<string, KnobRow>> = {
     lookaheadMs: ['Lookahead', 'linear', 'ms'],
   },
   clipper67: {
+    inputDb: ['Input', 'linear', 'db'],
     thresholdDb: ['Threshold', 'linear', 'db'],
     shape: ['Shape', 'linear', 'percent'],
     ceilingDb: ['Ceiling', 'linear', 'db'],
@@ -137,7 +138,7 @@ const BIPOLAR: Record<Kind, string[]> = {
   fa76: [],
   zcomp: ['makeupDb'],
   burnlimit: ['gainDb'],
-  clipper67: [],
+  clipper67: ['inputDb'],
   transient: ['attack', 'sustain'],
 }
 
@@ -196,9 +197,9 @@ function choiceHint(kind: Kind, e: Editor): string {
       ][wireEnum(e.value('style'), 4)]
     case 'clipper67':
       return [
-        'Soft clipper only',
-        'Clipper plus peak gain reduction',
-        'Clipper plus the strongest peak gain reduction',
+        'Clips at the threshold, untouched below the knee',
+        'Clips 3 dB past the knee, 1 ms limiter beyond',
+        '1 ms lookahead peak limiter at the threshold',
       ][wireEnum(e.value('mode'), 3)]
     case 'transient':
       return ''
@@ -284,15 +285,42 @@ function staticReductionDb(level: number, threshold: number, kneeDb: number): nu
 /** burnlimit::Style::knee_db, by wire value. */
 const BURN_KNEE_DB = [4, 2, 1.5, 0.2]
 
-/** clipper67::clip_curve */
-function clipCurve(x: number, shape: number): number {
-  const softness = clamp(shape, 0, 100) / 100
-  if (softness <= 0.001) return clamp(x, -1, 1)
-  const drive = 1 + (1 - softness) * 15
-  return Math.tanh(x * drive) / Math.tanh(drive)
+/** clipper67::KNEE_MAX, HYBRID_CLIP_DB, TAPS_PER_PHASE, LOOKAHEAD_SECONDS */
+const CLIP_KNEE_MAX = 0.5
+const HYBRID_CLIP_DB = 3
+const CLIP_OS_TAPS = 32
+const CLIP_LOOKAHEAD_MS = 1
+
+/** clipper67::Oversampling, by wire value. */
+const CLIP_OVERSAMPLING = ['1×', '2×', '4×', '8×']
+
+/** clipper67::clip_curve: unity to level·(1 − knee), a quadratic bend that
+ *  meets the level flat at level·(1 + knee), the level beyond. */
+function clipCurve(x: number, level: number, knee: number): number {
+  const a = Math.abs(x)
+  const start = level * (1 - knee)
+  if (a <= start) return x
+  let y: number
+  if (knee <= 0 || a >= level * (1 + knee)) y = level
+  else {
+    const u = a - start
+    y = a - (u * u) / (4 * level * knee)
+  }
+  return Math.sign(x) * y
 }
 
-const HYBRID_CATCH = 0.9
+/** clipper67::clip_level_db: the threshold, never above the ceiling. */
+const clipLevelDb = (e: Editor) => Math.min(e.value('thresholdDb'), e.value('ceilingDb'))
+
+/** What the clipper's settings cost in delay (clipper67::latency_for). */
+function clipLatencyHint(e: Editor): string {
+  const filters = wireEnum(e.value('oversampling'), 4) > 0
+  const lookahead = wireEnum(e.value('mode'), 3) > 0
+  if (filters && lookahead) return `Latency ${CLIP_OS_TAPS} samples + ${CLIP_LOOKAHEAD_MS} ms`
+  if (filters) return `Latency ${CLIP_OS_TAPS} samples`
+  if (lookahead) return `Latency ${CLIP_LOOKAHEAD_MS} ms lookahead`
+  return 'Zero latency'
+}
 
 /** The steady-state output, in dBFS, of a level held at `input`: the DSP
  *  crates' own `transfer_db`. Null for an effect without one drawn. */
@@ -322,21 +350,22 @@ function transferOf(kind: Kind, e: Editor): ((input: number) => number) | null {
       }
     }
     case 'clipper67': {
-      const threshold = e.value('thresholdDb')
-      const shape = e.value('shape')
-      const ceiling = e.value('ceilingDb')
+      // clipper67::transfer_db
+      const gain = dbToLinear(e.value('inputDb'))
+      const level = dbToLinear(clipLevelDb(e))
+      const knee = (clamp(e.value('shape'), 0, 100) / 100) * CLIP_KNEE_MAX
+      const ceiling = dbToLinear(e.value('ceilingDb'))
+      const hybridTarget = level * (1 + knee) * dbToLinear(HYBRID_CLIP_DB)
       const mode = wireEnum(e.value('mode'), 3)
       return (input) => {
         if (!power) return input
         const dry = dbToLinear(input)
-        const driven = dry * dbToLinear(-threshold)
+        const driven = dry * gain
         let wet: number
-        if (mode === 0) wet = clipCurve(driven, shape)
-        else if (mode === 1) {
-          const clipped = clipCurve(driven, shape)
-          wet = clipped <= HYBRID_CATCH ? clipped : clipped * Math.sqrt(HYBRID_CATCH / clipped)
-        } else wet = Math.min(1, driven)
-        return linearToDb(Math.max(1e-9, blend(dry, wet * dbToLinear(ceiling), amount)))
+        if (mode === 0) wet = clipCurve(driven, level, knee)
+        else if (mode === 1) wet = clipCurve(Math.min(driven, hybridTarget), level, knee)
+        else wet = Math.min(driven, level)
+        return linearToDb(Math.max(1e-9, blend(dry, Math.min(wet, ceiling), amount)))
       }
     }
     default:
@@ -373,7 +402,7 @@ function paintTransfer(
   h: number,
   transfer: (input: number) => number,
   range: number,
-  action: ActionLine | null,
+  actions: ActionLine[],
   bypassed: boolean,
 ) {
   const c = colors()
@@ -391,7 +420,7 @@ function paintTransfer(
     }
   }
   dashed(ctx, [x0, y0 + ph], [x0 + pw, y0], 1, alpha(c.text, 0.22))
-  if (action) {
+  for (const action of actions) {
     const color = alpha(action.color, 0.7)
     if (action.vertical) dashed(ctx, [xAt(action.db), y0], [xAt(action.db), y0 + ph], 1, color)
     else dashed(ctx, [x0, yAt(action.db)], [x0 + pw, yAt(action.db)], 1, color)
@@ -459,7 +488,9 @@ function markers(kind: Kind, e: Editor): Marker[] {
   }
   if (kind === 'burnlimit') return [ceiling()]
   if (kind === 'clipper67') {
+    // The threshold only marks a level when it sits under the ceiling.
     const db = e.value('thresholdDb')
+    if (db >= e.value('ceilingDb')) return [ceiling()]
     return [{ db, label: `Threshold ${db.toFixed(1)} dB`, color: colors().accent }, ceiling()]
   }
   return []
@@ -519,22 +550,28 @@ function Displays(props: { editor: Editor; kind: Kind; vuOutput: boolean }) {
     // BurnLimit meters its input after the drive.
     const offset = kind === 'burnlimit' ? e.value('gainDb') : 0
     let legend: string
-    let action: ActionLine
+    let actions: ActionLine[]
     if (kind === 'zcomp') {
       const c = zcompCurve(e)
       legend = `${c.thresholdDb.toFixed(1)} dB · ${c.ratio.toFixed(1)}:1`
-      action = { db: c.thresholdDb, vertical: true, color: colors().accent }
+      actions = [{ db: c.thresholdDb, vertical: true, color: colors().accent }]
     } else {
       const ceiling = e.value('ceilingDb')
       legend = `Ceiling ${ceiling.toFixed(1)} dB`
-      action = { db: ceiling, vertical: false, color: warning() }
+      actions = [{ db: ceiling, vertical: false, color: warning() }]
+      if (kind === 'clipper67') {
+        legend = `Clip ${clipLevelDb(e).toFixed(1)} dB · ${CLIP_OVERSAMPLING[wireEnum(e.value('oversampling'), 4)]}`
+        // A threshold under the ceiling is where it clips.
+        const threshold = e.value('thresholdDb')
+        if (threshold < ceiling) actions.push({ db: threshold, vertical: false, color: colors().accent })
+      }
     }
     return column(
       2,
       220,
       <LiveCanvas
         draw={(ctx, w, h) => {
-          paintTransfer(ctx, w, h, curve, range, action, bypassed)
+          paintTransfer(ctx, w, h, curve, range, actions, bypassed)
           if (!bypassed) paintOperatingPoint(ctx, w, h, live, range, offset, curve)
         }}
       >
@@ -769,32 +806,46 @@ function Controls(props: { editor: Editor; kind: Kind; vuOutput: boolean; setVuO
           )}
         </Row>
       )
-    case 'clipper67':
+    case 'clipper67': {
+      // Limit ignores the knee: Shape has nothing to do.
+      const limiting = wireEnum(e.value('mode'), 3) === 2
       return (
         <Row>
           {modeCard('MODE')}
           {card(
-            'CLIPPING',
-            2,
-            2 * KNOB_PITCH + 130,
-            <div className="dyn-cluster tight">
-              {hero('thresholdDb')}
-              {hero('shape')}
-              <span className="dyn-hint">0 % hard · 100 % soft</span>
+            'DRIVE · CLIP',
+            3,
+            3 * KNOB_PITCH + 60,
+            <div className="dyn-stack hair">
+              <div className="dyn-cluster tight">
+                {hero('inputDb')}
+                {hero('thresholdDb')}
+                {knob('shape', HERO_KNOB, limiting ? 'Limit' : undefined)}
+              </div>
+              <span className="dyn-hint">Unity under the knee · Shape 0 % hard, 100 % soft</span>
             </div>,
           )}
           {knobCard('OUTPUT', [knob('ceilingDb'), knob('mix')])}
           {card(
-            'OPTIONS',
+            'OVERSAMPLING',
             1,
-            140,
+            trackWidth(CLIP_OVERSAMPLING) + 18,
             <div className="dyn-stack">
+              <ParamChoice
+                editor={e}
+                id="oversampling"
+                options={CLIP_OVERSAMPLING.map((l, i): [number, string] => [i, l])}
+                className="dyn-track"
+              />
+              <span className="dyn-hint">{clipLatencyHint(e)}</span>
               <ParamCheck editor={e} id="dcFilter" label="DC Filter" />
               <ParamCheck editor={e} id="stereoLink" label="Stereo Link" />
+              <ParamCheck editor={e} id="delta" label="Delta (what is clipped)" />
             </div>,
           )}
         </Row>
       )
+    }
     case 'transient':
       return (
         <Row>
@@ -826,8 +877,9 @@ function editorFor(kind: Kind): EditorComponent {
         editor={editor}
         title={TITLE[kind]}
         subtitle={subtitle(kind, editor)}
-        // SC Listen is a listening aid, not a sound: a preset leaves it.
-        keep={kind === 'zcomp' ? ['scListen'] : undefined}
+        // SC Listen is a listening aid, not a sound: a preset leaves it. So
+        // do the clipper's oversampling (a latency choice) and Delta.
+        keep={kind === 'zcomp' ? ['scListen'] : kind === 'clipper67' ? ['oversampling', 'delta'] : undefined}
       >
         <Displays editor={editor} kind={kind} vuOutput={vuOutput} />
         <Controls editor={editor} kind={kind} vuOutput={vuOutput} setVuOutput={setVuOutput} />

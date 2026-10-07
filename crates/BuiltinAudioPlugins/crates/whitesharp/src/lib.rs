@@ -21,8 +21,12 @@
 //! variation) can be laid on every corrected note.
 //!
 //! The shifter runs a fixed delay per input type (reported as latency, so
-//! the graph compensates for it). Everything is sized at construction for
-//! the widest input type: nothing allocates on the audio path.
+//! the graph compensates for it). Live latency swaps it for a path with no
+//! lookahead (`splice`): a delay-line head read at the shifted speed and
+//! spliced a period at a time — two samples of fixed delay, the formants
+//! moving with the pitch. A change of latency mode crossfades the two
+//! paths. Everything is sized at construction for the widest input type:
+//! nothing allocates on the audio path.
 
 use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
@@ -35,6 +39,7 @@ pub mod ipc;
 pub mod presets;
 pub mod scale;
 pub mod shifter;
+pub mod splice;
 pub mod telemetry;
 pub mod ui;
 
@@ -45,6 +50,7 @@ pub use scale::{NOTE_NAMES, Scale, scale_mask};
 use detect::{Detector, Estimate};
 use scale::{ALL_NOTES, nearest_target, pitch_class};
 use shifter::{Control, MAX_FORMANT, Shifter};
+use splice::Splicer;
 use telemetry::{History, Reading};
 
 pub const PLUGIN_ID: &str = "futureboard.whitesharp";
@@ -61,6 +67,9 @@ const VIBRATO_SPLIT_HZ: f32 = 3.0;
 const RELEASE_MS: f32 = 150.0;
 /// Readout and power crossfades.
 const SMOOTH_MS: f32 = 10.0;
+/// The crossfade between the two paths when the latency mode changes. They
+/// play the voice at different delays, so the fade keeps power, not gain.
+const MODE_FADE_MS: f32 = 20.0;
 
 /// The voice the detector listens for. Each narrows the pitch range, which
 /// makes tracking surer and — the low ones aside — the delay shorter.
@@ -159,8 +168,61 @@ impl VibratoShape {
     }
 }
 
+/// How the correction is played: the delay it costs against what it can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum LatencyMode {
+    /// Pitch-synchronous grains (PSOLA): formant correction and throat, at
+    /// a fixed delay per input type that the graph compensates.
+    #[default]
+    Quality,
+    /// No lookahead: a delay-line head spliced a period at a time. Two
+    /// samples of fixed delay, plus up to about a period while the pitch
+    /// is moved; the formants move with the pitch.
+    Live,
+}
+
+impl LatencyMode {
+    pub const ALL: [Self; 2] = [Self::Quality, Self::Live];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Quality => "Quality",
+            Self::Live => "Live",
+        }
+    }
+
+    /// Whether formant correction and throat work in this mode.
+    pub const fn shapes_formants(self) -> bool {
+        matches!(self, Self::Quality)
+    }
+
+    pub const fn to_wire(self) -> f32 {
+        self as u8 as f32
+    }
+
+    pub fn from_wire(value: f32) -> Self {
+        Self::ALL[(value.round().max(0.0) as usize).min(Self::ALL.len() - 1)]
+    }
+}
+
 /// The lowest pitch any input type reaches: what the buffers are sized for.
 const LOWEST_HZ: f32 = 30.0;
+
+/// The latency a WhiteSharp at `sample_rate` reports for `input_type` in
+/// `mode`, without building one — what an editor shows. Matches
+/// [`Dsp::latency_samples`] exactly.
+pub fn latency_samples_for(sample_rate: f32, input_type: InputType, mode: LatencyMode) -> usize {
+    match mode {
+        LatencyMode::Live => splice::LATENCY,
+        LatencyMode::Quality => {
+            let sr = sample_rate.max(1.0);
+            let (lowest, _) = input_type.range_hz();
+            let (centre_lag, hop) = detect::timing(sr, lowest);
+            Shifter::latency_for_input(sr, sr / LOWEST_HZ, sr / lowest, centre_lag + hop) as usize
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -221,6 +283,10 @@ pub struct Params {
     /// How much each cycle's rate and depth wander, in percent.
     #[serde(default)]
     pub vibrato_variation: f32,
+    /// Grains with formant control at a compensated delay, or the live path
+    /// with none. A state saved before this existed is Quality.
+    #[serde(default)]
+    pub latency: LatencyMode,
 }
 
 fn default_vibrato_rate() -> f32 {
@@ -266,6 +332,7 @@ pub fn default_params() -> Params {
         vibrato_pitch: default_vibrato_pitch(),
         vibrato_amp: 0.0,
         vibrato_variation: 0.0,
+        latency: LatencyMode::Quality,
     }
 }
 
@@ -327,6 +394,7 @@ const PARAMS: &[ParamDescriptor] = &[
         100.0,
         "%",
     ),
+    param("latency", "Latency", 0.0, 0.0, 1.0, "enum"),
 ];
 
 pub fn descriptor() -> PluginDescriptor {
@@ -365,6 +433,7 @@ struct Tuning {
     vibrato_pitch: f32,
     vibrato_amp: f32,
     vibrato_variation: f32,
+    live: bool,
 }
 
 impl Tuning {
@@ -393,6 +462,7 @@ impl Tuning {
             vibrato_pitch: clamp(p.vibrato_pitch, 0.0, 100.0),
             vibrato_amp: clamp(p.vibrato_amp / 100.0, 0.0, 1.0),
             vibrato_variation: clamp(p.vibrato_variation / 100.0, 0.0, 1.0),
+            live: p.latency == LatencyMode::Live,
         }
     }
 }
@@ -410,6 +480,15 @@ pub struct Dsp {
     tuning: Tuning,
     detector: Detector,
     shifter: Shifter,
+    splicer: Splicer,
+    /// Where the output stands between the paths: 0 is the PSOLA shifter,
+    /// 1 the live splicer. Moves by `mode_step` a sample on a mode change.
+    mode_mix: f32,
+    mode_step: f32,
+    /// Whether each path rendered the last sample. A path that idled
+    /// restarts cleanly before it plays again.
+    quality_running: bool,
+    live_running: bool,
     history: History,
     /// Input samples taken.
     now: u64,
@@ -442,6 +521,7 @@ impl Dsp {
         let sr = sample_rate.max(1.0);
         let detector = Detector::new(sr, LOWEST_HZ);
         let shifter = Shifter::new(sr, sr / LOWEST_HZ);
+        let splicer = Splicer::new(sr, sr / LOWEST_HZ);
         let hop_seconds = detector.hop_samples() as f32 / sr;
         let params = default_params();
         let tuning = Tuning::resolve(&params);
@@ -450,6 +530,11 @@ impl Dsp {
             tuning,
             detector,
             shifter,
+            splicer,
+            mode_mix: if tuning.live { 1.0 } else { 0.0 },
+            mode_step: 1.0 / (MODE_FADE_MS * 0.001 * sr).max(1.0),
+            quality_running: true,
+            live_running: true,
             history: History::default(),
             now: 0,
             hop_seconds,
@@ -510,10 +595,22 @@ impl Dsp {
         }
     }
 
-    /// The delay the correction runs at, for graph delay compensation. Fixed
-    /// per input type.
+    /// The delay the correction runs at, for graph delay compensation: fixed
+    /// per input type in Quality, the live path's two samples in Live. The
+    /// new mode's from the moment it is set; the crossfade between the
+    /// paths follows it.
     pub fn latency_samples(&self) -> usize {
-        self.shifter.latency() as usize
+        match self.params.latency {
+            LatencyMode::Quality => self.shifter.latency() as usize,
+            LatencyMode::Live => self.splicer.latency(),
+        }
+    }
+
+    /// The live path's head delay now (its fixed latency plus what the
+    /// shifting has wandered) and how many splices it has made — for
+    /// measuring it.
+    pub fn live_head(&self) -> (f64, u64) {
+        (self.splicer.delay(), self.splicer.splices())
     }
 
     /// The newest pitch readings, as the editor's meter and keyboard read
@@ -531,7 +628,13 @@ impl Dsp {
             self.mix.settle();
             self.output_gain.settle();
             self.active.settle();
+            self.settle_mode();
         }
+    }
+
+    /// Puts the output wholly on the mode's path, without a fade.
+    fn settle_mode(&mut self) {
+        self.mode_mix = if self.tuning.live { 1.0 } else { 0.0 };
     }
 
     fn apply_input_type(&mut self) {
@@ -567,6 +670,7 @@ impl Dsp {
                 formant: 1.0,
                 gain: 1.0,
             });
+            self.splicer.set_control(None, 1.0, 1.0);
             self.history.push(Reading::SILENT);
             return;
         };
@@ -640,11 +744,64 @@ impl Dsp {
             formant: clamp(formant, 1.0 / MAX_FORMANT, MAX_FORMANT),
             gain,
         });
+        // The live path plays the newest estimate at once: there is no
+        // delay to line it up with the audio it measured.
+        self.splicer.set_control(Some(period), ratio, gain);
         self.history.push(Reading {
             input: Some(midi),
             output: Some(midi + cents / 100.0),
             target: target.map(|note| note + (t.transpose_cents / 100.0) as i32),
         });
+    }
+
+    /// Runs whichever path the latency mode plays — both while one fades
+    /// into the other — and returns the wet frame and the input at the same
+    /// delay. The idle path still takes its input, so it can take over
+    /// without a gap.
+    #[inline]
+    fn play_paths(&mut self, left: f32, right: f32) -> ([f32; 2], [f32; 2]) {
+        let target = if self.tuning.live { 1.0 } else { 0.0 };
+        if self.mode_mix != target {
+            self.mode_mix = if self.mode_mix < target {
+                (self.mode_mix + self.mode_step).min(target)
+            } else {
+                (self.mode_mix - self.mode_step).max(target)
+            };
+        }
+        let m = self.mode_mix;
+        let quality = if m < 1.0 {
+            if !self.quality_running {
+                self.shifter.resume();
+                self.quality_running = true;
+            }
+            Some(self.shifter.process(left, right))
+        } else {
+            self.shifter.skip(left, right);
+            self.quality_running = false;
+            None
+        };
+        let live = if m > 0.0 {
+            if !self.live_running {
+                self.splicer.restart();
+                self.live_running = true;
+            }
+            Some(self.splicer.process(left, right))
+        } else {
+            self.splicer.skip(left, right);
+            self.live_running = false;
+            None
+        };
+        match (quality, live) {
+            (Some(q), Some(z)) => {
+                let angle = std::f32::consts::FRAC_PI_2 * m;
+                let (gq, gz) = (angle.cos(), angle.sin());
+                let blend =
+                    |a: [f32; 2], b: [f32; 2]| [a[0] * gq + b[0] * gz, a[1] * gq + b[1] * gz];
+                (blend(q.0, z.0), blend(q.1, z.1))
+            }
+            (Some(path), None) | (None, Some(path)) => path,
+            (None, None) => ([0.0; 2], [0.0; 2]),
+        }
     }
 
     /// One hop of the created vibrato: its pitch offset in cents and its
@@ -689,6 +846,10 @@ impl StereoEffect for Dsp {
     fn reset(&mut self) {
         self.detector.reset();
         self.shifter.reset();
+        self.splicer.reset();
+        self.settle_mode();
+        self.quality_running = true;
+        self.live_running = true;
         self.target = None;
         self.correction = 0.0;
         self.slow_pitch = None;
@@ -715,7 +876,7 @@ impl StereoEffect for Dsp {
         {
             self.on_estimate(estimate);
         }
-        let (wet, dry) = self.shifter.process(left, right);
+        let (wet, dry) = self.play_paths(left, right);
         self.now += 1;
 
         let step = self.smooth_step;

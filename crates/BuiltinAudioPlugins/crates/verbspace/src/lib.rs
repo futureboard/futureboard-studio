@@ -4,23 +4,34 @@
 //! is
 //!
 //! ```txt
-//! pre-delay ─┬─ early reflections (12 taps a side) ─────────────────────┐
-//!            └─ input diffusion (4 allpasses a side) ─ 16-line FDN ─────┴─ low cut / high cut
-//!                 (Hadamard feedback, modulated cubic reads, an allpass     ─ width ─ mix
-//!                  and a two-shelf absorption filter in every line)
+//! pre-delay ─┬─ early reflections (12 taps a side, spread ∝ Size) ─ early diffusion ─── early ─┐
+//!            └─ (input + reflections) ─ input diffusion (4 allpasses a side, ∝ Size)      Early/Late
+//!                 ─ 16-line FDN (Hadamard feedback, modulated reads, an allpass and a ── late ─┘
+//!                   two-shelf absorption filter in every line; lengths ∝ Size)
+//!                                                  ─ low cut / high cut ─ width ─ output ─ mix
 //! ```
 //!
-//! The tank decays in three bands: `decaySec` is the RT60 of the middle,
-//! `bassMult` scales it below the low split and `damping` shortens it above
-//! the high split. Every line's absorption filter is designed from its own
-//! length, so each one loses exactly what its share of the RT60 says — the
-//! decay the editor draws ([`decay_profile`]) is computed from the very same
-//! coefficients.
+//! Every control does one thing, and does it by a large, predictable amount:
+//!
+//! * **Decay** is the RT60 of the middle band, exactly: every line's
+//!   absorption is designed from its own length. **Bass** multiplies it below
+//!   **Bass Freq**, **Damping** divides it (down to a tenth) above **Damp
+//!   Freq**. [`decay_profile`] is computed from the very coefficients the
+//!   tank plays, so the editor's decay display is the decay that sounds.
+//! * **Size** scales the room: tank lines from 5–16 ms (a booth) to
+//!   58–180 ms (a cathedral), the early pattern from 5 to 140 ms, and the
+//!   input diffusers with them. It does not touch the decay time.
+//! * The tail's level is normalised by its expected energy, so stretching
+//!   Decay or Size changes how long the room rings, not how loud it is.
+//! * **Mode** is a label: picking one in an editor loads that space type's
+//!   starting point ([`ReverbMode::starting_point`]) into the ordinary
+//!   params. The DSP never reads it, so it can never override a knob.
 //!
 //! Every buffer is sized at construction for the widest reachable setting, so
-//! a parameter edit only moves targets: line lengths, the pre-delay and the
-//! early pattern glide to theirs, and every gain is smoothed, so nothing a
-//! user does on a running tail clicks. No realtime allocation.
+//! a parameter edit only moves targets: line lengths, the pre-delay, the
+//! early pattern and the diffusers glide to theirs and every gain and filter
+//! corner is smoothed, so nothing a user does on a running tail clicks. No
+//! realtime allocation.
 
 use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_2, PI, TAU};
 
@@ -33,6 +44,8 @@ use builtin_dsp_core::{
 use serde::{Deserialize, Serialize};
 
 pub mod ipc;
+#[cfg(test)]
+mod measure;
 pub mod presets;
 pub mod ui;
 
@@ -44,12 +57,15 @@ pub use presets::{FactoryPreset, factory_presets};
 pub const PLUGIN_ID: &str = "futureboard.verbspace";
 
 /// Delay lines in the tank. Sixteen under a Hadamard matrix give a tail dense
-/// enough for a hall from the first few hundred milliseconds without any
-/// audible flutter, and the fast transform keeps the mixing at 64 adds.
+/// enough for a hall without audible flutter, and the fast transform keeps
+/// the mixing at 64 adds.
 pub const LINE_COUNT: usize = 16;
 
 /// Allpass diffusers per channel ahead of the tank.
 pub const DIFFUSER_COUNT: usize = 4;
+
+/// Allpasses per channel smearing the early reflections.
+const EARLY_DIFFUSER_COUNT: usize = 2;
 
 /// Early reflections per side.
 pub const EARLY_TAPS: usize = 12;
@@ -57,35 +73,62 @@ pub const EARLY_TAPS: usize = 12;
 /// Longest pre-delay the ring is sized for.
 pub const MAX_PREDELAY_MS: f32 = 500.0;
 
-/// Peak modulation excursion of a tank read at `modDepth` 100 %.
-const MAX_MOD_MS: f32 = 0.9;
+/// The longest tank line at `size` 0 % and 100 %; the rest scale between
+/// them exponentially, so every step of the knob is the same ratio.
+pub const MIN_LONGEST_LINE_MS: f32 = 16.0;
+pub const MAX_LONGEST_LINE_MS: f32 = 180.0;
+/// The shortest line as a share of the longest.
+const SHORTEST_LINE_SHARE: f32 = 0.32;
 
-/// How far a line, the pre-delay or the early pattern travels toward a new
-/// length per second: a time constant, so a size or mode change bends the
+/// Arrival of the last early reflection at `size` 0 % and 100 %.
+pub const MIN_EARLY_SPAN_MS: f32 = 5.0;
+pub const MAX_EARLY_SPAN_MS: f32 = 140.0;
+
+/// Input-diffuser length multiplier at `size` 0 % and 100 %.
+const MIN_DIFFUSER_SCALE: f32 = 0.4;
+const MAX_DIFFUSER_SCALE: f32 = 1.6;
+
+/// Peak excursion of a tank read at `modDepth` 100 %. A read swings between
+/// its line length and twice this past it.
+pub const MAX_MOD_MS: f32 = 1.2;
+
+/// Allpass gains at `diffusion` 100 %; 0 % is a plain delay everywhere.
+const MAX_INPUT_DIFFUSION: f32 = 0.75;
+const MAX_EARLY_DIFFUSION: f32 = 0.7;
+const MAX_TANK_DIFFUSION: f32 = 0.6;
+
+/// How fast a line, the pre-delay, the early pattern or the diffusers
+/// travel toward a new length: a time constant, so a Size drag bends the
 /// running tail instead of cutting it.
 const GLIDE_MS: f32 = 70.0;
 
-/// Time constant of every smoothed gain (mix, output, width, input).
+/// Time constant of every smoothed gain and filter corner.
 const SMOOTH_MS: f32 = 25.0;
 
 /// Loop gain while frozen. Not exactly one: a lossless loop is only
-/// marginally stable in floating point, and this still loses less than
-/// 0.01 dB a second.
+/// marginally stable in floating point, and this still loses well under
+/// 0.1 dB a second.
 const FREEZE_GAIN: f32 = 0.99995;
 
-/// RT60 ceiling per band. `decaySec` tops out at 20 s, and `bassMult` can
-/// double that below the low split.
-const MAX_RT60_SEC: f32 = 40.0;
+/// RT60 ceiling per band: `decaySec` tops out at 20 s, and `bassMult` can
+/// triple that below the bass crossover.
+const MAX_RT60_SEC: f32 = 60.0;
 
-/// The tank's low band ends here; `bassMult` scales the decay below it.
-pub const LOW_SPLIT_HZ: f32 = 320.0;
+/// Top-band decay as a share of the middle band's at `damping` 100 %. The
+/// share falls geometrically with the knob: 50 % is a third of the decay.
+pub const MIN_HIGH_RATIO: f32 = 0.1;
 
-/// Shortest decay of the top band at `damping` 100 %, as a share of the
-/// middle band's.
-const MIN_HIGH_RATIO: f32 = 0.12;
+/// Late tail into the output: with the energy normalisation this leaves the
+/// tank's tail at the early pattern's level (unit energy), so Early/Late
+/// trades one for the other without a level change.
+const LATE_OUTPUT: f32 = 1.0;
 
-/// Reverb character. Picks the tank's line lengths, the early pattern, how
-/// much diffusion the mode brings, and where its highs start to fall away.
+/// Wet-path trim. With the default cuts the wet signal sits about 3–4 dB
+/// under a broadband input at 100 % wet, whatever the room or its decay.
+const WET_TRIM_DB: f32 = 0.0;
+
+/// Space type. A label and a starting point, never a hidden voicing: picking
+/// one loads [`ReverbMode::starting_point`]; the DSP does not read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReverbMode {
@@ -95,30 +138,6 @@ pub enum ReverbMode {
     Plate,
     Ambience,
 }
-
-/// What a mode is made of, at `size` 100 %.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Character {
-    /// Shortest and longest tank line.
-    pub shortest_ms: f32,
-    pub longest_ms: f32,
-    /// Arrival of the last early reflection; zero for none.
-    pub early_span_ms: f32,
-    /// Early reflections' level against the tail.
-    pub early_level: f32,
-    /// Input allpass gain at `diffusion` 0 %; 100 % reaches
-    /// [`MAX_INPUT_DIFFUSION`].
-    pub input_diffusion: f32,
-    /// In-tank allpass gain at `diffusion` 100 %; 0 % is half of it.
-    pub tank_diffusion: f32,
-    /// Where the top band, the one `damping` shortens, begins.
-    pub high_split_hz: f32,
-    /// Wet trim that brings the mode to the same loudness as the others:
-    /// about 3 dB under a broadband input at 100 % wet.
-    pub trim_db: f32,
-}
-
-const MAX_INPUT_DIFFUSION: f32 = 0.78;
 
 impl ReverbMode {
     pub const ALL: [Self; 5] = [
@@ -180,80 +199,83 @@ impl ReverbMode {
         }
     }
 
-    pub const fn character(self) -> Character {
+    /// The type's space, as the values it puts on the ordinary knobs:
+    /// `(predelayMs, size, decaySec, diffusion, damping, bassMult,
+    /// bassFreqHz, dampFreqHz, earlyLate, modDepth, modRateHz)`.
+    pub const fn space(self) -> [f32; 11] {
         match self {
-            Self::Room => Character {
-                shortest_ms: 8.0,
-                longest_ms: 38.0,
-                early_span_ms: 36.0,
-                early_level: 0.62,
-                input_diffusion: 0.25,
-                tank_diffusion: 0.45,
-                high_split_hz: 5_200.0,
-                trim_db: 3.7,
-            },
-            Self::Chamber => Character {
-                shortest_ms: 13.0,
-                longest_ms: 58.0,
-                early_span_ms: 52.0,
-                early_level: 0.48,
-                input_diffusion: 0.30,
-                tank_diffusion: 0.50,
-                high_split_hz: 4_800.0,
-                trim_db: 5.1,
-            },
-            Self::Hall => Character {
-                shortest_ms: 22.0,
-                longest_ms: 104.0,
-                early_span_ms: 74.0,
-                early_level: 0.32,
-                input_diffusion: 0.30,
-                tank_diffusion: 0.50,
-                high_split_hz: 4_000.0,
-                trim_db: 6.8,
-            },
+            Self::Room => [
+                4.0, 22.0, 0.7, 70.0, 45.0, 1.0, 250.0, 4_500.0, 40.0, 12.0, 0.6,
+            ],
+            Self::Chamber => [
+                10.0, 40.0, 1.4, 85.0, 35.0, 1.1, 250.0, 5_000.0, 55.0, 20.0, 0.7,
+            ],
+            Self::Hall => [
+                20.0, 60.0, 2.4, 80.0, 40.0, 1.2, 250.0, 4_000.0, 65.0, 25.0, 0.7,
+            ],
             // A plate is a sheet, not a room: no discrete reflections, the
             // densest build-up, and a top end that rings longest.
-            Self::Plate => Character {
-                shortest_ms: 5.0,
-                longest_ms: 44.0,
-                early_span_ms: 0.0,
-                early_level: 0.0,
-                input_diffusion: 0.45,
-                tank_diffusion: 0.62,
-                high_split_hz: 7_000.0,
-                trim_db: 7.8,
-            },
-            Self::Ambience => Character {
-                shortest_ms: 4.0,
-                longest_ms: 22.0,
-                early_span_ms: 30.0,
-                early_level: 0.85,
-                input_diffusion: 0.20,
-                tank_diffusion: 0.40,
-                high_split_hz: 6_000.0,
-                trim_db: 1.7,
-            },
+            Self::Plate => [
+                6.0, 35.0, 1.8, 95.0, 15.0, 0.8, 400.0, 8_000.0, 100.0, 30.0, 1.0,
+            ],
+            Self::Ambience => [
+                0.0, 12.0, 0.5, 60.0, 50.0, 0.9, 250.0, 5_000.0, 25.0, 10.0, 0.5,
+            ],
+        }
+    }
+
+    /// `current` with this type's space loaded: the space knobs move to the
+    /// type's values, the mode label follows, and everything that is not the
+    /// room — cuts, width, mix, output, wet-only, freeze, power — stays.
+    pub fn starting_point(self, current: &Params) -> Params {
+        let [
+            predelay_ms,
+            size,
+            decay_sec,
+            diffusion,
+            damping,
+            bass_mult,
+            bass_freq_hz,
+            damp_freq_hz,
+            early_late,
+            mod_depth,
+            mod_rate_hz,
+        ] = self.space();
+        Params {
+            mode: self,
+            predelay_ms,
+            size,
+            decay_sec,
+            diffusion,
+            damping,
+            bass_mult,
+            bass_freq_hz,
+            damp_freq_hz,
+            early_late,
+            mod_depth,
+            mod_rate_hz,
+            ..current.clone()
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct Params {
     pub power: bool,
+    /// The space type last loaded as a starting point. A label only.
     pub mode: ReverbMode,
     /// Silence before the reflections start, in milliseconds.
     pub predelay_ms: f32,
-    /// Tank line-length and early-pattern scaling, in percent.
+    /// Room scale, in percent: tank lines, early pattern and diffusers.
     pub size: f32,
     /// RT60 of the middle band, in seconds.
     pub decay_sec: f32,
-    /// Input and in-tank allpass amount, in percent.
+    /// Input, early and in-tank allpass amount, in percent.
     pub diffusion: f32,
     /// How much shorter the top band decays, in percent.
     pub damping: f32,
-    /// Decay multiplier below [`LOW_SPLIT_HZ`].
+    /// Decay multiplier below [`Params::bass_freq_hz`].
     pub bass_mult: f32,
     /// Tank read modulation depth, in percent of [`MAX_MOD_MS`].
     pub mod_depth: f32,
@@ -272,29 +294,70 @@ pub struct Params {
     /// Hold the tail: loop pinned just under unity, input muted, absorption
     /// bypassed.
     pub freeze: bool,
+    /// Crossover under which `bass_mult` scales the decay, in hertz.
+    pub bass_freq_hz: f32,
+    /// Crossover above which `damping` shortens the decay, in hertz.
+    pub damp_freq_hz: f32,
+    /// Early reflections against the late tail, in percent: 0 is early only,
+    /// 100 late only, on an equal-power law.
+    pub early_late: f32,
+    /// No dry signal and the wet at full level, whatever `mix` says: for a
+    /// send/return bus.
+    pub wet_only: bool,
 }
 
-pub fn default_params() -> Params {
-    Params {
-        power: true,
-        mode: ReverbMode::Hall,
-        predelay_ms: 20.0,
-        size: 60.0,
-        decay_sec: 2.4,
-        diffusion: 72.0,
-        damping: 45.0,
-        bass_mult: 1.1,
-        mod_depth: 25.0,
-        mod_rate_hz: 0.6,
-        low_cut_hz: 90.0,
-        high_cut_hz: 9_500.0,
-        width: 110.0,
-        mix: 28.0,
-        output_db: 0.0,
-        freeze: false,
+impl Default for Params {
+    fn default() -> Self {
+        default_params()
     }
 }
 
+pub fn default_params() -> Params {
+    let base = Params {
+        power: true,
+        mode: ReverbMode::Hall,
+        predelay_ms: 0.0,
+        size: 0.0,
+        decay_sec: 0.0,
+        diffusion: 0.0,
+        damping: 0.0,
+        bass_mult: 0.0,
+        mod_depth: 0.0,
+        mod_rate_hz: 0.0,
+        low_cut_hz: 80.0,
+        high_cut_hz: 12_000.0,
+        width: 100.0,
+        mix: 30.0,
+        output_db: 0.0,
+        freeze: false,
+        bass_freq_hz: 0.0,
+        damp_freq_hz: 0.0,
+        early_late: 0.0,
+        wet_only: false,
+    };
+    ReverbMode::Hall.starting_point(&base)
+}
+
+const fn param(
+    id: &'static str,
+    name: &'static str,
+    default_value: f32,
+    min: f32,
+    max: f32,
+    unit: &'static str,
+) -> ParamDescriptor {
+    ParamDescriptor {
+        id,
+        name,
+        default_value,
+        min,
+        max,
+        unit,
+    }
+}
+
+/// The parameter table. Defaults are the Hall starting point, as
+/// [`default_params`]; a test holds the two together.
 pub fn descriptor() -> PluginDescriptor {
     PluginDescriptor {
         id: PLUGIN_ID,
@@ -302,143 +365,37 @@ pub fn descriptor() -> PluginDescriptor {
         vendor: "Futureboard",
         category: PluginCategory::Effect,
         version: env!("CARGO_PKG_VERSION"),
-        params: &[
-            ParamDescriptor {
-                id: "power",
-                name: "Power",
-                default_value: 1.0,
-                min: 0.0,
-                max: 1.0,
-                unit: "bool",
-            },
-            ParamDescriptor {
-                id: "mode",
-                name: "Mode",
-                default_value: 2.0,
-                min: 0.0,
-                max: 4.0,
-                unit: "enum",
-            },
-            ParamDescriptor {
-                id: "predelayMs",
-                name: "Pre-Delay",
-                default_value: 20.0,
-                min: 0.0,
-                max: MAX_PREDELAY_MS,
-                unit: "ms",
-            },
-            ParamDescriptor {
-                id: "size",
-                name: "Size",
-                default_value: 60.0,
-                min: 10.0,
-                max: 100.0,
-                unit: "%",
-            },
-            ParamDescriptor {
-                id: "decaySec",
-                name: "Decay",
-                default_value: 2.4,
-                min: 0.1,
-                max: 20.0,
-                unit: "s",
-            },
-            ParamDescriptor {
-                id: "diffusion",
-                name: "Diffusion",
-                default_value: 72.0,
-                min: 0.0,
-                max: 100.0,
-                unit: "%",
-            },
-            ParamDescriptor {
-                id: "damping",
-                name: "Damping",
-                default_value: 45.0,
-                min: 0.0,
-                max: 100.0,
-                unit: "%",
-            },
-            ParamDescriptor {
-                id: "bassMult",
-                name: "Bass",
-                default_value: 1.1,
-                min: 0.2,
-                max: 2.0,
-                unit: "x",
-            },
-            ParamDescriptor {
-                id: "modDepth",
-                name: "Mod Depth",
-                default_value: 25.0,
-                min: 0.0,
-                max: 100.0,
-                unit: "%",
-            },
-            ParamDescriptor {
-                id: "modRateHz",
-                name: "Mod Rate",
-                default_value: 0.6,
-                min: 0.05,
-                max: 5.0,
-                unit: "Hz",
-            },
-            ParamDescriptor {
-                id: "lowCutHz",
-                name: "Low Cut",
-                default_value: 90.0,
-                min: 20.0,
-                max: 1_000.0,
-                unit: "Hz",
-            },
-            ParamDescriptor {
-                id: "highCutHz",
-                name: "High Cut",
-                default_value: 9_500.0,
-                min: 1_000.0,
-                max: 20_000.0,
-                unit: "Hz",
-            },
-            ParamDescriptor {
-                id: "width",
-                name: "Width",
-                default_value: 110.0,
-                min: 0.0,
-                max: 200.0,
-                unit: "%",
-            },
-            ParamDescriptor {
-                id: "mix",
-                name: "Mix",
-                default_value: 28.0,
-                min: 0.0,
-                max: 100.0,
-                unit: "%",
-            },
-            ParamDescriptor {
-                id: "outputDb",
-                name: "Output",
-                default_value: 0.0,
-                min: -24.0,
-                max: 12.0,
-                unit: "dB",
-            },
-            ParamDescriptor {
-                id: "freeze",
-                name: "Freeze",
-                default_value: 0.0,
-                min: 0.0,
-                max: 1.0,
-                unit: "bool",
-            },
-        ],
+        params: PARAMS,
     }
 }
 
+static PARAMS: &[ParamDescriptor] = &[
+    param("power", "Power", 1.0, 0.0, 1.0, "bool"),
+    param("mode", "Mode", 2.0, 0.0, 4.0, "enum"),
+    param("predelayMs", "Pre-Delay", 20.0, 0.0, MAX_PREDELAY_MS, "ms"),
+    param("size", "Size", 60.0, 0.0, 100.0, "%"),
+    param("decaySec", "Decay", 2.4, 0.1, 20.0, "s"),
+    param("diffusion", "Diffusion", 80.0, 0.0, 100.0, "%"),
+    param("damping", "Damping", 40.0, 0.0, 100.0, "%"),
+    param("bassMult", "Bass", 1.2, 0.2, 3.0, "x"),
+    param("modDepth", "Mod Depth", 25.0, 0.0, 100.0, "%"),
+    param("modRateHz", "Mod Rate", 0.7, 0.05, 5.0, "Hz"),
+    param("lowCutHz", "Low Cut", 80.0, 20.0, 1_000.0, "Hz"),
+    param("highCutHz", "High Cut", 12_000.0, 1_000.0, 20_000.0, "Hz"),
+    param("width", "Width", 100.0, 0.0, 200.0, "%"),
+    param("mix", "Mix", 30.0, 0.0, 100.0, "%"),
+    param("outputDb", "Output", 0.0, -24.0, 12.0, "dB"),
+    param("freeze", "Freeze", 0.0, 0.0, 1.0, "bool"),
+    param("bassFreqHz", "Bass Freq", 250.0, 50.0, 1_000.0, "Hz"),
+    param("dampFreqHz", "Damp Freq", 4_000.0, 1_000.0, 16_000.0, "Hz"),
+    param("earlyLate", "Early/Late", 65.0, 0.0, 100.0, "%"),
+    param("wetOnly", "Wet Only", 0.0, 0.0, 1.0, "bool"),
+];
+
 // ── Fixed tables ─────────────────────────────────────────────────────────────
 
-/// Where each line sits between a mode's shortest and longest length, before
-/// the permutation below: an even spread nudged off the grid, so no two lines
+/// Where each line sits between the shortest and longest length, before the
+/// permutation below: an even spread nudged off the grid, so no two lines
 /// share a simple ratio and the modes never stack into a comb.
 const LINE_SPREAD_JITTER: [f32; LINE_COUNT] = [
     0.0, 0.21, -0.17, 0.31, -0.08, 0.27, -0.29, 0.12, -0.22, 0.33, -0.11, 0.19, -0.31, 0.07, -0.24,
@@ -449,16 +406,19 @@ const LINE_SPREAD_JITTER: [f32; LINE_COUNT] = [
 /// apart in the Hadamard butterflies.
 const LINE_ORDER: [usize; LINE_COUNT] = [0, 9, 3, 12, 6, 15, 1, 10, 4, 13, 7, 2, 11, 5, 14, 8];
 
-/// The allpass inside each line, in milliseconds. Fixed, not scaled by size:
-/// a length change inside a feedback loop would click.
+/// The allpass inside each line, in milliseconds. Fixed, not scaled by size.
 const TANK_ALLPASS_MS: [f32; LINE_COUNT] = [
     0.61, 0.73, 0.89, 0.97, 1.13, 1.27, 1.39, 1.51, 1.67, 1.79, 1.93, 2.11, 2.29, 2.41, 2.63, 2.87,
 ];
 
-/// Input diffusers, offset between the channels so the two decorrelate before
-/// they reach the tank.
-const DIFFUSER_MS_L: [f32; DIFFUSER_COUNT] = [3.13, 4.71, 7.93, 11.37];
-const DIFFUSER_MS_R: [f32; DIFFUSER_COUNT] = [3.53, 5.19, 8.41, 12.07];
+/// Input diffusers at a diffuser scale of 1, offset between the channels so
+/// the two decorrelate before they reach the tank.
+const DIFFUSER_MS_L: [f32; DIFFUSER_COUNT] = [1.9, 3.1, 4.7, 7.3];
+const DIFFUSER_MS_R: [f32; DIFFUSER_COUNT] = [2.2, 3.5, 5.3, 7.9];
+
+/// The allpasses that smear the early reflections.
+const EARLY_DIFFUSER_MS_L: [f32; EARLY_DIFFUSER_COUNT] = [1.37, 2.71];
+const EARLY_DIFFUSER_MS_R: [f32; EARLY_DIFFUSER_COUNT] = [1.61, 3.03];
 
 /// Every line's LFO runs at the rate times its own factor, so the tank never
 /// sweeps in step.
@@ -469,8 +429,8 @@ const MOD_DEPTH_SPREAD: [f32; LINE_COUNT] = [
     1.00, 1.18, 0.86, 1.24, 0.79, 1.09, 0.93, 1.21, 0.82, 1.13, 0.90, 1.25, 0.76, 1.05, 0.97, 1.16,
 ];
 
-/// Arrival of each early reflection as a share of the mode's span. The two
-/// sides interleave so they never coincide.
+/// Arrival of each early reflection as a share of the pattern's span. The
+/// two sides interleave so they never coincide.
 const EARLY_AT_L: [f32; EARLY_TAPS] = [
     0.043, 0.087, 0.131, 0.179, 0.233, 0.297, 0.367, 0.443, 0.531, 0.629, 0.743, 0.887,
 ];
@@ -541,11 +501,54 @@ fn hadamard(v: &mut [f32; LINE_COUNT]) {
     }
 }
 
+// ── The space curves: one place, read by the DSP and the editors ─────────────
+
+/// `size` 0–100 % onto 0–1.
+fn space(size: f32) -> f32 {
+    clamp(size / 100.0, 0.0, 1.0)
+}
+
+/// Exponential travel from `min` at 0 to `max` at 1.
+fn sweep(min: f32, max: f32, at: f32) -> f32 {
+    min * (max / min).powf(at)
+}
+
+/// The longest tank line at `size`, in milliseconds.
+pub fn longest_line_ms(size: f32) -> f32 {
+    sweep(MIN_LONGEST_LINE_MS, MAX_LONGEST_LINE_MS, space(size))
+}
+
+/// Arrival of the last early reflection at `size`, in milliseconds.
+pub fn early_span_ms(size: f32) -> f32 {
+    sweep(MIN_EARLY_SPAN_MS, MAX_EARLY_SPAN_MS, space(size))
+}
+
+fn diffuser_scale(size: f32) -> f32 {
+    sweep(MIN_DIFFUSER_SCALE, MAX_DIFFUSER_SCALE, space(size))
+}
+
+/// `damping` 0–100 % onto the top band's share of the middle band's decay.
+pub fn high_ratio(damping: f32) -> f32 {
+    MIN_HIGH_RATIO.powf(clamp(damping / 100.0, 0.0, 1.0))
+}
+
+/// `earlyLate` onto the `(early, late)` output gains, equal power.
+pub fn early_late_gains(early_late: f32) -> (f32, f32) {
+    let b = clamp(early_late / 100.0, 0.0, 1.0);
+    if b >= 1.0 {
+        (0.0, 1.0)
+    } else if b <= 0.0 {
+        (1.0, 0.0)
+    } else {
+        ((b * FRAC_PI_2).cos(), (b * FRAC_PI_2).sin())
+    }
+}
+
 // ── Tuning: every derived value, from one place ─────────────────────────────
 
 /// Bilinear one-pole low-pass `y = b (x + x₁) + a y₁`: unity at DC, an exact
 /// zero at Nyquist, monotonic between — which is what lets a shelf built
-/// from it hit both its end gains exactly.
+/// from it hit both its end gains exactly. `b` is always `(1 − a) / 2`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct OnePole {
     a: f32,
@@ -553,18 +556,23 @@ struct OnePole {
 }
 
 impl OnePole {
-    fn new(corner_hz: f32, sample_rate: f32) -> Self {
+    fn a_for(corner_hz: f32, sample_rate: f32) -> f32 {
         let corner = clamp(corner_hz, 1.0, sample_rate * 0.45);
         let k = (PI * corner / sample_rate).tan();
+        (1.0 - k) / (1.0 + k)
+    }
+
+    #[inline]
+    fn from_a(a: f32) -> Self {
         Self {
-            a: (1.0 - k) / (1.0 + k),
-            b: k / (1.0 + k),
+            a,
+            b: (1.0 - a) * 0.5,
         }
     }
 
-    /// Magnitude at `hz`.
-    fn magnitude(self, hz: f32, sample_rate: f32) -> (f64, f64) {
-        // Complex response b (1 + e^-jw) / (1 - a e^-jw), as (re, im).
+    /// Complex response at `hz`, as `(re, im)`.
+    fn response(self, hz: f32, sample_rate: f32) -> (f64, f64) {
+        // b (1 + e^-jw) / (1 - a e^-jw).
         let w = std::f64::consts::TAU * f64::from(hz) / f64::from(sample_rate);
         let (a, b) = (f64::from(self.a), f64::from(self.b));
         let (num_re, num_im) = (b * (1.0 + w.cos()), -b * w.sin());
@@ -607,8 +615,8 @@ impl Absorption {
 
     /// Magnitude of the loss at `hz`.
     fn magnitude(self, low: OnePole, high: OnePole, hz: f32, sample_rate: f32) -> f64 {
-        let (lr, li) = low.magnitude(hz, sample_rate);
-        let (hr, hi) = high.magnitude(hz, sample_rate);
+        let (lr, li) = low.response(hz, sample_rate);
+        let (hr, hi) = high.response(hz, sample_rate);
         // Low shelf 1 + (low − 1)·LP, high shelf high + (1 − high)·LP.
         let low_shelf = (
             1.0 + (f64::from(self.low) - 1.0) * lr,
@@ -633,22 +641,25 @@ struct Tuning {
     /// Line plus its allpass: one trip round the loop.
     loops: [f32; LINE_COUNT],
     absorption: [Absorption; LINE_COUNT],
-    low_split: OnePole,
-    high_split: OnePole,
+    /// The crossovers' one-pole coefficient `a`.
+    low_split_a: f32,
+    high_split_a: f32,
     rt: [f32; 3],
     input_diffusion: f32,
+    early_diffusion: f32,
     tank_diffusion: f32,
     /// Span of the early pattern, in samples.
     early_span: f32,
-    early_level: f32,
+    diffuser_scale: f32,
     mod_depth: f32,
     /// Per-line LFO rotation `(cos, sin)` per sample.
     mod_step: [(f32, f32); LINE_COUNT],
-    /// Gain into the tank, so a long decay sounds bigger without arriving
-    /// many decibels louder than a short one.
-    late_gain: f32,
+    /// Gain into the tank that takes back the energy a longer decay or a
+    /// shorter loop piles up, so the tail plays at one level.
+    late_norm: f32,
     input_gain: f32,
-    output_gain: f32,
+    early_gain: f32,
+    late_gain: f32,
     mid_gain: f32,
     side_gain: f32,
     dry_gain: f32,
@@ -658,89 +669,89 @@ struct Tuning {
 impl Tuning {
     fn resolve(p: &Params, sample_rate: f32) -> Self {
         let sr = sample_rate;
-        let character = p.mode.character();
-        let scale = size_scale(p.size);
         let ms = |ms: f32| ms * 0.001 * sr;
 
+        let longest = longest_line_ms(p.size);
+        let shortest = longest * SHORTEST_LINE_SHARE;
         let mut lines = [0.0; LINE_COUNT];
-        let ratio = character.longest_ms / character.shortest_ms;
         for rank in 0..LINE_COUNT {
             let at = clamp(
                 (rank as f32 + LINE_SPREAD_JITTER[rank]) / (LINE_COUNT - 1) as f32,
                 0.0,
                 1.0,
             );
-            lines[LINE_ORDER[rank]] = ms(character.shortest_ms * ratio.powf(at) * scale).max(4.0);
+            lines[LINE_ORDER[rank]] = ms(sweep(shortest, longest, at)).max(4.0);
         }
         let loops: [f32; LINE_COUNT] =
             std::array::from_fn(|i| lines[i] + allpass_len(TANK_ALLPASS_MS[i], sr) as f32);
 
         let rt_mid = clamp(p.decay_sec, 0.05, MAX_RT60_SEC);
         let rt_low = clamp(p.decay_sec * p.bass_mult, 0.05, MAX_RT60_SEC);
-        let damping = clamp(p.damping / 100.0, 0.0, 1.0);
-        let rt_high = rt_mid * (1.0 - damping * (1.0 - MIN_HIGH_RATIO));
+        let rt_high = clamp(rt_mid * high_ratio(p.damping), 0.02, MAX_RT60_SEC);
         let rt = [rt_low, rt_mid, rt_high];
-        let absorption = std::array::from_fn(|i| {
-            if p.freeze {
-                Absorption::FROZEN
-            } else {
-                Absorption::for_loop(loops[i], sr, rt)
-            }
-        });
+        let decaying: [Absorption; LINE_COUNT] =
+            std::array::from_fn(|i| Absorption::for_loop(loops[i], sr, rt));
+        let absorption = if p.freeze {
+            [Absorption::FROZEN; LINE_COUNT]
+        } else {
+            decaying
+        };
+
+        // A loop that keeps g² of its energy each pass holds 1 / (1 − g²) of
+        // what went in. Taking that back leaves the tail at one level from a
+        // 0.1 s booth to a 20 s cathedral. Read from the unfrozen decay, so
+        // Freeze holds the level it caught.
+        let kept = decaying.iter().map(|a| a.gain * a.gain).sum::<f32>() / LINE_COUNT as f32;
+        let late_norm = (1.0 - kept).max(1.0e-5).sqrt();
 
         let diffusion = clamp(p.diffusion / 100.0, 0.0, 1.0);
-        let input_diffusion = character.input_diffusion
-            + diffusion * (MAX_INPUT_DIFFUSION - character.input_diffusion);
-        let tank_diffusion = character.tank_diffusion * (0.5 + 0.5 * diffusion);
-
         let rate = clamp(p.mod_rate_hz, 0.0, 20.0);
         let mod_step = std::array::from_fn(|i| {
             let w = TAU * rate * MOD_RATE_SPREAD[i] / sr;
             (w.cos(), w.sin())
         });
 
-        // The tail's energy grows with RT60 over loop length. Taking 0.35 of
-        // it back leaves ten times the decay about 3 dB louder — bigger, not
-        // overwhelming. Read from the unfrozen decay, so Freeze holds the
-        // level it caught.
-        let mean_loop = loops.iter().sum::<f32>() / LINE_COUNT as f32;
-        let energy = (rt_mid * sr / (6.0 * std::f32::consts::LN_10 * mean_loop)).max(0.5);
-        let late_gain = energy.powf(-0.35);
-
+        let (early_gain, late_gain) = early_late_gains(p.early_late);
         let width = clamp(p.width / 100.0, 0.0, 2.0);
+        // Width as a mid/side balance whose powers sum to a constant: 0 % is
+        // mono, 100 % untouched, 200 % twice the side over a quieter mid —
+        // wide, and it still folds down.
+        let width_norm = (2.0 / (1.0 + width * width)).sqrt();
         let mix = clamp(p.mix / 100.0, 0.0, 1.0);
+        let (dry_gain, wet_mix) = if p.wet_only {
+            (0.0, 1.0)
+        } else if mix >= 1.0 {
+            (0.0, 1.0)
+        } else {
+            // Dry and wet are uncorrelated, so an equal-power law keeps the
+            // loudness steady across the whole travel.
+            ((mix * FRAC_PI_2).cos(), (mix * FRAC_PI_2).sin())
+        };
         Self {
             predelay: ms(clamp(p.predelay_ms, 0.0, MAX_PREDELAY_MS)),
             lines,
             loops,
             absorption,
-            low_split: OnePole::new(LOW_SPLIT_HZ, sr),
-            high_split: OnePole::new(character.high_split_hz, sr),
+            low_split_a: OnePole::a_for(p.bass_freq_hz, sr),
+            high_split_a: OnePole::a_for(p.damp_freq_hz, sr),
             rt,
-            input_diffusion,
-            tank_diffusion,
-            early_span: ms(character.early_span_ms * scale),
-            early_level: character.early_level,
+            input_diffusion: diffusion * MAX_INPUT_DIFFUSION,
+            early_diffusion: diffusion * MAX_EARLY_DIFFUSION,
+            tank_diffusion: diffusion * MAX_TANK_DIFFUSION,
+            early_span: ms(early_span_ms(p.size)),
+            diffuser_scale: diffuser_scale(p.size),
             mod_depth: ms(clamp(p.mod_depth / 100.0, 0.0, 1.0) * MAX_MOD_MS),
             mod_step,
-            late_gain,
+            late_norm,
             input_gain: if p.freeze { 0.0 } else { 1.0 },
-            output_gain: db_to_linear(p.output_db + character.trim_db),
-            // Width as a mid/side trim whose two gains sum in power, so 0 %
-            // and 200 % stay near the loudness of 100 %.
-            mid_gain: (2.0 - width).sqrt() * FRAC_1_SQRT_2,
-            side_gain: width.sqrt() * FRAC_1_SQRT_2,
-            // Dry and wet are uncorrelated, so an equal-power law keeps the
-            // loudness steady across the whole travel.
-            dry_gain: (mix * FRAC_PI_2).cos(),
-            wet_gain: (mix * FRAC_PI_2).sin(),
+            early_gain,
+            late_gain,
+            mid_gain: width_norm,
+            side_gain: width * width_norm,
+            dry_gain,
+            wet_gain: wet_mix * db_to_linear(p.output_db + WET_TRIM_DB),
         }
     }
-}
-
-/// `size` 10–100 % onto a length multiplier.
-fn size_scale(size: f32) -> f32 {
-    0.3 + 0.7 * clamp(size / 100.0, 0.0, 1.0)
 }
 
 /// What [`Allpass::for_ms`] rounds `ms` to, without building one.
@@ -749,7 +760,7 @@ fn allpass_len(ms: f32, sample_rate: f32) -> usize {
 }
 
 /// Gains of the early pattern: signed, falling with arrival, and normalised
-/// to unit energy per side so `early_level` is the level that plays.
+/// to unit energy per side.
 fn early_gains(at: &[f32; EARLY_TAPS]) -> [f32; EARLY_TAPS] {
     let raw: [f32; EARLY_TAPS] = std::array::from_fn(|i| (1.0 - 0.75 * at[i]) * EARLY_SIGN[i]);
     let norm = raw.iter().map(|g| g * g).sum::<f32>().sqrt();
@@ -763,7 +774,7 @@ fn early_gains(at: &[f32; EARLY_TAPS]) -> [f32; EARLY_TAPS] {
 pub struct EarlyReflection {
     /// After the dry signal, pre-delay included.
     pub at_ms: f32,
-    /// Signed linear gain into its side.
+    /// Signed linear gain into its side, Early/Late balance included.
     pub gain: f32,
     pub right: bool,
 }
@@ -776,6 +787,9 @@ pub struct DecayProfile {
     pub early: [EarlyReflection; EARLY_TAPS * 2],
     /// First arrival of the tail, after the pre-delay.
     pub first_late_ms: f32,
+    /// Level the tail starts at, in dB, on the same scale as the early
+    /// reflections' gains: the Early/Late balance's late share.
+    pub late_db: f32,
     /// RT60 of the three bands; infinite while frozen.
     pub rt_low_sec: f32,
     pub rt_mid_sec: f32,
@@ -826,7 +840,7 @@ pub fn decay_profile(params: &Params, sample_rate: f32) -> DecayProfile {
         };
         EarlyReflection {
             at_ms: (tuning.predelay + at * tuning.early_span) * to_ms,
-            gain: gain * tuning.early_level,
+            gain: gain * tuning.early_gain,
             right,
         }
     });
@@ -840,17 +854,18 @@ pub fn decay_profile(params: &Params, sample_rate: f32) -> DecayProfile {
         predelay_ms: tuning.predelay * to_ms,
         early,
         first_late_ms: tuning.lines.iter().copied().fold(f32::MAX, f32::min) * to_ms,
+        late_db: 20.0 * tuning.late_gain.max(1.0e-6).log10(),
         rt_low_sec: rt(tuning.rt[0]),
         rt_mid_sec: rt(tuning.rt[1]),
         rt_high_sec: rt(tuning.rt[2]),
-        low_split_hz: LOW_SPLIT_HZ,
-        high_split_hz: params.mode.character().high_split_hz,
+        low_split_hz: params.bass_freq_hz,
+        high_split_hz: params.damp_freq_hz,
         frozen,
         sample_rate: sr,
         loop_samples: tuning.loops[typical],
         absorption: tuning.absorption[typical],
-        low_split: tuning.low_split,
-        high_split: tuning.high_split,
+        low_split: OnePole::from_a(tuning.low_split_a),
+        high_split: OnePole::from_a(tuning.high_split_a),
     }
 }
 
@@ -936,6 +951,33 @@ impl Line {
     }
 }
 
+/// A Schroeder allpass whose length follows Size: a ring read at a gliding
+/// fractional delay. Outside every feedback loop, so a length change only
+/// bends the pitch of what passes for the moment it lasts.
+#[derive(Debug, Clone)]
+struct GlideAllpass {
+    ring: DelayRing,
+    /// Length at a diffuser scale of 1, in samples.
+    base: f32,
+}
+
+impl GlideAllpass {
+    fn new(ms: f32, sample_rate: f32) -> Self {
+        Self {
+            ring: DelayRing::for_ms(ms * MAX_DIFFUSER_SCALE + 1.0, sample_rate),
+            base: ms * 0.001 * sample_rate,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, input: f32, gain: f32, scale: f32) -> f32 {
+        let delayed = self.ring.read_linear(self.base * scale);
+        let stored = flush_denormal(input + delayed * gain);
+        self.ring.push(stored);
+        delayed - stored * gain
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Dsp {
     sample_rate: f32,
@@ -946,8 +988,10 @@ pub struct Dsp {
     predelay_r: DelayRing,
     early_l: DelayRing,
     early_r: DelayRing,
-    diffusers_l: [Allpass; DIFFUSER_COUNT],
-    diffusers_r: [Allpass; DIFFUSER_COUNT],
+    early_diffusers_l: [Allpass; EARLY_DIFFUSER_COUNT],
+    early_diffusers_r: [Allpass; EARLY_DIFFUSER_COUNT],
+    diffusers_l: [GlideAllpass; DIFFUSER_COUNT],
+    diffusers_r: [GlideAllpass; DIFFUSER_COUNT],
     lines: [Line; LINE_COUNT],
     early_gain_l: [f32; EARLY_TAPS],
     early_gain_r: [f32; EARLY_TAPS],
@@ -960,16 +1004,20 @@ pub struct Dsp {
     smooth_step: f32,
     predelay: Smoothed,
     early_span: Smoothed,
-    early_level: Smoothed,
-    late_gain: Smoothed,
+    diffuser_scale: Smoothed,
+    late_norm: Smoothed,
     input_gain: Smoothed,
-    output_gain: Smoothed,
+    early_gain: Smoothed,
+    late_gain: Smoothed,
     mid_gain: Smoothed,
     side_gain: Smoothed,
     dry_gain: Smoothed,
     wet_gain: Smoothed,
     input_diffusion: Smoothed,
+    early_diffusion: Smoothed,
     tank_diffusion: Smoothed,
+    low_split_a: Smoothed,
+    high_split_a: Smoothed,
     /// Samples since the last LFO renormalisation.
     lfo_tick: u32,
     /// Nothing has played since construction or the last reset: there is no
@@ -986,10 +1034,12 @@ impl Dsp {
             sample_rate: sr,
             predelay_l: DelayRing::for_ms(MAX_PREDELAY_MS, sr),
             predelay_r: DelayRing::for_ms(MAX_PREDELAY_MS, sr),
-            early_l: DelayRing::for_ms(Self::max_early_ms(), sr),
-            early_r: DelayRing::for_ms(Self::max_early_ms(), sr),
-            diffusers_l: Self::build_diffusers(sr, &DIFFUSER_MS_L),
-            diffusers_r: Self::build_diffusers(sr, &DIFFUSER_MS_R),
+            early_l: DelayRing::for_ms(MAX_EARLY_SPAN_MS + 2.0, sr),
+            early_r: DelayRing::for_ms(MAX_EARLY_SPAN_MS + 2.0, sr),
+            early_diffusers_l: std::array::from_fn(|i| Allpass::for_ms(EARLY_DIFFUSER_MS_L[i], sr)),
+            early_diffusers_r: std::array::from_fn(|i| Allpass::for_ms(EARLY_DIFFUSER_MS_R[i], sr)),
+            diffusers_l: std::array::from_fn(|i| GlideAllpass::new(DIFFUSER_MS_L[i], sr)),
+            diffusers_r: std::array::from_fn(|i| GlideAllpass::new(DIFFUSER_MS_R[i], sr)),
             lines: Self::build_lines(sr, &tuning),
             early_gain_l: early_gains(&EARLY_AT_L),
             early_gain_r: early_gains(&EARLY_AT_R),
@@ -1001,16 +1051,20 @@ impl Dsp {
             smooth_step: smoothing_step(SMOOTH_MS, sr),
             predelay: Smoothed::at(tuning.predelay),
             early_span: Smoothed::at(tuning.early_span),
-            early_level: Smoothed::at(tuning.early_level),
-            late_gain: Smoothed::at(tuning.late_gain),
+            diffuser_scale: Smoothed::at(tuning.diffuser_scale),
+            late_norm: Smoothed::at(tuning.late_norm),
             input_gain: Smoothed::at(tuning.input_gain),
-            output_gain: Smoothed::at(tuning.output_gain),
+            early_gain: Smoothed::at(tuning.early_gain),
+            late_gain: Smoothed::at(tuning.late_gain),
             mid_gain: Smoothed::at(tuning.mid_gain),
             side_gain: Smoothed::at(tuning.side_gain),
             dry_gain: Smoothed::at(tuning.dry_gain),
             wet_gain: Smoothed::at(tuning.wet_gain),
             input_diffusion: Smoothed::at(tuning.input_diffusion),
+            early_diffusion: Smoothed::at(tuning.early_diffusion),
             tank_diffusion: Smoothed::at(tuning.tank_diffusion),
+            low_split_a: Smoothed::at(tuning.low_split_a),
+            high_split_a: Smoothed::at(tuning.high_split_a),
             lfo_tick: 0,
             fresh: true,
             tuning,
@@ -1020,31 +1074,9 @@ impl Dsp {
         dsp
     }
 
-    /// The longest early pattern any mode reaches at size 100 %.
-    fn max_early_ms() -> f32 {
-        ReverbMode::ALL
-            .iter()
-            .map(|mode| mode.character().early_span_ms)
-            .fold(0.0, f32::max)
-            + 2.0
-    }
-
-    /// The longest tank line any mode reaches, plus the modulation's swing.
+    /// The longest tank line Size reaches, plus the modulation's swing.
     fn max_line_ms() -> f32 {
-        ReverbMode::ALL
-            .iter()
-            .map(|mode| mode.character().longest_ms)
-            .fold(0.0, f32::max)
-            * size_scale(100.0)
-            + MAX_MOD_MS * 2.5
-            + 2.0
-    }
-
-    fn build_diffusers(
-        sample_rate: f32,
-        lengths: &[f32; DIFFUSER_COUNT],
-    ) -> [Allpass; DIFFUSER_COUNT] {
-        std::array::from_fn(|i| Allpass::for_ms(lengths[i], sample_rate))
+        MAX_LONGEST_LINE_MS + MAX_MOD_MS * 2.5 + 2.0
     }
 
     fn build_lines(sample_rate: f32, tuning: &Tuning) -> [Line; LINE_COUNT] {
@@ -1095,6 +1127,8 @@ impl Dsp {
         }
         match wire_index {
             ipc::LOW_CUT_INDEX | ipc::HIGH_CUT_INDEX => self.rebuild_filters(),
+            // A label: nothing to retune.
+            ipc::MODE_INDEX => {}
             _ => self.retune(),
         }
         true
@@ -1120,16 +1154,20 @@ impl Dsp {
         let t = Tuning::resolve(&self.params, self.sample_rate);
         self.predelay.target = t.predelay;
         self.early_span.target = t.early_span;
-        self.early_level.target = t.early_level;
-        self.late_gain.target = t.late_gain;
+        self.diffuser_scale.target = t.diffuser_scale;
+        self.late_norm.target = t.late_norm;
         self.input_gain.target = t.input_gain;
-        self.output_gain.target = t.output_gain;
+        self.early_gain.target = t.early_gain;
+        self.late_gain.target = t.late_gain;
         self.mid_gain.target = t.mid_gain;
         self.side_gain.target = t.side_gain;
         self.dry_gain.target = t.dry_gain;
         self.wet_gain.target = t.wet_gain;
         self.input_diffusion.target = t.input_diffusion;
+        self.early_diffusion.target = t.early_diffusion;
         self.tank_diffusion.target = t.tank_diffusion;
+        self.low_split_a.target = t.low_split_a;
+        self.high_split_a.target = t.high_split_a;
         self.tuning = t;
         if self.fresh {
             self.snap();
@@ -1141,14 +1179,20 @@ impl Dsp {
         for smoothed in [
             &mut self.predelay,
             &mut self.early_span,
-            &mut self.early_level,
-            &mut self.late_gain,
+            &mut self.diffuser_scale,
+            &mut self.late_norm,
             &mut self.input_gain,
-            &mut self.output_gain,
+            &mut self.early_gain,
+            &mut self.late_gain,
             &mut self.mid_gain,
             &mut self.side_gain,
             &mut self.dry_gain,
             &mut self.wet_gain,
+            &mut self.input_diffusion,
+            &mut self.early_diffusion,
+            &mut self.tank_diffusion,
+            &mut self.low_split_a,
+            &mut self.high_split_a,
         ] {
             smoothed.settle();
         }
@@ -1156,8 +1200,6 @@ impl Dsp {
             line.delay = self.tuning.lines[i];
             line.loss = self.tuning.absorption[i];
         }
-        self.input_diffusion.settle();
-        self.tank_diffusion.settle();
     }
 
     fn rebuild_filters(&mut self) {
@@ -1204,11 +1246,18 @@ impl StereoEffect for Dsp {
         self.early_l.clear();
         self.early_r.clear();
         for ap in self
+            .early_diffusers_l
+            .iter_mut()
+            .chain(self.early_diffusers_r.iter_mut())
+        {
+            ap.clear();
+        }
+        for ap in self
             .diffusers_l
             .iter_mut()
             .chain(self.diffusers_r.iter_mut())
         {
-            ap.clear();
+            ap.ring.clear();
         }
         for line in self.lines.iter_mut() {
             line.clear();
@@ -1260,26 +1309,32 @@ impl StereoEffect for Dsp {
                 self.predelay_r.read_linear(predelay + 1.0),
             )
         };
+        // Freeze mutes what enters the room; the room keeps what it has.
+        let input = self.input_gain.next(smooth);
+        let (x_l, x_r) = (pre_l * input, pre_r * input);
 
-        // Early reflections.
-        self.early_l.push(pre_l);
-        self.early_r.push(pre_r);
+        // Early reflections, spread over the room's span.
+        self.early_l.push(x_l);
+        self.early_r.push(x_r);
         let span = self.early_span.next(glide);
-        let early_level = self.early_level.next(smooth);
-        let (early_l, early_r) = if early_level > 1.0e-4 {
-            self.early(span)
-        } else {
-            (0.0, 0.0)
-        };
+        let (er_l, er_r) = self.early(span);
+        let early_g = self.early_diffusion.next(smooth);
+        let (mut early_l, mut early_r) = (er_l, er_r);
+        for i in 0..EARLY_DIFFUSER_COUNT {
+            early_l = self.early_diffusers_l[i].process(early_l, early_g);
+            early_r = self.early_diffusers_r[i].process(early_r, early_g);
+        }
 
-        // Input diffusion.
-        let input_gain = self.input_gain.next(smooth) * self.late_gain.next(smooth);
-        let mut diff_l = pre_l * input_gain;
-        let mut diff_r = pre_r * input_gain;
+        // The tank hears the direct sound and its reflections, so the tail
+        // builds over the early span the way a room's does.
+        let norm = self.late_norm.next(smooth) * FRAC_1_SQRT_2;
+        let mut diff_l = (x_l + er_l) * norm;
+        let mut diff_r = (x_r + er_r) * norm;
+        let scale = self.diffuser_scale.next(glide);
         let g = self.input_diffusion.next(smooth);
         for i in 0..DIFFUSER_COUNT {
-            diff_l = self.diffusers_l[i].process(diff_l, g);
-            diff_r = self.diffusers_r[i].process(diff_r, g);
+            diff_l = self.diffusers_l[i].process(diff_l, g, scale);
+            diff_r = self.diffusers_r[i].process(diff_r, g, scale);
         }
 
         // Tank: read every line before any of them is written — the
@@ -1314,7 +1369,8 @@ impl StereoEffect for Dsp {
         }
 
         let tank_g = self.tank_diffusion.next(smooth);
-        let (low_split, high_split) = (t.low_split, t.high_split);
+        let low_split = OnePole::from_a(self.low_split_a.next(smooth));
+        let high_split = OnePole::from_a(self.high_split_a.next(smooth));
         for (i, line) in self.lines.iter_mut().enumerate() {
             line.glide_loss(t.absorption[i], smooth);
             let absorbed = line.absorb(taps[i], low_split, high_split);
@@ -1326,8 +1382,10 @@ impl StereoEffect for Dsp {
             line.ring.push(flush_denormal(taps[i] + injected));
         }
 
-        let mut wet_l = late_l * 0.25 + early_l * early_level;
-        let mut wet_r = late_r * 0.25 + early_r * early_level;
+        let early_out = self.early_gain.next(smooth);
+        let late_out = self.late_gain.next(smooth) * LATE_OUTPUT;
+        let mut wet_l = late_l * late_out + early_l * early_out;
+        let mut wet_r = late_r * late_out + early_r * early_out;
         if let Some(f) = self.low_cut_l.as_mut() {
             wet_l = f.run(wet_l);
         }
@@ -1341,470 +1399,16 @@ impl StereoEffect for Dsp {
             wet_r = f.run(wet_r);
         }
 
-        let mid = (wet_l + wet_r) * FRAC_1_SQRT_2 * self.mid_gain.next(smooth);
-        let side = (wet_l - wet_r) * FRAC_1_SQRT_2 * self.side_gain.next(smooth);
-        let wet = self.wet_gain.next(smooth) * self.output_gain.next(smooth);
+        let mid = (wet_l + wet_r) * 0.5 * self.mid_gain.next(smooth);
+        let side = (wet_l - wet_r) * 0.5 * self.side_gain.next(smooth);
+        let wet = self.wet_gain.next(smooth);
         let dry = self.dry_gain.next(smooth);
         (
-            left * dry + (mid + side) * wet,
-            right * dry + (mid - side) * wet,
+            flush_denormal(left * dry + (mid + side) * wet),
+            flush_denormal(right * dry + (mid - side) * wet),
         )
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SR: f32 = 48_000.0;
-
-    fn wet_only(mut params: Params) -> Params {
-        params.mix = 100.0;
-        params
-    }
-
-    fn dsp_with(params: Params) -> Dsp {
-        let mut dsp = Dsp::new(SR);
-        dsp.set_params(params);
-        dsp.reset();
-        dsp
-    }
-
-    /// The wet impulse response, left and right.
-    fn impulse_response(params: Params, frames: usize) -> (Vec<f32>, Vec<f32>) {
-        let mut dsp = dsp_with(wet_only(params));
-        let mut left = Vec::with_capacity(frames);
-        let mut right = Vec::with_capacity(frames);
-        for n in 0..frames {
-            let x = if n == 0 { 1.0 } else { 0.0 };
-            let (l, r) = dsp.process_stereo(x, x);
-            assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
-            left.push(l);
-            right.push(r);
-        }
-        (left, right)
-    }
-
-    /// Seconds for the backward-integrated energy (Schroeder) to fall from
-    /// −5 to −25 dB, scaled to 60 dB.
-    fn measured_rt60(signal: &[f32]) -> f32 {
-        let mut energy: Vec<f64> = signal.iter().map(|x| f64::from(*x).powi(2)).collect();
-        for i in (0..energy.len() - 1).rev() {
-            energy[i] += energy[i + 1];
-        }
-        let total = energy[0];
-        let level = |i: usize| 10.0 * (energy[i] / total).log10();
-        let start = (0..energy.len()).find(|&i| level(i) <= -5.0).unwrap();
-        let end = (0..energy.len()).find(|&i| level(i) <= -25.0).unwrap();
-        (end - start) as f32 / SR * 3.0
-    }
-
-    #[test]
-    fn descriptor_ids_are_unique_and_match_defaults() {
-        let d = descriptor();
-        assert_eq!(d.id, PLUGIN_ID);
-        assert_eq!(d.category, PluginCategory::Effect);
-
-        let mut ids: Vec<_> = d.params.iter().map(|p| p.id).collect();
-        let count = ids.len();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(count, ids.len(), "duplicate parameter id in descriptor");
-
-        let defaults = ipc::ui_values(&default_params());
-        for param in d.params {
-            let (_, actual) = defaults
-                .iter()
-                .find(|(id, _)| *id == param.id)
-                .copied()
-                .unwrap_or_else(|| panic!("`{}` is missing from ui_values", param.id));
-            assert!(
-                (param.default_value - actual).abs() < 1.0e-6,
-                "`{}`: descriptor says {}, default_params() says {actual}",
-                param.id,
-                param.default_value,
-            );
-            assert!(
-                param.default_value >= param.min && param.default_value <= param.max,
-                "`{}`: default {} is outside {}..{}",
-                param.id,
-                param.default_value,
-                param.min,
-                param.max,
-            );
-        }
-    }
-
-    #[test]
-    fn bypass_when_power_off() {
-        let mut params = default_params();
-        params.power = false;
-        let mut dsp = dsp_with(params);
-        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
-    }
-
-    #[test]
-    fn mix_at_zero_is_the_dry_signal() {
-        let mut params = default_params();
-        params.mix = 0.0;
-        let mut dsp = dsp_with(params);
-        for n in 0..4_800 {
-            let x = (n as f32 * 0.05).sin() * 0.5;
-            let (l, r) = dsp.process_stereo(x, -x);
-            assert!((l - x).abs() < 1.0e-6 && (r + x).abs() < 1.0e-6);
-        }
-    }
-
-    #[test]
-    fn the_feedback_matrix_preserves_energy() {
-        let mut v: [f32; LINE_COUNT] = std::array::from_fn(|i| (i as f32 * 0.37).sin());
-        let before: f32 = v.iter().map(|x| x * x).sum();
-        hadamard(&mut v);
-        let after: f32 = v.iter().map(|x| x * x).sum();
-        assert!((before - after).abs() < 1.0e-5);
-    }
-
-    /// Two orthogonal output vectors are what decorrelate left and right;
-    /// injections that are not rows of the matrix are what spread at once.
-    #[test]
-    fn the_tank_vectors_are_orthogonal_and_spread() {
-        let dot = |a: &[f32; LINE_COUNT], b: &[f32; LINE_COUNT]| -> f32 {
-            a.iter().zip(b).map(|(x, y)| x * y).sum()
-        };
-        assert_eq!(dot(&INPUT_L, &INPUT_R), 0.0);
-        assert_eq!(dot(&OUTPUT_L, &OUTPUT_R), 0.0);
-        for input in [INPUT_L, INPUT_R] {
-            let mut mixed = input;
-            hadamard(&mut mixed);
-            let loudest = mixed.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-            assert!(loudest < 3.0, "an injection collapsed onto one line");
-        }
-    }
-
-    #[test]
-    fn impulse_builds_a_tail_at_every_rate_and_mode() {
-        for &sr in &[44_100.0f32, 48_000.0, 96_000.0] {
-            for mode in ReverbMode::ALL {
-                let mut dsp = Dsp::new(sr);
-                let mut params = default_params();
-                params.mode = mode;
-                params.mix = 100.0;
-                dsp.set_params(params);
-                dsp.reset();
-                let _ = dsp.process_stereo(1.0, 1.0);
-                let mut late = 0.0f32;
-                for n in 0..(sr as usize / 2) {
-                    let (l, r) = dsp.process_stereo(0.0, 0.0);
-                    assert!(l.is_finite() && r.is_finite());
-                    if n > sr as usize / 5 {
-                        late = late.max(l.abs()).max(r.abs());
-                    }
-                }
-                assert!(late > 1.0e-4, "{mode:?} @ {sr} produced no tail");
-            }
-        }
-    }
-
-    /// The tank is a feedback loop around a unit-gain mixing matrix; the
-    /// longest decay at the largest size is where a coefficient slip shows up
-    /// as a slow build to infinity rather than as a tail.
-    #[test]
-    fn longest_decay_stays_bounded() {
-        let mut params = wet_only(default_params());
-        params.decay_sec = 20.0;
-        params.size = 100.0;
-        params.damping = 0.0;
-        params.bass_mult = 2.0;
-        params.mod_depth = 100.0;
-        params.diffusion = 100.0;
-        let mut dsp = dsp_with(params);
-        let mut peak = 0.0f32;
-        for n in 0..(48_000 * 8) {
-            let x = if n < 4_800 {
-                (n as f32 * 0.01).sin() * 0.7
-            } else {
-                0.0
-            };
-            let (l, r) = dsp.process_stereo(x, x);
-            assert!(l.is_finite() && r.is_finite(), "non-finite at sample {n}");
-            peak = peak.max(l.abs()).max(r.abs());
-        }
-        assert!(peak < 4.0, "tank ran away: peak {peak}");
-    }
-
-    /// The decay the editor draws is the decay that plays.
-    #[test]
-    fn the_measured_decay_is_the_drawn_decay() {
-        for (mode, decay) in [
-            (ReverbMode::Hall, 1.5f32),
-            (ReverbMode::Room, 0.8),
-            (ReverbMode::Plate, 2.5),
-        ] {
-            let mut params = default_params();
-            params.mode = mode;
-            params.decay_sec = decay;
-            params.damping = 0.0;
-            params.bass_mult = 1.0;
-            params.low_cut_hz = 20.0;
-            params.high_cut_hz = 20_000.0;
-            params.mod_depth = 0.0;
-            params.predelay_ms = 0.0;
-            let profile = decay_profile(&params, SR);
-            assert!((profile.rt_at(1_000.0) - decay).abs() < decay * 0.02);
-            let (left, right) = impulse_response(params, (SR * decay * 1.6) as usize);
-            let sum: Vec<f32> = left.iter().zip(&right).map(|(l, r)| l + r).collect();
-            let measured = measured_rt60(&sum);
-            assert!(
-                (measured - decay).abs() < decay * 0.15,
-                "{mode:?}: drew {decay} s, measured {measured} s"
-            );
-        }
-    }
-
-    #[test]
-    fn damping_shortens_the_top_and_bass_lengthens_the_bottom() {
-        let mut params = default_params();
-        params.decay_sec = 2.0;
-        params.damping = 80.0;
-        params.bass_mult = 1.6;
-        let profile = decay_profile(&params, SR);
-        assert!(
-            (profile.rt_at(30.0) - 3.2).abs() < 0.1,
-            "{}",
-            profile.rt_at(30.0)
-        );
-        assert!((profile.rt_at(1_200.0) - 2.0).abs() < 0.25);
-        assert!(profile.rt_at(16_000.0) < 0.8, "{}", profile.rt_at(16_000.0));
-        assert!(profile.rt_at(200.0) > profile.rt_at(2_000.0));
-        assert!(profile.rt_at(2_000.0) > profile.rt_at(10_000.0));
-    }
-
-    /// A mono source comes back as two different tails that still sum: wide,
-    /// and safe to fold down.
-    #[test]
-    fn a_mono_source_gets_a_wide_tail_that_folds_down() {
-        let mut params = wet_only(default_params());
-        params.width = 100.0;
-        params.predelay_ms = 0.0;
-        let mut dsp = dsp_with(params);
-        let mut seed = 0x1234_5678u32;
-        let (mut ll, mut rr, mut lr, mut mono) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        for n in 0..(48_000 * 2) {
-            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let x = (seed >> 9) as f32 / (1u32 << 23) as f32 - 0.5;
-            let (l, r) = dsp.process_stereo(x, x);
-            if n > 24_000 {
-                let (l, r) = (f64::from(l), f64::from(r));
-                ll += l * l;
-                rr += r * r;
-                lr += l * r;
-                mono += (l + r) * (l + r) * 0.25;
-            }
-        }
-        let correlation = lr / (ll * rr).sqrt();
-        assert!(correlation.abs() < 0.35, "correlation {correlation}");
-        assert!(
-            mono > 0.3 * (ll + rr) * 0.5,
-            "the fold-down cancels: {mono} vs {}",
-            (ll + rr) * 0.5
-        );
-        // Balanced, too.
-        assert!((10.0 * (ll / rr).log10()).abs() < 1.5);
-    }
-
-    #[test]
-    fn nothing_arrives_before_the_predelay() {
-        let mut params = default_params();
-        params.predelay_ms = 50.0;
-        let (left, right) = impulse_response(params, 4_800);
-        let onset = left
-            .iter()
-            .zip(&right)
-            .position(|(l, r)| l.abs() > 1.0e-6 || r.abs() > 1.0e-6)
-            .unwrap();
-        assert!(onset >= 2_400, "arrived at {onset}");
-    }
-
-    #[test]
-    fn freeze_holds_the_tail_after_the_input_stops() {
-        let mut params = wet_only(default_params());
-        params.decay_sec = 2.0;
-        let mut dsp = dsp_with(params);
-        for n in 0..24_000 {
-            let x = (n as f32 * 0.03).sin() * 0.5;
-            let _ = dsp.process_stereo(x, x);
-        }
-        assert!(dsp.apply_ui_param("freeze", 1.0));
-
-        let mut early = 0.0f32;
-        for _ in 0..4_800 {
-            let (l, r) = dsp.process_stereo(0.0, 0.0);
-            early = early.max(l.abs()).max(r.abs());
-        }
-        let mut late = 0.0f32;
-        for _ in 0..(48_000 * 4) {
-            let (l, r) = dsp.process_stereo(0.0, 0.0);
-            late = late.max(l.abs()).max(r.abs());
-        }
-        assert!(early > 1.0e-4, "nothing in the tank to freeze");
-        assert!(
-            late > early * 0.5,
-            "freeze decayed away: early {early}, late {late}"
-        );
-
-        // And unfreezing lets it go.
-        assert!(dsp.apply_ui_param("freeze", 0.0));
-        for _ in 0..(48_000 * 6) {
-            let _ = dsp.process_stereo(0.0, 0.0);
-        }
-        let (l, r) = dsp.process_stereo(0.0, 0.0);
-        assert!(l.abs().max(r.abs()) < early * 0.01);
-    }
-
-    /// Dragging Size or switching mode on a running tail bends it; it never
-    /// steps. A step shows as a sample-to-sample jump out of proportion to
-    /// the level around it; a glide only bends the pitch, which at most
-    /// doubles the slope of a tone for the moment it lasts.
-    #[test]
-    fn a_size_or_mode_change_does_not_click() {
-        for (id, value) in [
-            ("size", 15.0f32),
-            ("mode", ReverbMode::Room.to_wire()),
-            ("decaySec", 0.3),
-            ("freeze", 1.0),
-            ("diffusion", 0.0),
-        ] {
-            let mut params = wet_only(default_params());
-            params.low_cut_hz = 20.0;
-            params.high_cut_hz = 20_000.0;
-            let mut dsp = dsp_with(params);
-            let mut previous = (0.0f32, 0.0f32);
-            let mut window_step = 0.0f32;
-            let mut window_peak = 0.0f32;
-            let mut steady = 0.0f32;
-            let mut worst = 0.0f32;
-            for n in 0..(48_000 * 2) {
-                let x = (n as f32 * TAU * 220.0 / SR).sin() * 0.3;
-                if n == 48_000 {
-                    assert!(dsp.apply_ui_param(id, value));
-                }
-                let (l, r) = dsp.process_stereo(x, x);
-                window_step = window_step.max((l - previous.0).abs().max((r - previous.1).abs()));
-                window_peak = window_peak.max(l.abs()).max(r.abs());
-                previous = (l, r);
-                if n % 1_000 == 999 && n > 24_000 {
-                    let ratio = window_step / window_peak.max(1.0e-6);
-                    if n < 48_000 {
-                        steady = steady.max(ratio);
-                    } else {
-                        worst = worst.max(ratio);
-                    }
-                    window_step = 0.0;
-                    window_peak = 0.0;
-                }
-            }
-            assert!(
-                worst < steady * 2.5,
-                "{id}: the change stepped ({worst} against {steady})"
-            );
-        }
-    }
-    #[test]
-    fn reset_clears_the_tail() {
-        let mut dsp = dsp_with(wet_only(default_params()));
-        for _ in 0..4_800 {
-            let _ = dsp.process_stereo(0.5, -0.5);
-        }
-        dsp.reset();
-        let (l, r) = dsp.process_stereo(0.0, 0.0);
-        assert!(l.abs() < 1.0e-6 && r.abs() < 1.0e-6);
-    }
-
-    #[test]
-    fn sample_rate_change_keeps_delays_inside_the_new_rings() {
-        let mut params = wet_only(default_params());
-        params.size = 100.0;
-        params.predelay_ms = MAX_PREDELAY_MS;
-        let mut dsp = dsp_with(params);
-        dsp.set_sample_rate(44_100.0);
-        assert_eq!(dsp.params().size, 100.0, "the params survive a rate change");
-        for line in &dsp.lines {
-            assert!(line.delay + MAX_MOD_MS * 0.001 * 44_100.0 * 2.5 < line.ring.max_cubic_delay());
-        }
-        assert!(dsp.tuning.predelay + 2.0 < dsp.predelay_l.len() as f32);
-        for _ in 0..44_100 {
-            let (l, r) = dsp.process_stereo(0.3, -0.3);
-            assert!(l.is_finite() && r.is_finite());
-        }
-    }
-
-    #[test]
-    fn wire_update_changes_only_authoritative_params() {
-        let mut dsp = Dsp::new(48_000.0);
-        assert!(dsp.apply_wire_param(ipc::DECAY_INDEX, 6.0));
-        assert_eq!(dsp.params().decay_sec, 6.0);
-        assert!(!dsp.apply_wire_param(u32::MAX, 0.0));
-        assert!(!dsp.apply_wire_param(ipc::DECAY_INDEX, f32::NAN));
-    }
-
-    #[test]
-    fn the_wet_cuts_are_what_the_editor_draws() {
-        let params = default_params();
-        assert!(wet_filter_response_db(&params, 1_000.0, SR).abs() < 0.5);
-        assert!(wet_filter_response_db(&params, 30.0, SR) < -12.0);
-        assert!(wet_filter_response_db(&params, 19_000.0, SR) < -6.0);
-    }
-
-    #[test]
-    fn plate_has_no_early_reflections_and_rooms_do() {
-        let plate = decay_profile(
-            &Params {
-                mode: ReverbMode::Plate,
-                ..default_params()
-            },
-            SR,
-        );
-        assert!(plate.early.iter().all(|e| e.gain == 0.0));
-        let room = decay_profile(
-            &Params {
-                mode: ReverbMode::Room,
-                ..default_params()
-            },
-            SR,
-        );
-        assert!(room.early.iter().any(|e| e.gain.abs() > 0.05));
-        assert!(room.early.iter().all(|e| e.at_ms >= room.predelay_ms));
-    }
-
-    /// Every mode, at any size or decay, comes back at about the same
-    /// loudness: switching character or stretching the decay changes the
-    /// room, not the fader.
-    #[test]
-    fn every_mode_sits_at_the_same_loudness() {
-        for mode in ReverbMode::ALL {
-            for (size, decay) in [(20.0f32, 0.5f32), (60.0, 2.4), (100.0, 12.0)] {
-                let mut params = wet_only(default_params());
-                params.mode = mode;
-                params.size = size;
-                params.decay_sec = decay;
-                let mut dsp = dsp_with(params);
-                let mut seed = 0x1234_5678u32;
-                let (mut input, mut output) = (0.0f64, 0.0f64);
-                for n in 0..(48_000 * 2) {
-                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    let x = (seed >> 9) as f32 / (1u32 << 23) as f32 - 0.5;
-                    let (l, r) = dsp.process_stereo(x, x);
-                    if n > 36_000 {
-                        input += f64::from(x * x);
-                        output += f64::from((l * l + r * r) * 0.5);
-                    }
-                }
-                let db = 10.0 * (output / input).log10();
-                assert!(
-                    (-5.0..=-1.0).contains(&db),
-                    "{mode:?} at size {size}, decay {decay}: {db:.1} dB"
-                );
-            }
-        }
-    }
-}
+mod tests;

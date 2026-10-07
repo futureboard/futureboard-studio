@@ -38,10 +38,26 @@ MKINITFS_FEATURES="ata base ext4 mmc nvme scsi usb virtio"
 # console proper, where the boot and the login banner show.
 CMDLINE="root=LABEL=lsroot rootfstype=ext4 ro modules=sd-mod,usb-storage,ext4 quiet console=ttyS0,115200 console=tty0"
 
+# Firmware for every Wi-Fi driver in the kernel: the packages holding what
+# drivers/net/wireless asks for (modinfo -F firmware), plus cypress (brcm's
+# links point there). What is left out upstream does not ship either (b43,
+# zd1211, ipw2x00, wil6210).
+WIFI_FIRMWARE="
+	linux-firmware-ath6k linux-firmware-ath9k_htc linux-firmware-ath10k
+	linux-firmware-ath11k linux-firmware-ath12k linux-firmware-atmel
+	linux-firmware-brcm linux-firmware-cypress linux-firmware-intel
+	linux-firmware-libertas linux-firmware-mediatek linux-firmware-mrvl
+	linux-firmware-mwl8k linux-firmware-other linux-firmware-rsi
+	linux-firmware-rtlwifi linux-firmware-rtw88 linux-firmware-rtw89
+	linux-firmware-ti-connectivity linux-firmware-wfx
+"
+
 PACKAGES="
 	alpine-base busybox-mdev-openrc busybox-openrc ifupdown-ng
 	linux-lts linux-firmware-rtl_nic intel-ucode amd-ucode
-	alsa-lib alsa-utils libgcc
+	alsa-lib alsa-utils libgcc tzdata
+	wpa_supplicant iw wireless-regdb
+	$WIFI_FIRMWARE
 	avahi avahi-openrc dbus dbus-openrc
 	e2fsprogs e2fsprogs-extra sfdisk partx mount umount blkid
 "
@@ -50,15 +66,17 @@ log() { printf '\n==> %s\n' "$*"; }
 
 # ── 1. livestage-server ─────────────────────────────────────────────────────
 
-log "Building livestage-server (musl, built-in effects only)"
+log "Building livestage-server (musl, built-in effects only) and livestage-setup"
 if [ ! -f /src/apps/native/livestage/webui/dist/index.html ]; then
 	echo "warning: the web UI is not built; the server will answer the browser with how to build it"
 fi
 export CARGO_TARGET_DIR=/target
 cargo build --release --locked --manifest-path /src/Cargo.toml \
-	-p livestage --no-default-features --bin livestage-server
+	-p livestage --no-default-features --features appliance \
+	--bin livestage-server --bin livestage-setup
 mkdir -p "$WORK"
 strip -o "$WORK/livestage-server" /target/release/livestage-server
+strip -o "$WORK/livestage-setup" /target/release/livestage-setup
 
 # ── 2. The root filesystem ──────────────────────────────────────────────────
 
@@ -74,6 +92,11 @@ apk add --root "$ROOT" --initdb --no-cache --keys-dir /etc/apk/keys \
 	--repositories-file /etc/apk/repositories $PACKAGES
 
 log "Configuring the system"
+# Wi-Fi firmware: Intel's package is everything Intel (Bluetooth, cameras,
+# audio DSPs, ...); only its Wi-Fi part stays. Marvell's is mostly network
+# switch chips (prestera, 73 MB); its Wi-Fi files stay.
+find "$ROOT/lib/firmware/intel" -mindepth 1 -maxdepth 1 ! -name iwlwifi -exec rm -rf {} +
+rm -rf "$ROOT/lib/firmware/mrvl/prestera"
 # File modes do not survive a Windows checkout: set them here.
 (cd "$HERE/rootfs" && find . -type f) | while read -r file; do
 	case "$file" in
@@ -83,14 +106,23 @@ log "Configuring the system"
 	install -D -m "$mode" "$HERE/rootfs/$file" "$ROOT/$file"
 done
 install -m 0755 "$WORK/livestage-server" "$ROOT/usr/bin/livestage-server"
+install -m 0755 "$WORK/livestage-setup" "$ROOT/usr/bin/livestage-setup"
 
-# Written at boot on /run: the root filesystem is read-only.
+# Written at boot on /run: the root filesystem is read-only. The setup's
+# settings (/data/system/setup.conf) make the name, network and time zone
+# (livestage-config); DHCP writes resolv.conf.
 ln -sf /run/resolv.conf "$ROOT/etc/resolv.conf"
 ln -sf /run/issue "$ROOT/etc/issue"
 ln -sf /run/machine-id "$ROOT/etc/machine-id"
+ln -sf /run/hostname "$ROOT/etc/hostname"
+ln -sf /run/hosts "$ROOT/etc/hosts"
+ln -sf /run/localtime "$ROOT/etc/localtime"
+mkdir -p "$ROOT/etc/network"
+ln -sf /run/network/interfaces "$ROOT/etc/network/interfaces"
 mkdir -p "$ROOT/data" "$ROOT/boot/efi"
-# avahi answers for livestage.local and announces the web UI.
-sed -i 's/^#\{0,1\}host-name=.*/host-name=livestage/; s/^#\{0,1\}publish-workstation=.*/publish-workstation=no/' \
+# avahi answers for NAME.local (the host name, livestage until the setup
+# changes it) and announces the web UI.
+sed -i 's/^#\{0,1\}publish-workstation=.*/publish-workstation=no/' \
 	"$ROOT/etc/avahi/avahi-daemon.conf"
 
 # The service account: plays and records (audio), owns /data/livestage.
@@ -101,7 +133,7 @@ chroot "$ROOT" /usr/sbin/addgroup livestage audio
 
 rc() { chroot "$ROOT" /sbin/rc-update add "$1" "$2" >/dev/null; }
 for s in devfs dmesg mdev hwdrivers; do rc "$s" sysinit; done
-for s in modules sysctl hostname bootmisc syslog hwclock livestage-data; do rc "$s" boot; done
+for s in modules sysctl hostname bootmisc syslog hwclock livestage-data livestage-config; do rc "$s" boot; done
 for s in networking acpid ntpd dbus avahi-daemon livestage local; do rc "$s" default; done
 for s in killprocs mount-ro savecache; do rc "$s" shutdown; done
 
@@ -139,6 +171,10 @@ cat >"$DATA/livestage/livestage.conf" <<'EOF'
 #LIVESTAGE_ARGS="--output hw:CARD=USB --input hw:CARD=USB --rate 48000 --buffer 128"
 EOF
 chown -R "$uid:$gid" "$DATA/livestage"
+# Both are read as root at boot: root's alone. The setup on tty1 writes the
+# first one; until it has, the defaults.
+chown 0:0 "$DATA/livestage/livestage.conf"
+mkdir -p "$DATA/system"
 
 rm -f "$WORK"/*.img
 mkfs.vfat -C -F 32 -n LSBOOT "$WORK/esp.img" $((ESP_MB * 1024)) >/dev/null

@@ -11,7 +11,7 @@ import { useEffect, useRef } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
 import { act } from '../store.ts'
 import type { Editor, EditorComponent } from './kit.tsx'
-import { Card, Check, EditorShell, KNOB, KitKnob, LiveCanvas, ParamChoice, Row } from './kit.tsx'
+import { Card, Check, Choice, EditorShell, KNOB, KitKnob, LiveCanvas, ParamChoice, Row } from './kit.tsx'
 import type { KnobSpec, Taper, Unit } from './knobspec.ts'
 import { DIVISION_LABELS, bipolar, spec } from './knobspec.ts'
 import type { Ctx } from './paint.ts'
@@ -33,6 +33,9 @@ const KNOBS: Record<Kind, Record<string, [string, Taper, Unit]>> = {
     diffusion: ['Diffusion', 'linear', 'percent'],
     damping: ['Damping', 'linear', 'percent'],
     bassMult: ['Bass', 'log', 'times'],
+    bassFreqHz: ['Bass Freq', 'log', 'hz'],
+    dampFreqHz: ['Damp Freq', 'log', 'hz'],
+    earlyLate: ['Early/Late', 'linear', 'percent'],
     modDepth: ['Depth', 'linear', 'percent'],
     modRateHz: ['Rate', 'log', 'hz'],
   },
@@ -333,22 +336,50 @@ const reverbMode = (v: number) => {
   return m === 0 || m === 1 || m === 3 || m === 4 ? m : 2
 }
 
-/** ReverbMode::character, the fields the decay reads: shortest and longest
- *  tank line (ms), early span (ms), early level, top-band split (Hz). */
-const CHARACTER: [number, number, number, number, number][] = [
-  [8, 38, 36, 0.62, 5200], // Room
-  [13, 58, 52, 0.48, 4800], // Chamber
-  [22, 104, 74, 0.32, 4000], // Hall
-  [5, 44, 0, 0, 7000], // Plate: no discrete reflections
-  [4, 22, 30, 0.85, 6000], // Ambience
+/** ReverbMode::space: the knobs a space type's starting point sets, and
+ *  each type's values for them, in the same order. The mode itself is a
+ *  label the DSP never reads. */
+const SPACE_IDS = [
+  'predelayMs',
+  'size',
+  'decaySec',
+  'diffusion',
+  'damping',
+  'bassMult',
+  'bassFreqHz',
+  'dampFreqHz',
+  'earlyLate',
+  'modDepth',
+  'modRateHz',
+] as const
+const TYPE_SPACE: number[][] = [
+  [4, 22, 0.7, 70, 45, 1.0, 250, 4500, 40, 12, 0.6], // Room
+  [10, 40, 1.4, 85, 35, 1.1, 250, 5000, 55, 20, 0.7], // Chamber
+  [20, 60, 2.4, 80, 40, 1.2, 250, 4000, 65, 25, 0.7], // Hall
+  [6, 35, 1.8, 95, 15, 0.8, 400, 8000, 100, 30, 1.0], // Plate: no reflections
+  [0, 12, 0.5, 60, 50, 0.9, 250, 5000, 25, 10, 0.5], // Ambience
 ]
+
+/** ReverbMode::starting_point, as the wire values it sends: the label and
+ *  the type's space. Cuts, width, mix, output and the switches stay. */
+function startingPoint(mode: number): Record<string, number> {
+  const values: Record<string, number> = { mode }
+  SPACE_IDS.forEach((id, i) => {
+    values[id] = TYPE_SPACE[mode][i]
+  })
+  return values
+}
 
 const LINE_COUNT = 16
 const MAX_PREDELAY_MS = 500
 const FREEZE_GAIN = 0.99995
-const MAX_RT60_SEC = 40
-const LOW_SPLIT_HZ = 320
-const MIN_HIGH_RATIO = 0.12
+const MAX_RT60_SEC = 60
+const MIN_HIGH_RATIO = 0.1
+const MIN_LONGEST_LINE_MS = 16
+const MAX_LONGEST_LINE_MS = 180
+const SHORTEST_LINE_SHARE = 0.32
+const MIN_EARLY_SPAN_MS = 5
+const MAX_EARLY_SPAN_MS = 140
 const LINE_SPREAD_JITTER = [
   0.0, 0.21, -0.17, 0.31, -0.08, 0.27, -0.29, 0.12, -0.22, 0.33, -0.11, 0.19, -0.31, 0.07, -0.24, 0.0,
 ]
@@ -360,7 +391,23 @@ const EARLY_AT_L = [0.043, 0.087, 0.131, 0.179, 0.233, 0.297, 0.367, 0.443, 0.53
 const EARLY_AT_R = [0.051, 0.097, 0.149, 0.199, 0.257, 0.319, 0.389, 0.471, 0.557, 0.661, 0.781, 0.937]
 const EARLY_SIGN = [1, -1, 1, 1, -1, 1, -1, -1, 1, -1, 1, -1]
 
-/** Bilinear one-pole low-pass. */
+/** `size` 0–100 % onto 0–1, and the exponential travel every Size curve
+ *  takes (space, sweep). */
+const space = (size: number) => clamp(size / 100, 0, 1)
+const sweep = (min: number, max: number, at: number) => min * Math.pow(max / min, at)
+
+/** high_ratio: the top band's share of the middle band's decay. */
+const highRatio = (damping: number) => Math.pow(MIN_HIGH_RATIO, clamp(damping / 100, 0, 1))
+
+/** early_late_gains: the (early, late) output gains, equal power. */
+function earlyLateGains(earlyLate: number): [number, number] {
+  const b = clamp(earlyLate / 100, 0, 1)
+  if (b >= 1) return [0, 1]
+  if (b <= 0) return [1, 0]
+  return [Math.cos((b * Math.PI) / 2), Math.sin((b * Math.PI) / 2)]
+}
+
+/** Bilinear one-pole low-pass (OnePole::a_for, from_a). */
 interface OnePole {
   a: number
   b: number
@@ -368,7 +415,8 @@ interface OnePole {
 
 function onePole(cornerHz: number, sampleRate: number): OnePole {
   const k = Math.tan((Math.PI * clamp(cornerHz, 1, sampleRate * 0.45)) / sampleRate)
-  return { a: (1 - k) / (1 + k), b: k / (1 + k) }
+  const a = (1 - k) / (1 + k)
+  return { a, b: (1 - a) * 0.5 }
 }
 
 /** The one-pole's complex response at `hz`, as [re, im]. */
@@ -398,6 +446,7 @@ interface DecayProfile {
   predelayMs: number
   early: EarlyReflection[]
   firstLateMs: number
+  lateDb: number
   rtLow: number
   rtMid: number
   rtHigh: number
@@ -416,30 +465,30 @@ function earlyGains(at: number[]): number[] {
 function decayProfile(editor: Editor, sampleRate: number): DecayProfile {
   const v = editor.value
   const sr = Math.max(1, sampleRate)
-  const [shortest, longest, earlySpanMs, earlyLevel, highSplitHz] = CHARACTER[reverbMode(v('mode'))]
-  const scale = 0.3 + 0.7 * clamp(v('size') / 100, 0, 1)
   const ms = (m: number) => m * 0.001 * sr
+  const at = space(v('size'))
+  const longest = sweep(MIN_LONGEST_LINE_MS, MAX_LONGEST_LINE_MS, at)
+  const shortest = longest * SHORTEST_LINE_SHARE
   const lines = new Array<number>(LINE_COUNT).fill(0)
-  const ratio = longest / shortest
   for (let rank = 0; rank < LINE_COUNT; rank++) {
-    const at = clamp((rank + LINE_SPREAD_JITTER[rank]) / (LINE_COUNT - 1), 0, 1)
-    lines[LINE_ORDER[rank]] = Math.max(4, ms(shortest * Math.pow(ratio, at) * scale))
+    const spread = clamp((rank + LINE_SPREAD_JITTER[rank]) / (LINE_COUNT - 1), 0, 1)
+    lines[LINE_ORDER[rank]] = Math.max(4, ms(sweep(shortest, longest, spread)))
   }
   const loops = lines.map((l, i) => l + Math.max(1, Math.round(TANK_ALLPASS_MS[i] * 0.001 * sr)))
   const decay = v('decaySec')
   const rtMid = clamp(decay, 0.05, MAX_RT60_SEC)
   const rtLow = clamp(decay * v('bassMult'), 0.05, MAX_RT60_SEC)
-  const damping = clamp(v('damping') / 100, 0, 1)
-  const rtHigh = rtMid * (1 - damping * (1 - MIN_HIGH_RATIO))
+  const rtHigh = clamp(rtMid * highRatio(v('damping')), 0.02, MAX_RT60_SEC)
   const frozen = editor.flag('freeze')
   const predelay = ms(clamp(v('predelayMs'), 0, MAX_PREDELAY_MS))
-  const earlySpan = ms(earlySpanMs * scale)
+  const earlySpan = ms(sweep(MIN_EARLY_SPAN_MS, MAX_EARLY_SPAN_MS, at))
+  const [earlyGain, lateGain] = earlyLateGains(v('earlyLate'))
   const toMs = 1000 / sr
   const gainsL = earlyGains(EARLY_AT_L)
   const gainsR = earlyGains(EARLY_AT_R)
   const early: EarlyReflection[] = [
-    ...EARLY_AT_L.map((at, i) => ({ atMs: (predelay + at * earlySpan) * toMs, gain: gainsL[i] * earlyLevel, right: false })),
-    ...EARLY_AT_R.map((at, i) => ({ atMs: (predelay + at * earlySpan) * toMs, gain: gainsR[i] * earlyLevel, right: true })),
+    ...EARLY_AT_L.map((a, i) => ({ atMs: (predelay + a * earlySpan) * toMs, gain: gainsL[i] * earlyGain, right: false })),
+    ...EARLY_AT_R.map((a, i) => ({ atMs: (predelay + a * earlySpan) * toMs, gain: gainsR[i] * earlyGain, right: true })),
   ]
   // The line whose loop is the median: "a typical line".
   const order = loops.map((_, i) => i).sort((a, b) => loops[a] - loops[b])
@@ -449,13 +498,14 @@ function decayProfile(editor: Editor, sampleRate: number): DecayProfile {
   const absorption: Absorption = frozen
     ? { gain: FREEZE_GAIN, low: 1, high: 1 }
     : { gain: perPass(rtMid), low: perPass(rtLow) / perPass(rtMid), high: perPass(rtHigh) / perPass(rtMid) }
-  const lowSplit = onePole(LOW_SPLIT_HZ, sr)
-  const highSplit = onePole(highSplitHz, sr)
+  const lowSplit = onePole(v('bassFreqHz'), sr)
+  const highSplit = onePole(v('dampFreqHz'), sr)
   const rt = (sec: number) => (frozen ? Infinity : sec)
   return {
     predelayMs: predelay * toMs,
     early,
     firstLateMs: Math.min(...lines) * toMs,
+    lateDb: 20 * log10(Math.max(1e-6, lateGain)),
     rtLow: rt(rtLow),
     rtMid: rt(rtMid),
     rtHigh: rt(rtHigh),
@@ -602,25 +652,27 @@ function paintDecay(ctx: Ctx, w: number, h: number, profile: DecayProfile, spanM
   // The pre-delay: nothing yet.
   if (profile.predelayMs > 0) rect(ctx, 0, 0, xAt(profile.predelayMs), h, alpha(p.shade, 0.55))
 
-  // The tail of each band, from the first late arrival.
+  // The tail of each band, from the first late arrival, starting at the
+  // level the Early/Late balance gives it and falling 60 dB in its RT60.
   const onset = profile.predelayMs + profile.firstLateMs
+  const startDb = Math.max(DECAY_FLOOR_DB, profile.lateDb - 3)
   const lineOf = (rt: number): [number, number][] => {
     if (!Number.isFinite(rt)) {
       return [
-        [xAt(onset), yAt(-3)],
-        [w, yAt(-3)],
+        [xAt(onset), yAt(startDb)],
+        [w, yAt(startDb)],
       ]
     }
     const end = onset + rt * 1000
     if (end <= spanMs) {
       return [
-        [xAt(onset), yAt(-3)],
-        [xAt(end), yAt(DECAY_FLOOR_DB)],
+        [xAt(onset), yAt(startDb)],
+        [xAt(end), yAt(startDb - 60)],
       ]
     }
-    const db = -3 + ((DECAY_FLOOR_DB + 3) * (spanMs - onset)) / (end - onset)
+    const db = startDb - (60 * (spanMs - onset)) / (end - onset)
     return [
-      [xAt(onset), yAt(-3)],
+      [xAt(onset), yAt(startDb)],
       [w, yAt(db)],
     ]
   }
@@ -829,31 +881,46 @@ function VerbDisplays(props: { editor: Editor }) {
 
 /** The listening state a preset or A/B swap leaves alone (preset_applied). */
 const KEEP = ['freeze']
+/** VerbSpace's, with its Wet Only routing. */
+const VERB_KEEP = ['freeze', 'wetOnly']
 
 function VerbSpaceEditor(props: { editor: Editor }) {
   const { editor } = props
-  const knobs = (ids: string[]) => ids.map((id) => <FxKnob key={id} editor={editor} kind="verb" id={id} />)
+  const wetOnly = editor.flag('wetOnly')
+  const knob = (id: string, why?: string) => <FxKnob key={id} editor={editor} kind="verb" id={id} why={why} />
+  const knobs = (ids: string[]) => ids.map((id) => knob(id))
   return (
-    <EditorShell editor={editor} title="VerbSpace" subtitle="Algorithmic reverb" keep={KEEP}>
+    <EditorShell editor={editor} title="VerbSpace" subtitle="Algorithmic reverb" keep={VERB_KEEP}>
       <div className="fx-toolbar">
-        <span className="fx-caption">MODE</span>
-        <ParamChoice editor={editor} id="mode" options={VERB_MODES} />
+        <span className="fx-caption">START FROM</span>
+        {/* A type is a starting point: it moves the knobs to its space, and
+            the knobs alone shape the sound. */}
+        <Choice
+          value={reverbMode(editor.value('mode'))}
+          options={VERB_MODES}
+          onChange={(mode) => editor.setMany(startingPoint(mode))}
+        />
         <span className="spacer" />
+        <Check label="Wet Only" checked={wetOnly} onChange={(on) => editor.set('wetOnly', on ? 1 : 0)} />
         <Check label="Freeze" checked={editor.flag('freeze')} onChange={(on) => editor.set('freeze', on ? 1 : 0)} />
       </div>
       <VerbDisplays editor={editor} />
       <Row>
-        <Section title="Space" count={4}>
-          {knobs(['predelayMs', 'size', 'decaySec', 'diffusion'])}
+        <Section title="Space" count={5}>
+          {knobs(['predelayMs', 'size', 'decaySec', 'diffusion', 'earlyLate'])}
         </Section>
-        <Section title="Tone" count={4}>
-          {knobs(['damping', 'bassMult', 'lowCutHz', 'highCutHz'])}
+        <Section title="Decay colour" count={4}>
+          {knobs(['bassMult', 'bassFreqHz', 'damping', 'dampFreqHz'])}
         </Section>
         <Section title="Motion" count={2}>
           {knobs(['modDepth', 'modRateHz'])}
         </Section>
-        <Section title="Output" count={3}>
-          {knobs(['width', 'mix', 'outputDb'])}
+        <Section title="Output" count={5}>
+          {knob('lowCutHz')}
+          {knob('highCutHz')}
+          {knob('width')}
+          {knob('mix', wetOnly ? 'wet only' : undefined)}
+          {knob('outputDb')}
         </Section>
       </Row>
     </EditorShell>

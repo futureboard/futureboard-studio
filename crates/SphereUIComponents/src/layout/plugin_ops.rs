@@ -142,6 +142,13 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::dyn_panel::DynEditorWindow>,
     >,
+    /// Open native WayGate editors, keyed by insert id, like
+    /// `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub waygate: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::gate_panel::WayGateEditorWindow>,
+    >,
     /// Open native Compressor and Imager editors (one window type for both),
     /// keyed by insert id, like `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
@@ -3296,6 +3303,13 @@ impl StudioLayout {
                 window,
                 cx,
             ),
+            Some(waygate::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.waygate,
+                crate::components::gate_panel::open_waygate_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
             Some(compresser::ui::UI_ORIGIN) => self.open_native_editor(
                 |windows| &mut windows.bands,
                 crate::components::band_panel::open_compresser_editor,
@@ -3484,6 +3498,10 @@ impl StudioLayout {
             }
             let dynamics: Vec<_> = self.plugin_editors.dynamics.values().copied().collect();
             for handle in dynamics {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let gates: Vec<_> = self.plugin_editors.waygate.values().copied().collect();
+            for handle in gates {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
             let bands: Vec<_> = self.plugin_editors.bands.values().copied().collect();

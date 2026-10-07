@@ -8,7 +8,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::scale::ALL_NOTES;
-use crate::{InputType, MAX_RETUNE_MS, Params, Scale, VibratoShape, clamp, default_params};
+use crate::{
+    InputType, LatencyMode, MAX_RETUNE_MS, Params, Scale, VibratoShape, clamp, default_params,
+};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const STATE_VERSION: u32 = 1;
@@ -38,8 +40,9 @@ pub const VIBRATO_ONSET_INDEX: u32 = 21;
 pub const VIBRATO_PITCH_INDEX: u32 = 22;
 pub const VIBRATO_AMP_INDEX: u32 = 23;
 pub const VIBRATO_VARIATION_INDEX: u32 = 24;
+pub const LATENCY_INDEX: u32 = 25;
 
-pub const PARAM_COUNT: usize = 25;
+pub const PARAM_COUNT: usize = 26;
 
 /// Wire index *is* the position in this table; the editor and the host both
 /// resolve through it, so the order is part of the persisted contract.
@@ -70,6 +73,7 @@ pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = [
     "vibratoPitch",
     "vibratoAmp",
     "vibratoVariation",
+    "latency",
 ];
 
 /// Inclusive `(min, max)` for every continuous parameter, indexed by wire
@@ -100,6 +104,7 @@ const RANGES: [(f32, f32); PARAM_COUNT] = [
     (0.0, 100.0),         // vibratoPitch
     (0.0, 100.0),         // vibratoAmp
     (0.0, 100.0),         // vibratoVariation
+    (0.0, 0.0),           // latency
 ];
 
 #[inline]
@@ -210,6 +215,7 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
         VIBRATO_PITCH_INDEX => params.vibrato_pitch = clamp_wire(index, value),
         VIBRATO_AMP_INDEX => params.vibrato_amp = clamp_wire(index, value),
         VIBRATO_VARIATION_INDEX => params.vibrato_variation = clamp_wire(index, value),
+        LATENCY_INDEX => params.latency = LatencyMode::from_wire(value),
         _ => return false,
     }
     true
@@ -252,6 +258,7 @@ pub fn ui_values(params: &Params) -> Vec<(&'static str, f32)> {
         ("vibratoPitch", params.vibrato_pitch),
         ("vibratoAmp", params.vibrato_amp),
         ("vibratoVariation", params.vibrato_variation),
+        ("latency", params.latency.to_wire()),
     ]
 }
 
@@ -291,6 +298,7 @@ mod tests {
         saved.vibrato_shape = VibratoShape::Square;
         saved.vibrato_rate_hz = 6.5;
         saved.vibrato_amp = 40.0;
+        saved.latency = LatencyMode::Live;
         let mut rebuilt = default_params();
         for (id, value) in ui_values(&saved) {
             assert!(apply_ui_param(&mut rebuilt, id, value), "{id}");

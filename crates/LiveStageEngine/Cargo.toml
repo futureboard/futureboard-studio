@@ -36,6 +36,7 @@ zcomp.workspace = true
 burnlimit.workspace = true
 clipper67.workspace = true
 transient.workspace = true
+waygate.workspace = true
 imager.workspace = true
 mixstation.workspace = true
 verbspace.workspace = true

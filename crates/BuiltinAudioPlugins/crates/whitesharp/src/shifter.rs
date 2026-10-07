@@ -36,13 +36,13 @@ pub const MAX_FORMANT: f32 = 1.5;
 
 /// Power-of-two ring indexed by absolute sample number.
 #[derive(Debug, Clone)]
-struct Track {
+pub(crate) struct Track {
     data: Box<[f32]>,
     mask: usize,
 }
 
 impl Track {
-    fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         let len = capacity.max(16).next_power_of_two();
         Self {
             data: vec![0.0; len].into_boxed_slice(),
@@ -51,18 +51,19 @@ impl Track {
     }
 
     #[inline]
-    fn at(&self, index: i64) -> f32 {
+    pub(crate) fn at(&self, index: i64) -> f32 {
         self.data[(index as usize) & self.mask]
     }
 
     #[inline]
-    fn slot(&mut self, index: i64) -> &mut f32 {
+    pub(crate) fn slot(&mut self, index: i64) -> &mut f32 {
         &mut self.data[(index as usize) & self.mask]
     }
 
-    /// Catmull-Rom read at a fractional position.
+    /// Catmull-Rom read at a fractional position: reaches one sample before
+    /// it and two after.
     #[inline]
-    fn read(&self, position: f64) -> f32 {
+    pub(crate) fn read(&self, position: f64) -> f32 {
         let whole = position.floor();
         let t = (position - whole) as f32;
         let i = whole as i64;
@@ -73,7 +74,7 @@ impl Track {
                 + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + t * (3.0 * (p1 - p2) + p3 - p0)))
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.data.fill(0.0);
     }
 }
@@ -150,6 +151,20 @@ impl Shifter {
         (3.0 * p).ceil() as u64 + extra as u64 + 4
     }
 
+    /// What [`Self::latency`] becomes for a shifter at `sample_rate` built
+    /// for `built_for` and set to `longest_period` with `extra` samples of
+    /// analysis lag — without building one.
+    pub fn latency_for_input(
+        sample_rate: f32,
+        built_for: f32,
+        longest_period: f32,
+        extra: usize,
+    ) -> u64 {
+        let unvoiced = (sample_rate * 0.005).round().max(16.0);
+        let p = longest_period.min(built_for).max(unvoiced);
+        Self::latency_for(p, unvoiced, extra)
+    }
+
     /// Retunes the delay for an input type reaching `longest_period`. Only
     /// between notes: the output restarts from the delayed input.
     pub fn set_longest_period(&mut self, longest_period: f32, extra: usize) {
@@ -180,6 +195,30 @@ impl Shifter {
         }
         self.weight.clear();
         self.control_count = 0;
+        self.next_grain = self.now as f64 - self.latency as f64;
+        self.mark = self.next_grain;
+    }
+
+    /// Takes one input frame without laying grains or reading output: the
+    /// shifter idles this way while the live path plays, so its input is
+    /// whole when [`Self::resume`] brings it back.
+    #[inline]
+    pub fn skip(&mut self, left: f32, right: f32) {
+        let n = self.now as i64;
+        *self.input[0].slot(n) = left;
+        *self.input[1].slot(n) = right;
+        self.now += 1;
+    }
+
+    /// Starts laying grains again after [`Self::skip`]: the output picks up
+    /// at the read point, the first grain centred on it, so the overlap is
+    /// whole from the first sample. Clears the output rings; allocates
+    /// nothing.
+    pub fn resume(&mut self) {
+        for track in self.output.iter_mut() {
+            track.clear();
+        }
+        self.weight.clear();
         self.next_grain = self.now as f64 - self.latency as f64;
         self.mark = self.next_grain;
     }

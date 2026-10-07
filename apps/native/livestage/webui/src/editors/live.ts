@@ -39,17 +39,28 @@ export function toDb(level: number): number {
   return level <= 1e-6 ? -120 : 20 * Math.log10(level)
 }
 
-interface HistoryPoint {
+export interface HistoryPoint {
   inDb: number
   outDb: number
   reductionDb: number
+  /** Rack position 0's input level. A single-stage built-in may carry its
+   *  own reading there: WayGate's key (`waygate::KEY_SLOT`). */
+  slotInDb: number
+  /** Whether rack position 0's output level is lit: WayGate's detector. */
+  slotLit: boolean
 }
 
 export class Live {
   /** The newest level frame; null while none is current. */
   private latest: LevelFrame | null = null
   private latestAt = 0
-  private history: HistoryPoint[] = Array.from({ length: HISTORY }, () => ({ inDb: -120, outDb: -120, reductionDb: 0 }))
+  private history: HistoryPoint[] = Array.from({ length: HISTORY }, () => ({
+    inDb: -120,
+    outDb: -120,
+    reductionDb: 0,
+    slotInDb: -120,
+    slotLit: false,
+  }))
   private write = 0
   /** Points of history filled. */
   count = 0
@@ -102,6 +113,8 @@ export class Live {
       inDb: toDb(frame.in_peak),
       outDb: toDb(frame.out_peak),
       reductionDb: Math.max(0, frame.gain_reduction_db),
+      slotInDb: toDb(frame.slot_in_peak[0] ?? 0),
+      slotLit: (frame.slot_out_peak[0] ?? 0) >= 0.5,
     }
     this.write = (this.write + 1) % HISTORY
     this.count = Math.min(HISTORY, this.count + 1)

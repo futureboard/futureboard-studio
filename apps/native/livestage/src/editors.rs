@@ -143,8 +143,8 @@ fn open_builtin(
     cx: &mut Context<LiveStageApp>,
 ) {
     use sphere_ui_components::components::{
-        band_panel, dyn_panel, eq_window, fx_window, mix_station_panel, rodhareist_window,
-        white_sharp_window,
+        band_panel, dyn_panel, eq_window, fx_window, gate_panel, mix_station_panel,
+        rodhareist_window, white_sharp_window,
     };
 
     let key = PluginInstanceKey {
@@ -215,6 +215,7 @@ fn open_builtin(
         "burnlimit" => open(dyn_panel::open_burnlimit_editor, b, k, i, h, c, cx),
         "clipper67" => open(dyn_panel::open_clipper67_editor, b, k, i, h, c, cx),
         "transient" => open(dyn_panel::open_transient_editor, b, k, i, h, c, cx),
+        "waygate" => open(gate_panel::open_waygate_editor, b, k, i, h, c, cx),
         "compresser" => open(band_panel::open_compresser_editor, b, k, i, h, c, cx),
         "imager" => open(band_panel::open_imager_editor, b, k, i, h, c, cx),
         "mixstation" => open(mix_station_panel::open_mixstation_editor, b, k, i, h, c, cx),

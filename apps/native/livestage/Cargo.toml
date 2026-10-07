@@ -18,6 +18,14 @@ required-features = ["gui"]
 name = "livestage-server"
 path = "src/server.rs"
 
+# The appliance's console (tty1): the first-boot setup and a status screen,
+# and `--boot`, which writes the network, name and time zone into /run. Built
+# for the appliance image only.
+[[bin]]
+name = "livestage-setup"
+path = "src/console/main.rs"
+required-features = ["appliance"]
+
 [features]
 default = ["gui", "external-plugins"]
 gui = [
@@ -28,6 +36,7 @@ gui = [
     "dep:gpui_linux",
 ]
 external-plugins = ["livestage-engine/external-plugins"]
+appliance = ["dep:ratatui", "dep:pbkdf2", "dep:sha1"]
 # Developer tool: `LiveStage --preview DIR` renders each view of a demo
 # session to PNG off-screen and quits. Never in a release.
 ui-preview = ["gui", "sphere_ui_components/ui-preview", "gpui/test-support", "dep:fa76"]
@@ -40,6 +49,12 @@ serde_json.workspace = true
 # (plain ws on the local network; no TLS, no async runtime).
 builtin-ui-embed.workspace = true
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# The appliance console's text UI (crossterm draws on the Linux console).
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"], optional = true }
+# The console's Wi-Fi setup keeps only the WPA key made from the password
+# (PBKDF2-HMAC-SHA1, as wpa_passphrase), never the password.
+pbkdf2 = { workspace = true, optional = true }
+sha1 = { version = "0.10", optional = true }
 # The preview demo addresses FA-76 parameters by name.
 fa76 = { workspace = true, optional = true }
 

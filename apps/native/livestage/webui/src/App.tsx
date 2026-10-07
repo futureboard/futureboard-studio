@@ -15,7 +15,8 @@ import {
 import { EffectPicker, InsertEditor } from './Inserts.tsx'
 import type { InsertTarget } from './Mixer.tsx'
 import { Mixer } from './Mixer.tsx'
-import { Patch } from './Patch.tsx'
+import { PATCH_TABS, Patch } from './Patch.tsx'
+import type { PatchTab } from './Patch.tsx'
 import type { Session, StripRef } from './protocol.ts'
 import { Setup } from './Setup.tsx'
 import { act, notify, request, useStore } from './store.ts'
@@ -29,8 +30,14 @@ const VIEWS: { id: View; label: string; icon: typeof SlidersVertical }[] = [
 ]
 
 function viewFromHash(): View {
-  const hash = location.hash.slice(1)
-  return VIEWS.some((v) => v.id === hash) ? (hash as View) : 'mixer'
+  const page = location.hash.slice(1).split('/')[0]
+  return VIEWS.some((v) => v.id === page) ? (page as View) : 'mixer'
+}
+
+/** `#patch/outputs`: the patch page's tab; `#patch` is its first. */
+function patchTabFromHash(): PatchTab {
+  const [page, tab] = location.hash.slice(1).split('/')
+  return page === 'patch' && PATCH_TABS.includes(tab as PatchTab) ? (tab as PatchTab) : 'inputs'
 }
 
 /** `#insert/<id>`: an insert's editor, open over the mixer. */
@@ -66,9 +73,18 @@ export function App() {
   const notice = useStore((s) => s.notice)
   // The page lives in the URL, so a reload or a tablet's bookmark lands on it.
   const [view, setViewState] = useState<View>(() => viewFromHash())
-  const setView = useCallback((next: View) => {
-    setViewState(next)
-    history.replaceState(null, '', next === 'mixer' ? location.pathname : `#${next}`)
+  const [patchTab, setPatchTabState] = useState<PatchTab>(() => patchTabFromHash())
+  const setView = useCallback(
+    (next: View) => {
+      setViewState(next)
+      const hash = next === 'patch' && patchTab !== 'inputs' ? `#patch/${patchTab}` : `#${next}`
+      history.replaceState(null, '', next === 'mixer' ? location.pathname : hash)
+    },
+    [patchTab],
+  )
+  const setPatchTab = useCallback((tab: PatchTab) => {
+    setPatchTabState(tab)
+    history.replaceState(null, '', tab === 'inputs' ? '#patch' : `#patch/${tab}`)
   }, [])
   const [editing, setEditing] = useState<InsertTarget | null>(null)
   const [adding, setAdding] = useState<StripRef | null>(null)
@@ -79,6 +95,7 @@ export function App() {
   useEffect(() => {
     const onHash = () => {
       setViewState(viewFromHash())
+      if (viewFromHash() === 'patch') setPatchTabState(patchTabFromHash())
       setHashInsert(insertFromHash())
       if (insertFromHash() === null) setEditing(null)
     }
@@ -236,7 +253,14 @@ export function App() {
             onAddEffect={setAdding}
           />
         ) : view === 'patch' ? (
-          <Patch session={session} inputs={engine?.in_channels ?? 0} outputs={engine?.out_channels ?? 2} />
+          <Patch
+            session={session}
+            inputs={engine?.in_channels ?? 0}
+            outputs={engine?.out_channels ?? 2}
+            recording={recording}
+            tab={patchTab}
+            onTab={setPatchTab}
+          />
         ) : (
           <Setup session={session} />
         )}

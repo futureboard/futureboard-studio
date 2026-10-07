@@ -168,7 +168,10 @@ export function Setup(props: { session: Session }) {
           <Disc3 size={16} />
           <div>
             <h2>Recording</h2>
-            <p>Each armed strip records to its own file; every take gets its own dated folder.</p>
+            <p>
+              Each armed strip records to its own file; every take gets its own dated folder. Which strips record,
+              and from where, is on Patch → Record.
+            </p>
           </div>
         </header>
         <Field label="Folder" hint="set on the server">
@@ -196,16 +199,6 @@ export function Setup(props: { session: Session }) {
               [32, '32-bit float'],
             ]}
             onChange={(bit_depth) => setRecording({ bit_depth })}
-          />
-        </Field>
-        <Field label="Channels record" hint="buses and master: after the fader">
-          <Segments
-            value={recording.tap}
-            options={[
-              ['input', 'Input (clean multitrack)'],
-              ['post_inserts', 'After inserts'],
-            ]}
-            onChange={(tap) => setRecording({ tap })}
           />
         </Field>
       </section>

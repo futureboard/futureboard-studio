@@ -262,18 +262,25 @@ fn toolbar(w: &FxEditorWindow, cx: &mut Cx) -> AnyElement {
                 .iter()
                 .position(|mode| *mode == p.mode)
                 .unwrap_or(0);
-            row.child(caption("MODE"))
+            // A type is a starting point: picking one moves the knobs to
+            // its space, and the knobs alone shape the sound.
+            row.child(caption("START FROM"))
                 .child(choice(
                     w,
                     cx,
                     "verb-mode",
                     &labels,
                     selected,
-                    |this, i, cx| {
-                        this.set_value("mode", verbspace::ReverbMode::ALL[i].to_wire(), cx)
-                    },
+                    |this, i, cx| this.load_verb_type(verbspace::ReverbMode::ALL[i], cx),
                 ))
                 .child(div().flex_1())
+                .child(fb_checkbox(
+                    "verb-wet-only",
+                    "Wet Only",
+                    p.wet_only,
+                    true,
+                    w.click_cb(cx, |this, cx| this.toggle("wetOnly", cx)),
+                ))
                 .child(freeze)
                 .into_any_element()
         }
@@ -729,18 +736,20 @@ fn paint_decay(
         ));
     }
 
-    // The tail of each band, from the first late arrival.
+    // The tail of each band, from the first late arrival, starting at the
+    // level the Early/Late balance gives it and falling 60 dB in its RT60.
     let onset = profile.predelay_ms + profile.first_late_ms;
+    let start_db = (profile.late_db - 3.0).max(DECAY_FLOOR_DB);
     let line_of = |rt_sec: f32| -> Vec<(f32, f32)> {
         if !rt_sec.is_finite() {
-            return vec![(x_at(onset), y_at(-3.0)), (x0 + w, y_at(-3.0))];
+            return vec![(x_at(onset), y_at(start_db)), (x0 + w, y_at(start_db))];
         }
         let end = onset + rt_sec * 1_000.0;
-        let mut points = vec![(x_at(onset), y_at(-3.0))];
+        let mut points = vec![(x_at(onset), y_at(start_db))];
         if end <= span_ms {
-            points.push((x_at(end), y_at(DECAY_FLOOR_DB)));
+            points.push((x_at(end), y_at(start_db - 60.0)));
         } else {
-            let db = -3.0 + (DECAY_FLOOR_DB + 3.0) * (span_ms - onset) / (end - onset);
+            let db = start_db - 60.0 * (span_ms - onset) / (end - onset);
             points.push((x0 + w, y_at(db)));
         }
         points
@@ -1028,7 +1037,8 @@ fn cards(w: &FxEditorWindow, cx: &mut Cx) -> AnyElement {
             .collect()
     };
     match &w.params {
-        FxParams::Verb(_) => {
+        FxParams::Verb(p) => {
+            let mix_off = p.wet_only.then_some("wet only");
             row = row
                 .child(section(
                     "SPACE",
@@ -1037,15 +1047,16 @@ fn cards(w: &FxEditorWindow, cx: &mut Cx) -> AnyElement {
                         ("size", None),
                         ("decaySec", None),
                         ("diffusion", None),
+                        ("earlyLate", None),
                     ]),
                 ))
                 .child(section(
-                    "TONE",
+                    "DECAY COLOUR",
                     knobs(&[
-                        ("damping", None),
                         ("bassMult", None),
-                        ("lowCutHz", None),
-                        ("highCutHz", None),
+                        ("bassFreqHz", None),
+                        ("damping", None),
+                        ("dampFreqHz", None),
                     ]),
                 ))
                 .child(section(
@@ -1054,7 +1065,13 @@ fn cards(w: &FxEditorWindow, cx: &mut Cx) -> AnyElement {
                 ))
                 .child(section(
                     "OUTPUT",
-                    knobs(&[("width", None), ("mix", None), ("outputDb", None)]),
+                    knobs(&[
+                        ("lowCutHz", None),
+                        ("highCutHz", None),
+                        ("width", None),
+                        ("mix", mix_off),
+                        ("outputDb", None),
+                    ]),
                 ));
         }
         FxParams::Echo(p) => {

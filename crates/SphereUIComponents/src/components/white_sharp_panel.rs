@@ -430,6 +430,65 @@ fn header(w: &WhiteSharpEditor, cx: &mut Cx) -> AnyElement {
         .into_any_element()
 }
 
+/// The width of the latency column, and of the empty one balancing it.
+fn latency_column() -> f32 {
+    track_width(&whitesharp::LatencyMode::ALL.map(|mode| mode.label()))
+}
+
+/// Quality or Live, and the delay the insert reports in that mode at the
+/// host's rate: how the correction is played, a setting of the rig that
+/// presets and A/B-style edits of the sound leave alone.
+fn latency_control(w: &WhiteSharpEditor, cx: &mut Cx) -> AnyElement {
+    let mode = w.params.latency;
+    let modes = whitesharp::LatencyMode::ALL;
+    let labels = modes.map(|mode| mode.label());
+    let mut track = fb_segmented_track();
+    for (index, choice) in modes.into_iter().enumerate() {
+        track = track.child(fb_segment(
+            ("whitesharp-latency", index),
+            choice.label(),
+            mode == choice,
+            segment_position(index, modes.len()),
+            w.click_cb(cx, move |this, cx| {
+                this.set_value("latency", choice.to_wire(), cx)
+            }),
+        ));
+    }
+    let rate = w.sample_rate();
+    let ms =
+        whitesharp::latency_samples_for(rate, w.params.input_type, mode) as f32 * 1_000.0 / rate;
+    let delay = if ms < 1.0 {
+        format!("{ms:.2} ms")
+    } else {
+        format!("{ms:.1} ms")
+    };
+    let note = if mode.shapes_formants() {
+        "Formant control"
+    } else {
+        "Formants follow pitch"
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(space::TIGHT))
+        .child(caption("LATENCY"))
+        .child(track.w(px(track_width(&labels))))
+        .child(
+            div()
+                .text_size(px(typography::UI_SM))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(Colors::text_primary())
+                .child(delay),
+        )
+        .child(
+            div()
+                .text_size(px(typography::DENSE_CAPTION))
+                .text_color(Colors::text_muted())
+                .child(note),
+        )
+        .into_any_element()
+}
+
 // ── Settings ───────────────────────────────────────────────────────────────
 
 /// The voice and the key, and the controls that set up the song rather
@@ -458,11 +517,20 @@ fn settings(w: &WhiteSharpEditor, cx: &mut Cx) -> AnyElement {
             true,
             w.click_cb(cx, move |this, cx| this.set_key((key + 1) % 12, cx)),
         ));
+    // The live path has no grains to reshape: formant correction and throat
+    // need the Quality path's lookahead, so they show as unavailable rather
+    // than as settings that do nothing.
+    let mode = w.params.latency;
+    let shapes = mode.shapes_formants();
     let formant = fb_checkbox(
         "whitesharp-formant",
-        "Keep formants",
-        w.params.formant,
-        true,
+        if shapes {
+            "Keep formants"
+        } else {
+            "Quality only"
+        },
+        w.params.formant && shapes,
+        shapes,
         w.click_cb(cx, |this, cx| this.toggle("formant", cx)),
     );
     card()
@@ -497,7 +565,13 @@ fn settings(w: &WhiteSharpEditor, cx: &mut Cx) -> AnyElement {
             "FORMANT",
             div().h(px(26.0)).flex().items_center().child(formant),
         ))
-        .child(knob_for(w, cx, "throat", KNOB, None))
+        .child(knob_for(
+            w,
+            cx,
+            "throat",
+            KNOB,
+            (!shapes).then_some("Quality"),
+        ))
         .child(knob_for(w, cx, "transpose", KNOB, None))
         .child(knob_for(w, cx, "detune", KNOB, None))
         .child(knob_for(w, cx, "tracking", KNOB, None))
@@ -572,6 +646,9 @@ fn correction(w: &WhiteSharpEditor, cx: &mut Cx) -> AnyElement {
             true,
             w.click_cb(cx, |this, cx| this.toggle("classic", cx)),
         ));
+    // The latency mode at the left; an empty column as wide at the right
+    // keeps Retune Speed at the centre.
+    let side = latency_column();
     card()
         .flex_shrink_0()
         .child(
@@ -579,12 +656,26 @@ fn correction(w: &WhiteSharpEditor, cx: &mut Cx) -> AnyElement {
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_center()
-                .gap(px(space::BLOCK))
-                .child(big_knob(w, cx, "humanize", SIDE_KNOB, modern_only))
-                .child(big_knob(w, cx, "retuneMs", HERO_KNOB, None))
-                .child(flex)
-                .child(big_knob(w, cx, "vibratoDb", SIDE_KNOB, None)),
+                .child(
+                    div()
+                        .w(px(side))
+                        .flex_shrink_0()
+                        .child(latency_control(w, cx)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(space::BLOCK))
+                        .child(big_knob(w, cx, "humanize", SIDE_KNOB, modern_only))
+                        .child(big_knob(w, cx, "retuneMs", HERO_KNOB, None))
+                        .child(flex)
+                        .child(big_knob(w, cx, "vibratoDb", SIDE_KNOB, None)),
+                )
+                .child(div().w(px(side)).flex_shrink_0()),
         )
         .into_any_element()
 }
