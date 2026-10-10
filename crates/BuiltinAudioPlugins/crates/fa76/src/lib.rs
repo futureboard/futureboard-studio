@@ -3,6 +3,7 @@
 //! Ratio buttons map to classic 4 / 8 / 12 / 20 / All curves. The gain cell
 //! uses the feedback topology and sub-millisecond timing of the hardware.
 
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
     linear_to_db, mix, time_constant,
@@ -30,6 +31,82 @@ const RMS_WINDOW_SECONDS: f32 = 0.300;
 
 /// Fall time for the peak meters. Rise is instantaneous.
 const PEAK_FALL_SECONDS: f32 = 0.400;
+
+/// Input, output and mix glide over this long, so a dragged knob — which
+/// arrives as one new value per block — does not step the level at every
+/// block edge.
+const GAIN_SMOOTHING_MS: f32 = 15.0;
+
+/// Power on/off swaps dry for processed over about this long.
+const POWER_FADE_MS: f32 = 10.0;
+
+/// The processed share `power` asks for.
+fn power_share(power: bool) -> f32 {
+    if power { 1.0 } else { 0.0 }
+}
+
+/// A control value that glides to a new target instead of stepping: two
+/// one-poles in series, so it leaves and lands with zero slope, and neither a
+/// dragged knob (a new target every block) nor a toggle puts a corner in the
+/// signal it scales. Once within [`Glide::SNAP`] of the target it lands on it
+/// exactly, so a settled glide costs one compare and "fully off" is an exact
+/// state the audio path can skip on.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    first: Smoothed,
+    second: Smoothed,
+    step: f32,
+}
+
+impl Glide {
+    /// −100 dB of a unity gain: a landing this size is inaudible.
+    const SNAP: f32 = 1.0e-5;
+
+    /// Settled at `value`, gliding over about `ms` at `sample_rate`.
+    fn new(value: f32, ms: f32, sample_rate: f32) -> Self {
+        let mut glide = Self {
+            first: Smoothed::at(value),
+            second: Smoothed::at(value),
+            step: 0.0,
+        };
+        glide.set_time(ms, sample_rate);
+        glide
+    }
+
+    /// Half of `ms` per pole.
+    fn set_time(&mut self, ms: f32, sample_rate: f32) {
+        self.step = smoothing_step(ms * 0.5, sample_rate);
+    }
+
+    fn set(&mut self, target: f32) {
+        self.first.target = target;
+    }
+
+    fn is_settled(&self) -> bool {
+        self.second.value == self.first.target && self.first.value == self.first.target
+    }
+
+    /// Lands on the target now: construction, reset, project restore.
+    fn settle(&mut self) {
+        self.first.settle();
+        self.second = Smoothed::at(self.first.target);
+    }
+
+    #[inline]
+    fn next(&mut self) -> f32 {
+        let target = self.first.target;
+        if self.is_settled() {
+            return target;
+        }
+        self.second.target = self.first.next(self.step);
+        let value = self.second.next(self.step);
+        if (value - target).abs() < Self::SNAP && (self.first.value - target).abs() < Self::SNAP {
+            self.settle();
+            return target;
+        }
+        value
+    }
+}
 
 /// Ratio pushbuttons on the FET faceplate. Wire order is the persisted contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,9 +497,14 @@ impl FetCell {
 pub struct Dsp {
     params: Params,
     compressor: FetCell,
-    input_gain: f32,
-    output_gain: f32,
-    input_color: f32,
+    /// Linear input and output gain, the input stage's drive (it follows
+    /// Input) and the wet share, all glided per sample.
+    input_gain: Glide,
+    output_gain: Glide,
+    input_color: Glide,
+    mix: Glide,
+    /// Dry → processed share, following `params.power`.
+    power: Glide,
     meters: Meters,
 }
 
@@ -432,12 +514,15 @@ impl Dsp {
         let mut dsp = Self {
             params: default_params(),
             compressor: FetCell::new(sr),
-            input_gain: 1.0,
-            output_gain: 1.0,
-            input_color: 0.0,
+            input_gain: Glide::new(1.0, GAIN_SMOOTHING_MS, sr),
+            output_gain: Glide::new(1.0, GAIN_SMOOTHING_MS, sr),
+            input_color: Glide::new(0.0, GAIN_SMOOTHING_MS, sr),
+            mix: Glide::new(1.0, GAIN_SMOOTHING_MS, sr),
+            power: Glide::new(1.0, POWER_FADE_MS, sr),
             meters: Meters::new(sr),
         };
         dsp.apply_params();
+        dsp.settle();
         dsp
     }
 
@@ -449,10 +534,22 @@ impl Dsp {
         self.compressor.gain_reduction_db
     }
 
+    /// Replace every parameter (project restore). Gains and power land on the
+    /// restored values rather than gliding in from the old ones.
     pub fn set_params(&mut self, params: Params) {
         self.params = params;
         ipc::sanitize_params(&mut self.params);
         self.apply_params();
+        self.settle();
+    }
+
+    /// Put every glide on its target.
+    fn settle(&mut self) {
+        self.input_gain.settle();
+        self.output_gain.settle();
+        self.input_color.settle();
+        self.mix.settle();
+        self.power.settle();
     }
 
     /// Full telemetry for the editor's VU meter: input/output levels, the
@@ -523,9 +620,22 @@ impl Dsp {
             release_ms,
             self.params.sidechain_hpf_hz,
         );
-        self.input_gain = db_to_linear(self.params.input_db);
-        self.output_gain = db_to_linear(self.params.output_db);
-        self.input_color = 0.03 + 0.09 * ((self.params.input_db + 12.0) / 48.0);
+        let sample_rate = self.compressor.sample_rate;
+        for glide in [
+            &mut self.input_gain,
+            &mut self.output_gain,
+            &mut self.input_color,
+            &mut self.mix,
+        ] {
+            glide.set_time(GAIN_SMOOTHING_MS, sample_rate);
+        }
+        self.power.set_time(POWER_FADE_MS, sample_rate);
+        self.input_gain.set(db_to_linear(self.params.input_db));
+        self.output_gain.set(db_to_linear(self.params.output_db));
+        self.input_color
+            .set(0.03 + 0.09 * ((self.params.input_db + 12.0) / 48.0));
+        self.mix.set(self.params.mix / 100.0);
+        self.power.set(power_share(self.params.power));
     }
 
     /// Gentle input-amplifier/transformer curvature. The transfer remains
@@ -542,6 +652,7 @@ impl StereoEffect for Dsp {
     fn reset(&mut self) {
         self.compressor.reset();
         self.meters.reset();
+        self.settle();
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
@@ -549,23 +660,34 @@ impl StereoEffect for Dsp {
         self.compressor.set_sample_rate(sr);
         self.meters = Meters::new(sr);
         self.apply_params();
+        self.settle();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
         // Metered on both sides of the cell even while bypassed: the editor's
-        // meter is how you set gain staging *before* engaging it.
-        if !self.params.power {
+        // meter is how you set gain staging *before* engaging it. Fully off
+        // and settled, the cell does not run.
+        if self.power.is_settled() && !self.params.power {
             self.meters.push((left, right), (left, right));
             return (left, right);
         }
-        let driven_l = Self::apply_input_stage(left * self.input_gain, self.input_color);
-        let driven_r = Self::apply_input_stage(right * self.input_gain, self.input_color);
+        let on = self.power.next();
+        let input_gain = self.input_gain.next();
+        let color = self.input_color.next();
+        let output_gain = self.output_gain.next();
+        let amount = self.mix.next();
+        let driven_l = Self::apply_input_stage(left * input_gain, color);
+        let driven_r = Self::apply_input_stage(right * input_gain, color);
         let (mut wet_l, mut wet_r) = self.compressor.process_stereo_linked(driven_l, driven_r);
-        wet_l *= self.output_gain;
-        wet_r *= self.output_gain;
-        let amount = self.params.mix / 100.0;
-        let out_l = mix(left, wet_l, amount);
-        let out_r = mix(right, wet_r, amount);
+        wet_l *= output_gain;
+        wet_r *= output_gain;
+        let mut out_l = mix(left, wet_l, amount);
+        let mut out_r = mix(right, wet_r, amount);
+        if on != 1.0 {
+            // Power fading: a step from the untouched input.
+            out_l = left + (out_l - left) * on;
+            out_r = right + (out_r - right) * on;
+        }
         self.meters.push((left, right), (out_l, out_r));
         (out_l, out_r)
     }
@@ -742,5 +864,134 @@ mod tests {
         assert!(frame.in_rms > 0.3);
         assert!(frame.out_peak >= 0.5);
         assert!(frame.out_rms > 0.3);
+    }
+
+    const BLOCK: usize = 128;
+    /// Blocks played before measuring, so filters and smoothers are at rest.
+    const WARM: usize = 50;
+
+    /// The measure of LiveStageEngine's `param_sweep`: a smooth two-tone
+    /// signal goes through `block` one 128-frame block at a time, and this is
+    /// the worst ratio of the kink (second difference) where a block meets
+    /// the last one to the biggest kink inside the block. About 1 is smooth;
+    /// a value that steps once per block reads many times that.
+    fn edge_kink(blocks: usize, mut block: impl FnMut(usize, &mut [f32], &mut [f32])) -> f32 {
+        let mut left = [0.0f32; BLOCK];
+        let mut right = [0.0f32; BLOCK];
+        let mut n = 0usize;
+        let mut last = [(0.0f32, 0.0f32); 2];
+        let mut worst = 0.0f32;
+        for index in 0..WARM + blocks {
+            for i in 0..BLOCK {
+                let t = n as f64 / 48_000.0;
+                let tone = (std::f64::consts::TAU * 110.0 * t).sin() * 0.3
+                    + (std::f64::consts::TAU * 330.0 * t).sin() * 0.1;
+                (left[i], right[i]) = (tone as f32, (tone * 0.8) as f32);
+                n += 1;
+            }
+            block(index.saturating_sub(WARM), &mut left, &mut right);
+            let mut edge = 0.0f32;
+            let mut inside = 1.0e-7f32;
+            for i in 0..BLOCK {
+                let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+                let kink =
+                    d2(last[0].0, last[1].0, left[i]).max(d2(last[0].1, last[1].1, right[i]));
+                if i < 2 {
+                    edge = edge.max(kink);
+                } else {
+                    inside = inside.max(kink);
+                }
+                last = [last[1], (left[i], right[i])];
+            }
+            if index >= WARM {
+                worst = worst.max(edge / inside);
+            }
+        }
+        worst
+    }
+
+    /// Plays `dsp`, calling `change(dsp, block)` before every measured block.
+    fn drag(dsp: &mut Dsp, blocks: usize, mut change: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let mut warm = WARM;
+        edge_kink(blocks, |index, left, right| {
+            if warm > 0 {
+                warm -= 1;
+            } else {
+                change(dsp, index);
+            }
+            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                (*l, *r) = dsp.process_stereo(*l, *r);
+            }
+        })
+    }
+
+    /// Up and back down across `min..max`, a value per block, over `blocks`.
+    fn sweep(min: f32, max: f32, block: usize, blocks: usize) -> f32 {
+        let phase = block as f32 / blocks as f32 * 2.0;
+        let x = if phase < 1.0 { phase } else { 2.0 - phase };
+        min + (max - min) * x
+    }
+
+    /// Power off at block 0, then flipped every 30 blocks.
+    fn toggle_power(dsp: &mut Dsp, block: usize) {
+        if block.is_multiple_of(30) {
+            let on = (block / 30) % 2 == 1;
+            assert!(dsp.apply_wire_param(ipc::POWER_INDEX, if on { 1.0 } else { 0.0 }));
+        }
+    }
+
+    /// The measure itself sees a gain that steps once per block.
+    #[test]
+    fn the_edge_kink_measure_catches_a_stepped_gain() {
+        let stepped = edge_kink(100, |index, left, right| {
+            let gain = 0.25 + index as f32 * 0.01;
+            left.iter_mut()
+                .chain(right.iter_mut())
+                .for_each(|s| *s *= gain);
+        });
+        assert!(stepped > 20.0, "{stepped}");
+    }
+
+    #[test]
+    fn dragging_input_output_or_mix_does_not_zipper() {
+        for (index, min, max) in [
+            (ipc::INPUT_INDEX, -12.0, 36.0),
+            (ipc::OUTPUT_INDEX, -36.0, 12.0),
+            (ipc::MIX_INDEX, 0.0, 100.0),
+        ] {
+            let mut dsp = Dsp::new(48_000.0);
+            let jump = drag(&mut dsp, 375, |dsp, block| {
+                assert!(dsp.apply_wire_param(index, sweep(min, max, block, 375)));
+            });
+            assert!(jump < 4.0, "wire {index} drag jump x {jump}");
+        }
+    }
+
+    #[test]
+    fn toggling_power_crossfades_without_a_step() {
+        let mut dsp = Dsp::new(48_000.0);
+        let jump = drag(&mut dsp, 300, toggle_power);
+        assert!(jump < 4.0, "power toggle jump x {jump}");
+        // Settled off is the input exactly.
+        assert!(dsp.apply_wire_param(ipc::POWER_INDEX, 0.0));
+        let _ = run_tone(&mut dsp, 0.5, 4_800);
+        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
+    }
+
+    /// A project load lands on its values; it does not fade them in.
+    #[test]
+    fn restored_state_starts_settled() {
+        let mut params = default_params();
+        params.input_db = 0.0;
+        params.output_db = 6.0;
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(params.clone());
+        // Far under the knee: only the output gain applies.
+        let x = 1.0e-4;
+        let (l, _) = dsp.process_stereo(x, x);
+        assert!((l - x * db_to_linear(6.0)).abs() < 1.0e-9, "{l}");
+        params.power = false;
+        dsp.set_params(params);
+        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
     }
 }

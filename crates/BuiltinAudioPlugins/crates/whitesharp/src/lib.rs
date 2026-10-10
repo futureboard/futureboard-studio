@@ -70,6 +70,10 @@ const SMOOTH_MS: f32 = 10.0;
 /// The crossfade between the two paths when the latency mode changes. They
 /// play the voice at different delays, so the fade keeps power, not gain.
 const MODE_FADE_MS: f32 = 20.0;
+/// The crossfade from the shifter at the old input type's delay to the one
+/// at the new type's. Same voice, two delays: it keeps power, like the mode
+/// fade.
+const TYPE_FADE_MS: f32 = 10.0;
 
 /// The voice the detector listens for. Each narrows the pitch range, which
 /// makes tracking surer and — the low ones aside — the delay shorter.
@@ -479,7 +483,16 @@ pub struct Dsp {
     params: Params,
     tuning: Tuning,
     detector: Detector,
+    /// The shifter the quality path plays.
     shifter: Shifter,
+    /// A second shifter, taking the same input and controls. An input type
+    /// change hands the path to it at the new delay while the old one plays
+    /// on at the old delay through the fade, instead of the output jumping
+    /// from one delay to the other.
+    retired: Shifter,
+    /// 0 to 1 across that fade; 1 when none is running.
+    type_fade: f32,
+    type_step: f32,
     splicer: Splicer,
     /// Where the output stands between the paths: 0 is the PSOLA shifter,
     /// 1 the live splicer. Moves by `mode_step` a sample on a mode change.
@@ -521,6 +534,7 @@ impl Dsp {
         let sr = sample_rate.max(1.0);
         let detector = Detector::new(sr, LOWEST_HZ);
         let shifter = Shifter::new(sr, sr / LOWEST_HZ);
+        let retired = Shifter::new(sr, sr / LOWEST_HZ);
         let splicer = Splicer::new(sr, sr / LOWEST_HZ);
         let hop_seconds = detector.hop_samples() as f32 / sr;
         let params = default_params();
@@ -530,6 +544,9 @@ impl Dsp {
             tuning,
             detector,
             shifter,
+            retired,
+            type_fade: 1.0,
+            type_step: 1.0 / (TYPE_FADE_MS * 0.001 * sr).max(1.0),
             splicer,
             mode_mix: if tuning.live { 1.0 } else { 0.0 },
             mode_step: 1.0 / (MODE_FADE_MS * 0.001 * sr).max(1.0),
@@ -582,7 +599,7 @@ impl Dsp {
         }
         self.retune();
         if self.params.input_type != before {
-            self.apply_input_type();
+            self.change_input_type();
         }
         true
     }
@@ -637,6 +654,28 @@ impl Dsp {
         self.mode_mix = if self.tuning.live { 1.0 } else { 0.0 };
     }
 
+    /// An input type edit while playing. When the quality path is heard, the
+    /// spare shifter takes over at the new delay and the old one fades out
+    /// at its own; otherwise (nothing played yet, or the live path playing)
+    /// the change simply lands.
+    fn change_input_type(&mut self) {
+        let audible = self.now > 0 && self.quality_running && self.mode_mix < 1.0;
+        if audible {
+            // The one playing becomes the old one and the spare is retuned.
+            // Mid-fade already, the louder of the two carries on as the old
+            // one and the quieter is retuned (a small step, only on edits
+            // closer together than the fade).
+            if self.type_fade < 0.5 {
+                std::mem::swap(&mut self.shifter, &mut self.retired);
+            }
+            std::mem::swap(&mut self.shifter, &mut self.retired);
+            self.type_fade = 0.0;
+        } else {
+            self.type_fade = 1.0;
+        }
+        self.apply_input_type();
+    }
+
     fn apply_input_type(&mut self) {
         let (lowest, highest) = self.params.input_type.range_hz();
         self.detector.set_range(lowest, highest);
@@ -663,13 +702,15 @@ impl Dsp {
             }
             self.slow_pitch = None;
             self.vibrato_phase = 0.0;
-            self.shifter.push_control(Control {
+            let control = Control {
                 centre,
                 period: None,
                 ratio: 1.0,
                 formant: 1.0,
                 gain: 1.0,
-            });
+            };
+            self.shifter.push_control(control);
+            self.retired.push_control(control);
             self.splicer.set_control(None, 1.0, 1.0);
             self.history.push(Reading::SILENT);
             return;
@@ -737,13 +778,15 @@ impl Dsp {
             self.correction + vibrato * 100.0 * t.vibrato_extra + created_cents + t.transpose_cents;
         let ratio = 2f32.powf(cents / 1_200.0);
         let formant = if t.preserve_formants { 1.0 } else { ratio } / t.throat;
-        self.shifter.push_control(Control {
+        let control = Control {
             centre,
             period: Some(period),
             ratio,
             formant: clamp(formant, 1.0 / MAX_FORMANT, MAX_FORMANT),
             gain,
-        });
+        };
+        self.shifter.push_control(control);
+        self.retired.push_control(control);
         // The live path plays the newest estimate at once: there is no
         // delay to line it up with the audio it measured.
         self.splicer.set_control(Some(period), ratio, gain);
@@ -773,10 +816,27 @@ impl Dsp {
             if !self.quality_running {
                 self.shifter.resume();
                 self.quality_running = true;
+                self.type_fade = 1.0;
             }
-            Some(self.shifter.process(left, right))
+            let new = self.shifter.process(left, right);
+            if self.type_fade < 1.0 {
+                // An input type change: the old delay fades out under the new.
+                self.type_fade = (self.type_fade + self.type_step).min(1.0);
+                let old = self.retired.process(left, right);
+                let x = self.type_fade;
+                let angle = std::f32::consts::FRAC_PI_2 * x * x * (3.0 - 2.0 * x);
+                let (g_old, g_new) = (angle.cos(), angle.sin());
+                let blend = |a: [f32; 2], b: [f32; 2]| {
+                    [a[0] * g_old + b[0] * g_new, a[1] * g_old + b[1] * g_new]
+                };
+                Some((blend(old.0, new.0), blend(old.1, new.1)))
+            } else {
+                self.retired.skip(left, right);
+                Some(new)
+            }
         } else {
             self.shifter.skip(left, right);
+            self.retired.skip(left, right);
             self.quality_running = false;
             None
         };
@@ -846,6 +906,8 @@ impl StereoEffect for Dsp {
     fn reset(&mut self) {
         self.detector.reset();
         self.shifter.reset();
+        self.retired.reset();
+        self.type_fade = 1.0;
         self.splicer.reset();
         self.settle_mode();
         self.quality_running = true;

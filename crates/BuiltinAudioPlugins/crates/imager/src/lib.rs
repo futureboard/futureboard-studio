@@ -128,6 +128,9 @@ const SCOPE_DECIMATION: usize = 12;
 /// Width and output changes glide over this long, so a dragged control does
 /// not step the side level sample to sample.
 const SMOOTHING_SEC: f32 = 0.02;
+
+/// How long Power and a band's solo take to crossfade.
+const SWITCH_MS: f32 = 10.0;
 /// Integration time of the correlation and band-level meters — slow enough to
 /// read, fast enough to follow a chorus into a verse.
 const CORRELATION_SEC: f32 = 0.3;
@@ -443,10 +446,68 @@ impl BandSpread {
     }
 }
 
+/// A switch's 0–1 crossfade. It walks linearly toward its end and is heard
+/// through a smoothstep, so a fade both leaves and lands without a kink.
+#[derive(Debug, Clone, Copy)]
+struct Fade {
+    position: f32,
+    target: f32,
+    step: f32,
+}
+
+impl Fade {
+    fn new(on: bool, sample_rate: f32) -> Self {
+        let at = if on { 1.0 } else { 0.0 };
+        Self {
+            position: at,
+            target: at,
+            step: Self::step_for(sample_rate),
+        }
+    }
+
+    fn step_for(sample_rate: f32) -> f32 {
+        1.0 / (SWITCH_MS * 0.001 * sample_rate).max(1.0)
+    }
+
+    fn set(&mut self, on: bool) {
+        self.target = if on { 1.0 } else { 0.0 };
+    }
+
+    fn settle(&mut self) {
+        self.position = self.target;
+    }
+
+    /// Off, and staying off.
+    fn is_off(&self) -> bool {
+        self.position == 0.0 && self.target == 0.0
+    }
+
+    /// One sample's step; the weight of the "on" side.
+    #[inline]
+    fn next(&mut self) -> f32 {
+        if self.position < self.target {
+            self.position = (self.position + self.step).min(self.target);
+        } else if self.position > self.target {
+            self.position = (self.position - self.step).max(self.target);
+        }
+        let x = self.position;
+        x * x * (3.0 - 2.0 * x)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Dsp {
     sample_rate: f32,
     params: Params,
+    /// Dry (0) to the imaged signal (1): Power fades rather than cuts, and
+    /// once off and settled nothing but the meters runs.
+    power: Fade,
+    /// Per band, how much of it is heard: a solo fades the other bands out
+    /// rather than cutting them.
+    band_gain: [Fade; BAND_COUNT],
+    /// Nothing has played since construction or the last reset, so a switch
+    /// lands at once (a state being applied) rather than fading.
+    fresh: bool,
     mid: BandSplitter,
     side: BandSplitter,
     spread: [BandSpread; BAND_COUNT],
@@ -502,9 +563,13 @@ impl Dsp {
             scope_write: 0,
             scope_countdown: SCOPE_DECIMATION,
             scope_fresh: false,
+            power: Fade::new(params.power, sr),
+            band_gain: [Fade::new(true, sr); BAND_COUNT],
+            fresh: true,
             params,
         };
         dsp.update_time_constants();
+        dsp.settle_switches();
         dsp
     }
 
@@ -524,6 +589,7 @@ impl Dsp {
         self.recover_gain = f32::from(self.params.recover_sides);
         self.output_target = db_to_linear(self.params.output_db);
         self.output_gain = self.output_target;
+        self.settle_switches();
     }
 
     /// Apply a compact wire update already resolved by the UI/control thread.
@@ -531,6 +597,12 @@ impl Dsp {
     pub fn apply_wire_param(&mut self, wire_index: u32, value: f32) -> bool {
         if !ipc::apply_wire_param(&mut self.params, wire_index, value) {
             return false;
+        }
+        if self.fresh {
+            // Nothing has played: this is a state being applied, not a gesture.
+            self.settle_switches();
+        } else {
+            self.switch_targets();
         }
         match wire_index {
             ipc::CROSSOVER_1_INDEX | ipc::CROSSOVER_2_INDEX | ipc::CROSSOVER_3_INDEX => {
@@ -611,6 +683,49 @@ impl Dsp {
         self.params.stereoize[self.source_band(band)] / MAX_STEREOIZE
     }
 
+    /// Points Power and the band gains at what `params` asks for. Waking from
+    /// a settled off starts the filters from silence, so stale state from
+    /// before it went off does not ring back in.
+    fn switch_targets(&mut self) {
+        if self.params.power && self.power.is_off() {
+            self.mid.reset();
+            self.side.reset();
+            for spread in &mut self.spread {
+                spread.clear();
+            }
+            self.power.set(true);
+            self.band_targets();
+            for gain in &mut self.band_gain {
+                gain.settle();
+            }
+            return;
+        }
+        self.power.set(self.params.power);
+        self.band_targets();
+    }
+
+    fn band_targets(&mut self) {
+        // A solo picks a band of a split; with no split there is none.
+        let solo = if self.params.multiband {
+            self.params.solo_band
+        } else {
+            SOLO_NONE
+        };
+        for (band, gain) in self.band_gain.iter_mut().enumerate() {
+            gain.set(solo < 0 || solo == band as i32);
+        }
+    }
+
+    /// Lands every switch where `params` puts it, without a fade.
+    fn settle_switches(&mut self) {
+        self.power.set(self.params.power);
+        self.band_targets();
+        self.power.settle();
+        for gain in &mut self.band_gain {
+            gain.settle();
+        }
+    }
+
     fn retune(&mut self) {
         let hz = effective_crossovers(&self.params, self.sample_rate);
         self.mid.retune(hz, self.sample_rate);
@@ -659,6 +774,8 @@ impl StereoEffect for Dsp {
         self.scope_write = 0;
         self.scope_countdown = SCOPE_DECIMATION;
         self.scope_fresh = false;
+        self.fresh = true;
+        self.settle_switches();
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
@@ -668,6 +785,12 @@ impl StereoEffect for Dsp {
         }
         self.sample_rate = sr;
         self.update_time_constants();
+        let step = Fade::step_for(sr);
+        self.power.step = step;
+        for gain in &mut self.band_gain {
+            gain.step = step;
+        }
+        self.settle_switches();
         let hz = effective_crossovers(&self.params, sr);
         self.mid = BandSplitter::new(hz, sr);
         self.side = BandSplitter::new(hz, sr);
@@ -679,23 +802,35 @@ impl StereoEffect for Dsp {
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
         self.input_level
             .push(left, right, self.peak_release, self.correlation_coeff);
-        if !self.params.power {
+        if self.power.is_off() {
             // Bypass is a pure pass-through; the meters keep reading so the
             // editor still shows the image it would be working on.
             self.record(left, right);
             return (left, right);
         }
+        self.fresh = false;
+        let on = self.power.next();
+        let (l, r) = self.run(left, right, on);
+        let out = if on >= 1.0 {
+            (l, r)
+        } else {
+            (left + (l - left) * on, right + (r - right) * on)
+        };
+        self.record(out.0, out.1);
+        out
+    }
+}
 
+impl Dsp {
+    /// One frame through the imager, power aside. `feed` scales what enters
+    /// the decorrelators: woken empty, a Haas line would otherwise play the
+    /// input starting mid-wave once the fade is already through.
+    #[inline]
+    fn run(&mut self, left: f32, right: f32, feed: f32) -> (f32, f32) {
         let mid = self.mid.run(0.5 * (left + right));
         let side = self.side.run(0.5 * (left - right));
 
         let glide = 1.0 - self.smooth_coeff;
-        // A solo picks a band of a split; with no split there is none.
-        let solo = if self.params.multiband {
-            self.params.solo_band
-        } else {
-            SOLO_NONE
-        };
         let second_mode = self.params.stereoize_mode == StereoizeMode::Two;
         let recover_target = f32::from(self.params.recover_sides);
         self.recover_gain += (recover_target - self.recover_gain) * glide;
@@ -711,12 +846,12 @@ impl StereoEffect for Dsp {
             *amount += (stereoize_target - *amount) * glide;
             let amount = *amount;
 
-            let (haas, smeared) = self.spread[band].stereoize(mid[band]);
+            let (haas, smeared) = self.spread[band].stereoize(mid[band] * feed);
             let made = if second_mode { smeared } else { haas };
             let band_side = side[band] * width + made * amount * STEREOIZE_DEPTH;
             // What narrowing takes off, back in the middle.
             let lost = side[band] * (1.0 - width).max(0.0);
-            let recovered = self.spread[band].recover(lost) * self.recover_gain;
+            let recovered = self.spread[band].recover(lost * feed) * self.recover_gain;
             let band_mid = mid[band] + recovered;
 
             self.band_correlation[band].push(
@@ -724,16 +859,14 @@ impl StereoEffect for Dsp {
                 band_mid - band_side,
                 self.correlation_coeff,
             );
-            if solo < 0 || solo == band as i32 {
-                mid_out += band_mid;
-                side_out += band_side;
-            }
+            let heard = self.band_gain[band].next();
+            mid_out += band_mid * heard;
+            side_out += band_side * heard;
         }
 
         self.output_gain += (self.output_target - self.output_gain) * glide;
         let out_l = (mid_out + side_out) * self.output_gain;
         let out_r = (mid_out - side_out) * self.output_gain;
-        self.record(out_l, out_r);
         (out_l, out_r)
     }
 }
@@ -810,6 +943,77 @@ mod tests {
         params.power = false;
         params.width = [0.0; BAND_COUNT];
         dsp.set_params(params);
+        assert_eq!(dsp.process_stereo(0.25, -0.5), (0.25, -0.5));
+    }
+
+    /// Two low tones, a little wide: smooth, so a step anywhere shows as a
+    /// kink.
+    fn two_tone(n: usize) -> (f32, f32) {
+        let t = n as f32 / RATE;
+        let x = (std::f32::consts::TAU * 110.0 * t).sin() * 0.3
+            + (std::f32::consts::TAU * 330.0 * t).sin() * 0.1;
+        (x, x * 0.8)
+    }
+
+    /// The biggest second difference of the output over `frames` frames
+    /// after a second of settling, with `edit` applied before each frame.
+    fn worst_kink(dsp: &mut Dsp, frames: usize, mut edit: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let settle = 48_000;
+        let mut history = [(0.0f32, 0.0f32); 2];
+        let mut worst = 0.0f32;
+        for n in 0..settle + frames {
+            if n >= settle {
+                edit(dsp, n - settle);
+            }
+            let (l, r) = two_tone(n);
+            let out = dsp.process_stereo(l, r);
+            if n >= settle {
+                let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+                let kink_l = d2(history[0].0, history[1].0, out.0);
+                let kink_r = d2(history[0].1, history[1].1, out.1);
+                worst = worst.max(kink_l).max(kink_r);
+            }
+            history = [history[1], out];
+        }
+        worst
+    }
+
+    /// Power and Solo crossfade: flipping either is no rougher than the
+    /// imager left alone (a solo used to cut whole bands in one sample).
+    #[test]
+    fn switching_power_and_solo_does_not_step() {
+        let mut params = default_params();
+        params.width = [60.0, 140.0, 120.0, 80.0];
+        params.stereoize = [40.0, 20.0, 0.0, 0.0];
+        params.recover_sides = true;
+        let fresh = |params: &Params| {
+            let mut dsp = Dsp::new(RATE);
+            dsp.set_params(params.clone());
+            dsp
+        };
+        let frames = 96_000;
+        let still = worst_kink(&mut fresh(&params), frames, |_, _| {});
+        let power = worst_kink(&mut fresh(&params), frames, |dsp, n| {
+            if n % 12_000 == 0 {
+                let on = (n / 12_000) % 2 == 1;
+                assert!(dsp.apply_wire_param(ipc::POWER_INDEX, if on { 1.0 } else { 0.0 }));
+            }
+        });
+        let solo = worst_kink(&mut fresh(&params), frames, |dsp, n| {
+            if n % 12_000 == 0 {
+                let band = ((n / 12_000) % (BAND_COUNT + 1)) as f32 - 1.0;
+                assert!(dsp.apply_wire_param(ipc::SOLO_INDEX, band));
+            }
+        });
+        assert!(power < still * 2.0, "power: {power} against {still}");
+        assert!(solo < still * 2.0, "solo: {solo} against {still}");
+    }
+
+    /// A state applied before anything plays lands as given, with no fade.
+    #[test]
+    fn switches_applied_before_playing_do_not_fade() {
+        let mut dsp = Dsp::new(RATE);
+        assert!(dsp.apply_wire_param(ipc::POWER_INDEX, 0.0));
         assert_eq!(dsp.process_stereo(0.25, -0.5), (0.25, -0.5));
     }
 

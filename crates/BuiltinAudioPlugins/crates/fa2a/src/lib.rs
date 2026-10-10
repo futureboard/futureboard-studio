@@ -4,6 +4,7 @@
 //! feedback leveling amplifier: a soft control curve, roughly 10 ms attack,
 //! and a two-stage, program-dependent release.
 
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
     linear_to_db, mix, time_constant,
@@ -31,6 +32,91 @@ const RMS_WINDOW_SECONDS: f32 = 0.300;
 
 /// Fall time for the peak meters. Rise is instantaneous.
 const PEAK_FALL_SECONDS: f32 = 0.400;
+
+/// Gain and mix glide over this long, so a dragged knob — which arrives as one
+/// new value per block — does not step the level at every block edge.
+const GAIN_SMOOTHING_MS: f32 = 15.0;
+
+/// The control curve (threshold, ratio, knee) glides over this long, so Peak
+/// Reduction and the Compress/Limit switch slide the curve rather than step
+/// the reduction it asks for.
+const CURVE_SMOOTHING_MS: f32 = 20.0;
+
+/// Power on/off swaps dry for processed over about this long.
+const POWER_FADE_MS: f32 = 10.0;
+
+/// The processed share `power` asks for.
+fn power_share(power: bool) -> f32 {
+    if power { 1.0 } else { 0.0 }
+}
+
+/// A control value that glides to a new target instead of stepping: two
+/// one-poles in series, so it leaves and lands with zero slope, and neither a
+/// dragged knob (a new target every block) nor a toggle puts a corner in the
+/// signal it scales. Once within [`Glide::SNAP`] of the target it lands on it
+/// exactly, so a settled glide costs one compare and "fully off" is an exact
+/// state the audio path can skip on.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    first: Smoothed,
+    second: Smoothed,
+    step: f32,
+}
+
+impl Glide {
+    /// −100 dB of a unity gain: a landing this size is inaudible.
+    const SNAP: f32 = 1.0e-5;
+
+    /// Settled at `value`, gliding over about `ms` at `sample_rate`.
+    fn new(value: f32, ms: f32, sample_rate: f32) -> Self {
+        let mut glide = Self {
+            first: Smoothed::at(value),
+            second: Smoothed::at(value),
+            step: 0.0,
+        };
+        glide.set_time(ms, sample_rate);
+        glide
+    }
+
+    /// Half of `ms` per pole.
+    fn set_time(&mut self, ms: f32, sample_rate: f32) {
+        self.step = smoothing_step(ms * 0.5, sample_rate);
+    }
+
+    fn set(&mut self, target: f32) {
+        self.first.target = target;
+    }
+
+    /// Where the glide is now.
+    fn value(&self) -> f32 {
+        self.second.value
+    }
+
+    fn is_settled(&self) -> bool {
+        self.second.value == self.first.target && self.first.value == self.first.target
+    }
+
+    /// Lands on the target now: construction, reset, project restore.
+    fn settle(&mut self) {
+        self.first.settle();
+        self.second = Smoothed::at(self.first.target);
+    }
+
+    #[inline]
+    fn next(&mut self) -> f32 {
+        let target = self.first.target;
+        if self.is_settled() {
+            return target;
+        }
+        self.second.target = self.first.next(self.step);
+        let value = self.second.next(self.step);
+        if (value - target).abs() < Self::SNAP && (self.first.value - target).abs() < Self::SNAP {
+            self.settle();
+            return target;
+        }
+        value
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -331,9 +417,10 @@ pub fn descriptor() -> PluginDescriptor {
 #[derive(Debug, Clone)]
 struct OpticalCell {
     sample_rate: f32,
-    threshold_db: f32,
-    ratio: f32,
-    knee_db: f32,
+    /// The control curve, glided per sample.
+    threshold_db: Glide,
+    ratio: Glide,
+    knee_db: Glide,
     attack_coeff: f32,
     release_fast_coeff: f32,
     release_tail_short_coeff: f32,
@@ -356,9 +443,9 @@ impl OpticalCell {
         let sr = sample_rate.max(1.0);
         let mut cell = Self {
             sample_rate: sr,
-            threshold_db: -18.0,
-            ratio: 3.0,
-            knee_db: 12.0,
+            threshold_db: Glide::new(-18.0, CURVE_SMOOTHING_MS, sr),
+            ratio: Glide::new(3.0, CURVE_SMOOTHING_MS, sr),
+            knee_db: Glide::new(12.0, CURVE_SMOOTHING_MS, sr),
             attack_coeff: 0.0,
             release_fast_coeff: 0.0,
             release_tail_short_coeff: 0.0,
@@ -387,6 +474,7 @@ impl OpticalCell {
             },
             90.0,
         );
+        cell.settle();
         cell
     }
 
@@ -395,9 +483,12 @@ impl OpticalCell {
     }
 
     fn set_model(&mut self, model: OpticalModel, sidechain_cutoff_hz: f32) {
-        self.threshold_db = model.threshold_db;
-        self.ratio = model.ratio.max(1.0);
-        self.knee_db = model.knee_db.max(0.0);
+        for glide in [&mut self.threshold_db, &mut self.ratio, &mut self.knee_db] {
+            glide.set_time(CURVE_SMOOTHING_MS, self.sample_rate);
+        }
+        self.threshold_db.set(model.threshold_db);
+        self.ratio.set(model.ratio.max(1.0));
+        self.knee_db.set(model.knee_db.max(0.0));
         self.attack_coeff = time_constant(self.sample_rate, model.attack_sec);
         self.release_fast_coeff = time_constant(self.sample_rate, model.release_sec);
         self.release_tail_short_coeff =
@@ -411,6 +502,13 @@ impl OpticalCell {
         self.sidechain_coeff = (-2.0 * std::f32::consts::PI * cutoff / self.sample_rate).exp();
         self.emphasis_coeff = 1.0 - (-std::f32::consts::TAU * 1_500.0 / self.sample_rate).exp();
         self.emphasis_gain = db_to_linear(model.emphasis_db);
+    }
+
+    /// Put the control curve on its targets.
+    fn settle(&mut self) {
+        self.threshold_db.settle();
+        self.ratio.settle();
+        self.knee_db.settle();
     }
 
     fn reset(&mut self) {
@@ -445,23 +543,26 @@ impl OpticalCell {
         self.emphasis_low[channel] + high * self.emphasis_gain
     }
 
+    /// Reduction the curve asks for at `level_db`, where the curve's glide
+    /// is now.
     #[inline]
     fn target_reduction_db(&self, level_db: f32) -> f32 {
-        let over = level_db - self.threshold_db;
-        let half_knee = self.knee_db * 0.5;
+        let knee_db = self.knee_db.value();
+        let over = level_db - self.threshold_db.value();
+        let half_knee = knee_db * 0.5;
         let curved_over = if over <= -half_knee {
             0.0
         } else if over >= half_knee {
             over
         } else {
             let t = over + half_knee;
-            t * t / (2.0 * self.knee_db.max(1.0e-6))
+            t * t / (2.0 * knee_db.max(1.0e-6))
         };
 
         // In a feedback topology this is loop gain, not the usual
         // feed-forward `(1 - 1 / ratio)` slope. `ratio - 1` produces the
         // intended closed-loop compression ratio.
-        curved_over * (self.ratio - 1.0)
+        curved_over * (self.ratio.value() - 1.0)
     }
 
     #[inline]
@@ -494,6 +595,9 @@ impl OpticalCell {
             detector_coeff * self.detector_envelope + (1.0 - detector_coeff) * detected;
 
         let level_db = linear_to_db(self.detector_envelope.max(1.0e-12));
+        self.threshold_db.next();
+        self.ratio.next();
+        self.knee_db.next();
         let target_gr_db = self.target_reduction_db(level_db);
         self.fast_gr_db = Self::follow(
             self.fast_gr_db,
@@ -519,7 +623,11 @@ impl OpticalCell {
 pub struct Dsp {
     params: Params,
     compressor: OpticalCell,
-    output_gain: f32,
+    /// Linear gain (Gain plus Output Trim) and wet share, glided per sample.
+    output_gain: Glide,
+    mix: Glide,
+    /// Dry → processed share, following `params.power`.
+    power: Glide,
     meters: Meters,
 }
 
@@ -529,10 +637,13 @@ impl Dsp {
         let mut dsp = Self {
             params: default_params(),
             compressor: OpticalCell::new(sr),
-            output_gain: 1.0,
+            output_gain: Glide::new(1.0, GAIN_SMOOTHING_MS, sr),
+            mix: Glide::new(1.0, GAIN_SMOOTHING_MS, sr),
+            power: Glide::new(1.0, POWER_FADE_MS, sr),
             meters: Meters::new(sr),
         };
         dsp.apply_params();
+        dsp.settle();
         dsp
     }
 
@@ -544,10 +655,21 @@ impl Dsp {
         self.compressor.gain_reduction_db()
     }
 
+    /// Replace every parameter (project restore). Gains, curve and power
+    /// land on the restored values rather than gliding in from the old ones.
     pub fn set_params(&mut self, params: Params) {
         self.params = params;
         ipc::sanitize_params(&mut self.params);
         self.apply_params();
+        self.settle();
+    }
+
+    /// Put every glide on its target.
+    fn settle(&mut self) {
+        self.compressor.settle();
+        self.output_gain.settle();
+        self.mix.settle();
+        self.power.settle();
     }
 
     /// Full telemetry for the editor's VU meter: input/output levels, the
@@ -611,7 +733,15 @@ impl Dsp {
         let model = optical_model_from_params(&self.params);
         self.compressor
             .set_model(model, self.params.sidechain_low_cut_hz);
-        self.output_gain = db_to_linear(self.params.gain_db + self.params.output_trim_db);
+        let sample_rate = self.compressor.sample_rate;
+        self.output_gain.set_time(GAIN_SMOOTHING_MS, sample_rate);
+        self.mix.set_time(GAIN_SMOOTHING_MS, sample_rate);
+        self.power.set_time(POWER_FADE_MS, sample_rate);
+        self.output_gain.set(db_to_linear(
+            self.params.gain_db + self.params.output_trim_db,
+        ));
+        self.mix.set(self.params.mix / 100.0);
+        self.power.set(power_share(self.params.power));
     }
 
     #[inline]
@@ -631,6 +761,7 @@ impl StereoEffect for Dsp {
     fn reset(&mut self) {
         self.compressor.reset();
         self.meters.reset();
+        self.settle();
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
@@ -638,22 +769,31 @@ impl StereoEffect for Dsp {
         self.compressor.set_sample_rate(sr);
         self.meters = Meters::new(sr);
         self.apply_params();
+        self.settle();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
         // Metered on both sides of the cell even while bypassed: the editor's
-        // meter is how you set gain staging *before* engaging it.
-        if !self.params.power {
+        // meter is how you set gain staging *before* engaging it. Fully off
+        // and settled, the cell does not run.
+        if self.power.is_settled() && !self.params.power {
             self.meters.push((left, right), (left, right));
             return (left, right);
         }
+        let on = self.power.next();
+        let gain = self.output_gain.next();
+        let amount = self.mix.next();
         let (mut wet_l, mut wet_r) = self.compressor.process_stereo_linked(left, right);
         let drive = self.params.color / 100.0;
-        wet_l = Self::apply_color(wet_l, drive) * self.output_gain;
-        wet_r = Self::apply_color(wet_r, drive) * self.output_gain;
-        let amount = self.params.mix / 100.0;
-        let out_l = mix(left, wet_l, amount);
-        let out_r = mix(right, wet_r, amount);
+        wet_l = Self::apply_color(wet_l, drive) * gain;
+        wet_r = Self::apply_color(wet_r, drive) * gain;
+        let mut out_l = mix(left, wet_l, amount);
+        let mut out_r = mix(right, wet_r, amount);
+        if on != 1.0 {
+            // Power fading: a step from the untouched input.
+            out_l = left + (out_l - left) * on;
+            out_r = right + (out_r - right) * on;
+        }
         self.meters.push((left, right), (out_l, out_r));
         (out_l, out_r)
     }
@@ -935,5 +1075,149 @@ mod tests {
         assert_eq!(dsp.params().mode, Mode::Limit);
         assert!(!dsp.apply_wire_param(u32::MAX, 0.0));
         assert!(!dsp.apply_wire_param(ipc::GAIN_INDEX, f32::NAN));
+    }
+
+    const BLOCK: usize = 128;
+    /// Blocks played before measuring, so filters and smoothers are at rest.
+    const WARM: usize = 50;
+
+    /// The measure of LiveStageEngine's `param_sweep`: a smooth two-tone
+    /// signal goes through `block` one 128-frame block at a time, and this is
+    /// the worst ratio of the kink (second difference) where a block meets
+    /// the last one to the biggest kink inside the block. About 1 is smooth;
+    /// a value that steps once per block reads many times that.
+    fn edge_kink(blocks: usize, mut block: impl FnMut(usize, &mut [f32], &mut [f32])) -> f32 {
+        let mut left = [0.0f32; BLOCK];
+        let mut right = [0.0f32; BLOCK];
+        let mut n = 0usize;
+        let mut last = [(0.0f32, 0.0f32); 2];
+        let mut worst = 0.0f32;
+        for index in 0..WARM + blocks {
+            for i in 0..BLOCK {
+                let t = n as f64 / 48_000.0;
+                let tone = (std::f64::consts::TAU * 110.0 * t).sin() * 0.3
+                    + (std::f64::consts::TAU * 330.0 * t).sin() * 0.1;
+                (left[i], right[i]) = (tone as f32, (tone * 0.8) as f32);
+                n += 1;
+            }
+            block(index.saturating_sub(WARM), &mut left, &mut right);
+            let mut edge = 0.0f32;
+            let mut inside = 1.0e-7f32;
+            for i in 0..BLOCK {
+                let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+                let kink =
+                    d2(last[0].0, last[1].0, left[i]).max(d2(last[0].1, last[1].1, right[i]));
+                if i < 2 {
+                    edge = edge.max(kink);
+                } else {
+                    inside = inside.max(kink);
+                }
+                last = [last[1], (left[i], right[i])];
+            }
+            if index >= WARM {
+                worst = worst.max(edge / inside);
+            }
+        }
+        worst
+    }
+
+    /// Plays `dsp`, calling `change(dsp, block)` before every measured block.
+    fn drag(dsp: &mut Dsp, blocks: usize, mut change: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let mut warm = WARM;
+        edge_kink(blocks, |index, left, right| {
+            if warm > 0 {
+                warm -= 1;
+            } else {
+                change(dsp, index);
+            }
+            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                (*l, *r) = dsp.process_stereo(*l, *r);
+            }
+        })
+    }
+
+    /// Up and back down across `min..max`, a value per block, over `blocks`.
+    fn sweep(min: f32, max: f32, block: usize, blocks: usize) -> f32 {
+        let phase = block as f32 / blocks as f32 * 2.0;
+        let x = if phase < 1.0 { phase } else { 2.0 - phase };
+        min + (max - min) * x
+    }
+
+    /// Power off at block 0, then flipped every 30 blocks.
+    fn toggle_power(dsp: &mut Dsp, block: usize) {
+        if block.is_multiple_of(30) {
+            let on = (block / 30) % 2 == 1;
+            assert!(dsp.apply_wire_param(ipc::POWER_INDEX, if on { 1.0 } else { 0.0 }));
+        }
+    }
+
+    /// The measure itself sees a gain that steps once per block.
+    #[test]
+    fn the_edge_kink_measure_catches_a_stepped_gain() {
+        let stepped = edge_kink(100, |index, left, right| {
+            let gain = 0.25 + index as f32 * 0.01;
+            left.iter_mut()
+                .chain(right.iter_mut())
+                .for_each(|s| *s *= gain);
+        });
+        assert!(stepped > 20.0, "{stepped}");
+    }
+
+    #[test]
+    fn dragging_gain_trim_or_mix_does_not_zipper() {
+        for (index, min, max) in [
+            (ipc::GAIN_INDEX, -12.0, 24.0),
+            (ipc::OUTPUT_TRIM_INDEX, -12.0, 12.0),
+            (ipc::MIX_INDEX, 0.0, 100.0),
+        ] {
+            let mut dsp = Dsp::new(48_000.0);
+            let jump = drag(&mut dsp, 375, |dsp, block| {
+                assert!(dsp.apply_wire_param(index, sweep(min, max, block, 375)));
+            });
+            assert!(jump < 4.0, "wire {index} drag jump x {jump}");
+        }
+    }
+
+    #[test]
+    fn toggling_power_crossfades_without_a_step() {
+        let mut dsp = Dsp::new(48_000.0);
+        let jump = drag(&mut dsp, 300, toggle_power);
+        assert!(jump < 4.0, "power toggle jump x {jump}");
+        // Settled off is the input exactly.
+        assert!(dsp.apply_wire_param(ipc::POWER_INDEX, 0.0));
+        let _ = run_tone(&mut dsp, 0.5, 4_800);
+        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
+    }
+
+    /// Compress ↔ Limit moves ratio and knee a long way; the curve glides
+    /// there instead of stepping the reduction.
+    #[test]
+    fn switching_mode_glides_the_curve() {
+        let mut dsp = Dsp::new(48_000.0);
+        let jump = drag(&mut dsp, 300, |dsp, block| {
+            if block.is_multiple_of(30) {
+                let limit = (block / 30) % 2 == 0;
+                let mode = if limit { Mode::Limit } else { Mode::Compress };
+                assert!(dsp.apply_wire_param(ipc::MODE_INDEX, mode.to_wire()));
+            }
+        });
+        assert!(jump < 4.0, "mode switch jump x {jump}");
+    }
+
+    /// A project load lands on its values; it does not fade them in.
+    #[test]
+    fn restored_state_starts_settled() {
+        let mut params = default_params();
+        params.gain_db = 6.0;
+        params.mix = 0.0;
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(params.clone());
+        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
+        params.mix = 100.0;
+        params.peak_reduction = 0.0;
+        params.color = 0.0;
+        dsp.set_params(params);
+        let (l, _) = dsp.process_stereo(0.001, 0.001);
+        assert!((l - 0.001 * db_to_linear(6.0)).abs() < 1.0e-7, "{l}");
     }
 }

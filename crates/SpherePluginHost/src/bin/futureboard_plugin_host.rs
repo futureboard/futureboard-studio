@@ -2075,9 +2075,13 @@ mod builtin_processor_tests {
         }
         assert!(output[126].abs() < 0.05, "the low cut takes out DC");
 
+        // Power off fades the EQ out instead of cutting (two 5 ms poles: it
+        // lands exactly within about 70 ms); then it is a pure bypass.
         let power = equzx::ui_param_index("power").expect("power in wire table");
         processor.apply_param(power, 0.0);
-        processor.process_block(&in_l, &in_r, &mut output, 64);
+        for _ in 0..80 {
+            processor.process_block(&in_l, &in_r, &mut output, 64);
+        }
         assert_eq!(output[0], in_l[0], "power-off must bypass");
         processor.apply_param(u32::MAX, 1.0);
         processor.apply_param(equzx::UI_PARAM_IDS.len() as u32, 1.0);
@@ -2152,10 +2156,13 @@ mod builtin_processor_tests {
         }
         assert!(tail > 1.0e-4, "no tail after the input stopped: {tail}");
 
-        // Power off is a pure bypass — the clearest observable param effect.
+        // Power off is a pure bypass — the clearest observable param effect —
+        // once its 10 ms fade (no click) is done.
         let power = verbspace::ui_param_index("power").expect("power in wire table");
         processor.apply_param(power, 0.0);
-        processor.process_block(&in_l, &in_r, &mut output, 64);
+        for _ in 0..16 {
+            processor.process_block(&in_l, &in_r, &mut output, 64);
+        }
         for i in 0..64 {
             assert_eq!(output[i * 2], in_l[i], "power-off must bypass");
             assert_eq!(output[i * 2 + 1], in_r[i], "power-off must bypass");
@@ -2289,10 +2296,13 @@ mod builtin_processor_tests {
         }
         assert!(tail > 1.0e-4, "no repeats after the input stopped: {tail}");
 
-        // Power off is a pure bypass — the clearest observable param effect.
+        // Power off is a pure bypass — the clearest observable param effect —
+        // once its 10 ms fade (no click) is done.
         let power = echospace::ui_param_index("power").expect("power in wire table");
         processor.apply_param(power, 0.0);
-        processor.process_block(&in_l, &in_r, &mut output, 64);
+        for _ in 0..16 {
+            processor.process_block(&in_l, &in_r, &mut output, 64);
+        }
         for i in 0..64 {
             assert_eq!(output[i * 2], in_l[i], "power-off must bypass");
             assert_eq!(output[i * 2 + 1], in_r[i], "power-off must bypass");

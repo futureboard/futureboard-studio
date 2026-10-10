@@ -3,6 +3,7 @@
 //! Lookahead peak limiting with style curves and a 4× cubic inter-sample peak
 //! detector. The audio path remains allocation-free and bounded.
 
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
     linear_to_db, mix, time_constant,
@@ -30,6 +31,13 @@ const TRUE_PEAK_PHASES: [f32; 3] = [0.25, 0.5, 0.75];
 /// exits the delay line.
 const TRUE_PEAK_MIN_DELAY_SAMPLES: usize = 3;
 const TRUE_PEAK_GAIN_HOLD_SAMPLES: usize = 4;
+const LOOKAHEAD_MASK: usize = MAX_LOOKAHEAD_SAMPLES - 1;
+/// Gain / ceiling / mix smoothing, per stage of a [`Glide`], so a dragged
+/// knob cannot zipper.
+const SMOOTH_MS: f32 = 7.0;
+/// Length of the Power crossfade and of a lookahead change's read-position
+/// crossfade.
+const FADE_MS: f32 = 10.0;
 
 /// Limiter character. Wire order is the persisted contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,21 +369,203 @@ pub fn descriptor() -> PluginDescriptor {
     }
 }
 
+/// How close (relative) a smoothed value must come before it lands exactly.
+const SETTLE: f32 = 1.0e-6;
+
+/// One sample of `value` toward its target ([`Smoothed::next`]). Lands
+/// exactly once the rest is negligible — or once a step no longer moves it in
+/// `f32` — so a finished move leaves the arithmetic it started from.
+#[inline]
+fn glide(value: &mut Smoothed, step: f32) -> f32 {
+    if value.value != value.target {
+        let before = value.value;
+        value.next(step);
+        if value.value == before
+            || (value.target - value.value).abs() <= SETTLE * (1.0 + value.target.abs())
+        {
+            value.settle();
+        }
+    }
+    value.value
+}
+
+/// Two [`Smoothed`] stages in series. The second starts every move with zero
+/// slope, so even a target that jumps bends in without a corner.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    inner: Smoothed,
+    outer: Smoothed,
+}
+
+impl Glide {
+    fn at(value: f32) -> Self {
+        Self {
+            inner: Smoothed::at(value),
+            outer: Smoothed::at(value),
+        }
+    }
+
+    fn set(&mut self, target: f32) {
+        self.inner.target = target;
+    }
+
+    fn settle(&mut self) {
+        self.inner.settle();
+        self.outer = Smoothed::at(self.inner.target);
+    }
+
+    #[inline]
+    fn moving(&self) -> bool {
+        self.outer.value != self.inner.target || self.inner.value != self.inner.target
+    }
+
+    /// One sample further; the smoothed value.
+    #[inline]
+    fn next(&mut self, step: f32) -> f32 {
+        if self.moving() {
+            glide(&mut self.inner, step);
+            self.outer.target = self.inner.value;
+            glide(&mut self.outer, step);
+        }
+        self.outer.value
+    }
+}
+
+/// Eased 0…1: zero slope at both ends, so a fade has no corner.
+#[inline]
+fn ease(pos: f32) -> f32 {
+    pos * pos * (3.0 - 2.0 * pos)
+}
+
+/// Samples in a [`FADE_MS`] crossfade, as a per-sample step.
+fn fade_step(sample_rate: f32) -> f32 {
+    1.0 / (FADE_MS * 0.001 * sample_rate.max(1.0)).max(1.0)
+}
+
+/// A 0…1 crossfade position: moves linearly toward its target over
+/// [`FADE_MS`] and is read eased, so neither end of the fade has a corner.
+/// Lands exactly on 0 or 1.
+#[derive(Debug, Clone, Copy)]
+struct Fade {
+    pos: f32,
+    target: f32,
+    step: f32,
+}
+
+impl Fade {
+    fn new(on: bool, sample_rate: f32) -> Self {
+        let at = if on { 1.0 } else { 0.0 };
+        Self {
+            pos: at,
+            target: at,
+            step: fade_step(sample_rate),
+        }
+    }
+
+    fn set(&mut self, on: bool) {
+        self.target = if on { 1.0 } else { 0.0 };
+    }
+
+    fn settle(&mut self) {
+        self.pos = self.target;
+    }
+
+    /// One sample further; the eased weight of the "on" side.
+    #[inline]
+    fn next(&mut self) -> f32 {
+        if self.pos < self.target {
+            self.pos = (self.pos + self.step).min(self.target);
+        } else if self.pos > self.target {
+            self.pos = (self.pos - self.step).max(self.target);
+        }
+        ease(self.pos)
+    }
+}
+
+/// `a` at `t` 0, `b` at `t` 1 (both exactly), a straight blend between.
+#[inline]
+fn blend(a: f32, b: f32, t: f32) -> f32 {
+    if t <= 0.0 {
+        a
+    } else if t >= 1.0 {
+        b
+    } else {
+        a + (b - a) * t
+    }
+}
+
+/// A delay time that changes while audio runs: instead of jumping the read
+/// position (a click), the output crossfades from the old position to the
+/// new one over [`FADE_MS`]. A change that arrives mid-fade waits for the
+/// fade to finish, so a dragged knob walks over in clean steps and always
+/// lands on the latest value.
+#[derive(Debug, Clone, Copy)]
+struct DelaySwitch {
+    from: usize,
+    to: usize,
+    /// The latest delay asked for: what the next fade goes to.
+    pending: usize,
+    pos: f32,
+    step: f32,
+}
+
+impl DelaySwitch {
+    fn new(delay: usize, sample_rate: f32) -> Self {
+        Self {
+            from: delay,
+            to: delay,
+            pending: delay,
+            pos: 1.0,
+            step: fade_step(sample_rate),
+        }
+    }
+
+    fn request(&mut self, delay: usize) {
+        self.pending = delay;
+    }
+
+    /// Straight to the latest delay, no fade.
+    fn settle(&mut self) {
+        self.from = self.pending;
+        self.to = self.pending;
+        self.pos = 1.0;
+    }
+
+    /// One sample further: `(from, to, weight of to)`. Settled, the weight
+    /// is exactly 1.
+    #[inline]
+    fn next(&mut self) -> (usize, usize, f32) {
+        if self.pos >= 1.0 {
+            if self.pending == self.to {
+                return (self.to, self.to, 1.0);
+            }
+            self.from = self.to;
+            self.to = self.pending;
+            self.pos = 0.0;
+        }
+        self.pos = (self.pos + self.step).min(1.0);
+        (self.from, self.to, ease(self.pos))
+    }
+}
+
+/// The lookahead delay. Written every sample whatever the delay, so a change
+/// reads real history; a change crossfades between the old and the new read
+/// position instead of jumping (or clearing) the line.
 #[derive(Debug, Clone)]
 struct LookaheadLine {
     left: [f32; MAX_LOOKAHEAD_SAMPLES],
     right: [f32; MAX_LOOKAHEAD_SAMPLES],
     write: usize,
-    delay: usize,
+    switch: DelaySwitch,
 }
 
 impl LookaheadLine {
-    fn new() -> Self {
+    fn new(sample_rate: f32) -> Self {
         Self {
             left: [0.0; MAX_LOOKAHEAD_SAMPLES],
             right: [0.0; MAX_LOOKAHEAD_SAMPLES],
             write: 0,
-            delay: 0,
+            switch: DelaySwitch::new(0, sample_rate),
         }
     }
 
@@ -383,40 +573,55 @@ impl LookaheadLine {
         self.left.fill(0.0);
         self.right.fill(0.0);
         self.write = 0;
+        self.switch.settle();
+    }
+
+    /// The delay the line is heading to (and reports).
+    fn delay(&self) -> usize {
+        self.switch.pending
     }
 
     fn set_delay(&mut self, delay: usize) {
-        let delay = delay.min(MAX_LOOKAHEAD_SAMPLES - 1);
-        if delay != self.delay {
-            self.reset();
-            self.delay = delay;
-        }
+        self.switch.request(delay.min(MAX_LOOKAHEAD_SAMPLES - 1));
     }
 
     #[inline]
     fn push_read(&mut self, left: f32, right: f32) -> (f32, f32) {
-        if self.delay == 0 {
-            return (left, right);
+        let write = self.write;
+        self.left[write] = left;
+        self.right[write] = right;
+        self.write = (write + 1) & LOOKAHEAD_MASK;
+        let at = |delay: usize| (write + MAX_LOOKAHEAD_SAMPLES - delay) & LOOKAHEAD_MASK;
+        let (from, to, weight) = self.switch.next();
+        if weight >= 1.0 {
+            (self.left[at(to)], self.right[at(to)])
+        } else {
+            let (old, new) = (at(from), at(to));
+            (
+                blend(self.left[old], self.left[new], weight),
+                blend(self.right[old], self.right[new], weight),
+            )
         }
-        let read = (self.write + MAX_LOOKAHEAD_SAMPLES - self.delay) % MAX_LOOKAHEAD_SAMPLES;
-        let out_l = self.left[read];
-        let out_r = self.right[read];
-        self.left[self.write] = left;
-        self.right[self.write] = right;
-        self.write += 1;
-        if self.write >= MAX_LOOKAHEAD_SAMPLES {
-            self.write = 0;
-        }
-        (out_l, out_r)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Dsp {
     params: Params,
+    /// Audio has run since construction or [`StereoEffect::reset`]. Until
+    /// it has, an edit lands at once — an insert or session being set up
+    /// replays its stored values, and there is nothing yet to glide over.
+    started: bool,
     sample_rate: f32,
-    input_gain: f32,
+    /// Linear input gain, gliding.
+    input_gain: Glide,
+    /// The ceiling in dB, gliding; `ceiling_linear` follows it.
+    ceiling_db: Glide,
     ceiling_linear: f32,
+    mix_amount: Glide,
+    smooth_step: f32,
+    /// Dry ↔ limited: Power crossfades instead of switching.
+    power: Fade,
     attack_coeff: f32,
     release_coeff: f32,
     knee_db: f32,
@@ -437,10 +642,15 @@ impl Dsp {
     pub fn new(sample_rate: f32) -> Self {
         let sr = sample_rate.max(1.0);
         let mut dsp = Self {
+            started: false,
             params: default_params(),
             sample_rate: sr,
-            input_gain: 1.0,
+            input_gain: Glide::at(1.0),
+            ceiling_db: Glide::at(0.0),
             ceiling_linear: 1.0,
+            mix_amount: Glide::at(1.0),
+            smooth_step: smoothing_step(SMOOTH_MS, sr),
+            power: Fade::new(true, sr),
             attack_coeff: 0.0,
             release_coeff: 0.0,
             knee_db: 1.5,
@@ -453,10 +663,11 @@ impl Dsp {
             true_peak_gain_r: 1.0,
             true_peak_hold_l: 0,
             true_peak_hold_r: 0,
-            delay: LookaheadLine::new(),
+            delay: LookaheadLine::new(sr),
             meters: Meters::new(sr),
         };
         dsp.apply_params();
+        dsp.settle();
         dsp
     }
 
@@ -468,10 +679,13 @@ impl Dsp {
         self.gr_db.max(0.0)
     }
 
+    /// Replace every parameter at once — a state load. Lands on the new
+    /// values without a glide or a fade.
     pub fn set_params(&mut self, params: Params) {
         self.params = params;
         ipc::sanitize_params(&mut self.params);
         self.apply_params();
+        self.settle();
     }
 
     pub fn meter_frame(&self) -> MeterFrame {
@@ -500,6 +714,9 @@ impl Dsp {
             return false;
         }
         self.apply_params();
+        if !self.started {
+            self.settle();
+        }
         true
     }
 
@@ -511,7 +728,7 @@ impl Dsp {
     }
 
     pub fn latency_samples(&self) -> usize {
-        self.delay.delay
+        self.delay.delay()
     }
 
     fn apply_params(&mut self) {
@@ -519,9 +736,10 @@ impl Dsp {
         self.knee_db = style.knee_db();
         self.attack_coeff = time_constant(self.sample_rate, style.attack_sec());
         self.release_coeff = time_constant(self.sample_rate, self.params.release_ms * 0.001);
-        self.input_gain = db_to_linear(self.params.gain_db);
-
-        self.ceiling_linear = db_to_linear(self.params.ceiling_db);
+        self.input_gain.set(db_to_linear(self.params.gain_db));
+        self.ceiling_db.set(self.params.ceiling_db);
+        self.mix_amount.set(self.params.mix / 100.0);
+        self.power.set(self.params.power);
 
         let mut delay = ((self.params.lookahead_ms * 0.001) * self.sample_rate).round() as usize;
         if self.params.true_peak {
@@ -537,14 +755,24 @@ impl Dsp {
         self.delay.set_delay(delay.min(MAX_LOOKAHEAD_SAMPLES - 1));
     }
 
+    /// Land the gains, the Power fade and the lookahead on their targets.
+    fn settle(&mut self) {
+        self.input_gain.settle();
+        self.ceiling_db.settle();
+        self.ceiling_linear = db_to_linear(self.ceiling_db.outer.value);
+        self.mix_amount.settle();
+        self.power.settle();
+        self.delay.switch.settle();
+    }
+
     /// Gain computer: how much linear gain keeps `level` at or under the ceiling.
     #[inline]
     fn compute_gain(&self, level: f32) -> f32 {
         if level <= 1.0e-12 {
             return 1.0;
         }
-        let ceiling = self.ceiling_linear.max(1.0e-6);
-        let gr_db = static_reduction_db(linear_to_db(level), linear_to_db(ceiling), self.knee_db);
+        let ceiling_db = self.ceiling_db.outer.value;
+        let gr_db = static_reduction_db(linear_to_db(level), ceiling_db, self.knee_db);
         db_to_linear(-gr_db)
     }
 
@@ -569,6 +797,7 @@ impl Dsp {
 
 impl StereoEffect for Dsp {
     fn reset(&mut self) {
+        self.started = false;
         self.envelope_l = 0.0;
         self.envelope_r = 0.0;
         self.gr_db = 0.0;
@@ -580,19 +809,27 @@ impl StereoEffect for Dsp {
         self.true_peak_hold_r = 0;
         self.delay.reset();
         self.meters.reset();
+        self.settle();
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate.max(1.0);
         self.meters = Meters::new(self.sample_rate);
+        self.smooth_step = smoothing_step(SMOOTH_MS, self.sample_rate);
+        self.power.step = fade_step(self.sample_rate);
+        self.delay.switch.step = fade_step(self.sample_rate);
         self.apply_params();
+        self.settle();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        self.started = true;
         // The delay always carries the unprocessed signal. This keeps bypass
         // and dry/wet mixing aligned with the latency reported to the host.
         let (delayed_l, delayed_r) = self.delay.push_read(left, right);
-        if !self.params.power {
+        let on = self.power.next();
+        if on <= 0.0 {
+            // Off and faded out: only the delay runs.
             self.meters.push_stereo(left, right, delayed_l, delayed_r);
             self.envelope_l = 0.0;
             self.envelope_r = 0.0;
@@ -606,8 +843,15 @@ impl StereoEffect for Dsp {
             return (delayed_l, delayed_r);
         }
 
-        let driven_l = left * self.input_gain;
-        let driven_r = right * self.input_gain;
+        let step = self.smooth_step;
+        let input_gain = self.input_gain.next(step);
+        if self.ceiling_db.moving() {
+            self.ceiling_linear = db_to_linear(self.ceiling_db.next(step));
+        }
+        let amount = self.mix_amount.next(step);
+
+        let driven_l = left * input_gain;
+        let driven_r = right * input_gain;
 
         // Detect on the undelayed path so GR can start before the peak exits.
         let peak_l = if self.params.true_peak {
@@ -674,8 +918,8 @@ impl StereoEffect for Dsp {
 
         let gain_l = self.compute_gain(self.envelope_l);
         let gain_r = self.compute_gain(self.envelope_r);
-        let delayed_driven_l = delayed_l * self.input_gain;
-        let delayed_driven_r = delayed_r * self.input_gain;
+        let delayed_driven_l = delayed_l * input_gain;
+        let delayed_driven_r = delayed_r * input_gain;
         // A final sample-peak safety gain makes ceiling compliance independent
         // of style attack. The lookahead envelope still supplies the musical
         // shape; this guard only catches what would otherwise overshoot.
@@ -701,7 +945,9 @@ impl StereoEffect for Dsp {
         let wet_l = delayed_driven_l * applied_l;
         let wet_r = delayed_driven_r * applied_r;
 
-        let amount = self.params.mix / 100.0;
+        // The limited signal eases in and out with Power: scaling the wet
+        // share is the same as blending the dry and processed outputs.
+        let amount = amount * on;
         let out_l = mix(delayed_l, wet_l, amount);
         let out_r = mix(delayed_r, wet_r, amount);
         self.meters.push_stereo(driven_l, driven_r, out_l, out_r);
@@ -712,6 +958,164 @@ impl StereoEffect for Dsp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BLOCK: usize = 128;
+    /// About a second of blocks: one drag across a range and back.
+    const DRAG_BLOCKS: usize = 375;
+
+    /// Two low tones: smooth, so a gain that steps shows as a kink.
+    fn tone(n: usize) -> (f32, f32) {
+        let t = n as f64 / 48_000.0;
+        let x = (std::f64::consts::TAU * 110.0 * t).sin() * 0.3
+            + (std::f64::consts::TAU * 330.0 * t).sin() * 0.1;
+        (x as f32, (x * 0.8) as f32)
+    }
+
+    /// The parameter sweep's measure: the biggest second difference where a
+    /// block meets the last one, against the biggest one inside a block,
+    /// while `change` edits the DSP before each 128-frame block. About 1 is
+    /// smooth; a value that steps once per block stands out many times over.
+    fn edge_jump(dsp: &mut Dsp, mut change: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let mut n = 0;
+        let mut last = [(0.0f32, 0.0f32); 2];
+        for _ in 0..200 * BLOCK {
+            let (l, r) = tone(n);
+            n += 1;
+            last = [last[1], dsp.process_stereo(l, r)];
+        }
+        let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+        let mut worst = 0.0f32;
+        for block in 0..DRAG_BLOCKS {
+            change(dsp, block);
+            let (mut edge, mut inside) = (0.0f32, 1.0e-7f32);
+            for i in 0..BLOCK {
+                let (l, r) = tone(n);
+                n += 1;
+                let out = dsp.process_stereo(l, r);
+                assert!(out.0.is_finite() && out.1.is_finite());
+                let kink = d2(last[0].0, last[1].0, out.0).max(d2(last[0].1, last[1].1, out.1));
+                if i < 2 {
+                    edge = edge.max(kink);
+                } else {
+                    inside = inside.max(kink);
+                }
+                last = [last[1], out];
+            }
+            worst = worst.max(edge / inside);
+        }
+        worst
+    }
+
+    /// Up and back down across `[min, max]`, a value per block.
+    fn drag(min: f32, max: f32, block: usize) -> f32 {
+        let phase = block as f32 / DRAG_BLOCKS as f32 * 2.0;
+        let x = if phase < 1.0 { phase } else { 2.0 - phase };
+        min + (max - min) * x
+    }
+
+    /// A click every quarter second, through every step of a switch.
+    fn click(dsp: &mut Dsp, index: u32, steps: usize, block: usize) {
+        if block.is_multiple_of(94) {
+            dsp.apply_wire_param(index, ((block / 94) % steps) as f32);
+        }
+    }
+
+    /// A limiter the sweep's tone drives into the ceiling.
+    fn limiting() -> Dsp {
+        let mut dsp = Dsp::new(48_000.0);
+        let mut params = default_params();
+        params.gain_db = 12.0;
+        dsp.set_params(params);
+        dsp
+    }
+
+    #[test]
+    fn dragged_gain_ceiling_and_mix_do_not_zipper() {
+        for (index, min, max) in [
+            (ipc::GAIN_INDEX, -12.0, 24.0),
+            (ipc::CEILING_INDEX, -6.0, 0.0),
+            (ipc::MIX_INDEX, 0.0, 100.0),
+        ] {
+            for start in [default_params(), limiting().params().clone()] {
+                let mut dsp = Dsp::new(48_000.0);
+                dsp.set_params(start);
+                let jump = edge_jump(&mut dsp, |dsp, block| {
+                    dsp.apply_wire_param(index, drag(min, max, block));
+                });
+                assert!(
+                    jump < 4.0,
+                    "{}: block-edge jump {jump}",
+                    UI_PARAM_IDS[index as usize]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_gliding_gain_still_holds_the_ceiling() {
+        let mut dsp = limiting();
+        let ceiling = db_to_linear(dsp.params().ceiling_db);
+        for block in 0..375 {
+            dsp.apply_wire_param(ipc::GAIN_INDEX, drag(0.0, 24.0, block));
+            for i in 0..128 {
+                let x = ((block * 128 + i) as f32 * 0.06).sin() * 0.9;
+                let (l, r) = dsp.process_stereo(x, -x);
+                assert!(l.abs() <= ceiling + 1.0e-6 && r.abs() <= ceiling + 1.0e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn a_dragged_lookahead_crossfades_instead_of_clearing() {
+        let mut dsp = limiting();
+        let jump = edge_jump(&mut dsp, |dsp, block| {
+            dsp.apply_wire_param(ipc::LOOKAHEAD_INDEX, drag(0.0, 10.0, block));
+        });
+        assert!(jump < 4.0, "lookahead: block-edge jump {jump}");
+        // It lands on the latest value, which is what it reports.
+        assert!(dsp.apply_ui_param("lookaheadMs", 5.0));
+        assert_eq!(dsp.latency_samples(), 240);
+        assert!(dsp.apply_ui_param("power", 0.0));
+        for _ in 0..4_800 {
+            dsp.process_stereo(0.0, 0.0);
+        }
+        let out: Vec<f32> = (0..480)
+            .map(|i| dsp.process_stereo(if i == 0 { 0.5 } else { 0.0 }, 0.0).0)
+            .collect();
+        assert_eq!(out[240], 0.5);
+        assert!(out.iter().enumerate().all(|(i, s)| i == 240 || *s == 0.0));
+    }
+
+    #[test]
+    fn switches_crossfade_instead_of_stepping() {
+        for (index, steps) in [
+            (ipc::POWER_INDEX, 2),
+            (ipc::TRUE_PEAK_INDEX, 2),
+            (ipc::STYLE_INDEX, 4),
+        ] {
+            let mut dsp = limiting();
+            let jump = edge_jump(&mut dsp, |dsp, block| click(dsp, index, steps, block));
+            assert!(
+                jump < 4.0,
+                "{}: block-edge jump {jump}",
+                UI_PARAM_IDS[index as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn faded_out_power_is_a_delayed_bit_exact_bypass() {
+        let mut dsp = limiting();
+        assert!(dsp.apply_ui_param("power", 0.0));
+        let delay = dsp.latency_samples();
+        for _ in 0..4_800 {
+            dsp.process_stereo(0.0, 0.0);
+        }
+        let out: Vec<(f32, f32)> = (0..delay + 1)
+            .map(|i| dsp.process_stereo(if i == 0 { 0.9 } else { 0.0 }, -0.25))
+            .collect();
+        assert_eq!(out[delay], (0.9, -0.25));
+    }
 
     fn run_tone(dsp: &mut Dsp, amplitude: f32, samples: usize) -> MeterFrame {
         for n in 0..samples {
@@ -939,5 +1343,16 @@ mod tests {
                 "{style:?} +{gain} dB at {input} dB: measured {measured}, drawn {drawn}"
             );
         }
+    }
+
+    /// An insert being set up replays its stored values before any audio:
+    /// they land at once instead of gliding in.
+    #[test]
+    fn edits_before_the_first_sample_land_at_once() {
+        let mut dsp = Dsp::new(48_000.0);
+        assert!(dsp.apply_ui_param("gainDb", 6.0));
+        assert!(dsp.apply_ui_param("lookaheadMs", 5.0));
+        assert_eq!(dsp.input_gain.outer.value, db_to_linear(6.0));
+        assert_eq!(dsp.delay.switch.next(), (240, 240, 1.0));
     }
 }

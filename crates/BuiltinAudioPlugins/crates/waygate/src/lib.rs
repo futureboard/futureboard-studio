@@ -23,6 +23,7 @@
 //! [`MAX_LOOKAHEAD_MS`] at up to 384 kHz when the DSP is built.
 
 use biquad::{Biquad, DirectForm1};
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, clamp, db_to_linear, flush_denormal,
     linear_to_db, make_eq_coefficients, time_constant,
@@ -64,6 +65,12 @@ const KEY_FILTER_Q: f32 = 0.707;
 const CLIP_THRESHOLD: f32 = 1.0;
 const RMS_WINDOW_SECONDS: f32 = 0.300;
 const PEAK_FALL_SECONDS: f32 = 0.400;
+/// Range smoothing, per stage of a [`Glide`], so a dragged range cannot
+/// zipper a closed gate.
+const SMOOTH_MS: f32 = 7.0;
+/// Length of the Power / Key Listen / Mode crossfades and of a lookahead
+/// change's read-position crossfade.
+const FADE_MS: f32 = 10.0;
 
 /// What the detector does when the key crosses the threshold. Wire order:
 /// Gate, Duck.
@@ -338,11 +345,191 @@ impl Meters {
     }
 }
 
+/// How close (relative) a smoothed value must come before it lands exactly.
+const SETTLE: f32 = 1.0e-6;
+
+/// One sample of `value` toward its target ([`Smoothed::next`]). Lands
+/// exactly once the rest is negligible — or once a step no longer moves it in
+/// `f32` — so a finished move leaves the arithmetic it started from.
+#[inline]
+fn glide(value: &mut Smoothed, step: f32) -> f32 {
+    if value.value != value.target {
+        let before = value.value;
+        value.next(step);
+        if value.value == before
+            || (value.target - value.value).abs() <= SETTLE * (1.0 + value.target.abs())
+        {
+            value.settle();
+        }
+    }
+    value.value
+}
+
+/// Two [`Smoothed`] stages in series. The second starts every move with zero
+/// slope, so even a target that jumps bends in without a corner.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    inner: Smoothed,
+    outer: Smoothed,
+}
+
+impl Glide {
+    fn at(value: f32) -> Self {
+        Self {
+            inner: Smoothed::at(value),
+            outer: Smoothed::at(value),
+        }
+    }
+
+    fn set(&mut self, target: f32) {
+        self.inner.target = target;
+    }
+
+    fn settle(&mut self) {
+        self.inner.settle();
+        self.outer = Smoothed::at(self.inner.target);
+    }
+
+    #[inline]
+    fn moving(&self) -> bool {
+        self.outer.value != self.inner.target || self.inner.value != self.inner.target
+    }
+
+    /// One sample further; the smoothed value.
+    #[inline]
+    fn next(&mut self, step: f32) -> f32 {
+        if self.moving() {
+            glide(&mut self.inner, step);
+            self.outer.target = self.inner.value;
+            glide(&mut self.outer, step);
+        }
+        self.outer.value
+    }
+}
+
+/// Eased 0…1: zero slope at both ends, so a fade has no corner.
+#[inline]
+fn ease(pos: f32) -> f32 {
+    pos * pos * (3.0 - 2.0 * pos)
+}
+
+/// Samples in a [`FADE_MS`] crossfade, as a per-sample step.
+fn fade_step(sample_rate: f32) -> f32 {
+    1.0 / (FADE_MS * 0.001 * sample_rate.max(1.0)).max(1.0)
+}
+
+/// A 0…1 crossfade position: moves linearly toward its target over
+/// [`FADE_MS`] and is read eased, so neither end of the fade has a corner.
+/// Lands exactly on 0 or 1.
+#[derive(Debug, Clone, Copy)]
+struct Fade {
+    pos: f32,
+    target: f32,
+    step: f32,
+}
+
+impl Fade {
+    fn new(on: bool, sample_rate: f32) -> Self {
+        let at = if on { 1.0 } else { 0.0 };
+        Self {
+            pos: at,
+            target: at,
+            step: fade_step(sample_rate),
+        }
+    }
+
+    fn set(&mut self, on: bool) {
+        self.target = if on { 1.0 } else { 0.0 };
+    }
+
+    fn settle(&mut self) {
+        self.pos = self.target;
+    }
+
+    /// One sample further; the eased weight of the "on" side.
+    #[inline]
+    fn next(&mut self) -> f32 {
+        if self.pos < self.target {
+            self.pos = (self.pos + self.step).min(self.target);
+        } else if self.pos > self.target {
+            self.pos = (self.pos - self.step).max(self.target);
+        }
+        ease(self.pos)
+    }
+}
+
+/// `a` at `t` 0, `b` at `t` 1 (both exactly), a straight blend between.
+#[inline]
+fn blend(a: f32, b: f32, t: f32) -> f32 {
+    if t <= 0.0 {
+        a
+    } else if t >= 1.0 {
+        b
+    } else {
+        a + (b - a) * t
+    }
+}
+
+/// A delay time that changes while audio runs: instead of jumping the read
+/// position (a click), the output crossfades from the old position to the
+/// new one over [`FADE_MS`]. A change that arrives mid-fade waits for the
+/// fade to finish, so a dragged knob walks over in clean steps and always
+/// lands on the latest value.
+#[derive(Debug, Clone, Copy)]
+struct DelaySwitch {
+    from: usize,
+    to: usize,
+    /// The latest delay asked for: what the next fade goes to.
+    pending: usize,
+    pos: f32,
+    step: f32,
+}
+
+impl DelaySwitch {
+    fn new(delay: usize, sample_rate: f32) -> Self {
+        Self {
+            from: delay,
+            to: delay,
+            pending: delay,
+            pos: 1.0,
+            step: fade_step(sample_rate),
+        }
+    }
+
+    fn request(&mut self, delay: usize) {
+        self.pending = delay;
+    }
+
+    /// Straight to the latest delay, no fade.
+    fn settle(&mut self) {
+        self.from = self.pending;
+        self.to = self.pending;
+        self.pos = 1.0;
+    }
+
+    /// One sample further: `(from, to, weight of to)`. Settled, the weight
+    /// is exactly 1.
+    #[inline]
+    fn next(&mut self) -> (usize, usize, f32) {
+        if self.pos >= 1.0 {
+            if self.pending == self.to {
+                return (self.to, self.to, 1.0);
+            }
+            self.from = self.to;
+            self.to = self.pending;
+            self.pos = 0.0;
+        }
+        self.pos = (self.pos + self.step).min(1.0);
+        (self.from, self.to, ease(self.pos))
+    }
+}
+
 /// Everything the per-sample path reads, resolved from the params once per
 /// edit.
 #[derive(Debug, Clone, Copy)]
 struct Coeffs {
-    duck: bool,
+    /// `0` gate … `1` duck; between the two while Mode crossfades.
+    duck: f32,
     open_level: f32,
     close_level: f32,
     detect_fall: f32,
@@ -390,7 +577,22 @@ impl GateChannel {
         } else {
             (self.env - c.release_step).max(0.0)
         };
-        let closed = if c.duck { self.env } else { 1.0 - self.env };
+        let gate = Self::gain_at(1.0 - self.env, c);
+        if c.duck <= 0.0 {
+            gate
+        } else if c.duck >= 1.0 {
+            Self::gain_at(self.env, c)
+        } else {
+            // Mode crossfading: a straight blend of the gate's and the
+            // ducker's gains, so neither the flip nor a full mute's snap to
+            // silence can step the output.
+            blend(gate, Self::gain_at(self.env, c), c.duck)
+        }
+    }
+
+    /// The gain for how far closed (`0` open … `1` closed) the ramp is.
+    #[inline]
+    fn gain_at(closed: f32, c: &Coeffs) -> f32 {
         if closed <= 0.0 {
             1.0
         } else if closed >= 1.0 {
@@ -420,9 +622,24 @@ impl DelayLine {
     }
 
     #[inline]
-    fn push(&mut self, write: usize, value: f32, delay: usize) -> f32 {
+    fn write(&mut self, write: usize, value: f32) {
         self.buffer[write] = value;
+    }
+
+    /// The sample `delay` writes before the one at `write`.
+    #[inline]
+    fn read(&self, write: usize, delay: usize) -> f32 {
         self.buffer[(write + LOOKAHEAD_CAPACITY - delay) & LOOKAHEAD_MASK]
+    }
+
+    /// What the line plays at `write` through a [`DelaySwitch`] step.
+    #[inline]
+    fn read_switched(&self, write: usize, (from, to, weight): (usize, usize, f32)) -> f32 {
+        if weight >= 1.0 {
+            self.read(write, to)
+        } else {
+            blend(self.read(write, from), self.read(write, to), weight)
+        }
     }
 
     fn clear(&mut self) {
@@ -464,6 +681,10 @@ impl KeyFilter {
 
 pub struct Dsp {
     params: Params,
+    /// Audio has run since construction or [`StereoEffect::reset`]. Until
+    /// it has, an edit lands at once — an insert or session being set up
+    /// replays its stored values, and there is nothing yet to glide over.
+    started: bool,
     sample_rate: f32,
     meters: Meters,
     coeffs: Coeffs,
@@ -474,7 +695,17 @@ pub struct Dsp {
     dry: [DelayLine; 2],
     key_line: [DelayLine; 2],
     write: usize,
-    lookahead: usize,
+    /// The lookahead, crossfaded when it changes.
+    lookahead: DelaySwitch,
+    /// The range in dB, gliding.
+    range: Glide,
+    smooth_step: f32,
+    /// Dry ↔ gated: Power crossfades instead of switching.
+    power: Fade,
+    /// Gated ↔ key audition.
+    listen: Fade,
+    /// Gate ↔ duck.
+    duck: Fade,
     /// The last sample's lower gain, for the meters.
     gain: f32,
 }
@@ -483,11 +714,12 @@ impl Dsp {
     pub fn new(sample_rate: f32) -> Self {
         let sr = sample_rate.max(1.0);
         let mut dsp = Self {
+            started: false,
             params: default_params(),
             sample_rate: sr,
             meters: Meters::new(sr),
             coeffs: Coeffs {
-                duck: false,
+                duck: 0.0,
                 open_level: 1.0,
                 close_level: 1.0,
                 detect_fall: 0.0,
@@ -504,10 +736,16 @@ impl Dsp {
             dry: [DelayLine::new(), DelayLine::new()],
             key_line: [DelayLine::new(), DelayLine::new()],
             write: 0,
-            lookahead: 0,
+            lookahead: DelaySwitch::new(0, sr),
+            range: Glide::at(RANGE_FLOOR_DB),
+            smooth_step: smoothing_step(SMOOTH_MS, sr),
+            power: Fade::new(true, sr),
+            listen: Fade::new(false, sr),
+            duck: Fade::new(false, sr),
             gain: 1.0,
         };
         dsp.apply_params();
+        dsp.settle();
         dsp.gain = dsp.coeffs.closed_gain;
         dsp
     }
@@ -516,10 +754,13 @@ impl Dsp {
         &self.params
     }
 
+    /// Replace every parameter at once — a state load. Lands on the new
+    /// values without a glide or a fade.
     pub fn set_params(&mut self, params: Params) {
         self.params = params;
         ipc::sanitize_params(&mut self.params);
         self.apply_params();
+        self.settle();
     }
 
     pub fn meter_frame(&self) -> MeterFrame {
@@ -554,6 +795,9 @@ impl Dsp {
             return false;
         }
         self.apply_params();
+        if !self.started {
+            self.settle();
+        }
         true
     }
 
@@ -567,7 +811,7 @@ impl Dsp {
     /// The lookahead, in samples. Reported whether or not the gate is on: the
     /// audio is delayed either way, so bypassing never moves the track.
     pub fn latency_samples(&self) -> usize {
-        self.lookahead
+        self.lookahead.pending
     }
 
     fn samples(&self, ms: f32) -> f32 {
@@ -581,20 +825,23 @@ impl Dsp {
         let attack = self.samples(p.attack_ms).max(1.0);
         let release = self.samples(p.release_ms).max(1.0);
         let hold = self.samples(p.hold_ms).round().max(0.0) as u32;
+        self.duck.set(p.mode == Mode::Duck);
+        self.power.set(p.power);
+        self.listen.set(p.key_listen);
+        // The range glides; the per-sample path keeps `span_db` and
+        // `closed_gain` with it while it moves.
+        self.range.set(span_db);
+        let span_now = self.range.outer.value;
         self.coeffs = Coeffs {
-            duck: p.mode == Mode::Duck,
+            duck: self.coeffs.duck,
             open_level: db_to_linear(p.threshold_db),
             close_level: db_to_linear(p.threshold_db - p.hysteresis_db.max(0.0)),
             detect_fall: time_constant(sr, DETECT_RELEASE_SEC),
             hold_samples: hold,
             attack_step: 1.0 / attack,
             release_step: 1.0 / release,
-            span_db,
-            closed_gain: if is_full_mute(p.range_db) {
-                0.0
-            } else {
-                db_to_linear(span_db)
-            },
+            span_db: span_now,
+            closed_gain: closed_gain(span_now, !self.range.moving()),
         };
 
         // The key filters retune in place; one switched on starts from rest.
@@ -619,18 +866,49 @@ impl Dsp {
         self.hpf_on = hpf_on;
         self.lpf_on = lpf_on;
 
-        self.lookahead =
-            (self.samples(p.lookahead_ms).round().max(0.0) as usize).min(LOOKAHEAD_CAPACITY - 1);
+        self.lookahead.request(
+            (self.samples(p.lookahead_ms).round().max(0.0) as usize).min(LOOKAHEAD_CAPACITY - 1),
+        );
+    }
+
+    /// Land the range, the fades and the lookahead on their targets.
+    fn settle(&mut self) {
+        self.range.settle();
+        self.power.settle();
+        self.listen.settle();
+        self.duck.settle();
+        self.coeffs.duck = self.duck.target;
+        self.lookahead.settle();
+        self.coeffs.span_db = self.range.outer.value;
+        self.coeffs.closed_gain = closed_gain(self.coeffs.span_db, true);
     }
 
     fn set_sample_rate_internal(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate.max(1.0);
         self.meters = Meters::new(self.sample_rate);
+        self.smooth_step = smoothing_step(SMOOTH_MS, self.sample_rate);
+        let step = fade_step(self.sample_rate);
+        self.power.step = step;
+        self.listen.step = step;
+        self.duck.step = step;
+        self.lookahead.step = step;
+    }
+}
+
+/// The gain once fully closed for a range of `span_db`: a mute at the floor
+/// once the range has landed there, else the range itself.
+#[inline]
+fn closed_gain(span_db: f32, settled: bool) -> f32 {
+    if settled && is_full_mute(span_db) {
+        0.0
+    } else {
+        db_to_linear(span_db)
     }
 }
 
 impl StereoEffect for Dsp {
     fn reset(&mut self) {
+        self.started = false;
         self.meters.reset();
         for channel in &mut self.channels {
             channel.reset();
@@ -641,29 +919,44 @@ impl StereoEffect for Dsp {
         for line in self.dry.iter_mut().chain(self.key_line.iter_mut()) {
             line.clear();
         }
+        self.settle();
         self.gain = self.coeffs.closed_gain;
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.set_sample_rate_internal(sample_rate);
         self.apply_params();
+        self.settle();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        self.started = true;
         let key_l = self.keys[0].run(left, self.hpf_on, self.lpf_on);
         let key_r = self.keys[1].run(right, self.hpf_on, self.lpf_on);
-        let (write, delay) = (self.write, self.lookahead);
+        let write = self.write;
         self.write = (write + 1) & LOOKAHEAD_MASK;
-        let dry_l = self.dry[0].push(write, left, delay);
-        let dry_r = self.dry[1].push(write, right, delay);
-        let late_key_l = self.key_line[0].push(write, key_l, delay);
-        let late_key_r = self.key_line[1].push(write, key_r, delay);
+        self.dry[0].write(write, left);
+        self.dry[1].write(write, right);
+        self.key_line[0].write(write, key_l);
+        self.key_line[1].write(write, key_r);
+        let delay = self.lookahead.next();
+        let dry_l = self.dry[0].read_switched(write, delay);
+        let dry_r = self.dry[1].read_switched(write, delay);
         let key_peak = key_l.abs().max(key_r.abs());
 
-        if !self.params.power {
+        let on = self.power.next();
+        if on <= 0.0 {
+            // Off and faded out: only the delay runs.
             self.gain = 1.0;
             self.meters.push((left, right), (dry_l, dry_r), key_peak);
             return (dry_l, dry_r);
+        }
+
+        self.coeffs.duck = self.duck.next();
+        if self.range.moving() {
+            let span = self.range.next(self.smooth_step);
+            self.coeffs.span_db = span;
+            self.coeffs.closed_gain = closed_gain(span, !self.range.moving());
         }
 
         let (gain_l, gain_r) = if self.params.stereo_link {
@@ -679,11 +972,17 @@ impl StereoEffect for Dsp {
         };
         self.gain = gain_l.min(gain_r);
 
-        let out = if self.params.key_listen {
-            (late_key_l, late_key_r)
-        } else {
-            (dry_l * gain_l, dry_r * gain_r)
-        };
+        let mut out = (dry_l * gain_l, dry_r * gain_r);
+        let listen = self.listen.next();
+        if listen > 0.0 {
+            let late_key_l = self.key_line[0].read_switched(write, delay);
+            let late_key_r = self.key_line[1].read_switched(write, delay);
+            out = (
+                blend(out.0, late_key_l, listen),
+                blend(out.1, late_key_r, listen),
+            );
+        }
+        let out = (blend(dry_l, out.0, on), blend(dry_r, out.1, on));
         self.meters.push((left, right), out, key_peak);
         out
     }
@@ -692,6 +991,147 @@ impl StereoEffect for Dsp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BLOCK: usize = 128;
+    /// About a second of blocks: one drag across a range and back.
+    const DRAG_BLOCKS: usize = 375;
+
+    /// Two low tones: smooth, so a gain that steps shows as a kink.
+    fn tone(n: usize) -> (f32, f32) {
+        let t = n as f64 / 48_000.0;
+        let x = (std::f64::consts::TAU * 110.0 * t).sin() * 0.3
+            + (std::f64::consts::TAU * 330.0 * t).sin() * 0.1;
+        (x as f32, (x * 0.8) as f32)
+    }
+
+    /// The parameter sweep's measure: the biggest second difference where a
+    /// block meets the last one, against the biggest one inside a block,
+    /// while `change` edits the DSP before each 128-frame block. About 1 is
+    /// smooth; a value that steps once per block stands out many times over.
+    fn edge_jump(dsp: &mut Dsp, mut change: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let mut n = 0;
+        let mut last = [(0.0f32, 0.0f32); 2];
+        for _ in 0..200 * BLOCK {
+            let (l, r) = tone(n);
+            n += 1;
+            last = [last[1], dsp.process_stereo(l, r)];
+        }
+        let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+        let mut worst = 0.0f32;
+        for block in 0..DRAG_BLOCKS {
+            change(dsp, block);
+            let (mut edge, mut inside) = (0.0f32, 1.0e-7f32);
+            for i in 0..BLOCK {
+                let (l, r) = tone(n);
+                n += 1;
+                let out = dsp.process_stereo(l, r);
+                assert!(out.0.is_finite() && out.1.is_finite());
+                let kink = d2(last[0].0, last[1].0, out.0).max(d2(last[0].1, last[1].1, out.1));
+                if i < 2 {
+                    edge = edge.max(kink);
+                } else {
+                    inside = inside.max(kink);
+                }
+                last = [last[1], out];
+            }
+            worst = worst.max(edge / inside);
+        }
+        worst
+    }
+
+    /// Up and back down across `[min, max]`, a value per block.
+    fn drag(min: f32, max: f32, block: usize) -> f32 {
+        let phase = block as f32 / DRAG_BLOCKS as f32 * 2.0;
+        let x = if phase < 1.0 { phase } else { 2.0 - phase };
+        min + (max - min) * x
+    }
+
+    /// A click every quarter second, through every step of a switch.
+    fn click(dsp: &mut Dsp, index: u32, steps: usize, block: usize) {
+        if block.is_multiple_of(94) {
+            dsp.apply_wire_param(index, ((block / 94) % steps) as f32);
+        }
+    }
+
+    /// A gate the sweep's tone sits under (closed, at −30 dB), with the key
+    /// filtered so Key Listen sounds different.
+    fn closed_gate() -> Dsp {
+        let mut dsp = Dsp::new(SR);
+        let mut params = default_params();
+        params.threshold_db = 0.0;
+        params.range_db = -30.0;
+        params.key_hpf_hz = 1_000.0;
+        dsp.set_params(params);
+        dsp
+    }
+
+    #[test]
+    fn a_dragged_range_does_not_zipper() {
+        let mut dsp = closed_gate();
+        let jump = edge_jump(&mut dsp, |dsp, block| {
+            dsp.apply_wire_param(ipc::RANGE_INDEX, drag(RANGE_FLOOR_DB, 0.0, block));
+        });
+        assert!(jump < 4.0, "range: block-edge jump {jump}");
+    }
+
+    #[test]
+    fn a_dragged_lookahead_crossfades_instead_of_jumping() {
+        let mut dsp = closed_gate();
+        let jump = edge_jump(&mut dsp, |dsp, block| {
+            dsp.apply_wire_param(ipc::LOOKAHEAD_INDEX, drag(0.0, MAX_LOOKAHEAD_MS, block));
+        });
+        assert!(jump < 4.0, "lookahead: block-edge jump {jump}");
+        // The reported latency is the latest value, and the audio lands on it.
+        assert!(dsp.apply_ui_param("lookaheadMs", 5.0));
+        assert_eq!(dsp.latency_samples(), ms(5.0));
+        assert!(dsp.apply_ui_param("thresholdDb", -80.0));
+        assert!(dsp.apply_ui_param("power", 0.0));
+        for _ in 0..ms(100.0) {
+            dsp.process_stereo(0.0, 0.0);
+        }
+        let out: Vec<f32> = (0..ms(10.0))
+            .map(|i| dsp.process_stereo(if i == 0 { 0.5 } else { 0.0 }, 0.0).0)
+            .collect();
+        assert_eq!(out[ms(5.0)], 0.5);
+        assert!(
+            out.iter()
+                .enumerate()
+                .all(|(i, s)| i == ms(5.0) || *s == 0.0)
+        );
+    }
+
+    #[test]
+    fn switches_crossfade_instead_of_stepping() {
+        for (index, steps) in [
+            (ipc::POWER_INDEX, 2),
+            (ipc::MODE_INDEX, 2),
+            (ipc::KEY_LISTEN_INDEX, 2),
+        ] {
+            // Closed at −30 dB, and open at the defaults (a full-mute range,
+            // so a Gate ↔ Duck flip runs between unity and silence).
+            for (setup, start) in [("closed", closed_gate()), ("open", gate())] {
+                let mut dsp = start;
+                let jump = edge_jump(&mut dsp, |dsp, block| click(dsp, index, steps, block));
+                assert!(
+                    jump < 4.0,
+                    "{} ({setup}): block-edge jump {jump}",
+                    UI_PARAM_IDS[index as usize]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_state_load_lands_at_once() {
+        let mut dsp = gate();
+        let mut params = default_params();
+        params.range_db = -12.0;
+        params.lookahead_ms = 2.0;
+        params.power = false;
+        dsp.set_params(params);
+        assert_eq!(dsp.coeffs.span_db, -12.0);
+        assert_eq!(dsp.lookahead.next(), (ms(2.0), ms(2.0), 1.0));
+    }
 
     const SR: f32 = 48_000.0;
 
@@ -1095,5 +1535,19 @@ mod tests {
         assert_eq!(dsp.params().mode, Mode::Duck);
         assert_eq!(gain_db_at(-18.0, 0.5), -9.0);
         assert!(is_full_mute(RANGE_FLOOR_DB) && !is_full_mute(-79.0));
+    }
+
+    /// An insert being set up replays its stored values before any audio:
+    /// they land at once instead of gliding in.
+    #[test]
+    fn edits_before_the_first_sample_land_at_once() {
+        let mut dsp = gate();
+        assert!(dsp.apply_ui_param("rangeDb", -24.0));
+        assert!(dsp.apply_ui_param("mode", 1.0));
+        assert_eq!(dsp.coeffs.span_db, -24.0);
+        assert_eq!(dsp.coeffs.duck, 1.0);
+        let _ = dsp.process_stereo(0.0, 0.0);
+        assert!(dsp.apply_ui_param("rangeDb", -12.0));
+        assert_eq!(dsp.coeffs.span_db, -24.0);
     }
 }

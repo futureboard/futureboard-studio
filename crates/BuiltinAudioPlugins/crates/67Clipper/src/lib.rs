@@ -25,6 +25,7 @@
 //! overshoot the anti-alias filter puts back), and the dry/wet mix blends in
 //! the latency-aligned input.
 
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
     linear_to_db, mix, time_constant,
@@ -63,6 +64,12 @@ const RMS_WINDOW_SECONDS: f32 = 0.300;
 const PEAK_FALL_SECONDS: f32 = 0.400;
 const REDUCTION_FALL_SECONDS: f32 = 0.200;
 const DC_BLOCK_HZ: f32 = 5.0;
+/// Input / level / knee / ceiling / mix smoothing, per stage of a [`Glide`],
+/// so a dragged knob cannot zipper.
+const SMOOTH_MS: f32 = 7.0;
+/// Length of the Power / Delta / DC-filter crossfades and of a mode or
+/// oversampling switch.
+const FADE_MS: f32 = 10.0;
 
 /// Host-rate history: the largest latency plus the interpolator's taps.
 const HISTORY: usize = 512;
@@ -521,6 +528,131 @@ impl Meters {
     }
 }
 
+/// How close (relative) a smoothed value must come before it lands exactly.
+const SETTLE: f32 = 1.0e-6;
+
+/// One sample of `value` toward its target ([`Smoothed::next`]). Lands
+/// exactly once the rest is negligible — or once a step no longer moves it in
+/// `f32` — so a finished move leaves the arithmetic it started from.
+#[inline]
+fn glide(value: &mut Smoothed, step: f32) -> f32 {
+    if value.value != value.target {
+        let before = value.value;
+        value.next(step);
+        if value.value == before
+            || (value.target - value.value).abs() <= SETTLE * (1.0 + value.target.abs())
+        {
+            value.settle();
+        }
+    }
+    value.value
+}
+
+/// Two [`Smoothed`] stages in series. The second starts every move with zero
+/// slope, so even a target that jumps bends in without a corner.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    inner: Smoothed,
+    outer: Smoothed,
+}
+
+impl Glide {
+    fn at(value: f32) -> Self {
+        Self {
+            inner: Smoothed::at(value),
+            outer: Smoothed::at(value),
+        }
+    }
+
+    fn set(&mut self, target: f32) {
+        self.inner.target = target;
+    }
+
+    fn settle(&mut self) {
+        self.inner.settle();
+        self.outer = Smoothed::at(self.inner.target);
+    }
+
+    #[inline]
+    fn moving(&self) -> bool {
+        self.outer.value != self.inner.target || self.inner.value != self.inner.target
+    }
+
+    /// One sample further; the smoothed value.
+    #[inline]
+    fn next(&mut self, step: f32) -> f32 {
+        if self.moving() {
+            glide(&mut self.inner, step);
+            self.outer.target = self.inner.value;
+            glide(&mut self.outer, step);
+        }
+        self.outer.value
+    }
+}
+
+/// Eased 0…1: zero slope at both ends, so a fade has no corner.
+#[inline]
+fn ease(pos: f32) -> f32 {
+    pos * pos * (3.0 - 2.0 * pos)
+}
+
+/// Samples in a [`FADE_MS`] crossfade, as a per-sample step.
+fn fade_step(sample_rate: f32) -> f32 {
+    1.0 / (FADE_MS * 0.001 * sample_rate.max(1.0)).max(1.0)
+}
+
+/// A 0…1 crossfade position: moves linearly toward its target over
+/// [`FADE_MS`] and is read eased, so neither end of the fade has a corner.
+/// Lands exactly on 0 or 1.
+#[derive(Debug, Clone, Copy)]
+struct Fade {
+    pos: f32,
+    target: f32,
+    step: f32,
+}
+
+impl Fade {
+    fn new(on: bool, sample_rate: f32) -> Self {
+        let at = if on { 1.0 } else { 0.0 };
+        Self {
+            pos: at,
+            target: at,
+            step: fade_step(sample_rate),
+        }
+    }
+
+    fn set(&mut self, on: bool) {
+        self.target = if on { 1.0 } else { 0.0 };
+    }
+
+    fn settle(&mut self) {
+        self.pos = self.target;
+    }
+
+    /// One sample further; the eased weight of the "on" side.
+    #[inline]
+    fn next(&mut self) -> f32 {
+        if self.pos < self.target {
+            self.pos = (self.pos + self.step).min(self.target);
+        } else if self.pos > self.target {
+            self.pos = (self.pos - self.step).max(self.target);
+        }
+        ease(self.pos)
+    }
+}
+
+/// `a` at `t` 0, `b` at `t` 1 (both exactly), a straight blend between.
+#[inline]
+fn blend(a: f32, b: f32, t: f32) -> f32 {
+    if t <= 0.0 {
+        a
+    } else if t >= 1.0 {
+        b
+    } else {
+        a + (b - a) * t
+    }
+}
+
 /// What a change of these settings has to rebuild: the filters in use, the
 /// lookahead and the reported latency.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -530,37 +662,40 @@ struct Layout {
     sample_rate: f32,
 }
 
-#[derive(Debug, Clone)]
-pub struct Dsp {
-    params: Params,
-    sample_rate: f32,
-    dc_block: DcBlock,
-    meters: Meters,
+impl Layout {
+    fn of(params: &Params, sample_rate: f32) -> Self {
+        Self {
+            factor: params.oversampling.factor(),
+            mode: params.mode,
+            sample_rate,
+        }
+    }
+}
 
-    // Resolved from the params.
-    drive: f32,
-    inv_drive: f32,
+/// The curve every path shapes against this sample: the clip level and knee
+/// (gliding), and whether they are moving.
+#[derive(Debug, Clone, Copy)]
+struct Curve {
     level: f32,
     knee: f32,
     knee_start: f32,
     hybrid_target: f32,
-    ceiling: f32,
-    mix_amount: f32,
+    stereo_link: bool,
+    /// The level, knee or drive is gliding: the quiet shortcut, which
+    /// compares the history against the knee, cannot be trusted.
+    moving: bool,
+}
 
-    // Layout.
-    layout: Option<Layout>,
-    filters: [AntiAlias; 3],
+/// The shaper for one layout: its oversampled residual, lookahead and
+/// limiter state. Two exist so a mode or oversampling change can run the
+/// new layout beside the old one and crossfade, instead of stepping.
+#[derive(Debug, Clone)]
+struct Path {
+    layout: Layout,
     filter: usize,
     factor: usize,
     lookahead_top: usize,
     latency: usize,
-
-    // Host-rate history: the raw input (dry path) and the driven input
-    // (interpolator taps and the delayed path the residual is added to).
-    dry_l: Ring,
-    dry_r: Ring,
-    drive_l: Ring,
-    drive_r: Ring,
     // Oversampled residual, for the decimator.
     residual_l: Ring,
     residual_r: Ring,
@@ -569,42 +704,23 @@ pub struct Dsp {
     ahead_r: Ring,
     limiter_l: Lookahead,
     limiter_r: Lookahead,
-
     top_time: u64,
     last_residual: u64,
     quiet_run: usize,
-    was_on: bool,
-
-    reduction_gain: f32,
-    reduction_fall: f32,
+    /// The path has not run since its state was last current (built, set to
+    /// a new layout, or idle while bypassed): it is primed from the host-rate
+    /// history before it next runs.
+    stale: bool,
 }
 
-impl Dsp {
-    pub fn new(sample_rate: f32) -> Self {
-        let sr = sample_rate.max(1.0);
-        let mut dsp = Self {
-            params: default_params(),
-            sample_rate: sr,
-            dc_block: DcBlock::new(sr),
-            meters: Meters::new(sr),
-            drive: 1.0,
-            inv_drive: 1.0,
-            level: 1.0,
-            knee: 0.0,
-            knee_start: 1.0,
-            hybrid_target: 1.0,
-            ceiling: 1.0,
-            mix_amount: 1.0,
-            layout: None,
-            filters: [AntiAlias::new(2), AntiAlias::new(4), AntiAlias::new(8)],
+impl Path {
+    fn new(layout: Layout) -> Self {
+        let mut path = Self {
+            layout,
             filter: 0,
             factor: 1,
             lookahead_top: 0,
             latency: 0,
-            dry_l: Ring::new(HISTORY),
-            dry_r: Ring::new(HISTORY),
-            drive_l: Ring::new(HISTORY),
-            drive_r: Ring::new(HISTORY),
             residual_l: Ring::new(RESIDUAL_HISTORY),
             residual_r: Ring::new(RESIDUAL_HISTORY),
             ahead_l: Ring::new(LOOKAHEAD_HISTORY),
@@ -614,11 +730,304 @@ impl Dsp {
             top_time: 0,
             last_residual: 0,
             quiet_run: 0,
-            was_on: true,
+            stale: true,
+        };
+        path.configure(layout);
+        // Write every buffer now, so the first switch onto this path does
+        // not fault fresh pages in on the audio thread.
+        path.clear();
+        path
+    }
+
+    /// Point at `layout`'s filter and lookahead. Allocation-free; the state
+    /// is cleared when the path is next primed.
+    fn configure(&mut self, layout: Layout) {
+        self.layout = layout;
+        self.factor = layout.factor;
+        self.filter = match layout.factor {
+            2 => 0,
+            4 => 1,
+            _ => 2,
+        };
+        let lookahead = if layout.mode.looks_ahead() {
+            lookahead_samples(layout.sample_rate)
+        } else {
+            0
+        };
+        self.lookahead_top = lookahead * self.factor;
+        let filters = if self.factor > 1 { TAPS_PER_PHASE } else { 0 };
+        self.latency = filters + lookahead;
+        let top_rate = layout.sample_rate * self.factor as f32;
+        let release = time_constant(
+            top_rate,
+            if layout.mode == Mode::Hybrid {
+                HYBRID_RELEASE_SECONDS
+            } else {
+                LIMIT_RELEASE_SECONDS
+            },
+        );
+        self.limiter_l.configure(self.lookahead_top + 1, release);
+        self.limiter_r.configure(self.lookahead_top + 1, release);
+        self.stale = true;
+    }
+
+    /// Clear what the shaper holds between samples.
+    fn clear(&mut self) {
+        self.residual_l.clear();
+        self.residual_r.clear();
+        self.ahead_l.clear();
+        self.ahead_r.clear();
+        self.limiter_l.reset();
+        self.limiter_r.reset();
+        self.top_time = 0;
+        self.last_residual = 0;
+        self.quiet_run = 0;
+    }
+
+    /// Start over from the host-rate history: clear, then replay the driven
+    /// input that fills the lookahead and the decimator without output, so
+    /// the path's first sample is what it would have been had it been
+    /// running all along. Called on the audio thread at most once per switch
+    /// or power-on; bounded (≤ the lookahead plus the filter span).
+    fn prime(&mut self, filters: &[AntiAlias; 3], drive: (&Ring, &Ring), curve: &Curve) {
+        self.clear();
+        let lookahead = self.lookahead_top / self.factor;
+        if self.factor == 1 {
+            if self.layout.mode.looks_ahead() {
+                for offset in (1..=lookahead).rev() {
+                    let _ = self.shape(drive.0.at(offset), drive.1.at(offset), curve);
+                }
+            }
+        } else {
+            for offset in (1..=lookahead + TAPS_PER_PHASE + 2).rev() {
+                self.advance(filters, drive, offset, curve);
+            }
+        }
+        self.stale = false;
+    }
+
+    /// The gain a peak of `peak` needs to sit at `target`.
+    #[inline]
+    fn needed(peak: f32, target: f32) -> f32 {
+        if peak > target { target / peak } else { 1.0 }
+    }
+
+    /// One (oversampled) sample pair through the mode's shaper. Returns the
+    /// shaped pair and the input pair it lines up with (the lookahead delays
+    /// both).
+    #[inline]
+    fn shape(&mut self, l: f32, r: f32, curve: &Curve) -> (f32, f32, f32, f32) {
+        let (level, knee) = (curve.level, curve.knee);
+        let mode = self.layout.mode;
+        if mode == Mode::Clip {
+            return (clip_curve(l, level, knee), clip_curve(r, level, knee), l, r);
+        }
+        self.ahead_l.push(l);
+        self.ahead_r.push(r);
+        let al = self.ahead_l.at(self.lookahead_top);
+        let ar = self.ahead_r.at(self.lookahead_top);
+        let target = if mode == Mode::Limit {
+            level
+        } else {
+            curve.hybrid_target
+        };
+        let (gl, gr) = if curve.stereo_link {
+            let g = self
+                .limiter_l
+                .next(Self::needed(l.abs().max(r.abs()), target));
+            (g, g)
+        } else {
+            (
+                self.limiter_l.next(Self::needed(l.abs(), target)),
+                self.limiter_r.next(Self::needed(r.abs(), target)),
+            )
+        };
+        let (yl, yr) = (al * gl, ar * gr);
+        if mode == Mode::Limit {
+            (yl.clamp(-level, level), yr.clamp(-level, level), al, ar)
+        } else {
+            (
+                clip_curve(yl, level, knee),
+                clip_curve(yr, level, knee),
+                al,
+                ar,
+            )
+        }
+    }
+
+    /// Oversample the driven input `offset` host samples ago through the
+    /// shaper and push what it took off onto the residual history.
+    #[inline]
+    fn advance(
+        &mut self,
+        filters: &[AntiAlias; 3],
+        drive: (&Ring, &Ring),
+        offset: usize,
+        curve: &Curve,
+    ) {
+        let factor = self.factor;
+        let taps = TAPS_PER_PHASE + 1;
+        let filter = &filters[self.filter];
+        // Clip mode with nothing near the knee across the interpolator's
+        // reach cannot put a residual out: skip the filter work.
+        let (dl, dr) = (drive.0.at(offset), drive.1.at(offset));
+        if !curve.moving && dl.abs().max(dr.abs()) * filter.peak_bound <= curve.knee_start {
+            self.quiet_run = self.quiet_run.saturating_add(1);
+        } else {
+            self.quiet_run = 0;
+        }
+        let quiet = self.layout.mode == Mode::Clip && self.quiet_run > taps;
+        for phase in 0..factor {
+            let (el, er) = if quiet {
+                (0.0, 0.0)
+            } else {
+                let ul = filter.interpolate(drive.0.recent_from(offset, taps), phase);
+                let ur = filter.interpolate(drive.1.recent_from(offset, taps), phase);
+                let (yl, yr, al, ar) = self.shape(ul, ur, curve);
+                (yl - al, yr - ar)
+            };
+            self.residual_l.push(el);
+            self.residual_r.push(er);
+            self.top_time += 1;
+            if el != 0.0 || er != 0.0 {
+                self.last_residual = self.top_time;
+            }
+        }
+    }
+
+    /// The wet pair for the newest driven input, aligned with the driven
+    /// input `latency` samples ago (`xl`, `xr`).
+    #[inline]
+    fn wet(
+        &mut self,
+        filters: &[AntiAlias; 3],
+        drive: (&Ring, &Ring),
+        xl: f32,
+        xr: f32,
+        curve: &Curve,
+    ) -> (f32, f32) {
+        if self.factor == 1 {
+            let (yl, yr, _, _) = self.shape(drive.0.at(0), drive.1.at(0), curve);
+            return (yl, yr);
+        }
+        self.advance(filters, drive, 0, curve);
+        // The decimator's newest tap is this step's first phase, which lines
+        // the residual up with the driven input `latency` samples ago.
+        let factor = self.factor;
+        let filter = &filters[self.filter];
+        let len = filter.taps.len();
+        if self.top_time.saturating_sub(self.last_residual) >= (len + factor) as u64 {
+            return (xl, xr);
+        }
+        let rl = filter.decimate(&self.residual_l.recent(factor - 1 + len)[factor - 1..]);
+        let rr = filter.decimate(&self.residual_r.recent(factor - 1 + len)[factor - 1..]);
+        // Adding a zero residual would still turn −0 into +0.
+        let add = |x: f32, residual: f32| if residual == 0.0 { x } else { x + residual };
+        (add(xl, rl), add(xr, rr))
+    }
+}
+
+/// One path's output for this sample.
+#[derive(Debug, Clone, Copy)]
+struct PathOut {
+    out: (f32, f32),
+    /// Driven input and wet output, for the reduction meter.
+    driven: (f32, f32),
+    wet: (f32, f32),
+}
+
+#[derive(Debug, Clone)]
+pub struct Dsp {
+    params: Params,
+    /// Audio has run since construction or [`StereoEffect::reset`]. Until
+    /// it has, an edit lands at once — an insert or session being set up
+    /// replays its stored values, and there is nothing yet to glide over.
+    started: bool,
+    sample_rate: f32,
+    dc_block: DcBlock,
+    meters: Meters,
+
+    // Resolved from the params; the continuous ones glide.
+    drive: Glide,
+    inv_drive: f32,
+    level: Glide,
+    knee: Glide,
+    ceiling: Glide,
+    mix_amount: Glide,
+    smooth_step: f32,
+    curve: Curve,
+    /// Dry ↔ processed.
+    power: Fade,
+    /// Clipped ↔ what was clipped off.
+    delta: Fade,
+    /// Raw ↔ DC-filtered input.
+    dc: Fade,
+
+    // Layout: the active path, and the one it is crossfading from.
+    filters: [AntiAlias; 3],
+    paths: [Path; 2],
+    active: usize,
+    /// The layout the params ask for; the active path moves to it.
+    pending: Layout,
+    /// Old → active path; settled (1) when no switch is running.
+    switch: Fade,
+    latency: usize,
+
+    // Host-rate history: the raw input (dry path) and the driven input
+    // (interpolator taps and the delayed path the residual is added to).
+    dry_l: Ring,
+    dry_r: Ring,
+    drive_l: Ring,
+    drive_r: Ring,
+
+    reduction_gain: f32,
+    reduction_fall: f32,
+}
+
+impl Dsp {
+    pub fn new(sample_rate: f32) -> Self {
+        let sr = sample_rate.max(1.0);
+        let params = default_params();
+        let layout = Layout::of(&params, sr);
+        let mut dsp = Self {
+            started: false,
+            sample_rate: sr,
+            dc_block: DcBlock::new(sr),
+            meters: Meters::new(sr),
+            drive: Glide::at(1.0),
+            inv_drive: 1.0,
+            level: Glide::at(1.0),
+            knee: Glide::at(0.0),
+            ceiling: Glide::at(1.0),
+            mix_amount: Glide::at(1.0),
+            smooth_step: smoothing_step(SMOOTH_MS, sr),
+            curve: Curve {
+                level: 1.0,
+                knee: 0.0,
+                knee_start: 1.0,
+                hybrid_target: 1.0,
+                stereo_link: true,
+                moving: false,
+            },
+            power: Fade::new(true, sr),
+            delta: Fade::new(false, sr),
+            dc: Fade::new(true, sr),
+            filters: [AntiAlias::new(2), AntiAlias::new(4), AntiAlias::new(8)],
+            paths: [Path::new(layout), Path::new(layout)],
+            active: 0,
+            pending: layout,
+            switch: Fade::new(true, sr),
+            latency: 0,
+            dry_l: Ring::new(HISTORY),
+            dry_r: Ring::new(HISTORY),
+            drive_l: Ring::new(HISTORY),
+            drive_r: Ring::new(HISTORY),
             reduction_gain: 1.0,
             reduction_fall: time_constant(sr, REDUCTION_FALL_SECONDS),
+            params,
         };
         dsp.apply_params();
+        dsp.settle();
         dsp
     }
 
@@ -626,10 +1035,13 @@ impl Dsp {
         &self.params
     }
 
+    /// Replace every parameter at once — a state load. Lands on the new
+    /// values (and layout) without a glide or a crossfade.
     pub fn set_params(&mut self, params: Params) {
         self.params = params;
         ipc::sanitize_params(&mut self.params);
         self.apply_params();
+        self.settle();
     }
 
     pub fn meter_frame(&self) -> MeterFrame {
@@ -658,6 +1070,9 @@ impl Dsp {
             return false;
         }
         self.apply_params();
+        if !self.started {
+            self.settle();
+        }
         true
     }
 
@@ -669,81 +1084,59 @@ impl Dsp {
     }
 
     /// The delay the output runs behind the input, in host samples (see
-    /// [`latency_for`]).
+    /// [`latency_for`]). After a mode or oversampling change it is the new
+    /// layout's, while the audio crossfades over to it.
     pub fn latency_samples(&self) -> usize {
         self.latency
     }
 
-    /// Resolve the params. Allocation-free: a layout change only re-points
-    /// at a prebuilt filter and clears fixed buffers.
+    /// Retarget the glides and fades and note the layout. Allocation-free and
+    /// cheap: a layout change is picked up by the audio path, which builds
+    /// the new layout on the idle path and crossfades.
     fn apply_params(&mut self) {
         let p = &self.params;
-        self.drive = db_to_linear(p.input_db);
-        self.inv_drive = 1.0 / self.drive;
-        self.level = db_to_linear(clip_level_db(p));
-        self.knee = knee_of(p.shape);
-        self.knee_start = self.level * (1.0 - self.knee);
-        self.hybrid_target = hybrid_target(self.level, self.knee);
-        self.ceiling = db_to_linear(p.ceiling_db);
-        self.mix_amount = clamp(p.mix, 0.0, 100.0) / 100.0;
-        // The quiet test below compares against the knee: start it over.
-        self.quiet_run = 0;
-
-        let layout = Layout {
-            factor: p.oversampling.factor(),
-            mode: p.mode,
-            sample_rate: self.sample_rate,
-        };
-        if self.layout != Some(layout) {
-            self.layout = Some(layout);
-            self.factor = layout.factor;
-            self.filter = match layout.factor {
-                2 => 0,
-                4 => 1,
-                _ => 2,
-            };
-            let lookahead = if layout.mode.looks_ahead() {
-                lookahead_samples(self.sample_rate)
-            } else {
-                0
-            };
-            self.lookahead_top = lookahead * self.factor;
-            self.latency = latency_for(&self.params, self.sample_rate);
-            let top_rate = self.sample_rate * self.factor as f32;
-            let release = time_constant(
-                top_rate,
-                if layout.mode == Mode::Hybrid {
-                    HYBRID_RELEASE_SECONDS
-                } else {
-                    LIMIT_RELEASE_SECONDS
-                },
-            );
-            self.limiter_l.configure(self.lookahead_top + 1, release);
-            self.limiter_r.configure(self.lookahead_top + 1, release);
-            self.clear_processing();
-        }
-
-        let power = self.params.power;
-        if power && !self.was_on {
-            // Coming back from bypass: the host-rate history kept running;
-            // the shaper's own state starts fresh.
-            self.clear_processing();
-        }
-        self.was_on = power;
+        self.drive.set(db_to_linear(p.input_db));
+        self.level.set(db_to_linear(clip_level_db(p)));
+        self.knee.set(knee_of(p.shape));
+        self.ceiling.set(db_to_linear(p.ceiling_db));
+        self.mix_amount.set(clamp(p.mix, 0.0, 100.0) / 100.0);
+        self.curve.stereo_link = p.stereo_link;
+        self.power.set(p.power);
+        self.delta.set(p.delta);
+        self.dc.set(p.dc_filter);
+        self.pending = Layout::of(p, self.sample_rate);
+        self.latency = latency_for(p, self.sample_rate);
     }
 
-    /// Clear what the shaper holds between samples. The host-rate history is
-    /// left alone: it is the real past input whatever the layout.
-    fn clear_processing(&mut self) {
-        self.residual_l.clear();
-        self.residual_r.clear();
-        self.ahead_l.clear();
-        self.ahead_r.clear();
-        self.limiter_l.reset();
-        self.limiter_r.reset();
-        self.top_time = 0;
-        self.last_residual = 0;
-        self.quiet_run = 0;
+    /// Land every glide and fade, and put the active path straight onto the
+    /// pending layout.
+    fn settle(&mut self) {
+        self.drive.settle();
+        self.level.settle();
+        self.knee.settle();
+        self.ceiling.settle();
+        self.mix_amount.settle();
+        self.power.settle();
+        self.delta.settle();
+        self.dc.settle();
+        self.resolve_curve(false);
+        self.switch.settle();
+        let active = &mut self.paths[self.active];
+        if active.layout != self.pending {
+            active.configure(self.pending);
+        }
+    }
+
+    /// The curve (and the drive's inverse) from the glides' current values.
+    #[inline]
+    fn resolve_curve(&mut self, moving: bool) {
+        let (level, knee) = (self.level.outer.value, self.knee.outer.value);
+        self.curve.level = level;
+        self.curve.knee = knee;
+        self.curve.knee_start = level * (1.0 - knee);
+        self.curve.hybrid_target = hybrid_target(level, knee);
+        self.curve.moving = moving;
+        self.inv_drive = 1.0 / self.drive.outer.value;
     }
 
     fn set_sample_rate_internal(&mut self, sample_rate: f32) {
@@ -751,105 +1144,52 @@ impl Dsp {
         self.dc_block.set_sample_rate(self.sample_rate);
         self.meters = Meters::new(self.sample_rate);
         self.reduction_fall = time_constant(self.sample_rate, REDUCTION_FALL_SECONDS);
+        self.smooth_step = smoothing_step(SMOOTH_MS, self.sample_rate);
+        let step = fade_step(self.sample_rate);
+        self.power.step = step;
+        self.delta.step = step;
+        self.dc.step = step;
+        self.switch.step = step;
     }
 
-    /// The gain a peak of `peak` needs to sit at `target`.
+    /// One path's output for the newest sample: its wet signal at its own
+    /// latency, the ceiling, the delta and mix blends, and Power's fade
+    /// against its latency-aligned dry. Faded out, the path does not run.
     #[inline]
-    fn needed(peak: f32, target: f32) -> f32 {
-        if peak > target { target / peak } else { 1.0 }
-    }
-
-    /// One (oversampled) sample pair through the mode's shaper. Returns the
-    /// shaped pair and the input pair it lines up with (the lookahead delays
-    /// both).
-    #[inline]
-    fn shape(&mut self, l: f32, r: f32) -> (f32, f32, f32, f32) {
-        let (level, knee) = (self.level, self.knee);
-        let mode = self.params.mode;
-        if mode == Mode::Clip {
-            return (clip_curve(l, level, knee), clip_curve(r, level, knee), l, r);
-        }
-        self.ahead_l.push(l);
-        self.ahead_r.push(r);
-        let al = self.ahead_l.at(self.lookahead_top);
-        let ar = self.ahead_r.at(self.lookahead_top);
-        let target = if mode == Mode::Limit {
-            level
-        } else {
-            self.hybrid_target
-        };
-        let (gl, gr) = if self.params.stereo_link {
-            let g = self
-                .limiter_l
-                .next(Self::needed(l.abs().max(r.abs()), target));
-            (g, g)
-        } else {
-            (
-                self.limiter_l.next(Self::needed(l.abs(), target)),
-                self.limiter_r.next(Self::needed(r.abs(), target)),
-            )
-        };
-        let (yl, yr) = (al * gl, ar * gr);
-        if mode == Mode::Limit {
-            (yl.clamp(-level, level), yr.clamp(-level, level), al, ar)
-        } else {
-            (
-                clip_curve(yl, level, knee),
-                clip_curve(yr, level, knee),
-                al,
-                ar,
-            )
-        }
-    }
-
-    /// The wet pair for the newest driven input, aligned with the driven
-    /// input `latency` samples ago (`xl`, `xr`).
-    #[inline]
-    fn wet(&mut self, dl: f32, dr: f32, xl: f32, xr: f32) -> (f32, f32) {
-        if self.factor == 1 {
-            let (yl, yr, _, _) = self.shape(dl, dr);
-            return (yl, yr);
-        }
-        let factor = self.factor;
-        let taps = TAPS_PER_PHASE + 1;
-        // Clip mode with nothing near the knee across the interpolator's
-        // reach cannot put a residual out: skip the filter work.
-        let bound = self.filters[self.filter].peak_bound;
-        if dl.abs().max(dr.abs()) * bound <= self.knee_start {
-            self.quiet_run = self.quiet_run.saturating_add(1);
-        } else {
-            self.quiet_run = 0;
-        }
-        let quiet = self.params.mode == Mode::Clip && self.quiet_run > taps;
-        for phase in 0..factor {
-            let (el, er) = if quiet {
-                (0.0, 0.0)
-            } else {
-                let filter = &self.filters[self.filter];
-                let ul = filter.interpolate(self.drive_l.recent(taps), phase);
-                let ur = filter.interpolate(self.drive_r.recent(taps), phase);
-                let (yl, yr, al, ar) = self.shape(ul, ur);
-                (yl - al, yr - ar)
+    fn run_path(&mut self, index: usize, on: f32, delta: f32) -> PathOut {
+        let path = &mut self.paths[index];
+        let latency = path.latency;
+        let dry = (self.dry_l.at(latency), self.dry_r.at(latency));
+        let (xl, xr) = (self.drive_l.at(latency), self.drive_r.at(latency));
+        if on <= 0.0 {
+            path.stale = true;
+            return PathOut {
+                out: dry,
+                driven: (xl, xr),
+                wet: (xl, xr),
             };
-            self.residual_l.push(el);
-            self.residual_r.push(er);
-            self.top_time += 1;
-            if el != 0.0 || er != 0.0 {
-                self.last_residual = self.top_time;
-            }
         }
-        // The decimator's newest tap is this step's first phase, which lines
-        // the residual up with the driven input `latency` samples ago.
-        let filter = &self.filters[self.filter];
-        let len = filter.taps.len();
-        if self.top_time.saturating_sub(self.last_residual) >= (len + factor) as u64 {
-            return (xl, xr);
+        let drive = (&self.drive_l, &self.drive_r);
+        if path.stale {
+            path.prime(&self.filters, drive, &self.curve);
         }
-        let rl = filter.decimate(&self.residual_l.recent(factor - 1 + len)[factor - 1..]);
-        let rr = filter.decimate(&self.residual_r.recent(factor - 1 + len)[factor - 1..]);
-        // Adding a zero residual would still turn −0 into +0.
-        let add = |x: f32, residual: f32| if residual == 0.0 { x } else { x + residual };
-        (add(xl, rl), add(xr, rr))
+        let (wl, wr) = path.wet(&self.filters, drive, xl, xr, &self.curve);
+        let ceiling = self.ceiling.outer.value;
+        let (wl, wr) = (wl.clamp(-ceiling, ceiling), wr.clamp(-ceiling, ceiling));
+        let amount = self.mix_amount.outer.value;
+        let mut out = (mix(dry.0, wl, amount), mix(dry.1, wr, amount));
+        if delta > 0.0 {
+            let scale = self.inv_drive * amount;
+            out = (
+                blend(out.0, (xl - wl) * scale, delta),
+                blend(out.1, (xr - wr) * scale, delta),
+            );
+        }
+        PathOut {
+            out: (blend(dry.0, out.0, on), blend(dry.1, out.1, on)),
+            driven: (xl, xr),
+            wet: (wl, wr),
+        }
     }
 
     #[inline]
@@ -872,67 +1212,259 @@ impl Dsp {
 
 impl StereoEffect for Dsp {
     fn reset(&mut self) {
+        self.started = false;
         self.dc_block.reset();
         self.meters.reset();
         self.dry_l.clear();
         self.dry_r.clear();
         self.drive_l.clear();
         self.drive_r.clear();
-        self.clear_processing();
+        for path in &mut self.paths {
+            path.stale = true;
+        }
+        self.settle();
         self.reduction_gain = 1.0;
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.set_sample_rate_internal(sample_rate);
         self.apply_params();
+        self.settle();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        self.started = true;
         let in_sum = (left + right) * 0.5;
-        let latency = self.latency;
+
+        // The glides move first, so the drive below is this sample's.
+        if self.drive.moving() || self.level.moving() || self.knee.moving() {
+            let step = self.smooth_step;
+            self.drive.next(step);
+            self.level.next(step);
+            self.knee.next(step);
+            self.resolve_curve(true);
+        } else if self.curve.moving {
+            self.curve.moving = false;
+        }
+        self.ceiling.next(self.smooth_step);
+        self.mix_amount.next(self.smooth_step);
 
         // The history runs in bypass too, so power and layout changes find
-        // the real past input.
+        // the real past input. The DC filter runs always and is faded in and
+        // out, so switching it cannot step.
         self.dry_l.push(left);
         self.dry_r.push(right);
-        let (mut pl, mut pr) = (left, right);
-        if self.params.dc_filter {
-            (pl, pr) = self.dc_block.run(pl, pr);
+        let (fl, fr) = self.dc_block.run(left, right);
+        let dc = self.dc.next();
+        let (pl, pr) = (blend(left, fl, dc), blend(right, fr, dc));
+        let drive = self.drive.outer.value;
+        self.drive_l.push(pl * drive);
+        self.drive_r.push(pr * drive);
+
+        let on = self.power.next();
+        let delta = self.delta.next();
+
+        // A layout change starts on the idle path once the last one is done.
+        if self.switch.pos >= 1.0 && self.paths[self.active].layout != self.pending {
+            self.active = 1 - self.active;
+            self.paths[self.active].configure(self.pending);
+            self.switch.pos = 0.0;
         }
-        let (dl, dr) = (pl * self.drive, pr * self.drive);
-        self.drive_l.push(dl);
-        self.drive_r.push(dr);
-        let (dry_l, dry_r) = (self.dry_l.at(latency), self.dry_r.at(latency));
-
-        if !self.params.power {
-            // Bypass keeps the reported latency.
-            self.meters.push(in_sum, (dry_l + dry_r) * 0.5);
-            return (dry_l, dry_r);
-        }
-
-        let (xl, xr) = (self.drive_l.at(latency), self.drive_r.at(latency));
-        let (wl, wr) = self.wet(dl, dr, xl, xr);
-        let ceiling = self.ceiling;
-        let (wl, wr) = (wl.clamp(-ceiling, ceiling), wr.clamp(-ceiling, ceiling));
-        self.track_reduction(xl, xr, wl, wr);
-
-        let (out_l, out_r) = if self.params.delta {
-            let scale = self.inv_drive * self.mix_amount;
-            ((xl - wl) * scale, (xr - wr) * scale)
-        } else {
+        let new = self.run_path(self.active, on, delta);
+        let out = if self.switch.pos < 1.0 {
+            let weight = self.switch.next();
+            let old = self.run_path(1 - self.active, on, delta);
             (
-                mix(dry_l, wl, self.mix_amount),
-                mix(dry_r, wr, self.mix_amount),
+                blend(old.out.0, new.out.0, weight),
+                blend(old.out.1, new.out.1, weight),
             )
+        } else {
+            new.out
         };
-        self.meters.push(in_sum, (out_l + out_r) * 0.5);
-        (out_l, out_r)
+
+        if on > 0.0 {
+            self.track_reduction(new.driven.0, new.driven.1, new.wet.0, new.wet.1);
+        }
+        self.meters.push(in_sum, (out.0 + out.1) * 0.5);
+        out
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BLOCK: usize = 128;
+    /// About a second of blocks: one drag across a range and back.
+    const DRAG_BLOCKS: usize = 375;
+
+    /// Two low tones: smooth, so a gain that steps shows as a kink.
+    fn tone(n: usize) -> (f32, f32) {
+        let t = n as f64 / 48_000.0;
+        let x = (std::f64::consts::TAU * 110.0 * t).sin() * 0.3
+            + (std::f64::consts::TAU * 330.0 * t).sin() * 0.1;
+        (x as f32, (x * 0.8) as f32)
+    }
+
+    /// The parameter sweep's measure: the biggest second difference where a
+    /// block meets the last one, against the biggest one inside a block,
+    /// while `change` edits the DSP before each 128-frame block. About 1 is
+    /// smooth; a value that steps once per block stands out many times over.
+    fn edge_jump(dsp: &mut Dsp, mut change: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let mut n = 0;
+        let mut last = [(0.0f32, 0.0f32); 2];
+        for _ in 0..200 * BLOCK {
+            let (l, r) = tone(n);
+            n += 1;
+            last = [last[1], dsp.process_stereo(l, r)];
+        }
+        let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+        let mut worst = 0.0f32;
+        for block in 0..DRAG_BLOCKS {
+            change(dsp, block);
+            let (mut edge, mut inside) = (0.0f32, 1.0e-7f32);
+            for i in 0..BLOCK {
+                let (l, r) = tone(n);
+                n += 1;
+                let out = dsp.process_stereo(l, r);
+                assert!(out.0.is_finite() && out.1.is_finite());
+                let kink = d2(last[0].0, last[1].0, out.0).max(d2(last[0].1, last[1].1, out.1));
+                if i < 2 {
+                    edge = edge.max(kink);
+                } else {
+                    inside = inside.max(kink);
+                }
+                last = [last[1], out];
+            }
+            worst = worst.max(edge / inside);
+        }
+        worst
+    }
+
+    /// Up and back down across `[min, max]`, a value per block.
+    fn drag(min: f32, max: f32, block: usize) -> f32 {
+        let phase = block as f32 / DRAG_BLOCKS as f32 * 2.0;
+        let x = if phase < 1.0 { phase } else { 2.0 - phase };
+        min + (max - min) * x
+    }
+
+    /// A click every quarter second, through every step of a switch.
+    fn click(dsp: &mut Dsp, index: u32, steps: usize, block: usize) {
+        if block.is_multiple_of(94) {
+            dsp.apply_wire_param(index, ((block / 94) % steps) as f32);
+        }
+    }
+
+    /// The sweep's tone pushed into the clipper, at 1× (no latency, so a
+    /// step lands on the block edge) and at the default 4×.
+    fn hot(oversampling: Oversampling) -> Dsp {
+        let mut params = default_params();
+        params.input_db = 9.0;
+        params.threshold_db = -3.0;
+        params.oversampling = oversampling;
+        dsp_with(params)
+    }
+
+    /// Dragged knobs, each from settings that bend the tone through the
+    /// knee across the whole drag but never clip it flat: a flat-topped
+    /// block has no curvature of its own to measure the edge against.
+    #[test]
+    fn dragged_gains_levels_and_mix_do_not_zipper() {
+        // (param, from, to, input dB, threshold dB)
+        for (index, min, max, input_db, threshold_db) in [
+            (ipc::INPUT_INDEX, -12.0, 9.0, 0.0, 0.0),
+            (ipc::THRESHOLD_INDEX, -10.0, 0.0, 0.0, 0.0),
+            (ipc::CEILING_INDEX, -6.0, 0.0, 0.0, 0.0),
+            (ipc::SHAPE_INDEX, 0.0, 100.0, 0.0, -6.0),
+            (ipc::MIX_INDEX, 0.0, 100.0, 3.0, -3.0),
+        ] {
+            for oversampling in [Oversampling::X1, Oversampling::X4] {
+                let mut params = default_params();
+                params.shape = 100.0;
+                params.input_db = input_db;
+                params.threshold_db = threshold_db;
+                params.oversampling = oversampling;
+                let mut dsp = dsp_with(params);
+                let jump = edge_jump(&mut dsp, |dsp, block| {
+                    dsp.apply_wire_param(index, drag(min, max, block));
+                });
+                assert!(
+                    jump < 4.0,
+                    "{} at {oversampling:?}: block-edge jump {jump}",
+                    UI_PARAM_IDS[index as usize]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn switches_crossfade_instead_of_stepping() {
+        for (index, steps) in [
+            (ipc::POWER_INDEX, 2),
+            (ipc::MODE_INDEX, 3),
+            (ipc::OVERSAMPLING_INDEX, 4),
+            (ipc::DELTA_INDEX, 2),
+            (ipc::DC_FILTER_INDEX, 2),
+        ] {
+            for oversampling in [Oversampling::X1, Oversampling::X4] {
+                let mut dsp = hot(oversampling);
+                let jump = edge_jump(&mut dsp, |dsp, block| click(dsp, index, steps, block));
+                assert!(
+                    jump < 4.0,
+                    "{} from {oversampling:?}: block-edge jump {jump}",
+                    UI_PARAM_IDS[index as usize]
+                );
+            }
+        }
+    }
+
+    /// A mode or oversampling change reports the new latency at once and,
+    /// once its crossfade is over, plays exactly what a fresh instance at
+    /// those settings plays.
+    #[test]
+    fn a_layout_switch_lands_on_the_new_layout() {
+        let mut switched = hot(Oversampling::X1);
+        let mut params = switched.params().clone();
+        let input = |n: usize| sine(1_000.0, 0.8, n);
+        for n in 0..4_800 {
+            switched.process_stereo(input(n), input(n));
+        }
+        params.mode = Mode::Limit;
+        params.oversampling = Oversampling::X4;
+        assert!(switched.apply_ui_param("mode", Mode::Limit.to_wire()));
+        assert!(switched.apply_ui_param("oversampling", Oversampling::X4.to_wire()));
+        assert_eq!(switched.latency_samples(), latency_for(&params, RATE));
+        let mut fresh = dsp_with(params);
+        for n in 0..4_800 {
+            fresh.process_stereo(input(n), input(n));
+        }
+        for n in 4_800..24_000 {
+            let a = switched.process_stereo(input(n), input(n));
+            let b = fresh.process_stereo(input(n), input(n));
+            // The lookahead limiter's held gain, started over from the
+            // history rather than run all along, settles within a hair
+            // (about −76 dB here) of a fresh instance's.
+            if n > 4_800 + 4_800 {
+                assert!(
+                    (a.0 - b.0).abs() < 1.0e-3 && (a.1 - b.1).abs() < 1.0e-3,
+                    "{n}: {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_state_load_lands_without_a_crossfade() {
+        let mut dsp = Dsp::new(RATE);
+        let mut params = default_params();
+        params.mode = Mode::Limit;
+        params.oversampling = Oversampling::X1;
+        params.mix = 40.0;
+        dsp.set_params(params);
+        assert_eq!(dsp.paths[dsp.active].layout.mode, Mode::Limit);
+        assert_eq!(dsp.switch.pos, 1.0);
+        assert_eq!(dsp.mix_amount.outer.value, 0.4);
+    }
 
     const RATE: f32 = 48_000.0;
     const ALL_MODES: [Mode; 3] = [Mode::Clip, Mode::Hybrid, Mode::Limit];
@@ -1274,5 +1806,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An insert being set up replays its stored values before any audio:
+    /// they land at once (a new layout included) instead of crossfading in.
+    #[test]
+    fn edits_before_the_first_sample_land_at_once() {
+        let mut dsp = Dsp::new(RATE);
+        assert!(dsp.apply_ui_param("mode", Mode::Limit.to_wire()));
+        assert!(dsp.apply_ui_param("mix", 40.0));
+        assert_eq!(dsp.paths[dsp.active].layout.mode, Mode::Limit);
+        assert_eq!(dsp.switch.pos, 1.0);
+        assert_eq!(dsp.mix_amount.outer.value, 0.4);
+        let _ = dsp.process_stereo(0.1, 0.1);
+        assert!(dsp.apply_ui_param("mode", Mode::Clip.to_wire()));
+        let _ = dsp.process_stereo(0.1, 0.1);
+        assert!(dsp.switch.pos < 1.0, "a running instance crossfades");
     }
 }

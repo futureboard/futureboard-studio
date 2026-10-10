@@ -25,7 +25,8 @@ pub use dsp::{CellFrame, ModelCoeffs, curve_reduction_db, model_coeffs};
 pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
 pub use presets::{FactoryPreset, factory_presets};
 
-use dsp::{GainCell, Smoothed};
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
+use dsp::{GainCell, glide};
 
 pub const PLUGIN_ID: &str = "futureboard.zcomp";
 
@@ -349,12 +350,125 @@ pub fn descriptor() -> PluginDescriptor {
     }
 }
 
+/// Two [`Smoothed`] stages in series. The second starts every move with zero
+/// slope, so even a target that jumps bends in without a corner.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    inner: Smoothed,
+    outer: Smoothed,
+}
+
+impl Glide {
+    fn at(value: f32) -> Self {
+        Self {
+            inner: Smoothed::at(value),
+            outer: Smoothed::at(value),
+        }
+    }
+
+    fn set(&mut self, target: f32) {
+        self.inner.target = target;
+    }
+
+    fn settle(&mut self) {
+        self.inner.settle();
+        self.outer = Smoothed::at(self.inner.target);
+    }
+
+    /// One sample further; the smoothed value.
+    #[inline]
+    fn next(&mut self, step: f32) -> f32 {
+        if self.outer.value != self.inner.target || self.inner.value != self.inner.target {
+            glide(&mut self.inner, step);
+            self.outer.target = self.inner.value;
+            glide(&mut self.outer, step);
+        }
+        self.outer.value
+    }
+}
+
+/// Makeup / Mix smoothing per stage of a [`Glide`] (about 20 ms overall).
+const GAIN_SMOOTH_MS: f32 = 8.0;
+
+/// Length of a switch crossfade (power, sidechain listen).
+const FADE_MS: f32 = 10.0;
+
+/// A 0…1 crossfade position: moves linearly toward its target over
+/// [`FADE_MS`] and is read through a smoothstep, so neither end of the fade
+/// has a corner. Lands exactly on 0 or 1.
+#[derive(Debug, Clone, Copy)]
+struct Fade {
+    pos: f32,
+    target: f32,
+    step: f32,
+}
+
+impl Fade {
+    fn new(on: bool, sample_rate: f32) -> Self {
+        let at = if on { 1.0 } else { 0.0 };
+        Self {
+            pos: at,
+            target: at,
+            step: Self::step_for(sample_rate),
+        }
+    }
+
+    fn step_for(sample_rate: f32) -> f32 {
+        1.0 / (FADE_MS * 0.001 * sample_rate.max(1.0)).max(1.0)
+    }
+
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        self.step = Self::step_for(sample_rate);
+    }
+
+    fn set(&mut self, on: bool) {
+        self.target = if on { 1.0 } else { 0.0 };
+    }
+
+    fn settle(&mut self) {
+        self.pos = self.target;
+    }
+
+    /// One sample further; the eased weight of the "on" side.
+    #[inline]
+    fn next(&mut self) -> f32 {
+        if self.pos < self.target {
+            self.pos = (self.pos + self.step).min(self.target);
+        } else if self.pos > self.target {
+            self.pos = (self.pos - self.step).max(self.target);
+        }
+        self.pos * self.pos * (3.0 - 2.0 * self.pos)
+    }
+}
+
+/// `a` at `t` 0, `b` at `t` 1 (both exactly), a straight blend between.
+#[inline]
+fn blend(a: f32, b: f32, t: f32) -> f32 {
+    if t <= 0.0 {
+        a
+    } else if t >= 1.0 {
+        b
+    } else {
+        mix(a, b, t)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Dsp {
     params: Params,
+    /// Audio has run since construction or [`StereoEffect::reset`]. Until
+    /// it has, an edit lands at once — an insert or session being set up
+    /// replays its stored values, and there is nothing yet to glide over.
+    started: bool,
     cell: GainCell,
-    makeup: Smoothed,
-    mix_amount: Smoothed,
+    makeup: Glide,
+    mix_amount: Glide,
+    /// Per stage of the two-stage gain glides.
+    gain_step: f32,
+    /// Dry ↔ processed: Power crossfades instead of switching.
+    power: Fade,
+    /// Compressed ↔ sidechain audition.
+    listen: Fade,
     meters: Meters,
 }
 
@@ -363,18 +477,23 @@ impl Dsp {
         let sr = sample_rate.max(1.0);
         let params = default_params();
         let mut dsp = Self {
+            started: false,
             cell: GainCell::new(
                 sr,
                 model_coeffs(&params),
                 params.sidechain_hpf_hz,
                 params.stereo_link,
             ),
-            makeup: Smoothed::new(sr, db_to_linear(params.makeup_db)),
-            mix_amount: Smoothed::new(sr, params.mix / 100.0),
+            makeup: Glide::at(db_to_linear(params.makeup_db)),
+            mix_amount: Glide::at(params.mix / 100.0),
+            gain_step: smoothing_step(GAIN_SMOOTH_MS, sr),
+            power: Fade::new(params.power, sr),
+            listen: Fade::new(params.sc_listen, sr),
             meters: Meters::new(sr),
             params,
         };
         dsp.apply_params();
+        dsp.settle();
         dsp
     }
 
@@ -386,10 +505,13 @@ impl Dsp {
         self.cell.gain_reduction_db()
     }
 
+    /// Replace every parameter at once — a state load. Lands on the new
+    /// values without a glide.
     pub fn set_params(&mut self, params: Params) {
         self.params = params;
         ipc::sanitize_params(&mut self.params);
         self.apply_params();
+        self.settle();
     }
 
     pub fn meter_frame(&self) -> MeterFrame {
@@ -418,6 +540,9 @@ impl Dsp {
             return false;
         }
         self.apply_params();
+        if !self.started {
+            self.settle();
+        }
         true
     }
 
@@ -434,61 +559,75 @@ impl Dsp {
         0
     }
 
-    /// Control-thread work: resolve the model, retune the cell, and retarget
-    /// the smoothed output gains. Never called from the audio callback.
+    /// Resolve the model, retune the cell, and retarget the smoothed gains
+    /// and switch fades. Runs between blocks; cheap and allocation-free.
     fn apply_params(&mut self) {
         self.cell.set_model(
             model_coeffs(&self.params),
             self.params.sidechain_hpf_hz,
             self.params.stereo_link,
         );
-        self.makeup.set_target(db_to_linear(self.params.makeup_db));
-        self.mix_amount.set_target(self.params.mix / 100.0);
+        self.makeup.set(db_to_linear(self.params.makeup_db));
+        self.mix_amount.set(self.params.mix / 100.0);
+        self.power.set(self.params.power);
+        self.listen.set(self.params.sc_listen);
+    }
+
+    /// Land every smoother and fade on its target.
+    fn settle(&mut self) {
+        self.cell.settle();
+        self.makeup.settle();
+        self.mix_amount.settle();
+        self.power.settle();
+        self.listen.settle();
     }
 }
 
 impl StereoEffect for Dsp {
     fn reset(&mut self) {
+        self.started = false;
         self.cell.reset();
         self.meters.reset();
-        self.makeup.snap(db_to_linear(self.params.makeup_db));
-        self.mix_amount.snap(self.params.mix / 100.0);
+        self.settle();
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
         let sr = sample_rate.max(1.0);
         self.cell.set_sample_rate(sr);
-        self.makeup.set_sample_rate(sr);
-        self.mix_amount.set_sample_rate(sr);
+        self.gain_step = smoothing_step(GAIN_SMOOTH_MS, sr);
+        self.power.set_sample_rate(sr);
+        self.listen.set_sample_rate(sr);
         self.meters = Meters::new(sr);
         self.apply_params();
+        self.settle();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
-        if !self.params.power {
+        self.started = true;
+        let on = self.power.next();
+        if on <= 0.0 {
+            // Off and faded out: nothing runs.
             self.meters.push((left, right), (left, right));
             return (left, right);
         }
 
         let frame = self.cell.process_stereo(left, right);
-        // Both smoothers advance every sample so a branch cannot desynchronise
-        // them from the audio they scale.
-        let makeup = self.makeup.next();
-        let amount = self.mix_amount.next();
+        // Both smoothers advance every processed sample so a branch cannot
+        // desynchronise them from the audio they scale.
+        let makeup = self.makeup.next(self.gain_step);
+        let amount = self.mix_amount.next(self.gain_step);
+        let listen = self.listen.next();
 
-        let (out_l, out_r) = if self.params.sc_listen {
+        let mut out_l = mix(left, frame.left * makeup, amount);
+        let mut out_r = mix(right, frame.right * makeup, amount);
+        if listen > 0.0 {
             // Auditioning the detector feed: the gain cell still runs so the
             // reduction meter keeps telling the truth about what it would do.
-            (
-                frame.sidechain_left * makeup,
-                frame.sidechain_right * makeup,
-            )
-        } else {
-            (
-                mix(left, frame.left * makeup, amount),
-                mix(right, frame.right * makeup, amount),
-            )
-        };
+            out_l = blend(out_l, frame.sidechain_left * makeup, listen);
+            out_r = blend(out_r, frame.sidechain_right * makeup, listen);
+        }
+        out_l = blend(left, out_l, on);
+        out_r = blend(right, out_r, on);
 
         self.meters.push((left, right), (out_l, out_r));
         (out_l, out_r)
@@ -498,6 +637,147 @@ impl StereoEffect for Dsp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BLOCK: usize = 128;
+    /// About a second of blocks: one drag across a range and back.
+    const DRAG_BLOCKS: usize = 375;
+
+    /// Two low tones: smooth, so a gain that steps shows as a kink.
+    fn tone(n: usize) -> (f32, f32) {
+        let t = n as f64 / 48_000.0;
+        let x = (std::f64::consts::TAU * 110.0 * t).sin() * 0.3
+            + (std::f64::consts::TAU * 330.0 * t).sin() * 0.1;
+        (x as f32, (x * 0.8) as f32)
+    }
+
+    /// The parameter sweep's measure: the biggest second difference where a
+    /// block meets the last one, against the biggest one inside a block,
+    /// while `change` edits the DSP before each 128-frame block. About 1 is
+    /// smooth; a value that steps once per block stands out many times over.
+    fn edge_jump(dsp: &mut Dsp, mut change: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let mut n = 0;
+        let mut last = [(0.0f32, 0.0f32); 2];
+        for _ in 0..200 * BLOCK {
+            let (l, r) = tone(n);
+            n += 1;
+            last = [last[1], dsp.process_stereo(l, r)];
+        }
+        let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+        let mut worst = 0.0f32;
+        for block in 0..DRAG_BLOCKS {
+            change(dsp, block);
+            let (mut edge, mut inside) = (0.0f32, 1.0e-7f32);
+            for i in 0..BLOCK {
+                let (l, r) = tone(n);
+                n += 1;
+                let out = dsp.process_stereo(l, r);
+                assert!(out.0.is_finite() && out.1.is_finite());
+                let kink = d2(last[0].0, last[1].0, out.0).max(d2(last[0].1, last[1].1, out.1));
+                if i < 2 {
+                    edge = edge.max(kink);
+                } else {
+                    inside = inside.max(kink);
+                }
+                last = [last[1], out];
+            }
+            worst = worst.max(edge / inside);
+        }
+        worst
+    }
+
+    /// Up and back down across `[min, max]`, a value per block.
+    fn drag(min: f32, max: f32, block: usize) -> f32 {
+        let phase = block as f32 / DRAG_BLOCKS as f32 * 2.0;
+        let x = if phase < 1.0 { phase } else { 2.0 - phase };
+        min + (max - min) * x
+    }
+
+    #[test]
+    fn dragged_threshold_makeup_and_mix_do_not_zipper() {
+        for (index, min, max) in [
+            (ipc::THRESHOLD_INDEX, -60.0, 0.0),
+            (ipc::RATIO_INDEX, 1.0, 20.0),
+            (ipc::KNEE_INDEX, 0.0, 24.0),
+            (ipc::MAKEUP_INDEX, -24.0, 24.0),
+            (ipc::MIX_INDEX, 0.0, 100.0),
+            (ipc::COLOR_INDEX, 0.0, 100.0),
+        ] {
+            let mut dsp = Dsp::new(48_000.0);
+            let jump = edge_jump(&mut dsp, |dsp, block| {
+                dsp.apply_wire_param(index, drag(min, max, block));
+            });
+            assert!(
+                jump < 4.0,
+                "{}: block-edge jump {jump}",
+                UI_PARAM_IDS[index as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn switches_crossfade_instead_of_stepping() {
+        for (index, steps) in [
+            (ipc::POWER_INDEX, 2),
+            (ipc::SC_LISTEN_INDEX, 2),
+            (ipc::MODEL_INDEX, 4),
+        ] {
+            let mut dsp = Dsp::new(48_000.0);
+            let jump = edge_jump(&mut dsp, |dsp, block| {
+                if block.is_multiple_of(94) {
+                    dsp.apply_wire_param(index, ((block / 94) % steps) as f32);
+                }
+            });
+            assert!(
+                jump < 4.0,
+                "{}: block-edge jump {jump}",
+                UI_PARAM_IDS[index as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn a_state_load_lands_without_a_glide() {
+        let mut dsp = Dsp::new(48_000.0);
+        let mut params = default_params();
+        params.makeup_db = 12.0;
+        params.power = false;
+        dsp.set_params(params);
+        // Bypassed from the first sample, bit for bit.
+        assert_eq!(dsp.process_stereo(0.25, -0.5), (0.25, -0.5));
+        assert_eq!(dsp.makeup.outer.value, db_to_linear(12.0));
+    }
+
+    /// Dragging the ratio costs about what processing costs: the retune is
+    /// a retarget, not a re-solve.
+    #[test]
+    fn a_ratio_drag_costs_about_what_processing_costs() {
+        let time = |drag_ratio: bool| {
+            let mut best = std::time::Duration::MAX;
+            for _ in 0..5 {
+                let mut dsp = Dsp::new(48_000.0);
+                let mut n = 0;
+                let started = std::time::Instant::now();
+                for block in 0..DRAG_BLOCKS {
+                    if drag_ratio {
+                        dsp.apply_wire_param(ipc::RATIO_INDEX, drag(1.0, 20.0, block));
+                    }
+                    for _ in 0..BLOCK {
+                        let (l, r) = tone(n);
+                        n += 1;
+                        std::hint::black_box(dsp.process_stereo(l, r));
+                    }
+                }
+                best = best.min(started.elapsed());
+            }
+            best
+        };
+        let still = time(false);
+        let dragged = time(true);
+        assert!(
+            dragged.as_secs_f64() < still.as_secs_f64() * 1.5,
+            "dragged {dragged:?} vs still {still:?}"
+        );
+    }
 
     fn run_tone(dsp: &mut Dsp, amplitude: f32, samples: usize) -> MeterFrame {
         for n in 0..samples {
@@ -692,15 +972,14 @@ mod tests {
         params.mix = 100.0;
         params.makeup_db = 0.0;
         params.color = 0.0;
-        dsp.set_params(params.clone());
+        dsp.set_params(params);
         for n in 0..4_800 {
             dsp.process_stereo((n as f32 * 0.05).sin() * 0.2, 0.0);
         }
 
-        params.makeup_db = 18.0;
-        dsp.set_params(params);
-
         let mut previous = dsp.process_stereo(0.2, 0.0).0;
+        // A knob edit, not a state load: it glides.
+        assert!(dsp.apply_wire_param(ipc::MAKEUP_INDEX, 18.0));
         for _ in 0..4_800 {
             let (out, _) = dsp.process_stereo(0.2, 0.0);
             assert!(
@@ -710,5 +989,19 @@ mod tests {
             );
             previous = out;
         }
+    }
+
+    /// An insert being set up replays its stored values before any audio:
+    /// they land at once instead of gliding in.
+    #[test]
+    fn edits_before_the_first_sample_land_at_once() {
+        let mut dsp = Dsp::new(48_000.0);
+        assert!(dsp.apply_wire_param(ipc::MAKEUP_INDEX, 12.0));
+        assert!(dsp.apply_wire_param(ipc::POWER_INDEX, 0.0));
+        assert_eq!(dsp.makeup.outer.value, db_to_linear(12.0));
+        assert_eq!(dsp.process_stereo(0.25, -0.5), (0.25, -0.5));
+        // Once audio runs, an edit glides.
+        assert!(dsp.apply_wire_param(ipc::MAKEUP_INDEX, 0.0));
+        assert_eq!(dsp.makeup.outer.value, db_to_linear(12.0));
     }
 }

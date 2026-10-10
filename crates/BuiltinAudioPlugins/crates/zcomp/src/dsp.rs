@@ -36,6 +36,7 @@
 //!    through its first antiderivative (ADAA), so drive adds harmonics instead
 //!    of folding them back down the spectrum.
 
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{clamp, db_to_linear, flush_denormal, linear_to_db, mix, time_constant};
 
 use crate::{CompModel, Params};
@@ -51,8 +52,29 @@ const MEMORY_SECONDS: f32 = 0.320;
 /// Fixed tilt frequency of the 2500-style "thrust" sidechain shelf.
 const THRUST_HZ: f32 = 170.0;
 
-/// Gain/mix smoothing so a moved knob cannot step the output.
-const SMOOTH_SECONDS: f32 = 0.020;
+/// Gain, mix and curve smoothing so a moved knob cannot step the output.
+pub const SMOOTH_MS: f32 = 20.0;
+
+/// How close (relative) a smoothed value must come before it lands exactly.
+const SETTLE: f32 = 1.0e-6;
+
+/// One sample of `value` toward its target ([`Smoothed::next`]). Lands
+/// exactly once the rest is negligible — or once a step no longer moves it,
+/// which in `f32` happens a few ulps divided by `step` short (about −80 dB
+/// relative) — so a finished move leaves the arithmetic it started from.
+#[inline]
+pub fn glide(value: &mut Smoothed, step: f32) -> f32 {
+    if value.value != value.target {
+        let before = value.value;
+        value.next(step);
+        if value.value == before
+            || (value.target - value.value).abs() <= SETTLE * (1.0 + value.target.abs())
+        {
+            value.settle();
+        }
+    }
+    value.value
+}
 
 /// Amplitude (≈ −10 dBFS) the colour stage is level-matched at, so Colour
 /// changes the harmonic content and not the fader.
@@ -381,11 +403,13 @@ pub struct CellFrame {
 pub struct GainCell {
     sample_rate: f32,
 
-    // Static curve.
-    threshold_db: f32,
-    ratio: f32,
-    knee_db: f32,
+    // Static curve, smoothed per sample (in dB, before the gain computer) so
+    // a dragged threshold, ratio or knee cannot step the reduction.
+    threshold_db: Smoothed,
+    ratio: Smoothed,
+    knee_db: Smoothed,
     over_easy_db: f32,
+    smooth_step: f32,
 
     // Ballistics.
     attack_coeff: f32,
@@ -405,7 +429,9 @@ pub struct GainCell {
     hpf: HpfCoeffs,
     stereo_link: f32,
 
-    // Colour.
+    // Colour: drive and asymmetry glide; the shaper constants follow them.
+    drive: Smoothed,
+    asymmetry: Smoothed,
     drive_gain: f32,
     drive_bias: f32,
     drive_bias_offset: f32,
@@ -420,6 +446,11 @@ pub struct GainCell {
     gr_db: [f32; 2],
     memory_db: [f32; 2],
     feedback_sample: [f32; 2],
+
+    /// The inputs of the last time-constant / filter solve, so a retune that
+    /// does not change them (a ratio or threshold drag) skips the `exp`/`tan`
+    /// work. NaN forces the next solve.
+    solved: [f32; 6],
 }
 
 impl GainCell {
@@ -427,10 +458,11 @@ impl GainCell {
         let sr = sample_rate.max(1.0);
         let mut cell = Self {
             sample_rate: sr,
-            threshold_db: -18.0,
-            ratio: 4.0,
-            knee_db: 6.0,
+            threshold_db: Smoothed::at(-18.0),
+            ratio: Smoothed::at(4.0),
+            knee_db: Smoothed::at(6.0),
             over_easy_db: 0.0,
+            smooth_step: smoothing_step(SMOOTH_MS, sr),
             attack_coeff: 0.0,
             release_fast_coeff: 0.0,
             release_slow_coeff: 0.0,
@@ -445,6 +477,8 @@ impl GainCell {
             thrust_coeff: (-2.0 * std::f32::consts::PI * THRUST_HZ / sr).exp(),
             hpf: HpfCoeffs::bypass(),
             stereo_link: 1.0,
+            drive: Smoothed::at(0.0),
+            asymmetry: Smoothed::at(0.0),
             drive_gain: 1.0,
             drive_bias: 0.0,
             drive_bias_offset: 0.0,
@@ -457,48 +491,80 @@ impl GainCell {
             gr_db: [0.0; 2],
             memory_db: [0.0; 2],
             feedback_sample: [0.0; 2],
+            solved: [f32::NAN; 6],
         };
         cell.set_model(coeffs, sidechain_hz, stereo_link);
+        cell.settle();
         cell
     }
 
+    /// A new rate. The caller retunes with [`Self::set_model`] afterwards,
+    /// which re-solves every rate-dependent constant.
     pub fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate.max(1.0);
         self.memory_coeff = time_constant(self.sample_rate, MEMORY_SECONDS);
         self.thrust_coeff = (-2.0 * std::f32::consts::PI * THRUST_HZ / self.sample_rate).exp();
+        self.smooth_step = smoothing_step(SMOOTH_MS, self.sample_rate);
+        self.solved = [f32::NAN; 6];
+    }
+
+    /// Land every smoothed value on its target: construction, reset, a new
+    /// rate and a state load start where they are, without a glide.
+    pub fn settle(&mut self) {
+        self.threshold_db.settle();
+        self.ratio.settle();
+        self.knee_db.settle();
+        self.drive.settle();
+        self.asymmetry.settle();
+        self.resolve_colour();
     }
 
     /// Resolve one model's constants into per-sample coefficients.
     ///
-    /// Control thread only. Every `exp`, `tan`, and division in the algorithm
-    /// happens here so the audio path stays arithmetic.
+    /// Runs between blocks (a parameter edit), so it stays cheap: the curve
+    /// and the colour only retarget their smoothers, and the `exp`/`tan`
+    /// solves run only when their inputs actually changed. The audio path
+    /// stays arithmetic.
     pub fn set_model(&mut self, coeffs: ModelCoeffs, sidechain_hz: f32, stereo_link: f32) {
         let sr = self.sample_rate;
 
-        self.threshold_db = clamp(coeffs.threshold_db, -80.0, 12.0);
-        self.ratio = coeffs.ratio.max(1.0);
-        self.knee_db = coeffs.knee_db.max(0.0);
+        self.threshold_db.target = clamp(coeffs.threshold_db, -80.0, 12.0);
+        self.ratio.target = coeffs.ratio.max(1.0);
+        self.knee_db.target = coeffs.knee_db.max(0.0);
         self.over_easy_db = coeffs.over_easy_db.max(0.0);
 
-        self.attack_coeff = time_constant(sr, coeffs.attack_sec);
         let fast = coeffs.release_fast_sec.max(0.001);
         let slow = coeffs.release_slow_sec.max(fast);
-        self.release_fast_coeff = time_constant(sr, fast);
-        self.release_slow_coeff = time_constant(sr, slow);
+        let rms_window = coeffs.rms_window_sec.max(0.0005);
+        let solve = [coeffs.attack_sec, fast, slow, rms_window, sidechain_hz, sr];
+        if solve != self.solved {
+            self.attack_coeff = time_constant(sr, coeffs.attack_sec);
+            self.release_fast_coeff = time_constant(sr, fast);
+            self.release_slow_coeff = time_constant(sr, slow);
+            self.rms_coeff = time_constant(sr, rms_window);
+            self.hpf = HpfCoeffs::new(sr, sidechain_hz);
+            self.solved = solve;
+        }
         self.program_depth = clamp(coeffs.program_depth, 0.0, 1.0);
         self.program_base = clamp(coeffs.program_auto_bias, 0.0, 1.0);
 
-        self.rms_coeff = time_constant(sr, coeffs.rms_window_sec.max(0.0005));
         self.rms_blend = clamp(coeffs.rms_blend, 0.0, 1.0);
         self.feedback = clamp(coeffs.feedback, 0.0, 0.95);
         self.detector_boost = coeffs.detector_boost.max(0.1);
         self.thrust = clamp(coeffs.thrust, 0.0, 1.0);
-        self.hpf = HpfCoeffs::new(sr, sidechain_hz);
         self.stereo_link = clamp(stereo_link, 0.0, 100.0) / 100.0;
 
-        let drive = coeffs.drive.max(0.0);
+        self.drive.target = coeffs.drive.max(0.0);
+        self.asymmetry.target = clamp(coeffs.asymmetry, 0.0, 1.0);
+    }
+
+    /// The colour stage's constants for the current (gliding) drive and
+    /// asymmetry. Arithmetic only, so it can follow a glide sample by sample.
+    #[inline]
+    fn resolve_colour(&mut self) {
+        let drive = self.drive.value.max(0.0);
         self.drive_gain = 1.0 + drive * 2.0;
-        self.drive_bias = clamp(coeffs.asymmetry, 0.0, 1.0) * drive * 0.35;
+        self.drive_bias = self.asymmetry.value * drive * 0.35;
         self.drive_bias_offset = clip_shape(self.drive_bias);
         // Level-match the colour stage at a nominal operating amplitude rather
         // than at zero. Normalising on the small-signal slope would leave a
@@ -515,6 +581,7 @@ impl GainCell {
     }
 
     pub fn reset(&mut self) {
+        self.settle();
         for channel in 0..2 {
             self.hpf_state[channel].reset();
             self.tilt_state[channel].reset();
@@ -541,9 +608,9 @@ impl GainCell {
     fn target_gr_db(&self, level_db: f32) -> f32 {
         curve_reduction_db(
             level_db,
-            self.threshold_db,
-            self.ratio,
-            self.knee_db,
+            self.threshold_db.value,
+            self.ratio.value,
+            self.knee_db.value,
             self.over_easy_db,
         )
     }
@@ -612,6 +679,16 @@ impl GainCell {
     /// One stereo frame through the whole cell.
     #[inline]
     pub fn process_stereo(&mut self, left: f32, right: f32) -> CellFrame {
+        let step = self.smooth_step;
+        glide(&mut self.threshold_db, step);
+        glide(&mut self.ratio, step);
+        glide(&mut self.knee_db, step);
+        if self.drive.value != self.drive.target || self.asymmetry.value != self.asymmetry.target {
+            glide(&mut self.drive, step);
+            glide(&mut self.asymmetry, step);
+            self.resolve_colour();
+        }
+
         let (det_l, sc_l) = self.detect(0, left);
         let (det_r, sc_r) = self.detect(1, right);
 
@@ -677,44 +754,6 @@ pub fn curve_reduction_db(
     curved * (1.0 - 1.0 / ratio)
 }
 
-/// One-pole parameter smoother: keeps gain and mix moves click-free.
-#[derive(Debug, Clone, Copy)]
-pub struct Smoothed {
-    value: f32,
-    target: f32,
-    coeff: f32,
-}
-
-impl Smoothed {
-    pub fn new(sample_rate: f32, value: f32) -> Self {
-        Self {
-            value,
-            target: value,
-            coeff: time_constant(sample_rate.max(1.0), SMOOTH_SECONDS),
-        }
-    }
-
-    pub fn set_sample_rate(&mut self, sample_rate: f32) {
-        self.coeff = time_constant(sample_rate.max(1.0), SMOOTH_SECONDS);
-    }
-
-    pub fn set_target(&mut self, target: f32) {
-        self.target = target;
-    }
-
-    /// Jump to the target: used on reset, never mid-stream.
-    pub fn snap(&mut self, target: f32) {
-        self.target = target;
-        self.value = target;
-    }
-
-    #[inline]
-    pub fn next(&mut self) -> f32 {
-        self.value = flush_denormal(self.coeff * self.value + (1.0 - self.coeff) * self.target);
-        self.value
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,7 +786,7 @@ mod tests {
     fn static_curve_matches_the_dialled_ratio_above_the_knee() {
         let params = plain_params();
         let cell = cell_for(&params);
-        let knee = cell.knee_db;
+        let knee = cell.knee_db.value;
 
         // Well below threshold the cell is transparent.
         assert_eq!(cell.target_gr_db(params.threshold_db - knee), 0.0);
@@ -769,7 +808,7 @@ mod tests {
         let cell = cell_for(&params);
 
         let mut previous = 0.0_f32;
-        let mut level = params.threshold_db - cell.knee_db;
+        let mut level = params.threshold_db - cell.knee_db.value;
         while level <= params.threshold_db + 24.0 {
             let gr = cell.target_gr_db(level);
             assert!(gr >= previous - 1.0e-4, "curve dipped at {level} dB");
@@ -788,13 +827,13 @@ mod tests {
         params.knee_db = 0.0;
         let mut cell = cell_for(&params);
 
-        let easy_near = cell.target_gr_db(cell.threshold_db + 2.0);
-        let easy_far = cell.target_gr_db(cell.threshold_db + 40.0);
+        let easy_near = cell.target_gr_db(cell.threshold_db.value + 2.0);
+        let easy_far = cell.target_gr_db(cell.threshold_db.value + 40.0);
 
         // Same curve with the optical term removed: a fixed-ratio reference.
         cell.over_easy_db = 0.0;
-        let fixed_near = cell.target_gr_db(cell.threshold_db + 2.0);
-        let fixed_far = cell.target_gr_db(cell.threshold_db + 40.0);
+        let fixed_near = cell.target_gr_db(cell.threshold_db.value + 2.0);
+        let fixed_far = cell.target_gr_db(cell.threshold_db.value + 40.0);
 
         assert!(
             easy_near < fixed_near * 0.7,
@@ -1027,12 +1066,13 @@ mod tests {
 
     #[test]
     fn smoothed_gain_never_steps() {
-        let mut smoothed = Smoothed::new(SR, 1.0);
-        smoothed.set_target(4.0);
+        let step = smoothing_step(SMOOTH_MS, SR);
+        let mut smoothed = Smoothed::at(1.0);
+        smoothed.target = 4.0;
         let mut previous = 1.0_f32;
-        // 0.2 s is ten smoothing time constants: long enough to have arrived.
-        for _ in 0..(SR as usize / 5) {
-            let value = smoothed.next();
+        // 0.4 s is twenty smoothing time constants: long enough to land.
+        for _ in 0..(SR as usize * 2 / 5) {
+            let value = glide(&mut smoothed, step);
             assert!(
                 (value - previous).abs() < 0.01,
                 "step of {}",
@@ -1040,6 +1080,31 @@ mod tests {
             );
             previous = value;
         }
-        assert!((previous - 4.0).abs() < 0.01, "never arrived: {previous}");
+        assert_eq!(previous, 4.0, "never landed");
+    }
+
+    #[test]
+    fn a_retune_that_moves_no_time_constant_skips_the_solve() {
+        let mut params = default_params();
+        let mut cell = cell_for(&params);
+        let solved = cell.solved;
+        params.ratio = 12.0;
+        params.threshold_db = -30.0;
+        cell.set_model(
+            model_coeffs(&params),
+            params.sidechain_hpf_hz,
+            params.stereo_link,
+        );
+        assert_eq!(cell.solved, solved);
+        // The curve glides to the new values instead of jumping.
+        assert_eq!(cell.ratio.value, 4.0);
+        assert_eq!(cell.ratio.target, 10.0);
+        params.attack_ms = 3.0;
+        cell.set_model(
+            model_coeffs(&params),
+            params.sidechain_hpf_hz,
+            params.stereo_link,
+        );
+        assert_ne!(cell.solved, solved);
     }
 }

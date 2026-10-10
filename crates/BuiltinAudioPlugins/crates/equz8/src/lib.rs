@@ -4,6 +4,7 @@
 //! [`biquad`] crate. No DirectAudioEngine dependency.
 
 use biquad::{Biquad, DirectForm1};
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, biquad_response_db, clamp,
     db_to_linear, flush_denormal, linear_to_db, make_eq_biquad, make_eq_coefficients, mix,
@@ -30,6 +31,81 @@ const DYNAMIC_SPAN_DB: f32 = 24.0;
 /// Rebuild the peaking/shelf filter when applied gain moves by at least this
 /// much — avoids per-sample coefficient work on a quiet envelope.
 const DYNAMIC_GAIN_EPS_DB: f32 = 0.05;
+
+/// Output and mix glide over this long, so a dragged knob — which arrives as
+/// one new value per block — does not step the level at every block edge.
+const GAIN_SMOOTHING_MS: f32 = 15.0;
+
+/// Power on/off swaps dry for processed over about this long.
+const POWER_FADE_MS: f32 = 10.0;
+
+/// The processed share `power` asks for.
+fn power_share(power: bool) -> f32 {
+    if power { 1.0 } else { 0.0 }
+}
+
+/// A control value that glides to a new target instead of stepping: two
+/// one-poles in series, so it leaves and lands with zero slope, and neither a
+/// dragged knob (a new target every block) nor a toggle puts a corner in the
+/// signal it scales. Once within [`Glide::SNAP`] of the target it lands on it
+/// exactly, so a settled glide costs one compare and "fully off" is an exact
+/// state the audio path can skip on.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    first: Smoothed,
+    second: Smoothed,
+    step: f32,
+}
+
+impl Glide {
+    /// −100 dB of a unity gain: a landing this size is inaudible.
+    const SNAP: f32 = 1.0e-5;
+
+    /// Settled at `value`, gliding over about `ms` at `sample_rate`.
+    fn new(value: f32, ms: f32, sample_rate: f32) -> Self {
+        let mut glide = Self {
+            first: Smoothed::at(value),
+            second: Smoothed::at(value),
+            step: 0.0,
+        };
+        glide.set_time(ms, sample_rate);
+        glide
+    }
+
+    /// Half of `ms` per pole.
+    fn set_time(&mut self, ms: f32, sample_rate: f32) {
+        self.step = smoothing_step(ms * 0.5, sample_rate);
+    }
+
+    fn set(&mut self, target: f32) {
+        self.first.target = target;
+    }
+
+    fn is_settled(&self) -> bool {
+        self.second.value == self.first.target && self.first.value == self.first.target
+    }
+
+    /// Lands on the target now: construction, reset, project restore.
+    fn settle(&mut self) {
+        self.first.settle();
+        self.second = Smoothed::at(self.first.target);
+    }
+
+    #[inline]
+    fn next(&mut self) -> f32 {
+        let target = self.first.target;
+        if self.is_settled() {
+            return target;
+        }
+        self.second.target = self.first.next(self.step);
+        let value = self.second.next(self.step);
+        if (value - target).abs() < Self::SNAP && (self.first.value - target).abs() < Self::SNAP {
+            self.settle();
+            return target;
+        }
+        value
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -294,7 +370,11 @@ pub struct Dsp {
     /// is soloed — built on the control thread so the audio path only runs it.
     solo_left: Option<DirectForm1<f32>>,
     solo_right: Option<DirectForm1<f32>>,
-    output_gain: f32,
+    /// Linear output gain and wet share (0..1), smoothed per sample.
+    output_gain: Glide,
+    mix: Glide,
+    /// Dry → processed share, following `params.power`.
+    power: Glide,
     /// Fast-path flag: skip detector/envelope work when nothing needs it.
     any_dynamic: bool,
 }
@@ -318,10 +398,13 @@ impl Dsp {
             dyn_state: [DynamicBandState::new(); BAND_COUNT],
             solo_left: None,
             solo_right: None,
-            output_gain: 1.0,
+            output_gain: Glide::new(1.0, GAIN_SMOOTHING_MS, sample_rate.max(1.0)),
+            mix: Glide::new(1.0, GAIN_SMOOTHING_MS, sample_rate.max(1.0)),
+            power: Glide::new(1.0, POWER_FADE_MS, sample_rate.max(1.0)),
             any_dynamic: false,
         };
         dsp.rebuild();
+        dsp.settle();
         dsp
     }
 
@@ -329,10 +412,20 @@ impl Dsp {
         &self.params
     }
 
+    /// Replace every parameter (project restore). Output, mix and power land
+    /// on the restored values rather than gliding in from the old ones.
     pub fn set_params(&mut self, params: Params) {
         self.params = params;
         ipc::sanitize_params(&mut self.params);
         self.rebuild();
+        self.settle();
+    }
+
+    /// Put every smoother on its target.
+    fn settle(&mut self) {
+        self.output_gain.settle();
+        self.mix.settle();
+        self.power.settle();
     }
 
     /// Apply a compact wire update already resolved by the UI/control thread.
@@ -346,11 +439,9 @@ impl Dsp {
         }
 
         match wire_index {
-            ipc::POWER_INDEX => {}
-            ipc::MIX_INDEX => {}
-            ipc::OUTPUT_INDEX => {
-                self.output_gain = db_to_linear(self.params.output_db);
-            }
+            ipc::POWER_INDEX => self.power.set(power_share(self.params.power)),
+            ipc::MIX_INDEX => self.mix.set(self.params.mix / 100.0),
+            ipc::OUTPUT_INDEX => self.output_gain.set(db_to_linear(self.params.output_db)),
             ipc::SOLO_INDEX => self.rebuild_solo(),
             _ => {
                 if let Some((band, _)) = ipc::decode_band_wire(wire_index) {
@@ -379,7 +470,13 @@ impl Dsp {
     }
 
     fn rebuild(&mut self) {
-        self.output_gain = db_to_linear(self.params.output_db);
+        self.output_gain
+            .set_time(GAIN_SMOOTHING_MS, self.sample_rate);
+        self.mix.set_time(GAIN_SMOOTHING_MS, self.sample_rate);
+        self.power.set_time(POWER_FADE_MS, self.sample_rate);
+        self.output_gain.set(db_to_linear(self.params.output_db));
+        self.mix.set(self.params.mix / 100.0);
+        self.power.set(power_share(self.params.power));
         for i in 0..BAND_COUNT {
             self.rebuild_band(i);
         }
@@ -500,28 +597,46 @@ impl StereoEffect for Dsp {
         for filter in self.solo_left.iter_mut().chain(self.solo_right.iter_mut()) {
             filter.reset_state();
         }
+        self.settle();
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate.max(1.0);
         self.rebuild();
+        self.settle();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
-        if !self.params.power {
+        // Fully off and settled: the chain is not run at all, as before.
+        if self.power.is_settled() && !self.params.power {
             return (left, right);
         }
+        let on = self.power.next();
+        let gain = self.output_gain.next();
+        let amount = self.mix.next();
+        let (wet_l, wet_r) = self.process_on(left, right, gain, amount);
+        if on == 1.0 {
+            (wet_l, wet_r)
+        } else {
+            // A step from dry, so a chain that leaves the signal untouched
+            // stays bit-exact through the fade.
+            (left + (wet_l - left) * on, right + (wet_r - right) * on)
+        }
+    }
+}
 
+impl Dsp {
+    /// The powered chain for one sample, at output `gain` and wet share
+    /// `amount` (both already smoothed).
+    #[inline]
+    fn process_on(&mut self, left: f32, right: f32, gain: f32, amount: f32) -> (f32, f32) {
         // Band solo replaces the chain rather than adding to it, and
         // deliberately ignores Mix: auditioning a band means hearing that
         // frequency region alone, so blending the dry signal back in would
         // defeat the point. Output level still applies so the audition can be
         // matched in loudness.
         if let (Some(solo_l), Some(solo_r)) = (self.solo_left.as_mut(), self.solo_right.as_mut()) {
-            return (
-                solo_l.run(left) * self.output_gain,
-                solo_r.run(right) * self.output_gain,
-            );
+            return (solo_l.run(left) * gain, solo_r.run(right) * gain);
         }
 
         if self.any_dynamic {
@@ -574,9 +689,8 @@ impl StereoEffect for Dsp {
                     wet_r = filter.run(wet_r);
                 }
             }
-            wet_l *= self.output_gain;
-            wet_r *= self.output_gain;
-            let amount = self.params.mix / 100.0;
+            wet_l *= gain;
+            wet_r *= gain;
             return (mix(left, wet_l, amount), mix(right, wet_r, amount));
         }
 
@@ -588,10 +702,8 @@ impl StereoEffect for Dsp {
         for filter in self.right.iter_mut().flatten() {
             wet_r = filter.run(wet_r);
         }
-        wet_l *= self.output_gain;
-        wet_r *= self.output_gain;
-
-        let amount = self.params.mix / 100.0;
+        wet_l *= gain;
+        wet_r *= gain;
         (mix(left, wet_l, amount), mix(right, wet_r, amount))
     }
 }
@@ -810,5 +922,141 @@ mod tests {
         assert!(!state.params.bands[0].dynamic);
         assert_eq!(state.params.bands[0].threshold_db, -24.0);
         assert_eq!(state.params.bands[0].range_db, 0.0);
+    }
+
+    const BLOCK: usize = 128;
+    /// Blocks played before measuring, so filters and smoothers are at rest.
+    const WARM: usize = 50;
+
+    /// The measure of LiveStageEngine's `param_sweep`: a smooth two-tone
+    /// signal goes through `block` one 128-frame block at a time, and this is
+    /// the worst ratio of the kink (second difference) where a block meets
+    /// the last one to the biggest kink inside the block. About 1 is smooth;
+    /// a value that steps once per block reads many times that.
+    fn edge_kink(blocks: usize, mut block: impl FnMut(usize, &mut [f32], &mut [f32])) -> f32 {
+        let mut left = [0.0f32; BLOCK];
+        let mut right = [0.0f32; BLOCK];
+        let mut n = 0usize;
+        let mut last = [(0.0f32, 0.0f32); 2];
+        let mut worst = 0.0f32;
+        for index in 0..WARM + blocks {
+            for i in 0..BLOCK {
+                let t = n as f64 / 48_000.0;
+                let tone = (std::f64::consts::TAU * 110.0 * t).sin() * 0.3
+                    + (std::f64::consts::TAU * 330.0 * t).sin() * 0.1;
+                (left[i], right[i]) = (tone as f32, (tone * 0.8) as f32);
+                n += 1;
+            }
+            block(index.saturating_sub(WARM), &mut left, &mut right);
+            let mut edge = 0.0f32;
+            let mut inside = 1.0e-7f32;
+            for i in 0..BLOCK {
+                let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+                let kink =
+                    d2(last[0].0, last[1].0, left[i]).max(d2(last[0].1, last[1].1, right[i]));
+                if i < 2 {
+                    edge = edge.max(kink);
+                } else {
+                    inside = inside.max(kink);
+                }
+                last = [last[1], (left[i], right[i])];
+            }
+            if index >= WARM {
+                worst = worst.max(edge / inside);
+            }
+        }
+        worst
+    }
+
+    /// Plays `dsp`, calling `change(dsp, block)` before every measured block.
+    fn drag(dsp: &mut Dsp, blocks: usize, mut change: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let mut warm = WARM;
+        edge_kink(blocks, |index, left, right| {
+            if warm > 0 {
+                warm -= 1;
+            } else {
+                change(dsp, index);
+            }
+            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                (*l, *r) = dsp.process_stereo(*l, *r);
+            }
+        })
+    }
+
+    /// Up and back down across `min..max`, a value per block, over `blocks`.
+    fn sweep(min: f32, max: f32, block: usize, blocks: usize) -> f32 {
+        let phase = block as f32 / blocks as f32 * 2.0;
+        let x = if phase < 1.0 { phase } else { 2.0 - phase };
+        min + (max - min) * x
+    }
+
+    /// A low bell that changes the test tone, so wet and dry differ.
+    fn shaping() -> Dsp {
+        let mut params = default_params();
+        params.bands[2].active = true;
+        params.bands[2].freq = 110.0;
+        params.bands[2].gain_db = 9.0;
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(params);
+        dsp
+    }
+
+    /// The measure itself sees a gain that steps once per block.
+    #[test]
+    fn the_edge_kink_measure_catches_a_stepped_gain() {
+        let stepped = edge_kink(100, |index, left, right| {
+            let gain = 0.25 + index as f32 * 0.01;
+            left.iter_mut()
+                .chain(right.iter_mut())
+                .for_each(|s| *s *= gain);
+        });
+        assert!(stepped > 20.0, "{stepped}");
+    }
+
+    #[test]
+    fn dragging_output_or_mix_does_not_zipper() {
+        let mut dsp = shaping();
+        let output = drag(&mut dsp, 375, |dsp, block| {
+            let db = sweep(-24.0, 12.0, block, 375);
+            assert!(dsp.apply_wire_param(ipc::OUTPUT_INDEX, db));
+        });
+        assert!(output < 4.0, "output drag jump x {output}");
+
+        let mut dsp = shaping();
+        let mix = drag(&mut dsp, 375, |dsp, block| {
+            assert!(dsp.apply_wire_param(ipc::MIX_INDEX, sweep(0.0, 100.0, block, 375)));
+        });
+        assert!(mix < 4.0, "mix drag jump x {mix}");
+    }
+
+    #[test]
+    fn toggling_power_crossfades_without_a_step() {
+        let mut dsp = shaping();
+        let jump = drag(&mut dsp, 300, |dsp, block| {
+            if block.is_multiple_of(30) {
+                let on = (block / 30) % 2 == 1;
+                assert!(dsp.apply_wire_param(ipc::POWER_INDEX, if on { 1.0 } else { 0.0 }));
+            }
+        });
+        assert!(jump < 4.0, "power toggle jump x {jump}");
+        // Settled off is the dry signal exactly.
+        assert!(dsp.apply_wire_param(ipc::POWER_INDEX, 0.0));
+        for _ in 0..4_800 {
+            let _ = dsp.process_stereo(0.1, 0.1);
+        }
+        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
+    }
+
+    /// A project load lands on its values; it does not fade them in.
+    #[test]
+    fn restored_state_starts_settled() {
+        let mut params = default_params();
+        params.output_db = -12.0;
+        params.mix = 50.0;
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(params);
+        let (l, _) = dsp.process_stereo(0.5, 0.5);
+        let expected = 0.5 * 0.5 + 0.5 * 0.5 * db_to_linear(-12.0);
+        assert!((l - expected).abs() < 1.0e-6, "{l} vs {expected}");
     }
 }

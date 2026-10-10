@@ -105,6 +105,9 @@ const GLIDE_MS: f32 = 70.0;
 /// Time constant of every smoothed gain and filter corner.
 const SMOOTH_MS: f32 = 25.0;
 
+/// How long Power takes to crossfade.
+const SWITCH_MS: f32 = 10.0;
+
 /// Loop gain while frozen. Not exactly one: a lossless loop is only
 /// marginally stable in floating point, and this still loses well under
 /// 0.1 dB a second.
@@ -978,6 +981,51 @@ impl GlideAllpass {
     }
 }
 
+/// Power's 0–1 crossfade. It walks linearly toward its end and is heard
+/// through a smoothstep, so the fade both leaves and lands without a kink.
+#[derive(Debug, Clone, Copy)]
+struct Fade {
+    position: f32,
+    target: f32,
+    step: f32,
+}
+
+impl Fade {
+    fn new(on: bool, sample_rate: f32) -> Self {
+        let at = if on { 1.0 } else { 0.0 };
+        Self {
+            position: at,
+            target: at,
+            step: 1.0 / (SWITCH_MS * 0.001 * sample_rate).max(1.0),
+        }
+    }
+
+    fn set(&mut self, on: bool) {
+        self.target = if on { 1.0 } else { 0.0 };
+    }
+
+    fn settle(&mut self) {
+        self.position = self.target;
+    }
+
+    /// Off, and staying off.
+    fn is_off(&self) -> bool {
+        self.position == 0.0 && self.target == 0.0
+    }
+
+    /// One sample's step; the weight of the "on" side.
+    #[inline]
+    fn next(&mut self) -> f32 {
+        if self.position < self.target {
+            self.position = (self.position + self.step).min(self.target);
+        } else if self.position > self.target {
+            self.position = (self.position - self.step).max(self.target);
+        }
+        let x = self.position;
+        x * x * (3.0 - 2.0 * x)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Dsp {
     sample_rate: f32,
@@ -1020,6 +1068,10 @@ pub struct Dsp {
     high_split_a: Smoothed,
     /// Samples since the last LFO renormalisation.
     lfo_tick: u32,
+    /// Dry (0) to the running room (1). Switching Power fades rather than
+    /// cuts, so switching off fades the tail out with it; once off and
+    /// settled nothing runs.
+    power: Fade,
     /// Nothing has played since construction or the last reset: there is no
     /// tail to glide on, so a retune lands at once.
     fresh: bool,
@@ -1066,6 +1118,7 @@ impl Dsp {
             low_split_a: Smoothed::at(tuning.low_split_a),
             high_split_a: Smoothed::at(tuning.high_split_a),
             lfo_tick: 0,
+            power: Fade::new(params.power, sr),
             fresh: true,
             tuning,
             params,
@@ -1113,6 +1166,8 @@ impl Dsp {
         if rebuild || self.low_cut_l.is_none() {
             self.rebuild_filters();
         }
+        // A loaded state starts as it was saved: Power does not fade in.
+        self.power.settle();
     }
 
     /// Apply a compact wire update already resolved by the UI/control thread.
@@ -1169,7 +1224,15 @@ impl Dsp {
         self.low_split_a.target = t.low_split_a;
         self.high_split_a.target = t.high_split_a;
         self.tuning = t;
+        // Waking from a settled off: the room still holds what was playing
+        // when it went off, which must not come back as a tail.
+        let waking = self.params.power && self.power.is_off();
+        self.power.set(self.params.power);
         if self.fresh {
+            self.snap();
+            self.power.settle();
+        } else if waking {
+            self.clear_room();
             self.snap();
         }
     }
@@ -1241,6 +1304,44 @@ impl Dsp {
 
 impl StereoEffect for Dsp {
     fn reset(&mut self) {
+        self.clear_room();
+        // Silence has nothing to glide from.
+        self.fresh = true;
+        self.snap();
+        self.power.settle();
+    }
+
+    fn set_sample_rate(&mut self, sample_rate: f32) {
+        let sr = sample_rate.max(1.0);
+        if (sr - self.sample_rate).abs() < f32::EPSILON {
+            return;
+        }
+        let params = self.params.clone();
+        *self = Self::new(sr);
+        self.set_params(params);
+        self.reset();
+    }
+
+    fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        if self.power.is_off() {
+            return (left, right);
+        }
+        let on = self.power.next();
+        // What enters the room fades with the switch too: a room woken empty
+        // would otherwise take the input starting mid-wave, and play that
+        // step back from every reflection.
+        let (l, r) = self.run(left, right, on);
+        if on >= 1.0 {
+            (l, r)
+        } else {
+            (left + (l - left) * on, right + (r - right) * on)
+        }
+    }
+}
+
+impl Dsp {
+    /// Empties every ring and filter. Memsets only: allocation-free.
+    fn clear_room(&mut self) {
         self.predelay_l.clear();
         self.predelay_r.clear();
         self.early_l.clear();
@@ -1273,36 +1374,23 @@ impl StereoEffect for Dsp {
         {
             filter.reset_state();
         }
-        // Silence has nothing to glide from.
-        self.fresh = true;
-        self.snap();
     }
 
-    fn set_sample_rate(&mut self, sample_rate: f32) {
-        let sr = sample_rate.max(1.0);
-        if (sr - self.sample_rate).abs() < f32::EPSILON {
-            return;
-        }
-        let params = self.params.clone();
-        *self = Self::new(sr);
-        self.set_params(params);
-        self.reset();
-    }
-
-    fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
-        if !self.params.power {
-            return (left, right);
-        }
+    /// One frame through the room, power aside; `feed` scales what enters
+    /// the room, not the dry.
+    #[inline]
+    fn run(&mut self, left: f32, right: f32, feed: f32) -> (f32, f32) {
         self.fresh = false;
         let glide = self.glide_step;
         let smooth = self.smooth_step;
+        let (in_l, in_r) = (left * feed, right * feed);
 
         // Pre-delay, gliding to its length so a drag does not click.
         let predelay = self.predelay.next(glide);
-        self.predelay_l.push(left);
-        self.predelay_r.push(right);
+        self.predelay_l.push(in_l);
+        self.predelay_r.push(in_r);
         let (pre_l, pre_r) = if predelay < 0.5 {
-            (left, right)
+            (in_l, in_r)
         } else {
             (
                 self.predelay_l.read_linear(predelay + 1.0),
@@ -1412,3 +1500,102 @@ impl StereoEffect for Dsp {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+
+    const SR: f32 = 48_000.0;
+
+    fn dsp_with(params: Params) -> Dsp {
+        let mut dsp = Dsp::new(SR);
+        dsp.set_params(params);
+        dsp.reset();
+        dsp
+    }
+
+    /// Two low tones: smooth, so a step anywhere shows as a kink.
+    fn two_tone(n: usize) -> (f32, f32) {
+        let t = n as f32 / SR;
+        let x = (TAU * 110.0 * t).sin() * 0.3 + (TAU * 330.0 * t).sin() * 0.1;
+        (x, x * 0.8)
+    }
+
+    /// The biggest second difference of the output over `frames` frames
+    /// after a second of settling, with `edit` applied before each frame.
+    fn worst_kink(dsp: &mut Dsp, frames: usize, mut edit: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let settle = 48_000;
+        let mut history = [(0.0f32, 0.0f32); 2];
+        let mut worst = 0.0f32;
+        for n in 0..settle + frames {
+            if n >= settle {
+                edit(dsp, n - settle);
+            }
+            let (l, r) = two_tone(n);
+            let out = dsp.process_stereo(l, r);
+            if n >= settle {
+                let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+                let kink_l = d2(history[0].0, history[1].0, out.0);
+                let kink_r = d2(history[0].1, history[1].1, out.1);
+                worst = worst.max(kink_l).max(kink_r);
+            }
+            history = [history[1], out];
+        }
+        worst
+    }
+
+    /// Power crossfades: flipping it is no rougher than the room left alone
+    /// (it used to step by the whole wet signal).
+    #[test]
+    fn switching_power_does_not_step() {
+        let mut params = default_params();
+        params.mix = 50.0;
+        let still = worst_kink(&mut dsp_with(params.clone()), 48_000, |_, _| {});
+        let power = worst_kink(&mut dsp_with(params), 48_000, |dsp, n| {
+            if n % 6_000 == 0 {
+                let on = (n / 6_000) % 2 == 1;
+                assert!(dsp.apply_wire_param(ipc::POWER_INDEX, if on { 1.0 } else { 0.0 }));
+            }
+        });
+        assert!(power < still * 2.0, "power: {power} against {still}");
+    }
+
+    /// Off and settled is a bit-exact pass-through, and switching back on
+    /// starts from an empty room rather than the old tail.
+    #[test]
+    fn power_off_settles_to_the_dry_signal_and_wakes_empty() {
+        let mut params = default_params();
+        params.mix = 100.0;
+        params.decay_sec = 8.0;
+        let mut dsp = dsp_with(params);
+        for n in 0..24_000 {
+            let (l, r) = two_tone(n);
+            let _ = dsp.process_stereo(l, r);
+        }
+        assert!(dsp.apply_wire_param(ipc::POWER_INDEX, 0.0));
+        for _ in 0..960 {
+            let _ = dsp.process_stereo(0.1, 0.1);
+        }
+        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
+        assert!(dsp.apply_wire_param(ipc::POWER_INDEX, 1.0));
+        let mut heard = 0.0f32;
+        for _ in 0..4_800 {
+            let (l, r) = dsp.process_stereo(0.0, 0.0);
+            heard = heard.max(l.abs()).max(r.abs());
+        }
+        assert!(heard < 1.0e-6, "the old tail came back: {heard}");
+    }
+
+    /// A state load lands as saved, with no fade.
+    #[test]
+    fn a_loaded_power_off_does_not_fade() {
+        let mut dsp = Dsp::new(SR);
+        for _ in 0..100 {
+            let _ = dsp.process_stereo(0.2, 0.2);
+        }
+        let mut params = default_params();
+        params.power = false;
+        dsp.set_params(params);
+        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
+    }
+}

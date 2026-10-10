@@ -22,6 +22,7 @@
 
 use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type};
 use builtin_dsp_core::crossover::{FourBandSplitter, SPLIT_BANDS};
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
     flush_denormal, linear_to_db, max_filter_frequency, time_constant,
@@ -71,6 +72,12 @@ pub const SOLO_NONE: i32 = -1;
 /// Makeup, mix and output changes glide over this long, so a dragged control
 /// does not step the level sample to sample.
 const SMOOTHING_SEC: f32 = 0.02;
+/// A dragged threshold glides in over this long, in dB, ahead of the gain
+/// computer — so the curve slides rather than stepping once per block.
+const THRESHOLD_SMOOTHING_MS: f32 = 20.0;
+/// Power on/off swaps dry for processed, and a mode change swaps one
+/// compressor for the other, over about this long.
+const FADE_MS: f32 = 10.0;
 /// Integration time of the RMS meters.
 const RMS_SEC: f32 = 0.3;
 /// Peak meters fall back over this long.
@@ -439,14 +446,93 @@ pub fn curve_reduction_db(level_db: f32, threshold_db: f32, ratio: f32, knee_db:
     }
 }
 
+/// A control value that glides to a new target instead of stepping: two
+/// one-poles in series, so it leaves and lands with zero slope, and neither a
+/// dragged knob (a new target every block) nor a toggle puts a corner in the
+/// signal it scales. Once within [`Glide::SNAP`] of the target it lands on it
+/// exactly, so a settled glide costs one compare and "fully off" is an exact
+/// state the audio path can skip on.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    first: Smoothed,
+    second: Smoothed,
+    step: f32,
+}
+
+impl Glide {
+    /// −100 dB of a unity gain: a landing this size is inaudible.
+    const SNAP: f32 = 1.0e-5;
+
+    /// Settled at `value`, gliding over about `ms` at `sample_rate`.
+    fn new(value: f32, ms: f32, sample_rate: f32) -> Self {
+        let mut glide = Self {
+            first: Smoothed::at(value),
+            second: Smoothed::at(value),
+            step: 0.0,
+        };
+        glide.set_time(ms, sample_rate);
+        glide
+    }
+
+    /// Half of `ms` per pole.
+    fn set_time(&mut self, ms: f32, sample_rate: f32) {
+        self.step = smoothing_step(ms * 0.5, sample_rate);
+    }
+
+    fn set(&mut self, target: f32) {
+        self.first.target = target;
+    }
+
+    fn is_settled(&self) -> bool {
+        self.second.value == self.first.target && self.first.value == self.first.target
+    }
+
+    /// Lands on the target now: construction, reset, project restore.
+    fn settle(&mut self) {
+        self.first.settle();
+        self.second = Smoothed::at(self.first.target);
+    }
+
+    /// The lowest value the glide can pass through from here on: it moves
+    /// monotonically from where it is toward the target, through a lowpass.
+    fn lowest_ahead(&self) -> f32 {
+        self.second
+            .value
+            .min(self.first.value)
+            .min(self.first.target)
+    }
+
+    #[inline]
+    fn next(&mut self) -> f32 {
+        let target = self.first.target;
+        if self.is_settled() {
+            return target;
+        }
+        self.second.target = self.first.next(self.step);
+        let value = self.second.next(self.step);
+        if (value - target).abs() < Self::SNAP && (self.first.value - target).abs() < Self::SNAP {
+            self.settle();
+            return target;
+        }
+        value
+    }
+}
+
+/// 1 for `on`, 0 for off: a fade's end.
+fn share(on: bool) -> f32 {
+    if on { 1.0 } else { 0.0 }
+}
+
 /// One compressor stage: gain computer, reduction smoother and makeup.
 #[derive(Debug, Clone, Copy)]
 struct Stage {
-    threshold_db: f32,
+    /// In dB, glided ahead of the gain computer.
+    threshold: Glide,
     ratio: f32,
     knee_db: f32,
     /// Detector level (linear) at the bottom of the knee. Anything at or under
-    /// it asks for no reduction, so a quiet signal skips the logarithm.
+    /// it asks for no reduction, so a quiet signal skips the logarithm. While
+    /// the threshold glides it sits at the lowest point of the glide.
     floor: f32,
     attack: f32,
     release: f32,
@@ -459,7 +545,7 @@ struct Stage {
 impl Stage {
     fn new() -> Self {
         Self {
-            threshold_db: 0.0,
+            threshold: Glide::new(0.0, THRESHOLD_SMOOTHING_MS, 48_000.0),
             ratio: 1.0,
             knee_db: 0.0,
             floor: 1.0,
@@ -481,27 +567,38 @@ impl Stage {
         release_ms: f32,
         makeup_db: f32,
     ) {
-        self.threshold_db = threshold_db;
+        self.threshold.set_time(THRESHOLD_SMOOTHING_MS, sample_rate);
+        self.threshold.set(threshold_db);
         self.ratio = ratio.max(1.0);
         self.knee_db = knee_db.max(0.0);
-        self.floor = db_to_linear(threshold_db - 0.5 * self.knee_db);
+        self.refresh_floor();
         self.attack = time_constant(sample_rate, attack_ms * 0.001);
         self.release = time_constant(sample_rate, release_ms * 0.001);
         self.makeup_target = db_to_linear(makeup_db);
     }
 
+    /// The floor for the lowest threshold still ahead. One exponential: on a
+    /// parameter change, and once more when a threshold glide lands.
+    fn refresh_floor(&mut self) {
+        self.floor = db_to_linear(self.threshold.lowest_ahead() - 0.5 * self.knee_db);
+    }
+
     /// Linear gain for one detector sample, makeup included.
     #[inline]
     fn gain(&mut self, level: f32, glide: f32) -> f32 {
+        let threshold_db = if self.threshold.is_settled() {
+            self.threshold.first.target
+        } else {
+            let threshold_db = self.threshold.next();
+            if self.threshold.is_settled() {
+                self.refresh_floor();
+            }
+            threshold_db
+        };
         let target = if level <= self.floor {
             0.0
         } else {
-            curve_reduction_db(
-                linear_to_db(level),
-                self.threshold_db,
-                self.ratio,
-                self.knee_db,
-            )
+            curve_reduction_db(linear_to_db(level), threshold_db, self.ratio, self.knee_db)
         };
         let coeff = if target > self.reduction_db {
             self.attack
@@ -529,6 +626,8 @@ impl Stage {
     fn reset(&mut self) {
         self.reduction_db = 0.0;
         self.makeup = self.makeup_target;
+        self.threshold.settle();
+        self.refresh_floor();
     }
 }
 
@@ -602,6 +701,11 @@ pub struct Dsp {
     output_gain: f32,
     output_target: f32,
     smooth_coeff: f32,
+    /// Dry → processed share, following `params.power`.
+    power: Glide,
+    /// Multi's share of the output, following `params.mode`. Both modes run
+    /// while it is between its ends.
+    multi: Glide,
 
     rms_coeff: f32,
     peak_release: f32,
@@ -628,6 +732,8 @@ impl Dsp {
             output_gain: 1.0,
             output_target: 1.0,
             smooth_coeff: 0.0,
+            power: Glide::new(1.0, FADE_MS, sr),
+            multi: Glide::new(0.0, FADE_MS, sr),
             rms_coeff: 0.0,
             peak_release: 0.0,
             input_level: Level::default(),
@@ -644,9 +750,9 @@ impl Dsp {
         &self.params
     }
 
-    /// Replace every parameter (project restore). The smoothers jump straight
-    /// to the new values: a restored state starts where it was saved rather
-    /// than gliding in from the defaults.
+    /// Replace every parameter (project restore). The smoothers and fades
+    /// jump straight to the new values: a restored state starts where it was
+    /// saved rather than gliding in from the defaults.
     pub fn set_params(&mut self, params: Params) {
         self.params = params;
         ipc::sanitize_params(&mut self.params);
@@ -663,9 +769,18 @@ impl Dsp {
             return false;
         }
         match wire_index {
+            ipc::POWER_INDEX => self.power.set(share(self.params.power)),
             ipc::MODE_INDEX => {
                 if self.params.mode != previous_mode {
-                    self.enter_mode();
+                    // The incoming mode starts from rest — unless a fade
+                    // still has it sounding, in which case it carries on.
+                    if self.multi.is_settled() {
+                        match self.params.mode {
+                            Mode::Single => self.reset_single(),
+                            Mode::Multi => self.reset_multi(),
+                        }
+                    }
+                    self.multi.set(share(self.params.mode == Mode::Multi));
                 }
             }
             ipc::THRESHOLD_INDEX
@@ -694,8 +809,8 @@ impl Dsp {
                 if let Some((band, _)) = ipc::band_param(index) {
                     self.configure_band(band);
                 }
-                // Power, solo and band bypass are read straight off `params`
-                // in `process_stereo`.
+                // Solo and band bypass are read straight off `params` in
+                // `process_stereo`.
             }
         }
         true
@@ -750,6 +865,8 @@ impl Dsp {
 
     fn update_time_constants(&mut self) {
         self.smooth_coeff = time_constant(self.sample_rate, SMOOTHING_SEC);
+        self.power.set_time(FADE_MS, self.sample_rate);
+        self.multi.set_time(FADE_MS, self.sample_rate);
         self.rms_coeff = time_constant(self.sample_rate, RMS_SEC);
         self.peak_release = time_constant(self.sample_rate, PEAK_RELEASE_SEC);
     }
@@ -761,6 +878,8 @@ impl Dsp {
         self.retune();
         self.mix_target = self.params.mix * 0.01;
         self.output_target = db_to_linear(self.params.output_db);
+        self.power.set(share(self.params.power));
+        self.multi.set(share(self.params.mode == Mode::Multi));
     }
 
     fn configure_single(&mut self) {
@@ -808,25 +927,71 @@ impl Dsp {
         self.split_r.retune(hz, self.sample_rate);
     }
 
-    /// Start the newly selected mode from rest: the stages and filters of the
-    /// mode that was idle hold whatever they had when it was last used.
-    fn enter_mode(&mut self) {
+    /// Bring Single to rest: its stage and detector filter hold whatever they
+    /// had when it was last used.
+    fn reset_single(&mut self) {
         self.single.reset();
         self.sidechain_l.reset_state();
         self.sidechain_r.reset_state();
+    }
+
+    /// Bring Multi to rest: crossovers and every band stage.
+    fn reset_multi(&mut self) {
         self.split_l.reset();
         self.split_r.reset();
         for band in &mut self.bands {
             band.reset();
         }
     }
+
+    /// Single for one sample: (dry, dry, wet, wet) for left and right.
+    #[inline]
+    fn run_single(&mut self, left: f32, right: f32, glide: f32) -> [f32; 4] {
+        let (detect_l, detect_r) = if self.sidechain_on {
+            (self.sidechain_l.run(left), self.sidechain_r.run(right))
+        } else {
+            (left, right)
+        };
+        let gain = self.single.gain(detect_l.abs().max(detect_r.abs()), glide);
+        [left, right, left * gain, right * gain]
+    }
+
+    /// Multi for one sample: the band sum is its dry side, so a partial mix
+    /// never combs against the crossover's phase shift.
+    #[inline]
+    fn run_multi(&mut self, left: f32, right: f32, glide: f32) -> [f32; 4] {
+        let lows = self.split_l.run(left);
+        let highs = self.split_r.run(right);
+        let solo = self.params.solo_band;
+        let (mut dry_l, mut dry_r, mut wet_l, mut wet_r) = (0.0, 0.0, 0.0, 0.0);
+        for band in 0..BAND_COUNT {
+            let (l, r) = (lows[band], highs[band]);
+            let stage = &mut self.bands[band];
+            let gain = if self.params.bands[band].bypass {
+                stage.release_all();
+                1.0
+            } else {
+                stage.gain(l.abs().max(r.abs()), glide)
+            };
+            if solo == SOLO_NONE || solo == band as i32 {
+                dry_l += l;
+                dry_r += r;
+                wet_l += l * gain;
+                wet_r += r * gain;
+            }
+        }
+        [dry_l, dry_r, wet_l, wet_r]
+    }
 }
 
 impl StereoEffect for Dsp {
     fn reset(&mut self) {
-        self.enter_mode();
+        self.reset_single();
+        self.reset_multi();
         self.mix = self.mix_target;
         self.output_gain = self.output_target;
+        self.power.settle();
+        self.multi.settle();
         self.input_level = Level::default();
         self.output_level = Level::default();
     }
@@ -842,60 +1007,47 @@ impl StereoEffect for Dsp {
         self.split_l = FourBandSplitter::new(hz, sr);
         self.split_r = FourBandSplitter::new(hz, sr);
         self.configure_all();
-        self.enter_mode();
+        self.reset_single();
+        self.reset_multi();
+        self.power.settle();
+        self.multi.settle();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
         self.input_level
             .push(left, right, self.peak_release, self.rms_coeff);
-        if !self.params.power {
+        if self.power.is_settled() && !self.params.power {
             // Bypass is a pure pass-through; the meters keep reading so the
             // editor still shows the signal it would be working on.
             self.output_level
                 .push(left, right, self.peak_release, self.rms_coeff);
             return (left, right);
         }
+        let on = self.power.next();
 
         let glide = 1.0 - self.smooth_coeff;
-        let (dry_l, dry_r, wet_l, wet_r) = match self.params.mode {
-            Mode::Single => {
-                let (detect_l, detect_r) = if self.sidechain_on {
-                    (self.sidechain_l.run(left), self.sidechain_r.run(right))
-                } else {
-                    (left, right)
-                };
-                let gain = self.single.gain(detect_l.abs().max(detect_r.abs()), glide);
-                (left, right, left * gain, right * gain)
-            }
-            Mode::Multi => {
-                let lows = self.split_l.run(left);
-                let highs = self.split_r.run(right);
-                let solo = self.params.solo_band;
-                let (mut dry_l, mut dry_r, mut wet_l, mut wet_r) = (0.0, 0.0, 0.0, 0.0);
-                for band in 0..BAND_COUNT {
-                    let (l, r) = (lows[band], highs[band]);
-                    let stage = &mut self.bands[band];
-                    let gain = if self.params.bands[band].bypass {
-                        stage.release_all();
-                        1.0
-                    } else {
-                        stage.gain(l.abs().max(r.abs()), glide)
-                    };
-                    if solo == SOLO_NONE || solo == band as i32 {
-                        dry_l += l;
-                        dry_r += r;
-                        wet_l += l * gain;
-                        wet_r += r * gain;
-                    }
-                }
-                (dry_l, dry_r, wet_l, wet_r)
-            }
+        // Only the modes that are sounding run; across a mode change both
+        // do, and their outputs are blended.
+        let multi = self.multi.next();
+        let [dry_l, dry_r, wet_l, wet_r] = if multi == 0.0 {
+            self.run_single(left, right, glide)
+        } else if multi == 1.0 {
+            self.run_multi(left, right, glide)
+        } else {
+            let single = self.run_single(left, right, glide);
+            let multiple = self.run_multi(left, right, glide);
+            std::array::from_fn(|i| single[i] + (multiple[i] - single[i]) * multi)
         };
 
         self.mix += (self.mix_target - self.mix) * glide;
         self.output_gain += (self.output_target - self.output_gain) * glide;
-        let out_l = (dry_l + (wet_l - dry_l) * self.mix) * self.output_gain;
-        let out_r = (dry_r + (wet_r - dry_r) * self.mix) * self.output_gain;
+        let mut out_l = (dry_l + (wet_l - dry_l) * self.mix) * self.output_gain;
+        let mut out_r = (dry_r + (wet_r - dry_r) * self.mix) * self.output_gain;
+        if on != 1.0 {
+            // Power fading: a step from the untouched input.
+            out_l = left + (out_l - left) * on;
+            out_r = right + (out_r - right) * on;
+        }
         self.output_level
             .push(out_l, out_r, self.peak_release, self.rms_coeff);
         (out_l, out_r)
@@ -1278,5 +1430,188 @@ mod tests {
             }
         }
         assert!((peak - 0.5).abs() < 0.01, "{peak}");
+    }
+
+    const BLOCK: usize = 128;
+    /// Blocks played before measuring, so filters and smoothers are at rest.
+    const WARM: usize = 50;
+
+    /// The measure of LiveStageEngine's `param_sweep`: a smooth two-tone
+    /// signal goes through `block` one 128-frame block at a time, and this is
+    /// the worst ratio of the kink (second difference) where a block meets
+    /// the last one to the biggest kink inside the block. About 1 is smooth;
+    /// a value that steps once per block reads many times that.
+    fn edge_kink(blocks: usize, mut block: impl FnMut(usize, &mut [f32], &mut [f32])) -> f32 {
+        let mut left = [0.0f32; BLOCK];
+        let mut right = [0.0f32; BLOCK];
+        let mut n = 0usize;
+        let mut last = [(0.0f32, 0.0f32); 2];
+        let mut worst = 0.0f32;
+        for index in 0..WARM + blocks {
+            for i in 0..BLOCK {
+                let t = n as f64 / 48_000.0;
+                let tone = (std::f64::consts::TAU * 110.0 * t).sin() * 0.3
+                    + (std::f64::consts::TAU * 330.0 * t).sin() * 0.1;
+                (left[i], right[i]) = (tone as f32, (tone * 0.8) as f32);
+                n += 1;
+            }
+            block(index.saturating_sub(WARM), &mut left, &mut right);
+            let mut edge = 0.0f32;
+            let mut inside = 1.0e-7f32;
+            for i in 0..BLOCK {
+                let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+                let kink =
+                    d2(last[0].0, last[1].0, left[i]).max(d2(last[0].1, last[1].1, right[i]));
+                if i < 2 {
+                    edge = edge.max(kink);
+                } else {
+                    inside = inside.max(kink);
+                }
+                last = [last[1], (left[i], right[i])];
+            }
+            if index >= WARM {
+                worst = worst.max(edge / inside);
+            }
+        }
+        worst
+    }
+
+    /// Plays `dsp`, calling `change(dsp, block)` before every measured block.
+    fn drag(dsp: &mut Dsp, blocks: usize, mut change: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let mut warm = WARM;
+        edge_kink(blocks, |index, left, right| {
+            if warm > 0 {
+                warm -= 1;
+            } else {
+                change(dsp, index);
+            }
+            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                (*l, *r) = dsp.process_stereo(*l, *r);
+            }
+        })
+    }
+
+    /// Up and back down across `min..max`, a value per block, over `blocks`.
+    fn sweep(min: f32, max: f32, block: usize, blocks: usize) -> f32 {
+        let phase = block as f32 / blocks as f32 * 2.0;
+        let x = if phase < 1.0 { phase } else { 2.0 - phase };
+        min + (max - min) * x
+    }
+
+    /// Power off at block 0, then flipped every 30 blocks.
+    fn toggle_power(dsp: &mut Dsp, block: usize) {
+        if block.is_multiple_of(30) {
+            let on = (block / 30) % 2 == 1;
+            assert!(dsp.apply_wire_param(ipc::POWER_INDEX, if on { 1.0 } else { 0.0 }));
+        }
+    }
+
+    /// The measure itself sees a gain that steps once per block.
+    #[test]
+    fn the_edge_kink_measure_catches_a_stepped_gain() {
+        let stepped = edge_kink(100, |index, left, right| {
+            let gain = 0.25 + index as f32 * 0.01;
+            left.iter_mut()
+                .chain(right.iter_mut())
+                .for_each(|s| *s *= gain);
+        });
+        assert!(stepped > 20.0, "{stepped}");
+    }
+
+    /// Defaults, compressing the test tone a few dB.
+    fn compressing(mode: Mode) -> Dsp {
+        let mut params = default_params();
+        params.mode = mode;
+        params.threshold_db = -24.0;
+        for band in &mut params.bands {
+            band.threshold_db = -30.0;
+        }
+        let mut dsp = Dsp::new(RATE);
+        dsp.set_params(params);
+        dsp
+    }
+
+    #[test]
+    fn dragging_a_threshold_does_not_zipper() {
+        let mut dsp = compressing(Mode::Single);
+        let single = drag(&mut dsp, 375, |dsp, block| {
+            let db = sweep(MIN_THRESHOLD_DB, MAX_THRESHOLD_DB, block, 375);
+            assert!(dsp.apply_wire_param(ipc::THRESHOLD_INDEX, db));
+        });
+        assert!(single < 4.0, "threshold drag jump x {single}");
+
+        let mut dsp = compressing(Mode::Multi);
+        let band = drag(&mut dsp, 375, |dsp, block| {
+            let db = sweep(MIN_THRESHOLD_DB, MAX_THRESHOLD_DB, block, 375);
+            assert!(dsp.apply_ui_param("band1ThresholdDb", db));
+        });
+        assert!(band < 4.0, "band threshold drag jump x {band}");
+    }
+
+    /// A glided threshold still lands where it was sent, and the floor that
+    /// lets a quiet signal skip the curve follows it there.
+    #[test]
+    fn a_glided_threshold_lands_on_its_value() {
+        let mut dsp = Dsp::new(RATE);
+        let mut params = default_params();
+        params.knee_db = 0.0;
+        params.ratio = 4.0;
+        params.attack_ms = 1.0;
+        dsp.set_params(params);
+        assert!(dsp.apply_wire_param(ipc::THRESHOLD_INDEX, -20.0));
+        let (out, _) = feed_constant(&mut dsp, db_to_linear(-8.0), 24_000);
+        assert!(
+            (linear_to_db(out) + 17.0).abs() < 0.05,
+            "{}",
+            linear_to_db(out)
+        );
+        assert!(dsp.apply_wire_param(ipc::THRESHOLD_INDEX, MAX_THRESHOLD_DB));
+        let (out, _) = feed_constant(&mut dsp, db_to_linear(-8.0), 96_000);
+        assert!((out - db_to_linear(-8.0)).abs() < 1.0e-6, "{out}");
+    }
+
+    #[test]
+    fn toggling_power_crossfades_without_a_step() {
+        for mode in [Mode::Single, Mode::Multi] {
+            let mut dsp = compressing(mode);
+            let jump = drag(&mut dsp, 300, toggle_power);
+            assert!(jump < 4.0, "{mode:?} power toggle jump x {jump}");
+        }
+        // Settled off is the input exactly.
+        let mut dsp = compressing(Mode::Single);
+        assert!(dsp.apply_wire_param(ipc::POWER_INDEX, 0.0));
+        feed_constant(&mut dsp, 0.5, 4_800);
+        assert_eq!(dsp.process_stereo(0.9, -0.5), (0.9, -0.5));
+    }
+
+    #[test]
+    fn switching_mode_crossfades_without_a_step() {
+        let mut dsp = compressing(Mode::Single);
+        let jump = drag(&mut dsp, 300, |dsp, block| {
+            if block.is_multiple_of(30) {
+                let multi = (block / 30) % 2 == 0;
+                assert!(dsp.apply_wire_param(ipc::MODE_INDEX, if multi { 1.0 } else { 0.0 }));
+            }
+        });
+        assert!(jump < 4.0, "mode switch jump x {jump}");
+    }
+
+    /// Flipping back before a mode fade has finished carries on from where
+    /// it is: nothing restarts from rest, nothing goes non-finite.
+    #[test]
+    fn a_mode_flip_mid_fade_reverses_cleanly() {
+        let mut dsp = compressing(Mode::Single);
+        feed_constant(&mut dsp, 0.5, 4_800);
+        let before = dsp.gain_reduction_db();
+        assert!(before > 1.0);
+        assert!(dsp.apply_wire_param(ipc::MODE_INDEX, 1.0));
+        feed_constant(&mut dsp, 0.5, 48);
+        assert!(dsp.apply_wire_param(ipc::MODE_INDEX, 0.0));
+        assert!(
+            dsp.gain_reduction_db() > before * 0.5,
+            "single kept running through the fade"
+        );
+        let (l, r) = feed_constant(&mut dsp, 0.5, 4_800);
+        assert!(l.is_finite() && r.is_finite());
     }
 }
