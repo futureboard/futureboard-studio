@@ -17,6 +17,7 @@ const DEFAULT_SESSION: &str = "/data/livestage/show.json";
 pub const LOG: &str = "/var/log/livestage.log";
 const ZONEINFO: &str = "/usr/share/zoneinfo";
 
+#[derive(Clone)]
 pub struct System {
     root: PathBuf,
     live: bool,

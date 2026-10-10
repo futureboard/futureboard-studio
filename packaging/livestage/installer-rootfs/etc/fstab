@@ -1,0 +1,7 @@
+# The LiveStage installer: its system is read-only, on the USB stick; what
+# it writes goes to /run. It mounts nothing of the disk it installs onto
+# but for a moment (the settings), by that disk's own partition numbers.
+LABEL=lsinstall	/		ext4	ro,noatime			0 1
+tmpfs		/tmp		tmpfs	nosuid,nodev,mode=1777		0 0
+tmpfs		/var/tmp	tmpfs	nosuid,nodev,mode=1777		0 0
+tmpfs		/var/log	tmpfs	nosuid,nodev,mode=0755		0 0

@@ -11,6 +11,6 @@ RUN apk add --no-cache \
         build-base pkgconf linux-headers rust cargo alsa-lib-dev \
         mkinitfs efi-mkuki systemd-efistub binutils \
         dosfstools mtools e2fsprogs e2fsprogs-extra exfatprogs sfdisk \
-        coreutils findutils tar xz
+        coreutils findutils tar xz zstd kmod
 
 WORKDIR /work

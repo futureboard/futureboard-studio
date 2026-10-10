@@ -26,6 +26,14 @@ name = "livestage-setup"
 path = "src/console/main.rs"
 required-features = ["appliance"]
 
+# The installer USB stick's text UI (tty1): puts the appliance image onto a
+# computer's disk, with the setup's answers if given there. Built for the
+# installer image only (packaging/livestage, -Installer).
+[[bin]]
+name = "livestage-installer"
+path = "src/installer/main.rs"
+required-features = ["appliance"]
+
 [features]
 default = ["gui", "external-plugins"]
 gui = [

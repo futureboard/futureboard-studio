@@ -15,12 +15,16 @@
 //! The system is read-only: what they make goes on /run, where /etc links to.
 //! Where recordings go (`RECORD_STORAGE`, the drives) is [`storage`]'s.
 
+mod blocks;
 mod config;
+mod drives;
 mod storage;
 #[path = "../storage_api.rs"]
 mod storage_api;
 mod system;
 mod ui;
+mod widgets;
+mod wizard;
 
 use std::path::PathBuf;
 use std::time::Duration;

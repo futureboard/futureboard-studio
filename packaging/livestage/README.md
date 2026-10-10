@@ -24,13 +24,90 @@ with full LTO and takes a while; later ones reuse Docker volumes
 (`livestage-cargo-*`, `livestage-target-*`).
 
 Options: `-DataMB` / `--data-mb` (the data partition in the image, 512 MiB),
-`-AlpineVersion` / `--alpine` (3.24), `-SkipWebUI` / `--skip-webui`.
+`-AlpineVersion` / `--alpine` (3.24), `-SkipWebUI` / `--skip-webui`,
+`-Kernel FILE` / `--kernel FILE` (below).
+
+### A newer kernel
+
+The image uses Alpine's `linux-lts` unless given a kernel built from
+kernel.org's sources by `kernel/build-kernel.sh`. On any x86-64 Linux with
+a kernel toolchain (gcc, make, bc, flex, bison, perl, openssl, libelf, cpio,
+xz, zstd, curl):
+
+```bash
+packaging/livestage/kernel/build-kernel.sh 7.2.9 ~/livestage-kernel
+```
+
+It checks the download against kernel.org's sha256sums, configures it as
+Alpine's linux-lts (`kernel/config-alpine-*`) with LiveStage's changes
+(`kernel/livestage.config`: full preemption, no debug info, a per-build
+module signing key), and packs `linux-7.2.9-livestage.tar.zst`. Then:
+
+```bash
+pwsh packaging/livestage/build.ps1 -Kernel out/livestage-kernel/linux-7.2.9-livestage.tar.zst
+```
+
+For a new Alpine release, refresh `config-alpine-*` from its `linux-lts`
+package (`boot/config-*`).
 
 ## Install
 
 Write the `.img` to a USB stick, SSD or SD card: balenaEtcher, Rufus (DD
 mode), or `dd if=livestage-….img of=/dev/sdX bs=4M conv=fsync`. Boot it with
 UEFI (Secure Boot off: the image is not signed).
+
+## Install onto a computer
+
+To put LiveStage onto a computer's own disk (an SSD inside it, say) rather
+than run it from a stick, build the installer too:
+
+```bash
+pwsh packaging/livestage/build.ps1 -Installer      # Windows
+packaging/livestage/build.sh --installer           # Linux, macOS
+```
+
+Out comes `out/livestage-alpine/livestage-installer-alpine3.24-x86_64.img`
+as well. Write it to a USB stick (as above) and boot the computer from it
+with UEFI. Its first screen, `livestage-installer`, is a text UI like the
+setup's:
+
+1. **Disk**: every disk of the computer, with its size, how it is attached
+   (NVMe, SATA, USB, SD/eMMC, virtio), its model and what is on it now
+   (Windows, Linux, LiveStage, empty). The installer's own stick, a
+   write-protected disk, a disk with a mounted partition and one too small
+   (the image plus 1 GiB) are listed with the reason and cannot be chosen.
+2. **Settings**: *Set up now* asks the first setup's questions (name,
+   network with a Wi-Fi scan, audio interface from this computer's sound
+   cards, web UI, time zone, console password) and writes the answers onto
+   the new disk, so its first boot goes straight to LiveStage; *On first
+   boot* leaves them to the setup on the new system's screen.
+3. **Confirm**: the disk, everything on it that is erased, the settings;
+   type the disk's name (`nvme0n1`) to go on. Esc goes back a step anywhere
+   until here.
+4. **Install**: the image is written to the whole disk (MB/s and time left
+   shown), read back past the cache and checked against its sha256, then
+   the settings go onto the new settings partition (`lssys`, found by its
+   partition number on that disk), the console password into the new
+   system, and a UEFI boot entry "LiveStage" is added with `efibootmgr`
+   (when that fails the disk still boots on most firmware; the screen says
+   so). The partition table goes on last: a disk left half-written has
+   none rather than a broken system. On an error the screen shows it as it
+   came and what is left on the disk.
+5. **Done**: remove the USB stick, then Reboot (or Power off, or a Shell).
+   The first boot gives the data partition the rest of the disk, as it does
+   for an image written by hand.
+
+A shell is on Alt+F2 (root, no password) and behind **Shell**. From a
+shell, `livestage-installer --list` lists the disks, and
+`livestage-installer --disk /dev/sdX --yes [--setup-conf FILE]` installs
+with no questions (a `setup.conf` as the setup writes it), printing its
+progress. The installer cannot run LiveStage itself: to try LiveStage
+without installing it, write the appliance image to a stick instead.
+
+The installer's partitions are `LSINSTALL` (boot) and `lsinstall` (its
+read-only system, with the image as
+`/usr/share/livestage/installer/livestage.img.zst` and its size and sha256
+in `payload.conf`), so they never mix with an installed LiveStage's.
 
 ## Try it in a virtual machine
 
@@ -47,6 +124,12 @@ the data partition. `-UsbDiskGB 8` plugs in an empty USB drive of that size
 (a file in the work folder), to try Storage with. The guest gets a sound card that plays nowhere
 (`-HostAudio` sends it to the host's speakers). Headless, the QEMU monitor
 listens on `127.0.0.1:4445` (`system_powerdown` presses the power button).
+
+The installer: `run-qemu.ps1 -Installer -DiskGB 8` boots the installer
+image as a USB stick with an empty 8 GB disk to install onto (`target.img`
+in the work folder; `-TargetBus nvme` for an NVMe disk instead of virtio).
+Afterwards `run-qemu.ps1 -BootTarget` boots that disk alone, with the same
+firmware settings, so the boot entry the installer added is used.
 
 ## First setup
 
