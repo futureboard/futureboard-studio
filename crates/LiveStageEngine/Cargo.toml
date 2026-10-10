@@ -25,6 +25,10 @@ crossbeam-channel.workspace = true
 parking_lot.workspace = true
 # Default features only (WAV + FLAC, pure Rust): no MP3, no native encoder.
 sphere-encoder = { path = "../SphereEncoder" }
+# Playback (virtual soundcheck) decodes and seeks the WAV/FLAC takes the
+# recorder writes. Pure Rust; the workspace's feature list (also used by the
+# Studio engine) is taken as is.
+symphonia.workspace = true
 
 builtin-dsp-core.workspace = true
 equz8.workspace = true
@@ -46,6 +50,10 @@ rodharerist.workspace = true
 
 sphere-plugin-host = { workspace = true, optional = true }
 sphere_directaudioengine = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# pthread_setschedparam: the audio threads ask for real-time priority.
+libc.workspace = true
 
 [lints]
 workspace = true

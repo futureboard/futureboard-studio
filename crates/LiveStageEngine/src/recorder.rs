@@ -41,8 +41,9 @@ pub struct RecordingSummary {
     pub errors: Vec<String>,
 }
 
-/// A file name that is safe on every platform.
-fn file_stem(name: &str) -> String {
+/// A file name that is safe on every platform. Playback matches a take's
+/// files to channels by it.
+pub(crate) fn file_stem(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| match c {

@@ -1522,6 +1522,61 @@ pub struct Dsp {
     in_gain: smooth::Smoothed,
     out_gain: smooth::Smoothed,
     meters: Meters,
+    /// Dry (0) to the running rig (1). Power fades rather than cuts; once
+    /// off and settled nothing runs.
+    power: PowerFade,
+    /// Nothing has played since construction or the last reset: a power
+    /// edit now is a state being applied and lands without a fade.
+    fresh: bool,
+}
+
+/// Power's 0–1 crossfade. It walks linearly toward its end and is heard
+/// through a smoothstep, so the fade both leaves and lands without a kink.
+#[derive(Debug, Clone, Copy)]
+struct PowerFade {
+    position: f32,
+    target: f32,
+    step: f32,
+}
+
+impl PowerFade {
+    fn new(on: bool, sample_rate: f32) -> Self {
+        let at = if on { 1.0 } else { 0.0 };
+        Self {
+            position: at,
+            target: at,
+            step: Self::step_for(sample_rate),
+        }
+    }
+
+    fn step_for(sample_rate: f32) -> f32 {
+        1.0 / (sample_rate * POWER_FADE_SECONDS).max(1.0)
+    }
+
+    fn set(&mut self, on: bool) {
+        self.target = if on { 1.0 } else { 0.0 };
+    }
+
+    fn settle(&mut self) {
+        self.position = self.target;
+    }
+
+    /// Off, and staying off.
+    fn is_off(&self) -> bool {
+        self.position == 0.0 && self.target == 0.0
+    }
+
+    /// One sample's step; the weight of the "on" side.
+    #[inline]
+    fn next(&mut self) -> f32 {
+        if self.position < self.target {
+            self.position = (self.position + self.step).min(self.target);
+        } else if self.position > self.target {
+            self.position = (self.position - self.step).max(self.target);
+        }
+        let x = self.position;
+        x * x * (3.0 - 2.0 * x)
+    }
 }
 
 /// Input/output telemetry for the editor. Written from the audio thread with
@@ -1587,6 +1642,9 @@ const TRIM_SMOOTH_SECONDS: f32 = 0.010;
 /// and the IR convolution engine.
 const CAB_ENGINE_FADE_SECONDS: f32 = 0.020;
 
+/// Crossfade time of the global Power switch.
+const POWER_FADE_SECONDS: f32 = 0.010;
+
 impl Dsp {
     pub fn new(sample_rate: f32) -> Self {
         let sr = sample_rate.max(1.0);
@@ -1614,8 +1672,12 @@ impl Dsp {
             in_gain: smooth::Smoothed::new(sr, TRIM_SMOOTH_SECONDS, 1.0),
             out_gain: smooth::Smoothed::new(sr, TRIM_SMOOTH_SECONDS, 1.0),
             meters: Meters::new(sr),
+            power: PowerFade::new(true, sr),
+            fresh: true,
         };
         dsp.apply_params();
+        dsp.power.set(dsp.params.power);
+        dsp.power.settle();
         dsp
     }
 
@@ -1650,9 +1712,18 @@ impl Dsp {
         self.meters.out_clip = false;
     }
 
-    /// Replace the whole parameter set (clamps to legal ranges) and recompute.
+    /// Replace the whole parameter set (clamps to legal ranges) and recompute
+    /// — a state being loaded, so Power lands as saved, without a fade.
     pub fn set_params(&mut self, params: Params) {
-        self.params = Params {
+        self.update_params(params);
+        self.power.settle();
+    }
+
+    /// Takes `params` (clamped to legal ranges) and reconfigures only the
+    /// stages whose settings moved. Every edit funnels through here, so a
+    /// knob costs its own stage's recompute, not the whole rig's.
+    fn update_params(&mut self, params: Params) {
+        let next = Params {
             power: params.power,
             input_trim_db: clamp(params.input_trim_db, -24.0, 24.0),
             output_trim_db: clamp(params.output_trim_db, -24.0, 24.0),
@@ -1720,7 +1791,24 @@ impl Dsp {
             nam_slim_size: clamp(params.nam_slim_size, 0.0, 100.0),
             stage_b: params.stage_b.clamped(),
         };
-        self.apply_params();
+        let old = std::mem::replace(&mut self.params, next);
+        self.configure_stages(Some(&old));
+        self.apply_power();
+    }
+
+    /// Points the Power fade at `params.power`. Waking from a settled off
+    /// empties the delay and reverb lines, so what was playing when it went
+    /// off does not come back as a tail.
+    fn apply_power(&mut self) {
+        if self.params.power && self.power.is_off() && !self.fresh {
+            self.delay.reset();
+            self.delay_b.reset();
+            self.reverb.reset();
+        }
+        self.power.set(self.params.power);
+        if self.fresh {
+            self.power.settle();
+        }
     }
 
     /// Route a single editor parameter (`data.ts` id) to the matching field, then
@@ -1739,7 +1827,7 @@ impl Dsp {
         if !apply_to_params(&mut p, id, value) {
             return false;
         }
-        self.set_params(p);
+        self.update_params(p);
         true
     }
 
@@ -1824,101 +1912,211 @@ impl Dsp {
             }
             _ => return false,
         }
-        self.params = p;
-        self.apply_params();
+        let old = std::mem::replace(&mut self.params, p);
+        self.configure_stages(Some(&old));
         true
     }
 
+    /// Push clamped params into every stage.
     fn apply_params(&mut self) {
+        self.configure_stages(None);
+    }
+
+    /// Push clamped params into each stage whose settings differ from `old`
+    /// (every stage when there is no `old`). A stage's `configure` can design
+    /// filters and resample tables; one knob need not pay for all of them.
+    fn configure_stages(&mut self, old: Option<&Params>) {
         let p = &self.params;
-        self.in_gain.set_target(db_to_linear(p.input_trim_db));
-        self.out_gain.set_target(db_to_linear(p.output_trim_db));
-        self.gate.set_threshold_db(p.gate_thresh_db);
-        self.comp_stage.configure(
-            p.comp_thresh_db,
-            p.comp_ratio,
-            p.comp_attack_ms,
-            p.comp_release_ms,
-            p.comp_makeup_db,
-        );
-        self.eq_stage.configure(
-            p.eq_model,
-            p.eq_low_gain_db,
-            p.eq_mid1_freq_hz,
-            p.eq_mid1_gain_db,
-            p.eq_mid2_freq_hz,
-            p.eq_mid2_gain_db,
-            p.eq_high_gain_db,
-        );
-        self.drive
-            .configure(p.drive_model, p.drive_gain, p.drive_tone, p.drive_level);
-        self.amp_stage.set_engine(p.tone_engine);
-        self.amp_stage.configure_classic(
-            p.amp_model,
-            p.amp_gain,
-            p.amp_bass,
-            p.amp_middle,
-            p.amp_treble,
-            p.amp_presence,
-            p.amp_master,
-        );
-        self.amp_stage.configure_nam(
-            p.nam_input_trim_db,
-            p.nam_output_trim_db,
-            p.nam_mix,
-            p.nam_loudness_norm,
-            p.nam_slim_size / 100.0,
-        );
-        self.mod_stage
-            .configure(p.mod_model, p.chorus_rate, p.chorus_depth, p.chorus_mix);
-        self.wah
-            .configure(p.wah_model, p.wah_pos, p.wah_res, p.wah_sens);
-        self.delay.configure(
-            p.delay_model,
-            p.delay_time_ms,
-            p.delay_fb,
-            p.delay_mix,
-            p.delay_tone,
-        );
-        self.reverb.configure(
-            p.reverb_model,
-            p.reverb_decay_s,
-            p.reverb_mix,
-            p.reverb_shimmer,
-        );
-        self.cab
-            .configure(p.cab_model, p.mic_model, p.cab_mic, p.cab_dist);
+        // Whether any of the named fields moved since `old`.
+        macro_rules! moved {
+            ($($($field:ident).+),+ $(,)?) => {
+                old.is_none_or(|o| false $(|| o.$($field).+ != p.$($field).+)+)
+            };
+        }
+        if moved!(input_trim_db) {
+            self.in_gain.set_target(db_to_linear(p.input_trim_db));
+        }
+        if moved!(output_trim_db) {
+            self.out_gain.set_target(db_to_linear(p.output_trim_db));
+        }
+        if moved!(gate_thresh_db) {
+            self.gate.set_threshold_db(p.gate_thresh_db);
+        }
+        if moved!(
+            comp_thresh_db,
+            comp_ratio,
+            comp_attack_ms,
+            comp_release_ms,
+            comp_makeup_db
+        ) {
+            self.comp_stage.configure(
+                p.comp_thresh_db,
+                p.comp_ratio,
+                p.comp_attack_ms,
+                p.comp_release_ms,
+                p.comp_makeup_db,
+            );
+        }
+        if moved!(
+            eq_model,
+            eq_low_gain_db,
+            eq_mid1_freq_hz,
+            eq_mid1_gain_db,
+            eq_mid2_freq_hz,
+            eq_mid2_gain_db,
+            eq_high_gain_db
+        ) {
+            self.eq_stage.configure(
+                p.eq_model,
+                p.eq_low_gain_db,
+                p.eq_mid1_freq_hz,
+                p.eq_mid1_gain_db,
+                p.eq_mid2_freq_hz,
+                p.eq_mid2_gain_db,
+                p.eq_high_gain_db,
+            );
+        }
+        if moved!(drive_model, drive_gain, drive_tone, drive_level) {
+            self.drive
+                .configure(p.drive_model, p.drive_gain, p.drive_tone, p.drive_level);
+        }
+        if moved!(tone_engine) {
+            self.amp_stage.set_engine(p.tone_engine);
+        }
+        if moved!(
+            amp_model,
+            amp_gain,
+            amp_bass,
+            amp_middle,
+            amp_treble,
+            amp_presence,
+            amp_master
+        ) {
+            self.amp_stage.configure_classic(
+                p.amp_model,
+                p.amp_gain,
+                p.amp_bass,
+                p.amp_middle,
+                p.amp_treble,
+                p.amp_presence,
+                p.amp_master,
+            );
+        }
+        if moved!(
+            nam_input_trim_db,
+            nam_output_trim_db,
+            nam_mix,
+            nam_loudness_norm,
+            nam_slim_size
+        ) {
+            self.amp_stage.configure_nam(
+                p.nam_input_trim_db,
+                p.nam_output_trim_db,
+                p.nam_mix,
+                p.nam_loudness_norm,
+                p.nam_slim_size / 100.0,
+            );
+        }
+        if moved!(mod_model, chorus_rate, chorus_depth, chorus_mix) {
+            self.mod_stage
+                .configure(p.mod_model, p.chorus_rate, p.chorus_depth, p.chorus_mix);
+        }
+        if moved!(wah_model, wah_pos, wah_res, wah_sens) {
+            self.wah
+                .configure(p.wah_model, p.wah_pos, p.wah_res, p.wah_sens);
+        }
+        if moved!(delay_model, delay_time_ms, delay_fb, delay_mix, delay_tone) {
+            self.delay.configure(
+                p.delay_model,
+                p.delay_time_ms,
+                p.delay_fb,
+                p.delay_mix,
+                p.delay_tone,
+            );
+        }
+        if moved!(reverb_model, reverb_decay_s, reverb_mix, reverb_shimmer) {
+            self.reverb.configure(
+                p.reverb_model,
+                p.reverb_decay_s,
+                p.reverb_mix,
+                p.reverb_shimmer,
+            );
+        }
+        if moved!(cab_model, mic_model, cab_mic, cab_dist) {
+            self.cab
+                .configure(p.cab_model, p.mic_model, p.cab_mic, p.cab_dist);
+        }
 
         // Second instances. Same `configure` calls against the same stage
         // types — the only difference is which params block feeds them.
         let b = &p.stage_b;
-        self.comp_b.configure(
-            b.comp_thresh_db,
-            b.comp_ratio,
-            b.comp_attack_ms,
-            b.comp_release_ms,
-            b.comp_makeup_db,
-        );
-        self.drive_b
-            .configure(b.drive_model, b.drive_gain, b.drive_tone, b.drive_level);
-        self.eq_b.configure(
-            b.eq_model,
-            b.eq_low_gain_db,
-            b.eq_mid1_freq_hz,
-            b.eq_mid1_gain_db,
-            b.eq_mid2_freq_hz,
-            b.eq_mid2_gain_db,
-            b.eq_high_gain_db,
-        );
-        self.mod_b
-            .configure(b.mod_model, b.chorus_rate, b.chorus_depth, b.chorus_mix);
-        self.delay_b.configure(
-            b.delay_model,
-            b.delay_time_ms,
-            b.delay_fb,
-            b.delay_mix,
-            b.delay_tone,
-        );
+        if moved!(
+            stage_b.comp_thresh_db,
+            stage_b.comp_ratio,
+            stage_b.comp_attack_ms,
+            stage_b.comp_release_ms,
+            stage_b.comp_makeup_db
+        ) {
+            self.comp_b.configure(
+                b.comp_thresh_db,
+                b.comp_ratio,
+                b.comp_attack_ms,
+                b.comp_release_ms,
+                b.comp_makeup_db,
+            );
+        }
+        if moved!(
+            stage_b.drive_model,
+            stage_b.drive_gain,
+            stage_b.drive_tone,
+            stage_b.drive_level
+        ) {
+            self.drive_b
+                .configure(b.drive_model, b.drive_gain, b.drive_tone, b.drive_level);
+        }
+        if moved!(
+            stage_b.eq_model,
+            stage_b.eq_low_gain_db,
+            stage_b.eq_mid1_freq_hz,
+            stage_b.eq_mid1_gain_db,
+            stage_b.eq_mid2_freq_hz,
+            stage_b.eq_mid2_gain_db,
+            stage_b.eq_high_gain_db
+        ) {
+            self.eq_b.configure(
+                b.eq_model,
+                b.eq_low_gain_db,
+                b.eq_mid1_freq_hz,
+                b.eq_mid1_gain_db,
+                b.eq_mid2_freq_hz,
+                b.eq_mid2_gain_db,
+                b.eq_high_gain_db,
+            );
+        }
+        if moved!(
+            stage_b.mod_model,
+            stage_b.chorus_rate,
+            stage_b.chorus_depth,
+            stage_b.chorus_mix
+        ) {
+            self.mod_b
+                .configure(b.mod_model, b.chorus_rate, b.chorus_depth, b.chorus_mix);
+        }
+        if moved!(
+            stage_b.delay_model,
+            stage_b.delay_time_ms,
+            stage_b.delay_fb,
+            stage_b.delay_mix,
+            stage_b.delay_tone
+        ) {
+            self.delay_b.configure(
+                b.delay_model,
+                b.delay_time_ms,
+                b.delay_fb,
+                b.delay_mix,
+                b.delay_tone,
+            );
+        }
     }
 
     /// Replace the Helix path order (control thread).
@@ -2365,6 +2563,8 @@ impl StereoEffect for Dsp {
         self.meters.reset();
         self.in_gain.snap();
         self.out_gain.snap();
+        self.power.settle();
+        self.fresh = true;
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
@@ -2390,14 +2590,32 @@ impl StereoEffect for Dsp {
         self.delay_b.set_sample_rate(sr);
         self.cab_ir_step = 1.0 / (sr * CAB_ENGINE_FADE_SECONDS).max(1.0);
         self.meters.rms_coeff = time_constant(sr, 0.300);
+        self.power.step = PowerFade::step_for(sr);
+        self.power.settle();
         self.apply_params();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
-        if !self.params.power {
+        if self.power.is_off() {
             return (left, right);
         }
+        self.fresh = false;
+        let on = self.power.next();
+        if on >= 1.0 {
+            return self.run(left, right);
+        }
+        // What enters the rig fades with the switch too: the delay and reverb
+        // woken empty would otherwise take the input starting mid-wave and
+        // play that step back a repeat later.
+        let (l, r) = self.run(left * on, right * on);
+        (left + (l - left) * on, right + (r - right) * on)
+    }
+}
 
+impl Dsp {
+    /// One frame through the rig, power aside.
+    #[inline]
+    fn run(&mut self, left: f32, right: f32) -> (f32, f32) {
         // Input trim first: everything downstream — including a NAM capture,
         // whose gain and voicing depend on the level it is fed — sees the
         // trimmed signal, so that is also what the input meter must report.
@@ -4242,5 +4460,96 @@ mod tests {
         dsp.clear_clip();
         assert!(!dsp.meter_frame().in_clip);
         assert!(!dsp.meter_frame().out_clip);
+    }
+
+    /// Two low tones: smooth, so a step anywhere shows as a kink.
+    fn two_tone(n: usize) -> (f32, f32) {
+        let t = n as f32 / 48_000.0;
+        let x = (std::f32::consts::TAU * 110.0 * t).sin() * 0.3
+            + (std::f32::consts::TAU * 330.0 * t).sin() * 0.1;
+        (x, x * 0.8)
+    }
+
+    /// The biggest second difference of the output over `frames` frames
+    /// after a second of settling, with `edit` applied before each frame.
+    fn worst_kink(dsp: &mut Dsp, frames: usize, mut edit: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let settle = 48_000;
+        let mut history = [(0.0f32, 0.0f32); 2];
+        let mut worst = 0.0f32;
+        for n in 0..settle + frames {
+            if n % 128 == 0 {
+                dsp.begin_block();
+            }
+            if n >= settle {
+                edit(dsp, n - settle);
+            }
+            let (l, r) = two_tone(n);
+            let out = dsp.process_stereo(l, r);
+            if n >= settle {
+                let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+                let kink_l = d2(history[0].0, history[1].0, out.0);
+                let kink_r = d2(history[0].1, history[1].1, out.1);
+                worst = worst.max(kink_l).max(kink_r);
+            }
+            history = [history[1], out];
+        }
+        worst
+    }
+
+    /// Power crossfades: flipping it is no rougher than the rig left alone
+    /// (it used to cut between the dry input and the amp in one sample).
+    #[test]
+    fn switching_power_does_not_step() {
+        let frames = 96_000;
+        let still = worst_kink(&mut Dsp::new(48_000.0), frames, |_, _| {});
+        let switched = worst_kink(&mut Dsp::new(48_000.0), frames, |dsp, n| {
+            if n % 12_000 == 0 {
+                let on = (n / 12_000) % 2 == 1;
+                assert!(dsp.apply_ui_param("power", if on { 1.0 } else { 0.0 }));
+            }
+        });
+        assert!(switched < still * 2.0, "{switched} against {still}");
+    }
+
+    /// A state applied before anything plays lands as given, with no fade.
+    #[test]
+    fn power_applied_before_playing_does_not_fade() {
+        let mut dsp = Dsp::new(48_000.0);
+        assert!(dsp.apply_ui_param("power", 0.0));
+        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
+    }
+
+    /// An edit reconfigures only the stage it touches. Whatever the order of
+    /// edits, the rig ends up configured exactly as one built straight from
+    /// the final settings.
+    #[test]
+    fn edits_configure_the_same_rig_as_a_full_apply() {
+        let edits: &[(&str, f32)] = &[
+            ("amp_treble", 8.5),
+            ("cab_mic", 70.0),
+            ("eq_low_gain", -6.0),
+            ("wah_sens", 7.0),
+            ("delay_fb", 55.0),
+            ("reverb_decay", 4.0),
+            ("comp_thresh", -30.0),
+            ("drive_gain", 9.0),
+            ("chorus_mix", 60.0),
+            ("amp_treble", 3.0),
+            ("input_trim", 4.0),
+            ("gate_thresh", -50.0),
+            ("cab_mic_type", 2.0),
+        ];
+        let mut edited = Dsp::new(48_000.0);
+        for (id, value) in edits {
+            assert!(edited.apply_ui_param(id, *value), "{id}");
+        }
+        let mut full = Dsp::new(48_000.0);
+        full.params = edited.params.clone();
+        full.apply_params();
+        edited.reset();
+        full.reset();
+        let a = render(&mut edited, 9_600);
+        let b = render(&mut full, 9_600);
+        assert_eq!(a, b);
     }
 }

@@ -13,7 +13,8 @@
 //! interface ([`device`]), compiles the session into a realtime [`graph`],
 //! runs the built-in effects in process ([`builtin_fx`]) and third-party ones
 //! in Futureboard's plug-in host (`external`, behind the `external-plugins`
-//! feature), and records ([`recorder`]).
+//! feature), records ([`recorder`]) and plays a recorded take back into the
+//! channels for virtual soundcheck ([`playback`]).
 
 pub mod builtin_fx;
 pub mod device;
@@ -21,10 +22,16 @@ pub mod engine;
 #[cfg(feature = "external-plugins")]
 pub mod external;
 pub mod graph;
+pub mod history;
+pub mod playback;
+pub mod processing;
 pub mod recorder;
 pub mod ring;
+pub mod scene;
 pub mod session;
 pub mod telemetry;
 
 pub use engine::{Command, EngineStatus, InsertState, LiveEngine, StripLevels};
+pub use history::History;
+pub use scene::RecallReport;
 pub use session::*;

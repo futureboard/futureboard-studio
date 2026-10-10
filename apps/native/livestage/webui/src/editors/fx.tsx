@@ -603,12 +603,12 @@ function palette(bypassed: boolean): Palette {
   const c = colors()
   if (!tokens) {
     const s = getComputedStyle(document.documentElement)
-    const v = (name: string, fallback: string) => s.getPropertyValue(name).trim() || fallback
+    const v = (name: string) => s.getPropertyValue(name).trim()
     tokens = {
-      success: v('--success', '#43d18a'),
-      warning: v('--warning', '#e8b75c'),
-      blue: v('--state-mute', '#6f9bff'),
-      window: v('--surface-window', '#16181f'),
+      success: v('--success'),
+      warning: v('--warning'),
+      blue: v('--state-mute'),
+      window: v('--surface-window'),
     }
   }
   return {

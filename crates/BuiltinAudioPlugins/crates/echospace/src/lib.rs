@@ -56,6 +56,9 @@ const FADE_MS: f32 = 45.0;
 /// Time constant of every smoothed control.
 const SMOOTH_MS: f32 = 20.0;
 
+/// How long Power and Mode take to crossfade.
+const SWITCH_MS: f32 = 10.0;
+
 /// Loop gain while frozen: just under unity, which holds a phrase for
 /// minutes without ever building.
 const FREEZE_GAIN: f32 = 0.9999;
@@ -782,6 +785,97 @@ impl Wobble {
     }
 }
 
+/// A switch's 0–1 crossfade. It walks linearly toward its end and is heard
+/// through a smoothstep, so a fade both leaves and lands without a kink.
+#[derive(Debug, Clone, Copy)]
+struct Fade {
+    position: f32,
+    target: f32,
+    step: f32,
+}
+
+impl Fade {
+    fn new(on: bool, sample_rate: f32) -> Self {
+        let at = if on { 1.0 } else { 0.0 };
+        Self {
+            position: at,
+            target: at,
+            step: 1.0 / (SWITCH_MS * 0.001 * sample_rate).max(1.0),
+        }
+    }
+
+    fn set(&mut self, on: bool) {
+        self.target = if on { 1.0 } else { 0.0 };
+    }
+
+    /// Starts a fresh fade from 0 to 1.
+    fn restart(&mut self) {
+        self.position = 0.0;
+        self.target = 1.0;
+    }
+
+    fn settle(&mut self) {
+        self.position = self.target;
+    }
+
+    fn is_settled(&self) -> bool {
+        self.position == self.target
+    }
+
+    /// Off, and staying off.
+    fn is_off(&self) -> bool {
+        self.position == 0.0 && self.target == 0.0
+    }
+
+    /// One sample's step; the weight of the "on" side.
+    #[inline]
+    fn next(&mut self) -> f32 {
+        if self.position < self.target {
+            self.position = (self.position + self.step).min(self.target);
+        } else if self.position > self.target {
+            self.position = (self.position - self.step).max(self.target);
+        }
+        let x = self.position;
+        x * x * (3.0 - 2.0 * x)
+    }
+}
+
+/// What each line is written with and what the wet pair reads, for `mode`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn route(
+    mode: DelayMode,
+    left: f32,
+    right: f32,
+    input_gain: f32,
+    taps: [f32; 2],
+    fb: f32,
+    cross: f32,
+    norm: f32,
+) -> ([f32; 2], [f32; 2]) {
+    let mono_in = (left + right) * 0.5;
+    match mode {
+        DelayMode::Stereo => (
+            [
+                left * input_gain + (taps[0] + cross * taps[1]) * norm,
+                right * input_gain + (taps[1] + cross * taps[0]) * norm,
+            ],
+            taps,
+        ),
+        DelayMode::PingPong => (
+            [
+                mono_in * input_gain + (taps[1] + cross * taps[0]) * norm,
+                (taps[0] + cross * taps[1]) * norm,
+            ],
+            taps,
+        ),
+        DelayMode::Mono => (
+            [mono_in * input_gain + taps[0] * fb, 0.0],
+            [taps[0], taps[0]],
+        ),
+    }
+}
+
 /// Tape-style drive with unit slope at rest: quiet repeats pass untouched,
 /// loud ones round off. Its slope never exceeds one, so it can only take
 /// gain out of the loop.
@@ -831,6 +925,15 @@ pub struct Dsp {
     wet_gain: Smoothed,
     output_gain: Smoothed,
     wobble_tick: u32,
+    /// Dry (0) to the running delay (1). Switching Power fades rather than
+    /// cuts, so switching off fades the repeats out with it; once off and
+    /// settled nothing runs.
+    power: Fade,
+    /// A Mode change fades the lines' writes and the wet pair from
+    /// `mode_from`'s routing to `mode_to`'s.
+    mode_from: DelayMode,
+    mode_to: DelayMode,
+    mode_fade: Fade,
     /// Nothing has played since construction or the last reset, so a retune
     /// lands at once rather than gliding.
     fresh: bool,
@@ -881,6 +984,10 @@ impl Dsp {
             wet_gain: Smoothed::at(0.0),
             output_gain: Smoothed::at(1.0),
             wobble_tick: 0,
+            power: Fade::new(true, sr),
+            mode_from: DelayMode::PingPong,
+            mode_to: DelayMode::PingPong,
+            mode_fade: Fade::new(true, sr),
             fresh: true,
         };
         dsp.rebuild_filters();
@@ -901,6 +1008,9 @@ impl Dsp {
             self.rebuild_filters();
         }
         self.retune();
+        // A loaded state starts as it was saved: no switch fades in.
+        self.power.settle();
+        self.mode_fade.settle();
     }
 
     /// Publish the block's transport tempo. Called from the host producer
@@ -1002,7 +1112,20 @@ impl Dsp {
         };
         self.wow_step = step(rate);
         self.flutter_step = step(rate * 5.3);
+        // Waking from a settled off: the lines hold whatever was playing when
+        // it went off, which must not come back as repeats.
+        let waking = self.params.power && self.power.is_off();
+        self.power.set(self.params.power);
+        if self.params.mode != self.mode_to {
+            self.mode_from = self.mode_to;
+            self.mode_to = self.params.mode;
+            self.mode_fade.restart();
+        }
         if self.fresh {
+            self.snap();
+            self.power.settle();
+        } else if waking {
+            self.clear_lines();
             self.snap();
         }
     }
@@ -1032,6 +1155,20 @@ impl Dsp {
             line.next = target;
             line.fade = None;
         }
+        self.mode_from = self.mode_to;
+        self.mode_fade.settle();
+    }
+
+    /// Empties both lines and the tone stage. A memset of the rings:
+    /// allocation-free.
+    fn clear_lines(&mut self) {
+        for line in self.lines.iter_mut() {
+            line.clear();
+        }
+        for tone in self.tones.iter_mut() {
+            tone.clear();
+        }
+        self.duck_env = 0.0;
     }
 
     fn rebuild_filters(&mut self) {
@@ -1050,15 +1187,10 @@ impl Dsp {
 
 impl StereoEffect for Dsp {
     fn reset(&mut self) {
-        for line in self.lines.iter_mut() {
-            line.clear();
-        }
-        for tone in self.tones.iter_mut() {
-            tone.clear();
-        }
-        self.duck_env = 0.0;
+        self.clear_lines();
         self.fresh = true;
         self.snap();
+        self.power.settle();
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
@@ -1074,12 +1206,29 @@ impl StereoEffect for Dsp {
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
-        if !self.params.power {
+        if self.power.is_off() {
             return (left, right);
         }
+        let on = self.power.next();
+        // What enters the lines fades with the switch too: a line woken empty
+        // would otherwise record the input starting mid-wave, and play that
+        // step back a delay later.
+        let (l, r) = self.run(left, right, on);
+        if on >= 1.0 {
+            (l, r)
+        } else {
+            (left + (l - left) * on, right + (r - right) * on)
+        }
+    }
+}
+
+impl Dsp {
+    /// One frame through the delay, power aside; `feed` scales what is
+    /// written into the lines.
+    #[inline]
+    fn run(&mut self, left: f32, right: f32, feed: f32) -> (f32, f32) {
         self.fresh = false;
         let smooth = self.smooth_step;
-        let mode = self.params.mode;
 
         // Read heads, wobbling.
         let swing = self.swing.next(smooth);
@@ -1101,28 +1250,28 @@ impl StereoEffect for Dsp {
         let fb = self.feedback.next(smooth);
         let cross = self.cross.next(smooth);
         let norm = fb / (1.0 + cross);
-        let input_gain = self.input_gain.next(smooth);
-        let mono_in = (left + right) * 0.5;
-        let (writes, wet) = match mode {
-            DelayMode::Stereo => (
-                [
-                    left * input_gain + (taps[0] + cross * taps[1]) * norm,
-                    right * input_gain + (taps[1] + cross * taps[0]) * norm,
-                ],
-                (taps[0], taps[1]),
-            ),
-            DelayMode::PingPong => (
-                [
-                    mono_in * input_gain + (taps[1] + cross * taps[0]) * norm,
-                    (taps[0] + cross * taps[1]) * norm,
-                ],
-                (taps[0], taps[1]),
-            ),
-            DelayMode::Mono => (
-                [mono_in * input_gain + taps[0] * fb, 0.0],
-                (taps[0], taps[0]),
-            ),
-        };
+        let input_gain = self.input_gain.next(smooth) * feed;
+        let (mut writes, mut wet) =
+            route(self.mode_to, left, right, input_gain, taps, fb, cross, norm);
+        if !self.mode_fade.is_settled() {
+            // A mode change: both routings run and the new one fades in, on
+            // what the lines are written with as well as on what they play.
+            let w = self.mode_fade.next();
+            let (old_writes, old_wet) = route(
+                self.mode_from,
+                left,
+                right,
+                input_gain,
+                taps,
+                fb,
+                cross,
+                norm,
+            );
+            for side in 0..2 {
+                writes[side] = old_writes[side] + (writes[side] - old_writes[side]) * w;
+                wet[side] = old_wet[side] + (wet[side] - old_wet[side]) * w;
+            }
+        }
 
         // Tone stage on the write path, bypassed while frozen.
         let freeze_mix = self.freeze_mix.next(smooth);
@@ -1149,8 +1298,8 @@ impl StereoEffect for Dsp {
         self.duck_env += (level - self.duck_env) * rate;
         let duck = 1.0 / (1.0 + self.duck_depth.next(smooth) * self.duck_env);
 
-        let mid = (wet.0 + wet.1) * FRAC_1_SQRT_2 * self.mid_gain.next(smooth);
-        let side = (wet.0 - wet.1) * FRAC_1_SQRT_2 * self.side_gain.next(smooth);
+        let mid = (wet[0] + wet[1]) * FRAC_1_SQRT_2 * self.mid_gain.next(smooth);
+        let side = (wet[0] - wet[1]) * FRAC_1_SQRT_2 * self.side_gain.next(smooth);
         let wet_gain = self.wet_gain.next(smooth) * self.output_gain.next(smooth) * duck;
         let dry = self.dry_gain.next(smooth);
         (
@@ -1670,6 +1819,104 @@ mod tests {
         assert_eq!(dsp.params().duck, 40.0);
         assert!(!dsp.apply_wire_param(u32::MAX, 0.0));
         assert!(!dsp.apply_wire_param(ipc::TIME_L_INDEX, f32::NAN));
+    }
+
+    /// Two low tones: smooth, so a step anywhere shows as a kink.
+    fn two_tone(n: usize) -> (f32, f32) {
+        let t = n as f32 / SR;
+        let x = (TAU * 110.0 * t).sin() * 0.3 + (TAU * 330.0 * t).sin() * 0.1;
+        (x, x * 0.8)
+    }
+
+    /// The biggest second difference of the output over `frames` frames
+    /// after a second of settling, with `edit` applied before each frame.
+    fn worst_kink(dsp: &mut Dsp, frames: usize, mut edit: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let settle = 48_000;
+        let mut history = [(0.0f32, 0.0f32); 2];
+        let mut worst = 0.0f32;
+        for n in 0..settle + frames {
+            if n >= settle {
+                edit(dsp, n - settle);
+            }
+            let (l, r) = two_tone(n);
+            let out = dsp.process_stereo(l, r);
+            if n >= settle {
+                let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+                let kink_l = d2(history[0].0, history[1].0, out.0);
+                let kink_r = d2(history[0].1, history[1].1, out.1);
+                worst = worst.max(kink_l).max(kink_r);
+            }
+            history = [history[1], out];
+        }
+        worst
+    }
+
+    /// Power and Mode crossfade: flipping either is no rougher than the
+    /// delay left alone (it used to step by the whole wet signal).
+    #[test]
+    fn switching_power_and_mode_does_not_step() {
+        let frames = 96_000;
+        let mut params = default_params();
+        params.mix = 50.0;
+        params.feedback = 50.0;
+        // Short times, so repeats of what was written since the switch came
+        // on play back while it is still on.
+        params.time_ms_l = 90.0;
+        params.time_ms_r = 140.0;
+        let still = worst_kink(&mut dsp_with(params.clone()), frames, |_, _| {});
+        let power = worst_kink(&mut dsp_with(params.clone()), frames, |dsp, n| {
+            if n % 12_000 == 0 {
+                let on = (n / 12_000) % 2 == 1;
+                assert!(dsp.apply_wire_param(ipc::POWER_INDEX, if on { 1.0 } else { 0.0 }));
+            }
+        });
+        let mode = worst_kink(&mut dsp_with(params), frames, |dsp, n| {
+            if n % 6_000 == 0 {
+                let mode = DelayMode::ALL[(n / 6_000) % 3];
+                assert!(dsp.apply_wire_param(ipc::MODE_INDEX, mode.to_wire()));
+            }
+        });
+        assert!(power < still * 2.0, "power: {power} against {still}");
+        assert!(mode < still * 2.0, "mode: {mode} against {still}");
+    }
+
+    /// Off and settled is a bit-exact pass-through, and switching back on
+    /// starts from empty lines rather than what played before.
+    #[test]
+    fn power_off_settles_to_the_dry_signal_and_wakes_empty() {
+        let mut params = default_params();
+        params.mix = 100.0;
+        params.feedback = 80.0;
+        let mut dsp = dsp_with(params);
+        for n in 0..24_000 {
+            let (l, r) = two_tone(n);
+            let _ = dsp.process_stereo(l, r);
+        }
+        assert!(dsp.apply_wire_param(ipc::POWER_INDEX, 0.0));
+        for _ in 0..960 {
+            let _ = dsp.process_stereo(0.1, 0.1);
+        }
+        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
+        assert!(dsp.apply_wire_param(ipc::POWER_INDEX, 1.0));
+        let mut heard = 0.0f32;
+        for _ in 0..4_800 {
+            let (l, r) = dsp.process_stereo(0.0, 0.0);
+            heard = heard.max(l.abs()).max(r.abs());
+        }
+        assert!(heard < 1.0e-6, "old repeats came back: {heard}");
+    }
+
+    /// A state load lands as saved, with no fade.
+    #[test]
+    fn a_loaded_power_off_does_not_fade() {
+        let mut dsp = Dsp::new(SR);
+        for _ in 0..100 {
+            let _ = dsp.process_stereo(0.2, 0.2);
+        }
+        let mut params = default_params();
+        params.power = false;
+        dsp.set_params(params);
+        assert_eq!(dsp.process_stereo(0.25, -0.25), (0.25, -0.25));
     }
 
     #[test]

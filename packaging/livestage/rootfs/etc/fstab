@@ -1,8 +1,14 @@
 # The system is read-only: a power cut in the middle of a show cannot damage
-# it. Sessions and recordings live on the data partition, mounted rw.
-LABEL=lsroot	/		ext4	ro,noatime			0 1
-LABEL=lsdata	/data		ext4	rw,noatime,nofail		0 2
-LABEL=LSBOOT	/boot/efi	vfat	ro,noauto,nofail		0 0
-tmpfs		/tmp		tmpfs	nosuid,nodev,mode=1777		0 0
-tmpfs		/var/tmp	tmpfs	nosuid,nodev,mode=1777		0 0
-tmpfs		/var/log	tmpfs	nosuid,nodev,mode=0755		0 0
+# it. The settings (root's) are on a small ext4 partition; sessions and
+# recordings are on the data partition, exFAT so any Windows or Mac computer
+# reads it. exFAT has no owners: it belongs to the service account (the build
+# fills in its uid and gid), and to no one else on this machine.
+LABEL=lsroot	/			ext4	ro,noatime			0 1
+LABEL=lssys	/var/lib/livestage	ext4	rw,noatime,nofail		0 2
+LABEL=lsdata	/data			exfat	rw,noatime,nofail,uid=@LIVESTAGE_UID@,gid=@LIVESTAGE_GID@,dmask=0027,fmask=0137,iocharset=utf8	0 2
+LABEL=LSBOOT	/boot/efi		vfat	ro,noauto,nofail		0 0
+tmpfs		/tmp			tmpfs	nosuid,nodev,mode=1777		0 0
+tmpfs		/var/tmp		tmpfs	nosuid,nodev,mode=1777		0 0
+tmpfs		/var/log		tmpfs	nosuid,nodev,mode=0755		0 0
+# Where livestage-storage mounts USB drives, /media/<UUID>.
+tmpfs		/media			tmpfs	nosuid,nodev,mode=0755		0 0

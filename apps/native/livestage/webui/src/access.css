@@ -1,0 +1,730 @@
+/* Phase 4: who is at the page (Login.tsx, Lock.tsx, Users.tsx, Remote.tsx):
+   the login screen and PIN pad, the lock, the user chip, Setup → Users and
+   Setup → Remote. Studio's tokens only (styles.css's roles); radius by what
+   a thing is: controls CONTROL, containers SURFACE, the login and lock
+   cards DIALOG. */
+
+/* ── The PIN pad ───────────────────────────────────────────────────────── */
+
+.pin-pad {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  width: 100%;
+  max-width: 300px;
+  margin: 0 auto;
+}
+
+.pin-dots {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  height: 44px;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r);
+  background: var(--surface-input);
+}
+
+.pin-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--text-primary);
+}
+
+.pin-placeholder {
+  color: var(--text-faint);
+  font-size: 13px;
+}
+
+.pin-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 18px;
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+.pin-error.on {
+  color: var(--error);
+}
+
+.pin-keys {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+/* Big keys for a finger: 56 px, each a filled button. */
+.pin-key {
+  display: grid;
+  place-items: center;
+  height: 56px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-primary);
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  touch-action: manipulation;
+}
+
+.pin-key:hover:not(:disabled) {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.pin-key:active:not(:disabled) {
+  background-image: linear-gradient(var(--state-recessed), var(--state-recessed));
+}
+
+.pin-key.quiet {
+  color: var(--text-muted);
+}
+
+/* The one primary action of the pad. */
+.pin-key.go {
+  border-color: var(--accent);
+  background-color: var(--accent);
+  color: var(--text-inverse);
+  font-size: 15px;
+}
+
+.pin-key.go:hover:not(:disabled) {
+  background-image: none;
+  background-color: var(--accent-hover);
+}
+
+.pin-key.go:disabled {
+  border-color: var(--button-border);
+  background-color: var(--button-bg);
+  color: var(--text-muted);
+}
+
+/* ── Login ─────────────────────────────────────────────────────────────── */
+
+.login {
+  display: grid;
+  place-items: start center;
+  min-height: 100%;
+  padding: max(16px, 8vh) 16px 16px;
+  background: var(--surface-window);
+  overflow: auto;
+}
+
+.login-card,
+.lock-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: min(380px, 100%);
+  padding: 20px;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r-dialog);
+  background: var(--surface-panel);
+}
+
+.login-head,
+.lock-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.login-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.login-title strong {
+  font-size: 15px;
+}
+
+.login-title span {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.login-wait {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px 0;
+  color: var(--text-muted);
+}
+
+.login-users {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.login-user {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 0 12px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.login-user:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+  color: var(--text-primary);
+}
+
+.login-user-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.login-pin {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.login-back {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  padding: 0 8px 0 4px;
+  border: 0;
+  border-radius: var(--r);
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+}
+
+.login-back:hover {
+  background: var(--state-hover);
+}
+
+.login-change {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.login-foot {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.4;
+}
+
+.login-foot svg {
+  margin-top: 2px;
+}
+
+/* A role: a label, never a state (no hue). */
+.role-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r-sm);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* ── Lock ──────────────────────────────────────────────────────────────── */
+
+/* A scrim, not a wall: the console stays visible and live under it. */
+.lock-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: color-mix(in srgb, var(--surface-overlay) 70%, transparent);
+  overflow: auto;
+}
+
+.lock-card {
+  box-shadow: var(--shadow-drag);
+}
+
+.lock-mark {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--r);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+}
+
+/* ── The top bar: user chip and Lock ───────────────────────────────────── */
+
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  max-width: 180px;
+  padding: 0 8px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-secondary);
+}
+
+.user-chip:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.user-chip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.view-only-pill {
+  white-space: nowrap;
+}
+
+/* A viewer: the values that would move show they will not. */
+.app.view-only .content .fader-track,
+.app.view-only .content .knob svg,
+.app.view-only .content .latch,
+.app.view-only .content .cell {
+  cursor: not-allowed;
+}
+
+/* Controls a role may not use (Setup.tsx `Gate`). */
+.role-gate {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.role-gate > .card,
+.role-gate > section {
+  opacity: 0.6;
+}
+
+.role-gate-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ── Setup → Users ─────────────────────────────────────────────────────── */
+
+.users-open {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  border-radius: var(--r);
+  background: color-mix(in srgb, var(--warning) 10%, var(--surface-panel));
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.users-open svg {
+  margin-top: 2px;
+  color: var(--warning);
+}
+
+.users-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.users-row {
+  display: grid;
+  grid-template-columns: 16px minmax(90px, 160px) auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 0 4px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.users-icon {
+  color: var(--text-muted);
+}
+
+.users-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.users-mixes {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.users-mixes .muted {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.warn-text {
+  color: var(--warning);
+}
+
+.users-note {
+  font-size: 12px;
+}
+
+.users-roles {
+  align-self: flex-start;
+}
+
+.users-pins {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.users-mix-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 4px;
+}
+
+.users-error {
+  align-self: center;
+  color: var(--error);
+  font-size: 12px;
+}
+
+/* ── Setup → Remote ────────────────────────────────────────────────────── */
+
+.remote-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.remote-block-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.remote-block-head > svg {
+  color: var(--text-muted);
+}
+
+.remote-block-head .muted {
+  font-size: 12px;
+}
+
+.remote-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+  border-radius: var(--r);
+  background: color-mix(in srgb, var(--warning) 10%, var(--surface-panel));
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.remote-warning svg {
+  flex: none;
+  margin-top: 1px;
+  color: var(--warning);
+}
+
+.remote-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.remote-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+}
+
+.remote-port {
+  width: 84px;
+}
+
+.remote-pill {
+  height: 22px;
+  padding: 0 8px;
+}
+
+.remote-diag {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.remote-sheet summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.remote-sheet-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.remote-sheet pre {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-input);
+  color: var(--text-secondary);
+  font: 12px/1.55 ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  user-select: text;
+}
+
+.remote-ports {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.remote-port-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.remote-port-list .knob-caption {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tb-dest.missing {
+  border-style: dashed;
+}
+
+.remote-missing {
+  flex: none;
+  color: var(--warning);
+  font-size: 11px;
+}
+
+.remote-maps {
+  overflow-x: auto;
+}
+
+.remote-maps .select {
+  width: 120px;
+}
+
+.remote-maps code,
+.remote-learn code {
+  padding: 1px 5px;
+  border-radius: var(--r-micro);
+  background: var(--surface-input);
+  font-size: 12px;
+}
+
+.remote-target-name {
+  font-size: 12px;
+}
+
+.remote-empty {
+  margin: 0;
+}
+
+.remote-learn {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-panel-alt);
+}
+
+.remote-learn.listening {
+  border-color: var(--accent);
+}
+
+.remote-learn .knob-caption {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.remote-learn-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.remote-learn-row .select {
+  width: auto;
+  min-width: 110px;
+}
+
+.remote-listening,
+.remote-learned {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.remote-listening {
+  color: var(--accent);
+}
+
+.remote-pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: blink 1s steps(2, start) infinite;
+}
+
+@media (max-width: 640px) {
+  .users-row {
+    grid-template-columns: 16px minmax(0, 1fr) auto auto auto;
+  }
+
+  .users-mixes {
+    grid-column: 2 / -1;
+    grid-row: 2;
+    padding-bottom: 8px;
+  }
+
+  .users-pins,
+  .remote-ports {
+    grid-template-columns: 1fr;
+  }
+
+  .user-chip .role-badge {
+    display: none;
+  }
+
+  .user-chip {
+    max-width: 120px;
+  }
+}
+
+.remote-diag.error {
+  align-items: center;
+  gap: 5px;
+  color: var(--error);
+}
+
+.remote-counters {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.remote-learned.error {
+  color: var(--error);
+}
+
+/* While a kept token is offered: a clear pane that only takes the clicks. */
+.lock-overlay.resuming {
+  background: transparent;
+}
+
+/* A desktop narrower than everything the top bar holds (scenes.css's
+   1500 px step): the chip keeps the name; the role is in its menu. */
+@media (max-width: 1500px) {
+  .user-chip .role-badge {
+    display: none;
+  }
+
+  .user-chip {
+    max-width: 104px;
+  }
+
+  /* Room for the chip and Lock (Phase 4): Talk keeps its icon (lit while
+     talking, titled), the scene name a little less width. */
+  .toolbar .tb-key-label {
+    display: none;
+  }
+
+  .toolbar .scene-current {
+    width: 150px;
+  }
+
+  /* The saved state keeps its dot (titled with the time and path); the
+     Save key carries its own unsaved badge. */
+  .toolbar .save-text {
+    display: none;
+  }
+}

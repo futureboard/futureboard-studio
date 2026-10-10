@@ -5,15 +5,26 @@
 //! livestage-setup             # the same from a shell, with a way out
 //! livestage-setup --setup     # straight into the setup
 //! livestage-setup --boot      # at boot: the name, network and time zone onto /run
+//! livestage-setup --storage-service  # root daemon: mounts drives, answers on
+//!                                    # /run/livestage/storage.sock
+//! livestage-setup --storage-path     # prints the recordings folder to use now
 //! livestage-setup --root DIR  # any of these on a copy of the tree; runs no commands
 //! ```
 //!
-//! The settings live in `/data/system/setup.conf` (see [`config`]). The
-//! system is read-only: what they make goes on /run, where /etc links to.
+//! The settings live in `/var/lib/livestage/setup.conf` (see [`config`]).
+//! The system is read-only: what they make goes on /run, where /etc links to.
+//! Where recordings go (`RECORD_STORAGE`, the drives) is [`storage`]'s.
 
+mod blocks;
 mod config;
+mod drives;
+mod storage;
+#[path = "../storage_api.rs"]
+mod storage_api;
 mod system;
 mod ui;
+mod widgets;
+mod wizard;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -22,12 +33,14 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 use system::System;
 
-const USAGE: &str = "usage: livestage-setup [--console | --setup | --boot] [--root DIR]";
+const USAGE: &str = "usage: livestage-setup [--console | --setup | --boot | --storage-service | --storage-path] [--root DIR]";
 
 struct Options {
     console: bool,
     setup: bool,
     boot: bool,
+    storage_service: bool,
+    storage_path: bool,
     root: Option<PathBuf>,
 }
 
@@ -36,6 +49,8 @@ fn parse_args() -> Result<Options, String> {
         console: false,
         setup: false,
         boot: false,
+        storage_service: false,
+        storage_path: false,
         root: None,
     };
     let mut args = std::env::args().skip(1);
@@ -44,6 +59,8 @@ fn parse_args() -> Result<Options, String> {
             "--console" => options.console = true,
             "--setup" => options.setup = true,
             "--boot" => options.boot = true,
+            "--storage-service" => options.storage_service = true,
+            "--storage-path" => options.storage_path = true,
             "--root" => {
                 options.root = Some(PathBuf::from(
                     args.next().ok_or("--root needs a directory")?,
@@ -66,9 +83,23 @@ fn main() {
     };
     let system = System::new(options.root.clone());
 
+    if options.storage_path {
+        // Always a folder and exit 0: the internal one when the drive is not
+        // there (the service must start whatever happens).
+        storage::print_path(&system);
+        return;
+    }
+    if options.storage_service {
+        if let Err(error) = storage::serve(system) {
+            eprintln!("livestage-setup: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if options.boot {
-        let configured = system.load_config();
-        let config = configured.clone().unwrap_or_default();
+        let set_up = system.is_set_up();
+        let config = system.load_config().unwrap_or_default();
         match system.write_runtime(&config) {
             Ok(()) => {
                 let network = match (&config.interface, &config.fixed) {
@@ -82,7 +113,7 @@ fn main() {
                     "{}, {network}, {}{}",
                     config.name,
                     config.timezone,
-                    if configured.is_none() {
+                    if !set_up {
                         " (not set up yet: the defaults)"
                     } else {
                         ""

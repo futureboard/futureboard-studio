@@ -1,13 +1,30 @@
 #!/sbin/openrc-run
 # The image is small; the disk it is written to usually is not. On the first
-# boot from a bigger disk, grow the data partition (the last one) to the end
-# of it, so recordings get the whole disk. Does nothing once it has.
+# boot from a bigger disk, give the data partition (the last one) the rest of
+# the disk, so recordings get all of it. exFAT cannot grow in place: the
+# partition is made anew, which is only done while it is still empty, as the
+# image left it. Does nothing once the partition reaches the end of the disk.
 
-description="Grow the LiveStage data partition to fill its disk"
+description="Give the LiveStage data partition the whole disk"
 
 depend() {
 	need root
+	after modules
 	before localmount
+}
+
+# Whether the exFAT filesystem on $1 holds nothing at all.
+is_empty() {
+	local dir=/run/livestage-data.check empty=1
+	mkdir -p "$dir" || return 1
+	if mount -t exfat -o ro "$1" "$dir" 2>/dev/null; then
+		[ -z "$(ls -A "$dir")" ] || empty=0
+		umount "$dir"
+	else
+		empty=0
+	fi
+	rmdir "$dir"
+	[ $empty = 1 ]
 }
 
 start() {
@@ -27,7 +44,13 @@ start() {
 	free=$((disk_size - start - size - 33))
 	[ "$free" -gt 32768 ] || return 0
 
-	ebegin "Growing the data partition to the end of $disk"
+	modprobe -q exfat 2>/dev/null
+	if ! is_empty "$part"; then
+		ewarn "The data partition has files on it: it keeps its size ($((size / 2048)) MiB)"
+		return 0
+	fi
+
+	ebegin "Giving the data partition the rest of $disk"
 	# The image's backup GPT sits where the image ended; move it to the real
 	# end of the disk first, then extend the last partition into the space.
 	sfdisk --force --no-reread --no-tell-kernel --relocate gpt-bak-std "$disk" >/dev/null 2>&1 &&
@@ -44,8 +67,6 @@ start() {
 		sleep 0.1
 		tries=$((tries + 1))
 	done
-	e2fsck -fy "$part" >/dev/null 2>&1
-	# e2fsck exits 1 when it fixed something; only 4 and up is a failure.
-	[ $? -lt 4 ] && resize2fs "$part" >/dev/null 2>&1
-	eend $? "Could not grow $part"
+	mkfs.exfat -L lsdata "$part" >/dev/null 2>&1
+	eend $? "Could not make the filesystem on $part"
 }

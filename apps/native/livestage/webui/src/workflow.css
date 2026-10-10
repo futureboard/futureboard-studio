@@ -1,0 +1,582 @@
+/* Phase 2 around the strips (Workflow.tsx, Sections.tsx, Library.tsx,
+   EditBar.tsx, Dialogs.tsx): the top bar's undo/redo and saved state,
+   anchored menus, the strip menu and selection, the section picker, the
+   library and the small dialogs. Studio's tokens only (styles.css's roles);
+   radius by what a thing is: 16–20 px controls CONTROL_SM, 24–32 px CONTROL,
+   containers SURFACE, dialogs DIALOG. */
+
+/* ── Top bar: edit and save ────────────────────────────────────────────── */
+
+.toolbar-edit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.history {
+  display: flex;
+  gap: 2px;
+}
+
+.save-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.save-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.save-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+/* Unsaved: the warning hue, on the dot and the words. */
+.save-controls.dirty .save-state {
+  color: var(--warning);
+}
+
+.save-controls.dirty .save-dot {
+  background: var(--warning);
+}
+
+.save-button {
+  position: relative;
+}
+
+.save-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warning);
+  box-shadow: 0 0 0 2px var(--button-bg);
+}
+
+/* ── Anchored menus ────────────────────────────────────────────────────── */
+
+.menu {
+  position: fixed;
+  z-index: 35;
+  display: flex;
+  flex-direction: column;
+  min-width: 220px;
+  max-width: min(320px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  padding: 4px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r);
+  box-shadow: var(--shadow-overlay);
+}
+
+.menu-head {
+  padding: 6px 8px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+}
+
+.menu-item:hover:not(:disabled) {
+  background: var(--state-hover);
+}
+
+.menu-item:active:not(:disabled) {
+  background: var(--state-recessed);
+}
+
+.menu-item.danger {
+  color: var(--error);
+}
+
+.menu-icon {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  color: var(--text-muted);
+}
+
+.menu-item.danger .menu-icon {
+  color: currentColor;
+}
+
+.menu-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.menu-label {
+  font-size: 13px;
+}
+
+.menu-detail {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-check {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  color: var(--accent);
+}
+
+.menu-separator {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--border-subtle);
+}
+
+/* ── Strips: menu, selection, recall safe ──────────────────────────────── */
+
+/* Revealed like the old remove button: on hover, focus, or always on touch. */
+.strip-menu {
+  opacity: 0;
+}
+
+.strip:hover .strip-menu,
+.strip-menu:focus-visible,
+.strip-menu[aria-expanded='true'] {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .strip-menu {
+    opacity: 1;
+  }
+}
+
+/* In the selection: the accent outline (no reflow: the border is always
+   there) and a check in the badge — colour and glyph. */
+.strip.picked {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.strip.picked .strip-badge {
+  background: var(--accent-muted);
+  color: var(--accent);
+}
+
+.picked-mark {
+  color: var(--accent);
+}
+
+/* A strip a recall leaves alone: a small lock in the automation hue. */
+.safe-light {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  border-radius: var(--r-micro);
+  background: color-mix(in srgb, var(--state-safe) 18%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--state-safe) 55%, transparent);
+  color: var(--state-safe);
+}
+
+/* ── The selection cluster ─────────────────────────────────────────────── */
+
+.console-cluster.selection {
+  gap: 4px;
+}
+
+.select-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.select-mode:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+  color: var(--text-primary);
+}
+
+/* Select mode is a selection tool: the accent, wash and border. */
+.select-mode.on {
+  border-color: var(--accent);
+  background-color: var(--accent-active);
+  color: var(--accent);
+}
+
+.selection-count {
+  padding: 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.selection-paste {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Section picker ────────────────────────────────────────────────────── */
+
+.section-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.section-group {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px;
+}
+
+.section-group.parts {
+  padding-left: 14px;
+  border-left: 2px solid var(--border-subtle);
+}
+
+.section-chip {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.section-chip:hover:not(:disabled) {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.section-chip.on {
+  border-color: var(--accent);
+  background-color: var(--accent-active);
+  color: var(--text-primary);
+}
+
+/* Covered by Processing: shown on, not separately choosable. */
+.section-chip.included {
+  opacity: 0.6;
+}
+
+.section-chip:disabled:not(.included) {
+  opacity: 0.35;
+}
+
+.section-box {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-micro);
+  color: var(--text-inverse);
+}
+
+.section-chip.on .section-box {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.section-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.section-label {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.section-detail {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* ── Dialogs ───────────────────────────────────────────────────────────── */
+
+.modal.small {
+  width: min(480px, 100%);
+}
+
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.dialog-text {
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.text-area {
+  height: auto;
+  min-height: 56px;
+  padding: 8px 10px;
+  resize: vertical;
+  font: inherit;
+  color: inherit;
+  line-height: 1.4;
+}
+
+/* ── Library ───────────────────────────────────────────────────────────── */
+
+.lib-tabs button {
+  height: 26px;
+}
+
+.lib-categories,
+.lib-category-picks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.lib-category {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--button-border);
+  border-radius: 999px;
+  background-color: var(--button-bg);
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.lib-category:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.lib-category.on {
+  border-color: var(--accent);
+  background-color: var(--accent-active);
+  color: var(--text-primary);
+}
+
+.lib-category.small {
+  height: 24px;
+  padding: 0 9px;
+  font-size: 11px;
+}
+
+.lib-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+
+/* Full-width list rows: square. */
+.lib-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 8px 10px 8px 12px;
+  background: var(--surface-panel);
+}
+
+.lib-item + .lib-item {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.lib-item:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.lib-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.lib-item-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  min-width: 0;
+}
+
+.lib-factory {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r-sm);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.lib-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.lib-item-category {
+  color: var(--text-secondary);
+}
+
+.lib-item-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.lib-item-actions .button {
+  margin-left: 6px;
+}
+
+.lib-save {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.lib-save-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* ── The Selected Channel ──────────────────────────────────────────────── */
+
+.cv-tools {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.cv-tools .button {
+  gap: 5px;
+}
+
+.recall-safe {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.recall-safe:hover:not(:disabled) {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+/* Latched in the recall-safe hue: wash, border, glyph. */
+.recall-safe.on {
+  background-color: color-mix(in srgb, var(--state-safe) 18%, var(--surface-panel));
+  border-color: color-mix(in srgb, var(--state-safe) 55%, transparent);
+  color: var(--state-safe);
+}
+
+/* ── Narrow screens ────────────────────────────────────────────────────── */
+
+@media (max-width: 1100px) {
+  .save-text {
+    display: none;
+  }
+
+  .save-state .save-dot {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .section-group {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .section-detail {
+    display: none;
+  }
+
+  .cv-tool-text {
+    display: none;
+  }
+
+  .selection-paste {
+    max-width: 90px;
+  }
+
+  .selection-library {
+    display: none;
+  }
+
+  .lib-item {
+    flex-wrap: wrap;
+  }
+
+  .lib-item-actions {
+    margin-left: auto;
+  }
+}

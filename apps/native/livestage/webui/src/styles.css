@@ -1,45 +1,114 @@
-/* Futureboard's dark theme tokens (crates/SphereUIComponents/src/theme.rs)
-   and its radius ladder (DESIGN.md): MICRO 3 · CONTROL_SM 4 · CONTROL 6 ·
+/* Futureboard Studio's default theme. Every colour comes from
+   packages/shared/themes/Default.json — the file Studio itself loads — as the
+   generated `--fb-*` properties (futureboard-theme.ts, imported in main.tsx).
+   This block only says which of Studio's tokens plays which role here, the
+   way crates/SphereUIComponents/src/theme.rs's `Colors::*` do: never write a
+   colour literal below, add a role here instead.
+
+   The radius ladder is DESIGN.md's: MICRO 3 · CONTROL_SM 4 · CONTROL 6 ·
    SURFACE 10 · DIALOG 14. */
 :root {
-  --surface-canvas: #0e1015;
-  --surface-window: #16181f;
-  --surface-titlebar: #14161c;
-  --surface-panel: #22252e;
-  --surface-panel-alt: #1c1f27;
-  --surface-raised: #2a2e38;
-  --surface-control-hover: #31353f;
-  --surface-hover: #383d48;
-  --surface-active: #4a4f5c;
-  --surface-input: #0e1015;
-  --surface-overlay: #05070ba6;
-  --border-subtle: #ffffff14;
-  --border-normal: #ffffff1f;
-  --border-strong: #ffffff33;
-  --text-primary: #ebedf2;
-  --text-secondary: #b9bdc6;
-  --text-muted: #8f949f;
-  --text-faint: #6f7480;
-  --text-disabled: #5b606b;
-  --accent: #2fc9d6;
-  --accent-hover: #54d8e2;
-  --accent-soft: #2fc9d629;
-  --accent-muted: #2fc9d61a;
-  --accent-pressed: #1aa8b5;
-  --on-accent: #06181b;
-  --error: #f2645f;
-  --warning: #e8b75c;
-  --success: #43d18a;
-  --state-mute: #6f9bff;
-  --state-solo: #e8b75c;
-  --state-arm: #f2645f;
-  --meter-low: #43d18a;
-  --meter-mid: #e8b75c;
-  --meter-high: #f2645f;
-  --meter-low-dim: #43d18a1f;
-  --meter-mid-dim: #e8b75c1f;
-  --meter-high-dim: #f2645f24;
-  --fader-thumb: #c8ccd4;
+  /* Surfaces, darkest to lightest (DESIGN.md's surface order). */
+  --surface-canvas: var(--fb-surface-canvas);
+  --surface-input: var(--fb-surface-input);
+  --surface-window: var(--fb-surface-window);
+  --surface-titlebar: var(--fb-surface-titlebar);
+  --surface-panel-alt: var(--fb-surface-panel-alt);
+  --surface-base: var(--fb-surface-base);
+  --surface-panel: var(--fb-surface-panel);
+  --surface-raised: var(--fb-surface-raised);
+  --surface-control-hover: var(--fb-surface-control-hover);
+  --surface-hover: var(--fb-surface-hover);
+  --surface-active: var(--fb-surface-active);
+  /* The scrim behind a dialog. A scrim, never a surface. */
+  --surface-overlay: var(--fb-surface-overlay);
+
+  /* Borders: white-alpha, so one token works on every plane. */
+  --border-subtle: var(--fb-border-subtle);
+  --border-normal: var(--fb-border-normal);
+  --border-strong: var(--fb-border-strong);
+
+  /* Text. */
+  --text-primary: var(--fb-text-primary);
+  --text-secondary: var(--fb-text-secondary);
+  --text-muted: var(--fb-text-muted);
+  --text-faint: var(--fb-text-faint);
+  --text-disabled: var(--fb-text-disabled);
+  /* Near-black on a light or saturated fill (Studio's primary buttons). */
+  --text-inverse: var(--fb-text-inverse);
+
+  /* The one accent: focus, selection, live routing, the primary action. */
+  --accent: var(--fb-accent-primary);
+  --accent-hover: var(--fb-accent-primary-hover);
+  --accent-pressed: var(--fb-accent-pressed);
+  --accent-active: var(--fb-accent-active);
+  --accent-soft: var(--fb-accent-soft);
+  --accent-muted: var(--fb-accent-muted);
+  --on-accent: var(--fb-accent-on-accent);
+  --focus-ring: var(--fb-state-focus-ring);
+
+  /* Status. */
+  --error: var(--fb-status-error);
+  --warning: var(--fb-status-warning);
+  --success: var(--fb-status-success);
+
+  /* Neutral state layers, composited over a control's rest fill (as a
+     background-image over its background-colour), never replacing it. */
+  --state-hover: var(--fb-state-hover);
+  --state-selected: var(--fb-state-selected);
+  --state-recessed: var(--fb-state-recessed);
+
+  /* Latched DAW states: each its own hue, never the accent. */
+  --state-mute: var(--fb-state-mute);
+  --state-solo: var(--fb-state-solo);
+  --state-arm: var(--fb-state-arm);
+  --state-monitor: var(--fb-state-monitor);
+  /* Recall safe: what scene automation leaves alone, so Studio's automation
+     hue (never the accent, never another latch's). */
+  --state-safe: var(--fb-state-automation);
+
+  /* Buttons (fb_button). */
+  --button-bg: var(--fb-button-bg);
+  --button-border: var(--fb-button-border);
+  --button-text: var(--fb-button-text);
+
+  /* Mixer strips and their racks (mixer_panel/console.rs). */
+  --strip-bg: var(--fb-surface-mixer-strip);
+  --strip-border: var(--fb-border-strip);
+  --master-strip-bg: var(--fb-mixer-master-strip-background);
+  --master-strip-border: var(--fb-border-master-strip);
+  --slot-empty-text: var(--fb-slot-empty-text);
+
+  /* Meters. */
+  --meter-bg: var(--fb-meter-background);
+  --meter-low: var(--fb-meter-low);
+  --meter-mid: var(--fb-meter-mid);
+  --meter-high: var(--fb-meter-high);
+  --meter-clip: var(--fb-meter-clip);
+
+  /* Faders and knobs (fader.rs, knob.rs). */
+  --fader-thumb: var(--fb-fader-thumb);
+  --fader-thumb-border: var(--fb-fader-thumb-border);
+  --fader-groove: var(--fb-fader-groove);
+  --fader-rail: var(--fb-fader-rail);
+  --fader-tick: var(--fb-fader-tick);
+  --fader-scale-text: var(--fb-fader-scale-text);
+  --knob-bg: var(--fb-knob-background);
+  --knob-ring: var(--fb-knob-ring);
+
+  /* An EQ band's colour, cycling (eq_graph.rs `band_color`): the theme's
+     categorical hues, so the accent stays for selection. */
+  --eq-band-1: var(--fb-track-bus);
+  --eq-band-2: var(--fb-track-audio);
+  --eq-band-3: var(--fb-track-instrument);
+  --eq-band-4: var(--fb-accent-warning);
+  --eq-band-5: var(--fb-accent-danger);
+  --eq-band-6: var(--fb-accent-purple);
+
+  /* Elevation (theme::elevation): shadow only for what genuinely floats. */
+  --shadow-overlay: 0 4px 12px rgb(0 0 0 / 0.45);
+  --shadow-drag: 0 8px 20px rgb(0 0 0 / 0.5);
+
   --r-micro: 3px;
   --r-sm: 4px;
   --r: 6px;
@@ -87,7 +156,7 @@ button:disabled {
 }
 
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
@@ -130,38 +199,44 @@ svg {
   gap: 6px;
   height: 32px;
   padding: 0 14px;
-  border: 1px solid var(--border-normal);
-  background: var(--surface-raised);
+  border: 1px solid var(--button-border);
+  background-color: var(--button-bg);
   border-radius: var(--r);
-  color: var(--text-primary);
+  color: var(--button-text);
 }
 
+/* Hover lifts the rest fill and pressed sinks it (state layers over the
+   fill); the border stays put. */
 .button:hover:not(:disabled) {
-  background: var(--surface-control-hover);
-  border-color: var(--border-strong);
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
 }
 
 .button:active:not(:disabled) {
-  background: var(--surface-active);
+  background-image: linear-gradient(var(--state-recessed), var(--state-recessed));
 }
 
+/* Near-black on the accent, as Studio's primary button. */
 .button.primary {
-  background: var(--accent);
+  background-color: var(--accent);
   border-color: var(--accent);
-  color: var(--on-accent);
+  color: var(--text-inverse);
   font-weight: 600;
 }
 
 .button.primary:hover:not(:disabled) {
-  background: var(--accent-hover);
+  background-image: none;
+  background-color: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 
 .button.primary:active:not(:disabled) {
-  background: var(--accent-pressed);
+  background-image: none;
+  background-color: var(--accent-pressed);
+  border-color: var(--accent-pressed);
 }
 
 .button.ghost {
-  background: transparent;
+  background-color: transparent;
   border-color: transparent;
   color: var(--text-secondary);
 }
@@ -184,7 +259,7 @@ svg {
 }
 
 .icon-button:hover:not(:disabled) {
-  background: var(--surface-hover);
+  background: var(--state-hover);
   color: var(--text-primary);
 }
 
@@ -222,16 +297,16 @@ svg {
   gap: 6px;
   height: 30px;
   padding: 0 12px;
-  border: 1px solid var(--border-normal);
+  border: 1px solid var(--button-border);
   border-radius: var(--r);
-  background: var(--surface-raised);
+  background: var(--button-bg);
   color: var(--text-muted);
   font-weight: 600;
 }
 
 .switch.on {
   border-color: var(--accent);
-  background: var(--accent-soft);
+  background: var(--accent-active);
   color: var(--accent);
 }
 
@@ -271,13 +346,14 @@ svg {
 .views button:hover,
 .tabs button:hover {
   color: var(--text-primary);
-  background: var(--surface-panel);
+  background: var(--state-hover);
 }
 
+/* fb_segment: the chosen one is the track lifted by the selected layer. */
 .segments button.on,
 .views button.on,
 .tabs button.on {
-  background: var(--surface-active);
+  background: var(--state-selected);
   color: var(--text-primary);
 }
 
@@ -435,7 +511,7 @@ svg {
 
 .status-pill.error {
   color: var(--error);
-  border-color: #f2645f55;
+  border-color: color-mix(in srgb, var(--error) 33%, transparent);
 }
 
 .status-pill.error svg,
@@ -511,8 +587,8 @@ svg {
   height: 32px;
   min-width: 88px;
   padding: 0 12px;
-  border: 1px solid var(--border-normal);
-  background: var(--surface-raised);
+  border: 1px solid var(--button-border);
+  background-color: var(--button-bg);
   border-radius: var(--r);
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -520,7 +596,7 @@ svg {
 }
 
 .rec:hover {
-  border-color: var(--border-strong);
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
 }
 
 .rec-dot {
@@ -531,7 +607,7 @@ svg {
 }
 
 .rec.on {
-  background: color-mix(in srgb, var(--state-arm) 20%, var(--surface-raised));
+  background-color: color-mix(in srgb, var(--state-arm) 18%, var(--button-bg));
   border-color: var(--state-arm);
 }
 
@@ -611,7 +687,7 @@ svg {
   background: var(--surface-raised);
   border: 1px solid var(--border-strong);
   border-radius: var(--r-surface);
-  box-shadow: 0 10px 30px #0008;
+  box-shadow: var(--shadow-overlay);
   z-index: 40;
   word-break: break-word;
   animation: rise 0.18s ease-out;
@@ -635,17 +711,28 @@ svg {
 
 /* ── Mixer ─────────────────────────────────────────────────────────────── */
 
+/* The console bar over the strips (console.css), then the strips. */
 .mixer {
   display: flex;
+  flex-direction: column;
   height: 100%;
-  min-height: 620px;
+}
+
+/* The strips take every pixel the bar leaves, and the fader takes what the
+   strip's fixed rows leave. Below this height the page scrolls instead,
+   so a fader never shrinks under a usable travel. */
+.mixer-main {
+  flex: 1;
+  display: flex;
+  min-height: 560px;
 }
 
 .mixer-scroll {
+  position: relative;
   flex: 1;
   display: flex;
   gap: 6px;
-  padding: 10px;
+  padding: 8px;
   overflow-x: auto;
   overflow-y: hidden;
 }
@@ -653,7 +740,7 @@ svg {
 .mixer-master {
   flex: none;
   display: flex;
-  padding: 10px;
+  padding: 8px;
   border-left: 1px solid var(--border-subtle);
   background: var(--surface-titlebar);
 }
@@ -711,20 +798,22 @@ svg {
   width: var(--strip-width);
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  padding: 7px;
-  background: var(--surface-panel);
-  border: 1px solid var(--border-subtle);
+  gap: 5px;
+  padding: 6px;
+  /* What the strip's wells and slots composite over. */
+  --strip-base: var(--strip-bg);
+  background: var(--strip-base);
+  border: 1px solid var(--strip-border);
   border-radius: var(--r-surface);
 }
 
 .strip-bus {
-  background: color-mix(in srgb, var(--surface-panel) 90%, var(--state-mute));
+  --strip-base: color-mix(in srgb, var(--strip-bg) 90%, var(--state-mute));
 }
 
 .strip-master {
-  background: var(--surface-panel);
-  border-color: var(--border-normal);
+  --strip-base: var(--master-strip-bg);
+  border-color: var(--master-strip-border);
 }
 
 .strip-head {
@@ -789,11 +878,19 @@ svg {
   outline: none;
 }
 
+/* Two 24 px rows: input and trim, role and Sends on Fader, sources. */
 .strip-top {
-  height: 64px;
+  flex: none;
+  height: 52px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
+}
+
+.strip-top .select,
+.strip > .select {
+  flex: none;
+  height: 24px;
 }
 
 .strip-note {
@@ -802,7 +899,7 @@ svg {
   height: 100%;
   padding: 0 6px;
   border-radius: var(--r);
-  background: var(--surface-panel-alt);
+  background: var(--state-recessed);
   color: var(--text-faint);
   font-size: 11px;
   text-align: center;
@@ -816,7 +913,12 @@ svg {
 }
 
 .trim-row {
+  height: 24px;
   justify-content: space-between;
+}
+
+.trim-row .latch {
+  height: 20px;
 }
 
 .trim-text {
@@ -873,7 +975,8 @@ svg {
   gap: 3px;
   padding: 3px;
   overflow-y: auto;
-  background: var(--surface-input);
+  /* The well the slots sit in: the strip, recessed (console::well). */
+  background: var(--state-recessed);
   border-radius: var(--r);
   scrollbar-width: thin;
 }
@@ -890,11 +993,15 @@ svg {
   height: 21px;
   padding: 0 5px;
   border-radius: var(--r-sm);
-  background: var(--surface-raised);
+  /* A loaded slot is the strip lifted by the selected layer: the lighter
+     thing in a dark rack (console::SlotTone). */
+  background: linear-gradient(var(--state-selected), var(--state-selected)) var(--strip-base);
 }
 
 .slot:hover {
-  background: var(--surface-control-hover);
+  background:
+    linear-gradient(var(--state-hover), var(--state-hover)),
+    linear-gradient(var(--state-selected), var(--state-selected)) var(--strip-base);
 }
 
 .slot-power {
@@ -907,6 +1014,14 @@ svg {
   border-radius: 50%;
   background: transparent;
   color: var(--accent);
+}
+
+.slot.bypassed {
+  background: transparent;
+}
+
+.slot.bypassed:hover {
+  background: var(--state-hover);
 }
 
 .slot.bypassed .slot-power {
@@ -927,7 +1042,11 @@ svg {
 }
 
 .slot.bypassed .slot-name {
-  color: var(--text-faint);
+  color: var(--text-disabled);
+}
+
+.slot.failed {
+  background: color-mix(in srgb, var(--error) 16%, transparent);
 }
 
 .slot.failed .slot-name,
@@ -940,7 +1059,7 @@ svg {
   gap: 4px;
   border: 1px dashed var(--border-normal);
   background: transparent;
-  color: var(--text-muted);
+  color: var(--slot-empty-text);
   font-size: 11px;
 }
 
@@ -950,13 +1069,196 @@ svg {
   background: var(--accent-muted);
 }
 
+/* An empty place in the rack: just the well. */
 .slot-blank,
 .slot-blank:hover {
-  background: #ffffff05;
+  background: transparent;
 }
 
+/* The strip's rows keep their height; only the fader block stretches. */
+.strip > * {
+  flex: none;
+}
+
+.strip > .fader-block {
+  flex: 1 1 0;
+}
+
+/* One row: the sends (a channel), what feeds it (a bus), its sources (a
+   matrix), or pre/post in Sends on Fader. */
 .strip-middle {
-  height: 116px;
+  height: 24px;
+}
+
+/* A one-row summary in the strip: the well, recessed, as the racks were;
+   what it summarises opens from it. */
+.sum-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  width: 100%;
+  height: 22px;
+  min-width: 0;
+  padding: 0 3px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: var(--state-recessed);
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.strip-middle > .sum-row {
+  height: 24px;
+}
+
+button.sum-row:hover,
+.sum-row button:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+  color: var(--text-primary);
+}
+
+/* The rest of a summary: "+N" or a chevron, opening the whole rack. */
+.sum-more {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  margin-left: auto;
+  padding: 0 3px;
+  border: 0;
+  border-radius: var(--r-micro);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.sum-more[aria-expanded='true'] {
+  color: var(--accent);
+}
+
+.sum-more-count {
+  flex: none;
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.sum-chevron {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-faint);
+}
+
+/* Inserts: the first two by name, each on the slot's lifted fill. Bypassed:
+   no fill, the name dimmed and struck through (colour and glyph); failed:
+   the error hue and an alert. */
+.ins-sum {
+  padding: 2px;
+}
+
+.ins-chip {
+  flex: 0 1 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 22px;
+  height: 18px;
+  padding: 0 4px;
+  border: 0;
+  border-radius: var(--r-micro);
+  /* A loaded slot: the strip lifted by the selected layer. */
+  background: linear-gradient(var(--state-selected), var(--state-selected)) var(--strip-base);
+  color: var(--text-primary);
+  font-size: 10.5px;
+}
+
+.ins-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ins-chip.bypassed {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--border-subtle);
+  color: var(--text-disabled);
+}
+
+.ins-chip.bypassed .ins-name {
+  text-decoration: line-through;
+}
+
+.ins-chip.failed {
+  background: color-mix(in srgb, var(--error) 16%, transparent);
+  color: var(--error);
+}
+
+.ins-mark {
+  flex: none;
+}
+
+.ins-add {
+  justify-content: center;
+  gap: 4px;
+  box-shadow: inset 0 0 0 1px var(--border-normal);
+  background: transparent;
+  color: var(--slot-empty-text);
+}
+
+button.ins-add:hover {
+  box-shadow: inset 0 0 0 1px var(--accent);
+  background: var(--accent-muted);
+  color: var(--accent);
+}
+
+/* Sends: the first bus by name and how many more. */
+.send-sum {
+  cursor: pointer;
+}
+
+.send-sum-icon {
+  flex: none;
+  color: var(--text-faint);
+}
+
+.send-sum-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.send-sum.empty .send-sum-name {
+  color: var(--text-faint);
+}
+
+.send-sum[aria-expanded='true'] {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* The rack a summary opens: as tall as it holds, on the raised plate. */
+.rack-pop {
+  width: 240px;
+  min-width: 0;
+  --strip-base: var(--surface-raised);
+}
+
+.rack.fit .rack-list,
+.rack.fit .rack-list.inserts,
+.rack.fit .send-list {
+  height: auto;
+  min-height: 0;
+  max-height: 300px;
+}
+
+.rack.fit .slot {
+  height: 26px;
+}
+
+.rack.fit .send {
+  height: 32px;
 }
 
 .send-list {
@@ -1025,8 +1327,38 @@ svg {
   color: var(--text-muted);
 }
 
+/* The knob, its name over its value beside it. */
 .pan-row {
-  height: 52px;
+  height: 28px;
+}
+
+.pan-row .knob {
+  display: grid;
+  grid-template-columns: auto auto;
+  grid-template-rows: auto auto;
+  align-items: center;
+  column-gap: 5px;
+  row-gap: 0;
+}
+
+.pan-row .knob svg {
+  grid-row: 1 / 3;
+}
+
+.pan-row .knob-caption {
+  align-self: end;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 10px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.pan-row .knob-text {
+  align-self: start;
+  min-width: 26px;
+  line-height: 13px;
 }
 
 /* Latched toggles: hue fixed per state (mute blue, solo amber, arm red),
@@ -1041,8 +1373,8 @@ svg {
   width: 23px;
   height: 22px;
   padding: 0;
-  border: 1px solid var(--border-normal);
-  background: var(--surface-raised);
+  border: 1px solid var(--button-border);
+  background-color: var(--button-bg);
   border-radius: var(--r-sm);
   font-weight: 700;
   font-size: 11px;
@@ -1051,27 +1383,29 @@ svg {
 
 .latch:hover {
   color: var(--text-primary);
-  border-color: var(--border-strong);
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
 }
 
 .latch-arm {
-  color: #f2645f88;
+  color: color-mix(in srgb, var(--state-arm) 53%, transparent);
 }
 
+/* Colors::latched: the hue at ARMED_WASH (18%) over the panel, its border at
+   ARMED_BORDER (55%), the glyph at full strength. */
 .latch-mute.on {
-  background: color-mix(in srgb, var(--state-mute) 18%, var(--surface-raised));
+  background-color: color-mix(in srgb, var(--state-mute) 18%, var(--surface-panel));
   border-color: color-mix(in srgb, var(--state-mute) 55%, transparent);
   color: var(--state-mute);
 }
 
 .latch-solo.on {
-  background: color-mix(in srgb, var(--state-solo) 18%, var(--surface-raised));
+  background-color: color-mix(in srgb, var(--state-solo) 18%, var(--surface-panel));
   border-color: color-mix(in srgb, var(--state-solo) 55%, transparent);
   color: var(--state-solo);
 }
 
 .latch-arm.on {
-  background: color-mix(in srgb, var(--state-arm) 18%, var(--surface-raised));
+  background-color: color-mix(in srgb, var(--state-arm) 18%, var(--surface-panel));
   border-color: color-mix(in srgb, var(--state-arm) 55%, transparent);
   color: var(--state-arm);
 }
@@ -1081,7 +1415,7 @@ svg {
 }
 
 .latch-plain.on {
-  background: var(--accent-soft);
+  background-color: var(--accent-active);
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -1091,9 +1425,9 @@ svg {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 26px;
+  height: 24px;
   border-radius: var(--r);
-  background: var(--surface-panel-alt);
+  background: var(--state-recessed);
   color: var(--text-muted);
   font-size: 12px;
 }
@@ -1106,7 +1440,7 @@ svg {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
 }
 
 .fader {
@@ -1123,7 +1457,7 @@ svg {
   position: relative;
   width: 20px;
   font-size: 9px;
-  color: var(--text-faint);
+  color: var(--fader-scale-text);
   text-align: right;
   user-select: none;
   font-variant-numeric: tabular-nums;
@@ -1152,9 +1486,9 @@ svg {
   left: 50%;
   width: 4px;
   margin-left: -2px;
-  background: var(--surface-canvas);
+  background: var(--fader-groove);
   border-radius: 2px;
-  box-shadow: inset 0 1px 1px #000a;
+  box-shadow: inset 0 0 0 1px var(--fader-rail);
 }
 
 .fader-tick {
@@ -1163,7 +1497,7 @@ svg {
   width: 14px;
   margin-left: -7px;
   height: 1px;
-  background: var(--border-normal);
+  background: var(--fader-tick);
 }
 
 .fader-tick.unity {
@@ -1180,22 +1514,25 @@ svg {
   place-items: center;
   border-radius: var(--r-sm);
   background: var(--fader-thumb);
-  border: 1px solid #ffffff40;
+  border: 1px solid var(--fader-thumb-border);
+  /* The moulding fader.rs paints on the cap: a white hairline on top, a
+     black one underneath. */
   box-shadow:
-    0 2px 4px #0009,
-    inset 0 -6px 0 #0000001a;
+    inset 0 1px 0 rgb(255 255 255 / 0.45),
+    inset 0 -1px 0 rgb(0 0 0 / 0.35);
 }
 
+/* The grip line, black at 45% as fader.rs draws it. */
 .fader-cap span {
   width: 70%;
   height: 2px;
   border-radius: 1px;
-  background: #16181f;
+  background: rgb(0 0 0 / 0.45);
 }
 
 .fader-track:hover .fader-cap,
 .fader-track.moving .fader-cap {
-  background: #dfe2e8;
+  filter: brightness(1.08);
 }
 
 .fader-readout,
@@ -1244,29 +1581,31 @@ svg {
   cursor: ns-resize;
 }
 
+/* knob.rs: the travel recessed in the fader groove, the value in the knob
+   ring, a dark body whose rim brightens under the pointer. */
 .knob-track {
   fill: none;
-  stroke: var(--surface-canvas);
+  stroke: var(--fader-groove);
   stroke-width: 3.5;
   stroke-linecap: round;
 }
 
 .knob-value {
   fill: none;
-  stroke: var(--accent);
+  stroke: var(--knob-ring);
   stroke-width: 3.5;
   stroke-linecap: round;
 }
 
 .knob-body {
-  fill: var(--surface-raised);
-  stroke: var(--border-normal);
+  fill: var(--knob-bg);
+  stroke: var(--border-strong);
   stroke-width: 1;
 }
 
 .knob:hover .knob-body,
 .knob.moving .knob-body {
-  fill: var(--surface-hover);
+  stroke: var(--text-muted);
 }
 
 .knob-pointer {
@@ -1311,7 +1650,7 @@ svg {
   background: var(--surface-panel);
   border: 1px solid var(--border-normal);
   border-radius: var(--r-dialog);
-  box-shadow: 0 24px 64px #000b;
+  box-shadow: var(--shadow-drag);
   overflow: hidden;
 }
 
@@ -1935,13 +2274,13 @@ svg {
   width: 34px;
   height: 28px;
   padding: 0;
-  border: 1px solid var(--border-normal);
+  border: 1px solid var(--button-border);
   border-radius: var(--r);
-  background: var(--surface-raised);
+  background-color: var(--button-bg);
 }
 
 .arm:hover {
-  border-color: var(--border-strong);
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
 }
 
 .arm-dot {
@@ -1952,7 +2291,7 @@ svg {
 }
 
 .arm.on {
-  background: color-mix(in srgb, var(--state-arm) 18%, var(--surface-raised));
+  background-color: color-mix(in srgb, var(--state-arm) 18%, var(--surface-panel));
   border-color: color-mix(in srgb, var(--state-arm) 55%, transparent);
 }
 
@@ -2024,6 +2363,323 @@ svg {
 
 .path svg {
   color: var(--text-muted);
+}
+
+/* ── Setup: storage (the appliance's drives) ───────────────────────────── */
+
+.button.small {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.button.danger {
+  background-color: var(--error);
+  border-color: var(--error);
+  color: var(--text-inverse);
+  font-weight: 600;
+}
+
+/* fb_button Danger: hover lifts by the primary text at 12%, pressed sinks. */
+.button.danger:hover:not(:disabled) {
+  background-image: none;
+  background-color: color-mix(in srgb, var(--error) 88%, var(--text-primary));
+  border-color: color-mix(in srgb, var(--error) 88%, var(--text-primary));
+}
+
+.storage-alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--warning) 55%, transparent);
+  border-radius: var(--r);
+  background: color-mix(in srgb, var(--warning) 12%, var(--surface-panel));
+  color: var(--text-primary);
+}
+
+.storage-alert svg {
+  margin-top: 1px;
+  color: var(--warning);
+}
+
+.storage-alert strong {
+  color: var(--warning);
+}
+
+.storage-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.storage-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 12px;
+  border-radius: var(--r);
+  background: var(--surface-panel-alt);
+  border: 1px solid var(--border-subtle);
+}
+
+.storage-stat-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.storage-stat > strong {
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.storage-stat-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.storage-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.storage-note .rec-dot {
+  width: 8px;
+  height: 8px;
+}
+
+.drives {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.drive {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-panel-alt);
+  overflow: hidden;
+}
+
+.drive-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 6px 8px 6px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  flex-wrap: wrap;
+}
+
+.drive-name {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.drive-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.volume {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  flex-wrap: wrap;
+}
+
+.volume + .volume {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.volume.here {
+  background: var(--accent-muted);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.volume-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.volume-main {
+  flex: 1 1 280px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.volume-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.volume-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.volume-badge .rec-dot {
+  width: 6px;
+  height: 6px;
+  background: currentColor;
+}
+
+.volume-state {
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r-micro);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 16px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.volume-state.rw {
+  border-color: color-mix(in srgb, var(--success) 50%, transparent);
+  color: var(--success);
+}
+
+.volume-state.off {
+  color: var(--text-faint);
+  border-style: dashed;
+}
+
+.volume-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.volume-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.usage {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.usage-bar {
+  flex: 1 1 160px;
+  max-width: 360px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-input);
+  overflow: hidden;
+}
+
+.usage-bar span {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+}
+
+.usage-bar.low span {
+  background: var(--warning);
+}
+
+.usage-numbers {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-numbers strong {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.format-warning {
+  display: flex;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--error) 50%, transparent);
+  border-radius: var(--r);
+  background: color-mix(in srgb, var(--error) 10%, var(--surface-panel));
+}
+
+.format-warning svg {
+  color: var(--error);
+}
+
+.format-warning div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.format-warning span {
+  color: var(--text-secondary);
+}
+
+.dialog-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+
+.dialog-field code {
+  padding: 1px 5px;
+  border-radius: var(--r-micro);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.dialog-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.text-input {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r);
+  background: var(--surface-input);
+  outline: none;
+}
+
+.text-input:focus {
+  border-color: var(--accent);
+}
+
+@media (max-width: 640px) {
+  .storage-summary {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* ── Narrow screens ────────────────────────────────────────────────────── */

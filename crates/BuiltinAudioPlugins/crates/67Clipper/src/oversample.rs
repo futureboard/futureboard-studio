@@ -62,6 +62,16 @@ impl Ring {
         &self.buf[self.pos..self.pos + len.min(self.cap)]
     }
 
+    /// `len` samples starting `offset` pushes ago, newest first: the window
+    /// [`Self::recent`] gave `offset` pushes back. `offset + len` stays
+    /// within the capacity.
+    #[inline]
+    pub fn recent_from(&self, offset: usize, len: usize) -> &[f32] {
+        let offset = offset.min(self.cap);
+        let start = self.pos + offset;
+        &self.buf[start..start + len.min(self.cap - offset)]
+    }
+
     pub fn clear(&mut self) {
         self.fill(0.0);
     }

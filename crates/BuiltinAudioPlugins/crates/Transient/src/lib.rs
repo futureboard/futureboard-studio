@@ -5,6 +5,7 @@
 //! independently, with Speed scaling the envelope times and Mix blending wet
 //! into dry. Allocation-free after construction.
 
+use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, clamp, db_to_linear,
     linear_to_db, mix, time_constant,
@@ -214,17 +215,130 @@ impl EnvelopePair {
     }
 }
 
+/// Attack / Sustain / Mix smoothing, per stage of a [`Glide`], so a dragged
+/// knob cannot zipper.
+const SMOOTH_MS: f32 = 7.0;
+/// Length of the Power crossfade.
+const FADE_MS: f32 = 10.0;
+/// How close (relative) a smoothed value must come before it lands exactly.
+const SETTLE: f32 = 1.0e-6;
+
+/// One sample of `value` toward its target ([`Smoothed::next`]). Lands
+/// exactly once the rest is negligible — or once a step no longer moves it in
+/// `f32` — so a finished move leaves the arithmetic it started from.
+#[inline]
+fn glide(value: &mut Smoothed, step: f32) -> f32 {
+    if value.value != value.target {
+        let before = value.value;
+        value.next(step);
+        if value.value == before
+            || (value.target - value.value).abs() <= SETTLE * (1.0 + value.target.abs())
+        {
+            value.settle();
+        }
+    }
+    value.value
+}
+
+/// Two [`Smoothed`] stages in series. The second starts every move with zero
+/// slope, so even a target that jumps bends in without a corner.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    inner: Smoothed,
+    outer: Smoothed,
+}
+
+impl Glide {
+    fn at(value: f32) -> Self {
+        Self {
+            inner: Smoothed::at(value),
+            outer: Smoothed::at(value),
+        }
+    }
+
+    fn set(&mut self, target: f32) {
+        self.inner.target = target;
+    }
+
+    fn settle(&mut self) {
+        self.inner.settle();
+        self.outer = Smoothed::at(self.inner.target);
+    }
+
+    /// One sample further; the smoothed value.
+    #[inline]
+    fn next(&mut self, step: f32) -> f32 {
+        if self.outer.value != self.inner.target || self.inner.value != self.inner.target {
+            glide(&mut self.inner, step);
+            self.outer.target = self.inner.value;
+            glide(&mut self.outer, step);
+        }
+        self.outer.value
+    }
+}
+
+/// A 0…1 crossfade position: moves linearly toward its target over
+/// [`FADE_MS`] and is read through a smoothstep, so neither end of the fade
+/// has a corner. Lands exactly on 0 or 1.
+#[derive(Debug, Clone, Copy)]
+struct Fade {
+    pos: f32,
+    target: f32,
+    step: f32,
+}
+
+impl Fade {
+    fn new(on: bool, sample_rate: f32) -> Self {
+        let at = if on { 1.0 } else { 0.0 };
+        Self {
+            pos: at,
+            target: at,
+            step: Self::step_for(sample_rate),
+        }
+    }
+
+    fn step_for(sample_rate: f32) -> f32 {
+        1.0 / (FADE_MS * 0.001 * sample_rate.max(1.0)).max(1.0)
+    }
+
+    fn set(&mut self, on: bool) {
+        self.target = if on { 1.0 } else { 0.0 };
+    }
+
+    fn settle(&mut self) {
+        self.pos = self.target;
+    }
+
+    /// One sample further; the eased weight of the "on" side.
+    #[inline]
+    fn next(&mut self) -> f32 {
+        if self.pos < self.target {
+            self.pos = (self.pos + self.step).min(self.target);
+        } else if self.pos > self.target {
+            self.pos = (self.pos - self.step).max(self.target);
+        }
+        self.pos * self.pos * (3.0 - 2.0 * self.pos)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Dsp {
     params: Params,
+    /// Audio has run since construction or [`StereoEffect::reset`]. Until
+    /// it has, an edit lands at once — an insert or session being set up
+    /// replays its stored values, and there is nothing yet to glide over.
+    started: bool,
     sample_rate: f32,
     meters: Meters,
     linked: EnvelopePair,
     left: EnvelopePair,
     right: EnvelopePair,
-    mix_amount: f32,
-    attack_amt: f32,
-    sustain_amt: f32,
+    mix_amount: Glide,
+    attack_amt: Glide,
+    sustain_amt: Glide,
+    smooth_step: f32,
+    /// Dry ↔ shaped: Power crossfades instead of switching.
+    power: Fade,
     fast_attack: f32,
     fast_release: f32,
     slow_attack: f32,
@@ -235,23 +349,28 @@ pub struct Dsp {
 impl Dsp {
     pub fn new(sample_rate: f32) -> Self {
         let sr = sample_rate.max(1.0);
+        let params = default_params();
         let mut dsp = Self {
-            params: default_params(),
+            started: false,
             sample_rate: sr,
             meters: Meters::new(sr),
             linked: EnvelopePair::default(),
             left: EnvelopePair::default(),
             right: EnvelopePair::default(),
-            mix_amount: 1.0,
-            attack_amt: 0.0,
-            sustain_amt: 0.0,
+            mix_amount: Glide::at(1.0),
+            attack_amt: Glide::at(0.0),
+            sustain_amt: Glide::at(0.0),
+            smooth_step: smoothing_step(SMOOTH_MS, sr),
+            power: Fade::new(params.power, sr),
             fast_attack: 0.0,
             fast_release: 0.0,
             slow_attack: 0.0,
             slow_release: 0.0,
             shape_db: 0.0,
+            params,
         };
         dsp.apply_params();
+        dsp.settle();
         dsp
     }
 
@@ -259,10 +378,13 @@ impl Dsp {
         &self.params
     }
 
+    /// Replace every parameter at once — a state load. Lands on the new
+    /// values without a glide.
     pub fn set_params(&mut self, params: Params) {
         self.params = params;
         ipc::sanitize_params(&mut self.params);
         self.apply_params();
+        self.settle();
     }
 
     pub fn meter_frame(&self) -> MeterFrame {
@@ -291,6 +413,9 @@ impl Dsp {
             return false;
         }
         self.apply_params();
+        if !self.started {
+            self.settle();
+        }
         true
     }
 
@@ -305,10 +430,13 @@ impl Dsp {
         0
     }
 
+    /// Retarget the smoothed amounts and the Power fade, and resolve the
+    /// envelope times. Runs between blocks; allocation-free.
     fn apply_params(&mut self) {
-        self.mix_amount = self.params.mix / 100.0;
-        self.attack_amt = self.params.attack / 100.0;
-        self.sustain_amt = self.params.sustain / 100.0;
+        self.mix_amount.set(self.params.mix / 100.0);
+        self.attack_amt.set(self.params.attack / 100.0);
+        self.sustain_amt.set(self.params.sustain / 100.0);
+        self.power.set(self.params.power);
 
         // Speed 0 = slowest envelopes, 100 = fastest. Map to a 0.25×…4× span.
         let speed_norm = clamp(self.params.speed, 0.0, 100.0) / 100.0;
@@ -320,9 +448,19 @@ impl Dsp {
         self.slow_release = time_constant(sr, SLOW_RELEASE_BASE_SEC * speed_scale);
     }
 
+    /// Land every smoother and the Power fade on its target.
+    fn settle(&mut self) {
+        self.mix_amount.settle();
+        self.attack_amt.settle();
+        self.sustain_amt.settle();
+        self.power.settle();
+    }
+
     fn set_sample_rate_internal(&mut self, sample_rate: f32) {
         self.sample_rate = sample_rate.max(1.0);
         self.meters = Meters::new(self.sample_rate);
+        self.smooth_step = smoothing_step(SMOOTH_MS, self.sample_rate);
+        self.power.step = Fade::step_for(self.sample_rate);
     }
 
     /// Gain from the dual-envelope state. Attack weights the fast−slow
@@ -346,25 +484,36 @@ impl Dsp {
 
 impl StereoEffect for Dsp {
     fn reset(&mut self) {
+        self.started = false;
         self.meters.reset();
         self.linked.reset();
         self.left.reset();
         self.right.reset();
         self.shape_db = 0.0;
+        self.settle();
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {
         self.set_sample_rate_internal(sample_rate);
         self.apply_params();
+        self.settle();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        self.started = true;
         let in_sum = (left + right) * 0.5;
-        if !self.params.power {
+        let on = self.power.next();
+        if on <= 0.0 {
+            // Off and faded out: nothing runs.
             self.meters.push(in_sum, in_sum);
             self.shape_db = 0.0;
             return (left, right);
         }
+
+        let step = self.smooth_step;
+        let attack_amt = self.attack_amt.next(step);
+        let sustain_amt = self.sustain_amt.next(step);
+        let mix_amount = self.mix_amount.next(step);
 
         let (gain_l, gain_r) = if self.params.stereo_link {
             let level = left.abs().max(right.abs());
@@ -375,7 +524,7 @@ impl StereoEffect for Dsp {
                 self.slow_attack,
                 self.slow_release,
             );
-            let gain = Self::shape_gain(&self.linked, self.attack_amt, self.sustain_amt);
+            let gain = Self::shape_gain(&self.linked, attack_amt, sustain_amt);
             (gain, gain)
         } else {
             self.left.push(
@@ -393,15 +542,18 @@ impl StereoEffect for Dsp {
                 self.slow_release,
             );
             (
-                Self::shape_gain(&self.left, self.attack_amt, self.sustain_amt),
-                Self::shape_gain(&self.right, self.attack_amt, self.sustain_amt),
+                Self::shape_gain(&self.left, attack_amt, sustain_amt),
+                Self::shape_gain(&self.right, attack_amt, sustain_amt),
             )
         };
 
+        // The shaped gain eases in and out with Power: a gain blend is the
+        // same as blending the dry and shaped signals.
+        let mix_amount = mix_amount * on;
         let wet_l = left * gain_l;
         let wet_r = right * gain_r;
-        let out_l = mix(left, wet_l, self.mix_amount);
-        let out_r = mix(right, wet_r, self.mix_amount);
+        let out_l = mix(left, wet_l, mix_amount);
+        let out_r = mix(right, wet_r, mix_amount);
 
         let report_gain = gain_l.min(gain_r);
         self.shape_db = if report_gain > 1.0e-12 {
@@ -418,6 +570,121 @@ impl StereoEffect for Dsp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BLOCK: usize = 128;
+    /// About a second of blocks: one drag across a range and back.
+    const DRAG_BLOCKS: usize = 375;
+
+    /// Two low tones: smooth, so a gain that steps shows as a kink.
+    fn tone(n: usize) -> (f32, f32) {
+        let t = n as f64 / 48_000.0;
+        let x = (std::f64::consts::TAU * 110.0 * t).sin() * 0.3
+            + (std::f64::consts::TAU * 330.0 * t).sin() * 0.1;
+        (x as f32, (x * 0.8) as f32)
+    }
+
+    /// The parameter sweep's measure: the biggest second difference where a
+    /// block meets the last one, against the biggest one inside a block,
+    /// while `change` edits the DSP before each 128-frame block. About 1 is
+    /// smooth; a value that steps once per block stands out many times over.
+    fn edge_jump(dsp: &mut Dsp, mut change: impl FnMut(&mut Dsp, usize)) -> f32 {
+        let mut n = 0;
+        let mut last = [(0.0f32, 0.0f32); 2];
+        for _ in 0..200 * BLOCK {
+            let (l, r) = tone(n);
+            n += 1;
+            last = [last[1], dsp.process_stereo(l, r)];
+        }
+        let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+        let mut worst = 0.0f32;
+        for block in 0..DRAG_BLOCKS {
+            change(dsp, block);
+            let (mut edge, mut inside) = (0.0f32, 1.0e-7f32);
+            for i in 0..BLOCK {
+                let (l, r) = tone(n);
+                n += 1;
+                let out = dsp.process_stereo(l, r);
+                assert!(out.0.is_finite() && out.1.is_finite());
+                let kink = d2(last[0].0, last[1].0, out.0).max(d2(last[0].1, last[1].1, out.1));
+                if i < 2 {
+                    edge = edge.max(kink);
+                } else {
+                    inside = inside.max(kink);
+                }
+                last = [last[1], out];
+            }
+            worst = worst.max(edge / inside);
+        }
+        worst
+    }
+
+    /// Up and back down across `[min, max]`, a value per block.
+    fn drag(min: f32, max: f32, block: usize) -> f32 {
+        let phase = block as f32 / DRAG_BLOCKS as f32 * 2.0;
+        let x = if phase < 1.0 { phase } else { 2.0 - phase };
+        min + (max - min) * x
+    }
+
+    /// A click every quarter second, through every step of a switch.
+    fn click(dsp: &mut Dsp, index: u32, steps: usize, block: usize) {
+        if block.is_multiple_of(94) {
+            dsp.apply_wire_param(index, ((block / 94) % steps) as f32);
+        }
+    }
+
+    /// A shaper with something to do on a steady tone.
+    fn shaping() -> Dsp {
+        let mut dsp = Dsp::new(48_000.0);
+        let mut params = default_params();
+        params.attack = 60.0;
+        params.sustain = 50.0;
+        dsp.set_params(params);
+        dsp
+    }
+
+    #[test]
+    fn dragged_amounts_and_mix_do_not_zipper() {
+        for (index, min, max) in [
+            (ipc::ATTACK_INDEX, -100.0, 100.0),
+            (ipc::SUSTAIN_INDEX, -100.0, 100.0),
+            (ipc::MIX_INDEX, 0.0, 100.0),
+            (ipc::SPEED_INDEX, 0.0, 100.0),
+        ] {
+            let mut dsp = shaping();
+            let jump = edge_jump(&mut dsp, |dsp, block| {
+                dsp.apply_wire_param(index, drag(min, max, block));
+            });
+            assert!(
+                jump < 4.0,
+                "{}: block-edge jump {jump}",
+                UI_PARAM_IDS[index as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn power_crossfades_instead_of_stepping() {
+        let mut dsp = shaping();
+        let jump = edge_jump(&mut dsp, |dsp, block| {
+            click(dsp, ipc::POWER_INDEX, 2, block)
+        });
+        assert!(jump < 4.0, "power: block-edge jump {jump}");
+    }
+
+    #[test]
+    fn faded_out_power_is_a_bit_exact_bypass() {
+        let mut dsp = shaping();
+        assert!(dsp.apply_ui_param("power", 0.0));
+        for n in 0..960 {
+            let _ = dsp.process_stereo(tone(n).0, tone(n).1);
+        }
+        assert_eq!(dsp.process_stereo(0.5, -0.4), (0.5, -0.4));
+        // A state load lands without a fade.
+        let mut params = default_params();
+        params.sustain = 80.0;
+        dsp.set_params(params);
+        assert_eq!(dsp.sustain_amt.outer.value, 0.8);
+    }
 
     fn run_impulse(dsp: &mut Dsp, samples: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity(samples);
@@ -526,5 +793,17 @@ mod tests {
         assert_eq!(dsp.params().speed, 10.0);
         assert_eq!(dsp.params().mix, 50.0);
         assert!(!dsp.params().stereo_link);
+    }
+
+    /// An insert being set up replays its stored values before any audio:
+    /// they land at once instead of gliding in.
+    #[test]
+    fn edits_before_the_first_sample_land_at_once() {
+        let mut dsp = Dsp::new(48_000.0);
+        assert!(dsp.apply_wire_param(ipc::SUSTAIN_INDEX, 40.0));
+        assert_eq!(dsp.sustain_amt.outer.value, 0.4);
+        let _ = dsp.process_stereo(0.1, 0.1);
+        assert!(dsp.apply_wire_param(ipc::SUSTAIN_INDEX, 0.0));
+        assert_eq!(dsp.sustain_amt.outer.value, 0.4);
     }
 }

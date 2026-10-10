@@ -2724,6 +2724,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "drumsilencer"
+version = "2026.10.1-beta1.4.2"
+dependencies = [
+ "builtin_dsp_core",
+ "rustfft",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dtor"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5020,12 +5030,15 @@ dependencies = [
  "gpui_windows",
  "libc",
  "livestage-engine",
+ "midir",
  "pbkdf2 0.12.2",
+ "rand 0.9.4",
  "ratatui",
  "raw-window-handle",
  "serde",
  "serde_json",
  "sha1 0.10.7",
+ "sha2",
  "sphere_ui_components",
  "tungstenite",
  "windows-sys 0.61.2",
@@ -5047,6 +5060,7 @@ dependencies = [
  "fa2a",
  "fa76",
  "imager",
+ "libc",
  "mixstation",
  "parking_lot",
  "rodharerist",
@@ -5055,6 +5069,7 @@ dependencies = [
  "sphere-encoder",
  "sphere-plugin-host",
  "sphere_directaudioengine",
+ "symphonia",
  "transient",
  "verbspace",
  "waygate",

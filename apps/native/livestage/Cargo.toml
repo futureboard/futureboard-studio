@@ -26,6 +26,14 @@ name = "livestage-setup"
 path = "src/console/main.rs"
 required-features = ["appliance"]
 
+# The installer USB stick's text UI (tty1): puts the appliance image onto a
+# computer's disk, with the setup's answers if given there. Built for the
+# installer image only (packaging/livestage, -Installer).
+[[bin]]
+name = "livestage-installer"
+path = "src/installer/main.rs"
+required-features = ["appliance"]
+
 [features]
 default = ["gui", "external-plugins"]
 gui = [
@@ -36,7 +44,7 @@ gui = [
     "dep:gpui_linux",
 ]
 external-plugins = ["livestage-engine/external-plugins"]
-appliance = ["dep:ratatui", "dep:pbkdf2", "dep:sha1"]
+appliance = ["dep:ratatui", "dep:sha1"]
 # Developer tool: `LiveStage --preview DIR` renders each view of a demo
 # session to PNG off-screen and quits. Never in a release.
 ui-preview = ["gui", "sphere_ui_components/ui-preview", "gpui/test-support", "dep:fa76"]
@@ -52,9 +60,17 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 # The appliance console's text UI (crossterm draws on the Linux console).
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"], optional = true }
 # The console's Wi-Fi setup keeps only the WPA key made from the password
-# (PBKDF2-HMAC-SHA1, as wpa_passphrase), never the password.
-pbkdf2 = { workspace = true, optional = true }
+# (PBKDF2-HMAC-SHA1, as wpa_passphrase), never the password; the server keeps
+# web users' PINs only as PBKDF2-HMAC-SHA256 hashes.
+pbkdf2.workspace = true
 sha1 = { version = "0.10", optional = true }
+sha2.workspace = true
+# The PIN hashes' salts and the log-in tokens, from the operating system's
+# random source.
+rand.workspace = true
+# The server's MIDI remote: control surfaces in and feedback out (WinMM on
+# Windows, the ALSA sequencer on Linux).
+midir.workspace = true
 # The preview demo addresses FA-76 parameters by name.
 fa76 = { workspace = true, optional = true }
 

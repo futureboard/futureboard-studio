@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { fileURLToPath } from 'node:url'
+import { futureboardTheme } from './futureboard-theme.ts'
 
 // The server embeds `dist/` at compile time (see ../build.rs) and serves it
 // itself. `bun run dev` serves the page from Vite instead and forwards the
@@ -9,7 +10,8 @@ const server = process.env.LIVESTAGE_SERVER ?? '127.0.0.1:8730'
 
 export default defineConfig({
   root: fileURLToPath(new URL('.', import.meta.url)),
-  plugins: [react()],
+  // Studio's colours, straight from its theme file (futureboard-theme.ts).
+  plugins: [react(), futureboardTheme()],
   build: {
     outDir: 'dist',
     emptyOutDir: true,

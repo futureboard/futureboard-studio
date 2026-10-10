@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, SyncSender, TryRecvError};
@@ -36,9 +36,14 @@ pub enum Inbound {
     StdinClosed,
     /// A text frame from a web client.
     Web(ClientId, String),
-    /// A web client connected; what is sent into the outbox reaches it.
-    Joined(ClientId, SyncSender<String>),
+    /// A web client connected from that address; what is sent into the
+    /// outbox reaches it.
+    Joined(ClientId, SyncSender<String>, Option<IpAddr>),
     Left(ClientId),
+    /// The storage worker's answer (see `storage`).
+    Storage(crate::storage::Done),
+    /// An OSC packet or a MIDI message (see `remote`).
+    Remote(crate::remote::RemoteIn),
 }
 
 /// Messages a client may have queued before it counts as stalled.
@@ -322,7 +327,9 @@ fn websocket(stream: Replay, id: ClientId, inbound: &Sender<Inbound>) {
     // Short reads from here on: between frames the thread drains its outbox.
     let _ = ws.get_ref().stream.set_read_timeout(Some(POLL));
     let (outbox, pending) = std::sync::mpsc::sync_channel::<String>(OUTBOX);
-    if inbound.send(Inbound::Joined(id, outbox)).is_err() {
+    // Failed log-ins are counted per address.
+    let peer = ws.get_ref().stream.peer_addr().ok().map(|a| a.ip());
+    if inbound.send(Inbound::Joined(id, outbox, peer)).is_err() {
         return;
     }
     'connection: loop {

@@ -1,0 +1,12 @@
+# /etc/inittab for the LiveStage installer (USB stick)
+
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+# tty1: the installer. tty2 (Alt+F2): a login shell (root, no password).
+tty1::respawn:/usr/bin/livestage-installer --console
+tty2::respawn:/sbin/getty 38400 tty2
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/openrc shutdown

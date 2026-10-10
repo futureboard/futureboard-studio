@@ -1,12 +1,15 @@
-//! The appliance's own settings, `/data/system/setup.conf`: shell variables
-//! that the boot scripts source and this tool reads back. The first setup
-//! writes it; until then every value is its default, which is a working
-//! machine (DHCP on every wired port, the web UI open to the network).
+//! The appliance's own settings, `/var/lib/livestage/setup.conf`: shell
+//! variables that the boot scripts source (as root) and this tool reads back.
+//! The first setup writes it; until then every value is its default, which
+//! is a working machine (DHCP on every wired port, the web UI open to the
+//! network, recordings on the data partition).
 //!
-//! Hand-made overrides belong in `/data/livestage/livestage.conf`, which the
-//! service reads after this file; this tool never touches that one.
+//! Hand-made overrides belong in `/var/lib/livestage/livestage.conf`, which
+//! the service reads after this file; this tool never touches that one.
 
 use std::net::Ipv4Addr;
+
+use super::storage_api;
 
 pub const DEFAULT_NAME: &str = "livestage";
 pub const DEFAULT_TIMEZONE: &str = "UTC";
@@ -37,6 +40,12 @@ pub struct SetupConfig {
     /// Once there is one, the session holds it (the web UI changes it there)
     /// and the setup edits the session instead.
     pub audio: AudioChoice,
+    /// Where recordings go: `internal` (the data partition) or the UUID of
+    /// an external volume (`RECORD_STORAGE`; the storage page changes it).
+    pub record_storage: String,
+    /// The name of that volume when it was last seen (`RECORD_STORAGE_LABEL`),
+    /// for saying which drive is missing; empty when none was known.
+    pub record_storage_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +97,8 @@ impl Default for SetupConfig {
             web_open: true,
             web_port: DEFAULT_PORT,
             audio: AudioChoice::default(),
+            record_storage: storage_api::INTERNAL.to_string(),
+            record_storage_label: String::new(),
         }
     }
 }
@@ -143,6 +154,8 @@ impl SetupConfig {
                         .filter(|b| BUFFERS.contains(b))
                         .unwrap_or(DEFAULT_BUFFER)
                 }
+                "RECORD_STORAGE" => config.record_storage = parse_record_storage(&value),
+                "RECORD_STORAGE_LABEL" => config.record_storage_label = parse_storage_label(&value),
                 _ => {}
             }
         }
@@ -169,7 +182,7 @@ impl SetupConfig {
             "# LiveStage appliance settings, written by livestage-setup (the setup on\n\
              # the console, tty1). Read at boot by /etc/init.d/livestage-config and\n\
              # /etc/init.d/livestage. Hand-made LiveStage settings go in\n\
-             # /data/livestage/livestage.conf instead, which wins over these.\n\n",
+             # /var/lib/livestage/livestage.conf instead, which wins over these.\n\n",
         );
         let mut put = |key: &str, value: &str| {
             out.push_str(key);
@@ -209,6 +222,8 @@ impl SetupConfig {
         put("AUDIO_INPUT", self.audio.input.as_deref().unwrap_or(""));
         put("AUDIO_RATE", &self.audio.rate.to_string());
         put("AUDIO_BUFFER", &self.audio.buffer.to_string());
+        put("RECORD_STORAGE", &self.record_storage);
+        put("RECORD_STORAGE_LABEL", &self.record_storage_label);
         out
     }
 
@@ -238,6 +253,46 @@ pub fn variables(text: &str) -> Vec<(String, String)> {
             Some((key.to_string(), unquote(value)))
         })
         .collect()
+}
+
+/// `RECORD_STORAGE`: `internal` or a UUID; anything else is `internal`.
+pub fn parse_record_storage(value: &str) -> String {
+    let value = value.trim();
+    if storage_api::valid_id(value) {
+        value.to_string()
+    } else {
+        storage_api::INTERNAL.to_string()
+    }
+}
+
+/// `RECORD_STORAGE_LABEL`: a volume label as blkid gave it, shown only; no
+/// control characters, at most 64 characters (anything else is none).
+pub fn parse_storage_label(value: &str) -> String {
+    let value = value.trim();
+    if value.chars().count() <= 64 && !value.chars().any(char::is_control) {
+        value.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// `text` with `key` set to `value`: its line replaced (the last one, which
+/// the shell would use), or added at the end. Every other line is kept as
+/// it is.
+pub fn set_variable(text: &str, key: &str, value: &str) -> String {
+    let line = format!("{key}={}", quote(value));
+    let is_key = |l: &str| {
+        let l = l.trim();
+        !l.starts_with('#') && l.split_once('=').is_some_and(|(k, _)| k == key)
+    };
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    match lines.iter().rposition(|l| is_key(l)) {
+        Some(index) => lines[index] = line,
+        None => lines.push(line),
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 /// Double quotes, with the four characters the shell still reads inside them
@@ -355,7 +410,7 @@ fn hex(bytes: &[u8]) -> String {
 /// channels the radio may use.
 pub fn wpa_supplicant_file(wifi: &Wifi, country: Option<&str>) -> String {
     let mut out = String::from(
-        "# Made by livestage-setup from /data/system/setup.conf.\n\
+        "# Made by livestage-setup from /var/lib/livestage/setup.conf.\n\
          ctrl_interface=/run/wpa_supplicant\nupdate_config=0\n",
     );
     if let Some(country) = country {
@@ -448,7 +503,7 @@ pub fn netmask(prefix: u8) -> Ipv4Addr {
 /// port is Wi-Fi, which wpa_supplicant joins to its network first.
 pub fn interfaces_file(config: &SetupConfig, wired: &[String], wireless: bool) -> String {
     let mut out = String::from(
-        "# Made at boot by livestage-setup from /data/system/setup.conf.\n\
+        "# Made at boot by livestage-setup from /var/lib/livestage/setup.conf.\n\
          # Change it with the setup on the console (tty1).\n\n\
          auto lo\niface lo inet loopback\n",
     );
@@ -546,6 +601,8 @@ mod tests {
                 rate: 48_000,
                 buffer: 128,
             },
+            record_storage: "1A2B-3C4D".into(),
+            record_storage_label: "Show \"$1\"".into(),
         };
         let file = config.to_file();
         assert!(file.contains("NET_ADDRESS=\"10.0.0.20/16\""));
@@ -557,7 +614,8 @@ mod tests {
     fn bad_values_fall_back_to_the_defaults() {
         let config = SetupConfig::parse(
             "DEVICE_NAME=\"-bad\"\nTIMEZONE=\"../../etc/passwd\"\nNET_INTERFACE=\"eth0; reboot\"\n\
-             NET_MODE=static\nNET_ADDRESS=300.1.1.1\nAUDIO_OUTPUT=\"$(reboot)\"\nAUDIO_RATE=12345\n",
+             NET_MODE=static\nNET_ADDRESS=300.1.1.1\nAUDIO_OUTPUT=\"$(reboot)\"\nAUDIO_RATE=12345\n\
+             RECORD_STORAGE=\"../../etc\"\n",
         );
         assert_eq!(config, SetupConfig::default());
     }
@@ -566,6 +624,56 @@ mod tests {
     fn a_fixed_address_without_a_port_is_dhcp() {
         let config = SetupConfig::parse("NET_MODE=static\nNET_ADDRESS=10.0.0.5/24\n");
         assert_eq!(config.fixed, None);
+    }
+
+    #[test]
+    fn the_recording_target_is_internal_or_a_uuid() {
+        assert_eq!(SetupConfig::default().record_storage, "internal");
+        assert!(
+            SetupConfig::default()
+                .to_file()
+                .contains("RECORD_STORAGE=\"internal\"\n")
+        );
+        let config = SetupConfig::parse("RECORD_STORAGE=\"1A2B-3C4D\"\n");
+        assert_eq!(config.record_storage, "1A2B-3C4D");
+        assert_eq!(
+            SetupConfig::parse("RECORD_STORAGE=sdb1\n").record_storage,
+            "internal"
+        );
+        assert_eq!(
+            SetupConfig::parse("RECORD_STORAGE=\n").record_storage,
+            "internal"
+        );
+        assert_eq!(
+            SetupConfig::parse("RECORD_STORAGE_LABEL=\"SHOW \\\"A\\\"\"\n").record_storage_label,
+            "SHOW \"A\""
+        );
+        assert_eq!(
+            SetupConfig::parse(&format!("RECORD_STORAGE_LABEL={}\n", "x".repeat(65)))
+                .record_storage_label,
+            ""
+        );
+    }
+
+    #[test]
+    fn setting_one_variable_keeps_the_rest() {
+        let text = "# hand-made\nDEVICE_NAME=\"foh\"\nRECORD_STORAGE=\"internal\"\nTIMEZONE=UTC\n";
+        let changed = set_variable(text, "RECORD_STORAGE", "1A2B-3C4D");
+        assert_eq!(
+            changed,
+            "# hand-made\nDEVICE_NAME=\"foh\"\nRECORD_STORAGE=\"1A2B-3C4D\"\nTIMEZONE=UTC\n"
+        );
+        assert_eq!(SetupConfig::parse(&changed).record_storage, "1A2B-3C4D");
+        assert_eq!(SetupConfig::parse(&changed).name, "foh");
+        // Not there yet (or no file at all): added.
+        assert_eq!(
+            set_variable("", "RECORD_STORAGE", "internal"),
+            "RECORD_STORAGE=\"internal\"\n"
+        );
+        assert_eq!(
+            set_variable("# RECORD_STORAGE=x\nA=1", "RECORD_STORAGE", "internal"),
+            "# RECORD_STORAGE=x\nA=1\nRECORD_STORAGE=\"internal\"\n"
+        );
     }
 
     #[test]

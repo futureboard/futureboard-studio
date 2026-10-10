@@ -1,0 +1,519 @@
+/* Phase 4: the personal monitor mix (MyMix.tsx). Phone first: one column of
+   rows, each at least 44 px, faders across the width with a fingertip cap.
+   From 720 px a row lays name, fader and pan side by side. The mix's own
+   colour tints only its chip and the header's leading edge; the accent
+   marks focus and the moving cap, as everywhere. */
+
+.mm-page {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 12px 12px 32px;
+}
+
+.mm-chip {
+  flex: none;
+  width: 4px;
+  height: 22px;
+  border-radius: var(--r-micro);
+  background: var(--strip-color, var(--border-strong));
+}
+
+.mm-chip.big {
+  height: 32px;
+}
+
+/* ── Choosing a mix ────────────────────────────────────────────────────── */
+
+.mm-choose {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.mm-choose-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.mm-choose-head > svg {
+  margin-top: 2px;
+  color: var(--text-muted);
+}
+
+.mm-choose-head h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.mm-choose-head p {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.mm-choices {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.mm-choice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 56px;
+  padding: 0 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-surface);
+  background-color: var(--surface-panel);
+  color: var(--text-muted);
+  text-align: left;
+}
+
+.mm-choice:hover:not(:disabled) {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.mm-choice-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.3;
+}
+
+.mm-choice-text strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.mm-choice-text span {
+  font-size: 12px;
+}
+
+/* ── The mix's header: name, mute, its own level ───────────────────────── */
+
+.mm-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-surface);
+  background: var(--surface-panel);
+}
+
+.mm-head-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+}
+
+.mm-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.mm-title strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 16px;
+}
+
+.mm-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.mm-head .latch {
+  height: 36px;
+  min-width: 64px;
+  padding: 0 12px;
+  font-size: 12px;
+}
+
+.mm-readonly {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.mm-master {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.mm-master-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* ── Rows ──────────────────────────────────────────────────────────────── */
+
+.mm-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.mm-group {
+  padding: 12px 4px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* A full-width row: square, a hairline between rows (DESIGN.md). */
+.mm-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    'name'
+    'fader'
+    'pan';
+  gap: 4px 12px;
+  min-height: 44px;
+  padding: 8px 4px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.mm-row.pinned {
+  background: color-mix(in srgb, var(--state-selected) 60%, transparent);
+}
+
+.mm-row-name {
+  grid-area: name;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 32px;
+}
+
+.mm-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.mm-row.unsent .mm-name {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.mm-tap {
+  flex: none;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+.mm-pin {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  margin: -2px 0 -2px -4px;
+  border: 0;
+  border-radius: var(--r);
+  background: transparent;
+  color: var(--text-faint);
+}
+
+.mm-pin:hover {
+  background: var(--state-hover);
+  color: var(--text-primary);
+}
+
+/* Pinned: the glyph filled and at full strength (two channels). */
+.mm-pin.on {
+  color: var(--text-primary);
+}
+
+.mm-pin.on svg {
+  fill: currentColor;
+}
+
+.mm-row > .mm-fader {
+  grid-area: fader;
+}
+
+.mm-pan {
+  grid-area: pan;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.mm-pan:empty {
+  display: none;
+}
+
+.mm-pan-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.mm-follow {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/* ── The horizontal fader ──────────────────────────────────────────────── */
+
+.mm-fader {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 64px;
+  grid-template-rows: auto auto;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 3px;
+  min-width: 0;
+}
+
+/* Under the groove, not the cap's travel ends. */
+.mm-fader > .mm-meter {
+  grid-column: 1;
+  grid-row: 2;
+  width: calc(100% - 30px);
+  margin: 0 15px;
+}
+
+.mm-fader > .mm-readout,
+.mm-fader > .mm-entry {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+/* 44 px tall to touch; a vertical swipe scrolls the page instead. */
+.mm-track {
+  --cap: 30px;
+  position: relative;
+  height: 44px;
+  touch-action: pan-y;
+  cursor: ew-resize;
+  border-radius: var(--r);
+  outline-offset: 2px;
+}
+
+.mm-track.readonly {
+  cursor: not-allowed;
+}
+
+.mm-groove,
+.mm-fill {
+  position: absolute;
+  top: calc(50% - 3px);
+  height: 6px;
+  left: calc(var(--cap) / 2);
+  border-radius: var(--r-micro);
+}
+
+.mm-groove {
+  right: calc(var(--cap) / 2);
+  background: var(--fader-groove);
+}
+
+.mm-fill {
+  width: calc(var(--pos) * (100% - var(--cap)));
+  background: color-mix(in srgb, var(--strip-color, var(--text-muted)) 70%, var(--fader-groove));
+}
+
+.mm-unity {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  width: 1px;
+  left: calc(var(--cap) / 2 + var(--unity) * (100% - var(--cap)));
+  background: var(--fader-tick);
+}
+
+.mm-cap {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  width: var(--cap);
+  left: calc(var(--pos) * (100% - var(--cap)));
+  border: 1px solid var(--fader-thumb-border);
+  border-radius: var(--r-sm);
+  background: var(--fader-thumb);
+  box-shadow: inset 0 0 0 1px var(--surface-panel);
+}
+
+.mm-cap::after {
+  content: '';
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: calc(50% - 1px);
+  width: 2px;
+  background: var(--text-inverse);
+  opacity: 0.6;
+}
+
+.mm-track.moving .mm-cap {
+  border-color: var(--accent);
+}
+
+.mm-track.readonly .mm-cap {
+  opacity: 0.55;
+}
+
+.mm-readout,
+.mm-entry {
+  width: 64px;
+  height: 32px;
+  padding: 0 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: right;
+}
+
+.mm-readout:disabled {
+  opacity: 1;
+  color: var(--text-secondary);
+}
+
+.mm-entry {
+  border-color: var(--accent);
+  outline: none;
+}
+
+/* The source's level, under its fader: square segments of data. */
+.mm-meter {
+  display: block;
+  width: 100%;
+  height: 4px;
+}
+
+.mm-meter.stereo {
+  height: 7px;
+}
+
+/* ── Pan across ────────────────────────────────────────────────────────── */
+
+.mm-panner {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mm-pan-track {
+  position: relative;
+  flex: 1;
+  height: 32px;
+  touch-action: pan-y;
+  cursor: ew-resize;
+  border-radius: var(--r);
+}
+
+.mm-pan-track::before {
+  content: '';
+  position: absolute;
+  top: calc(50% - 2px);
+  left: 0;
+  right: 0;
+  height: 4px;
+  border-radius: var(--r-micro);
+  background: var(--fader-groove);
+}
+
+.mm-pan-fill {
+  position: absolute;
+  top: calc(50% - 2px);
+  height: 4px;
+  left: calc(var(--from) * 100%);
+  width: calc((var(--to) - var(--from)) * 100%);
+  background: var(--knob-ring);
+}
+
+.mm-pan-mark {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  width: 10px;
+  left: calc(var(--pos) * (100% - 10px));
+  border: 1px solid var(--fader-thumb-border);
+  border-radius: var(--r-micro);
+  background: var(--fader-thumb);
+}
+
+.mm-pan-track.readonly {
+  cursor: not-allowed;
+}
+
+.mm-pan-value {
+  width: 34px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: right;
+}
+
+/* The connection-lost card over a musician's mix: the same as the console's. */
+.mm-offline {
+  z-index: 45;
+}
+
+/* A musician's top bar: one row even on a phone. */
+.app.musician .toolbar {
+  flex-wrap: nowrap;
+  gap: 8px;
+}
+
+/* Tablet and up: name | fader | pan on one line. */
+@media (min-width: 720px) {
+  .mm-page {
+    padding: 16px 20px 40px;
+  }
+
+  .mm-row {
+    grid-template-columns: minmax(150px, 220px) minmax(0, 1fr) minmax(0, 240px);
+    grid-template-areas: 'name fader pan';
+    align-items: center;
+    padding: 6px 4px;
+  }
+
+  .mm-head {
+    top: 8px;
+  }
+}

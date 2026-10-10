@@ -1,0 +1,12 @@
+
+LiveStage installer (Alpine Linux)
+
+  livestage-installer                 the installer (it runs on Alt+F1 too)
+  livestage-installer --list          the disks, and which can take LiveStage
+  livestage-installer --disk /dev/sdX --yes [--setup-conf FILE]
+                                      install with no questions
+  blkid, sfdisk -l, efibootmgr        what the disks and the firmware hold
+
+  The image it installs: /usr/share/livestage/installer/livestage.img.zst
+  The system is read-only; /tmp and /run are in memory.
+

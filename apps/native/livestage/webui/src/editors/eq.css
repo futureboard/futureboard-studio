@@ -127,7 +127,7 @@
   left: 8px;
   padding: 1px 6px;
   border-radius: var(--r-micro);
-  background: color-mix(in srgb, var(--surface-window) 88%, transparent);
+  background: color-mix(in srgb, var(--surface-base) 88%, transparent);
   font-size: 10px;
   font-weight: 500;
   color: var(--text-secondary);
@@ -150,7 +150,7 @@
   padding: 4px 8px;
   border: 1px solid var(--border-subtle);
   border-radius: var(--r-sm);
-  background: color-mix(in srgb, var(--surface-window) 92%, transparent);
+  background: color-mix(in srgb, var(--surface-base) 92%, transparent);
   font-size: 10px;
   color: var(--text-secondary);
   text-align: center;
@@ -186,7 +186,8 @@
 
 .eq-cell.selected {
   border-color: var(--border-normal);
-  background: color-mix(in srgb, var(--surface-panel), #ffffff 10%);
+  /* The panel lifted by the selected layer (eq_panel.rs). */
+  background: linear-gradient(var(--state-selected), var(--state-selected)) var(--surface-panel);
 }
 
 .eq-cell.off {

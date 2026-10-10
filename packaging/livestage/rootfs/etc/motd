@@ -7,10 +7,12 @@ LiveStage appliance (Alpine Linux)
   livestage-server --list-devices               audio interfaces
   aplay -l                                      ALSA cards
 
-  Setup:         /data/system/setup.conf  (livestage-setup writes it)
-  Settings:      /data/livestage/livestage.conf  (see /etc/conf.d/livestage)
-  Session:       /data/livestage/show.json
-  Recordings:    /data/livestage/recordings
+  Setup:         /var/lib/livestage/setup.conf  (livestage-setup writes it)
+  Settings:      /var/lib/livestage/livestage.conf  (see /etc/conf.d/livestage)
+  Session:       /data/livestage/show.json  (exFAT: readable on any computer)
+  Recordings:    /data/livestage/recordings, or a USB drive's
+                 "LiveStage Recordings" (Setup → Storage)
+  Storage log:   /var/log/livestage-storage.log
 
   The system is read-only. To change it: mount -o remount,rw /
 

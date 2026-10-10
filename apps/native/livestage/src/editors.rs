@@ -101,6 +101,7 @@ pub fn open_editor(
     let strip_name = match strip {
         StripRef::Channel(id) => session.channel(id).map(|c| c.name.clone()),
         StripRef::Bus(id) => session.bus(id).map(|b| b.name.clone()),
+        StripRef::Matrix(id) => session.matrix(id).map(|m| m.name.clone()),
         StripRef::Master => Some("Master".to_string()),
     }
     .unwrap_or_default();

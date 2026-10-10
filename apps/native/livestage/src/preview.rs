@@ -57,11 +57,13 @@ fn demo_session() -> Session {
             bus: reverb,
             level_db: -12.0,
             pre_fader: false,
+            ..SendSlot::default()
         },
         SendSlot {
             bus: monitor,
             level_db: 0.0,
             pre_fader: true,
+            ..SendSlot::default()
         },
     ];
     let comp = builtin(&mut session, "zcomp");
@@ -77,12 +79,14 @@ fn demo_session() -> Session {
             fader_db: -6.0,
             ..Default::default()
         },
+        role: livestage_engine::BusRole::Fx,
         output: StripOutput::Master,
-        record_arm: false,
+        ..BusStrip::default()
     });
     session.buses.push(BusStrip {
         id: monitor,
         name: "IEM 1".to_string(),
+        role: livestage_engine::BusRole::Aux,
         output: StripOutput::None,
         ..BusStrip::default()
     });

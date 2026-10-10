@@ -192,10 +192,11 @@
   display: flex;
   flex-direction: column;
   padding: 4px;
-  background: var(--surface-overlay);
+  /* Studio's context menu: the panel plane, floating. */
+  background: var(--surface-panel);
   border: 1px solid var(--border-normal);
   border-radius: var(--r);
-  box-shadow: 0 8px 24px #0006;
+  box-shadow: var(--shadow-overlay);
 }
 
 .ms-menu-head {

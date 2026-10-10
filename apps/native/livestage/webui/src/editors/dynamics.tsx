@@ -384,11 +384,11 @@ const TAG_ROOM = 26
 let warningColor: string | null = null
 /** The page's warning accent (the native accent_warning). */
 function warning(): string {
-  warningColor ??= getComputedStyle(document.documentElement).getPropertyValue('--warning').trim() || '#e8b75c'
+  warningColor ??= getComputedStyle(document.documentElement).getPropertyValue('--warning').trim()
   return warningColor
 }
 
-interface ActionLine {
+export interface ActionLine {
   db: number
   vertical: boolean
   color: string
@@ -396,7 +396,7 @@ interface ActionLine {
 
 /** dyn_panel::paint_transfer: the grid, unity, where the action starts, and
  *  the static curve. */
-function paintTransfer(
+export function paintTransfer(
   ctx: Ctx,
   w: number,
   h: number,

@@ -3,8 +3,8 @@
 # the root filesystem is read-only.
 port=8730
 [ -r /etc/conf.d/livestage ] && . /etc/conf.d/livestage
-[ -r /data/system/setup.conf ] && . /data/system/setup.conf
-[ -r /data/livestage/livestage.conf ] && . /data/livestage/livestage.conf
+[ -r /var/lib/livestage/setup.conf ] && . /var/lib/livestage/setup.conf
+[ -r /var/lib/livestage/livestage.conf ] && . /var/lib/livestage/livestage.conf
 [ -n "$LIVESTAGE_HTTP" ] && port=${LIVESTAGE_HTTP##*:}
 
 # Give DHCP a moment if it has not answered yet.

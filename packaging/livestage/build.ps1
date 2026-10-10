@@ -6,6 +6,8 @@ livestage-server. Needs Docker (Linux containers) and bun.
 .EXAMPLE
 pwsh packaging/livestage/build.ps1
 pwsh packaging/livestage/build.ps1 -DataMB 2048 -Out D:\images
+pwsh packaging/livestage/build.ps1 -Kernel out/livestage-kernel/linux-7.2.9-livestage.tar.zst
+pwsh packaging/livestage/build.ps1 -Installer    # the installer USB stick image too
 #>
 param(
     # Where the image goes.
@@ -15,7 +17,13 @@ param(
     [int]$DataMB = 512,
     [string]$AlpineVersion = "3.24",
     # Use the web UI already in apps/native/livestage/webui/dist.
-    [switch]$SkipWebUI
+    [switch]$SkipWebUI,
+    # A kernel made by kernel/build-kernel.sh (.tar.zst) in place of
+    # Alpine's linux-lts.
+    [string]$Kernel,
+    # Also make the installer USB stick image, which puts the appliance
+    # image onto a computer's own disk (livestage-installer-....img).
+    [switch]$Installer
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,6 +46,16 @@ $outDir = (Resolve-Path $outDir).Path
 
 # Cargo's registry and target directory live in volumes: the second build is
 # quick, and the Windows target/ is never touched.
+$kernelArgs = @()
+if ($Kernel) {
+    $kernelFile = (Resolve-Path $Kernel).Path
+    Write-Host "==> Kernel $kernelFile"
+    $kernelArgs = @("-v", "${kernelFile}:/kernel.tar.zst:ro", "-e", "KERNEL_TARBALL=/kernel.tar.zst")
+}
+if ($Installer) {
+    $kernelArgs += @("-e", "INSTALLER=1")
+}
+
 docker run --rm `
     -v "${repo}:/src:ro" `
     -v "${outDir}:/out" `
@@ -45,9 +63,14 @@ docker run --rm `
     -v livestage-cargo-git:/root/.cargo/git `
     -v "livestage-target-alpine${AlpineVersion}:/target" `
     -e "DATA_MB=$DataMB" `
+    @kernelArgs `
     $tag sh /src/packaging/livestage/make-image.sh
 if ($LASTEXITCODE -ne 0) { throw "image build failed" }
 
 Write-Host ""
 Write-Host "Write $outDir\livestage-alpine$AlpineVersion-x86_64.img to a USB stick or disk"
 Write-Host "(Rufus in DD mode, balenaEtcher, or dd), then boot it in UEFI mode."
+if ($Installer) {
+    Write-Host "Or write $outDir\livestage-installer-alpine$AlpineVersion-x86_64.img to a USB stick"
+    Write-Host "and boot the computer from it: it installs LiveStage onto the computer's own disk."
+}

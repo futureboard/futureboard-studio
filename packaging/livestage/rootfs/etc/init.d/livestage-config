@@ -1,10 +1,11 @@
 #!/sbin/openrc-run
-# The settings the console's setup (tty1) saves in /data/system/setup.conf:
+# The settings the console's setup (tty1) saves in
+# /var/lib/livestage/setup.conf:
 # the machine's name, its network and its time zone. The system is
 # read-only, so they are written to /run, where /etc/hostname, /etc/hosts,
 # /etc/network/interfaces and /etc/localtime point.
 #
-# Before the first setup (or without /data), the defaults: "livestage", DHCP
+# Before the first setup (or without the settings partition), the defaults: "livestage", DHCP
 # on every wired port, UTC.
 
 description="Apply the LiveStage setup: name, network, time zone"

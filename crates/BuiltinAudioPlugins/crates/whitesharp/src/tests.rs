@@ -787,3 +787,64 @@ fn live_mode_stays_finite_at_every_setting_and_rate() {
         }
     }
 }
+
+/// Two low tones: smooth, so a step anywhere shows as a kink.
+fn two_tone(n: usize) -> (f32, f32) {
+    let t = n as f32 / SR;
+    let x = (std::f32::consts::TAU * 110.0 * t).sin() * 0.3
+        + (std::f32::consts::TAU * 330.0 * t).sin() * 0.1;
+    (x, x * 0.8)
+}
+
+/// The biggest second difference of the output over `frames` frames after a
+/// second of settling, with `edit` applied before each frame.
+fn worst_kink(dsp: &mut Dsp, frames: usize, mut edit: impl FnMut(&mut Dsp, usize)) -> f32 {
+    let settle = 48_000;
+    let mut history = [(0.0f32, 0.0f32); 2];
+    let mut worst = 0.0f32;
+    for n in 0..settle + frames {
+        if n >= settle {
+            edit(dsp, n - settle);
+        }
+        let (l, r) = two_tone(n);
+        let out = dsp.process_stereo(l, r);
+        if n >= settle {
+            let d2 = |a: f32, b: f32, c: f32| (c - 2.0 * b + a).abs();
+            let kink_l = d2(history[0].0, history[1].0, out.0);
+            let kink_r = d2(history[0].1, history[1].1, out.1);
+            worst = worst.max(kink_l).max(kink_r);
+        }
+        history = [history[1], out];
+    }
+    worst
+}
+
+/// An input type change moves the quality path's delay. The output used to
+/// jump from one delay to the other in a sample; now the old delay fades
+/// out under the new one.
+#[test]
+fn an_input_type_change_does_not_step() {
+    let params = Params {
+        mix: 100.0,
+        latency: LatencyMode::Quality,
+        ..default_params()
+    };
+    let frames = 96_000;
+    let still = worst_kink(&mut dsp_with(params.clone()), frames, |_, _| {});
+    let mut latencies = Vec::new();
+    let switched = worst_kink(&mut dsp_with(params), frames, |dsp, n| {
+        if n % 12_000 == 0 {
+            let input = InputType::ALL[(n / 12_000) % InputType::ALL.len()];
+            assert!(dsp.apply_wire_param(ipc::INPUT_TYPE_INDEX, input.to_wire()));
+            latencies.push((input, dsp.latency_samples()));
+        }
+    });
+    assert!(switched < still * 2.0, "{switched} against {still}");
+    // The reported latency is still the new type's, from the moment it is set.
+    for (input, latency) in latencies {
+        assert_eq!(
+            latency,
+            latency_samples_for(SR, input, LatencyMode::Quality)
+        );
+    }
+}

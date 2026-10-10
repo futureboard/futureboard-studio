@@ -1,0 +1,3 @@
+# The installer needs no network: its Wi-Fi scan brings the port up itself.
+auto lo
+iface lo inet loopback
