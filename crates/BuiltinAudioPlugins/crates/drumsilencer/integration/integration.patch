@@ -1,0 +1,3484 @@
+diff --git a/apps/native/livestage/src/editors.rs b/apps/native/livestage/src/editors.rs
+index f5163382..f665deb1 100644
+--- a/apps/native/livestage/src/editors.rs
++++ b/apps/native/livestage/src/editors.rs
+@@ -143,8 +143,8 @@ fn open_builtin(
+     cx: &mut Context<LiveStageApp>,
+ ) {
+     use sphere_ui_components::components::{
+-        band_panel, dyn_panel, eq_window, fx_window, gate_panel, mix_station_panel,
+-        rodhareist_window, white_sharp_window,
++        band_panel, drum_silencer_panel, dyn_panel, eq_window, fx_window, gate_panel,
++        mix_station_panel, rodhareist_window, white_sharp_window,
+     };
+ 
+     let key = PluginInstanceKey {
+@@ -216,6 +216,15 @@ fn open_builtin(
+         "clipper67" => open(dyn_panel::open_clipper67_editor, b, k, i, h, c, cx),
+         "transient" => open(dyn_panel::open_transient_editor, b, k, i, h, c, cx),
+         "waygate" => open(gate_panel::open_waygate_editor, b, k, i, h, c, cx),
++        "drumsilencer" => open(
++            drum_silencer_panel::open_drumsilencer_editor,
++            b,
++            k,
++            i,
++            h,
++            c,
++            cx,
++        ),
+         "compresser" => open(band_panel::open_compresser_editor, b, k, i, h, c, cx),
+         "imager" => open(band_panel::open_imager_editor, b, k, i, h, c, cx),
+         "mixstation" => open(mix_station_panel::open_mixstation_editor, b, k, i, h, c, cx),
+diff --git a/apps/native/livestage/webui/src/editors/index.tsx b/apps/native/livestage/webui/src/editors/index.tsx
+index c22f417e..348d0101 100644
+--- a/apps/native/livestage/webui/src/editors/index.tsx
++++ b/apps/native/livestage/webui/src/editors/index.tsx
+@@ -5,6 +5,7 @@
+ 
+ import type { BuiltinEffect, BuiltinParam, InsertSlot } from '../protocol.ts'
+ import { editors as band } from './band.tsx'
++import { editors as drumsilencer } from './drumsilencer.tsx'
+ import { editors as dynamics } from './dynamics.tsx'
+ import { editors as eq } from './eq.tsx'
+ import { editors as fx } from './fx.tsx'
+@@ -19,6 +20,7 @@ import { editors as whitesharp } from './whitesharp.tsx'
+ const REGISTRY: Record<string, EditorComponent> = {
+   ...dynamics,
+   ...gate,
++  ...drumsilencer,
+   ...band,
+   ...mixstation,
+   ...eq,
+diff --git a/crates/BuiltinAudioPlugins/Cargo.toml b/crates/BuiltinAudioPlugins/Cargo.toml
+index b1db5507..0f05ebad 100644
+--- a/crates/BuiltinAudioPlugins/Cargo.toml
++++ b/crates/BuiltinAudioPlugins/Cargo.toml
+@@ -26,6 +26,7 @@ burnlimit.workspace = true
+ clipper67.workspace = true
+ transient.workspace = true
+ waygate.workspace = true
++drumsilencer.workspace = true
+ c1073.workspace = true
+ meowsyn.workspace = true
+ wrapsynth.workspace = true
+diff --git a/crates/BuiltinAudioPlugins/src/lib.rs b/crates/BuiltinAudioPlugins/src/lib.rs
+index 3e7c8f23..e6f3f138 100644
+--- a/crates/BuiltinAudioPlugins/src/lib.rs
++++ b/crates/BuiltinAudioPlugins/src/lib.rs
+@@ -24,6 +24,7 @@ pub use c1073;
+ pub use clipper67;
+ pub use compresser;
+ pub use drumsampler;
++pub use drumsilencer;
+ pub use echospace;
+ pub use equz8;
+ pub use equzx;
+@@ -51,6 +52,7 @@ pub fn focus_descriptors() -> Vec<PluginDescriptor> {
+         clipper67::descriptor(),
+         transient::descriptor(),
+         waygate::descriptor(),
++        drumsilencer::descriptor(),
+         c1073::descriptor(),
+         meowsyn::descriptor(),
+         wrapsynth::descriptor(),
+@@ -78,6 +80,7 @@ mod tests {
+         assert!(ids.contains(&clipper67::PLUGIN_ID));
+         assert!(ids.contains(&transient::PLUGIN_ID));
+         assert!(ids.contains(&waygate::PLUGIN_ID));
++        assert!(ids.contains(&drumsilencer::PLUGIN_ID));
+         assert!(ids.contains(&c1073::PLUGIN_ID));
+         assert!(ids.contains(&meowsyn::PLUGIN_ID));
+         assert!(ids.contains(&wrapsynth::PLUGIN_ID));
+@@ -97,6 +100,7 @@ mod tests {
+         let mut ultimate = zcomp::Dsp::new(48_000.0);
+         let mut strip = mixstation::Dsp::new(48_000.0);
+         let mut gate = waygate::Dsp::new(48_000.0);
++        let mut silencer = drumsilencer::Dsp::new(48_000.0);
+ 
+         for dsp in [
+             &mut eq as &mut dyn StereoEffect,
+@@ -108,6 +112,7 @@ mod tests {
+             &mut ultimate,
+             &mut strip,
+             &mut gate,
++            &mut silencer,
+         ] {
+             let (l, r) = dsp.process_stereo(0.2, -0.1);
+             assert!(l.is_finite() && r.is_finite());
+diff --git a/crates/LiveStageEngine/Cargo.toml b/crates/LiveStageEngine/Cargo.toml
+index 75ac2974..f8fe8587 100644
+--- a/crates/LiveStageEngine/Cargo.toml
++++ b/crates/LiveStageEngine/Cargo.toml
+@@ -37,6 +37,7 @@ burnlimit.workspace = true
+ clipper67.workspace = true
+ transient.workspace = true
+ waygate.workspace = true
++drumsilencer.workspace = true
+ imager.workspace = true
+ mixstation.workspace = true
+ verbspace.workspace = true
+diff --git a/crates/LiveStageEngine/src/builtin_fx.rs b/crates/LiveStageEngine/src/builtin_fx.rs
+index 8ed5563a..18afaf1e 100644
+--- a/crates/LiveStageEngine/src/builtin_fx.rs
++++ b/crates/LiveStageEngine/src/builtin_fx.rs
+@@ -8,7 +8,9 @@
+ 
+ use builtin_dsp_core::StereoEffect;
+ 
+-use crate::telemetry::{IMAGE_BANDS, LevelFrame, PITCH_SLOTS, REDUCTION_BANDS, SCOPE_SAMPLES};
++use crate::telemetry::{
++    IMAGE_BANDS, LevelFrame, PITCH_SLOTS, RACK_SLOTS, REDUCTION_BANDS, SCOPE_SAMPLES,
++};
+ 
+ /// One built-in effect LiveStage can load.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -91,6 +93,11 @@ pub const BUILTIN_EFFECTS: &[BuiltinEffectInfo] = &[
+         name: "Imager",
+         category: "Utility",
+     },
++    BuiltinEffectInfo {
++        stem: "drumsilencer",
++        name: "Drum Silencer",
++        category: "Utility",
++    },
+     BuiltinEffectInfo {
+         stem: "whitesharp",
+         name: "WhiteSharp",
+@@ -188,6 +195,7 @@ pub fn builtin_params(stem: &str) -> Vec<BuiltinParam> {
+         "echospace" => params_of!(echospace::descriptor, echospace::ipc::ui_param_index),
+         "verbspace" => params_of!(verbspace::descriptor, verbspace::ipc::ui_param_index),
+         "imager" => params_of!(imager::descriptor, imager::ipc::ui_param_index),
++        "drumsilencer" => params_of!(drumsilencer::descriptor, drumsilencer::ipc::ui_param_index),
+         "whitesharp" => params_of!(whitesharp::descriptor, whitesharp::ipc::ui_param_index),
+         "rodharerist" => params_of!(rodharerist::descriptor, rodharerist::ui_param_index),
+         _ => Vec::new(),
+@@ -304,6 +312,11 @@ pub fn builtin_spec(stem: &str) -> Option<BuiltinSpec> {
+             verbspace::ipc::ui_values
+         ),
+         "imager" => spec_of!(imager, imager::ipc::UI_PARAM_IDS, imager::ipc::ui_values),
++        "drumsilencer" => spec_of!(
++            drumsilencer,
++            drumsilencer::ipc::UI_PARAM_IDS,
++            drumsilencer::ipc::ui_values
++        ),
+         "whitesharp" => spec_of!(
+             whitesharp,
+             whitesharp::ipc::UI_PARAM_IDS,
+@@ -337,6 +350,7 @@ pub enum BuiltinFx {
+     Echospace(echospace::Dsp),
+     Verbspace(verbspace::Dsp),
+     Imager(imager::Dsp),
++    DrumSilencer(drumsilencer::Dsp),
+     WhiteSharp(Box<whitesharp::Dsp>),
+     Rodhareist(Box<rodharerist::Dsp>),
+ }
+@@ -359,6 +373,7 @@ macro_rules! with_dsp {
+             BuiltinFx::Echospace($dsp) => $body,
+             BuiltinFx::Verbspace($dsp) => $body,
+             BuiltinFx::Imager($dsp) => $body,
++            BuiltinFx::DrumSilencer($dsp) => $body,
+             BuiltinFx::WhiteSharp($dsp) => $body,
+             BuiltinFx::Rodhareist($dsp) => $body,
+         }
+@@ -385,6 +400,7 @@ impl BuiltinFx {
+             "echospace" => Self::Echospace(echospace::Dsp::new(sr)),
+             "verbspace" => Self::Verbspace(verbspace::Dsp::new(sr)),
+             "imager" => Self::Imager(imager::Dsp::new(sr)),
++            "drumsilencer" => Self::DrumSilencer(drumsilencer::Dsp::new(sr)),
+             "whitesharp" => Self::WhiteSharp(Box::new(whitesharp::Dsp::new(sr))),
+             "rodharerist" => Self::Rodhareist(Box::new(rodharerist::Dsp::new(sr))),
+             _ => return None,
+@@ -444,6 +460,9 @@ impl BuiltinFx {
+             Self::Imager(dsp) => {
+                 let _ = dsp.apply_wire_param(index, value);
+             }
++            Self::DrumSilencer(dsp) => {
++                let _ = dsp.apply_wire_param(index, value);
++            }
+             Self::WhiteSharp(dsp) => {
+                 let _ = dsp.apply_wire_param(index, value);
+             }
+@@ -512,6 +531,25 @@ impl BuiltinFx {
+                     slot_out_peak,
+                 }
+             }
++            // Nothing is a reduction; the rack blocks carry, per band
++            // (`drumsilencer::BAND_EDGES_HZ`), the drums the network hears
++            // on the input levels and the whole input on the output levels
++            // (`MeterFrame::rack_slots`), as in Studio's host.
++            Self::DrumSilencer(dsp) => {
++                let f = dsp.meter_frame();
++                let (slot_in_peak, slot_out_peak) = f.rack_slots::<RACK_SLOTS>();
++                LevelFrame {
++                    in_peak: f.in_peak,
++                    in_rms: f.in_rms,
++                    out_peak: f.out_peak,
++                    out_rms: f.out_rms,
++                    gain_reduction_db: 0.0,
++                    in_clip: f.in_clip,
++                    out_clip: f.out_clip,
++                    slot_in_peak,
++                    slot_out_peak,
++                }
++            }
+             Self::Clipper67(dsp) => frame!(dsp.meter_frame(), f => f.gain_reduction_db),
+             Self::BurnLimit(dsp) => frame!(dsp.meter_frame(), f => f.gain_reduction_db),
+             // Multiband: the largest band's; the bands come apart in
+@@ -719,4 +757,49 @@ mod tests {
+         assert!(open.slot_in_peak[waygate::KEY_SLOT] > 0.4);
+         assert_eq!(left[255], 0.5);
+     }
++
++    /// Drum Silencer's frame: the input per band rides the rack blocks'
++    /// output levels, the drums heard their input levels — none while it is
++    /// off. Its delay is the fixed 255 samples the editor's latency note
++    /// states, and it needs no stage default to get there.
++    #[test]
++    fn drumsilencer_reports_its_bands_on_the_rack_blocks() {
++        assert!(stage_defaults("drumsilencer").is_empty());
++        let Some(BuiltinFx::DrumSilencer(dsp)) = BuiltinFx::new("drumsilencer", 48_000) else {
++            panic!("drumsilencer builds");
++        };
++        assert_eq!(dsp.latency_samples(), 255);
++
++        let mut fx = BuiltinFx::new("drumsilencer", 48_000).unwrap();
++        fx.apply_wire_param(drumsilencer::ipc::POWER_INDEX, 0.0);
++        // 500 Hz: the 300 Hz–1 kHz band.
++        let tone = |n: usize| -> Vec<f32> {
++            (0..n)
++                .map(|i| (i as f32 * std::f32::consts::TAU * 500.0 / 48_000.0).sin() * 0.5)
++                .collect()
++        };
++        let mut left = tone(4_096);
++        let mut right = left.clone();
++        fx.process(&mut left, &mut right);
++        let off = fx.level_frame().expect("Drum Silencer meters itself");
++        assert_eq!(off.gain_reduction_db, 0.0);
++        assert!(off.in_peak > 0.4 && off.out_peak > 0.4);
++        assert!(
++            off.slot_in_peak.iter().all(|&d| d == 0.0),
++            "no drums while off"
++        );
++        let input = off.slot_out_peak;
++        let loudest = (0..drumsilencer::BANDS)
++            .max_by(|&a, &b| input[a].total_cmp(&input[b]))
++            .unwrap();
++        assert_eq!(loudest, 2, "{input:?}");
++        // RMS of a 0.5 sine, give or take the window's spread.
++        assert!((input[2] - 0.354).abs() < 0.05, "{input:?}");
++
++        fx.apply_wire_param(drumsilencer::ipc::POWER_INDEX, 1.0);
++        fx.process(&mut left, &mut right);
++        let on = fx.level_frame().unwrap();
++        assert!(on.slot_in_peak.iter().all(|d| d.is_finite() && *d >= 0.0));
++        assert!(on.slot_out_peak[2] > 0.3);
++    }
+ }
+diff --git a/crates/SphereAudioEditor/src/tools.rs b/crates/SphereAudioEditor/src/tools.rs
+index 7d23a39d..05fd0a78 100644
+--- a/crates/SphereAudioEditor/src/tools.rs
++++ b/crates/SphereAudioEditor/src/tools.rs
+@@ -194,10 +194,10 @@ impl AudioRepairModule {
+         Self::DeClick,
+         Self::DeHum,
+         Self::SpectralRepair,
++        Self::DrumSilencer,
+         Self::DeReverb,
+         Self::DeBleed,
+         Self::DeFeedback,
+-        Self::DrumSilencer,
+     ];
+ 
+     pub const fn label(self) -> &'static str {
+@@ -238,16 +238,15 @@ impl AudioRepairModule {
+             Self::DeClick => "Detected impulses are marked at their source frame.",
+             Self::DeHum => "Notch bands track the fundamental and its harmonics.",
+             Self::SpectralRepair => "Draw a time-frequency region on the canvas to target it.",
+-            Self::DeReverb | Self::DeBleed | Self::DeFeedback | Self::DrumSilencer => {
+-                "No processor is connected yet."
+-            }
++            Self::DrumSilencer => "The rendered result is drawn as a before/after level lane.",
++            Self::DeReverb | Self::DeBleed | Self::DeFeedback => "No processor is connected yet.",
+         }
+     }
+ 
+     pub const fn is_available(self) -> bool {
+         matches!(
+             self,
+-            Self::Denoise | Self::DeClick | Self::DeHum | Self::SpectralRepair
++            Self::Denoise | Self::DeClick | Self::DeHum | Self::SpectralRepair | Self::DrumSilencer
+         )
+     }
+ 
+@@ -271,7 +270,18 @@ mod tests {
+     #[test]
+     fn unavailable_repair_modules_are_marked() {
+         assert!(AudioRepairModule::Denoise.is_available());
++        assert!(AudioRepairModule::DrumSilencer.is_available());
+         assert!(!AudioRepairModule::DeReverb.is_available());
++        assert!(!AudioRepairModule::DeBleed.is_available());
++        assert!(!AudioRepairModule::DeFeedback.is_available());
++    }
++
++    #[test]
++    fn connected_modules_do_not_claim_to_be_disconnected() {
++        for module in AudioRepairModule::ALL {
++            let disconnected = module.canvas_hint() == "No processor is connected yet.";
++            assert_eq!(disconnected, !module.is_available(), "{}", module.label());
++        }
+     }
+ 
+     #[test]
+diff --git a/crates/SpherePluginHost/Cargo.toml b/crates/SpherePluginHost/Cargo.toml
+index 8e711444..36dd472f 100644
+--- a/crates/SpherePluginHost/Cargo.toml
++++ b/crates/SpherePluginHost/Cargo.toml
+@@ -47,6 +47,7 @@ burnlimit.workspace = true
+ clipper67.workspace = true
+ transient.workspace = true
+ waygate.workspace = true
++drumsilencer.workspace = true
+ wrapsynth.workspace = true
+ drumsampler.workspace = true
+ quicksampler.workspace = true
+diff --git a/crates/SpherePluginHost/src/bin/futureboard_plugin_host.rs b/crates/SpherePluginHost/src/bin/futureboard_plugin_host.rs
+index bb2c892d..5081321c 100644
+--- a/crates/SpherePluginHost/src/bin/futureboard_plugin_host.rs
++++ b/crates/SpherePluginHost/src/bin/futureboard_plugin_host.rs
+@@ -318,6 +318,7 @@ enum BuiltinDsp {
+     Clipper67(clipper67::Dsp),
+     Transient(transient::Dsp),
+     WayGate(waygate::Dsp),
++    DrumSilencer(drumsilencer::Dsp),
+     WrapSynth(wrapsynth::Dsp),
+     DrumSampler(drumsampler::Dsp),
+     QuickSampler(quicksampler::Dsp),
+@@ -397,6 +398,7 @@ impl BuiltinHostProcessor {
+             "clipper67" => Some(Self::clipper67(sample_rate, state_json)),
+             "transient" => Some(Self::transient(sample_rate, state_json)),
+             "waygate" => Some(Self::waygate(sample_rate, state_json)),
++            "drumsilencer" => Some(Self::drumsilencer(sample_rate, state_json)),
+             "wrapsynth" => Some(Self::wrapsynth(sample_rate, state_json)),
+             "drumsampler" => Some(Self::drumsampler(sample_rate, state_json)),
+             "quicksampler" => Some(Self::quicksampler(sample_rate, state_json)),
+@@ -675,6 +677,37 @@ impl BuiltinHostProcessor {
+         }
+     }
+ 
++    fn drumsilencer(sample_rate: u32, state_json: Option<&str>) -> Self {
++        let sr = sample_rate.max(1) as f32;
++        // Built here, on the IPC thread: the FFT plans, the history and the
++        // network's state for every rate are allocated now, never on the
++        // producer.
++        let mut dsp = drumsilencer::Dsp::new(sr);
++        if let Some(json) = state_json {
++            match drumsilencer::ipc::DrumSilencerState::from_json(json) {
++                Ok(state) => {
++                    dsp.set_params(state.params);
++                    eprintln!(
++                        "[plugin-host-builtin] restored state version={}",
++                        state.version
++                    );
++                }
++                Err(error) => {
++                    eprintln!("[plugin-host-builtin] state blob rejected, using defaults: {error}");
++                }
++            }
++        }
++        Self {
++            dsp: UnsafeCell::new(BuiltinDsp::DrumSilencer(dsp)),
++            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
++            nam_loader: None,
++            ir_loader: None,
++            drum_pad_loaders: None,
++            sample_loader: None,
++            sample_rate: sr,
++        }
++    }
++
+     fn echospace(sample_rate: u32, state_json: Option<&str>) -> Self {
+         let sr = sample_rate.max(1) as f32;
+         let mut dsp = echospace::Dsp::new(sr);
+@@ -1067,6 +1100,13 @@ impl BuiltinHostProcessor {
+                     interleaved[i * 2 + 1] = r;
+                 }
+             }
++            BuiltinDsp::DrumSilencer(dsp) => {
++                for i in 0..frames {
++                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
++                    interleaved[i * 2] = l;
++                    interleaved[i * 2 + 1] = r;
++                }
++            }
+             BuiltinDsp::WrapSynth(dsp) => {
+                 for i in 0..frames {
+                     let (l, r) = dsp.process_stereo();
+@@ -1404,6 +1444,26 @@ impl BuiltinHostProcessor {
+                     slot_out_peak,
+                 })
+             }
++            BuiltinDsp::DrumSilencer(dsp) => {
++                let f = dsp.meter_frame();
++                // A single stage: the rack blocks carry the bands instead —
++                // the drums heard in the input levels, the whole input in the
++                // output levels (`drumsilencer::MeterFrame::rack_slots`).
++                let (slot_in_peak, slot_out_peak) = f.rack_slots();
++                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
++                    in_peak: f.in_peak,
++                    in_rms: f.in_rms,
++                    out_peak: f.out_peak,
++                    out_rms: f.out_rms,
++                    // A spectral mask, not a gain computer: there is no one
++                    // reduction to report.
++                    gain_reduction_db: 0.0,
++                    in_clip: f.in_clip,
++                    out_clip: f.out_clip,
++                    slot_in_peak,
++                    slot_out_peak,
++                })
++            }
+             BuiltinDsp::Compresser(dsp) => {
+                 let f = dsp.meter_frame();
+                 Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+@@ -1450,6 +1510,8 @@ impl BuiltinHostProcessor {
+             BuiltinDsp::Transient(dsp) => dsp.latency_samples(),
+             // The lookahead, bypassed or not.
+             BuiltinDsp::WayGate(dsp) => dsp.latency_samples(),
++            // The transform's synthesis window, bypassed or not.
++            BuiltinDsp::DrumSilencer(dsp) => dsp.latency_samples(),
+             BuiltinDsp::Echospace(dsp) => dsp.latency_samples(),
+             BuiltinDsp::Imager(dsp) => dsp.latency_samples(),
+             BuiltinDsp::WrapSynth(_) => 0,
+@@ -1512,6 +1574,9 @@ impl BuiltinHostProcessor {
+             BuiltinDsp::WayGate(dsp) => {
+                 let _ = dsp.apply_wire_param(param_id, value);
+             }
++            BuiltinDsp::DrumSilencer(dsp) => {
++                let _ = dsp.apply_wire_param(param_id, value);
++            }
+             BuiltinDsp::WrapSynth(dsp) => {
+                 let _ = dsp.apply_wire_param(param_id, value);
+             }
+@@ -3010,6 +3075,87 @@ mod builtin_processor_tests {
+         assert!(output.iter().all(|sample| sample.is_finite()));
+         assert_eq!(fallback.latency_samples(), 0);
+     }
++
++    /// The bands ride the rack blocks the editors read — the drums heard in
++    /// the input levels, the whole input in the output levels — and the
++    /// transform's delay is reported at every rate. Nothing here depends on
++    /// the network's weights: the input bands are measured before the mask.
++    #[test]
++    fn drumsilencer_publishes_its_bands_and_latency_through_the_host_frame() {
++        let processor = BuiltinHostProcessor::drumsilencer(48_000, None);
++        assert_eq!(processor.latency_samples(), 255);
++        // 2 kHz sits in band 3 (1–3 kHz); a 0.5 sine is 0.354 RMS.
++        let tone: Vec<f32> = (0..24_000)
++            .map(|i| (std::f32::consts::TAU * 2_000.0 * i as f32 / 48_000.0).sin() * 0.5)
++            .collect();
++        let mut output = [0.0f32; 960];
++        for block in tone.chunks_exact(480) {
++            processor.process_block(block, block, &mut output, 480);
++        }
++        assert!(output.iter().all(|sample| sample.is_finite()));
++        let frame = processor
++            .meter_frame()
++            .expect("drum silencer always publishes a frame");
++        assert!(
++            (frame.slot_out_peak[3] - 0.354).abs() < 0.03,
++            "{:?}",
++            frame.slot_out_peak
++        );
++        for (band, level) in frame.slot_out_peak.iter().enumerate() {
++            if band != 3 {
++                assert!(*level < 0.01, "band {band}: {level}");
++            }
++        }
++        assert!(frame.slot_in_peak.iter().all(|level| level.is_finite()));
++        assert!(frame.in_rms > 0.3);
++        assert_eq!(frame.gain_reduction_db, 0.0);
++
++        assert_eq!(
++            BuiltinHostProcessor::drumsilencer(96_000, None).latency_samples(),
++            511
++        );
++    }
++
++    #[test]
++    fn drumsilencer_restores_state_and_takes_wire_params() {
++        let mut params = drumsilencer::default_params();
++        params.power = false;
++        params.mode = drumsilencer::Mode::Solo;
++        let json = drumsilencer::ipc::DrumSilencerState::new(params)
++            .to_json()
++            .expect("state serializes");
++
++        let restored = BuiltinHostProcessor::drumsilencer(48_000, Some(&json));
++        // Bypassed, the transform still runs at unit gain: the input comes
++        // out whole, 255 samples late, so switching never clicks.
++        assert_eq!(restored.latency_samples(), 255);
++        let input: Vec<f32> = (0..2_048)
++            .map(|i| ((i * 7_919) % 1_000) as f32 / 1_000.0 - 0.5)
++            .collect();
++        let mut output = vec![0.0f32; 2 * input.len()];
++        restored.process_block(&input, &input, &mut output, input.len());
++        for i in 0..input.len() {
++            let expected = if i < 255 { 0.0 } else { input[i - 255] };
++            assert!(
++                (output[i * 2] - expected).abs() < 1.0e-5,
++                "restored power-off must be a pure delay at {i}"
++            );
++        }
++        let frame = restored.meter_frame().expect("frame is published");
++        assert!(frame.slot_in_peak.iter().all(|level| *level == 0.0));
++        assert!(frame.slot_out_peak.iter().any(|level| *level > 0.0));
++
++        restored.apply_param(u32::MAX, 1.0);
++        restored.apply_param(drumsilencer::UI_PARAM_IDS.len() as u32, 1.0);
++        let power = drumsilencer::ui_param_index("power").expect("in wire table");
++        restored.apply_param(power, 1.0);
++        restored.process_block(&input, &input, &mut output, input.len());
++        assert!(output.iter().all(|sample| sample.is_finite()));
++
++        let fallback = BuiltinHostProcessor::drumsilencer(48_000, Some("not json"));
++        fallback.process_block(&input, &input, &mut output, input.len());
++        assert!(output.iter().all(|sample| sample.is_finite()));
++    }
+ }
+ 
+ #[derive(Debug)]
+diff --git a/crates/SpherePluginHost/src/builtin.rs b/crates/SpherePluginHost/src/builtin.rs
+index 5df5ffb4..94c90dc1 100644
+--- a/crates/SpherePluginHost/src/builtin.rs
++++ b/crates/SpherePluginHost/src/builtin.rs
+@@ -168,6 +168,15 @@ const CATALOG: &[BuiltinEntry] = &[
+         // Native GPUI editor (`sphere_ui_components::components::gate_panel`).
+         editor: BuiltinEditorKind::Native,
+     },
++    BuiltinEntry {
++        stem: "drumsilencer",
++        name: "Drum Silencer",
++        category: "Utility",
++        kind: PluginKind::Effect,
++        // Native GPUI editor
++        // (`sphere_ui_components::components::drum_silencer_panel`).
++        editor: BuiltinEditorKind::Native,
++    },
+     BuiltinEntry {
+         stem: "c1073",
+         name: "C1073",
+@@ -279,6 +288,7 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
+     "clipper67",
+     "transient",
+     "waygate",
++    "drumsilencer",
+     "wrapsynth",
+     "drumsampler",
+     "zcomp",
+@@ -444,6 +454,7 @@ mod tests {
+             "clipper67",
+             "transient",
+             "waygate",
++            "drumsilencer",
+             "compresser",
+             "imager",
+             "mixstation",
+@@ -494,6 +505,8 @@ mod tests {
+         assert!(builtin_audio_bridge_supported("builtin:transient"));
+         assert!(builtin_audio_bridge_supported("waygate"));
+         assert!(builtin_audio_bridge_supported("builtin:waygate"));
++        assert!(builtin_audio_bridge_supported("drumsilencer"));
++        assert!(builtin_audio_bridge_supported("builtin:drumsilencer"));
+         assert!(builtin_audio_bridge_supported("wrapsynth"));
+         assert!(builtin_audio_bridge_supported("builtin:wrapsynth"));
+         assert!(builtin_audio_bridge_supported("drumsampler"));
+@@ -537,6 +550,10 @@ mod tests {
+         assert_eq!(builtin_display_name("builtin:clipper67"), Some("67Clipper"));
+         assert_eq!(builtin_display_name("builtin:transient"), Some("Transient"));
+         assert_eq!(builtin_display_name("waygate"), Some("WayGate"));
++        assert_eq!(
++            builtin_display_name("builtin:drumsilencer"),
++            Some("Drum Silencer")
++        );
+         assert_eq!(builtin_display_name("builtin:wrapsynth"), Some("WrapSynth"));
+         assert_eq!(builtin_display_name("compresser"), Some("Compressor"));
+         assert_eq!(builtin_display_name("vst3:whatever"), None);
+diff --git a/crates/SphereUIComponents/Cargo.toml b/crates/SphereUIComponents/Cargo.toml
+index 45d5aa45..003d337f 100644
+--- a/crates/SphereUIComponents/Cargo.toml
++++ b/crates/SphereUIComponents/Cargo.toml
+@@ -114,6 +114,9 @@ burnlimit = { workspace = true, optional = true }
+ clipper67 = { workspace = true, optional = true }
+ transient = { workspace = true, optional = true }
+ waygate = { workspace = true, optional = true }
++# Not optional: Audio Repair's Drum Silencer module renders offline through
++# it in every build, with or without the built-in editor host.
++drumsilencer.workspace = true
+ wrapsynth = { workspace = true, optional = true }
+ drumsampler = { workspace = true, optional = true }
+ quicksampler = { workspace = true, optional = true }
+diff --git a/crates/SphereUIComponents/src/components/audio_tools/mod.rs b/crates/SphereUIComponents/src/components/audio_tools/mod.rs
+index fa3591b4..a9c06525 100644
+--- a/crates/SphereUIComponents/src/components/audio_tools/mod.rs
++++ b/crates/SphereUIComponents/src/components/audio_tools/mod.rs
+@@ -1,6 +1,7 @@
+ //! Floating audio-editor tool windows.
+ 
+ mod canvas;
++mod drum_silencer;
+ mod graph;
+ mod module_list;
+ mod preview;
+diff --git a/crates/SphereUIComponents/src/components/audio_tools/module_list.rs b/crates/SphereUIComponents/src/components/audio_tools/module_list.rs
+index 216ebe8e..c85849ab 100644
+--- a/crates/SphereUIComponents/src/components/audio_tools/module_list.rs
++++ b/crates/SphereUIComponents/src/components/audio_tools/module_list.rs
+@@ -70,6 +70,10 @@ pub(super) const MODULES: [AudioRepairModuleMeta; AudioRepairModule::ALL.len()]
+         AudioRepairModule::SpectralRepair,
+         assets::ICON_REPAIR_SPECTRAL_PATH,
+     ),
++    meta(
++        AudioRepairModule::DrumSilencer,
++        assets::ICON_REPAIR_DRUM_SILENCER_PATH,
++    ),
+     meta(
+         AudioRepairModule::DeReverb,
+         assets::ICON_REPAIR_DE_REVERB_PATH,
+@@ -82,10 +86,6 @@ pub(super) const MODULES: [AudioRepairModuleMeta; AudioRepairModule::ALL.len()]
+         AudioRepairModule::DeFeedback,
+         assets::ICON_REPAIR_DE_FEEDBACK_PATH,
+     ),
+-    meta(
+-        AudioRepairModule::DrumSilencer,
+-        assets::ICON_REPAIR_DRUM_SILENCER_PATH,
+-    ),
+ ];
+ 
+ pub(super) fn index_of(module: AudioRepairModule) -> usize {
+diff --git a/crates/SphereUIComponents/src/components/audio_tools/repair.rs b/crates/SphereUIComponents/src/components/audio_tools/repair.rs
+index 0a740835..d6c28fed 100644
+--- a/crates/SphereUIComponents/src/components/audio_tools/repair.rs
++++ b/crates/SphereUIComponents/src/components/audio_tools/repair.rs
+@@ -46,6 +46,7 @@ use super::canvas::{
+     CanvasMask, CanvasOverlays, CanvasRegion, CanvasTransform, CanvasView, CanvasViewport,
+     EventTone, ProcessingCanvas, WaveformPeaks,
+ };
++use super::drum_silencer;
+ use super::module_list::{self, repair_module_list, MODULES};
+ use super::viz;
+ use super::window::AudioToolWindow;
+@@ -555,6 +556,9 @@ impl AudioToolWindow {
+                 AudioRepairModule::SpectralRepair => {
+                     Some(self.spectral_inspector(cx).into_any_element())
+                 }
++                AudioRepairModule::DrumSilencer => {
++                    Some(self.drum_silencer_inspector(cx).into_any_element())
++                }
+                 _ => None,
+             })
+             .child(self.region_section(cx))
+@@ -778,6 +782,123 @@ impl AudioToolWindow {
+             ))
+     }
+ 
++    fn drum_silencer_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
++        use drumsilencer::{Mode, HIGH_OFF_HZ, LOW_OFF_HZ};
++        const LOW_MAX_HZ: f32 = 2_000.0;
++        const HIGH_MIN_HZ: f32 = 1_000.0;
++        let params = &self.drum_silencer;
++        let modes = [(Mode::Remove, "Remove"), (Mode::Solo, "Drums Only")];
++        let count = modes.len();
++        let low_off = params.low_hz <= LOW_OFF_HZ + 0.5;
++        let high_off = params.high_hz >= HIGH_OFF_HZ - 0.5;
++        div()
++            .flex()
++            .flex_col()
++            .gap(px(space::TIGHT))
++            .child(fb_section_label("MODE"))
++            .child(
++                workspace::segment_track().children(modes.into_iter().enumerate().map(
++                    |(index, (mode, label))| {
++                        workspace::compact_segment(
++                            format!("repair-ds-mode-{}", mode.as_str()),
++                            label,
++                            params.mode == mode,
++                            workspace::segment_position(index, count),
++                            cx.listener(move |this, _, _, cx| {
++                                this.drum_silencer.mode = mode;
++                                this.invalidate_repair_preview(cx);
++                                cx.notify();
++                            }),
++                        )
++                    },
++                )),
++            )
++            .child(repair_param(
++                "Amount",
++                format!("{:.0}%", params.amount),
++                workspace::unipolar_slider(
++                    "repair-ds-amount",
++                    params.amount,
++                    0.0,
++                    100.0,
++                    bind_repair(cx, |this, value, cx| {
++                        this.drum_silencer.amount = value.clamp(0.0, 100.0);
++                        this.invalidate_repair_preview(cx);
++                    }),
++                    Some(100.0),
++                ),
++            ))
++            .child(fb_section_label("RANGE"))
++            // The edges move in octaves, so the sliders run on log2(Hz):
++            // equal travel is an equal musical interval at both ends.
++            .child(repair_param(
++                "Low",
++                if low_off {
++                    "Off".to_string()
++                } else {
++                    format_hz(params.low_hz)
++                },
++                workspace::unipolar_slider(
++                    "repair-ds-low",
++                    params.low_hz.max(LOW_OFF_HZ).log2(),
++                    LOW_OFF_HZ.log2(),
++                    LOW_MAX_HZ.log2(),
++                    bind_repair(cx, |this, value, cx| {
++                        this.drum_silencer.low_hz = value.exp2().clamp(LOW_OFF_HZ, LOW_MAX_HZ);
++                        this.invalidate_repair_preview(cx);
++                    }),
++                    Some(LOW_OFF_HZ.log2()),
++                ),
++            ))
++            .child(repair_param(
++                "High",
++                if high_off {
++                    "Off".to_string()
++                } else {
++                    format_hz(params.high_hz)
++                },
++                workspace::unipolar_slider(
++                    "repair-ds-high",
++                    params.high_hz.max(HIGH_MIN_HZ).log2(),
++                    HIGH_MIN_HZ.log2(),
++                    HIGH_OFF_HZ.log2(),
++                    bind_repair(cx, |this, value, cx| {
++                        this.drum_silencer.high_hz = value.exp2().clamp(HIGH_MIN_HZ, HIGH_OFF_HZ);
++                        this.invalidate_repair_preview(cx);
++                    }),
++                    Some(HIGH_OFF_HZ.log2()),
++                ),
++            ))
++            .child(fb_section_label("OUTPUT"))
++            .child(repair_param(
++                "Output",
++                format!("{:+.1} dB", params.output_db),
++                workspace::unipolar_slider(
++                    "repair-ds-output",
++                    params.output_db,
++                    -24.0,
++                    12.0,
++                    bind_repair(cx, |this, value, cx| {
++                        this.drum_silencer.output_db = value.clamp(-24.0, 12.0);
++                        this.invalidate_repair_preview(cx);
++                    }),
++                    Some(0.0),
++                ),
++            ))
++            .child(
++                div()
++                    .text_size(px(typography::DENSE_CAPTION))
++                    .text_color(Colors::text_muted())
++                    .child(
++                        "Runs Drum Silencer's trained model over the range. Remove takes \
++                         the drums it detects out; Drums Only keeps just them. Rendered \
++                         offline: the plug-in's 5 ms live delay is compensated, and up to \
++                         1 s before the range is processed first so the model starts with \
++                         context.",
++                    ),
++            )
++    }
++
+     fn spectral_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+         div()
+             .flex()
+@@ -1382,6 +1503,7 @@ impl AudioToolWindow {
+         let denoise = self.denoise;
+         let declick = self.declick;
+         let dehum = self.dehum;
++        let drum_silencer = self.drum_silencer.clone();
+         let gain_db = self.spectral_gain_db;
+         let region = self.repair.region;
+         let window_start = self.repair_window_start() as i64;
+@@ -1407,6 +1529,7 @@ impl AudioToolWindow {
+                         denoise,
+                         declick,
+                         dehum,
++                        drum_silencer,
+                         gain_db,
+                         region,
+                         window_start,
+@@ -1479,6 +1602,7 @@ struct PreviewRequest {
+     denoise: SpectralDenoiseParams,
+     declick: DeclickParams,
+     dehum: DehumParams,
++    drum_silencer: drumsilencer::Params,
+     gain_db: f32,
+     region: Option<CanvasRegion>,
+     window_start: i64,
+@@ -1501,6 +1625,7 @@ fn compute_preview(request: PreviewRequest) -> PreviewResult {
+         denoise,
+         declick,
+         dehum,
++        drum_silencer: drum_params,
+         gain_db,
+         region,
+         window_start,
+@@ -1543,6 +1668,20 @@ fn compute_preview(request: PreviewRequest) -> PreviewResult {
+             processor.process(slice, &mut out);
+             processed = Some(out);
+         }
++        AudioRepairModule::DrumSilencer => {
++            // The same render Commit runs, with the same lead-in when the
++            // analyzed window has audio before the visible range.
++            let lead_in = drum_silencer::pre_roll_frames(sample_rate).min(start);
++            let from = ((start - lead_in) * channels).min(pcm.len());
++            let to = (end * channels).min(pcm.len());
++            processed = Some(drum_silencer::render_interleaved(
++                &pcm[from..to],
++                channels,
++                sample_rate,
++                &drum_params,
++                lead_in,
++            ));
++        }
+         AudioRepairModule::SpectralRepair => {
+             if let Some(region) = region {
+                 let mono = downmix_interleaved(slice, channels);
+@@ -1597,6 +1736,14 @@ fn rms(samples: &[f32]) -> f32 {
+     (sum / samples.len() as f64).sqrt() as f32
+ }
+ 
++fn format_hz(hz: f32) -> String {
++    if hz >= 1_000.0 {
++        format!("{:.2} kHz", hz / 1_000.0)
++    } else {
++        format!("{hz:.0} Hz")
++    }
++}
++
+ fn spread_mono(mono: &[f32], channels: usize) -> Vec<f32> {
+     let channels = channels.max(1);
+     let mut out = Vec::with_capacity(mono.len() * channels);
+@@ -1708,6 +1855,7 @@ mod tests {
+             denoise: SpectralDenoiseParams::default(),
+             declick: DeclickParams::default(),
+             dehum: DehumParams::default(),
++            drum_silencer: drumsilencer::default_params(),
+             gain_db: 0.0,
+             region: None,
+             window_start: 0,
+@@ -1732,6 +1880,7 @@ mod tests {
+             denoise: SpectralDenoiseParams::default(),
+             declick: DeclickParams::default(),
+             dehum: DehumParams::default(),
++            drum_silencer: drumsilencer::default_params(),
+             gain_db: 0.0,
+             region: None,
+             window_start: 0,
+@@ -1748,5 +1897,76 @@ mod tests {
+         assert!(has_engine_audition(AudioRepairModule::DeHum));
+         assert!(!has_engine_audition(AudioRepairModule::DeClick));
+         assert!(!has_engine_audition(AudioRepairModule::SpectralRepair));
++        assert!(!has_engine_audition(AudioRepairModule::DrumSilencer));
++    }
++
++    fn drum_request(pcm: Arc<[f32]>, start: usize, end: usize) -> PreviewRequest {
++        PreviewRequest {
++            module: AudioRepairModule::DrumSilencer,
++            pcm,
++            channels: 2,
++            start,
++            end,
++            sample_rate: 48_000,
++            profile: None,
++            denoise: SpectralDenoiseParams::default(),
++            declick: DeclickParams::default(),
++            dehum: DehumParams::default(),
++            drum_silencer: drumsilencer::default_params(),
++            gain_db: 0.0,
++            region: None,
++            window_start: 0,
++            frequency_scale: FrequencyScale::Logarithmic,
++        }
++    }
++
++    fn tone(frames: usize) -> Arc<[f32]> {
++        (0..frames)
++            .flat_map(|i| {
++                let value = (std::f32::consts::TAU * 220.0 * i as f32 / 48_000.0).sin() * 0.3;
++                [value, value * 0.5]
++            })
++            .collect::<Vec<_>>()
++            .into()
++    }
++
++    #[test]
++    fn drum_silencer_preview_draws_a_diff_over_the_visible_range() {
++        let result = compute_preview(drum_request(tone(16_384), 4_096, 12_288));
++        let diff = result
++            .diff
++            .expect("Drum Silencer renders a before/after diff");
++        assert_eq!((diff.start_frame, diff.end_frame), (4_096, 12_288));
++        assert!(result.mask.is_none());
++        assert!(result.clicks.is_empty());
++    }
++
++    /// At 0 % the preview measures no change: the render is aligned with the
++    /// source, so before and after are the same audio.
++    #[test]
++    fn drum_silencer_preview_at_no_amount_reports_no_change() {
++        let mut request = drum_request(tone(16_384), 4_096, 12_288);
++        request.drum_silencer.amount = 0.0;
++        let result = compute_preview(request);
++        assert!((result.stats.peak_after_db - result.stats.peak_before_db).abs() < 0.01);
++        assert!((result.stats.rms_after_db - result.stats.rms_before_db).abs() < 0.01);
++    }
++
++    /// The preview renders the audio before the visible range as context, the
++    /// way Commit does, instead of starting the model cold at the left edge.
++    #[test]
++    fn drum_silencer_preview_uses_the_audio_before_the_view_as_context() {
++        let pcm = tone(16_384);
++        let (start, end) = (4_096, 12_288);
++        let result = compute_preview(drum_request(pcm.clone(), start, end));
++        let expected = drum_silencer::render_interleaved(
++            &pcm[..end * 2],
++            2,
++            48_000,
++            &drumsilencer::default_params(),
++            start,
++        );
++        let after = viz::hop_levels(&downmix_interleaved(&expected, 2), ENVELOPE_HOPS);
++        assert_eq!(result.diff.unwrap().after, after);
+     }
+ }
+diff --git a/crates/SphereUIComponents/src/components/audio_tools/window.rs b/crates/SphereUIComponents/src/components/audio_tools/window.rs
+index f2bc44b6..4c1a9771 100644
+--- a/crates/SphereUIComponents/src/components/audio_tools/window.rs
++++ b/crates/SphereUIComponents/src/components/audio_tools/window.rs
+@@ -35,6 +35,7 @@ use crate::components::title_bar::external_window_titlebar;
+ use crate::theme::{space, Colors};
+ use crate::window_position::{apply_owner_display, centered_window_bounds};
+ 
++use super::drum_silencer;
+ use super::preview::ClipPreviewOverride;
+ use super::repair::RepairSurface;
+ use super::viz::{self, DisplaySmoothing, GraphDraw, GraphStyle};
+@@ -45,11 +46,12 @@ pub const AUDIO_TOOL_WINDOW_MIN_HEIGHT: f32 = 320.0;
+ 
+ const GONIO_TRAIL: usize = 192;
+ const LEVEL_HOPS: usize = 256;
+-const AVAILABLE_REPAIR: [AudioRepairModule; 4] = [
++const AVAILABLE_REPAIR: [AudioRepairModule; 5] = [
+     AudioRepairModule::Denoise,
+     AudioRepairModule::DeClick,
+     AudioRepairModule::DeHum,
+     AudioRepairModule::SpectralRepair,
++    AudioRepairModule::DrumSilencer,
+ ];
+ 
+ const REFRESH: Duration = Duration::from_millis(50);
+@@ -173,6 +175,7 @@ struct AbSnapshot {
+     denoise: SpectralDenoiseParams,
+     declick: DeclickParams,
+     dehum: DehumParams,
++    drum_silencer: drumsilencer::Params,
+     spectral_gain_db: f32,
+     fft_size: FftSize,
+     spectrum_window: SpectrumWindow,
+@@ -232,6 +235,7 @@ pub struct AudioToolWindow {
+     pub(super) learned_noise: Option<Vec<f32>>,
+     pub(super) declick: DeclickParams,
+     pub(super) dehum: DehumParams,
++    pub(super) drum_silencer: drumsilencer::Params,
+     pub(super) spectral_gain_db: f32,
+     spectrum_busy: bool,
+     pub(super) display_smoothing: DisplaySmoothing,
+@@ -318,6 +322,7 @@ impl AudioToolWindow {
+             learned_noise: None,
+             declick: DeclickParams::default(),
+             dehum: DehumParams::default(),
++            drum_silencer: drumsilencer::default_params(),
+             spectral_gain_db: 0.0,
+             spectrum_busy: false,
+             display_smoothing: DisplaySmoothing::Light,
+@@ -704,6 +709,7 @@ impl AudioToolWindow {
+             denoise: self.denoise,
+             declick: self.declick,
+             dehum: self.dehum,
++            drum_silencer: self.drum_silencer.clone(),
+             spectral_gain_db: self.spectral_gain_db,
+             fft_size: self.fft_size,
+             spectrum_window: self.spectrum_window,
+@@ -730,6 +736,7 @@ impl AudioToolWindow {
+         self.denoise = snap.denoise;
+         self.declick = snap.declick;
+         self.dehum = snap.dehum;
++        self.drum_silencer = snap.drum_silencer;
+         self.spectral_gain_db = snap.spectral_gain_db;
+         self.fft_size = snap.fft_size;
+         self.spectrum_window = snap.spectrum_window;
+@@ -888,6 +895,24 @@ impl AudioToolWindow {
+                 });
+                 return;
+             }
++            AudioToolKind::AudioRepair if self.repair.module == AudioRepairModule::DrumSilencer => {
++                let params = self.drum_silencer.clone();
++                self.apply_offline_pcm_with_pre_roll(
++                    cx,
++                    drum_silencer::PRE_ROLL_SECONDS,
++                    move |samples, channels, sr, lead_in| {
++                        let mut out = drum_silencer::render_interleaved(
++                            samples, channels, sr, &params, lead_in,
++                        );
++                        let original = &samples[(lead_in * channels.max(1)).min(samples.len())..];
++                        if original.len() == out.len() {
++                            drum_silencer::fade_edges(&mut out, original, channels, sr);
++                        }
++                        Ok(out)
++                    },
++                );
++                return;
++            }
+             AudioToolKind::AudioRepair
+                 if self.repair.module == AudioRepairModule::SpectralRepair =>
+             {
+@@ -1010,6 +1035,21 @@ impl AudioToolWindow {
+         &mut self,
+         cx: &mut Context<Self>,
+         process: impl FnOnce(&[f32], usize, u32) -> Result<Vec<f32>, String> + Send + 'static,
++    ) {
++        self.apply_offline_pcm_with_pre_roll(cx, 0.0, move |samples, channels, sr, _lead_in| {
++            process(samples, channels, sr)
++        });
++    }
++
++    /// [`Self::apply_offline_pcm`] for a processor that needs context: up to
++    /// `pre_roll_seconds` of the source before the processed range (when the
++    /// file has it) is handed over first, and `process` receives how many
++    /// leading frames that is. It must return the processed range only.
++    fn apply_offline_pcm_with_pre_roll(
++        &mut self,
++        cx: &mut Context<Self>,
++        pre_roll_seconds: f64,
++        process: impl FnOnce(&[f32], usize, u32, usize) -> Result<Vec<f32>, String> + Send + 'static,
+     ) {
+         let clip_id = self.session.target.clip_id.clone();
+         // The clip's *current* source: after an earlier Apply it plays a
+@@ -1066,8 +1106,17 @@ impl AudioToolWindow {
+                     if clip_samples.is_empty() {
+                         return Err("clip source window is empty".to_string());
+                     }
++                    let pre_roll =
++                        (pre_roll_seconds.max(0.0) * buffer.sample_rate as f64).round() as u64;
+                     if process_whole_clip {
+-                        clip_samples = process(&clip_samples, channels, buffer.sample_rate)?;
++                        let (input, lead) = with_pre_roll(
++                            &buffer.samples,
++                            channels,
++                            window_start,
++                            pre_roll,
++                            &clip_samples,
++                        );
++                        clip_samples = process(&input, channels, buffer.sample_rate, lead)?;
+                     } else if let Some(sel) = selection {
+                         let local_start =
+                             (sel.start_frame.max(0) as u64).saturating_sub(window_start);
+@@ -1081,7 +1130,14 @@ impl AudioToolWindow {
+                             local_end as i64,
+                         );
+                         if !region.is_empty() {
+-                            let processed = process(&region, channels, buffer.sample_rate)?;
++                            let (input, lead) = with_pre_roll(
++                                &buffer.samples,
++                                channels,
++                                window_start + local_start,
++                                pre_roll,
++                                &region,
++                            );
++                            let processed = process(&input, channels, buffer.sample_rate, lead)?;
+                             replace_frame_range(
+                                 &mut clip_samples,
+                                 channels,
+@@ -1090,7 +1146,14 @@ impl AudioToolWindow {
+                             );
+                         }
+                     } else {
+-                        clip_samples = process(&clip_samples, channels, buffer.sample_rate)?;
++                        let (input, lead) = with_pre_roll(
++                            &buffer.samples,
++                            channels,
++                            window_start,
++                            pre_roll,
++                            &clip_samples,
++                        );
++                        clip_samples = process(&input, channels, buffer.sample_rate, lead)?;
+                     }
+                     let sample_rate = resample_target.unwrap_or(buffer.sample_rate);
+                     let source = std::path::Path::new(&path);
+@@ -1147,6 +1210,27 @@ impl AudioToolWindow {
+     }
+ }
+ 
++/// `body` preceded by up to `pre_roll` frames of `source` ending at absolute
++/// frame `start`, and how many frames that lead-in is. Without a lead-in the
++/// body is passed through uncopied.
++fn with_pre_roll<'a>(
++    source: &[f32],
++    channels: usize,
++    start: u64,
++    pre_roll: u64,
++    body: &'a [f32],
++) -> (std::borrow::Cow<'a, [f32]>, usize) {
++    let total_frames = (source.len() / channels.max(1)) as u64;
++    let start = start.min(total_frames);
++    let lead = pre_roll.min(start);
++    if lead == 0 {
++        return (std::borrow::Cow::Borrowed(body), 0);
++    }
++    let mut input = slice_frames(source, channels, (start - lead) as i64, start as i64);
++    input.extend_from_slice(body);
++    (std::borrow::Cow::Owned(input), lead as usize)
++}
++
+ fn bind_f32(
+     cx: &mut Context<AudioToolWindow>,
+     write: impl Fn(&mut AudioToolWindow, f32, &mut Context<AudioToolWindow>) + 'static,
+@@ -2397,3 +2481,69 @@ pub fn open_audio_tool_window(
+     })
+     .map_err(|e| e.to_string())
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Frame `i` of a stereo source holds `(i, -i)`.
++    fn ramp(frames: usize) -> Vec<f32> {
++        (0..frames).flat_map(|i| [i as f32, -(i as f32)]).collect()
++    }
++
++    #[test]
++    fn the_pre_roll_is_the_source_just_before_the_range() {
++        let source = ramp(100);
++        let body = slice_frames(&source, 2, 40, 60);
++        let (input, lead) = with_pre_roll(&source, 2, 40, 10, &body);
++        assert_eq!(lead, 10);
++        assert_eq!(&input[..], &slice_frames(&source, 2, 30, 60)[..]);
++    }
++
++    #[test]
++    fn the_pre_roll_stops_at_the_start_of_the_file() {
++        let source = ramp(100);
++        let body = slice_frames(&source, 2, 4, 20);
++        let (input, lead) = with_pre_roll(&source, 2, 4, 10, &body);
++        assert_eq!(lead, 4);
++        assert_eq!(&input[..], &slice_frames(&source, 2, 0, 20)[..]);
++
++        let (input, lead) = with_pre_roll(&source, 2, 0, 10, &body);
++        assert_eq!(lead, 0);
++        assert!(matches!(input, std::borrow::Cow::Borrowed(_)));
++    }
++
++    /// End to end through the commit's own pieces: a mid-file range rendered
++    /// with its pre-roll is the matching stretch of one render of the whole
++    /// file from that pre-roll on, and splices back in at the same frames.
++    #[test]
++    fn a_drum_silencer_commit_renders_the_range_with_context() {
++        let sample_rate = 48_000u32;
++        let frames = 3 * sample_rate as usize;
++        let source: Vec<f32> = (0..frames)
++            .flat_map(|i| {
++                let value = (std::f32::consts::TAU * 330.0 * i as f32 / 48_000.0).sin() * 0.25;
++                [value, -value]
++            })
++            .collect();
++        let (start, end) = (2 * sample_rate as u64, 2 * sample_rate as u64 + 4_800);
++        let pre_roll = drum_silencer::pre_roll_frames(sample_rate) as u64;
++        let params = drumsilencer::default_params();
++
++        let region = slice_frames(&source, 2, start as i64, end as i64);
++        let (input, lead) = with_pre_roll(&source, 2, start, pre_roll, &region);
++        assert_eq!(lead as u64, pre_roll);
++        let processed = drum_silencer::render_interleaved(&input, 2, sample_rate, &params, lead);
++        assert_eq!(processed.len(), region.len());
++
++        let reference_input = slice_frames(&source, 2, (start - pre_roll) as i64, end as i64);
++        let reference =
++            drum_silencer::render_interleaved(&reference_input, 2, sample_rate, &params, 0);
++        assert_eq!(processed, reference[pre_roll as usize * 2..]);
++
++        let mut clip = source.clone();
++        replace_frame_range(&mut clip, 2, start as i64, &processed);
++        assert_eq!(clip[..start as usize * 2], source[..start as usize * 2]);
++        assert_eq!(clip[end as usize * 2..], source[end as usize * 2..]);
++    }
++}
+diff --git a/crates/SphereUIComponents/src/components/band_panel.rs b/crates/SphereUIComponents/src/components/band_panel.rs
+index a3dc7487..ff8151a8 100644
+--- a/crates/SphereUIComponents/src/components/band_panel.rs
++++ b/crates/SphereUIComponents/src/components/band_panel.rs
+@@ -50,7 +50,7 @@ const CROSSOVER_HIT: f32 = 8.0;
+ /// Drag travel under Shift.
+ const FINE: f32 = 0.2;
+ /// The frequencies the band display labels.
+-const FREQ_TICKS: [(f32, &str); 10] = [
++pub(crate) const FREQ_TICKS: [(f32, &str); 10] = [
+     (20.0, "20"),
+     (50.0, "50"),
+     (100.0, "100"),
+diff --git a/crates/SphereUIComponents/src/components/builtin_plugin_editor.rs b/crates/SphereUIComponents/src/components/builtin_plugin_editor.rs
+index 0f7e5f18..14089379 100644
+--- a/crates/SphereUIComponents/src/components/builtin_plugin_editor.rs
++++ b/crates/SphereUIComponents/src/components/builtin_plugin_editor.rs
+@@ -84,6 +84,7 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
+         clipper67::ui::UI_ORIGIN => clipper67::ui_param_index(param_id),
+         transient::ui::UI_ORIGIN => transient::ui_param_index(param_id),
+         waygate::ui::UI_ORIGIN => waygate::ui_param_index(param_id),
++        drumsilencer::ui::UI_ORIGIN => drumsilencer::ui_param_index(param_id),
+         wrapsynth::ui::UI_ORIGIN => wrapsynth::ui_param_index(param_id),
+         drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_index(param_id),
+         quicksampler::ui::UI_ORIGIN => quicksampler::ui_param_index(param_id),
+@@ -138,6 +139,7 @@ mod state_mirror {
+         Clipper67(Box<clipper67::Params>),
+         Transient(Box<transient::Params>),
+         WayGate(Box<waygate::Params>),
++        DrumSilencer(Box<drumsilencer::Params>),
+         WrapSynth(Box<wrapsynth::Params>),
+         DrumSampler(Box<drumsampler::Params>),
+         QuickSampler(Box<quicksampler::Params>),
+@@ -163,6 +165,7 @@ mod state_mirror {
+                 Self::Clipper67(_) => clipper67::ui::UI_ORIGIN,
+                 Self::Transient(_) => transient::ui::UI_ORIGIN,
+                 Self::WayGate(_) => waygate::ui::UI_ORIGIN,
++                Self::DrumSilencer(_) => drumsilencer::ui::UI_ORIGIN,
+                 Self::WrapSynth(_) => wrapsynth::ui::UI_ORIGIN,
+                 Self::DrumSampler(_) => drumsampler::ui::UI_ORIGIN,
+                 Self::QuickSampler(_) => quicksampler::ui::UI_ORIGIN,
+@@ -203,6 +206,9 @@ mod state_mirror {
+                     Some(Self::Transient(Box::new(transient::default_params())))
+                 }
+                 waygate::ui::UI_ORIGIN => Some(Self::WayGate(Box::new(waygate::default_params()))),
++                drumsilencer::ui::UI_ORIGIN => {
++                    Some(Self::DrumSilencer(Box::new(drumsilencer::default_params())))
++                }
+                 wrapsynth::ui::UI_ORIGIN => {
+                     Some(Self::WrapSynth(Box::new(wrapsynth::default_params())))
+                 }
+@@ -267,6 +273,7 @@ mod state_mirror {
+             clipper67::ui::UI_ORIGIN => clipper67::ui_param_id(wire_index).is_some(),
+             transient::ui::UI_ORIGIN => transient::ui_param_id(wire_index).is_some(),
+             waygate::ui::UI_ORIGIN => waygate::ui_param_id(wire_index).is_some(),
++            drumsilencer::ui::UI_ORIGIN => drumsilencer::ui_param_id(wire_index).is_some(),
+             wrapsynth::ui::UI_ORIGIN => wrapsynth::ui_param_id(wire_index).is_some(),
+             drumsampler::ui::UI_ORIGIN => drumsampler::ui_param_id(wire_index).is_some(),
+             quicksampler::ui::UI_ORIGIN => quicksampler::ui_param_id(wire_index).is_some(),
+@@ -324,6 +331,9 @@ mod state_mirror {
+             Some(BuiltinParams::WayGate(params)) => {
+                 let _ = waygate::ipc::apply_wire_param(params, wire_index, value);
+             }
++            Some(BuiltinParams::DrumSilencer(params)) => {
++                let _ = drumsilencer::ipc::apply_wire_param(params, wire_index, value);
++            }
+             Some(BuiltinParams::WrapSynth(params)) => {
+                 let _ = wrapsynth::ipc::apply_wire_param(params, wire_index, value);
+             }
+@@ -398,6 +408,13 @@ mod state_mirror {
+             waygate::ui::UI_ORIGIN => waygate::ipc::WayGateState::from_json(text)
+                 .ok()
+                 .map(|state| BuiltinParams::WayGate(Box::new(state.params))),
++            drumsilencer::ui::UI_ORIGIN => drumsilencer::ipc::DrumSilencerState::from_json(text)
++                .ok()
++                .map(|state| {
++                    let mut params = state.params;
++                    drumsilencer::ipc::sanitize_params(&mut params);
++                    BuiltinParams::DrumSilencer(Box::new(params))
++                }),
+             wrapsynth::ui::UI_ORIGIN => wrapsynth::ipc::WrapSynthState::from_json(text)
+                 .ok()
+                 .map(|state| BuiltinParams::WrapSynth(Box::new(state.params))),
+@@ -508,6 +525,11 @@ mod state_mirror {
+                     .to_json()
+                     .ok()?
+             }
++            BuiltinParams::DrumSilencer(params) if origin == drumsilencer::ui::UI_ORIGIN => {
++                drumsilencer::ipc::DrumSilencerState::new((**params).clone())
++                    .to_json()
++                    .ok()?
++            }
+             BuiltinParams::WrapSynth(params) if origin == wrapsynth::ui::UI_ORIGIN => {
+                 wrapsynth::ipc::WrapSynthState::new(**params)
+                     .to_json()
+@@ -667,6 +689,12 @@ mod state_mirror {
+                     .filter_map(|(id, value)| waygate::ui_param_index(id).map(|i| (i, value)))
+                     .collect()
+             }
++            Some(BuiltinParams::DrumSilencer(params)) if origin == drumsilencer::ui::UI_ORIGIN => {
++                drumsilencer::ipc::ui_values(params)
++                    .into_iter()
++                    .filter_map(|(id, value)| drumsilencer::ui_param_index(id).map(|i| (i, value)))
++                    .collect()
++            }
+             Some(BuiltinParams::WrapSynth(params)) if origin == wrapsynth::ui::UI_ORIGIN => {
+                 wrapsynth::ipc::ui_values(params)
+                     .into_iter()
+@@ -926,6 +954,16 @@ mod state_mirror {
+         }
+     }
+ 
++    /// A Drum Silencer insert's mirrored params, like
++    /// [`builtin_verbspace_params`].
++    pub fn builtin_drumsilencer_params(insert_id: &str) -> Option<drumsilencer::Params> {
++        let states = map().lock().ok()?;
++        match states.get(insert_id)? {
++            BuiltinParams::DrumSilencer(params) => Some((**params).clone()),
++            _ => None,
++        }
++    }
++
+     /// A Compressor insert's mirrored params, like
+     /// [`builtin_verbspace_params`].
+     pub fn builtin_compresser_params(insert_id: &str) -> Option<compresser::Params> {
+@@ -1048,14 +1086,15 @@ mod state_mirror {
+ #[cfg(feature = "builtin-plugin-editor")]
+ pub use state_mirror::{
+     builtin_burnlimit_params, builtin_clipper67_params, builtin_compresser_params,
+-    builtin_default_replay, builtin_drum_sampler_params, builtin_echospace_params,
+-    builtin_equz8_params, builtin_equzx_params, builtin_fa2a_params, builtin_fa76_params,
+-    builtin_imager_params, builtin_mixstation_params, builtin_quick_sampler_params,
+-    builtin_replay_changes, builtin_rodhareist_params, builtin_sample_names, builtin_slicer_params,
+-    builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
+-    builtin_state_replay, builtin_state_seed, builtin_state_set_sample, builtin_transient_params,
+-    builtin_used_output_buses, builtin_verbspace_params, builtin_waygate_params,
+-    builtin_whitesharp_params, builtin_wrapsynth_params, builtin_zcomp_params,
++    builtin_default_replay, builtin_drum_sampler_params, builtin_drumsilencer_params,
++    builtin_echospace_params, builtin_equz8_params, builtin_equzx_params, builtin_fa2a_params,
++    builtin_fa76_params, builtin_imager_params, builtin_mixstation_params,
++    builtin_quick_sampler_params, builtin_replay_changes, builtin_rodhareist_params,
++    builtin_sample_names, builtin_slicer_params, builtin_state_apply, builtin_state_bytes,
++    builtin_state_clear, builtin_state_remove, builtin_state_replay, builtin_state_seed,
++    builtin_state_set_sample, builtin_transient_params, builtin_used_output_buses,
++    builtin_verbspace_params, builtin_waygate_params, builtin_whitesharp_params,
++    builtin_wrapsynth_params, builtin_zcomp_params,
+ };
+ 
+ /// Featureless no-ops: without the editor there is no param wire, so there is
+@@ -3385,6 +3424,41 @@ mod tests {
+         assert!(builtin_transient_params(insert).is_none());
+     }
+ 
++    /// Drum Silencer's edits land in the mirror, persist as a
++    /// `DrumSilencerState` blob, replay in wire order, and are what its
++    /// native editor reads back.
++    #[cfg(feature = "builtin-plugin-editor")]
++    #[test]
++    fn drumsilencer_state_is_mirrored_persisted_and_replayed() {
++        let insert = "test-insert-drumsilencer-mirror";
++        assert_eq!(
++            origin_for_plugin_id("builtin:drumsilencer"),
++            Some("drumsilencer")
++        );
++        assert_eq!(origin_for_plugin_id("drumsilencer"), Some("drumsilencer"));
++        let amount = builtin_param_index("drumsilencer", "amount").expect("amount is an id");
++        let mode = builtin_param_index("builtin:drumsilencer", "mode").expect("mode is an id");
++        assert!(builtin_param_index("drumsilencer", "thresholdDb").is_none());
++        builtin_state_apply("drumsilencer", insert, amount, 40.0);
++        builtin_state_apply("drumsilencer", insert, mode, 1.0);
++
++        let bytes =
++            builtin_state_bytes("drumsilencer", insert).expect("Drum Silencer owns this state");
++        let json = String::from_utf8(bytes).expect("state blobs are UTF-8 JSON");
++        let state =
++            drumsilencer::ipc::DrumSilencerState::from_json(&json).expect("a Drum Silencer blob");
++        assert_eq!(state.params.amount, 40.0);
++        assert_eq!(state.params.mode, drumsilencer::Mode::Solo);
++
++        let replay = builtin_state_replay("drumsilencer", insert);
++        assert_eq!(replay.len(), drumsilencer::UI_PARAM_IDS.len());
++        assert!(replay.contains(&(amount, 40.0)));
++        let mirrored = builtin_drumsilencer_params(insert).expect("the editor reads it back");
++        assert_eq!(mirrored.amount, 40.0);
++        assert!(builtin_state_bytes("waygate", insert).is_none());
++        assert!(builtin_waygate_params(insert).is_none());
++    }
++
+     /// The reload after project open asks the mirror which file each pad was
+     /// loaded from; only a Drum Sampler slot answers, and only for its own
+     /// loaded pads.
+diff --git a/crates/SphereUIComponents/src/components/mod.rs b/crates/SphereUIComponents/src/components/mod.rs
+index 124db180..b333b21a 100644
+--- a/crates/SphereUIComponents/src/components/mod.rs
++++ b/crates/SphereUIComponents/src/components/mod.rs
+@@ -115,6 +115,10 @@ pub mod band_panel;
+ #[cfg(feature = "builtin-plugin-editor")]
+ pub mod imager_panel;
+ #[cfg(feature = "builtin-plugin-editor")]
++pub mod drum_silencer_model;
++#[cfg(feature = "builtin-plugin-editor")]
++pub mod drum_silencer_panel;
++#[cfg(feature = "builtin-plugin-editor")]
+ pub mod dyn_model;
+ #[cfg(feature = "builtin-plugin-editor")]
+ pub mod dyn_panel;
+diff --git a/crates/SphereUIComponents/src/components/plugin_live.rs b/crates/SphereUIComponents/src/components/plugin_live.rs
+index a3d6793f..cb81700a 100644
+--- a/crates/SphereUIComponents/src/components/plugin_live.rs
++++ b/crates/SphereUIComponents/src/components/plugin_live.rs
+@@ -93,6 +93,9 @@ pub struct Live {
+     /// held and falling back.
+     polar: [f32; POLAR_BINS],
+     sample_rate: Option<f32>,
++    /// The latency the host reports for the instance, in samples at
++    /// `sample_rate`: what the engine compensates.
++    latency_samples: Option<u32>,
+ }
+ 
+ impl Live {
+@@ -118,6 +121,7 @@ impl Live {
+             scope_gain: 1.0,
+             polar: [0.0; POLAR_BINS],
+             sample_rate: None,
++            latency_samples: None,
+         }
+     }
+ 
+@@ -142,10 +146,26 @@ impl Live {
+         self.reduction = reduction.map(|bands| (0, bands));
+     }
+ 
++    /// The host's sample rate and the instance's latency, for the preview
++    /// tool and the tests, as if the host had published them.
++    pub fn show_status(&mut self, sample_rate: u32, latency_samples: u32) {
++        if sample_rate > 0 {
++            self.sample_rate = Some(sample_rate as f32);
++            self.latency_samples = Some(latency_samples);
++        }
++    }
++
+     pub fn sample_rate(&self) -> Option<f32> {
+         self.sample_rate
+     }
+ 
++    /// The instance's latency as the host reports it, in milliseconds;
++    /// `None` until the host has said.
++    pub fn latency_ms(&self) -> Option<f32> {
++        let rate = self.sample_rate?;
++        Some(self.latency_samples? as f32 * 1_000.0 / rate)
++    }
++
+     /// Reads every source. True when anything worth a redraw moved, so an
+     /// idle editor stays idle.
+     pub fn poll(&mut self) -> bool {
+@@ -190,9 +210,12 @@ impl Live {
+                 moved = true;
+             }
+         }
+-        if let Some((rate, ..)) = self.status_source.as_ref().and_then(|s| s(&self.key)) {
++        if let Some((rate, _, latency, _)) = self.status_source.as_ref().and_then(|s| s(&self.key))
++        {
+             if rate > 0 {
+-                self.sample_rate = Some(rate as f32);
++                moved |=
++                    self.sample_rate != Some(rate as f32) || self.latency_samples != Some(latency);
++                self.show_status(rate, latency);
+             }
+         }
+         moved
+diff --git a/crates/SphereUIComponents/src/layout/plugin_ops.rs b/crates/SphereUIComponents/src/layout/plugin_ops.rs
+index 31e78f5f..4a054693 100644
+--- a/crates/SphereUIComponents/src/layout/plugin_ops.rs
++++ b/crates/SphereUIComponents/src/layout/plugin_ops.rs
+@@ -149,6 +149,13 @@ pub(crate) struct PluginEditorWindows {
+         String,
+         gpui::WindowHandle<crate::components::gate_panel::WayGateEditorWindow>,
+     >,
++    /// Open native Drum Silencer editors, keyed by insert id, like
++    /// `quick_sampler`.
++    #[cfg(feature = "builtin-plugin-editor")]
++    pub drum_silencer: std::collections::HashMap<
++        String,
++        gpui::WindowHandle<crate::components::drum_silencer_panel::DrumSilencerEditorWindow>,
++    >,
+     /// Open native Compressor and Imager editors (one window type for both),
+     /// keyed by insert id, like `quick_sampler`.
+     #[cfg(feature = "builtin-plugin-editor")]
+@@ -3310,6 +3317,13 @@ impl StudioLayout {
+                 window,
+                 cx,
+             ),
++            Some(drumsilencer::ui::UI_ORIGIN) => self.open_native_editor(
++                |windows| &mut windows.drum_silencer,
++                crate::components::drum_silencer_panel::open_drumsilencer_editor,
++                (target, identity, host_ops),
++                window,
++                cx,
++            ),
+             Some(compresser::ui::UI_ORIGIN) => self.open_native_editor(
+                 |windows| &mut windows.bands,
+                 crate::components::band_panel::open_compresser_editor,
+@@ -3504,6 +3518,15 @@ impl StudioLayout {
+             for handle in gates {
+                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+             }
++            let silencers: Vec<_> = self
++                .plugin_editors
++                .drum_silencer
++                .values()
++                .copied()
++                .collect();
++            for handle in silencers {
++                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
++            }
+             let bands: Vec<_> = self.plugin_editors.bands.values().copied().collect();
+             for handle in bands {
+                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+diff --git a/crates/SphereUIComponents/src/preview.rs b/crates/SphereUIComponents/src/preview.rs
+index be80bce6..cc505ee8 100644
+--- a/crates/SphereUIComponents/src/preview.rs
++++ b/crates/SphereUIComponents/src/preview.rs
+@@ -21,6 +21,7 @@ use gpui::{
+ use crate::components::band_model::BandKind;
+ use crate::components::builtin_plugin_editor::builtin_state_seed;
+ use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
++use crate::components::drum_silencer_panel::DrumSilencerModel;
+ use crate::components::dyn_model::DynKind;
+ use crate::components::eq_model::{EqKind, EqParams, Placement, Shape};
+ use crate::components::eq_window::EqEditorWindow;
+@@ -245,6 +246,24 @@ pub fn scenes() -> Vec<Scene> {
+             height: WayGateModel.window_size().1,
+             open: waygate_duck_scene,
+         },
++        Scene {
++            name: "drumsilencer",
++            width: DrumSilencerModel.window_size().0,
++            height: DrumSilencerModel.window_size().1,
++            open: drumsilencer_scene,
++        },
++        Scene {
++            name: "drumsilencer-drums-only",
++            width: DrumSilencerModel.window_size().0,
++            height: DrumSilencerModel.window_size().1,
++            open: drumsilencer_drums_only_scene,
++        },
++        Scene {
++            name: "drumsilencer-bypassed",
++            width: DrumSilencerModel.window_size().0,
++            height: DrumSilencerModel.window_size().1,
++            open: drumsilencer_bypassed_scene,
++        },
+         Scene {
+             name: "compressor-single",
+             width: BandKind::Comp.window_size().0,
+@@ -760,6 +779,147 @@ fn waygate_duck_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowH
+     open_waygate(options, cx, "waygate-duck", params)
+ }
+ 
++/// Ten seconds of Drum Silencer telemetry, measured by running the real DSP
++/// (with whatever weights it ships) at `params` over a synthetic groove: a
++/// kick on every beat, a snare on two and four, eighth-note hats, over a
++/// bass note and a held chord. One frame per ~33 ms block, as the host
++/// publishes them; with the latency the DSP reports.
++fn drumsilencer_frames(
++    params: &drumsilencer::Params,
++) -> (
++    Arc<Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame>>,
++    u32,
++) {
++    use drumsilencer::StereoEffect;
++    use std::f32::consts::TAU;
++    const SR: f32 = 48_000.0;
++    const BLOCK: usize = 1_600;
++    let mut dsp = drumsilencer::Dsp::new(SR);
++    dsp.set_params(params.clone());
++    let mut seed = 0x2545_f491u32;
++    let mut noise = move || {
++        seed ^= seed << 13;
++        seed ^= seed >> 17;
++        seed ^= seed << 5;
++        seed as f32 / u32::MAX as f32 * 2.0 - 1.0
++    };
++    let mut last_noise = 0.0f32;
++    let mut frames = Vec::with_capacity(300);
++    for block in 0..300 {
++        for n in 0..BLOCK {
++            let t = (block * BLOCK + n) as f32 / SR;
++            let in_beat = t % 0.5;
++            let beat = (t / 0.5) as usize;
++            let in_eighth = t % 0.25;
++            let kick = 0.8
++                * (-in_beat / 0.12).exp()
++                * (TAU * (50.0 + 60.0 * (-in_beat / 0.03).exp()) * in_beat).sin();
++            let white = noise();
++            let snare = if beat % 2 == 1 {
++                0.35 * (-in_beat / 0.09).exp() * (white + 0.6 * (TAU * 190.0 * in_beat).sin())
++            } else {
++                0.0
++            };
++            let hat = 0.08 * (-in_eighth / 0.025).exp() * (white - last_noise);
++            last_noise = white;
++            let bass = 0.15 * (TAU * 55.0 * t).sin();
++            let chord = 0.05
++                * ((TAU * 220.0 * t).sin() + (TAU * 277.2 * t).sin() + (TAU * 329.6 * t).sin());
++            let x = kick + snare + hat + bass + chord;
++            dsp.process_stereo(x, x);
++        }
++        let f = dsp.meter_frame();
++        let (slot_in_peak, slot_out_peak) = f.rack_slots();
++        frames.push(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
++            in_peak: f.in_peak,
++            in_rms: f.in_rms,
++            out_peak: f.out_peak,
++            out_rms: f.out_rms,
++            gain_reduction_db: 0.0,
++            in_clip: f.in_clip,
++            out_clip: f.out_clip,
++            slot_in_peak,
++            slot_out_peak,
++        });
++    }
++    (Arc::new(frames), dsp.latency_samples() as u32)
++}
++
++fn open_drumsilencer(
++    options: WindowOptions,
++    cx: &mut App,
++    insert: &'static str,
++    params: drumsilencer::Params,
++) -> Result<AnyWindowHandle> {
++    if let Ok(json) = drumsilencer::ipc::DrumSilencerState::new(params.clone()).to_json() {
++        seed("drumsilencer", insert, json);
++    }
++    let (frames, latency) = drumsilencer_frames(&params);
++    let source = frames.clone();
++    let tick = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    let host_ops = BuiltinEditorHostOps {
++        meter_source: Some(Arc::new(move |_| {
++            let at = tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            source.get(at % source.len()).copied()
++        })),
++        host_status_source: Some(Arc::new(move |_| Some((48_000, 512, latency, 120.0)))),
++        ..preview_host_ops()
++    };
++    let handle = cx.open_window(options, move |_, cx| {
++        cx.new(|cx| {
++            let window = KitWindow::new(
++                DrumSilencerModel,
++                key(insert),
++                identity("Drum Silencer"),
++                host_ops,
++                no_close(),
++                cx,
++            );
++            {
++                let mut live = window.live().borrow_mut();
++                for frame in frames.iter() {
++                    live.show(*frame);
++                }
++                live.show_status(48_000, latency);
++            }
++            window
++        })
++    })?;
++    Ok(handle.into())
++}
++
++fn drumsilencer_preset(name: &str) -> drumsilencer::Params {
++    drumsilencer::factory_presets()
++        .into_iter()
++        .find(|preset| preset.name == name)
++        .map_or_else(drumsilencer::default_params, |preset| preset.params)
++}
++
++fn drumsilencer_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
++    open_drumsilencer(
++        options,
++        cx,
++        "drumsilencer",
++        drumsilencer_preset("Keep Kick"),
++    )
++}
++
++fn drumsilencer_drums_only_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
++    let params = drumsilencer::Params {
++        high_hz: 8_000.0,
++        ..drumsilencer_preset("Drums Only")
++    };
++    open_drumsilencer(options, cx, "drumsilencer-drums-only", params)
++}
++
++fn drumsilencer_bypassed_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
++    let params = drumsilencer::Params {
++        power: false,
++        ..drumsilencer_preset("Quieter Drums")
++    };
++    open_drumsilencer(options, cx, "drumsilencer-bypassed", params)
++}
++
+ fn band_preset(kind: BandKind, name: &str) -> crate::components::band_model::BandParams {
+     crate::components::band_model::presets(kind)
+         .iter()
+diff --git a/apps/native/livestage/webui/src/editors/drumsilencer.css b/apps/native/livestage/webui/src/editors/drumsilencer.css
+new file mode 100644
+index 00000000..5c300358
+--- /dev/null
++++ b/apps/native/livestage/webui/src/editors/drumsilencer.css
+@@ -0,0 +1,116 @@
++/* Drum Silencer's editor (drumsilencer.tsx): a row of displays over a row
++   of control cards, laid out as the gate and dynamics editors are. */
++
++.ds-displays {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 10px;
++  min-width: 0;
++}
++
++/* A display column: its share of the row by flex-grow, never narrower than
++   its min-width (set inline, capped at the row's width for a phone). */
++.ds-col {
++  display: flex;
++  flex-direction: column;
++  flex-basis: 0;
++  height: 300px;
++  min-width: 0;
++}
++
++.ds-col > .pe-canvas {
++  flex: 1;
++}
++
++/* The meter bay: a fixed-width panel of three columns. */
++.ds-meters {
++  flex: 0 0 170px;
++  width: 170px;
++}
++
++.ds-well {
++  display: flex;
++  flex: 1;
++  padding: 8px;
++  border: 1px solid var(--border-subtle);
++  border-radius: var(--r);
++  background: var(--surface-panel);
++  min-height: 0;
++}
++
++.ds-well > .pe-canvas {
++  flex: 1;
++}
++
++.ds-bare {
++  background: transparent;
++  border: 0;
++  border-radius: 0;
++}
++
++/* The passing notice along a display's bottom edge. */
++.ds-notice {
++  position: absolute;
++  left: 50%;
++  bottom: 40px;
++  transform: translateX(-50%);
++  max-width: calc(100% - 24px);
++  padding: 4px 8px;
++  border: 1px solid var(--border-subtle);
++  border-radius: var(--r);
++  background: var(--surface-raised);
++  color: var(--text-secondary);
++  font-size: 10px;
++  text-align: center;
++  pointer-events: none;
++}
++
++.ds-stack {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  min-width: 0;
++}
++
++.ds-stack.hair {
++  gap: 2px;
++}
++
++/* A segmented choice is as wide as its labels, not its column. */
++.ds-stack > .segments {
++  align-self: flex-start;
++}
++
++.ds-hint {
++  max-width: 180px;
++  font-size: 10px;
++  color: var(--text-muted);
++}
++
++.ds-latency {
++  font-size: 13px;
++  font-weight: 600;
++  color: var(--text-primary);
++}
++
++/* Segments split a track equally, as the native segmented track does. */
++.ds-track {
++  display: flex;
++}
++
++.ds-track button {
++  flex: 1 1 0;
++  justify-content: center;
++  padding: 0 10px;
++  white-space: nowrap;
++}
++
++@media (max-width: 640px) {
++  .ds-col {
++    height: 240px;
++  }
++
++  .ds-meters {
++    flex-grow: 1;
++  }
++}
+diff --git a/apps/native/livestage/webui/src/editors/drumsilencer.tsx b/apps/native/livestage/webui/src/editors/drumsilencer.tsx
+new file mode 100644
+index 00000000..588f30f0
+--- /dev/null
++++ b/apps/native/livestage/webui/src/editors/drumsilencer.tsx
+@@ -0,0 +1,405 @@
++// Drum Silencer's editor, in the frame and visual language of the other
++// built-in editors (gate.tsx, dynamics.tsx).
++//
++// A row of displays over a row of control cards:
++// * Bands: per meter band (drumsilencer::BAND_EDGES_HZ) the whole input and
++//   the drums the network hears, on one frequency axis with the range the
++//   effect works in (drumsilencer::range_weight) shaded over it and drawn as
++//   a lane underneath;
++// * Meters: In, Drums and Out.
++//
++// The bands arrive in the standard level frame (MeterFrame::rack_slots):
++// rack position b's input level is band b's drums, its output level band b's
++// input. The Drums meter is those bands summed: the DSP's drums level is the
++// same sum, so this reads it exactly (with the bands' hold).
++//
++// LiveStage compensates no insert delay, so the editor says what this one
++// costs: the delay is fixed, on or off, at every setting.
++
++import type { CSSProperties, ReactNode } from 'react'
++import { Knob } from '../controls.tsx'
++import type { Editor, EditorComponent } from './kit.tsx'
++import { Card, DisplayTag, EditorShell, HERO_KNOB, KNOB, LiveCanvas, ParamChoice, Row } from './kit.tsx'
++import type { KnobSpec } from './knobspec.ts'
++import { bipolar, formatValue, fromKnob, knobRange, readout as kitReadout, spec, toKnob } from './knobspec.ts'
++import type { Live } from './live.ts'
++import { toDb } from './live.ts'
++import type { Ctx } from './paint.ts'
++import { alpha, area, colors, dashed, dbText, DENSE_CAPTION, freqFraction, label, line, rect, UI_XS } from './paint.ts'
++import './drumsilencer.css'
++
++/** drumsilencer::LOW_OFF_HZ / HIGH_OFF_HZ: a range edge here is off. */
++const LOW_OFF_HZ = 20
++const HIGH_OFF_HZ = 20000
++/** drumsilencer::EDGE_OCTAVES: how far past an edge the effect fades out. */
++const EDGE_OCTAVES = 0.5
++/** drumsilencer::BAND_EDGES_HZ, closed at both ends of the axis. */
++const BAND_EDGES = [20, 100, 300, 1000, 3000, 8000, 20000]
++const BANDS = BAND_EDGES.length - 1
++/** Mode in wire order (drumsilencer::Mode). */
++const SOLO = 1
++/** The level floor the bands and meters draw down to, dBFS. */
++const FLOOR_DB = -60
++/** Room for a display's tags above what it paints. */
++const TAG_ROOM = 26
++/** native plugin_kit::KNOB_PITCH: a knob cell and its gap. */
++const KNOB_PITCH = 62
++const FREQ_TICKS: [number, string][] = [
++  [20, '20'],
++  [50, '50'],
++  [100, '100'],
++  [200, '200'],
++  [500, '500'],
++  [1000, '1k'],
++  [2000, '2k'],
++  [5000, '5k'],
++  [10000, '10k'],
++  [20000, '20k'],
++]
++
++const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v))
++/** A min-width that never pushes past a phone's width. */
++const minWidth = (px: number): CSSProperties => ({ minWidth: `min(${px}px, 100%)` })
++
++const lowIsOff = (hz: number) => hz <= LOW_OFF_HZ + 0.5
++const highIsOff = (hz: number) => hz >= HIGH_OFF_HZ - 0.5
++
++/** drumsilencer::range_weight: how much of the effect applies at `hz`. */
++function rangeWeight(hz: number, lowHz: number, highHz: number): number {
++  let w = 1
++  if (!lowIsOff(lowHz)) w *= clamp(1 + Math.log2(Math.max(hz, 1e-3) / lowHz) / EDGE_OCTAVES, 0, 1)
++  if (!highIsOff(highHz)) w *= clamp(1 - Math.log2(Math.max(hz, 1e-3) / highHz) / EDGE_OCTAVES, 0, 1)
++  return w
++}
++
++/** The insert's delay in ms (Dsp::latency_samples: two hops less one, the
++ *  hop 128 samples times the rate's scale — 255 samples at 48 kHz). */
++function latencyMs(sampleRate: number): number {
++  const sr = Math.max(1, sampleRate)
++  let scale = clamp(Math.round(sr / 48000), 1, 4)
++  if (scale === 3) scale = 2
++  return ((256 * scale - 1) * 1000) / sr
++}
++
++interface Settings {
++  solo: boolean
++  lowHz: number
++  highHz: number
++  power: boolean
++}
++
++function settingsOf(e: Editor): Settings {
++  return {
++    solo: Math.round(e.value('mode')) === SOLO,
++    lowHz: e.value('lowHz'),
++    highHz: e.value('highHz'),
++    power: e.flag('power'),
++  }
++}
++
++/** Whether the range leaves anything for the effect to work on. */
++function rangeIsEmpty(s: Settings): boolean {
++  for (let i = 0; i <= 200; i++) {
++    if (rangeWeight(20 * Math.pow(1000, i / 200), s.lowHz, s.highHz) > 0.01) return false
++  }
++  return true
++}
++
++function edgeText(id: 'lowHz' | 'highHz', hz: number): string {
++  return (id === 'lowHz' ? lowIsOff(hz) : highIsOff(hz)) ? 'Off' : formatValue('hz', hz)
++}
++
++function rangeText(s: Settings): string {
++  const low = lowIsOff(s.lowHz)
++  const high = highIsOff(s.highHz)
++  if (low && high) return 'Full range'
++  if (high) return `Above ${formatValue('hz', s.lowHz)}`
++  if (low) return `Below ${formatValue('hz', s.highHz)}`
++  return `${formatValue('hz', s.lowHz)} – ${formatValue('hz', s.highHz)}`
++}
++
++/** The drums heard over every band: the bands' mean squares summed. */
++function drumsLevel(drumBands: number[]): number {
++  let ms = 0
++  for (let b = 0; b < BANDS; b++) ms += (drumBands[b] ?? 0) ** 2
++  return Math.sqrt(ms)
++}
++
++// ── The bands ───────────────────────────────────────────────────────────
++
++function paintBands(ctx: Ctx, w: number, h: number, live: Live, s: Settings, dim: boolean) {
++  const c = colors()
++  const GUTTER = 44
++  const LANE_H = 12
++  const LANE_GAP = 6
++  const TICKS_H = 16
++  const plotW = Math.max(1, w - GUTTER)
++  const laneY = h - TICKS_H - LANE_H
++  const plotTop = 18
++  const plotH = Math.max(1, laneY - LANE_GAP - plotTop)
++  const xAt = (hz: number) => freqFraction(hz) * plotW
++  const yAt = (db: number) => plotTop + clamp(db / FLOOR_DB, 0, 1) * plotH
++  const a = dim ? 0.45 : 1
++
++  for (const db of [0, -12, -24, -36, -48, -60]) {
++    const y = yAt(db)
++    rect(ctx, 0, y, plotW, 1, alpha(c.text, 0.06))
++    label(ctx, db.toFixed(0), DENSE_CAPTION, c.textFaint, plotW + 6, y - 6)
++  }
++  for (const [hz, text] of FREQ_TICKS) {
++    const x = xAt(hz)
++    rect(ctx, x, plotTop, 1, laneY + LANE_H - plotTop, alpha(c.text, 0.035))
++    const align = hz === 20 ? 'left' : hz === 20000 ? 'right' : 'center'
++    label(ctx, text, DENSE_CAPTION, c.textFaint, x, laneY + LANE_H + 3, align)
++  }
++
++  // Each band: the input behind, the drums heard in front.
++  const frame = live.frame
++  for (let b = 0; b < BANDS; b++) {
++    const left = xAt(BAND_EDGES[b])
++    const right = xAt(BAND_EDGES[b + 1])
++    if (b > 0) rect(ctx, left, plotTop, 1, plotH, alpha(c.text, 0.08))
++    if (!frame) continue
++    const inputDb = toDb(frame.slot_out_peak[b] ?? 0)
++    const drumsDb = toDb(frame.slot_in_peak[b] ?? 0)
++    const [x, bw] = [left + 3, Math.max(1, right - left - 6)]
++    const inputY = yAt(inputDb)
++    if (inputDb > FLOOR_DB) {
++      rect(ctx, x, inputY, bw, plotTop + plotH - inputY, alpha(c.textMuted, 0.22 * a))
++      rect(ctx, x, inputY, bw, 1.5, alpha(c.textMuted, 0.8 * a))
++    }
++    const inset = Math.min(bw * 0.2, 14)
++    const drumsY = yAt(drumsDb)
++    if (drumsDb > FLOOR_DB) {
++      rect(ctx, x + inset, drumsY, bw - 2 * inset, plotTop + plotH - drumsY, alpha(c.accent, 0.5 * a))
++      rect(ctx, x + inset, drumsY, bw - 2 * inset, 1.5, alpha(c.accentHover, a))
++    }
++    if (right - left > 40) {
++      const text = drumsDb > FLOOR_DB ? dbText(drumsDb) : '—'
++      label(ctx, text, DENSE_CAPTION, c.textSecondary, (left + right) * 0.5, Math.max(plotTop, Math.min(inputY, drumsY) - 14), 'center')
++    }
++  }
++
++  // The range on the same axis: what lies outside it is shaded over the
++  // bands, the weight itself is the lane, and each edge that is on a line.
++  const STEP = 2
++  const weights: [number, number][] = []
++  for (let x = 0; x <= plotW; x += STEP) {
++    const hz = 20 * Math.pow(1000, x / plotW)
++    const weight = rangeWeight(hz, s.lowHz, s.highHz)
++    weights.push([x, weight])
++    if (weight < 0.99) rect(ctx, x, plotTop, STEP, plotH, alpha(c.canvas, 0.6 * (1 - weight)))
++  }
++  rect(ctx, 0, laneY, plotW, LANE_H, c.meterBg)
++  const lane = weights.map(([x, weight]): [number, number] => [x, laneY + LANE_H - weight * LANE_H])
++  area(ctx, lane, laneY + LANE_H, alpha(c.accent, 0.4 * a))
++  line(ctx, lane, 1, alpha(c.accent, a))
++  label(ctx, 'Range', DENSE_CAPTION, c.textFaint, plotW + 6, laneY)
++  const edge = (hz: number, text: string, side: 'left' | 'right') => {
++    const x = xAt(hz)
++    dashed(ctx, [x, plotTop], [x, laneY + LANE_H], 1, alpha(c.accent, 0.85 * a))
++    label(ctx, text, DENSE_CAPTION, alpha(c.accent, a), side === 'left' ? x + 4 : x - 4, plotTop + plotH - 14, side)
++  }
++  if (!lowIsOff(s.lowHz)) edge(s.lowHz, `Low ${formatValue('hz', s.lowHz)}`, 'left')
++  if (!highIsOff(s.highHz)) edge(s.highHz, `High ${formatValue('hz', s.highHz)}`, 'right')
++
++  // The legend, under the tags.
++  const legend: [string, string][] = [
++    ['Input', alpha(c.textMuted, 0.8)],
++    ['Drums heard', c.accent],
++  ]
++  let lx = 8
++  for (const [text, color] of legend) {
++    rect(ctx, lx, 3, 8, 8, color, 2)
++    label(ctx, text, DENSE_CAPTION, c.textMuted, lx + 12, 1)
++    lx += 12 + ctx.measureText(text).width + 14
++  }
++  if (!frame) label(ctx, 'No signal', UI_XS, c.textMuted, plotW / 2, plotTop + plotH / 2 - 7, 'center')
++}
++
++// ── The meters ──────────────────────────────────────────────────────────
++
++function paintMeters(ctx: Ctx, w: number, h: number, live: Live, dim: boolean) {
++  const c = colors()
++  const CAPTION_H = 16
++  const READOUT_H = 18
++  const NOTE_H = 16
++  const BAR_W = 12
++  const frame = live.frame
++  const barTop = CAPTION_H
++  const barH = Math.max(1, h - CAPTION_H - READOUT_H - NOTE_H)
++  const unit = (level: number) => clamp((toDb(level) - FLOOR_DB) / -FLOOR_DB, 0, 1)
++  const columns: [string, number | null, number | null, string][] = [
++    ['In', frame?.in_rms ?? null, frame?.in_peak ?? null, c.textMuted],
++    ['Drums', frame ? drumsLevel(frame.slot_in_peak) : null, null, dim ? c.textMuted : c.accent],
++    ['Out', frame?.out_rms ?? null, frame?.out_peak ?? null, c.textMuted],
++  ]
++  const columnW = w / columns.length
++  columns.forEach(([caption, rms, peak, tone], i) => {
++    const centre = columnW * (i + 0.5)
++    label(ctx, caption, DENSE_CAPTION, c.textMuted, centre, 0, 'center')
++    const x = centre - BAR_W / 2
++    rect(ctx, x, barTop, BAR_W, barH, c.meterBg)
++    if (rms !== null) {
++      const top = barTop + (1 - unit(rms)) * barH
++      rect(ctx, x, top, BAR_W, barTop + barH - top, tone)
++    }
++    if (peak !== null && unit(peak) > 0) {
++      rect(ctx, x, barTop + (1 - unit(peak)) * barH, BAR_W, 1.5, peak >= 1 ? c.meterHigh : c.text)
++    }
++    const text = rms === null ? '—' : dbText(toDb(rms))
++    label(ctx, text, UI_XS, c.textSecondary, centre, barTop + barH + 3, 'center')
++  })
++  label(ctx, 'RMS · tick: peak', DENSE_CAPTION, c.textFaint, w / 2, h - NOTE_H + 3, 'center')
++}
++
++// ── The editor ──────────────────────────────────────────────────────────
++
++function Displays(props: { editor: Editor }) {
++  const e = props.editor
++  const live = e.live
++  const s = settingsOf(e)
++  const ms = latencyMs(e.sampleRate).toFixed(1)
++  const notice = !s.power
++    ? `Power off — audio passes unchanged, still ${ms} ms late`
++    : e.bypassed
++      ? `Bypassed — the insert is skipped, and its ${ms} ms delay with it`
++      : rangeIsEmpty(s)
++        ? s.solo
++          ? 'The range is empty — nothing is kept'
++          : 'The range is empty — nothing is taken out'
++        : null
++  return (
++    <div className="ds-displays">
++      <div className="ds-col" style={{ flexGrow: 4, ...minWidth(300) }}>
++        <LiveCanvas
++          draw={(ctx, w, h) => {
++            ctx.translate(0, TAG_ROOM)
++            paintBands(ctx, w, h - TAG_ROOM, live, s, e.bypassed)
++          }}
++        >
++          <DisplayTag>Bands</DisplayTag>
++          <DisplayTag right>{rangeText(s)}</DisplayTag>
++          {notice && <span className="ds-notice">{notice}</span>}
++        </LiveCanvas>
++      </div>
++      <div className="ds-col ds-meters">
++        <div className="ds-well">
++          <LiveCanvas className="ds-bare" draw={(ctx, w, h) => paintMeters(ctx, w, h, live, e.bypassed)} />
++        </div>
++      </div>
++    </div>
++  )
++}
++
++const KNOBS: Record<string, KnobSpec> = {
++  amount: spec('amount', 'Amount', 0, 100, 'linear', 'percent'),
++  lowHz: spec('lowHz', 'Low', LOW_OFF_HZ, 2000, 'log', 'hz'),
++  highHz: spec('highHz', 'High', 1000, HIGH_OFF_HZ, 'log', 'hz'),
++  outputDb: bipolar(spec('outputDb', 'Output', -24, 12, 'linear', 'db'), 0),
++}
++
++/** The knob for `id`, its range from the effect's descriptor. */
++function knobSpec(e: Editor, id: string): KnobSpec | null {
++  const range = e.effect.params.find((p) => p.id === id)
++  const s = KNOBS[id]
++  return range && s ? { ...s, min: range.min, max: range.max } : null
++}
++
++/** The range edges read "Off" at their end stops; the rest as the kit does. */
++function readout(s: KnobSpec, value: number): string {
++  return s.id === 'lowHz' || s.id === 'highHz' ? edgeText(s.id, value) : kitReadout(s, value)
++}
++
++/** kit's KitKnob, with the range edges' readout. */
++function DsKnob(props: { editor: Editor; id: string; size?: number }) {
++  const { editor } = props
++  const s = knobSpec(editor, props.id)
++  if (!s) return null
++  const [lo, hi] = knobRange(s)
++  return (
++    <div className="pe-knob">
++      <Knob
++        value={toKnob(s, editor.value(s.id))}
++        min={lo}
++        max={hi}
++        defaultValue={toKnob(s, editor.defaultOf(s.id))}
++        bipolar={s.bipolar}
++        size={props.size ?? KNOB}
++        label={`${s.label} (double-click: default)`}
++        caption={s.label}
++        format={(units) => readout(s, fromKnob(s, units))}
++        onChange={(units) => editor.set(s.id, fromKnob(s, units))}
++      />
++    </div>
++  )
++}
++
++function Controls(props: { editor: Editor }) {
++  const e = props.editor
++  const s = settingsOf(e)
++  const knob = (id: string, size = KNOB) => <DsKnob key={id} editor={e} id={id} size={size} />
++  const ms = latencyMs(e.sampleRate).toFixed(1)
++  const knobCard = (title: string, knobs: ReactNode[], hint?: string) => (
++    <Card key={title} title={title} grow={knobs.length} style={minWidth(knobs.length * KNOB_PITCH + 18)}>
++      <div className="ds-stack">
++        <div className="pe-knobs">{knobs}</div>
++        {hint && <span className="ds-hint">{hint}</span>}
++      </div>
++    </Card>
++  )
++  return (
++    <Row>
++      <Card title="MODE" grow={0} style={minWidth(210)}>
++        <div className="ds-stack">
++          <ParamChoice
++            editor={e}
++            id="mode"
++            options={[
++              [0, 'Remove'],
++              [SOLO, 'Drums Only'],
++            ]}
++            className="ds-track"
++          />
++          <span className="ds-hint">
++            {s.solo ? 'Keeps the drums the network hears, and only them' : 'Takes the drums the network hears out of the mix'}
++          </span>
++        </div>
++      </Card>
++      {knobCard('AMOUNT', [knob('amount', HERO_KNOB), knob('outputDb')])}
++      {knobCard(
++        'RANGE',
++        [knob('lowHz'), knob('highHz')],
++        s.solo ? 'Outside the range is silent' : 'Outside the range passes untouched',
++      )}
++      <Card title="LATENCY" grow={1} style={minWidth(170)}>
++        <div className="ds-stack hair">
++          <strong className="ds-latency">Adds {ms} ms</strong>
++          <span className="ds-hint">
++            Fixed, on or off. LiveStage does not delay the other strips to match: this strip plays {ms} ms behind them.
++          </span>
++        </div>
++      </Card>
++    </Row>
++  )
++}
++
++function DrumSilencerEditor(props: { editor: Editor }) {
++  const { editor } = props
++  const s = settingsOf(editor)
++  const ms = latencyMs(editor.sampleRate).toFixed(1)
++  const full = lowIsOff(s.lowHz) && highIsOff(s.highHz)
++  const subtitle = [s.solo ? 'Drums only' : 'Drum removal', full ? null : rangeText(s), `adds ${ms} ms`]
++    .filter(Boolean)
++    .join(' · ')
++  return (
++    <EditorShell editor={editor} title="Drum Silencer" subtitle={subtitle}>
++      <Displays editor={editor} />
++      <Controls editor={editor} />
++    </EditorShell>
++  )
++}
++
++export const editors: Record<string, EditorComponent> = {
++  drumsilencer: DrumSilencerEditor,
++}
+diff --git a/crates/SphereUIComponents/src/components/audio_tools/drum_silencer.rs b/crates/SphereUIComponents/src/components/audio_tools/drum_silencer.rs
+new file mode 100644
+index 00000000..3a608edd
+--- /dev/null
++++ b/crates/SphereUIComponents/src/components/audio_tools/drum_silencer.rs
+@@ -0,0 +1,242 @@
++//! Drum Silencer as an offline Audio Repair processor.
++//!
++//! The built-in plug-in's DSP (`drumsilencer::Dsp`) is a streaming effect: a
++//! causal recurrent network masks each short-time spectrum, and the output
++//! trails the input by `latency_samples()`. Offline that delay is removed
++//! exactly — the input is followed by `latency` zero frames and the first
++//! `latency` output frames are dropped — so the render lines up with the source
++//! sample for sample and can be spliced back into the clip.
++//!
++//! The network warms up over its first half second, so a render that starts
++//! mid-file is given up to [`PRE_ROLL_SECONDS`] of the audio before it as
++//! context. That lead-in is processed and then discarded.
++//!
++//! Scanner/offline code: runs on the background executor only. Allocation is
++//! fine here; nothing in this file is on a realtime path.
++
++use drumsilencer::{Dsp, Params, StereoEffect};
++
++/// Audio before the processed range the network hears first, when the source
++/// has it.
++pub(super) const PRE_ROLL_SECONDS: f64 = 1.0;
++
++/// [`PRE_ROLL_SECONDS`] in frames at `sample_rate`.
++pub(super) fn pre_roll_frames(sample_rate: u32) -> usize {
++    (PRE_ROLL_SECONDS * sample_rate as f64).round() as usize
++}
++
++/// Render interleaved `samples` through Drum Silencer.
++///
++/// The first `lead_in` frames are context only: they are processed so the
++/// network's state is warm, and are not part of the result. The returned
++/// buffer holds the remaining frames, aligned sample-exactly with them.
++///
++/// Channels are processed in pairs (L/R share the plug-in's one stereo
++/// transform); a last odd channel — or a mono file — runs as `(x, x)` and
++/// keeps the left output.
++pub(super) fn render_interleaved(
++    samples: &[f32],
++    channels: usize,
++    sample_rate: u32,
++    params: &Params,
++    lead_in: usize,
++) -> Vec<f32> {
++    let channels = channels.max(1);
++    let frames = samples.len() / channels;
++    let lead_in = lead_in.min(frames);
++    let out_frames = frames - lead_in;
++    let mut out = vec![0.0; out_frames * channels];
++    if out_frames == 0 {
++        return out;
++    }
++    let mut first = 0;
++    while first < channels {
++        let pair = first + 1 < channels;
++        let mut dsp = Dsp::new(sample_rate.max(1) as f32);
++        dsp.set_params(params.clone());
++        let latency = dsp.latency_samples();
++        // Output frame `i` is input frame `i - latency`; the frames the
++        // result keeps are inputs `lead_in..frames`.
++        for i in 0..frames + latency {
++            let (left, right) = if i < frames {
++                let left = samples[i * channels + first];
++                let right = if pair {
++                    samples[i * channels + first + 1]
++                } else {
++                    left
++                };
++                (left, right)
++            } else {
++                (0.0, 0.0)
++            };
++            let (out_left, out_right) = dsp.process_stereo(left, right);
++            let Some(source) = i.checked_sub(latency) else {
++                continue;
++            };
++            let Some(k) = source.checked_sub(lead_in) else {
++                continue;
++            };
++            out[k * channels + first] = out_left;
++            if pair {
++                out[k * channels + first + 1] = out_right;
++            }
++        }
++        first += if pair { 2 } else { 1 };
++    }
++    out
++}
++
++/// How long the result fades in from, and back out to, the original at each
++/// end of the range.
++pub(super) const EDGE_SECONDS: f64 = 0.010;
++
++/// Crossfade `processed` into the clip: over the first [`EDGE_SECONDS`] it
++/// moves linearly from `original` to the render, and over the last back again,
++/// so the splice has no step where a drum was cut off mid-ring. `original` is
++/// the same frames before processing; the two are sample-aligned, so the fade
++/// cannot comb. A range shorter than two edges fades over half of it each way.
++pub(super) fn fade_edges(
++    processed: &mut [f32],
++    original: &[f32],
++    channels: usize,
++    sample_rate: u32,
++) {
++    let channels = channels.max(1);
++    debug_assert_eq!(processed.len(), original.len());
++    let frames = processed.len().min(original.len()) / channels;
++    let edge = ((EDGE_SECONDS * sample_rate as f64).round() as usize)
++        .min(frames / 2)
++        .max(1);
++    for i in 0..edge.min(frames) {
++        let w = (i as f32 + 0.5) / edge as f32;
++        for frame in [i, frames - 1 - i] {
++            for c in 0..channels {
++                let k = frame * channels + c;
++                processed[k] = original[k] + (processed[k] - original[k]) * w;
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_edges_fade_from_and_back_to_the_original() {
++        let channels = 2;
++        let frames = 4_800;
++        let original = vec![1.0f32; frames * channels];
++        let mut processed = vec![0.0f32; frames * channels];
++        fade_edges(&mut processed, &original, channels, SR);
++        let edge = (EDGE_SECONDS * SR as f64) as usize;
++        // Close to the original at both ends, the render in the middle.
++        assert!(processed[0] > 0.99 && processed[(frames - 1) * channels + 1] > 0.99);
++        assert_eq!(processed[edge * channels], 0.0);
++        assert_eq!(processed[(frames / 2) * channels], 0.0);
++        // Halfway through the fade, halfway between.
++        assert!((processed[(edge / 2) * channels] - 0.5).abs() < 0.01);
++        // Monotone: no step anywhere in the fade.
++        for i in 1..edge {
++            assert!(processed[i * channels] <= processed[(i - 1) * channels]);
++        }
++        // A range too short for two edges still meets in the middle cleanly.
++        let mut short = vec![0.0f32; 10 * channels];
++        fade_edges(&mut short, &vec![1.0; 10 * channels], channels, SR);
++        assert!(short
++            .iter()
++            .all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
++    }
++
++    const SR: u32 = 48_000;
++
++    fn noise(frames: usize, channels: usize, seed: u32) -> Vec<f32> {
++        let mut s = seed.wrapping_mul(747_796_405).wrapping_add(1);
++        (0..frames * channels)
++            .map(|_| {
++                s ^= s << 13;
++                s ^= s >> 17;
++                s ^= s << 5;
++                ((s as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.4
++            })
++            .collect()
++    }
++
++    fn worst_error(a: &[f32], b: &[f32]) -> f32 {
++        assert_eq!(a.len(), b.len());
++        a.iter()
++            .zip(b)
++            .fold(0.0f32, |worst, (x, y)| worst.max((x - y).abs()))
++    }
++
++    fn bypassed() -> Params {
++        Params {
++            power: false,
++            ..drumsilencer::default_params()
++        }
++    }
++
++    fn no_amount() -> Params {
++        Params {
++            amount: 0.0,
++            ..drumsilencer::default_params()
++        }
++    }
++
++    /// With the effect off — bypassed, or at 0 % — the offline render is the
++    /// input itself: the plug-in's delay is gone, not just shortened.
++    #[test]
++    fn a_transparent_render_equals_the_input_sample_for_sample() {
++        for channels in [1, 2, 3, 4] {
++            let input = noise(12_000, channels, channels as u32);
++            for params in [bypassed(), no_amount()] {
++                let out = render_interleaved(&input, channels, SR, &params, 0);
++                let err = worst_error(&input, &out);
++                assert!(err < 1.0e-5, "{channels} ch, power {}: {err}", params.power);
++            }
++        }
++    }
++
++    #[test]
++    fn the_latency_is_removed_at_high_rates_too() {
++        for rate in [44_100, 96_000, 192_000] {
++            let input = noise(rate as usize / 8, 2, 7);
++            let out = render_interleaved(&input, 2, rate, &bypassed(), 0);
++            assert!(worst_error(&input, &out) < 1.0e-5, "{rate}");
++        }
++    }
++
++    /// The lead-in is rendered for context and dropped: what comes back is the
++    /// selection only, and it is exactly the tail of rendering the lead-in and
++    /// the selection as one stream.
++    #[test]
++    fn the_pre_roll_is_processed_and_discarded() {
++        let lead_in = pre_roll_frames(SR) / 4;
++        let selection = 6_000;
++        let input = noise(lead_in + selection, 2, 11);
++        let params = drumsilencer::default_params();
++
++        let whole = render_interleaved(&input, 2, SR, &params, 0);
++        let out = render_interleaved(&input, 2, SR, &params, lead_in);
++        assert_eq!(out.len(), selection * 2);
++        assert_eq!(out, whole[lead_in * 2..]);
++
++        // Transparent settings still give back the selection itself, so the
++        // lead-in never leaks into the result or shifts it.
++        let out = render_interleaved(&input, 2, SR, &no_amount(), lead_in);
++        assert!(worst_error(&input[lead_in * 2..], &out) < 1.0e-5);
++    }
++
++    #[test]
++    fn a_lead_in_longer_than_the_input_renders_nothing() {
++        let input = noise(100, 2, 3);
++        assert!(render_interleaved(&input, 2, SR, &bypassed(), 500).is_empty());
++        assert!(render_interleaved(&[], 2, SR, &bypassed(), 0).is_empty());
++    }
++
++    #[test]
++    fn the_pre_roll_is_one_second() {
++        assert_eq!(pre_roll_frames(48_000), 48_000);
++        assert_eq!(pre_roll_frames(44_100), 44_100);
++    }
++}
+diff --git a/crates/SphereUIComponents/src/components/drum_silencer_model.rs b/crates/SphereUIComponents/src/components/drum_silencer_model.rs
+new file mode 100644
+index 00000000..a93a09f2
+--- /dev/null
++++ b/crates/SphereUIComponents/src/components/drum_silencer_model.rs
+@@ -0,0 +1,254 @@
++//! What Drum Silencer's native editor edits: its params, their wire table,
++//! presets, knobs, and the words and levels the editor shows.
++//!
++//! No GPUI here. Every value goes back to the plug-in as wire edits the DSP
++//! crate's own `ipc` table computes and clamps, so an edit lands in the
++//! editor's copy exactly as it lands in Studio's state mirror and in the host.
++
++use std::sync::{Arc, OnceLock};
++
++use crate::components::fx_model::{format_value, spec, KnobSpec, Taper, Unit};
++use crate::components::plugin_kit::{bank, KitPreset};
++
++pub use drumsilencer::Params as SilencerParams;
++
++/// The bands the DSP meters, low to high, by name.
++pub const BAND_NAMES: [&str; drumsilencer::BANDS] =
++    ["Sub", "Low", "Low Mid", "Mid", "High Mid", "High"];
++
++/// Every band's edges, `BANDS + 1` of them: the DSP's inner edges between
++/// the ends of the display's axis.
++pub fn band_edges() -> [f32; drumsilencer::BANDS + 1] {
++    let mut edges = [drumsilencer::LOW_OFF_HZ; drumsilencer::BANDS + 1];
++    edges[1..drumsilencer::BANDS].copy_from_slice(&drumsilencer::BAND_EDGES_HZ);
++    edges[drumsilencer::BANDS] = drumsilencer::HIGH_OFF_HZ;
++    edges
++}
++
++/// Every param as `(wire index, value)`, in wire order.
++pub fn wire_values(params: &SilencerParams) -> Vec<(u32, f32)> {
++    drumsilencer::ipc::ui_values(params)
++        .into_iter()
++        .filter_map(|(id, value)| drumsilencer::ui_param_index(id).map(|index| (index, value)))
++        .collect()
++}
++
++/// Applies one edit by id the way the DSP will.
++pub fn with(params: &SilencerParams, id: &str, value: f32) -> SilencerParams {
++    let mut next = params.clone();
++    drumsilencer::ipc::apply_ui_param(&mut next, id, value);
++    next
++}
++
++pub fn value(params: &SilencerParams, id: &str) -> f32 {
++    drumsilencer::ipc::ui_values(params)
++        .into_iter()
++        .find(|(candidate, _)| *candidate == id)
++        .map_or(0.0, |(_, value)| value)
++}
++
++/// The factory bank, `Default` first.
++pub fn presets() -> Arc<Vec<KitPreset<SilencerParams>>> {
++    static BANK: OnceLock<Arc<Vec<KitPreset<SilencerParams>>>> = OnceLock::new();
++    BANK.get_or_init(|| bank(drumsilencer::factory_presets(), |p| (p.name, p.params)))
++        .clone()
++}
++
++/// `preset` as it would play here: power stays as it is.
++pub fn preset_applied(current: &SilencerParams, preset: &SilencerParams) -> SilencerParams {
++    SilencerParams {
++        power: current.power,
++        ..preset.clone()
++    }
++}
++
++/// The ids the knobs cover, in the order the editor lays them out.
++pub const KNOB_IDS: [&str; 4] = ["amount", "lowHz", "highHz", "outputDb"];
++
++/// The knob table. Ranges come from the DSP crate's descriptor, so a range
++/// change there reaches the editor without a second edit here.
++pub fn knob(id: &str) -> Option<KnobSpec> {
++    let descriptor = drumsilencer::descriptor();
++    let range = descriptor.params.iter().find(|p| p.id == id)?;
++    let (label, taper, unit) = match id {
++        "amount" => ("Amount", Taper::Linear, Unit::Percent),
++        "lowHz" => ("Low", Taper::Log, Unit::CutHz(drumsilencer::LOW_OFF_HZ)),
++        "highHz" => ("High", Taper::Log, Unit::Hz),
++        "outputDb" => ("Output", Taper::Linear, Unit::Db),
++        _ => return None,
++    };
++    let mut knob = spec(range.id, label, range.min, range.max, taper, unit);
++    // Output trims around unity.
++    knob.bipolar = id == "outputDb";
++    Some(knob)
++}
++
++/// Whether the range's low edge is off.
++pub fn low_off(hz: f32) -> bool {
++    hz <= drumsilencer::LOW_OFF_HZ + 0.5
++}
++
++/// Whether the range's high edge is off.
++pub fn high_off(hz: f32) -> bool {
++    hz >= drumsilencer::HIGH_OFF_HZ - 0.5
++}
++
++/// A knob's readout: an edge at its end stop is off, not 20 Hz or 20 kHz.
++pub fn readout(id: &str, value: f32) -> String {
++    match id {
++        "lowHz" if low_off(value) => "Off".to_string(),
++        "highHz" if high_off(value) => "Off".to_string(),
++        _ => knob(id).map_or_else(String::new, |k| format_value(k.unit, value)),
++    }
++}
++
++pub fn mode_labels() -> &'static [&'static str] {
++    &["Remove", "Drums Only"]
++}
++
++pub fn mode_hint(params: &SilencerParams) -> &'static str {
++    match params.mode {
++        drumsilencer::Mode::Remove => "Takes Amount of the drums out of the mix",
++        drumsilencer::Mode::Solo => "Keeps the drums, takes Amount of the rest out",
++    }
++}
++
++/// What happens outside the range, in the mode's own terms.
++pub fn range_hint(params: &SilencerParams) -> &'static str {
++    match params.mode {
++        drumsilencer::Mode::Remove => "Outside the range the mix passes untouched",
++        drumsilencer::Mode::Solo => "Outside the range is taken out with the rest",
++    }
++}
++
++/// The range the effect applies over, in words.
++pub fn range_text(params: &SilencerParams) -> String {
++    let hz = |value: f32| format_value(Unit::Hz, value);
++    match (low_off(params.low_hz), high_off(params.high_hz)) {
++        (true, true) => "Whole spectrum".to_string(),
++        (false, true) => format!("Above {}", hz(params.low_hz)),
++        (true, false) => format!("Below {}", hz(params.high_hz)),
++        (false, false) => format!("{} – {}", hz(params.low_hz), hz(params.high_hz)),
++    }
++}
++
++/// The drums heard, as one level, from the per-band levels the host
++/// publishes: their root-sum-square. The bands split the spectrum, so this
++/// is the DSP's `drums_rms`, with the bands' fall.
++pub fn drums_level(bands: &[f32]) -> f32 {
++    bands.iter().map(|level| level * level).sum::<f32>().sqrt()
++}
++
++/// A latency as the editor shows it.
++pub fn latency_text(ms: Option<f32>) -> String {
++    match ms {
++        None => "—".to_string(),
++        Some(ms) if ms < 0.05 => "0 ms".to_string(),
++        Some(ms) => format!("{ms:.1} ms"),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn same(a: &SilencerParams, b: &SilencerParams) -> bool {
++        let theirs = wire_values(b);
++        wire_values(a).iter().all(|(index, value)| {
++            theirs
++                .iter()
++                .find(|(i, _)| i == index)
++                .is_some_and(|(_, other)| (value - other).abs() <= 0.002 * value.abs().max(1.0))
++        })
++    }
++
++    /// Replaying a diff through the DSP's own wire table lands on the target —
++    /// the same path Studio's mirror and the host take.
++    #[test]
++    fn every_preset_lands_exactly_from_every_other() {
++        let bank = presets();
++        assert_eq!(bank[0].name, "Default");
++        assert!(bank.iter().any(|preset| preset.name == "Drums Only"));
++        for from in bank.iter() {
++            for to in bank.iter() {
++                let before = wire_values(&from.params);
++                let mut landed = from.params.clone();
++                for (index, value) in wire_values(&to.params) {
++                    if before.iter().any(|(i, v)| *i == index && *v == value) {
++                        continue;
++                    }
++                    landed = with(&landed, drumsilencer::ui_param_id(index).unwrap(), value);
++                }
++                assert!(same(&landed, &to.params), "{} → {}", from.name, to.name);
++            }
++        }
++    }
++
++    #[test]
++    fn a_preset_keeps_power() {
++        let current = with(&drumsilencer::default_params(), "power", 0.0);
++        for preset in presets().iter() {
++            assert!(!preset_applied(&current, &preset.params).power);
++        }
++    }
++
++    #[test]
++    fn every_knob_round_trips_through_its_taper() {
++        let defaults = drumsilencer::default_params();
++        for id in KNOB_IDS {
++            let knob = knob(id).unwrap_or_else(|| panic!("no knob for {id}"));
++            let default = value(&defaults, id);
++            let back = knob.from_knob(knob.to_knob(default));
++            assert!(
++                (back - default).abs() <= 0.011 * default.abs().max(1.0),
++                "{id}: {default} came back {back}"
++            );
++        }
++        // The end stops are reachable, and they are the off values.
++        let low = knob("lowHz").unwrap();
++        assert_eq!(low.from_knob(0.0), drumsilencer::LOW_OFF_HZ);
++        let high = knob("highHz").unwrap();
++        assert_eq!(high.from_knob(1.0), drumsilencer::HIGH_OFF_HZ);
++        assert!(knob("outputDb").unwrap().bipolar);
++    }
++
++    #[test]
++    fn readouts_say_off_at_the_off_values() {
++        assert_eq!(readout("lowHz", 20.0), "Off");
++        assert_eq!(readout("lowHz", 150.0), "150 Hz");
++        assert_eq!(readout("highHz", 20_000.0), "Off");
++        assert_eq!(readout("highHz", 8_000.0), "8.0 kHz");
++        assert_eq!(readout("amount", 60.0), "60 %");
++        assert_eq!(readout("outputDb", 0.0), "0.0 dB");
++    }
++
++    #[test]
++    fn the_range_reads_in_words() {
++        let params = drumsilencer::default_params();
++        assert_eq!(range_text(&params), "Whole spectrum");
++        let kick = with(&params, "lowHz", 150.0);
++        assert_eq!(range_text(&kick), "Above 150 Hz");
++        let both = with(&kick, "highHz", 8_000.0);
++        assert_eq!(range_text(&both), "150 Hz – 8.0 kHz");
++        let top = with(&params, "highHz", 4_000.0);
++        assert_eq!(range_text(&top), "Below 4.0 kHz");
++    }
++
++    #[test]
++    fn the_bands_span_the_axis_and_sum_to_the_drums_level() {
++        let edges = band_edges();
++        assert_eq!(edges[0], drumsilencer::LOW_OFF_HZ);
++        assert_eq!(edges[1], 100.0);
++        assert_eq!(edges[drumsilencer::BANDS], drumsilencer::HIGH_OFF_HZ);
++        assert!(edges.windows(2).all(|pair| pair[0] < pair[1]));
++        assert!((drums_level(&[0.3, 0.4, 0.0, 0.0, 0.0, 0.0]) - 0.5).abs() < 1.0e-6);
++        assert_eq!(drums_level(&[0.0; 6]), 0.0);
++    }
++
++    #[test]
++    fn latency_reads_in_milliseconds() {
++        assert_eq!(latency_text(None), "—");
++        assert_eq!(latency_text(Some(255.0 * 1_000.0 / 48_000.0)), "5.3 ms");
++        assert_eq!(latency_text(Some(0.0)), "0 ms");
++    }
++}
+diff --git a/crates/SphereUIComponents/src/components/drum_silencer_panel.rs b/crates/SphereUIComponents/src/components/drum_silencer_panel.rs
+new file mode 100644
+index 00000000..7a8fb0d8
+--- /dev/null
++++ b/crates/SphereUIComponents/src/components/drum_silencer_panel.rs
+@@ -0,0 +1,708 @@
++//! Drum Silencer's native editor, on the plug-in kit.
++//!
++//! One display and a meter bay over a row of control cards:
++//!
++//! * **Bands** — the six bands the DSP meters, on one frequency axis: each
++//!   band's whole input as a muted column, the drums the network hears in it
++//!   as a narrower accent column inside, and along the bottom a lane showing
++//!   how much of the effect applies at each frequency
++//!   ([`drumsilencer::range_weight`], what the DSP itself weighs its bins
++//!   by), with the range's edges marked;
++//! * **Meters** — In, Drums and Out, and the latency the host reports for
++//!   the insert.
++//!
++//! The panel paints only what follows the params — the axis, the band edges,
++//! the range; the levels are painted by the window's overlay into the bounds
++//! recorded here. Telemetry comes through the standard level frame: the drums
++//! heard per band ride the rack positions' input levels and the whole input
++//! per band their output levels (`drumsilencer::MeterFrame::rack_slots`).
++
++use std::sync::Arc;
++
++use gpui::{
++    canvas, div, fill, px, AnyElement, App, Bounds, IntoElement, ParentElement, Pixels, Styled,
++    Window,
++};
++
++use crate::components::band_panel::{band_plot, x_of, FREQ_TICKS};
++use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
++use crate::components::drum_silencer_model::{
++    self, band_edges, drums_level, high_off, latency_text, low_off, mode_hint, mode_labels,
++    preset_applied, presets, range_hint, range_text, readout, SilencerParams, BAND_NAMES,
++};
++use crate::components::eq_graph::{freq_at_fraction, paint_area, paint_line};
++use crate::components::fx_model::{format_value, KnobSpec, Unit};
++use crate::components::knob::knob_with_default;
++use crate::components::native_plugin_shell::ShellIdentity;
++use crate::components::plugin_kit::{
++    card, choice, display_frame, header, hint, knob_for, open_kit_editor, Cx, KitEditor, KitModel,
++    KitPreset, KitWindow, LiveBounds, LiveSlot, HERO_KNOB, KNOB, KNOB_PITCH,
++};
++use crate::components::plugin_live::{dashed, frame_of, label, Align, Live};
++use crate::components::quick_sampler_panel::{knob_cell, rect};
++use crate::theme::{space, typography, Colors};
++
++/// The bottom of every level axis the editor draws, in dBFS.
++const FLOOR_DB: f32 = -60.0;
++/// The range lane along the bottom of the band display, and the gap above
++/// it the edges' tags sit in, clear of the columns.
++const LANE_H: f32 = 12.0;
++const LANE_GAP: f32 = 16.0;
++/// Columns the range lane and wash are sampled in.
++const RANGE_STEPS: usize = 160;
++
++/// Drum Silencer as a [`KitModel`]: one plug-in, so a unit type.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct DrumSilencerModel;
++
++/// What the overlay paints from.
++pub struct SilencerLiveView {
++    params: SilencerParams,
++}
++
++impl KitModel for DrumSilencerModel {
++    type Params = SilencerParams;
++    type Ui = ();
++    type LiveView = SilencerLiveView;
++
++    fn title(self) -> &'static str {
++        "Drum Silencer"
++    }
++
++    fn subtitle(self, params: &SilencerParams) -> String {
++        match params.mode {
++            drumsilencer::Mode::Remove => "Removes the drums",
++            drumsilencer::Mode::Solo => "Keeps only the drums",
++        }
++        .to_string()
++    }
++
++    fn key(self) -> &'static str {
++        "drumsilencer"
++    }
++
++    fn defaults(self) -> SilencerParams {
++        drumsilencer::default_params()
++    }
++
++    fn from_mirror(self, insert_id: &str) -> Option<SilencerParams> {
++        crate::components::builtin_plugin_editor::builtin_drumsilencer_params(insert_id)
++    }
++
++    fn wire_values(self, params: &SilencerParams) -> Vec<(u32, f32)> {
++        drum_silencer_model::wire_values(params)
++    }
++
++    fn with(self, params: &SilencerParams, id: &str, value: f32) -> SilencerParams {
++        drum_silencer_model::with(params, id, value)
++    }
++
++    fn value(self, params: &SilencerParams, id: &str) -> f32 {
++        drum_silencer_model::value(params, id)
++    }
++
++    fn presets(self) -> Arc<Vec<KitPreset<SilencerParams>>> {
++        presets()
++    }
++
++    fn preset_applied(self, current: &SilencerParams, preset: &SilencerParams) -> SilencerParams {
++        preset_applied(current, preset)
++    }
++
++    fn knob(self, id: &str) -> Option<KnobSpec> {
++        drum_silencer_model::knob(id)
++    }
++
++    fn panel(editor: &KitEditor<Self>, cx: &mut Cx<Self>) -> AnyElement {
++        silencer_panel(editor, cx)
++    }
++
++    fn live_view(editor: &KitEditor<Self>) -> SilencerLiveView {
++        SilencerLiveView {
++            params: editor.params.clone(),
++        }
++    }
++
++    fn paint_live(
++        view: &SilencerLiveView,
++        live: &mut Live,
++        bounds: &LiveBounds,
++        window: &mut Window,
++        cx: &mut App,
++    ) {
++        let bypassed = !view.params.power;
++        if let Some(b) = bounds.get(LiveSlot::Bands) {
++            paint_band_levels(window, cx, b, live, bypassed);
++        }
++        if let Some(b) = bounds.get(LiveSlot::Meters) {
++            paint_silencer_meters(window, cx, b, live);
++        }
++    }
++
++    fn window_size(self) -> (f32, f32) {
++        (1_000.0, 640.0)
++    }
++
++    fn min_size(self) -> (f32, f32) {
++        (860.0, 560.0)
++    }
++}
++
++pub type DrumSilencerEditorWindow = KitWindow<DrumSilencerModel>;
++
++/// Opens with a track's Drum Silencer insert.
++pub fn open_drumsilencer_editor(
++    owner_bounds: Option<Bounds<Pixels>>,
++    key: PluginInstanceKey,
++    identity: ShellIdentity,
++    host_ops: BuiltinEditorHostOps,
++    on_close: Arc<dyn Fn(&mut Window, &mut App)>,
++    cx: &mut App,
++) -> Result<gpui::WindowHandle<DrumSilencerEditorWindow>, String> {
++    open_kit_editor(
++        DrumSilencerModel,
++        owner_bounds,
++        key,
++        identity,
++        host_ops,
++        on_close,
++        cx,
++    )
++}
++
++// ── The panel ───────────────────────────────────────────────────────────────
++
++fn silencer_panel(e: &KitEditor<DrumSilencerModel>, cx: &mut Cx<DrumSilencerModel>) -> AnyElement {
++    div()
++        .flex()
++        .flex_col()
++        .size_full()
++        .bg(Colors::surface_window())
++        .child(header(e, cx))
++        .child(
++            div()
++                .flex()
++                .flex_col()
++                .flex_1()
++                .min_h(px(0.0))
++                .p(px(space::LOOSE))
++                .gap(px(space::BASE))
++                .child(displays(e))
++                .child(controls(e, cx)),
++        )
++        .into_any_element()
++}
++
++/// The notice over the band display: a passing word, or what bypass does
++/// here — the transform keeps running at unit gain, so the delay stays.
++fn notice(e: &KitEditor<DrumSilencerModel>) -> Option<String> {
++    e.notice().map(str::to_string).or_else(|| {
++        (!e.power())
++            .then(|| "Bypassed — audio passes through untouched, at the same latency".to_string())
++    })
++}
++
++fn displays(e: &KitEditor<DrumSilencerModel>) -> AnyElement {
++    let bypassed = !e.power();
++    let params = e.params.clone();
++    let range = canvas(
++        |_, _, _| (),
++        move |bounds, _, window, cx| paint_band_display(window, cx, bounds, &params, bypassed),
++    )
++    .absolute()
++    .size_full();
++    let bands = div().flex().flex_col().flex_1().min_w(px(360.0)).child(
++        display_frame(
++            "BANDS",
++            Some(format!("Range: {}", range_text(&e.params))),
++            notice(e),
++            div()
++                .relative()
++                .size_full()
++                .child(range)
++                .child(e.live_bounds.slot(LiveSlot::Bands).absolute().size_full()),
++        )
++        .flex_1(),
++    );
++    let meters = div()
++        .flex()
++        .flex_col()
++        .w(px(METER_BAY_W))
++        .flex_shrink_0()
++        .child(
++            div()
++                .flex_1()
++                .p(px(space::BASE))
++                .border(px(1.0))
++                .border_color(Colors::border_subtle())
++                .bg(Colors::surface_panel())
++                .child(e.live_bounds.slot(LiveSlot::Meters).size_full()),
++        );
++
++    div()
++        .flex()
++        .flex_row()
++        .flex_1()
++        .min_h(px(220.0))
++        .gap(px(space::BASE))
++        .opacity(if bypassed { 0.8 } else { 1.0 })
++        .child(bands)
++        .child(meters)
++        .into_any_element()
++}
++
++/// The knob for `id`, with the plug-in's own readout ("Off" at an edge's
++/// end stop).
++fn silencer_knob(
++    e: &KitEditor<DrumSilencerModel>,
++    cx: &mut Cx<DrumSilencerModel>,
++    id: &'static str,
++    size: f32,
++) -> AnyElement {
++    let Some(spec) = drum_silencer_model::knob(id) else {
++        return div().into_any_element();
++    };
++    let value = e.value(id);
++    let default = drum_silencer_model::value(&drumsilencer::default_params(), id);
++    let (min, max) = spec.knob_range();
++    let control = knob_with_default(
++        format!("drumsilencer-{id}"),
++        spec.to_knob(value),
++        min,
++        max,
++        size,
++        Colors::accent_primary(),
++        spec.to_knob(default),
++        e.knob_cb(cx, spec),
++    );
++    knob_cell(spec.label, readout(id, value), control)
++}
++
++fn controls(e: &KitEditor<DrumSilencerModel>, cx: &mut Cx<DrumSilencerModel>) -> AnyElement {
++    let mode = choice(
++        e,
++        cx,
++        "drumsilencer-mode",
++        mode_labels(),
++        Some(e.params.mode.to_wire() as usize),
++        |this, index, cx| this.set_value("mode", index as f32, cx),
++    );
++    let mode_card = card(
++        "MODE",
++        0.0,
++        MODE_CARD_W,
++        div()
++            .flex()
++            .flex_col()
++            .gap(px(space::SNUG))
++            .child(mode)
++            .child(hint(mode_hint(&e.params))),
++    );
++    let amount = card(
++        "AMOUNT",
++        1.0,
++        KNOB_PITCH + 2.0 * space::BASE + 2.0,
++        silencer_knob(e, cx, "amount", HERO_KNOB),
++    );
++    let range = card(
++        "RANGE",
++        2.0,
++        2.0 * KNOB_PITCH + RANGE_HINT_W + space::LOOSE + 2.0 * space::BASE + 2.0,
++        div()
++            .flex()
++            .flex_row()
++            .items_start()
++            .gap(px(space::LOOSE))
++            .child(silencer_knob(e, cx, "lowHz", KNOB))
++            .child(silencer_knob(e, cx, "highHz", KNOB))
++            .child(
++                div()
++                    .w(px(RANGE_HINT_W))
++                    .pt(px(space::TIGHT))
++                    .child(hint(range_hint(&e.params))),
++            ),
++    );
++    let output = card(
++        "OUTPUT",
++        1.0,
++        KNOB_PITCH + 2.0 * space::BASE + 2.0,
++        knob_for(e, cx, "outputDb", KNOB, None),
++    );
++
++    div()
++        .flex()
++        .flex_row()
++        .flex_wrap()
++        .flex_shrink_0()
++        .gap(px(space::BASE))
++        .child(mode_card)
++        .child(amount)
++        .child(range)
++        .child(output)
++        .into_any_element()
++}
++
++/// The mode card's width: room for "Drums Only" on its segment.
++const MODE_CARD_W: f32 = 224.0;
++/// The range card's column of explanation.
++const RANGE_HINT_W: f32 = 130.0;
++/// The meter bay's width: three columns.
++const METER_BAY_W: f32 = 180.0;
++
++// ── The band display ────────────────────────────────────────────────────────
++
++/// The band display's two rectangles, `(x0, y0, w, h)`, within its slot: the
++/// levels above, the range lane below. The panel and the overlay both place
++/// by these, so the columns sit on the axis the panel drew.
++fn band_geometry(bounds: Bounds<Pixels>) -> ((f32, f32, f32, f32), (f32, f32, f32, f32)) {
++    let (x0, y0, w, h) = band_plot(bounds);
++    let levels_h = (h - LANE_H - LANE_GAP).max(1.0);
++    (
++        (x0, y0, w, levels_h),
++        (x0, y0 + levels_h + LANE_GAP, w, LANE_H),
++    )
++}
++
++fn level_unit(db: f32) -> f32 {
++    ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0)
++}
++
++fn to_db(level: f32) -> f32 {
++    if level <= 1.0e-6 {
++        -120.0
++    } else {
++        20.0 * level.log10()
++    }
++}
++
++fn db_text(level: f32) -> String {
++    let db = to_db(level);
++    if db <= -119.0 {
++        "—".to_string()
++    } else if db.abs() < 0.05 {
++        "0.0".to_string()
++    } else {
++        format!("{db:.1}")
++    }
++}
++
++/// What follows the params: the frequency and level grid, the band edges,
++/// and the range — a wash over the levels where the effect applies, the lane
++/// drawn from the DSP's own weighting, and a marker at each edge that is on.
++fn paint_band_display(
++    window: &mut Window,
++    cx: &mut App,
++    bounds: Bounds<Pixels>,
++    params: &SilencerParams,
++    bypassed: bool,
++) {
++    let (plot, lane) = band_geometry(bounds);
++    let (x0, y0, w, h) = plot;
++    let ink = Colors::text_primary();
++    let faint = Colors::text_faint();
++
++    for (hz, text) in FREQ_TICKS {
++        let x = x_of(hz, plot);
++        window.paint_quad(fill(rect(x, y0, 1.0, h), Colors::with_alpha(ink, 0.045)));
++        let align = match hz {
++            20.0 => Align::Left,
++            20_000.0 => Align::Right,
++            _ => Align::Center,
++        };
++        label(
++            window,
++            cx,
++            text,
++            typography::DENSE_CAPTION,
++            faint,
++            x,
++            lane.1 + LANE_H + 3.0,
++            align,
++        );
++    }
++    for db in [-12.0, -24.0, -36.0, -48.0] {
++        let y = y0 + (1.0 - level_unit(db)) * h;
++        window.paint_quad(fill(rect(x0, y, w, 1.0), Colors::with_alpha(ink, 0.06)));
++        label(
++            window,
++            cx,
++            &format!("{db:.0}"),
++            typography::DENSE_CAPTION,
++            faint,
++            x0 + 4.0,
++            y - 12.0,
++            Align::Left,
++        );
++    }
++    // The band edges the meters split at.
++    for hz in drumsilencer::BAND_EDGES_HZ {
++        let x = x_of(hz, plot);
++        window.paint_quad(fill(
++            rect(x - 0.5, y0, 1.0, h),
++            Colors::with_alpha(ink, 0.14),
++        ));
++    }
++
++    // The range: how much of the effect applies at each frequency.
++    let accent = Colors::accent_primary();
++    let dim = if bypassed { 0.4 } else { 1.0 };
++    let column_w = w / RANGE_STEPS as f32;
++    let lane_bottom = lane.1 + LANE_H;
++    window.paint_quad(fill(rect(x0, lane.1, w, LANE_H), Colors::meter_bg()));
++    let mut curve = Vec::with_capacity(RANGE_STEPS + 1);
++    for i in 0..=RANGE_STEPS {
++        let fraction = i as f32 / RANGE_STEPS as f32;
++        let weight =
++            drumsilencer::range_weight(freq_at_fraction(fraction), params.low_hz, params.high_hz);
++        let x = x0 + fraction * w;
++        if i < RANGE_STEPS && weight > 0.01 {
++            window.paint_quad(fill(
++                rect(x, y0, column_w + 0.5, h),
++                Colors::with_alpha(accent, 0.05 * weight * dim),
++            ));
++        }
++        curve.push((x, lane_bottom - weight * LANE_H));
++    }
++    paint_area(
++        window,
++        &curve,
++        lane_bottom,
++        Colors::with_alpha(accent, 0.45 * dim),
++    );
++    paint_line(window, &curve, 1.25, Colors::with_alpha(accent, dim));
++
++    let edge = |window: &mut Window, cx: &mut App, hz: f32, text: String, align: Align| {
++        let x = x_of(hz, plot);
++        let color = Colors::with_alpha(accent, 0.85 * dim);
++        dashed(window, (x, y0), (x, lane_bottom), 1.0, color);
++        let tag_x = match align {
++            Align::Right => x - 4.0,
++            _ => x + 4.0,
++        };
++        label(
++            window,
++            cx,
++            &text,
++            typography::DENSE_CAPTION,
++            color,
++            tag_x,
++            lane.1 - LANE_GAP + 2.0,
++            align,
++        );
++    };
++    if !low_off(params.low_hz) {
++        let text = format!("Low {}", format_value(Unit::Hz, params.low_hz));
++        edge(window, cx, params.low_hz, text, Align::Left);
++    }
++    if !high_off(params.high_hz) {
++        let text = format!("High {}", format_value(Unit::Hz, params.high_hz));
++        edge(window, cx, params.high_hz, text, Align::Right);
++    }
++}
++
++/// Each band's input as a column, the drums heard in it as a narrower one
++/// inside, and the two readings over the band.
++fn paint_band_levels(
++    window: &mut Window,
++    cx: &mut App,
++    bounds: Bounds<Pixels>,
++    live: &Live,
++    bypassed: bool,
++) {
++    let Some((drums, input)) = live.slot_peaks() else {
++        return;
++    };
++    let (plot, _) = band_geometry(bounds);
++    let (_, y0, _, h) = plot;
++    let bottom = y0 + h;
++    let edges = band_edges();
++    let muted = Colors::text_muted();
++    let accent = Colors::accent_primary();
++    let y_of = |level: f32| y0 + (1.0 - level_unit(to_db(level))) * h;
++    for band in 0..drumsilencer::BANDS {
++        let left = x_of(edges[band], plot) + 2.0;
++        let right = x_of(edges[band + 1], plot) - 2.0;
++        let width = right - left;
++        if width < 4.0 {
++            continue;
++        }
++        let top = y_of(input[band]);
++        if bottom - top > 0.5 {
++            window.paint_quad(fill(
++                rect(left, top, width, bottom - top),
++                Colors::with_alpha(muted, 0.22),
++            ));
++            window.paint_quad(fill(
++                rect(left, top, width, 1.5),
++                Colors::with_alpha(muted, 0.8),
++            ));
++        }
++        let heard = if bypassed { 0.0 } else { drums[band] };
++        let top = y_of(heard);
++        let inset = width * 0.22;
++        if bottom - top > 0.5 {
++            window.paint_quad(fill(
++                rect(left + inset, top, width - 2.0 * inset, bottom - top),
++                Colors::with_alpha(accent, 0.7),
++            ));
++            window.paint_quad(fill(
++                rect(left + inset, top, width - 2.0 * inset, 1.5),
++                accent,
++            ));
++        }
++        if width > 60.0 {
++            let centre = (left + right) * 0.5;
++            label(
++                window,
++                cx,
++                BAND_NAMES[band],
++                typography::DENSE_CAPTION,
++                Colors::text_secondary(),
++                centre,
++                y0 + 2.0,
++                Align::Center,
++            );
++            label(
++                window,
++                cx,
++                &format!("in {}", db_text(input[band])),
++                typography::DENSE_CAPTION,
++                muted,
++                centre,
++                y0 + 15.0,
++                Align::Center,
++            );
++            label(
++                window,
++                cx,
++                &format!("drums {}", db_text(heard)),
++                typography::DENSE_CAPTION,
++                Colors::accent_primary_hover(),
++                centre,
++                y0 + 28.0,
++                Align::Center,
++            );
++        }
++    }
++}
++
++// ── Meters ──────────────────────────────────────────────────────────────────
++
++/// In, Drums and Out as RMS bars over [`FLOOR_DB`] to 0 dBFS — In and Out
++/// with their peak as a tick — and the latency the host reports under them.
++fn paint_silencer_meters(window: &mut Window, cx: &mut App, bounds: Bounds<Pixels>, live: &Live) {
++    const CAPTION_H: f32 = 16.0;
++    const READOUT_H: f32 = 18.0;
++    const FOOT_H: f32 = 30.0;
++    const BAR_W: f32 = 12.0;
++    let (x0, y0, w, h) = frame_of(bounds);
++    let frame = live.frame;
++    let foot_top = y0 + h - FOOT_H;
++    let bar_top = y0 + CAPTION_H;
++    let bar_h = (foot_top - READOUT_H - space::BASE - bar_top).max(1.0);
++    let column_w = w / 3.0;
++    // `(caption, rms, peak)`; `None` until the host publishes a frame.
++    let columns: [(&str, Option<f32>, Option<f32>); 3] = [
++        ("In", frame.map(|f| f.in_rms), frame.map(|f| f.in_peak)),
++        (
++            "Drums",
++            frame.map(|f| drums_level(&f.slot_in_peak[..drumsilencer::BANDS])),
++            None,
++        ),
++        ("Out", frame.map(|f| f.out_rms), frame.map(|f| f.out_peak)),
++    ];
++    for (i, (caption, rms, peak)) in columns.into_iter().enumerate() {
++        let centre = x0 + column_w * (i as f32 + 0.5);
++        let drums = i == 1;
++        label(
++            window,
++            cx,
++            caption,
++            typography::DENSE_CAPTION,
++            Colors::text_muted(),
++            centre,
++            y0,
++            Align::Center,
++        );
++        let x = centre - BAR_W * 0.5;
++        window.paint_quad(fill(rect(x, bar_top, BAR_W, bar_h), Colors::meter_bg()));
++        if let Some(rms) = rms {
++            let fill_top = bar_top + (1.0 - level_unit(to_db(rms))) * bar_h;
++            let color = if peak.is_some_and(|peak| peak >= 1.0) {
++                Colors::meter_high()
++            } else if drums {
++                Colors::accent_primary()
++            } else {
++                Colors::text_muted()
++            };
++            window.paint_quad(fill(
++                rect(x, fill_top, BAR_W, bar_top + bar_h - fill_top),
++                color,
++            ));
++        }
++        if let Some(peak) = peak {
++            let unit = level_unit(to_db(peak));
++            if unit > 0.0 {
++                window.paint_quad(fill(
++                    rect(x, bar_top + (1.0 - unit) * bar_h, BAR_W, 1.5),
++                    Colors::text_primary(),
++                ));
++            }
++        }
++        label(
++            window,
++            cx,
++            &rms.map_or_else(|| "—".to_string(), db_text),
++            typography::UI_XS,
++            Colors::text_secondary(),
++            centre,
++            bar_top + bar_h + 3.0,
++            Align::Center,
++        );
++    }
++
++    window.paint_quad(fill(rect(x0, foot_top, w, 1.0), Colors::border_subtle()));
++    label(
++        window,
++        cx,
++        "Latency",
++        typography::DENSE_CAPTION,
++        Colors::text_muted(),
++        x0,
++        foot_top + 9.0,
++        Align::Left,
++    );
++    label(
++        window,
++        cx,
++        &latency_text(live.latency_ms()),
++        typography::UI_XS,
++        Colors::text_secondary(),
++        x0 + w,
++        foot_top + 8.0,
++        Align::Right,
++    );
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_subtitle_names_the_mode() {
++        let params = drumsilencer::default_params();
++        assert_eq!(DrumSilencerModel.subtitle(&params), "Removes the drums");
++        let solo = drum_silencer_model::with(&params, "mode", 1.0);
++        assert_eq!(DrumSilencerModel.subtitle(&solo), "Keeps only the drums");
++    }
++
++    #[test]
++    fn levels_place_on_the_display_floor() {
++        assert_eq!(level_unit(0.0), 1.0);
++        assert_eq!(level_unit(FLOOR_DB), 0.0);
++        assert_eq!(level_unit(-120.0), 0.0);
++        assert_eq!(db_text(0.0), "—");
++        assert_eq!(db_text(1.0), "0.0");
++        assert_eq!(db_text(0.1), "-20.0");
++    }
++}
