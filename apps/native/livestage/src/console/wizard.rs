@@ -1343,6 +1343,7 @@ impl Wizard {
             }
             Page::Password => {
                 let now = match self.password_state {
+                    _ if self.install => "The new system has none unless it is set here.",
                     PasswordState::None => "There is no password now.",
                     PasswordState::Set => "A password is set now; a new one replaces it.",
                     PasswordState::Locked => "Root login is locked now; a password opens it.",

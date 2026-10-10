@@ -50,30 +50,40 @@ pwsh packaging/livestage/build.ps1 -Kernel out/livestage-kernel/linux-7.2.9-live
 For a new Alpine release, refresh `config-alpine-*` from its `linux-lts`
 package (`boot/config-*`).
 
-## Install
+## Boot direct: the `.img`
 
-Write the `.img` to a USB stick, SSD or SD card: balenaEtcher, Rufus (DD
-mode), or `dd if=livestage-….img of=/dev/sdX bs=4M conv=fsync`. Boot it with
-UEFI (Secure Boot off: the image is not signed).
+`livestage-alpine3.24-x86_64.img` is the system itself: the disk it is
+written to is the LiveStage machine. Write it to a USB stick, SSD or SD card
+with balenaEtcher, Rufus (DD mode), or `dd if=livestage-….img of=/dev/sdX
+bs=4M conv=fsync`, and boot from it with UEFI (Secure Boot off: the image
+is not signed).
 
-## Install onto a computer
+## Install onto a computer: the `.iso`
 
-To put LiveStage onto a computer's own disk (an SSD inside it, say) rather
-than run it from a stick, build the installer too:
+To put LiveStage onto a computer's own disk (an SSD inside it, say), build
+the installer too:
 
 ```bash
 pwsh packaging/livestage/build.ps1 -Installer      # Windows
 packaging/livestage/build.sh --installer           # Linux, macOS
 ```
 
-Out comes `out/livestage-alpine/livestage-installer-alpine3.24-x86_64.img`
-as well. Write it to a USB stick (as above) and boot the computer from it
-with UEFI. Its first screen, `livestage-installer`, is a text UI like the
-setup's:
+Out comes `out/livestage-alpine/livestage-installer-alpine3.24-x86_64.iso`
+as well (its sha256 is in `livestage-alpine3.24-x86_64.sha256` with the
+image's). It is a hybrid ISO, **UEFI only** (like the appliance; Secure Boot
+off, no legacy BIOS boot):
+
+- **USB stick**: write the `.iso` raw, exactly as the `.img` above (Rufus in
+  DD mode — not ISO mode —, balenaEtcher, `dd`).
+- **CD or virtual CD**: burn it, or attach it as a server's virtual media
+  (BMC) or a virtual machine's CD drive.
+
+Boot the computer from it with UEFI. Its first screen, `livestage-installer`,
+is a text UI like the setup's:
 
 1. **Disk**: every disk of the computer, with its size, how it is attached
    (NVMe, SATA, USB, SD/eMMC, virtio), its model and what is on it now
-   (Windows, Linux, LiveStage, empty). The installer's own stick, a
+   (Windows, Linux, LiveStage, empty). The stick the installer runs from, a
    write-protected disk, a disk with a mounted partition and one too small
    (the image plus 1 GiB) are listed with the reason and cannot be chosen.
 2. **Settings**: *Set up now* asks the first setup's questions (name,
@@ -93,7 +103,8 @@ setup's:
    so). The partition table goes on last: a disk left half-written has
    none rather than a broken system. On an error the screen shows it as it
    came and what is left on the disk.
-5. **Done**: remove the USB stick, then Reboot (or Power off, or a Shell).
+5. **Done**: remove the installer (stick or CD), then Reboot (or Power off,
+   or a Shell).
    The first boot gives the data partition the rest of the disk, as it does
    for an image written by hand.
 
@@ -102,12 +113,21 @@ shell, `livestage-installer --list` lists the disks, and
 `livestage-installer --disk /dev/sdX --yes [--setup-conf FILE]` installs
 with no questions (a `setup.conf` as the setup writes it), printing its
 progress. The installer cannot run LiveStage itself: to try LiveStage
-without installing it, write the appliance image to a stick instead.
+without installing it, write the `.img` to a stick instead.
 
-The installer's partitions are `LSINSTALL` (boot) and `lsinstall` (its
-read-only system, with the image as
-`/usr/share/livestage/installer/livestage.img.zst` and its size and sha256
-in `payload.conf`), so they never mix with an installed LiveStage's.
+Inside the ISO: an ISO 9660 volume labelled `LSINSTALL` holding
+`livestage/installer.sfs` (the installer's system, squashfs),
+`livestage/livestage.img.zst` (the image it installs) and
+`livestage/payload.conf` (that image's size and sha256), and
+`boot/efiboot.img`, a FAT image with `EFI/BOOT/BOOTX64.EFI` (a unified
+kernel image), which is both the CD's El Torito boot image and, on a stick,
+the GPT EFI system partition.
+The kernel's own initramfs (`iso/init`) looks for the `LSINSTALL` volume on
+every disk and CD drive for up to 15 s, mounts `installer.sfs` read-only
+under a tmpfs (changes are lost at power off) and starts it; the medium
+stays mounted at `/media/medium`. When the medium is not found it says so on
+the screen and opens a shell. None of the labels are the appliance's, so the
+two never mix up on one machine.
 
 ## Try it in a virtual machine
 
@@ -126,8 +146,9 @@ the data partition. `-UsbDiskGB 8` plugs in an empty USB drive of that size
 listens on `127.0.0.1:4445` (`system_powerdown` presses the power button).
 
 The installer: `run-qemu.ps1 -Installer -DiskGB 8` boots the installer
-image as a USB stick with an empty 8 GB disk to install onto (`target.img`
-in the work folder; `-TargetBus nvme` for an NVMe disk instead of virtio).
+ISO as a USB stick (`-AsCD`: in a CD drive) with an empty 8 GB disk to
+install onto (`target.img` in the work folder; `-TargetBus nvme` for an NVMe
+disk instead of virtio).
 Afterwards `run-qemu.ps1 -BootTarget` boots that disk alone, with the same
 firmware settings, so the boot entry the installer added is used.
 

@@ -1,5 +1,5 @@
 //! `livestage-installer`: puts LiveStage onto a computer's disk, from the
-//! installer USB stick (`build.ps1 -Installer`). A text UI in the console's
+//! installer ISO (`build.ps1 -Installer`), from a CD or a USB stick. A text UI in the console's
 //! look: choose the disk, set LiveStage up now or at its first boot, confirm
 //! by typing the disk's name, install, reboot.
 //!
@@ -9,7 +9,7 @@
 //! livestage-installer --list           # the disks, and which can take LiveStage
 //! livestage-installer --disk /dev/vdb --yes [--setup-conf FILE]
 //!                                      # no questions; prints progress lines
-//!   --payload FILE    the image (default /usr/share/livestage/installer/livestage.img.zst,
+//!   --payload FILE    the image (default /media/medium/livestage/livestage.img.zst,
 //!                     with payload.conf next to it)
 //!   --root DIR        on a copy of a machine's tree: runs no commands, and the
 //!                     disk is the file DIR/dev/NAME
@@ -287,7 +287,7 @@ fn unattended(
                 println!("note: {note}");
             }
             println!(
-                "Done: LiveStage is on {}. Remove the USB stick, then reboot.",
+                "Done: LiveStage is on {}. Remove the installer, then reboot.",
                 found.device()
             );
             0

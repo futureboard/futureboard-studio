@@ -741,7 +741,7 @@ impl App {
         let mut lines = vec![
             Line::raw(
                 "This puts LiveStage onto a disk of this computer, which then starts \
-                 from it without the USB stick: a mixer you control from a browser on any \
+                 from it without the installer: a mixer you control from a browser on any \
                  phone, tablet or computer on the same network.",
             ),
             Line::raw(""),
@@ -758,7 +758,7 @@ impl App {
             Line::raw(""),
             Line::raw(
                 "The steps: choose the disk; set LiveStage up now or at its first boot; \
-                 check and confirm; install (a few minutes). Then remove the USB stick \
+                 check and confirm; install (a few minutes). Then remove the installer \
                  and reboot.",
             ),
             Line::raw(""),
@@ -1156,7 +1156,7 @@ impl App {
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "Do not turn the computer off or pull out the USB stick until it is done.",
+            "Do not turn the computer off or remove the installer until it is done.",
             Style::new().fg(FOCUS),
         ));
         let inner = area.inner(Margin::new(1, 0));
@@ -1204,7 +1204,10 @@ impl App {
                     lines.push(Line::raw(""));
                 }
                 lines.push(Line::from(vec![
-                    Span::styled("Remove the USB stick", Style::new().bold()),
+                    Span::styled(
+                        "Remove the installer (USB stick or CD)",
+                        Style::new().bold(),
+                    ),
                     Span::raw(format!(
                         ", then Reboot: the computer starts LiveStage from {disk}."
                     )),
@@ -1433,7 +1436,7 @@ mod tests {
             println!("{page}");
         }
         assert!(done.contains("LiveStage is installed on vda"), "{done}");
-        assert!(done.contains("Remove the USB stick"), "{done}");
+        assert!(done.contains("Remove the installer"), "{done}");
         assert!(done.contains("first boot shows the setup"), "{done}");
         let written = std::fs::read(root.join("dev/vda")).unwrap();
         assert_eq!(&written[..image.len()], &image[..]);
