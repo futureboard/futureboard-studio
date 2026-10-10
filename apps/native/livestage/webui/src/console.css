@@ -1,0 +1,1453 @@
+/* The console core (Console.tsx, Mixer.tsx, SelectedChannel.tsx): the bar
+   over the mixer, strip colour and the processing summary, DCA strips, and
+   the Selected Channel page. Studio's tokens only (styles.css's roles), the
+   radius ladder by what a thing is: 16–20 px controls CONTROL_SM, 24–32 px
+   CONTROL, containers SURFACE. */
+
+/* ── The console bar ───────────────────────────────────────────────────── */
+
+/* One row on a wide screen (banks · selection · mute groups · monitor); it
+   wraps, a module at a time, below that. Every row it takes comes off the
+   faders, so its modules stay dense: secondary words go to tooltips and
+   popovers before anything wraps. */
+.console-bar {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+/* chrome_cluster: an inset plate holding one module of controls. */
+.console-cluster {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  min-height: 38px;
+  padding: 0 4px;
+  background: var(--state-recessed);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-surface);
+}
+
+.console-cluster > .segments,
+.console-cluster .bank-segments {
+  padding: 2px;
+  border-radius: var(--r);
+}
+
+.cluster-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.console-missing {
+  flex: none;
+}
+
+.spill-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 3px 0 9px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--accent-muted);
+  color: var(--accent);
+  font-size: 12px;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.spill-text {
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.spill-chip .icon-button {
+  border-radius: 50%;
+}
+
+/* Mute groups: eight number keys in the mute hue (the name on hover and in
+   the list). */
+.mg-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 26px);
+  gap: 3px;
+}
+
+.mg,
+.mg-name-edit {
+  height: 26px;
+  min-width: 0;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+}
+
+.mg {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  line-height: 1.1;
+  color: var(--text-muted);
+}
+
+.mg:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+  color: var(--text-primary);
+}
+
+.mg:active {
+  background-image: linear-gradient(var(--state-recessed), var(--state-recessed));
+}
+
+.mg-num {
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.mg-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+}
+
+.mg.unused .mg-name {
+  color: var(--text-faint);
+}
+
+/* Colors::latched in the mute hue: wash, border, glyph. */
+.mg.on {
+  background-color: color-mix(in srgb, var(--state-mute) 18%, var(--surface-panel));
+  border-color: color-mix(in srgb, var(--state-mute) 55%, transparent);
+  color: var(--state-mute);
+}
+
+.mg.on .mg-name {
+  color: var(--text-primary);
+}
+
+.mg-name-edit {
+  flex: 1;
+  padding: 0 6px;
+  font-size: 12px;
+  outline: none;
+}
+
+.mg-name-edit:focus {
+  border-color: var(--accent);
+}
+
+/* The list key: an icon-sized chevron beside the number keys, or (where
+   they do not fit) "Mute", the active count and the chevron. */
+.mg-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: var(--r);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.mg-more:hover {
+  background: var(--state-hover);
+  color: var(--text-primary);
+}
+
+.mg-more-label,
+.mg-more-count {
+  display: none;
+}
+
+/* Some group is muting: the count in the mute hue, wash and border. */
+.mg-more-count {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--r-micro);
+  background: color-mix(in srgb, var(--state-mute) 18%, var(--surface-panel));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--state-mute) 55%, transparent);
+  color: var(--state-mute);
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+  letter-spacing: 0;
+}
+
+/* The list: one row per group, a latch each. */
+.mg-pop {
+  min-width: 230px;
+}
+
+.mg-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mg-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-right: 2px;
+}
+
+.mg-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 8px;
+}
+
+.mg-row.mg {
+  justify-content: flex-start;
+}
+
+.mg-row .mg-num {
+  min-width: 14px;
+  text-align: right;
+}
+
+.mg-row .mg-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  text-align: left;
+}
+
+.mg-row.naming {
+  padding: 0 0 0 8px;
+  color: var(--text-muted);
+}
+
+.mg-members {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.pop-note {
+  max-width: 260px;
+  margin: 4px 8px 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+a.menu-item {
+  text-decoration: none;
+}
+
+.icon-button.on {
+  color: var(--accent);
+}
+
+/* The monitor. */
+.solo-mode button {
+  height: 24px;
+  padding: 0 7px;
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+/* SIP reaches the PA: the warning hue, on the button and around the module. */
+.solo-mode button.sip.on {
+  background: color-mix(in srgb, var(--warning) 20%, transparent);
+  color: var(--warning);
+}
+
+.console-cluster.monitor.sip {
+  border-color: color-mix(in srgb, var(--warning) 55%, transparent);
+}
+
+.sip-warning {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--warning);
+  white-space: nowrap;
+}
+
+/* PFL/AFL with no output taking the monitor bus: solo is heard nowhere.
+   A link to where that is fixed. */
+.monitor-unpatched {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid color-mix(in srgb, var(--warning) 55%, transparent);
+  border-radius: var(--r);
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  color: var(--warning);
+  font-size: 11px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.monitor-unpatched:hover {
+  text-decoration: underline;
+}
+
+/* On the bar: the warning as a key, its words in a popover. */
+button.monitor-unpatched {
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+}
+
+button.monitor-unpatched:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.monitor-unpatched.small {
+  height: auto;
+  padding: 3px 6px;
+  font-size: 10px;
+  white-space: normal;
+  text-align: center;
+}
+
+.monitor-level {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.monitor-db {
+  min-width: 32px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.clear-solo {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.clear-solo-s {
+  font-size: 10px;
+}
+
+.clear-solo-label {
+  font-weight: 600;
+}
+
+.clear-solo.on {
+  background-color: color-mix(in srgb, var(--state-solo) 18%, var(--surface-panel));
+  border-color: color-mix(in srgb, var(--state-solo) 55%, transparent);
+  color: var(--state-solo);
+}
+
+.clear-solo.on:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.monitor-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 2px;
+}
+
+.monitor-meter canvas {
+  display: block;
+}
+
+/* ── Strips ────────────────────────────────────────────────────────────── */
+
+/* The name plate: tinted, with a bar underneath, when the strip has a
+   colour; the same geometry either way. */
+.strip-head {
+  margin: 0 -2px;
+  padding: 0 2px;
+  border-radius: var(--r-sm);
+}
+
+.strip.colored {
+  --strip-base: color-mix(in srgb, var(--strip-bg) 92%, var(--strip-color));
+}
+
+.strip.colored .strip-head {
+  background: color-mix(in srgb, var(--strip-color) 22%, transparent);
+  box-shadow: inset 0 -2px 0 var(--strip-color);
+}
+
+.strip-head .strip-name {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.strip-head .strip-name:hover {
+  color: var(--accent);
+}
+
+.strip.muted .strip-head .strip-name {
+  color: var(--text-muted);
+}
+
+.strip-head .strip-badge.handle {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 0 4px 0 1px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.strip-badge .grip {
+  color: var(--text-faint);
+}
+
+.strip.dragged {
+  position: relative;
+  z-index: 5;
+  box-shadow: var(--shadow-drag);
+  cursor: grabbing;
+}
+
+.mixer-scroll.reordering {
+  cursor: grabbing;
+}
+
+.reorder-line {
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+/* The processing section at a glance. */
+.proc-row {
+  flex: none;
+  display: flex;
+  gap: 2px;
+  height: 22px;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: var(--state-recessed);
+}
+
+.proc-row:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.proc-light {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  border-radius: var(--r-micro);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--text-faint);
+}
+
+.proc-light.on {
+  background: var(--accent-muted);
+  color: var(--accent);
+}
+
+/* The gate's open light: filled while open, a ring while closed. */
+.gate-light {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.gate-light[data-state='open'] {
+  background: var(--state-monitor);
+}
+
+.gate-light[data-state='closed'] {
+  box-shadow: inset 0 0 0 1px var(--text-muted);
+}
+
+.gate-light[data-state='off'] {
+  display: none;
+}
+
+.gr-meter {
+  display: block;
+  height: 100%;
+}
+
+/* DCA and mute-group membership. */
+.strip-assign {
+  flex: none;
+  display: flex;
+  gap: 2px;
+  height: 15px;
+  overflow: hidden;
+}
+
+.assign-chip {
+  flex: none;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: var(--r-micro);
+  background: var(--surface-raised);
+  box-shadow: inset 2px 0 0 var(--chip-color, transparent);
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.assign-chip.mg {
+  color: var(--text-muted);
+}
+
+/* The chip of what is muting the strip now, in the mute hue. */
+.assign-chip.muting {
+  background: color-mix(in srgb, var(--state-mute) 18%, var(--surface-panel));
+  color: var(--state-mute);
+}
+
+/* A mute a DCA or mute group holds: the mute hue, dashed. */
+.latch-mute.implied {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--state-mute) 55%, transparent);
+  color: var(--state-mute);
+}
+
+.spill-empty {
+  align-self: center;
+  max-width: 320px;
+  padding: 18px;
+  border: 1px dashed var(--border-normal);
+  border-radius: var(--r-surface);
+  color: var(--text-muted);
+}
+
+/* ── DCA strips ────────────────────────────────────────────────────────── */
+
+.dca-top {
+  position: relative;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  height: 26px;
+}
+
+.dca-members {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.dca-members.none {
+  color: var(--text-faint);
+}
+
+.dca-color {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r-sm);
+  background-color: var(--button-bg);
+}
+
+.dca-color.on {
+  border-color: var(--accent);
+}
+
+.dca-color-chip {
+  width: 12px;
+  height: 12px;
+  border-radius: var(--r-micro);
+  background: var(--strip-color, transparent);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+.dca-palette {
+  position: absolute;
+  top: 28px;
+  left: -4px;
+  right: -4px;
+  z-index: 6;
+  padding: 6px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r);
+  box-shadow: var(--shadow-overlay);
+}
+
+.spill {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 28px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.spill:hover:not(:disabled) {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.spill.on {
+  border-color: var(--accent);
+  background-color: var(--accent-active);
+  color: var(--accent);
+}
+
+/* ── Colour swatches ───────────────────────────────────────────────────── */
+
+.swatches {
+  display: grid;
+  grid-template-columns: repeat(7, 30px);
+  gap: 6px;
+}
+
+.swatch {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  color: var(--text-inverse);
+}
+
+.swatch:hover {
+  border-color: var(--border-strong);
+}
+
+/* Chosen: a check and a ring outside, never a changed shape. */
+.swatch.on {
+  box-shadow:
+    0 0 0 2px var(--surface-panel),
+    0 0 0 3px var(--text-primary);
+}
+
+.swatch.none {
+  background: var(--surface-input);
+  color: var(--text-faint);
+}
+
+.swatch.none.on {
+  color: var(--text-primary);
+}
+
+.swatches.small {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 3px;
+}
+
+.swatches.small .swatch {
+  width: auto;
+  height: auto;
+  aspect-ratio: 1;
+  border-radius: var(--r-micro);
+}
+
+/* Inside a strip-wide popover: four across, big enough for a finger. */
+.dca-palette .swatches.small {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.swatches.small .swatch.on {
+  box-shadow:
+    0 0 0 1px var(--surface-raised),
+    0 0 0 2px var(--text-primary);
+}
+
+/* ── Gain-reduction bars ───────────────────────────────────────────────── */
+
+.gr-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.gr-bar canvas {
+  display: block;
+  flex: 1;
+  min-width: 60px;
+  height: 8px;
+}
+
+.gr-bar-value {
+  min-width: 34px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-align: right;
+}
+
+.gr-bar.off .gr-bar-value {
+  color: var(--text-faint);
+}
+
+.gr-bar.vertical {
+  flex: none;
+  flex-direction: column;
+  align-self: stretch;
+  width: 34px;
+  gap: 4px;
+}
+
+.gr-bar.vertical canvas {
+  width: 10px;
+  min-width: 0;
+  height: auto;
+}
+
+.gr-bar.vertical .gr-bar-value {
+  min-width: 0;
+  text-align: center;
+}
+
+/* ── The Selected Channel ──────────────────────────────────────────────── */
+
+.cv {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  /* What racks and slots composite over here: a card. */
+  --strip-base: var(--surface-panel);
+}
+
+.cv-head {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--surface-titlebar);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.cv.colored .cv-head {
+  box-shadow: inset 0 -2px 0 var(--strip-color);
+}
+
+.cv-back {
+  padding: 0 10px 0 6px;
+}
+
+.cv-nav,
+.cv-move {
+  display: flex;
+  gap: 2px;
+}
+
+.cv-badge {
+  flex: none;
+  display: grid;
+  place-items: center;
+  min-width: 30px;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: var(--r);
+  background: var(--surface-raised);
+  color: var(--text-secondary);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.cv.colored .cv-badge {
+  background: var(--strip-color);
+  color: var(--text-inverse);
+}
+
+.cv-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.2;
+}
+
+.cv-name,
+.cv-name-static {
+  width: min(320px, 100%);
+  height: 24px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  font-size: 15px;
+  font-weight: 600;
+  outline: none;
+}
+
+.cv-name-static {
+  display: block;
+  line-height: 22px;
+}
+
+.cv-name:hover {
+  border-color: var(--border-subtle);
+}
+
+.cv-name:focus {
+  border-color: var(--accent);
+  background: var(--surface-input);
+}
+
+.cv-kind {
+  padding-left: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The signal path. */
+.cv-flow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.flow-line {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.flow-stage {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-sm);
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.flow-stage.on {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+  background: var(--accent-muted);
+  color: var(--accent);
+}
+
+.flow-arrow {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.flow-order.pe-choice button {
+  height: 26px;
+  font-size: 12px;
+}
+
+.cv-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 176px;
+  align-items: start;
+  gap: 10px;
+  padding: 10px;
+}
+
+.cv-main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.cv-side {
+  position: sticky;
+  top: 52px;
+}
+
+.cv-side-card {
+  align-items: center;
+  height: min(640px, calc(100vh - 170px));
+  min-height: 400px;
+}
+
+.cv-side-card .fader-block {
+  width: 100%;
+}
+
+.cv-side-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.solo-safe {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.solo-safe:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+/* Latched in the solo hue: it is a solo state. */
+.solo-safe.on {
+  background-color: color-mix(in srgb, var(--state-solo) 18%, var(--surface-panel));
+  border-color: color-mix(in srgb, var(--state-solo) 55%, transparent);
+  color: var(--state-solo);
+}
+
+/* A section taken out: its controls stay live, its displays and knobs dim. */
+.cv-section.out .pe-knob,
+.cv-section.out .cv-graph,
+.cv-section.out .cv-transfer-wrap,
+.cv-section.out .cv-gr-row {
+  opacity: 0.55;
+}
+
+.cv-section-aside {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cv-knobs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px 10px;
+}
+
+.cv-latch-cell,
+.cv-choice-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding-top: 6px;
+}
+
+.cv-gr-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The EQ graph (the same plot as the EQ editors'). */
+.cv-graph {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.cv-plot-row {
+  display: flex;
+  height: clamp(180px, 30vh, 300px);
+}
+
+.cv-db {
+  position: relative;
+  flex: none;
+  width: 30px;
+}
+
+.cv-db span {
+  position: absolute;
+  right: 4px;
+  margin-top: -6px;
+  font-size: 10px;
+  line-height: 12px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-db span.zero {
+  color: var(--text-secondary);
+}
+
+.cv-plot {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  cursor: crosshair;
+  user-select: none;
+  touch-action: none;
+}
+
+.cv-plot.dragging {
+  cursor: grabbing;
+}
+
+/* A data canvas: square edges. */
+.cv-plot .pe-canvas {
+  position: absolute;
+  inset: 0;
+  border-radius: 0;
+}
+
+.cv-freq {
+  position: relative;
+  height: 16px;
+  margin-left: 30px;
+}
+
+.cv-freq span {
+  position: absolute;
+  top: 2px;
+  width: 30px;
+  margin-left: -15px;
+  text-align: center;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* A band's node. Hit-testing is by distance, so nodes never take the
+   pointer themselves. */
+.cv-node {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin: -10px 0 0 -10px;
+  border: 1.5px solid;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.cv-node.off {
+  border-style: dashed;
+}
+
+.cv-node.selected {
+  border-width: 2px;
+}
+
+.cv-readout,
+.cv-graph-note {
+  position: absolute;
+  top: 6px;
+  padding: 1px 6px;
+  border-radius: var(--r-micro);
+  background: color-mix(in srgb, var(--surface-base) 88%, transparent);
+  font-size: 10px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.cv-readout {
+  left: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-graph-note {
+  right: 8px;
+  color: var(--text-muted);
+}
+
+.cv-bands {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+/* A band's controls, its colour along the top edge. */
+.cv-band {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px 6px 6px;
+  border-radius: var(--r);
+  background: var(--state-recessed);
+  box-shadow: inset 0 2px 0 var(--band-color);
+}
+
+.cv-band.selected {
+  background: var(--state-selected);
+}
+
+.cv-band-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.cv-band-num {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--band-color);
+  color: var(--surface-canvas);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.cv-band-name {
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cv-band .cv-band-kind {
+  display: flex;
+  flex-wrap: nowrap;
+}
+
+.cv-band .cv-band-kind button {
+  flex: 1;
+  justify-content: center;
+  min-width: 0;
+  height: 22px;
+  padding: 0 4px;
+  font-size: 10px;
+}
+
+.cv-band-knobs {
+  display: flex;
+  justify-content: space-between;
+  gap: 2px;
+}
+
+.cv-band-knobs .pe-knob {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The compressor. */
+.cv-comp-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 12px;
+}
+
+.cv-transfer-wrap {
+  display: flex;
+  gap: 6px;
+  flex: 1 1 260px;
+  min-width: 220px;
+  max-width: 440px;
+  height: 230px;
+}
+
+.cv-transfer {
+  flex: 1;
+}
+
+.cv-comp-knobs {
+  flex: 1 1 240px;
+  align-content: flex-start;
+}
+
+/* Delay. */
+.cv-delay-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.cv-number {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 116px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-input);
+}
+
+.cv-number:focus-within {
+  border-color: var(--accent);
+}
+
+.cv-number input {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  outline: none;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.cv-number-unit {
+  width: 18px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* Assignment. */
+.cv-assign {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.assign-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.assign {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  box-shadow: inset 3px 0 0 var(--chip-color, transparent);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.assign:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+  color: var(--text-primary);
+}
+
+/* Assigned: a routing, so the accent — wash, border and number. */
+.assign.on {
+  border-color: var(--accent);
+  background-color: var(--accent-active);
+  color: var(--text-primary);
+}
+
+.assign.on .assign-num {
+  color: var(--accent);
+}
+
+/* A mute group that is muting now: its edge in the mute hue. */
+.assign.assign-mg.active {
+  box-shadow: inset 3px 0 0 var(--state-mute);
+}
+
+.assign-num {
+  flex: none;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.assign-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The strip's racks, in cards here: their own heads go (the card has one),
+   their heights follow what they hold. */
+.cv-rack .rack-head {
+  display: none;
+}
+
+.cv-rack .rack-list.inserts,
+.cv-rack .rack-list.send-list {
+  height: auto;
+  min-height: 60px;
+  max-height: 260px;
+}
+
+/* ── Console bar density ───────────────────────────────────────────────── */
+
+/* Below a wide screen: the mute groups go behind their list key (with the
+   active count), the monitor's words go to tooltips. The number keys need
+   ~310 px and the monitor's words ~90 more: at 1880 px the bar still holds
+   them in one row with a few custom layers. */
+@media (max-width: 1879px) {
+  .mg-grid,
+  .mg-label,
+  .cluster-label-text,
+  .sip-warning-text,
+  .clear-solo-label {
+    display: none;
+  }
+
+  .mg-more {
+    padding: 0 7px;
+    border-color: var(--button-border);
+    background-color: var(--button-bg);
+    color: var(--text-muted);
+  }
+
+  .mg-more:hover {
+    background-color: var(--button-bg);
+    background-image: linear-gradient(var(--state-hover), var(--state-hover));
+  }
+
+  .mg-more.on {
+    color: var(--text-primary);
+  }
+
+  .mg-more-label {
+    display: inline;
+  }
+
+  .mg-more-count {
+    display: inline-block;
+  }
+}
+
+/* ── Narrow screens ────────────────────────────────────────────────────── */
+
+@media (max-width: 900px) {
+  .cv-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .cv-side {
+    position: static;
+  }
+
+  .cv-side-card {
+    height: 380px;
+    min-height: 0;
+  }
+}
+
+@media (max-width: 760px) {
+  .cv-bands {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .console-bar {
+    padding: 6px;
+    gap: 6px;
+  }
+
+  .console-cluster.monitor {
+    flex-wrap: wrap;
+    padding: 4px;
+  }
+
+  .cv-head {
+    flex-wrap: wrap;
+    padding: 6px 8px;
+  }
+
+  .cv-back span {
+    display: none;
+  }
+
+  .cv-flow,
+  .cv-body {
+    padding: 8px;
+  }
+
+  .flow-arrow {
+    display: none;
+  }
+
+  .assign-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .swatches {
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+  }
+
+  .swatch {
+    width: auto;
+    height: auto;
+    aspect-ratio: 1;
+  }
+}

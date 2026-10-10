@@ -2,17 +2,18 @@
 # LiveStage: the headless mixer and its web UI.
 #
 # Settings: /etc/conf.d/livestage, then what the console's setup saved
-# (/data/system/setup.conf), then /data/livestage/livestage.conf, which wins
-# (the root filesystem is read-only; /data is not).
+# (/var/lib/livestage/setup.conf), then /var/lib/livestage/livestage.conf,
+# which wins. All three are root's: the root filesystem is read-only, and the
+# settings partition is not writable by the service account. (The data
+# partition is exFAT and is the service's: nothing on it is read as root.)
 
 name="LiveStage"
 description="LiveStage live mixer and its web UI"
 
-[ -r /data/system/setup.conf ] && . /data/system/setup.conf
-[ -r /data/livestage/livestage.conf ] && . /data/livestage/livestage.conf
+[ -r /var/lib/livestage/setup.conf ] && . /var/lib/livestage/setup.conf
+[ -r /var/lib/livestage/livestage.conf ] && . /var/lib/livestage/livestage.conf
 
 : "${LIVESTAGE_SESSION:=/data/livestage/show.json}"
-: "${LIVESTAGE_RECORDINGS:=/data/livestage/recordings}"
 : "${LIVESTAGE_HTTP:=0.0.0.0:8730}"
 
 # The interface the setup picked, for the very first start only: from then on
@@ -27,8 +28,6 @@ fi
 
 supervisor="supervise-daemon"
 command="/usr/bin/livestage-server"
-# shellcheck disable=SC2086
-command_args="--session ${LIVESTAGE_SESSION} --record-dir ${LIVESTAGE_RECORDINGS} --http ${LIVESTAGE_HTTP} --daemon${first_audio} ${LIVESTAGE_ARGS}"
 command_user="livestage:audio"
 directory="/data/livestage"
 output_log="/var/log/livestage.log"
@@ -38,14 +37,31 @@ respawn_delay=2
 respawn_max=0
 # SIGTERM closes the take being recorded and saves the session.
 retry="TERM/15/KILL/5"
+# The audio threads ask for real-time priority (SCHED_FIFO 70), so the web
+# server, a browser or a disk write cannot hold them past their period: the
+# service account may use up to 70.
+rc_ulimit="-r 70"
 
 depend() {
 	need localmount
-	use net mdev hwdrivers
-	after livestage-data livestage-config avahi-daemon
+	use net mdev hwdrivers livestage-storage
+	after livestage-data livestage-config livestage-storage avahi-daemon
 }
 
 start_pre() {
-	checkpath -d -m 0755 -o livestage:audio /data/livestage "${LIVESTAGE_RECORDINGS}" &&
-		checkpath -f -m 0640 -o livestage:audio /var/log/livestage.log
+	# Where recordings go: the storage the setup chose (a USB drive, mounted
+	# now if it is plugged in), else the data partition. LIVESTAGE_RECORDINGS
+	# in livestage.conf overrides it. The running server follows later
+	# changes itself.
+	if [ -z "${LIVESTAGE_RECORDINGS}" ]; then
+		LIVESTAGE_RECORDINGS=$(/usr/bin/livestage-setup --storage-path 2>/dev/null) ||
+			LIVESTAGE_RECORDINGS=/data/livestage/recordings
+	fi
+	# exFAT: the folders are the service's by the mount's options, not by
+	# chown.
+	mkdir -p /data/livestage "${LIVESTAGE_RECORDINGS}" &&
+		checkpath -f -m 0640 -o livestage:audio /var/log/livestage.log || return 1
+	# OpenRC evals command_args: the quotes keep a folder with spaces in it
+	# ("LiveStage Recordings") one argument.
+	command_args="--session \"${LIVESTAGE_SESSION}\" --record-dir \"${LIVESTAGE_RECORDINGS}\" --http ${LIVESTAGE_HTTP} --daemon${first_audio} ${LIVESTAGE_ARGS}"
 }

@@ -1,5 +1,5 @@
 //! The console's screens: the status of the machine (home), the setup
-//! wizard, and the progress of applying it.
+//! wizard, the progress of applying it, and the drives recordings go to.
 //!
 //! Drawn for the Linux text console: 80×25 at the least, its sixteen colours,
 //! and no glyphs beyond the box-drawing set its font has.
@@ -14,6 +14,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::config::{self, AudioChoice, FixedAddress, SetupConfig, Wifi};
+use super::storage::Storage;
+use super::storage_api::{self as api, Mount, State as StorageState, Volume};
 use super::system::{self, NetPort, PasswordState, ServiceState, SoundCard, System, WifiNetwork};
 
 const ACCENT: Color = Color::Cyan;
@@ -26,6 +28,8 @@ const REFRESH: Duration = Duration::from_secs(2);
 
 pub struct App {
     system: System,
+    /// The drives (the console acts on them directly, as root).
+    storage: Storage,
     /// On tty1: never quits (init would only start it again).
     console: bool,
     /// Opened with `--setup` from a shell: leaving the setup ends the tool.
@@ -44,6 +48,7 @@ enum Screen {
     Home { focus: usize },
     Wizard(Box<Wizard>),
     Applying(Box<Applying>),
+    Storage(Box<StorageScreen>),
 }
 
 enum Popup {
@@ -62,6 +67,13 @@ enum Popup {
         title: &'static str,
         text: String,
     },
+    /// What can be done with the drive picked on the storage screen.
+    DriveMenu {
+        title: String,
+        items: Vec<DriveAction>,
+        selected: usize,
+    },
+    Format(FormatDialog),
 }
 
 #[derive(Clone, Copy)]
@@ -75,6 +87,7 @@ enum Action {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HomeAction {
     Setup,
+    Storage,
     RestartMixer,
     Log,
     Reboot,
@@ -86,6 +99,7 @@ impl HomeAction {
     fn label(self) -> &'static str {
         match self {
             Self::Setup => "Setup",
+            Self::Storage => "Storage",
             Self::RestartMixer => "Restart LiveStage",
             Self::Log => "Log",
             Self::Reboot => "Reboot",
@@ -104,13 +118,13 @@ struct Status {
     links: Vec<(String, Option<(String, Option<f32>)>)>,
     mixer: ServiceState,
     mixer_line: Option<String>,
-    space: Option<(u64, u64)>,
+    storage: StorageState,
     config: SetupConfig,
     password: PasswordState,
 }
 
 impl Status {
-    fn read(system: &System) -> Self {
+    fn read(system: &System, storage: &Storage) -> Self {
         let ports = system.ports();
         let links = ports
             .iter()
@@ -124,7 +138,7 @@ impl Status {
             links,
             mixer: system.service("livestage"),
             mixer_line: system.mixer_summary(),
-            space: system.data_space(),
+            storage: storage.state(system),
             config: system.load_config().unwrap_or_default(),
             password: system.password(),
         }
@@ -141,10 +155,12 @@ impl Status {
 
 impl App {
     pub fn new(system: System, console: bool, open_setup: bool) -> Self {
-        let status = Status::read(&system);
-        let first = system.load_config().is_none();
+        let storage = Storage::new();
+        let status = Status::read(&system, &storage);
+        let first = !system.is_set_up();
         let mut app = Self {
             system,
+            storage,
             console,
             quit_after_setup: open_setup && !console,
             screen: Screen::Home { focus: 0 },
@@ -155,7 +171,11 @@ impl App {
             redraw: false,
         };
         if first || open_setup {
-            app.screen = Screen::Wizard(Box::new(Wizard::new(&app.system, first)));
+            app.screen = Screen::Wizard(Box::new(Wizard::new(
+                &app.system,
+                first,
+                app.status.storage.clone(),
+            )));
         }
         app
     }
@@ -163,6 +183,7 @@ impl App {
     fn home_actions(&self) -> Vec<HomeAction> {
         let mut actions = vec![
             HomeAction::Setup,
+            HomeAction::Storage,
             HomeAction::RestartMixer,
             HomeAction::Log,
             HomeAction::Reboot,
@@ -191,6 +212,24 @@ impl App {
             }
             return;
         }
+        if let Screen::Storage(screen) = &mut self.screen
+            && let Some(action) = screen.pending.take()
+        {
+            let outcome = action.run(&self.system, &self.storage);
+            self.refresh();
+            self.popup = Some(match outcome {
+                Ok(Some(text)) => Popup::Message {
+                    title: "Done",
+                    text,
+                },
+                Ok(None) => return,
+                Err(text) => Popup::Message {
+                    title: "That did not work",
+                    text,
+                },
+            });
+            return;
+        }
         if self.refreshed.elapsed() >= REFRESH {
             self.refresh();
         }
@@ -201,17 +240,52 @@ impl App {
         match &self.screen {
             Screen::Applying(applying) => !applying.finished(),
             Screen::Wizard(wizard) => wizard.scan == Scan::Pending,
+            Screen::Storage(screen) => screen.pending.is_some(),
             Screen::Home { .. } => false,
         }
     }
 
     fn refresh(&mut self) {
-        self.status = Status::read(&self.system);
+        self.status = Status::read(&self.system, &self.storage);
         self.refreshed = Instant::now();
         // Ports come and go (a USB Wi-Fi stick, a cable): the setup follows.
         if let Screen::Wizard(wizard) = &mut self.screen {
             wizard.ports = self.status.ports.clone();
+            wizard.storage = self.status.storage.clone();
         }
+        if let Screen::Storage(screen) = &mut self.screen
+            && let Some(wizard) = &mut screen.back
+        {
+            wizard.storage = self.status.storage.clone();
+        }
+    }
+
+    /// The storage screen, over the setup (`back`) or from the home screen.
+    fn open_storage(&mut self, back: Option<Box<Wizard>>) {
+        self.refresh();
+        self.screen = Screen::Storage(Box::new(StorageScreen {
+            back,
+            selected: 0,
+            pending: None,
+        }));
+    }
+
+    fn leave_storage(&mut self) {
+        let screen = std::mem::replace(&mut self.screen, Screen::Home { focus: 0 });
+        self.screen = match screen {
+            Screen::Storage(screen) => match screen.back {
+                Some(wizard) => Screen::Wizard(wizard),
+                None => Screen::Home {
+                    focus: self
+                        .home_actions()
+                        .iter()
+                        .position(|a| *a == HomeAction::Storage)
+                        .unwrap_or(0),
+                },
+            },
+            other => other,
+        };
+        self.refresh();
     }
 
     fn go_home(&mut self) {
@@ -243,6 +317,7 @@ impl App {
         }
         let outcome = match &mut self.screen {
             Screen::Home { .. } => return self.home_key(key),
+            Screen::Storage(_) => return self.storage_key(key),
             Screen::Wizard(wizard) => match wizard.key(key) {
                 // Nothing to go back to from the first setup: it is the way in.
                 WizardOutcome::Leave if wizard.first => WizardOutcome::Stay,
@@ -267,6 +342,70 @@ impl App {
             }
             WizardOutcome::Pick(picker) => self.popup = Some(Popup::Picker(picker)),
             WizardOutcome::Apply(applying) => self.screen = Screen::Applying(applying),
+            WizardOutcome::Storage => {
+                if let Screen::Wizard(wizard) =
+                    std::mem::replace(&mut self.screen, Screen::Home { focus: 0 })
+                {
+                    self.open_storage(Some(wizard));
+                }
+            }
+        }
+    }
+
+    fn storage_key(&mut self, key: KeyEvent) {
+        let rows = drive_rows(&self.status.storage);
+        let Screen::Storage(screen) = &mut self.screen else {
+            return;
+        };
+        let last = rows.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => screen.selected = screen.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Tab => screen.selected = (screen.selected + 1).min(last),
+            KeyCode::Home => screen.selected = 0,
+            KeyCode::End => screen.selected = last,
+            KeyCode::Esc | KeyCode::Left => self.leave_storage(),
+            KeyCode::Char('q') if screen.back.is_none() && !self.console => self.quit = true,
+            KeyCode::Enter | KeyCode::Right => {
+                let Some(row) = rows.get(screen.selected.min(last)) else {
+                    return;
+                };
+                let state = &self.status.storage;
+                let items = row.actions(state);
+                self.popup = Some(if items.is_empty() {
+                    Popup::Message {
+                        title: "Storage",
+                        text: if row.is_recording(state) {
+                            "Recordings go here already.".to_string()
+                        } else {
+                            "Nothing can be done with this one here.".to_string()
+                        },
+                    }
+                } else {
+                    Popup::DriveMenu {
+                        title: row.title(state),
+                        items,
+                        selected: 0,
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// An action chosen on the storage screen: done at the next tick (after
+    /// "Working..." is drawn), or first the format dialog.
+    fn drive_action(&mut self, action: DriveAction) {
+        if let DriveAction::Format {
+            disk,
+            what,
+            label: None,
+        } = &action
+        {
+            self.popup = Some(Popup::Format(FormatDialog::new(disk, what)));
+            return;
+        }
+        if let Screen::Storage(screen) = &mut self.screen {
+            screen.pending = Some(action);
         }
     }
 
@@ -292,8 +431,13 @@ impl App {
     fn home_action(&mut self, action: HomeAction) {
         match action {
             HomeAction::Setup => {
-                self.screen = Screen::Wizard(Box::new(Wizard::new(&self.system, false)))
+                self.screen = Screen::Wizard(Box::new(Wizard::new(
+                    &self.system,
+                    false,
+                    self.status.storage.clone(),
+                )))
             }
+            HomeAction::Storage => self.open_storage(None),
             HomeAction::RestartMixer => {
                 self.popup = Some(Popup::Confirm {
                     title: "Restart LiveStage",
@@ -385,6 +529,41 @@ impl App {
                 }
             },
             Popup::Message { .. } => {}
+            Popup::DriveMenu {
+                title,
+                items,
+                mut selected,
+            } => match key.code {
+                KeyCode::Esc | KeyCode::Left => {}
+                KeyCode::Enter => {
+                    if let Some(action) = items.get(selected).cloned() {
+                        self.drive_action(action);
+                    }
+                }
+                code => {
+                    match code {
+                        KeyCode::Up | KeyCode::BackTab => selected = selected.saturating_sub(1),
+                        KeyCode::Down | KeyCode::Tab => {
+                            selected = (selected + 1).min(items.len().saturating_sub(1))
+                        }
+                        _ => {}
+                    }
+                    self.popup = Some(Popup::DriveMenu {
+                        title,
+                        items,
+                        selected,
+                    });
+                }
+            },
+            Popup::Format(mut dialog) => match dialog.key(key) {
+                FormatOutcome::Stay => self.popup = Some(Popup::Format(dialog)),
+                FormatOutcome::Cancel => {}
+                FormatOutcome::Format(label) => self.drive_action(DriveAction::Format {
+                    disk: dialog.disk,
+                    what: dialog.what,
+                    label: Some(label),
+                }),
+            },
         }
     }
 
@@ -438,6 +617,10 @@ impl App {
             Screen::Home { .. } => " LiveStage".to_string(),
             Screen::Wizard(wizard) => format!(" LiveStage setup  -  {}", wizard.page().title()),
             Screen::Applying(_) => " LiveStage setup  -  Applying".to_string(),
+            Screen::Storage(screen) if screen.back.is_some() => {
+                " LiveStage setup  -  Storage".to_string()
+            }
+            Screen::Storage(_) => " LiveStage  -  Storage".to_string(),
         };
         let bar = Style::new().fg(Color::Black).bg(ACCENT);
         frame.render_widget(Paragraph::new(title).style(bar).bold(), header);
@@ -459,6 +642,10 @@ impl App {
             (Some(Popup::Log { .. }), _) => "Up/Down PgUp/PgDn scroll   Esc close",
             (Some(Popup::Confirm { .. }), _) => "Left/Right choose   Enter confirm   Esc cancel",
             (Some(Popup::Message { .. }), _) => "Any key closes",
+            (Some(Popup::DriveMenu { .. }), _) => "Up/Down choose   Enter do it   Esc close",
+            (Some(Popup::Format(_)), _) => "Tab next field   Enter format   Esc cancel",
+            (None, Screen::Storage(screen)) if screen.pending.is_some() => "Working...",
+            (None, Screen::Storage(_)) => "Up/Down choose   Enter what to do   Esc back",
             (None, Screen::Home { .. }) if self.console => {
                 "Left/Right choose   Enter open   Alt+F2 shell"
             }
@@ -475,6 +662,7 @@ impl App {
             Screen::Home { focus } => self.draw_home(frame, body, *focus),
             Screen::Wizard(wizard) => wizard.draw(frame, body),
             Screen::Applying(applying) => applying.draw(frame, body),
+            Screen::Storage(screen) => screen.draw(frame, body, &self.status.storage),
         }
         if let Some(popup) = &self.popup {
             draw_popup(frame, body, popup);
@@ -583,16 +771,7 @@ impl App {
 
         lines.push(row("Name", vec![Span::raw(status.name.clone())]));
         lines.push(row("Time zone", vec![Span::raw(config.timezone.clone())]));
-        if let Some((free, total)) = status.space {
-            lines.push(row(
-                "Recordings",
-                vec![Span::raw(format!(
-                    "{} free of {} (/data)",
-                    system::megabytes(free),
-                    system::megabytes(total)
-                ))],
-            ));
-        }
+        lines.push(row("Recordings", recordings_summary(&status.storage)));
         match status.password {
             PasswordState::None => lines.push(row(
                 "Console",
@@ -624,7 +803,72 @@ impl App {
             info,
         );
         let labels: Vec<&str> = self.home_actions().iter().map(|a| a.label()).collect();
-        frame.render_widget(button_row(&labels, Some(focus)), buttons);
+        // Every button on one line, closer together on a narrow screen.
+        let wide: usize = 1 + labels.iter().map(|l| l.chars().count() + 6).sum::<usize>();
+        frame.render_widget(
+            if wide <= buttons.width as usize {
+                button_row(&labels, Some(focus))
+            } else {
+                compact_button_row(&labels, Some(focus))
+            },
+            buttons,
+        );
+    }
+}
+
+/// Where recordings go, for the home screen: the drive and its free space,
+/// or the warning that its drive is missing.
+fn recordings_summary(state: &StorageState) -> Vec<Span<'static>> {
+    let internal = state.volume(api::INTERNAL);
+    let space = |volume: Option<&Volume>| match volume.and_then(|v| v.free_bytes) {
+        Some(free) => format!("{} free", system::megabytes(free)),
+        None => "free space unknown".to_string(),
+    };
+    if state.falling_back() {
+        return vec![Span::styled(
+            format!(
+                "{}: recording to Internal ({})",
+                fallback_reason(state),
+                space(internal)
+            ),
+            Style::new().fg(FOCUS),
+        )];
+    }
+    let volume = state.volume(&state.target.id);
+    let name = match volume {
+        Some(v) if v.id != api::INTERNAL => volume_name(v),
+        _ => api::INTERNAL_LABEL.to_string(),
+    };
+    let mut text = format!("{name}: {}", space(volume));
+    if let Some(size) = volume.map(|v| v.size_bytes).filter(|s| *s > 0) {
+        text.push_str(&format!(" of {}", system::megabytes(size)));
+    }
+    if let Some(model) = volume
+        .filter(|v| v.id != api::INTERNAL)
+        .and_then(|v| v.model.as_ref())
+    {
+        text.push_str(&format!(" ({model})"));
+    }
+    vec![Span::raw(text)]
+}
+
+/// Why recordings are not going to the drive chosen for them.
+fn fallback_reason(state: &StorageState) -> String {
+    match state.volume(&state.target.id) {
+        Some(volume) if volume.ejected => format!("{} is ejected", state.target.label),
+        Some(_) => format!("{} cannot be written to", state.target.label),
+        None => format!("{} is not plugged in", state.target.label),
+    }
+}
+
+/// A volume as people know it: its label, else its device.
+fn volume_name(volume: &Volume) -> String {
+    if volume.id == api::INTERNAL {
+        api::INTERNAL_LABEL.to_string()
+    } else if volume.label.is_empty() {
+        format!("{} (no name)", volume.device)
+    } else {
+        volume.label.clone()
     }
 }
 
@@ -646,6 +890,21 @@ fn button_row(labels: &[&str], focus: Option<usize>) -> Paragraph<'static> {
         };
         spans.push(Span::styled(format!("[ {label} ]"), style));
         spans.push(Span::raw("  "));
+    }
+    Paragraph::new(Line::from(spans))
+}
+
+/// [`button_row`] for a narrow screen: `[Label]`, one space apart.
+fn compact_button_row(labels: &[&str], focus: Option<usize>) -> Paragraph<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (index, label) in labels.iter().enumerate() {
+        let style = if focus == Some(index) {
+            Style::new().fg(Color::Black).bg(FOCUS).bold()
+        } else {
+            Style::new()
+        };
+        spans.push(Span::styled(format!("[{label}]"), style));
+        spans.push(Span::raw(" "));
     }
     Paragraph::new(Line::from(spans))
 }
@@ -705,6 +964,36 @@ fn draw_popup(frame: &mut Frame, area: Rect, popup: &Popup) {
             frame.render_widget(Paragraph::new(text), inner);
         }
         Popup::Picker(picker) => picker.draw(frame, area),
+        Popup::DriveMenu {
+            title,
+            items,
+            selected,
+        } => {
+            let longest = items
+                .iter()
+                .map(|i| i.label().chars().count())
+                .chain(std::iter::once(title.chars().count()))
+                .max()
+                .unwrap_or(0) as u16;
+            let rect = centered(area, (longest + 8).max(30), items.len() as u16 + 2);
+            frame.render_widget(Clear, rect);
+            let block = Block::bordered()
+                .title(format!(" {title} "))
+                .border_style(Style::new().fg(FOCUS));
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            let list: Vec<ListItem> = items
+                .iter()
+                .map(|i| ListItem::new(format!(" {}", i.label())))
+                .collect();
+            let mut state = ListState::default().with_selected(Some(*selected));
+            frame.render_stateful_widget(
+                List::new(list).highlight_style(Style::new().fg(Color::Black).bg(FOCUS)),
+                inner,
+                &mut state,
+            );
+        }
+        Popup::Format(dialog) => dialog.draw(frame, area),
     }
 }
 
@@ -801,17 +1090,19 @@ enum Page {
     Name,
     Network,
     Audio,
+    Storage,
     Web,
     Time,
     Password,
     Review,
 }
 
-const PAGES: [Page; 8] = [
+const PAGES: [Page; 9] = [
     Page::Welcome,
     Page::Name,
     Page::Network,
     Page::Audio,
+    Page::Storage,
     Page::Web,
     Page::Time,
     Page::Password,
@@ -825,6 +1116,7 @@ impl Page {
             Page::Name => "Name",
             Page::Network => "Network",
             Page::Audio => "Audio interface",
+            Page::Storage => "Storage",
             Page::Web => "Web UI",
             Page::Time => "Time zone",
             Page::Password => "Console password",
@@ -838,6 +1130,7 @@ impl Page {
             Page::Name => "Name",
             Page::Network => "Network",
             Page::Audio => "Audio",
+            Page::Storage => "Storage",
             Page::Web => "Web UI",
             Page::Time => "Time",
             Page::Password => "Password",
@@ -851,7 +1144,8 @@ impl Page {
                 "This machine runs LiveStage: a mixer you control from a browser on any \
                  phone, tablet or computer on the same network.\n\n\
                  A few questions set it up: its name, the network, the audio interface, \
-                 who can open the web UI, the time zone and a console password. Every \
+                 where recordings go, who can open the web UI, the time zone and a \
+                 console password. Every \
                  one has a sensible default. You can come back here any time from this \
                  screen."
             }
@@ -867,6 +1161,11 @@ impl Page {
             Page::Audio => {
                 "The interface LiveStage plays and records with. It can be changed later \
                  from the web UI's Setup page too."
+            }
+            Page::Storage => {
+                "Recordings go to the internal storage, or to a USB drive plugged into \
+                 this machine. What is done on the drives page happens straight away, \
+                 not at Apply."
             }
             Page::Web => {
                 "The web UI has no login: anyone who can reach it controls the mixer. \
@@ -897,6 +1196,7 @@ enum FieldId {
     Scan,
     WifiPassword,
     Output,
+    Storage,
     Input,
     Rate,
     Buffer,
@@ -931,7 +1231,7 @@ impl FieldId {
             | Self::WebPort
             | Self::Password
             | Self::Again => Kind::Text,
-            Self::Scan => Kind::Action,
+            Self::Scan | Self::Storage => Kind::Action,
             Self::Interface
             | Self::Mode
             | Self::Output
@@ -958,6 +1258,7 @@ impl FieldId {
             Self::Scan => "",
             Self::WifiPassword => "Wi-Fi key",
             Self::Output => "Output",
+            Self::Storage => "Recordings",
             Self::Input => "Input",
             Self::Rate => "Sample rate",
             Self::Buffer => "Buffer",
@@ -1006,6 +1307,8 @@ enum WizardOutcome {
     Leave,
     Pick(Picker),
     Apply(Box<Applying>),
+    /// The drives page, over the setup.
+    Storage,
 }
 
 struct Wizard {
@@ -1020,6 +1323,8 @@ struct Wizard {
     ports: Vec<NetPort>,
     cards: Vec<SoundCard>,
     zones: Vec<String>,
+    /// The drives, as last read.
+    storage: StorageState,
 
     name: TextInput,
     interface: Option<String>,
@@ -1043,7 +1348,7 @@ struct Wizard {
 }
 
 impl Wizard {
-    fn new(system: &System, first: bool) -> Self {
+    fn new(system: &System, first: bool, storage: StorageState) -> Self {
         let original = system.load_config().unwrap_or_default();
         let session_audio = system.session_audio();
         let session_exists = session_audio.is_some();
@@ -1066,6 +1371,7 @@ impl Wizard {
             password_state: system.password(),
             cards: system.sound_cards(),
             zones: system.zones(),
+            storage,
             name: TextInput::new(original.name.clone()),
             interface: original.interface.clone(),
             fixed: fixed.is_some(),
@@ -1136,6 +1442,7 @@ impl Wizard {
                 fields
             }
             Page::Audio => vec![Output, Input, Rate, Buffer, Back, Next],
+            Page::Storage => vec![Storage, Back, Next],
             Page::Web => vec![Access, WebPort, Back, Next],
             Page::Time => vec![Zone, Back, Next],
             Page::Password => vec![Password, Again, Back, Next],
@@ -1426,6 +1733,7 @@ impl Wizard {
                     return WizardOutcome::Pick(Picker::new(id, id.label(), entries, &current));
                 }
                 Kind::Button => return self.press(id),
+                Kind::Action if id == FieldId::Storage => return WizardOutcome::Storage,
                 Kind::Action => {
                     if id == FieldId::Scan {
                         self.scan = Scan::Pending;
@@ -1653,6 +1961,9 @@ impl Wizard {
                 .parse()
                 .unwrap_or(config::DEFAULT_PORT),
             audio: self.audio(),
+            // The drives page saves its choice itself, straight away.
+            record_storage: self.original.record_storage.clone(),
+            record_storage_label: self.original.record_storage_label.clone(),
         }
     }
 
@@ -1727,14 +2038,26 @@ impl Wizard {
         let inner = block.inner(outer).inner(Margin::new(1, 0));
         frame.render_widget(block, outer);
 
-        // The steps, the current one lit.
+        // The steps, the current one lit; closer together when they would
+        // not fit.
+        let shown = PAGES.len() - usize::from(!self.first);
+        let wide = PAGES[PAGES.len() - shown..]
+            .iter()
+            .map(|p| p.short().len())
+            .sum::<usize>()
+            + 3 * (shown - 1);
+        let separator = if wide <= inner.width as usize {
+            " > "
+        } else {
+            "  "
+        };
         let mut steps = Vec::new();
         for (index, page) in PAGES.iter().enumerate() {
             if index == 0 && !self.first {
                 continue;
             }
             if !steps.is_empty() {
-                steps.push(Span::styled(" > ", Style::new().fg(DIM)));
+                steps.push(Span::styled(separator, Style::new().fg(DIM)));
             }
             let style = if index == self.page {
                 Style::new().fg(ACCENT).bold()
@@ -1859,6 +2182,19 @@ impl Wizard {
                     spans.push(Span::raw("  "));
                     spans.push(Span::raw(label));
                 }
+            }
+            Kind::Action if id == FieldId::Storage => {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    "[ Drives... ]",
+                    if focused {
+                        Style::new().fg(Color::Black).bg(FOCUS).bold()
+                    } else {
+                        Style::new()
+                    },
+                ));
+                spans.push(Span::raw("  "));
+                spans.extend(recordings_summary(&self.storage));
             }
             Kind::Action => {
                 let label = match &self.scan {
@@ -1988,6 +2324,16 @@ impl Wizard {
                         dim,
                     ));
                 }
+            }
+            Page::Storage => {
+                lines.push(drive_header());
+                for row in drive_rows(&self.storage) {
+                    lines.push(row.line(&self.storage, false));
+                }
+                lines.push(Line::styled(
+                    "Enter on Drives... to record onto one, eject it or format it.",
+                    dim,
+                ));
             }
             Page::Web => {
                 let port = self.web_port.value.trim();
@@ -2122,6 +2468,17 @@ impl Wizard {
                     config.web_port
                 ),
                 config.web_open != original.web_open || config.web_port != original.web_port,
+            ),
+            row(
+                "Recordings",
+                match self.storage.volume(&self.storage.target.id) {
+                    Some(volume) if volume.id != api::INTERNAL => volume_name(volume),
+                    _ if self.storage.falling_back() => {
+                        format!("Internal for now ({})", fallback_reason(&self.storage))
+                    }
+                    _ => api::INTERNAL_LABEL.to_string(),
+                },
+                false,
             ),
             row(
                 "Time zone",
@@ -2324,7 +2681,16 @@ impl Applying {
             return;
         };
         let result = match step {
-            Step::Save => system.save_config(&self.config),
+            Step::Save => {
+                // Where recordings go is saved by the drives page as it is
+                // chosen (or by the web UI meanwhile): keep the latest.
+                let mut config = self.config.clone();
+                if let Some(saved) = system.load_config() {
+                    config.record_storage = saved.record_storage;
+                    config.record_storage_label = saved.record_storage_label;
+                }
+                system.save_config(&config)
+            }
             Step::Network => system.restart_network(&self.config),
             Step::Name => system.write_runtime(&self.config).and_then(|_| {
                 // avahi answers for the new name once it starts again.
@@ -2423,6 +2789,495 @@ impl Applying {
                 .block(Block::bordered().border_style(DIM)),
             area.inner(Margin::new(1, 0)),
         );
+    }
+}
+
+// ── Storage ─────────────────────────────────────────────────────────────────
+
+/// The drives: every volume (and every disk with none), where recordings
+/// go, and what can be done with each.
+struct StorageScreen {
+    /// The setup it was opened from, to go back to.
+    back: Option<Box<Wizard>>,
+    selected: usize,
+    /// Chosen; done at the next tick, after "Working..." is drawn.
+    pending: Option<DriveAction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DriveAction {
+    Use {
+        id: String,
+        name: String,
+    },
+    Eject {
+        id: String,
+        name: String,
+    },
+    /// Without a label: the format dialog first.
+    Format {
+        disk: String,
+        what: String,
+        label: Option<String>,
+    },
+}
+
+impl DriveAction {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Use { .. } => "Record here",
+            Self::Eject { .. } => "Eject",
+            Self::Format { .. } => "Format disk...",
+        }
+    }
+
+    fn working(&self) -> String {
+        match self {
+            Self::Use { name, .. } => format!("Switching recordings to {name}..."),
+            Self::Eject { name, .. } => format!("Ejecting {name}..."),
+            Self::Format { what, .. } => {
+                format!("Formatting {what}... this can take a minute.")
+            }
+        }
+    }
+
+    /// Does it: what to tell, when there is something.
+    fn run(self, system: &System, storage: &Storage) -> Result<Option<String>, String> {
+        let result = self.run_now(system, storage);
+        if system.is_live() {
+            return result;
+        }
+        result.map(|text| {
+            Some(format!(
+                "{}(Trying out with --root: no command was run.)",
+                text.map(|t| format!("{t} ")).unwrap_or_default()
+            ))
+        })
+    }
+
+    fn run_now(self, system: &System, storage: &Storage) -> Result<Option<String>, String> {
+        match self {
+            Self::Use { id, .. } => storage.use_target(system, &id).map(|_| None),
+            Self::Eject { id, name } => storage
+                .eject(system, &id)
+                .map(|_| Some(format!("{name} can be pulled out now."))),
+            Self::Format { disk, what, label } => {
+                let label = label.unwrap_or_else(|| api::DEFAULT_LABEL.to_string());
+                storage
+                    .format(system, &disk, &label)
+                    .map(|_| Some(format!("{what} is now one exFAT volume, {label}.")))
+            }
+        }
+    }
+}
+
+/// A line of the drives list: a volume, or a disk with none on it.
+#[derive(Clone, Copy)]
+enum DriveRow {
+    Volume(usize),
+    Blank(usize),
+}
+
+fn drive_rows(state: &StorageState) -> Vec<DriveRow> {
+    let mut rows: Vec<DriveRow> = (0..state.volumes.len()).map(DriveRow::Volume).collect();
+    for (index, disk) in state.disks.iter().enumerate() {
+        if !disk.system && !state.volumes.iter().any(|v| v.disk == disk.disk) {
+            rows.push(DriveRow::Blank(index));
+        }
+    }
+    rows
+}
+
+/// The column names over [`DriveRow::line`].
+fn drive_header() -> Line<'static> {
+    Line::styled(
+        format!(
+            "  {:<12} {:<19} {:<7}{:>8}{:>8}  {}",
+            "Volume", "Drive", "Format", "Size", "Free", "State"
+        ),
+        Style::new().fg(DIM),
+    )
+}
+
+fn fs_name(fs: Option<&str>) -> String {
+    match fs {
+        Some("exfat") => "exFAT".into(),
+        Some("vfat") => "FAT32".into(),
+        Some("ntfs") => "NTFS".into(),
+        Some(other) => other.into(),
+        None => "-".into(),
+    }
+}
+
+/// At most `width` characters.
+fn fit(text: &str, width: usize) -> String {
+    text.chars().take(width).collect()
+}
+
+impl DriveRow {
+    fn is_recording(self, state: &StorageState) -> bool {
+        match self {
+            Self::Volume(index) => {
+                let volume = &state.volumes[index];
+                (volume.id == state.target.id && state.target.available)
+                    || (volume.id == api::INTERNAL && state.falling_back())
+            }
+            Self::Blank(_) => false,
+        }
+    }
+
+    /// `sdb, SanDisk Ultra (64 GB)`: the whole disk, for Format.
+    fn disk_text(state: &StorageState, disk: &str) -> String {
+        let found = state.disks.iter().find(|d| d.disk == disk);
+        let mut text = disk.to_string();
+        if let Some(model) = found.and_then(|d| d.model.as_ref()) {
+            text.push_str(&format!(", {model}"));
+        }
+        if let Some(size) = found.map(|d| d.size_bytes) {
+            text.push_str(&format!(" ({})", system::megabytes(size)));
+        }
+        text
+    }
+
+    fn title(self, state: &StorageState) -> String {
+        match self {
+            Self::Volume(index) => {
+                let volume = &state.volumes[index];
+                match &volume.model {
+                    Some(model) if volume.id != api::INTERNAL => {
+                        format!("{} ({model})", volume_name(volume))
+                    }
+                    _ => volume_name(volume),
+                }
+            }
+            Self::Blank(index) => Self::disk_text(state, &state.disks[index].disk),
+        }
+    }
+
+    fn actions(self, state: &StorageState) -> Vec<DriveAction> {
+        let format = |disk: &str| DriveAction::Format {
+            disk: disk.to_string(),
+            what: Self::disk_text(state, disk),
+            label: None,
+        };
+        match self {
+            Self::Volume(index) => {
+                let volume = &state.volumes[index];
+                let mut actions = Vec::new();
+                let target = volume.id == state.target.id && state.target.available;
+                if volume.supported && !target {
+                    actions.push(DriveAction::Use {
+                        id: volume.id.clone(),
+                        name: volume_name(volume),
+                    });
+                }
+                if volume.id != api::INTERNAL {
+                    if volume.mounted.is_some() {
+                        actions.push(DriveAction::Eject {
+                            id: volume.id.clone(),
+                            name: volume_name(volume),
+                        });
+                    }
+                    if !state
+                        .disks
+                        .iter()
+                        .any(|d| d.disk == volume.disk && d.system)
+                    {
+                        actions.push(format(&volume.disk));
+                    }
+                }
+                actions
+            }
+            Self::Blank(index) => vec![format(&state.disks[index].disk)],
+        }
+    }
+
+    fn line(self, state: &StorageState, selected: bool) -> Line<'static> {
+        let (label, drive, fs, size, free, status, colour) = match self {
+            Self::Volume(index) => {
+                let volume = &state.volumes[index];
+                let (status, colour) = if self.is_recording(state) {
+                    (
+                        "Recording here",
+                        if state.falling_back() { FOCUS } else { GOOD },
+                    )
+                } else if volume.ejected {
+                    ("ejected", DIM)
+                } else if !volume.supported {
+                    ("unsupported", DIM)
+                } else if volume.id == state.target.id {
+                    // Chosen, plugged in, but not mounted to write.
+                    ("not mounted", BAD)
+                } else if volume.mounted.is_some() {
+                    ("ready", Color::Reset)
+                } else {
+                    ("not mounted", FOCUS)
+                };
+                (
+                    if volume.id != api::INTERNAL && volume.label.is_empty() {
+                        "(no name)".to_string()
+                    } else {
+                        volume_name(volume)
+                    },
+                    match &volume.model {
+                        Some(model) => format!("{} {model}", volume.device),
+                        None => volume.device.clone(),
+                    },
+                    fs_name(volume.fs.as_deref()),
+                    system::megabytes(volume.size_bytes),
+                    volume
+                        .free_bytes
+                        .map(system::megabytes)
+                        .unwrap_or_else(|| "-".into()),
+                    status,
+                    colour,
+                )
+            }
+            Self::Blank(index) => {
+                let disk = &state.disks[index];
+                (
+                    "(no volume)".to_string(),
+                    match &disk.model {
+                        Some(model) => format!("{} {model}", disk.disk),
+                        None => disk.disk.clone(),
+                    },
+                    "-".into(),
+                    system::megabytes(disk.size_bytes),
+                    "-".into(),
+                    "blank",
+                    DIM,
+                )
+            }
+        };
+        let text = format!(
+            "{}{:<12} {:<19} {:<7}{:>8}{:>8}  ",
+            if selected { "> " } else { "  " },
+            fit(&label, 12),
+            fit(&drive, 19),
+            fit(&fs, 7),
+            size,
+            free
+        );
+        if selected {
+            let style = Style::new().fg(Color::Black).bg(FOCUS);
+            Line::from(vec![
+                Span::styled(text, style),
+                Span::styled(status, style.bold()),
+            ])
+        } else {
+            Line::from(vec![
+                Span::raw(text),
+                Span::styled(status, Style::new().fg(colour)),
+            ])
+        }
+    }
+
+    /// What to know about the selected line.
+    fn details(self, state: &StorageState) -> String {
+        match self {
+            Self::Volume(index) => {
+                let volume = &state.volumes[index];
+                let place = match (&volume.mount_path, volume.mounted) {
+                    (Some(path), Some(Mount::Rw)) => format!("mounted at {path}"),
+                    (Some(path), _) => format!("mounted read-only at {path}"),
+                    _ => "not mounted".to_string(),
+                };
+                let device = format!("/dev/{}, {place}", volume.device);
+                if volume.ejected {
+                    format!("{device}. Ejected: unplug it, or Record here to use it again.")
+                } else if !volume.supported {
+                    format!(
+                        "{device}. LiveStage records to exFAT, FAT32, NTFS and ext4; \
+                         Format disk... makes it exFAT."
+                    )
+                } else if volume.fs.as_deref() == Some("vfat") {
+                    format!("{device}. FAT32 holds no file over 4 GB: long takes are cut.")
+                } else {
+                    format!("{device}.")
+                }
+            }
+            Self::Blank(_) => "No volume on it: Format disk... makes it one exFAT volume.".into(),
+        }
+    }
+}
+
+impl StorageScreen {
+    fn draw(&self, frame: &mut Frame, area: Rect, state: &StorageState) {
+        let block = Block::bordered()
+            .title(" Drives ")
+            .border_style(DIM)
+            .padding(ratatui::widgets::Padding::horizontal(1));
+        let outer = area.inner(Margin::new(1, 0));
+        let inner = block.inner(outer);
+        frame.render_widget(block, outer);
+        let dim = Style::new().fg(DIM);
+        let mut lines = Vec::new();
+        let target = &state.target;
+        if state.falling_back() {
+            lines.push(Line::styled(
+                format!(
+                    "{}: recordings go to the internal storage for now.",
+                    fallback_reason(state)
+                ),
+                Style::new().fg(FOCUS).bold(),
+            ));
+        } else {
+            let name = match state.volume(&target.id) {
+                Some(volume) => volume_name(volume),
+                None => target.label.clone(),
+            };
+            lines.push(Line::from(vec![
+                Span::raw("Recordings go to "),
+                Span::styled(name, Style::new().bold()),
+            ]));
+        }
+        lines.push(Line::styled(format!("  {}", target.recordings_dir), dim));
+        lines.push(Line::raw(""));
+        lines.push(drive_header());
+        let rows = drive_rows(state);
+        let selected = self.selected.min(rows.len().saturating_sub(1));
+        for (index, row) in rows.iter().enumerate() {
+            lines.push(row.line(state, index == selected));
+        }
+        lines.push(Line::raw(""));
+        if let Some(action) = &self.pending {
+            lines.push(Line::styled(
+                action.working(),
+                Style::new().fg(FOCUS).bold(),
+            ));
+        } else if let Some(row) = rows.get(selected) {
+            lines.push(Line::styled(row.details(state), dim));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+}
+
+enum FormatOutcome {
+    Stay,
+    Cancel,
+    Format(String),
+}
+
+/// Erasing a disk asks for its new name and for FORMAT typed out.
+struct FormatDialog {
+    disk: String,
+    what: String,
+    label: TextInput,
+    confirm: TextInput,
+    /// 0 the name, 1 the confirmation.
+    focus: usize,
+    error: Option<String>,
+}
+
+impl FormatDialog {
+    fn new(disk: &str, what: &str) -> Self {
+        Self {
+            disk: disk.to_string(),
+            what: what.to_string(),
+            label: TextInput::new(api::DEFAULT_LABEL),
+            confirm: TextInput::default(),
+            focus: 1,
+            error: None,
+        }
+    }
+
+    fn key(&mut self, key: KeyEvent) -> FormatOutcome {
+        match key.code {
+            KeyCode::Esc => return FormatOutcome::Cancel,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => self.focus ^= 1,
+            KeyCode::Enter if self.focus == 0 => self.focus = 1,
+            KeyCode::Enter => {
+                let label = self.label.value.trim().to_string();
+                if !self.confirm.value.trim().eq_ignore_ascii_case("FORMAT") {
+                    self.error = Some("Type FORMAT to erase the disk.".into());
+                } else if let Err(message) = api::valid_label(&label) {
+                    self.error = Some(message.into());
+                    self.focus = 0;
+                } else {
+                    return FormatOutcome::Format(label);
+                }
+            }
+            _ => {
+                let field = if self.focus == 0 {
+                    &mut self.label
+                } else {
+                    &mut self.confirm
+                };
+                if field.key(key) {
+                    self.error = None;
+                }
+            }
+        }
+        FormatOutcome::Stay
+    }
+
+    fn draw(&self, frame: &mut Frame, area: Rect) {
+        let rect = centered(area, 66, 12);
+        frame.render_widget(Clear, rect);
+        let block = Block::bordered()
+            .title(" Format disk ")
+            .border_style(Style::new().fg(BAD));
+        let inner = block.inner(rect).inner(Margin::new(1, 0));
+        frame.render_widget(block, rect);
+        let text = format!(
+            "Everything on {} is erased: every partition and every file on it. \
+             It becomes one exFAT volume, which Windows and Mac computers read.",
+            self.what
+        );
+        let text_height = wrapped_height(&text, inner.width);
+        let [text_area, _, name_area, confirm_area, _, error_area] = Layout::vertical([
+            Constraint::Length(text_height),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .areas(inner);
+        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), text_area);
+        for (index, (label, field, hint, area)) in [
+            ("Name", &self.label, "up to 11 characters", name_area),
+            ("Type FORMAT", &self.confirm, "to confirm", confirm_area),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let focused = index == self.focus;
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{label:<width$}", width = LABEL_WIDTH as usize),
+                    if focused {
+                        Style::new().fg(FOCUS).bold()
+                    } else {
+                        Style::new().fg(ACCENT)
+                    },
+                ),
+                Span::styled(
+                    format!("{:<16}", field.shown()),
+                    if focused {
+                        Style::new().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::new().add_modifier(Modifier::UNDERLINED)
+                    },
+                ),
+                Span::styled(format!("  {hint}"), Style::new().fg(DIM)),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            if focused {
+                let x = area.x + LABEL_WIDTH + field.cursor as u16;
+                if x < area.right() {
+                    frame.set_cursor_position((x, area.y));
+                }
+            }
+        }
+        if let Some(error) = &self.error {
+            frame.render_widget(
+                Paragraph::new(error.as_str())
+                    .fg(BAD)
+                    .wrap(Wrap { trim: true }),
+                error_area,
+            );
+        }
     }
 }
 
@@ -2548,6 +3403,12 @@ mod tests {
         }
         app.key(press(KeyCode::Enter));
 
+        // Storage: as it is.
+        pages.push(screen(&app));
+        assert!(pages.last().unwrap().contains("Drives..."));
+        app.key(press(KeyCode::BackTab));
+        app.key(press(KeyCode::Enter));
+
         // Web UI: as it is.
         pages.push(screen(&app));
         app.key(press(KeyCode::BackTab));
@@ -2664,7 +3525,7 @@ mod tests {
             app.key(press(KeyCode::Down));
         }
         app.key(press(KeyCode::Enter)); // to Audio
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.key(press(KeyCode::Up)); // Next, on each page
             app.key(press(KeyCode::Enter));
         }
@@ -2713,8 +3574,8 @@ mod tests {
         // Set up before: the setup opens on the name, not the welcome.
         system.save_config(&SetupConfig::default()).unwrap();
         let mut app = App::new(system, false, true);
-        // Name, Network, Audio, Web, Time: Next on each.
-        for _ in 0..5 {
+        // Name, Network, Audio, Storage, Web, Time: Next on each.
+        for _ in 0..6 {
             app.key(press(KeyCode::BackTab));
             app.key(press(KeyCode::Enter));
         }
@@ -2727,6 +3588,147 @@ mod tests {
         let text = screen(&app);
         assert!(text.contains("at least 6"), "{text}");
         assert!(text.contains("***"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The drives page from the home screen: the list, Record here, the
+    /// format dialog (printed with `--nocapture`).
+    #[test]
+    fn the_drives_page_records_ejects_and_formats() {
+        let (system, root) = crate::storage::tests::machine("console");
+        system.save_config(&SetupConfig::default()).unwrap();
+        let mut app = App::new(system, false, false);
+        let home = screen(&app);
+        println!("{home}");
+        assert!(home.contains("[Storage]"), "{home}");
+        assert!(home.contains("Recordings    Internal:"), "{home}");
+
+        app.key(press(KeyCode::Right)); // Storage
+        app.key(press(KeyCode::Enter));
+        let page = screen(&app);
+        println!("{page}");
+        assert!(page.contains("Recordings go to Internal"), "{page}");
+        assert!(page.contains("sdb1 SanDisk Ultra"), "{page}");
+        assert!(page.contains("Recording here"), "{page}");
+        assert!(page.contains("(no volume)"), "{page}");
+        assert!(page.contains("unsupported"), "{page}");
+
+        // The stick: Record here.
+        app.key(press(KeyCode::Down));
+        app.key(press(KeyCode::Enter));
+        let menu = screen(&app);
+        println!("{menu}");
+        assert!(
+            menu.contains("Record here") && menu.contains("Eject"),
+            "{menu}"
+        );
+        app.key(press(KeyCode::Enter));
+        assert!(app.busy());
+        println!("{}", screen(&app));
+        app.tick();
+        assert_eq!(
+            app.system.load_config().unwrap().record_storage,
+            "1A2B-3C4D"
+        );
+        // Nothing is mounted under --root: honest about it.
+        let fallback = screen(&app);
+        println!("{fallback}");
+        assert!(fallback.contains("cannot be written to"), "{fallback}");
+        // As the service leaves it: read-write.
+        let mounts = app.system.path("/proc/mounts");
+        let text = std::fs::read_to_string(&mounts)
+            .unwrap()
+            .replace("/media/1A2B-3C4D exfat ro", "/media/1A2B-3C4D exfat rw");
+        std::fs::write(&mounts, text).unwrap();
+        app.refresh();
+        let recording = screen(&app);
+        println!("{recording}");
+        assert!(
+            recording.contains("Recordings go to SHOW \"A\""),
+            "{recording}"
+        );
+        assert!(
+            recording.contains("/media/1A2B-3C4D/LiveStage Recordings"),
+            "{recording}"
+        );
+
+        // The blank disk: Format, typed out.
+        for _ in 0..10 {
+            app.key(press(KeyCode::Down));
+        }
+        app.key(press(KeyCode::Enter));
+        app.key(press(KeyCode::Enter)); // Format disk...
+        typing(&mut app, "yes");
+        app.key(press(KeyCode::Enter));
+        let dialog = screen(&app);
+        println!("{dialog}");
+        assert!(
+            dialog.contains("Type FORMAT to erase the disk."),
+            "{dialog}"
+        );
+        assert!(dialog.contains("sdf, Blank (16 GB)"), "{dialog}");
+        for _ in 0..3 {
+            app.key(press(KeyCode::Backspace));
+        }
+        typing(&mut app, "FORMAT");
+        app.key(press(KeyCode::Enter));
+        assert!(app.busy());
+        let working = screen(&app);
+        println!("{working}");
+        assert!(working.contains("Formatting sdf"), "{working}");
+        app.tick();
+        let done = screen(&app);
+        println!("{done}");
+        assert!(done.contains("one exFAT volume, LIVESTAGE"), "{done}");
+        app.key(press(KeyCode::Enter)); // the message
+        app.key(press(KeyCode::Esc)); // home
+        let home = screen(&app);
+        assert!(home.contains("Recordings    SHOW"), "{home}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The setup's Storage page opens the drives over the setup, and Esc
+    /// comes back to the same page.
+    #[test]
+    fn the_setup_opens_the_drives_and_comes_back() {
+        let (system, root) = crate::storage::tests::machine("console-setup");
+        system.save_config(&SetupConfig::default()).unwrap();
+        let mut app = App::new(system, false, true);
+        // Name, Network, Audio: Next on each.
+        for _ in 0..3 {
+            app.key(press(KeyCode::BackTab));
+            app.key(press(KeyCode::Enter));
+        }
+        let page = screen(&app);
+        assert!(page.contains("setup  -  Storage"), "{page}");
+        assert!(page.contains("SHOW \"A\""), "{page}");
+        app.key(press(KeyCode::Enter)); // Drives...
+        let drives = screen(&app);
+        assert!(
+            drives.contains("setup  -  Storage") && drives.contains("Drives"),
+            "{drives}"
+        );
+        assert!(drives.contains("Esc back"), "{drives}");
+        app.key(press(KeyCode::Esc));
+        let back = screen(&app);
+        assert!(back.contains("[ Drives... ]"), "{back}");
+        assert!(back.contains("[ Next ]"), "{back}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The system disk and the internal volume offer nothing destructive.
+    #[test]
+    fn the_system_disk_cannot_be_formatted_from_the_console() {
+        let (system, root) = crate::storage::tests::machine("console-system");
+        let state = Storage::new().state(&system);
+        let rows = drive_rows(&state);
+        let internal = rows[0].actions(&state);
+        assert!(internal.is_empty(), "{internal:?}");
+        assert!(rows.iter().all(|row| {
+            row.actions(&state)
+                .iter()
+                .all(|action| !matches!(action, DriveAction::Format { disk, .. } if disk == "sda"))
+        }));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

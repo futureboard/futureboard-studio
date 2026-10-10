@@ -14,22 +14,28 @@
 #                     firmware boots it from the removable-media path, with no
 #                     boot loader and nothing to configure.
 #   2  lsroot  ext4   the system, mounted read-only
-#   3  lsdata  ext4   /data: the session and recordings. Grown to the end of
-#                     the disk on the first boot.
+#   3  lssys   ext4   /var/lib/livestage: the setup's answers and settings,
+#                     root's alone (the service account cannot write them)
+#   4  lsdata  exFAT  /data: the session and recordings, readable on any
+#                     Windows or Mac computer the disk is plugged into. Made
+#                     anew to fill the disk on the first boot (exFAT cannot
+#                     grow).
 #
 # Nothing is mounted and nothing needs privileges: the filesystems are written
-# from directories (mke2fs -d, mtools) and placed into the disk image by offset.
+# from directories (mke2fs -d, mtools) or made empty (mkfs.exfat), and placed
+# into the disk image by offset.
 
 set -eu
 
 ALPINE_VERSION=$(cut -d. -f1,2 /etc/alpine-release)
 ESP_MB=${ESP_MB:-128}
 DATA_MB=${DATA_MB:-512}
+SYS_MB=32
 IMAGE_NAME=${IMAGE_NAME:-livestage-alpine${ALPINE_VERSION}-x86_64}
 HERE=/src/packaging/livestage
 WORK=/work
 ROOT=$WORK/rootfs
-DATA=$WORK/datafs
+SYS=$WORK/sysfs
 
 # Disk drivers the initramfs needs to find the root partition: SATA, NVMe, USB
 # sticks, SD/eMMC, and virtio for virtual machines.
@@ -59,7 +65,7 @@ PACKAGES="
 	wpa_supplicant iw wireless-regdb
 	$WIFI_FIRMWARE
 	avahi avahi-openrc dbus dbus-openrc
-	e2fsprogs e2fsprogs-extra sfdisk partx mount umount blkid
+	e2fsprogs e2fsprogs-extra exfatprogs sfdisk partx mount umount blkid
 "
 
 log() { printf '\n==> %s\n' "$*"; }
@@ -81,7 +87,7 @@ strip -o "$WORK/livestage-setup" /target/release/livestage-setup
 # ── 2. The root filesystem ──────────────────────────────────────────────────
 
 log "Installing Alpine $ALPINE_VERSION into the root filesystem"
-rm -rf "$ROOT" "$DATA"
+rm -rf "$ROOT" "$SYS"
 mkdir -p "$ROOT/etc/apk" "$ROOT/etc/mkinitfs"
 cp /etc/apk/repositories "$ROOT/etc/apk/repositories"
 # The initramfs is made below from this tree; stop the kernel package's
@@ -119,7 +125,13 @@ ln -sf /run/hosts "$ROOT/etc/hosts"
 ln -sf /run/localtime "$ROOT/etc/localtime"
 mkdir -p "$ROOT/etc/network"
 ln -sf /run/network/interfaces "$ROOT/etc/network/interfaces"
-mkdir -p "$ROOT/data" "$ROOT/boot/efi"
+mkdir -p "$ROOT/data" "$ROOT/boot/efi" "$ROOT/var/lib/livestage" "$ROOT/media"
+# The data partition is exFAT; the kernel's driver is a module. USB sticks
+# come FAT32 too.
+printf 'exfat\nvfat\n' >>"$ROOT/etc/modules"
+# The MIDI remote (midir) talks to USB MIDI devices through the ALSA
+# sequencer; the service account is in audio, which owns /dev/snd/seq.
+printf 'snd-seq\nsnd-seq-midi\n' >>"$ROOT/etc/modules"
 # avahi answers for NAME.local (the host name, livestage until the setup
 # changes it) and announces the web UI.
 sed -i 's/^#\{0,1\}publish-workstation=.*/publish-workstation=no/' \
@@ -134,7 +146,7 @@ chroot "$ROOT" /usr/sbin/addgroup livestage audio
 rc() { chroot "$ROOT" /sbin/rc-update add "$1" "$2" >/dev/null; }
 for s in devfs dmesg mdev hwdrivers; do rc "$s" sysinit; done
 for s in modules sysctl hostname bootmisc syslog hwclock livestage-data livestage-config; do rc "$s" boot; done
-for s in networking acpid ntpd dbus avahi-daemon livestage local; do rc "$s" default; done
+for s in networking acpid ntpd dbus avahi-daemon livestage-storage livestage local; do rc "$s" default; done
 for s in killprocs mount-ro savecache; do rc "$s" shutdown; done
 
 KVER=$(basename "$(find "$ROOT/lib/modules" -mindepth 1 -maxdepth 1 -type d | head -1)")
@@ -161,32 +173,37 @@ root_used=$(du -s -B1 "$ROOT" | cut -f1)
 # Room for ext4's own structures and a little growth.
 ROOT_MB=$(($(mib "$root_used") * 5 / 4 + 64))
 
-# The data partition starts with the service's folder in it, owned right.
+# exFAT has no owners: the data partition is mounted as the service's, with
+# its uid and gid in the mount options.
 uid=$(chroot "$ROOT" id -u livestage)
 gid=$(chroot "$ROOT" id -g livestage)
-mkdir -p "$DATA/livestage/recordings"
-cat >"$DATA/livestage/livestage.conf" <<'EOF'
+sed -i "s/@LIVESTAGE_UID@/$uid/; s/@LIVESTAGE_GID@/$gid/" "$ROOT/etc/fstab"
+grep -q "uid=$uid,gid=$gid" "$ROOT/etc/fstab"
+
+# The settings partition: root's, read at boot. The setup on tty1 writes
+# setup.conf; livestage.conf is for changes by hand.
+mkdir -p "$SYS"
+cat >"$SYS/livestage.conf" <<'EOF'
 # LiveStage settings for this machine; see /etc/conf.d/livestage.
 #LIVESTAGE_HTTP="0.0.0.0:8730"
 #LIVESTAGE_ARGS="--output hw:CARD=USB --input hw:CARD=USB --rate 48000 --buffer 128"
 EOF
-chown -R "$uid:$gid" "$DATA/livestage"
-# Both are read as root at boot: root's alone. The setup on tty1 writes the
-# first one; until it has, the defaults.
-chown 0:0 "$DATA/livestage/livestage.conf"
-mkdir -p "$DATA/system"
+chmod 0644 "$SYS/livestage.conf"
 
 rm -f "$WORK"/*.img
 mkfs.vfat -C -F 32 -n LSBOOT "$WORK/esp.img" $((ESP_MB * 1024)) >/dev/null
 mcopy -s -i "$WORK/esp.img" "$WORK/esp/EFI" ::/
 mke2fs -q -t ext4 -L lsroot -d "$ROOT" "$WORK/root.img" "${ROOT_MB}M"
-mke2fs -q -t ext4 -L lsdata -m 0 -d "$DATA" "$WORK/data.img" "${DATA_MB}M"
+mke2fs -q -t ext4 -L lssys -m 0 -E root_owner=0:0 -d "$SYS" "$WORK/sys.img" "${SYS_MB}M"
+# Empty: livestage's start makes its folders.
+truncate -s "${DATA_MB}M" "$WORK/data.img"
+mkfs.exfat -L lsdata "$WORK/data.img" >/dev/null
 
 # ── 5. The disk ─────────────────────────────────────────────────────────────
 
 log "Assembling the disk image"
 DISK=$WORK/$IMAGE_NAME.img
-TOTAL_MB=$((1 + ESP_MB + ROOT_MB + DATA_MB + 1))
+TOTAL_MB=$((1 + ESP_MB + ROOT_MB + SYS_MB + DATA_MB + 1))
 truncate -s "${TOTAL_MB}M" "$DISK"
 sfdisk -q "$DISK" <<EOF
 label: gpt
@@ -194,12 +211,14 @@ unit: sectors
 first-lba: 2048
 start=2048, size=$((ESP_MB * 2048)), type=uefi, name=LSBOOT
 size=$((ROOT_MB * 2048)), type=linux, name=lsroot
-size=$((DATA_MB * 2048)), type=linux, name=lsdata
+size=$((SYS_MB * 2048)), type=linux, name=lssys
+size=$((DATA_MB * 2048)), type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7, name=lsdata
 EOF
 place() { dd if="$1" of="$DISK" bs=1M seek="$2" conv=notrunc,sparse status=none; }
 place "$WORK/esp.img" 1
 place "$WORK/root.img" $((1 + ESP_MB))
-place "$WORK/data.img" $((1 + ESP_MB + ROOT_MB))
+place "$WORK/sys.img" $((1 + ESP_MB + ROOT_MB))
+place "$WORK/data.img" $((1 + ESP_MB + ROOT_MB + SYS_MB))
 
 mkdir -p /out
 cp --sparse=always "$DISK" "/out/$IMAGE_NAME.img"
@@ -207,6 +226,6 @@ cp "$WORK/esp/EFI/BOOT/BOOTX64.EFI" "/out/$IMAGE_NAME.efi"
 (cd /out && sha256sum "$IMAGE_NAME.img" "$IMAGE_NAME.efi" >"$IMAGE_NAME.sha256")
 
 log "Done"
-printf '  %s  %s MiB (boot %s, system %s, data %s, grows on first boot)\n' \
-	"/out/$IMAGE_NAME.img" "$TOTAL_MB" "$ESP_MB" "$ROOT_MB" "$DATA_MB"
+printf '  %s  %s MiB (boot %s, system %s, settings %s, data %s exFAT, fills the disk on first boot)\n' \
+	"/out/$IMAGE_NAME.img" "$TOTAL_MB" "$ESP_MB" "$ROOT_MB" "$SYS_MB" "$DATA_MB"
 printf '  kernel %s, livestage-server %s KiB\n' "$KVER" "$(($(stat -c %s "$WORK/livestage-server") / 1024))"

@@ -1,10 +1,13 @@
 # LiveStage service settings. The root filesystem is read-only: the console's
-# setup (tty1) saves the web UI's address in /data/system/setup.conf, and
-# hand-made changes go in /data/livestage/livestage.conf (same variables),
-# which wins over both.
+# setup (tty1) saves the web UI's address in /var/lib/livestage/setup.conf,
+# and hand-made changes go in /var/lib/livestage/livestage.conf (same
+# variables), which wins over both.
 
-# The session (mix) and where takes are recorded: both on the data partition.
+# The session (mix), on the data partition.
 #LIVESTAGE_SESSION="/data/livestage/show.json"
+# Where takes are recorded. Unset, the storage chosen in the setup or the web
+# UI (Setup → Storage): a USB drive's "LiveStage Recordings" folder, or
+# /data/livestage/recordings. Set, this folder always, whatever is chosen.
 #LIVESTAGE_RECORDINGS="/data/livestage/recordings"
 
 # The web UI's address. 0.0.0.0 is every network interface: anyone who can

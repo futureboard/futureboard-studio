@@ -1,0 +1,592 @@
+/* Scene memory (Scenes.tsx): the top bar's scene indicator and the Scenes
+   page with its recall-safe overview. Studio's tokens only (styles.css's
+   roles); radius by what a thing is. */
+
+/* ── The top bar ───────────────────────────────────────────────────────── */
+
+.toolbar-scene {
+  display: flex;
+  min-width: 0;
+}
+
+/* chrome_cluster: one module, inset. */
+.scene-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  height: 36px;
+  padding: 2px;
+  background: var(--state-recessed);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-surface);
+}
+
+.scene-bar .icon-button.large {
+  width: 28px;
+  height: 30px;
+}
+
+.scene-current {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  width: 220px;
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  background: var(--surface-input);
+  color: var(--text-primary);
+  text-align: left;
+}
+
+.scene-current:hover {
+  border-color: var(--border-strong);
+}
+
+.scene-num {
+  flex: none;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.scene-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.scene-name.empty {
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+/* The mix moved since the scene was stored or recalled: a dot and the word,
+   in the warning hue. */
+.scene-modified {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--warning);
+}
+
+.scene-modified-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warning);
+}
+
+/* A cued scene: not where the console is; Recall goes there. The accent
+   (it is the one primary action now), on the frame and the tag. */
+.scene-bar.cued .scene-current {
+  border-style: dashed;
+  border-color: var(--accent);
+}
+
+.scene-cue-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: var(--r-micro);
+  background: var(--accent-muted);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.scene-recall {
+  margin-left: 2px;
+  height: 30px;
+}
+
+.scene-bar.unavailable {
+  gap: 6px;
+  padding: 0 10px;
+  color: var(--text-faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.scene-bar-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── The Scenes page ───────────────────────────────────────────────────── */
+
+.scenes-page {
+  max-width: 980px;
+}
+
+.scenes-head-text {
+  min-width: 0;
+}
+
+.scenes-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.scenes-go {
+  display: flex;
+  gap: 6px;
+}
+
+.scene-list {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+}
+
+.scene-list.dragging {
+  cursor: grabbing;
+  user-select: none;
+}
+
+/* Full-width rows: square; the current one is selected — the selected
+   layer plus a leading accent marker drawn over it. */
+.scene-row {
+  position: relative;
+  background: var(--surface-panel);
+}
+
+.scene-row + .scene-row {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.scene-row:first-child {
+  border-radius: var(--r) var(--r) 0 0;
+}
+
+.scene-row:last-child {
+  border-radius: 0 0 var(--r) var(--r);
+}
+
+.scene-row.current {
+  background-image: linear-gradient(var(--state-selected), var(--state-selected));
+}
+
+.scene-row.current::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.scene-row.dragged {
+  z-index: 5;
+  box-shadow: var(--shadow-drag);
+}
+
+.scene-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 52px;
+  padding: 6px 8px 6px 4px;
+}
+
+.scene-grip {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 36px;
+  color: var(--text-faint);
+  cursor: grab;
+  touch-action: none;
+}
+
+.scene-grip:hover {
+  color: var(--text-primary);
+}
+
+.scene-row-num {
+  flex: none;
+  width: 26px;
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--text-secondary);
+}
+
+.scene-row.current .scene-row-num {
+  color: var(--accent);
+}
+
+.scene-row-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.scene-row-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  font-weight: 600;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.scene-tag {
+  flex: none;
+  padding: 0 6px;
+  border-radius: var(--r-micro);
+  background: var(--accent-muted);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.scene-row-note {
+  max-width: 100%;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.scene-scope-chip {
+  flex: none;
+  max-width: 220px;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-sm);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 20px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A focused scene leaves parts alone: worth seeing before a recall. */
+.scene-scope-chip.partial {
+  border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+  color: var(--warning);
+}
+
+.scene-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 12px 14px 42px;
+}
+
+.scene-detail-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.scene-drop-line {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  height: 2px;
+  margin-top: -1px;
+  background: var(--accent);
+  pointer-events: none;
+  z-index: 6;
+}
+
+/* The scope ("focus"). */
+.scope {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.scope-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scope-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.scope-summary {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.scope-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 6px;
+}
+
+.scope-part {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 6px 9px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-muted);
+  text-align: left;
+}
+
+.scope-part:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+/* Recalled: a filled light (the scene reaches this part) and full text.
+   Kept out of the recall: a hollow light, dim text and "Kept" in the warning
+   hue, as on the list's focus chip — the exception is what must be seen. */
+.scope-part.on {
+  color: var(--text-primary);
+}
+
+.scope-light {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--text-faint);
+}
+
+.scope-part.on .scope-light {
+  background: var(--accent);
+  box-shadow: none;
+}
+
+.scope-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.scope-label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.scope-detail {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.scope-state {
+  flex: none;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--warning);
+}
+
+.scope-part.on .scope-state {
+  color: var(--text-faint);
+}
+
+.scope-part:not(.on) {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--warning) 45%, transparent);
+}
+
+/* Recall safe. */
+.safe-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+
+.safe-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 6px 8px 6px 12px;
+}
+
+.safe-row + .safe-row {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.safe-name {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.safe-kind {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.card-actions .muted {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+/* ── Narrow screens ────────────────────────────────────────────────────── */
+
+/* A desktop narrower than everything the top bar holds: the page buttons
+   go to icons (titled) before anything is clipped. */
+@media (max-width: 1500px) {
+  .views button span {
+    display: none;
+  }
+
+  .views button {
+    padding: 0 10px;
+  }
+
+  .scene-current {
+    width: 180px;
+  }
+}
+
+@media (max-width: 900px) {
+  .toolbar-scene {
+    flex: 1 1 260px;
+    order: 4;
+  }
+
+  .scene-bar {
+    flex: 1;
+  }
+
+  .scene-current {
+    flex: 1;
+    width: auto;
+  }
+
+  .toolbar-edit {
+    order: 5;
+  }
+
+  /* Record stays on the first row, at its end. */
+  .toolbar-actions {
+    margin-left: auto;
+  }
+}
+
+@media (max-width: 640px) {
+  /* A phone: brand, pages and REC on the first row; the scene bar with
+     undo, redo and save on the second; the status pills under them. */
+  /* (Qualified: styles.css loads after this file.) */
+  .app .toolbar {
+    column-gap: 8px;
+    padding: 8px;
+  }
+
+  .toolbar .brand-text span {
+    max-width: 70px;
+  }
+
+  .toolbar .rec {
+    min-width: 0;
+    padding: 0 10px;
+  }
+
+  .toolbar-scene {
+    flex: 1 1 200px;
+  }
+
+  .toolbar-edit {
+    gap: 4px;
+  }
+
+  .scene-current {
+    padding: 0 7px;
+  }
+
+  .scene-modified-text {
+    display: none;
+  }
+
+  /* The Selected Channel's head: the strip's name keeps its row; moving
+     and copy/paste go to the next. */
+  .cv-title {
+    flex: 1 1 150px;
+  }
+
+  .cv-move {
+    order: 5;
+  }
+
+  .cv-tools {
+    order: 6;
+  }
+
+  .scene-scope-chip-text {
+    display: none;
+  }
+
+  .scene-line {
+    gap: 6px;
+    padding-right: 4px;
+  }
+
+  .scene-detail {
+    padding-left: 12px;
+  }
+
+  .scenes-go {
+    flex: 1 1 100%;
+  }
+
+  .scenes-go .button {
+    flex: 1;
+  }
+
+  .scope-grid {
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  }
+
+  .scope-detail {
+    display: none;
+  }
+}

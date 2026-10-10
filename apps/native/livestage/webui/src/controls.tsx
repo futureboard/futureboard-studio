@@ -3,13 +3,14 @@
 
 import { useEffect, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react'
+import { alpha } from './editors/paint.ts'
 import { dbToPosition, formatDb, meterFraction, positionToDb } from './faderLaw.ts'
 import { MAX_FADER_DB, MIN_FADER_DB } from './protocol.ts'
 import { meters } from './store.ts'
 
 /** A value the user is moving: shown as they move it, and for a moment
  *  after, until the server's echo has caught up. */
-function useHeld(server: number) {
+export function useHeld(server: number) {
   const [held, setHeld] = useState<number | null>(null)
   const release = useRef<number | undefined>(undefined)
   useEffect(() => () => window.clearTimeout(release.current), [])
@@ -231,7 +232,7 @@ export function Knob(props: {
 
 // ── Meters ──────────────────────────────────────────────────────────────
 
-type Draw = (now: number) => void
+export type Draw = (now: number) => void
 const drawers = new Set<Draw>()
 let lastFrame = 0
 let running = false
@@ -251,6 +252,8 @@ function frame(now: number) {
       if (now - meter.outputHoldAt[side] > HOLD_MS) meter.outputHold[side] *= decay * decay
       if (now - meter.inputHoldAt[side] > HOLD_MS) meter.inputHold[side] *= decay * decay
     }
+    meter.gateDb *= decay
+    meter.compDb *= decay
   }
   if (drawers.size > 0) requestAnimationFrame(frame)
   else running = false
@@ -275,7 +278,11 @@ export function Meter(props: { strip: string; tap?: 'output' | 'input' }) {
     const styles = getComputedStyle(document.documentElement)
     const color = (name: string) => styles.getPropertyValue(name).trim()
     const lit = [color('--meter-low'), color('--meter-mid'), color('--meter-high')]
-    const dim = [color('--meter-low-dim'), color('--meter-mid-dim'), color('--meter-high-dim')]
+    // An unlit segment is its zone's colour, faint, so the scale stays legible.
+    const dim = [alpha(lit[0], 0.12), alpha(lit[1], 0.12), alpha(lit[2], 0.14)]
+    // The clip light: a hotter red than the meter's top zone (meter.clip).
+    const clip = color('--meter-clip')
+    const clipDim = alpha(clip, 0.14)
     const capHeight = 4
     const zone = (f: number) => (f <= GREEN_TOP ? 0 : f <= YELLOW_TOP ? 1 : 2)
     // Sized to the element on the frame its height changes, never ahead.
@@ -295,7 +302,7 @@ export function Meter(props: { strip: string; tap?: 'output' | 'input' }) {
       const meter = meters.get(props.strip)
       context.clearRect(0, 0, width, height)
       const clipAt = meter ? (tap === 'output' ? meter.outputClip : meter.inputClip) : -Infinity
-      context.fillStyle = now - clipAt < CLIP_HOLD_MS ? lit[2] : dim[2]
+      context.fillStyle = now - clipAt < CLIP_HOLD_MS ? clip : clipDim
       context.fillRect(0, 0, width, capHeight)
       for (const side of [0, 1] as const) {
         const x = side * 7
@@ -342,17 +349,24 @@ export function Meter(props: { strip: string; tap?: 'output' | 'input' }) {
   )
 }
 
-/** A short horizontal level bar, both sides' louder one: enough to see at a
- *  glance whether a strip has signal, in a table row. */
-export function LevelBar(props: { strip: string; tap?: 'output' | 'input'; title?: string }) {
+/** A short horizontal level bar, both sides' louder one (or `side` alone):
+ *  enough to see at a glance whether a strip has signal, in a table row. */
+export function LevelBar(props: {
+  strip: string
+  tap?: 'output' | 'input'
+  title?: string
+  side?: 0 | 1
+  width?: number
+}) {
   const canvas = useRef<HTMLCanvasElement>(null)
   const tap = props.tap ?? 'output'
+  const width = props.width ?? 44
+  const side = props.side
   useEffect(() => {
     const element = canvas.current
     if (!element) return
     const context = element.getContext('2d')
     if (!context) return
-    const width = 44
     const height = 6
     const ratio = window.devicePixelRatio || 1
     element.width = width * ratio
@@ -364,7 +378,9 @@ export function LevelBar(props: { strip: string; tap?: 'output' | 'input'; title
     const track = color('--surface-input')
     const draw: Draw = (now) => {
       const meter = meters.get(props.strip)
-      const level = meter ? meterFraction(Math.max(meter[tap][0], meter[tap][1])) : 0
+      const level = meter
+        ? meterFraction(side === undefined ? Math.max(meter[tap][0], meter[tap][1]) : meter[tap][side])
+        : 0
       const clipAt = meter ? (tap === 'output' ? meter.outputClip : meter.inputClip) : -Infinity
       context.fillStyle = track
       context.fillRect(0, 0, width, height)
@@ -381,8 +397,155 @@ export function LevelBar(props: { strip: string; tap?: 'output' | 'input'; title
     return () => {
       drawers.delete(draw)
     }
-  }, [props.strip, tap])
-  return <canvas ref={canvas} className="level-bar" style={{ width: 44, height: 6 }} title={props.title} />
+  }, [props.strip, tap, width, side])
+  return <canvas ref={canvas} className="level-bar" style={{ width, height: 6 }} title={props.title} />
+}
+
+/** Adds a per-frame drawer to the meters' animation loop until `undo`. */
+export function addDrawer(draw: Draw): () => void {
+  drawers.add(draw)
+  if (!running) {
+    running = true
+    lastFrame = 0
+    requestAnimationFrame(frame)
+  }
+  return () => {
+    drawers.delete(draw)
+  }
+}
+
+/** How much a gain-reduction display shows, top to bottom. */
+const GR_FULL_DB = 24
+
+/** The processing section's gain reduction beside a strip's meter, hanging
+ *  from the top: the compressor's on the left, the gate's on the right, each
+ *  only while that section is on. */
+export function GrMeter(props: { strip: string; comp: boolean; gate: boolean }) {
+  const canvas = useRef<HTMLCanvasElement>(null)
+  const { strip, comp, gate } = props
+  useEffect(() => {
+    const element = canvas.current
+    if (!element) return
+    const context = element.getContext('2d')
+    if (!context) return
+    const width = 7
+    const styles = getComputedStyle(document.documentElement)
+    const compInk = styles.getPropertyValue('--accent').trim()
+    const gateInk = styles.getPropertyValue('--text-secondary').trim()
+    const track = styles.getPropertyValue('--meter-bg').trim()
+    let height = 0
+    return addDrawer(() => {
+      if (element.clientHeight !== height) {
+        height = element.clientHeight
+        const ratio = window.devicePixelRatio || 1
+        element.width = width * ratio
+        element.height = Math.max(1, height) * ratio
+        context.setTransform(ratio, 0, 0, ratio, 0, 0)
+      }
+      const meter = meters.get(strip)
+      context.clearRect(0, 0, width, height)
+      // Square fills: the lowest lit pixel is the value (DESIGN.md).
+      const bar = (x: number, on: boolean, db: number, ink: string) => {
+        if (!on) return
+        context.fillStyle = track
+        context.fillRect(x, 0, 3, height)
+        context.fillStyle = ink
+        context.fillRect(x, 0, 3, Math.round(Math.min(1, Math.max(0, db / GR_FULL_DB)) * height))
+      }
+      bar(0, comp, meter?.compDb ?? 0, compInk)
+      bar(4, gate, meter?.gateDb ?? 0, gateInk)
+    })
+  }, [strip, comp, gate])
+  return (
+    <canvas
+      ref={canvas}
+      className="gr-meter"
+      style={{ width: 7 }}
+      title={`Gain reduction, 0 to ${GR_FULL_DB} dB down: compressor ${comp ? '(left)' : 'off'}, gate ${gate ? '(right)' : 'off'}`}
+    />
+  )
+}
+
+/** A gain-reduction bar with its reading, over 24 dB: across (growing from
+ *  the right) or down (hanging from the top). The Selected Channel's gate
+ *  and compressor. */
+export function GrBar(props: { strip: string; which: 'gate' | 'comp'; on: boolean; vertical?: boolean }) {
+  const canvas = useRef<HTMLCanvasElement>(null)
+  const text = useRef<HTMLSpanElement>(null)
+  const { strip, which, on, vertical } = props
+  useEffect(() => {
+    const element = canvas.current
+    if (!element) return
+    const context = element.getContext('2d')
+    if (!context) return
+    const styles = getComputedStyle(document.documentElement)
+    const ink = styles.getPropertyValue(which === 'comp' ? '--accent' : '--text-secondary').trim()
+    const track = styles.getPropertyValue('--meter-bg').trim()
+    const tick = styles.getPropertyValue('--border-normal').trim()
+    let w = 0
+    let h = 0
+    let shown = ''
+    return addDrawer(() => {
+      if (element.clientWidth !== w || element.clientHeight !== h) {
+        w = element.clientWidth
+        h = element.clientHeight
+        const ratio = window.devicePixelRatio || 1
+        element.width = Math.max(1, w) * ratio
+        element.height = Math.max(1, h) * ratio
+        context.setTransform(ratio, 0, 0, ratio, 0, 0)
+      }
+      const meter = meters.get(strip)
+      const db = on ? ((which === 'comp' ? meter?.compDb : meter?.gateDb) ?? 0) : 0
+      const unit = Math.min(1, Math.max(0, db / GR_FULL_DB))
+      context.fillStyle = track
+      context.fillRect(0, 0, w, h)
+      context.fillStyle = tick
+      for (const mark of [3, 6, 12]) {
+        const at = (mark / GR_FULL_DB) * (vertical ? h : w)
+        if (vertical) context.fillRect(0, Math.round(at), w, 1)
+        else context.fillRect(Math.round(w - at), 0, 1, h)
+      }
+      if (on) {
+        context.fillStyle = ink
+        if (vertical) context.fillRect(0, 0, w, Math.round(unit * h))
+        else context.fillRect(Math.round(w - unit * w), 0, Math.round(unit * w), h)
+      }
+      const next = !on ? 'off' : db >= 0.05 ? `−${db.toFixed(1)}` : '0.0'
+      if (next !== shown && text.current) {
+        shown = next
+        text.current.textContent = next
+      }
+    })
+  }, [strip, which, on, vertical])
+  return (
+    <div className={`gr-bar${vertical ? ' vertical' : ''}${on ? '' : ' off'}`} title="Gain reduction, dB">
+      <canvas ref={canvas} />
+      <span ref={text} className="gr-bar-value value">
+        —
+      </span>
+    </div>
+  )
+}
+
+/** The gate's open light: lit while the gate passes signal, dark while it
+ *  holds it down, hollow while the gate is off. Updated each frame without
+ *  a re-render. */
+export function GateLight(props: { strip: string; on: boolean }) {
+  const light = useRef<HTMLSpanElement>(null)
+  const { strip, on } = props
+  useEffect(() => {
+    const element = light.current
+    if (!element) return
+    let shown: string | null = null
+    return addDrawer(() => {
+      const next = !on ? 'off' : (meters.get(strip)?.gateOpen ?? true) ? 'open' : 'closed'
+      if (next === shown) return
+      shown = next
+      element.dataset.state = next
+      element.title = next === 'off' ? 'Gate off' : next === 'open' ? 'Gate open' : 'Gate closed'
+    })
+  }, [strip, on])
+  return <span ref={light} className="gate-light" />
 }
 
 export function Latch(props: {
@@ -391,11 +554,13 @@ export function Latch(props: {
   onClick: () => void
   children: ReactNode
   title?: string
+  /** Not latched itself, but in effect (a mute a DCA or mute group holds). */
+  implied?: boolean
 }) {
   return (
     <button
       type="button"
-      className={`latch latch-${props.kind}${props.on ? ' on' : ''}`}
+      className={`latch latch-${props.kind}${props.on ? ' on' : ''}${props.implied && !props.on ? ' implied' : ''}`}
       aria-pressed={props.on}
       title={props.title}
       onClick={props.onClick}

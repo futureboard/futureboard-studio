@@ -305,9 +305,9 @@ function formatMs(ms: number): string {
 
 // ── The filters (builtin_dsp_core + the `biquad` crate) ─────────────────
 
-type FilterKind = 'bell' | 'lowshelf' | 'highshelf' | 'lowpass' | 'highpass' | 'notch' | 'bandpass'
+export type FilterKind = 'bell' | 'lowshelf' | 'highshelf' | 'lowpass' | 'highpass' | 'notch' | 'bandpass'
 
-interface Coeffs {
+export interface Coeffs {
   b0: number
   b1: number
   b2: number
@@ -318,7 +318,7 @@ interface Coeffs {
 /** `make_eq_coefficients`: the Audio EQ Cookbook biquad the DSP runs, its
  *  centre clamped to 0.49 × the sample rate and its Q to 0.1–12. Rounded to
  *  f32 at the end, as the DSP stores them. */
-function coefficients(kind: FilterKind, freqHz: number, gainDb: number, q: number, sampleRate: number): Coeffs | null {
+export function coefficients(kind: FilterKind, freqHz: number, gainDb: number, q: number, sampleRate: number): Coeffs | null {
   const fs = Math.max(1, sampleRate)
   const f0 = clamp(freqHz, 10, fs * 0.49)
   const qv = clamp(q, 0.1, 12)
@@ -382,7 +382,7 @@ function coefficients(kind: FilterKind, freqHz: number, gainDb: number, q: numbe
 }
 
 /** `biquad_response_db`: the magnitude of H(e^jw) in dB. */
-function responseDb(c: Coeffs, hz: number, sampleRate: number): number {
+export function responseDb(c: Coeffs, hz: number, sampleRate: number): number {
   const w = (2 * Math.PI * hz) / Math.max(1, sampleRate)
   const [cos1, sin1, cos2, sin2] = [Math.cos(w), Math.sin(w), Math.cos(2 * w), Math.sin(2 * w)]
   const numRe = c.b0 + c.b1 * cos1 + c.b2 * cos2
@@ -451,8 +451,10 @@ const DOUBLE_PX = 8
 
 /** Each band's colour, on its node, strip cell and curve: the native
  *  theme's categorical hues, cycling. The accent stays for selection. */
-const BAND_COLORS = ['#7fa8ff', '#38c7b4', '#5fd98c', '#e8b75c', '#f2645f', '#a78bfa']
-const bandColor = (index: number) => BAND_COLORS[index % BAND_COLORS.length]
+const bandColor = (index: number) => {
+  const bands = colors().bands
+  return bands[index % bands.length]
+}
 
 /** Fraction down the plot (0 top) of `db` on a ±`range` scale. */
 const dbFraction = (db: number, range: number) => 0.5 - db / (2 * Math.max(1, range))

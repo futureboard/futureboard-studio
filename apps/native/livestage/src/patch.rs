@@ -139,12 +139,22 @@ fn output_matrix(app: &LiveStageApp, this: &WeakEntity<LiveStageApp>) -> impl In
     let outputs = app.engine.output_channels() as u16;
     let pairs = output_pairs(outputs);
     let session = app.engine.session();
-    let mut sources: Vec<(String, PatchSource)> = vec![("Master".to_string(), PatchSource::Master)];
+    let mut sources: Vec<(String, PatchSource)> = vec![
+        ("Master".to_string(), PatchSource::Master),
+        // Solo (PFL/AFL) or the master: headphones, a wedge.
+        ("Monitor".to_string(), PatchSource::Monitor),
+    ];
     sources.extend(
         session
             .buses
             .iter()
             .map(|b| (b.name.clone(), PatchSource::Bus(b.id))),
+    );
+    sources.extend(
+        session
+            .matrices
+            .iter()
+            .map(|m| (format!("{} (matrix)", m.name), PatchSource::Matrix(m.id))),
     );
     sources.extend(
         session

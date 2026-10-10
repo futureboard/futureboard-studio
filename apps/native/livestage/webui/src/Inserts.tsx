@@ -29,8 +29,10 @@ import {
 } from 'lucide-react'
 import { PluginEditor } from './editors/index.tsx'
 import type { Command, InsertSlot, Session, StripRef } from './protocol.ts'
+import { findStrip } from './routing.ts'
 import { act, loadInstalled, useStore } from './store.ts'
 import type { InsertTarget } from './Mixer.tsx'
+import { stripLabel } from './workstate.ts'
 
 export function categoryIcon(category: string, size = 16): ReactNode {
   switch (category) {
@@ -55,25 +57,48 @@ export function categoryIcon(category: string, size = 16): ReactNode {
   }
 }
 
-function Modal(props: {
+// Open dialogs, innermost last: Escape closes only the one on top (a
+// confirmation over the library closes the confirmation).
+const modalStack: object[] = []
+
+export function Modal(props: {
   icon: ReactNode
   title: string
   subtitle?: string
   onClose: () => void
   children: ReactNode
   toolbar?: ReactNode
+  /** The action row under the body (Cancel and the action). */
+  footer?: ReactNode
   /** A plug-in editor: wide, its own padding. */
   plugin?: boolean
+  /** A confirmation or a short form. */
+  small?: boolean
 }) {
   const { onClose } = props
+  const closeRef = useRef(onClose)
+  closeRef.current = onClose
+  // Once per dialog, so a re-render never moves it above one opened over it.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    const token = {}
+    modalStack.push(token)
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && modalStack[modalStack.length - 1] === token) closeRef.current()
+    }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      modalStack.splice(modalStack.indexOf(token), 1)
+    }
+  }, [])
   return (
     <div className="modal-backdrop" onPointerDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className={`modal${props.plugin ? ' plugin' : ''}`} role="dialog" aria-label={props.title}>
+      <div
+        className={`modal${props.plugin ? ' plugin' : ''}${props.small ? ' small' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label={props.title}
+      >
         <div className="modal-head">
           <span className="modal-icon">{props.icon}</span>
           <div className="modal-title">
@@ -86,21 +111,18 @@ function Modal(props: {
           </button>
         </div>
         <div className="modal-body">{props.children}</div>
+        {props.footer && <div className="modal-foot">{props.footer}</div>}
       </div>
     </div>
   )
 }
 
 export function stripName(session: Session, strip: StripRef): string {
-  if (strip.kind === 'master') return 'Master'
-  if (strip.kind === 'bus') return session.buses.find((b) => b.id === strip.id)?.name ?? 'Bus'
-  return session.channels.find((c) => c.id === strip.id)?.name ?? 'Channel'
+  return stripLabel(session, strip)
 }
 
 function stripInserts(session: Session, strip: StripRef): InsertSlot[] {
-  if (strip.kind === 'master') return session.master.inserts
-  if (strip.kind === 'bus') return session.buses.find((b) => b.id === strip.id)?.inserts ?? []
-  return session.channels.find((c) => c.id === strip.id)?.inserts ?? []
+  return findStrip(session, strip)?.core.inserts ?? []
 }
 
 export function InsertEditor(props: { session: Session; target: InsertTarget; onClose: () => void }) {

@@ -4,19 +4,37 @@
 //
 // * Inputs: the interface's inputs into channels;
 // * Outputs: the mixes (master, buses, channels direct) to the outputs;
-// * Record: which strips record, and from where.
+// * Record: which strips record, and from where;
+// * Playback: a take played back into the channels (Playback.tsx).
 
 import { useState } from 'react'
 import type { ReactNode } from 'react'
-import { Cable, Check, Circle, Disc3, Eraser, Layers, ListOrdered, LogIn, LogOut, Mic, Speaker } from 'lucide-react'
+import {
+  Cable,
+  Check,
+  Circle,
+  Disc3,
+  Eraser,
+  Grid3x3,
+  Headphones,
+  Layers,
+  ListMusic,
+  ListOrdered,
+  LogIn,
+  LogOut,
+  Mic,
+  Speaker,
+} from 'lucide-react'
 import { LevelBar } from './controls.tsx'
+import { PlaybackPage } from './Playback.tsx'
+import { roleInfo } from './routing.ts'
 import type { ChannelStrip, InputPatch, OutputPatch, PatchSource, RecordTap, Session, StripRef } from './protocol.ts'
 import { sameStrip, stripKey } from './protocol.ts'
 import { act } from './store.ts'
 
-export type PatchTab = 'inputs' | 'outputs' | 'record'
+export type PatchTab = 'inputs' | 'outputs' | 'record' | 'playback'
 
-export const PATCH_TABS: PatchTab[] = ['inputs', 'outputs', 'record']
+export const PATCH_TABS: PatchTab[] = ['inputs', 'outputs', 'record', 'playback']
 
 /** 1/2, 3/4, … and a last single output when the count is odd. */
 function outputPairs(outputs: number): [number, number | null][] {
@@ -37,7 +55,7 @@ function inputLabel(input: InputPatch): string {
 
 /** What a recording does with this strip, as `recording_strips` in the
  *  engine decides: mono channels stay mono only when recorded at the input. */
-function recordWidth(session: Session, strip: StripRef): 1 | 2 {
+export function recordWidth(session: Session, strip: StripRef): 1 | 2 {
   if (strip.kind !== 'channel') return 2
   const channel = session.channels.find((c) => c.id === strip.id)
   if (!channel) return 2
@@ -52,6 +70,9 @@ function fileNames(session: Session): Map<string, string> {
   const strips: [StripRef, string][] = [
     ...session.channels.filter((c) => c.record_arm).map((c): [StripRef, string] => [{ kind: 'channel', id: c.id }, c.name]),
     ...session.buses.filter((b) => b.record_arm).map((b): [StripRef, string] => [{ kind: 'bus', id: b.id }, b.name]),
+    ...session.matrices
+      .filter((m) => m.record_arm)
+      .map((m): [StripRef, string] => [{ kind: 'matrix', id: m.id }, m.name]),
     ...(session.master.record_arm ? [[{ kind: 'master' }, 'Master'] as [StripRef, string]] : []),
   ]
   const used = new Set<string>()
@@ -113,6 +134,7 @@ export function Patch(props: {
   const armed =
     session.channels.filter((c) => c.record_arm).length +
     session.buses.filter((b) => b.record_arm).length +
+    session.matrices.filter((m) => m.record_arm).length +
     (session.master.record_arm ? 1 : 0)
 
   const tabs: { id: PatchTab; label: string; icon: ReactNode; count: string; title: string }[] = [
@@ -137,6 +159,17 @@ export function Patch(props: {
       count: `${armed}`,
       title: 'Strips armed to record',
     },
+    {
+      id: 'playback',
+      label: 'Playback',
+      icon: <ListMusic size={15} />,
+      count: session.playback.virtual_soundcheck
+        ? 'VSC'
+        : `${session.playback.tracks.filter((t) => t.channel !== null).length}`,
+      title: session.playback.virtual_soundcheck
+        ? 'Virtual soundcheck is on'
+        : 'Tracks of the loaded take assigned to channels',
+    },
   ]
 
   return (
@@ -154,7 +187,10 @@ export function Patch(props: {
             >
               {icon}
               <span>{label}</span>
-              <span className={`tab-count${id === 'record' && armed > 0 ? ' armed' : ''}`} title={title}>
+              <span
+                className={`tab-count${(id === 'record' && armed > 0) || (id === 'playback' && session.playback.virtual_soundcheck) ? ' armed' : ''}`}
+                title={title}
+              >
                 {count}
               </span>
             </button>
@@ -165,8 +201,10 @@ export function Patch(props: {
         <InputsPage session={session} inputs={inputs} />
       ) : tab === 'outputs' ? (
         <OutputsPage session={session} outputs={outputs} />
-      ) : (
+      ) : tab === 'record' ? (
         <RecordPage session={session} recording={props.recording} />
+      ) : (
+        <PlaybackPage session={session} recording={props.recording} />
       )}
     </div>
   )
@@ -331,11 +369,20 @@ function OutputsPage(props: { session: Session; outputs: number }) {
   const pairs = outputPairs(outputs)
   const sources: { name: string; group: string; source: PatchSource; icon: ReactNode }[] = [
     { name: 'Master', group: 'Mix', source: { kind: 'master' }, icon: <Speaker size={13} /> },
+    // The solo bus (PFL/AFL), or the master while nothing is soloed: headphones.
+    { name: 'Monitor', group: 'Mix', source: { kind: 'monitor' }, icon: <Headphones size={13} /> },
     ...session.buses.map((b) => ({
       name: b.name,
-      group: 'Bus',
+      group: roleInfo(b.role).label,
       source: { kind: 'bus', id: b.id } as PatchSource,
       icon: <Layers size={13} />,
+    })),
+    // Matrices reach the outputs only here: they have no other output.
+    ...session.matrices.map((m) => ({
+      name: m.name,
+      group: 'Matrix',
+      source: { kind: 'matrix', id: m.id } as PatchSource,
+      icon: <Grid3x3 size={13} />,
     })),
     ...session.channels.map((c) => ({
       name: c.name,
@@ -359,7 +406,7 @@ function OutputsPage(props: { session: Session; outputs: number }) {
     <section className="patch-page">
       <PageHead
         title="Mixes to outputs"
-        text="A mix can go to several outputs, and an output can take several mixes. Direct outs send a channel on its own, after its fader."
+        text="A mix can go to several outputs, and an output can take several mixes. Direct outs send a channel on its own, after its fader. Monitor carries the solo bus, or its chosen source while nothing is soloed. A matrix is heard only where it is patched here."
       >
         <button
           type="button"
@@ -463,6 +510,14 @@ function RecordPage(props: { session: Session; recording: boolean }) {
       icon: <Layers size={13} />,
       source: 'after the fader',
       on: b.record_arm,
+    })),
+    ...session.matrices.map((m) => ({
+      strip: { kind: 'matrix', id: m.id } as StripRef,
+      name: m.name,
+      group: 'Matrix',
+      icon: <Grid3x3 size={13} />,
+      source: 'after the fader',
+      on: m.record_arm,
     })),
     {
       strip: { kind: 'master' },

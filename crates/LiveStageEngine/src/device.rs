@@ -6,7 +6,7 @@
 //! drives the mix and pulls whatever the capture side has delivered.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -103,7 +103,56 @@ pub struct DeviceStatus {
     pub callbacks: AtomicU64,
     /// Share of the callback period the last mix took (0..1, can exceed 1).
     pub load: AtomicF32,
+    /// Whether the audio threads run at real-time priority: [`REALTIME_UNKNOWN`]
+    /// until the first callback asks, then [`REALTIME_YES`] or [`REALTIME_NO`].
+    pub realtime: AtomicU8,
     pub error: Mutex<Option<String>>,
+}
+
+pub const REALTIME_UNKNOWN: u8 = 0;
+pub const REALTIME_YES: u8 = 1;
+pub const REALTIME_NO: u8 = 2;
+
+/// The SCHED_FIFO priority asked for: under the kernel's own interrupt
+/// threads' default (50 on PREEMPT_RT is *below* this; on a stock kernel
+/// interrupts are not threads), above everything else on the machine.
+#[cfg(target_os = "linux")]
+const REALTIME_PRIORITY: libc::c_int = 70;
+
+/// Puts the calling thread — an audio callback, on its first call — in the
+/// real-time scheduling class, so the web server, a browser or a disk write
+/// on the same machine cannot keep it waiting past its period. Linux only
+/// (cpal's ALSA threads run at normal priority otherwise; WASAPI and Core
+/// Audio raise their own). Needs RLIMIT_RTPRIO (the appliance's service has
+/// it) or CAP_SYS_NICE; without them it is refused, and the status says so.
+fn promote_to_realtime(status: &DeviceStatus) {
+    #[cfg(target_os = "linux")]
+    {
+        // musl's sched_param has more fields than glibc's: zero them all,
+        // then set the one that matters.
+        // SAFETY: sched_param is plain integers; all-zero is valid.
+        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+        param.sched_priority = REALTIME_PRIORITY;
+        // SAFETY: plain syscalls on this thread's own handle.
+        let ok = unsafe {
+            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) == 0
+        };
+        // One refused thread is enough to say no.
+        let state = if ok { REALTIME_YES } else { REALTIME_NO };
+        let _ = status.realtime.compare_exchange(
+            REALTIME_UNKNOWN,
+            state,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        if !ok {
+            status.realtime.store(REALTIME_NO, Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = status;
+    }
 }
 
 /// Open streams and what they actually run at.
@@ -236,7 +285,7 @@ pub fn open(
             input: vec![0.0; 8192 * in_channels.max(1)],
             output: vec![0.0; 8192 * out_channels as usize],
             render,
-            status: status.clone(),
+            status,
             sample_rate,
         },
     )?;
@@ -289,9 +338,15 @@ fn build_input(
         f32: cpal::FromSample<T>,
     {
         let mut scratch = vec![0.0f32; 8192 * config.channels as usize];
+        let promote = status.clone();
+        let mut promoted = false;
         device.build_input_stream(
             config,
             move |data: &[T], _| {
+                if !promoted {
+                    promoted = true;
+                    promote_to_realtime(&promote);
+                }
                 for chunk in data.chunks(scratch.len()) {
                     for (out, sample) in scratch.iter_mut().zip(chunk) {
                         *out = cpal::Sample::from_sample(*sample);
@@ -386,6 +441,9 @@ fn build_output<F: FnMut(&[f32], &mut [f32]) + Send + 'static>(
                 // After that the callback owns it outright: no lock per block.
                 if owned.is_none() {
                     owned = handoff.try_lock().and_then(|mut slot| slot.take());
+                    if let Some(duplex) = &owned {
+                        promote_to_realtime(&duplex.status);
+                    }
                 }
                 let Some(duplex) = owned.as_mut() else {
                     data.fill(T::EQUILIBRIUM);

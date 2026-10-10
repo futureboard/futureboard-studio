@@ -161,6 +161,7 @@ fn strip_key(strip: StripRef) -> String {
     match strip {
         StripRef::Channel(id) => format!("ch{id}"),
         StripRef::Bus(id) => format!("bus{id}"),
+        StripRef::Matrix(id) => format!("mx{id}"),
         StripRef::Master => "master".to_string(),
     }
 }
@@ -331,7 +332,9 @@ fn send_row(
                     channel,
                     bus,
                     level_db: *db,
-                    pre_fader,
+                    pre_fader: Some(pre_fader),
+                    pan: None,
+                    pan_follow: None,
                 },
             );
         }
@@ -346,7 +349,9 @@ fn send_row(
                     channel,
                     bus,
                     level_db,
-                    pre_fader: !pre_fader,
+                    pre_fader: Some(!pre_fader),
+                    pan: None,
+                    pan_follow: None,
                 },
             );
         }
@@ -812,6 +817,8 @@ pub fn mixer_view(app: &mut LiveStageApp, cx: &mut Context<LiveStageApp>) -> imp
     scroller = scroller.child(add_button("mixer-add-bus", "+ Bus", &this, move |_| {
         Command::AddBus {
             name: format!("Bus {}", bus_count + 1),
+            role: None,
+            stereo: None,
         }
     }));
 
@@ -872,7 +879,8 @@ pub fn menu_overlay(
             let current = match strip {
                 StripRef::Channel(id) => session.channel(id).map(|c| c.output),
                 StripRef::Bus(id) => session.bus(id).map(|b| b.output),
-                StripRef::Master => None,
+                // A matrix has no route; it feeds its output patch only.
+                StripRef::Master | StripRef::Matrix(_) => None,
             };
             let selected = choices
                 .iter()
@@ -976,7 +984,10 @@ pub fn menu_overlay(
                                 channel,
                                 bus: *bus,
                                 level_db: 0.0,
-                                pre_fader: false,
+                                // Pre or post as the bus's role has it.
+                                pre_fader: None,
+                                pan: None,
+                                pan_follow: None,
                             },
                         );
                     }

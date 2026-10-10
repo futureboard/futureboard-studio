@@ -1,0 +1,357 @@
+/* Talkback and the oscillator (Talkback.tsx): the top bar's key and the
+   panel beside the mixer. Talkback open is a live input: the monitor
+   (green) latch hue. The oscillator sounding is a warning: the warning
+   hue. Each on two channels — fill and words. */
+
+.tb-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-secondary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.tb-key:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.tb-key.open {
+  border-color: var(--border-strong);
+  background-image: linear-gradient(var(--state-selected), var(--state-selected));
+}
+
+.tb-key.talking {
+  border-color: color-mix(in srgb, var(--state-monitor) 55%, transparent);
+  background-color: color-mix(in srgb, var(--state-monitor) 18%, var(--surface-panel));
+  color: var(--state-monitor);
+}
+
+.tb-key-osc {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 18px;
+  padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--warning) 55%, transparent);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--warning) 18%, var(--surface-panel));
+  color: var(--warning);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+/* The panel: floats beside the work (it is used while mixing), so it is
+   not modal and has a shadow. */
+.tb-panel {
+  position: fixed;
+  top: 58px;
+  right: 12px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 400px;
+  max-height: calc(100vh - 70px);
+  padding: 12px;
+  overflow-y: auto;
+  border: 1px solid var(--border-normal);
+  border-radius: var(--r-dialog);
+  background: var(--surface-panel);
+  box-shadow: var(--shadow-overlay);
+}
+
+.tb-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tb-head svg {
+  color: var(--text-muted);
+}
+
+.tb-old {
+  display: flex;
+  gap: 6px;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--warning) 50%, transparent);
+  border-radius: var(--r);
+  background: color-mix(in srgb, var(--warning) 10%, var(--surface-panel));
+  color: var(--warning);
+  font-size: 12px;
+}
+
+.tb-old svg {
+  flex: none;
+  margin-top: 1px;
+}
+
+.tb-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-surface);
+  background: var(--state-recessed);
+}
+
+.tb-section.osc.on {
+  border-color: color-mix(in srgb, var(--warning) 55%, transparent);
+}
+
+.tb-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.tb-section .pe-note {
+  margin: 0;
+}
+
+/* TALK: big, for a thumb. */
+.talk-key {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  height: 76px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r-surface);
+  background-color: var(--button-bg);
+  color: var(--text-secondary);
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.talk-key:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.talk-key-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.talk-key-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.talk-key.talking,
+.talk-key.latched {
+  border-color: color-mix(in srgb, var(--state-monitor) 60%, transparent);
+  background-color: color-mix(in srgb, var(--state-monitor) 22%, var(--surface-panel));
+  color: var(--state-monitor);
+}
+
+.talk-key.talking .talk-key-hint,
+.talk-key.latched .talk-key-hint {
+  color: var(--text-primary);
+}
+
+/* Latched: a heavier frame, so it reads as "stays on" at a glance. */
+.talk-key.latched {
+  border-width: 3px;
+  border-color: var(--state-monitor);
+}
+
+.talk-key.nowhere:not(.talking):not(.latched) {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--warning) 55%, transparent);
+}
+
+.tb-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -4px 0 0;
+  color: var(--warning);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.osc-warning {
+  margin: 0;
+}
+
+.tb-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.tb-row > .select {
+  width: 130px;
+}
+
+.tb-level {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tb-db {
+  min-width: 46px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.tb-db.hot {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.tb-hpf {
+  height: 22px;
+  padding: 0 7px;
+  font-size: 10px;
+}
+
+.tb-hz {
+  width: 96px;
+}
+
+.tb-meter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tb-meter-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.tb-meter canvas {
+  max-width: 100%;
+}
+
+.tb-dests {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tb-dest-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+  gap: 4px;
+}
+
+.tb-dest {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 32px;
+  padding: 0 7px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tb-dest:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+  color: var(--text-primary);
+}
+
+/* Ticked: a routing, so the accent. */
+.tb-dest.on {
+  border-color: var(--accent);
+  background-color: var(--accent-active);
+  color: var(--text-primary);
+}
+
+.tb-dest input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.tb-dest-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tb-dest-group {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  align-items: start;
+  gap: 8px;
+}
+
+.tb-dest-group-name {
+  padding-top: 9px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* The oscillator's key: one deliberate click; on, it is the warning hue
+   with its level in words. */
+.osc-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--button-border);
+  border-radius: var(--r);
+  background-color: var(--button-bg);
+  color: var(--text-secondary);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+}
+
+.osc-key:hover {
+  background-image: linear-gradient(var(--state-hover), var(--state-hover));
+}
+
+.osc-key.on {
+  border-color: var(--warning);
+  background-color: color-mix(in srgb, var(--warning) 22%, var(--surface-panel));
+  color: var(--warning);
+}
+
+@media (max-width: 640px) {
+  .tb-panel {
+    top: auto;
+    bottom: 8px;
+    left: 8px;
+    right: 8px;
+    width: auto;
+    max-height: calc(100vh - 120px);
+  }
+
+  .tb-key-label {
+    display: none;
+  }
+}

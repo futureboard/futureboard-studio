@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+# LiveStage storage: mounts USB drives as they come and go (read-only, the
+# recording drive read-write), and answers the mixer on
+# /run/livestage/storage.sock — list, choose where recordings go, eject,
+# format as exFAT. Runs as root; the mixer (the service account) can only ask
+# it those few things.
+
+name="LiveStage storage"
+description="Mounts drives and manages where LiveStage records"
+
+supervisor="supervise-daemon"
+command="/usr/bin/livestage-setup"
+command_args="--storage-service"
+output_log="/var/log/livestage-storage.log"
+error_log="/var/log/livestage-storage.log"
+respawn_delay=2
+respawn_max=0
+
+depend() {
+	need localmount
+	use mdev hwdrivers
+	after livestage-data livestage-config
+	before livestage
+}

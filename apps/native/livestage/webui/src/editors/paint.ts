@@ -31,12 +31,14 @@ export interface Theme {
   canvas: string
   panel: string
   border: string
+  /** An EQ band's colour by index, cycling (eq_graph.rs `band_color`). */
+  bands: string[]
   font: string
 }
 
 let theme: Theme | null = null
 
-/** The page's colour tokens, read once. */
+/** The page's colour tokens (Studio's theme, styles.css), read once. */
 export function colors(): Theme {
   if (theme) return theme
   const s = getComputedStyle(document.documentElement)
@@ -48,13 +50,14 @@ export function colors(): Theme {
     textFaint: v('--text-faint'),
     accent: v('--accent'),
     accentHover: v('--accent-hover'),
-    meterBg: '#00000047',
+    meterBg: v('--meter-bg'),
     meterLow: v('--meter-low'),
     meterMid: v('--meter-mid'),
     meterHigh: v('--meter-high'),
     canvas: v('--surface-canvas'),
     panel: v('--surface-panel'),
     border: v('--border-normal'),
+    bands: [1, 2, 3, 4, 5, 6].map((i) => v(`--eq-band-${i}`)),
     font: v('--font') || 'system-ui',
   }
   return theme

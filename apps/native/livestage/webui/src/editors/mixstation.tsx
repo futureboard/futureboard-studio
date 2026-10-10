@@ -446,8 +446,8 @@ let warningInk: string | null = null
 function extraTokens(): [string, string] {
   if (!disabledInk || !warningInk) {
     const s = getComputedStyle(document.documentElement)
-    disabledInk = s.getPropertyValue('--text-disabled').trim() || '#5b606b'
-    warningInk = s.getPropertyValue('--warning').trim() || '#e8b75c'
+    disabledInk = s.getPropertyValue('--text-disabled').trim()
+    warningInk = s.getPropertyValue('--warning').trim()
   }
   return [disabledInk, warningInk]
 }

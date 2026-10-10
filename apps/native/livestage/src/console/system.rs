@@ -11,8 +11,8 @@ use std::process::{Command, Stdio};
 
 use super::config::{self, AudioChoice, SetupConfig};
 
-pub const SETUP_CONF: &str = "/data/system/setup.conf";
-const LIVESTAGE_CONF: &str = "/data/livestage/livestage.conf";
+pub const SETUP_CONF: &str = "/var/lib/livestage/setup.conf";
+const LIVESTAGE_CONF: &str = "/var/lib/livestage/livestage.conf";
 const DEFAULT_SESSION: &str = "/data/livestage/show.json";
 pub const LOG: &str = "/var/log/livestage.log";
 const ZONEINFO: &str = "/usr/share/zoneinfo";
@@ -107,11 +107,11 @@ impl System {
         self.root.join(absolute.trim_start_matches('/'))
     }
 
-    fn read(&self, absolute: &str) -> Option<String> {
+    pub fn read(&self, absolute: &str) -> Option<String> {
         std::fs::read_to_string(self.path(absolute)).ok()
     }
 
-    fn write(&self, absolute: &str, text: &str) -> Result<(), String> {
+    pub fn write(&self, absolute: &str, text: &str) -> Result<(), String> {
         let path = self.path(absolute);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -125,7 +125,7 @@ impl System {
         self.run_with_input(program, args, None)
     }
 
-    fn run_with_input(
+    pub fn run_with_input(
         &self,
         program: &str,
         args: &[&str],
@@ -172,16 +172,39 @@ impl System {
 
     // ── The settings ────────────────────────────────────────────────────────
 
-    /// `None` until the first setup has been saved.
+    /// `None` while there is no settings file.
     pub fn load_config(&self) -> Option<SetupConfig> {
         self.read(SETUP_CONF).map(|text| SetupConfig::parse(&text))
     }
 
+    /// The first setup has been saved. (Choosing where to record before it
+    /// writes `RECORD_STORAGE` alone into the file; that is not a setup.)
+    pub fn is_set_up(&self) -> bool {
+        self.read(SETUP_CONF).is_some_and(|text| {
+            config::variables(&text)
+                .iter()
+                .any(|(key, _)| key == "DEVICE_NAME")
+        })
+    }
+
     pub fn save_config(&self, config: &SetupConfig) -> Result<(), String> {
+        self.save_settings(&config.to_file())
+    }
+
+    /// Sets `RECORD_STORAGE` and `RECORD_STORAGE_LABEL` (the volume's name,
+    /// for when it is missing) in the settings, leaving the rest as it is.
+    pub fn set_record_storage(&self, id: &str, label: &str) -> Result<(), String> {
+        let text = self.read(SETUP_CONF).unwrap_or_default();
+        let text = config::set_variable(&text, "RECORD_STORAGE", id);
+        let text = config::set_variable(&text, "RECORD_STORAGE_LABEL", label);
+        self.save_settings(&text)
+    }
+
+    fn save_settings(&self, text: &str) -> Result<(), String> {
         // Next to it first, then over it: a power cut leaves the old file or
         // the new one, never half of one.
         let temporary = format!("{SETUP_CONF}.new");
-        self.write(&temporary, &config.to_file())?;
+        self.write(&temporary, text)?;
         // It holds the Wi-Fi key: readable by root only.
         self.private(&temporary)?;
         std::fs::rename(self.path(&temporary), self.path(SETUP_CONF))
@@ -585,12 +608,12 @@ impl System {
             .collect()
     }
 
-    /// Free and total bytes on /data.
-    pub fn data_space(&self) -> Option<(u64, u64)> {
+    /// Free and total bytes on the filesystem holding `absolute`.
+    pub fn space(&self, absolute: &str) -> Option<(u64, u64)> {
         #[cfg(target_os = "linux")]
         {
             let path =
-                std::ffi::CString::new(self.path("/data").to_string_lossy().as_bytes()).ok()?;
+                std::ffi::CString::new(self.path(absolute).to_string_lossy().as_bytes()).ok()?;
             let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
             // SAFETY: a NUL-terminated path and a zeroed out-struct.
             if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
@@ -601,6 +624,7 @@ impl System {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            let _ = absolute;
             None
         }
     }
