@@ -6,7 +6,8 @@
 //!
 //! The bank is deliberately minimal but valid SF2: one looping sine sample,
 //! one instrument, and presets at the banks a General MIDI player must handle —
-//! a melodic bank 0 preset and a drum bank 128 preset.
+//! a melodic bank 0 preset, a melodic variation-bank preset and a drum bank
+//! 128 preset.
 
 use std::sync::Arc;
 
@@ -19,6 +20,10 @@ pub const MELODIC_PRESET: (i32, i32) = (0, 0);
 /// left and one hard right — in exclusive class [`DRUM_CHOKE_GROUP`], the way
 /// a General MIDI kit's hi-hats are.
 pub const DRUM_PRESET: (i32, i32) = (128, 0);
+/// Bank/patch of a melodic preset in a variation bank (as GS fonts put their
+/// variation tones). It plays the same tone as [`MELODIC_PRESET`] panned hard
+/// right, so a test can hear which of the two a channel actually selected.
+pub const VARIATION_PRESET: (i32, i32) = (8, 0);
 /// The drum preset's exclusive class (choke group).
 pub const DRUM_CHOKE_GROUP: u16 = 1;
 /// Bank name reported by [`sound_font`].
@@ -159,8 +164,8 @@ fn instrument_header(name: &str, zone_start: u16) -> Vec<u8> {
 }
 
 fn pdta_list() -> Vec<u8> {
-    // Two presets (melodic + drum) sharing one instrument, plus the terminator
-    // record each SF2 list ends with.
+    // Three presets (melodic, variation, drum) over two instruments, plus the
+    // terminator record each SF2 list ends with.
     let mut phdr = Vec::new();
     phdr.extend_from_slice(&preset_header(
         "Test Tone",
@@ -174,16 +179,26 @@ fn pdta_list() -> Vec<u8> {
         DRUM_PRESET.0 as u16,
         1,
     ));
-    phdr.extend_from_slice(&preset_header("EOP", 0, 0, 2));
+    phdr.extend_from_slice(&preset_header(
+        "Variation Tone",
+        VARIATION_PRESET.1 as u16,
+        VARIATION_PRESET.0 as u16,
+        2,
+    ));
+    phdr.extend_from_slice(&preset_header("EOP", 0, 0, 3));
 
     let mut pbag = Vec::new();
     pbag.extend_from_slice(&zone(0));
     pbag.extend_from_slice(&zone(1));
     pbag.extend_from_slice(&zone(2));
+    pbag.extend_from_slice(&zone(4));
 
     let mut pgen = Vec::new();
     pgen.extend_from_slice(&generator(GEN_INSTRUMENT, 0));
     pgen.extend_from_slice(&generator(GEN_INSTRUMENT, 1));
+    // The variation: the tone instrument, panned hard right at preset level.
+    pgen.extend_from_slice(&generator(GEN_PAN, 500));
+    pgen.extend_from_slice(&generator(GEN_INSTRUMENT, 0));
     pgen.extend_from_slice(&generator(0, 0)); // terminator
 
     let mut inst = Vec::new();

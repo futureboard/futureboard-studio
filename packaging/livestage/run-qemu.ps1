@@ -3,21 +3,22 @@
 Boots the LiveStage appliance image in QEMU with UEFI firmware, on a copy of
 the image. The web UI is forwarded to http://127.0.0.1:18730/.
 
-With -Installer it boots the installer image instead, as a USB stick, with an
-empty disk to install onto (target.img, -DiskGB, 8 by default); -BootTarget
-then boots that disk alone, with the same firmware settings (so the boot
-entry the installer added is there).
+With -Installer it boots the installer ISO instead, written raw to a USB
+stick (a copy of it), or with -AsCD in a CD drive, with an empty disk to
+install onto (target.img, -DiskGB, 8 by default); -BootTarget then boots
+that disk alone, with the same firmware settings (so the boot entry the
+installer added is there).
 
 .EXAMPLE
 pwsh packaging/livestage/run-qemu.ps1
 pwsh packaging/livestage/run-qemu.ps1 -DiskGB 4 -Headless
 pwsh packaging/livestage/run-qemu.ps1 -UsbDiskGB 8     # plus an empty USB drive
-pwsh packaging/livestage/run-qemu.ps1 -Installer -DiskGB 8 [-TargetBus nvme]
+pwsh packaging/livestage/run-qemu.ps1 -Installer -DiskGB 8 [-TargetBus nvme] [-AsCD]
 pwsh packaging/livestage/run-qemu.ps1 -BootTarget [-TargetBus nvme]
 #>
 param(
     # The image to boot; by default the appliance image, or with -Installer
-    # the installer image.
+    # the installer ISO.
     [string]$Image = "",
     # Host port for the web UI.
     [int]$Port = 18730,
@@ -39,9 +40,11 @@ param(
     # stalled right after the firmware handed over; plain emulation boots in
     # about two minutes.
     [switch]$Accel,
-    # Boot the installer image as a USB stick (xhci), with an empty disk of
+    # Boot the installer ISO as a USB stick (xhci), with an empty disk of
     # -DiskGB to install onto: target.img in the work folder, made anew.
     [switch]$Installer,
+    # With -Installer: the ISO in a CD drive (SATA) instead of on a stick.
+    [switch]$AsCD,
     # Boot the disk the last -Installer run installed onto, alone.
     [switch]$BootTarget,
     # How the target disk is attached.
@@ -52,9 +55,10 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 if ($Installer -and $BootTarget) { throw "-Installer or -BootTarget, not both" }
+if ($AsCD -and -not $Installer) { throw "-AsCD goes with -Installer" }
 if (-not $Image) {
     $Image = if ($Installer) {
-        "out/livestage-alpine/livestage-installer-alpine3.24-x86_64.img"
+        "out/livestage-alpine/livestage-installer-alpine3.24-x86_64.iso"
     } else {
         "out/livestage-alpine/livestage-alpine3.24-x86_64.img"
     }
@@ -81,11 +85,9 @@ $targetDrive = @("-drive", "file=$target,format=raw,if=none,id=target") + $(
     else { @("-device", "virtio-blk-pci,drive=target") })
 $drives = @()
 if ($Installer) {
-    # The stick is a copy of the installer image; the target an empty disk,
-    # sparse so that only what is written takes room. The firmware settings
-    # are kept for -BootTarget.
-    $stick = Join-Path $runDir "installer-stick.img"
-    Copy-Item $imagePath $stick -Force
+    # The stick is a copy of the ISO (the CD is the ISO itself, read-only);
+    # the target an empty disk, sparse so that only what is written takes
+    # room. The firmware settings are kept for -BootTarget.
     if (Test-Path $target) { Remove-Item -LiteralPath $target -Force }
     New-Item -ItemType File $target | Out-Null
     fsutil sparse setflag $target | Out-Null
@@ -94,10 +96,21 @@ if ($Installer) {
     try { $stream.SetLength([int64]$size * 1GB) } finally { $stream.Close() }
     $vars = $targetVars
     Copy-Item (Join-Path $share "edk2-i386-vars.fd") $vars -Force
-    $drives = @("-device", "qemu-xhci,id=xhci",
-        "-drive", "if=none,id=stick,format=raw,file=$stick",
-        "-device", "usb-storage,bus=xhci.0,drive=stick,id=installer,bootindex=0") + $targetDrive
-    Write-Host "Installer on a USB stick; target disk $target ($size GB, $TargetBus)"
+    # No bootindex: with one, QEMU hands the firmware a boot order that
+    # drops the entry the installer adds. The empty target does not boot,
+    # so the firmware goes on to the stick or the CD.
+    if ($AsCD) {
+        $drives = @("-drive", "if=none,id=cd,media=cdrom,readonly=on,format=raw,file=$imagePath",
+            "-device", "ide-cd,drive=cd,id=installer") + $targetDrive
+        Write-Host "Installer in a CD drive; target disk $target ($size GB, $TargetBus)"
+    } else {
+        $stick = Join-Path $runDir "installer-stick.img"
+        Copy-Item $imagePath $stick -Force
+        $drives = @("-device", "qemu-xhci,id=xhci",
+            "-drive", "if=none,id=stick,format=raw,file=$stick",
+            "-device", "usb-storage,bus=xhci.0,drive=stick,id=installer") + $targetDrive
+        Write-Host "Installer on a USB stick; target disk $target ($size GB, $TargetBus)"
+    }
 } elseif ($BootTarget) {
     if (-not (Test-Path $target)) { throw "no target disk at ${target}: run with -Installer first" }
     $vars = $targetVars

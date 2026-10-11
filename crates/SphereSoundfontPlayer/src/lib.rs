@@ -685,13 +685,18 @@ impl SoundfontPlayer {
             return Err(SoundfontPlayerError::PresetNotFound { bank, patch });
         }
         let drums = bank >= DRUM_BANK;
+        let selected = if drums { bank - DRUM_BANK } else { bank };
+        let Some(bank_msb) = bank_select_msb(selected) else {
+            return Err(SoundfontPlayerError::PresetUnreachableOnChannel {
+                channel,
+                bank,
+                patch,
+            });
+        };
         self.synthesizer
             .set_percussion_channel(channel.into(), drums);
-        let selected = if drums { bank - DRUM_BANK } else { bank };
         self.synthesizer
-            .process_midi_message(channel.into(), 0xB0, 0x00, (selected >> 7) & 0x7F);
-        self.synthesizer
-            .process_midi_message(channel.into(), 0xB0, 0x20, selected & 0x7F);
+            .process_midi_message(channel.into(), 0xB0, 0x00, bank_msb);
         self.synthesizer
             .process_midi_message(channel.into(), 0xC0, patch, 0);
         Ok(())
@@ -840,12 +845,15 @@ impl SoundfontPlayer {
             });
         };
 
-        let bank_msb = (selected >> 7) & 0x7F;
-        let bank_lsb = selected & 0x7F;
+        let Some(bank_msb) = bank_select_msb(selected) else {
+            return Err(SoundfontPlayerError::PresetUnreachableOnChannel {
+                channel,
+                bank,
+                patch,
+            });
+        };
         self.synthesizer
             .process_midi_message(channel.into(), 0xB0, 0x00, bank_msb);
-        self.synthesizer
-            .process_midi_message(channel.into(), 0xB0, 0x20, bank_lsb);
         self.synthesizer
             .process_midi_message(channel.into(), 0xC0, patch, 0);
         Ok(())
@@ -964,6 +972,16 @@ impl SoundfontPlayer {
 /// `None` when the channel cannot reach that bank at all. The percussion
 /// channel adds [`DRUM_BANK`] to whatever bank select it receives, so it only
 /// addresses drum banks and every other channel only addresses melodic ones.
+/// The Bank Select MSB that addresses SoundFont bank `selected` (already
+/// taken out of the drum banks). The synthesizer, like the SoundFont 2 bank
+/// numbering it follows, reads the bank from CC 0 alone — CC 32 is ignored —
+/// so a bank past 127 cannot be selected at all. Splitting it into MSB and
+/// LSB, as a 14-bit bank would be, sent every variation bank (1..=127) as
+/// bank 0.
+fn bank_select_msb(selected: i32) -> Option<i32> {
+    (0..=127).contains(&selected).then_some(selected)
+}
+
 fn bank_select_value(channel: u8, bank: i32) -> Option<i32> {
     if channel == PERCUSSION_CHANNEL {
         (bank >= DRUM_BANK).then_some(bank - DRUM_BANK)
@@ -1723,13 +1741,48 @@ mod tests {
     fn loads_synthetic_font_metadata() {
         let player = player();
         assert_eq!(player.bank_name(), test_font::BANK_NAME);
-        assert_eq!(player.preset_count(), 2);
+        assert_eq!(player.preset_count(), 3);
+        assert!(player.has_preset(test_font::VARIATION_PRESET.0, test_font::VARIATION_PRESET.1));
         assert!(player.has_preset(test_font::MELODIC_PRESET.0, test_font::MELODIC_PRESET.1));
         assert!(player.has_preset(test_font::DRUM_PRESET.0, test_font::DRUM_PRESET.1));
         assert!(!player.has_preset(0, 42));
         assert_eq!(
             player.preset_name(test_font::MELODIC_PRESET.0, test_font::MELODIC_PRESET.1),
             Some("Test Tone")
+        );
+    }
+
+    #[test]
+    fn a_variation_bank_preset_plays_its_own_sound_not_bank_zero() {
+        let mut player = player();
+        let (bank, patch) = test_font::VARIATION_PRESET;
+        player
+            .select_preset_all_channels(bank, patch)
+            .expect("variation preset");
+        player.note_on(0, 60, 100).expect("note on");
+        let (left, right) = stereo_peaks(&mut player, 4_096);
+        assert!(right > 0.01, "the variation sounds");
+        assert!(
+            left < right * 0.2,
+            "panned hard right: bank {bank} was selected, not bank 0 (left {left}, right {right})"
+        );
+    }
+
+    #[test]
+    fn a_multi_part_plays_a_variation_bank_preset() {
+        let mut player = multi_player();
+        let mut channels = default_channels();
+        channels[2].preset = Some(test_font::VARIATION_PRESET);
+        player.set_channels(&channels);
+        assert_eq!(
+            player.channels()[2].preset,
+            Some(test_font::VARIATION_PRESET)
+        );
+        player.note_on(2, 60, 100).expect("note on");
+        let (left, right) = stereo_peaks(&mut player, 4_096);
+        assert!(
+            right > 0.01 && left < right * 0.2,
+            "left {left}, right {right}"
         );
     }
 

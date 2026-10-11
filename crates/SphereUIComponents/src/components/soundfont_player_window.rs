@@ -11,6 +11,17 @@
 //! and every edit goes back through [`SoundfontPlayerTrackUpdate`], the one
 //! path that records undo and reaches the engine.
 //!
+//! A MIDI track's bank/program selection sets the preset of the part on its
+//! channel ([`soundfont_program_parts`]): the window shows it, the engine
+//! plays it through the part (so a kit on any channel loads as a kit), and
+//! picking a preset for such a part in the browser writes the MIDI track's
+//! program instead, so the two never disagree.
+//!
+//! In sixteen-channel mode each part can be fed from here: the `+` on a
+//! channel creates a MIDI track that plays it, or puts an existing MIDI track
+//! on it ([`SoundfontMidiRoute`]); the edit goes through the same undo and
+//! engine path as the Inspector's MIDI Out.
+//!
 //! The window reads the `.sf2` itself only for its metadata (bank name and
 //! presets), off the UI thread. It never plays: the keyboard and the Test
 //! button send MIDI preview through [`SoundfontPlayerPreview`] to the engine,
@@ -21,12 +32,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
     KeyDownEvent, ParentElement, Render, Styled, Subscription, UniformListScrollHandle, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, div, px, size,
 };
 
+use crate::components::context_menu::{ContextMenuEntry, context_menu_overlay};
 use crate::components::soundfont_player_mdi::{
     CHANNELS, SOUNDFONT_MULTI_TITLE, SOUNDFONT_PLAYER_MDI_TITLE, SoundfontPlayerCallbacks,
     SoundfontPlayerPanelState, browser_rows, default_parts, soundfont_player_panel,
@@ -36,8 +49,9 @@ use crate::components::text_input::{
 };
 use crate::components::timeline::Timeline;
 use crate::components::timeline::timeline_state::{
-    MidiOutputChannelMode, SoundfontChannel, SoundfontPlayerMode, SoundfontPlayerSettingsState,
-    TimelineState, TrackType,
+    CreateTrackOptions, InputMonitorMode, MidiOutputChannelMode, SoundfontChannel,
+    SoundfontChannels, SoundfontPlayerMode, SoundfontPlayerSettingsState, TimelineState,
+    TrackOutputRouting, TrackState, TrackType,
 };
 use crate::components::title_bar::external_window_titlebar;
 use crate::soundfont_player::{
@@ -45,6 +59,7 @@ use crate::soundfont_player::{
     SoundfontPresetInfo, SoundfontRenderQuality,
 };
 use crate::theme::Colors;
+use sphere_midi_service::program::{MidiPatchFormat, MidiProgramSelection, XG_DRUM_BANK_MSB};
 
 pub const SOUNDFONT_PLAYER_WINDOW_WIDTH: f32 = 920.0;
 /// Tall enough to open with the preset card, the envelope and the output all
@@ -98,6 +113,287 @@ pub struct SoundfontTrackView {
     pub settings: SoundfontPlayerSettingsState,
     pub channel_sources: [Vec<String>; CHANNELS],
     pub per_note_sources: Vec<String>,
+    /// Every MIDI track of the project, for putting one on a channel.
+    pub midi_tracks: Vec<SoundfontMidiTrackChoice>,
+    /// Per channel, the track whose program sets that part's preset.
+    pub program_parts: [Option<SoundfontProgramPart>; CHANNELS],
+}
+
+/// SoundFont bank of the drum kits.
+const DRUM_BANK: i32 = 128;
+
+/// A part whose preset a track's bank/program selection sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundfontProgramPart {
+    pub track_id: String,
+    pub track_name: String,
+    pub preset: (i32, i32),
+}
+
+/// The SoundFont preset `selection` picks on `channel` (0-based) of a
+/// Soundfont Multi, or `None` when it picks no program. The synthesizer takes
+/// the bank from Bank Select MSB alone, so the MSB is the SoundFont bank; a
+/// drum selection (channel 10 in GM and GS, the drum banks in XG) is the kit
+/// of that number in the drum bank.
+pub fn soundfont_preset_for_program(
+    selection: MidiProgramSelection,
+    channel: u8,
+) -> Option<(i32, i32)> {
+    let selection = selection.sanitized();
+    let program = i32::from(selection.program?);
+    if selection.is_drum_bank(channel.min(15) + 1) {
+        return Some((DRUM_BANK, program));
+    }
+    let bank = selection.bank().map_or(0, |(msb, _)| i32::from(msb));
+    Some((bank, program))
+}
+
+/// The selection that picks `preset` on `channel` (0-based): the inverse of
+/// [`soundfont_preset_for_program`], keeping `current`'s format when it can
+/// say the same thing.
+pub fn program_for_soundfont_preset(
+    current: MidiProgramSelection,
+    channel: u8,
+    (bank, patch): (i32, i32),
+) -> MidiProgramSelection {
+    let program = Some(patch.clamp(0, 127) as u8);
+    let drum_channel = channel == 9;
+    if bank >= DRUM_BANK {
+        // GM and GS put the kits on channel 10; anywhere else only XG's drum
+        // bank says "kit".
+        if drum_channel && current.format != MidiPatchFormat::Xg {
+            return MidiProgramSelection {
+                format: current.format,
+                program,
+                bank_msb: 0,
+                bank_lsb: 0,
+            };
+        }
+        return MidiProgramSelection {
+            format: MidiPatchFormat::Xg,
+            program,
+            bank_msb: XG_DRUM_BANK_MSB,
+            bank_lsb: 0,
+        };
+    }
+    let bank = bank.clamp(0, 125) as u8;
+    let format = if drum_channel {
+        // A melodic sound on channel 10: XG chooses drums by bank, not by
+        // channel.
+        MidiPatchFormat::Xg
+    } else {
+        match current.format {
+            MidiPatchFormat::Gm if bank == 0 => MidiPatchFormat::Gm,
+            MidiPatchFormat::Gm => MidiPatchFormat::Gs,
+            format => format,
+        }
+    };
+    MidiProgramSelection {
+        format,
+        program,
+        bank_msb: bank,
+        bank_lsb: 0,
+    }
+}
+
+/// Per channel of `instrument_id`'s Soundfont Multi, the track whose program
+/// selection sets that part: a MIDI track playing it (or the instrument track
+/// itself) on that channel. The last such track in track order wins, as it
+/// would for the channel of a hardware module.
+pub fn soundfont_program_parts(
+    state: &TimelineState,
+    instrument_id: &str,
+) -> [Option<SoundfontProgramPart>; CHANNELS] {
+    let mut parts: [Option<SoundfontProgramPart>; CHANNELS] = Default::default();
+    let Some(instrument) = state.find_track(instrument_id) else {
+        return parts;
+    };
+    if !instrument.builtin_soundfont_player
+        || instrument.soundfont_mode != SoundfontPlayerMode::Multi
+    {
+        return parts;
+    }
+    for track in &state.tracks {
+        if state.effective_instrument_track_id(&track.id).as_deref() != Some(instrument_id) {
+            continue;
+        }
+        // The channel its selection goes out on, as for any instrument.
+        let channel = track.routing.midi_channel.unwrap_or(1).clamp(1, 16) - 1;
+        if let Some(preset) = soundfont_preset_for_program(track.routing.program, channel) {
+            parts[channel as usize] = Some(SoundfontProgramPart {
+                track_id: track.id.clone(),
+                track_name: track.name.clone(),
+                preset,
+            });
+        }
+    }
+    parts
+}
+
+/// `track`'s parts as they play: a part a program selection sets takes that
+/// preset. Unchanged for a track that is no Soundfont Multi.
+pub fn effective_soundfont_channels(
+    state: &TimelineState,
+    track: &TrackState,
+) -> SoundfontChannels {
+    let mut channels = track.soundfont_channels;
+    for (part, program) in channels
+        .iter_mut()
+        .zip(soundfont_program_parts(state, &track.id))
+    {
+        if let Some(program) = program {
+            part.preset = Some(program.preset);
+        }
+    }
+    channels
+}
+
+/// A MIDI track as the channel menu offers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundfontMidiTrackChoice {
+    pub id: String,
+    pub name: String,
+    /// It plays this instrument now.
+    pub plays_here: bool,
+    /// Its fixed output channel, 0-based; `None` when each note keeps its own.
+    pub channel: Option<u8>,
+}
+
+impl SoundfontMidiTrackChoice {
+    fn plays_channel(&self, channel: u8) -> bool {
+        self.plays_here && self.channel == Some(channel)
+    }
+}
+
+/// A change to which MIDI tracks play an instrument, asked for by the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SoundfontMidiRoute {
+    /// New MIDI tracks, each playing one channel (0-based) under its name.
+    NewTracks(Vec<(u8, String)>),
+    /// An existing MIDI track plays `channel` (0-based) of the instrument.
+    Assign { track_id: String, channel: u8 },
+    /// The MIDI track stops playing the instrument.
+    Disconnect { track_id: String },
+    /// The track whose program sets part `channel` (0-based) selects `preset`.
+    Program {
+        track_id: String,
+        channel: u8,
+        preset: (i32, i32),
+    },
+}
+
+impl SoundfontMidiRoute {
+    /// Existing tracks the change edits. Tracks it creates are found by the
+    /// undo record itself.
+    pub fn edited_tracks(&self) -> Vec<String> {
+        match self {
+            Self::NewTracks(_) => Vec::new(),
+            Self::Assign { track_id, .. }
+            | Self::Disconnect { track_id }
+            | Self::Program { track_id, .. } => vec![track_id.clone()],
+        }
+    }
+
+    pub fn history_label(&self) -> &'static str {
+        match self {
+            Self::NewTracks(parts) if parts.len() > 1 => "Add MIDI Tracks",
+            Self::NewTracks(_) => "Add MIDI Track",
+            Self::Assign { .. } => "Route MIDI Track",
+            Self::Disconnect { .. } => "Disconnect MIDI Track",
+            Self::Program { .. } => "Set Program",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SoundfontMidiRouteRequest {
+    pub instrument_track_id: String,
+    pub route: SoundfontMidiRoute,
+}
+
+/// Applies `route` to the instrument track `instrument_id`: the MIDI track
+/// goes out to it (MIDI Out → Instrument) on a fixed channel. New tracks take
+/// the instrument's colour and sit below the last track already playing it.
+/// Returns whether anything changed.
+pub fn apply_soundfont_midi_route(
+    state: &mut TimelineState,
+    instrument_id: &str,
+    route: &SoundfontMidiRoute,
+) -> bool {
+    let Some(instrument) = state.find_track(instrument_id) else {
+        return false;
+    };
+    if instrument.track_type != TrackType::Instrument {
+        return false;
+    }
+    let color = instrument.color;
+    let route_to = |state: &mut TimelineState, id: &str, channel: u8| {
+        let mut changed = state.set_track_output_routing(
+            id,
+            TrackOutputRouting::Instrument {
+                track_id: instrument_id.to_string(),
+            },
+        );
+        changed |= state.set_track_midi_channel(id, Some(channel.min(15) + 1));
+        changed |= state.set_track_midi_output_per_note(id, false);
+        changed
+    };
+    match route {
+        SoundfontMidiRoute::NewTracks(parts) => {
+            for (channel, name) in parts {
+                let insert_at = state
+                    .tracks
+                    .iter()
+                    .rposition(|t| {
+                        t.id == instrument_id
+                            || state.effective_instrument_track_id(&t.id).as_deref()
+                                == Some(instrument_id)
+                    })
+                    .map_or(state.tracks.len(), |last| last + 1);
+                let id = state.create_track(CreateTrackOptions {
+                    track_type: TrackType::Midi,
+                    name: name.clone(),
+                    color,
+                    volume: crate::components::timeline::timeline_state::volume::db_to_norm(0.0),
+                    pan: 0.0,
+                    armed: false,
+                    input_monitor: InputMonitorMode::Off,
+                });
+                route_to(state, &id, *channel);
+                let index = state.tracks.len() - 1;
+                if insert_at < index {
+                    state.move_track_to(index, insert_at);
+                }
+            }
+            !parts.is_empty()
+        }
+        SoundfontMidiRoute::Assign { track_id, channel } => {
+            if state
+                .find_track(track_id)
+                .is_none_or(|t| t.track_type != TrackType::Midi)
+            {
+                return false;
+            }
+            route_to(state, track_id, *channel)
+        }
+        SoundfontMidiRoute::Disconnect { track_id } => {
+            let plays_here = state.find_track(track_id).is_some_and(|t| {
+                matches!(&t.routing.output, TrackOutputRouting::Instrument { track_id } if track_id == instrument_id)
+            });
+            plays_here && state.set_track_output_routing(track_id, TrackOutputRouting::None)
+        }
+        SoundfontMidiRoute::Program {
+            track_id,
+            channel,
+            preset,
+        } => {
+            let Some(current) = state.find_track(track_id).map(|t| t.routing.program) else {
+                return false;
+            };
+            let next = program_for_soundfont_preset(current, *channel, *preset);
+            state.set_track_program_selection(track_id, next)
+        }
+    }
 }
 
 /// The view of `track_id`'s player in `state`, or `None` when the track is
@@ -115,10 +411,25 @@ pub fn soundfont_track_view(state: &TimelineState, track_id: &str) -> Option<Sou
         envelope: track.soundfont_envelope,
         quality: track.soundfont_quality,
         mode: track.soundfont_mode,
-        channels: track.soundfont_channels,
+        // As they play: the parts programs set show those presets.
+        channels: effective_soundfont_channels(state, track),
     };
     let mut channel_sources: [Vec<String>; CHANNELS] = Default::default();
     let mut per_note_sources = Vec::new();
+    let midi_tracks = state
+        .tracks
+        .iter()
+        .filter(|t| t.track_type == TrackType::Midi)
+        .map(|t| SoundfontMidiTrackChoice {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            plays_here: state.effective_instrument_track_id(&t.id).as_deref() == Some(track_id),
+            channel: match t.routing.output_channel_mode() {
+                MidiOutputChannelMode::Fixed(channel) => Some(channel.raw()),
+                MidiOutputChannelMode::PerNote => None,
+            },
+        })
+        .collect();
     for source in &state.tracks {
         let plays_here = source.id == track_id
             || (source.track_type == TrackType::Midi
@@ -137,11 +448,14 @@ pub fn soundfont_track_view(state: &TimelineState, track_id: &str) -> Option<Sou
         settings,
         channel_sources,
         per_note_sources,
+        midi_tracks,
+        program_parts: soundfont_program_parts(state, track_id),
     })
 }
 
 type PreviewCb = Arc<dyn Fn(&str, SoundfontPlayerPreview, &mut App) + Send + Sync>;
 type UpdateCb = Arc<dyn Fn(SoundfontPlayerTrackUpdate, &mut App) + Send + Sync>;
+type RouteCb = Arc<dyn Fn(SoundfontMidiRouteRequest, &mut App) + Send + Sync>;
 
 /// A font's metadata, read off the UI thread.
 struct FontInfo {
@@ -164,6 +478,13 @@ pub struct SoundfontPlayerWindow {
     on_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
     on_update_track: UpdateCb,
     on_preview: PreviewCb,
+    on_route_midi: RouteCb,
+    /// The MIDI tracks of the project, for the channel menu.
+    midi_tracks: Vec<SoundfontMidiTrackChoice>,
+    /// Per channel, the track whose program sets the part.
+    program_parts: [Option<SoundfontProgramPart>; CHANNELS],
+    /// The open channel menu: channel (0-based) and where it was asked for.
+    menu: Option<(u8, f32, f32)>,
     focus_handle: FocusHandle,
     focused_once: bool,
     search: TextInputState,
@@ -186,6 +507,7 @@ impl SoundfontPlayerWindow {
         on_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
         on_update_track: UpdateCb,
         on_preview: PreviewCb,
+        on_route_midi: RouteCb,
         cx: &mut Context<Self>,
     ) -> Self {
         let sync = cx.observe(&timeline, |this, _timeline, cx| this.sync_from_track(cx));
@@ -196,6 +518,10 @@ impl SoundfontPlayerWindow {
             on_close,
             on_update_track,
             on_preview,
+            on_route_midi,
+            midi_tracks: Vec::new(),
+            program_parts: Default::default(),
+            menu: None,
             focus_handle: cx.focus_handle(),
             focused_once: false,
             search: TextInputState::new("soundfont-preset-search", cx.focus_handle())
@@ -219,10 +545,17 @@ impl SoundfontPlayerWindow {
         let path = view.settings.path.clone().filter(|path| !path.is_empty());
         let changed = self.panel.settings != view.settings
             || self.panel.channel_sources != view.channel_sources
-            || self.panel.per_note_sources != view.per_note_sources;
+            || self.panel.per_note_sources != view.per_note_sources
+            || self.midi_tracks != view.midi_tracks
+            || self.program_parts != view.program_parts;
         self.panel.settings = view.settings;
         self.panel.channel_sources = view.channel_sources;
         self.panel.per_note_sources = view.per_note_sources;
+        self.midi_tracks = view.midi_tracks;
+        self.panel.program_sources =
+            std::array::from_fn(|i| view.program_parts[i].as_ref().map(|p| p.track_name.clone()));
+        self.program_parts = view.program_parts;
+        self.panel.parts_without_track = self.parts_without_track().len();
         if path != self.loaded_path {
             self.load_font_info(path, cx);
             cx.notify();
@@ -400,8 +733,20 @@ impl SoundfontPlayerWindow {
         }
         let mut settings = self.panel.settings.clone();
         if settings.mode == SoundfontPlayerMode::Multi {
-            settings.channels[self.panel.selected_channel as usize % CHANNELS].preset =
-                Some(preset);
+            let channel = self.panel.selected_channel % CHANNELS as u8;
+            // A part a program sets follows that program: change the
+            // program, so the track and the part keep agreeing.
+            if let Some(owner) = &self.program_parts[channel as usize] {
+                let route = SoundfontMidiRoute::Program {
+                    track_id: owner.track_id.clone(),
+                    channel,
+                    preset,
+                };
+                self.panel.settings.channels[channel as usize].preset = Some(preset);
+                self.route_midi(route, cx);
+                return;
+            }
+            settings.channels[channel as usize].preset = Some(preset);
         } else {
             settings.preset = Some(preset);
         }
@@ -421,6 +766,121 @@ impl SoundfontPlayerWindow {
         let mut settings = self.panel.settings.clone();
         settings.channels[channel as usize % CHANNELS] = part;
         self.publish(settings, cx);
+    }
+
+    /// The name a new MIDI track for `channel` gets: its part's preset.
+    fn part_track_name(&self, channel: u8) -> String {
+        let part = self.panel.settings.channels[channel as usize % CHANNELS];
+        match self.panel.preset_name(part.preset) {
+            Some(name) => format!("Ch {} · {name}", channel + 1),
+            None => format!("MIDI Ch {}", channel + 1),
+        }
+    }
+
+    /// Channels no MIDI track plays yet, muted parts aside.
+    fn parts_without_track(&self) -> Vec<u8> {
+        (0..CHANNELS as u8)
+            .filter(|&channel| {
+                !self.panel.settings.channels[channel as usize].mute
+                    && !self.midi_tracks.iter().any(|t| t.plays_channel(channel))
+            })
+            .collect()
+    }
+
+    fn route_midi(&mut self, route: SoundfontMidiRoute, cx: &mut Context<Self>) {
+        self.menu = None;
+        (self.on_route_midi)(
+            SoundfontMidiRouteRequest {
+                instrument_track_id: self.track_id.clone(),
+                route,
+            },
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn add_part_tracks(&mut self, cx: &mut Context<Self>) {
+        let parts: Vec<(u8, String)> = self
+            .parts_without_track()
+            .into_iter()
+            .map(|channel| (channel, self.part_track_name(channel)))
+            .collect();
+        if !parts.is_empty() {
+            self.route_midi(SoundfontMidiRoute::NewTracks(parts), cx);
+        }
+    }
+
+    fn open_channel_menu(&mut self, channel: u8, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.select_channel(channel, cx);
+        self.menu = Some((channel.min(CHANNELS as u8 - 1), x, y));
+        cx.notify();
+    }
+
+    fn channel_menu_entries(&self, channel: u8) -> Vec<ContextMenuEntry> {
+        let mut entries = vec![
+            ContextMenuEntry::Header(format!("Channel {}", channel + 1)),
+            ContextMenuEntry::item("New MIDI Track", "new"),
+        ];
+        if !self.midi_tracks.is_empty() {
+            entries.push(ContextMenuEntry::Separator);
+            entries.push(ContextMenuEntry::Header("Play from MIDI track".into()));
+            for track in &self.midi_tracks {
+                let label = match (track.plays_here, track.channel) {
+                    (true, Some(other)) if other != channel => {
+                        format!("{}  (Ch {})", track.name, other + 1)
+                    }
+                    (true, None) => format!("{}  (per note)", track.name),
+                    _ => track.name.clone(),
+                };
+                entries.push(ContextMenuEntry::checked_item(
+                    label,
+                    format!("assign:{}", track.id),
+                    track.plays_channel(channel),
+                ));
+            }
+        }
+        let here: Vec<&SoundfontMidiTrackChoice> = self
+            .midi_tracks
+            .iter()
+            .filter(|t| t.plays_channel(channel))
+            .collect();
+        if !here.is_empty() {
+            entries.push(ContextMenuEntry::Separator);
+            for track in here {
+                entries.push(ContextMenuEntry::item(
+                    format!("Disconnect {}", track.name),
+                    format!("disconnect:{}", track.id),
+                ));
+            }
+        }
+        entries
+    }
+
+    fn run_menu_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        let Some((channel, _, _)) = self.menu.take() else {
+            return;
+        };
+        let route = if command == "new" {
+            Some(SoundfontMidiRoute::NewTracks(vec![(
+                channel,
+                self.part_track_name(channel),
+            )]))
+        } else if let Some(id) = command.strip_prefix("assign:") {
+            Some(SoundfontMidiRoute::Assign {
+                track_id: id.to_string(),
+                channel,
+            })
+        } else {
+            command
+                .strip_prefix("disconnect:")
+                .map(|id| SoundfontMidiRoute::Disconnect {
+                    track_id: id.to_string(),
+                })
+        };
+        match route {
+            Some(route) => self.route_midi(route, cx),
+            None => cx.notify(),
+        }
     }
 
     fn preview(&self, event: SoundfontPlayerPreview, app: &mut App) {
@@ -618,6 +1078,10 @@ impl SoundfontPlayerWindow {
                 cx.notify();
             }),
             on_shift_octave: with(&entity, |this, delta: i32, cx| this.shift_octave(delta, cx)),
+            on_channel_menu: with(&entity, |this, (channel, x, y): (u8, f32, f32), cx| {
+                this.open_channel_menu(channel, x, y, cx)
+            }),
+            on_add_part_tracks: void(&entity, |this, cx| this.add_part_tracks(cx)),
         }
     }
 }
@@ -649,8 +1113,32 @@ impl Render for SoundfontPlayerWindow {
         } else {
             SOUNDFONT_PLAYER_MDI_TITLE
         };
+        let menu = self.menu.map(|(channel, x, y)| {
+            let viewport = window.viewport_size();
+            let command_target = entity.clone();
+            let close_target = entity.clone();
+            context_menu_overlay(
+                self.channel_menu_entries(channel),
+                x,
+                y,
+                viewport.width.into(),
+                viewport.height.into(),
+                Arc::new(move |command: &String, _window, cx| {
+                    let command = command.clone();
+                    let _ =
+                        command_target.update(cx, |this, cx| this.run_menu_command(&command, cx));
+                }),
+                Arc::new(move |_: &(), _window, cx| {
+                    let _ = close_target.update(cx, |this, cx| {
+                        this.menu = None;
+                        cx.notify();
+                    });
+                }),
+            )
+        });
 
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -691,6 +1179,7 @@ impl Render for SoundfontPlayerWindow {
                         self.browser_scroll.clone(),
                     )),
             )
+            .when_some(menu, |root, menu| root.child(menu))
     }
 }
 
@@ -701,6 +1190,7 @@ pub fn open_soundfont_player_window(
     on_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
     on_update_track: UpdateCb,
     on_preview: PreviewCb,
+    on_route_midi: RouteCb,
     cx: &mut App,
 ) -> Result<WindowHandle<SoundfontPlayerWindow>, String> {
     let window_bounds = crate::window_position::centered_window_bounds(
@@ -731,6 +1221,7 @@ pub fn open_soundfont_player_window(
                 on_close,
                 on_update_track,
                 on_preview,
+                on_route_midi,
                 cx,
             )
         })
@@ -805,5 +1296,235 @@ mod tests {
         assert_eq!(view.per_note_sources, ["Chords"]);
         assert!(view.channel_sources[4].is_empty());
         assert!(soundfont_track_view(&state, "gone").is_none());
+        let bass_choice = view.midi_tracks.iter().find(|t| t.id == bass).unwrap();
+        assert!(bass_choice.plays_here && bass_choice.channel == Some(1));
+        let loose_choice = view
+            .midi_tracks
+            .iter()
+            .find(|t| t.name == "Elsewhere")
+            .unwrap();
+        assert!(!loose_choice.plays_here);
+    }
+
+    #[test]
+    fn a_new_midi_track_plays_its_part_and_sits_below_the_instrument() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let gm = add(&mut state, TrackType::Instrument, "GM");
+        let other = add(&mut state, TrackType::Audio, "Vocals");
+        assert!(apply_soundfont_midi_route(
+            &mut state,
+            &gm,
+            &SoundfontMidiRoute::NewTracks(vec![
+                (2, "Ch 3 · Strings".into()),
+                (9, "Ch 10 · Kit".into())
+            ]),
+        ));
+        let names: Vec<&str> = state.tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["GM", "Ch 3 · Strings", "Ch 10 · Kit", "Vocals"]);
+        let strings = &state.tracks[1];
+        assert_eq!(strings.track_type, TrackType::Midi);
+        assert_eq!(strings.routing.midi_channel, Some(3));
+        assert_eq!(
+            state.effective_instrument_track_id(&strings.id).as_deref(),
+            Some(gm.as_str())
+        );
+        let view = soundfont_track_view(&state, &gm).unwrap();
+        assert_eq!(view.channel_sources[2], ["Ch 3 · Strings"]);
+        assert_eq!(view.channel_sources[9], ["Ch 10 · Kit"]);
+        let _ = other;
+    }
+
+    #[test]
+    fn an_existing_midi_track_moves_to_a_channel_and_can_be_disconnected() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let gm = add(&mut state, TrackType::Instrument, "GM");
+        let lead = add(&mut state, TrackType::Midi, "Lead");
+        state.set_track_midi_output_per_note(&lead, true);
+        let route = SoundfontMidiRoute::Assign {
+            track_id: lead.clone(),
+            channel: 4,
+        };
+        assert!(apply_soundfont_midi_route(&mut state, &gm, &route));
+        assert!(
+            !apply_soundfont_midi_route(&mut state, &gm, &route),
+            "already there"
+        );
+        let view = soundfont_track_view(&state, &gm).unwrap();
+        assert_eq!(
+            view.channel_sources[4],
+            ["Lead"],
+            "a fixed channel, not per note"
+        );
+        assert_eq!(route.edited_tracks(), [lead.clone()]);
+
+        let disconnect = SoundfontMidiRoute::Disconnect {
+            track_id: lead.clone(),
+        };
+        assert!(apply_soundfont_midi_route(&mut state, &gm, &disconnect));
+        assert!(state.effective_instrument_track_id(&lead).is_none());
+        assert!(!apply_soundfont_midi_route(&mut state, &gm, &disconnect));
+    }
+
+    fn multi(state: &mut TimelineState, name: &str) -> String {
+        let id = add(state, TrackType::Instrument, name);
+        let track = state.tracks.iter_mut().find(|t| t.id == id).unwrap();
+        track.builtin_soundfont_player = true;
+        track.soundfont_mode = SoundfontPlayerMode::Multi;
+        id
+    }
+
+    fn selection(format: MidiPatchFormat, msb: u8, program: u8) -> MidiProgramSelection {
+        MidiProgramSelection {
+            format,
+            program: Some(program),
+            bank_msb: msb,
+            bank_lsb: 0,
+        }
+    }
+
+    #[test]
+    fn a_program_selection_maps_to_its_soundfont_preset() {
+        use MidiPatchFormat::{Gm, Gs, Xg};
+        assert_eq!(
+            soundfont_preset_for_program(selection(Gm, 5, 40), 0),
+            Some((0, 40)),
+            "GM has no banks"
+        );
+        assert_eq!(
+            soundfont_preset_for_program(selection(Gs, 8, 4), 2),
+            Some((8, 4))
+        );
+        assert_eq!(
+            soundfont_preset_for_program(selection(Gm, 0, 25), 9),
+            Some((128, 25)),
+            "channel 10 kit"
+        );
+        assert_eq!(
+            soundfont_preset_for_program(selection(Xg, 127, 0), 3),
+            Some((128, 0)),
+            "XG kit anywhere"
+        );
+        assert_eq!(
+            soundfont_preset_for_program(selection(Xg, 0, 0), 9),
+            Some((0, 0)),
+            "XG melodic on 10"
+        );
+        assert_eq!(
+            soundfont_preset_for_program(MidiProgramSelection::default(), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_preset_maps_back_to_a_selection_that_picks_it() {
+        use MidiPatchFormat::{Gm, Gs, Xg};
+        for current in [
+            MidiProgramSelection::default(),
+            selection(Gs, 3, 1),
+            selection(Xg, 0, 9),
+        ] {
+            for channel in [0u8, 4, 9] {
+                for preset in [(0, 0), (0, 73), (8, 4), (128, 0), (128, 25)] {
+                    let next = program_for_soundfont_preset(current, channel, preset);
+                    assert_eq!(
+                        soundfont_preset_for_program(next, channel),
+                        Some(preset),
+                        "{current:?} ch{channel} {preset:?} -> {next:?}"
+                    );
+                }
+            }
+        }
+        // A plain GM selection stays GM where GM can say it.
+        assert_eq!(
+            program_for_soundfont_preset(MidiProgramSelection::default(), 0, (0, 40)).format,
+            Gm
+        );
+    }
+
+    #[test]
+    fn a_midi_track_program_sets_the_part_on_its_channel() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let gm = multi(&mut state, "GM");
+        let bass = add(&mut state, TrackType::Midi, "Bass");
+        let kit = add(&mut state, TrackType::Midi, "Kit");
+        for (id, channel) in [(&bass, 2), (&kit, 4)] {
+            state.set_track_output_routing(
+                id,
+                TrackOutputRouting::Instrument {
+                    track_id: gm.clone(),
+                },
+            );
+            state.set_track_midi_channel(id, Some(channel));
+        }
+        state.set_track_program_selection(&bass, selection(MidiPatchFormat::Gs, 8, 33));
+        state.set_track_program_selection(&kit, selection(MidiPatchFormat::Xg, 127, 16));
+
+        let parts = soundfont_program_parts(&state, &gm);
+        assert_eq!(
+            parts[1].as_ref().map(|p| (p.track_name.as_str(), p.preset)),
+            Some(("Bass", (8, 33)))
+        );
+        assert_eq!(parts[3].as_ref().map(|p| p.preset), Some((128, 16)));
+        assert!(parts[0].is_none());
+
+        let view = soundfont_track_view(&state, &gm).unwrap();
+        assert_eq!(view.settings.channels[1].preset, Some((8, 33)));
+        assert!(view.settings.channels[3].is_drum_kit());
+        let instrument = state.find_track(&gm).unwrap();
+        assert_eq!(
+            effective_soundfont_channels(&state, instrument)[1].preset,
+            Some((8, 33))
+        );
+        assert_eq!(
+            instrument.soundfont_channels[1].preset, None,
+            "the stored part is untouched"
+        );
+
+        // The browser writes the program back.
+        let route = SoundfontMidiRoute::Program {
+            track_id: bass.clone(),
+            channel: 1,
+            preset: (0, 38),
+        };
+        assert!(apply_soundfont_midi_route(&mut state, &gm, &route));
+        assert_eq!(
+            soundfont_program_parts(&state, &gm)[1]
+                .as_ref()
+                .map(|p| p.preset),
+            Some((0, 38))
+        );
+    }
+
+    #[test]
+    fn a_single_mode_player_has_no_program_parts() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let gm = multi(&mut state, "GM");
+        state.tracks[0].soundfont_mode = SoundfontPlayerMode::Single;
+        state.set_track_program_selection(&gm, selection(MidiPatchFormat::Gm, 0, 5));
+        assert!(
+            soundfont_program_parts(&state, &gm)
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn only_midi_tracks_are_routed_and_only_to_an_instrument_track() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let gm = add(&mut state, TrackType::Instrument, "GM");
+        let audio = add(&mut state, TrackType::Audio, "Vocals");
+        let assign_audio = SoundfontMidiRoute::Assign {
+            track_id: audio.clone(),
+            channel: 0,
+        };
+        assert!(!apply_soundfont_midi_route(&mut state, &gm, &assign_audio));
+        let new = SoundfontMidiRoute::NewTracks(vec![(0, "x".into())]);
+        assert!(!apply_soundfont_midi_route(&mut state, &audio, &new));
+        assert_eq!(state.tracks.len(), 2);
     }
 }

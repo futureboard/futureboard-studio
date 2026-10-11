@@ -4,8 +4,8 @@
 #
 #   packaging/livestage/build.sh [--out DIR] [--data-mb N] [--alpine 3.24] [--skip-webui]
 #                                [--kernel linux-VERSION-livestage.tar.zst] [--installer]
-#   --installer   also make the installer USB stick image (livestage-installer-....img),
-#                 which puts the appliance image onto a computer's own disk
+#   --installer   also make the installer ISO (livestage-installer-....iso: a CD, or
+#                 a USB stick), which puts the appliance image onto a computer's own disk
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -61,6 +61,7 @@ echo
 echo "Write $out/livestage-alpine$alpine-x86_64.img to a USB stick or disk"
 echo "(dd, balenaEtcher, Rufus in DD mode), then boot it in UEFI mode."
 if [ "$installer" = 1 ]; then
-	echo "Or write $out/livestage-installer-alpine$alpine-x86_64.img to a USB stick and boot"
-	echo "the computer from it: it installs LiveStage onto the computer's own disk."
+	echo "To install onto a computer's own disk instead: boot it (UEFI) from"
+	echo "$out/livestage-installer-alpine$alpine-x86_64.iso, written raw to a USB stick the"
+	echo "same way, or as a CD / virtual CD."
 fi

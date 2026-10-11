@@ -93,6 +93,7 @@ fn snapshot(notes: Vec<EngineMidiNoteSnapshot>) -> EngineProjectSnapshot {
         ],
         clips: Vec::new(),
         midi_clips: vec![std::sync::Arc::new(EngineMidiClipSnapshot {
+            source_track_id: None,
             id: "clip-1".to_string(),
             track_id: TRACK.to_string(),
             start_beat: 0.0,

@@ -7,7 +7,7 @@ livestage-server. Needs Docker (Linux containers) and bun.
 pwsh packaging/livestage/build.ps1
 pwsh packaging/livestage/build.ps1 -DataMB 2048 -Out D:\images
 pwsh packaging/livestage/build.ps1 -Kernel out/livestage-kernel/linux-7.2.9-livestage.tar.zst
-pwsh packaging/livestage/build.ps1 -Installer    # the installer USB stick image too
+pwsh packaging/livestage/build.ps1 -Installer    # the installer ISO too
 #>
 param(
     # Where the image goes.
@@ -21,8 +21,8 @@ param(
     # A kernel made by kernel/build-kernel.sh (.tar.zst) in place of
     # Alpine's linux-lts.
     [string]$Kernel,
-    # Also make the installer USB stick image, which puts the appliance
-    # image onto a computer's own disk (livestage-installer-....img).
+    # Also make the installer ISO, which puts the appliance image onto a
+    # computer's own disk (livestage-installer-....iso: a CD, or a USB stick).
     [switch]$Installer
 )
 
@@ -71,6 +71,7 @@ Write-Host ""
 Write-Host "Write $outDir\livestage-alpine$AlpineVersion-x86_64.img to a USB stick or disk"
 Write-Host "(Rufus in DD mode, balenaEtcher, or dd), then boot it in UEFI mode."
 if ($Installer) {
-    Write-Host "Or write $outDir\livestage-installer-alpine$AlpineVersion-x86_64.img to a USB stick"
-    Write-Host "and boot the computer from it: it installs LiveStage onto the computer's own disk."
+    Write-Host "To install onto a computer's own disk instead: boot it (UEFI) from"
+    Write-Host "$outDir\livestage-installer-alpine$AlpineVersion-x86_64.iso, written raw to a USB stick"
+    Write-Host "the same way, or as a CD / virtual CD."
 }

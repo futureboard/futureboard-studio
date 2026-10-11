@@ -12,8 +12,12 @@ use super::system::{self, System};
 /// Under `--root`: what `blkid` printed on the machine the tree is from (as
 /// the console's storage reads it).
 pub const BLKID_SAMPLE: &str = "/blkid.txt";
-/// The installer's own root filesystem (on the USB stick it runs from).
+/// The installer's own label: its ISO 9660 volume (`LSINSTALL`), and the
+/// root filesystem of earlier installer sticks.
 pub const INSTALLER_LABEL: &str = "lsinstall";
+/// Where the installer ISO's initramfs leaves the medium it booted from
+/// (iso/init): a CD (`sr0`), or the USB stick the ISO was written to.
+pub const MEDIUM: &str = "/media/medium";
 /// Room a disk needs beyond the image: the data partition grows into the
 /// rest at the first boot, and recordings need somewhere to go.
 pub const SPARE_BYTES: u64 = 1 << 30;
@@ -189,14 +193,26 @@ pub fn parse_swaps(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The disk the installer runs from: the one `/` is on (by device number,
-/// else by /proc/mounts), else the one with the installer's label.
+/// The disk the installer runs from: the whole disk behind the medium the
+/// ISO is mounted from (none when that is a CD, which is not listed
+/// anyway); without a medium, the one `/` is on (by device number, else by
+/// /proc/mounts), else the one with the installer's label.
 fn own_disk(facts: &Facts) -> Option<String> {
     let names = |disk: &BlockDisk| {
         std::iter::once((disk.name.clone(), disk.dev.clone()))
             .chain(disk.parts.iter().map(|p| (p.name.clone(), p.dev.clone())))
             .collect::<Vec<_>>()
     };
+    let holding = |device: &str| {
+        facts
+            .disks
+            .iter()
+            .find(|d| names(d).iter().any(|(name, _)| name == device))
+            .map(|d| d.name.clone())
+    };
+    if let Some(medium) = facts.mounts.iter().find(|m| m.path == MEDIUM) {
+        return medium.device().and_then(holding);
+    }
     if let Some(root) = facts.root_dev
         && let Some(disk) = facts
             .disks
@@ -205,17 +221,14 @@ fn own_disk(facts: &Facts) -> Option<String> {
     {
         return Some(disk.name.clone());
     }
-    if let Some(device) = facts
+    if let Some(disk) = facts
         .mounts
         .iter()
         .find(|m| m.path == "/")
         .and_then(|m| m.device())
-        && let Some(disk) = facts
-            .disks
-            .iter()
-            .find(|d| names(d).iter().any(|(name, _)| name == device))
+        .and_then(holding)
     {
-        return Some(disk.name.clone());
+        return Some(disk);
     }
     facts
         .disks
@@ -295,6 +308,12 @@ pub fn classify(facts: &Facts) -> Vec<Disk> {
                 holds.retain(|h| *h != "LiveStage");
             }
             let installer = own.as_deref() == Some(block.name.as_str());
+            // Written raw, the ISO's label shows on the disk only as far as
+            // blkid looks past the partition table; it is the installer
+            // either way.
+            if installer {
+                holds = vec!["LiveStage installer"];
+            }
             let mounted = facts
                 .mounts
                 .iter()
@@ -466,8 +485,8 @@ pub(crate) mod tests {
         put(
             &root,
             BLKID_SAMPLE,
-            "/dev/sda1: LABEL=\"LSINSTALL\" UUID=\"1111-2222\" TYPE=\"vfat\"\n\
-             /dev/sda2: LABEL=\"lsinstall\" UUID=\"aaaa\" TYPE=\"ext4\"\n\
+            "/dev/sda: LABEL=\"LSINSTALL\" UUID=\"2026-10-10-15-00-00-00\" TYPE=\"iso9660\" PTTYPE=\"PMBR\"\n\
+             /dev/sda2: LABEL_FATBOOT=\"LSINSTEFI\" LABEL=\"LSINSTEFI\" UUID=\"aaaa\" TYPE=\"vfat\"\n\
              /dev/nvme0n1p1: UUID=\"3333-4444\" TYPE=\"vfat\"\n\
              /dev/nvme0n1p3: LABEL=\"Windows\" UUID=\"0123\" TYPE=\"ntfs\"\n\
              /dev/mmcblk0p1: LABEL=\"lsdata\" UUID=\"5555-6666\" TYPE=\"exfat\"\n\
@@ -476,7 +495,9 @@ pub(crate) mod tests {
         put(
             &root,
             "/proc/mounts",
-            "/dev/sda2 / ext4 ro,noatime 0 0\n\
+            "overlay / overlay rw 0 0\n\
+             /dev/sda /media/medium iso9660 ro 0 0\n\
+             /dev/loop0 /media/lower squashfs ro 0 0\n\
              /dev/sdc1 /mnt/backup exfat rw 0 0\n\
              tmpfs /run tmpfs rw 0 0\n",
         );
@@ -587,6 +608,41 @@ pub(crate) mod tests {
         let leaked: &'static [MountEntry] = Box::leak(mounts.into_boxed_slice());
         assert_eq!(own_disk(&facts(None, leaked)).as_deref(), Some("sdb"));
         assert_eq!(own_disk(&facts(None, &[])).as_deref(), Some("sda"));
+        // Booted from the ISO: the medium's mount decides, whole disk or a
+        // partition of it, over the device number and the label.
+        let medium: &'static [MountEntry] = Box::leak(
+            blocks::parse_mounts(
+                "overlay / overlay rw 0 0
+/dev/sdb /media/medium iso9660 ro 0 0
+",
+            )
+            .into_boxed_slice(),
+        );
+        assert_eq!(
+            own_disk(&facts(Some("8:1"), medium)).as_deref(),
+            Some("sdb")
+        );
+        let partition: &'static [MountEntry] = Box::leak(
+            blocks::parse_mounts(
+                "/dev/sdb1 /media/medium iso9660 ro 0 0
+",
+            )
+            .into_boxed_slice(),
+        );
+        assert_eq!(own_disk(&facts(None, partition)).as_deref(), Some("sdb"));
+        // From a CD: no disk is the installer's, not even one labelled so.
+        let cd: &'static [MountEntry] = Box::leak(
+            blocks::parse_mounts(
+                "overlay / overlay rw 0 0
+/dev/sr0 /media/medium iso9660 ro 0 0
+",
+            )
+            .into_boxed_slice(),
+        );
+        assert_eq!(own_disk(&facts(None, cd)), None);
+        let classified = classify(&facts(None, cd));
+        assert!(classified.iter().all(|d| !d.installer), "{classified:?}");
+        assert!(classified.iter().all(|d| d.available()), "{classified:?}");
         // Swap counts as in use.
         let swaps = parse_swaps("Filename Type Size Used Priority\n/dev/sdb1 partition 1 0 -2\n");
         assert_eq!(swaps, ["sdb1"]);

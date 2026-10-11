@@ -8,6 +8,7 @@
 //! | `DauxCpalBackend`        | All          | cpal: WASAPI Shared / CoreAudio / ALSA |
 //! | `DauxWasapiExclBackend`  | Windows only | Raw WASAPI professional + MMCSS        |
 //! | `DauxWdmKsBackend`       | Windows only | WDM-KS low-level driver path        |
+//! | `DauxDirectBackend`      | Windows only | DAUx engine, DAUx-KS kernel streaming |
 //! | `DauxAsioBackend`        | Windows only | Host supplied by an edition provider |
 //! | `DauxMmeBackend`         | Windows only | Legacy MME stub (fallback only)     |
 //!
@@ -24,6 +25,8 @@ pub mod asio_session;
 pub mod cpal_backend;
 pub mod render;
 
+#[cfg(target_os = "windows")]
+pub mod daux_direct;
 #[cfg(target_os = "windows")]
 pub mod wasapi_exclusive;
 #[cfg(target_os = "windows")]
@@ -43,6 +46,9 @@ pub enum BackendKind {
     WasapiExclusive,
     /// Windows: WDM-KS low-level driver path (experimental).
     WdmKs,
+    /// Windows: the DAUx engine streaming straight to the driver's kernel
+    /// pins (DAUx-KS) — covers USB audio class devices WDM-KS cannot.
+    DauxDirect,
     /// Windows: Steinberg ASIO driver path supplied by Professional Edition.
     Asio,
     /// macOS: CoreAudio (same as Auto on macOS, explicit selection).
@@ -60,6 +66,7 @@ impl BackendKind {
             BackendKind::WasapiShared => "DAUx WASAPI Shared",
             BackendKind::WasapiExclusive => "DAUx WASAPI Exclusive",
             BackendKind::WdmKs => "DAUx WDM-KS",
+            BackendKind::DauxDirect => "DAUx Direct",
             BackendKind::Asio => "DAUx ASIO",
             BackendKind::CoreAudio => "DAUx CoreAudio",
             BackendKind::Alsa => "DAUx ALSA",
@@ -73,6 +80,7 @@ impl BackendKind {
             BackendKind::WasapiShared => "wasapi-shared",
             BackendKind::WasapiExclusive => "wasapi-exclusive",
             BackendKind::WdmKs => "wdm-ks",
+            BackendKind::DauxDirect => "daux-direct",
             BackendKind::Asio => "asio",
             BackendKind::CoreAudio => "coreaudio",
             BackendKind::Alsa => "alsa",
@@ -85,6 +93,7 @@ impl BackendKind {
             "wasapi-shared" | "wasapishared" => BackendKind::WasapiShared,
             "wasapi-exclusive" | "wasapiprofessional" => BackendKind::WasapiExclusive,
             "wdm-ks" | "wdmks" | "wdm_ks" => BackendKind::WdmKs,
+            "daux-direct" | "dauxdirect" | "daux-ks" => BackendKind::DauxDirect,
             "asio" | "daux-asio" => BackendKind::Asio,
             "coreaudio" | "core-audio" => BackendKind::CoreAudio,
             "alsa" => BackendKind::Alsa,
@@ -104,6 +113,7 @@ impl BackendKind {
                 BackendKind::WasapiShared,
                 BackendKind::WasapiExclusive,
                 BackendKind::WdmKs,
+                BackendKind::DauxDirect,
                 BackendKind::MmeFallback,
             ];
             if asio_support_enabled() {
@@ -266,6 +276,15 @@ pub fn list_available_backends() -> Vec<BackendInfo> {
             available: true,
             is_default: false,
             description: "WDM-KS low-level Windows driver path — experimental".into(),
+        });
+        list.push(BackendInfo {
+            id: "daux-direct".into(),
+            name: "DAUx Direct".into(),
+            available: true,
+            is_default: false,
+            description: "DAUx engine — kernel streaming straight to the driver (USB audio), \
+                          bypassing the Windows audio engine"
+                .into(),
         });
         if asio_support_enabled() {
             list.push(BackendInfo {
@@ -448,6 +467,16 @@ mod tests {
     #[cfg(all(target_os = "windows", feature = "asio"))]
     fn test_asio_entitlement() -> bool {
         TEST_ASIO_ENTITLEMENT.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn daux_direct_backend_id_round_trips() {
+        assert_eq!(BackendKind::from_id("daux-direct"), BackendKind::DauxDirect);
+        assert_eq!(BackendKind::DauxDirect.id(), "daux-direct");
+        assert_eq!(
+            BackendKind::DauxDirect.is_allowed_on_current_platform(),
+            cfg!(target_os = "windows")
+        );
     }
 
     #[test]

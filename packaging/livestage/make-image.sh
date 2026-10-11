@@ -9,7 +9,7 @@
 #   /target  cargo's target directory (a cache volume)
 # and, with KERNEL_TARBALL set, the kernel to use in place of Alpine's
 # linux-lts: a tar.zst made by kernel/build-kernel.sh. With INSTALLER=1 it
-# then makes the installer USB stick image too (section 6, below).
+# then makes the installer ISO too (section 6, below).
 #
 # The disk (GPT):
 #   1  LSBOOT  FAT32  EFI/BOOT/BOOTX64.EFI: one unified kernel image (stub,
@@ -28,15 +28,23 @@
 # from directories (mke2fs -d, mtools) or made empty (mkfs.exfat), and placed
 # into the disk image by offset.
 #
-# The installer (INSTALLER=1), livestage-installer-....img, for a USB stick
-# that puts the image above onto a computer's own disk:
-#   1  LSINSTALL  FAT32  its own unified kernel image, root=LABEL=lsinstall
-#   2  lsinstall  ext4   the same Alpine system, read-only, where tty1 runs
-#                        livestage-installer instead of the setup and no
-#                        LiveStage service runs; the image above, compressed,
-#                        is /usr/share/livestage/installer/livestage.img.zst
-#                        with its size and sha256 in payload.conf
-# Its labels are not the appliance's, so the two never mix up on one machine.
+# The installer (INSTALLER=1), livestage-installer-....iso, which puts the
+# image above onto a computer's own disk. A UEFI-only hybrid ISO: it boots
+# from a CD or virtual CD (El Torito, its EFI image) and, written raw to a USB
+# stick, as a disk (the same FAT image, inside the ISO, is also a GPT EFI
+# system partition). Its ISO 9660 filesystem, volume LSINSTALL, holds:
+#   boot/efiboot.img              the EFI image: EFI/BOOT/BOOTX64.EFI, the same
+#                                 kernel with an initramfs of its own (iso/init)
+#                                 that finds this volume on any block device,
+#                                 CD or not, and starts installer.sfs under a
+#                                 tmpfs overlay
+#   livestage/installer.sfs       the installer's system: the same Alpine, where
+#                                 tty1 runs livestage-installer and no LiveStage
+#                                 service runs (squashfs, zstd)
+#   livestage/livestage.img.zst   the image above, compressed
+#   livestage/payload.conf        its size and sha256 uncompressed
+# Nothing depends on the GPT but the firmware's way in from a stick. Its
+# labels are not the appliance's, so the two never mix up on one machine.
 
 set -eu
 
@@ -60,7 +68,11 @@ MKINITFS_FEATURES="ata base ext4 mmc nvme scsi usb virtio"
 # Kernel messages go to the serial port too; the screen (tty0, last) is the
 # console proper, where the boot and the login banner show.
 CMDLINE="root=LABEL=lsroot rootfstype=ext4 ro modules=sd-mod,usb-storage,ext4 quiet console=ttyS0,115200 console=tty0"
-INSTALLER_CMDLINE="root=LABEL=lsinstall rootfstype=ext4 ro modules=sd-mod,usb-storage,ext4 quiet console=ttyS0,115200 console=tty0"
+# The installer's initramfs (iso/init) finds its medium by this label, on
+# CDs (sr*), USB sticks, disks of any kind.
+ISO_LABEL=LSINSTALL
+ISO_FEATURES="ata base cdrom mmc nvme scsi squashfs usb virtio"
+INSTALLER_CMDLINE="livestage.label=$ISO_LABEL quiet console=ttyS0,115200 console=tty0"
 
 # Firmware for every Wi-Fi driver in the kernel: the packages holding what
 # drivers/net/wireless asks for (modinfo -F firmware), plus cypress (brcm's
@@ -117,7 +129,7 @@ fi
 # ── 2. The root filesystem ──────────────────────────────────────────────────
 
 log "Installing Alpine $ALPINE_VERSION into the root filesystem"
-rm -rf "$ROOT" "$SYS" "$IROOT" "$WORK/esp" "$WORK/iesp"
+rm -rf "$ROOT" "$SYS" "$IROOT" "$WORK/esp" "$WORK/iso" "$WORK/kernel"
 mkdir -p "$ROOT/etc/apk" "$ROOT/etc/mkinitfs"
 cp /etc/apk/repositories "$ROOT/etc/apk/repositories"
 # The initramfs is made below from this tree; stop the kernel package's
@@ -199,13 +211,10 @@ efi-mkuki -c "$CMDLINE" -r "$ROOT/etc/os-release" -o "$WORK/esp/EFI/BOOT/BOOTX64
 	"$ROOT/boot/vmlinuz-lts" "$ROOT/boot/intel-ucode.img" "$ROOT/boot/amd-ucode.img" \
 	"$WORK/initramfs"
 if [ "$INSTALLER" = 1 ]; then
-	# The same kernel and initramfs; the installer's root by its own label.
-	mkdir -p "$WORK/iesp/EFI/BOOT"
-	efi-mkuki -c "$INSTALLER_CMDLINE" -r "$ROOT/etc/os-release" \
-		-o "$WORK/iesp/EFI/BOOT/BOOTX64.EFI" \
-		"$ROOT/boot/vmlinuz-lts" "$ROOT/boot/intel-ucode.img" "$ROOT/boot/amd-ucode.img" \
-		"$WORK/initramfs"
-	echo "$INSTALLER_CMDLINE" >"$WORK/iesp/EFI/BOOT/cmdline.txt"
+	# The installer's UKI is made in section 6, from the same kernel.
+	mkdir -p "$WORK/kernel"
+	cp -L "$ROOT/boot/vmlinuz-lts" "$ROOT/boot/intel-ucode.img" "$ROOT/boot/amd-ucode.img" \
+		"$WORK/kernel/"
 fi
 # The kernel lives in the UKI; the root filesystem does not need its copies.
 rm -f "$ROOT"/boot/vmlinuz-* "$ROOT"/boot/initramfs-* "$ROOT"/boot/*-ucode.img \
@@ -279,7 +288,7 @@ printf '  kernel %s, livestage-server %s KiB\n' "$KVER" "$(($(stat -c %s "$WORK/
 
 [ "$INSTALLER" = 1 ] || exit 0
 
-# ── 6. The installer ────────────────────────────────────────────────────────
+# ── 6. The installer ISO ────────────────────────────────────────────────────
 
 log "The installer's system: the same one, with livestage-installer on tty1"
 cp -a "$ROOT" "$IROOT"
@@ -307,14 +316,32 @@ ln -s /usr/share/zoneinfo/UTC "$IROOT/etc/localtime"
 	install -D -m 0644 "$HERE/installer-rootfs/$file" "$IROOT/$file"
 done
 install -m 0755 "$WORK/livestage-installer" "$IROOT/usr/bin/livestage-installer"
+# Where iso/init moves the medium, the squashfs and the overlay's tmpfs.
+mkdir -p "$IROOT/media/medium" "$IROOT/media/lower" "$IROOT/media/rw"
 
-log "The image to install, compressed"
-PAYLOAD=$IROOT/usr/share/livestage/installer
-mkdir -p "$PAYLOAD"
+log "The installer's initramfs (iso/init) and unified kernel image"
+printf 'features="%s"\ndisable_trigger="yes"\n' "$ISO_FEATURES" >"$WORK/mkinitfs-iso.conf"
+mkinitfs -b "$IROOT" -c "$WORK/mkinitfs-iso.conf" -i "$HERE/iso/init" \
+	-o "$WORK/initramfs-iso" "$KVER"
+mkdir -p "$WORK/iesp/EFI/BOOT"
+efi-mkuki -c "$INSTALLER_CMDLINE" -r "$IROOT/etc/os-release" -o "$WORK/iesp/EFI/BOOT/BOOTX64.EFI" \
+	"$WORK/kernel/vmlinuz-lts" "$WORK/kernel/intel-ucode.img" "$WORK/kernel/amd-ucode.img" \
+	"$WORK/initramfs-iso"
+echo "$INSTALLER_CMDLINE" >"$WORK/iesp/EFI/BOOT/cmdline.txt"
+# The EFI system partition / El Torito image: the UKI and a little room.
+uki_mb=$(mib "$(du -s -B1 "$WORK/iesp" | cut -f1)")
+mkdir -p "$WORK/iso/boot"
+mkfs.vfat -C -n LSINSTEFI "$WORK/iso/boot/efiboot.img" $(((uki_mb + 4) * 1024)) >/dev/null
+mcopy -s -i "$WORK/iso/boot/efiboot.img" "$WORK/iesp/EFI" ::/
+
+log "The installer's files: its system (squashfs) and the image to install"
+mkdir -p "$WORK/iso/livestage"
+mksquashfs "$IROOT" "$WORK/iso/livestage/installer.sfs" -comp zstd -Xcompression-level 15 \
+	-noappend -no-progress -quiet
 image_bytes=$(stat -c %s "$DISK")
 image_sha=$(sha256sum "$DISK" | cut -d' ' -f1)
-zstd -q -T0 -10 -o "$PAYLOAD/livestage.img.zst" "$DISK"
-cat >"$PAYLOAD/payload.conf" <<EOF
+zstd -q -T0 -10 -o "$WORK/iso/livestage/livestage.img.zst" "$DISK"
+cat >"$WORK/iso/livestage/payload.conf" <<EOF
 # What livestage.img.zst holds, uncompressed: made by make-image.sh, checked
 # by livestage-installer as it writes the image and again when it reads it
 # back from the disk.
@@ -323,28 +350,22 @@ IMAGE_BYTES="$image_bytes"
 IMAGE_SHA256="$image_sha"
 EOF
 
-log "The installer's filesystems and disk"
-iroot_used=$(du -s -B1 "$IROOT" | cut -f1)
-IROOT_MB=$(($(mib "$iroot_used") * 9 / 8 + 64))
-mkfs.vfat -C -F 32 -n LSINSTALL "$WORK/iesp.img" $((ESP_MB * 1024)) >/dev/null
-mcopy -s -i "$WORK/iesp.img" "$WORK/iesp/EFI" ::/
-mke2fs -q -t ext4 -L lsinstall -d "$IROOT" "$WORK/iroot.img" "${IROOT_MB}M"
-IDISK=$WORK/$INSTALLER_NAME.img
-ITOTAL_MB=$((1 + ESP_MB + IROOT_MB + 1))
-truncate -s "${ITOTAL_MB}M" "$IDISK"
-sfdisk -q "$IDISK" <<EOF
-label: gpt
-unit: sectors
-first-lba: 2048
-start=2048, size=$((ESP_MB * 2048)), type=uefi, name=LSINSTALL
-size=$((IROOT_MB * 2048)), type=linux, name=lsinstall
-EOF
-dd if="$WORK/iesp.img" of="$IDISK" bs=1M seek=1 conv=notrunc,sparse status=none
-dd if="$WORK/iroot.img" of="$IDISK" bs=1M seek=$((1 + ESP_MB)) conv=notrunc,sparse status=none
-cp --sparse=always "$IDISK" "/out/$INSTALLER_NAME.img"
-(cd /out && sha256sum "$INSTALLER_NAME.img" >"$INSTALLER_NAME.sha256")
+log "The installer ISO"
+# One copy of the EFI image serves both ways in: El Torito's for a CD, and a
+# GPT EFI system partition over the same bytes for a stick. It stays inside
+# the ISO 9660 volume: it is over El Torito's 32 MiB load size, and firmware
+# (edk2) then takes the boot image to run to the volume's end, which an image
+# appended after the volume is not within.
+xorriso -as mkisofs -quiet \
+	-iso-level 3 -full-iso9660-filenames -joliet -joliet-long -rational-rock \
+	-volid "$ISO_LABEL" -appid "LiveStage installer" -publisher "Futureboard" \
+	-e boot/efiboot.img -no-emul-boot -efi-boot-part --efi-boot-image \
+	-output "/out/$INSTALLER_NAME.iso" "$WORK/iso"
+(cd /out && sha256sum "$IMAGE_NAME.img" "$IMAGE_NAME.efi" "$INSTALLER_NAME.iso" >"$IMAGE_NAME.sha256")
 
 log "Done: the installer"
-printf '  %s  %s MiB (boot %s, system %s with the image, %s MiB of it compressed)\n' \
-	"/out/$INSTALLER_NAME.img" "$ITOTAL_MB" "$ESP_MB" "$IROOT_MB" \
-	"$(($(stat -c %s "$PAYLOAD/livestage.img.zst") / 1048576))"
+printf '  %s  %s MiB (system %s MiB squashfs, image %s MiB compressed, EFI %s MiB)\n' \
+	"/out/$INSTALLER_NAME.iso" "$(($(stat -c %s "/out/$INSTALLER_NAME.iso") / 1048576))" \
+	"$(($(stat -c %s "$WORK/iso/livestage/installer.sfs") / 1048576))" \
+	"$(($(stat -c %s "$WORK/iso/livestage/livestage.img.zst") / 1048576))" \
+	"$(($(stat -c %s "$WORK/iso/boot/efiboot.img") / 1048576))"

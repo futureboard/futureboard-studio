@@ -1,6 +1,6 @@
 [package]
 name = "sphere_ui_components"
-version = "2026.10.1-beta1.4.2"
+version = "2026.10.11-beta1.4.3"
 edition = "2021"
 autobins = false
 # Bakes FUTUREBOARD_AUTH_API_URL and FUTUREBOARD_TONE3000_API_KEY; see build.rs.
@@ -57,7 +57,6 @@ builtin-plugin-editor = [
     "dep:waygate",
     "dep:wrapsynth",
     "dep:drumsampler",
-    "dep:quicksampler",
     "dep:slicer",
     "dep:zcomp",
     "dep:mixstation",
@@ -116,7 +115,9 @@ transient = { workspace = true, optional = true }
 waygate = { workspace = true, optional = true }
 wrapsynth = { workspace = true, optional = true }
 drumsampler = { workspace = true, optional = true }
-quicksampler = { workspace = true, optional = true }
+# Not optional: `quick_sampler_panel` (whose layout helpers every native
+# editor shares) reads its parameter types even without the CEF editor host.
+quicksampler.workspace = true
 slicer = { workspace = true, optional = true }
 zcomp = { workspace = true, optional = true }
 mixstation = { workspace = true, optional = true }

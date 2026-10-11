@@ -28,6 +28,8 @@ use crate::audio_source::{sample_source_stereo, ClipAudioSource};
 use crate::backend::wasapi_exclusive::{self, WasapiExclusiveHandle};
 #[cfg(target_os = "windows")]
 use crate::backend::wdm_ks::{self, WdmKsHandle};
+#[cfg(target_os = "windows")]
+use crate::backend::daux_direct::{self, DauxDirectHandle};
 use crate::backend::{
     cpal_backend::{self, CpalStreamHandle},
     list_available_backends, BackendKind, DauxDeviceConfig,
@@ -823,6 +825,8 @@ enum ActiveStream {
     WasapiExclusive(WasapiExclusiveHandle),
     #[cfg(target_os = "windows")]
     WdmKs(WdmKsHandle),
+    #[cfg(target_os = "windows")]
+    DauxDirect(DauxDirectHandle),
 }
 
 impl ActiveStream {
@@ -835,6 +839,8 @@ impl ActiveStream {
             ActiveStream::WasapiExclusive(h) => Some(&h.cmd_tx),
             #[cfg(target_os = "windows")]
             ActiveStream::WdmKs(h) => Some(&h.cmd_tx),
+            #[cfg(target_os = "windows")]
+            ActiveStream::DauxDirect(h) => Some(&h.cmd_tx),
         }
     }
     fn play(&self) -> Result<(), String> {
@@ -846,6 +852,8 @@ impl ActiveStream {
             ActiveStream::WasapiExclusive(_) => Ok(()), // already playing from stream start
             #[cfg(target_os = "windows")]
             ActiveStream::WdmKs(_) => Ok(()), // already playing from stream start
+            #[cfg(target_os = "windows")]
+            ActiveStream::DauxDirect(_) => Ok(()), // already playing from stream start
         }
     }
     fn pause(&self) -> Result<(), String> {
@@ -857,6 +865,8 @@ impl ActiveStream {
             ActiveStream::WasapiExclusive(_) => Ok(()), // no pause in exclusive — caller mutes output
             #[cfg(target_os = "windows")]
             ActiveStream::WdmKs(_) => Ok(()), // no pause in low-level backend — caller mutes output
+            #[cfg(target_os = "windows")]
+            ActiveStream::DauxDirect(_) => Ok(()), // kernel pin keeps running — caller mutes output
         }
     }
     #[cfg(all(target_os = "windows", feature = "asio"))]
@@ -876,6 +886,8 @@ impl ActiveStream {
             ActiveStream::WasapiExclusive(h) => h.sample_rate,
             #[cfg(target_os = "windows")]
             ActiveStream::WdmKs(h) => h.sample_rate,
+            #[cfg(target_os = "windows")]
+            ActiveStream::DauxDirect(h) => h.sample_rate,
         }
     }
     #[allow(dead_code)]
@@ -888,6 +900,8 @@ impl ActiveStream {
             ActiveStream::WasapiExclusive(h) => h.buffer_size,
             #[cfg(target_os = "windows")]
             ActiveStream::WdmKs(h) => h.buffer_size,
+            #[cfg(target_os = "windows")]
+            ActiveStream::DauxDirect(h) => h.buffer_size,
         }
     }
     #[allow(dead_code)]
@@ -900,6 +914,8 @@ impl ActiveStream {
             ActiveStream::WasapiExclusive(h) => &h.device_name,
             #[cfg(target_os = "windows")]
             ActiveStream::WdmKs(h) => &h.device_name,
+            #[cfg(target_os = "windows")]
+            ActiveStream::DauxDirect(h) => &h.device_name,
         }
     }
     fn backend_name(&self) -> &str {
@@ -911,6 +927,8 @@ impl ActiveStream {
             ActiveStream::WasapiExclusive(_) => "DAUx WASAPI Exclusive",
             #[cfg(target_os = "windows")]
             ActiveStream::WdmKs(_) => "DAUx WDM-KS",
+            #[cfg(target_os = "windows")]
+            ActiveStream::DauxDirect(_) => "DAUx Direct",
         }
     }
 }
@@ -4497,6 +4515,31 @@ impl EngineInner {
                 self.commit_stream_open(sr, bs, dev_name, "DAUx WDM-KS".into());
                 stream
             }
+            #[cfg(target_os = "windows")]
+            BackendKind::DauxDirect => {
+                let handle = daux_direct::open(
+                    &daux_cfg,
+                    Arc::clone(&self.shared),
+                    initial_runtime,
+                    Arc::clone(&self.glitch_counter),
+                )?;
+                let sr = handle.sample_rate;
+                let bs = handle.buffer_size;
+                let dev_name = handle.device_name.clone();
+                // The engine knows its exact output buffering (queued kernel
+                // packets); publish it like a driver-reported latency.
+                self.shared.output_latency_secs.store(
+                    f32_store(handle.output_latency_frames as f32 / sr.max(1) as f32),
+                    Ordering::Relaxed,
+                );
+                self.shared
+                    .latency_from_driver
+                    .store(true, Ordering::Relaxed);
+                eprintln!("[DAUx Direct] {}", handle.output_format);
+                let stream = ActiveStream::DauxDirect(handle);
+                self.commit_stream_open(sr, bs, dev_name, "DAUx Direct".into());
+                stream
+            }
             #[cfg(all(target_os = "windows", feature = "asio"))]
             BackendKind::Asio => {
                 let host = crate::backend::asio_host()?;
@@ -4527,6 +4570,12 @@ impl EngineInner {
             BackendKind::WdmKs => {
                 return Err(SphereAudioError::BackendUnavailable(
                     "DAUx WDM-KS is only available on Windows".into(),
+                ));
+            }
+            #[cfg(not(target_os = "windows"))]
+            BackendKind::DauxDirect => {
+                return Err(SphereAudioError::BackendUnavailable(
+                    "DAUx Direct is only available on Windows".into(),
                 ));
             }
             _ => {
@@ -5924,6 +5973,7 @@ fn sample_rate_mode_label(backend: &BackendKind) -> &'static str {
         BackendKind::WasapiShared => "WASAPI_SHARED",
         BackendKind::WasapiExclusive => "WASAPI_EXCLUSIVE",
         BackendKind::WdmKs => "WDM_KS",
+        BackendKind::DauxDirect => "DAUX_DIRECT",
         BackendKind::Asio => "ASIO",
         BackendKind::CoreAudio => "COREAUDIO",
         BackendKind::Alsa => "ALSA",
@@ -9173,6 +9223,7 @@ mod structure_key_tests {
                 .iter()
                 .map(|id| {
                     std::sync::Arc::new(EngineMidiClipSnapshot {
+                        source_track_id: None,
                         id: id.to_string(),
                         track_id: "track-1".to_string(),
                         start_beat: 0.0,

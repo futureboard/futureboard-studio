@@ -7,6 +7,7 @@ LiveStage installer (Alpine Linux)
                                       install with no questions
   blkid, sfdisk -l, efibootmgr        what the disks and the firmware hold
 
-  The image it installs: /usr/share/livestage/installer/livestage.img.zst
-  The system is read-only; /tmp and /run are in memory.
+  The installer's medium (the ISO) is mounted at /media/medium; the image it
+  installs is /media/medium/livestage/livestage.img.zst. Changes to this
+  system are kept in memory only.
 

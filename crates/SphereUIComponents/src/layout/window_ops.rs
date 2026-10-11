@@ -2843,6 +2843,42 @@ impl StudioLayout {
             });
         });
 
+        // The `+` of a sixteen-channel part: MIDI tracks created for it or
+        // moved onto it, as one undo step that reaches the engine like an
+        // Inspector MIDI Out change.
+        let studio = cx.entity().clone();
+        let on_route_midi: Arc<
+            dyn Fn(crate::components::soundfont_player_window::SoundfontMidiRouteRequest, &mut App)
+                + Send
+                + Sync,
+        > = Arc::new(move |request, app| {
+            let _ = studio.update(app, |layout, cx| {
+                let edit = layout.begin_track_edit(
+                    TrackEditScope::tracks(request.route.edited_tracks()),
+                    cx,
+                );
+                let changed = layout.timeline.update(cx, |timeline, cx| {
+                    let changed =
+                        crate::components::soundfont_player_window::apply_soundfont_midi_route(
+                            &mut timeline.state,
+                            &request.instrument_track_id,
+                            &request.route,
+                        );
+                    if changed {
+                        cx.notify();
+                    }
+                    changed
+                });
+                if changed {
+                    layout.commit_track_edit(request.route.history_label(), edit, cx);
+                    layout.mark_dirty();
+                    layout.audio_bridge.project_dirty = true;
+                    layout.schedule_audio_project_sync(cx, false, "soundfont_midi_route");
+                }
+                cx.notify();
+            });
+        });
+
         match crate::components::soundfont_player_window::open_soundfont_player_window(
             owner_bounds,
             track_id,
@@ -2850,6 +2886,7 @@ impl StudioLayout {
             on_close,
             on_update_track,
             on_preview,
+            on_route_midi,
             cx,
         ) {
             Ok(handle) => self.external_windows.soundfont_player = Some(handle),

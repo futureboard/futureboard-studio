@@ -439,7 +439,7 @@ pub fn write_image(
     if digest != payload.sha256 {
         return Err(format!(
             "The installer's copy of LiveStage is damaged: its sha256 is {digest}, not {}. \
-             Write the installer image to the USB stick again.",
+             Write the installer ISO again.",
             payload.sha256
         ));
     }

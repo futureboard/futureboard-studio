@@ -1,5 +1,5 @@
 //! The LiveStage disk image the installer writes, as the installer image
-//! carries it: `livestage.img.zst` (the appliance image, compressed with
+//! carries it: `livestage/livestage.img.zst` on the ISO (the appliance image, compressed with
 //! zstd) and next to it `payload.conf`, which the image build writes:
 //!
 //! ```txt
@@ -17,7 +17,8 @@ use std::process::{Child, Command, Stdio};
 
 use super::config;
 
-pub const DEFAULT_PAYLOAD: &str = "/usr/share/livestage/installer/livestage.img.zst";
+/// On the installer ISO, beside its system (see iso/init).
+pub const DEFAULT_PAYLOAD: &str = "/media/medium/livestage/livestage.img.zst";
 /// Next to the payload.
 pub const MANIFEST: &str = "payload.conf";
 
