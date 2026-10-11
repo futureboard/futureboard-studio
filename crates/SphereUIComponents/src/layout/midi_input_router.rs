@@ -2,7 +2,7 @@ use gpui::{App, Context};
 
 use crate::components;
 use crate::components::timeline::timeline_state::{
-    InputMonitorMode, MidiChannel, TrackMidiInputRouting, TrackType,
+    InputMonitorMode, MidiChannel, MidiOutputChannelMode, TrackMidiInputRouting, TrackType,
 };
 use sphere_midi_service::{
     HardwareMidiInputMessage, MidiInputEvent, MidiInputRouteStatus, MidiInputRouter,
@@ -216,6 +216,15 @@ impl StudioLayout {
         cx: &App,
     ) -> MidiInputRouteStatus {
         let _source = source;
+        let event = match capture_track_id {
+            Some(track_id) => event_on_track_channel(
+                &self.timeline.read(cx).state,
+                track_id,
+                &target.track_id,
+                event,
+            ),
+            None => event,
+        };
         if let Some(track_id) = capture_track_id {
             self.capture_midi_record_event_at(track_id, &event, capture_beat, cx);
         }
@@ -794,6 +803,56 @@ fn route_result<E: std::fmt::Display>(result: Result<(), E>) -> MidiInputRouteSt
     }
 }
 
+/// A MIDI track playing another track's instrument sends live input on its
+/// own fixed MIDI channel, whatever channel the keyboard transmits on — what
+/// its clips do on playback and the piano roll's keys already do. This is what
+/// lets each MIDI track play its own part of a Soundfont Multi.
+fn event_on_track_channel(
+    state: &components::timeline::timeline_state::TimelineState,
+    capture_track_id: &str,
+    target_track_id: &str,
+    event: MidiInputEvent,
+) -> MidiInputEvent {
+    if capture_track_id == target_track_id {
+        return event;
+    }
+    let Some(track) = state.find_track(capture_track_id) else {
+        return event;
+    };
+    if track.track_type != TrackType::Midi {
+        return event;
+    }
+    let MidiOutputChannelMode::Fixed(channel) = track.routing.output_channel_mode() else {
+        return event;
+    };
+    let channel = channel.raw();
+    match event {
+        MidiInputEvent::NoteOn { note, velocity, .. } => MidiInputEvent::NoteOn {
+            note,
+            velocity,
+            channel,
+        },
+        MidiInputEvent::NoteOff { note, .. } => MidiInputEvent::NoteOff { note, channel },
+        MidiInputEvent::ControlChange {
+            controller, value, ..
+        } => MidiInputEvent::ControlChange {
+            controller,
+            value,
+            channel,
+        },
+        MidiInputEvent::PitchBend { value, .. } => MidiInputEvent::PitchBend { value, channel },
+        MidiInputEvent::ChannelPressure { value, .. } => {
+            MidiInputEvent::ChannelPressure { value, channel }
+        }
+        MidiInputEvent::PolyPressure { note, value, .. } => MidiInputEvent::PolyPressure {
+            note,
+            value,
+            channel,
+        },
+        other @ (MidiInputEvent::AllNotesOff | MidiInputEvent::Panic) => other,
+    }
+}
+
 fn is_keyboard_target_candidate(track: &components::timeline::timeline_state::TrackState) -> bool {
     matches!(track.track_type, TrackType::Instrument | TrackType::Midi)
 }
@@ -911,6 +970,42 @@ fn compensated_midi_capture_beat(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_input_on_a_routed_midi_track_plays_its_channel() {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        let gm = add_track(&mut state, TrackType::Instrument, "GM");
+        let bass = add_track(&mut state, TrackType::Midi, "Bass");
+        state.set_track_output_routing(
+            &bass,
+            TrackOutputRouting::Instrument {
+                track_id: gm.clone(),
+            },
+        );
+        state.set_track_midi_channel(&bass, Some(3));
+        let on = MidiInputEvent::NoteOn {
+            note: 40,
+            velocity: 90,
+            channel: 0,
+        };
+        assert_eq!(
+            event_on_track_channel(&state, &bass, &gm, on.clone()),
+            MidiInputEvent::NoteOn {
+                note: 40,
+                velocity: 90,
+                channel: 2
+            }
+        );
+        // The instrument track itself, and per-note tracks, keep the channel.
+        assert_eq!(event_on_track_channel(&state, &gm, &gm, on.clone()), on);
+        state.set_track_midi_output_per_note(&bass, true);
+        assert_eq!(event_on_track_channel(&state, &bass, &gm, on.clone()), on);
+        assert_eq!(
+            event_on_track_channel(&state, &bass, &gm, MidiInputEvent::AllNotesOff),
+            MidiInputEvent::AllNotesOff
+        );
+    }
+
     use super::*;
     use crate::components::timeline::timeline_state::{
         CreateTrackOptions, InputMonitorMode, TimelineState, TrackOutputRouting,

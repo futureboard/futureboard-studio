@@ -54,6 +54,8 @@ pub enum AudioBackend {
     WasapiExclusive,
     /// Windows: WDM-KS low-level driver path (experimental).
     WdmKs,
+    /// Windows: DAUx engine, kernel streaming straight to the driver.
+    DauxDirect,
     /// Windows: ASIO driver path. Selectable only once an edition provider has
     /// registered an ASIO host — see [`AudioBackend::sanitize_for_current_build`].
     Asio,
@@ -87,6 +89,7 @@ impl AudioBackend {
             AudioBackend::WasapiShared => BackendKind::WasapiShared,
             AudioBackend::WasapiExclusive => BackendKind::WasapiExclusive,
             AudioBackend::WdmKs => BackendKind::WdmKs,
+            AudioBackend::DauxDirect => BackendKind::DauxDirect,
             AudioBackend::Asio => BackendKind::Asio,
         }
     }
@@ -103,6 +106,7 @@ impl AudioBackend {
                 AudioDeviceId::WasapiEndpoint(_)
             ) | (AudioBackend::WasapiShared, AudioDeviceId::DauxEndpoint(_))
                 | (AudioBackend::WdmKs, AudioDeviceId::WdmKsFilterPin { .. })
+                | (AudioBackend::DauxDirect, AudioDeviceId::DauxKernelPin(_))
                 | (AudioBackend::Asio, AudioDeviceId::AsioDevice(_))
                 | (
                     AudioBackend::Auto | AudioBackend::Cpal,
@@ -126,6 +130,8 @@ pub enum AudioDeviceId {
     DauxEndpoint(String),
     /// ASIO driver/device name resolved only against CPAL's ASIO host.
     AsioDevice(String),
+    /// DAUx Direct kernel-streaming pin id (`ks:<filter path>|<pin>`).
+    DauxKernelPin(String),
 }
 
 impl AudioDeviceId {
@@ -133,7 +139,8 @@ impl AudioDeviceId {
         match self {
             AudioDeviceId::WasapiEndpoint(id)
             | AudioDeviceId::DauxEndpoint(id)
-            | AudioDeviceId::AsioDevice(id) => id,
+            | AudioDeviceId::AsioDevice(id)
+            | AudioDeviceId::DauxKernelPin(id) => id,
             AudioDeviceId::WdmKsFilterPin { filter_path, .. } => filter_path,
         }
     }
@@ -263,6 +270,22 @@ impl EngineDeviceInfo {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn from_daux_direct(d: crate::backend::daux_direct::DauxDirectDeviceInfo) -> Self {
+        let channel_info = generic_channel_info("output", d.channels);
+        Self {
+            device_id: AudioDeviceId::DauxKernelPin(d.id.clone()),
+            id: d.id,
+            name: d.name,
+            kind: "output".into(),
+            channels: d.channels,
+            channel_info,
+            default_sample_rate: d.default_sample_rate,
+            is_default: d.is_default,
+            backend: "DAUx Direct".into(),
+        }
+    }
+
     fn from_daux(d: crate::types::JsAudioDeviceInfo) -> Self {
         Self::from_daux_with_backend(d, None)
     }
@@ -386,6 +409,19 @@ fn list_wdm_ks_output_devices() -> Vec<EngineDeviceInfo> {
 
 #[cfg(not(target_os = "windows"))]
 fn list_wdm_ks_output_devices() -> Vec<EngineDeviceInfo> {
+    Vec::new()
+}
+
+#[cfg(target_os = "windows")]
+fn list_daux_direct_output_devices() -> Vec<EngineDeviceInfo> {
+    crate::backend::daux_direct::list_output_devices()
+        .into_iter()
+        .map(EngineDeviceInfo::from_daux_direct)
+        .collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn list_daux_direct_output_devices() -> Vec<EngineDeviceInfo> {
     Vec::new()
 }
 
@@ -975,6 +1011,7 @@ impl AudioEngine {
     pub fn list_output_devices_for_backend(&self, backend: AudioBackend) -> Vec<EngineDeviceInfo> {
         match backend {
             AudioBackend::WdmKs => list_wdm_ks_output_devices(),
+            AudioBackend::DauxDirect => list_daux_direct_output_devices(),
             AudioBackend::WasapiExclusive => device::list_output_devices()
                 .into_iter()
                 .map(EngineDeviceInfo::from_wasapi)
@@ -1009,7 +1046,8 @@ impl AudioEngine {
 
     pub fn list_input_devices_for_backend(&self, backend: AudioBackend) -> Vec<EngineDeviceInfo> {
         match backend {
-            AudioBackend::WdmKs => Vec::new(),
+            // Output-only backends: recording opens its own capture stream.
+            AudioBackend::WdmKs | AudioBackend::DauxDirect => Vec::new(),
             AudioBackend::WasapiExclusive => device::list_input_devices()
                 .into_iter()
                 .map(EngineDeviceInfo::from_wasapi)

@@ -266,6 +266,26 @@ Distributables:
 | Windows | `bun run bundle:native:win` — Inno Setup installer (`packaging/windows`)           |
 | macOS   | `bun run bundle:native:mac` · `bun run bundle:native:mac:dmg` (`packaging/native`) |
 | Linux   | `packaging/linux/bundle-appimage.sh` — AppImage · `packaging/aur` — AUR package    |
+| Nix     | `nix build .#studio` (and every other app) — see below and `nix/README.md`         |
+
+### Nix (x86_64-linux)
+
+`flake.nix` builds every native app with its runtime layout, offline, from
+pinned sources (CEF, Crashpad, ONNX Runtime and the LiveStage web UI's npm
+packages are prefetched as fixed-output sources):
+
+```bash
+nix build .#studio            # also: livestage, livestage-server, livestage-appliance,
+                              # jamsession, singer, apakinstaller, plugin-host, cef-helper, all
+nix run                       # Futureboard Studio
+nix run .#livestage-server -- --http 0.0.0.0:8730
+nix develop                   # toolchain, native libraries and SDK paths for cargo
+nix flake check               # smoke tests (embedded LiveStage web UI, apak CLI)
+```
+
+New files must be `git add`ed before a flake sees them. Package contents,
+how each build-time download is handled, the APAK key and hash refreshes are
+documented in [`nix/README.md`](nix/README.md).
 
 ### macOS universal (Apple Silicon + Intel)
 

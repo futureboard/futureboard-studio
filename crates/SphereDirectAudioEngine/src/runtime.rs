@@ -2312,6 +2312,20 @@ pub struct RuntimeMidiEvent {
     pub cc_value: f32,
     /// For `Pitch`: the sounding frequency in Hz. Unused by every other kind.
     pub pitch_hz: f32,
+    /// Index into [`RuntimeMidiTrack::sources`]: the MIDI track this event
+    /// comes from when that track plays this instrument. `None` for the
+    /// instrument track's own clips.
+    pub source: Option<u16>,
+}
+
+/// A MIDI track that plays another track's instrument (MIDI Out → Instrument).
+/// Its notes are merged into the instrument's schedule; kept here so its own
+/// mute and solo still apply.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeMidiSource {
+    pub track_id: String,
+    /// Resolved like [`RuntimeMidiTrack::track_index`]; `None` when missing.
+    pub track_index: Option<usize>,
 }
 
 /// Structural per-clip representation, retained for logging / future reuse.
@@ -2361,6 +2375,8 @@ pub struct RuntimeMidiTrack {
     pub active: Vec<(u8, u8)>,
     /// UI preview notes currently held independently of transport playback.
     pub preview_active: Vec<(u8, u8)>,
+    /// MIDI tracks routed into this one ([`RuntimeMidiEvent::source`]).
+    pub sources: Vec<RuntimeMidiSource>,
 }
 
 /// A project's MIDI schedule on its own: what a note edit changes, swapped
@@ -2579,6 +2595,9 @@ impl RuntimeProject {
         for i in 0..self.midi_tracks.len() {
             let ix = track_indices.get(&self.midi_tracks[i].track_id).copied();
             self.midi_tracks[i].track_index = ix;
+            for source in &mut self.midi_tracks[i].sources {
+                source.track_index = track_indices.get(&source.track_id).copied();
+            }
         }
         // Control Room source: resolve the selected bus/track to an index once,
         // here, so the audio callback branches on `Option<usize>` instead of
@@ -4130,6 +4149,13 @@ impl RuntimeProject {
                     continue;
                 }
                 let offset = callback_offset.saturating_add((ev.sample - base_sample) as u32);
+                if matches!(ev.kind, RuntimeMidiEventKind::NoteOn)
+                    && track_ix.is_some_and(|ti| {
+                        midi_source_silenced(&self.tracks, &mt.sources, ev.source, ti, ev.beat)
+                    })
+                {
+                    continue;
+                }
                 apply_active(&mut mt.active, &ev);
                 if let Some(ti) = track_ix {
                     let has_soundfont = self.tracks[ti].soundfont_player.is_some();
@@ -4637,6 +4663,7 @@ impl RuntimeProject {
                 cursor: 0,
                 active: Vec::with_capacity(128),
                 preview_active: Vec::with_capacity(128),
+                sources: Vec::new(),
             });
             let Some(mt) = self
                 .midi_tracks
@@ -5325,12 +5352,70 @@ pub(crate) fn has_soloed_route_target(runtime: &RuntimeProject, source_track_ind
 }
 
 /// True when solo, though the track itself is not soloed, still lets it play:
-/// one of its VSTi channels is soloed ([`has_soloed_vsti_output_child`]), or
-/// a group or bus it plays through is ([`has_soloed_route_target`]).
+/// one of its VSTi channels is soloed ([`has_soloed_vsti_output_child`]), a
+/// group or bus it plays through is ([`has_soloed_route_target`]), or a MIDI
+/// track that plays it is ([`has_soloed_midi_source`]).
 #[inline]
 pub(crate) fn solo_keeps_source_audible(runtime: &RuntimeProject, track_index: usize) -> bool {
     has_soloed_vsti_output_child(runtime, track_index)
         || has_soloed_route_target(runtime, track_index)
+        || has_soloed_midi_source(runtime, track_index)
+}
+
+/// True when a MIDI track routed into instrument track `track_index` is
+/// soloed: soloing that MIDI track must keep the instrument it plays audible.
+/// Scans the (few) MIDI schedules and their sources; no allocation.
+#[inline]
+pub(crate) fn has_soloed_midi_source(runtime: &RuntimeProject, track_index: usize) -> bool {
+    runtime
+        .midi_tracks
+        .iter()
+        .filter(|mt| mt.track_index == Some(track_index))
+        .any(|mt| any_source_soloed(&runtime.tracks, &mt.sources))
+}
+
+fn any_source_soloed(tracks: &[RuntimeTrack], sources: &[RuntimeMidiSource]) -> bool {
+    sources
+        .iter()
+        .filter_map(|s| s.track_index.and_then(|ix| tracks.get(ix)))
+        .any(|t| t.solo)
+}
+
+/// Whether a note from `source` (an index into `sources`, or the instrument
+/// track's own clip when `None`) must not start: its MIDI track is muted
+/// (automation included), or another MIDI track of the same instrument is
+/// soloed and it is not. Soloing the instrument track itself keeps every
+/// source playing. Audio-thread safe: index lookups only.
+#[inline]
+fn midi_source_silenced(
+    tracks: &[RuntimeTrack],
+    sources: &[RuntimeMidiSource],
+    source: Option<u16>,
+    instrument_ix: usize,
+    beat: f64,
+) -> bool {
+    if sources.is_empty() {
+        return false;
+    }
+    let source_track = source
+        .and_then(|s| sources.get(usize::from(s)))
+        .and_then(|s| s.track_index)
+        .and_then(|ix| tracks.get(ix));
+    if let Some(track) = source_track {
+        if track
+            .automation_values_at_beat(beat)
+            .muted
+            .unwrap_or(track.muted)
+        {
+            return true;
+        }
+    }
+    let instrument_soloed = tracks.get(instrument_ix).is_some_and(|t| t.solo);
+    let own_solo = match source_track {
+        Some(track) => track.solo,
+        None => instrument_soloed,
+    };
+    !own_solo && !instrument_soloed && any_source_soloed(tracks, sources)
 }
 
 /// True when `child_track_index` is a VSTi multi-out child ("Out Ch") strip
@@ -5500,6 +5585,7 @@ fn push_mpe_configuration_events(
             cc_number: controller,
             cc_value: value.clamp(0.0, 1.0),
             pitch_hz: 0.0,
+            source: None,
         });
     }
 
@@ -5672,6 +5758,9 @@ pub fn build_unresolved_midi_schedule(
 pub fn resolve_midi_schedule_tracks(data: &mut RuntimeMidiData, track_ids: &[String]) {
     for midi_track in &mut data.midi_tracks {
         midi_track.track_index = track_ids.iter().position(|id| *id == midi_track.track_id);
+        for source in &mut midi_track.sources {
+            source.track_index = track_ids.iter().position(|id| *id == source.track_id);
+        }
     }
 }
 
@@ -5696,6 +5785,8 @@ fn build_midi_runtime(
     let mut sustain_changes_by_track: HashMap<String, Vec<(f64, bool)>> = HashMap::new();
     let mut stolen_note_cutoffs: HashMap<u64, u64> = HashMap::new();
     let mut next_runtime_note_id = 1_u64;
+    // Per output track: the MIDI tracks routed into it, in first-seen order.
+    let mut sources_by_track: HashMap<String, Vec<RuntimeMidiSource>> = HashMap::new();
 
     // Sustain is a track-wide controller state. Build one absolute timeline
     // before allocating voices so a pedal change in a neighboring/overlapping
@@ -5849,6 +5940,7 @@ fn build_midi_runtime(
                         cc_number: 0,
                         cc_value: 0.0,
                         pitch_hz: 0.0,
+                        source: None,
                     });
                 }
                 if allocation.reset_required {
@@ -5866,6 +5958,7 @@ fn build_midi_runtime(
                             cc_number,
                             cc_value,
                             pitch_hz: 0.0,
+                            source: None,
                         });
                     }
                 }
@@ -5897,6 +5990,7 @@ fn build_midi_runtime(
                                 point.value.clamp(0.0, 1.0)
                             },
                             pitch_hz: 0.0,
+                            source: None,
                         });
                     }
                 }
@@ -5926,6 +6020,7 @@ fn build_midi_runtime(
                     cc_number: articulation,
                     cc_value: 0.0,
                     pitch_hz: 0.0,
+                    source: None,
                 });
             }
             events.push(RuntimeMidiEvent {
@@ -5943,6 +6038,7 @@ fn build_midi_runtime(
                 cc_number: 0,
                 cc_value: 0.0,
                 pitch_hz: 0.0,
+                source: None,
             });
             let note_off = RuntimeMidiEvent {
                 sample: off_sample,
@@ -5959,6 +6055,7 @@ fn build_midi_runtime(
                 cc_number: 0,
                 cc_value: 0.0,
                 pitch_hz: 0.0,
+                source: None,
             };
             if mpe_enabled {
                 deferred_mpe_note_offs.push((runtime_note_id, note_off));
@@ -5994,6 +6091,7 @@ fn build_midi_runtime(
                     cc_number: 0,
                     cc_value: 0.0,
                     pitch_hz: point.hz,
+                    source: None,
                 });
             }
         }
@@ -6017,11 +6115,33 @@ fn build_midi_runtime(
                     cc_number: lane.controller,
                     cc_value: point.value.clamp(0.0, 1.0),
                     pitch_hz: 0.0,
+                    source: None,
                 });
             }
         }
         // Sort by sample; NoteOff before NoteOn at the same sample.
         sort_midi_events(&mut events);
+        if let Some(source_id) = clip
+            .source_track_id
+            .as_ref()
+            .filter(|id| **id != clip.track_id)
+        {
+            let sources = sources_by_track.entry(clip.track_id.clone()).or_default();
+            let index = match sources.iter().position(|s| s.track_id == *source_id) {
+                Some(index) => index,
+                None => {
+                    sources.push(RuntimeMidiSource {
+                        track_id: source_id.clone(),
+                        track_index: None,
+                    });
+                    sources.len() - 1
+                }
+            };
+            let source = u16::try_from(index).ok();
+            for event in &mut events {
+                event.source = source;
+            }
+        }
         let end_beat = clip_end_beat;
         clips.push(RuntimeMidiClip {
             id: clip.id.clone(),
@@ -6057,6 +6177,7 @@ fn build_midi_runtime(
             let events = resolve_overlapping_notes(events);
             let active = Vec::with_capacity(128); // bound growth out of the audio callback
             RuntimeMidiTrack {
+                sources: sources_by_track.remove(&track_id).unwrap_or_default(),
                 track_id,
                 track_index: None, // resolved by RuntimeProject::resolve_indices
                 events,
@@ -6339,6 +6460,7 @@ mod stretch_runtime_tests {
             };
 
             let midi_clip = EngineMidiClipSnapshot {
+                source_track_id: None,
                 id: "midi".to_string(),
                 track_id: "track".to_string(),
                 start_beat: 0.0,
@@ -7214,6 +7336,7 @@ mod midi_tests {
 
     fn clip_with_one_note() -> EngineMidiClipSnapshot {
         EngineMidiClipSnapshot {
+            source_track_id: None,
             id: "mc1".into(),
             track_id: "track-1".into(),
             start_beat: 4.0, // bar 2 in 4/4
@@ -7966,6 +8089,7 @@ mod midi_tests {
             cc_number: 0,
             cc_value: 0.0,
             pitch_hz: 0.0,
+            source: None,
         };
         use RuntimeMidiEventKind::{NoteOff, NoteOn};
         // C held 0..300; C again 100..200; E 0..300 untouched.

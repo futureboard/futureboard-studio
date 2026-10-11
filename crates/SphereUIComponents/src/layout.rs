@@ -319,6 +319,7 @@ fn native_audio_backend_from_driver_type(driver_type: &str) -> DirectAudio::Audi
         "WASAPI Shared" => DirectAudio::AudioBackend::WasapiShared,
         "WASAPI Exclusive" => DirectAudio::AudioBackend::WasapiExclusive,
         "WDM-KS" => DirectAudio::AudioBackend::WdmKs,
+        "DAUx Direct" => DirectAudio::AudioBackend::DauxDirect,
         "ASIO" => DirectAudio::AudioBackend::Asio,
         _ => DirectAudio::AudioBackend::Auto,
     };

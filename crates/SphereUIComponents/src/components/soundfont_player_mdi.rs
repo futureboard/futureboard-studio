@@ -71,6 +71,10 @@ pub struct SoundfontPlayerPanelState {
     pub channel_sources: [Vec<String>; CHANNELS],
     /// Tracks routed here whose notes each keep their own channel.
     pub per_note_sources: Vec<String>,
+    /// Unmuted parts no MIDI track plays yet ("Add MIDI tracks").
+    pub parts_without_track: usize,
+    /// Per channel, the track whose program selection sets the part.
+    pub program_sources: [Option<String>; CHANNELS],
     /// MIDI note of the leftmost key on the panel keyboard.
     pub keyboard_root: u8,
     /// Notes the panel is currently holding on the engine, so keys and the
@@ -99,6 +103,8 @@ impl Default for SoundfontPlayerPanelState {
             selected_channel: 0,
             channel_sources: Default::default(),
             per_note_sources: Vec::new(),
+            parts_without_track: 0,
+            program_sources: Default::default(),
             keyboard_root: KEYBOARD_DEFAULT_ROOT,
             active_notes: Vec::new(),
             testing: false,
@@ -161,6 +167,7 @@ type EnvelopeCb = Arc<dyn Fn(&SoundfontEnvelope, &mut Window, &mut App) + 'stati
 type QualityCb = Arc<dyn Fn(&SoundfontRenderQuality, &mut Window, &mut App) + 'static>;
 type ModeCb = Arc<dyn Fn(&SoundfontPlayerMode, &mut Window, &mut App) + 'static>;
 type ChannelCb = Arc<dyn Fn(&(u8, SoundfontChannel), &mut Window, &mut App) + 'static>;
+type ChannelMenuCb = Arc<dyn Fn(&(u8, f32, f32), &mut Window, &mut App) + 'static>;
 
 #[derive(Clone)]
 pub struct SoundfontPlayerCallbacks {
@@ -188,6 +195,11 @@ pub struct SoundfontPlayerCallbacks {
     /// Releases everything the panel is holding.
     pub on_all_notes_off: VoidCb,
     pub on_shift_octave: I32Cb,
+    /// The `+` of a channel: a menu (at the pointer) to create a MIDI track
+    /// for the part or put an existing one on it.
+    pub on_channel_menu: ChannelMenuCb,
+    /// One new MIDI track for every part that has none yet.
+    pub on_add_part_tracks: VoidCb,
 }
 
 const POLYPHONY_MIN: usize = 1;
@@ -907,6 +919,7 @@ fn channel_rack(panel: &SoundfontPlayerPanelState, cb: &SoundfontPlayerCallbacks
                 .text_color(Colors::text_faint())
                 .child(div().w(px(CHANNEL_NUMBER_W)).child("CH"))
                 .child(div().flex_1().min_w(px(0.0)).child("PART"))
+                .child(div().w(px(CHANNEL_TRACK_W)).child(""))
                 .child(div().w(px(CHANNEL_LEVEL_W)).child("LEVEL"))
                 .child(div().w(px(CHANNEL_PAN_W)).child("PAN"))
                 .child(div().w(px(CHANNEL_LATCH_W)).child(""))
@@ -930,17 +943,41 @@ fn channel_rack(panel: &SoundfontPlayerPanelState, cb: &SoundfontPlayerCallbacks
             false,
         ));
     }
+    let add_all = cb.on_add_part_tracks.clone();
+    let missing = panel.parts_without_track;
     column
-        .child(hint(
-            "Route MIDI tracks to this track and set each one's MIDI output channel; the \
-             browser assigns a preset to the selected part."
-                .to_string(),
-            false,
-        ))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(space::BASE))
+                .child(fb_button(
+                    "soundfont-add-part-tracks",
+                    if missing == 0 {
+                        "Every part has a MIDI track".to_string()
+                    } else {
+                        format!("Add MIDI Tracks ({missing})")
+                    },
+                    FbButtonKind::Default,
+                    missing > 0,
+                    move |_, w, cx| add_all(w, cx),
+                ))
+                .child(
+                    div().flex_1().min_w(px(0.0)).child(hint(
+                        "Each part plays the MIDI tracks on its channel: + creates one or puts \
+                     an existing MIDI track on it. A track's program sets its part (PRG); \
+                     the browser assigns a preset to the selected part."
+                            .to_string(),
+                        false,
+                    )),
+                ),
+        )
         .into_any_element()
 }
 
 const CHANNEL_NUMBER_W: f32 = 22.0;
+const CHANNEL_TRACK_W: f32 = 24.0;
 const CHANNEL_LEVEL_W: f32 = 116.0;
 const CHANNEL_PAN_W: f32 = 58.0;
 const CHANNEL_LATCH_W: f32 = 44.0;
@@ -964,7 +1001,9 @@ fn channel_row(
         })
         .unwrap_or_else(|| "Font default".to_string());
     let sources = &panel.channel_sources[index];
+    let program_source = panel.program_sources[index].as_deref();
     let select = cb.on_select_channel.clone();
+    let open_menu = cb.on_channel_menu.clone();
     let hover = Colors::composite(Colors::surface_card(), Colors::state_hover());
 
     let set = cb.on_set_channel.clone();
@@ -1071,6 +1110,18 @@ fn channel_row(
                                 .text_color(Colors::text_primary())
                                 .child(name),
                         )
+                        .when(program_source.is_some(), |row| {
+                            row.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px(px(space::TIGHT))
+                                    .rounded(px(radius::MICRO))
+                                    .bg(Colors::surface_badge())
+                                    .text_size(px(typography::DENSE_CAPTION))
+                                    .text_color(Colors::text_muted())
+                                    .child("PRG"),
+                            )
+                        })
                         .when(part.is_drum_kit(), |row| {
                             row.child(
                                 div()
@@ -1093,12 +1144,30 @@ fn channel_row(
                         } else {
                             Colors::text_faint()
                         })
-                        .child(if sources.is_empty() {
-                            "No track".to_string()
-                        } else {
-                            format!("← {}", sources.join(", "))
+                        .child(match (sources.is_empty(), program_source) {
+                            (true, _) => "No track".to_string(),
+                            (false, Some(owner)) => {
+                                format!("← {} · program from {owner}", sources.join(", "))
+                            }
+                            (false, None) => format!("← {}", sources.join(", ")),
                         }),
                 ),
+        )
+        .child(
+            div()
+                .w(px(CHANNEL_TRACK_W))
+                .flex_shrink_0()
+                .child(fb_button(
+                    ("soundfont-channel-track", index),
+                    "+",
+                    FbButtonKind::Ghost,
+                    true,
+                    move |event: &gpui::ClickEvent, w, cx| {
+                        cx.stop_propagation();
+                        let at = event.position();
+                        open_menu(&(channel, at.x.into(), at.y.into()), w, cx);
+                    },
+                )),
         )
         .child(
             div()

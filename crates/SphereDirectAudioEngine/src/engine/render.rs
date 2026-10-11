@@ -4862,6 +4862,7 @@ mod soundfont_instrument_tests {
             ],
             clips: Vec::new(),
             midi_clips: vec![std::sync::Arc::new(EngineMidiClipSnapshot {
+                source_track_id: None,
                 id: "clip-1".to_string(),
                 track_id: "sf-1".to_string(),
                 start_beat: 1.0,
@@ -4988,6 +4989,131 @@ mod soundfont_instrument_tests {
             render_peak(&mut runtime) > 0.001,
             "the player must still sound with an effect in the chain"
         );
+    }
+
+    // ---- MIDI tracks playing a Soundfont Multi (MIDI Out → Instrument) ----
+
+    fn midi_track(id: &str) -> EngineTrackSnapshot {
+        let mut track = master_track();
+        track.id = id.to_string();
+        track.track_type = "midi".to_string();
+        track
+    }
+
+    /// A Soundfont Multi on `sf-1` played by MIDI tracks `midi-a` (channel 1)
+    /// and `midi-b` (channel 2); only `midi-a` has a note, at beat 0.
+    fn routed_multi_runtime(font: &FontFile) -> RuntimeProject {
+        let mut sf = soundfont_track("sf-1", font, test_font::MELODIC_PRESET);
+        sf.soundfont_mode = sphere_soundfont_player::SoundfontPlayerMode::Multi;
+        sf.soundfont_channels = melodic_parts();
+        let clip = EngineMidiClipSnapshot {
+            id: "clip-a".into(),
+            track_id: "sf-1".into(),
+            source_track_id: Some("midi-a".into()),
+            start_beat: 0.0,
+            length_beats: 4.0,
+            notes: vec![EngineMidiNoteSnapshot {
+                id: 1,
+                pitch: 60,
+                start_beat: 0.0,
+                length_beats: 2.0,
+                velocity: 100,
+                channel: 0,
+                expression: Default::default(),
+                pitch_points: Vec::new(),
+                articulation: None,
+            }],
+            controllers: Vec::new(),
+            mpe: Default::default(),
+        };
+        let snapshot = EngineProjectSnapshot {
+            spatial: Default::default(),
+            project_id: "soundfont-routed".to_string(),
+            project_root: None,
+            preferred_input_device: None,
+            bpm: 120.0,
+            tempo_points: Vec::new(),
+            time_signature: [4, 4],
+            sample_rate: SAMPLE_RATE,
+            tracks: vec![
+                sf,
+                midi_track("midi-a"),
+                midi_track("midi-b"),
+                master_track(),
+            ],
+            clips: Vec::new(),
+            midi_clips: vec![std::sync::Arc::new(clip)],
+            pdc_enabled: true,
+            latency_graph_version: 1,
+            routing: EngineRoutingSnapshot {
+                master_output_device: None,
+                sample_rate: SAMPLE_RATE,
+                buffer_size: FRAMES as u32,
+            },
+        };
+        RuntimeProject::build(&snapshot, SAMPLE_RATE, &mut HashMap::new(), None, true)
+            .expect("routed runtime builds")
+    }
+
+    /// Schedules the first block of the timeline, then renders it.
+    fn play_first_block(runtime: &mut RuntimeProject) -> f32 {
+        runtime.schedule_midi_block_with_offset(0, FRAMES as u64, 0);
+        render_peak(runtime)
+    }
+
+    #[test]
+    fn a_routed_midi_track_plays_its_soundfont_multi_part() {
+        let font = FontFile::new("routed-plays");
+        let mut runtime = routed_multi_runtime(&font);
+        assert_eq!(
+            runtime.midi_tracks.len(),
+            1,
+            "routed notes join the instrument's schedule"
+        );
+        assert_eq!(runtime.midi_tracks[0].sources.len(), 1);
+        assert!(play_first_block(&mut runtime) > 0.001);
+    }
+
+    #[test]
+    fn muting_a_routed_midi_track_silences_its_notes() {
+        let font = FontFile::new("routed-mute");
+        let mut runtime = routed_multi_runtime(&font);
+        runtime.update_track_mute("midi-a", true);
+        assert!(
+            play_first_block(&mut runtime) < 1.0e-4,
+            "the muted MIDI track must not sound"
+        );
+    }
+
+    #[test]
+    fn soloing_a_routed_midi_track_keeps_its_instrument_audible() {
+        let font = FontFile::new("routed-solo");
+        let mut runtime = routed_multi_runtime(&font);
+        runtime.update_track_solo("midi-a", true);
+        assert!(
+            play_first_block(&mut runtime) > 0.001,
+            "solo on the MIDI track is a solo of what it plays"
+        );
+    }
+
+    #[test]
+    fn soloing_another_midi_track_of_the_instrument_silences_this_one() {
+        let font = FontFile::new("routed-solo-other");
+        let mut runtime = routed_multi_runtime(&font);
+        runtime.update_track_solo("midi-b", true);
+        assert!(
+            play_first_block(&mut runtime) < 1.0e-4,
+            "only the soloed MIDI track plays"
+        );
+    }
+
+    #[test]
+    fn soloing_the_instrument_keeps_every_midi_track_playing() {
+        let font = FontFile::new("routed-solo-instrument");
+        let mut runtime = routed_multi_runtime(&font);
+        runtime.update_track_solo("midi-b", true);
+        runtime.update_track_solo("sf-1", true);
+        assert!(play_first_block(&mut runtime) > 0.001);
     }
 }
 

@@ -1066,7 +1066,12 @@ fn build_engine_project_snapshot_inner(
             soundfont_envelope: track.soundfont_envelope,
             soundfont_quality: track.soundfont_quality,
             soundfont_mode: track.soundfont_mode,
-            soundfont_channels: track.soundfont_channels,
+            // As they play: a part a MIDI track's program sets carries that
+            // preset (see `attach_midi_programs`).
+            soundfont_channels:
+                crate::components::soundfont_player_window::effective_soundfont_channels(
+                    state, track,
+                ),
             solfege_engine: track.solfege.as_ref().map(|state| EngineSolfegeSnapshot {
                 model_path: state.model_path.clone(),
                 instrument: state.instrument.clone(),
@@ -1309,6 +1314,9 @@ fn build_engine_project_snapshot_inner(
                     EngineMidiClipSnapshot {
                         id: clip.id.clone(),
                         track_id: track_id.clone(),
+                        // A MIDI track playing another track's instrument
+                        // keeps its identity, so its own mute/solo apply.
+                        source_track_id: (*track_id != track.id).then(|| track.id.clone()),
                         start_beat: clip.start_beat.max(0.0) as f64,
                         length_beats: clip.duration_beats.max(0.0) as f64,
                         notes: notes
@@ -1515,6 +1523,15 @@ fn attach_midi_programs(state: &TimelineState, tracks: &mut [EngineTrackSnapshot
         let target = state
             .effective_instrument_track_id(&track.id)
             .unwrap_or_else(|| track.id.clone());
+        // A Soundfont Multi takes the selection as the preset of the part
+        // (`effective_soundfont_channels`), which also turns the channel into
+        // a kit when it picks one; a raw program change could not.
+        if state.find_track(&target).is_some_and(|t| {
+            t.builtin_soundfont_player
+                && t.soundfont_mode == timeline_state::SoundfontPlayerMode::Multi
+        }) {
+            continue;
+        }
         let Some(snapshot) = tracks.iter_mut().find(|t| t.id == target) else {
             continue;
         };
@@ -1818,6 +1835,62 @@ mod tests {
             .expect("track in snapshot");
         assert_eq!(track.soundfont_mode, SoundfontPlayerMode::Multi);
         assert_eq!(track.soundfont_channels, settings.channels);
+    }
+
+    #[test]
+    fn a_midi_track_program_reaches_a_soundfont_multi_as_its_part() {
+        use crate::components::timeline::timeline_state::{
+            CreateTrackOptions, InputMonitorMode, SoundfontPlayerMode,
+            SoundfontPlayerSettingsState, TrackOutputRouting, TrackType,
+        };
+        use sphere_midi_service::program::{MidiPatchFormat, MidiProgramSelection};
+
+        let (mut state, _clip) = instrument_state_with_clip();
+        let instrument = state.tracks[0].id.clone();
+        let settings = SoundfontPlayerSettingsState {
+            path: Some("/fonts/GM.sf2".to_string()),
+            mode: SoundfontPlayerMode::Multi,
+            ..SoundfontPlayerSettingsState::default()
+        };
+        assert!(state.set_track_soundfont_player_state(&instrument, settings));
+        state.tracks[0].builtin_soundfont_player = true;
+        let bass = state.create_track(CreateTrackOptions {
+            track_type: TrackType::Midi,
+            name: "Bass".to_string(),
+            color: state.track_color_for_index(1),
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        });
+        state.set_track_output_routing(
+            &bass,
+            TrackOutputRouting::Instrument {
+                track_id: instrument.clone(),
+            },
+        );
+        state.set_track_midi_channel(&bass, Some(3));
+        state.set_track_program_selection(
+            &bass,
+            MidiProgramSelection {
+                format: MidiPatchFormat::Gs,
+                program: Some(33),
+                bank_msb: 8,
+                bank_lsb: 0,
+            },
+        );
+
+        let snapshot = build_engine_project_snapshot(&state, 48_000, None, None);
+        let track = snapshot
+            .tracks
+            .iter()
+            .find(|t| t.id == instrument)
+            .expect("instrument in snapshot");
+        assert_eq!(track.soundfont_channels[2].preset, Some((8, 33)));
+        assert!(
+            track.midi_programs.is_empty(),
+            "the part carries the selection; no raw program change on top"
+        );
     }
 
     #[test]

@@ -352,6 +352,12 @@ pub struct EngineMidiClipSnapshot {
     /// offline MIDI scheduling use the same zone policy.
     #[serde(default)]
     pub mpe: MpeTrackConfiguration,
+    /// The MIDI track these notes come from when it plays another track's
+    /// instrument (`track_id` is then that instrument track, e.g. one part of
+    /// a Soundfont Multi). Lets the engine honour that MIDI track's own mute
+    /// and solo. `None` for an instrument track's own clips.
+    #[serde(default)]
+    pub source_track_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

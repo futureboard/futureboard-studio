@@ -1100,8 +1100,9 @@ mod state_mirror_stubs {
 
 #[cfg(not(feature = "builtin-plugin-editor"))]
 pub use state_mirror_stubs::{
-    builtin_sample_names, builtin_state_apply, builtin_state_bytes, builtin_state_clear,
-    builtin_state_remove, builtin_state_replay, builtin_state_seed, builtin_state_set_sample,
+    builtin_default_replay, builtin_replay_changes, builtin_sample_names, builtin_state_apply,
+    builtin_state_bytes, builtin_state_clear, builtin_state_remove, builtin_state_replay,
+    builtin_state_seed, builtin_state_set_sample,
 };
 
 /// A Drum Sampler pad's loaded sample, as its editor draws it: the file, its

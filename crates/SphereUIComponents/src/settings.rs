@@ -231,6 +231,7 @@ fn ui_label_for_backend_id(id: &str) -> Option<String> {
         "wasapi-shared" => Some("WASAPI Shared".to_string()),
         "wasapi-exclusive" => Some("WASAPI Exclusive".to_string()),
         "wdm-ks" => Some("WDM-KS".to_string()),
+        "daux-direct" => Some("DAUx Direct".to_string()),
         "asio" => Some("ASIO".to_string()),
         "coreaudio" => Some("CoreAudio".to_string()),
         "alsa" => Some("ALSA".to_string()),
