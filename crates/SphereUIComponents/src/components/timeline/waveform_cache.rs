@@ -639,25 +639,139 @@ pub(crate) fn aggregate_peak_range_in_entry_opt(
     }
 
     let spp = samples_per_peak as u32;
+    aggregate_chunked(peak_start, peak_end, |chunk| {
+        entry
+            .chunks
+            .get(&(spp, chunk as u32))
+            .map(|peaks| peaks.as_slice())
+    })
+}
+
+/// Min/max over peak indices `[peak_start, peak_end)` of a chunked level,
+/// `None` when no chunk in the range holds any of them.
+///
+/// Walks the range a chunk at a time — one `chunk` lookup per [`CHUNK_PEAKS`]
+/// peaks rather than one per peak, which is what a zoomed-out column spanning
+/// thousands of peaks used to pay in hash lookups.
+fn aggregate_chunked<'a>(
+    peak_start: usize,
+    peak_end: usize,
+    chunk: impl Fn(usize) -> Option<&'a [WaveformPeak]>,
+) -> Option<WaveformPeak> {
     let mut mn = f32::MAX;
     let mut mx = f32::MIN;
     let mut any = false;
-    for pk in peak_start..peak_end {
-        let ci = (pk / CHUNK_PEAKS) as u32;
-        let local = pk % CHUNK_PEAKS;
-        if let Some(chunk) = entry.chunks.get(&(spp, ci)) {
-            if let Some(p) = chunk.get(local) {
-                if p.min < mn {
-                    mn = p.min;
-                }
-                if p.max > mx {
-                    mx = p.max;
+    let mut pk = peak_start;
+    while pk < peak_end {
+        let ci = pk / CHUNK_PEAKS;
+        let base = ci * CHUNK_PEAKS;
+        let next = (base + CHUNK_PEAKS).min(peak_end);
+        if let Some(peaks) = chunk(ci) {
+            let end = (next - base).min(peaks.len());
+            let start = pk - base;
+            if start < end {
+                for p in &peaks[start..end] {
+                    if p.min < mn {
+                        mn = p.min;
+                    }
+                    if p.max > mx {
+                        mx = p.max;
+                    }
                 }
                 any = true;
             }
         }
+        pk = next;
     }
     any.then_some(WaveformPeak { min: mn, max: mx })
+}
+
+/// One peak level's data over a span of peak indices, held by `Arc` so it can
+/// be aggregated after the file-cache lock is released.
+///
+/// The render path used to run its whole per-column aggregation inside
+/// [`with_file_entry`], holding the global file cache for as long as a clip's
+/// bars took to build — and every background chunk install queued behind it.
+/// Taking this snapshot costs one `Arc` clone per chunk; the aggregation then
+/// runs unlocked.
+pub(crate) enum PeakSpan {
+    /// A level of the preview ladder: built for the whole file.
+    Ladder {
+        preview: Arc<WaveformPreview>,
+        lod: usize,
+    },
+    /// A chunked level: the chunks covering the span, `None` where a chunk
+    /// is not resident.
+    Chunks {
+        first_chunk: usize,
+        chunks: Vec<Option<Arc<Vec<WaveformPeak>>>>,
+    },
+}
+
+/// Snapshot `samples_per_peak` over peak indices `[peak_start, peak_end)`.
+/// [`PeakSpan::aggregate`] answers exactly what
+/// [`aggregate_peak_range_in_entry_opt`] would on this entry for any range
+/// inside that span.
+pub(crate) fn peak_span_in_entry(
+    entry: &FileEntry,
+    samples_per_peak: usize,
+    peak_start: usize,
+    peak_end: usize,
+) -> PeakSpan {
+    if let Some(preview) = &entry.preview {
+        if let Some(lod) = preview
+            .lods
+            .iter()
+            .position(|l| l.samples_per_peak == samples_per_peak)
+        {
+            return PeakSpan::Ladder {
+                preview: Arc::clone(preview),
+                lod,
+            };
+        }
+    }
+    if peak_end <= peak_start {
+        return PeakSpan::Chunks {
+            first_chunk: 0,
+            chunks: Vec::new(),
+        };
+    }
+    let spp = samples_per_peak as u32;
+    let first_chunk = peak_start / CHUNK_PEAKS;
+    let last_chunk = (peak_end - 1) / CHUNK_PEAKS;
+    PeakSpan::Chunks {
+        first_chunk,
+        chunks: (first_chunk..=last_chunk)
+            .map(|chunk| entry.chunks.get(&(spp, chunk as u32)).cloned())
+            .collect(),
+    }
+}
+
+impl PeakSpan {
+    /// [`aggregate_peak_range_in_entry_opt`] over the snapshot. A range
+    /// reaching outside the snapshotted span reads as not resident there.
+    pub(crate) fn aggregate(&self, peak_start: usize, peak_end: usize) -> Option<WaveformPeak> {
+        match self {
+            Self::Ladder { preview, lod } => {
+                let peaks = &preview.lods[*lod].peaks;
+                let end = peak_end.min(peaks.len());
+                let start = peak_start.min(end);
+                if start >= end {
+                    return Some(WaveformPeak { min: 0.0, max: 0.0 });
+                }
+                Some(aggregate_slice(&peaks[start..end]))
+            }
+            Self::Chunks {
+                first_chunk,
+                chunks,
+            } => aggregate_chunked(peak_start, peak_end, |chunk| {
+                chunks
+                    .get(chunk.checked_sub(*first_chunk)?)?
+                    .as_deref()
+                    .map(Vec::as_slice)
+            }),
+        }
+    }
 }
 
 /// Whether every chunk covering peak indices `[peak_start, peak_end)` is
@@ -1050,7 +1164,7 @@ fn synth_sample(kind: SynthKind, t: f32, duration: f32) -> f32 {
 // timeline repaint — including every playhead tick and meter notify — even when
 // nothing about a clip's geometry changed. This cache stores the finished bar
 // list keyed by a hash of everything that affects the geometry (peak revision,
-// LOD, visible window, clip size, stretch/reverse). On a hit the render path
+// LOD, column tile, clip size, stretch/reverse). On a hit the render path
 // reuses an immutable `Arc<WaveformBars>` and skips both the aggregation and the
 // allocation; on a miss it computes once and publishes. Bars hold no color, so
 // two clips with identical geometry share one entry.
@@ -1097,10 +1211,12 @@ impl GeometryCache {
 static GEOMETRY_CACHE: OnceLock<Mutex<GeometryCache>> = OnceLock::new();
 
 fn geometry_cache() -> &'static Mutex<GeometryCache> {
-    // ~1k entries keeps memory bounded (a full-viewport-width bar list is tens
-    // of KB at most) while far exceeding the live working set (visible clips ×
-    // a handful of recent zoom/scroll states).
-    GEOMETRY_CACHE.get_or_init(|| Mutex::new(GeometryCache::new(1024)))
+    // Entries are fixed-width column tiles (see `waveform_canvas`), a few KB
+    // each, and a visible clip holds several. 4k keeps memory bounded at
+    // roughly what 1k viewport-wide bar lists used to cost while still far
+    // exceeding the live working set (visible clips × their tiles × a handful
+    // of recent zoom states).
+    GEOMETRY_CACHE.get_or_init(|| Mutex::new(GeometryCache::new(4096)))
 }
 
 /// Look up precomputed bars for a geometry signature (see [`WaveformBars`]).
@@ -1203,6 +1319,76 @@ mod tests {
         // the difference.
         let flattened = aggregate_peak_range_in_entry(&entry, 4, 0, 4);
         assert_eq!((flattened.min, flattened.max), (0.0, 0.0));
+    }
+
+    /// The chunk-at-a-time walk against the one-lookup-per-peak loop it
+    /// replaced, over ranges that start and end mid-chunk, span several
+    /// chunks, cross missing ones and run past a short last chunk — and the
+    /// unlocked snapshot against both.
+    #[test]
+    fn chunked_aggregation_matches_a_per_peak_walk() {
+        let spp = 64usize;
+        let mut entry = entry_with(Some(256), &[]);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for chunk in [0u32, 1, 3, 4] {
+            // Chunk 4 is short, as a file's last chunk is.
+            let len = if chunk == 4 { 1000 } else { CHUNK_PEAKS };
+            let peaks = (0..len)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    WaveformPeak {
+                        min: -((seed & 0xFFFF) as f32) / 65_535.0,
+                        max: ((seed >> 16) & 0xFFFF) as f32 / 65_535.0,
+                    }
+                })
+                .collect();
+            entry.chunks.insert((spp as u32, chunk), Arc::new(peaks));
+        }
+        let per_peak = |start: usize, end: usize| {
+            let mut found: Option<WaveformPeak> = None;
+            for pk in start..end {
+                let chunk = entry.chunks.get(&(spp as u32, (pk / CHUNK_PEAKS) as u32));
+                if let Some(p) = chunk.and_then(|c| c.get(pk % CHUNK_PEAKS)) {
+                    let f = found.get_or_insert(*p);
+                    f.min = f.min.min(p.min);
+                    f.max = f.max.max(p.max);
+                }
+            }
+            found.map(|p| (p.min, p.max))
+        };
+        let c = CHUNK_PEAKS;
+        let ranges = [
+            (0, 1),
+            (5, 5),
+            (17, 3_000),
+            (c - 3, c + 3),
+            (100, 3 * c + 50),
+            (2 * c, 3 * c),
+            (2 * c + 10, 2 * c + 20),
+            (3 * c - 1, 4 * c + 999),
+            (4 * c + 990, 4 * c + 1_010),
+            (4 * c + 1_000, 5 * c),
+            (0, 6 * c),
+        ];
+        for (start, end) in ranges {
+            let expected = per_peak(start, end);
+            let got = aggregate_peak_range_in_entry_opt(&entry, spp, start, end);
+            assert_eq!(got.map(|p| (p.min, p.max)), expected, "range {start}..{end}");
+            let span = peak_span_in_entry(&entry, spp, start, end);
+            let snap = span.aggregate(start, end);
+            assert_eq!(snap.map(|p| (p.min, p.max)), expected, "snapshot {start}..{end}");
+        }
+        // A ladder level snapshots as the ladder and answers as it does.
+        let ladder = peak_span_in_entry(&entry, 256, 0, 4);
+        assert!(matches!(ladder, PeakSpan::Ladder { .. }));
+        for (start, end) in [(0, 4), (2, 3), (900, 950)] {
+            assert_eq!(
+                ladder.aggregate(start, end).map(|p| (p.min, p.max)),
+                aggregate_peak_range_in_entry_opt(&entry, 256, start, end).map(|p| (p.min, p.max))
+            );
+        }
     }
 
     /// Past the end of a level that does exist is a real answer: there is no

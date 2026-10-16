@@ -3448,23 +3448,25 @@ impl Timeline {
     }
 
     pub(super) fn timeline_content_width(&self) -> f32 {
-        let clip_end_seconds = self
+        // Time only grows with the beat, so the last clip end in beats is the
+        // last in seconds too: one tempo conversion for the whole project
+        // rather than one per clip (each of which re-resolved the tempo map).
+        let last_clip_end_beat = self
             .state
             .tracks
             .iter()
             .flat_map(|track| track.clips.iter())
-            .map(|clip| {
-                self.state
-                    .seconds_at_beat((clip.start_beat + clip.duration_beats) as f64)
-                    as f32
-                    + 4.0
-            })
-            .fold(16.0_f32, f32::max);
+            .map(|clip| clip.start_beat + clip.duration_beats)
+            .reduce(f32::max);
+        let tempo = self.state.tempo_lookup();
+        let clip_end_seconds = last_clip_end_beat
+            .map(|beat| tempo.seconds_at_beat(beat as f64) as f32 + 4.0)
+            .map_or(16.0_f32, |end| end.max(16.0));
         let song_text_end_seconds = self
             .state
             .song_text_events
             .last()
-            .map(|event| self.state.seconds_at_beat(event.beat) as f32 + 4.0)
+            .map(|event| tempo.seconds_at_beat(event.beat) as f32 + 4.0)
             .unwrap_or(0.0);
         let longest_seconds = clip_end_seconds.max(song_text_end_seconds);
         (longest_seconds * self.state.viewport.pixels_per_second).max(1200.0)
@@ -3574,7 +3576,10 @@ impl Timeline {
         let track_view_h = (window_h - used_v).max(DEFAULT_TRACK_HEIGHT);
         let content_w = self.timeline_content_width();
 
-        if std::env::var_os("FUTUREBOARD_TIMELINE_VIEWPORT_DEBUG").is_some() {
+        static VIEWPORT_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *VIEWPORT_DEBUG
+            .get_or_init(|| std::env::var_os("FUTUREBOARD_TIMELINE_VIEWPORT_DEBUG").is_some())
+        {
             eprintln!(
                 "[tl-viewport] window={}x{} body={}x{} browser={} inspector={} bottom={} status={} content={}x{}",
                 window_w,

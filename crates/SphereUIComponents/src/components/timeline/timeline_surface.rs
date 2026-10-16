@@ -151,6 +151,7 @@ pub fn timeline_surface(
 
     let mut options = SnapshotBuildOptions::default();
     options.scale_factor = 1.0;
+    options.include_content = active_timeline_renderer_backend() != "gpui-paint";
 
     let mut snapshot = TimelineRenderSnapshot::from_row_layout(state, row_layout, options);
     snapshot.viewport.width = grid_width.max(1.0);

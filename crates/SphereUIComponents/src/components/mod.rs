@@ -142,6 +142,7 @@ pub mod rodhareist_panel;
 pub mod rodhareist_window;
 pub mod routing_matrix_window;
 pub mod scroll_thumb;
+pub mod scrollbar;
 pub mod settings_components;
 pub mod settings_dialog;
 pub mod settings_layout;

@@ -133,6 +133,12 @@ pub struct TimelineRenderSnapshot {
 pub struct SnapshotBuildOptions {
     pub scale_factor: f32,
     pub track_overscan: usize,
+    /// Build the lane and clip lists. Only a renderer that draws clips itself
+    /// needs them; the GPUI painter draws the grid and bar shades alone (clips
+    /// are their own elements), and building them cloned every visible clip's
+    /// ids and took the waveform cache lock several times per audio clip on
+    /// every grid rebuild.
+    pub include_content: bool,
 }
 
 impl Default for SnapshotBuildOptions {
@@ -140,6 +146,7 @@ impl Default for SnapshotBuildOptions {
         Self {
             scale_factor: 1.0,
             track_overscan: 2,
+            include_content: true,
         }
     }
 }
@@ -188,8 +195,14 @@ impl TimelineRenderSnapshot {
             end_beat: visible_end.max(visible_start),
         };
 
-        let lanes = build_lanes(state, row_layout, &visible_tracks);
-        let clips = build_clips(state, row_layout, &visible_tracks, &viewport);
+        let (lanes, clips) = if options.include_content {
+            (
+                build_lanes(state, row_layout, &visible_tracks),
+                build_clips(state, row_layout, &visible_tracks, &viewport),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let grid_lines = state
             .arrangement_grid_lines(grid_width)
             .iter()

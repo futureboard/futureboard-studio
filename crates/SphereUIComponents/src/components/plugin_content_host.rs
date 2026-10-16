@@ -98,7 +98,7 @@ mod imp {
         GetClientRect, GetDesktopWindow, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect,
         GetWindowThreadProcessId, IsChild, IsWindow, RegisterClassW, SetWindowLongPtrW,
         SetWindowPos, SetWindowsHookExW, UnhookWindowsHookEx, GA_PARENT, GWLP_HWNDPARENT,
-        GWL_STYLE, GW_CHILD, GW_OWNER, HC_ACTION, HHOOK, HMENU, HWND_TOPMOST, MSG, PM_REMOVE,
+        GWL_STYLE, GW_CHILD, GW_OWNER, HC_ACTION, HHOOK, HMENU, HWND_TOP, MSG, PM_REMOVE,
         SWP_NOACTIVATE, SWP_NOZORDER, WH_GETMESSAGE, WINDOW_EX_STYLE, WM_ERASEBKGND, WM_KEYDOWN,
         WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NULL, WM_PARENTNOTIFY, WM_RBUTTONDOWN, WM_SETFOCUS,
         WM_SYSKEYDOWN, WM_XBUTTONDOWN, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
@@ -602,9 +602,8 @@ mod imp {
     /// Windows keeps an owned window above its owner, keeps it off the taskbar
     /// and out of Alt-Tab, and destroys it with the owner. GPUI's
     /// `WindowKind::PopUp` supplies none of that (it creates the window with
-    /// `WS_EX_TOOLWINDOW`, no owner and no topmost bit), and the editor it drops
-    /// from is `WS_EX_TOPMOST`, so without this the popup is created, activated,
-    /// drawn — and sits underneath.
+    /// `WS_EX_TOOLWINDOW` and no owner), so without this the popup is created,
+    /// activated, drawn — and sits underneath the editor it drops from.
     ///
     /// The rectangle is applied here too, in physical pixels supplied by the
     /// caller, because a popup's own DPI is sampled at the `CW_USEDEFAULT`
@@ -633,7 +632,7 @@ mod imp {
             SetWindowLongPtrW(popup, GWLP_HWNDPARENT, owner.0 as isize);
             let _ = SetWindowPos(
                 popup,
-                Some(HWND_TOPMOST),
+                Some(HWND_TOP),
                 x,
                 y,
                 width.max(1),

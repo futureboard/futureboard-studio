@@ -1,20 +1,7 @@
-use gpui::{div, px, Empty, IntoElement, ParentElement, Render, Styled, Window};
+use gpui::{div, px, IntoElement, ParentElement, Render, Styled, Window};
 
 use crate::components::reorder::{DragRefusal, RefusableDrag};
 use crate::theme::Colors;
-
-/// Zero-sized GPUI drag payload for the mixer's horizontal scrollbar thumb.
-/// Same pattern as [`super::MixerSplitDrag`]: `on_drag` registers it and
-/// `on_drag_move` on the scrollbar track maps the captured pointer to a scroll
-/// offset for as long as the pointer is held.
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct MixerScrollDrag;
-
-impl Render for MixerScrollDrag {
-    fn render(&mut self, _w: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        Empty
-    }
-}
 
 #[derive(Clone)]
 pub(super) struct SendSlotDrag {

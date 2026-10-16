@@ -2171,54 +2171,91 @@ impl PianoRoll {
             .into_any_element()
     }
 
-    /// Scroll position indicators, inside the grid along its right and
-    /// bottom edges.
+    /// The grid's scrollbars, along its right and bottom edges: drag the thumb
+    /// or click the track to scroll, the same as the mixer's. They overlay the
+    /// grid (whose size every coordinate in the roll is measured against) and
+    /// take the pointer before it, so a press on a bar never starts a note.
     fn render_scrollbars(&self, cx: &Context<Self>) -> Vec<gpui::AnyElement> {
-        use crate::theme::{radius, space};
-        const THICKNESS: f32 = 4.0;
+        use crate::components::scrollbar::{scrollbar, Axis, THICKNESS};
         let (view_w, view_h) = self.grid_view_size();
         let max_x = self.max_scroll_x(cx);
         let max_y = self.max_scroll_y();
-        let thumb = Colors::with_alpha(Colors::text_primary(), 0.20);
+        let has_x = max_x > 0.5;
+        let has_y = max_y > 0.5;
+        // Where both show, each stops short of the corner the other runs into.
+        let corner = |other: bool| if other { THICKNESS } else { 0.0 };
+        let entity = cx.entity().downgrade();
         let mut bars = Vec::new();
 
-        if max_y > 0.5 {
-            let track_h = (view_h - space::TIGHT * 2.0).max(1.0);
-            // A just-created/floating editor can have a viewport shorter than
-            // the preferred thumb. `clamp` panics when its minimum exceeds its
-            // maximum, so cap the preferred minimum to the track first.
-            let min_thumb_h = 24.0_f32.min(track_h);
-            let thumb_h = (track_h * (view_h / (view_h + max_y))).clamp(min_thumb_h, track_h);
-            let thumb_y = ((self.scroll_y / max_y) * (track_h - thumb_h)).clamp(0.0, track_h);
-            bars.push(
-                div()
-                    .absolute()
-                    .right(px(space::HAIR))
-                    .top(px(space::TIGHT + thumb_y))
-                    .w(px(THICKNESS))
-                    .h(px(thumb_h))
-                    .rounded(px(radius::PILL))
-                    .bg(thumb)
-                    .into_any_element(),
-            );
+        if has_y {
+            let entity = entity.clone();
+            let on_scroll = std::sync::Arc::new(move |y: f32, _: &mut Window, cx: &mut gpui::App| {
+                let _ = entity.update(cx, |this, cx| {
+                    let y = y.clamp(0.0, this.max_scroll_y());
+                    if (this.scroll_y - y).abs() > 0.01 {
+                        this.scroll_y = y;
+                        cx.notify();
+                    }
+                });
+            });
+            let track_len = (view_h - corner(has_x)).max(1.0);
+            if let Some(bar) = scrollbar(
+                "piano-roll-vscroll",
+                Axis::Vertical,
+                self.scroll_y,
+                view_h + max_y,
+                view_h,
+                max_y,
+                track_len,
+                on_scroll,
+            ) {
+                bars.push(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .h(px(track_len))
+                        .w(px(THICKNESS))
+                        .child(bar)
+                        .into_any_element(),
+                );
+            }
         }
 
-        if max_x > 0.5 {
-            let track_w = (view_w - space::TIGHT * 2.0).max(1.0);
-            let min_thumb_w = 32.0_f32.min(track_w);
-            let thumb_w = (track_w * (view_w / (view_w + max_x))).clamp(min_thumb_w, track_w);
-            let thumb_x = ((self.scroll_x / max_x) * (track_w - thumb_w)).clamp(0.0, track_w);
-            bars.push(
-                div()
-                    .absolute()
-                    .left(px(space::TIGHT + thumb_x))
-                    .bottom(px(space::HAIR))
-                    .w(px(thumb_w))
-                    .h(px(THICKNESS))
-                    .rounded(px(radius::PILL))
-                    .bg(thumb)
-                    .into_any_element(),
-            );
+        if has_x {
+            let on_scroll = std::sync::Arc::new(move |x: f32, _: &mut Window, cx: &mut gpui::App| {
+                let _ = entity.update(cx, |this, cx| {
+                    let x = x.clamp(0.0, this.max_scroll_x(cx));
+                    if (this.scroll_x - x).abs() > 0.01 {
+                        let before = this.scroll_x;
+                        this.scroll_x = x;
+                        this.note_user_scrolled_x(before, cx);
+                        cx.notify();
+                    }
+                });
+            });
+            let track_len = (view_w - corner(has_y)).max(1.0);
+            if let Some(bar) = scrollbar(
+                "piano-roll-hscroll",
+                Axis::Horizontal,
+                self.scroll_x,
+                view_w + max_x,
+                view_w,
+                max_x,
+                track_len,
+                on_scroll,
+            ) {
+                bars.push(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .bottom_0()
+                        .w(px(track_len))
+                        .h(px(THICKNESS))
+                        .child(bar)
+                        .into_any_element(),
+                );
+            }
         }
 
         bars

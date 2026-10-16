@@ -47,16 +47,24 @@ impl GpuiPaintTimelineRenderer {
             );
         }
 
+        // Resolved once: each theme getter takes the theme lock.
+        let shade_color = Colors::timeline_region_background();
+        let (bar_color, beat_color, sub_color) = (
+            Colors::timeline_grid_bar(),
+            Colors::timeline_grid_major(),
+            Colors::timeline_grid_minor(),
+        );
+
         for shade in &snapshot.bar_shades {
             let bar_bounds = local_bounds(bounds, shade.x, 0.0, shade.width, grid_height);
-            window.paint_quad(fill(bar_bounds, Colors::timeline_region_background()));
+            window.paint_quad(fill(bar_bounds, shade_color));
         }
 
         for line in &snapshot.grid_lines {
             let color = match line.level {
-                GridLineLevel::Bar => Colors::timeline_grid_bar(),
-                GridLineLevel::Beat => Colors::timeline_grid_major(),
-                GridLineLevel::Sub => Colors::timeline_grid_minor(),
+                GridLineLevel::Bar => bar_color,
+                GridLineLevel::Beat => beat_color,
+                GridLineLevel::Sub => sub_color,
             };
             let line_bounds = local_bounds(bounds, line.x, 0.0, 1.0, grid_height);
             window.paint_quad(fill(line_bounds, color));
@@ -105,7 +113,8 @@ fn arrangement_canvas_size(bounds: Bounds<Pixels>) -> (f32, f32) {
 
 /// Dev-only: log snapshot stats when WGPU path runs in parallel with GPUI display.
 pub fn log_snapshot_stats(snapshot: &TimelineRenderSnapshot, backend: &str) {
-    if std::env::var_os("FUTUREBOARD_GPU_RENDERER_DEBUG").is_some() {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DEBUG.get_or_init(|| std::env::var_os("FUTUREBOARD_GPU_RENDERER_DEBUG").is_some()) {
         eprintln!(
             "[gpu-renderer] snapshot backend={backend} grid={} clips={} lanes={} tracks={}..{}",
             snapshot.grid_lines.len(),

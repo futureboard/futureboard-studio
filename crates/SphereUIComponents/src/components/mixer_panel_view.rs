@@ -20,8 +20,9 @@ use crate::components::mixer_master_strip_view::{
 use crate::components::mixer_meter_layer::{clip_region, ClipRegion, SharedMeterLayout};
 use crate::components::mixer_panel::{
     build_mixer_render_snapshot, collect_mixer_render_items, mixer_center_lightweight,
+    mixer_reserves_scrollbar, mixer_scrollbar_row, mixer_strip_height_with_scrollbar,
     mixer_strip_scroller, mixer_sub_header, mixer_visible_item_range, MixerRenderItem, MixerSplit,
-    MixerSplitAction, MixerSplitDrag, VstiOutputMeterState,
+    MixerSplitAction, MixerSplitDrag, VstiOutputMeterState, MIXER_SCROLLBAR_ROW,
 };
 use crate::components::mixer_surface::render_mixer_primitives;
 use crate::components::mixer_tree_sidebar_view::MixerTreeSidebar;
@@ -136,6 +137,15 @@ impl MixerPanelView {
             .state
             .apply_volume_previews_to_snapshot(&mut tracks, &mut master);
 
+        // The channel scrollbar gets its own row under the strips, taken out of
+        // their height (see `mixer_reserves_scrollbar`).
+        let reserve_scrollbar = mixer_reserves_scrollbar(strip_count, chrome.viewport_width);
+        let (strip_available_px, body_scrolls) = mixer_strip_height_with_scrollbar(
+            chrome.strip_available_px,
+            chrome.body_scrolls,
+            reserve_scrollbar,
+        );
+
         MixerPanelViewState {
             tracks,
             master,
@@ -146,8 +156,9 @@ impl MixerPanelView {
             vsti_output_meters: chrome.vsti_output_meters.clone(),
             scroll_x: chrome.scroll_x,
             viewport_width: chrome.viewport_width,
-            strip_available_px: chrome.strip_available_px,
-            body_scrolls: chrome.body_scrolls,
+            strip_available_px,
+            body_scrolls,
+            reserve_scrollbar,
             strip_count,
             track_count: timeline.state.tracks.len(),
             tree_enabled: chrome.tree_sidebar_enabled,
@@ -167,6 +178,7 @@ impl MixerPanelView {
         q(state.viewport_width).hash(&mut hasher);
         q(state.strip_available_px).hash(&mut hasher);
         state.body_scrolls.hash(&mut hasher);
+        state.reserve_scrollbar.hash(&mut hasher);
         q(split.insert_px).hash(&mut hasher);
         q(split.send_px).hash(&mut hasher);
         split.active_target.hash(&mut hasher);
@@ -188,6 +200,7 @@ struct MixerPanelViewState {
     viewport_width: f32,
     strip_available_px: f32,
     body_scrolls: bool,
+    reserve_scrollbar: bool,
     strip_count: usize,
     track_count: usize,
     tree_enabled: bool,
@@ -241,6 +254,7 @@ impl Render for MixerPanelView {
             }
         };
 
+        let mut scrollbar_row = None;
         let mut channel_row = if state.strip_count == 0 {
             crate::perf::count("mixer_center_paint_count", 1);
             fill(div().flex().flex_row())
@@ -251,6 +265,16 @@ impl Render for MixerPanelView {
                 .child(div().w(px(1.0)).h_full().bg(Colors::border_default()))
                 .child(self.master_strip.clone())
         } else {
+            scrollbar_row = if state.reserve_scrollbar {
+                mixer_scrollbar_row(
+                    state.strip_count,
+                    state.scroll_x,
+                    state.viewport_width,
+                    on_scroll.clone(),
+                )
+            } else {
+                None
+            };
             let strip_row = mixer_strip_scroller(
                 &state.tracks,
                 state.selected_track_id.as_deref(),
@@ -293,6 +317,17 @@ impl Render for MixerPanelView {
             channel_row = fill(div().relative())
                 .child(primitives)
                 .child(channel_row.size_full());
+        }
+
+        // The strips, then their scrollbar in its own row underneath.
+        if let Some(bar) = scrollbar_row {
+            let column = div().flex().flex_col();
+            let column = if body_scrolls {
+                column.flex_none().h(px(strip_h + MIXER_SCROLLBAR_ROW))
+            } else {
+                column.flex_1().min_h_0()
+            };
+            channel_row = column.child(channel_row).child(bar);
         }
 
         let channel_row = if body_scrolls {

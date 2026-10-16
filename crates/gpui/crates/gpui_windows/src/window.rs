@@ -498,6 +498,11 @@ impl WindowsWindow {
                 };
                 Some(parent_window)
             }
+        } else if params.kind == WindowKind::Floating {
+            // Floating = above its application, not above every application.
+            // An *owned* window is exactly that on Win32: it stays above its
+            // owner, hides when the owner minimizes and is destroyed with it.
+            floating_owner_window()
         } else {
             None
         };
@@ -555,12 +560,10 @@ impl WindowsWindow {
         if params.kind == WindowKind::Dialog {
             dwstyle |= WINDOW_STYLE(DS_MODALFRAME as u32);
         }
-        if params.kind == WindowKind::Floating {
-            // macOS gives `Floating` NSFloatingWindowLevel and X11 gives it
-            // WM_TRANSIENT_FOR; WS_EX_TOPMOST is the Win32 equivalent. Without
-            // it the kind silently degrades to a plain window here.
-            dwexstyle |= WS_EX_TOPMOST;
-        }
+        // `Floating` is expressed through the owner above, not `WS_EX_TOPMOST`:
+        // X11 gives the kind WM_TRANSIENT_FOR (owner-relative), and a topmost
+        // window here pinned plug-in editors, the MIDI editor and every other
+        // tool window over *all* applications on the desktop.
         if !disable_direct_composition {
             dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
         }
@@ -1526,6 +1529,44 @@ impl NativeDialogTemplate {
 
     fn as_ptr(&self) -> *const DLGTEMPLATE {
         self.words.as_ptr().cast()
+    }
+}
+
+/// The window a new `Floating` window is owned by: the application's main
+/// window.
+///
+/// Resolved through the *root owner* of the active window, never the active
+/// window itself — a tool window opened from another tool window must not be
+/// owned by it, or closing the first would destroy the second with it. When
+/// nothing of ours is active (opened from a background task), the first
+/// visible, unowned top-level window of this UI thread is the main window.
+fn floating_owner_window() -> Option<HWND> {
+    unsafe {
+        let active = GetActiveWindow();
+        if !active.is_invalid() {
+            let root = GetAncestor(active, GA_ROOTOWNER);
+            if !root.is_invalid() {
+                return Some(root);
+            }
+        }
+
+        unsafe extern "system" fn first_main_window(hwnd: HWND, found: LPARAM) -> BOOL {
+            unsafe {
+                let unowned = GetWindow(hwnd, GW_OWNER).map_or(true, |owner| owner.is_invalid());
+                if unowned && IsWindowVisible(hwnd).as_bool() {
+                    *(found.0 as *mut HWND) = hwnd;
+                    return false.into();
+                }
+            }
+            true.into()
+        }
+        let mut found = HWND::default();
+        let _ = EnumThreadWindows(
+            windows::Win32::System::Threading::GetCurrentThreadId(),
+            Some(first_main_window),
+            LPARAM(&mut found as *mut HWND as isize),
+        );
+        (!found.is_invalid()).then_some(found)
     }
 }
 

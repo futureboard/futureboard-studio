@@ -68,7 +68,16 @@ impl Render for Timeline {
         // One meter entity per track that has a header. Built here because this
         // is where the track set is known, and pruned in the same pass so a
         // deleted track does not leave its entity behind.
-        {
+        //
+        // Checked first without allocating: this runs on every repaint, and the
+        // track set almost never changes between two of them.
+        let views_in_sync = self.track_meters.len() == self.state.tracks.len()
+            && self.track_lanes.len() == self.state.tracks.len()
+            && self.state.tracks.iter().all(|t| {
+                self.track_meters.contains_key(t.id.as_str())
+                    && self.track_lanes.contains_key(t.id.as_str())
+            });
+        if !views_in_sync {
             let ids: std::collections::HashSet<&str> =
                 self.state.tracks.iter().map(|t| t.id.as_str()).collect();
             self.track_meters.retain(|id, _| ids.contains(id.as_str()));
@@ -1775,15 +1784,15 @@ impl Render for Timeline {
         let pen_preview_overlay = self
             .pen_clip_draw
             .as_ref()
-            .and_then(|preview| pen_clip_draw_overlay(preview, state));
+            .and_then(|preview| pen_clip_draw_overlay(preview, state, &row_layout));
         let file_drop_overlay = self
             .file_drop_hint
             .as_ref()
-            .and_then(|hint| file_drop_hint_overlay(hint, state));
+            .and_then(|hint| file_drop_hint_overlay(hint, state, &row_layout));
         let clip_clone_overlay = self
             .clip_clone_hint
             .as_ref()
-            .and_then(|hint| clip_clone_hint_overlay(hint, state));
+            .and_then(|hint| clip_clone_hint_overlay(hint, state, &row_layout));
         let clip_move_overlay = self
             .clip_move_origin
             .as_ref()
@@ -1795,6 +1804,7 @@ impl Render for Timeline {
                     self.clip_move_hint_from,
                     self.clip_move_hint_generation,
                     state,
+                    &row_layout,
                 )
             });
         let chord_drop_overlay =
@@ -2906,7 +2916,7 @@ impl Render for Timeline {
             // 2b. Arrangement range-selection overlay (UI-only). Drawn above the
             // lane content but below the playhead/tools so it never hides the
             // playhead. Follows zoom/scroll via the same lane coordinate space.
-            .children(arrangement_range_overlay(state).map(|overlay| {
+            .children(arrangement_range_overlay(state, &row_layout).map(|overlay| {
                 div()
                     .absolute()
                     .left(px(HEADER_WIDTH))
@@ -3507,14 +3517,17 @@ fn file_drop_hint_label(paths: &[std::path::PathBuf]) -> &'static str {
     }
 }
 
-fn file_drop_hint_overlay(hint: &FileDropHint, state: &TimelineState) -> Option<gpui::AnyElement> {
+fn file_drop_hint_overlay(
+    hint: &FileDropHint,
+    state: &TimelineState,
+    row_layout: &crate::components::timeline::timeline_state::TrackRowLayout,
+) -> Option<gpui::AnyElement> {
     let window_x: f32 = hint.position.x.into();
     let window_y: f32 = hint.position.y.into();
     let lane_x = state.lane_x_from_window_x(window_x).max(0.0);
     let lane_y = state.track_viewport_y_from_window_y(window_y).max(0.0);
     let beat = state.snap_beats(state.x_to_beats(lane_x)).max(0.0);
     let track_index = state.track_index_at_y(lane_y);
-    let row_layout = state.track_row_layout();
     let (target_top, target_h, target_name, target_color) = if let Some(index) = track_index {
         let row = row_layout.row_for_index(index)?;
         let track = state.tracks.get(index)?;
@@ -3621,10 +3634,10 @@ fn file_drop_hint_overlay(hint: &FileDropHint, state: &TimelineState) -> Option<
 fn clip_clone_hint_overlay(
     hint: &ClipCloneHint,
     state: &TimelineState,
+    row_layout: &crate::components::timeline::timeline_state::TrackRowLayout,
 ) -> Option<gpui::AnyElement> {
     let (_, source_clip) = state.find_clip(&hint.clip_id)?;
     let target_track = state.tracks.get(hint.target_track_index)?;
-    let row_layout = state.track_row_layout();
     let row = row_layout.row_for_index(hint.target_track_index)?;
 
     let x = state.beats_to_x(hint.start_beat).max(0.0);
@@ -3705,6 +3718,7 @@ fn clip_move_hint_overlay(
     from_index: Option<usize>,
     generation: u64,
     state: &TimelineState,
+    row_layout: &crate::components::timeline::timeline_state::TrackRowLayout,
 ) -> Option<gpui::AnyElement> {
     let source_index = state.tracks.iter().position(|track| {
         track
@@ -3717,7 +3731,6 @@ fn clip_move_hint_overlay(
         return None;
     }
     let max_index = state.tracks.len().saturating_sub(1) as isize;
-    let row_layout = state.track_row_layout();
     let scroll_y = state.viewport.scroll_y;
     let pad = 7.0;
     let row_top = |index: usize| row_layout.row_for_index(index).map(|row| row.y - scroll_y);
@@ -3871,6 +3884,7 @@ fn clip_move_hint_overlay(
 fn pen_clip_draw_overlay(
     preview: &ClipDrawPreview,
     state: &TimelineState,
+    row_layout: &crate::components::timeline::timeline_state::TrackRowLayout,
 ) -> Option<gpui::AnyElement> {
     let track_index = state.tracks.iter().position(|t| t.id == preview.track_id)?;
     let track_color = state.tracks[track_index].color;
@@ -3881,7 +3895,6 @@ fn pen_clip_draw_overlay(
 
     let x_lo = state.beats_to_x(clip_start);
     let width = (state.beats_to_x(clip_end) - x_lo).max(2.0);
-    let row_layout = state.track_row_layout();
     let row = row_layout.row_for_index(track_index)?;
     let pad = 7.0;
     let top = row.y - state.viewport.scroll_y + pad;
@@ -4005,7 +4018,12 @@ fn pen_clip_draw_overlay(
     )
 }
 
-pub(crate) fn arrangement_range_overlay(state: &TimelineState) -> Option<gpui::AnyElement> {
+/// `row_layout` is the frame's shared layout: rebuilding it here cloned every
+/// track id on each repaint while a range was selected.
+pub(crate) fn arrangement_range_overlay(
+    state: &TimelineState,
+    row_layout: &crate::components::timeline::timeline_state::TrackRowLayout,
+) -> Option<gpui::AnyElement> {
     let range = state.arrangement_range.as_ref()?;
     let (start_beat, end_beat) = range.as_f32_range();
     let (lo, hi) = normalize_range(start_beat, end_beat);
@@ -4017,8 +4035,10 @@ pub(crate) fn arrangement_range_overlay(state: &TimelineState) -> Option<gpui::A
     let (y_top, height) = {
         let mut min_idx = usize::MAX;
         let mut max_idx = 0usize;
+        let range_ids: std::collections::HashSet<&str> =
+            range.track_ids.iter().map(String::as_str).collect();
         for (idx, track) in state.tracks.iter().enumerate() {
-            if range.track_ids.iter().any(|id| id == &track.id) {
+            if range_ids.contains(track.id.as_str()) {
                 min_idx = min_idx.min(idx);
                 max_idx = max_idx.max(idx);
             }
@@ -4026,7 +4046,6 @@ pub(crate) fn arrangement_range_overlay(state: &TimelineState) -> Option<gpui::A
         if min_idx == usize::MAX {
             (0.0_f32, state.viewport.track_area_height.max(0.0))
         } else {
-            let row_layout = state.track_row_layout();
             let top = row_layout
                 .row_for_index(min_idx)
                 .map(|row| row.y)

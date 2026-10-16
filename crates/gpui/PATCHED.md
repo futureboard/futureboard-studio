@@ -104,3 +104,15 @@ wheel handlers attached to the same scrollable element.
 
 When updating GPUI from upstream, preserve this Futureboard patch or port it
 forward deliberately.
+
+## Windows: `Floating` windows are owned, not topmost
+
+`gpui_windows` used to create `WindowKind::Floating` windows with
+`WS_EX_TOPMOST` and no owner, so every Studio tool window (plug-in editors,
+the MIDI editor, FX/EQ, samplers) floated above *every application* on the
+desktop. A floating window is now created *owned by* the application's main
+window instead (`floating_owner_window`: the root owner of the active window,
+or the first visible unowned window of the UI thread). Windows keeps an owned
+window above its owner, hides it when the owner is minimized and destroys it
+with the owner — which is what macOS's floating level and X11's
+`WM_TRANSIENT_FOR` already gave the kind on those platforms.

@@ -540,13 +540,93 @@ pub fn evaluate_automation(points: &[AutomationPoint], beat: f64, default: f32) 
         let a = &points[i];
         let b = &points[i + 1];
         if beat >= a.beat && beat <= b.beat {
-            let span = (b.beat - a.beat).max(1.0e-6);
-            let t = ((beat - a.beat) / span).clamp(0.0, 1.0);
-            let factor = DirectAudio::automation_curve_factor(a.curve.to_tag(), a.tension, t);
-            return a.value + (b.value - a.value) * factor;
+            return automation_segment_value(a, b, beat);
         }
     }
     points[last].value
+}
+
+/// Value of the segment `a → b` at `beat` (which lies inside it). Shared by
+/// [`evaluate_automation`] and [`AutomationSampler`] so both produce the same
+/// bits.
+#[inline]
+fn automation_segment_value(a: &AutomationPoint, b: &AutomationPoint, beat: f32) -> f32 {
+    let span = (b.beat - a.beat).max(1.0e-6);
+    let t = ((beat - a.beat) / span).clamp(0.0, 1.0);
+    let factor = DirectAudio::automation_curve_factor(a.curve.to_tag(), a.tension, t);
+    a.value + (b.value - a.value) * factor
+}
+
+/// [`evaluate_automation`] for many beats in a row, such as the per-pixel
+/// samples of a drawn lane.
+///
+/// `evaluate_automation` scans every segment, so sampling a lane per pixel is
+/// O(width × points). This keeps a cursor on the segment of the previous beat
+/// and walks forward from it, so ascending beats cost O(width + points) in
+/// total; a beat that goes backwards re-seeks with a binary search. Results
+/// are bit-identical to `evaluate_automation`, including the held ends and
+/// the first-matching segment among points that share a beat. Points that are
+/// not sorted (or carry a NaN beat) fall back to `evaluate_automation` itself,
+/// because the cursor's segment choice is only equivalent on sorted input.
+pub struct AutomationSampler<'a> {
+    points: &'a [AutomationPoint],
+    default: f32,
+    sorted: bool,
+    /// First index whose beat is `>= last_beat`.
+    next: usize,
+    last_beat: f32,
+}
+
+impl<'a> AutomationSampler<'a> {
+    pub fn new(points: &'a [AutomationPoint], default: f32) -> Self {
+        let sorted = points.iter().all(|p| !p.beat.is_nan())
+            && points.windows(2).all(|w| w[0].beat <= w[1].beat);
+        Self {
+            points,
+            default,
+            sorted,
+            next: 0,
+            last_beat: f32::NEG_INFINITY,
+        }
+    }
+
+    /// Same as `evaluate_automation(points, beat, default)`.
+    pub fn value_at(&mut self, beat: f64) -> f32 {
+        let points = self.points;
+        if !self.sorted {
+            return evaluate_automation(points, beat, self.default);
+        }
+        if points.is_empty() {
+            return self.default;
+        }
+        let beat = beat as f32;
+        if beat <= points[0].beat {
+            return points[0].value;
+        }
+        let last = points.len() - 1;
+        if beat >= points[last].beat {
+            return points[last].value;
+        }
+        if beat.is_nan() {
+            // `evaluate_automation` matches no segment and lands on its tail.
+            return points[last].value;
+        }
+        // `points[0].beat < beat < points[last].beat` here. The scan in
+        // `evaluate_automation` takes the first `i` with
+        // `points[i].beat <= beat <= points[i + 1].beat`; on sorted points that
+        // is the segment ending at the first point whose beat is `>= beat`.
+        let mut j = if beat >= self.last_beat {
+            self.next
+        } else {
+            points.partition_point(|p| p.beat < beat)
+        };
+        while points[j].beat < beat {
+            j += 1;
+        }
+        self.next = j;
+        self.last_beat = beat;
+        automation_segment_value(&points[j - 1], &points[j], beat)
+    }
 }
 
 impl TimelineState {
@@ -1492,6 +1572,133 @@ mod tests {
         assert!(approx(evaluate_automation(&pts, 2.0, 0.0), 0.5));
         // Second segment [4,8] midpoint: 1.0 + (0.5-1.0)*0.5 = 0.75.
         assert!(approx(evaluate_automation(&pts, 6.0, 0.0), 0.75));
+    }
+
+    fn point(beat: f32, value: f32, curve: AutomationCurve, tension: f32) -> AutomationPoint {
+        let mut p = AutomationPoint::with_curve(beat, value, curve);
+        p.set_tension(tension);
+        p
+    }
+
+    /// Lanes covering every curve shape, tension, step points, shared beats
+    /// and unsorted input.
+    fn sampler_lanes() -> Vec<Vec<AutomationPoint>> {
+        use AutomationCurve::{Hold, Linear, Smooth};
+        let mut lanes = vec![
+            Vec::new(),
+            vec![point(3.0, 0.4, Linear, 0.0)],
+            vec![point(0.0, 0.2, Linear, 0.0), point(4.0, 0.6, Linear, 0.0)],
+            vec![
+                point(0.0, 0.1, Linear, 0.7),
+                point(1.5, 0.9, Hold, 0.0),
+                point(3.0, 0.3, Smooth, -0.6),
+                point(4.25, 0.8, Linear, -1.0),
+                point(6.0, 0.0, Hold, 0.4),
+                point(8.0, 1.0, Linear, 1.0),
+                point(9.0, 0.5, Linear, 0.0),
+            ],
+            // Step points: two points on one beat jump the value there.
+            vec![
+                point(1.0, 0.2, Linear, 0.3),
+                point(2.0, 0.2, Linear, 0.0),
+                point(2.0, 0.9, Hold, 0.0),
+                point(2.0, 0.5, Linear, -0.5),
+                point(5.0, 0.1, Smooth, 0.2),
+                point(5.0, 0.7, Linear, 0.0),
+                point(7.0, 0.7, Linear, 0.0),
+                point(7.0, 0.0, Linear, 0.0),
+            ],
+            // Shared beats at both ends.
+            vec![
+                point(2.0, 0.3, Linear, 0.0),
+                point(2.0, 0.6, Linear, 0.5),
+                point(4.0, 0.9, Linear, 0.0),
+                point(4.0, 0.1, Linear, 0.0),
+            ],
+            // Unsorted: the sampler must fall back, not pick another segment.
+            vec![
+                point(4.0, 0.9, Linear, 0.0),
+                point(1.0, 0.2, Hold, 0.0),
+                point(6.0, 0.4, Smooth, 0.3),
+                point(3.0, 0.7, Linear, -0.2),
+            ],
+        ];
+        // A long, dense lane with pseudo-random shapes (deterministic LCG).
+        let mut seed: u32 = 0x1234_5678;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let mut beat = 0.0f32;
+        let mut dense = Vec::new();
+        for _ in 0..200 {
+            // Some steps land on the previous beat to make duplicates.
+            if next() > 0.15 {
+                beat += next() * 0.75;
+            }
+            let curve = match (next() * 3.0) as u32 {
+                0 => Linear,
+                1 => Hold,
+                _ => Smooth,
+            };
+            dense.push(point(beat, next(), curve, next() * 2.0 - 1.0));
+        }
+        lanes.push(dense);
+        lanes
+    }
+
+    /// Sample positions: dense ascending, every point's exact beat (and its
+    /// neighbouring floats), then backwards and jumping around to exercise the
+    /// sampler's re-seek.
+    fn sampler_beats(points: &[AutomationPoint]) -> Vec<f64> {
+        let end = points.iter().map(|p| p.beat).fold(10.0f32, f32::max) + 2.0;
+        let mut beats: Vec<f64> = (0..=4000)
+            .map(|i| -1.0 + i as f64 * (end as f64 + 1.0) / 4000.0)
+            .collect();
+        for p in points {
+            let b = p.beat;
+            beats.push(f32::from_bits(b.to_bits().saturating_sub(1)) as f64);
+            beats.push(b as f64);
+            beats.push(f32::from_bits(b.to_bits() + 1) as f64);
+        }
+        let ascending = beats.clone();
+        beats.extend(ascending.iter().rev());
+        beats.extend(ascending.iter().step_by(7).rev().step_by(3));
+        beats.extend([f64::NAN, 2.0, f64::INFINITY, f64::NEG_INFINITY, 2.0]);
+        beats
+    }
+
+    #[test]
+    fn sampler_matches_evaluate_automation_bit_for_bit() {
+        for (lane_index, points) in sampler_lanes().iter().enumerate() {
+            for default in [0.0f32, 0.5, 0.8] {
+                // Ascending only (the render path), then everything in order.
+                let mut ascending = super::AutomationSampler::new(points, default);
+                let mut beats = sampler_beats(points);
+                let mut sorted = beats.clone();
+                sorted.retain(|b| !b.is_nan());
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                for &beat in &sorted {
+                    let want = evaluate_automation(points, beat, default);
+                    let got = ascending.value_at(beat);
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "lane {lane_index} ascending beat {beat}: {got} != {want}"
+                    );
+                }
+                let mut mixed = super::AutomationSampler::new(points, default);
+                for beat in beats.drain(..) {
+                    let want = evaluate_automation(points, beat, default);
+                    let got = mixed.value_at(beat);
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "lane {lane_index} mixed beat {beat}: {got} != {want}"
+                    );
+                }
+            }
+        }
     }
 }
 

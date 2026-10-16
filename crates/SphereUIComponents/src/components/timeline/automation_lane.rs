@@ -1,7 +1,7 @@
 use crate::components::timeline::timeline_state::{
     automation_value_to_y, automation_y_to_value, evaluate_automation, AutomationHover,
-    AutomationLaneState, AutomationMarquee, AutomationTarget, TimelineGestureContext,
-    TimelineState, HEADER_WIDTH,
+    AutomationLaneState, AutomationMarquee, AutomationPoint, AutomationSampler, AutomationTarget,
+    TimelineGestureContext, TimelineState, HEADER_WIDTH,
 };
 use crate::assets;
 use crate::theme::{radius, space, typography, Colors};
@@ -149,6 +149,11 @@ pub fn automation_lane(
     } else {
         Colors::automation_lane_header_bg()
     };
+    // Theme lookups shared by several header controls, resolved once per render.
+    let state_hover = Colors::state_hover();
+    let header_hover = Colors::composite(header_bg, state_hover);
+    let text_muted = Colors::text_muted();
+    let border_subtle = Colors::border_subtle();
     let mut accent = track_color;
     accent.a = if is_active { 1.0 } else { 0.7 };
     let lane_action = |action: AutomationLaneAction| {
@@ -172,7 +177,7 @@ pub fn automation_lane(
         .h_full()
         .flex_none()
         .border_r(px(1.0))
-        .border_color(Colors::border_subtle())
+        .border_color(border_subtle)
         .bg(header_bg)
         .id(("automation-lane-header", id_num))
         .cursor(gpui::CursorStyle::PointingHand)
@@ -211,7 +216,7 @@ pub fn automation_lane(
         .px(px(space::TIGHT))
         .rounded(px(radius::CONTROL))
         .cursor(gpui::CursorStyle::PointingHand)
-        .hover(move |s| s.bg(Colors::composite(header_bg, Colors::state_hover())))
+        .hover(move |s| s.bg(header_hover))
         .tooltip(crate::components::fb_tooltip("Choose parameter"))
         .on_mouse_down(
             gpui::MouseButton::Left,
@@ -234,7 +239,7 @@ pub fn automation_lane(
                 .text_color(if lane.enabled {
                     Colors::text_primary()
                 } else {
-                    Colors::text_muted()
+                    text_muted
                 })
                 .child(lane.name.clone()),
         )
@@ -244,7 +249,7 @@ pub fn automation_lane(
                 .flex_none()
                 .w(px(10.0))
                 .h(px(10.0))
-                .text_color(Colors::text_muted()),
+                .text_color(text_muted),
         );
 
     // The hovered point's value, else what the lane plays at the playhead —
@@ -266,16 +271,13 @@ pub fn automation_lane(
         .flex_none()
         .text_size(px(typography::UI_XS))
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .font_features(gpui::FontFeatures(std::sync::Arc::new(vec![(
-            "tnum".to_string(),
-            1,
-        )])))
+        .font_features(tabular_numerals())
         .text_color(if hovered_point_value.is_some() {
             Colors::automation_curve()
         } else if lane.enabled {
             Colors::text_secondary()
         } else {
-            Colors::text_muted()
+            text_muted
         })
         .child(lane.target.format_value(readout_value));
 
@@ -294,24 +296,25 @@ pub fn automation_lane(
     // Two honest states: Read plays the lane back, Off bypasses it. Fill and
     // border carry the state together (the latched language), never hue alone.
     let (mode_label, mode_tip, mode_fill, mode_border, mode_text) = if lane.enabled {
-        let (fill, border) = Colors::latched(header_bg, Colors::state_automation());
+        let state_automation = Colors::state_automation();
+        let (fill, border) = Colors::latched(header_bg, state_automation);
         (
             "Read",
             "Read — the lane drives the parameter. Click to bypass it.",
             fill,
             border,
-            Colors::state_automation(),
+            state_automation,
         )
     } else {
         (
             "Off",
             "Off — the lane is bypassed. Click to read it again.",
             Colors::with_alpha(header_bg, 0.0),
-            Colors::border_subtle(),
-            Colors::text_muted(),
+            border_subtle,
+            text_muted,
         )
     };
-    let mode_hover = Colors::composite(mode_fill, Colors::state_hover());
+    let mode_hover = Colors::composite(mode_fill, state_hover);
     let mode_pill = div()
         .id(("automation-lane-mode", id_num))
         .flex_none()
@@ -365,36 +368,42 @@ pub fn automation_lane(
                         .min_w(px(0.0))
                         .truncate()
                         .text_size(px(typography::UI_XS))
-                        .text_color(Colors::text_muted())
+                        .text_color(text_muted)
                         .child(category),
                 ),
         )
-        .child(
+        .child({
+            // Clear is the destructive one (every point goes), so it is the one
+            // that reads danger on hover; Remove drops the lane.
+            let status_error = Colors::status_error();
+            let danger_hover = (
+                Colors::composite(header_bg, Colors::with_alpha(status_error, 0.18)),
+                status_error,
+            );
+            let plain_hover = (header_hover, Colors::text_secondary());
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(space::HAIR))
                 .flex_none()
-                // Clear is the destructive one (every point goes), so it is
-                // the one that reads danger on hover; Remove drops the lane.
                 .child(lane_button(
                     ("automation-lane-clear", id_num).into(),
                     assets::ICON_ERASER_PATH,
                     "Clear this lane's points",
-                    true,
-                    header_bg,
+                    danger_hover,
+                    text_muted,
                     lane_action(AutomationLaneAction::Clear),
                 ))
                 .child(lane_button(
                     ("automation-lane-remove", id_num).into(),
                     assets::ICON_X_PATH,
                     "Remove lane",
-                    false,
-                    header_bg,
+                    plain_hover,
+                    text_muted,
                     lane_action(AutomationLaneAction::Hide),
-                )),
-        );
+                ))
+        });
 
     let header = header.child(
         div()
@@ -415,6 +424,7 @@ pub fn automation_lane(
     // lane — a lane id alone ("volume") repeats on every track.
     let lane_marquee = marquee.filter(|m| m.started && m.track_id == track_id);
     let envelope = lane_envelope(
+        id_num,
         lane,
         state,
         lane_height,
@@ -579,26 +589,26 @@ pub fn automation_lane(
         .child(lane_area)
 }
 
-/// A 20 px icon button of the lane header. `danger` reads red on hover.
+/// Tabular numerals for the live readout, so the digits do not jitter as the
+/// value changes. Built once; every render shares the same feature list.
+fn tabular_numerals() -> gpui::FontFeatures {
+    static TNUM: std::sync::OnceLock<gpui::FontFeatures> = std::sync::OnceLock::new();
+    TNUM.get_or_init(|| gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".to_string(), 1)])))
+        .clone()
+}
+
+/// A 20 px icon button of the lane header. `hover` is the `(fill, glyph)` pair
+/// it lifts to (the caller resolves it once per lane, danger reading red);
+/// `glyph` is the resting icon colour.
 fn lane_button(
     id: gpui::ElementId,
     icon: &'static str,
     tooltip: &'static str,
-    danger: bool,
-    rest: gpui::Rgba,
+    hover: (gpui::Rgba, gpui::Rgba),
+    glyph: gpui::Rgba,
     on_press: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
-    let (hover_fill, hover_glyph) = if danger {
-        (
-            Colors::composite(rest, Colors::with_alpha(Colors::status_error(), 0.18)),
-            Colors::status_error(),
-        )
-    } else {
-        (
-            Colors::composite(rest, Colors::state_hover()),
-            Colors::text_secondary(),
-        )
-    };
+    let (hover_fill, hover_glyph) = hover;
     div()
         .id(id)
         .flex()
@@ -607,12 +617,12 @@ fn lane_button(
         .w(px(20.0))
         .h(px(20.0))
         .rounded(px(radius::CONTROL))
-        .text_color(Colors::text_muted())
+        .text_color(glyph)
         .cursor(gpui::CursorStyle::PointingHand)
         .hover(move |s| s.bg(hover_fill).text_color(hover_glyph))
         .tooltip(crate::components::fb_tooltip(tooltip))
         .on_mouse_down(gpui::MouseButton::Left, on_press)
-        .child(svg().path(icon).w(px(11.0)).h(px(11.0)).text_color(Colors::text_muted()))
+        .child(svg().path(icon).w(px(11.0)).h(px(11.0)).text_color(glyph))
 }
 
 /// Logical stroke widths for the automation envelope. Kept comfortably above
@@ -659,12 +669,173 @@ fn paint_automation_stroke(
     }
 }
 
+/// Screen-space adaptive sampling: ~one sample per logical pixel of visible
+/// width. That keeps the polyline continuous and smooth at any zoom (a wider
+/// visible segment / higher zoom yields more samples), while a hard cap stops
+/// an ultra-wide window from blowing up the per-frame stroke tessellation. A
+/// 1px screen step is below what a thin AA stroke can resolve, so curves read
+/// as smooth without oversampling tiny offscreen detail.
+const MAX_SAMPLES: usize = 4096;
+
+/// Lanes whose sampled envelope is kept between renders. Past this the cache
+/// is dropped wholesale (lanes that were removed or scrolled away age out).
+const ENVELOPE_CACHE_MAX_LANES: usize = 128;
+
+/// Everything a lane's sampled polyline is a pure function of besides its
+/// points: the x → beat transform, the lane box and the empty-lane value.
+/// Floats are compared by bits, so a hit means the resample would produce
+/// the exact same polyline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EnvelopeParams {
+    scroll_x: u32,
+    pixels_per_beat: u32,
+    pixels_per_second: u32,
+    warp_linear: bool,
+    warp_key: u64,
+    lane_w: u32,
+    lane_height: u32,
+    default_value: u32,
+}
+
+impl EnvelopeParams {
+    fn new(state: &TimelineState, lane_w: f32, lane_height: f32, default_value: f32) -> Self {
+        let viewport = &state.viewport;
+        Self {
+            scroll_x: viewport.scroll_x.to_bits(),
+            pixels_per_beat: viewport.pixels_per_beat.to_bits(),
+            pixels_per_second: viewport.pixels_per_second.to_bits(),
+            warp_linear: viewport.time_warp.is_linear(),
+            warp_key: viewport.time_warp.key(),
+            lane_w: lane_w.to_bits(),
+            lane_height: lane_height.to_bits(),
+            default_value: default_value.to_bits(),
+        }
+    }
+}
+
+/// The parts of one point the curve depends on: `(beat, value, curve, tension)`.
+/// Id and selection are left out — they change markers, never the curve.
+type EnvelopePointKey = (u32, u32, u8, u32);
+
+fn envelope_point_key(p: &AutomationPoint) -> EnvelopePointKey {
+    (
+        p.beat.to_bits(),
+        p.value.to_bits(),
+        p.curve.to_tag(),
+        p.tension.to_bits(),
+    )
+}
+
+struct EnvelopeCacheEntry {
+    params: EnvelopeParams,
+    points: Vec<EnvelopePointKey>,
+    samples: std::rc::Rc<Vec<(f32, f32)>>,
+}
+
+thread_local! {
+    /// Sampled envelope per lane (keyed by the lane's header id hash), reused
+    /// while neither the points nor the view changed — hover, selection and
+    /// playhead-only frames then skip the resample. The entry stores every
+    /// input it was built from and is checked in full, so a key collision
+    /// only costs a resample, never a stale curve.
+    static ENVELOPE_CACHE: std::cell::RefCell<std::collections::HashMap<usize, EnvelopeCacheEntry>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Sample the lane's curve once per `sample_step` px into lane-local
+/// `(x, y)` pairs. Beats ascend with x, so the sampler's cursor walks the
+/// points once instead of scanning them per sample.
+fn sample_envelope(
+    points: &[AutomationPoint],
+    state: &TimelineState,
+    lane_w: f32,
+    lane_height: f32,
+    default_value: f32,
+    sample_step: f32,
+    sample_count: usize,
+) -> Vec<(f32, f32)> {
+    let mut sampler = AutomationSampler::new(points, default_value);
+    let mut samples: Vec<(f32, f32)> = Vec::with_capacity(sample_count + 1);
+    for sample in 0..=sample_count {
+        let x = (sample as f32 * sample_step).min(lane_w);
+        let beat = state.x_to_beat(x);
+        let v = sampler.value_at(beat);
+        samples.push((x, automation_value_to_y(v, lane_height)));
+    }
+    samples
+}
+
+/// [`sample_envelope`] through [`ENVELOPE_CACHE`].
+fn cached_envelope(
+    cache_id: usize,
+    points: &[AutomationPoint],
+    state: &TimelineState,
+    lane_w: f32,
+    lane_height: f32,
+    default_value: f32,
+    sample_step: f32,
+    sample_count: usize,
+) -> std::rc::Rc<Vec<(f32, f32)>> {
+    let params = EnvelopeParams::new(state, lane_w, lane_height, default_value);
+    ENVELOPE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(entry) = cache.get_mut(&cache_id) {
+            let same_points = entry.points.len() == points.len()
+                && entry
+                    .points
+                    .iter()
+                    .zip(points)
+                    .all(|(key, p)| *key == envelope_point_key(p));
+            if !(same_points && entry.params == params) {
+                entry.params = params;
+                if !same_points {
+                    entry.points.clear();
+                    entry.points.extend(points.iter().map(envelope_point_key));
+                }
+                entry.samples = std::rc::Rc::new(sample_envelope(
+                    points,
+                    state,
+                    lane_w,
+                    lane_height,
+                    default_value,
+                    sample_step,
+                    sample_count,
+                ));
+            }
+            return std::rc::Rc::clone(&entry.samples);
+        }
+        if cache.len() >= ENVELOPE_CACHE_MAX_LANES {
+            cache.clear();
+        }
+        let samples = std::rc::Rc::new(sample_envelope(
+            points,
+            state,
+            lane_w,
+            lane_height,
+            default_value,
+            sample_step,
+            sample_count,
+        ));
+        cache.insert(
+            cache_id,
+            EnvelopeCacheEntry {
+                params,
+                points: points.iter().map(envelope_point_key).collect(),
+                samples: std::rc::Rc::clone(&samples),
+            },
+        );
+        samples
+    })
+}
+
 /// Draw the automation envelope for one lane inside its sub-lane area: the
 /// filled body under the curve, the curve, the dashed base-value guide, the
 /// points, and a value tag on the hovered (or, on the active lane, selected)
 /// point. Pure render of state. The curve is sampled per visible column so
 /// Hold steps and Linear ramps are both correct.
+#[allow(clippy::too_many_arguments)]
 fn lane_envelope(
+    cache_id: usize,
     lane: &AutomationLaneState,
     state: &TimelineState,
     lane_height: f32,
@@ -673,16 +844,9 @@ fn lane_envelope(
     hover: Option<&AutomationHover>,
 ) -> impl IntoElement {
     let default_value = lane.target.default_value();
-    let points = lane.points.clone();
+    let points = &lane.points;
 
     let lane_w = state.viewport.viewport_width.max(1.0);
-    // Screen-space adaptive sampling: ~one sample per logical pixel of visible
-    // width. That keeps the polyline continuous and smooth at any zoom (a wider
-    // visible segment / higher zoom yields more samples), while a hard cap stops
-    // an ultra-wide window from blowing up the per-frame stroke tessellation. A
-    // 1px screen step is below what a thin AA stroke can resolve, so curves read
-    // as smooth without oversampling tiny offscreen detail.
-    const MAX_SAMPLES: usize = 4096;
     let sample_step = (lane_w / MAX_SAMPLES as f32).max(1.0);
     let sample_count = (lane_w / sample_step).ceil().max(1.0) as usize;
 
@@ -703,29 +867,33 @@ fn lane_envelope(
             (c1 > c0).then_some((c0, c1, active))
         });
 
-    let mut samples: Vec<(f32, f32)> = Vec::with_capacity(sample_count + 1);
-    for sample in 0..=sample_count {
-        let x = (sample as f32 * sample_step).min(lane_w);
-        let beat = state.x_to_beat(x);
-        let v = evaluate_automation(&points, beat, default_value);
-        samples.push((x, automation_value_to_y(v, lane_height)));
-    }
+    let samples = cached_envelope(
+        cache_id,
+        points,
+        state,
+        lane_w,
+        lane_height,
+        default_value,
+        sample_step,
+        sample_count,
+    );
     let baseline_y = automation_value_to_y(default_value, lane_height);
 
     let enabled = lane.enabled;
+    let curve_color = Colors::automation_curve();
     // Curve at ~0.85 so it stays clearly readable without the razor-sharp edge.
     let line_color = if enabled {
-        Colors::with_alpha(Colors::automation_curve(), 0.85)
+        Colors::with_alpha(curve_color, 0.85)
     } else {
-        Colors::with_alpha(Colors::automation_curve(), 0.32)
+        Colors::with_alpha(curve_color, 0.32)
     };
     // Hovered / dragged segment: same hue at full alpha, thicker line (width
     // carries the emphasis). No accent, glow or gloss — keeps the lane's "only
     // saturated element is the curve" rule. Active drag is thicker than hover.
     let highlight_color = if enabled {
-        Colors::automation_curve()
+        curve_color
     } else {
-        Colors::with_alpha(Colors::automation_curve(), 0.5)
+        Colors::with_alpha(curve_color, 0.5)
     };
     // Base-value guide: dashed so it reads as a reference, never as a second
     // curve. The filled body under the curve is what gives the lane its amount;
@@ -737,7 +905,7 @@ fn lane_envelope(
         (true, false) => 0.10,
         (false, _) => 0.05,
     };
-    let body_color = Colors::with_alpha(Colors::automation_curve(), body_alpha);
+    let body_color = Colors::with_alpha(curve_color, body_alpha);
     let body_floor = lane_height;
 
     let line = canvas(
@@ -814,17 +982,34 @@ fn lane_envelope(
     let hovered_point = hover.and_then(|h| h.point_id);
     let mut markers: Vec<gpui::Div> = Vec::new();
     let mut value_tags: Vec<gpui::Div> = Vec::new();
-    for p in &points {
+    // Only the points that can show. On sorted points x ascends with the
+    // index, so start at the first one inside the left margin and stop past
+    // the right one; unsorted points (mid-edit) are all checked.
+    const MARKER_MARGIN: f32 = 8.0;
+    let sorted = points.windows(2).all(|w| w[0].beat <= w[1].beat);
+    let first_visible = if sorted {
+        points.partition_point(|p| state.beats_to_x(p.beat) < -MARKER_MARGIN)
+    } else {
+        0
+    };
+    let text_primary = Colors::text_primary();
+    let point_color = Colors::automation_point();
+    let surface_raised = Colors::surface_raised();
+    let border_subtle = Colors::border_subtle();
+    for p in &points[first_visible..] {
         let x = state.beats_to_x(p.beat);
-        if x < -8.0 || x > lane_w + 8.0 {
+        if x > lane_w + MARKER_MARGIN && sorted {
+            break;
+        }
+        if x < -MARKER_MARGIN || x > lane_w + MARKER_MARGIN {
             continue;
         }
         let y = automation_value_to_y(p.value, lane_height);
         let hovered = hovered_point == Some(p.id);
         let (fill_color, ring) = if p.selected {
-            (Colors::text_primary(), Colors::automation_curve())
+            (text_primary, curve_color)
         } else {
-            (Colors::automation_point(), Colors::automation_curve())
+            (point_color, curve_color)
         };
         let size_px = if p.selected || hovered { 9.0 } else { 7.0 };
         markers.push(
@@ -859,16 +1044,16 @@ fn lane_envelope(
                     .flex()
                     .items_center()
                     .rounded(px(crate::theme::radius::CONTROL))
-                    .bg(Colors::surface_raised())
+                    .bg(surface_raised)
                     .border(px(1.0))
                     .border_color(if hovered {
-                        Colors::with_alpha(Colors::automation_curve(), 0.7)
+                        Colors::with_alpha(curve_color, 0.7)
                     } else {
-                        Colors::border_subtle()
+                        border_subtle
                     })
                     .text_size(px(9.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(Colors::text_primary())
+                    .text_color(text_primary)
                     .whitespace_nowrap()
                     .child(lane.target.format_value(p.value)),
             );
@@ -898,4 +1083,112 @@ fn lane_envelope(
         .children(markers)
         .children(value_tags)
         .children(marquee_el)
+}
+
+#[cfg(test)]
+mod envelope_cache_tests {
+    use super::*;
+    use crate::components::timeline::timeline_state::AutomationCurve;
+
+    /// The per-pixel polyline exactly as it was drawn before the sampler and
+    /// cache: `evaluate_automation` per sample.
+    fn reference(
+        state: &TimelineState,
+        lane: &AutomationLaneState,
+        lane_height: f32,
+    ) -> Vec<(f32, f32)> {
+        let default_value = lane.target.default_value();
+        let lane_w = state.viewport.viewport_width.max(1.0);
+        let sample_step = (lane_w / MAX_SAMPLES as f32).max(1.0);
+        let sample_count = (lane_w / sample_step).ceil().max(1.0) as usize;
+        (0..=sample_count)
+            .map(|sample| {
+                let x = (sample as f32 * sample_step).min(lane_w);
+                let v = evaluate_automation(&lane.points, state.x_to_beat(x), default_value);
+                (x, automation_value_to_y(v, lane_height))
+            })
+            .collect()
+    }
+
+    fn cached(
+        state: &TimelineState,
+        lane: &AutomationLaneState,
+        lane_height: f32,
+    ) -> std::rc::Rc<Vec<(f32, f32)>> {
+        let default_value = lane.target.default_value();
+        let lane_w = state.viewport.viewport_width.max(1.0);
+        let sample_step = (lane_w / MAX_SAMPLES as f32).max(1.0);
+        let sample_count = (lane_w / sample_step).ceil().max(1.0) as usize;
+        cached_envelope(
+            0xA17E,
+            &lane.points,
+            state,
+            lane_w,
+            lane_height,
+            default_value,
+            sample_step,
+            sample_count,
+        )
+    }
+
+    fn bits(samples: &[(f32, f32)]) -> Vec<(u32, u32)> {
+        samples
+            .iter()
+            .map(|&(x, y)| (x.to_bits(), y.to_bits()))
+            .collect()
+    }
+
+    /// Every input change resamples, and an unchanged lane reuses the polyline.
+    #[test]
+    fn cached_envelope_matches_a_fresh_sample_after_every_change() {
+        let mut state = TimelineState::default();
+        state.viewport.viewport_width = 1500.0;
+        let mut lane = AutomationLaneState::new("volume", AutomationTarget::TrackVolume);
+        lane.points = vec![
+            AutomationPoint::new(0.5, 0.2),
+            AutomationPoint::with_curve(3.0, 0.9, AutomationCurve::Hold),
+            AutomationPoint::new(6.0, 0.4),
+            AutomationPoint::new(6.0, 0.7),
+            AutomationPoint::with_curve(11.0, 0.1, AutomationCurve::Smooth),
+        ];
+        lane.points[0].set_tension(0.6);
+        let mut height = 64.0;
+
+        let check = |state: &TimelineState, lane: &AutomationLaneState, height: f32| {
+            let got = cached(state, lane, height);
+            assert_eq!(bits(&got), bits(&reference(state, lane, height)));
+            got
+        };
+
+        let first = check(&state, &lane, height);
+        // Nothing changed: the same polyline comes back without a resample.
+        assert!(std::rc::Rc::ptr_eq(&first, &cached(&state, &lane, height)));
+        // Selection and ids are not part of the curve.
+        lane.points[1].selected = true;
+        assert!(std::rc::Rc::ptr_eq(&first, &cached(&state, &lane, height)));
+
+        lane.points[2].value = 0.55;
+        check(&state, &lane, height);
+        lane.points[3].set_tension(-0.4);
+        check(&state, &lane, height);
+        lane.points[1].curve = AutomationCurve::Linear;
+        check(&state, &lane, height);
+        lane.points[4].beat = 12.5;
+        check(&state, &lane, height);
+        lane.points.push(AutomationPoint::new(14.0, 1.0));
+        check(&state, &lane, height);
+        lane.points.remove(0);
+        check(&state, &lane, height);
+        state.viewport.scroll_x = 133.0;
+        check(&state, &lane, height);
+        state.viewport.pixels_per_beat = 41.0;
+        check(&state, &lane, height);
+        state.viewport.viewport_width = 900.0;
+        check(&state, &lane, height);
+        height = 96.0;
+        check(&state, &lane, height);
+        lane.target = AutomationTarget::TrackPan;
+        lane.points.clear();
+        check(&state, &lane, height);
+    }
 }

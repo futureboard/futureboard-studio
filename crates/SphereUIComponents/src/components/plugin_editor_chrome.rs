@@ -482,15 +482,13 @@ pub fn preset_menu_size(count: usize) -> gpui::Size<Pixels> {
 /// that rectangle is removed from the editor window's visible region and
 /// **GPUI cannot paint there at all** while a view is attached.
 ///
-/// # Why it is *owned* and *topmost*
+/// # Why it is *owned*
 ///
 /// A `WindowKind::PopUp` is created with `(WS_EX_TOOLWINDOW, WINDOW_STYLE(0))`
-/// and no owner (`gpui_windows/src/window.rs:497`), while the editor is
-/// `WindowKind::Floating` and therefore `WS_EX_TOPMOST`. Windows keeps every
-/// topmost window above every non-topmost one regardless of activation, so an
-/// un-owned popup sits *underneath* the window it drops from.
-/// [`place_owned_popup`] gives it the editor as its owner and puts it in the
-/// same z-band.
+/// and no owner, while the editor is a `WindowKind::Floating` window owned by
+/// Studio's main window. An un-owned popup is not kept above the editor, so it
+/// can open *underneath* the window it drops from. [`place_owned_popup`] gives
+/// it the editor as its owner, which Windows keeps above that owner.
 ///
 /// [`place_owned_popup`]: crate::components::plugin_content_host::place_owned_popup
 pub struct PresetMenuWindow {
