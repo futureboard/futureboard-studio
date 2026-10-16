@@ -570,6 +570,29 @@ plugin-manager.action.reveal-plugin = แสดงปลั๊กอินใน
 plugin-manager.action.reveal-preset = แสดงพรีเซ็ตใน Explorer
 plugin-manager.add-location = + เพิ่มตำแหน่ง
 plugin-manager.clear-database = ล้างฐานข้อมูล
+plugin-manager.filter.attention = Needs Attention
+plugin-manager.stat.plugins = { $count } plug-ins
+plugin-manager.stat.instruments = { $count } instruments
+plugin-manager.stat.effects = { $count } effects
+plugin-manager.stat.attention = { $count } need attention
+plugin-manager.stat.never-scanned = Not scanned yet
+plugin-manager.more = More actions
+plugin-manager.status.ready = Ready
+plugin-manager.status.not-registered = Not registered
+plugin-manager.status.failed = Failed
+plugin-manager.status.crashed = Crashed
+plugin-manager.status.disabled = Disabled
+plugin-manager.status.unsupported = Unsupported
+plugin-manager.health.not-registered = Not registered yet, so it cannot be inserted. Validate & Register loads it once to build its preset.
+plugin-manager.health.failed = The scanner could not load this plug-in.
+plugin-manager.health.crashed = This plug-in crashed the scanner and was set aside.
+plugin-manager.health.disabled = This plug-in is disabled and is not offered for insert.
+plugin-manager.health.unsupported = This plug-in format cannot be inserted yet.
+plugin-manager.action.copy-path = Copy Path
+plugin-manager.copied-path = Plug-in path copied.
+plugin-manager.details.close = Close details
+plugin-manager.clear.confirm = Clear the plug-in database? All { $count } cached plug-ins are removed and need a new scan.
+plugin-manager.clear.cancel = Cancel
 plugin-manager.column.status = สถานะ
 plugin-manager.details.title = รายละเอียดปลั๊กอิน
 plugin-manager.editor.hint = Editor\: รองรับเฉพาะปลั๊กอิน VST3 ที่มีพรีเซ็ต
@@ -672,7 +695,12 @@ project.error.corrupted = ไฟล์โปรเจกต์เสียหา
 project.error.invalid-magic = ไม่ใช่ไฟล์โปรเจกต์ Futureboard
 project.error.io = I/O Error\: { $e }
 project.error.unsupported-version = ไม่รองรับเวอร์ชันโปรเจกต์นี้\: { $v }
+project.error.old-version = This project was created with an older version of Futureboard. It can be opened, but some features may be missing or behave differently.
 project.file.missing = หาไฟล์ไม่พบ
+project.error.restore-failed = The restored arrangement did not match the project file.
+project.error.file-not-found = The project file could not be found at the saved location.
+project.error.restore-session-failed = The project file could not be restored into the session.
+project.error.warning-dialog-failed = Could not show version warning dialog.
 project.subtitle.opened = เปิดแล้ว
 project.subtitle.save-failed = บันทึกไม่สำเร็จ\: { $error }
 project.subtitle.saved = บันทึกแล้ว
@@ -979,6 +1007,16 @@ window.restore = คืนค่า
 
 ## Dialogs
 
+dialog.old-version-project.title = โปรเจกต์รุ่นเก่า
+dialog.old-version-project.message = โปรเจกต์นี้สร้างด้วย Futureboard v{ $version } (รุ่นปัจจุบันคือ v{ $currentVersion })\nยังเปิดได้ แต่บางฟีเจอร์อาจหายไปหรือทำงานต่างออกไป\nบันทึกแล้วจะอัปเกรดเป็นรูปแบบรุ่นใหม่
+dialog.old-version-project.detail = รุ่นขั้นต่ำที่รองรับ: v{ $minVersion }\nรุ่นของโปรเจกต์นี้: v{ $version }\nรุ่นปัจจุบัน: v{ $currentVersion }
+dialog.old-version-project.button.open-anyway = เปิดอยู่ดี
+dialog.old-version-project.button.cancel = ยกเลิก
+dialog.old-version-project.open-failed = ไม่สามารถเปิดไฟล์โปรเจกต์ได้
+dialog.old-version-project.open-failed-detail = การจัดวางที่กู้คืนมาไม่ตรงกับไฟล์โปรเจกต์
+dialog.old-version-project.cancelled = การเปิดโปรเจกต์รุ่นเก่าถูกยกเลิก
+dialog.old-version-project.warning-dialog-failed = ไม่สามารถแสดงกล่องเตือนเวอร์ชันได้
+
 wizard.bpm = BPM
 wizard.button.browse = เลือก…
 wizard.button.cancel = ยกเลิก
@@ -1014,14 +1052,4 @@ wizard.title = โปรเจกต์ใหม่
 
 ## Dialogs
 
-dialog.old-version-project.title = โปรเจกต์รุ่นเก่า
-dialog.old-version-project.message = โปรเจกต์นี้สร้างด้วย Futureboard v{ $version } (รุ่นปัจจุบันคือ v{ $currentVersion })\nยังเปิดได้ แต่บางฟีเจอร์อาจหายไปหรือทำงานต่างออกไป\nบันทึกแล้วจะอัปเกรดเป็นรูปแบบรุ่นใหม่
-dialog.old-version-project.detail = รุ่นขั้นต่ำที่รองรับ: v{ $minVersion }\nรุ่นของโปรเจกต์นี้: v{ $version }\nรุ่นปัจจุบัน: v{ $currentVersion }
-dialog.old-version-project.button.open-anyway = เปิดอยู่ดี
-dialog.old-version-project.button.cancel = ยกเลิก
-dialog.old-version-project.open-failed = ไม่สามารถเปิดไฟล์โปรเจกต์ได้
-dialog.old-version-project.open-failed-detail = การจัดวางที่กู้คืนมาไม่ตรงกับไฟล์โปรเจกต์
-dialog.old-version-project.cancelled = การเปิดโปรเจกต์รุ่นเก่าถูกยกเลิก
-dialog.old-version-project.warning-dialog-failed = ไม่สามารถแสดงกล่องเตือนเวอร์ชันได้
 
-wizard.bpm = BPM

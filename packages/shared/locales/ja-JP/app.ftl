@@ -570,6 +570,29 @@ plugin-manager.action.reveal-plugin = Reveal Plug-in in Explorer
 plugin-manager.action.reveal-preset = Reveal Preset in Explorer
 plugin-manager.add-location = + Add Location
 plugin-manager.clear-database = データベースを消去
+plugin-manager.filter.attention = Needs Attention
+plugin-manager.stat.plugins = { $count } plug-ins
+plugin-manager.stat.instruments = { $count } instruments
+plugin-manager.stat.effects = { $count } effects
+plugin-manager.stat.attention = { $count } need attention
+plugin-manager.stat.never-scanned = Not scanned yet
+plugin-manager.more = More actions
+plugin-manager.status.ready = Ready
+plugin-manager.status.not-registered = Not registered
+plugin-manager.status.failed = Failed
+plugin-manager.status.crashed = Crashed
+plugin-manager.status.disabled = Disabled
+plugin-manager.status.unsupported = Unsupported
+plugin-manager.health.not-registered = Not registered yet, so it cannot be inserted. Validate & Register loads it once to build its preset.
+plugin-manager.health.failed = The scanner could not load this plug-in.
+plugin-manager.health.crashed = This plug-in crashed the scanner and was set aside.
+plugin-manager.health.disabled = This plug-in is disabled and is not offered for insert.
+plugin-manager.health.unsupported = This plug-in format cannot be inserted yet.
+plugin-manager.action.copy-path = Copy Path
+plugin-manager.copied-path = Plug-in path copied.
+plugin-manager.details.close = Close details
+plugin-manager.clear.confirm = Clear the plug-in database? All { $count } cached plug-ins are removed and need a new scan.
+plugin-manager.clear.cancel = Cancel
 plugin-manager.column.status = Status
 plugin-manager.details.title = Plug-in Details
 plugin-manager.editor.hint = Editor\: VST3 plug-ins with an available preset only.
@@ -672,7 +695,12 @@ project.error.corrupted = Corrupted project\: { $msg }
 project.error.invalid-magic = Not a Futureboard project file
 project.error.io = I/O error\: { $e }
 project.error.unsupported-version = Unsupported project version\: { $v }
+project.error.old-version = This project was created with an older version of Futureboard. It can be opened, but some features may be missing or behave differently.
 project.file.missing = Missing
+project.error.restore-failed = The restored arrangement did not match the project file.
+project.error.file-not-found = The project file could not be found at the saved location.
+project.error.restore-session-failed = The project file could not be restored into the session.
+project.error.warning-dialog-failed = Could not show version warning dialog.
 project.subtitle.opened = Opened
 project.subtitle.save-failed = Save failed\: { $error }
 project.subtitle.saved = Saved
@@ -979,6 +1007,16 @@ window.restore = RESTORE
 
 ## Dialogs
 
+dialog.old-version-project.title = 古いプロジェクトバージョン
+dialog.old-version-project.message = このプロジェクトは Futureboard v{ $version } で作成されました (現在のバージョンは v{ $currentVersion } です)。\n開くことはできますが、一部の機能が欠けているか、動作が異なる場合があります。\nプロジェクトを保存すると、現在のフォーマットにアップグレードされます。
+dialog.old-version-project.detail = 最小対応バージョン: v{ $minVersion }\nプロジェクトのバージョン: v{ $version }\n現在のバージョン: v{ $currentVersion }
+dialog.old-version-project.button.open-anyway = このまま開く
+dialog.old-version-project.button.cancel = キャンセル
+dialog.old-version-project.open-failed = プロジェクトファイルを開けませんでした。
+dialog.old-version-project.open-failed-detail = 復元された配置がプロジェクトファイルと一致しません。
+dialog.old-version-project.cancelled = 古いバージョンのプロジェクトを開く操作がキャンセルされました。
+dialog.old-version-project.warning-dialog-failed = バージョン警告ダイアログを表示できませんでした。
+
 wizard.bpm = BPM
 wizard.button.browse = Browse
 wizard.button.cancel = Cancel
@@ -1014,14 +1052,4 @@ wizard.title = New Project
 
 ## Dialogs
 
-dialog.old-version-project.title = 古いプロジェクトバージョン
-dialog.old-version-project.message = このプロジェクトは Futureboard v{ $version } で作成されました (現在のバージョンは v{ $currentVersion } です)。\n開くことはできますが、一部の機能が欠けているか、動作が異なる場合があります。\nプロジェクトを保存すると、現在のフォーマットにアップグレードされます。
-dialog.old-version-project.detail = 最小対応バージョン: v{ $minVersion }\nプロジェクトのバージョン: v{ $version }\n現在のバージョン: v{ $currentVersion }
-dialog.old-version-project.button.open-anyway = このまま開く
-dialog.old-version-project.button.cancel = キャンセル
-dialog.old-version-project.open-failed = プロジェクトファイルを開けませんでした。
-dialog.old-version-project.open-failed-detail = 復元された配置がプロジェクトファイルと一致しません。
-dialog.old-version-project.cancelled = 古いバージョンのプロジェクトを開く操作がキャンセルされました。
-dialog.old-version-project.warning-dialog-failed = バージョン警告ダイアログを表示できませんでした。
 
-wizard.bpm = BPM

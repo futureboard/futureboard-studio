@@ -570,6 +570,29 @@ plugin-manager.action.reveal-plugin = 在资源管理器中显示插件
 plugin-manager.action.reveal-preset = 在资源管理器中显示预设
 plugin-manager.add-location = + 添加位置
 plugin-manager.clear-database = 清除数据库
+plugin-manager.filter.attention = Needs Attention
+plugin-manager.stat.plugins = { $count } plug-ins
+plugin-manager.stat.instruments = { $count } instruments
+plugin-manager.stat.effects = { $count } effects
+plugin-manager.stat.attention = { $count } need attention
+plugin-manager.stat.never-scanned = Not scanned yet
+plugin-manager.more = More actions
+plugin-manager.status.ready = Ready
+plugin-manager.status.not-registered = Not registered
+plugin-manager.status.failed = Failed
+plugin-manager.status.crashed = Crashed
+plugin-manager.status.disabled = Disabled
+plugin-manager.status.unsupported = Unsupported
+plugin-manager.health.not-registered = Not registered yet, so it cannot be inserted. Validate & Register loads it once to build its preset.
+plugin-manager.health.failed = The scanner could not load this plug-in.
+plugin-manager.health.crashed = This plug-in crashed the scanner and was set aside.
+plugin-manager.health.disabled = This plug-in is disabled and is not offered for insert.
+plugin-manager.health.unsupported = This plug-in format cannot be inserted yet.
+plugin-manager.action.copy-path = Copy Path
+plugin-manager.copied-path = Plug-in path copied.
+plugin-manager.details.close = Close details
+plugin-manager.clear.confirm = Clear the plug-in database? All { $count } cached plug-ins are removed and need a new scan.
+plugin-manager.clear.cancel = Cancel
 plugin-manager.column.status = 状态
 plugin-manager.details.title = 插件详情
 plugin-manager.editor.hint = 编辑器：仅显示有可用预设的 VST3 插件。
@@ -672,7 +695,12 @@ project.error.corrupted = 项目已损坏：{ $msg }
 project.error.invalid-magic = 不是 Futureboard 项目文件
 project.error.io = I/O 错误：{ $e }
 project.error.unsupported-version = 不支持的项目版本：{ $v }
+project.error.old-version = This project was created with an older version of Futureboard. It can be opened, but some features may be missing or behave differently.
 project.file.missing = 缺失
+project.error.restore-failed = The restored arrangement did not match the project file.
+project.error.file-not-found = The project file could not be found at the saved location.
+project.error.restore-session-failed = The project file could not be restored into the session.
+project.error.warning-dialog-failed = Could not show version warning dialog.
 project.subtitle.opened = 已打开
 project.subtitle.save-failed = 保存失败：{ $error }
 project.subtitle.saved = 已保存
@@ -979,6 +1007,16 @@ window.restore = 还原
 
 ## Dialogs
 
+dialog.old-version-project.title = 旧版本项目
+dialog.old-version-project.message = 此项目是使用 Futureboard v{ $version } 创建的（当前版本为 v{ $currentVersion }）。\n仍可打开，但部分功能可能缺失或表现异常。\n保存时将升级为当前格式。
+dialog.old-version-project.detail = 最低支持版本: v{ $minVersion }\n项目版本: v{ $version }\n当前版本: v{ $currentVersion }
+dialog.old-version-project.button.open-anyway = 仍要打开
+dialog.old-version-project.button.cancel = 取消
+dialog.old-version-project.open-failed = 无法打开项目文件。
+dialog.old-version-project.open-failed-detail = 恢复的排列与项目文件不匹配。
+dialog.old-version-project.cancelled = 打开旧版本项目的操作已取消。
+dialog.old-version-project.warning-dialog-failed = 无法显示版本警告对话框。
+
 wizard.bpm = BPM
 wizard.button.browse = 浏览
 wizard.button.cancel = 取消
@@ -1014,14 +1052,4 @@ wizard.title = 新建项目
 
 ## Dialogs
 
-dialog.old-version-project.title = 旧版本项目
-dialog.old-version-project.message = 此项目是使用 Futureboard v{ $version } 创建的（当前版本为 v{ $currentVersion }）。\n仍可打开，但部分功能可能缺失或表现异常。\n保存时将升级为当前格式。
-dialog.old-version-project.detail = 最低支持版本: v{ $minVersion }\n项目版本: v{ $version }\n当前版本: v{ $currentVersion }
-dialog.old-version-project.button.open-anyway = 仍要打开
-dialog.old-version-project.button.cancel = 取消
-dialog.old-version-project.open-failed = 无法打开项目文件。
-dialog.old-version-project.open-failed-detail = 恢复的排列与项目文件不匹配。
-dialog.old-version-project.cancelled = 打开旧版本项目的操作已取消。
-dialog.old-version-project.warning-dialog-failed = 无法显示版本警告对话框。
 
-wizard.bpm = BPM
