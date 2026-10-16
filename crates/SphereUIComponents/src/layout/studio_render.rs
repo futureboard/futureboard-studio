@@ -1463,16 +1463,31 @@ impl Render for StudioLayout {
                 }
                 main_row = main_row.child({
                     let owner = cx.entity().clone();
+                    // Cached, with its per-frame layers beside it rather than
+                    // in it: the playhead and the header meters move at the
+                    // display rate, and as descendants each move re-rendered
+                    // the whole arrangement. See `arrangement_overlay`.
+                    let overlay_layers: Vec<gpui::AnyView> = self
+                        .timeline
+                        .update(cx, |timeline, cx| {
+                            timeline.ensure_overlay_layers(cx);
+                            timeline.overlay_layers().collect()
+                        });
                     div()
                         .flex_1()
                         .min_w_0()
                         .min_h_0()
+                        .relative()
                         .on_mouse_down(gpui::MouseButton::Left, move |_event, _window, cx| {
                             let _ = owner.update(cx, |layout, cx| {
                                 layout.set_active_panel(WorkspaceActivePanel::Arrangement, cx);
                             });
                         })
-                        .child(self.timeline.clone())
+                        .child(
+                            gpui::AnyView::from(self.timeline.clone())
+                                .cached(components::timeline::Timeline::cached_style()),
+                        )
+                        .children(overlay_layers)
                 });
                 if show_inspector {
                     // Cached: the dock rebuilds when the shell changes, not

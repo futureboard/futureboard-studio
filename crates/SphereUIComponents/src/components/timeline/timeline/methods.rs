@@ -263,8 +263,10 @@ impl Timeline {
             playhead_frame: std::rc::Rc::new(std::cell::Cell::new(
                 crate::components::timeline::playhead::PlayheadFrame::default(),
             )),
+            overlay_layout: Default::default(),
             playhead_overlay: None,
-            track_meters: Default::default(),
+            meter_overlay: None,
+            inline_refresh: None,
             arrangement_surface: None,
             track_lanes: Default::default(),
             frame_lane_ctx: None,
@@ -362,8 +364,10 @@ impl Timeline {
             playhead_frame: std::rc::Rc::new(std::cell::Cell::new(
                 crate::components::timeline::playhead::PlayheadFrame::default(),
             )),
+            overlay_layout: Default::default(),
             playhead_overlay: None,
-            track_meters: Default::default(),
+            meter_overlay: None,
+            inline_refresh: None,
             arrangement_surface: None,
             track_lanes: Default::default(),
             frame_lane_ctx: None,
@@ -1360,13 +1364,18 @@ impl Timeline {
     /// Push the measured chrome panel sizes that surround the timeline so
     /// `scroll_geometry` can compute the real available body rect. Called
     /// by `StudioLayout` each render — cheap, no notify.
-    pub fn set_chrome_metrics(&mut self, metrics: TimelineChromeMetrics) {
+    ///
+    /// Returns whether they changed. `Timeline` is a cached view: a change that
+    /// does not also move its bounds must notify, or it keeps its old layout.
+    pub fn set_chrome_metrics(&mut self, metrics: TimelineChromeMetrics) -> bool {
+        let changed = self.chrome_metrics != metrics;
         self.chrome_metrics = metrics;
         // The browser panel is collapsible, so the timeline's own window-space
         // origin moves with it. Publishing it into the viewport keeps pointer
         // gestures (clip move/resize, ruler, lane tools) on the same transform
         // used to draw, instead of assuming the panel is always open.
         self.state.viewport.panel_origin_x = metrics.browser_width;
+        changed
     }
 
     /// Push the current project's root folder (or `None` when Untitled). Called
@@ -1553,20 +1562,80 @@ impl Timeline {
         cx.notify();
     }
 
+    /// Push this poll's levels to the header meters' layer. Returns `true` when
+    /// a visible meter changed by a drawn pixel and the layer repaints.
     pub(crate) fn publish_track_meters(&self, cx: &mut gpui::App) -> bool {
-        if self.track_meters.is_empty() {
+        let Some(overlay) = self.meter_overlay.as_ref() else {
             return false;
+        };
+        crate::perf::count("track_meter_tick", 1);
+        let sig = self.overlay_layout.borrow().meter_signature(&self.state.tracks);
+        overlay.update(cx, |overlay, cx| overlay.apply_signature(sig, cx))
+    }
+
+    /// The playhead and header-meter layers, built here because only a
+    /// `Timeline` context can create them with a handle back to it. The studio
+    /// root calls this before it renders them beside the arrangement.
+    pub(crate) fn ensure_overlay_layers(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.playhead_overlay.is_none() {
+            let frame = self.playhead_frame.clone();
+            let layout = self.overlay_layout.clone();
+            self.playhead_overlay = Some(cx.new(|_| {
+                crate::components::timeline::arrangement_overlay::PlayheadOverlay::new(
+                    frame,
+                    layout,
+                    RULER_HEIGHT,
+                    HEADER_WIDTH,
+                )
+            }));
         }
-        let mut repainted = false;
-        for track in &self.state.tracks {
-            let Some(meter) = self.track_meters.get(track.id.as_str()) else {
-                continue;
-            };
-            repainted |= meter.update(cx, |meter, cx| {
-                meter.apply(track.meter_level_l, track.meter_level_r, cx)
-            });
+        if self.inline_refresh.is_none() {
+            self.inline_refresh = Some(cx.new(|_| {
+                crate::components::timeline::arrangement_overlay::InlineRefresh
+            }));
         }
-        repainted
+        if self.meter_overlay.is_none() {
+            let timeline = cx.weak_entity();
+            let layout = self.overlay_layout.clone();
+            self.meter_overlay = Some(cx.new(|_| {
+                crate::components::timeline::arrangement_overlay::ArrangementMeterOverlay::new(
+                    timeline, layout,
+                )
+            }));
+        }
+    }
+
+    /// Re-render the arrangement's inline UI — headers, faders, ruler — for a
+    /// change only it shows, without a `Timeline` notify: the cached clip lanes
+    /// and the grid, which observe that notify, are reused as drawn. Nor do
+    /// `Timeline`'s other observers hear it; the caller tells the ones that
+    /// show the same change.
+    pub(crate) fn refresh_inline_ui(&self, cx: &mut gpui::App) {
+        // Before the first render there is nothing cached to keep.
+        if let Some(marker) = self.inline_refresh.as_ref() {
+            marker.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    /// The layers [`Self::ensure_overlay_layers`] built: the header meters,
+    /// then the playhead over them.
+    pub fn overlay_layers(&self) -> impl Iterator<Item = gpui::AnyView> {
+        let meters = self.meter_overlay.clone().map(gpui::AnyView::from);
+        let playhead = self.playhead_overlay.clone().map(gpui::AnyView::from);
+        meters.into_iter().chain(playhead)
+    }
+
+    /// Layout-affecting half of the root `render` builds, for the studio root's
+    /// `AnyView::cached`.
+    pub fn cached_style() -> gpui::StyleRefinement {
+        use gpui::Styled;
+        gpui::StyleRefinement::default()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .w_full()
+            .h_full()
+            .relative()
     }
 
     /// Push the current playhead position to its own entity.
@@ -1703,6 +1772,7 @@ impl Timeline {
             return false;
         }
         self.playhead_frame.set(next);
+        crate::perf::count("playhead_tick", 1);
         overlay.update(cx, |_, cx| cx.notify());
         true
     }

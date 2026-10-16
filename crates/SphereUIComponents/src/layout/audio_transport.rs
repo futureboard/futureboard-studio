@@ -1027,7 +1027,7 @@ impl StudioLayout {
                 self.engine_sync.displayed_bar_beat = bar_beat;
                 transport_display_changed = true;
             }
-            let playhead_moved = self.timeline.update(cx, move |timeline, cx| {
+            let (playhead_moved, faders_moved) = self.timeline.update(cx, move |timeline, cx| {
                 timeline.state.transport.playing = true;
                 // No threshold while playing — even sub-pixel beat motion
                 // matters for the bar:beat:tick readout in the chrome.
@@ -1046,14 +1046,13 @@ impl StudioLayout {
                 // volume so the mixer/track-header/inspector fader track the curve
                 // during playback. UI-only (faders read `display_volume`), so this
                 // never writes the base value or fires a user-edit command.
-                // Faders live in the track headers and the mixer, so a curve
-                // moving one is a real arrangement change.
-                if timeline
+                // Faders live in the track headers and the inspector, not in the
+                // clip lanes or the grid: a curve moving one re-renders the
+                // headers (`refresh_inline_ui`) and leaves the lanes, which a
+                // `Timeline` notify would rebuild on every tick.
+                let faders_moved = timeline
                     .state
-                    .recompute_effective_volumes(next, "playback_tick")
-                {
-                    arrangement_dirty = true;
-                }
+                    .recompute_effective_volumes(next, "playback_tick");
                 // Follow-playhead / auto-scroll. Keeps the playhead visible
                 // during playback; user-scroll temporarily disables it via
                 // `note_user_scrolled`. Cheap — no rebuild, just viewport
@@ -1067,13 +1066,23 @@ impl StudioLayout {
                 }
                 if arrangement_dirty {
                     // The repaint recomputes the playhead's x on its way past,
-                    // so the overlay does not need telling twice.
+                    // and the root repaints its layer with it.
                     cx.notify();
-                } else if playhead_moved {
-                    timeline.publish_playhead(cx);
+                } else {
+                    if faders_moved {
+                        timeline.refresh_inline_ui(cx);
+                    }
+                    if playhead_moved {
+                        timeline.publish_playhead(cx);
+                    }
                 }
-                playhead_moved
+                (playhead_moved, faders_moved && !arrangement_dirty)
             });
+            // `refresh_inline_ui` notifies none of `Timeline`'s observers; of
+            // those, the inspector shows the selected track's fader.
+            if faders_moved {
+                let _ = self.right_dock.update(cx, |_, cx| cx.notify());
+            }
             // The MIDI editors draw the same transport, and nothing else
             // reaches them on a tick. The docked one used to move only when the
             // shell happened to repaint, and the floating window — which has no

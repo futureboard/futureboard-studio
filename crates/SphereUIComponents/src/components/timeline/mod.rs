@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod arrangement_bench;
+pub mod arrangement_overlay;
 pub mod audio_clip;
 pub mod audio_import;
 pub mod automation_control_lane;

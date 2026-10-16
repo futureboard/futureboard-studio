@@ -26,7 +26,7 @@ use crate::components::timeline::track_resize::{
     track_row_resize_handle, visible_track_row_range, TrackHeightResizeArmCb,
     TrackHeightResizeResetCb,
 };
-use crate::components::timeline::vu_meter::TrackMeterViews;
+use crate::components::timeline::arrangement_overlay::SharedArrangementOverlay;
 use crate::theme::Colors;
 
 /// Rows above/below the visible viewport that are kept rendered to prevent
@@ -50,7 +50,7 @@ fn timeline_bg_debug_enabled() -> bool {
 pub fn track_list(
     state: &TimelineState,
     row_layout: &TrackRowLayout,
-    meters: &TrackMeterViews,
+    meters: &SharedArrangementOverlay,
     header_callbacks: TrackHeaderCallbacks,
     on_resize_arm: TrackHeightResizeArmCb,
     on_resize_reset: TrackHeightResizeResetCb,

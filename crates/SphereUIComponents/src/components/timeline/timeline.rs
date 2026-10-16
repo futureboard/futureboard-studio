@@ -58,7 +58,7 @@ use std::time::Duration;
 /// rect. Pushed by `StudioLayout` each render so resizing the bottom
 /// panel, toggling browser/inspector, and maximizing the window all stay
 /// in sync — no hardcoded constants.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TimelineChromeMetrics {
     pub browser_width: f32,
     pub inspector_width: f32,
@@ -363,16 +363,23 @@ pub struct Timeline {
     /// place that knows the current scroll and zoom) and by the playback poll
     /// between renders; read by the overlay entity below.
     playhead_frame: crate::components::timeline::playhead::PlayheadFrameCell,
-    /// The playhead's own entity, built on first render.
-    ///
-    /// The line has to move at the display rate while the transport runs, and
-    /// notifying `Timeline` for it rebuilt the whole arrangement per frame.
-    /// Isolated here, a playback tick repaints one line.
-    playhead_overlay: Option<gpui::Entity<crate::components::timeline::playhead::PlayheadOverlay>>,
-    /// One meter entity per track header, so a level change repaints a bar
-    /// instead of the arrangement. Built and pruned by `render`, fed by the
-    /// audio poll.
-    track_meters: crate::components::timeline::vu_meter::TrackMeterViews,
+    /// Where the playhead and header meters go, recorded while the arrangement
+    /// lays itself out; see `arrangement_overlay`.
+    overlay_layout: crate::components::timeline::arrangement_overlay::SharedArrangementOverlay,
+    /// The playhead's layer. Rendered by the studio root beside this view, not
+    /// in it: it moves at the display rate while the transport runs, and as a
+    /// descendant every move re-rendered the arrangement.
+    playhead_overlay:
+        Option<gpui::Entity<crate::components::timeline::arrangement_overlay::PlayheadOverlay>>,
+    /// Rendered inside the arrangement so it can be notified instead of it;
+    /// see `arrangement_overlay::InlineRefresh`.
+    inline_refresh:
+        Option<gpui::Entity<crate::components::timeline::arrangement_overlay::InlineRefresh>>,
+    /// The header meters' layer, rendered by the studio root for the same
+    /// reason; fed by the audio poll.
+    meter_overlay: Option<
+        gpui::Entity<crate::components::timeline::arrangement_overlay::ArrangementMeterOverlay>,
+    >,
     /// The arrangement grid's own entity, built on first render and rendered
     /// through `AnyView::cached`. Keeps the grid out of playhead and meter
     /// frames; see `timeline_surface::TimelineSurfaceView`.

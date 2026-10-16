@@ -14,6 +14,10 @@ fn playhead_debug_enabled() -> bool {
 impl Render for Timeline {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _tl_scope = crate::perf::PerfScope::enter("Timeline");
+        // Against `playhead_tick` / `track_meter_tick`: a cached arrangement
+        // must not re-render for either, so during playback this stays near
+        // zero while they count the display rate.
+        crate::perf::count("timeline_render", 1);
         // A plug-in drag released anywhere but here leaves no event on this
         // element; drop its hint once no drag is in flight.
         if self.plugin_drop_hint.is_some() && !cx.has_active_drag() {
@@ -65,34 +69,21 @@ impl Render for Timeline {
             cx.notify();
         }
         row_layout.scroll_y = self.state.viewport.scroll_y;
-        // One meter entity per track that has a header. Built here because this
-        // is where the track set is known, and pruned in the same pass so a
-        // deleted track does not leave its entity behind.
+        // One cached lane view per track that has a row. Built here because
+        // this is where the track set is known, and pruned in the same pass so
+        // a deleted track does not leave its view behind.
         //
         // Checked first without allocating: this runs on every repaint, and the
         // track set almost never changes between two of them.
-        let views_in_sync = self.track_meters.len() == self.state.tracks.len()
-            && self.track_lanes.len() == self.state.tracks.len()
-            && self.state.tracks.iter().all(|t| {
-                self.track_meters.contains_key(t.id.as_str())
-                    && self.track_lanes.contains_key(t.id.as_str())
-            });
+        let views_in_sync = self.track_lanes.len() == self.state.tracks.len()
+            && self
+                .state
+                .tracks
+                .iter()
+                .all(|t| self.track_lanes.contains_key(t.id.as_str()));
         if !views_in_sync {
             let ids: std::collections::HashSet<&str> =
                 self.state.tracks.iter().map(|t| t.id.as_str()).collect();
-            self.track_meters.retain(|id, _| ids.contains(id.as_str()));
-            for index in 0..self.state.tracks.len() {
-                let id = self.state.tracks[index].id.clone();
-                if self.track_meters.contains_key(&id) {
-                    continue;
-                }
-                let meter =
-                    cx.new(|_| crate::components::timeline::vu_meter::TrackMeterView::new());
-                self.track_meters.insert(id, meter);
-            }
-            // Same lifecycle for the cached lane views: one per track that has
-            // a row, pruned in the same pass so a deleted track does not leave
-            // its view behind.
             self.track_lanes.retain(|id, _| ids.contains(id.as_str()));
             let timeline = cx.entity();
             for index in 0..self.state.tracks.len() {
@@ -109,18 +100,11 @@ impl Render for Timeline {
                 self.track_lanes.insert(id, lane);
             }
         }
-        if self.playhead_overlay.is_none() {
-            // Built on first render for the same reason the focus subscription
-            // below is: `Timeline::new` has no context to create an entity in.
-            let frame = self.playhead_frame.clone();
-            self.playhead_overlay = Some(cx.new(|_| {
-                crate::components::timeline::playhead::PlayheadOverlay::new(
-                    frame,
-                    RULER_HEIGHT,
-                    HEADER_WIDTH,
-                )
-            }));
-        }
+        // Normally built by the studio root before its first frame; here too so
+        // a `Timeline` rendered on its own still has a playhead frame to feed.
+        self.ensure_overlay_layers(cx);
+        // Everything the layers read is recorded again by this layout.
+        self.overlay_layout.borrow_mut().begin_build();
         if self.cut_guide_overlay.is_none() {
             let frame = self.cut_guide.clone();
             self.cut_guide_overlay = Some(
@@ -181,7 +165,6 @@ impl Render for Timeline {
                 self.playhead_frame.get().x
             );
         }
-        let playhead_overlay = self.playhead_overlay.clone();
         let cut_guide_overlay = self.cut_guide_overlay.clone();
         // The hovered or dragged clip's fade handles, resolved against this
         // frame's scroll and zoom.
@@ -2660,8 +2643,16 @@ impl Render for Timeline {
             .flex()
             .flex_col()
             .flex_1()
+            // Explicit width: the studio root caches this view, and a cached
+            // view lays its root out on its own, where an auto-width flex
+            // column shrinks to its content — the header column alone.
+            .w_full()
             .h_full()
             .bg(Colors::surface_base())
+            .child(crate::components::timeline::arrangement_overlay::timeline_bounds_probe(
+                &self.overlay_layout,
+            ))
+            .children(self.inline_refresh.clone())
             // No side borders of its own: each seam belongs to the panel
             // beside it (the browser's right edge, the dock's left edge, the
             // bottom panel's top edge), so every seam is one 1px line. Its own
@@ -2858,11 +2849,15 @@ impl Render for Timeline {
                     Some(on_global_lane_resize_reset.clone()),
                 ))
             })
-            // 2. Track List Scroll Area
-            .child(div().flex_1().min_h_0().relative().child(track_list(
+            // 2. Track List Scroll Area. Also the header meters' clip.
+            .child(div().flex_1().min_h_0().relative().child(
+                crate::components::timeline::arrangement_overlay::meter_clip_probe(
+                    &self.overlay_layout,
+                ),
+            ).child(track_list(
                 state,
                 &row_layout,
-                &self.track_meters,
+                &self.overlay_layout,
                 header_callbacks.clone(),
                 on_track_height_resize_arm.clone(),
                 on_track_height_resize_reset.clone(),
@@ -3009,12 +3004,10 @@ impl Render for Timeline {
                     .overflow_hidden()
                     .child(overlay)
             }))
-            // The playhead is its own entity: it moves at the display rate
-            // while the transport runs, and drawing it inline meant every one of
-            // those frames rebuilt the whole arrangement behind it. Its head and
-            // body are both in there, so the line stays continuous through the
-            // conductor lanes rather than restarting below them.
-            .children(playhead_overlay)
+            // The playhead is not drawn here: the studio root paints it over
+            // this view (see `arrangement_overlay`), so its display-rate moves
+            // do not re-render the arrangement. Controls drawn after this point
+            // that it passes under record themselves as occluders.
             // The Smart Tool's razor line; empty unless hovering a cut zone.
             .children(cut_guide_overlay)
             // The hovered clip's fade handles; empty unless over an audio clip.
@@ -3025,6 +3018,10 @@ impl Render for Timeline {
                     .absolute()
                     .left(px(toolbar_position.0))
                     .top(px(toolbar_position.1))
+                    .child(crate::components::timeline::arrangement_overlay::occluder_probe(
+                        &self.overlay_layout,
+                        "tools-bar",
+                    ))
                     .child(floating_tools_bar(
                         state.active_tool,
                         on_select_tool.clone(),
@@ -3066,6 +3063,10 @@ impl Render for Timeline {
                     .absolute()
                     .bottom(px(16.0))
                     .right(px(16.0))
+                    .child(crate::components::timeline::arrangement_overlay::occluder_probe(
+                        &self.overlay_layout,
+                        "zoom-controls",
+                    ))
                     .flex()
                     .flex_row()
                     .items_center()

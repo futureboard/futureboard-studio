@@ -227,13 +227,18 @@ impl StudioLayout {
             status_bar_height: STATUS_BAR_HEIGHT,
         };
         let project_root = self.project_session.folder_path.clone();
-        let _ = self.timeline.update(cx, |timeline, _cx| {
-            timeline.set_chrome_metrics(metrics);
+        let _ = self.timeline.update(cx, |timeline, cx| {
+            let metrics_changed = timeline.set_chrome_metrics(metrics);
             timeline.set_project_root(project_root);
             // The Control Room's destination is an Output Audio Connection, so
             // the device's channel count is validated by the registry rather
             // than mirrored into a separate list of hardware pairs here.
-            timeline.state.refresh_output_labels();
+            let labels_changed = timeline.state.refresh_output_labels();
+            // `Timeline` is cached by the root: what it lays out from has to
+            // say so when it changes.
+            if metrics_changed || labels_changed {
+                cx.notify();
+            }
         });
     }
 

@@ -190,7 +190,8 @@ impl StudioLayout {
         }
         self.engine_sync.last_meter_notify_sig = sig;
 
-        // Track-header meters, each in its own entity. This used to notify the
+        // Track-header meters: one layer painted by the studio root beside the
+        // cached arrangement (`arrangement_overlay`). This used to notify the
         // whole `Timeline`, which rebuilt the ruler, the grid, every visible
         // row, every clip and every waveform so a few pixels of green could
         // move — at display refresh, for as long as anything was audible.
