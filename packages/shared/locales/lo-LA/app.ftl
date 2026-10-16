@@ -617,7 +617,7 @@ plugin-manager.filter.instruments = ເຄື່ອງດົນຕີ
 plugin-manager.filter.kind = ປະເພດ
 plugin-manager.filter.library = ຄັງເກັບ
 plugin-manager.footer.cached = ແຄສໄວ້ { $count } ລາຍການ
-plugin-manager.footer.last-scan = ສະແກນຫຼ້າສຸດ: { $when }
+plugin-manager.footer.last-scan = ສະແກນຫຼ້າສຸດ\: { $when }
 plugin-manager.footer.missing = ຂາດ { $count } ລາຍການ
 plugin-manager.kind.effect = ເອັບເຟັກ
 plugin-manager.kind.instrument = ເຄື່ອງດົນຕີ
@@ -1009,7 +1009,7 @@ window.restore = ຄືນຄ່າ
 
 dialog.old-version-project.title = ໂປຣເຈັກລຸ່ມເກັນ
 dialog.old-version-project.message = ໂປຣເຈັກນີ້ຖືກສ້າງດ້ວຍ Futureboard v{ $version } (ລະດັບປະຈຸບັນເຂົ້າສູ່ v{ $currentVersion })ແລ້ວ\nສາມາດເປີດໄດ້, ແຕ່ອາດຸນສຸດທິການອາດຈະບໍ່ມີ ຫຼື ເຮັດວຽກແຕ່ກ່ອນນີ້.\nເມື່ອບັນທຶກຈະອັບເກຣດເປັນຮູບແບບປະຈຸບັນປະຈຸບັນ.
-dialog.old-version-project.detail = ລະດັບຕໍ່ຕໍ່: v{ $minVersion }\nລະດັບຂອງໂປຣເຈັກ: v{ $version }\nລະດັບປະຈຸບັນ: v{ $currentVersion }
+dialog.old-version-project.detail = ລະດັບຕໍ່ຕໍ່\: v{ $minVersion }\nລະດັບຂອງໂປຣເຈັກ\: v{ $version }\nລະດັບປະຈຸບັນ\: v{ $currentVersion }
 dialog.old-version-project.button.open-anyway = ເປີດພາຍໃນ
 dialog.old-version-project.button.cancel = ຍົກເລີກ
 dialog.old-version-project.open-failed = ບໍ່ສາມາດເປີດໄຟລ໌ໂປຣເຈັກໄດ້
@@ -1049,7 +1049,3 @@ wizard.summary.template = ເທັມເພດ
 wizard.summary.tracks = ແທຣັກ
 wizard.summary.tracks-value = { $audio } ສຽງ / { $midi } MIDI
 wizard.title = ໂປຣເຈັກໃໝ່
-
-## Dialogs
-
-
