@@ -296,8 +296,9 @@ let
   # FutureboardNative and the apakinstaller GUI at the same time needs more
   # than 12 GiB. So the binaries are requested in two cargo runs over the
   # *same* package/feature selection: the first builds every shared artifact
-  # and links the sidecars and APAK tools, the second only links
-  # FutureboardNative. The result is identical to xtask's one invocation (CI
+  # and links the sidecars and APAK tools, the second only links the Studio
+  # engine library (libFutureboardEngine_x64.so, which FutureboardNative loads
+  # from its own directory) and the launcher. The result is identical to xtask's one invocation (CI
   # instead caps the whole build at CARGO_BUILD_JOBS=2).
   studioPackages = [
     "-p"
@@ -335,7 +336,7 @@ let
       cargo build -j "$NIX_BUILD_CORES" --offline --profile release --target ${rustTarget} \
         ${lib.concatStringsSep " " studioPackages} \
         --features ${lib.concatStringsSep "," studioFeatures} \
-        --bin FutureboardNative
+        --lib --bin FutureboardNative
 
       cargo build -j "$NIX_BUILD_CORES" --offline --profile release --target ${rustTarget} \
         ${lib.concatMapStringsSep " " (plugin: "-p ${plugin.package}") builtinPlugins}
@@ -349,6 +350,7 @@ let
 
       install -m755 \
         ${releaseDir}/FutureboardNative \
+        ${releaseDir}/libFutureboardEngine_x64.so \
         ${releaseDir}/FutureboardPluginHostX64 \
         ${releaseDir}/FutureboardPluginScanner \
         $app/

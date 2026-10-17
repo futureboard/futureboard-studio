@@ -159,6 +159,8 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
     //    executables it spawns from its own directory, and any runtime libraries
     //    the build placed beside the binary.
     let binary_name = staging::stage_executable(&plan.staging_dir, executable)?;
+    let engine_library_name = staging::stage_executable(&plan.staging_dir, &build.engine_library)?;
+    eprintln!("[xtask] staged engine library: {engine_library_name}");
 
     let mut sidecar_names = Vec::with_capacity(build.sidecar_executables.len());
     for sidecar in &build.sidecar_executables {
@@ -259,7 +261,13 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
 
     // 5. Optional symbols.
     if options.symbols {
-        let staged = staging::stage_symbols(&plan.staging_dir, executable)?;
+        // The engine library holds nearly all of the Studio's code, so its
+        // symbols matter more than the launcher's.
+        let mut staged = staging::stage_symbols(&plan.staging_dir, executable)?;
+        staged.extend(staging::stage_symbols(
+            &plan.staging_dir,
+            &build.engine_library,
+        )?);
         if staged.is_empty() {
             eprintln!("[xtask] --symbols requested but no .pdb was found beside the binary");
         }
@@ -285,6 +293,7 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
     validation::validate_staging(&ValidationInputs {
         staging_dir: &plan.staging_dir,
         binary_name: &binary_name,
+        libraries: std::slice::from_ref(&engine_library_name),
         sidecars: &sidecar_names,
         tools: &apak_tool_names,
         symbols_enabled: options.symbols,

@@ -33,6 +33,9 @@ const BANNED_LAYOUT_DIRS: &[&str] = &["CEF", "PluginUI"];
 pub struct ValidationInputs<'a> {
     pub staging_dir: &'a Path,
     pub binary_name: &'a str,
+    /// Dynamic libraries the binary loads from its own directory at startup
+    /// (the Studio engine library).
+    pub libraries: &'a [String],
     pub sidecars: &'a [String],
     /// Required executables staged at relative paths such as `bin/apak.exe`.
     pub tools: &'a [String],
@@ -47,6 +50,10 @@ pub struct ValidationInputs<'a> {
 pub fn validate_staging(inputs: &ValidationInputs<'_>) -> Result<()> {
     let staging_dir = inputs.staging_dir;
     check_executable(staging_dir, inputs.binary_name)?;
+    for library in inputs.libraries {
+        check_executable(staging_dir, library)
+            .with_context(|| format!("required library `{library}` missing or empty"))?;
+    }
     for sidecar in inputs.sidecars {
         check_executable(staging_dir, sidecar)
             .with_context(|| format!("required sidecar `{sidecar}` missing or empty"))?;
@@ -303,6 +310,7 @@ mod tests {
         ValidationInputs {
             staging_dir: dir,
             binary_name: binary,
+            libraries: &[],
             sidecars,
             tools: &[],
             symbols_enabled: symbols,
@@ -375,6 +383,7 @@ mod tests {
         let inputs = ValidationInputs {
             staging_dir: temp.path(),
             binary_name: "FutureboardNative.exe",
+            libraries: &[],
             sidecars: &[],
             tools: &tools,
             symbols_enabled: false,
@@ -384,6 +393,21 @@ mod tests {
 
         assert!(validate_staging(&inputs).is_err());
         fs::write(temp.path().join("bin/makeapak.exe"), b"MZ").unwrap();
+        validate_staging(&inputs).unwrap();
+    }
+
+    #[test]
+    fn missing_engine_library_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        valid_package(temp.path());
+        let libraries = ["FutureboardEngine_x64.dll".to_string()];
+        let inputs = ValidationInputs {
+            libraries: &libraries,
+            ..inputs(temp.path(), "FutureboardNative.exe", &[], false, false)
+        };
+
+        assert!(validate_staging(&inputs).is_err());
+        fs::write(temp.path().join("FutureboardEngine_x64.dll"), b"MZ").unwrap();
         validate_staging(&inputs).unwrap();
     }
 

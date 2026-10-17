@@ -1,269 +1,228 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod audio_state;
-mod crash_reporting;
-mod updater;
-mod window;
+//! `FutureboardNative` — the Futureboard Studio launcher.
+//!
+//! The Studio itself lives in the `FutureboardEngine_x64` library built by this
+//! package (`lib.rs`). This executable keeps what has to belong to the process
+//! image — the Windows icon, manifest and version resources, and the process
+//! identity that CEF helper launches, `fbrd://` links, the updater and Crashpad
+//! all point at — loads the engine from its own directory and hands the main
+//! thread to it. It deliberately uses nothing but `std`.
 
-#[cfg(feature = "professional")]
-mod professional_edition;
+mod engine_abi;
 
-use sphere_platform::platform;
-use sphere_ui_components::boot;
-use sphere_ui_components::embedded_assets::EmbeddedAssets;
+use std::ffi::{c_char, c_void, CStr};
+use std::path::PathBuf;
 
 fn main() {
-    // A file-backed logger and startup marker must exist before CEF dispatch,
-    // DirectX device creation, settings I/O, or any window construction.
-    boot::init_process();
-
-    // ── Phase -1 — CEF process dispatch ───────────────────────────────────────
-    // CEF re-launches THIS executable for its own helper processes (renderer,
-    // GPU, utility). Those launches must be detected and serviced before any
-    // other initialization: a helper process must not create a window, open the
-    // audio device, touch settings, or run the elevation check. `execute_process`
-    // returns >= 0 only in a helper, and in that case the only correct action is
-    // to exit with the code it hands back.
-    //
-    // The app passed here declares the `mikoplugin://` scheme. CEF requires the
-    // same object to be handed to browser-process initialization, so ownership
-    // is transferred to the UI-thread host after dispatch.
-    #[cfg(feature = "builtin-plugin-editor")]
-    dispatch_cef_process();
-
-    // ── fbrd:// links ─────────────────────────────────────────────────────────
-    // The OS launches a fresh process for a scheme URL. If a Studio is already
-    // running this process hands the URL over and leaves before it has opened
-    // an audio device, touched settings, or shown a window — none of which a
-    // second instance should ever do. Otherwise the URL is queued and this
-    // process becomes the instance that acts on it once it has booted.
-    if let Some(url) = sphere_ui_components::deeplink::url_from_args(std::env::args_os().skip(1)) {
-        if sphere_ui_components::deeplink::forward_to_running_instance(&url) {
-            boot::log("fbrd link handed to the running instance");
-            return;
-        }
-        sphere_ui_components::deeplink::enqueue(url);
-    }
-
-    // Privilege safety — must run before audio, plugins, settings, or project I/O.
-    // Community and Professional Edition both block elevated launches. Developer
-    // builds may opt in with `--features allow_elevated_for_testing`.
-    platform::abort_if_elevated();
-
-    // Install Crashpad before account, plugin, audio, or window initialization.
-    // CEF helper processes have already exited from the dispatch above, so only
-    // the browser/main process reaches this point.
-    crash_reporting::install();
-
-    // A Futureboard account is not an entitlement, so sign-in is installed for
-    // every edition. Runs before the Professional install so a licensed build
-    // layers licensing on top of the same identity rather than a second one.
-    sphere_ui_components::account::install_default_account_provider();
-
-    #[cfg(feature = "professional")]
-    professional_edition::install().expect("failed to install Professional Edition providers");
-
-    // ── Phase 0 — process setup ───────────────────────────────────────────────
-    // env flags (before GPUI/window creation), panic hook, logging. No window,
-    // no settings I/O, no device/plugin work here.
-    boot::log("process setup start");
-    eprintln!(
-        "[process] role=main pid={} exe=futureboard_native",
-        std::process::id()
-    );
-    // Publish the app package version to the shared UI crate. `CARGO_PKG_VERSION`
-    // here is the application crate's version; the UI crate cannot read it
-    // itself because its own package version differs.
-    sphere_ui_components::edition::set_app_version(env!("CARGO_PKG_VERSION"));
-
-    // Plugin runtime selection diagnostics. External PluginHost bridge is the
-    // default; legacy in-process VST3 requires FUTUREBOARD_PLUGIN_LEGACY_IN_PROCESS=1.
-    sphere_ui_components::plugin_host_client::log_bridge_env();
-    let soundfont_backend =
-        sphere_ui_components::soundfont_player::soundfont_player_backend_status();
-    boot::log(&format!(
-        "soundfont player backend: {} available={}",
-        soundfont_backend.backend, soundfont_backend.available
-    ));
-    sphere_ui_components::plugin_host_lifecycle::init_plugin_host_job();
-    // Same explicit AppUserModelID as the plugin-host process: keeps any
-    // app-visible plugin window from spawning a stray taskbar identity.
-    sphere_ui_components::plugin_host_lifecycle::set_futureboard_app_user_model_id();
-
-    // Discord IPC is optional and never runs on the GPUI thread. The
-    // application ID resolves to Futureboard's own unless a build or runtime
-    // override points elsewhere, so a plain checkout gets Rich Presence without
-    // any local configuration. Missing Discord itself must not block startup.
-    let discord_rpc_enabled = sphere_ui_components::settings::SettingsSchema::load_from_disk()
-        .general
-        .discord_rpc_enabled;
-    let discord_rpc = sphere_discord_rpc::DiscordRpcConfig::from_env(env!("CARGO_PKG_VERSION"))
-        .and_then(|config| {
-            match sphere_discord_rpc::DiscordRpc::start(
-                config,
-                sphere_discord_rpc::Presence::Welcome,
-                discord_rpc_enabled,
-            ) {
-                Ok(rpc) => {
-                    app::install_discord_rpc(rpc.handle());
-                    Some(rpc)
-                }
-                Err(error) => {
-                    boot::log(&format!("Discord RPC disabled: {error}"));
-                    None
-                }
-            }
-        });
-
-    // Catch any panic that escapes the GPUI render loop so we see *why*
-    // the window blanks out instead of getting a silent crash.
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("[panic] {info}");
-        let bt = std::backtrace::Backtrace::force_capture();
-        eprintln!("[panic] backtrace:\n{bt}");
-        sphere_ui_components::plugin_host_lifecycle::PluginHostProcessManager::global()
-            .shutdown_all(sphere_ui_components::plugin_host_lifecycle::HOST_SHUTDOWN_TIMEOUT)
-            .ok();
-        app::shutdown_discord_rpc();
-    }));
-
-    // GPUI's default DirectComposition target is created with topmost=true, which
-    // draws above all WS_CHILD HWNDs. Plugin editors embed VST3 UI as children of
-    // the GPUI window; without this, transparent windows show the DAW behind them
-    // instead of the native plugin. Disabling DComp lets child HWNDs composite
-    // above the swap chain. MUST be set before GPUI creates any window.
-    #[cfg(target_os = "windows")]
-    if std::env::var_os("GPUI_DISABLE_DIRECT_COMPOSITION").is_none() {
-        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
-        boot::log("GPUI_DISABLE_DIRECT_COMPOSITION=1 (plugin editor HWND embedding)");
-    }
-
-    // The GPU chosen in Preferences → Performance. GPUI creates its D3D11 /
-    // Metal device while the platform is built below, so the choice has to be
-    // in place before `application()` — the settings model does not exist yet.
-    sphere_ui_components::startup::export_gpu_adapter_preference();
-
-    boot::log("process setup done");
-    boot::log(
-        "Initialize Win32/GPUI platform; Windows D3D11 device creation follows synchronously",
-    );
-    let application = application().with_assets(EmbeddedAssets::new());
-    // macOS hands a `fbrd://` link to the running app as an Apple event; the
-    // shell drains this queue on the UI thread. Windows and Linux never call
-    // this — they launch a new process, which is handled above.
-    application.on_open_urls(|urls| {
-        for url in urls {
-            sphere_ui_components::deeplink::enqueue(url);
-        }
-    });
-    application.run(app::setup);
-    #[cfg(feature = "builtin-plugin-editor")]
-    sphere_ui_components::components::builtin_plugin_editor::shutdown();
-    if let Some(discord_rpc) = discord_rpc {
-        discord_rpc.shutdown();
-    }
-    boot::log("gpui application exited");
-}
-
-#[cfg(feature = "builtin-plugin-editor")]
-fn dispatch_cef_process() {
-    use sphere_webview::runtime::ProcessDispatch;
-
-    sphere_webview::runtime::log_process_entry();
-    let mut scheme_app = match sphere_webview::scheme::plugin_scheme_app() {
-        Ok(app) => app,
-        Err(error) => {
-            handle_cef_process_setup_failure(&error);
-            return;
+    let code = match launch() {
+        Ok(code) => code,
+        Err(detail) => {
+            report_launch_failure(&detail);
+            1
         }
     };
-    match sphere_webview::runtime::execute_subprocess(Some(&mut scheme_app)) {
-        Ok(ProcessDispatch::SubprocessExit(code)) => {
-            boot::log(&format!("CEF subprocess dispatch complete code={code}"));
-            eprintln!(
-                "[cef-process] subprocess_exit pid={} code={} before_futureboard_startup=true",
-                std::process::id(),
-                code
-            );
-            std::process::exit(code);
-        }
-        Ok(ProcessDispatch::BrowserProcess) => {
-            boot::log("CEF execute_process returned browser process");
-            if boot::has_flag("--disable-cef") {
-                boot::log("CEF disabled by --disable-cef; native application remains available");
-                return;
-            }
-            #[cfg(target_os = "macos")]
-            if let Err(error) = gpui_macos::configure_cef_application() {
-                eprintln!(
-                    "[cef-process] macos_application_setup_failed error={error}; \
-                     built-in plugin editors will be unavailable"
-                );
-                return;
-            }
-            if let Err(error) =
-                sphere_ui_components::components::builtin_plugin_editor::install_process_app(
-                    scheme_app,
+    std::process::exit(code);
+}
+
+fn launch() -> Result<i32, String> {
+    let path = engine_path()?;
+    let library = platform::Library::open(&path)
+        .map_err(|error| format!("Could not load {}:\n{error}", path.display()))?;
+
+    // SAFETY: every symbol is looked up under the name and signature declared
+    // in `engine_abi.rs`, which `lib.rs` exports.
+    let abi_version: extern "C" fn() -> u32 =
+        unsafe { library.function(engine_abi::ABI_VERSION_SYMBOL)? };
+    let engine_abi_version = abi_version();
+    if engine_abi_version != engine_abi::ABI_VERSION {
+        return Err(format!(
+            "{} has engine ABI {engine_abi_version}; this launcher needs ABI {}.",
+            path.display(),
+            engine_abi::ABI_VERSION
+        ));
+    }
+
+    let version: extern "C" fn() -> *const c_char =
+        unsafe { library.function(engine_abi::VERSION_SYMBOL)? };
+    // SAFETY: the engine returns a pointer to a static NUL-terminated string.
+    let engine_version = unsafe { CStr::from_ptr(version()) }.to_string_lossy();
+    if engine_version != env!("CARGO_PKG_VERSION") {
+        return Err(format!(
+            "{} is version {engine_version}, but FutureboardNative is version {}.",
+            path.display(),
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+
+    let engine_main: extern "C" fn() -> i32 = unsafe { library.function(engine_abi::MAIN_SYMBOL)? };
+    // The engine owns the process from here on and is never unloaded: its
+    // audio, plug-in host and CEF threads can outlive the call below.
+    std::mem::forget(library);
+    Ok(engine_main())
+}
+
+/// The engine library beside this executable. On macOS that is the bundle's
+/// `Contents/MacOS`; on Linux the real install directory behind any symlink.
+fn engine_path() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("Could not locate FutureboardNative: {error}"))?;
+    #[cfg(unix)]
+    let executable = std::fs::canonicalize(&executable).unwrap_or(executable);
+    let directory = executable
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", executable.display()))?;
+    Ok(directory.join(engine_abi::library_file_name()))
+}
+
+fn report_launch_failure(detail: &str) {
+    let mut message = format!(
+        "Futureboard Studio could not start its engine.\n\n{detail}\n\n\
+         Reinstall Futureboard Studio to restore missing or mismatched files."
+    );
+    if cfg!(debug_assertions) {
+        message.push_str(
+            "\n\nDeveloper build: `cargo run` and `cargo build --bin FutureboardNative` \
+             build only the launcher. Build the whole package with \
+             `cargo build -p futureboard_native` to (re)build the engine library.",
+        );
+    }
+    eprintln!("[launcher] {message}");
+    platform::show_error("Futureboard Studio", &message);
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::*;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
+    const MB_ICONERROR: u32 = 0x0000_0010;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryExW(file_name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(owner: *mut c_void, text: *const u16, caption: *const u16, kind: u32)
+            -> i32;
+    }
+
+    pub struct Library(*mut c_void);
+
+    impl Library {
+        /// Loads by absolute path; the altered search path resolves the
+        /// engine's own imports (`libcef.dll`, the VC runtime) from its
+        /// directory first.
+        pub fn open(path: &Path) -> Result<Self, String> {
+            let wide = wide(path.as_os_str());
+            let module = unsafe {
+                LoadLibraryExW(
+                    wide.as_ptr(),
+                    std::ptr::null_mut(),
+                    LOAD_WITH_ALTERED_SEARCH_PATH,
                 )
-            {
-                eprintln!("[cef-process] browser_app_install_failed error={error}");
+            };
+            if module.is_null() {
+                return Err(std::io::Error::last_os_error().to_string());
             }
+            Ok(Self(module))
         }
-        Err(error) => handle_cef_process_setup_failure(&error),
+
+        /// # Safety
+        /// `F` must be the function pointer type the symbol was exported with.
+        pub unsafe fn function<F: Copy>(&self, name: &CStr) -> Result<F, String> {
+            assert_eq!(size_of::<F>(), size_of::<*mut c_void>());
+            let address = GetProcAddress(self.0, name.as_ptr());
+            if address.is_null() {
+                return Err(format!(
+                    "The engine library does not export `{}`.",
+                    name.to_string_lossy()
+                ));
+            }
+            Ok(std::mem::transmute_copy(&address))
+        }
+    }
+
+    pub fn show_error(caption: &str, message: &str) {
+        let text = wide(message.as_ref());
+        let caption = wide(caption.as_ref());
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                caption.as_ptr(),
+                MB_ICONERROR,
+            );
+        }
+    }
+
+    fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
+        value.encode_wide().chain(Some(0)).collect()
     }
 }
 
-#[cfg(feature = "builtin-plugin-editor")]
-fn handle_cef_process_setup_failure(error: &sphere_webview::runtime::CefRuntimeError) {
-    let subprocess = sphere_webview::runtime::is_subprocess_command_line();
-    eprintln!(
-        "[cef-process] setup_failed pid={} subprocess={} error={error}",
-        std::process::id(),
-        subprocess
-    );
-    if subprocess {
-        std::process::exit(1);
+#[cfg(unix)]
+mod platform {
+    use super::*;
+    use std::ffi::{c_int, CString};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    const RTLD_NOW: c_int = 2;
+
+    #[cfg_attr(all(target_os = "linux", target_env = "gnu"), link(name = "dl"))]
+    extern "C" {
+        fn dlopen(file_name: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn dlerror() -> *const c_char;
     }
-}
 
-/// Text backend to build the Windows platform with.
-///
-/// The text system is created before the app — and therefore before the
-/// settings model — exists, so the preference is read straight off disk here.
-/// `SettingsSchema::load_from_disk` falls back to defaults on any read or parse
-/// error, so a damaged settings file cannot stop the app from starting.
-#[cfg(target_os = "windows")]
-fn windows_text_backend() -> gpui_windows::WindowsTextBackend {
-    use sphere_ui_components::settings::{SettingsSchema, TextRenderingBackend};
+    pub struct Library(*mut c_void);
 
-    match SettingsSchema::load_from_disk().appearance.text_rendering {
-        TextRenderingBackend::DirectWrite => gpui_windows::WindowsTextBackend::DirectWrite,
-        TextRenderingBackend::Gdi => gpui_windows::WindowsTextBackend::Gdi,
+    impl Library {
+        pub fn open(path: &Path) -> Result<Self, String> {
+            let file_name = CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| "the path contains a NUL byte".to_string())?;
+            let handle = unsafe { dlopen(file_name.as_ptr(), RTLD_NOW) };
+            if handle.is_null() {
+                return Err(last_dl_error());
+            }
+            Ok(Self(handle))
+        }
+
+        /// # Safety
+        /// `F` must be the function pointer type the symbol was exported with.
+        pub unsafe fn function<F: Copy>(&self, name: &CStr) -> Result<F, String> {
+            assert_eq!(size_of::<F>(), size_of::<*mut c_void>());
+            let address = dlsym(self.0, name.as_ptr());
+            if address.is_null() {
+                return Err(format!(
+                    "The engine library does not export `{}`: {}",
+                    name.to_string_lossy(),
+                    last_dl_error()
+                ));
+            }
+            Ok(std::mem::transmute_copy(&address))
+        }
     }
-}
 
-/// Builds a GPUI [`Application`] with the correct OS platform backend.
-///
-/// The vendored standalone gpui removed `Application::new()`; the platform must
-/// now be constructed explicitly. We mirror `gpui_platform::current_platform`
-/// here instead of depending on `gpui_platform`, because that crate
-/// force-enables gpui's `windows-manifest` feature, which would embed a second
-/// application manifest and collide (CVT1100) with this binary's own manifest
-/// from `app.rc`.
-fn application() -> gpui::Application {
-    #[cfg(target_os = "windows")]
-    let platform: std::rc::Rc<dyn gpui::Platform> = std::rc::Rc::new(
-        gpui_windows::WindowsPlatform::new_with_text_backend(false, windows_text_backend())
-            .expect("failed to initialize Windows platform"),
-    );
+    fn last_dl_error() -> String {
+        let error = unsafe { dlerror() };
+        if error.is_null() {
+            "unknown dynamic loader error".to_string()
+        } else {
+            unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
 
-    #[cfg(target_os = "macos")]
-    let platform: std::rc::Rc<dyn gpui::Platform> =
-        std::rc::Rc::new(gpui_macos::MacPlatform::new(false));
-
-    #[cfg(target_os = "linux")]
-    let platform: std::rc::Rc<dyn gpui::Platform> = gpui_linux::current_platform(false);
-
-    gpui::Application::with_platform(platform)
+    pub fn show_error(_caption: &str, _message: &str) {
+        // Already on stderr; there is no toolkit loaded to show a dialog with.
+    }
 }

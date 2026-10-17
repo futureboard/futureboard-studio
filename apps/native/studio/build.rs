@@ -1,4 +1,6 @@
-//! Embeds Windows icon, application manifest, and version resources from `apps/shared/`.
+//! Embeds Windows icon, application manifest, and version resources from `apps/shared/`
+//! into the `FutureboardNative` launcher (`embed_resource::compile` links them into
+//! bins only); the engine library gets the rest of this script's configuration.
 
 use std::path::{Path, PathBuf};
 
@@ -33,11 +35,13 @@ fn main() {
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     // `libcef` (and the staged ONNX Runtime) ship beside the binary in the
-    // packaged tree, so the loader must search the executable's own directory.
-    // Windows already searches it; ELF/Mach-O need an explicit run path.
+    // packaged tree, and the engine library is what links them, so its loader
+    // must search the library's own directory. Windows `LoadLibraryExW` with an
+    // altered search path already does (see `main.rs`); ELF/Mach-O need an
+    // explicit run path. The launcher opens the engine by absolute path.
     match target_os.as_str() {
-        "linux" => println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN"),
-        "macos" => println!("cargo:rustc-link-arg-bins=-Wl,-rpath,@executable_path"),
+        "linux" => println!("cargo:rustc-link-arg-cdylib=-Wl,-rpath,$ORIGIN"),
+        "macos" => println!("cargo:rustc-link-arg-cdylib=-Wl,-rpath,@loader_path"),
         _ => {}
     }
     if target_os == "windows" {

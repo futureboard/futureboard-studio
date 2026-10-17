@@ -12,6 +12,10 @@
 //! `[[bin]]` targets of the `sphere-plugin-host` package. The distributable also
 //! carries the APAK installer and CLI tools under `bin/`, so all required
 //! executables are built in one invocation and discovered from Cargo messages.
+//!
+//! `FutureboardNative` itself is only a launcher: the Studio is the app
+//! package's `cdylib` (`FutureboardEngine_x64`), loaded from the launcher's
+//! directory, so that library is built and discovered the same way.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,7 +26,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, anyhow, bail};
 use cargo_metadata::{Artifact, Message};
 
-use crate::platform::{Edition, host_target};
+use crate::platform::{Edition, dynamic_library_extension, host_target};
 use crate::{jobs, toolchain};
 
 /// The Futureboard workspace root (xtask lives at `<root>/xtask`).
@@ -43,6 +47,10 @@ fn target_is_windows(target: Option<&str>) -> bool {
 /// The application package and its primary binary.
 pub const APP_PACKAGE: &str = "futureboard_native";
 pub const APP_BINARY: &str = "FutureboardNative";
+/// The app package's `cdylib` target: the Studio engine `FutureboardNative`
+/// loads from its own directory. Cargo does not build a `cdylib`-only library
+/// for `--bin`, so it is requested with `--lib`.
+pub const ENGINE_LIBRARY: &str = "FutureboardEngine_x64";
 
 /// Package that owns the runtime sidecar executables.
 const SIDECAR_PACKAGE: &str = "sphere-plugin-host";
@@ -71,6 +79,8 @@ const SIDECAR_FEATURES: &[&str] = &[
 pub struct BuildOutput {
     /// Absolute path to the primary application binary.
     pub app_executable: PathBuf,
+    /// Absolute path to the engine dynamic library [`ENGINE_LIBRARY`].
+    pub engine_library: PathBuf,
     /// Absolute paths to the runtime sidecar executables, in the order of
     /// [`SIDECAR_BINARIES`].
     pub sidecar_executables: Vec<PathBuf>,
@@ -112,6 +122,9 @@ pub fn build(
         .args(["--package", SIDECAR_PACKAGE])
         .args(["--package", APAK_PACKAGE])
         .args(["--bin", APP_BINARY])
+        // Every selected package has a library; only the app's is a shipped
+        // artifact (the others are dependencies of the binaries anyway).
+        .arg("--lib")
         .args(["--profile", profile])
         .arg("--target-dir")
         .arg(&target_dir);
@@ -199,11 +212,14 @@ pub fn build(
         .ok_or_else(|| anyhow!("cargo produced no stdout stream"))?;
 
     let mut executables: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut engine_library = None;
     for message in Message::parse_stream(BufReader::new(stdout)) {
         let message = message.context("failed to parse a cargo JSON message")?;
         if let Message::CompilerArtifact(artifact) = message {
             if let Some((name, path)) = wanted_executable(&artifact) {
                 executables.insert(name, path);
+            } else if let Some(path) = engine_library_artifact(&artifact, &target_triple) {
+                engine_library = Some(path);
             }
         }
     }
@@ -217,6 +233,12 @@ pub fn build(
         anyhow!(
             "cargo build succeeded but emitted no executable artifact for `{APP_BINARY}`; \
              is the `{APP_PACKAGE}` package still producing a `[[bin]]` named `{APP_BINARY}`?"
+        )
+    })?;
+    let engine_library = engine_library.ok_or_else(|| {
+        anyhow!(
+            "cargo build succeeded but emitted no dynamic library for `{ENGINE_LIBRARY}`; \
+             `{APP_BINARY}` loads it at startup and it must ship beside the binary"
         )
     })?;
 
@@ -252,6 +274,7 @@ pub fn build(
 
     Ok(BuildOutput {
         app_executable,
+        engine_library,
         sidecar_executables,
         cef_helper_executable,
         apak_executables,
@@ -583,6 +606,27 @@ fn wanted_executable(artifact: &Artifact) -> Option<(String, PathBuf)> {
         .executable
         .as_ref()
         .map(|path| (name.to_string(), PathBuf::from(path.as_std_path())))
+}
+
+/// The engine library file if this artifact is the app package's `cdylib`
+/// target. Cargo also reports the import library (`.dll.lib`) and `.pdb` in
+/// `filenames`; only the loadable library is returned.
+fn engine_library_artifact(artifact: &Artifact, target_triple: &str) -> Option<PathBuf> {
+    let is_engine = artifact.target.name == ENGINE_LIBRARY
+        && artifact
+            .target
+            .kind
+            .iter()
+            .any(|kind| kind.as_str() == "cdylib");
+    if !is_engine {
+        return None;
+    }
+    let extension = dynamic_library_extension(target_triple);
+    artifact
+        .filenames
+        .iter()
+        .find(|path| path.extension() == Some(extension))
+        .map(|path| PathBuf::from(path.as_std_path()))
 }
 
 #[cfg(test)]

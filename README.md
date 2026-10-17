@@ -229,8 +229,14 @@ Run the app in development:
 
 ```bash
 cargo build -p sphere-plugin-host --bins   # helper binaries the app spawns
-cargo run -p futureboard_native            # = bun run dev:native
+cargo build -p futureboard_native          # launcher + engine library
+cargo run -p futureboard_native            # (both lines = bun run dev:native)
 ```
+
+`FutureboardNative` is only a launcher: the Studio — UI, audio engine, plug-in
+hosting — is the `FutureboardEngine_x64` library (`.dll`/`.so`/`.dylib`) it
+loads from its own directory. `cargo run` and `--bin FutureboardNative` build
+only the launcher, so build the whole package after changing code.
 
 The built-in plug-in editors run in an embedded Chromium (CEF). Packaging
 stages the CEF runtime for you; for a plain `cargo run` with working editors,
@@ -331,7 +337,7 @@ ASIO is available in Professional Edition only.
 
 | Script                                                                          | Runs                                                     |
 | ------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| `dev:native`                                                                    | `cargo run -p futureboard_native`                        |
+| `dev:native`                                                                    | `cargo build -p futureboard_native && cargo run -p futureboard_native` |
 | `build:native` · `build:native:debug`                                           | `xtask package` (release / dev, Community, all plug-ins) |
 | `build:plugin-editors`                                                          | Build every built-in plug-in editor bundle               |
 | `bundle:native:win` · `bundle:native:mac[:dmg]` · `installer:native:win`        | Package distributables                                   |

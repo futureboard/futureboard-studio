@@ -13,7 +13,9 @@ Before changing code, read:
 Futureboard Studio is the native Rust/GPUI application:
 
 - app: `apps/native/studio`
-- binary: `FutureboardNative`
+- binary: `FutureboardNative` (launcher only; loads the engine library)
+- engine library: `FutureboardEngine_x64` (`cdylib` of the same package; all
+  UI and audio code runs here — `cargo run` alone does not rebuild it)
 - package: `futureboard_native`
 - native UI: `crates/SphereUIComponents`
 - audio engine: `crates/SphereDirectAudioEngine`

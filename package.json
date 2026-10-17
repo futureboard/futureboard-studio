@@ -51,7 +51,7 @@
     }
   },
   "scripts": {
-    "dev:native": "cargo run -p futureboard_native",
+    "dev:native": "cargo build -p futureboard_native && cargo run -p futureboard_native",
     "dev:server": "bun run --cwd apps/server dev",
     "cargo:check": "cargo check --workspace",
     "cargo:build": "cargo build --workspace",

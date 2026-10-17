@@ -5,6 +5,18 @@ edition = "2021"
 build = "build.rs"
 license.workspace = true
 
+# The Studio itself — GPUI shell, native UI components, audio engine, plug-in
+# host client, CEF editor host — is this dynamic library. The `cdylib`-only
+# crate type keeps fat LTO for the engine; it also means `cargo build --bin
+# FutureboardNative` / `cargo run` build only the launcher, so build the whole
+# package (`cargo build -p futureboard_native`) to refresh the engine.
+[lib]
+name = "FutureboardEngine_x64"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+# Thin launcher: carries the icon/manifest/version resources and the process
+# identity, then loads `FutureboardEngine_x64` from its own directory.
 [[bin]]
 name = "FutureboardNative"
 path = "src/main.rs"
