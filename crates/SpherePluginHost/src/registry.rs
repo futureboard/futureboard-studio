@@ -186,8 +186,8 @@ impl RegistryPlugin {
             && self.status == PluginStatus::PresetReady
     }
 
-    /// Editor window: built-ins use the embedded CEF (`mikoplugin://`) editor;
-    /// external plug-ins use the native host-owned window. Every module format
+    /// Editor window: built-ins draw a native GPUI editor; external plug-ins
+    /// use the native host-owned window. Every module format
     /// (VST3, VST2, CLAP) has one; an Audio Unit does not yet.
     pub fn supports_editor(&self) -> bool {
         if self.is_builtin() {

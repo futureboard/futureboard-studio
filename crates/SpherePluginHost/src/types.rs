@@ -1,9 +1,4 @@
 use serde::{Deserialize, Serialize};
-
-#[cfg(feature = "napi")]
-use napi_derive::napi;
-
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct HostStatus {
@@ -14,8 +9,6 @@ pub struct HostStatus {
     pub clap_helpers: bool,
     pub message: String,
 }
-
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PluginInfo {
     pub id: String,

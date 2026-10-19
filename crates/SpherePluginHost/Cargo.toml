@@ -2,12 +2,11 @@
 name = "sphere-plugin-host"
 version = "2026.10.16-beta1.4.4"
 edition = "2021"
-description = "SpherePluginHost — N-API control bridge and native plugin host shell for Futureboard Studio"
+description = "SpherePluginHost — plugin scanning, the out-of-process host and native editor shell for Futureboard Studio"
 license.workspace = true
 
 [lib]
 name = "SpherePluginHost"
-crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "FutureboardPluginScanner"
@@ -22,8 +21,6 @@ path = "src/bin/futureboard_plugin_host.rs"
 required-features = ["plugin-host-bin"]
 
 [dependencies]
-napi        = { workspace = true, optional = true }
-napi-derive = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
@@ -72,7 +69,6 @@ libc.workspace = true
 
 [build-dependencies]
 cc.workspace = true
-napi-build.workspace = true
 embed-resource.workspace = true
 
 [features]
@@ -82,11 +78,7 @@ default = [
     "plugin-scanner-bin"
 ]
 
-# Build the N-API surface (`*.node` addon entrypoints and Js-visible types).
-napi = ["dep:napi", "dep:napi-derive"]
-
-# Opt-in standalone scanner target. Workspace builds skip this so the binary
-# does not try to link N-API symbols outside a Node/Electron host.
+# Opt-in standalone scanner target.
 plugin-scanner-bin = []
 
 # Opt-in standalone plugin/editor host process target.

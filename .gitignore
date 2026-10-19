@@ -45,12 +45,8 @@ Cargo.lock.bak
 **/flycheck*/
 **/.rustc_info.json
 
-# Electron build output
-apps/electron/release/
+# Packaging output
 packaging/native/out/
-apps/electron/dist/
-apps/electron/out/
-*.asar
 
 # Native / C++ / Windows build junk
 *.obj

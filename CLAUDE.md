@@ -1,12 +1,11 @@
 # Futureboard Studio Agent Rules
 
-Before changing code, read:
+Before changing code, read `DESIGN.md` when the task touches UI, layout,
+interaction, windows, panels, dialogs, or plugin editors — then only the
+smallest relevant implementation area.
 
-1. `SKILL.md` for repository workflow and engineering constraints.
-2. `DESIGN.md` when the task touches UI, layout, interaction, windows, panels, dialogs, or plugin editors.
-3. Only the smallest relevant implementation area after that.
-
-`AGENTS.md` delegates here so every coding agent follows the same contract.
+`AGENTS.md` and `GEMINI.md` delegate here so every coding agent follows the
+same contract.
 
 ## Product scope
 
@@ -22,15 +21,14 @@ Futureboard Studio is the native Rust/GPUI application:
 - plugin host and scanner: `crates/SpherePluginHost`
 - built-in plugins: `crates/BuiltinAudioPlugins`
 
-Electron and the general-purpose Web UI are retired. Do not implement, repair,
-port from, validate, or use them as product/design authority unless the user
-explicitly asks for legacy removal or archaeology.
+Electron, N-API bindings and the general-purpose Web UI have been removed. Do
+not reintroduce them unless the user explicitly asks.
 
-The only active Web UI scope is a built-in plugin's embedded editor. Those
-editors live under `crates/BuiltinAudioPlugins/crates/*/editor` or `editorui`,
-are compiled to static assets, embedded by `builtin_ui_embed`, and hosted by
-the native app through `SphereWebView`/CEF. They are plugin views, not a second
-Futureboard application.
+Built-in plugin editors are native GPUI views (`plugin_kit`). The CEF runtime
+(`crates/SphereWebView`, `apps/native/cef_helper`, xtask's CEF staging) is
+kept on purpose even though no built-in editor uses it today: do not remove
+it. LiveStage's web console (`apps/native/livestage/webui`, embedded through
+`builtin_ui_embed`) is the only web front end.
 
 ## Operating contract
 
@@ -48,18 +46,26 @@ Before editing:
 While editing:
 
 - Do not rewrite adjacent systems or complete an unrequested roadmap.
-- Do not add fake production behavior, disconnected controls, or mock runtime
-  data.
+- Connect controls to real state and runtime behavior. Do not add fake
+  production behavior, disconnected controls, or mock runtime data; disable or
+  label incomplete behavior instead of faking success.
+- Preserve save/load and undo semantics when state changes, and keep stable
+  identifiers across UI, project persistence, engine, bridge, and plugin
+  instances.
 - Do not add dependencies without a concrete need.
-- Keep edition behavior behind the existing verified edition/license provider.
+- Keep edition behavior behind the existing verified edition/license provider;
+  do not add parallel entitlement checks.
 - Preserve project compatibility and opaque plugin state.
-- Keep native and embedded-plugin-Web-UI boundaries explicit.
+- Keep expensive diagnostics gated and off realtime threads.
 
 When finishing:
 
 - Run the smallest relevant check first.
-- Separate compile/test evidence from manual/runtime/visual evidence.
-- Report changed files, commands run, failures, and remaining validation.
+- Separate compile/test evidence from manual/runtime/visual evidence. A
+  successful compile is not proof that gestures, audio output, editor
+  embedding, window lifecycle, project restore, or layout work at runtime.
+- Report the behavior delivered, changed files, commands run with their exact
+  outcomes, checks actually performed, and anything unverified or blocked.
 - Never claim a check or gesture was tested when it was not.
 
 ## Realtime and bridge rules
@@ -70,18 +76,23 @@ unbounded queue operations, UI work, or panics across FFI.
 
 Use preallocated buffers, compact resolved identifiers, immutable snapshots,
 atomics, bounded SPSC/lock-free queues, event-driven wakeups, and diagnostics
-rings drained off the hot path.
+rings drained off the hot path. Do not mask xruns with debounce, sleeps, larger
+stale windows, or removed freshness guards: find the slow or mis-synchronized
+stage.
 
-For bridged plugins:
+For hosted and bridged plugins:
 
 - Route MIDI, parameters, state, and responses by the exact plugin instance.
 - Keep freshness/sequence guards; never hide stale output by removing them.
-- Persist component and controller state as opaque data where available.
+- Persist component and controller state as opaque data where available, and
+  restore it after instantiation, before playback or editor use.
 - Supply transport-derived process context; do not hardcode tempo, position,
   playing state, or time signature outside explicit tests.
 - Carry automation from UI/project state through the engine and bridge into the
   target plugin.
-- Include bridged latency in graph delay compensation.
+- Include plugin and bridged latency in graph delay compensation.
+- Keep scanning and editor lifecycle off the audio thread, and isolate plugin
+  failure from the Studio process wherever the architecture allows.
 
 ## Native UI rules
 
@@ -90,26 +101,15 @@ For bridged plugins:
 - Keep one layout owner, one scroll owner, and one clip owner for each region.
 - Use the same coordinate transform for ruler, grid, clips, notes, automation,
   playhead, hit-testing, and overlays.
+- Virtualize or cull large track, mixer, MIDI, waveform, and automation views.
 - Keep per-frame visuals isolated from broad entity rerenders.
 - Defer parent mutations when a child callback would create nested GPUI entity
   updates.
 - Treat external plugin editors as plugin-owned native child views with exact
-  client bounds, DPI handling, focus forwarding, resize, and teardown.
+  client bounds, DPI handling, focus forwarding, resize, and teardown; detach
+  the child before destroying its parent.
 
 For visual direction and interaction details, follow `DESIGN.md`.
-
-## Built-in plugin editor Web UI
-
-Web technologies are allowed only inside a built-in plugin editor bundle.
-
-- Keep DSP, parameter schema, defaults, normalization, and persistence in Rust.
-- Keep the editor a thin view over the real parameter bridge.
-- Use stable parameter IDs shared with the Rust core.
-- Build to deterministic static assets; do not depend on a dev server or remote
-  network content at runtime.
-- Keep the custom scheme/asset lookup and CEF lifecycle native-owned.
-- Do not import plugin editor React/Tailwind conventions into GPUI app chrome.
-- Do not turn the embedded editor exception into a general Web UI platform.
 
 ## Validation
 
@@ -118,28 +118,21 @@ Choose only commands relevant to the touched scope:
 ```bash
 cargo fmt --all -- --check
 cargo check -p futureboard_native
-cargo check -p sphere_ui_components
 cargo check -p sphere-plugin-host
 cargo test -p sphere-plugin-host
-cargo check -p BuiltinAudioPlugins
 cargo check --workspace
 ```
 
-For an embedded plugin editor, run its own package scripts, for example:
-
-```bash
-bun run --cwd crates/BuiltinAudioPlugins/crates/rodharerist/editorui build
-```
-
-A runnable native debug build also needs the helper binaries next to the app:
+A runnable native build also needs the helper binaries next to the app; the
+packager builds everything together:
 
 ```bash
 cargo build -p futureboard_native
 cargo build -p sphere-plugin-host --bins
+cargo package-dev
 ```
 
-Use `README.md` and `CONTRIBUTING.md` for broader supported commands. Do not run
-retired Electron/Web commands as routine validation.
+Use `README.md` and `CONTRIBUTING.md` for broader supported commands.
 
 ## Final rule
 

@@ -19,8 +19,8 @@ pub(super) fn is_supported_audio_ext(ext: &str) -> bool {
 
 /// Resolve a shared menu command ID to a transport action.
 /// Returns `None` for commands the unified dispatcher should log as
-/// unsupported. Keep in lock-step with `apps/web/src/menu/actionRunner.ts`
-/// and `packages/shared/generated/native-menu.json`.
+/// unsupported. Keep in lock-step with
+/// `packages/shared/generated/native-menu.json`.
 pub(super) fn transport_command_from_id(command_id: &str) -> Option<TransportCommand> {
     match command_id {
         "transport:play-pause" => Some(TransportCommand::PlayPause),

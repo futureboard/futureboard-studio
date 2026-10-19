@@ -238,9 +238,8 @@ hosting — is the `FutureboardEngine_x64` library (`.dll`/`.so`/`.dylib`) it
 loads from its own directory. `cargo run` and `--bin FutureboardNative` build
 only the launcher, so build the whole package after changing code.
 
-The built-in plug-in editors run in an embedded Chromium (CEF). Packaging
-stages the CEF runtime for you; for a plain `cargo run` with working editors,
-install it once:
+The app links the Chromium Embedded Framework (CEF) runtime. Packaging stages
+it for you; for a plain `cargo run`, install it once:
 
 ```bash
 cargo run -p SphereWebView --example install_cef --features installer
@@ -339,7 +338,6 @@ ASIO is available in Professional Edition only.
 | ------------------------------------------------------------------------------- | -------------------------------------------------------- |
 | `dev:native`                                                                    | `cargo build -p futureboard_native && cargo run -p futureboard_native` |
 | `build:native` · `build:native:debug`                                           | `xtask package` (release / dev, Community, all plug-ins) |
-| `build:plugin-editors`                                                          | Build every built-in plug-in editor bundle               |
 | `bundle:native:win` · `bundle:native:mac[:dmg]` · `installer:native:win`        | Package distributables                                   |
 | `cargo:check` · `cargo:build` · `cargo:release` · `cargo:test` · `cargo:clippy` | Rust workspace passthroughs                              |
 | `cargo:fmt[:check]` · `check` · `lint` · `fmt`                                  | Formatting and combined checks                           |
@@ -359,8 +357,8 @@ process so a crashing plug-in cannot take the session down.
 | [`SphereUIComponents`](crates/SphereUIComponents)                           | The GPUI shell, editors, mixer, windows and theme             |
 | [`SphereDirectAudioEngine`](crates/SphereDirectAudioEngine)                 | Real-time engine: graph, transport, mixing, recording, export |
 | [`SpherePluginHost`](crates/SpherePluginHost)                               | Plug-in scanning, the out-of-process host and editor bridging |
-| [`BuiltinAudioPlugins`](crates/BuiltinAudioPlugins)                         | Built-in plug-in DSP and their embedded editors               |
-| [`SphereWebView`](crates/SphereWebView)                                     | CEF host for the built-in plug-in editors                     |
+| [`BuiltinAudioPlugins`](crates/BuiltinAudioPlugins)                         | Built-in plug-in DSP and their native editors                 |
+| [`SphereWebView`](crates/SphereWebView)                                     | The CEF runtime host                                          |
 | [`SphereSoundfontPlayer`](crates/SphereSoundfontPlayer)                     | The built-in SoundFont instrument                             |
 | [`SphereMidiService`](crates/SphereMidiService)                             | MIDI devices, programs and MPE                                |
 | [`SphereAudioProcessor`](crates/SphereAudioProcessor)                       | Time-stretch, pitch and audio analysis                        |
@@ -371,10 +369,9 @@ Other native apps share the same crates: `jamsession` (standalone Audio Jam
 client), `singer` (Solfege instrument playground) and `apakinstaller` (signed
 `.apak` package tools). See [ARCHITECTURE.md](ARCHITECTURE.md) for the full map.
 
-The only web code in the product is each built-in plug-in's editor, under
-`crates/BuiltinAudioPlugins/crates/*/editor` or `editorui`: compiled to static
-assets, embedded in the binary and shown through CEF. The earlier general-purpose
-web and Electron surfaces are retired.
+Built-in plug-in editors are native GPUI views. The only web code in the
+product is LiveStage's console (`apps/native/livestage/webui`); the earlier
+web, Electron and N-API surfaces have been removed.
 
 ### Repository layout
 
@@ -383,7 +380,6 @@ Futureboard
 ├─ apps/native/    studio (the app) · jamsession · singer · apakinstaller · cef_helper
 ├─ crates/         engine, UI, plug-in host, built-in plug-ins, GPUI fork, services
 ├─ packages/       assets · keymaps · shared (locales, themes, menus, fonts, icons)
-├─ extensions/     extension template
 ├─ external/       vendored SDKs (git submodules) and patched dependencies
 ├─ packaging/      Windows · macOS · Linux · AUR packaging
 ├─ scripts/        plug-in editor build, menu/keymap/locale generation, versioning

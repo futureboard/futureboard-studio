@@ -1,7 +1,0 @@
-[package]
-name = "SphereFBMediaUtils"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]

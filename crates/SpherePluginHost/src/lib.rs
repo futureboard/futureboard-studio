@@ -21,8 +21,6 @@ pub mod audio_bridge;
 /// rows (identified by a `builtin:` id).
 pub mod builtin;
 pub mod editor_quirk;
-#[cfg(feature = "napi")]
-mod editor_window;
 /// Control-thread manager for live built-in instances and the one shared CEF
 /// editor binding per plug-in type.
 pub mod instance_manager;
@@ -61,8 +59,8 @@ mod types;
 
 pub use builtin::{
     builtin_audio_bridge_supported, builtin_catalog, builtin_display_name, builtin_editor_kind,
-    builtin_editor_url, builtin_has_native_editor, builtin_id, is_builtin_id, is_builtin_ref,
-    resolve_builtin_stem, with_builtins, BuiltinEditorKind, BUILTIN_ID_PREFIX,
+    builtin_has_native_editor, builtin_id, is_builtin_id, is_builtin_ref, resolve_builtin_stem,
+    with_builtins, BuiltinEditorKind, BUILTIN_ID_PREFIX,
 };
 pub use editor_quirk::{
     detect_plugin_editor_runtime, match_quirk, PluginEditorHostMode, PluginEditorQuirk,
@@ -88,63 +86,3 @@ pub use scan::{
     PluginDescriptor, PluginScanError, PluginScanFormat, ScanResultPayload,
 };
 pub use scanner::{discover_plugin_bundles, scan_plugin_bundle};
-
-#[cfg(feature = "napi")]
-pub use editor_window::{drain_plugin_editor_param_events, PluginEditorParamEvent};
-
-#[cfg(feature = "napi")]
-use napi_derive::napi;
-
-#[cfg(feature = "napi")]
-use scanner::{scan_audio_plugin_paths, scan_clap_paths, scan_vst3_paths};
-
-#[cfg(feature = "napi")]
-use types::{HostStatus, PluginInfo};
-
-#[cfg(feature = "napi")]
-#[napi]
-pub fn init_plugin_host() -> napi::Result<HostStatus> {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let vst3_sdk_path = manifest_dir.join("../../external/vst3sdk/public.sdk");
-    let clap_sdk_path = manifest_dir.join("../../external/clap/include/clap/clap.h");
-    let clap_helpers_path = manifest_dir.join("../../external/clap-helpers/include/clap/helpers");
-    Ok(HostStatus {
-        available: true,
-        backend: "vst3-clap-native-scanner".to_string(),
-        vst3_sdk: vst3_sdk_path.exists(),
-        clap_sdk: clap_sdk_path.exists(),
-        clap_helpers: clap_helpers_path.exists(),
-        message: "SpherePluginHost initialized. VST3, VST2, and CLAP scanners are available."
-            .to_string(),
-    })
-}
-
-#[cfg(feature = "napi")]
-#[napi]
-pub fn shutdown_plugin_host() -> napi::Result<()> {
-    Ok(())
-}
-
-#[cfg(feature = "napi")]
-#[napi]
-pub fn scan_vst3(paths: Vec<String>) -> napi::Result<Vec<PluginInfo>> {
-    scan_vst3_paths(&paths).map_err(napi::Error::from_reason)
-}
-
-#[cfg(feature = "napi")]
-#[napi]
-pub fn scan_clap(paths: Vec<String>) -> napi::Result<Vec<PluginInfo>> {
-    scan_clap_paths(&paths).map_err(napi::Error::from_reason)
-}
-
-#[cfg(feature = "napi")]
-#[napi]
-pub fn scan_audio_plugins(paths: Vec<String>) -> napi::Result<Vec<PluginInfo>> {
-    scan_audio_plugin_paths(&paths).map_err(napi::Error::from_reason)
-}
-
-#[cfg(feature = "napi")]
-#[napi]
-pub fn get_backend_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
-}

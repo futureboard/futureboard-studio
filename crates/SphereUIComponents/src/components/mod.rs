@@ -201,7 +201,7 @@ pub use background_tasks::{
     BackgroundTaskProgress, BackgroundTaskStatus, BackgroundTaskStore, BackgroundTaskToggleCb,
     BackgroundTaskUpdate,
 };
-pub use bottom_panel::{bottom_panel, BottomPanelResizeDrag, BottomPanelState, BottomTab};
+pub use bottom_panel::{BottomPanelResizeDrag, BottomPanelState, BottomTab};
 pub(crate) use bottom_panel_shell::BottomPanelShell;
 pub use box_list_view::{
     box_list_empty_state, box_list_group_label, box_list_icon_button, box_list_item,
@@ -212,7 +212,7 @@ pub use color_picker::{
     color_picker_field, color_picker_trigger, default_presets, ColorPickerCallbacks,
     ColorPickerPlacement, ColorPickerState, ColorPickerValue,
 };
-pub use combo_box::{combo_box_menu, combo_box_trigger, dedupe_preserve_order, ComboBoxOption};
+pub use combo_box::{combo_box_trigger, dedupe_preserve_order, ComboBoxOption};
 pub use command_palette::{
     command_palette_entries, command_palette_overlay, CommandPaletteEntry, CommandPaletteState,
 };
@@ -259,7 +259,7 @@ pub use numeric_edit::{
     is_intermediate_draft, parse_draft, CommitPolicy, CommitTrigger, NumberFormat,
     NumericEditSession,
 };
-pub use panel::{inspector_debug, inspector_debug_enabled, right_panel};
+pub use panel::{inspector_debug, inspector_debug_enabled};
 pub use performance_overlay::{performance_overlay, PerformanceOverlaySnapshot};
 pub use piano_roll::PianoRoll;
 pub use plugin_manager::{

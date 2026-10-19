@@ -3,8 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-// NativeEditorShell uses manual layout intentionally. Yoga is reserved for
-// complex component UI.
+// NativeEditorShell uses manual layout intentionally.
 
 enum class DauxEditorKind : int {
   ChildHwndEmbed = 0,

@@ -210,9 +210,6 @@ jobs:
         if: hashFiles('build/cef/150.0.11/**/archive.json') == ''
         run: cargo run -p SphereWebView --example install_cef --features installer
 
-      - name: Install and build built-in plugin editors
-        run: bun run build:plugin-editors
-
       - name: cargo clippy (Community Edition)
         run: cargo clippy-ce --all-targets -- -D warnings
 
@@ -279,9 +276,6 @@ jobs:
 
       - name: Install pinned CEF SDK (macOS x86_64)
         run: cargo run -p SphereWebView --example install_cef --features installer -- --target x86_64-apple-darwin
-
-      - name: Install and build built-in plugin editors
-        run: bun run build:plugin-editors
 
       - name: cargo check (x86_64-apple-darwin)
         run: |

@@ -3,34 +3,10 @@ name = "sphere_directaudioengine"
 version = "2026.10.16-beta1.4.4"
 edition = "2021"
 description = "SphereDirectAudioEngine — native Rust audio backend for Futureboard Studio"
-
-# ── Library target ───────────────────────────────────────────────────────────
-#
-# rlib:
-#   Used by Futureboard Studio native / GPUI directly.
-#
-# cdylib:
-#   Used when building the Electron / Node.js native addon.
-#
-# NOTE:
-# Cargo cannot feature-gate crate-type directly, so this crate always declares
-# both outputs. The actual N-API Rust code must still be guarded with:
-#
-#   #[cfg(feature = "napi")]
-#
-# so normal native workspace builds do not link against Node/N-API symbols.
 license.workspace = true
 
 [lib]
 name = "DirectAudio"
-crate-type = ["rlib", "cdylib"]
-
-# ── Main native executable ───────────────────────────────────────────────────
-# Output: SphereDirectAudioEngine.exe (explicit bin name; the package keeps its
-# `sphere_directaudioengine` name so dependency references are unaffected).
-[[bin]]
-name = "SphereDirectAudioEngine"
-path = "src/main.rs"
 
 # ── CLI test harness ─────────────────────────────────────────────────────────
 #
@@ -45,13 +21,6 @@ required-features = ["audio-test-bin"]
 
 # ── Runtime dependencies ─────────────────────────────────────────────────────
 [dependencies]
-# N-API binding framework.
-#
-# Disabled by default so Futureboard Studio native does not link against
-# Electron / Node.js symbols.
-napi = { workspace = true, optional = true }
-napi-derive = { workspace = true, optional = true }
-
 # Cross-platform audio I/O:
 #   Windows → WASAPI
 #   macOS   → CoreAudio
@@ -114,12 +83,6 @@ zbus.workspace = true
 
 # ── Build dependencies ───────────────────────────────────────────────────────
 [build-dependencies]
-# Required when building the N-API addon path.
-#
-# IMPORTANT:
-# build.rs should only call napi_build setup when CARGO_FEATURE_NAPI is set.
-napi-build.workspace = true
-
 # Native helper build tooling.
 cc.workspace = true
 pkg-config.workspace = true
@@ -128,15 +91,6 @@ pkg-config.workspace = true
 [features]
 # Default build is native/rlib-safe for Futureboard Studio.
 default = []
-
-# Enable Electron / Node.js native addon surface.
-#
-# Build example:
-#   cargo build -p sphere_directaudioengine --features napi
-napi = [
-    "dep:napi",
-    "dep:napi-derive",
-]
 
 # Enable local CLI test binary.
 #

@@ -15,7 +15,6 @@ REQUIRED_SUBMODULES=(
   external/ARA_SDK
   external/clap
   external/clap-helpers
-  external/yoga
   packages/shared/tabler-icons
   packages/shared/lucide
 )
@@ -35,7 +34,6 @@ echo "Initializing required submodules (shallow where safe)..."
 git submodule update --init --force --depth=1 --checkout -- \
   external/clap \
   external/clap-helpers \
-  external/yoga \
   packages/shared/tabler-icons \
   packages/shared/lucide
 

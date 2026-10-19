@@ -13,8 +13,6 @@
 
 use std::collections::HashMap;
 
-use crate::builtin::builtin_editor_url;
-
 /// A track insert slot a built-in instance occupies. `track_id` is the host's
 /// stable track identity; `insert_index` is the slot on that track's chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -152,11 +150,6 @@ impl InstanceManager {
             .get(plugin_id)
             .and_then(|id| self.instances.get(id))
     }
-
-    /// The `mikoplugin://` editor URL for a plug-in type (built-ins with a UI).
-    pub fn editor_url(&self, plugin_id: &str) -> Option<String> {
-        builtin_editor_url(plugin_id)
-    }
 }
 
 #[cfg(test)]
@@ -214,21 +207,5 @@ mod tests {
         m.remove_instance(a);
         assert!(m.bound_instance(ROD).is_none());
         assert!(m.is_empty());
-    }
-
-    #[test]
-    fn no_builtin_resolves_a_web_editor_url() {
-        let m = InstanceManager::new();
-        // Every built-in editor is native now; none has a CEF bundle.
-        for id in [
-            ROD,
-            "builtin:equz8",
-            "builtin:verbspace",
-            "builtin:imager",
-            "builtin:mixstation",
-            "builtin:c1073",
-        ] {
-            assert!(m.editor_url(id).is_none(), "{id}");
-        }
     }
 }

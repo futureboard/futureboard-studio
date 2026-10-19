@@ -9,11 +9,7 @@ use SphereAudioProcessor::StretchParams;
 
 // ── DAUx backend selection types ──────────────────────────────────────────────
 
-#[cfg(feature = "napi")]
-use napi_derive::napi;
-
 /// Information about one available DAUx backend.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsDauxBackendInfo {
     /// Machine-readable id: "auto" | "wasapi-shared" | "wasapi-exclusive" | "wdm-ks" | "coreaudio" | "alsa" | "mme"
@@ -29,7 +25,6 @@ pub struct JsDauxBackendInfo {
 }
 
 /// Configuration for selecting / opening a DAUx backend.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsDauxConfig {
     /// Backend id string (see `JsDauxBackendInfo.id`).
@@ -47,7 +42,6 @@ pub struct JsDauxConfig {
 }
 
 /// Runtime status of the active DAUx backend.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsDauxStatus {
     /// Active backend id.
@@ -91,11 +85,8 @@ pub struct JsDauxStatus {
     pub device_state: String,
 }
 
-// ── N-API–visible types ────────────────────────────────────────────────────────
-// These cross the Rust/JS boundary via napi-derive.  Field names use camelCase
-// so they arrive at JS looking natural.
-
-#[cfg_attr(feature = "napi", napi(object))]
+// ── Engine control types ─────────────────────────────────────────────────────
+// The `Js*` names are historical (they once crossed an N-API boundary).
 #[derive(Debug, Default)]
 pub struct JsSphereAudioStatus {
     pub available: bool,
@@ -111,8 +102,6 @@ pub struct JsSphereAudioStatus {
     pub output_device: Option<String>,
     pub last_error: Option<String>,
 }
-
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Clone)]
 pub struct JsAudioDeviceInfo {
     pub id: String,
@@ -123,8 +112,6 @@ pub struct JsAudioDeviceInfo {
     pub is_default: bool,
     pub backend: String,
 }
-
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default)]
 pub struct JsDeviceOpenConfig {
     pub input_device_id: Option<String>,
@@ -132,8 +119,6 @@ pub struct JsDeviceOpenConfig {
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
 }
-
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsTrackMeterSnapshot {
     pub track_id: String,
@@ -142,8 +127,6 @@ pub struct JsTrackMeterSnapshot {
     pub rms_l: f64,
     pub rms_r: f64,
 }
-
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsPluginOutputMeterSnapshot {
     pub track_id: String,
@@ -151,8 +134,6 @@ pub struct JsPluginOutputMeterSnapshot {
     pub channel: u32,
     pub peak: f64,
 }
-
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsMeterSnapshot {
     pub tracks: Vec<JsTrackMeterSnapshot>,
@@ -174,7 +155,6 @@ pub struct JsMeterSnapshot {
 }
 
 /// Per-track plugin latency (sum of enabled native-plugin insert latencies).
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsTrackLatency {
     pub track_id: String,
@@ -190,7 +170,6 @@ pub struct JsTrackLatency {
 
 /// Latency report for the Audio Settings / mixer UI (Phase V — reporting only;
 /// full plug-in delay compensation is Phase W).
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsLatencyInfo {
     pub sample_rate: u32,
@@ -210,8 +189,6 @@ pub struct JsLatencyInfo {
     /// Longest per-track plugin latency (legacy field kept for older UI callers).
     pub max_track_samples: u32,
 }
-
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsWavPeakResult {
     pub file_id: String,
@@ -223,16 +200,12 @@ pub struct JsWavPeakResult {
     /// Interleaved Int16 min/max pairs per peak/channel, widened for N-API.
     pub peaks: Vec<i32>,
 }
-
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsWavExportResult {
     pub file_path: String,
     pub frames_written: f64,
     pub data_bytes: f64,
 }
-
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsAudioFileInfo {
     pub path: String,
@@ -243,7 +216,7 @@ pub struct JsAudioFileInfo {
     pub format: String,
 }
 
-// ── Internal (non-napi) serializable types ────────────────────────────────────
+// ── Internal serializable types ──────────────────────────────────────────────
 // These live purely on the Rust side and are used for project snapshots
 // passed as JSON strings from the JS side.
 
@@ -844,7 +817,6 @@ pub struct EngineStatus {
 // ── Recording types ───────────────────────────────────────────────────────────
 
 /// Config for one armed track being recorded.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsRecordingTrackConfig {
     pub track_id: String,
@@ -855,7 +827,6 @@ pub struct JsRecordingTrackConfig {
 }
 
 /// Full config passed to `startRecording()`.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsStartRecordingConfig {
     /// Absolute path to the project folder root.
@@ -885,7 +856,6 @@ pub struct JsStartRecordingConfig {
 }
 
 /// Per-track result returned by `stopRecording()`.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsRecordingResult {
     pub track_id: String,
@@ -916,7 +886,6 @@ pub struct JsRecordingResult {
 }
 
 /// Snapshot of recording state for UI polling.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsRecordingStatus {
     pub active: bool,
@@ -926,7 +895,6 @@ pub struct JsRecordingStatus {
 
 /// Debug state snapshot returned by `getDebugInfo()`.
 /// Exposes the internal runtime graph so JS can verify the engine is loaded.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default)]
 pub struct JsEngineDebugInfo {
     /// Project ID from the last loaded snapshot.
@@ -985,7 +953,6 @@ pub struct JsEngineDebugInfo {
 // ── Audio input diagnostics (Layer 10) ─────────────────────────────────────────
 
 /// Per-track input/monitor state snapshot for the audio diagnostics panel.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsTrackInputDiagnostics {
     pub track_id: String,
@@ -1000,7 +967,6 @@ pub struct JsTrackInputDiagnostics {
 /// Whole-pipeline diagnostics snapshot. Mirrors the `AudioDiagnostics` struct in
 /// the task spec — lets the UI (or a dev console dump) verify every layer of the
 /// input path at a glance.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsAudioDiagnostics {
     pub backend: String,
@@ -1034,7 +1000,6 @@ pub struct JsAudioDiagnostics {
 // ── Recording waveform preview (Part 1) ────────────────────────────────────────
 
 /// One realtime preview peak bin (min/max/rms of one preview window).
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JsWaveformPeak {
     pub min: f64,
@@ -1044,7 +1009,6 @@ pub struct JsWaveformPeak {
 
 /// Metadata + current bin count for the in-progress recording preview. The UI
 /// polls this, then drains new bins with `drainRecordingPreviewPeaks(from)`.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsRecordingPreviewInfo {
     pub active: bool,
@@ -1063,7 +1027,6 @@ pub struct JsRecordingPreviewInfo {
 /// recording preview (multi-track). The UI polls
 /// `recordingPreviewTracks()`, then drains each track with
 /// `drainRecordingPreviewPeaksForTrack(trackId, from)`.
-#[cfg_attr(feature = "napi", napi(object))]
 #[derive(Debug, Default, Clone)]
 pub struct JsRecordingPreviewTrackInfo {
     pub track_id: String,

@@ -1,7 +1,3 @@
-// Required by napi-build to generate platform-specific .def / linker files
-// for the native Node.js addon (.node output).
-extern crate napi_build;
-
 fn main() {
     let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let sdk_root = manifest_dir.join("../../external/vst3sdk");
@@ -69,8 +65,6 @@ fn main() {
 
     build_vst2_bridge(&manifest_dir, &bridge_root);
     build_clap_bridge(&manifest_dir, &bridge_root);
-
-    napi_build::setup();
 }
 
 /// Add the header-only ARA API include path, but only when the SDK submodule is

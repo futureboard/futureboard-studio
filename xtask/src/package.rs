@@ -106,15 +106,6 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
                 .collect()
         }
     };
-    let editor_directory_names = selected_editor_directory_names(&selected);
-    if !editor_directory_names.is_empty() {
-        // scripts/build.ts discovers editors by their directory names. Those
-        // names are not required to match Cargo package names (for example,
-        // `67Clipper` contains the `clipper67` package).
-        eprintln!("[xtask] installing and building editor frontends for selected plugins");
-        plugins::build_editor_uis(&workspace, &editor_directory_names)?;
-    }
-
     let cef_dist = cef::prepare_cef_dist(&workspace, &target_triple)
         .context("failed to prepare the CEF distribution")?;
     if options.stage_cef && cef_dist.is_none() {
@@ -217,21 +208,6 @@ pub fn run(options: &PackageOptions) -> Result<PathBuf> {
 
     // 4b. Optionally build and stage Built-in Plugin dynamic libraries.
     if options.plugins.is_enabled() {
-        // A plugin that embeds its editor is not release-ready when the static
-        // bundle is absent: compiling it would silently embed an empty asset
-        // table. A plugin that merely *ships* a bundle nothing consumes yet is
-        // unaffected, so it must not block a release.
-        for plugin in &selected {
-            if plugins::embeds_editor_ui(&plugin.crate_dir)
-                && !plugins::editor_ui_built(&plugin.crate_dir)
-            {
-                bail!(
-                    "plugin `{}` embeds its editor but has no built dist/index.html; \
-                     run its editor build before packaging",
-                    plugin.name,
-                );
-            }
-        }
         let packages: Vec<String> = selected.iter().map(|p| p.name.clone()).collect();
         let built = plugins::build_plugins(
             &packages,
@@ -390,19 +366,9 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// A discovered Built-in Plugin package (name + crate directory).
+/// A discovered Built-in Plugin package.
 struct DiscoveredPlugin {
     name: String,
-    crate_dir: PathBuf,
-}
-
-fn selected_editor_directory_names(selected: &[&DiscoveredPlugin]) -> Vec<String> {
-    selected
-        .iter()
-        .filter(|plugin| plugins::has_editor_ui(&plugin.crate_dir))
-        .filter_map(|plugin| plugin.crate_dir.file_name())
-        .map(|name| name.to_string_lossy().into_owned())
-        .collect()
 }
 
 /// Workspace member packages that build a Built-in Plugin dynamic library
@@ -428,13 +394,8 @@ fn plugin_packages() -> Result<Vec<DiscoveredPlugin>> {
                 .any(|kind| matches!(kind.as_str(), "cdylib" | "dylib"))
         });
         if in_plugin_dir && produces_dylib {
-            let crate_dir = manifest
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."));
             packages.push(DiscoveredPlugin {
                 name: package.name.to_string(),
-                crate_dir,
             });
         }
     }
@@ -459,12 +420,9 @@ fn package_version() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::path::PathBuf;
 
-    use super::{
-        DiscoveredPlugin, PluginSelection, macos_app_bundle_out, selected_editor_directory_names,
-    };
+    use super::{PluginSelection, macos_app_bundle_out};
 
     #[test]
     fn plugin_selection_all_and_none() {
@@ -510,23 +468,6 @@ mod tests {
         assert_eq!(
             PluginSelection::parse(Some("none"), true),
             PluginSelection::None
-        );
-    }
-
-    #[test]
-    fn editor_build_uses_directory_name_instead_of_cargo_package_name() {
-        let temp = tempfile::tempdir().unwrap();
-        let crate_dir = temp.path().join("67Clipper");
-        fs::create_dir_all(crate_dir.join("editorui")).unwrap();
-        fs::write(crate_dir.join("editorui/package.json"), "{}").unwrap();
-        let clipper = DiscoveredPlugin {
-            name: "clipper67".to_string(),
-            crate_dir,
-        };
-
-        assert_eq!(
-            selected_editor_directory_names(&[&clipper]),
-            vec!["67Clipper".to_string()]
         );
     }
 

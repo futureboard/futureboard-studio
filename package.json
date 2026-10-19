@@ -4,13 +4,8 @@
   "type": "module",
   "workspaces": {
     "packages": [
-      "apps/*",
       "apps/native/livestage/webui",
-      "packages/*",
-      "crates/*",
-      "extensions/template",
-      "crates/BuiltinAudioPlugins/crates/*/editor",
-      "crates/BuiltinAudioPlugins/crates/*/editorui"
+      "packages/*"
     ],
     "catalog": {
       "@dnd-kit/core": "^6.3.1",
@@ -52,7 +47,6 @@
   },
   "scripts": {
     "dev:native": "cargo build -p futureboard_native && cargo run -p futureboard_native",
-    "dev:server": "bun run --cwd apps/server dev",
     "cargo:check": "cargo check --workspace",
     "cargo:build": "cargo build --workspace",
     "cargo:release": "cargo build --workspace --release",
@@ -61,7 +55,6 @@
     "cargo:fmt": "cargo fmt --all",
     "cargo:fmt:check": "cargo fmt --all -- --check",
     "cargo:clean": "cargo clean",
-    "build:plugin-editors": "bun run scripts/build.ts",
     "build:livestage-web": "bun run --cwd apps/native/livestage/webui build",
     "build:native": "cargo run -p xtask -- package --profile release --edition community --plugin all",
     "build:native:debug": "cargo run -p xtask -- package --profile dev --edition community --plugin all",
@@ -69,14 +62,12 @@
     "bundle:native:mac:dmg": "bash packaging/native/bundle-macos.sh && bash packaging/native/bundle-macos-dmg.sh",
     "bundle:native:win": "pwsh -File packaging/windows/build-installer.ps1",
     "installer:native:win": "bun run build:native && pwsh -File packaging/windows/build-installer.ps1",
-    "build:audio:plugins": "cargo check -p sphere-audio-plugins && cargo check --manifest-path extensions/template/Cargo.toml && bun install --cwd extensions/template && bun run --cwd extensions/template typecheck",
     "build:all": "bun run build:native",
     "check": "bun run cargo:check",
     "lint": "bun run cargo:clippy",
     "fmt": "bun run cargo:fmt"
   },
   "dependencies": {
-    "concurrently": "^9.2.1",
     "sharp": "^0.35.1"
   }
 }

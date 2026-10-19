@@ -14,12 +14,10 @@ members = [
     "crates/SphereDirectAudioEngine",
     "crates/SphereEncoder",
     "crates/SphereGraphicEngine",
-    "crates/SphereNotationEngine",
     "crates/SpherePluginHost",
     "crates/SphereSoundfontPlayer",
     "crates/SphereUIComponents",
     "crates/SphereVideoPlayer",
-    "crates/SphereWebAudioCore",
     "crates/SpherePackageInstaller",
     "apps/native/apakinstaller",
     "crates/SphereAudioProcessor",
@@ -74,17 +72,7 @@ exclude = [
     # but must not be claimed as a member of the Futureboard root workspace.
     "crates/gpui",
 
-    # JS/Rust extension templates — built independently.
-    "extensions",
-    "extensions/template",
-    "extensions/template-react",
-    "extensions/template-vue",
-
     # Experimental / placeholder crates. Promote only when implementation is real.
-    "crates/SphereExtensionHost",
-    "crates/SphereMediaUtils",
-    "crates/SphereNoiseRemover",
-    "crates/SphereSettings",
     "crates/SphereVoiceTune",
 ]
 
@@ -207,30 +195,8 @@ gpui_macros = { path = "crates/gpui/crates/gpui_macros" }
 gpui_platform = { path = "crates/gpui/crates/gpui_platform", default-features = false }
 gpui_shared_string = { path = "crates/gpui/crates/gpui_shared_string" }
 gpui_util = { path = "crates/gpui/crates/gpui_util" }
-gpui_web = { path = "crates/gpui/crates/gpui_web" }
 gpui_wgpu = { path = "crates/gpui/crates/gpui_wgpu" }
 gpui_windows = { path = "crates/gpui/crates/gpui_windows", default-features = false }
-
-
-# =============================================================================
-# Zed / GPUI support crates vendored in this repository
-# =============================================================================
-
-collections = { path = "crates/collections", version = "0.1.0" }
-derive_refineable = { path = "crates/refineable/derive_refineable" }
-http_client = { path = "crates/http_client" }
-http_client_tls = { path = "crates/http_client_tls" }
-media = { path = "crates/media" }
-perf = { path = "tooling/perf" }
-refineable = { path = "crates/refineable" }
-reqwest_client = { path = "crates/reqwest_client" }
-scheduler = { path = "crates/scheduler" }
-sum_tree = { path = "crates/sum_tree" }
-util = { path = "crates/util" }
-util_macros = { path = "crates/util_macros" }
-zlog = { path = "crates/zlog" }
-ztracing = { path = "crates/ztracing" }
-ztracing_macro = { path = "crates/ztracing_macro" }
 
 
 # =============================================================================
@@ -333,15 +299,6 @@ slotmap = "1.0.6"
 smol_str = "0.3.6"
 thiserror = "2.0.12"
 uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
-
-
-# =============================================================================
-# N-API / native addon compatibility
-# =============================================================================
-
-napi = { version = "2", features = ["napi4"] }
-napi-build = "2"
-napi-derive = "2"
 
 
 # =============================================================================
@@ -500,17 +457,6 @@ windows-registry = "0.5"
 
 
 # =============================================================================
-# Web / WASM
-# =============================================================================
-
-console_error_panic_hook = "0.1"
-serde-wasm-bindgen = "0.6"
-wasm-bindgen = "0.2.120"
-wasm-bindgen-test = "0.3"
-web-time = "1.1.0"
-
-
-# =============================================================================
 # Networking / cloud / collaboration
 # =============================================================================
 
@@ -575,7 +521,6 @@ quote = "1.0.9"
 rand = "0.9"
 rayon = "1.8"
 regex = "1.5"
-scap = { git = "https://github.com/zed-industries/scap", rev = "4afea48c3b002197176fb19cd0f9b180dd36eaac", default-features = false, package = "zed-scap", version = "0.0.8-zed" }
 sha2 = "0.10"
 shlex = "1.3.0"
 smallvec = { version = "1.6", features = ["union", "const_new"] }
@@ -667,7 +612,3 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
-
-[profile.release.package.futureboard-core]
-opt-level = "s"
-strip = "debuginfo"

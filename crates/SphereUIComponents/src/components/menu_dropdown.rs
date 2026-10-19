@@ -1,7 +1,5 @@
-//! Native GPUI port of the WebUI top-menu dropdown panel.
-//!
-//! Source of truth for the visuals is `apps/web/src/components/TransportBar.tsx`'s
-//! `MenuPanel`. Matching tokens:
+//! The top-menu dropdown panel. Visual tokens (carried over from the retired
+//! web UI's `MenuPanel`):
 //!
 //! * panel background  = `daw-surface`
 //! * panel border      = `daw-border`

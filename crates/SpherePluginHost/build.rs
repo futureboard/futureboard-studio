@@ -1,5 +1,3 @@
-extern crate napi_build;
-
 fn main() {
     let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -121,7 +119,6 @@ fn main() {
     }
 
     build.compile("sphere_plugin_host_vst3");
-    napi_build::setup();
 }
 
 fn target_os_for_au() -> String {

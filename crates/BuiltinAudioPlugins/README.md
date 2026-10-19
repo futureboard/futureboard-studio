@@ -21,7 +21,7 @@ Wire-up into DAUx / `SphereAudioPlugins` happens in a later integration pass.
 | `c1073` | 3-band channel EQ + drive | 3 hard | `biquad` |
 | `meowsyn` | Polyphonic soft-synth | 3 hard | [`fundsp`](https://crates.io/crates/fundsp) (MIT OR Apache-2.0) |
 
-Other stub crates under `crates/` (`ampstage`, …) stay placeholders until a later slice.
+Only real plugin crates live under `crates/`; placeholders are not kept.
 
 ## Shared contract
 

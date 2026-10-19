@@ -150,21 +150,13 @@ detach the child before destroying its parent.
 
 ## Built-in plug-in editors
 
+- Built-in editors are native GPUI views built from `plugin_kit`; there is no
+  web editor bundle to build.
 - Rust is the authority for parameter IDs, ranges, defaults, normalization,
   DSP, state and persistence; the editor is a thin view over the parameter
   bridge.
-- Build to deterministic static assets. No dev server, CDN or network access
-  at runtime.
-- The custom scheme, asset lookup and CEF lifecycle stay native-owned.
-- Keep the editor's React/Tailwind conventions inside the editor — they do not
-  belong in the GPUI app chrome.
-
-Each editor has its own package scripts, for example:
-
-```bash
-bun run --cwd crates/BuiltinAudioPlugins/crates/rodharerist/editorui build
-bun run build:plugin-editors   # every editor
-```
+- The CEF runtime (`crates/SphereWebView`) stays in the build even though no
+  editor uses it today.
 
 ---
 

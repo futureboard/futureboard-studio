@@ -7,11 +7,8 @@
 //! matched exhaustively in ~150 places). Built-ins are identified by a
 //! `builtin:` id prefix via [`is_builtin_id`] / [`RegistryPlugin::is_builtin`].
 //!
-//! Every built-in editor is a native GPUI view today. The `Web` kind and the
-//! shared `mikoplugin://<plugin>/index.html` scheme [`builtin_editor_url`]
-//! builds remain for a built-in that ships an embedded editor bundle; none
-//! does now. This module is pure data + string mapping — no DSP crate dependency, so the
-//! host crate stays lean.
+//! Every built-in editor is a native GPUI view. This module is pure data +
+//! string mapping — no DSP crate dependency, so the host crate stays lean.
 
 use crate::plugin_db::PluginScanStatus;
 use crate::registry::{PluginFormat, PluginKind, PluginStatus, RegistryPlugin};
@@ -19,19 +16,11 @@ use crate::registry::{PluginFormat, PluginKind, PluginStatus, RegistryPlugin};
 /// Id prefix that marks a registry row as a Futureboard built-in.
 pub const BUILTIN_ID_PREFIX: &str = "builtin:";
 
-/// Custom URL scheme the shared CEF host uses for embedded plugin editors. Must
-/// stay in sync with `builtin_audio_plugins::ui::PLUGIN_URL_SCHEME` (kept as a
-/// literal here so the host crate does not depend on the DSP umbrella crate).
-pub const PLUGIN_URL_SCHEME: &str = "mikoplugin";
-
 /// How a built-in's editor is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinEditorKind {
     /// No editor; the insert is edited from Studio's generic controls.
     None,
-    /// An embeddable React bundle (`editor/` or `editorui/` — both layouts
-    /// are in use), served to CEF through `mikoplugin://<stem>`.
-    Web,
     /// A native GPUI view drawn by Studio itself, inside the same plug-in
     /// shell. No browser involved.
     Native,
@@ -39,7 +28,7 @@ pub enum BuiltinEditorKind {
 
 /// One entry in the curated built-in catalog.
 struct BuiltinEntry {
-    /// Library / plugin id stem (also the `mikoplugin://<stem>` origin).
+    /// Library / plugin id stem.
     stem: &'static str,
     name: &'static str,
     category: &'static str,
@@ -314,15 +303,6 @@ pub fn builtin_editor_kind(id: &str) -> Option<BuiltinEditorKind> {
         .map(|entry| entry.editor)
 }
 
-/// The `mikoplugin://<stem>/index.html` editor URL for a built-in id, or `None`
-/// when the id is not a built-in or that built-in ships no web editor.
-pub fn builtin_editor_url(id: &str) -> Option<String> {
-    let stem = builtin_stem(id)?;
-    let entry = CATALOG.iter().find(|e| e.stem == stem)?;
-    (entry.editor == BuiltinEditorKind::Web)
-        .then(|| format!("{PLUGIN_URL_SCHEME}://{stem}/index.html"))
-}
-
 /// Whether a built-in id has an editor of either kind.
 pub fn builtin_has_editor(id: &str) -> bool {
     builtin_editor_kind(id).is_some_and(|kind| kind != BuiltinEditorKind::None)
@@ -402,24 +382,8 @@ mod tests {
         }
     }
 
-    /// Every built-in editor is native now: none is served to CEF.
-    #[test]
-    fn no_builtin_ships_a_web_editor() {
-        for plugin in builtin_catalog(0) {
-            assert!(builtin_editor_url(&plugin.id).is_none(), "{}", plugin.name);
-            assert_ne!(
-                builtin_editor_kind(&plugin.id),
-                Some(BuiltinEditorKind::Web),
-                "{}",
-                plugin.name
-            );
-        }
-        assert!(builtin_editor_url("vst3:whatever").is_none());
-    }
-
     #[test]
     fn rodharerist_is_native_not_web() {
-        assert!(builtin_editor_url(&builtin_id("rodharerist")).is_none());
         assert_eq!(
             builtin_editor_kind(&builtin_id("rodharerist")),
             Some(BuiltinEditorKind::Native)
@@ -448,7 +412,6 @@ mod tests {
             "imager",
             "mixstation",
         ] {
-            assert!(builtin_editor_url(&builtin_id(stem)).is_none(), "{stem}");
             assert_eq!(
                 builtin_editor_kind(&builtin_id(stem)),
                 Some(BuiltinEditorKind::Native)

@@ -1,10 +1,7 @@
 //! The shell a built-in plug-in's **native** editor sits in.
 //!
-//! Built-in plug-ins have two kinds of editor (see
-//! `SpherePluginHost::BuiltinEditorKind`): a web bundle hosted in CEF by
-//! `builtin_plugin_editor_window`, or a native GPUI view drawn by Studio.
-//! This module is the frame every native one shares, so they all read as one
-//! family with the CEF-hosted editors:
+//! Every built-in plug-in editor is a native GPUI view drawn by Studio. This
+//! module is the frame they all share, so they read as one family:
 //!
 //! * the external-window title bar;
 //! * an identity strip — the plug-in, the track and insert it is editing, and

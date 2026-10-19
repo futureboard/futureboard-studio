@@ -376,13 +376,6 @@ fn track_type_color(t: TrackType) -> gpui::Rgba {
     }
 }
 
-/// Legacy entry point — kept so any existing call sites still compile. Returns
-/// an empty placeholder identical to the pre-state version.
-pub fn right_panel() -> impl IntoElement {
-    let i18n = I18n::new("en");
-    inspector_shell(false, i18n).child(no_selection(0, i18n))
-}
-
 /// Inspector driven by the live selection. Renders one of:
 /// 1. Clip details when a clip is selected.
 /// 2. Track details when only a track is selected.

@@ -13,9 +13,6 @@
 [submodule "external/clap-helpers"]
 	path = external/clap-helpers
 	url = https://github.com/free-audio/clap-helpers
-[submodule "external/yoga"]
-	path = external/yoga
-	url = https://github.com/facebook/yoga
 [submodule "external/ARA_SDK"]
 	path = external/ARA_SDK
 	url = https://github.com/Celemony/ARA_SDK

@@ -28,4 +28,4 @@ Plugin processing must avoid:
 - logging
 - blocking calls
 
-Extension backends should follow the same contract as the template in `extensions/template`.
+Extension backends should follow the same contract.

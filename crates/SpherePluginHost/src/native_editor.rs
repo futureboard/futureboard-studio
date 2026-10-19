@@ -5,7 +5,7 @@
 //! is feature-gated; this module ships the native surface as
 //! `Result<u64, String>`.
 //!
-//! Hard rules (per `SKILL.md` §13–14):
+//! Hard rules (per `CLAUDE.md`, hosted and bridged plugins):
 //! - These calls must not run on the audio thread.
 //! - Every `attach_editor_into_parent` must pair with `detach_editor`.
 //! - Bad plugin → `Err(...)`, never panic.
