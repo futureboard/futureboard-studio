@@ -217,6 +217,12 @@ pub struct TimelineState {
     /// otherwise follow. Compare it for equality only: values are unique in
     /// the process, not consecutive.
     pub track_names_revision: u64,
+    /// The track most recently created in this arrangement (added,
+    /// duplicated), with a stamp no other creation in this process shares.
+    /// Non-persisted. The shell compares the stamp to notice an addition
+    /// once and bring the new track up in the Mixer; see
+    /// [`TimelineState::note_track_created`].
+    pub last_created_track: Option<(String, u64)>,
     /// Legacy single signature — kept in sync with the marker at beat 0 for
     /// templates and engine fallbacks.
     pub time_signature_num: u32,
@@ -386,6 +392,7 @@ impl Default for TimelineState {
             song_text_index: SongTextIndex::default(),
             song_text_revision: 0,
             track_names_revision: fresh_track_names_revision(),
+            last_created_track: None,
             time_signature_num: 4,
             time_signature_den: 4,
             viewport: TimelineViewport {

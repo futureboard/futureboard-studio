@@ -71,12 +71,21 @@ use drag::SendSlotDrag;
 pub use split::*;
 
 /// True when a mixer strip should paint as selected (multi-select aware).
+///
+/// The same rule as `TimelineSelection::is_track_selected`, so a strip and
+/// its arrangement header always agree: the selected tracks, or the primary
+/// alone when the multi-selection does not hold it (a track picked by an
+/// import or a new-track action, which set only the primary).
 #[inline]
 fn mixer_strip_is_selected(track_id: &str, primary: Option<&str>, selected_ids: &[String]) -> bool {
-    if !selected_ids.is_empty() {
-        selected_ids.iter().any(|id| id == track_id)
-    } else {
-        primary == Some(track_id)
+    match primary {
+        Some(primary)
+            if selected_ids.is_empty() || !selected_ids.iter().any(|id| id == primary) =>
+        {
+            primary == track_id
+        }
+        Some(_) => selected_ids.iter().any(|id| id == track_id),
+        None => false,
     }
 }
 
@@ -2946,6 +2955,27 @@ pub fn mixer_scroll_x_for_strip_index(
     target.clamp(0.0, max_scroll_x.max(0.0))
 }
 
+/// The scroll that brings a strip into view, or `None` when it is already
+/// wholly on screen. Revealing the selection should not move a mixer the
+/// user is looking at; an off-screen strip is centred like a tree focus.
+pub fn mixer_scroll_x_to_reveal(
+    strip_index: usize,
+    scroll_x: f32,
+    viewport_width: f32,
+    strip_count: usize,
+) -> Option<f32> {
+    let left = strip_index as f32 * STRIP_WIDTH;
+    let right = left + STRIP_WIDTH;
+    if left >= scroll_x - 0.5 && right <= scroll_x + viewport_width + 0.5 {
+        return None;
+    }
+    Some(mixer_scroll_x_for_strip_index(
+        strip_index,
+        viewport_width,
+        strip_count,
+    ))
+}
+
 pub(crate) fn collect_mixer_render_items(
     tracks: &[TrackState],
     collapsed_vsti_output_groups: &HashSet<String>,
@@ -3841,7 +3871,9 @@ mod collapse_filter_tests {
 
 #[cfg(test)]
 mod mixer_virtualization_tests {
-    use super::mixer_visible_item_range;
+    use super::{
+        mixer_scroll_x_to_reveal, mixer_strip_is_selected, mixer_visible_item_range, STRIP_WIDTH,
+    };
 
     #[test]
     fn thousand_strip_detail_window_stays_bounded() {
@@ -3852,6 +3884,56 @@ mod mixer_virtualization_tests {
         assert!(middle.len() <= 12);
         assert!(end.len() <= 12);
         assert_eq!(end.end, 1_000);
+    }
+
+    #[test]
+    fn revealing_a_strip_scrolls_only_when_it_is_off_screen() {
+        let viewport = STRIP_WIDTH * 5.0;
+        // Strips 0..5 fill the view at scroll 0.
+        assert_eq!(mixer_scroll_x_to_reveal(0, 0.0, viewport, 40), None);
+        assert_eq!(mixer_scroll_x_to_reveal(4, 0.0, viewport, 40), None);
+
+        let scroll = mixer_scroll_x_to_reveal(20, 0.0, viewport, 40).expect("off screen");
+        let left = 20.0 * STRIP_WIDTH;
+        assert!(left >= scroll && left + STRIP_WIDTH <= scroll + viewport);
+
+        // Back to the start from far right; clamped at the first strip.
+        assert_eq!(
+            mixer_scroll_x_to_reveal(0, 30.0 * STRIP_WIDTH, viewport, 40),
+            Some(0.0)
+        );
+        // A strip half under the right edge counts as off screen; once the
+        // view has moved one strip it is wholly visible and stays put.
+        assert!(mixer_scroll_x_to_reveal(5, STRIP_WIDTH * 0.5, viewport, 40).is_some());
+        assert!(mixer_scroll_x_to_reveal(5, 0.0, viewport, 40).is_some());
+        assert!(mixer_scroll_x_to_reveal(5, STRIP_WIDTH, viewport, 40).is_none());
+    }
+
+    #[test]
+    fn a_strip_is_selected_exactly_when_its_arrangement_header_is() {
+        use crate::components::timeline::timeline_state::TimelineState;
+
+        let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let cases: [(Option<&str>, Vec<String>); 5] = [
+            (None, ids(&[])),
+            (Some("a"), ids(&[])),
+            (Some("a"), ids(&["a", "b"])),
+            // A primary set alone (an import, a new track) over a stale list.
+            (Some("c"), ids(&["a", "b"])),
+            (None, ids(&["a"])),
+        ];
+        for (primary, selected) in cases {
+            let mut selection = TimelineState::default().selection;
+            selection.selected_track_id = primary.map(str::to_string);
+            selection.selected_track_ids = selected.clone();
+            for track in ["a", "b", "c"] {
+                assert_eq!(
+                    mixer_strip_is_selected(track, primary, &selected),
+                    selection.is_track_selected(track),
+                    "track {track} with primary {primary:?} and list {selected:?}"
+                );
+            }
+        }
     }
 }
 
@@ -3914,4 +3996,3 @@ mod vsti_meter_key_tests {
         assert_eq!(VstiOutputMeterState::default().last_seen, 0);
     }
 }
-

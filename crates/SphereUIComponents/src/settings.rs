@@ -556,7 +556,7 @@ impl Default for HistoryEditingSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EditingSettings {
     #[serde(default)]
     pub mouse: MouseEditingSettings,
@@ -564,6 +564,21 @@ pub struct EditingSettings {
     pub snap: SnapEditingSettings,
     #[serde(default)]
     pub history: HistoryEditingSettings,
+    /// Bring up the Mixer tab, scrolled to the new track, whenever a track
+    /// is added and selected. Off keeps the dock on whatever tab it shows.
+    #[serde(default = "default_true")]
+    pub show_mixer_on_add_track: bool,
+}
+
+impl Default for EditingSettings {
+    fn default() -> Self {
+        Self {
+            mouse: MouseEditingSettings::default(),
+            snap: SnapEditingSettings::default(),
+            history: HistoryEditingSettings::default(),
+            show_mixer_on_add_track: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1638,5 +1653,13 @@ mod text_rendering_settings_tests {
         assert!(parsed.auto_offset_from_jam);
         assert_eq!(parsed.recording_offset_ms, -3);
         assert!(AudioRecordingSettings::default().auto_offset_from_jam);
+    }
+
+    #[test]
+    fn showing_the_mixer_on_add_track_is_on_for_older_settings() {
+        let parsed: EditingSettings = serde_json::from_str("{}").expect("deserialize");
+        assert!(parsed.show_mixer_on_add_track);
+        assert!(EditingSettings::default().show_mixer_on_add_track);
+        assert!(SettingsSchema::default().editing.show_mixer_on_add_track);
     }
 }

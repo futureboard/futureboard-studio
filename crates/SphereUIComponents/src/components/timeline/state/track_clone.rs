@@ -207,6 +207,7 @@ impl TimelineState {
         if let Some(height) = self.track_view_layout.height_for(source_id) {
             self.track_view_layout.set_height(track_id.clone(), height);
         }
+        self.note_track_created(&track_id);
         Some(TrackClone {
             track_id,
             inserts: insert_map,

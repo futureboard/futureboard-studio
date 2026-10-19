@@ -59,6 +59,9 @@ impl Render for StudioLayout {
         // A track was renamed somewhere (a header, the Inspector, undo, redo):
         // views that copy names out of the timeline catch up once.
         self.sync_track_name_surfaces(cx);
+        // The selected track moved (or a track was added and selected): the
+        // mixer strip and the arrangement row follow it.
+        self.sync_track_selection_surfaces(cx);
 
         // Keep the OS window title in sync with the project lifecycle state
         // (Part G/H), e.g. "Untitled Project — Unsaved" / "My Song — Saved".

@@ -378,6 +378,83 @@ impl StudioLayout {
         });
     }
 
+    /// Keep the mixer paired with the arrangement's track selection, and bring
+    /// up the Mixer when a track is added.
+    ///
+    /// Whoever moved the primary selection — a header click, a strip click,
+    /// the tree, undo, an import — the other surfaces follow: the selected
+    /// track's strip and its arrangement row scroll into view if they are off
+    /// screen, and the pop-out mixer repaints its highlight. When the change is
+    /// a just-created track (the Add Track dialog, a plug-in or preset drop, a
+    /// duplicate, stem extraction) the dock switches to the Mixer first, unless
+    /// the mixer is popped out or the preference is off.
+    ///
+    /// Checked once per frame like [`Self::sync_track_name_surfaces`]; nothing
+    /// is cloned unless something changed, and the work runs after the frame
+    /// because it updates other views.
+    pub(super) fn sync_track_selection_surfaces(&mut self, cx: &mut Context<Self>) {
+        let state = &self.timeline.read(cx).state;
+        let created_stamp = state
+            .last_created_track
+            .as_ref()
+            .map_or(0, |(_, stamp)| *stamp);
+        let Some(seen_stamp) = self.created_track_stamp_seen else {
+            self.created_track_stamp_seen = Some(created_stamp);
+            self.selected_track_seen = state.selection.selected_track_id.clone();
+            return;
+        };
+        let created = created_stamp != seen_stamp;
+        if !created && state.selection.selected_track_id == self.selected_track_seen {
+            return;
+        }
+        let selected = state.selection.selected_track_id.clone();
+        let added_and_selected = created
+            && selected.is_some()
+            && state.last_created_track.as_ref().map(|(id, _)| id) == selected.as_ref();
+        self.created_track_stamp_seen = Some(created_stamp);
+        let selection_moved = selected != self.selected_track_seen;
+        self.selected_track_seen = selected.clone();
+        let Some(track_id) = selected else {
+            if selection_moved {
+                self.defer_mixer_snapshot_push(cx);
+            }
+            return;
+        };
+        if !added_and_selected && !selection_moved {
+            return;
+        }
+        let show_mixer = added_and_selected
+            && self
+                .settings
+                .read(cx)
+                .current
+                .editing
+                .show_mixer_on_add_track;
+        let this = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |this, cx| {
+                if show_mixer && this.mixer_window_handle().is_none() {
+                    this.show_bottom_panel_tab(crate::components::BottomTab::Mixer, cx);
+                }
+                this.reveal_track_in_mixer(&track_id, cx);
+                this.timeline.update(cx, |timeline, cx| {
+                    if timeline.state.reveal_track_row(&track_id) {
+                        cx.notify();
+                    }
+                });
+                this.push_mixer_snapshot_to_window(cx);
+            });
+        });
+    }
+
+    /// Repaint the pop-out mixer's selection after the frame.
+    fn defer_mixer_snapshot_push(&mut self, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |this, cx| this.push_mixer_snapshot_to_window(cx));
+        });
+    }
+
     pub(super) fn project_switcher_visible_entries(
         &self,
     ) -> Vec<crate::components::project_switcher::ProjectSummary> {

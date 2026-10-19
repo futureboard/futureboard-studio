@@ -4,9 +4,9 @@ use std::{collections::HashMap, path::PathBuf};
 use crate::components::edit::EditCommand;
 use crate::components::mixer_panel::{
     clamp_mixer_section_height_px, mixer_render_item_count, mixer_scroll_x_for_strip_index,
-    mixer_strip_index_for_channel, MixerCallbacks, MixerSplitAction, MixerSplitTarget,
-    VstiOutputMeterState, MIXER_INSERT_SECTION_DEFAULT_PX, MIXER_SEND_SECTION_DEFAULT_PX,
-    MIXER_SUB_HEADER_H, STRIP_MIN_HEIGHT, STRIP_WIDTH,
+    mixer_scroll_x_to_reveal, mixer_strip_index_for_channel, MixerCallbacks, MixerSplitAction,
+    MixerSplitTarget, VstiOutputMeterState, MIXER_INSERT_SECTION_DEFAULT_PX,
+    MIXER_SEND_SECTION_DEFAULT_PX, MIXER_SUB_HEADER_H, STRIP_MIN_HEIGHT, STRIP_WIDTH,
 };
 use crate::components::mixer_tree_model::{
     ensure_timeline_mixer_tree_defaults, expand_ancestors_for_channel, MixerTreeModel,
@@ -591,6 +591,52 @@ impl StudioLayout {
             self.mixer_view.tree_show_only_selected_group,
             timeline.state.selection.selected_track_id.as_deref(),
         )
+    }
+
+    /// Scroll the mixer just enough to show `track_id`'s strip — the docked
+    /// mixer and the pop-out share one scroll position, so this is whichever
+    /// is showing. A strip already on screen, or one hidden in the mixer
+    /// tree, leaves the scroll alone. Returns whether it moved.
+    pub(crate) fn reveal_track_in_mixer(&mut self, track_id: &str, cx: &mut Context<Self>) -> bool {
+        let (strip_index, strip_count) = {
+            let timeline = self.timeline.read(cx);
+            let tracks = &timeline.state.tracks;
+            let collapsed = collapsed_vsti_output_group_keys_from_tracks(tracks);
+            let hidden = &timeline.state.mixer_tree.hidden_channel_ids;
+            (
+                mixer_strip_index_for_channel(tracks, &collapsed, hidden, track_id),
+                mixer_render_item_count(tracks, &collapsed, hidden),
+            )
+        };
+        let Some(strip_index) = strip_index else {
+            return false;
+        };
+        // The pop-out measures its strip row the way `MixerWindow` lays it out;
+        // the docked one through the same metrics the panel renders with.
+        let viewport_width = match self.mixer_window_handle() {
+            Some(handle) => {
+                let tree_width = self.mixer_tree_sidebar_width();
+                handle
+                    .update(cx, |_, window, _| {
+                        (f32::from(window.bounds().size.width) - tree_width - 90.0).max(100.0)
+                    })
+                    .unwrap_or_else(|_| self.mixer_panel_viewport_metrics(cx).0)
+            }
+            None => self.mixer_panel_viewport_metrics(cx).0,
+        };
+        let Some(scroll_x) = mixer_scroll_x_to_reveal(
+            strip_index,
+            self.mixer_view.scroll_x,
+            viewport_width,
+            strip_count,
+        ) else {
+            return false;
+        };
+        if !self.set_mixer_scroll_x(scroll_x, cx) {
+            return false;
+        }
+        let _ = self.mixer_panel.update(cx, |_, cx| cx.notify());
+        true
     }
 
     pub(crate) fn mixer_focus_channel(

@@ -782,6 +782,18 @@ fn editing(cx: &PageCtx) -> Vec<PrefGroup> {
                 }),
             ),
         )),
+        PrefGroup::new("Tracks").row(PrefRow::described(
+            "Show the Mixer when a track is added",
+            "Switches the dock to the Mixer and scrolls to the new track's strip.",
+            &["mixer", "track", "add", "new", "panel", "tab", "dock"],
+            pref_switch(
+                "editing-show-mixer-on-add-track",
+                s.editing.show_mixer_on_add_track,
+                apply(&up, |s| {
+                    s.editing.show_mixer_on_add_track = !s.editing.show_mixer_on_add_track
+                }),
+            ),
+        )),
     ]
 }
 

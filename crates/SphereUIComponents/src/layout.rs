@@ -800,6 +800,13 @@ pub struct StudioLayout {
     /// The timeline's `track_names_revision` the name-copying surfaces were
     /// last refreshed for. See [`Self::sync_track_name_surfaces`].
     track_names_revision_seen: u64,
+    /// Stamp of the timeline's `last_created_track` already acted on, and the
+    /// primary selected track the mixer was last paired with. See
+    /// [`Self::sync_track_selection_surfaces`].
+    /// None until the first frame, which only records what it finds: a
+    /// restored session is not an addition and should not move the mixer.
+    created_track_stamp_seen: Option<u64>,
+    selected_track_seen: Option<String>,
     /// Secondary window bounds loaded from the layout file, waiting to be
     /// opened during the first deferred tick after `new()`. Cleared immediately
     /// after `restore_secondary_windows_from_layout` runs.
@@ -1464,6 +1471,8 @@ impl StudioLayout {
             session_generation: 0,
             last_external_mixer_meter_push: std::time::Instant::now(),
             track_names_revision_seen: 0,
+            created_track_stamp_seen: None,
+            selected_track_seen: None,
             pending_secondary_window_restore:
                 crate::workspace_layout::SavedSecondaryWindows::default(),
         };

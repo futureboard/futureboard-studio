@@ -559,7 +559,48 @@ impl TimelineState {
             soundfont_channels: sphere_soundfont_player::default_channels(),
             solfege: None,
         });
+        self.note_track_created(&id);
         id
+    }
+
+    /// Record `track_id` as the newest track. Every path that adds a track
+    /// to the arrangement goes through [`Self::create_track`] or
+    /// [`Self::clone_track`], which both call this; restoring a deleted
+    /// track through undo does not, so an undo never reads as an addition.
+    pub fn note_track_created(&mut self, track_id: &str) {
+        self.last_created_track = Some((track_id.to_string(), fresh_track_created_stamp()));
+    }
+
+    /// Move the arrangement vertically just enough to show `track_id`'s
+    /// row, the way a list reveals its selection. Returns whether it moved;
+    /// a row already on screen, or one a collapsed folder hides, leaves the
+    /// view where the user put it.
+    pub fn reveal_track_row(&mut self, track_id: &str) -> bool {
+        let layout = self.track_row_layout();
+        let Some(row) = layout.rows.iter().find(|row| row.track_id == track_id) else {
+            return false;
+        };
+        let view_height = self.viewport.track_area_height;
+        if view_height <= 0.0 {
+            return false;
+        }
+        let scroll_y = self.viewport.scroll_y;
+        let row_height = row.height.min(view_height);
+        let target = if row.y < scroll_y {
+            row.y
+        } else if row.y + row_height > scroll_y + view_height {
+            row.y + row_height - view_height
+        } else {
+            return false;
+        };
+        let max_y = (layout.total_height - view_height).max(0.0);
+        let target = target.clamp(0.0, max_y);
+        if (target - scroll_y).abs() < 0.5 {
+            return false;
+        }
+        self.viewport.scroll_y = target;
+        self.viewport.target_scroll_y = target;
+        true
     }
 
     pub fn toggle_group_collapsed(&mut self, group_id: &str) -> Option<bool> {
@@ -810,6 +851,14 @@ impl TimelineState {
     }
 }
 
+/// A fresh stamp for [`TimelineState::last_created_track`]: never 0, never
+/// handed out twice in this process.
+fn fresh_track_created_stamp() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// A fresh value for [`TimelineState::track_names_revision`]: never 0, never
 /// handed out twice in this process.
 pub(crate) fn fresh_track_names_revision() -> u64 {
@@ -999,5 +1048,74 @@ mod move_hint_tests {
 
         state.clear_track_drag();
         assert_eq!(state.drag_indicator_from_index, None);
+    }
+}
+
+#[cfg(test)]
+mod created_track_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn arrangement(tracks: usize) -> TimelineState {
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        for _ in 0..tracks {
+            state.create_audio_track();
+        }
+        state
+    }
+
+    #[test]
+    fn every_new_track_is_noted_with_a_stamp_of_its_own() {
+        let mut state = arrangement(0);
+        assert!(state.last_created_track.is_none());
+
+        let first = state.create_audio_track();
+        let (noted, first_stamp) = state.last_created_track.clone().expect("noted");
+        assert_eq!(noted, first);
+
+        let second = state.create_midi_track();
+        let (noted, second_stamp) = state.last_created_track.clone().expect("noted");
+        assert_eq!(noted, second);
+        assert_ne!(first_stamp, second_stamp, "two additions must read as two");
+    }
+
+    #[test]
+    fn a_duplicated_track_is_noted_as_created() {
+        let mut state = arrangement(1);
+        let source = state.tracks[0].id.clone();
+        let before = state.last_created_track.clone();
+        let clone = state
+            .clone_track(&source, true, &HashMap::new())
+            .expect("an audio track can be cloned");
+        let (noted, stamp) = state.last_created_track.clone().expect("noted");
+        assert_eq!(noted, clone.track_id);
+        assert_ne!(Some(stamp), before.map(|(_, stamp)| stamp));
+    }
+
+    #[test]
+    fn revealing_a_row_scrolls_only_when_it_is_off_screen() {
+        let mut state = arrangement(40);
+        let layout = state.track_row_layout();
+        let row_height = layout.rows[0].height;
+        state.viewport.track_area_height = row_height * 5.0;
+        state.viewport.scroll_y = 0.0;
+
+        let visible = state.tracks[2].id.clone();
+        assert!(!state.reveal_track_row(&visible), "already on screen");
+        assert_eq!(state.viewport.scroll_y, 0.0);
+
+        let below = state.tracks[30].id.clone();
+        assert!(state.reveal_track_row(&below));
+        let row = state.track_row_layout().rows[30].clone();
+        let bottom = state.viewport.scroll_y + state.viewport.track_area_height;
+        assert!(row.y >= state.viewport.scroll_y && row.y + row.height <= bottom + 0.5);
+        assert_eq!(state.viewport.target_scroll_y, state.viewport.scroll_y);
+
+        let above = state.tracks[0].id.clone();
+        assert!(state.reveal_track_row(&above));
+        assert_eq!(state.viewport.scroll_y, 0.0);
+
+        assert!(!state.reveal_track_row("no-such-track"));
     }
 }

@@ -247,6 +247,7 @@ impl TimelineState {
             song_text_index: SongTextIndex::default(),
             song_text_revision: 0,
             track_names_revision: fresh_track_names_revision(),
+            last_created_track: None,
             time_signature_num: 4,
             time_signature_den: 4,
             viewport: TimelineViewport {
