@@ -55,6 +55,11 @@ pub(crate) struct RecordingSessionState {
     /// of the transport is a new take (see `RecordLoop`). `None` records
     /// straight through.
     pub record_loop: Option<RecordLoop>,
+    /// The jam's arrival latency when the session started, in milliseconds.
+    /// The take is committed with the value measured then if it is still
+    /// measurable, and with this one if the jam dropped before the files
+    /// were closed.
+    pub jam_offset_ms: Option<f64>,
 }
 
 impl Default for RecordingSessionState {
@@ -70,6 +75,7 @@ impl Default for RecordingSessionState {
             awaiting_finalize: false,
             pass: 0,
             record_loop: None,
+            jam_offset_ms: None,
         }
     }
 }
@@ -623,6 +629,7 @@ impl StudioLayout {
             )
         };
         self.recording.record_loop = record_loop;
+        self.recording.jam_offset_ms = crate::jam::recording_offset_ms();
         if !midi_tracks.is_empty() {
             self.recording.midi = Some(MidiRecordingTake {
                 start_beat: start_beat.max(0.0),
@@ -1092,18 +1099,25 @@ impl StudioLayout {
     ) {
         let bpm = self.timeline.read(cx).state.bpm;
         let timeline = self.timeline.clone();
-        let (generate_waveforms, recording_offset_ms) = {
+        let (generate_waveforms, recording_offset_ms, auto_offset_from_jam) = {
             let settings = self.settings.read(cx);
+            let audio = &settings.current.recording.audio;
             (
-                settings
-                    .current
-                    .recording
-                    .audio
-                    .generate_waveform_after_record,
-                settings.current.recording.audio.recording_offset_ms,
+                audio.generate_waveform_after_record,
+                audio.recording_offset_ms,
+                audio.auto_offset_from_jam,
             )
         };
         let recording_offset_beats = recording_offset_ms as f32 / 1000.0 * bpm / 60.0;
+        // Playing along to a jam, the performer is late by however long the
+        // remote audio took to reach them; the take moves back by that much so
+        // the part lines up with the performers it was played to.
+        let jam_offset_ms = if auto_offset_from_jam {
+            crate::jam::recording_offset_ms().or(self.recording.jam_offset_ms)
+        } else {
+            None
+        };
+        let jam_offset_beats = jam_offset_ms.unwrap_or(0.0) as f32 / 1000.0 * bpm / 60.0;
         let mut import_paths: Vec<(PathBuf, String)> = Vec::new();
         let mut failed_tracks: Vec<String> = Vec::new();
         // One stamp for the whole pass, so every track's take from this Record
@@ -1140,22 +1154,24 @@ impl StudioLayout {
                     .and_then(|s| s.to_str())
                     .unwrap_or("Recording")
                     .to_string();
-                // Auto latency compensation: pull the take earlier by the
-                // engine-measured round-trip so an overdub lands where the
-                // performer heard it. The manual `recording_offset_ms` is layered
-                // on top for per-rig fine-tuning (it may be negative or positive).
-                let latency_beats = result.latency_seconds as f32 * bpm / 60.0;
+                // The engine has already pulled `start_beat` back by the
+                // round trip (`latency_seconds`) and plug-in delay. On top of
+                // that: the jam's arrival latency, then the manual
+                // `recording_offset_ms` for per-rig fine-tuning (it may be
+                // negative or positive).
                 let placed_beat =
-                    (result.start_beat as f32 - latency_beats + recording_offset_beats).max(0.0);
-                if latency_beats != 0.0
-                    && std::env::var_os("FUTUREBOARD_RECORDING_DEBUG").is_some()
+                    (result.start_beat as f32 - jam_offset_beats + recording_offset_beats)
+                        .max(0.0);
+                if jam_offset_ms.is_some()
+                    || std::env::var_os("FUTUREBOARD_RECORDING_DEBUG").is_some()
                 {
                     eprintln!(
-                        "[recording] latency comp track={} raw_start={:.3} latency={:.1}ms (-{:.3} beats) manual_offset={:.3} beats -> start={:.3}",
+                        "[recording] placement track={} engine_start={:.3} (round trip {:.1} ms applied) jam_offset={:.1} ms (-{:.3} beats) manual_offset={:.3} beats -> start={:.3}",
                         result.track_id,
                         result.start_beat,
                         result.latency_seconds * 1000.0,
-                        latency_beats,
+                        jam_offset_ms.unwrap_or(0.0),
+                        jam_offset_beats,
                         recording_offset_beats,
                         placed_beat
                     );

@@ -145,6 +145,14 @@ pub struct JamStreamView {
     /// Underruns plus overruns on its ring since it was bound — how often the
     /// network failed to keep the cushion.
     pub dropouts: u64,
+    /// How far behind the publisher's capture the audio this engine is about
+    /// to play is, in milliseconds: network, jitter buffer and ring cushion
+    /// together, measured on the session clock and smoothed across polls.
+    ///
+    /// `None` until the clock has locked and the stream is routed and playing.
+    /// It is what a performer playing along to this stream is late by, and so
+    /// what [`JamUiState::recording_offset_ms`] pulls a take back by.
+    pub arrival_latency_ms: Option<f64>,
 }
 
 /// One stream this Studio is putting into the room, as the panel shows it.
@@ -220,6 +228,31 @@ pub struct JamUiState {
 }
 
 impl JamUiState {
+    /// How much earlier a take recorded while playing along to this jam
+    /// belongs: the mean arrival latency of the remote streams this project
+    /// routes, in milliseconds.
+    ///
+    /// The performer plays in time with what reaches them, which is the
+    /// publishers' audio late by that much; pulling the take back by it lines
+    /// the part up with the performers it was played to. With several remote
+    /// streams the performer hears a blend of their delays, so the mean is
+    /// used. `None` when not connected or nothing has been measured, in which
+    /// case no jam offset applies.
+    pub fn recording_offset_ms(&self) -> Option<f64> {
+        if !self.connected {
+            return None;
+        }
+        let (sum, count) = self
+            .streams
+            .iter()
+            .filter(|stream| stream.routed && stream.receiving)
+            .filter_map(|stream| stream.arrival_latency_ms)
+            .fold((0.0, 0usize), |(sum, count), latency| {
+                (sum + latency, count + 1)
+            });
+        (count > 0).then(|| sum / count as f64)
+    }
+
     /// Every stream belonging to one account, in menu order.
     pub fn streams_for_user(&self, user_id: &str) -> Vec<&JamStreamView> {
         self.streams
@@ -480,6 +513,12 @@ pub fn poll() -> Vec<JamEvent> {
     }
 }
 
+/// The offset a take recorded now should be pulled earlier by, in
+/// milliseconds. See [`JamUiState::recording_offset_ms`].
+pub fn recording_offset_ms() -> Option<f64> {
+    ui_state().read().ok()?.recording_offset_ms()
+}
+
 /// The jam session's clock, when a session is running.
 pub fn session_clock() -> Option<Arc<Mutex<SessionClock>>> {
     controller()
@@ -524,6 +563,10 @@ pub struct JamController {
     /// restates them.
     sends: BTreeMap<String, JamSend>,
     last_error: Option<String>,
+    /// Smoothed arrival latency per stream id, in milliseconds. One raw read
+    /// moves by up to a block as the callback advances the ring, so the UI
+    /// and the recorder see an average instead.
+    arrival_latency: Mutex<BTreeMap<String, f64>>,
 }
 
 impl JamController {
@@ -551,6 +594,7 @@ impl JamController {
             ingress: JamIngress::Routed,
             sends: BTreeMap::new(),
             last_error: None,
+            arrival_latency: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -1380,6 +1424,32 @@ impl JamController {
             .collect()
     }
 
+    /// Replace each stream's raw arrival latency with its running average, and
+    /// forget streams that are gone. A poll with no reading keeps the last
+    /// average rather than blanking it, so one skipped read does not flicker
+    /// the panel or drop a take's offset.
+    fn smooth_arrival_latency(&self, streams: &mut [JamStreamView]) {
+        let Ok(mut averages) = self.arrival_latency.lock() else {
+            return;
+        };
+        averages.retain(|stream_id, _| {
+            streams
+                .iter()
+                .any(|stream| stream.routed && &stream.stream_id == stream_id)
+        });
+        for stream in streams.iter_mut() {
+            let previous = averages.get(&stream.stream_id).copied();
+            stream.arrival_latency_ms = match stream.arrival_latency_ms {
+                Some(raw) => {
+                    let average = smoothed_arrival_latency(previous, raw);
+                    averages.insert(stream.stream_id.clone(), average);
+                    Some(average)
+                }
+                None => previous,
+            };
+        }
+    }
+
     /// Rebuild the published UI state from the session snapshot and the bus.
     fn publish_ui_state(&self) {
         let session_snapshot = self
@@ -1387,7 +1457,13 @@ impl JamController {
             .as_ref()
             .map(|session| session.snapshot())
             .unwrap_or_default();
-        let mut next = build_ui_state(&session_snapshot, &self.config, &self.shared);
+        let now = self
+            .clock
+            .lock()
+            .ok()
+            .and_then(|clock| SessionNow::read(&clock));
+        let mut next = build_ui_state(&session_snapshot, &self.config, &self.shared, now);
+        self.smooth_arrival_latency(&mut next.streams);
         next.last_error = self
             .last_error
             .clone()
@@ -1453,7 +1529,78 @@ fn publish_key_labels(key: &str) -> (String, String) {
     }
 }
 
-fn build_ui_state(snapshot: &JamSnapshot, config: &JamConfig, shared: &SharedState) -> JamUiState {
+/// The session clock read once per poll: the current session tick and the
+/// tick rate. Read under the clock's lock and released straight away, so the
+/// receive thread, which takes the same lock per packet, never waits on a UI
+/// rebuild.
+#[derive(Debug, Clone, Copy)]
+struct SessionNow {
+    ticks: i64,
+    rate: u32,
+}
+
+impl SessionNow {
+    /// `None` until the clock has locked: there is no session time to measure
+    /// against before the first exchange.
+    fn read(clock: &SessionClock) -> Option<Self> {
+        Some(Self {
+            ticks: clock.session_ticks_at(sphere_jam_client::clock::client_nanos())?,
+            rate: clock.rate(),
+        })
+    }
+}
+
+/// How far behind its publisher's capture the next frame the engine reads
+/// from `slot` is, in milliseconds.
+///
+/// Both ends are session time: the slot's capture position is the publisher's
+/// own capture stamp carried in every packet (converted to the engine rate by
+/// the sink), and `now` is this machine's estimate of the session clock. Their
+/// difference is everything between the publisher's capture and this engine's
+/// read head — network, jitter buffer and ring cushion. A resampled stream's
+/// filter delay is not in it: the sink stamps the resampler's output with its
+/// input's capture time.
+fn arrival_latency_ms(slot: &DirectAudio::jam_bus::JamInputSlot, now: SessionNow) -> Option<f64> {
+    let rate = slot.sample_rate();
+    if slot.is_priming() || rate == 0 || now.rate == 0 {
+        return None;
+    }
+    let next = slot.next_capture_position()?;
+    let now_samples = (now.ticks as i128 * rate as i128 / now.rate as i128) as i64;
+    let samples = now_samples.saturating_sub(next);
+    // Negative or implausibly long means the capture clock was just re-based (a
+    // reconnect or a loss gap) or the session clock just stepped; skip the read
+    // rather than report it.
+    if samples < 0 || samples > rate as i64 * 2 {
+        return None;
+    }
+    Some(samples as f64 * 1000.0 / rate as f64)
+}
+
+/// Weight of a new reading in the per-stream average. At one poll per UI frame
+/// the average settles within a few tenths of a second.
+const ARRIVAL_LATENCY_SMOOTHING: f64 = 0.1;
+
+/// A reading this far from the average is a new situation — a reconnect, a
+/// re-primed ring — not jitter, so the average restarts from it.
+const ARRIVAL_LATENCY_RESET_MS: f64 = 50.0;
+
+/// Fold one raw reading into a stream's running average.
+fn smoothed_arrival_latency(previous: Option<f64>, raw: f64) -> f64 {
+    match previous {
+        Some(previous) if (raw - previous).abs() < ARRIVAL_LATENCY_RESET_MS => {
+            previous + (raw - previous) * ARRIVAL_LATENCY_SMOOTHING
+        }
+        _ => raw,
+    }
+}
+
+fn build_ui_state(
+    snapshot: &JamSnapshot,
+    config: &JamConfig,
+    shared: &SharedState,
+    now: Option<SessionNow>,
+) -> JamUiState {
     let mut streams = Vec::with_capacity(snapshot.streams.len());
     for summary in &snapshot.streams {
         let id = StreamId::new(summary.id.clone());
@@ -1491,6 +1638,9 @@ fn build_ui_state(snapshot: &JamSnapshot, config: &JamConfig, shared: &SharedSta
         let dropouts = slot
             .map(|slot| slot.underruns().saturating_add(slot.overruns()))
             .unwrap_or(0);
+        let arrival_latency_ms = slot
+            .zip(now)
+            .and_then(|(slot, now)| arrival_latency_ms(slot, now));
 
         // Start the download here rather than during render: the port menus and
         // the participant list both read the cache every frame and must never
@@ -1517,6 +1667,7 @@ fn build_ui_state(snapshot: &JamSnapshot, config: &JamConfig, shared: &SharedSta
             routed,
             buffering,
             dropouts,
+            arrival_latency_ms,
         });
     }
 
@@ -1844,7 +1995,12 @@ mod tests {
     #[test]
     fn a_room_snapshot_flattens_into_something_a_panel_can_render() {
         let shared = SharedState::default();
-        let state = build_ui_state(&snapshot_with_one_guitar(), &JamConfig::default(), &shared);
+        let state = build_ui_state(
+            &snapshot_with_one_guitar(),
+            &JamConfig::default(),
+            &shared,
+            None,
+        );
         assert!(state.connected);
         assert_eq!(state.jam_name, "Saturday Session");
         assert_eq!(state.transport_label, "UDP");
@@ -1862,7 +2018,7 @@ mod tests {
         let mut snapshot = snapshot_with_one_guitar();
         snapshot.formats.clear();
         let shared = SharedState::default();
-        let state = build_ui_state(&snapshot, &JamConfig::default(), &shared);
+        let state = build_ui_state(&snapshot, &JamConfig::default(), &shared, None);
         assert_eq!(state.streams.len(), 1);
         assert!(!state.streams[0].receiving);
     }
@@ -1879,7 +2035,7 @@ mod tests {
             .push(stream("str_2", "pcp_2", "usr_1", "phone", "Talkback"));
 
         let shared = SharedState::default();
-        let state = build_ui_state(&snapshot, &JamConfig::default(), &shared);
+        let state = build_ui_state(&snapshot, &JamConfig::default(), &shared, None);
         let grouped = state.by_participant();
         assert_eq!(grouped.len(), 2, "one account, two devices, two rows");
         assert_eq!(grouped[0].1[0].stream_name, "Guitar");
@@ -2020,5 +2176,120 @@ mod stream_identity_tests {
         for name in ["Aria Kim", "@nut", "n", ""] {
             assert!(monogram_for(name).chars().count() <= 2, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod jam_offset_tests {
+    use super::{
+        arrival_latency_ms, smoothed_arrival_latency, JamStreamView, JamUiState, SessionNow,
+        ARRIVAL_LATENCY_RESET_MS,
+    };
+    use DirectAudio::engine::SharedState;
+    use DirectAudio::jam_bus::JamChannelMode;
+
+    const RATE: u32 = 48_000;
+
+    fn stream(id: &str, routed: bool, receiving: bool, latency: Option<f64>) -> JamStreamView {
+        JamStreamView {
+            stream_id: id.to_string(),
+            routed,
+            receiving,
+            arrival_latency_ms: latency,
+            ..Default::default()
+        }
+    }
+
+    /// The latency is measured where the performer hears it: the engine's read
+    /// head, against the publisher's own capture stamp, in session time.
+    #[test]
+    fn arrival_latency_is_session_now_minus_the_read_heads_capture_time() {
+        let shared = SharedState::default();
+        let index = shared.jam_bus.bind_input("str_1").expect("a free slot");
+        let slot = shared.jam_bus.input(index).expect("bound slot");
+
+        // 50 ms of audio captured by the publisher at session sample 1_000_000.
+        let captured = vec![0.25_f32; 2400 * 2];
+        slot.write_interleaved(&captured, 2, 1_000_000, RATE);
+        let now = SessionNow {
+            ticks: 1_000_000 + 2400,
+            rate: RATE,
+        };
+        assert_eq!(
+            arrival_latency_ms(slot, now),
+            None,
+            "a ring still filling its cushion is not playing anything yet"
+        );
+
+        let mut left = vec![0.0; 256];
+        let mut right = vec![0.0; 256];
+        let played = slot.mix_into(
+            JamChannelMode::from_channels(&[0, 1]),
+            &mut left,
+            &mut right,
+            256,
+        );
+        assert_eq!(played, 256);
+
+        let read_head = slot.next_capture_position().expect("capture is known");
+        let latency = arrival_latency_ms(slot, now).expect("a playing stream is measured");
+        let expected = (1_000_000 + 2400 - read_head) as f64 * 1000.0 / RATE as f64;
+        assert!((latency - expected).abs() < 1e-9, "{latency} vs {expected}");
+        assert!(latency > 0.0);
+
+        // A session clock behind the capture stamps (a just re-based ring, a
+        // stepped clock) is not reported as a negative latency.
+        let behind = SessionNow {
+            ticks: read_head - 10,
+            rate: RATE,
+        };
+        assert_eq!(arrival_latency_ms(slot, behind), None);
+    }
+
+    #[test]
+    fn the_offset_is_the_mean_of_the_routed_streams_that_are_arriving() {
+        let state = JamUiState {
+            connected: true,
+            streams: vec![
+                stream("guitar", true, true, Some(40.0)),
+                stream("keys", true, true, Some(60.0)),
+                // In the room but not routed here: not what anyone played to.
+                stream("talkback", false, true, Some(500.0)),
+                // Routed but not arriving yet.
+                stream("drums", true, false, Some(500.0)),
+                // Routed and arriving, not measured yet.
+                stream("bass", true, true, None),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(state.recording_offset_ms(), Some(50.0));
+    }
+
+    #[test]
+    fn no_offset_applies_outside_a_connected_jam_or_without_a_measurement() {
+        let disconnected = JamUiState {
+            connected: false,
+            streams: vec![stream("guitar", true, true, Some(40.0))],
+            ..Default::default()
+        };
+        assert_eq!(disconnected.recording_offset_ms(), None);
+
+        let unmeasured = JamUiState {
+            connected: true,
+            streams: vec![stream("guitar", true, true, None)],
+            ..Default::default()
+        };
+        assert_eq!(unmeasured.recording_offset_ms(), None);
+    }
+
+    #[test]
+    fn readings_are_averaged_and_a_jump_restarts_the_average() {
+        assert_eq!(smoothed_arrival_latency(None, 42.0), 42.0);
+
+        let averaged = smoothed_arrival_latency(Some(40.0), 45.0);
+        assert!(averaged > 40.0 && averaged < 45.0, "{averaged}");
+
+        let jumped = 40.0 + ARRIVAL_LATENCY_RESET_MS + 1.0;
+        assert_eq!(smoothed_arrival_latency(Some(40.0), jumped), jumped);
     }
 }

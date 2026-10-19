@@ -4337,8 +4337,12 @@ impl EngineInner {
             } else {
                 0.0
             };
-        // Round-trip compensation: driver-reported latencies when the ASIO
-        // session provides them, else the 2×buffer estimate.
+        // Round-trip compensation, applied here and only here: the latency
+        // measured during the take (`latency_seconds`: output play-out plus
+        // input capture) when the backend timestamped it, else driver-reported
+        // latencies when the ASIO session provides them, else the 2×buffer
+        // estimate. The UI used to subtract `latency_seconds` a second time on
+        // top of this.
         let asio_round_trip = self.asio_caps.lock().as_ref().map(|caps| {
             caps.input_latency_samples
                 .saturating_add(caps.output_latency_samples)
@@ -4366,10 +4370,16 @@ impl EngineInner {
                         .copied()
                         .unwrap_or(0),
                 );
-            let offset_samples = round_trip_buffer.saturating_add(path_samples);
+            let measured_round_trip = (result.latency_seconds * sample_rate).round() as u64;
+            let round_trip = if measured_round_trip > 0 {
+                measured_round_trip
+            } else {
+                round_trip_buffer as u64
+            };
+            let offset_samples = round_trip.saturating_add(path_samples as u64);
             let offset_beats = runtime
                 .tempo_map
-                .beat_at_samples(offset_samples as u64, sample_rate);
+                .beat_at_samples(offset_samples, sample_rate);
             result.start_beat = (result.start_beat + capture_offset_beats - offset_beats).max(0.0);
         }
         drop(runtime);

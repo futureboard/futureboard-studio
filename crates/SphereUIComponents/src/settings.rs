@@ -573,6 +573,11 @@ pub struct AudioRecordingSettings {
     pub recording_path: String,
     #[serde(default)]
     pub recording_offset_ms: i32,
+    /// While a jam session is connected, pull each take earlier by the measured
+    /// arrival latency of the remote streams the performer played along to
+    /// (`jam::recording_offset_ms`). Layered under `recording_offset_ms`.
+    #[serde(default = "default_true")]
+    pub auto_offset_from_jam: bool,
     #[serde(default = "default_true")]
     pub save_before_recording: bool,
     #[serde(default = "default_true")]
@@ -586,6 +591,7 @@ impl Default for AudioRecordingSettings {
             bit_depth: 24,
             recording_path: String::new(),
             recording_offset_ms: 0,
+            auto_offset_from_jam: true,
             save_before_recording: true,
             generate_waveform_after_record: true,
         }
@@ -1621,5 +1627,16 @@ mod text_rendering_settings_tests {
             serde_json::to_string(&SpacebarAction::PlayStop).unwrap(),
             "\"play-stop\""
         );
+    }
+
+    #[test]
+    fn jam_auto_offset_is_on_for_settings_saved_before_it_existed() {
+        let parsed: AudioRecordingSettings = serde_json::from_str(
+            r#"{"format":"wav","bit_depth":24,"recording_path":"","recording_offset_ms":-3}"#,
+        )
+        .expect("deserialize");
+        assert!(parsed.auto_offset_from_jam);
+        assert_eq!(parsed.recording_offset_ms, -3);
+        assert!(AudioRecordingSettings::default().auto_offset_from_jam);
     }
 }

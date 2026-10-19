@@ -1657,6 +1657,7 @@ mod tests {
             routed: true,
             buffering: false,
             dropouts: 0,
+            arrival_latency_ms: None,
         }
     }
 
@@ -1754,6 +1755,7 @@ mod flow_visibility_tests {
             routed: true,
             buffering: false,
             dropouts: 0,
+            arrival_latency_ms: None,
         }
     }
 

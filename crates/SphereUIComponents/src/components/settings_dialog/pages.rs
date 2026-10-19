@@ -537,6 +537,28 @@ fn recording(cx: &PageCtx) -> Vec<PrefGroup> {
                             (s.recording.audio.recording_offset_ms + 1).clamp(-2000, 2000)
                     }),
                 ),
+            ))
+            .row(PrefRow::described(
+                "Auto Offset from JAM Session",
+                match crate::jam::recording_offset_ms() {
+                    Some(latency) => format!(
+                        "Pulls takes earlier by the jam's measured latency, so a part lines \
+                         up with the performers it was played to. Now {latency:.0} ms."
+                    ),
+                    None => "Pulls takes earlier by the jam's measured latency, so a part \
+                             lines up with the performers it was played to. Not measuring: \
+                             no routed jam stream is playing."
+                        .to_string(),
+                },
+                &["jam", "offset", "latency", "compensation", "record"],
+                pref_switch(
+                    "rec-auto-offset-jam",
+                    s.recording.audio.auto_offset_from_jam,
+                    apply(&up, |s| {
+                        s.recording.audio.auto_offset_from_jam =
+                            !s.recording.audio.auto_offset_from_jam
+                    }),
+                ),
             )),
         PrefGroup::new("Input Test").row(PrefRow::block(
             "Input Test",

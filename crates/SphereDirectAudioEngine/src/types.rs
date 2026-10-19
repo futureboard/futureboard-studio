@@ -893,7 +893,9 @@ pub struct JsRecordingResult {
     pub file_path: String,
     /// Path relative to project root (e.g., "recordings/take_0001.rauf").
     pub relative_path: String,
-    /// Transport beat at which recording started.
+    /// Transport beat the take's audio belongs at, with the capture start and
+    /// the round-trip and plug-in delay compensation already applied by the
+    /// engine (see `latency_seconds`).
     pub start_beat: f64,
     pub duration_seconds: f64,
     pub sample_rate: u32,
@@ -903,9 +905,11 @@ pub struct JsRecordingResult {
     /// PCM encoding for the internal recording file, currently "s32le".
     pub sample_format: String,
     /// Measured audio round-trip latency (output play-out + input capture) in
-    /// seconds. The UI shifts the committed take earlier by this much so a live
-    /// overdub lines up with what the performer heard. `0.0` when the backend
-    /// reports no timestamp (no auto-compensation, matching the old behaviour).
+    /// seconds. Already subtracted from `start_beat` — the engine shifts the
+    /// take earlier by it so a live overdub lines up with what the performer
+    /// heard — and reported for diagnostics only. `0.0` when the backend gave
+    /// no timestamp; the engine then falls back to the driver's or a 2×buffer
+    /// estimate.
     pub latency_seconds: f64,
     pub success: bool,
     pub error: Option<String>,
