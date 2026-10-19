@@ -1038,6 +1038,7 @@ mod tests {
             routed: true,
             buffering: false,
             dropouts: 0,
+            arrival_latency_ms: None,
         }
     }
 
