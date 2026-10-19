@@ -215,6 +215,45 @@ pub fn dispatch_license_action(window: &mut Window, cx: &mut App) {
     }
 }
 
+// ── Licensed provider refresh ────────────────────────────────────────────────
+//
+// A Professional build installs what its license grants (ASIO) at startup. The
+// Futureboard Launcher renews or activates a license while Studio is already
+// running — it may even start Studio and renew a moment later — and without a
+// second look Studio keeps the answer it read at startup until it restarts.
+// The app layer installs a handler that re-reads the license; the shared crate
+// calls it where an entitlement is about to be shown.
+
+type LicenseRefreshHandler = Arc<dyn Fn() + Send + Sync + 'static>;
+
+fn license_refresh_slot() -> &'static RwLock<Option<LicenseRefreshHandler>> {
+    static SLOT: OnceLock<RwLock<Option<LicenseRefreshHandler>>> = OnceLock::new();
+    SLOT.get_or_init(|| RwLock::new(None))
+}
+
+/// Install the handler that re-reads the license and installs what it now
+/// grants. Called once by the app layer of a Professional build at startup.
+pub fn set_license_refresh_handler(handler: LicenseRefreshHandler) {
+    if let Ok(mut guard) = license_refresh_slot().write() {
+        *guard = Some(handler);
+    }
+}
+
+/// Re-read the license so a renewal or activation made while Studio runs takes
+/// effect. Local file and signature work only — call it when a surface that
+/// shows entitlements opens, never per frame. No-op in a Community build.
+pub fn refresh_licensed_providers() {
+    let handler = {
+        let Ok(guard) = license_refresh_slot().read() else {
+            return;
+        };
+        guard.as_ref().cloned()
+    };
+    if let Some(handler) = handler {
+        handler();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

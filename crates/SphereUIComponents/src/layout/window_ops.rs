@@ -1668,7 +1668,10 @@ impl StudioLayout {
         // Only list backends that actually exist on this build/edition — a
         // Windows-only option like "WASAPI Shared" must never be selectable
         // on Linux/macOS, and Exclusive-only ASIO must never appear on
-        // Community (or an Exclusive build without ASIO entitlement).
+        // Community (or an Exclusive build without ASIO entitlement). The
+        // license is read again first: one renewed in the Launcher after
+        // Studio started would otherwise leave ASIO off until a restart.
+        crate::edition::refresh_licensed_providers();
         let available_backends = crate::settings::available_audio_driver_types();
 
         let on_update: OnSettingUpdate = Arc::new(move |updater, cx| {

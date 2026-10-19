@@ -148,6 +148,14 @@ pub fn install() -> Result<(), String> {
     // Futureboard Launcher now, so there is nothing to spawn here and nothing
     // that can delay the DAW opening.
     install_licensed_providers()?;
+    // The Launcher can renew after this point — it may start Studio and renew a
+    // moment later — so the shared UI asks again when it is about to show what
+    // the license grants.
+    sphere_ui_components::edition::set_license_refresh_handler(std::sync::Arc::new(|| {
+        if let Err(error) = install_licensed_providers() {
+            eprintln!("[License] refreshing licensed providers failed: {error}");
+        }
+    }));
     Ok(())
 }
 
