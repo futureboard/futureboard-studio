@@ -1761,13 +1761,15 @@ fn text_field_inner(
         .child(
             // Wrapper owns the text content rect; the transparent hit probe shapes
             // the same text to drive grapheme-accurate pointer hit-testing without
-            // affecting the visible layout.
+            // affecting the visible layout. Full height so the editing line,
+            // which fills its parent, gets the field's height rather than 0.
             div()
                 .relative()
                 .flex()
                 .flex_row()
                 .items_center()
                 .flex_1()
+                .h_full()
                 .min_w_0()
                 .overflow_hidden()
                 .child(content)
