@@ -46,6 +46,7 @@ pub mod color;
 pub mod components;
 pub mod deeplink;
 pub mod device_registry;
+pub mod dialog_frame;
 pub mod edition;
 pub mod embedded_assets;
 pub mod export;

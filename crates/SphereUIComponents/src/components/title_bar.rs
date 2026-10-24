@@ -401,6 +401,20 @@ pub fn external_window_titlebar_with_icon(
     external_titlebar(icon_path, title.into(), close_id.into(), on_close, true)
 }
 
+/// A dialog titlebar that gives way to the platform caption in a
+/// native-framed dialog ([`crate::dialog_frame`]).
+fn dialog_titlebar(
+    bar: Div,
+    title: &str,
+    close: crate::dialog_frame::DialogClose,
+) -> crate::dialog_frame::DialogTitlebar {
+    crate::dialog_frame::DialogTitlebar::new(
+        bar.into_any_element(),
+        crate::platform_chrome::branded_window_title(title),
+        close,
+    )
+}
+
 /// The same external-dialog title bar with Close as its only caption button,
 /// for fixed-size windows that can neither minimize nor maximize (message
 /// boxes, progress). Same height, inset, title weight and close control as
@@ -415,6 +429,18 @@ pub fn external_window_titlebar_compact(
 }
 
 fn external_titlebar(
+    icon_path: Option<&'static str>,
+    title: String,
+    close_id: gpui::ElementId,
+    on_close: impl Fn(&mut Window, &mut App) + 'static + Clone,
+    min_max: bool,
+) -> crate::dialog_frame::DialogTitlebar {
+    let close = crate::dialog_frame::DialogClose::Callback(std::rc::Rc::new(on_close.clone()));
+    let bar = external_titlebar_bar(icon_path, title.clone(), close_id, on_close, min_max);
+    dialog_titlebar(bar, &title, close)
+}
+
+fn external_titlebar_bar(
     icon_path: Option<&'static str>,
     title: String,
     close_id: gpui::ElementId,
@@ -511,8 +537,27 @@ pub fn chromeless_window_titlebar(
     close_id: impl Into<gpui::ElementId>,
     on_close: Option<WindowChromeCloseCb>,
 ) -> impl IntoElement {
+    let title: String = title.into();
+    let close = match on_close.clone() {
+        Some(on_close) => crate::dialog_frame::DialogClose::Callback(std::rc::Rc::new(
+            move |window: &mut Window, cx: &mut App| on_close(window, cx),
+        )),
+        None => crate::dialog_frame::DialogClose::Blocked,
+    };
+    dialog_titlebar(
+        chromeless_titlebar_bar(&title, close_id, on_close),
+        &title,
+        close,
+    )
+}
+
+fn chromeless_titlebar_bar(
+    title: &str,
+    close_id: impl Into<gpui::ElementId>,
+    on_close: Option<WindowChromeCloseCb>,
+) -> Div {
     let policy = PlatformChromePolicy::chromeless_dialog();
-    let title_text = crate::platform_chrome::branded_window_title(&title.into());
+    let title_text = crate::platform_chrome::branded_window_title(title);
 
     div()
         .flex()

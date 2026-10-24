@@ -509,7 +509,7 @@ pub(crate) fn open_insert_picker_window(
     ));
     apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, |_window, cx| {
         cx.new(|cx| InsertPickerWindow::new(owner, snapshot, cx))
     })
     .map_err(|e| e.to_string())

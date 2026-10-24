@@ -472,7 +472,7 @@ fn open_message_box_window_with_kind(
     window_options.window_background = WindowBackgroundAppearance::Transparent;
     apply_owner_display(&mut window_options, owner_bounds, cx);
 
-    cx.open_window(window_options, move |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, window_options, move |_window, cx| {
         cx.new(|cx| MessageBoxWindow::new(options, on_response, cx))
     })
     .map_err(|e| e.to_string())

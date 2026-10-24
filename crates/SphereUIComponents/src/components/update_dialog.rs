@@ -530,11 +530,10 @@ fn open_update_dialog_impl(
     options.window_background = WindowBackgroundAppearance::Transparent;
     apply_owner_display(&mut options, owner_bounds, cx);
 
-    let handle = cx
-        .open_window(options, move |_window, cx| {
-            cx.new(|cx| UpdateDialogWindow::new(candidate, cx))
-        })
-        .map_err(|error| error.to_string())?;
+    let handle = crate::dialog_frame::open_dialog_window(cx, options, move |_window, cx| {
+        cx.new(|cx| UpdateDialogWindow::new(candidate, cx))
+    })
+    .map_err(|error| error.to_string())?;
     cx.set_global(OpenUpdateDialog(handle));
     Ok(handle)
 }

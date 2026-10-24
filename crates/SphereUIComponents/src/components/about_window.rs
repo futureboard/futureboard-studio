@@ -374,6 +374,8 @@ pub fn open_about_window(
     options.window_background = WindowBackgroundAppearance::Transparent;
     apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, move |_window, cx| cx.new(AboutWindow::new))
-        .map_err(|error| error.to_string())
+    crate::dialog_frame::open_dialog_window(cx, options, move |_window, cx| {
+        cx.new(AboutWindow::new)
+    })
+    .map_err(|error| error.to_string())
 }

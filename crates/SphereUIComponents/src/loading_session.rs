@@ -2019,11 +2019,11 @@ fn open_workspace_prepare_window(
     cx: &mut App,
 ) -> Result<WindowHandle<LoadingSessionWindow>, String> {
     let window_options = session_transaction_window_options(None, cx);
-    let handle = cx
-        .open_window(window_options, move |_window, cx| {
-            cx.new(|cx| LoadingSessionWindow::new_progress(heading, "Preparing session", cx))
-        })
-        .map_err(|e| e.to_string())?;
+    let handle = crate::dialog_frame::open_dialog_window(cx, window_options, move |window, cx| {
+        crate::dialog_frame::keep_on_top(window);
+        cx.new(|cx| LoadingSessionWindow::new_progress(heading, "Preparing session", cx))
+    })
+    .map_err(|e| e.to_string())?;
     let _ = handle.update(cx, |window, _win, cx| window.start_progress_animation(cx));
     Ok(handle)
 }
@@ -2035,7 +2035,8 @@ fn open_loading_session_window(
     cx: &mut App,
 ) -> Result<WindowHandle<LoadingSessionWindow>, String> {
     let window_options = session_transaction_window_options(owner_bounds, cx);
-    cx.open_window(window_options, move |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, window_options, move |window, cx| {
+        crate::dialog_frame::keep_on_top(window);
         cx.new(|cx| LoadingSessionWindow::new_for_load(session_name, transaction, cx))
     })
     .map_err(|e| e.to_string())

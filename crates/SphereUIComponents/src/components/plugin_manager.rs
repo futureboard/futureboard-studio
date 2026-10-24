@@ -2322,8 +2322,10 @@ pub fn open_plugin_manager_window(
     ));
     crate::window_position::apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, |_window, cx| cx.new(PluginManagerWindow::new))
-        .map_err(|error| error.to_string())
+    crate::dialog_frame::open_dialog_window(cx, options, |_window, cx| {
+        cx.new(PluginManagerWindow::new)
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// Scan the default plug-in locations in a compact, standalone progress dialog.

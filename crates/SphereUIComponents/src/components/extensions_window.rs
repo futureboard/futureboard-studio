@@ -631,7 +631,7 @@ pub fn open_extensions_window(
     ));
     apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, move |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, move |_window, cx| {
         cx.new(|cx| ExtensionsWindow::new(on_close, cx))
     })
     .map_err(|error| error.to_string())

@@ -232,6 +232,8 @@ pub fn open_login_window(
     options.window_background = WindowBackgroundAppearance::Transparent;
     apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, |_window, cx| cx.new(|_cx| LoginWindow::new()))
-        .map_err(|error| error.to_string())
+    crate::dialog_frame::open_dialog_window(cx, options, |_window, cx| {
+        cx.new(|_cx| LoginWindow::new())
+    })
+    .map_err(|error| error.to_string())
 }

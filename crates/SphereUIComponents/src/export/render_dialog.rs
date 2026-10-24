@@ -918,7 +918,7 @@ pub fn open_render_dialog(
     apply_owner_display(&mut window_options, owner_bounds, cx);
 
     let language = language.to_string();
-    cx.open_window(window_options, move |window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, window_options, move |window, cx| {
         let dialog = cx.new(|cx| RenderDialog::new(language, launch, cx));
         let focus = dialog.read(cx).focus_handle.clone();
         focus.focus(window, cx);

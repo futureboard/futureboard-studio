@@ -3088,7 +3088,7 @@ pub fn open_add_track_window(
     ));
     apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, |_window, cx| {
         cx.new(|cx| {
             AddTrackWindow::new(
                 state,

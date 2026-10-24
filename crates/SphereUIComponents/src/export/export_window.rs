@@ -2031,7 +2031,7 @@ pub fn open_export_arrangement_window(
     ));
     apply_owner_display(&mut window_options, owner_bounds, cx);
 
-    cx.open_window(window_options, move |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, window_options, move |_window, cx| {
         cx.new(|cx| {
             let mut win = ExportArrangementWindow::new(
                 project_name,

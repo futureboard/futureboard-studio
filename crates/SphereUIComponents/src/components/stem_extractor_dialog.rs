@@ -1434,7 +1434,7 @@ pub fn open_stem_extractor_window(
     options.window_background = WindowBackgroundAppearance::Transparent;
     apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, move |_window, cx| {
+    crate::dialog_frame::open_dialog_window(cx, options, move |_window, cx| {
         cx.new(|cx| StemExtractorWindow::new(defaults, on_apply, cx))
     })
     .map_err(|e| e.to_string())
