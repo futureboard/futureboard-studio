@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    deferred, div, px, svg, AnyElement, App, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, Window,
+    deferred, div, point, px, relative, size, svg, AnyElement, App, AvailableSpace, Bounds, Div,
+    Element, ElementId, GlobalElementId, InteractiveElement, IntoElement, LayoutId, ParentElement,
+    Pixels, Position, Stateful, StatefulInteractiveElement, Style, Styled, Window,
 };
 
 use crate::assets;
@@ -58,6 +59,12 @@ const SELECT_MENU_PRIORITY: usize = 100;
 /// overflow would not be clipped, it would simply be unreachable. Roughly 13
 /// plain rows, which clears every fixed list in the app.
 const SELECT_MENU_MAX_HEIGHT: f32 = 420.0;
+
+/// Gap between the trigger and the menu edge.
+const SELECT_MENU_GAP: f32 = 3.0;
+
+/// Minimum distance kept between the menu and the window edge.
+const SELECT_MENU_WINDOW_MARGIN: f32 = 8.0;
 
 pub fn select(
     id: &'static str,
@@ -200,25 +207,14 @@ pub fn select_with_placement_and_header(
                     "[ui-popup] render kind=select id={id} placement={placement:?} z=overlay"
                 );
             }
-            let mut menu = div()
-                .absolute()
-                .left_0()
-                .right_0()
-                .max_h(px(SELECT_MENU_MAX_HEIGHT))
+            let menu = div()
                 .rounded(px(crate::theme::radius::CONTROL))
                 .border(px(1.0))
                 .border_color(Colors::border_default())
                 .bg(Colors::surface_panel_raised())
                 .shadow(vec![gpui::BoxShadow {
                     color: Colors::surface_overlay().into(),
-                    offset: gpui::point(
-                        px(0.0),
-                        px(if placement == SelectMenuPlacement::Above {
-                            -8.0
-                        } else {
-                            10.0
-                        }),
-                    ),
+                    offset: gpui::point(px(0.0), px(2.0)),
                     blur_radius: px(24.0),
                     spread_radius: px(0.0),
                     inset: false,
@@ -229,12 +225,7 @@ pub fn select_with_placement_and_header(
                 .occlude()
                 .on_mouse_down(gpui::MouseButton::Left, |_, _window, cx| {
                     cx.stop_propagation();
-                });
-            menu = match placement {
-                SelectMenuPlacement::Below => menu.top(px(31.0)),
-                SelectMenuPlacement::Above => menu.bottom(px(31.0)),
-            };
-            let menu = menu
+                })
                 .children(menu_header)
                 .children(options.into_iter().enumerate().map(move |(index, option)| {
                     let active = selected_id == Some(option.id.as_str());
@@ -327,10 +318,147 @@ pub fn select_with_placement_and_header(
                 }));
             // Defer the menu so it paints after every sibling row and the
             // dialog footer, and escapes any parent scroll container's clip.
-            // Layout still resolves against the relative() wrapper above, so
-            // the menu keeps the trigger's width and chosen placement.
-            root.child(deferred(menu).with_priority(SELECT_MENU_PRIORITY))
+            // The anchor covers the trigger, so the menu keeps its width and
+            // is fitted against the window once the trigger is placed.
+            root.child(
+                deferred(SelectMenuAnchor {
+                    menu: Some(menu),
+                    preferred: placement,
+                    menu_element: None,
+                })
+                .with_priority(SELECT_MENU_PRIORITY),
+            )
         })
+}
+
+/// Places the open menu next to the trigger and keeps it inside the window:
+/// it opens on the preferred side when the menu fits there, otherwise on the
+/// side with more room, and its height is capped to that room so the last
+/// rows stay reachable by scrolling instead of being painted off-window.
+struct SelectMenuAnchor {
+    menu: Option<Stateful<Div>>,
+    preferred: SelectMenuPlacement,
+    menu_element: Option<AnyElement>,
+}
+
+impl IntoElement for SelectMenuAnchor {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SelectMenuAnchor {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.position = Position::Absolute;
+        style.inset.top = px(0.0).into();
+        style.inset.left = px(0.0).into();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        trigger: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let Some(menu) = self.menu.take() else {
+            return;
+        };
+        let viewport = window.viewport_size();
+        let space_below = f32::from(viewport.height)
+            - f32::from(trigger.bottom())
+            - SELECT_MENU_GAP
+            - SELECT_MENU_WINDOW_MARGIN;
+        let space_above = f32::from(trigger.top()) - SELECT_MENU_GAP - SELECT_MENU_WINDOW_MARGIN;
+        let max_height = space_below
+            .max(space_above)
+            .min(SELECT_MENU_MAX_HEIGHT)
+            .max(0.0);
+        let width = trigger.size.width;
+        let mut menu = menu.w(width).max_h(px(max_height)).into_any_element();
+        let height = f32::from(
+            menu.layout_as_root(
+                size(AvailableSpace::Definite(width), AvailableSpace::MinContent),
+                window,
+                cx,
+            )
+            .height,
+        );
+        let placement = fit_menu_placement(self.preferred, height, space_below, space_above);
+        let top = match placement {
+            SelectMenuPlacement::Below => f32::from(trigger.bottom()) + SELECT_MENU_GAP,
+            SelectMenuPlacement::Above => f32::from(trigger.top()) - SELECT_MENU_GAP - height,
+        };
+        if crate::ui_debug_enabled() {
+            eprintln!(
+                "[ui-popup] fit kind=select preferred={:?} placement={placement:?} height={height:.0} below={space_below:.0} above={space_above:.0}",
+                self.preferred
+            );
+        }
+        menu.prepaint_at(point(trigger.left(), px(top.round())), window, cx);
+        self.menu_element = Some(menu);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(menu) = self.menu_element.as_mut() {
+            menu.paint(window, cx);
+        }
+    }
+}
+
+/// Side the menu opens on: the preferred one when `height` fits there,
+/// otherwise whichever side has more room.
+fn fit_menu_placement(
+    preferred: SelectMenuPlacement,
+    height: f32,
+    space_below: f32,
+    space_above: f32,
+) -> SelectMenuPlacement {
+    let preferred_space = match preferred {
+        SelectMenuPlacement::Below => space_below,
+        SelectMenuPlacement::Above => space_above,
+    };
+    if height <= preferred_space {
+        preferred
+    } else if space_below >= space_above {
+        SelectMenuPlacement::Below
+    } else {
+        SelectMenuPlacement::Above
+    }
 }
 
 /// Full-window click-catcher that dismisses an open [`select`] when the user
@@ -387,5 +515,27 @@ mod tests {
     #[test]
     fn very_long_lists_stay_bounded() {
         assert!(menu_height_for(40) > SELECT_MENU_MAX_HEIGHT);
+    }
+
+    #[test]
+    fn menu_keeps_preferred_side_when_it_fits() {
+        let below = SelectMenuPlacement::Below;
+        assert_eq!(fit_menu_placement(below, 120.0, 200.0, 400.0), below);
+        let above = SelectMenuPlacement::Above;
+        assert_eq!(fit_menu_placement(above, 120.0, 400.0, 200.0), above);
+    }
+
+    /// A trigger near the bottom of a short dialog window: the list does not
+    /// fit below, so it opens upward where there is more room.
+    #[test]
+    fn menu_flips_to_the_roomier_side_when_it_overflows() {
+        assert_eq!(
+            fit_menu_placement(SelectMenuPlacement::Below, 380.0, 150.0, 400.0),
+            SelectMenuPlacement::Above
+        );
+        assert_eq!(
+            fit_menu_placement(SelectMenuPlacement::Above, 380.0, 400.0, 150.0),
+            SelectMenuPlacement::Below
+        );
     }
 }
