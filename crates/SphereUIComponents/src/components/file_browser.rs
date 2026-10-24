@@ -2279,11 +2279,9 @@ mod tests {
             Some(Path::new("C:/presets/Alpha.pst"))
         );
         assert!(alpha.is_plugin_preset());
-        assert!(
-            state
-                .instrument_for(Path::new("C:/presets/Alpha.pst"))
-                .is_some()
-        );
+        assert!(state
+            .instrument_for(Path::new("C:/presets/Alpha.pst"))
+            .is_some());
 
         // A vendor folds away like any group.
         state.toggle_node("group:vendor:Beta Audio", None);

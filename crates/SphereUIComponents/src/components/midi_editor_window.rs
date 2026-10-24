@@ -6,8 +6,8 @@ use std::sync::Arc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, Styled, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
+    IntoElement, KeyDownEvent, ParentElement, Render, Styled, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowKind,
 };
 
 use crate::components::piano_roll::PianoRoll;

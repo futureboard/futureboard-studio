@@ -12,11 +12,13 @@ use crate::components::spin_drag::SpinDrag;
 use crate::components::text_input::{
     text_field_with_callbacks_and_ime, TextInputCallbacks, TextInputState,
 };
+use crate::components::timeline::arrangement_overlay::{
+    track_meter_slot, SharedArrangementOverlay,
+};
 use crate::components::timeline::timeline_state::{
     volume, GroupTree, TimelineState, TrackDragItem, TrackLaneMode, TrackState, TrackType,
     HEADER_WIDTH, TRACK_HEADER_CONTROLS_MIN_HEIGHT,
 };
-use crate::components::timeline::arrangement_overlay::{track_meter_slot, SharedArrangementOverlay};
 use crate::theme::{radius, size, space, typography, Colors};
 
 type TrackCallback = std::sync::Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>;

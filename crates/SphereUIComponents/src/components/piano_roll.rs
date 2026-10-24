@@ -23,10 +23,10 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    canvas, deferred, div, fill, point, px, size, svg, Animation, AnimationExt,
-    AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Render, ScrollWheelEvent, StatefulInteractiveElement, Styled, Subscription, Window,
+    canvas, deferred, div, fill, point, px, size, svg, Animation, AnimationExt, AppContext, Bounds,
+    Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent,
+    StatefulInteractiveElement, Styled, Subscription, Window,
 };
 
 use crate::assets;

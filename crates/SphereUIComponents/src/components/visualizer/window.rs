@@ -17,21 +17,22 @@ use std::time::Instant;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, Corners, DevicePixels, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, RenderImage, StatefulInteractiveElement, Styled, Window,
-    WindowBounds, WindowControlArea, WindowHandle, WindowKind, canvas, div, point, px, size, svg,
+    canvas, div, point, px, size, svg, App, AppContext, Bounds, Context, Corners, DevicePixels,
+    InteractiveElement, IntoElement, ParentElement, Pixels, Render, RenderImage,
+    StatefulInteractiveElement, Styled, Window, WindowBounds, WindowControlArea, WindowHandle,
+    WindowKind,
 };
 use smallvec::SmallVec;
 
-use super::VisualizerKind;
 use super::analysis::Analyzer;
 use super::gpu::{self, Presented, Surface};
 use super::scene::{
-    self, FREQ_TICKS, LOUDNESS_GRID, LOUDNESS_PANEL, LOUDNESS_ROWS, LOUDNESS_TARGET, Layout,
-    Palette, SPECTRUM_GRID_DB, STEREO_METER_CAPTION, TITLE_BAR, ViewState,
+    self, Layout, Palette, ViewState, FREQ_TICKS, LOUDNESS_GRID, LOUDNESS_PANEL, LOUDNESS_ROWS,
+    LOUDNESS_TARGET, SPECTRUM_GRID_DB, STEREO_METER_CAPTION, TITLE_BAR,
 };
+use super::VisualizerKind;
 use crate::components::title_bar::begin_titlebar_drag;
-use crate::theme::{Colors, typography};
+use crate::theme::{typography, Colors};
 
 const DEFAULT_SIZE: (f32, f32) = (420.0, 260.0);
 const MIN_SIZE: (f32, f32) = (240.0, 180.0);

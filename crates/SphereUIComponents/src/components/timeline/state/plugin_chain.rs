@@ -2023,8 +2023,8 @@ mod bridge_hosted_module_tests {
 #[cfg(test)]
 mod vsti_output_bus_layout_tests {
     use super::{
-        InsertSlotState, VSTI_MAX_BRIDGE_CHANNELS, vsti_output_bus_flat_range,
-        vsti_output_bus_strip_indices, vsti_output_child_channels_for_bus_layout,
+        vsti_output_bus_flat_range, vsti_output_bus_strip_indices,
+        vsti_output_child_channels_for_bus_layout, InsertSlotState, VSTI_MAX_BRIDGE_CHANNELS,
     };
 
     #[test]

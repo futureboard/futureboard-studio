@@ -23,34 +23,34 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use drumsampler::{PADS, Pad, Params};
+use drumsampler::{Pad, Params, PADS};
 use gpui::{
-    App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
-    WindowKind, div, px, size,
+    div, px, size, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowKind,
 };
 
-use crate::components::builtin_plugin_editor::{DrumPadWaveform, drum_waveforms};
+use crate::components::builtin_plugin_editor::{drum_waveforms, DrumPadWaveform};
 use crate::components::builtin_plugin_editor_window::{
-    BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps, PluginInstanceKey, read_dropped_sample,
+    read_dropped_sample, BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps, PluginInstanceKey,
 };
 use crate::components::builtin_plugin_files::{self as files, BuiltinFileKind};
 use crate::components::context_menu::context_menu_overlay;
 use crate::components::drum_sampler_menu::{
-    DrumMenuTarget, cleared_pad, command, free_output, menu_entries, next_empty_pad,
-    paste_settings, reset_pad,
+    cleared_pad, command, free_output, menu_entries, next_empty_pad, paste_settings, reset_pad,
+    DrumMenuTarget,
 };
 use crate::components::drum_sampler_panel::{
-    DRAG_SLOP_PX, DrumSamplerCallbacks, DrumSamplerPanelState, DrumView, EDGE_GRAB_PX, FaderPress,
-    PadAdjust, PadPress, RegionEdge, adjusted, bank_of, drum_sampler_panel, edge_near,
-    fader_dragged, with_edge,
+    adjusted, bank_of, drum_sampler_panel, edge_near, fader_dragged, with_edge,
+    DrumSamplerCallbacks, DrumSamplerPanelState, DrumView, FaderPress, PadAdjust, PadPress,
+    RegionEdge, DRAG_SLOP_PX, EDGE_GRAB_PX,
 };
 use crate::components::native_plugin_shell::{
-    NativeBuiltinEditor, SHELL_METER_INTERVAL, ShellIdentity, ShellMeter, native_plugin_shell,
+    native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::quick_sampler_window::SAMPLE_EXTENSIONS;
 use crate::components::text_input::{
-    TextInputState, bind_mouse_selection, text_field_with_callbacks_and_ime,
+    bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputState,
 };
 
 pub const DRUM_SAMPLER_WINDOW_WIDTH: f32 = 1_180.0;

@@ -39,8 +39,8 @@ use crate::components::builtin_plugin_editor_surface::{
 };
 use crate::components::plugin_content_host::{ContentChildHwnd, ContentHostKind, ContentRect};
 use crate::components::plugin_editor_chrome::{
-    CHROME_ROW_H, InstanceTab, PluginEditorAction, PluginEditorChrome, TAB_STRIP_H,
-    render_builtin_chrome_tools, render_instance_tab_strip,
+    render_builtin_chrome_tools, render_instance_tab_strip, InstanceTab, PluginEditorAction,
+    PluginEditorChrome, CHROME_ROW_H, TAB_STRIP_H,
 };
 use crate::components::title_bar::{external_window_titlebar, TITLEBAR_HEIGHT};
 use crate::components::transport_key::{self, TransportKeySource};
@@ -256,10 +256,10 @@ pub(crate) fn read_dropped_sample(
 /// revokes a target from the thread that registered it.
 #[cfg(windows)]
 fn revoke_child_drop_targets(parent: u64) -> usize {
+    use windows::core::{w, BOOL};
     use windows::Win32::Foundation::{HWND, LPARAM};
     use windows::Win32::System::Ole::RevokeDragDrop;
     use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetPropW};
-    use windows::core::{BOOL, w};
 
     unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let found = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
@@ -1457,7 +1457,7 @@ impl BuiltinPluginEditorWindow {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        use crate::components::builtin_plugin_files::{BuiltinFileKind, sanitize_file_name};
+        use crate::components::builtin_plugin_files::{sanitize_file_name, BuiltinFileKind};
         self.post_file_drag(None);
         if self.active_instance.is_none() {
             return;

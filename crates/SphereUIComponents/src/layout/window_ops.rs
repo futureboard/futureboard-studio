@@ -2856,10 +2856,8 @@ impl StudioLayout {
                 + Sync,
         > = Arc::new(move |request, app| {
             let _ = studio.update(app, |layout, cx| {
-                let edit = layout.begin_track_edit(
-                    TrackEditScope::tracks(request.route.edited_tracks()),
-                    cx,
-                );
+                let edit = layout
+                    .begin_track_edit(TrackEditScope::tracks(request.route.edited_tracks()), cx);
                 let changed = layout.timeline.update(cx, |timeline, cx| {
                     let changed =
                         crate::components::soundfont_player_window::apply_soundfont_midi_route(

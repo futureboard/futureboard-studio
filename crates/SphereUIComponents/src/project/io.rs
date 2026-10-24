@@ -1,10 +1,9 @@
 use super::{
-    ClipSource, FutureboardProject, ProjectAsset,
     format::{
-        ProjectError, ProjectIdentity, decode_project, decode_project_identity,
-        decode_project_with_options, encode_project,
+        decode_project, decode_project_identity, decode_project_with_options, encode_project,
+        ProjectError, ProjectIdentity,
     },
-    now_secs,
+    now_secs, ClipSource, FutureboardProject, ProjectAsset,
 };
 use crate::components::timeline::timeline_state::AudioClipStretchState;
 use crate::paths::{FutureboardPaths, ProjectFolderLayout};
@@ -1650,9 +1649,9 @@ mod tests {
     use super::*;
     use crate::components::timeline::timeline_state::AudioClipStretchState;
     use crate::project::{
+        format::{encode_project, ProjectError, PROJECT_HEADER_SIZE},
         ClipSource, FutureboardProject, ProjectAsset, ProjectClip, ProjectSession, ProjectTrack,
         ProjectTrackType, TrackRouting,
-        format::{PROJECT_HEADER_SIZE, ProjectError, encode_project},
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -2392,7 +2391,7 @@ mod tests {
     /// Test D: missing peak file is a disk miss (regeneration path).
     #[test]
     fn missing_peak_file_reports_disk_miss() {
-        use crate::components::timeline::waveform_peak_file::{PeakFileError, read_peak_file};
+        use crate::components::timeline::waveform_peak_file::{read_peak_file, PeakFileError};
 
         let root = temp_dir("peak-d");
         let asset_id = "Assets/Audio/loop.wav";

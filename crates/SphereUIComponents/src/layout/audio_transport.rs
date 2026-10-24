@@ -3973,7 +3973,7 @@ impl StudioLayout {
         cx: &mut Context<Self>,
     ) {
         use crate::components::timeline::timeline_state::{
-            TS_ALLOWED_DENOMINATORS, normalize_time_signature_denominator,
+            normalize_time_signature_denominator, TS_ALLOWED_DENOMINATORS,
         };
         let den = normalize_time_signature_denominator(den);
         if !(1..=64).contains(&num) || !TS_ALLOWED_DENOMINATORS.contains(&den) {

@@ -2121,16 +2121,14 @@ impl PianoRoll {
                 })
                 .collect()
         } else {
-            vec![
-                div()
-                    .absolute()
-                    .right(px(space::SNUG))
-                    .bottom(px(space::TIGHT))
-                    .text_size(px(typography::DENSE_CAPTION))
-                    .text_color(Colors::text_faint())
-                    .child(self.lane_range())
-                    .into_any_element(),
-            ]
+            vec![div()
+                .absolute()
+                .right(px(space::SNUG))
+                .bottom(px(space::TIGHT))
+                .text_size(px(typography::DENSE_CAPTION))
+                .text_color(Colors::text_faint())
+                .child(self.lane_range())
+                .into_any_element()]
         };
         div()
             .relative()
@@ -2189,15 +2187,16 @@ impl PianoRoll {
 
         if has_y {
             let entity = entity.clone();
-            let on_scroll = std::sync::Arc::new(move |y: f32, _: &mut Window, cx: &mut gpui::App| {
-                let _ = entity.update(cx, |this, cx| {
-                    let y = y.clamp(0.0, this.max_scroll_y());
-                    if (this.scroll_y - y).abs() > 0.01 {
-                        this.scroll_y = y;
-                        cx.notify();
-                    }
+            let on_scroll =
+                std::sync::Arc::new(move |y: f32, _: &mut Window, cx: &mut gpui::App| {
+                    let _ = entity.update(cx, |this, cx| {
+                        let y = y.clamp(0.0, this.max_scroll_y());
+                        if (this.scroll_y - y).abs() > 0.01 {
+                            this.scroll_y = y;
+                            cx.notify();
+                        }
+                    });
                 });
-            });
             let track_len = (view_h - corner(has_x)).max(1.0);
             if let Some(bar) = scrollbar(
                 "piano-roll-vscroll",
@@ -2223,17 +2222,18 @@ impl PianoRoll {
         }
 
         if has_x {
-            let on_scroll = std::sync::Arc::new(move |x: f32, _: &mut Window, cx: &mut gpui::App| {
-                let _ = entity.update(cx, |this, cx| {
-                    let x = x.clamp(0.0, this.max_scroll_x(cx));
-                    if (this.scroll_x - x).abs() > 0.01 {
-                        let before = this.scroll_x;
-                        this.scroll_x = x;
-                        this.note_user_scrolled_x(before, cx);
-                        cx.notify();
-                    }
+            let on_scroll =
+                std::sync::Arc::new(move |x: f32, _: &mut Window, cx: &mut gpui::App| {
+                    let _ = entity.update(cx, |this, cx| {
+                        let x = x.clamp(0.0, this.max_scroll_x(cx));
+                        if (this.scroll_x - x).abs() > 0.01 {
+                            let before = this.scroll_x;
+                            this.scroll_x = x;
+                            this.note_user_scrolled_x(before, cx);
+                            cx.notify();
+                        }
+                    });
                 });
-            });
             let track_len = (view_w - corner(has_y)).max(1.0);
             if let Some(bar) = scrollbar(
                 "piano-roll-hscroll",
@@ -2400,15 +2400,13 @@ impl PianoRoll {
                 .into_any_element(),
             ])
             .into_any_element(),
-            insp_action_row(vec![
-                insp_action(
-                    "pr-expression-reset-all",
-                    "Reset All Expression",
-                    false,
-                    cx.listener(|this, _, _w, cx| this.reset_selected_expression(None, cx)),
-                )
-                .into_any_element(),
-            ])
+            insp_action_row(vec![insp_action(
+                "pr-expression-reset-all",
+                "Reset All Expression",
+                false,
+                cx.listener(|this, _, _w, cx| this.reset_selected_expression(None, cx)),
+            )
+            .into_any_element()])
             .into_any_element(),
         ]
     }
@@ -2432,29 +2430,27 @@ impl PianoRoll {
             1 => "Note".to_string(),
             n => format!("{} Notes", group_thousands(n)),
         };
-        let mut content: Vec<gpui::AnyElement> = vec![
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(space::SNUG))
-                .h(px(size::DEFAULT))
-                .child(
-                    div()
-                        .text_size(px(typography::UI_SM))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(Colors::text_primary())
-                        .child(title),
-                )
-                .when(count > 0, |header| {
-                    header.child(crate::components::controls::fb_badge(
-                        snapshot.pitch_label(),
-                        Colors::accent_primary(),
-                    ))
-                })
-                .into_any_element(),
-        ];
+        let mut content: Vec<gpui::AnyElement> = vec![div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(space::SNUG))
+            .h(px(size::DEFAULT))
+            .child(
+                div()
+                    .text_size(px(typography::UI_SM))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(Colors::text_primary())
+                    .child(title),
+            )
+            .when(count > 0, |header| {
+                header.child(crate::components::controls::fb_badge(
+                    snapshot.pitch_label(),
+                    Colors::accent_primary(),
+                ))
+            })
+            .into_any_element()];
 
         if count == 0 {
             let (notes, lowest, highest) = {

@@ -11,11 +11,11 @@
 //! The shell owns no plug-in state. The editor window that uses it keeps the
 //! instance key and host ops, and drives [`ShellMeter::poll`] from its timer.
 
-use gpui::{AnyElement, App, IntoElement, ParentElement, Styled, Window, div, px, relative};
+use gpui::{div, px, relative, AnyElement, App, IntoElement, ParentElement, Styled, Window};
 
 use crate::components::builtin_plugin_editor_window::{BuiltinMeterSource, PluginInstanceKey};
 use crate::components::title_bar::external_window_titlebar;
-use crate::theme::{Colors, radius, space, typography};
+use crate::theme::{radius, space, typography, Colors};
 
 /// How often a native editor polls its insert's meter: about 30 Hz, the rate
 /// the CEF editors' telemetry pump runs at.

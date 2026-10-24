@@ -1,14 +1,14 @@
+use crate::assets;
 use crate::components::timeline::timeline_state::{
     automation_value_to_y, automation_y_to_value, evaluate_automation, AutomationHover,
     AutomationLaneState, AutomationMarquee, AutomationPoint, AutomationSampler, AutomationTarget,
     TimelineGestureContext, TimelineState, HEADER_WIDTH,
 };
-use crate::assets;
 use crate::theme::{radius, space, typography, Colors};
 use gpui::{
-    canvas, div, fill, point, px, size, svg, AnyView, App, AppContext, Background, Bounds,
-    Context, InteractiveElement, IntoElement, ParentElement, PathBuilder, PathStyle, Pixels,
-    Point, Render, StatefulInteractiveElement, StrokeOptions, Styled, Window,
+    canvas, div, fill, point, px, size, svg, AnyView, App, AppContext, Background, Bounds, Context,
+    InteractiveElement, IntoElement, ParentElement, PathBuilder, PathStyle, Pixels, Point, Render,
+    StatefulInteractiveElement, StrokeOptions, Styled, Window,
 };
 
 /// Tiny tooltip surface for sub-lane control buttons. Matches the global lane

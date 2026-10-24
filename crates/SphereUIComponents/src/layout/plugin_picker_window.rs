@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind, div, px, size,
+    div, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, Render, Styled, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowKind,
 };
 
 use crate::components::plugin_picker::{
+    compute_filter_result, ensure_default_highlight, picker_perf_debug, plugin_picker_panel,
     CatalogStatus, KindTab, PickerFilter, PluginPickerCallbacks, PluginPickerPrefs,
-    PluginPickerScrollHandles, PluginPickerState, PluginSearchIndex, compute_filter_result,
-    ensure_default_highlight, picker_perf_debug, plugin_picker_panel,
+    PluginPickerScrollHandles, PluginPickerState, PluginSearchIndex,
 };
 use crate::components::text_input::{
-    TextInputCallbacks, TextInputMouseCb, TextInputMouseEvent, bind_mouse_selection,
+    bind_mouse_selection, TextInputCallbacks, TextInputMouseCb, TextInputMouseEvent,
 };
 use crate::components::title_bar::external_window_titlebar;
 use crate::theme::{self, Colors};

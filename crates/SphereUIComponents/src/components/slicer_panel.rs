@@ -25,25 +25,25 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, Bounds, InteractiveElement, IntoElement, ParentElement, Pixels,
-    StatefulInteractiveElement, Styled, Window, canvas, div, fill, px, relative,
+    canvas, div, fill, px, relative, AnyElement, App, Bounds, InteractiveElement, IntoElement,
+    ParentElement, Pixels, StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::components::controls::{
-    FbButtonKind, FbSegment, fb_button, fb_checkbox, fb_segment, fb_segmented_track,
-    fb_stepper_button,
+    fb_button, fb_checkbox, fb_segment, fb_segmented_track, fb_stepper_button, FbButtonKind,
+    FbSegment,
 };
 use crate::components::quick_sampler_panel::{
-    DISPLAY_H, DisplayColors, FLAG_H, I32Cb, KEYBOARD_HIGHEST_ROOT, NoteCb, ParamsCb,
-    SAMPLE_DROP_GROUP, SampleSummary, VoidCb, amp_module, bipolar_knob, controls_row,
-    empty_sample_drop_zone, filter_module, module, output_module, paint_display_frame,
-    paint_waveform, piano_keyboard, rect, ruler_labels, sample_drop_overlay, sampler_header,
-    sampler_keyboard_footer, status_banner, stepper, with,
+    amp_module, bipolar_knob, controls_row, empty_sample_drop_zone, filter_module, module,
+    output_module, paint_display_frame, paint_waveform, piano_keyboard, rect, ruler_labels,
+    sample_drop_overlay, sampler_header, sampler_keyboard_footer, status_banner, stepper, with,
+    DisplayColors, I32Cb, NoteCb, ParamsCb, SampleSummary, VoidCb, DISPLAY_H, FLAG_H,
+    KEYBOARD_HIGHEST_ROOT, SAMPLE_DROP_GROUP,
 };
 use crate::components::soundfont_player_mdi::note_label;
-use crate::theme::{Colors, radius, space, typography};
+use crate::theme::{radius, space, typography, Colors};
 use quicksampler::QuickSamplerParams;
-use slicer::{BeatDivision, MAX_SLICES, SliceMode, SlicerParams};
+use slicer::{BeatDivision, SliceMode, SlicerParams, MAX_SLICES};
 
 pub const SLICER_TITLE: &str = "Slicer";
 

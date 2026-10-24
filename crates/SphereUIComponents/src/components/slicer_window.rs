@@ -26,26 +26,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext, Bounds, Context, ExternalPaths, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind, div, px, size,
+    div, px, size, App, AppContext, Bounds, Context, ExternalPaths, FocusHandle,
+    InteractiveElement, IntoElement, ParentElement, Pixels, Render, Styled, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 
 use crate::components::builtin_plugin_editor_window::{
-    BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps, PluginInstanceKey, read_dropped_sample,
+    read_dropped_sample, BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps, PluginInstanceKey,
 };
 use crate::components::builtin_plugin_files::{self as files, BuiltinFileKind};
-use crate::components::context_menu::{ContextMenuEntry, context_menu_overlay};
+use crate::components::context_menu::{context_menu_overlay, ContextMenuEntry};
 use crate::components::native_plugin_shell::{
-    NativeBuiltinEditor, SHELL_METER_INTERVAL, ShellIdentity, ShellMeter, native_plugin_shell,
+    native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::quick_sampler_panel::SampleSummary;
 use crate::components::quick_sampler_window::SAMPLE_EXTENSIONS;
 use crate::components::slicer_panel::{
-    SlicerCallbacks, SlicerPanelState, SoundingSlice, point_under, slicer_panel,
+    point_under, slicer_panel, SlicerCallbacks, SlicerPanelState, SoundingSlice,
 };
 use crate::components::timeline::timeline_state::detect_tempo_from_mono;
-use slicer::{SliceMode, SlicerParams, slicing};
+use slicer::{slicing, SliceMode, SlicerParams};
 
 pub const SLICER_WINDOW_WIDTH: f32 = 1_040.0;
 pub const SLICER_WINDOW_HEIGHT: f32 = 860.0;

@@ -13,9 +13,9 @@ mod search_index;
 mod sidebar;
 mod state;
 
-pub use category::{NormalizedCategory, normalize_category, normalized_category_label};
-pub use filter::{FilterCounts, FilterResult, compute_filter_result, picker_perf_debug};
-pub use insert::{InsertValidation, PluginInsertKind, PluginInsertTarget, validate_insert};
+pub use category::{normalize_category, normalized_category_label, NormalizedCategory};
+pub use filter::{compute_filter_result, picker_perf_debug, FilterCounts, FilterResult};
+pub use insert::{validate_insert, InsertValidation, PluginInsertKind, PluginInsertTarget};
 pub use list_view::PluginDragItem;
 pub use overlay::{
     page_size_for_height, plugin_picker_overlay, plugin_picker_panel, visible_plugin_id_at,

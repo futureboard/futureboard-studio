@@ -1,8 +1,8 @@
 use crate::components::plugin_picker::STUB_PLUGIN_ID;
 use crate::components::timeline::timeline_state::{
-    self, ClipState, ClipType, InsertSlotState, MASTER_TRACK_ID, MidiControllerKind, StretchMode,
-    TimelineState, TrackState, TrackType, vsti_output_bus_flat_range,
-    vsti_output_child_channels_for_bus_layout, vsti_output_child_track_id,
+    self, vsti_output_bus_flat_range, vsti_output_child_channels_for_bus_layout,
+    vsti_output_child_track_id, ClipState, ClipType, InsertSlotState, MidiControllerKind,
+    StretchMode, TimelineState, TrackState, TrackType, MASTER_TRACK_ID,
 };
 
 use DirectAudio::types::{

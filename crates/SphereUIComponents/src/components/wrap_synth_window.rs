@@ -16,17 +16,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement,
-    Render, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
-    div, px, size,
+    div, px, size, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement,
+    ParentElement, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowKind,
 };
 
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
 use crate::components::native_plugin_shell::{
-    NativeBuiltinEditor, SHELL_METER_INTERVAL, ShellIdentity, ShellMeter, native_plugin_shell,
+    native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::wrap_synth_panel::{
-    SynthPage, WrapSynthCallbacks, WrapSynthPanelState, wrap_synth_panel,
+    wrap_synth_panel, SynthPage, WrapSynthCallbacks, WrapSynthPanelState,
 };
 use wrapsynth::Params;
 

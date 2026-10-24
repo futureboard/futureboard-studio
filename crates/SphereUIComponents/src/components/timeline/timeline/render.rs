@@ -1097,7 +1097,11 @@ impl Render for Timeline {
         let on_chord_header_menu = self.on_context_menu.clone().map(|cb| {
             std::sync::Arc::new(
                 move |pos: &(f32, f32), window: &mut gpui::Window, cx: &mut gpui::App| {
-                    cb(&(TimelineContextTarget::ChordLaneHeader, pos.0, pos.1), window, cx);
+                    cb(
+                        &(TimelineContextTarget::ChordLaneHeader, pos.0, pos.1),
+                        window,
+                        cx,
+                    );
                 },
             ) as crate::components::timeline::region_track::GlobalLaneMenuCallback
         });

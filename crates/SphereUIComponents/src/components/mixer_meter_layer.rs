@@ -26,13 +26,13 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
-    Bounds, ContentMask, Context, Entity, IntoElement, ParentElement, Pixels, Render, Styled,
-    Window, canvas, div, px,
+    canvas, div, px, Bounds, ContentMask, Context, Entity, IntoElement, ParentElement, Pixels,
+    Render, Styled, Window,
 };
 
-use crate::components::mixer_panel::{VstiOutputMeterState, vsti_output_meter_key};
+use crate::components::mixer_panel::{vsti_output_meter_key, VstiOutputMeterState};
 use crate::components::timeline::timeline::Timeline;
-use crate::components::timeline::vu_meter::{STEREO_METER_WIDTH, paint_stereo_meter};
+use crate::components::timeline::vu_meter::{paint_stereo_meter, STEREO_METER_WIDTH};
 use crate::layout::StudioLayout;
 
 /// Where the meter of a VSTi output channel reads from when its backing track

@@ -30,31 +30,31 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use drumsampler::{
-    BANK_PADS, FilterMode, MAX_CUTOFF_HZ, MAX_DECAY_MS, MAX_HOLD_MS, MIN_REGION, OUTPUTS, PADS, Pad,
+    FilterMode, Pad, BANK_PADS, MAX_CUTOFF_HZ, MAX_DECAY_MS, MAX_HOLD_MS, MIN_REGION, OUTPUTS, PADS,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, ExternalPaths, InteractiveElement,
-    IntoElement, ParentElement, PathBuilder, Pixels, StatefulInteractiveElement, Styled, Window,
-    canvas, div, fill, point, px, relative,
+    canvas, div, fill, point, px, relative, Animation, AnimationExt, AnyElement, App, Bounds,
+    ExternalPaths, InteractiveElement, IntoElement, ParentElement, PathBuilder, Pixels,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::components::builtin_plugin_editor::DrumPadWaveform;
 use crate::components::builtin_plugin_files::BuiltinFileEntry;
 use crate::components::controls::{
-    FbButtonKind, FbSegment, fb_button, fb_checkbox, fb_segment, fb_segmented_track,
-    fb_stepper_button,
+    fb_button, fb_checkbox, fb_segment, fb_segmented_track, fb_stepper_button, FbButtonKind,
+    FbSegment,
 };
 use crate::components::drum_sampler_menu::DrumMenuTarget;
 use crate::components::knob::{format_pan_label, knob_bipolar, knob_with_default};
 use crate::components::quick_sampler_panel::{
-    DisplayColors, FLAG_H, FLAG_W, GRAPH_H, GraphColors, KNOB_SIZE, SAMPLE_DROP_GROUP, VoidCb,
     controls_row, cutoff_from_position, cutoff_position, empty_sample_drop_zone, format_hz,
     format_ms, format_seconds, knob_cell, module, paint_curve, paint_display_frame,
-    paint_graph_frame, paint_waveform, rect, ruler_labels, status_banner,
+    paint_graph_frame, paint_waveform, rect, ruler_labels, status_banner, DisplayColors,
+    GraphColors, VoidCb, FLAG_H, FLAG_W, GRAPH_H, KNOB_SIZE, SAMPLE_DROP_GROUP,
 };
 use crate::components::soundfont_player_mdi::note_label;
-use crate::theme::{Colors, radius, space, typography};
+use crate::theme::{radius, space, typography, Colors};
 
 /// Pad 1 bottom-left, as on a hardware pad controller: the grid's rows, top
 /// to bottom.
@@ -341,7 +341,11 @@ pub fn envelope_at(pad: &Pad, t: f32) -> f32 {
         return 1.0;
     }
     let level = DECAY_FLOOR.powf((t - attack - hold) / (pad.decay_ms / 1_000.0));
-    if level <= DECAY_FLOOR { 0.0 } else { level }
+    if level <= DECAY_FLOOR {
+        0.0
+    } else {
+        level
+    }
 }
 
 /// The pad filter's response in dB at `hz`: the analog prototype of the

@@ -1,7 +1,7 @@
 use gpui::{
-    AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    div, px, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
     KeyDownEvent, ParentElement, Render, Role, StatefulInteractiveElement, Styled,
-    UniformListScrollHandle, Window, WindowHandle, div, px,
+    UniformListScrollHandle, Window, WindowHandle,
 };
 
 pub use crate::shutdown::ShutdownState;
@@ -13,22 +13,22 @@ pub use session_load::PreparedWorkspaceFinish;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use crate::components;
-use crate::components::BottomPanelState;
-use crate::components::MixerWindow;
 use crate::components::add_track_dialog::AddTrackKind;
 use crate::components::edit::ClipSnapshot;
 use crate::components::file_browser::FileBrowserState;
 use crate::components::plugin_picker::{
+    compute_filter_result, ensure_default_highlight, plugin_picker_overlay,
     CatalogStatus as PluginCatalogStatus, PickerFilter, PluginPickerCallbacks, PluginPickerPrefs,
-    PluginPickerScrollHandles, PluginPickerState, PluginSearchIndex, compute_filter_result,
-    ensure_default_highlight, plugin_picker_overlay,
+    PluginPickerScrollHandles, PluginPickerState, PluginSearchIndex,
 };
 use crate::components::project_switcher::ProjectSwitcherState;
 use crate::components::text_input::{
-    TextInputCallbacks, TextInputState, text_input_context_entries,
+    text_input_context_entries, TextInputCallbacks, TextInputState,
 };
 use crate::components::timeline::timeline::TimelineContextTarget;
 use crate::components::timeline::timeline_state::{ClipType, TempoCurve, TrackEditScope};
+use crate::components::BottomPanelState;
+use crate::components::MixerWindow;
 use crate::components::{BackgroundTaskStore, CommandPaletteState};
 use crate::overlay::{project_title_anchor, titlebar_label_anchor};
 use crate::paths::FutureboardPaths;
@@ -67,6 +67,7 @@ mod midi_input_router;
 mod mixer_ops;
 mod stem_extract_ops;
 pub(crate) use mixer_ops::{clone_track_for_mixer, clone_track_for_mixer_summary};
+mod folder_ops;
 pub(crate) mod plugin_bridge_runtime;
 mod plugin_editor_chrome_ops;
 mod plugin_load_progress;
@@ -87,7 +88,6 @@ mod studio_state;
 mod tempo_key_ops;
 mod tempo_map_ops;
 mod track_clip_ops;
-mod folder_ops;
 mod track_duplicate_ops;
 mod transport_freeze_debug;
 mod transport_ops;
@@ -100,9 +100,9 @@ pub use context_menu_ops::{ContextMenuRequest, ContextMenuTarget};
 use engine_snapshot::volume_norm_to_linear;
 use frame_diagnostics::FrameDiagnostics;
 use helpers::{
-    FocusContext, edit_command_debug, find_clip_summary, is_midi_routable_edit_command,
-    is_supported_audio_ext, is_tap_tempo_command, is_text_input_key, key_debug,
-    normalize_command_id, should_handle_global_transport_shortcut, transport_command_from_id,
+    edit_command_debug, find_clip_summary, is_midi_routable_edit_command, is_supported_audio_ext,
+    is_tap_tempo_command, is_text_input_key, key_debug, normalize_command_id,
+    should_handle_global_transport_shortcut, transport_command_from_id, FocusContext,
 };
 use project_ops::LifecycleAction;
 pub use studio_state::{
@@ -122,7 +122,7 @@ fn use_demo_project() -> bool {
 /// it's safe to call at app launch and again when the studio is built.
 fn apply_renderer_preference(schema: &crate::settings::SettingsSchema) {
     use crate::components::timeline::render::{
-        TimelineRendererBackend, set_preferred_backend, set_preferred_gpu_device_id,
+        set_preferred_backend, set_preferred_gpu_device_id, TimelineRendererBackend,
     };
     use crate::settings::RenderMode;
     let chosen = match schema.performance.render_mode {
@@ -139,7 +139,7 @@ fn apply_renderer_preference(schema: &crate::settings::SettingsSchema) {
     // mixer until the GPU path is visually verified. The backend itself is always
     // GPUI-paint today (offscreen WGPU is parked / falls back).
     {
-        use crate::components::mixer_render::{MixerRendererBackend, set_preferred_mixer_backend};
+        use crate::components::mixer_render::{set_preferred_mixer_backend, MixerRendererBackend};
         use crate::components::mixer_surface::set_mixer_gpu_primitives_enabled;
         let mixer_backend = match schema.performance.render_mode {
             #[cfg(feature = "gpu-renderer")]
@@ -3317,9 +3317,7 @@ impl StudioLayout {
                 schema.playback.dropout_protection,
             ));
 
-            engine.set_record_pdc_bypass_enabled(
-                schema.recording.audio.bypass_pdc_while_recording,
-            );
+            engine.set_record_pdc_bypass_enabled(schema.recording.audio.bypass_pdc_while_recording);
             let desired_pdc = schema.playback.latency_compensation;
             if engine.pdc_enabled() != desired_pdc {
                 engine.set_pdc_enabled(desired_pdc);

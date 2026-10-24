@@ -14,45 +14,45 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, px, svg,
+    div, px, svg, App, AppContext, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::assets;
 use crate::audio_connections::AudioConnectionRegistry;
 use crate::components::color_picker::{
-    ColorPickerCallbacks, ColorPickerPlacement, ColorPickerState, color_picker_field,
-    default_presets,
+    color_picker_field, default_presets, ColorPickerCallbacks, ColorPickerPlacement,
+    ColorPickerState,
 };
 use crate::components::combo_box::{combo_box_string_menu, combo_box_trigger};
 use crate::components::controls::{
-    FbButtonKind, FbSegment, fb_button, fb_checkbox, fb_segment, fb_segmented_track,
-    fb_shortcut_hint,
+    fb_button, fb_checkbox, fb_segment, fb_segmented_track, fb_shortcut_hint, FbButtonKind,
+    FbSegment,
 };
 use crate::components::inspector::{
-    InspectorSelectOption, inspector_checkbox as shared_inspector_checkbox, inspector_hint_text,
-    inspector_mini_button, inspector_numeric_stepper, inspector_numeric_stepper_coarse,
-    inspector_numeric_stepper_with_drag_callbacks, inspector_select,
+    inspector_checkbox as shared_inspector_checkbox, inspector_hint_text, inspector_mini_button,
+    inspector_numeric_stepper, inspector_numeric_stepper_coarse,
+    inspector_numeric_stepper_with_drag_callbacks, inspector_select, InspectorSelectOption,
 };
 use crate::components::inspector_kit;
 use crate::components::reorder::{
-    DragRefusal, DropIndicator, DropSlot, InsertDropCb, InsertDropTarget, insert_drop_forwarder,
-    insert_drop_target,
+    insert_drop_forwarder, insert_drop_target, DragRefusal, DropIndicator, DropSlot, InsertDropCb,
+    InsertDropTarget,
 };
 use crate::components::slider::{bipolar_slider_with_drag_callbacks, slider_with_drag_callbacks};
 use crate::components::solfege_editor::SolfegePitchSummary;
 use crate::components::text_input::{
-    TextInputCallbacks, TextInputState, text_field_with_callbacks,
+    text_field_with_callbacks, TextInputCallbacks, TextInputState,
 };
 use crate::components::timeline::timeline_state::{
-    AudioClipStretchState, ClipType, InsertLoadStatus, InsertSlotState, StretchTiming,
-    TrackAudioFormat, TrackMidiInputRouting, TrackOutputRouting, TrackState, TrackType, volume,
-    vsti_output_child_channels_for_bus_layout,
+    volume, vsti_output_child_channels_for_bus_layout, AudioClipStretchState, ClipType,
+    InsertLoadStatus, InsertSlotState, StretchTiming, TrackAudioFormat, TrackMidiInputRouting,
+    TrackOutputRouting, TrackState, TrackType,
 };
 use crate::i18n::I18n;
-use crate::overlay::{OverlayAnchor, inspector_combo_menu_position};
+use crate::overlay::{inspector_combo_menu_position, OverlayAnchor};
 use crate::solfege::{ModelLoadState, SolfegeModelInfo};
-use crate::theme::{Colors, space, typography};
+use crate::theme::{space, typography, Colors};
 use sphere_midi_service::mpe::{MpeOutputMode, MpeTrackConfiguration};
 use sphere_midi_service::program::{MidiPatchFormat, MidiProgramSelection, XG_DRUM_BANK_MSB};
 
@@ -4355,14 +4355,12 @@ mod solfege_inspector_tests {
             weight_bytes: 4_096,
             usable: false,
         });
-        assert!(
-            model
-                .accent
-                .as_ref()
-                .unwrap()
-                .summary()
-                .contains("uses the rule")
-        );
+        assert!(model
+            .accent
+            .as_ref()
+            .unwrap()
+            .summary()
+            .contains("uses the rule"));
     }
 
     #[test]

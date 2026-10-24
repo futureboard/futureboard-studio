@@ -9,7 +9,7 @@ use crate::menu::{MenuItem, MenuManifest};
 use super::conflicts::{annotate_row_conflicts, find_conflicts_for_binding};
 use super::model::{
     KeyBinding, KeymapConflict, KeymapProfile, KeymapRow, KeymapScope, KeymapSource,
-    PROFILE_DESCRIPTORS, ResolvedKeyBinding,
+    ResolvedKeyBinding, PROFILE_DESCRIPTORS,
 };
 use super::normalize::{canonical_accel, format_accel_display};
 use super::storage::{

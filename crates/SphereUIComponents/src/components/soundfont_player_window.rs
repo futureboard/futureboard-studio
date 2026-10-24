@@ -34,25 +34,26 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, Styled, Subscription, UniformListScrollHandle, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, div, px, size,
+    div, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, Render, Styled, Subscription,
+    UniformListScrollHandle, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowKind,
 };
 
-use crate::components::context_menu::{ContextMenuEntry, context_menu_overlay};
+use crate::components::context_menu::{context_menu_overlay, ContextMenuEntry};
 use crate::components::soundfont_player_mdi::{
-    CHANNELS, SOUNDFONT_MULTI_TITLE, SOUNDFONT_PLAYER_MDI_TITLE, SoundfontPlayerCallbacks,
-    SoundfontPlayerPanelState, browser_rows, default_parts, soundfont_player_panel,
+    browser_rows, default_parts, soundfont_player_panel, SoundfontPlayerCallbacks,
+    SoundfontPlayerPanelState, CHANNELS, SOUNDFONT_MULTI_TITLE, SOUNDFONT_PLAYER_MDI_TITLE,
 };
 use crate::components::text_input::{
-    TextInputState, bind_mouse_selection, text_field_with_callbacks_and_ime,
+    bind_mouse_selection, text_field_with_callbacks_and_ime, TextInputState,
 };
-use crate::components::timeline::Timeline;
 use crate::components::timeline::timeline_state::{
     CreateTrackOptions, InputMonitorMode, MidiOutputChannelMode, SoundfontChannel,
     SoundfontChannels, SoundfontPlayerMode, SoundfontPlayerSettingsState, TimelineState,
     TrackOutputRouting, TrackState, TrackType,
 };
+use crate::components::timeline::Timeline;
 use crate::components::title_bar::external_window_titlebar;
 use crate::soundfont_player::{
     SoundfontEnvelope, SoundfontPlayer, SoundfontPlayerError, SoundfontPlayerSettings,
@@ -1505,11 +1506,9 @@ mod tests {
         let gm = multi(&mut state, "GM");
         state.tracks[0].soundfont_mode = SoundfontPlayerMode::Single;
         state.set_track_program_selection(&gm, selection(MidiPatchFormat::Gm, 0, 5));
-        assert!(
-            soundfont_program_parts(&state, &gm)
-                .iter()
-                .all(Option::is_none)
-        );
+        assert!(soundfont_program_parts(&state, &gm)
+            .iter()
+            .all(Option::is_none));
     }
 
     #[test]

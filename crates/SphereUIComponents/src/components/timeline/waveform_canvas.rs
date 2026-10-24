@@ -864,8 +864,8 @@ fn draw_preview_waveform(
                         let frac1 = (x1 / clip_w).min(1.0);
                         // Every column is inside the clip, so `p0` is too; the
                         // clamp only keeps a rounding edge from slicing past it.
-                        let p0 = ((frac0 * total_peaks as f32).floor() as usize)
-                            .min(total_peaks - 1);
+                        let p0 =
+                            ((frac0 * total_peaks as f32).floor() as usize).min(total_peaks - 1);
                         let p1 = (frac1 * total_peaks as f32).ceil() as usize;
                         let end = p1.min(total_peaks).max(p0 + 1);
                         let agg = aggregate_slice(&lod.peaks[p0..end]);
@@ -1219,18 +1219,19 @@ mod tests {
                 let (lo, hi) = (s0.min(s1), s0.max(s1));
                 let p0 = sample_to_peak_index(lo, plan.spp);
                 let p1 = sample_to_peak_index(hi, plan.spp).max(p0);
-                let peak = waveform_cache::aggregate_peak_range_in_entry_opt(
-                    entry,
-                    plan.spp,
-                    p0,
-                    p1 + 1,
-                )
-                .or_else(|| {
-                    let ladder = plan.fallback_spp?;
-                    let f0 = sample_to_peak_index(lo, ladder);
-                    let f1 = sample_to_peak_index(hi, ladder).max(f0);
-                    waveform_cache::aggregate_peak_range_in_entry_opt(entry, ladder, f0, f1 + 1)
-                });
+                let peak =
+                    waveform_cache::aggregate_peak_range_in_entry_opt(entry, plan.spp, p0, p1 + 1)
+                        .or_else(|| {
+                            let ladder = plan.fallback_spp?;
+                            let f0 = sample_to_peak_index(lo, ladder);
+                            let f1 = sample_to_peak_index(hi, ladder).max(f0);
+                            waveform_cache::aggregate_peak_range_in_entry_opt(
+                                entry,
+                                ladder,
+                                f0,
+                                f1 + 1,
+                            )
+                        });
                 let Some(WaveformPeak { min, max }) = peak else {
                     continue;
                 };
@@ -1260,7 +1261,10 @@ mod tests {
                 continue;
             }
             let expected = per_window_bars(asset_key, clip, state);
-            assert!(!expected.is_empty(), "{asset_key}: scroll {scroll} drew nothing");
+            assert!(
+                !expected.is_empty(),
+                "{asset_key}: scroll {scroll} drew nothing"
+            );
             // Twice: once built, once from the cache.
             for pass in 0..2 {
                 let (bars, _) = tiled(asset_key, clip, state);
@@ -1272,7 +1276,10 @@ mod tests {
             }
             compared += 1;
         }
-        assert!(compared >= 3, "{asset_key}: only {compared} scrolls had the clip on screen");
+        assert!(
+            compared >= 3,
+            "{asset_key}: only {compared} scrolls had the clip on screen"
+        );
     }
 
     #[test]
@@ -1318,7 +1325,10 @@ mod tests {
         for scroll in [301.0, 300.25, 299.0] {
             state.viewport.scroll_x = scroll;
             let (again, hit) = tiled(key, clip, state);
-            assert!(hit, "scrolling to {scroll} inside the same tiles missed the cache");
+            assert!(
+                hit,
+                "scrolling to {scroll} inside the same tiles missed the cache"
+            );
             for ((a, _), (b, _)) in first.iter().zip(&again) {
                 assert!(Arc::ptr_eq(a, b), "scroll {scroll} rebuilt a tile");
             }
@@ -1362,7 +1372,11 @@ mod tests {
             .iter()
             .filter(|(tile, _)| before.iter().any(|(old, _)| Arc::ptr_eq(old, tile)))
             .count();
-        assert_eq!(reused, after.len() - 1, "only the newly revealed tile rebuilds");
+        assert_eq!(
+            reused,
+            after.len() - 1,
+            "only the newly revealed tile rebuilds"
+        );
     }
 
     #[test]

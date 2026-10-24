@@ -24,27 +24,27 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    Styled, UniformListScrollHandle, Window, div, px, svg, uniform_list,
+    div, px, svg, uniform_list, AnyElement, App, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window,
 };
 
 use crate::assets;
 use crate::components::controls::{
-    FbButtonKind, FbLatch, FbSegment, fb_button, fb_checkbox, fb_segment, fb_segmented_track,
-    fb_stepper_button, fb_toggle,
+    fb_button, fb_checkbox, fb_segment, fb_segmented_track, fb_stepper_button, fb_toggle,
+    FbButtonKind, FbLatch, FbSegment,
 };
 use crate::components::knob::{format_pan_label, knob, knob_bipolar};
 use crate::components::mdi::{
-    MdiDocumentKind, MdiWorkspaceCallbacks, MdiWorkspaceState, mdi_workspace,
+    mdi_workspace, MdiDocumentKind, MdiWorkspaceCallbacks, MdiWorkspaceState,
 };
 use crate::components::slider::slider;
 use crate::components::timeline::timeline_state::{
     SoundfontChannel, SoundfontPlayerMode, SoundfontPlayerSettingsState,
 };
 use crate::soundfont_player::{
-    DRUM_BANK, SoundfontEnvelope, SoundfontPresetInfo, SoundfontRenderQuality,
+    SoundfontEnvelope, SoundfontPresetInfo, SoundfontRenderQuality, DRUM_BANK,
 };
-use crate::theme::{Colors, radius, size, space, typography};
+use crate::theme::{radius, size, space, typography, Colors};
 
 pub const SOUNDFONT_PLAYER_MDI_TITLE: &str = "Soundfont Player";
 /// The window's title in sixteen-channel mode.

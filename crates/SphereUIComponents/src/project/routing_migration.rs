@@ -461,12 +461,10 @@ mod tests {
 
         assert_eq!(result.generated_connections.len(), 1);
         let id = result.tracks[0].audio_input_connection_id.clone();
-        assert!(
-            result
-                .tracks
-                .iter()
-                .all(|t| t.audio_input_connection_id == id)
-        );
+        assert!(result
+            .tracks
+            .iter()
+            .all(|t| t.audio_input_connection_id == id));
     }
 
     #[test]
@@ -547,12 +545,10 @@ mod tests {
         ];
         let result = migrate(&tracks);
         assert!(result.generated_connections.is_empty());
-        assert!(
-            result
-                .tracks
-                .iter()
-                .all(|t| t.audio_input_connection_id.is_none())
-        );
+        assert!(result
+            .tracks
+            .iter()
+            .all(|t| t.audio_input_connection_id.is_none()));
     }
 
     // ── MIDI conflict rules ─────────────────────────────────────────────────

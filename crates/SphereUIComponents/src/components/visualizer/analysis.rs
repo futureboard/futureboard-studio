@@ -470,7 +470,11 @@ impl Analyzer {
 
 #[inline]
 fn flush(value: f32) -> f32 {
-    if value.abs() < 1.0e-25 { 0.0 } else { value }
+    if value.abs() < 1.0e-25 {
+        0.0
+    } else {
+        value
+    }
 }
 
 #[cfg(test)]

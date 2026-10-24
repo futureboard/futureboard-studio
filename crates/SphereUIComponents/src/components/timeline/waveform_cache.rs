@@ -1375,10 +1375,18 @@ mod tests {
         for (start, end) in ranges {
             let expected = per_peak(start, end);
             let got = aggregate_peak_range_in_entry_opt(&entry, spp, start, end);
-            assert_eq!(got.map(|p| (p.min, p.max)), expected, "range {start}..{end}");
+            assert_eq!(
+                got.map(|p| (p.min, p.max)),
+                expected,
+                "range {start}..{end}"
+            );
             let span = peak_span_in_entry(&entry, spp, start, end);
             let snap = span.aggregate(start, end);
-            assert_eq!(snap.map(|p| (p.min, p.max)), expected, "snapshot {start}..{end}");
+            assert_eq!(
+                snap.map(|p| (p.min, p.max)),
+                expected,
+                "snapshot {start}..{end}"
+            );
         }
         // A ladder level snapshots as the ladder and answers as it does.
         let ladder = peak_span_in_entry(&entry, 256, 0, 4);

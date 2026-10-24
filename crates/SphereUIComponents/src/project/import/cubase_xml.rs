@@ -32,9 +32,9 @@ use roxmltree::{Document, Node, NodeId};
 
 use crate::components::timeline::timeline_state::volume;
 use crate::project::{
-    AudioClipStretchState, ClipSource, FutureboardProject, InputMonitorMode, ProjectAsset,
-    ProjectClip, ProjectTempoPoint, ProjectTimeSignaturePoint, ProjectTrack, ProjectTrackType,
-    TrackRouting, format::ProjectError, new_id,
+    format::ProjectError, new_id, AudioClipStretchState, ClipSource, FutureboardProject,
+    InputMonitorMode, ProjectAsset, ProjectClip, ProjectTempoPoint, ProjectTimeSignaturePoint,
+    ProjectTrack, ProjectTrackType, TrackRouting,
 };
 
 /// Ticks per quarter note in the arrangement domain.

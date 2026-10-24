@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::analysis::DISPLAY_BINS;
-use super::scene::{Scene, VERTEX_FLOATS, Vertex};
+use super::scene::{Scene, Vertex, VERTEX_FLOATS};
 
 /// BGRA, not sRGB: theme colours land in the target with the numeric values
 /// GPUI paints them with, and GPUI's atlas imports exactly this format.
@@ -826,10 +826,10 @@ fn create_spectrogram(context: &GpuContext) -> Spectrogram {
 mod shared {
     use windows_d3d12::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE};
     use windows_d3d12::Win32::Graphics::Direct3D12::{
-        D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
+        ID3D12Resource, D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
         D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
-        D3D12_RESOURCE_STATE_COMMON, D3D12_TEXTURE_LAYOUT_UNKNOWN, ID3D12Resource,
+        D3D12_RESOURCE_STATE_COMMON, D3D12_TEXTURE_LAYOUT_UNKNOWN,
     };
     use windows_d3d12::Win32::Graphics::Dxgi::Common::{
         DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -840,7 +840,7 @@ mod shared {
 
     impl SharedHandle {
         pub fn raw(&self) -> usize {
-            self.0.0 as usize
+            self.0 .0 as usize
         }
     }
 
@@ -1114,16 +1114,16 @@ mod tests {
     /// Just enough D3D11 to stand in for GPUI's atlas in a test.
     #[cfg(target_os = "windows")]
     mod d3d11 {
+        use windows::core::Interface;
         use windows::Win32::Foundation::{HANDLE, HMODULE};
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
         use windows::Win32::Graphics::Direct3D11::{
-            D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
-            D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
             D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D,
+            D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+            D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
         use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
-        use windows::core::Interface;
 
         pub fn read_first_pixel(luid: u64, handle: usize) -> windows::core::Result<[u8; 4]> {
             unsafe {

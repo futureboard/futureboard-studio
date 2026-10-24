@@ -2,6 +2,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{div, px, InteractiveElement, IntoElement, ParentElement, Styled};
 
 use crate::components::edit::{lane_press_intent, LanePressIntent};
+use crate::components::timeline::arrangement_overlay::SharedArrangementOverlay;
 use crate::components::timeline::audio_clip::{
     AudioClipProcessCommitCb, AudioClipProcessPreviewCb,
 };
@@ -26,7 +27,6 @@ use crate::components::timeline::track_resize::{
     track_row_resize_handle, visible_track_row_range, TrackHeightResizeArmCb,
     TrackHeightResizeResetCb,
 };
-use crate::components::timeline::arrangement_overlay::SharedArrangementOverlay;
 use crate::theme::Colors;
 
 /// Rows above/below the visible viewport that are kept rendered to prevent
@@ -442,7 +442,7 @@ fn track_move_hint(
     row_layout: &TrackRowLayout,
     grid_height: f32,
 ) -> Option<gpui::AnyElement> {
-    use gpui::{Animation, AnimationExt, ease_out_quint};
+    use gpui::{ease_out_quint, Animation, AnimationExt};
     use std::time::Duration;
 
     let dragging = state.dragging_track_id.as_deref()?;

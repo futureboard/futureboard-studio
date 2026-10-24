@@ -7,8 +7,8 @@
 
 use gpui::Rgba;
 
-use super::VisualizerKind;
 use super::analysis::{Analyzer, DISPLAY_BINS, LOUDNESS_HISTORY, MAX_HZ, MIN_HZ};
+use super::VisualizerKind;
 
 /// One vertex: position in physical pixels, straight (not premultiplied)
 /// colour.

@@ -34,7 +34,9 @@ use crate::components::audio_connections_panel::{
 };
 use crate::components::combo_box::{combo_box_icon_menu, MenuGlyph, MenuItem};
 use crate::components::controls::{fb_button, FbButtonKind};
-use crate::components::text_input::{bind_mouse_selection, text_field_with_callbacks, TextInputState};
+use crate::components::text_input::{
+    bind_mouse_selection, text_field_with_callbacks, TextInputState,
+};
 use crate::components::title_bar::{external_window_titlebar, TITLEBAR_HEIGHT};
 use crate::theme::Colors;
 use crate::window_position::{apply_owner_display, centered_window_bounds};

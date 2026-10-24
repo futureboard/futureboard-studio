@@ -695,7 +695,7 @@ impl Timeline {
         }
         let edit = self.begin_track_edit(
             crate::components::timeline::timeline_state::TrackEditScope::tracks(vec![
-                track_id.to_string(),
+                track_id.to_string()
             ]),
         );
         if let Some(track) = self.state.tracks.iter_mut().find(|t| t.id == track_id) {
@@ -1578,7 +1578,10 @@ impl Timeline {
             return false;
         };
         crate::perf::count("track_meter_tick", 1);
-        let sig = self.overlay_layout.borrow().meter_signature(&self.state.tracks);
+        let sig = self
+            .overlay_layout
+            .borrow()
+            .meter_signature(&self.state.tracks);
         overlay.update(cx, |overlay, cx| overlay.apply_signature(sig, cx))
     }
 
@@ -1599,9 +1602,8 @@ impl Timeline {
             }));
         }
         if self.inline_refresh.is_none() {
-            self.inline_refresh = Some(cx.new(|_| {
-                crate::components::timeline::arrangement_overlay::InlineRefresh
-            }));
+            self.inline_refresh =
+                Some(cx.new(|_| crate::components::timeline::arrangement_overlay::InlineRefresh));
         }
         if self.meter_overlay.is_none() {
             let timeline = cx.weak_entity();
@@ -1840,7 +1842,7 @@ impl Timeline {
     /// The Pen's release: one MIDI clip, default length for a plain click or
     /// the dragged span. Only the Pen draws clips here.
     pub(super) fn finish_pen_midi_clip(&mut self, end_beat: f32, cx: &mut gpui::Context<Self>) {
-        use crate::components::timeline::timeline_state::{MIN_MIDI_CLIP_BEATS, TrackType};
+        use crate::components::timeline::timeline_state::{TrackType, MIN_MIDI_CLIP_BEATS};
         let Some(preview) = self.pen_clip_draw.take() else {
             return;
         };
@@ -2420,7 +2422,7 @@ impl Timeline {
         window_y: f32,
     ) -> f32 {
         use crate::components::timeline::timeline_state::{
-            AUTOMATION_SUBLANE_HEIGHT, automation_y_to_value,
+            automation_y_to_value, AUTOMATION_SUBLANE_HEIGHT,
         };
         // Map against the lane's own sub-row bounds so a drag stays anchored to
         // the lane the gesture started in.
@@ -2998,7 +3000,7 @@ impl Timeline {
         stroke: &crate::components::timeline::timeline_state::AutomationPaintStroke,
     ) {
         use crate::components::timeline::timeline_state::{
-            AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT, paint_automation_stroke,
+            paint_automation_stroke, AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT,
         };
         let ppb = self.state.viewport.pixels_per_beat.max(1.0);
         let usable = (AUTOMATION_SUBLANE_HEIGHT - 2.0 * AUTOMATION_LANE_PAD).max(1.0);
@@ -3022,8 +3024,8 @@ impl Timeline {
         cx: &mut Context<Self>,
     ) {
         use crate::components::timeline::timeline_state::{
-            AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT, AutomationCurveDrag, AutomationHover,
-            AutomationMarquee, AutomationPointDrag, TrackLaneMode,
+            AutomationCurveDrag, AutomationHover, AutomationMarquee, AutomationPointDrag,
+            TrackLaneMode, AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT,
         };
         self.state.select_track(track_id);
         if self.state.track_lane_mode(track_id) != TrackLaneMode::Automation {
@@ -3434,7 +3436,7 @@ impl Timeline {
         cx: &mut Context<Self>,
     ) {
         use crate::components::timeline::timeline_state::{
-            AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT, AutomationHover, TrackLaneMode,
+            AutomationHover, TrackLaneMode, AUTOMATION_LANE_PAD, AUTOMATION_SUBLANE_HEIGHT,
         };
         if self.automation_drag.is_some()
             || self.automation_curve_drag.is_some()

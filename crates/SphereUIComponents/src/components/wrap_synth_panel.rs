@@ -23,24 +23,24 @@
 use std::sync::{Arc, OnceLock};
 
 use gpui::{
-    AnyElement, App, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
-    Styled, Window, canvas, div, fill, px, svg,
+    canvas, div, fill, px, svg, AnyElement, App, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::assets;
 use crate::components::controls::{
-    FbSegment, fb_checkbox, fb_segment, fb_segmented_track, fb_stepper_button,
+    fb_checkbox, fb_segment, fb_segmented_track, fb_stepper_button, FbSegment,
 };
 use crate::components::knob::{knob_bipolar, knob_with_default};
 use crate::components::quick_sampler_panel::{
-    GRAPH_H, GraphColors, I32Cb, KNOB_SIZE, NoteCb, controls_row, format_hz, format_ms, knob_cell,
-    module, paint_curve, paint_graph_frame, percent, piano_keyboard, rect, sampler_keyboard_footer,
+    controls_row, format_hz, format_ms, knob_cell, module, paint_curve, paint_graph_frame, percent,
+    piano_keyboard, rect, sampler_keyboard_footer, GraphColors, I32Cb, NoteCb, GRAPH_H, KNOB_SIZE,
 };
-use crate::theme::{Colors, radius, size as ui_size, space, typography};
-use wrapsynth::envelope::{ATTACK_RATIO, DECAY_RATIO, segment_progress};
+use crate::theme::{radius, size as ui_size, space, typography, Colors};
+use wrapsynth::envelope::{segment_progress, ATTACK_RATIO, DECAY_RATIO};
 use wrapsynth::{
-    FactoryPreset, FilterModel, FilterType, LfoShape, MAX_UNISON, MAX_VOICES, MOD_SLOTS, ModDest,
-    ModSource, Params, VoiceMode, Wavetable,
+    FactoryPreset, FilterModel, FilterType, LfoShape, ModDest, ModSource, Params, VoiceMode,
+    Wavetable, MAX_UNISON, MAX_VOICES, MOD_SLOTS,
 };
 
 /// Four octaves from C2.

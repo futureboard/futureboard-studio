@@ -526,7 +526,10 @@ pub fn fb_tooltip(
 
 /// Wrap an element to show its keyboard shortcut as a tooltip on hover.
 /// Usage: `with_shortcut_hint(element, "command:id")`
-pub fn with_shortcut_hint<E: gpui::StatefulInteractiveElement + gpui::IntoElement>(element: E, command: &str) -> impl IntoElement {
+pub fn with_shortcut_hint<E: gpui::StatefulInteractiveElement + gpui::IntoElement>(
+    element: E,
+    command: &str,
+) -> impl IntoElement {
     let shortcut = crate::keymap::shortcut_for_command(command).unwrap_or_else(|| "—".to_string());
     element.tooltip(fb_tooltip(shortcut))
 }
@@ -535,7 +538,8 @@ pub fn with_shortcut_hint<E: gpui::StatefulInteractiveElement + gpui::IntoElemen
 /// Requires the element to implement `StatefulInteractiveElement` for tooltip support.
 pub trait ShortcutHintExt: gpui::StatefulInteractiveElement + Sized {
     fn shortcut_hint(self, command: &str) -> Self {
-        let shortcut = crate::keymap::shortcut_for_command(command).unwrap_or_else(|| "—".to_string());
+        let shortcut =
+            crate::keymap::shortcut_for_command(command).unwrap_or_else(|| "—".to_string());
         self.tooltip(fb_tooltip(shortcut))
     }
 }

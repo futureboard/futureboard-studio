@@ -29,19 +29,19 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
+    canvas, div, fill, linear_color_stop, linear_gradient, point, px, relative, size, svg,
     AnyElement, App, Bounds, InteractiveElement, IntoElement, ParentElement, PathBuilder, Pixels,
-    Rgba, StatefulInteractiveElement, Styled, Window, canvas, div, fill, linear_color_stop,
-    linear_gradient, point, px, relative, size, svg,
+    Rgba, StatefulInteractiveElement, Styled, Window,
 };
 
 use crate::assets;
 use crate::components::controls::{
-    FbButtonKind, FbSegment, fb_button, fb_checkbox, fb_segment, fb_segmented_track,
-    fb_stepper_button,
+    fb_button, fb_checkbox, fb_segment, fb_segmented_track, fb_stepper_button, FbButtonKind,
+    FbSegment,
 };
 use crate::components::knob::{format_pan_label, knob_bipolar, knob_with_default};
 use crate::components::soundfont_player_mdi::note_label;
-use crate::theme::{Colors, radius, size as ui_size, space, typography};
+use crate::theme::{radius, size as ui_size, space, typography, Colors};
 use quicksampler::{
     FilterMode as QuickSamplerFilter, LoopMode as QuickSamplerLoop, QuickSamplerParams,
 };

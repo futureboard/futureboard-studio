@@ -17,17 +17,17 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowHandle,
-    WindowKind, div, px, size,
+    div, px, size, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Render, StatefulInteractiveElement, Styled, Window, WindowBounds,
+    WindowHandle, WindowKind,
 };
 use solfege_spatialaudio::{ListeningDevice, ListeningGroup, ListeningProfile, SimulationSettings};
 
 use crate::components::controls::{
-    FbLatch, FbSegment, fb_badge, fb_segment, fb_segmented_track, fb_toggle,
+    fb_badge, fb_segment, fb_segmented_track, fb_toggle, FbLatch, FbSegment,
 };
 use crate::components::title_bar::external_window_titlebar;
-use crate::theme::{self, Colors, radius, space, typography};
+use crate::theme::{self, radius, space, typography, Colors};
 use crate::window_position::{apply_owner_display, centered_window_bounds};
 
 const WINDOW_WIDTH: f32 = 560.0;

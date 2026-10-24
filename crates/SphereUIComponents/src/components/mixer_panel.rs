@@ -3462,7 +3462,8 @@ pub fn mixer_panel(
             .flex_1()
             .min_h_0()
             .when(body_scrolls, |col| {
-                col.flex_none().h(px(strip_available_px + MIXER_SCROLLBAR_ROW))
+                col.flex_none()
+                    .h(px(strip_available_px + MIXER_SCROLLBAR_ROW))
             })
             .child(channel_row)
             .child(bar),

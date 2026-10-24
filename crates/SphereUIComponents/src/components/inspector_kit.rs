@@ -35,11 +35,11 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
-    Window, div, px, svg,
+    div, px, svg, App, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+    Styled, Window,
 };
 
-use crate::theme::{Colors, radius, size, space, typography};
+use crate::theme::{radius, size, space, typography, Colors};
 
 // ── Metrics ──────────────────────────────────────────────────────────────────
 // Named so a tab never writes a literal, and so a density change is one edit.

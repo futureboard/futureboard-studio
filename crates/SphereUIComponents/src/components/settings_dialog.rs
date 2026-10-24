@@ -13,37 +13,37 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, ParentElement, Render, StatefulInteractiveElement, Styled, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, div, px, size, svg,
+    div, px, size, svg, App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, StatefulInteractiveElement,
+    Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 
 use crate::assets;
 use crate::components::box_list_view::{
-    BoxListBadgeTone, box_list_empty_state, box_list_group_label, box_list_icon_button,
-    box_list_item, box_list_item_badge, box_list_item_content, box_list_item_leading_icon,
-    box_list_item_title, box_list_item_trailing, box_list_toggle, box_list_view,
+    box_list_empty_state, box_list_group_label, box_list_icon_button, box_list_item,
+    box_list_item_badge, box_list_item_content, box_list_item_leading_icon, box_list_item_title,
+    box_list_item_trailing, box_list_toggle, box_list_view, BoxListBadgeTone,
 };
 use crate::components::combo_box::{combo_box_string_menu, combo_box_trigger};
 use crate::components::controls::{
-    FbButtonKind, FbSegment, fb_button, fb_segment, fb_segmented_track, fb_stepper_button,
+    fb_button, fb_segment, fb_segmented_track, fb_stepper_button, FbButtonKind, FbSegment,
 };
 use crate::components::settings_components::settings_restart_label;
 use crate::components::settings_layout::{
-    SETTINGS_SIDEBAR_WIDTH, SETTINGS_WINDOW_HEIGHT, SETTINGS_WINDOW_WIDTH, settings_status_badge,
+    settings_status_badge, SETTINGS_SIDEBAR_WIDTH, SETTINGS_WINDOW_HEIGHT, SETTINGS_WINDOW_WIDTH,
 };
 use crate::components::slider::slider;
 use crate::components::text_input::{
-    TextInputAction, TextInputCallbacks, TextInputState, text_field_with_callbacks,
+    text_field_with_callbacks, TextInputAction, TextInputCallbacks, TextInputState,
 };
 use crate::components::timeline::render::cached_gpu_devices;
 use crate::components::title_bar::external_window_titlebar;
 use crate::device_registry::cached_midi_devices;
 use crate::i18n::{I18n, Locale};
 use crate::overlay::{
-    COMBO_TRIGGER_HEIGHT, OverlayAnchor, OverlayPlacement, OverlaySize, anchor_visible_in_window,
-    compute_overlay_position, external_dialog_overlay_bounds, form_combo_trigger_bounds,
-    refresh_form_anchor, settings_form_column,
+    anchor_visible_in_window, compute_overlay_position, external_dialog_overlay_bounds,
+    form_combo_trigger_bounds, refresh_form_anchor, settings_form_column, OverlayAnchor,
+    OverlayPlacement, OverlaySize, COMBO_TRIGGER_HEIGHT,
 };
 use crate::settings::{
     DefaultMonitorMode, GpuDevicePreference, MidiDeviceDirection, MidiDeviceSetting, RenderMode,
@@ -539,7 +539,7 @@ pub struct SettingsWindow {
 
 #[cfg(test)]
 mod driver_status_tests {
-    use super::{DRIVER_STATUS_SUMMARY_MAX, concise_driver_status};
+    use super::{concise_driver_status, DRIVER_STATUS_SUMMARY_MAX};
 
     /// The Driver Status row must stay bounded so a long backend diagnostic
     /// can't force an expensive relayout. A multi-paragraph WDM-KS/Intel-SST

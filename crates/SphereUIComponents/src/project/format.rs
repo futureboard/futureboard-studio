@@ -4149,12 +4149,10 @@ mod tests {
         encode_midi_note(&mut w, &note(60, false));
         let bytes = w.into_bytes();
         let mut r = FbReader::new(&bytes);
-        assert!(
-            decode_midi_note(&mut r, PROJECT_VERSION)
-                .unwrap()
-                .accent
-                .is_none()
-        );
+        assert!(decode_midi_note(&mut r, PROJECT_VERSION)
+            .unwrap()
+            .accent
+            .is_none());
     }
 
     /// A v38 file has no accent bytes at all. Reading it as v39 would consume

@@ -6,11 +6,11 @@
 //! This module builds the entries and holds the pure edits behind them; the
 //! window runs the commands.
 
-use drumsampler::{OUTPUTS, PADS, Pad, Params};
+use drumsampler::{Pad, Params, OUTPUTS, PADS};
 
 use crate::components::context_menu::ContextMenuEntry;
 use crate::components::drum_sampler_panel::{
-    DrumSamplerPanelState, DrumView, output_label, pad_number,
+    output_label, pad_number, DrumSamplerPanelState, DrumView,
 };
 use crate::components::soundfont_player_mdi::note_label;
 

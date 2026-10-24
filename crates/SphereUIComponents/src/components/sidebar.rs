@@ -28,24 +28,24 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Div, Empty, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, Rgba, Role, Stateful, StatefulInteractiveElement, Styled,
-    Toggled, UniformListScrollHandle, Window, canvas, div, fill, point, px, svg, uniform_list,
+    canvas, div, fill, point, px, svg, uniform_list, App, AppContext, Bounds, Div, Empty,
+    FocusHandle, InteractiveElement, IntoElement, ParentElement, Pixels, Render, Rgba, Role,
+    Stateful, StatefulInteractiveElement, Styled, Toggled, UniformListScrollHandle, Window,
 };
 
 use crate::assets;
 use crate::components::controls::{fb_shortcut_hint, fb_tooltip};
 use crate::components::file_browser::{
-    BrowserCrumb, BrowserIcon, BrowserNodeKind, BrowserTab, BrowserVisibleNode, FileBrowserState,
-    MAX_VISUAL_DEPTH, format_size,
+    format_size, BrowserCrumb, BrowserIcon, BrowserNodeKind, BrowserTab, BrowserVisibleNode,
+    FileBrowserState, MAX_VISUAL_DEPTH,
 };
 use crate::components::scroll_thumb::vertical_scrollbar_thumb;
 use crate::components::text_input::{
-    TextInputCallbacks, TextInputState, text_field_with_callbacks,
+    text_field_with_callbacks, TextInputCallbacks, TextInputState,
 };
 use crate::components::timeline::waveform_cache;
 use crate::i18n::I18n;
-use crate::theme::{Colors, elevation, radius, size, space, typography};
+use crate::theme::{elevation, radius, size, space, typography, Colors};
 use DirectAudio::AUDITION_PREVIEW_SECONDS;
 
 pub const SIDEBAR_WIDTH: f32 = 272.0;

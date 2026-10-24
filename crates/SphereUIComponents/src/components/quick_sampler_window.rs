@@ -23,21 +23,21 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Bounds, Context, ExternalPaths, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowHandle, WindowKind, div, px, size,
+    div, px, size, App, AppContext, Bounds, Context, ExternalPaths, FocusHandle,
+    InteractiveElement, IntoElement, ParentElement, Pixels, Render, Styled, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 
 use crate::components::builtin_plugin_editor_window::{
-    BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps, PluginInstanceKey, read_dropped_sample,
+    read_dropped_sample, BuiltinDrumSampleLoadRequest, BuiltinEditorHostOps, PluginInstanceKey,
 };
 use crate::components::builtin_plugin_files::{self as files, BuiltinFileKind};
-use crate::components::context_menu::{ContextMenuEntry, context_menu_overlay};
+use crate::components::context_menu::{context_menu_overlay, ContextMenuEntry};
 use crate::components::native_plugin_shell::{
-    NativeBuiltinEditor, SHELL_METER_INTERVAL, ShellIdentity, ShellMeter, native_plugin_shell,
+    native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
 use crate::components::quick_sampler_panel::{
-    QuickSamplerCallbacks, QuickSamplerPanelState, SampleMarker, SampleSummary, quick_sampler_panel,
+    quick_sampler_panel, QuickSamplerCallbacks, QuickSamplerPanelState, SampleMarker, SampleSummary,
 };
 use quicksampler::{LoopMode, QuickSamplerParams};
 
@@ -534,7 +534,7 @@ impl QuickSamplerEditorWindow {
         fn with<T: Clone + 'static>(
             entity: &gpui::Entity<QuickSamplerEditorWindow>,
             f: impl Fn(&mut QuickSamplerEditorWindow, T, &mut Context<QuickSamplerEditorWindow>)
-            + 'static,
+                + 'static,
         ) -> Arc<dyn Fn(&T, &mut Window, &mut App) + 'static> {
             let entity = entity.clone();
             Arc::new(move |value: &T, _window, app: &mut App| {

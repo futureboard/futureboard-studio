@@ -9,16 +9,16 @@ pub mod template;
 pub mod view;
 
 pub use format::{
-    PROJECT_MAGIC, PROJECT_VERSION, ProjectError, decode_project, decode_project_with_options,
-    encode_project,
+    decode_project, decode_project_with_options, encode_project, ProjectError, PROJECT_MAGIC,
+    PROJECT_VERSION,
 };
-pub use import::{IMPORT_PROJECT_FILE_EXTS, is_import_path};
+pub use import::{is_import_path, IMPORT_PROJECT_FILE_EXTS};
 pub use io::{
-    LEGACY_PROJECT_FILE_EXT, PROJECT_FILE_EXT, SUPPORTED_PROJECT_FILE_EXTS, backup_legacy_project,
-    create_project_folder, default_projects_dir, import_audio_file_to_project,
-    legacy_project_backup_path, load_project, load_project_strict, project_backup_path,
-    project_temp_path, sanitize_project_name, save_project, validate_project_file,
-    verify_project_file,
+    backup_legacy_project, create_project_folder, default_projects_dir,
+    import_audio_file_to_project, legacy_project_backup_path, load_project, load_project_strict,
+    project_backup_path, project_temp_path, sanitize_project_name, save_project,
+    validate_project_file, verify_project_file, LEGACY_PROJECT_FILE_EXT, PROJECT_FILE_EXT,
+    SUPPORTED_PROJECT_FILE_EXTS,
 };
 pub use recent::{RecentProject, RecentProjectsStore};
 pub use session::ProjectSession;
@@ -28,8 +28,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::solfege::SolfegeTrackState;
-use sphere_midi_service::NoteExpression;
 use sphere_midi_service::mpe::MpeTrackConfiguration;
+use sphere_midi_service::NoteExpression;
 pub use sphere_soundfont_player::{
     SoundfontChannels, SoundfontEnvelope, SoundfontPlayerMode, SoundfontRenderQuality,
 };
@@ -2615,7 +2615,7 @@ pub(crate) fn legacy_routing_to_runtime(
     crate::components::timeline::timeline_state::TrackMidiInputRouting,
 ) {
     use crate::project::routing_migration::{
-        LegacyTrackInputRouting, LegacyTrackRouting, migrate_track_routing,
+        migrate_track_routing, LegacyTrackInputRouting, LegacyTrackRouting,
     };
 
     let legacy_input = match legacy {
@@ -3357,12 +3357,10 @@ mod v33_routing_adapter_tests {
         );
         // The persisted forms are exactly the ids — no device, port, or channel
         // is smuggled into them.
-        assert!(
-            project
-                .master_output_connection_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with("ac-"))
-        );
+        assert!(project
+            .master_output_connection_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("ac-")));
     }
 
     /// A pre-v35 project has never initialized output routing, so the
@@ -3679,11 +3677,9 @@ mod v33_routing_adapter_tests {
         );
         assert_eq!(warning.track_id.as_deref(), Some(track_id.as_str()));
         assert_eq!(warning.source_project_version, 33);
-        assert!(
-            warning
-                .message
-                .contains("dedicated MIDI input assignment was retained")
-        );
+        assert!(warning
+            .message
+            .contains("dedicated MIDI input assignment was retained"));
 
         // The dedicated assignment wins.
         assert_eq!(
@@ -4248,13 +4244,11 @@ mod project_settings_persistence_tests {
         // A note that was never analysed comes back un-analysed, not neutral:
         // the two are different states and the re-analysis policy depends on
         // telling them apart.
-        assert!(
-            restored
-                .midi_note(&clip_id, untouched_id)
-                .expect("note restored")
-                .accent
-                .is_none()
-        );
+        assert!(restored
+            .midi_note(&clip_id, untouched_id)
+            .expect("note restored")
+            .accent
+            .is_none());
     }
 }
 
@@ -4305,13 +4299,11 @@ mod group_track_persistence_tests {
         );
         assert!(restored.find_track(&group_id).unwrap().group_collapsed);
         assert!(restored.remove_track_from_group(&child_id));
-        assert!(
-            restored
-                .find_track(&child_id)
-                .unwrap()
-                .parent_group_id
-                .is_none()
-        );
+        assert!(restored
+            .find_track(&child_id)
+            .unwrap()
+            .parent_group_id
+            .is_none());
     }
 
     #[test]
@@ -4484,8 +4476,8 @@ mod articulation_persistence_tests {
 mod vsti_substrip_persistence_tests {
     use super::*;
     use crate::components::timeline::timeline_state::{
-        CreateTrackOptions, InsertPluginFormat, TimelineState, TrackType,
-        vsti_output_child_track_id,
+        vsti_output_child_track_id, CreateTrackOptions, InsertPluginFormat, TimelineState,
+        TrackType,
     };
 
     /// Substrip (VSTi multi-out child strip) mixer state and FX insert chains —
@@ -4820,7 +4812,7 @@ mod vsti_substrip_persistence_tests {
 mod conductor_lane_persistence_tests {
     use super::*;
     use crate::components::timeline::timeline_state::{
-        GLOBAL_LANE_MAX_HEIGHT, GlobalLaneKind, TimelineState,
+        GlobalLaneKind, TimelineState, GLOBAL_LANE_MAX_HEIGHT,
     };
 
     /// Folding the tempo lane away is an arrangement of the workspace, not a

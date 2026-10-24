@@ -1752,11 +1752,9 @@ mod tests {
     #[test]
     fn the_octave_nearest_the_project_is_chosen() {
         let samples = drum_loop(87.0, 20.0, DETECT_RATE);
-        let fast =
-            detect_tempo_from_mono(&samples, DETECT_RATE, 60.0, 200.0, Some(170.0)).unwrap();
+        let fast = detect_tempo_from_mono(&samples, DETECT_RATE, 60.0, 200.0, Some(170.0)).unwrap();
         assert!((fast.bpm - 174.0).abs() <= 0.2, "{fast:?}");
-        let slow =
-            detect_tempo_from_mono(&samples, DETECT_RATE, 60.0, 200.0, Some(90.0)).unwrap();
+        let slow = detect_tempo_from_mono(&samples, DETECT_RATE, 60.0, 200.0, Some(90.0)).unwrap();
         assert!((slow.bpm - 87.0).abs() <= 0.1, "{slow:?}");
     }
 

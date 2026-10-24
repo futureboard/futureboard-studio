@@ -13,43 +13,43 @@ pub(crate) use track_rename::{
 
 use crate::assets;
 use crate::components::edit::{
-    ClipSnapshot, EditCommand, EditHistory, EditImpact, TempoStateSnapshot,
-    TimeSignatureStateSnapshot, normalize_range,
+    normalize_range, ClipSnapshot, EditCommand, EditHistory, EditImpact, TempoStateSnapshot,
+    TimeSignatureStateSnapshot,
 };
 use crate::components::sidebar::BrowserDragItem;
+use crate::components::timeline::chord_track::{
+    chord_track_lane, ChordEventDrag, ChordEventDragUpdate,
+};
 use crate::components::timeline::floating_tools_bar::floating_tools_bar;
 use crate::components::timeline::global_lane_header::{
     GlobalLaneResizeArmCb, GlobalLaneResizeResetCb,
 };
-use crate::components::timeline::chord_track::{
-    chord_track_lane, ChordEventDrag, ChordEventDragUpdate,
-};
 use crate::components::timeline::marker_track::marker_track_lane;
 use crate::components::timeline::region_track::region_track_lane;
 use crate::components::timeline::song_text_track::{
-    SongTextDragPreview, SongTextDragSession, SongTextMarkerDown, song_text_drag_positions,
-    song_text_track_lane,
+    song_text_drag_positions, song_text_track_lane, SongTextDragPreview, SongTextDragSession,
+    SongTextMarkerDown,
 };
 use crate::components::timeline::tempo_track::tempo_track_lane;
 use crate::components::timeline::time_signature_track::time_signature_track_lane;
 use crate::components::timeline::timeline_ruler::{
-    LaneOriginProbe, TimelineLoopDragUpdate, TimelineRegionDrag, TimelineRegionDragUpdate,
-    timeline_ruler,
+    timeline_ruler, LaneOriginProbe, TimelineLoopDragUpdate, TimelineRegionDrag,
+    TimelineRegionDragUpdate,
 };
 use crate::components::timeline::timeline_state::{
-    ArrangementCoordinateContext, ArrangementHitTarget, ClipDragItem, ClipEdge, ClipResizeDrag,
-    ClipState, ClipType, DEFAULT_TRACK_HEIGHT, GlobalLaneKind, GlobalLaneResizeDrag, HEADER_WIDTH,
-    RULER_HEIGHT, TempoLaneDrag, TimeSignaturePointDrag, TimelineMarkerDrag, TimelineMarkerState,
+    hit_test_arrangement, ArrangementCoordinateContext, ArrangementHitTarget, ClipDragItem,
+    ClipEdge, ClipResizeDrag, ClipState, ClipType, GlobalLaneKind, GlobalLaneResizeDrag,
+    TempoLaneDrag, TimeSignaturePointDrag, TimelineMarkerDrag, TimelineMarkerState,
     TimelineRegionState, TimelineState, TimelineTool, TrackDragItem, TrackHeightResizeDrag,
-    TrackType, hit_test_arrangement,
+    TrackType, DEFAULT_TRACK_HEIGHT, HEADER_WIDTH, RULER_HEIGHT,
 };
 use crate::components::timeline::track_list::track_list;
 use crate::theme::Colors;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt, AppContext, Context, Empty, ExternalPaths, InteractiveElement,
-    IntoElement, ParentElement, PinchEvent, Render, ScrollDelta, StatefulInteractiveElement,
-    Styled, Subscription, Window, div, pulsating_between, px, svg,
+    div, pulsating_between, px, svg, Animation, AnimationExt, AppContext, Context, Empty,
+    ExternalPaths, InteractiveElement, IntoElement, ParentElement, PinchEvent, Render, ScrollDelta,
+    StatefulInteractiveElement, Styled, Subscription, Window,
 };
 use std::time::Duration;
 
