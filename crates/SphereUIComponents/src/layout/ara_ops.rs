@@ -1370,6 +1370,24 @@ impl ParkedRestore {
     }
 }
 
+/// How many clips that left their session [`AraState`] keeps the ARA state
+/// of, newest first; older ones are forgotten.
+const DEPARTED_CAPACITY: usize = 64;
+
+/// The ARA state of a clip that left its track: moved to another track, or
+/// deleted. Its modification is destroyed with the region, so the document it
+/// lived in is stored first and restored, for that clip's audio, into the
+/// session the clip turns up in next — another track bound to the same
+/// plug-in, or its own track after an undo.
+struct DepartedClip {
+    clip: AraClipKey,
+    plugin_id: String,
+    /// The document the clip left, shared by every clip that left with it.
+    archive: Arc<SavedArchive>,
+    /// Archived persistent ID of the source the clip's modification is on.
+    source_pid: String,
+}
+
 /// The part of a kept-back archive whose audio is in the graph again.
 struct ReturningPart {
     /// Archived persistent IDs of the sources restored now.
@@ -1402,6 +1420,9 @@ pub struct AraState {
     /// Per session, the archive restored in part because some of its audio
     /// was offline, kept for the rest (see [`Self::defer`]).
     deferred: HashMap<AraSessionKey, DeferredRestore>,
+    /// Clips that left their session, oldest first, with the document they
+    /// left (see [`Self::capture_departures`]).
+    departed: Vec<DepartedClip>,
     /// Saved documents kept verbatim beside the live documents, and saved
     /// with the project: archives a restore did not show landed, and live
     /// documents of unconfirmed sessions whose plug-in was removed. One copy
@@ -1432,6 +1453,7 @@ impl Default for AraState {
             pending_archives: HashMap::new(),
             awaiting_media: HashSet::new(),
             deferred: HashMap::new(),
+            departed: Vec::new(),
             orphans: Vec::new(),
             asset_fingerprints: HashMap::new(),
             generation: 0,
@@ -1509,6 +1531,7 @@ impl AraState {
         self.pending_archives.clear();
         self.awaiting_media.clear();
         self.deferred.clear();
+        self.departed.clear();
         self.orphans.clear();
         for (key, orphan) in saved.orphans {
             self.keep_orphan(&key, orphan);
@@ -1644,6 +1667,96 @@ impl AraState {
             orphans: self.orphans.clone(),
             deferred,
         }
+    }
+
+    /// Stores this session's document when a clip it renders is no longer on
+    /// its track, before the next sync destroys that clip's modification.
+    ///
+    /// `on_track` is every clip id the track holds now. A clip still on it
+    /// (offline, say) is not departing: its modification stays, or the
+    /// kept-back archive covers it. Each departing clip is remembered with the
+    /// document, and restored into whichever session it turns up in next; see
+    /// [`Self::arrivals`]. Must run for every session before any of them
+    /// syncs, so a clip moving between two tracks is stored by the one it
+    /// leaves before the one it reaches is built.
+    pub fn capture_departures(&mut self, key: &AraSessionKey, on_track: &HashSet<&str>) {
+        let Some(session) = self.sessions.get_mut(key) else {
+            return;
+        };
+        let leaving: Vec<AraClipKey> = session
+            .clips
+            .iter()
+            .filter(|clip| !on_track.contains(clip.0.as_str()))
+            .cloned()
+            .collect();
+        if leaving.is_empty() {
+            return;
+        }
+        let stored = match session.plugin.store_archive() {
+            Ok(stored) => stored,
+            Err(error) => {
+                eprintln!(
+                    "[ARA] {} on {} could not store the state of {} clip(s) leaving it: {error}",
+                    session.plugin_name,
+                    key.track_id,
+                    leaving.len()
+                );
+                return;
+            }
+        };
+        let departing: Vec<(AraClipKey, String)> = leaving
+            .into_iter()
+            .filter_map(|clip| {
+                let modification = stored
+                    .identity
+                    .modifications
+                    .iter()
+                    .find(|modification| modification.clip == clip)?;
+                Some((clip, modification.source_persistent_id.clone()))
+            })
+            .collect();
+        if departing.is_empty() {
+            return;
+        }
+        let archive = Arc::new(SavedArchive {
+            archive_id: session.archive_id.clone(),
+            written_with: Some(ara_restore_plan::project_identity(&stored.identity)),
+            data: stored.bytes,
+            stored_now: false,
+        });
+        for (clip, source_pid) in departing {
+            self.departed.retain(|held| held.clip != clip);
+            self.departed.push(DepartedClip {
+                clip,
+                plugin_id: key.plugin_id.clone(),
+                archive: Arc::clone(&archive),
+                source_pid,
+            });
+        }
+        let excess = self.departed.len().saturating_sub(DEPARTED_CAPACITY);
+        self.departed.drain(..excess);
+    }
+
+    /// Takes out the departed clips that arrive in this session with `graph`:
+    /// bound to the same plug-in, in the graph, and not rendered by the
+    /// session yet.
+    fn arrivals(&mut self, key: &AraSessionKey, graph: &AraGraph) -> Vec<DepartedClip> {
+        let Some(session) = self.sessions.get(key) else {
+            return Vec::new();
+        };
+        let arriving = |held: &DepartedClip| {
+            held.plugin_id == key.plugin_id
+                && !session.clips.contains(&held.clip)
+                && graph.regions.iter().any(|region| region.key == held.clip)
+        };
+        if !self.departed.iter().any(arriving) {
+            return Vec::new();
+        }
+        let (taken, kept) = std::mem::take(&mut self.departed)
+            .into_iter()
+            .partition(arriving);
+        self.departed = kept;
+        taken
     }
 
     /// How many times the parked documents were replaced or every session
@@ -2061,9 +2174,13 @@ impl AraState {
             }
         });
         let returning = self.returning_part(key, graph);
-        let restore_due = parked.as_ref().is_some_and(ParkedRestore::due) || returning.is_some();
+        let arriving = self.arrivals(key, graph);
+        let restore_due = parked.as_ref().is_some_and(ParkedRestore::due)
+            || returning.is_some()
+            || !arriving.is_empty();
         let Some(session) = self.sessions.get_mut(key) else {
             self.repark(key, parked.map(|parked| parked.archive));
+            self.departed.extend(arriving);
             return Err(AraHostError::invalid("ARA session disappeared mid-apply"));
         };
 
@@ -2126,6 +2243,7 @@ impl AraState {
             media_paths,
             parked,
             returning,
+            arriving,
         );
         if outcome.is_err() {
             // A failed edit must not leave the track silent until some later,
@@ -2203,6 +2321,7 @@ impl AraState {
         media_paths: HashMap<AraSourceKey, PathBuf>,
         parked: Option<ParkedRestore>,
         returning: Option<ReturningPart>,
+        arriving: Vec<DepartedClip>,
     ) -> AraResult<()> {
         // The kept-back archive restored in part here; a copy, so that a
         // failure below leaves the record exactly as it was.
@@ -2210,8 +2329,40 @@ impl AraState {
             .as_ref()
             .and_then(|_| self.deferred.get(key))
             .map(|held| held.archive.clone());
+        // One restore per document the arriving clips left, limited to the
+        // sources their modifications are on; their modifications are found
+        // by clip id, which a move keeps.
+        let mut arrival_groups: Vec<(Arc<SavedArchive>, Vec<String>, usize)> = Vec::new();
+        for held in &arriving {
+            match arrival_groups
+                .iter_mut()
+                .find(|(archive, _, _)| Arc::ptr_eq(archive, &held.archive))
+            {
+                Some((_, sources, clips)) => {
+                    if !sources.contains(&held.source_pid) {
+                        sources.push(held.source_pid.clone());
+                    }
+                    *clips += 1;
+                }
+                None => arrival_groups.push((
+                    Arc::clone(&held.archive),
+                    vec![held.source_pid.clone()],
+                    1,
+                )),
+            }
+        }
+        let arrival_identities: Vec<_> = arrival_groups
+            .iter()
+            .map(|(archive, _, _)| {
+                archive
+                    .written_with
+                    .as_ref()
+                    .map(ara_restore_plan::host_identity)
+            })
+            .collect();
         let Some(session) = self.sessions.get_mut(key) else {
             self.repark(key, parked.map(|parked| parked.archive));
+            self.departed.extend(arriving);
             return Err(AraHostError::invalid("ARA session disappeared mid-apply"));
         };
 
@@ -2226,6 +2377,7 @@ impl AraState {
             .and_then(|()| session.plugin.set_musical_timeline(timeline));
         if let Err(error) = prepared {
             self.repark(key, parked.map(|parked| parked.archive));
+            self.departed.extend(arriving);
             return Err(error);
         }
 
@@ -2238,7 +2390,7 @@ impl AraState {
             .and_then(|parked| parked.archive.written_with.as_ref())
             .map(ara_restore_plan::host_identity);
         let parked_scope = asked.and_then(ParkedRestore::scope_now);
-        let mut requests: Vec<AraRestoreRequest<'_>> = Vec::with_capacity(2);
+        let mut requests: Vec<AraRestoreRequest<'_>> = Vec::with_capacity(2 + arrival_groups.len());
         if let (Some(part), Some(archive)) = (returning.as_ref(), kept_back.as_ref()) {
             requests.push(AraRestoreRequest {
                 archive_id: &archive.archive_id,
@@ -2249,6 +2401,21 @@ impl AraState {
                 // again would overwrite what was done since.
                 scope: AraRestoreScope::Sources {
                     archived: &part.due,
+                    document_data: false,
+                },
+            });
+        }
+        // Before the parked document, which brings the document data and so
+        // comes last; these never do, since the session's own is live.
+        let arrivals_from = requests.len();
+        for ((archive, sources, _), identity) in arrival_groups.iter().zip(&arrival_identities) {
+            requests.push(AraRestoreRequest {
+                archive_id: &archive.archive_id,
+                bytes: &archive.data,
+                identity: identity.as_ref(),
+                map: None,
+                scope: AraRestoreScope::Sources {
+                    archived: sources,
                     document_data: false,
                 },
             });
@@ -2277,11 +2444,33 @@ impl AraState {
             Err(error) => {
                 // The graph was not applied and no restore counted.
                 self.repark(key, parked.map(|parked| parked.archive));
+                self.departed.extend(arriving);
                 return Err(error);
             }
         };
         drop(requests);
         let parked_report = parked_index.and_then(|index| reports.get(index).cloned());
+        for (index, (_, sources, clips)) in arrival_groups.iter().enumerate() {
+            match reports.get(arrivals_from + index) {
+                Some(report)
+                    if report.error.is_none() && report.outcome != AraRestoreOutcome::Missed =>
+                {
+                    trace(&format!(
+                        "carried the state of {clips} clip(s) into {plugin_name} on {} \
+                         (sources {sources:?})",
+                        key.track_id
+                    ));
+                }
+                report => eprintln!(
+                    "[ARA] {plugin_name} on {}: the state of {clips} moved clip(s) did not \
+                     carry over (sources {sources:?}): {}",
+                    key.track_id,
+                    report
+                        .and_then(|report| report.error.as_ref())
+                        .map_or_else(|| "nothing restored".to_string(), ToString::to_string)
+                ),
+            }
+        }
         if let (Some(part), Some(archive)) = (returning, kept_back) {
             let report = if reports.is_empty() {
                 AraRestoreReport {
@@ -2912,6 +3101,7 @@ impl AraState {
         self.pending_archives.clear();
         self.awaiting_media.clear();
         self.deferred.clear();
+        self.departed.clear();
         self.orphans.clear();
         self.asset_fingerprints.clear();
         self.notices.clear();

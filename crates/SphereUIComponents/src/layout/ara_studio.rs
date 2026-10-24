@@ -5,6 +5,7 @@
 //! step — the clip's binding, the ARA document, the engine's renderer list, and
 //! the project snapshot — so no caller has to know the order.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use gpui::Context;
@@ -383,19 +384,34 @@ impl StudioLayout {
         if !self.ara.is_active() {
             return;
         }
-        let keys: Vec<AraSessionKey> = self.ara.keys().cloned().collect();
+        let mut keys: Vec<AraSessionKey> = self.ara.keys().cloned().collect();
         let choices = self.ara_plugin_choices();
-        for key in keys {
-            // A session whose track no longer names it is on its way out — see
-            // `unbind_track_from_ara`, which clears the binding first and closes
-            // the session once the plug-in's view has let go. Re-applying it
-            // here would edit a model that is being torn down.
-            if self
-                .ara_binding_for_track(&key.track_id, cx)
-                .is_none_or(|(plugin_id, _)| plugin_id != key.plugin_id)
-            {
-                continue;
+        // A session whose track no longer names it is on its way out — see
+        // `unbind_track_from_ara`, which clears the binding first and closes
+        // the session once the plug-in's view has let go. Re-applying it here
+        // would edit a model that is being torn down.
+        keys.retain(|key| {
+            self.ara_binding_for_track(&key.track_id, cx)
+                .is_some_and(|(plugin_id, _)| plugin_id == key.plugin_id)
+        });
+        // Every session that is losing a clip stores its document before any
+        // session syncs: a clip moved to another track takes its edits with
+        // it only if the track it left is stored before the one it reached is
+        // built (see `AraState::capture_departures`).
+        {
+            let timeline = self.timeline.read(cx);
+            for key in &keys {
+                let on_track: HashSet<&str> = timeline
+                    .state
+                    .tracks
+                    .iter()
+                    .find(|track| track.id == key.track_id)
+                    .map(|track| track.clips.iter().map(|clip| clip.id.as_str()).collect())
+                    .unwrap_or_default();
+                self.ara.capture_departures(key, &on_track);
             }
+        }
+        for key in keys {
             if let Some(choice) = choices.iter().find(|choice| choice.id == key.plugin_id) {
                 let choice = choice.clone();
                 self.sync_ara_session(&key, &choice, cx);
