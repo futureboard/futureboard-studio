@@ -1067,13 +1067,9 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
-            BuiltinDsp::WrapSynth(dsp) => {
-                for i in 0..frames {
-                    let (l, r) = dsp.process_stereo();
-                    interleaved[i * 2] = l;
-                    interleaved[i * 2 + 1] = r;
-                }
-            }
+            // Renders whole blocks, playing each queued MIDI event on its
+            // own sample.
+            BuiltinDsp::WrapSynth(dsp) => dsp.process_block(interleaved, frames),
             // Multi-out: every pad on its own output's pair, 32 channels.
             BuiltinDsp::DrumSampler(dsp) => dsp.process_block_multi(interleaved, frames),
             // Renders whole blocks: its voices run as a block loop, and a
@@ -1108,14 +1104,17 @@ impl BuiltinHostProcessor {
     /// from it. Producer thread only, same exclusivity contract as
     /// [`Self::process_block`].
     ///
-    /// Only the tempo-synced delay reads it today, so the other variants fall
-    /// through without touching their DSP: this costs a discriminant test per
-    /// block, and inside EchoSpace a float compare that exits early unless the
-    /// tempo actually moved.
+    /// EchoSpace's synced delay and WrapSynth's synced LFOs and delay read
+    /// it, so the other variants fall through without touching their DSP:
+    /// this costs a discriminant test per block, and inside those a float
+    /// compare that exits early unless the tempo actually moved.
     fn set_transport_tempo(&self, tempo_bpm: f32) {
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
-        if let BuiltinDsp::Echospace(dsp) = unsafe { &mut *self.dsp.get() } {
-            dsp.set_tempo_bpm(tempo_bpm);
+        match unsafe { &mut *self.dsp.get() } {
+            BuiltinDsp::Echospace(dsp) => dsp.set_tempo_bpm(tempo_bpm),
+            // Its synced LFOs and delay.
+            BuiltinDsp::WrapSynth(dsp) => dsp.set_tempo_bpm(tempo_bpm),
+            _ => {}
         }
     }
 
@@ -1542,12 +1541,12 @@ impl BuiltinHostProcessor {
     fn apply_midi(&self, event: SharedMidiEvent) {
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &mut *self.dsp.get() } {
-            BuiltinDsp::WrapSynth(dsp) => match event.status & 0xf0 {
-                0x90 if event.data2 > 0 => dsp.note_on(event.data1, event.data2),
-                0x80 | 0x90 => dsp.note_off(event.data1),
-                0xb0 if matches!(event.data1, 120 | 123) => dsp.all_notes_off(),
-                _ => {}
-            },
+            // Queued with its sample offset and applied on that sample of
+            // the next block: notes, pitch bend, mod wheel, sustain,
+            // aftertouch and the all-notes/all-sound controllers.
+            BuiltinDsp::WrapSynth(dsp) => {
+                dsp.queue_midi(event.sample_offset, event.status, event.data1, event.data2)
+            }
             BuiltinDsp::DrumSampler(dsp) => match event.status & 0xf0 {
                 0x90 if event.data2 > 0 => dsp.note_on(event.data1, event.data2),
                 0x80 | 0x90 => dsp.note_off(event.data1),
@@ -1750,16 +1749,26 @@ mod builtin_processor_tests {
     fn wrapsynth_consumes_instance_midi_and_renders_audio() {
         let processor = BuiltinHostProcessor::wrapsynth(48_000, None);
         processor.apply_midi(SharedMidiEvent {
+            sample_offset: 64,
             status: 0x90,
             data1: 60,
             data2: 110,
+            ..SharedMidiEvent::default()
+        });
+        processor.apply_midi(SharedMidiEvent {
+            sample_offset: 128,
+            status: 0xe0,
+            data1: 0,
+            data2: 0x60,
             ..SharedMidiEvent::default()
         });
         let silence = [0.0f32; 256];
         let mut output = [0.0f32; 512];
         processor.process_block(&silence, &silence, &mut output, 256);
         assert!(output.iter().all(|sample| sample.is_finite()));
-        assert!(output.iter().any(|sample| sample.abs() > 1.0e-4));
+        // The note starts on its sample, not at the top of the block.
+        assert!(output[..128].iter().all(|sample| *sample == 0.0));
+        assert!(output[128..].iter().any(|sample| sample.abs() > 1.0e-4));
 
         processor.apply_midi(SharedMidiEvent {
             status: 0x80,

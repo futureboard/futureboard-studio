@@ -300,6 +300,18 @@ pub fn scenes() -> Vec<Scene> {
             open: wrap_synth,
         },
         Scene {
+            name: "wrapsynth-modulation",
+            width: 1_280.0,
+            height: 1_040.0,
+            open: wrap_synth_modulation,
+        },
+        Scene {
+            name: "wrapsynth-voice-fx",
+            width: 1_280.0,
+            height: 900.0,
+            open: wrap_synth_voice_fx,
+        },
+        Scene {
             name: "drum-sampler",
             width: 1_200.0,
             height: 820.0,
@@ -1153,6 +1165,49 @@ default_editor!(
     "wrapsynth",
     "WrapSynth"
 );
+/// WrapSynth on one of its pages, with a patch that shows the page off.
+fn wrap_synth_on(
+    page: crate::components::wrap_synth_panel::SynthPage,
+    preset: usize,
+    options: WindowOptions,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| {
+        cx.new(|cx| {
+            let mut window = crate::components::wrap_synth_window::WrapSynthEditorWindow::new(
+                key("wrapsynth"),
+                identity("WrapSynth"),
+                preview_host_ops(),
+                no_close(),
+                cx,
+            );
+            window.show_for_preview(page, wrapsynth::factory_presets()[preset].params);
+            window
+        })
+    })?;
+    Ok(handle.into())
+}
+
+fn wrap_synth_modulation(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    // Wobble Bass: a synced LFO on the cutoff and the wavetable.
+    wrap_synth_on(
+        crate::components::wrap_synth_panel::SynthPage::Modulation,
+        6,
+        options,
+        cx,
+    )
+}
+
+fn wrap_synth_voice_fx(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    // Supersaw Lead: legato with glide, delay and reverb.
+    wrap_synth_on(
+        crate::components::wrap_synth_panel::SynthPage::VoiceFx,
+        1,
+        options,
+        cx,
+    )
+}
+
 default_editor!(
     drum_sampler,
     crate::components::drum_sampler_window::DrumSamplerEditorWindow,

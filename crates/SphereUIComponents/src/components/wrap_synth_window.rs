@@ -26,14 +26,14 @@ use crate::components::native_plugin_shell::{
     NativeBuiltinEditor, SHELL_METER_INTERVAL, ShellIdentity, ShellMeter, native_plugin_shell,
 };
 use crate::components::wrap_synth_panel::{
-    WrapSynthCallbacks, WrapSynthPanelState, wrap_synth_panel,
+    SynthPage, WrapSynthCallbacks, WrapSynthPanelState, wrap_synth_panel,
 };
 use wrapsynth::Params;
 
-/// Opens with both oscillators on one row and the filter, envelope and
-/// output on the next, keyboard below. Narrower, the cards wrap and the body
-/// scrolls; the header and keyboard stay put.
-pub const WRAP_SYNTH_WINDOW_WIDTH: f32 = 980.0;
+/// Opens on the Synth page with both oscillators on one row and the filter,
+/// envelope and output on the next, keyboard below. Narrower, the cards wrap
+/// and the body scrolls; the header and keyboard stay put.
+pub const WRAP_SYNTH_WINDOW_WIDTH: f32 = 1_080.0;
 pub const WRAP_SYNTH_WINDOW_HEIGHT: f32 = 720.0;
 pub const WRAP_SYNTH_WINDOW_MIN_WIDTH: f32 = 660.0;
 pub const WRAP_SYNTH_WINDOW_MIN_HEIGHT: f32 = 520.0;
@@ -128,6 +128,16 @@ impl WrapSynthEditorWindow {
         cx.notify();
     }
 
+    /// The UI preview's scenes: one page, one patch, without a host.
+    pub fn show_for_preview(
+        &mut self,
+        page: crate::components::wrap_synth_panel::SynthPage,
+        params: Params,
+    ) {
+        self.panel.page = page;
+        self.panel.params = params;
+    }
+
     fn preview(&self, pitch: u8, velocity: Option<u8>, cx: &mut App) {
         if let Some(preview) = self.host_ops.preview_note.as_ref() {
             preview(&self.key, 0, pitch, velocity, cx);
@@ -194,6 +204,10 @@ impl WrapSynthEditorWindow {
         WrapSynthCallbacks {
             on_set_params: with(&entity, |this, params: Params, cx| {
                 this.set_params(params, cx)
+            }),
+            on_page: with(&entity, |this, page: SynthPage, cx| {
+                this.panel.page = page;
+                cx.notify();
             }),
             on_note_on: with(&entity, |this, pitch: u8, cx| this.note_on(pitch, cx)),
             on_note_off: with(&entity, |this, pitch: u8, cx| this.note_off(pitch, cx)),

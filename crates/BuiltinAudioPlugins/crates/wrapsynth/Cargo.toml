@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "WrapSynth - polyphonic dual-wavetable instrument"
+description = "WrapSynth - polyphonic wavetable synthesizer"
 
 [lib]
 name = "wrapsynth"
@@ -12,6 +12,11 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 builtin-dsp-core.workspace = true
+# Band-limited wavetable synthesis (MIT OR Apache-2.0).
+rustfft.workspace = true
+# The delay and reverb in the effects rack.
+echospace.workspace = true
+verbspace.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

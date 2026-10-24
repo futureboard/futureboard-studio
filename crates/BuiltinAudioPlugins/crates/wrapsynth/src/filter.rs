@@ -190,6 +190,13 @@ fn prewarp(cutoff: f32, sample_rate: f32) -> f32 {
 }
 
 impl Coefficients {
+    /// A placeholder until a voice works out its first set.
+    pub const NEUTRAL: Self = Self {
+        kind: FilterType::LowPass12,
+        g: [0.0; 3],
+        k: 2.0,
+    };
+
     /// `resonance` is 0..1; the analog damping follows the original
     /// WrapSynth curve, so old patches ring the same.
     pub fn new(kind: FilterType, cutoff: f32, resonance: f32, sample_rate: f32) -> Self {

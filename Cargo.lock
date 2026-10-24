@@ -11508,8 +11508,11 @@ name = "wrapsynth"
 version = "2026.10.16-beta1.4.4"
 dependencies = [
  "builtin_dsp_core",
+ "echospace",
+ "rustfft",
  "serde",
  "serde_json",
+ "verbspace",
 ]
 
 [[package]]
