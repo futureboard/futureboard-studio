@@ -191,6 +191,7 @@ pub(super) fn import(path: &Path) -> Result<FutureboardProject, ProjectError> {
             solfege: None,
             takes: Vec::new(),
             takes_expanded: false,
+            freeze: None,
         });
     }
 

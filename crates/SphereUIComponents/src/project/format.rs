@@ -160,7 +160,9 @@ pub const PROJECT_MAGIC: &[u8; 8] = b"FBSTUD1\0";
 /// instrument with every part at rest.
 /// v59 adds MIDI input tag 3, the MIDI another track's plug-ins produce,
 /// followed by that track's id. No earlier file holds it.
-pub const PROJECT_VERSION: u32 = 59;
+/// v60 appends each track's freeze: a flag, then the bounce's path, start
+/// beat and duration. A pre-v60 track is not frozen.
+pub const PROJECT_VERSION: u32 = 60;
 
 /// Oldest on-disk format version whose migration to the current one is
 /// supported (see [`super::migrate`]): v30, which introduced arrangement
@@ -1165,6 +1167,18 @@ fn encode_track(w: &mut FbWriter, t: &ProjectTrack, version: u32) {
         w.write_f32(spatial.spread);
         w.write_f32(spatial.width);
         w.write_f32(spatial.lfe);
+    }
+    // v60: the freeze bounce.
+    if version >= 60 {
+        match &t.freeze {
+            Some(freeze) => {
+                w.write_bool(true);
+                w.write_str(&freeze.media_path);
+                w.write_f64(freeze.start_beat);
+                w.write_f64(freeze.duration_seconds);
+            }
+            None => w.write_bool(false),
+        }
     }
 }
 
@@ -3296,6 +3310,17 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
         .sanitized();
     }
 
+    // v60: the freeze bounce. A pre-v60 track is not frozen.
+    let freeze = if version >= 60 && r.read_bool()? {
+        Some(crate::components::timeline::timeline_state::TrackFreeze {
+            media_path: r.read_str()?,
+            start_beat: r.read_f64()?,
+            duration_seconds: r.read_f64()?,
+        })
+    } else {
+        None
+    };
+
     // v55: folder members play through their folder (see `PROJECT_VERSION`).
     if version < 55
         && !matches!(
@@ -3336,6 +3361,7 @@ fn decode_track(r: &mut FbReader, version: u32) -> Result<ProjectTrack, ProjectE
         solfege,
         takes,
         takes_expanded,
+        freeze,
     })
 }
 
@@ -5236,6 +5262,7 @@ mod tests {
             solfege: None,
             takes: Vec::new(),
             takes_expanded: false,
+            freeze: None,
         }
     }
 

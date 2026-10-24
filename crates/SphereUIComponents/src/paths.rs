@@ -346,6 +346,7 @@ impl FutureboardPaths {
 ///   Rendered/Mixdowns/
 ///   Rendered/Stems/
 ///   Rendered/Bounces/
+///   Rendered/Freeze/
 /// ```
 #[derive(Debug, Clone)]
 pub struct ProjectFolderLayout {
@@ -361,6 +362,8 @@ pub struct ProjectFolderLayout {
     pub rendered_mixdowns: PathBuf,
     pub rendered_stems: PathBuf,
     pub rendered_bounces: PathBuf,
+    /// Frozen tracks' bounces.
+    pub rendered_freeze: PathBuf,
 }
 
 impl ProjectFolderLayout {
@@ -384,6 +387,7 @@ impl ProjectFolderLayout {
             rendered_mixdowns: rendered.join("Mixdowns"),
             rendered_stems: rendered.join("Stems"),
             rendered_bounces: rendered.join("Bounces"),
+            rendered_freeze: rendered.join("Freeze"),
             root,
         }
     }
@@ -402,6 +406,7 @@ impl ProjectFolderLayout {
             &self.rendered_mixdowns,
             &self.rendered_stems,
             &self.rendered_bounces,
+            &self.rendered_freeze,
         ];
         for dir in &dirs {
             fs::create_dir_all(dir)?;

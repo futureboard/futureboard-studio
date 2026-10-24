@@ -101,6 +101,7 @@ impl AssetSource for EmbeddedAssets {
             assets::ICON_SCAN_SEARCH_PATH => Some(assets::icons::SCAN_SEARCH.as_bytes()),
             assets::ICON_LOCK_PATH => Some(assets::icons::LOCK.as_bytes()),
             assets::ICON_LOCK_OPEN_PATH => Some(assets::icons::LOCK_OPEN.as_bytes()),
+            assets::ICON_SNOWFLAKE_PATH => Some(assets::icons::SNOWFLAKE.as_bytes()),
             assets::ICON_DICES_PATH => Some(assets::icons::DICES.as_bytes()),
             assets::ICON_REFRESH_CW_PATH => Some(assets::icons::REFRESH_CW.as_bytes()),
             assets::ICON_ARROW_LEFT_RIGHT_PATH => Some(assets::icons::ARROW_LEFT_RIGHT.as_bytes()),

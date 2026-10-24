@@ -1386,7 +1386,7 @@ fn build_engine_project_snapshot_inner(
         .collect();
     forget_unlisted_midi_clips(&midi_clips);
 
-    EngineProjectSnapshot {
+    let mut snapshot = EngineProjectSnapshot {
         project_id: "futureboard-native".to_string(),
         project_root: project_root.map(str::to_string),
         preferred_input_device: preferred_input_device
@@ -1417,6 +1417,59 @@ fn build_engine_project_snapshot_inner(
             buffer_size: 256,
         },
         spatial: build_engine_spatial_snapshot(state),
+    };
+    apply_track_freezes(state, &mut snapshot);
+    snapshot
+}
+
+/// A frozen track plays its bounce: its own clips, and the MIDI played on its
+/// instrument, leave the snapshot and one clip of the bounce takes their
+/// place. Its sound sources stop working — inserts stay loaded but disabled,
+/// so unfreezing needs no reload — while fader, pan, sends and automation
+/// carry on as before.
+pub(super) fn apply_track_freezes(state: &TimelineState, snapshot: &mut EngineProjectSnapshot) {
+    let frozen: Vec<(&str, &timeline_state::TrackFreeze)> = state
+        .tracks
+        .iter()
+        .filter_map(|track| track.freeze.as_ref().map(|f| (track.id.as_str(), f)))
+        .collect();
+    if frozen.is_empty() {
+        return;
+    }
+    let is_frozen = |id: &str| frozen.iter().any(|(frozen_id, _)| *frozen_id == id);
+    snapshot.clips.retain(|clip| !is_frozen(&clip.track_id));
+    snapshot
+        .midi_clips
+        .retain(|clip| !is_frozen(&clip.track_id));
+    for track in snapshot.tracks.iter_mut().filter(|t| is_frozen(&t.id)) {
+        for insert in &mut track.inserts {
+            insert.enabled = false;
+        }
+        track.builtin_soundfont_player = false;
+        track.solfege_engine = None;
+        track.armed = false;
+        track.input_monitor = false;
+    }
+    let tempo = state.tempo_lookup();
+    for (track_id, freeze) in frozen {
+        let start_beat = freeze.start_beat.max(0.0);
+        let end_beat =
+            tempo.beat_at_seconds(tempo.seconds_at_beat(start_beat) + freeze.duration_seconds);
+        snapshot.clips.push(EngineClipSnapshot {
+            id: format!("freeze-{track_id}"),
+            track_id: track_id.to_string(),
+            asset_id: format!("freeze-{track_id}"),
+            media_path: Some(freeze.media_path.clone()),
+            start_beat,
+            duration_beats: (end_beat - start_beat).max(0.0),
+            offset_seconds: 0.0,
+            gain: 1.0,
+            muted: false,
+            ara_rendered: false,
+            fades: None,
+            stretch: Default::default(),
+            audio_process: None,
+        });
     }
 }
 

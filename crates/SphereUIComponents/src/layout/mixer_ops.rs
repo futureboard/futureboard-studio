@@ -2833,6 +2833,7 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         // take pointing at a clip that is not there.
         takes: _,
         takes_expanded: _,
+        freeze,
     } = track;
     TrackState {
         // Preserved, not reset: the mixer strip renders its PFL/AFL buttons
@@ -2863,6 +2864,7 @@ fn clone_track_for_mixer_detail(track: &TrackState, include_detail: bool) -> Tra
         clips: Vec::new(),
         takes: Vec::new(),
         takes_expanded: false,
+        freeze: freeze.clone(),
         automation_lanes: if include_detail {
             automation_lanes.clone()
         } else {

@@ -249,6 +249,7 @@ impl StudioLayout {
                 .state
                 .tracks
                 .iter()
+                .filter(|track| !track.is_frozen())
                 .flat_map(|track| track.clips.iter().map(|clip| clip.id.clone()))
                 .collect();
             if !clip_ids.is_empty() {

@@ -46,6 +46,7 @@ mod audio_editor_ops;
 mod audio_tool_ops;
 mod audio_transport;
 mod bottom_panel_ops;
+mod bounce_ops;
 mod browser_ops;
 mod chord_ops;
 mod close_ops;
@@ -741,6 +742,9 @@ pub struct StudioLayout {
     project_path: Option<PathBuf>,
     /// Root folder of the current project (contains Media/, Cache/, etc.).
     project_folder: Option<PathBuf>,
+    /// A freeze / render-in-place job is running. One at a time: each borrows
+    /// the live plug-in bridges for its whole render.
+    bounce_running: bool,
     /// Persistent recent-projects list backed by `<AppData>/Futureboard Studio/recent.json`.
     recent_projects: RecentProjectsStore,
     /// Studio-window / app-integration hooks (own window handle, last known
@@ -1251,6 +1255,24 @@ impl StudioLayout {
         {
             let target = cx.entity().clone();
             let _ = timeline.update(cx, |timeline, _cx| {
+                timeline.set_toggle_track_freeze_callback(Some(Arc::new(
+                    move |track_id, window, cx| {
+                        let track_id = track_id.clone();
+                        StudioLayout::defer_update_in_window(
+                            &target,
+                            window,
+                            cx,
+                            move |this, _window, cx| {
+                                this.toggle_track_freeze(&track_id, cx);
+                            },
+                        );
+                    },
+                )));
+            });
+        }
+        {
+            let target = cx.entity().clone();
+            let _ = timeline.update(cx, |timeline, _cx| {
                 timeline.set_plugin_preset_drop_callback(Some(Arc::new(
                     move |(preset_path, track_id), window, cx| {
                         let preset_path = preset_path.clone();
@@ -1452,6 +1474,7 @@ impl StudioLayout {
             project_session: crate::project::ProjectSession::default(),
             project_path: None,
             project_folder: None,
+            bounce_running: false,
             recent_projects: RecentProjectsStore::load(),
             window_hooks: window_ops::StudioWindowHooks::default(),
             lifecycle_guard: close_ops::LifecycleGuardState::default(),
@@ -2905,6 +2928,12 @@ impl StudioLayout {
                 }
             }
             "track:delete" => self.delete_selected_track(cx),
+            "track:freeze" => self.freeze_selected_tracks(cx),
+            "track:unfreeze" => self.unfreeze_selected_tracks(cx),
+            "track:flatten" => self.flatten_selected_tracks(cx),
+            "audio:bounce-in-place" => self.render_selected_tracks_in_place(cx),
+            "audio:render-selection" => self.render_arrangement_selection(cx),
+            "clip:consolidate" => self.consolidate_selected_clips(cx),
             "track:duplicate" => self.duplicate_context_track(true, cx),
             "track:group-selected" => self.group_selected_tracks(cx),
             "track:remove-from-folder" => self.remove_context_track_from_folder(cx),

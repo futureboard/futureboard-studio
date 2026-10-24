@@ -579,7 +579,7 @@ fn build_action_catalog() -> HashMap<String, String> {
     #[rustfmt::skip]
     let fallback: &[(&str, &str)] = &[
         ("app:force-reload",               "App › Force Reload"),
-        ("audio:bounce-in-place",          "Audio › Bounce in Place"),
+        ("audio:bounce-in-place",          "Audio › Render in Place"),
         ("audio:create-crossfade",         "Audio › Create Crossfade"),
         ("audio:find-tempo-key",           "Audio › Find Tempo & Key"),
         ("chords:open-generator",          "Chords › Chord Generator"),
@@ -639,6 +639,9 @@ fn build_action_catalog() -> HashMap<String, String> {
         ("tools:select-mute",              "Tools › Select / Mute Tool"),
         ("track:add",                      "Project › Add Track"),
         ("track:arm",                      "Track › Arm for Recording"),
+        ("track:freeze",                   "Track › Freeze"),
+        ("track:unfreeze",                 "Track › Unfreeze"),
+        ("track:flatten",                  "Track › Flatten Frozen Track"),
         ("track:mute",                     "Track › Mute"),
         ("track:solo",                     "Track › Solo"),
         ("window:minimize",                "Window › Minimize"),
@@ -660,9 +663,6 @@ fn build_action_catalog() -> HashMap<String, String> {
 /// studio runs yet. They get no row and no key until they do.
 pub(crate) const UNHANDLED_COMMANDS: &[&str] = &[
     "app:force-reload",
-    "audio:bounce-in-place",
-    "audio:render-selection",
-    "clip:consolidate",
     "file:import-audio",
     "panel:toggle-automation",
     "panel:toggle-device-panel",

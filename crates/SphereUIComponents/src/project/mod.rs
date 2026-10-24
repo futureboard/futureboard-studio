@@ -572,6 +572,8 @@ pub struct ProjectTrack {
     pub takes: Vec<ProjectTake>,
     /// Whether the take sub-lane is open in the header (v44+).
     pub takes_expanded: bool,
+    /// The track's freeze bounce, when it is frozen (v60+).
+    pub freeze: Option<crate::components::timeline::timeline_state::TrackFreeze>,
 }
 
 /// One persisted recorded take. See
@@ -1568,6 +1570,7 @@ impl From<&TimelineState> for FutureboardProject {
                         })
                         .collect(),
                     takes_expanded: t.takes_expanded,
+                    freeze: t.freeze.clone(),
                 }
             })
             .collect();
@@ -2409,6 +2412,7 @@ pub fn apply_to_timeline(
                     })
                     .collect(),
                 takes_expanded: pt.takes_expanded,
+                freeze: pt.freeze.clone(),
                 solfege: pt.solfege.as_ref().map(|state| SolfegeTrackState {
                     model_path: state
                         .model_path
@@ -3243,7 +3247,7 @@ mod v33_routing_adapter_tests {
         let bytes = crate::project::format::encode_project(&FutureboardProject::new("current"));
         let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
         assert_eq!(version, crate::project::format::PROJECT_VERSION);
-        assert_eq!(crate::project::format::PROJECT_VERSION, 59);
+        assert_eq!(crate::project::format::PROJECT_VERSION, 60);
     }
 
     // ── v35 Master / Monitor output routing ─────────────────────────────────

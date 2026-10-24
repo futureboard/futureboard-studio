@@ -17,6 +17,8 @@ pub use export_settings::{
 pub use export_window::{
     open_export_arrangement_window, ExportArrangementWindow, ExportIntent, EXPORT_WINDOW_WIDTH,
 };
+pub(crate) use export_settings::sanitize_file_stem;
+pub(crate) use render_dialog::BridgeSinkHandoff;
 pub use render_dialog::{RealtimeTransportHooks, RenderDialog};
 
 #[cfg(test)]

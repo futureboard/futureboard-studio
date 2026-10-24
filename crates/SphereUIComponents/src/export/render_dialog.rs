@@ -84,13 +84,13 @@ struct RenderShared {
 /// scope — success, error, or worker panic (Drop runs during unwind). Losing
 /// the restore would leave every bridged insert silent in realtime playback
 /// after the render.
-struct BridgeSinkHandoff<'a> {
+pub(crate) struct BridgeSinkHandoff<'a> {
     engine: Option<&'a DirectAudio::AudioEngine>,
     sinks: &'a PluginBridgeSinkMap,
 }
 
 impl<'a> BridgeSinkHandoff<'a> {
-    fn detach(
+    pub(crate) fn detach(
         engine: Option<&'a DirectAudio::AudioEngine>,
         sinks: &'a PluginBridgeSinkMap,
     ) -> Self {

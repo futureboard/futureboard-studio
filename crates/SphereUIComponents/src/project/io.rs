@@ -176,6 +176,9 @@ pub fn save_project_with_report_from(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     project_save_log(format_args!("serialize start"));
     let offline_media = prepare_portable_assets(project, path, records_root)?;
+    if let Some(project_root) = path.parent() {
+        relativize_freeze_paths(project, project_root);
+    }
     for missing in &offline_media {
         project_save_log(format_args!(
             "offline media kept as a reference: {}",
@@ -1229,10 +1232,30 @@ fn offline_project_relative(source_abs: &Path, project_root: &Path) -> Option<St
         .map(path_to_project_string)
 }
 
+/// A freeze bounce inside the project folder is saved relative to it, so the
+/// folder can move; one outside it (a Save As elsewhere) keeps its full path.
+fn relativize_freeze_paths(project: &mut FutureboardProject, project_root: &Path) {
+    for freeze in project.tracks.iter_mut().filter_map(|t| t.freeze.as_mut()) {
+        let path = Path::new(&freeze.media_path);
+        if path.is_absolute() {
+            if let Some(relative) = relative_path_in_project(path, project_root) {
+                freeze.media_path = relative;
+            }
+        }
+    }
+}
+
 fn resolve_project_relative_assets(project: &mut FutureboardProject, project_file: &Path) {
     let Some(project_root) = project_file.parent() else {
         return;
     };
+    for freeze in project.tracks.iter_mut().filter_map(|t| t.freeze.as_mut()) {
+        if Path::new(&freeze.media_path).is_relative() {
+            freeze.media_path = resolve_project_relative_path(project_root, &freeze.media_path)
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
     for track in &mut project.tracks {
         for clip in &mut track.clips {
             let ClipSource::Audio {
@@ -1812,6 +1835,7 @@ mod tests {
             solfege: None,
             takes: Vec::new(),
             takes_expanded: false,
+            freeze: None,
         });
 
         let project_file = root.join("Portable.fbproj");
@@ -1893,6 +1917,7 @@ mod tests {
             solfege: None,
             takes: Vec::new(),
             takes_expanded: false,
+            freeze: None,
         }
     }
 
@@ -3247,6 +3272,7 @@ mod tests {
             solfege: None,
             takes: Vec::new(),
             takes_expanded: false,
+            freeze: None,
         });
 
         let archive = root.join("My Song.zip");

@@ -39,6 +39,7 @@ pub mod icons {
         include_str!("../../../packages/shared/lucide/icons/scan-search.svg");
     pub const LOCK: &str = include_str!("../../../packages/shared/lucide/icons/lock.svg");
     pub const LOCK_OPEN: &str = include_str!("../../../packages/shared/lucide/icons/lock-open.svg");
+    pub const SNOWFLAKE: &str = include_str!("../../../packages/shared/lucide/icons/snowflake.svg");
     pub const DICES: &str = include_str!("../../../packages/shared/lucide/icons/dices.svg");
     pub const REFRESH_CW: &str =
         include_str!("../../../packages/shared/lucide/icons/refresh-cw.svg");
@@ -159,6 +160,7 @@ pub const ICON_SEARCH_PATH: &str = "icons/search.svg";
 pub const ICON_SCAN_SEARCH_PATH: &str = "icons/scan-search.svg";
 pub const ICON_LOCK_PATH: &str = "icons/lock.svg";
 pub const ICON_LOCK_OPEN_PATH: &str = "icons/lock-open.svg";
+pub const ICON_SNOWFLAKE_PATH: &str = "icons/snowflake.svg";
 pub const ICON_DICES_PATH: &str = "icons/dices.svg";
 pub const ICON_REFRESH_CW_PATH: &str = "icons/refresh-cw.svg";
 pub const ICON_ARROW_LEFT_RIGHT_PATH: &str = "icons/arrow-left-right.svg";

@@ -67,6 +67,8 @@ pub struct TrackHeaderCallbacks {
     /// Open the track's instrument plugin editor, or the instrument picker when
     /// the slot is empty. `None` hides the header button.
     pub on_open_instrument: Option<TrackCallback>,
+    /// Freeze the track, or unfreeze a frozen one. `None` hides the toggle.
+    pub on_toggle_freeze: Option<TrackCallback>,
     /// Open the inline name editor on a plain double-click of the name; see
     /// [`opens_track_rename`].
     pub on_begin_rename: TrackCallback,
@@ -299,12 +301,16 @@ fn folder_menu_button(
 /// on the shared edge and half of it would disappear.
 ///
 /// `divider` is `None` for the first segment — there is nothing to its left but
-/// the group's own frame.
+/// the group's own frame. A segment that is not `enabled` keeps its place in
+/// the strip, dimmed, and takes no press; its tooltip says why.
+#[allow(clippy::too_many_arguments)]
 fn latch_segment(
     id: gpui::ElementId,
     label: &'static str,
     icon: Option<&'static str>,
+    tooltip: String,
     active: bool,
+    enabled: bool,
     semantic: gpui::Rgba,
     divider: Option<gpui::Rgba>,
     on_click: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
@@ -316,7 +322,9 @@ fn latch_segment(
         Colors::button_bg()
     };
     let hover = Colors::composite(rest, Colors::state_hover());
-    let fg = if active {
+    let fg = if !enabled {
+        Colors::text_disabled()
+    } else if active {
         semantic
     } else {
         Colors::text_muted()
@@ -334,9 +342,15 @@ fn latch_segment(
         .text_size(px(typography::DENSE_CAPTION))
         .font_weight(gpui::FontWeight::BOLD)
         .text_color(fg)
-        .cursor(gpui::CursorStyle::PointingHand)
-        .hover(move |s| s.bg(hover))
-        .on_mouse_down(gpui::MouseButton::Left, on_click)
+        .tooltip(fb_tooltip(tooltip))
+        .when(enabled, |seg| {
+            seg.cursor(gpui::CursorStyle::PointingHand)
+                .hover(move |s| s.bg(hover))
+                .on_mouse_down(gpui::MouseButton::Left, on_click)
+        })
+        .when(!enabled, |seg| {
+            seg.on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        })
         .when_some(divider, |seg, color| {
             seg.border_l(px(1.0)).border_color(color)
         });
@@ -367,13 +381,18 @@ fn latch_divider(left: Option<gpui::Rgba>, right: Option<gpui::Rgba>) -> gpui::R
     }
 }
 
-/// The five toggle handlers, bundled so the strip's signature stays readable.
+type LatchPressHandler =
+    Box<dyn Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static>;
+
+/// The toggle handlers, bundled so the strip's signature stays readable.
+/// `on_freeze` is `None` on a track that cannot be frozen.
 struct LatchStripHandlers<M, S, R, I, A> {
     on_mute: M,
     on_solo: S,
     on_arm: R,
     on_input: I,
     on_automation: A,
+    on_freeze: Option<LatchPressHandler>,
 }
 
 /// The M/S/R/I/A strip: five latching toggles as one touching group.
@@ -399,9 +418,10 @@ where
     A: Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 {
     let is_folder = track.track_type == TrackType::Group;
+    let frozen = track.is_frozen();
     // Hue when latched, `None` when not — the divider colouring reads this to
     // decide which side of each seam is lit.
-    let states: [Option<gpui::Rgba>; 5] = [
+    let states: [Option<gpui::Rgba>; 6] = [
         track.muted.then(Colors::state_mute),
         track.solo.then(Colors::state_solo),
         track.armed.then(Colors::state_arm),
@@ -410,7 +430,17 @@ where
             .is_active(track.armed)
             .then(Colors::state_monitor),
         is_automation.then(Colors::state_automation),
+        frozen.then(Colors::state_freeze),
     ];
+    // A frozen track plays its bounce: there is nothing to record into or
+    // monitor until it is unfrozen.
+    let unless_frozen = |label: &str| {
+        if frozen {
+            format!("{label} (unfreeze the track first)")
+        } else {
+            label.to_string()
+        }
+    };
 
     div()
         // Transparent padding, not a taller strip: the visible group stays
@@ -437,7 +467,9 @@ where
                     ("mute-btn", id_num).into(),
                     "M",
                     None,
+                    "Mute".to_string(),
                     track.muted,
+                    true,
                     Colors::state_mute(),
                     None,
                     handlers.on_mute,
@@ -446,7 +478,9 @@ where
                     ("solo-btn", id_num).into(),
                     "S",
                     None,
+                    "Solo".to_string(),
                     track.solo,
+                    true,
                     Colors::state_solo(),
                     Some(latch_divider(states[0], states[1])),
                     handlers.on_solo,
@@ -457,7 +491,9 @@ where
                             ("arm-btn", id_num).into(),
                             "R",
                             None,
+                            unless_frozen("Record Arm"),
                             track.armed,
+                            !frozen,
                             Colors::state_arm(),
                             Some(latch_divider(states[1], states[2])),
                             handlers.on_arm,
@@ -466,7 +502,9 @@ where
                             ("input-btn", id_num).into(),
                             "I",
                             None,
+                            unless_frozen("Input Monitoring"),
                             track.input_monitor.is_active(track.armed),
+                            !frozen,
                             Colors::state_monitor(),
                             Some(latch_divider(states[2], states[3])),
                             handlers.on_input,
@@ -478,7 +516,9 @@ where
                     ("auto-btn", id_num).into(),
                     "A",
                     None,
+                    "Automation".to_string(),
                     is_automation,
+                    true,
                     Colors::state_automation(),
                     Some(if is_folder {
                         latch_divider(states[1], states[4])
@@ -486,7 +526,24 @@ where
                         latch_divider(states[3], states[4])
                     }),
                     handlers.on_automation,
-                )),
+                ))
+                .when_some(handlers.on_freeze, |strip, on_freeze| {
+                    strip.child(latch_segment(
+                        ("freeze-btn", id_num).into(),
+                        "F",
+                        Some(assets::ICON_SNOWFLAKE_PATH),
+                        if frozen {
+                            "Unfreeze Track".to_string()
+                        } else {
+                            "Freeze Track: render it and turn its plug-ins off".to_string()
+                        },
+                        frozen,
+                        true,
+                        Colors::state_freeze(),
+                        Some(latch_divider(states[4], states[5])),
+                        on_freeze,
+                    ))
+                }),
         )
 }
 
@@ -648,6 +705,13 @@ pub fn track_header(
         Some(Colors::surface_selected_soft())
     } else if is_selected {
         Some(Colors::track_selected_overlay())
+    } else if track.is_frozen() {
+        // The same frost wash the frozen lane carries, so header and lane read
+        // as one locked row.
+        Some(Colors::with_alpha(
+            Colors::state_freeze(),
+            crate::theme::state::ARMED_WASH,
+        ))
     } else {
         None
     };
@@ -736,6 +800,20 @@ pub fn track_header(
             cb(&automation_id, window, cx);
         }
     };
+
+    let on_freeze = callbacks
+        .on_toggle_freeze
+        .clone()
+        .filter(|_| track.track_type.can_freeze())
+        .map(|cb| {
+            let freeze_id = track_id.clone();
+            Box::new(
+                move |_: &gpui::MouseDownEvent, window: &mut gpui::Window, cx: &mut gpui::App| {
+                    cx.stop_propagation();
+                    cb(&freeze_id, window, cx);
+                },
+            ) as LatchPressHandler
+        });
 
     let vol_id = track_id.clone();
     let on_volume_drag_start = {
@@ -1042,6 +1120,7 @@ pub fn track_header(
                                 on_arm,
                                 on_input,
                                 on_automation,
+                                on_freeze,
                             },
                         ))
                         .when_some(folder_menu, |row, (track_id, on_open)| {

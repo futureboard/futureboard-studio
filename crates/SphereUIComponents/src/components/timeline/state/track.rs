@@ -201,6 +201,28 @@ impl TrackTimebase {
     }
 }
 
+/// A frozen track's bounce: its clips through its instrument and insert chain,
+/// before the fader, rendered to `media_path` from `start_beat` on.
+///
+/// While set, the engine plays this file in place of the track's clips,
+/// instrument and inserts (which stay loaded but do no work); fader, pan,
+/// sends and their automation stay live. The clips are kept untouched, so
+/// unfreezing is clearing this.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackFreeze {
+    pub media_path: String,
+    pub start_beat: f64,
+    pub duration_seconds: f64,
+}
+
+impl TrackType {
+    /// Whether a track of this type makes its own sound from clips, and so can
+    /// be frozen or rendered in place.
+    pub fn can_freeze(self) -> bool {
+        matches!(self, TrackType::Audio | TrackType::Instrument)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackState {
     pub id: String,
@@ -321,6 +343,14 @@ pub struct TrackState {
     /// the first pass that overlaps another; closed is the resting state for a
     /// track nobody is comping.
     pub takes_expanded: bool,
+    /// Set while the track is frozen. Saved with the track (v60).
+    pub freeze: Option<TrackFreeze>,
+}
+
+impl TrackState {
+    pub fn is_frozen(&self) -> bool {
+        self.freeze.is_some()
+    }
 }
 
 impl TrackState {
@@ -546,6 +576,7 @@ impl TimelineState {
             routing: TrackRoutingState::for_track_type(track_type),
             takes: Vec::new(),
             takes_expanded: false,
+            freeze: None,
             instrument_plugin_instance_id: None,
             builtin_soundfont_player: false,
             soundfont_path: None,

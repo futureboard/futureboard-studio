@@ -1722,6 +1722,7 @@ impl Render for Timeline {
                 })
             },
             on_open_instrument: self.on_open_track_instrument.clone(),
+            on_toggle_freeze: self.on_toggle_track_freeze.clone(),
             on_begin_rename: std::sync::Arc::new(on_begin_rename),
             rename: track_rename,
         };

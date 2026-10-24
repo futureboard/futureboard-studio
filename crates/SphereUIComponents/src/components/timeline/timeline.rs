@@ -347,6 +347,8 @@ pub struct Timeline {
     on_open_song_text_editor: Option<TimelineOpenEditorCb>,
     /// Opens the selected instrument track's plugin editor (or the picker).
     on_open_track_instrument: Option<TimelineOpenTrackInstrumentCb>,
+    /// Freezes the track, or unfreezes a frozen one (the header's toggle).
+    on_toggle_track_freeze: Option<TimelineOpenTrackInstrumentCb>,
     chrome_metrics: TimelineChromeMetrics,
     /// Window x of the lane content column, measured from the ruler each frame
     /// and folded into the viewport at the top of the next render. Pointer math

@@ -153,6 +153,7 @@ arrangement:
 | Arm / record | `state.arm` | red |
 | Input monitor | `state.monitor` | green |
 | Automation | `state.automation` | violet |
+| Frozen | `state.freeze` | frost |
 
 **Hard rules.** Every state is encoded on two channels — fill *and* border, or
 color *and* glyph — never hue alone. Radius never changes between states:

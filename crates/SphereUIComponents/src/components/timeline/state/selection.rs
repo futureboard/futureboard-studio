@@ -270,7 +270,10 @@ impl TimelineState {
             // misses it (it crosses only the pads or the automation lanes)
             // touches none of them: nothing to measure.
             let (band_top, band_height) = clip_lane_band(row.height);
-            if !(rect.top < row.y + (band_top + band_height) && rect.bottom > row.y + band_top) {
+            // A frozen track's clips are locked until it is unfrozen.
+            if track.is_frozen()
+                || !(rect.top < row.y + (band_top + band_height) && rect.bottom > row.y + band_top)
+            {
                 continue;
             }
             for clip in &track.clips {

@@ -14,7 +14,9 @@ use crate::components::timeline::timeline_state::{
 use crate::components::timeline::video_clip::video_clip;
 use crate::theme::Colors;
 use gpui::prelude::FluentBuilder;
-use gpui::{div, px, InteractiveElement, IntoElement, ParentElement, Styled};
+use gpui::{
+    div, px, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
+};
 
 /// A left press on arrangement lane space that no clip owns, which starts a
 /// marquee. Positions are raw window pixels: the timeline anchors the
@@ -285,6 +287,14 @@ pub fn track_lane(
         track.id.hash(&mut hasher);
         hasher.finish() as usize
     };
+    let frozen_overlay = track.is_frozen().then(|| {
+        frozen_lane_overlay(
+            id_num,
+            track_id.clone(),
+            on_select_track.clone(),
+            on_track_context_menu.clone(),
+        )
+    });
 
     div()
         .flex_1()
@@ -391,4 +401,43 @@ pub fn track_lane(
             (!crossfade_elements.is_empty())
                 .then(|| div().absolute().inset_0().children(crossfade_elements)),
         )
+        .children(frozen_overlay)
+}
+
+/// Covers a frozen track's clips: they stay visible under a frost wash but
+/// take no edit gesture until the track is unfrozen. A press still chooses
+/// the track, and the context menu (where Unfreeze lives) still opens.
+fn frozen_lane_overlay(
+    id_num: usize,
+    track_id: String,
+    on_select: std::sync::Arc<dyn Fn(&String, &mut gpui::Window, &mut gpui::App) + 'static>,
+    on_context_menu: Option<
+        std::sync::Arc<dyn Fn(&(String, f32, f32), &mut gpui::Window, &mut gpui::App) + 'static>,
+    >,
+) -> impl IntoElement {
+    let select_id = track_id.clone();
+    div()
+        .id(("frozen-lane", id_num))
+        .absolute()
+        .inset_0()
+        .bg(Colors::with_alpha(
+            Colors::state_freeze(),
+            crate::theme::state::ARMED_WASH,
+        ))
+        .occlude()
+        .tooltip(crate::components::controls::fb_tooltip(
+            "Frozen: unfreeze the track to edit its clips",
+        ))
+        .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+            cx.stop_propagation();
+            on_select(&select_id, window, cx);
+        })
+        .when_some(on_context_menu, |overlay, open_menu| {
+            overlay.on_mouse_down(gpui::MouseButton::Right, move |event, window, cx| {
+                cx.stop_propagation();
+                let x: f32 = event.position.x.into();
+                let y: f32 = event.position.y.into();
+                open_menu(&(track_id.clone(), x, y), window, cx);
+            })
+        })
 }

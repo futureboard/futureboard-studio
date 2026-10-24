@@ -1920,6 +1920,7 @@ impl TimelineState {
                     routing: TrackRoutingState::for_track_type(TrackType::Bus),
                     takes: Vec::new(),
                     takes_expanded: false,
+                    freeze: None,
                 },
             );
             insert_at += 1;

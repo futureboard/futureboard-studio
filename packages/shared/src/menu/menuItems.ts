@@ -608,6 +608,48 @@ export const APP_MENUS: AppMenuGroup[] = [
       },
       {
         type: "separator",
+        id: "audio.sep.render",
+      },
+      {
+        id: "audio.bounce_in_place",
+        label: "Render in Place",
+        accelerator: "Ctrl+B",
+        action: "audio:bounce-in-place",
+        description: "Render the selected tracks to new audio tracks and mute the originals",
+      },
+      {
+        id: "audio.render_selection",
+        label: "Render Selection",
+        accelerator: "Ctrl+R",
+        action: "audio:render-selection",
+        description: "Render the arrangement selection of the selected tracks to new audio tracks",
+      },
+      {
+        id: "edit.consolidate",
+        label: "Consolidate Clips",
+        accelerator: "Ctrl+J",
+        action: "clip:consolidate",
+        description: "Render the selected audio clips on one track into a single clip",
+      },
+      {
+        id: "audio.freeze_selected_tracks",
+        label: "Freeze Selected Tracks",
+        action: "track:freeze",
+        description: "Render the selected tracks with their inserts and turn the plug-ins off",
+      },
+      {
+        id: "audio.unfreeze_selected_tracks",
+        label: "Unfreeze Selected Tracks",
+        action: "track:unfreeze",
+      },
+      {
+        id: "audio.flatten_frozen_tracks",
+        label: "Flatten Frozen Tracks",
+        action: "track:flatten",
+        description: "Replace a frozen track with a plain audio track of its render",
+      },
+      {
+        type: "separator",
         id: "audio.sep.routing",
       },
       {

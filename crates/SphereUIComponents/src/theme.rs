@@ -1008,6 +1008,9 @@ impl Colors {
     theme_color!(state_arm, "state.arm", "#F2645F");
     theme_color!(state_monitor, "state.monitor", "#43D18A");
     theme_color!(state_automation, "state.automation", "#A78BFA");
+    // A frozen track: pale frost, lighter than mute's blue and well clear of
+    // the cyan accent.
+    theme_color!(state_freeze, "state.freeze", "#BFE3F2");
 
     // Automation sublane tokens — quiet graphite lanes with a purple curve so the
     // envelope is the only saturated element in the section.

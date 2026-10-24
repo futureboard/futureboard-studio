@@ -1633,6 +1633,13 @@ impl StudioLayout {
                     }
                 }
                 entries.push(ContextMenuEntry::Separator);
+                if is_audio && selected_count >= 2 {
+                    entries.push(menu_item_enabled(
+                        "Consolidate Clips",
+                        "clip:consolidate",
+                        !self.bounce_running,
+                    ));
+                }
                 entries.push(menu_item_enabled(
                     "Clip Properties",
                     "clip:properties",
@@ -1659,6 +1666,21 @@ impl StudioLayout {
                     menu_item_enabled("Track Color", "track:color", exists),
                     menu_item_enabled("Track Settings", "track:settings", exists),
                 ]);
+                if let Some(track) = track.as_ref().filter(|track| track.track_type.can_freeze()) {
+                    let idle = !self.bounce_running;
+                    entries.push(ContextMenuEntry::Separator);
+                    if track.is_frozen() {
+                        entries.extend([
+                            menu_item_enabled("Unfreeze Track", "track:unfreeze", idle),
+                            menu_item_enabled("Flatten Frozen Track", "track:flatten", idle),
+                        ]);
+                    } else {
+                        entries.extend([
+                            menu_item_enabled("Freeze Track", "track:freeze", idle),
+                            menu_item_enabled("Render in Place", "audio:bounce-in-place", idle),
+                        ]);
+                    }
+                }
                 entries.extend(self.folder_menu_entries(track_id, cx));
                 if let Some(track) = track.as_ref().filter(|track| !track.takes.is_empty()) {
                     entries.extend([
