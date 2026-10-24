@@ -871,6 +871,13 @@ impl PlatformWindow for WindowsWindow {
                         ShowWindowAsync(hwnd, SW_RESTORE).ok().log_err();
                     }
 
+                    // Already in front: nothing to do, and taking focus to the
+                    // window itself would pull it off an embedded child's
+                    // own focused window (a plug-in editor's popup menu).
+                    if GetForegroundWindow() == hwnd {
+                        return;
+                    }
+
                     SetActiveWindow(hwnd).ok();
                     SetFocus(Some(hwnd)).ok();
                 }

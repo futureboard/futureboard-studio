@@ -116,3 +116,19 @@ or the first visible unowned window of the UI thread). Windows keeps an owned
 window above its owner, hides it when the owner is minimized and destroys it
 with the owner — which is what macOS's floating level and X11's
 `WM_TRANSIENT_FOR` already gave the kind on those platforms.
+
+## Windows: activation leaves an embedded child's focus alone
+
+`WM_MOUSEACTIVATE` called `SetActiveWindow` on every click that reached the
+window, including clicks inside an embedded child window (a plug-in editor's
+view, possibly in another process). When the window was not active that ran the
+default activation, which focuses the top-level window. `activate()` likewise
+called `SetActiveWindow` + `SetFocus` on the window, synthesized an Alt
+press/release and called `SetForegroundWindow`, even when the window was
+already in front.
+
+A JUCE popup menu closes itself as soon as focus leaves the plug-in's own
+windows, so either path made a plug-in's dropdown flash open and shut. Now
+`WM_MOUSEACTIVATE` (events.rs) activates only a window that is not already the
+active one, and `activate()` (window.rs) returns after restoring a minimized
+window when `GetForegroundWindow()` is already this window.

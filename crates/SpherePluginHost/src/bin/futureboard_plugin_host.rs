@@ -7083,6 +7083,312 @@ mod platform {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         }
         install_transport_keyboard_hook();
+        install_focus_trace();
+        install_popup_foreground_hook();
+    }
+
+    /// The plug-in popup this host made the foreground window, and what to
+    /// give the foreground and focus back to when it closes.
+    #[derive(Clone, Copy)]
+    struct PopupForeground {
+        popup: isize,
+        restore_window: isize,
+        restore_focus: isize,
+    }
+
+    thread_local! {
+        static POPUP_FOREGROUND: std::cell::Cell<Option<PopupForeground>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Keeps a plug-in's popup menu open while its editor is embedded in the
+    /// app's window.
+    ///
+    /// An embedded editor is a child of a window in the app's process, so
+    /// that process owns the foreground window. JUCE before 6.1 closes any
+    /// popup menu about 10 ms after it opens when its own process is not the
+    /// foreground one (ValhallaRoom's REVERB MODE list flashed open and shut
+    /// on every click; `plugin_popup_probe` reproduces it). So when a
+    /// plug-in shows a popup while another process is foreground, the popup
+    /// is made the foreground window — the host may, as it just received the
+    /// click that opened it — and when it closes the app's window gets the
+    /// foreground back, with focus on the view that had it.
+    /// `FUTUREBOARD_POPUP_FOREGROUND=0` turns it off.
+    fn install_popup_foreground_hook() {
+        use windows::Win32::UI::WindowsAndMessaging::WH_CALLWNDPROCRET;
+        if std::env::var("FUTUREBOARD_POPUP_FOREGROUND").is_ok_and(|v| v.trim() == "0") {
+            return;
+        }
+        let thread = unsafe { GetCurrentThreadId() };
+        let hook =
+            unsafe { SetWindowsHookExW(WH_CALLWNDPROCRET, Some(popup_ret_proc), None, thread) };
+        if hook.is_err() {
+            eprintln!("[plugin-popup] foreground hook not installed");
+        }
+    }
+
+    unsafe extern "system" fn popup_ret_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CWPRETSTRUCT, SWP_HIDEWINDOW, WINDOWPOS, WM_DESTROY, WM_WINDOWPOSCHANGED,
+        };
+        if code >= 0 {
+            let message = unsafe { &*(lparam.0 as *const CWPRETSTRUCT) };
+            match message.message {
+                WM_WINDOWPOSCHANGED => {
+                    let pos = unsafe { &*(message.lParam.0 as *const WINDOWPOS) };
+                    if pos.flags.0 & SWP_SHOWWINDOW.0 != 0 {
+                        unsafe { popup_shown(message.hwnd, pos.cx, pos.cy) };
+                    } else if pos.flags.0 & SWP_HIDEWINDOW.0 != 0 {
+                        unsafe { popup_gone(message.hwnd) };
+                    }
+                }
+                WM_DESTROY => unsafe { popup_gone(message.hwnd) },
+                _ => {}
+            }
+        }
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+
+    /// A window of this thread was just shown. A plug-in's popup — a
+    /// top-level `WS_POPUP` that takes clicks and is more than a sliver (JUCE
+    /// draws its menu's drop shadow as click-through 1-px windows) — while
+    /// another process is foreground becomes the foreground window.
+    ///
+    /// # Safety
+    /// `hwnd` must be a window of the calling thread.
+    unsafe fn popup_shown(hwnd: HWND, width: i32, height: i32) {
+        use windows::Win32::UI::WindowsAndMessaging::{WS_EX_TRANSPARENT, WS_POPUP};
+        if width < 8 || height < 8 || POPUP_FOREGROUND.with(|state| state.get()).is_some() {
+            return;
+        }
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+        let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+        if style & WS_POPUP.0 == 0 || style & WS_CHILD.0 != 0 || ex_style & WS_EX_TRANSPARENT.0 != 0
+        {
+            return;
+        }
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.0.is_null() {
+            return;
+        }
+        let mut foreground_pid = 0u32;
+        unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_pid)) };
+        if foreground_pid == std::process::id() {
+            return;
+        }
+        let focus = unsafe { GetFocus() };
+        POPUP_FOREGROUND.with(|state| {
+            state.set(Some(PopupForeground {
+                popup: hwnd.0 as isize,
+                restore_window: foreground.0 as isize,
+                restore_focus: focus.0 as isize,
+            }))
+        });
+        let raised = unsafe { SetForegroundWindow(hwnd) }.as_bool();
+        if plugin_debug() || std::env::var_os("FUTUREBOARD_FOCUS_TRACE").is_some() {
+            focus_trace_line(&format!(
+                "host popup 0x{:x} '{}' {width}x{height} made foreground={raised} (was 0x{:x})",
+                hwnd.0 as usize,
+                class_name(hwnd),
+                foreground.0 as usize
+            ));
+        }
+    }
+
+    /// A window of this thread was hidden or destroyed. When it is the popup
+    /// made foreground, the app's window gets the foreground back, and the
+    /// plug-in view that had focus gets it again.
+    ///
+    /// # Safety
+    /// `hwnd` must be a window of the calling thread.
+    unsafe fn popup_gone(hwnd: HWND) {
+        let Some(state) = POPUP_FOREGROUND.with(|state| state.get()) else {
+            return;
+        };
+        if state.popup != hwnd.0 as isize {
+            return;
+        }
+        POPUP_FOREGROUND.with(|cell| cell.set(None));
+        let restore = HWND(state.restore_window as *mut core::ffi::c_void);
+        // Only while the foreground is still this host's: a click that took
+        // the user to another app closes the popup too, and must win.
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut foreground_pid = 0u32;
+        if !foreground.0.is_null() {
+            unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_pid)) };
+        }
+        let ours = foreground.0.is_null() || foreground_pid == std::process::id();
+        if !ours || !unsafe { IsWindow(Some(restore)) }.as_bool() {
+            return;
+        }
+        let restored = unsafe { SetForegroundWindow(restore) }.as_bool();
+        let focus = HWND(state.restore_focus as *mut core::ffi::c_void);
+        if !focus.0.is_null() && unsafe { IsWindow(Some(focus)) }.as_bool() {
+            let _ = unsafe { SetFocus(Some(focus)) };
+        }
+        if plugin_debug() || std::env::var_os("FUTUREBOARD_FOCUS_TRACE").is_some() {
+            focus_trace_line(&format!(
+                "host popup 0x{:x} closed; foreground back to 0x{:x}={restored}",
+                hwnd.0 as usize, restore.0 as usize
+            ));
+        }
+    }
+
+    /// `FUTUREBOARD_FOCUS_TRACE=1`: logs, from inside the plug-in UI thread,
+    /// every message that decides whether a plug-in's popup menu stays open —
+    /// focus, activation, show/hide, and real moves and resizes of its
+    /// windows — with who is foreground and focused at that moment. JUCE
+    /// closes a dropdown on exactly these (its own `WH_CALLWNDPROC` hook sees
+    /// the same messages), so the line before a popup's hide names the cause.
+    fn install_focus_trace() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CWPSTRUCT, WH_CALLWNDPROC, WH_GETMESSAGE, WM_NCLBUTTONDOWN,
+        };
+        if std::env::var_os("FUTUREBOARD_FOCUS_TRACE").is_none() {
+            return;
+        }
+        unsafe extern "system" fn call_proc(
+            code: i32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> windows::Win32::Foundation::LRESULT {
+            if code >= 0 {
+                let message = unsafe { &*(lparam.0 as *const CWPSTRUCT) };
+                unsafe {
+                    trace_window_message(
+                        message.hwnd,
+                        message.message,
+                        message.wParam,
+                        message.lParam,
+                    )
+                };
+            }
+            unsafe { CallNextHookEx(None, code, wparam, lparam) }
+        }
+        unsafe extern "system" fn get_proc(
+            code: i32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> windows::Win32::Foundation::LRESULT {
+            if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
+                let message = unsafe { &*(lparam.0 as *const MSG) };
+                if matches!(
+                    message.message,
+                    WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_NCLBUTTONDOWN
+                ) {
+                    unsafe {
+                        trace_window_message(
+                            message.hwnd,
+                            message.message,
+                            message.wParam,
+                            message.lParam,
+                        )
+                    };
+                }
+            }
+            unsafe { CallNextHookEx(None, code, wparam, lparam) }
+        }
+        let thread = unsafe { GetCurrentThreadId() };
+        let call = unsafe { SetWindowsHookExW(WH_CALLWNDPROC, Some(call_proc), None, thread) };
+        let get = unsafe { SetWindowsHookExW(WH_GETMESSAGE, Some(get_proc), None, thread) };
+        focus_trace_line(&format!(
+            "host installed pid={} thread={thread} callwndproc={} getmessage={}",
+            std::process::id(),
+            call.is_ok(),
+            get.is_ok()
+        ));
+    }
+
+    /// One focus-trace line, to stderr and to `futureboard-focus-trace.log`
+    /// in the temp folder: a release build has no console, and the app's
+    /// half of the trace (`plugin_content_host`) appends to the same file.
+    fn focus_trace_line(line: &str) {
+        use std::io::Write;
+        eprintln!("[focus-trace] {line}");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::env::temp_dir().join("futureboard-focus-trace.log"))
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    /// One window for the focus trace: handle, class, process, thread, and
+    /// whether it is a child or a top-level window.
+    fn describe_window(hwnd: HWND) -> String {
+        if hwnd.0.is_null() {
+            return "none".to_string();
+        }
+        let mut pid = 0u32;
+        let tid = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+        format!(
+            "0x{:x}'{}' pid={pid} tid={tid} {}",
+            hwnd.0 as usize,
+            class_name(hwnd),
+            if style & WS_CHILD.0 != 0 {
+                "child"
+            } else {
+                "top"
+            }
+        )
+    }
+
+    /// # Safety
+    /// `lparam` must be the message's own, as delivered to the window.
+    unsafe fn trace_window_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            WINDOWPOS, WM_ACTIVATE, WM_ACTIVATEAPP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KILLFOCUS,
+            WM_MOUSEACTIVATE, WM_MOVE, WM_NCACTIVATE, WM_NCLBUTTONDOWN, WM_SETFOCUS, WM_SHOWWINDOW,
+            WM_SIZE, WM_WINDOWPOSCHANGING,
+        };
+        let other = |raw: isize| describe_window(HWND(raw as *mut core::ffi::c_void));
+        let what = match message {
+            WM_SETFOCUS => format!("SETFOCUS from {}", other(wparam.0 as isize)),
+            WM_KILLFOCUS => format!("KILLFOCUS to {}", other(wparam.0 as isize)),
+            WM_ACTIVATE => format!(
+                "ACTIVATE state={} other={}",
+                wparam.0 & 0xFFFF,
+                other(lparam.0)
+            ),
+            WM_ACTIVATEAPP => format!("ACTIVATEAPP active={} thread={}", wparam.0, lparam.0),
+            WM_NCACTIVATE => format!("NCACTIVATE {}", wparam.0),
+            WM_MOUSEACTIVATE => "MOUSEACTIVATE".to_string(),
+            WM_SHOWWINDOW => format!("SHOWWINDOW show={} status={}", wparam.0, lparam.0),
+            WM_CAPTURECHANGED => format!("CAPTURECHANGED to {}", other(lparam.0)),
+            WM_CANCELMODE => "CANCELMODE".to_string(),
+            WM_MOVE => "MOVE".to_string(),
+            WM_SIZE => format!("SIZE type={}", wparam.0),
+            WM_WINDOWPOSCHANGING => {
+                let pos = unsafe { &*(lparam.0 as *const WINDOWPOS) };
+                let moving = pos.flags.0 & SWP_NOMOVE.0 == 0;
+                let sizing = pos.flags.0 & SWP_NOSIZE.0 == 0;
+                if !moving && !sizing {
+                    return;
+                }
+                format!(
+                    "WINDOWPOSCHANGING {}x{} at {},{} flags=0x{:x}",
+                    pos.cx, pos.cy, pos.x, pos.y, pos.flags.0
+                )
+            }
+            WM_LBUTTONDOWN => "LBUTTONDOWN".to_string(),
+            WM_LBUTTONUP => "LBUTTONUP".to_string(),
+            WM_RBUTTONDOWN => "RBUTTONDOWN".to_string(),
+            WM_NCLBUTTONDOWN => "NCLBUTTONDOWN".to_string(),
+            _ => return,
+        };
+        focus_trace_line(&format!(
+            "t={} host {} :: {what} | fg={} focus={}",
+            unsafe { GetTickCount64() },
+            describe_window(hwnd),
+            describe_window(unsafe { GetForegroundWindow() }),
+            describe_window(unsafe { GetFocus() }),
+        ));
     }
 
     /// Low-level keyboard hook so Space still reaches the host when a plug-in's
@@ -7385,6 +7691,14 @@ mod platform {
             let hwnd = hwnd_from(handle);
             if !IsWindow(Some(hwnd)).as_bool() {
                 return false;
+            }
+            // A view embedded in the app's own window is a child of it: the
+            // app owns that window's activation, and raising or foregrounding
+            // a child of another process only steals focus from the view (and
+            // closes any popup it has open).
+            if (GetWindowLongPtrW(hwnd, GWL_STYLE) as u32) & WS_CHILD.0 != 0 {
+                eprintln!("[NativeEditorShell] show/focus skipped for embedded child=0x{handle:x}");
+                return true;
             }
             eprintln!("[NativeEditorShell] show/focus requested existing=0x{handle:x}");
             let _ = ShowWindow(hwnd, SW_SHOWNORMAL);

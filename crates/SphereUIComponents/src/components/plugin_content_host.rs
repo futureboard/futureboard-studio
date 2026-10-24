@@ -532,11 +532,44 @@ mod imp {
     /// the inner widget that takes its keys — Melodyne's note canvas, say — and
     /// pulling it back up to the view's outer window on every click left the
     /// plug-in with no focused widget to deliver its shortcuts to.
+    ///
+    /// Nor when focus is on any other window of the plug-in's UI thread. A
+    /// JUCE dropdown is a top-level popup of that thread, not a child of the
+    /// view, and it closes itself the moment focus leaves the plug-in's own
+    /// windows: taking focus back to the view on the click that opened it
+    /// made every dropdown flash open and shut.
     unsafe fn focus_embedded_child(hwnd: HWND) {
         if let Ok(child) = unsafe { GetWindow(hwnd, GW_CHILD) } {
             let focus = unsafe { GetFocus() };
             if focus == child || unsafe { IsChild(child, focus) }.as_bool() {
                 return;
+            }
+            if !focus.is_invalid() {
+                let focus_thread = unsafe { GetWindowThreadProcessId(focus, None) };
+                let child_thread = unsafe { GetWindowThreadProcessId(child, None) };
+                if focus_thread != 0 && focus_thread == child_thread {
+                    return;
+                }
+            }
+            if std::env::var_os("FUTUREBOARD_FOCUS_TRACE").is_some() {
+                // The plug-in host's half of this trace appends to the same
+                // file (a release build has no console).
+                use std::io::Write;
+                let line = format!(
+                    "t={} app content host 0x{:x} focuses child 0x{:x} (focus was 0x{:x})",
+                    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() },
+                    hwnd.0 as usize,
+                    child.0 as usize,
+                    focus.0 as usize
+                );
+                eprintln!("[focus-trace] {line}");
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(std::env::temp_dir().join("futureboard-focus-trace.log"))
+                {
+                    let _ = writeln!(file, "{line}");
+                }
             }
             let _ = unsafe { SetFocus(Some(child)) };
             static LOGGED: AtomicBool = AtomicBool::new(false);

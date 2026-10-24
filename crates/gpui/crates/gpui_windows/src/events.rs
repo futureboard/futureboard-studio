@@ -61,7 +61,13 @@ impl WindowsWindowInner {
         match msg {
             // eagerly activate the window, so calls to `active_window` will work correctly
             WM_MOUSEACTIVATE => {
-                unsafe { SetActiveWindow(handle).ok() };
+                // Only when it is not already active: activating again runs
+                // the default activation, which moves focus to this window
+                // and off whatever a click inside an embedded child (a
+                // plug-in editor) had just focused, such as its popup menu.
+                if unsafe { GetActiveWindow() } != handle {
+                    unsafe { SetActiveWindow(handle).ok() };
+                }
                 None
             }
             WM_ACTIVATE => self.handle_activate_msg(wparam),
