@@ -389,6 +389,8 @@ impl Render for MixerPanelView {
                         let _ = timeline.update(cx, |timeline, cx| timeline.clear_all_solos(cx));
                     })
                 }),
+                crate::components::mixer_panel::effect_bypass_state(&state.tracks, &state.master),
+                callbacks.on_bypass_all_inserts.clone(),
                 i18n,
             ))
             .child(body)

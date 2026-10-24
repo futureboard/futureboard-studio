@@ -613,6 +613,7 @@ fn build_action_catalog() -> HashMap<String, String> {
         ("midi:transpose-up",              "MIDI › Transpose Up"),
         ("midi:velocity-decrease",         "MIDI › Decrease Velocity"),
         ("midi:velocity-increase",         "MIDI › Increase Velocity"),
+        ("mixer:bypass-all-inserts",       "Mixer › Bypass All Plug-ins"),
         ("mixer:create-bus",               "Mixer › Create Bus"),
         ("mixer:reset-pan",                "Mixer › Reset Pan"),
         ("mixer:reset-volume",             "Mixer › Reset Volume"),

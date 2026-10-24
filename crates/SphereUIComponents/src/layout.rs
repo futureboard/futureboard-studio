@@ -2955,6 +2955,7 @@ impl StudioLayout {
             "track:arm" => self.toggle_selected_track_arm(cx),
             "mixer:reset-volume" => self.reset_selected_track_volume(cx),
             "mixer:reset-pan" => self.reset_selected_track_pan(cx),
+            "mixer:bypass-all-inserts" => self.toggle_bypass_all_inserts(cx),
             "edit:delete"
             | "edit:delete-backspace"
             | "clip:delete"

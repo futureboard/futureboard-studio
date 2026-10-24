@@ -78,6 +78,9 @@ pub struct MixerCallbacks {
     /// Toggle bypass on the named insert slot.
     pub on_toggle_insert_bypass:
         std::sync::Arc<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>,
+    /// "Bypass All Plug-ins" from the mixer header: bypasses every effect
+    /// plug-in while any is in use, otherwise brings them all back.
+    pub on_bypass_all_inserts: Option<std::sync::Arc<dyn Fn(&mut Window, &mut App) + 'static>>,
     /// Expand/collapse the VSTi output sub-strips for a track/insert group.
     pub on_toggle_vsti_output_group:
         std::sync::Arc<dyn Fn(&String, &mut Window, &mut App) + 'static>,
@@ -181,6 +184,7 @@ pub fn noop_mixer_callbacks() -> MixerCallbacks {
         on_add_insert: noop_track.clone(),
         on_remove_insert: noop_insert_pair.clone(),
         on_toggle_insert_bypass: noop_insert_pair.clone(),
+        on_bypass_all_inserts: None,
         on_toggle_vsti_output_group: Arc::new(|_: &String, _: &mut Window, _: &mut App| {}),
         on_toggle_folder: Arc::new(|_: &String, _: &mut Window, _: &mut App| {}),
         on_drop_insert: noop_insert_drop,

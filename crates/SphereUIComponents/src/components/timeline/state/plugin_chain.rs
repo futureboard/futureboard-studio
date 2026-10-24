@@ -1447,6 +1447,41 @@ impl TimelineState {
         Some(slot.bypassed)
     }
 
+    /// Whether any effect plug-in in the project is in use (loaded and not
+    /// bypassed): the state "Bypass All Plug-ins" acts on. Instrument slots do
+    /// not count; bypassing those would silence their tracks.
+    pub fn any_effect_insert_active(&self) -> bool {
+        self.tracks
+            .iter()
+            .flat_map(|track| track.effect_inserts().iter())
+            .chain(self.master.inserts.iter())
+            .any(|slot| !slot.is_empty() && !slot.bypassed)
+    }
+
+    /// Bypasses every effect plug-in in the project, or takes every one out
+    /// of bypass, master included and instrument slots excepted (see
+    /// [`Self::any_effect_insert_active`]). Returns the `(owner, insert)` pairs
+    /// it changed, the owner being [`MASTER_TRACK_ID`] for the master bus.
+    pub fn set_all_effect_inserts_bypassed(&mut self, bypassed: bool) -> Vec<(String, String)> {
+        let mut changed = Vec::new();
+        for track in &mut self.tracks {
+            let track_id = track.id.clone();
+            for slot in track.effect_inserts_mut() {
+                if !slot.is_empty() && slot.bypassed != bypassed {
+                    slot.bypassed = bypassed;
+                    changed.push((track_id.clone(), slot.id.clone()));
+                }
+            }
+        }
+        for slot in &mut self.master.inserts {
+            if !slot.is_empty() && slot.bypassed != bypassed {
+                slot.bypassed = bypassed;
+                changed.push((MASTER_TRACK_ID.to_string(), slot.id.clone()));
+            }
+        }
+        changed
+    }
+
     pub fn toggle_insert_enabled(&mut self, track_id: &str, insert_id: &str) -> Option<bool> {
         let slot = self
             .insert_slots_mut(track_id)?

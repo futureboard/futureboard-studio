@@ -1861,6 +1861,13 @@ impl StudioLayout {
                 entries
             }
             ContextTarget::Mixer(track_id) => {
+                // Says what a click will do: bypass while any effect is in
+                // use, otherwise bring them all back.
+                let bypass_all = if self.timeline.read(cx).state.any_effect_insert_active() {
+                    i18n.tr_or("context.mixer.bypass-all", "Bypass All Plug-ins")
+                } else {
+                    i18n.tr_or("context.mixer.enable-all", "Enable All Plug-ins")
+                };
                 let mut entries = vec![
                     ContextMenuEntry::item("Add Bus", "mixer:create-bus"),
                     ContextMenuEntry::Separator,
@@ -1869,6 +1876,7 @@ impl StudioLayout {
                         "mixer:reset-volume",
                     ),
                     ContextMenuEntry::item(i18n.tr("context.mixer.reset-pan"), "mixer:reset-pan"),
+                    ContextMenuEntry::item(bypass_all, "mixer:bypass-all-inserts"),
                     ContextMenuEntry::Separator,
                     ContextMenuEntry::item(i18n.tr("context.track.mute"), "track:mute"),
                     ContextMenuEntry::item(i18n.tr("context.track.solo"), "track:solo"),
