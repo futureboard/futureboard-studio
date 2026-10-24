@@ -747,6 +747,10 @@ impl TimelineState {
                 if track.takes.is_empty() {
                     track.takes_expanded = false;
                 }
+                // It may have been the take heard there: an alternate under it
+                // takes over instead of the bars going silent.
+                let track_id = track.id.clone();
+                self.settle_track_takes(&track_id);
                 return;
             }
         }
@@ -922,6 +926,9 @@ impl TimelineState {
                 .find(|track| Some(&track.id) == source_track_id.as_ref())
             {
                 source.takes.retain(|take| take.clip_id != clip_id);
+            }
+            if let Some(source_id) = source_track_id.as_deref() {
+                self.settle_track_takes(source_id);
             }
         }
 

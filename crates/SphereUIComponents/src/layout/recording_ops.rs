@@ -1085,8 +1085,20 @@ impl StudioLayout {
                 ) {
                     timeline.record_pass_command(command, cx);
                 }
+                // Only the passes heard: an alternate is in the take lanes, and
+                // a Delete must not remove a clip nobody can see is chosen.
+                let state = &timeline.state;
+                let heard: Vec<String> = selected_clip_ids
+                    .into_iter()
+                    .filter(|clip_id| {
+                        !state
+                            .tracks
+                            .iter()
+                            .any(|track| track.is_hidden_take_clip(clip_id))
+                    })
+                    .collect();
                 timeline.state.selection.selected_track_id = selected_track_id;
-                timeline.state.selection.selected_clip_ids = selected_clip_ids;
+                timeline.state.selection.selected_clip_ids = heard;
                 cx.notify();
             }
         });

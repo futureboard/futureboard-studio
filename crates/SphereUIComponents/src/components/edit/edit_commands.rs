@@ -127,10 +127,17 @@ fn restore_take(state: &mut TimelineState, track_id: &str, take: Option<&TrackTa
     let Some(take) = take else {
         return;
     };
+    let mut restored = false;
     if let Some(track) = state.tracks.iter_mut().find(|t| t.id == track_id) {
         if !track.takes.iter().any(|existing| existing.id == take.id) {
             track.takes.push(take.clone());
+            restored = true;
         }
+    }
+    // Taking the take away let an alternate under it be heard in its place;
+    // back, it is the one heard again, not a second one stacked on it.
+    if restored && take.active {
+        state.set_active_take(track_id, &take.id);
     }
 }
 
@@ -877,10 +884,18 @@ impl EditCommand {
                 }
                 if let Some(first) = clips.first() {
                     state.selection.selected_track_id = Some(first.track_id.clone());
-                    state.selection.selected_clip_ids = clips
+                    // Only the passes heard; an alternate is in the take lanes.
+                    let heard: Vec<String> = clips
                         .iter()
                         .map(|snapshot| snapshot.clip.id.clone())
+                        .filter(|clip_id| {
+                            !state
+                                .tracks
+                                .iter()
+                                .any(|track| track.is_hidden_take_clip(clip_id))
+                        })
                         .collect();
+                    state.selection.selected_clip_ids = heard;
                 }
             }
             EditCommand::CreateClip { track_id, clip } => {

@@ -338,6 +338,7 @@ impl TimelineState {
         passes: &[(String, bool)],
         recorded_at: &str,
     ) -> Vec<String> {
+        self.adopt_clips_under_passes(track_id, passes);
         let taken: Vec<(String, bool)> = passes
             .iter()
             .filter_map(|(clip_id, complete)| {
@@ -355,6 +356,50 @@ impl TimelineState {
             }
         }
         taken.into_iter().map(|(take_id, _)| take_id).collect()
+    }
+
+    /// Makes a take of every audio clip on `track_id` that an audio pass of
+    /// this recording lands on and that is not a take yet: an import, a
+    /// paste, a clip from before takes were recorded. The pass then replaces
+    /// it like any earlier take instead of playing on top of it, and it can
+    /// be chosen back. A clip the user muted is left alone, and so is MIDI,
+    /// where recording over a part is as often an overdub as a replacement.
+    fn adopt_clips_under_passes(&mut self, track_id: &str, passes: &[(String, bool)]) {
+        let Some(track) = self.tracks.iter_mut().find(|track| track.id == track_id) else {
+            return;
+        };
+        let bounds = |clip: &ClipState| {
+            (
+                clip.start_beat,
+                clip.start_beat + clip.duration_beats.max(0.0),
+            )
+        };
+        let is_audio = |clip: &ClipState| matches!(clip.clip_type, ClipType::Audio { .. });
+        let is_pass = |clip: &ClipState| passes.iter().any(|(id, _)| *id == clip.id);
+        let pass_bounds: Vec<(f32, f32)> = track
+            .clips
+            .iter()
+            .filter(|clip| is_pass(clip) && is_audio(clip))
+            .map(bounds)
+            .collect();
+        let adopted: Vec<(String, String)> = track
+            .clips
+            .iter()
+            .filter(|clip| {
+                !is_pass(clip)
+                    && is_audio(clip)
+                    && !clip.muted
+                    && !track.takes.iter().any(|take| take.clip_id == clip.id)
+                    && pass_bounds
+                        .iter()
+                        .any(|pass| ranges_overlap(*pass, bounds(clip)))
+            })
+            .map(|clip| (clip.id.clone(), clip.name.clone()))
+            .collect();
+        for (clip_id, name) in adopted {
+            let id = next_free_take_id(track_id, &track.takes);
+            track.takes.push(TrackTake::new(id, name, clip_id));
+        }
     }
 
     /// Make `take_id` the take that is heard, muting every take it overlaps and
@@ -403,34 +448,50 @@ impl TimelineState {
             })
             .collect();
 
+        // Only the target and what it collides with change. A take elsewhere
+        // on the track keeps its state: one muted there is an alternate of a
+        // take heard there, and waking it would stack the two.
         let mut changed = false;
         for take in &mut track.takes {
-            let should_be_active =
-                take.id == target.id || !colliding.iter().any(|(id, _)| *id == take.id);
+            let should_be_active = if take.id == target.id {
+                true
+            } else if colliding.iter().any(|(id, _)| *id == take.id) {
+                false
+            } else {
+                continue;
+            };
             if take.active != should_be_active {
                 take.active = should_be_active;
                 changed = true;
             }
         }
-        let muted_clips: Vec<String> = colliding.into_iter().map(|(_, clip)| clip).collect();
-        for clip in &mut track.clips {
-            let should_be_muted = muted_clips.iter().any(|id| id == &clip.id);
-            // Only clips this take list owns: a clip that is not a take keeps
-            // whatever mute the user gave it.
-            let is_take_clip = track.takes.iter().any(|take| take.clip_id == clip.id);
-            if !is_take_clip {
-                continue;
-            }
-            if clip.muted != should_be_muted {
-                clip.muted = should_be_muted;
-                changed = true;
-            }
-        }
+        // A colliding take that also reached past the target leaves that
+        // part with nothing heard; an alternate of it that covers it takes
+        // over. Mutes follow, for take clips only: a clip that is not a take
+        // keeps whatever mute the user gave it.
+        let (hidden, settled) = track.settle_takes(Some(&target.id));
         // An alternate leaves the track's lane, so it leaves the selection
         // too: a Delete must not remove a clip nobody can see is chosen.
         self.selection
             .selected_clip_ids
-            .retain(|id| !muted_clips.contains(id));
+            .retain(|id| !hidden.contains(id));
+        changed || settled
+    }
+
+    /// Brings `track_id`'s takes back in line after its clips changed under
+    /// them (see [`TrackState::settle_takes`]), and drops the clips of
+    /// inactive takes from the selection. Returns whether anything changed.
+    pub fn settle_track_takes(&mut self, track_id: &str) -> bool {
+        let Some(track) = self.tracks.iter_mut().find(|track| track.id == track_id) else {
+            return false;
+        };
+        if track.takes.is_empty() {
+            return false;
+        }
+        let (hidden, changed) = track.settle_takes(None);
+        self.selection
+            .selected_clip_ids
+            .retain(|id| !hidden.contains(id));
         changed
     }
 
@@ -447,13 +508,9 @@ impl TimelineState {
         if track.takes.is_empty() {
             track.takes_expanded = false;
         }
-        // Deleting the take that was heard leaves its slot silent, so promote
-        // the most recent surviving take that covered the same ground.
-        if removed.active {
-            if let Some(next) = track.takes.last().map(|take| take.id.clone()) {
-                self.set_active_take(track_id, &next);
-            }
-        }
+        // Deleting the take that was heard leaves its slot silent: the most
+        // recent surviving take that covered the same ground takes over.
+        self.settle_track_takes(track_id);
         true
     }
 
@@ -490,6 +547,7 @@ impl TimelineState {
     /// take list never offers a row that would do nothing.
     pub fn prune_orphaned_takes(&mut self) -> bool {
         let mut changed = false;
+        let mut hidden = Vec::new();
         for track in &mut self.tracks {
             let before = track.takes.len();
             track
@@ -497,30 +555,108 @@ impl TimelineState {
                 .retain(|take| track.clips.iter().any(|clip| clip.id == take.clip_id));
             if track.takes.len() != before {
                 changed = true;
+                // The deleted clip may have been the take heard there; an
+                // alternate under it takes over rather than staying hidden.
+                let (track_hidden, _) = track.settle_takes(None);
+                hidden.extend(track_hidden);
             }
             if track.takes.is_empty() && track.takes_expanded {
                 track.takes_expanded = false;
             }
+        }
+        if !hidden.is_empty() {
+            self.selection
+                .selected_clip_ids
+                .retain(|id| !hidden.contains(id));
         }
         changed
     }
 
     /// An id no take on `track_id` is using.
     fn next_take_id(&self, track_id: &str) -> String {
-        let used: Vec<&str> = self
+        let takes = self
             .tracks
             .iter()
             .find(|track| track.id == track_id)
-            .map(|track| track.takes.iter().map(|take| take.id.as_str()).collect())
+            .map(|track| track.takes.as_slice())
             .unwrap_or_default();
-        let mut n = used.len() as u32 + 1;
-        loop {
-            let candidate = format!("{track_id}-take-{n}");
-            if !used.iter().any(|id| *id == candidate) {
-                return candidate;
-            }
-            n += 1;
+        next_free_take_id(track_id, takes)
+    }
+}
+
+/// An id none of `takes` (the takes on `track_id`) is using.
+fn next_free_take_id(track_id: &str, takes: &[TrackTake]) -> String {
+    let mut n = takes.len() as u32 + 1;
+    loop {
+        let candidate = format!("{track_id}-take-{n}");
+        if !takes.iter().any(|take| take.id == candidate) {
+            return candidate;
         }
+        n += 1;
+    }
+}
+
+impl TrackState {
+    /// Makes sure every stretch of the track that holds takes has one heard:
+    /// an inactive take that no active take overlaps becomes active again,
+    /// the newest first. What leaves a stretch without an active take is the
+    /// take heard there going away (deleted, cut, or replaced by a shorter
+    /// one), and nothing else may leave it silent.
+    ///
+    /// Every inactive take's clip is muted, and the clips of the takes made
+    /// active here or named in `heard` are unmuted. Any other active take
+    /// keeps the mute the user gave it.
+    ///
+    /// Returns the clips of the takes that are inactive afterwards, and
+    /// whether anything changed.
+    fn settle_takes(&mut self, heard: Option<&str>) -> (Vec<String>, bool) {
+        let bounds_of = |clips: &[ClipState], clip_id: &str| {
+            clips.iter().find(|clip| clip.id == clip_id).map(|clip| {
+                (
+                    clip.start_beat,
+                    clip.start_beat + clip.duration_beats.max(0.0),
+                )
+            })
+        };
+        let mut changed = false;
+        let mut woken: Vec<String> = heard.map(str::to_string).into_iter().collect();
+        for index in (0..self.takes.len()).rev() {
+            if self.takes[index].active {
+                continue;
+            }
+            let Some(bounds) = bounds_of(&self.clips, &self.takes[index].clip_id) else {
+                continue;
+            };
+            let covered = self.takes.iter().any(|other| {
+                other.active
+                    && bounds_of(&self.clips, &other.clip_id)
+                        .is_some_and(|other_bounds| ranges_overlap(bounds, other_bounds))
+            });
+            if !covered {
+                self.takes[index].active = true;
+                woken.push(self.takes[index].id.clone());
+                changed = true;
+            }
+        }
+        let mut hidden = Vec::new();
+        for take in &self.takes {
+            let muted = if !take.active {
+                hidden.push(take.clip_id.clone());
+                true
+            } else if woken.contains(&take.id) {
+                false
+            } else {
+                continue;
+            };
+            let Some(clip) = self.clips.iter_mut().find(|clip| clip.id == take.clip_id) else {
+                continue;
+            };
+            if clip.muted != muted {
+                clip.muted = muted;
+                changed = true;
+            }
+        }
+        (hidden, changed)
     }
 }
 
@@ -698,6 +834,98 @@ mod tests {
             .unwrap();
         assert!(state.tracks[0].takes_expanded);
         assert_eq!(state.tracks[0].take_stack_depth(), 2);
+    }
+
+    /// A pass recorded somewhere else on the track must not wake the
+    /// alternates of a comp elsewhere: A and B are alternates over 0..8, C is
+    /// recorded at 16..24, and A has to stay muted.
+    #[test]
+    fn a_take_elsewhere_leaves_other_alternates_muted() {
+        let mut state = track_with_clips(&[(0.0, 8.0), (0.0, 8.0), (16.0, 8.0)]);
+        let id = track_id(&state);
+        let a = state
+            .register_recorded_take(&id, "clip-0", String::new())
+            .unwrap();
+        let b = state
+            .register_recorded_take(&id, "clip-1", String::new())
+            .unwrap();
+        let c = state
+            .register_recorded_take(&id, "clip-2", String::new())
+            .unwrap();
+
+        let track = &state.tracks[0];
+        assert!(!track.take(&a).unwrap().active);
+        assert!(track.take(&b).unwrap().active);
+        assert!(track.take(&c).unwrap().active);
+        assert!(track.clips[0].muted, "A and B play stacked");
+        assert!(!track.clips[1].muted && !track.clips[2].muted);
+
+        // Choosing C again changes nothing over 0..8 either.
+        state.set_active_take(&id, &c);
+        assert!(state.tracks[0].clips[0].muted);
+        assert!(!state.tracks[0].clips[1].muted);
+    }
+
+    /// Recording over an imported clip replaces it like any take, and the
+    /// clip can be chosen back.
+    #[test]
+    fn a_pass_over_a_plain_clip_makes_it_an_alternate() {
+        let mut state = track_with_clips(&[(0.0, 8.0), (2.0, 4.0)]);
+        let id = track_id(&state);
+        let take = state
+            .register_recorded_passes(&id, &[("clip-1".to_string(), true)], "12:00")
+            .pop()
+            .unwrap();
+        let track = &state.tracks[0];
+        assert_eq!(track.takes.len(), 2);
+        assert!(track.clips[0].muted, "the pass plays on top of the clip");
+        assert!(!track.clips[1].muted);
+        let original = track
+            .takes
+            .iter()
+            .find(|candidate| candidate.clip_id == "clip-0")
+            .expect("the clip under the pass is a take")
+            .id
+            .clone();
+        assert_ne!(original, take);
+
+        state.set_active_take(&id, &original);
+        assert!(!state.tracks[0].clips[0].muted);
+        assert!(state.tracks[0].clips[1].muted);
+    }
+
+    /// Deleting the clip heard from the track lane brings the alternate under
+    /// it back rather than leaving the bars silent.
+    #[test]
+    fn deleting_the_heard_clip_brings_its_alternate_back() {
+        let mut state = track_with_clips(&[(0.0, 8.0), (0.0, 8.0)]);
+        let id = track_id(&state);
+        let first = state
+            .register_recorded_take(&id, "clip-0", String::new())
+            .unwrap();
+        state
+            .register_recorded_take(&id, "clip-1", String::new())
+            .unwrap();
+        state.delete_clip("clip-1");
+        let track = &state.tracks[0];
+        assert!(track.take(&first).unwrap().active);
+        assert!(!track.clips[0].muted);
+        assert!(!track.is_hidden_take_clip("clip-0"));
+    }
+
+    /// Settling takes never unmutes an active take the user muted.
+    #[test]
+    fn a_muted_active_take_stays_muted() {
+        let mut state = track_with_clips(&[(0.0, 8.0), (0.0, 8.0), (16.0, 4.0)]);
+        let id = track_id(&state);
+        state.register_recorded_take(&id, "clip-0", String::new());
+        let second = state
+            .register_recorded_take(&id, "clip-1", String::new())
+            .unwrap();
+        state.register_recorded_take(&id, "clip-2", String::new());
+        state.tracks[0].clips[2].muted = true;
+        state.set_active_take(&id, &second);
+        assert!(state.tracks[0].clips[2].muted);
     }
 
     #[test]
