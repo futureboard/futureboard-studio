@@ -185,8 +185,8 @@ fn transport_button(
             })
         })
         .flex_none()
-        .w(px(crate::components::title_bar::CHROME_ICON_BUTTON_SIZE))
-        .h(px(crate::components::title_bar::CHROME_ICON_BUTTON_SIZE))
+        .w(px(crate::shell_metrics::TRANSPORT_BUTTON_SIZE))
+        .h(px(crate::shell_metrics::TRANSPORT_BUTTON_SIZE))
         .flex()
         .items_center()
         .justify_center()
@@ -206,8 +206,8 @@ fn transport_button(
         .child(
             svg()
                 .path(icon_path)
-                .w(px(14.0))
-                .h(px(14.0))
+                .w(px(16.0))
+                .h(px(16.0))
                 .text_color(glyph),
         )
         .on_click(move |_, window, cx| action(&(), window, cx))
@@ -489,14 +489,14 @@ fn bpm_display(
         .focusable()
         .tab_stop(true)
         .focus_visible(|style| style.bg(Colors::surface_control_hover()))
-        .min_w(px(38.0))
-        .h(px(19.0))
+        .min_w(px(42.0))
+        .h(px(24.0))
         .flex()
         .items_center()
         .justify_center()
         .rounded(px(crate::theme::radius::CONTROL_SM))
         .text_color(Colors::text_primary())
-        .text_size(px(14.0))
+        .text_size(px(16.0))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .font_features(tabular_figures())
         .cursor(gpui::CursorStyle::ResizeUpDown)
@@ -699,14 +699,14 @@ fn lcd_caption(icon: &'static str) -> impl IntoElement {
     svg()
         .path(icon)
         .flex_none()
-        .w(px(12.0))
-        .h(px(12.0))
+        .w(px(14.0))
+        .h(px(14.0))
         .text_color(Colors::text_faint())
 }
 
 /// One field of the readout panel: its glyph beside its value.
 ///
-/// Stacking the glyph over the value cost a whole line of the 30px panel for a
+/// Stacking the glyph over the value cost a whole line of the panel for a
 /// label, and forced a fixed-height value slot to keep the three glyphs on one
 /// baseline. Side by side, the row is a single line of centred content and the
 /// panel gets its height back for the numbers.
@@ -737,7 +737,7 @@ fn lcd_field(
 fn lcd_divider() -> impl IntoElement {
     div()
         .w(px(1.0))
-        .h(px(20.0))
+        .h(px(24.0))
         .flex_none()
         .bg(Colors::border_normal())
 }
@@ -770,7 +770,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             .flex_none()
             .w(px(1.0))
             .when(latched, |seam| seam.h_full())
-            .when(!latched, |seam| seam.h(px(14.0)))
+            .when(!latched, |seam| seam.h(px(16.0)))
             .bg(Colors::border_subtle())
     };
 
@@ -916,7 +916,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
         Colors::state_hover(),
     );
     let count_in_split = div()
-        .h(px(crate::components::title_bar::CHROME_ICON_BUTTON_SIZE))
+        .h(px(crate::shell_metrics::TRANSPORT_BUTTON_SIZE))
         .flex()
         .flex_row()
         .items_center()
@@ -956,8 +956,8 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
                 .child(
                     svg()
                         .path(assets::ICON_TIMER_PATH)
-                        .w(px(13.0))
-                        .h(px(13.0))
+                        .w(px(15.0))
+                        .h(px(15.0))
                         .text_color(if state.count_in_enabled {
                             Colors::accent_primary()
                         } else {
@@ -1014,7 +1014,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
     );
     let on_metronome_menu_icon = on_metronome_menu.clone();
     let metronome_split = div()
-        .h(px(crate::components::title_bar::CHROME_ICON_BUTTON_SIZE))
+        .h(px(crate::shell_metrics::TRANSPORT_BUTTON_SIZE))
         .flex()
         .flex_row()
         .items_center()
@@ -1055,8 +1055,8 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
                 .child(
                     svg()
                         .path(assets::ICON_METRONOME_PATH)
-                        .w(px(13.0))
-                        .h(px(13.0))
+                        .w(px(15.0))
+                        .h(px(15.0))
                         .text_color(metronome_color),
                 ),
         )
@@ -1134,7 +1134,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
         } else {
             Colors::text_primary()
         })
-        .text_size(px(17.0))
+        .text_size(px(20.0))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .font_features(tabular_figures())
         .child(state.position_label)
@@ -1188,7 +1188,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             .items_center()
             .justify_center()
             .text_color(Colors::text_primary())
-            .text_size(px(13.0))
+            .text_size(px(15.0))
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .font_features(tabular_figures())
             .child(text)
@@ -1249,7 +1249,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
                 .flex_row()
                 .items_center()
                 .gap(px(1.0))
-                .h(px(20.0))
+                .h(px(24.0))
                 .px(px(crate::theme::space::HAIR))
                 .rounded(px(crate::theme::radius::CONTROL_SM))
                 .cursor(gpui::CursorStyle::PointingHand)
@@ -1284,10 +1284,10 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
             .id(id)
             .flex()
             .items_center()
-            .h(px(20.0))
+            .h(px(24.0))
             .px(px(crate::theme::space::HAIR))
             .rounded(px(crate::theme::radius::CONTROL_SM))
-            .text_size(px(if strong { 13.0 } else { 11.0 }))
+            .text_size(px(if strong { 15.0 } else { 12.0 }))
             .font_weight(if strong {
                 gpui::FontWeight::SEMIBOLD
             } else {
@@ -1432,7 +1432,7 @@ fn transport_bar(state: TransportChromeState, viewport_width: f32, i18n: I18n) -
         .gap(px(crate::theme::space::BASE))
         // One step up the ramp from the titlebar. The two bands share an edge,
         // so if they share a surface token as well the shell reads as one
-        // 76px-tall slab of chrome instead of two rows with different jobs.
+        // single tall slab of chrome instead of two rows with different jobs.
         .bg(Colors::surface_base())
         .border_b(px(1.0))
         .border_color(Colors::border_subtle())

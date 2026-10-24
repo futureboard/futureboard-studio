@@ -25,19 +25,20 @@ pub const TITLEBAR_BAND_HEIGHT: f32 = 36.0;
 /// Drawn height of the transport bar that sits directly under the titlebar,
 /// including its 1 px bottom border.
 ///
-/// Sized for the readout panel plus 5 px above and below.
+/// Sized for the readout panel plus 6 px above and below.
 ///
-/// Trimmed from 44: at that height the transport out-weighed the timeline ruler
-/// directly beneath it, so the eye anchored on the chrome instead of on musical
-/// time. The ruler was given its own surface plane in the same change; both
-/// halves of that balance have to move together.
-pub const TRANSPORT_BAR_HEIGHT: f32 = 40.0;
+/// The timeline measures its real origin each frame, so this only moves the
+/// first-frame fallback of [`APP_CHROME_HEIGHT`], not steady-state hit-tests.
+pub const TRANSPORT_BAR_HEIGHT: f32 = 48.0;
 
 /// Total height of everything above the arrangement's top edge.
 pub const APP_CHROME_HEIGHT: f32 = TITLEBAR_BAND_HEIGHT + TRANSPORT_BAR_HEIGHT;
 
 /// Height of the interactive control band inside the transport bar.
-pub const TRANSPORT_CONTROL_HEIGHT: f32 = 28.0;
+pub const TRANSPORT_CONTROL_HEIGHT: f32 = 32.0;
 
 /// Height of the recessed readout panel in the middle of the transport bar.
-pub const TRANSPORT_READOUT_HEIGHT: f32 = 30.0;
+pub const TRANSPORT_READOUT_HEIGHT: f32 = 36.0;
+
+/// Square size of the transport and mode buttons.
+pub const TRANSPORT_BUTTON_SIZE: f32 = 30.0;
