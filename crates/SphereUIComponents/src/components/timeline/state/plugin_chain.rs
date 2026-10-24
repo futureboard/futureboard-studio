@@ -1447,36 +1447,50 @@ impl TimelineState {
         Some(slot.bypassed)
     }
 
-    /// Whether any effect plug-in in the project is in use (loaded and not
-    /// bypassed): the state "Bypass All Plug-ins" acts on. Instrument slots do
-    /// not count; bypassing those would silence their tracks.
-    pub fn any_effect_insert_active(&self) -> bool {
-        self.tracks
-            .iter()
-            .flat_map(|track| track.effect_inserts().iter())
-            .chain(self.master.inserts.iter())
-            .any(|slot| !slot.is_empty() && !slot.bypassed)
+    /// The effect slots of one channel, [`MASTER_TRACK_ID`] for the master
+    /// bus. Instrument slots are not effects: bypassing one would silence
+    /// its track.
+    fn channel_effect_inserts(&self, owner_id: &str) -> Option<&[InsertSlotState]> {
+        if owner_id == MASTER_TRACK_ID {
+            Some(&self.master.inserts)
+        } else {
+            self.find_track(owner_id)
+                .map(|track| track.effect_inserts())
+        }
     }
 
-    /// Bypasses every effect plug-in in the project, or takes every one out
-    /// of bypass, master included and instrument slots excepted (see
-    /// [`Self::any_effect_insert_active`]). Returns the `(owner, insert)` pairs
-    /// it changed, the owner being [`MASTER_TRACK_ID`] for the master bus.
-    pub fn set_all_effect_inserts_bypassed(&mut self, bypassed: bool) -> Vec<(String, String)> {
+    /// Whether every effect plug-in on a channel is bypassed: `None` when it
+    /// has none to bypass. What the channel's bypass button shows.
+    pub fn channel_effects_bypassed(&self, owner_id: &str) -> Option<bool> {
+        let mut effects = self
+            .channel_effect_inserts(owner_id)?
+            .iter()
+            .filter(|slot| !slot.is_empty())
+            .peekable();
+        effects.peek()?;
+        Some(effects.all(|slot| slot.bypassed))
+    }
+
+    /// Bypasses every effect plug-in on one channel, or takes every one out
+    /// of bypass. Returns the insert ids it changed.
+    pub fn set_channel_effect_inserts_bypassed(
+        &mut self,
+        owner_id: &str,
+        bypassed: bool,
+    ) -> Vec<String> {
+        let slots = if owner_id == MASTER_TRACK_ID {
+            Some(self.master.inserts.as_mut_slice())
+        } else {
+            self.tracks
+                .iter_mut()
+                .find(|track| track.id == owner_id)
+                .map(|track| track.effect_inserts_mut())
+        };
         let mut changed = Vec::new();
-        for track in &mut self.tracks {
-            let track_id = track.id.clone();
-            for slot in track.effect_inserts_mut() {
-                if !slot.is_empty() && slot.bypassed != bypassed {
-                    slot.bypassed = bypassed;
-                    changed.push((track_id.clone(), slot.id.clone()));
-                }
-            }
-        }
-        for slot in &mut self.master.inserts {
+        for slot in slots.into_iter().flatten() {
             if !slot.is_empty() && slot.bypassed != bypassed {
                 slot.bypassed = bypassed;
-                changed.push((MASTER_TRACK_ID.to_string(), slot.id.clone()));
+                changed.push(slot.id.clone());
             }
         }
         changed

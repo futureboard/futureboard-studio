@@ -103,84 +103,41 @@ pub const MIXER_SUB_HEADER_H: f32 = 30.0;
 /// timeline to clear it on (the detached window's snapshot).
 pub type ClearSolosCb = std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + 'static>;
 
-/// Whether every effect plug-in in the mixer is bypassed: `None` when there
-/// is none to bypass (instrument slots are not effects). What the header's
-/// plug-in chip shows.
-pub fn effect_bypass_state(tracks: &[TrackState], master: &MasterBusState) -> Option<bool> {
-    let mut effects = tracks
-        .iter()
-        .flat_map(|track| track.effect_inserts().iter())
-        .chain(master.inserts.iter())
-        .filter(|slot| !slot.is_empty())
-        .peekable();
-    effects.peek()?;
-    Some(effects.all(|slot| slot.bypassed))
-}
-
-/// The header's plug-in chip: "FX" while effects run, a tinted
-/// "Plug-ins bypassed" while every one is bypassed so the state cannot go
-/// unnoticed. A click flips them all ("Bypass All Plug-ins").
-fn bypass_all_chip(
-    all_bypassed: bool,
-    on_bypass_all: Option<ClearSolosCb>,
+/// The inserts rack's channel bypass for `owner_id`, from the bypass state of
+/// its loaded effect slots (instrument slots are not effects). `None` when
+/// the channel has no effect to bypass or the surface cannot toggle it.
+fn channel_bypass(
+    owner_id: &str,
+    mut effects_bypassed: impl Iterator<Item = bool>,
+    callbacks: &MixerCallbacks,
     i18n: I18n,
-) -> impl IntoElement {
-    let tint = Colors::state_monitor();
-    let mut chip = div()
-        .id("mixer-bypass-all")
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(4.0))
-        .h(px(18.0))
-        .px(px(6.0))
-        .rounded(px(crate::theme::radius::CONTROL_SM))
-        .border(px(1.0))
-        .text_size(px(typography::DENSE_CAPTION))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .child(
-            div()
-                .w(px(6.0))
-                .h(px(6.0))
-                .rounded_full()
-                .bg(if all_bypassed {
-                    Colors::text_disabled()
-                } else {
-                    tint
-                }),
-        );
-    chip = if all_bypassed {
-        chip.bg(Colors::with_alpha(tint, 0.18))
-            .border_color(Colors::with_alpha(tint, 0.55))
-            .text_color(tint)
-            .child(i18n.tr_or("mixer.plugins-bypassed", "Plug-ins bypassed"))
-    } else {
-        chip.bg(Colors::button_bg())
-            .border_color(Colors::border_default())
-            .text_color(Colors::text_secondary())
-            .child("FX")
-    };
-    if let Some(on_bypass_all) = on_bypass_all {
-        let tooltip = if all_bypassed {
-            i18n.tr_or("mixer.enable-all-plugins", "Enable all plug-ins")
+) -> Option<console::RackBypass> {
+    let on_toggle = callbacks.on_toggle_channel_bypass.clone()?;
+    let first = effects_bypassed.next()?;
+    let bypassed = first && effects_bypassed.all(|bypassed| bypassed);
+    let owner_id = owner_id.to_string();
+    Some(console::RackBypass {
+        id: gpui::SharedString::from(format!("insert-channel-bypass-{owner_id}")),
+        bypassed,
+        tooltip: if bypassed {
+            i18n.tr_or(
+                "mixer.enable-channel-plugins",
+                "Enable this channel's plug-ins",
+            )
         } else {
-            i18n.tr_or("mixer.bypass-all-plugins", "Bypass all plug-ins")
-        };
-        chip = chip
-            .cursor(gpui::CursorStyle::PointingHand)
-            .hover(|s| s.bg(Colors::surface_control_hover()))
-            .tooltip(crate::components::controls::fb_tooltip(tooltip))
-            .on_click(move |_, window, cx| on_bypass_all(window, cx));
-    }
-    chip
+            i18n.tr_or(
+                "mixer.bypass-channel-plugins",
+                "Bypass this channel's plug-ins",
+            )
+        },
+        on_click: std::sync::Arc::new(move |window, cx| on_toggle(&owner_id, window, cx)),
+    })
 }
 
 pub fn mixer_sub_header(
     track_count: usize,
     soloed_count: usize,
     on_clear_solos: Option<ClearSolosCb>,
-    effects_bypassed: Option<bool>,
-    on_bypass_all: Option<ClearSolosCb>,
     i18n: I18n,
 ) -> impl IntoElement {
     // Any solo silences every channel that is not soloed — including one on a
@@ -267,9 +224,6 @@ pub fn mixer_sub_header(
                 .text_size(px(typography::DENSE_CAPTION))
                 .text_color(Colors::text_secondary())
                 .child(format!("{} ch", track_count)),
-        )
-        .children(
-            effects_bypassed.map(|all_bypassed| bypass_all_chip(all_bypassed, on_bypass_all, i18n)),
         )
         .children(solo_chip)
 }
@@ -1017,9 +971,21 @@ fn inserts_section(
         })
     };
 
+    let bypass = channel_bypass(
+        &track.id,
+        track
+            .effect_inserts()
+            .iter()
+            .filter(|slot| !slot.is_empty())
+            .map(|slot| slot.bypassed),
+        callbacks,
+        i18n,
+    );
+
     rack(
         gpui::SharedString::from(format!("insert-slot-scroll-{}", track.id)),
         i18n.tr("mixer.section.inserts"),
+        bypass,
         header_plus,
         height_px,
         base,
@@ -1058,6 +1024,7 @@ fn chain_end(
 fn rack(
     scroll_id: gpui::SharedString,
     label: String,
+    bypass: Option<console::RackBypass>,
     plus: Option<RackPlus>,
     height_px: f32,
     base: gpui::Rgba,
@@ -1071,7 +1038,7 @@ fn rack(
         .overflow_hidden()
         .border_b(px(1.0))
         .border_color(console::rule())
-        .child(console::rack_label(label, plus))
+        .child(console::rack_label(label, bypass, plus))
         .child(
             div()
                 .id(scroll_id)
@@ -1147,9 +1114,21 @@ fn master_inserts_section(
         })
     };
 
+    let bypass = channel_bypass(
+        MASTER_TRACK_ID,
+        master
+            .inserts
+            .iter()
+            .filter(|slot| !slot.is_empty())
+            .map(|slot| slot.bypassed),
+        callbacks,
+        i18n,
+    );
+
     rack(
         gpui::SharedString::from("insert-slot-scroll-master"),
         i18n.tr("mixer.section.inserts"),
+        bypass,
         header_plus,
         height_px,
         base,
@@ -1441,6 +1420,7 @@ fn sends_section(
     rack(
         gpui::SharedString::from(format!("send-slot-scroll-{}", track.id)),
         i18n.tr("mixer.section.sends"),
+        None,
         None,
         height_px,
         base,
@@ -3325,8 +3305,6 @@ pub fn mixer_panel(
 
     let track_count = tracks.len();
     let on_master = callbacks.on_master_volume_change.clone();
-    let effects_bypassed = effect_bypass_state(tracks, master);
-    let on_bypass_all = callbacks.on_bypass_all_inserts.clone();
     // What the panel actually has, and what a strip needs. They are not the
     // same number, and pretending they were is what broke the mixer at small
     // heights: the strips were laid out at their 320 px minimum inside a
@@ -3405,8 +3383,6 @@ pub fn mixer_panel(
                 track_count,
                 tracks.iter().filter(|track| track.solo).count(),
                 None,
-                effects_bypassed,
-                on_bypass_all.clone(),
                 i18n,
             ))
             .child(content_row);
@@ -3524,8 +3500,6 @@ pub fn mixer_panel(
             track_count,
             tracks.iter().filter(|track| track.solo).count(),
             None,
-            effects_bypassed,
-            on_bypass_all,
             i18n,
         ))
         .child(content_row)

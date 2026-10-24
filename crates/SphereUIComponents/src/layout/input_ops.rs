@@ -1861,13 +1861,21 @@ impl StudioLayout {
                 entries
             }
             ContextTarget::Mixer(track_id) => {
-                // Says what a click will do: bypass while any effect is in
-                // use, otherwise bring them all back.
-                let bypass_all = if self.timeline.read(cx).state.any_effect_insert_active() {
-                    i18n.tr_or("context.mixer.bypass-all", "Bypass All Plug-ins")
-                } else {
-                    i18n.tr_or("context.mixer.enable-all", "Enable All Plug-ins")
-                };
+                // Says what a click will do to this channel: bypass while any
+                // of its effects is in use, otherwise bring them all back.
+                let channel_bypass = self
+                    .timeline
+                    .read(cx)
+                    .state
+                    .channel_effects_bypassed(track_id)
+                    .map(|all_bypassed| {
+                        let label = if all_bypassed {
+                            i18n.tr_or("context.mixer.enable-channel", "Enable Channel Plug-ins")
+                        } else {
+                            i18n.tr_or("context.mixer.bypass-channel", "Bypass Channel Plug-ins")
+                        };
+                        ContextMenuEntry::item(label, "mixer:bypass-channel-inserts")
+                    });
                 let mut entries = vec![
                     ContextMenuEntry::item("Add Bus", "mixer:create-bus"),
                     ContextMenuEntry::Separator,
@@ -1876,13 +1884,15 @@ impl StudioLayout {
                         "mixer:reset-volume",
                     ),
                     ContextMenuEntry::item(i18n.tr("context.mixer.reset-pan"), "mixer:reset-pan"),
-                    ContextMenuEntry::item(bypass_all, "mixer:bypass-all-inserts"),
+                ];
+                entries.extend(channel_bypass);
+                entries.extend([
                     ContextMenuEntry::Separator,
                     ContextMenuEntry::item(i18n.tr("context.track.mute"), "track:mute"),
                     ContextMenuEntry::item(i18n.tr("context.track.solo"), "track:solo"),
                     ContextMenuEntry::Separator,
                     ContextMenuEntry::item("Track Color", "track:color"),
-                ];
+                ]);
                 entries.extend(self.track_copy_menu_entries(track_id, cx));
                 entries.push(ContextMenuEntry::danger_item(
                     i18n.tr("context.track.delete"),

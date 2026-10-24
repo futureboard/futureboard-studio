@@ -421,7 +421,11 @@ fn attach_native_menu_bar(
         NativeMenu {
             label: i18n.tr_or("mixer.menu", "&Mixer"),
             items: vec![
-                NativeMenuItem::manifest(i18n, "mixer:bypass-all-inserts", "Bypass All Plug-ins"),
+                NativeMenuItem::manifest(
+                    i18n,
+                    "mixer:bypass-channel-inserts",
+                    "Bypass Channel Plug-ins",
+                ),
                 NativeMenuItem::Separator,
                 NativeMenuItem::manifest(i18n, "floatingwindow:routing-matrix", "Routing Matrix"),
             ],

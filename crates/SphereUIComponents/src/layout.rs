@@ -2955,7 +2955,11 @@ impl StudioLayout {
             "track:arm" => self.toggle_selected_track_arm(cx),
             "mixer:reset-volume" => self.reset_selected_track_volume(cx),
             "mixer:reset-pan" => self.reset_selected_track_pan(cx),
-            "mixer:bypass-all-inserts" => self.toggle_bypass_all_inserts(cx),
+            "mixer:bypass-channel-inserts" => {
+                if let Some(owner_id) = self.context_track_id_or_selected(cx) {
+                    self.toggle_channel_inserts_bypass(&owner_id, cx);
+                }
+            }
             "edit:delete"
             | "edit:delete-backspace"
             | "clip:delete"

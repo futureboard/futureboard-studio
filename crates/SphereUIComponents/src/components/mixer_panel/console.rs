@@ -56,7 +56,10 @@
 //!   labels, 8.5 px uppercase for section names. Nothing else.
 
 use gpui::prelude::FluentBuilder;
-use gpui::{div, px, svg, InteractiveElement, IntoElement, ParentElement, Styled};
+use gpui::{
+    div, px, svg, InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement,
+    Styled,
+};
 
 use crate::assets;
 use crate::theme::Colors;
@@ -173,9 +176,60 @@ pub(crate) struct RackPlus {
     pub on_click: std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App)>,
 }
 
+/// The inserts rack's channel bypass: whether every effect plug-in on the
+/// channel is bypassed, and the toggle.
+pub(crate) struct RackBypass {
+    pub id: gpui::SharedString,
+    pub bypassed: bool,
+    pub tooltip: String,
+    pub on_click: std::sync::Arc<dyn Fn(&mut gpui::Window, &mut gpui::App)>,
+}
+
 /// "INSERTS", "SENDS" — the caption above a rack.
-pub(crate) fn rack_label(label: impl Into<String>, plus: Option<RackPlus>) -> impl IntoElement {
+pub(crate) fn rack_label(
+    label: impl Into<String>,
+    bypass: Option<RackBypass>,
+    plus: Option<RackPlus>,
+) -> impl IntoElement {
     let label = label.into();
+    let bypass = bypass.map(
+        |RackBypass {
+             id,
+             bypassed,
+             tooltip,
+             on_click,
+         }| {
+            // Lit while the channel's plug-ins run, like each slot's pip; a
+            // bypassed channel tints so it cannot go unnoticed.
+            let tint = Colors::state_monitor();
+            div()
+                .id(id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .w(px(14.0))
+                .h(px(12.0))
+                .rounded(px(crate::theme::radius::MICRO))
+                .cursor(gpui::CursorStyle::PointingHand)
+                .when(bypassed, |el| el.bg(Colors::with_alpha(tint, 0.18)))
+                .hover(|s| s.bg(Colors::state_hover()))
+                .tooltip(crate::components::controls::fb_tooltip(tooltip))
+                .child(
+                    svg()
+                        .path(assets::ICON_POWER_PATH)
+                        .w(px(9.0))
+                        .h(px(9.0))
+                        .text_color(if bypassed {
+                            Colors::text_disabled()
+                        } else {
+                            tint
+                        }),
+                )
+                .on_mouse_down(gpui::MouseButton::Left, move |_e, w, cx| on_click(w, cx))
+                .occlude()
+        },
+    );
     div()
         .flex()
         .flex_row()
@@ -195,6 +249,7 @@ pub(crate) fn rack_label(label: impl Into<String>, plus: Option<RackPlus>) -> im
                 .text_color(Colors::text_faint())
                 .child(label.to_uppercase()),
         )
+        .children(bypass)
         .children(plus.map(|RackPlus { id, on_click }| {
             div()
                 .id(id)

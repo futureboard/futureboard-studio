@@ -2327,13 +2327,16 @@ impl StudioLayout {
             on_add_insert,
             on_remove_insert,
             on_toggle_insert_bypass,
-            on_bypass_all_inserts: Some({
+            on_toggle_channel_bypass: Some({
                 let this = owner.clone();
-                std::sync::Arc::new(move |_w: &mut Window, cx: &mut gpui::App| {
-                    StudioLayout::defer_update(&this, cx, |this, cx| {
-                        this.toggle_bypass_all_inserts(cx);
-                    });
-                })
+                std::sync::Arc::new(
+                    move |owner_id: &String, _w: &mut Window, cx: &mut gpui::App| {
+                        let owner_id = owner_id.clone();
+                        StudioLayout::defer_update(&this, cx, move |this, cx| {
+                            this.toggle_channel_inserts_bypass(&owner_id, cx);
+                        });
+                    },
+                )
             }),
             on_toggle_vsti_output_group,
             on_toggle_folder,
@@ -2543,32 +2546,32 @@ impl StudioLayout {
         cx.notify();
     }
 
-    /// "Bypass All Plug-ins": bypasses every effect plug-in in the project
-    /// (master included, instruments excepted) while any is in use, and
-    /// otherwise takes them all out of bypass. One undo step. Applied live,
-    /// slot by slot, like a single bypass toggle: no graph rebuild.
-    pub(crate) fn toggle_bypass_all_inserts(&mut self, cx: &mut Context<Self>) {
-        let (bypass, scope) = {
-            let state = &self.timeline.read(cx).state;
-            let mut scope = TrackEditScope::tracks(
-                state
-                    .tracks
-                    .iter()
-                    .filter(|track| track.effect_inserts().iter().any(|slot| !slot.is_empty()))
-                    .map(|track| track.id.clone()),
-            );
-            scope.master = state.master.inserts.iter().any(|slot| !slot.is_empty());
-            (state.any_effect_insert_active(), scope)
+    /// A channel's plug-in bypass: bypasses every effect plug-in on the
+    /// channel (`owner_id`, `MASTER_TRACK_ID` for the master; instruments
+    /// excepted) while any is in use, and otherwise takes them all out of
+    /// bypass. One undo step. Applied live, slot by slot, like a single
+    /// bypass toggle: no graph rebuild.
+    pub(crate) fn toggle_channel_inserts_bypass(&mut self, owner_id: &str, cx: &mut Context<Self>) {
+        let Some(all_bypassed) = self
+            .timeline
+            .read(cx)
+            .state
+            .channel_effects_bypassed(owner_id)
+        else {
+            return;
         };
-        let edit = self.begin_track_edit(scope, cx);
+        let bypass = !all_bypassed;
+        let edit = self.begin_track_edit(TrackEditScope::channel(owner_id), cx);
         let changed = self.timeline.update(cx, |timeline, _cx| {
-            timeline.state.set_all_effect_inserts_bypassed(bypass)
+            timeline
+                .state
+                .set_channel_effect_inserts_bypassed(owner_id, bypass)
         });
         self.commit_track_edit(
             if bypass {
-                "Bypass All Plug-ins"
+                "Bypass Channel Plug-ins"
             } else {
-                "Enable All Plug-ins"
+                "Enable Channel Plug-ins"
             },
             edit,
             cx,
@@ -2576,8 +2579,8 @@ impl StudioLayout {
         if changed.is_empty() {
             return;
         }
-        for (owner, insert_id) in &changed {
-            self.push_insert_enabled_to_engine(owner, insert_id, cx);
+        for insert_id in &changed {
+            self.push_insert_enabled_to_engine(owner_id, insert_id, cx);
         }
         self.mark_dirty_view_only();
         self.push_mixer_snapshot_to_window(cx);
