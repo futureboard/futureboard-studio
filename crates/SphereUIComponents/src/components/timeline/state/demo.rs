@@ -274,6 +274,7 @@ impl TimelineState {
                 loop_start_beats: 0.0,
                 loop_end_beats: 16.0,
                 last_engine_frame: 0,
+                relocated_while_playing: None,
             },
             tracks: vec![track1, track2, track3],
             audio_connections: crate::audio_connections::AudioConnectionRegistry::new(),

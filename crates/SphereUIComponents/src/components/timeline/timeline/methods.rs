@@ -3602,6 +3602,20 @@ impl Timeline {
     ) {
         self.state.transport.playhead_beats = beat.max(0.0);
         let beat = self.state.transport.playhead_beats;
+        // A place the user chose while it plays is where Stop goes back to.
+        // Each scrub move overwrites it, so the drop point wins. A take keeps
+        // ending where it began.
+        if self.state.transport.playing
+            && !self.state.transport.recording
+            && matches!(
+                reason,
+                crate::layout::SeekReason::TimelineClick
+                    | crate::layout::SeekReason::UserDragging
+                    | crate::layout::SeekReason::UserDragEnd
+            )
+        {
+            self.state.transport.relocated_while_playing = Some(beat);
+        }
         self.state.recompute_effective_volumes(beat, "seek");
         if let Some(cb) = self.on_seek_beats.as_ref() {
             cb(beat, self.state.bpm, reason);

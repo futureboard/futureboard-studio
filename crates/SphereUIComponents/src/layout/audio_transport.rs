@@ -2423,6 +2423,21 @@ impl StudioLayout {
     }
 
     pub(super) fn start_native_playback(&mut self, cx: &mut Context<Self>) {
+        self.start_native_playback_with(false, cx);
+    }
+
+    /// Starts the transport under a take that is already armed.
+    ///
+    /// Unlike Play it does not wait for a pending engine sync: the take
+    /// captures through the input tap, not the graph, and arming it is what
+    /// usually left the project dirty. Waiting meant pressing Record and
+    /// hearing nothing until the whole graph was rebuilt. The sync still runs,
+    /// and lands while the take plays.
+    pub(super) fn start_native_playback_for_take(&mut self, cx: &mut Context<Self>) {
+        self.start_native_playback_with(true, cx);
+    }
+
+    fn start_native_playback_with(&mut self, for_take: bool, cx: &mut Context<Self>) {
         if !self.session_install_status.is_ready() {
             eprintln!("[SessionLoad] play blocked during session install");
             return;
@@ -2460,14 +2475,23 @@ impl StudioLayout {
                 .playhead_beats
                 .max(0.0),
         );
+        // A bar picked during an earlier run is not this run's.
+        let _ = self.timeline.update(cx, |timeline, _cx| {
+            timeline.state.transport.relocated_while_playing = None;
+        });
 
         transport_freeze_debug::log("before sync/dirty gates");
-        if self.audio_bridge.sync_in_flight {
+        if for_take {
+            if !self.audio_bridge.sync_in_flight
+                && (self.audio_bridge.project_dirty || self.audio_bridge.media_dirty)
+            {
+                self.schedule_audio_project_sync(cx, false, "record_start_pending_sync");
+            }
+        } else if self.audio_bridge.sync_in_flight {
             self.audio_bridge.play_after_sync = true;
             transport_freeze_debug::log("defer: audio_sync_in_flight");
             return;
-        }
-        if self.audio_bridge.project_dirty || self.audio_bridge.media_dirty {
+        } else if self.audio_bridge.project_dirty || self.audio_bridge.media_dirty {
             self.audio_bridge.play_after_sync = true;
             transport_freeze_debug::log("defer: schedule_audio_project_sync");
             self.schedule_audio_project_sync(cx, false, "transport_play_pending_sync");
@@ -4077,6 +4101,28 @@ impl StudioLayout {
     pub(super) fn return_playhead_to_playback_anchor(&mut self, cx: &mut Context<Self>) {
         let beat = self.audio_bridge.playback_anchor_beats.unwrap_or(0.0);
         self.seek_native_playhead(cx, beat);
+    }
+
+    /// Where the playhead lands once playback has stopped.
+    ///
+    /// A bar the user moved to while it played wins: Stop goes back there,
+    /// and it is the place a later return-to-start uses too. Otherwise the
+    /// playhead returns to where Play was pressed when `return_to_anchor`
+    /// asks for it, and stays where playback reached when it does not.
+    pub(super) fn settle_playhead_after_stop(
+        &mut self,
+        return_to_anchor: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let relocated = self.timeline.update(cx, |timeline, _cx| {
+            timeline.state.transport.relocated_while_playing.take()
+        });
+        if let Some(beat) = relocated {
+            self.audio_bridge.playback_anchor_beats = Some(beat);
+            self.seek_native_playhead(cx, beat);
+        } else if return_to_anchor {
+            self.return_playhead_to_playback_anchor(cx);
+        }
     }
 
     pub(super) fn set_playhead_scrub_active(&mut self, active: bool, _cx: &mut Context<Self>) {

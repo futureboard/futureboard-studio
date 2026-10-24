@@ -229,9 +229,7 @@ impl StudioLayout {
                         crate::settings::SpacebarAction::PlayStop
                     );
                     self.stop_native_playback(cx);
-                    if play_stop {
-                        self.return_playhead_to_playback_anchor(cx);
-                    }
+                    self.settle_playhead_after_stop(play_stop, cx);
                 } else {
                     self.start_native_playback(cx);
                 }
@@ -244,15 +242,14 @@ impl StudioLayout {
                     self.log_transport_debug("Stop", "stop_recording_and_stop_transport", cx);
                 }
                 self.stop_native_playback(cx);
-                if !recording
-                    && self
+                if !recording {
+                    let return_on_stop = self
                         .settings
                         .read(cx)
                         .current
                         .playback
-                        .return_playhead_on_stop
-                {
-                    self.return_playhead_to_playback_anchor(cx);
+                        .return_playhead_on_stop;
+                    self.settle_playhead_after_stop(return_on_stop, cx);
                 }
             }
             TransportCommand::ReturnToStart => self.seek_native_playhead(cx, 0.0),

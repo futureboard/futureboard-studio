@@ -340,7 +340,7 @@ impl StudioLayout {
                     return;
                 }
                 this.recording.ui_state = RecordingUiState::Recording;
-                this.start_native_playback(cx);
+                this.start_native_playback_for_take(cx);
                 cx.notify();
             });
         })
@@ -719,7 +719,7 @@ impl StudioLayout {
             .map(|s| s.transport_playing)
             .unwrap_or(false);
         if !playing {
-            self.start_native_playback(cx);
+            self.start_native_playback_for_take(cx);
         }
     }
 
@@ -775,6 +775,9 @@ impl StudioLayout {
             // A take ends where it began: back to where Record started the
             // transport. The MIDI take already read its end off the playhead
             // above, and the audio take's position comes from the engine.
+            let _ = self.timeline.update(cx, |timeline, _cx| {
+                timeline.state.transport.relocated_while_playing = None;
+            });
             self.return_playhead_to_playback_anchor(cx);
             step("return playhead");
 

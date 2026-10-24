@@ -10,6 +10,10 @@ pub struct TransportState {
     pub loop_start_beats: f32,
     pub loop_end_beats: f32,
     pub last_engine_frame: u64,
+    /// Where the user last put the playhead while it was playing (a ruler or
+    /// lane click, or the end of a scrub). Stop goes back there instead of to
+    /// wherever playback has run on to. Cleared when playback starts.
+    pub relocated_while_playing: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -419,6 +423,7 @@ impl Default for TimelineState {
                 loop_start_beats: 0.0,
                 loop_end_beats: 16.0,
                 last_engine_frame: 0,
+                relocated_while_playing: None,
             },
             tracks: Vec::new(),
             audio_connections: crate::audio_connections::AudioConnectionRegistry::new(),
