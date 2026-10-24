@@ -180,6 +180,121 @@ fn render(multicore: bool, level: SimdLevel) -> (Vec<f32>, Vec<(f32, f32)>) {
     (all, meters)
 }
 
+/// Peak of the device output when one audio track plays through `target` (a
+/// routing track of `target_type`), or straight to master. The track plays a
+/// clip when `from_clip`, its monitored input otherwise.
+fn routed_output_peak(target: Option<(&str, &str)>, from_clip: bool) -> f32 {
+    let mut source = track("audio-0", "audio");
+    let mut cache: HashMap<String, std::sync::Arc<crate::audio_source::ClipAudioSource>> =
+        HashMap::new();
+    let mut clips = Vec::new();
+    if from_clip {
+        source.input_monitor = false;
+        source.input_source = Default::default();
+        let frames = SAMPLE_RATE as usize;
+        cache.insert(
+            "dc.wav".to_string(),
+            std::sync::Arc::new(crate::audio_source::ClipAudioSource::InMemory(
+                std::sync::Arc::new(crate::audio_file::AudioFileBuffer {
+                    sample_rate: SAMPLE_RATE,
+                    channels: 2,
+                    frames,
+                    samples: vec![0.5; frames * 2],
+                }),
+            )),
+        );
+        clips.push(crate::types::EngineClipSnapshot {
+            id: "dc".to_string(),
+            track_id: "audio-0".to_string(),
+            asset_id: "dc".to_string(),
+            media_path: Some("dc.wav".to_string()),
+            start_beat: 0.0,
+            duration_beats: 2.0,
+            offset_seconds: 0.0,
+            gain: 1.0,
+            muted: false,
+            ara_rendered: false,
+            fades: None,
+            stretch: Default::default(),
+            audio_process: None,
+        });
+    }
+    let mut tracks = Vec::new();
+    if let Some((id, track_type)) = target {
+        source.output_track_id = Some(id.to_string());
+        tracks.push(source);
+        tracks.push(track(id, track_type));
+    } else {
+        tracks.push(source);
+    }
+    tracks.push(track("master", "master"));
+    let snapshot = EngineProjectSnapshot {
+        spatial: Default::default(),
+        project_id: "bus-routing".to_string(),
+        project_root: None,
+        preferred_input_device: None,
+        bpm: 120.0,
+        tempo_points: Vec::new(),
+        time_signature: [4, 4],
+        sample_rate: SAMPLE_RATE,
+        tracks,
+        clips,
+        midi_clips: Vec::new(),
+        pdc_enabled: true,
+        latency_graph_version: 1,
+        routing: EngineRoutingSnapshot {
+            master_output_device: None,
+            sample_rate: SAMPLE_RATE,
+            buffer_size: 256,
+        },
+    };
+    let mut runtime = RuntimeProject::build(&snapshot, SAMPLE_RATE, &mut cache, None, true)
+        .expect("bus routing runtime");
+    let input_l = vec![0.5f32; FRAMES];
+    let input_r = vec![0.5f32; FRAMES];
+    let mut peak = 0.0f32;
+    for block in 0..8 {
+        let mut output = vec![0.0f32; FRAMES * CHANNELS];
+        render_project_block_interleaved_with_live_input(
+            &mut runtime,
+            (block * FRAMES) as u64,
+            1.0,
+            &mut output,
+            CHANNELS,
+            true,
+            4,
+            4,
+            None,
+            &input_l,
+            &input_r,
+        );
+        peak = output
+            .iter()
+            .fold(peak, |peak, sample| peak.max(sample.abs()));
+    }
+    peak
+}
+
+#[test]
+fn a_track_routed_to_a_bus_or_group_is_heard() {
+    for from_clip in [false, true] {
+        let direct = routed_output_peak(None, from_clip);
+        assert!(direct > 0.1, "the source itself is silent: {direct}");
+        for target in [
+            ("bus-a", "bus"),
+            ("group-1", "group"),
+            ("return-1", "return"),
+        ] {
+            let routed = routed_output_peak(Some(target), from_clip);
+            assert!(
+                (routed - direct).abs() < 1e-3,
+                "routing a {} through {target:?} gave {routed}, straight to master {direct}",
+                if from_clip { "clip" } else { "monitored input" }
+            );
+        }
+    }
+}
+
 #[test]
 fn multicore_and_every_instruction_set_render_the_same_samples() {
     let (reference, reference_meters) = render(false, SimdLevel::Sse);

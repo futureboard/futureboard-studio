@@ -1699,6 +1699,40 @@ mod tests {
         (state, clip_id)
     }
 
+    /// A track routed to a Bus, and one grouped into a folder, reach the
+    /// engine pointed at that routing track, which is audible and feeds master.
+    #[test]
+    fn a_track_routed_to_a_bus_or_folder_reaches_the_engine_routed() {
+        let mut state = TimelineState::default();
+        let audio = state.create_audio_track();
+        let bus = state.create_bus_track(&[audio.clone()]);
+        let member = state.create_audio_track();
+        state.select_track(&member);
+        state.selection.selected_track_ids = vec![member.clone()];
+        let group = state
+            .group_selected_tracks("Folder".to_string())
+            .expect("folder");
+        let snapshot = build_engine_project_snapshot(&state, 48_000, None, None);
+        let track = |id: &str| {
+            snapshot
+                .tracks
+                .iter()
+                .find(|track| track.id == id)
+                .expect("track in snapshot")
+        };
+        assert_eq!(track(&audio).output_track_id.as_deref(), Some(bus.as_str()));
+        assert_eq!(
+            track(&member).output_track_id.as_deref(),
+            Some(group.as_str())
+        );
+        for (id, kind) in [(&bus, "bus"), (&group, "group")] {
+            let routing = track(id);
+            assert_eq!(routing.track_type, kind);
+            assert!(!routing.muted && routing.volume > 0.5);
+            assert_eq!(routing.output_track_id, None);
+        }
+    }
+
     #[test]
     fn unchanged_midi_clips_are_shared_and_any_change_rebuilds_the_clip() {
         use crate::components::timeline::timeline_state::MidiNoteState;
