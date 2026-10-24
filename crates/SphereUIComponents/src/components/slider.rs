@@ -4,9 +4,9 @@
 //!
 //! Drag-driven. The slider's hitbox is intentionally taller than its visible
 //! rail so vertical wiggle during a drag does not lose tracking. Mouse-down
-//! does **not** snap value-to-cursor; the user has to start moving for the
-//! slider to update. This keeps accidental clicks on the rail from changing
-//! volume.
+//! does **not** snap value-to-cursor, and a drag moves the value by the
+//! pointer's travel rather than to its position (Shift for fine), so grabbing
+//! the rail anywhere never jumps the level.
 //!
 //! Both variants share one element body ([`drag_slider`]) so paint, hit-test,
 //! accessibility and gesture handling cannot drift apart between them. What
@@ -16,13 +16,12 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, AccessibleAction, App, AppContext, DragMoveEvent, Empty, InteractiveElement,
-    IntoElement, Orientation, ParentElement, Render, Role, StatefulInteractiveElement, Styled,
-    Window,
+    div, px, AccessibleAction, App, AppContext, DragMoveEvent, InteractiveElement, IntoElement,
+    Orientation, ParentElement, Role, StatefulInteractiveElement, Styled, Window,
 };
 use std::sync::Arc;
 
-use crate::components::fader::is_reset_double_click;
+use crate::components::fader::{drag_to, is_reset_double_click, FaderDrag};
 use crate::theme::{elevation, radius, Colors};
 
 type SliderValueCb = Arc<dyn Fn(&f32, &mut Window, &mut App) + 'static>;
@@ -150,10 +149,23 @@ impl SliderSpec {
     }
 }
 
-/// Pointer x -> value over the element's full width.
-fn pointer_to_value(pointer_x: f32, bounds_x: f32, bounds_w: f32, spec: &SliderSpec) -> f32 {
-    let t = ((pointer_x - bounds_x) / bounds_w.max(1.0)).clamp(0.0, 1.0);
-    (spec.min + t * spec.span()).clamp(spec.min, spec.max)
+/// The value a drag that started at track position `start_pos` reaches with
+/// the pointer at window x `pointer_x`.
+///
+/// Relative, like the faders and knobs: the thumb moves by how far the pointer
+/// travels across the rail, never to where it is. Mapping the pointer straight
+/// onto a 70–120 px rail jumped the value to wherever the press landed and made
+/// every pixel a coarse step. Shift drags at a tenth of the rate.
+fn dragged_value(
+    drag: &FaderDrag,
+    start_pos: f32,
+    pointer_x: f32,
+    rail_w: f32,
+    fine: bool,
+    spec: &SliderSpec,
+) -> f32 {
+    let pos = drag_to(drag, start_pos, pointer_x, fine, rail_w, |dx| dx);
+    (spec.min + pos * spec.span()).clamp(spec.min, spec.max)
 }
 
 /// Pull a value inside the dead zone onto the neutral point.
@@ -205,20 +217,6 @@ fn stepped(value: f32, delta: f32, spec: &SliderSpec) -> f32 {
         (value / grid).floor() * grid
     };
     next.clamp(spec.min, spec.max)
-}
-
-/// Drag payload sent from a slider mouse-down. Carries the slider's `id` so a
-/// shared on_drag_move listener (or multiple sliders on screen) can dispatch
-/// to the correct callback.
-#[derive(Clone, Debug)]
-pub struct SliderDrag {
-    pub id: String,
-}
-
-impl Render for SliderDrag {
-    fn render(&mut self, _w: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
-        Empty
-    }
 }
 
 /// Render a horizontal slider.
@@ -332,24 +330,22 @@ pub fn compact_slider_with_reset(
                 .rounded(px(radius::PILL)),
         )
         .on_drag(
-            SliderDrag {
-                id: id_string.clone(),
-            },
-            move |drag, _offset, _window, cx| {
-                cx.new(|_| SliderDrag {
-                    id: drag.id.clone(),
-                })
-            },
+            FaderDrag::new(id_string.clone()),
+            move |drag, _offset, _window, cx| cx.new(|_| FaderDrag::new(drag.id.clone())),
         )
-        .on_drag_move::<SliderDrag>(move |event: &DragMoveEvent<SliderDrag>, window, cx| {
-            if event.drag(cx).id != id_string {
+        .on_drag_move::<FaderDrag>(move |event: &DragMoveEvent<FaderDrag>, window, cx| {
+            let drag = event.drag(cx);
+            if drag.id != id_string {
                 return;
             }
-            let bounds = event.bounds;
-            let x: f32 = event.event.position.x.into();
-            let ox: f32 = bounds.origin.x.into();
-            let ow: f32 = f32::from(bounds.size.width).max(1.0);
-            let new_value = ((x - ox) / ow).clamp(0.0, 1.0);
+            let new_value = dragged_value(
+                drag,
+                value,
+                event.event.position.x.into(),
+                f32::from(event.bounds.size.width).max(1.0),
+                event.event.modifiers.shift,
+                &SliderSpec::unipolar(),
+            );
             on_change_drag(&new_value, window, cx);
         })
         .when_some(on_double_click_reset, |this, reset| {
@@ -591,27 +587,28 @@ fn drag_slider(
                 ),
         )
         .on_drag(
-            SliderDrag {
-                id: id_string.clone(),
-            },
+            FaderDrag::new(id_string.clone()),
             move |drag, _offset, window, cx| {
                 if let Some(start) = on_drag_start.as_ref() {
                     start(&value, window, cx);
                 }
-                cx.new(|_| SliderDrag {
-                    id: drag.id.clone(),
-                })
+                cx.new(|_| FaderDrag::new(drag.id.clone()))
             },
         )
-        .on_drag_move::<SliderDrag>(move |event: &DragMoveEvent<SliderDrag>, window, cx| {
-            if event.drag(cx).id != id_string {
+        .on_drag_move::<FaderDrag>(move |event: &DragMoveEvent<FaderDrag>, window, cx| {
+            let drag = event.drag(cx);
+            if drag.id != id_string {
                 return;
             }
-            let bounds = event.bounds;
-            let x: f32 = event.event.position.x.into();
-            let ox: f32 = bounds.origin.x.into();
-            let ow: f32 = f32::from(bounds.size.width).max(1.0);
-            let new_value = pointer_to_value(x, ox, ow, &spec);
+            let ow: f32 = f32::from(event.bounds.size.width).max(1.0);
+            let new_value = dragged_value(
+                drag,
+                pos,
+                event.event.position.x.into(),
+                ow,
+                event.event.modifiers.shift,
+                &spec,
+            );
             let new_value = apply_center_snap(
                 new_value,
                 spec.neutral(),
@@ -651,24 +648,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unipolar_pointer_mapping_is_unchanged() {
+    fn a_drag_moves_by_pointer_travel_not_to_the_pointer() {
         let spec = SliderSpec::unipolar();
-        assert!((pointer_to_value(0.0, 0.0, 200.0, &spec) - 0.0).abs() < 1.0e-6);
-        assert!((pointer_to_value(100.0, 0.0, 200.0, &spec) - 0.5).abs() < 1.0e-6);
-        assert!((pointer_to_value(200.0, 0.0, 200.0, &spec) - 1.0).abs() < 1.0e-6);
-        // Out of bounds clamps rather than running past the rail.
-        assert!((pointer_to_value(-40.0, 0.0, 200.0, &spec) - 0.0).abs() < 1.0e-6);
-        assert!((pointer_to_value(400.0, 0.0, 200.0, &spec) - 1.0).abs() < 1.0e-6);
+        let drag = FaderDrag::new("s".into());
+        // Grabbed at 0.25 with the pointer far from the thumb: no jump.
+        assert!((dragged_value(&drag, 0.25, 500.0, 200.0, false, &spec) - 0.25).abs() < 1.0e-6);
+        // 20 px of a 200 px rail is a tenth of the travel.
+        assert!((dragged_value(&drag, 0.25, 520.0, 200.0, false, &spec) - 0.35).abs() < 1.0e-6);
+        // Clamped to the domain.
+        assert!((dragged_value(&drag, 0.25, 900.0, 200.0, false, &spec) - 1.0).abs() < 1.0e-6);
     }
 
     #[test]
-    fn bipolar_pointer_mapping_centres_on_the_rail_midpoint() {
+    fn shift_drags_a_bipolar_slider_finely_without_a_jump() {
         let spec = SliderSpec::bipolar();
-        assert!((pointer_to_value(0.0, 0.0, 120.0, &spec) + 1.0).abs() < 1.0e-6);
-        assert!(pointer_to_value(60.0, 0.0, 120.0, &spec).abs() < 1.0e-6);
-        assert!((pointer_to_value(120.0, 0.0, 120.0, &spec) - 1.0).abs() < 1.0e-6);
-        // The element may be offset in the window; the mapping is relative.
-        assert!(pointer_to_value(360.0, 300.0, 120.0, &spec).abs() < 1.0e-6);
+        let drag = FaderDrag::new("p".into());
+        // Pan centre on a 120 px rail; 12 px right is a tenth of the rail.
+        assert!(dragged_value(&drag, 0.5, 300.0, 120.0, false, &spec).abs() < 1.0e-6);
+        assert!((dragged_value(&drag, 0.5, 312.0, 120.0, false, &spec) - 0.2).abs() < 1.0e-5);
+        // Pressing Shift continues from there at a tenth of the rate.
+        assert!((dragged_value(&drag, 0.5, 312.0, 120.0, true, &spec) - 0.2).abs() < 1.0e-5);
+        assert!((dragged_value(&drag, 0.5, 324.0, 120.0, true, &spec) - 0.22).abs() < 1.0e-5);
     }
 
     #[test]

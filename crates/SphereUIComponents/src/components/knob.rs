@@ -34,8 +34,9 @@ pub const KNOB_DEFAULT_SIZE: f32 = 30.0;
 
 /// Sweep half-angle in degrees: 7 o'clock to 5 o'clock.
 const SWEEP_DEG: f32 = 135.0;
-/// Pointer travel for the whole range, in pixels of vertical drag.
-const DRAG_SPAN_PX: f32 = 150.0;
+/// Pointer travel for the whole range, in pixels of vertical drag. Pan
+/// (−100…100) moves about one point per pixel.
+const DRAG_SPAN_PX: f32 = 200.0;
 /// Width of the track and value arcs.
 const ARC_W: f32 = 2.5;
 /// Angular step of the arc polylines. Tessellated as one stroke, so the
