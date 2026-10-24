@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement,
     IntoElement, KeyDownEvent, ParentElement, Render, Styled, Window,
@@ -52,6 +53,9 @@ pub struct MidiEditorWindow {
     virtual_keyboard: Entity<VirtualKeyboardPanel>,
     /// Last clip we successfully rendered — used for the "clip deleted" empty state.
     last_clip_id: Option<String>,
+    /// The caption last given to the platform's frame, so it is only set
+    /// again when the selected clip changes it.
+    native_title: Option<String>,
     on_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
     dispatch_command: Arc<dyn Fn(&'static str, &mut App) + Send + Sync>,
     /// Runs the studio keymap's MIDI Editor scope (and the global keys) for a
@@ -98,6 +102,7 @@ impl MidiEditorWindow {
             piano_roll,
             virtual_keyboard,
             last_clip_id: None,
+            native_title: None,
             on_close,
             dispatch_command,
             dispatch_key,
@@ -226,8 +231,14 @@ impl MidiEditorWindow {
 }
 
 impl Render for MidiEditorWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.title_for_clip(cx);
+        // With the platform's frame the clip name goes in its caption.
+        let native_frame = crate::platform_chrome::native_tool_window_frame();
+        if native_frame && self.native_title.as_deref() != Some(title.as_str()) {
+            window.set_window_title(&title);
+            self.native_title = Some(title.clone());
+        }
 
         let body: gpui::AnyElement = match self.current_midi_clip(cx) {
             Some((_track_id, clip_id)) => {
@@ -287,15 +298,17 @@ impl Render for MidiEditorWindow {
                 }
             })
             .child(div().w(px(0.0)).h(px(0.0)).track_focus(&self.focus_handle))
-            .child(external_window_titlebar(
-                title.as_str(),
-                "midi-editor-window-close",
-                move |window, cx| {
-                    midi_editor_debug("close window");
-                    on_close(window, cx);
-                    window.remove_window();
-                },
-            ))
+            .when(!native_frame, |root| {
+                root.child(external_window_titlebar(
+                    title.as_str(),
+                    "midi-editor-window-close",
+                    move |window, cx| {
+                        midi_editor_debug("close window");
+                        on_close(window, cx);
+                        window.remove_window();
+                    },
+                ))
+            })
             .child(
                 div()
                     .flex()
@@ -353,7 +366,7 @@ pub fn open_midi_editor_window(
     // dialog options here leaves `dialog_parenting` enabled before changing
     // the kind to Floating, which can make GPUI/Win32 tear down the window
     // during creation instead of returning a normal window handle.
-    let mut options = crate::platform_chrome::external_window_options_partial();
+    let mut options = crate::platform_chrome::native_tool_window_options_partial("MIDI Editor");
     options.window_bounds = Some(WindowBounds::Windowed(window_bounds));
     options.kind = WindowKind::Floating;
     options.is_resizable = true;
@@ -365,8 +378,21 @@ pub fn open_midi_editor_window(
     ));
     crate::window_position::apply_owner_display(&mut options, owner_bounds, cx);
 
-    cx.open_window(options, move |_window, cx| {
+    cx.open_window(options, move |window, cx| {
+        // The platform's close button (and Alt+F4) close the window without
+        // the drawn titlebar's handler, so the Studio hears it here: that is
+        // what releases the virtual keyboard and sounding notes.
+        let closing = on_close.clone();
+        window.on_window_should_close(cx, move |window, cx| {
+            midi_editor_debug("close window");
+            closing(window, cx);
+            true
+        });
         cx.new(|cx| {
+            #[cfg(target_os = "windows")]
+            if crate::platform_chrome::native_tool_window_frame() {
+                attach_native_menu_bar(window, dispatch_command.clone(), cx);
+            }
             MidiEditorWindow::new(
                 timeline,
                 piano_roll,
@@ -379,4 +405,80 @@ pub fn open_midi_editor_window(
         })
     })
     .map_err(|e| e.to_string())
+}
+
+/// The floating MIDI editor's native menu bar
+/// ([`crate::native_win32_menu`]). Its commands are the Studio's MIDI
+/// commands, which act on the clip this window shows (the selected one).
+#[cfg(target_os = "windows")]
+fn attach_native_menu_bar(
+    window: &mut Window,
+    dispatch_command: Arc<dyn Fn(&'static str, &mut App) + Send + Sync>,
+    cx: &mut Context<MidiEditorWindow>,
+) {
+    use crate::native_win32_menu::{attach, NativeMenu, NativeMenuItem};
+    // The command channel takes static ids, so every command the bar can send
+    // is listed here and a chosen one is matched back to its entry.
+    const COMMANDS: [&str; 10] = [
+        "midi:export-clip",
+        "edit:undo",
+        "edit:redo",
+        "midi:select-all",
+        "midi:delete-selected",
+        "midi:quantize",
+        "midi:fit-notes",
+        "chords:open-generator",
+        "view:toggle-virtual-keyboard",
+        "editor:open-bottom",
+    ];
+    let i18n = crate::i18n::I18n::from_app(cx);
+    let item = |command: &str, fallback: &str| NativeMenuItem::manifest(i18n, command, fallback);
+    let menus = [
+        NativeMenu {
+            label: i18n.tr_menu("file", "&File"),
+            items: vec![item("midi:export-clip", "Export MIDI Clip...")],
+        },
+        NativeMenu {
+            label: i18n.tr_menu("edit", "&Edit"),
+            items: vec![
+                item("edit:undo", "Undo"),
+                item("edit:redo", "Redo"),
+                NativeMenuItem::Separator,
+                item("midi:select-all", "Select All Notes"),
+                item("midi:delete-selected", "Delete Selected Notes"),
+            ],
+        },
+        NativeMenu {
+            label: i18n.tr_menu("midi", "&MIDI"),
+            items: vec![
+                item("midi:quantize", "Quantize"),
+                item("midi:fit-notes", "Fit Notes"),
+                NativeMenuItem::Separator,
+                item("chords:open-generator", "Chord Generator..."),
+            ],
+        },
+        NativeMenu {
+            label: i18n.tr_menu("view", "&View"),
+            items: vec![
+                item("view:toggle-virtual-keyboard", "Virtual Keyboard"),
+                item("editor:open-bottom", "Open in Bottom Panel"),
+            ],
+        },
+    ];
+    let Some(commands) = attach(window, &menus) else {
+        return;
+    };
+    cx.spawn_in(window, async move |_this, cx| loop {
+        let chosen = commands.next().await;
+        let Some(command) = COMMANDS.iter().copied().find(|command| *command == chosen) else {
+            continue;
+        };
+        if cx
+            .update(|_window, cx| dispatch_command(command, cx))
+            .is_err()
+        {
+            break;
+        }
+    })
+    .detach();
 }

@@ -65,6 +65,8 @@ pub mod loading_session;
 pub mod loopback_ports;
 pub mod menu;
 pub mod native_macos_menu;
+#[cfg(target_os = "windows")]
+pub mod native_win32_menu;
 pub mod output_routing;
 pub mod overlay;
 pub mod paths;

@@ -423,6 +423,9 @@ pub struct LoadedTheme {
     pub id: String,
     pub name: String,
     pub path: Option<PathBuf>,
+    /// The theme's declared `appearance`: what native surfaces the app does
+    /// not draw itself (window frames, menus) follow.
+    pub dark: bool,
     colors: HashMap<String, Rgba>,
     track_colors: Vec<Rgba>,
 }
@@ -441,6 +444,7 @@ pub struct ThemeLoadReport {
 struct ThemeManifest {
     id: Option<String>,
     name: Option<String>,
+    appearance: Option<String>,
     tokens: Option<Value>,
     track_colors: Option<Vec<String>>,
 }
@@ -517,7 +521,18 @@ pub fn activate_theme_by_id(id: &str) -> bool {
     *active_theme_store()
         .write()
         .unwrap_or_else(|e| e.into_inner()) = theme;
+    #[cfg(target_os = "windows")]
+    crate::native_win32_menu::apply_theme_to_all();
     true
+}
+
+/// Whether the active theme is dark. Native surfaces the app does not draw
+/// itself (window frames, menus) follow it.
+pub fn is_dark() -> bool {
+    active_theme_store()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .dark
 }
 
 pub fn last_theme_load_report() -> Option<ThemeLoadReport> {
@@ -665,6 +680,7 @@ fn load_default_theme() -> LoadedTheme {
             id: "futureboard.default".to_string(),
             name: "Futureboard Default".to_string(),
             path: None,
+            dark: true,
             colors: HashMap::new(),
             track_colors: DEFAULT_TRACK_COLOR_VALUES
                 .iter()
@@ -723,6 +739,13 @@ fn load_theme_from_str(
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "Unnamed Theme".to_string()),
         path,
+        // A theme that does not say inherits its base's (the bundled default
+        // is dark).
+        dark: match manifest.appearance.as_deref().map(str::trim) {
+            Some(appearance) if appearance.eq_ignore_ascii_case("light") => false,
+            Some(appearance) if appearance.eq_ignore_ascii_case("dark") => true,
+            _ => base.is_none_or(|base| base.dark),
+        },
         colors,
         track_colors,
     })

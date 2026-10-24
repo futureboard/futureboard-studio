@@ -357,6 +357,30 @@ pub fn external_window_options_partial() -> WindowOptions {
     }
 }
 
+/// Whether external tool windows (the Mixer, the MIDI Editor) take the
+/// platform's own frame: its caption, caption buttons and a native menu bar
+/// (see [`crate::native_win32_menu`]). Only on Windows; elsewhere they keep
+/// the drawn chrome.
+pub fn native_tool_window_frame() -> bool {
+    PlatformChromePolicy::current().kind == PlatformChromeKind::Windows
+}
+
+/// [`external_window_options_partial`] with the platform's frame on Windows
+/// ([`native_tool_window_frame`]): the OS draws the caption and its buttons,
+/// so the window draws no titlebar of its own. `title` is the caption text.
+pub fn native_tool_window_options_partial(title: impl Into<gpui::SharedString>) -> WindowOptions {
+    let mut options = external_window_options_partial();
+    if native_tool_window_frame() {
+        options.titlebar = Some(TitlebarOptions {
+            title: Some(title.into()),
+            appears_transparent: false,
+            traffic_light_position: None,
+        });
+        options.window_decorations = None;
+    }
+    options
+}
+
 #[cfg(test)]
 mod chrome_policy_tests {
     use super::*;

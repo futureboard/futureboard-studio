@@ -5,6 +5,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement,
     IntoElement, KeyDownEvent, ParentElement, Point, Render, Styled, Window,
@@ -225,8 +226,15 @@ impl Render for MixerWindow {
             0.0
         };
         let mixer_viewport_width = (viewport_width - tree_width - 90.0).max(100.0);
-        let mixer_viewport_height =
-            (viewport_height - TITLEBAR_HEIGHT - MIXER_MENU_BAR_HEIGHT).max(0.0);
+        // With the platform's frame the caption and the menu bar are outside
+        // the client area.
+        let native_frame = crate::platform_chrome::native_tool_window_frame();
+        let chrome_height = if native_frame {
+            0.0
+        } else {
+            TITLEBAR_HEIGHT + MIXER_MENU_BAR_HEIGHT
+        };
+        let mixer_viewport_height = (viewport_height - chrome_height).max(0.0);
         let mixer_split = MixerSplit {
             insert_px: clamp_mixer_section_height_px(mixer_insert_section_px),
             send_px: clamp_mixer_section_height_px(mixer_send_section_px),
@@ -259,15 +267,17 @@ impl Render for MixerWindow {
                 }
             })
             .child(div().w(px(0.0)).h(px(0.0)).track_focus(&self.focus_handle))
-            .child(external_window_titlebar(
-                i18n.tr("mixer.title"),
-                "mixer-window-close",
-                move |window, cx| {
-                    on_close(window, cx);
-                    window.remove_window();
-                },
-            ))
-            .child(mixer_menu_bar(i18n))
+            .when(!native_frame, |root| {
+                root.child(external_window_titlebar(
+                    i18n.tr("mixer.title"),
+                    "mixer-window-close",
+                    move |window, cx| {
+                        on_close(window, cx);
+                        window.remove_window();
+                    },
+                ))
+                .child(mixer_menu_bar(i18n))
+            })
             .child(
                 div()
                     .flex()
@@ -344,7 +354,9 @@ pub fn open_mixer_window(
         y: px((parent_y + parent_h - MIXER_WINDOW_HEIGHT).max(24.0)),
     };
 
-    let mut options = crate::platform_chrome::external_window_options_partial();
+    let i18n = I18n::from_app(cx);
+    let mut options =
+        crate::platform_chrome::native_tool_window_options_partial(i18n.tr("mixer.title"));
     options.window_bounds = Some(WindowBounds::Windowed(Bounds {
         origin,
         size: size(px(MIXER_WINDOW_WIDTH), px(MIXER_WINDOW_HEIGHT)),
@@ -358,8 +370,19 @@ pub fn open_mixer_window(
     ));
     crate::window_position::apply_owner_display(&mut options, Some(owner_bounds), cx);
 
-    cx.open_window(options, move |_window, cx| {
+    cx.open_window(options, move |window, cx| {
+        // The platform's close button (and Alt+F4) close the window without
+        // the drawn titlebar's handler, so the Studio hears it here.
+        let closing = on_close.clone();
+        window.on_window_should_close(cx, move |window, cx| {
+            closing(window, cx);
+            true
+        });
         cx.new(|cx| {
+            #[cfg(target_os = "windows")]
+            if crate::platform_chrome::native_tool_window_frame() {
+                attach_native_menu_bar(window, i18n, on_menu_command.clone(), cx);
+            }
             MixerWindow::new(
                 snapshot,
                 tree_sidebar,
@@ -375,6 +398,48 @@ pub fn open_mixer_window(
         })
     })
     .map_err(|e| e.to_string())
+}
+
+/// The external mixer's native menu bar ([`crate::native_win32_menu`]): its
+/// commands run in the Studio, like the ones its context menus send.
+#[cfg(target_os = "windows")]
+fn attach_native_menu_bar(
+    window: &mut Window,
+    i18n: I18n,
+    on_menu_command: Arc<dyn Fn(&str, &mut Window, &mut App) + Send + Sync>,
+    cx: &mut Context<MixerWindow>,
+) {
+    use crate::native_win32_menu::{attach, NativeMenu, NativeMenuItem};
+    let menus = [
+        NativeMenu {
+            label: i18n.tr_menu("edit", "&Edit"),
+            items: vec![
+                NativeMenuItem::manifest(i18n, "edit:undo", "Undo"),
+                NativeMenuItem::manifest(i18n, "edit:redo", "Redo"),
+            ],
+        },
+        NativeMenu {
+            label: i18n.tr_or("mixer.menu", "&Mixer"),
+            items: vec![
+                NativeMenuItem::manifest(i18n, "mixer:bypass-all-inserts", "Bypass All Plug-ins"),
+                NativeMenuItem::Separator,
+                NativeMenuItem::manifest(i18n, "floatingwindow:routing-matrix", "Routing Matrix"),
+            ],
+        },
+    ];
+    let Some(commands) = attach(window, &menus) else {
+        return;
+    };
+    cx.spawn_in(window, async move |_this, cx| loop {
+        let command = commands.next().await;
+        if cx
+            .update(|window, cx| on_menu_command(&command, window, cx))
+            .is_err()
+        {
+            break;
+        }
+    })
+    .detach();
 }
 
 /// Cached check for the external-mixer debug flag. Read once and memoized so the
