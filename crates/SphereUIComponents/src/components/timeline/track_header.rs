@@ -80,6 +80,13 @@ pub struct TrackHeaderCallbacks {
 /// changes the height of the name line, on a compact row or a full one.
 pub const TRACK_NAME_FIELD_HEIGHT: f32 = 22.0;
 
+/// Text inset of the inline name field.
+pub const TRACK_NAME_FIELD_PAD_X: f32 = 4.0;
+
+/// How far the inline name field reaches left of the name: its border and
+/// inset, so its text starts exactly where the name's did.
+const TRACK_NAME_FIELD_INSET: f32 = 1.0 + TRACK_NAME_FIELD_PAD_X;
+
 /// What the header needs to draw the name editor the arrangement owns.
 pub struct TrackHeaderRename {
     pub track_id: String,
@@ -976,6 +983,7 @@ pub fn track_header(
                                             Some(rename) => div()
                                                 .flex_1()
                                                 .min_w(px(0.0))
+                                                .ml(px(-TRACK_NAME_FIELD_INSET))
                                                 .child(text_field_with_callbacks_and_ime(
                                                     &rename.input,
                                                     rename.focused,

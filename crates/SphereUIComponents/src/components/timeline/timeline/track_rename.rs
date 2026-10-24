@@ -279,7 +279,14 @@ impl Timeline {
         }
         let mut input = TextInputState::new("track-header-rename", cx.focus_handle())
             .with_accessible_label("Track name")
-            .with_field_height(TRACK_NAME_FIELD_HEIGHT);
+            .with_field_height(TRACK_NAME_FIELD_HEIGHT)
+            // The name's own weight and a narrow inset, which the header
+            // takes back (`TRACK_NAME_FIELD_INSET`), so the text stays where
+            // the label had it as editing begins.
+            .with_inline_text(
+                crate::components::timeline::track_header::TRACK_NAME_FIELD_PAD_X,
+                gpui::FontWeight::SEMIBOLD,
+            );
         input.set_value(track.name.clone());
         input.select_all();
         // The row is on screen — it was just double-clicked — so the field can

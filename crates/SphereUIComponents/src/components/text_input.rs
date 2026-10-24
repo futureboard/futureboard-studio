@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -313,6 +313,15 @@ pub struct TextInputState {
     /// Outer height of the drawn field; `None` is the standard 30 px. See
     /// [`Self::with_field_height`].
     field_height: Option<f32>,
+    /// Horizontal text inset; `None` is the standard 9 px. See
+    /// [`Self::with_inline_text`].
+    padding_x: Option<f32>,
+    /// Weight of the edited text; `None` is the regular UI weight.
+    font_weight: Option<gpui::FontWeight>,
+    /// How far the text is scrolled left while editing, so the caret stays in
+    /// view in a value wider than the field. Kept across frames; clones share
+    /// it, as they draw the same field.
+    scroll_x: Rc<Cell<f32>>,
 }
 
 impl std::ops::Deref for TextInputState {
@@ -339,6 +348,9 @@ impl TextInputState {
             blur_on_click_outside: false,
             mouse_selecting: false,
             field_height: None,
+            padding_x: None,
+            font_weight: None,
+            scroll_x: Rc::new(Cell::new(0.0)),
         }
     }
 
@@ -347,6 +359,16 @@ impl TextInputState {
     /// Padding, text size and pointer hit-testing are unchanged.
     pub fn with_field_height(mut self, height: f32) -> Self {
         self.field_height = Some(height);
+        self
+    }
+
+    /// Inset the text `padding_x` px and draw it at `weight`, for a field that
+    /// replaces a label in place (a track header's name): the text then
+    /// starts where, and looks as, the label it replaces did, instead of
+    /// jumping sideways and changing weight as editing begins.
+    pub fn with_inline_text(mut self, padding_x: f32, weight: gpui::FontWeight) -> Self {
+        self.padding_x = Some(padding_x);
+        self.font_weight = Some(weight);
         self
     }
 
@@ -1533,6 +1555,14 @@ fn text_field_inner(
     let hit: FieldHitCell = Rc::new(RefCell::new(None));
     let hit_down = hit.clone();
     let hit_move = hit.clone();
+    let font_weight = state.font_weight;
+    let padding_x = state.padding_x.unwrap_or(TEXT_INPUT_PAD_X);
+    let scroll_x = state.scroll_x.clone();
+    // An unfocused field shows its value from the start.
+    if !focused {
+        scroll_x.set(0.0);
+    }
+    let editing_line = focused && !value.is_empty();
 
     let border = if focused {
         Colors::border_focus()
@@ -1561,58 +1591,33 @@ fn text_field_inner(
                     .child(placeholder),
             )
             .into_any_element()
-    } else if let Some(range) = selection {
-        let before: String = value.chars().take(range.start).collect();
-        let selected: String = value
-            .chars()
-            .skip(range.start)
-            .take(range.end - range.start)
-            .collect();
-        let after: String = value.chars().skip(range.end).collect();
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .min_w_0()
-            .overflow_hidden()
-            .child(text_segment(before, false))
-            .when(cursor == range.start && focused, |d| d.child(caret()))
-            .child(text_segment(selected, true))
-            .when(cursor == range.end && focused, |d| d.child(caret()))
-            .child(text_segment(after, false))
-            .into_any_element()
-    } else if let Some(range) = state.marked_range.clone() {
-        let before: String = value.chars().take(range.start).collect();
-        let marked: String = value
-            .chars()
-            .skip(range.start)
-            .take(range.end - range.start)
-            .collect();
-        let after: String = value.chars().skip(range.end).collect();
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .min_w_0()
-            .overflow_hidden()
-            .child(text_segment(before, false))
-            .child(text_segment(marked, true))
-            .when(focused, |d| d.child(caret()))
-            .child(text_segment(after, false))
-            .into_any_element()
+    } else if focused {
+        // While editing, the value is one shaped line with the selection and
+        // the caret painted over it. Drawn as pieces between the caret and
+        // the selection, each piece cut itself short with "…" (the end of a
+        // long name being typed went missing), the caret pushed the text
+        // after it sideways as it moved, and clicks landed beside the
+        // character under the pointer.
+        let marked = state.marked_range.clone();
+        let (highlight, caret_at) = match (selection, marked) {
+            (Some(range), _) => (Some(range), cursor),
+            (None, Some(range)) => {
+                let end = range.end;
+                (Some(range), end)
+            }
+            (None, None) => (None, cursor),
+        };
+        FieldLine {
+            text: value.clone(),
+            caret: caret_at,
+            highlight,
+            weight: font_weight,
+            hit: hit.clone(),
+            scroll: scroll_x.clone(),
+        }
+        .into_any_element()
     } else {
-        let before: String = value.chars().take(cursor).collect();
-        let after: String = value.chars().skip(cursor).collect();
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .min_w_0()
-            .overflow_hidden()
-            .child(text_segment(before, false))
-            .when(focused, |d| d.child(caret()))
-            .child(text_segment(after, false))
-            .into_any_element()
+        text_segment(value.clone(), font_weight).into_any_element()
     };
 
     div()
@@ -1630,7 +1635,7 @@ fn text_field_inner(
         .items_center()
         .w_full()
         .h(px(field_height))
-        .px(px(9.0))
+        .px(px(padding_x))
         .rounded(px(crate::theme::radius::CONTROL))
         .overflow_hidden()
         .border(px(1.0))
@@ -1766,28 +1771,215 @@ fn text_field_inner(
                 .min_w_0()
                 .overflow_hidden()
                 .child(content)
-                .child(div().absolute().inset_0().child(TextHitProbe {
-                    text: value.clone(),
-                    hit: hit.clone(),
-                })),
+                // An editing line records its own layout, scrolled; anything
+                // else is probed from the start.
+                .when(!editing_line, |wrapper| {
+                    wrapper.child(div().absolute().inset_0().child(TextHitProbe {
+                        text: value.clone(),
+                        weight: font_weight,
+                        hit: hit.clone(),
+                    }))
+                }),
         )
         .children(ime_layer)
         .children(context_overlay)
 }
 
-fn text_segment(text: String, selected: bool) -> impl IntoElement {
+/// An unfocused field's value: one line, cut short with "…" when it does not
+/// fit.
+fn text_segment(text: String, weight: Option<gpui::FontWeight>) -> impl IntoElement {
     div()
         .min_w(px(0.0))
         .overflow_hidden()
         .truncate()
-        .rounded(px(crate::theme::radius::CONTROL))
-        .when(selected, |d| {
-            d.bg(Colors::with_alpha(Colors::accent_primary(), 0.25))
-                .px(px(2.0))
-        })
         .text_size(px(12.0))
         .text_color(Colors::text_primary())
+        .when_some(weight, |d, weight| d.font_weight(weight))
         .child(text)
+}
+
+/// Caret width in a [`FieldLine`].
+const CARET_W: f32 = 1.5;
+/// Caret height in a [`FieldLine`].
+const CARET_H: f32 = 15.0;
+
+/// A focused field's value as one shaped line, with the selection (or the IME
+/// composition) and the caret painted over it rather than laid out between
+/// pieces of it. Scrolls horizontally to keep the caret in view, and records
+/// the scrolled layout for pointer hit-testing ([`hit_index`]).
+struct FieldLine {
+    text: String,
+    /// Caret position, in chars.
+    caret: usize,
+    /// Highlighted range, in chars: the selection, or the composition.
+    highlight: Option<Range<usize>>,
+    weight: Option<gpui::FontWeight>,
+    hit: FieldHitCell,
+    scroll: Rc<Cell<f32>>,
+}
+
+/// Byte offset of char `index` in `text`, clamped to its end.
+fn byte_of_char(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+/// Shapes `text` the way a field draws it: the ambient UI font at 12 px, at
+/// `weight` when one is given.
+fn shape_field_text(
+    text: &str,
+    weight: Option<gpui::FontWeight>,
+    window: &mut Window,
+) -> (ShapedLine, gpui::Hsla) {
+    let (mut font, color) = {
+        let style = window.text_style();
+        (style.font(), style.color)
+    };
+    if let Some(weight) = weight {
+        font.weight = weight;
+    }
+    let runs = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![TextRun {
+            len: text.len(),
+            font,
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }]
+    };
+    let line = window
+        .text_system()
+        .shape_line(text.to_string().into(), px(12.0), &runs, None);
+    (line, color)
+}
+
+impl IntoElement for FieldLine {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for FieldLine {
+    type RequestLayoutState = ();
+    type PrepaintState = Option<(ShapedLine, Pixels)>;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+        let (line, _) = shape_field_text(&self.text, self.weight, window);
+        let caret_x: f32 = line
+            .x_for_index(byte_of_char(&self.text, self.caret))
+            .into();
+        let view_w: f32 = bounds.size.width.into();
+        let line_w: f32 = line.width.into();
+        // Scroll just far enough to show the caret, and never past the end
+        // of the text.
+        let mut scroll = self.scroll.get();
+        if caret_x - scroll > view_w - CARET_W {
+            scroll = caret_x - view_w + CARET_W;
+        }
+        if caret_x - scroll < 0.0 {
+            scroll = caret_x;
+        }
+        scroll = scroll.clamp(0.0, (line_w + CARET_W - view_w).max(0.0));
+        self.scroll.set(scroll);
+        let origin_x = bounds.origin.x - px(scroll);
+        // Hit-testing reads the line from where it is drawn.
+        let mut hit_bounds = bounds;
+        hit_bounds.origin.x = origin_x;
+        *self.hit.borrow_mut() = Some(FieldHit {
+            bounds: hit_bounds,
+            line: line.clone(),
+            text: self.text.clone(),
+        });
+        Some((line, origin_x))
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some((line, origin_x)) = prepaint.take() else {
+            return;
+        };
+        let mask = gpui::ContentMask { bounds };
+        window.with_content_mask(Some(mask), |window| {
+            let line_height = window.line_height();
+            let top = bounds.origin.y + (bounds.size.height - line_height) / 2.0;
+            if let Some(range) = self
+                .highlight
+                .clone()
+                .filter(|range| range.end > range.start)
+            {
+                let x0 = line.x_for_index(byte_of_char(&self.text, range.start));
+                let x1 = line.x_for_index(byte_of_char(&self.text, range.end));
+                window.paint_quad(gpui::fill(
+                    Bounds::from_corners(
+                        point(origin_x + x0, top),
+                        point(origin_x + x1, top + line_height),
+                    ),
+                    Colors::with_alpha(Colors::accent_primary(), 0.25),
+                ));
+            }
+            let _ = line.paint(
+                point(origin_x, top),
+                line_height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+            let caret_x = line.x_for_index(byte_of_char(&self.text, self.caret));
+            let caret_top = bounds.origin.y + (bounds.size.height - px(CARET_H)) / 2.0;
+            window.paint_quad(gpui::fill(
+                Bounds::new(
+                    point(origin_x + caret_x, caret_top),
+                    gpui::size(px(CARET_W), px(CARET_H)),
+                ),
+                Colors::accent_primary(),
+            ));
+        });
+    }
 }
 
 fn caret() -> impl IntoElement {
@@ -1852,6 +2044,7 @@ fn hit_index(hit: &FieldHitCell, global_x: f32) -> usize {
 /// hitbox, so it never affects rendering or click routing.
 struct TextHitProbe {
     text: String,
+    weight: Option<gpui::FontWeight>,
     hit: FieldHitCell,
 }
 
@@ -1897,27 +2090,9 @@ impl Element for TextHitProbe {
         window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
-        // Shape with the ambient UI font at the field's fixed 12px text size — the
-        // same as the visible `text_segment` glyphs — so x positions line up.
-        let (font, color) = {
-            let style = window.text_style();
-            (style.font(), style.color)
-        };
-        let runs = if self.text.is_empty() {
-            Vec::new()
-        } else {
-            vec![TextRun {
-                len: self.text.len(),
-                font,
-                color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            }]
-        };
-        let line = window
-            .text_system()
-            .shape_line(self.text.clone().into(), px(12.0), &runs, None);
+        // Shaped as the visible `text_segment` glyphs are, so x positions
+        // line up.
+        let (line, _) = shape_field_text(&self.text, self.weight, window);
         *self.hit.borrow_mut() = Some(FieldHit {
             bounds,
             line,
