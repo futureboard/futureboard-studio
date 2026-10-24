@@ -509,6 +509,20 @@ fn recording(cx: &PageCtx) -> Vec<PrefGroup> {
                     }),
                 ),
             ))
+            .row(PrefRow::described(
+                "Bypass delay compensation while recording",
+                "Recording starts without waiting on high-latency plug-ins; tracks \
+                 behind them play late until the transport stops.",
+                &["latency", "pdc", "compensation", "delay", "record"],
+                pref_switch(
+                    "rec-bypass-pdc",
+                    s.recording.audio.bypass_pdc_while_recording,
+                    apply(&up, |s| {
+                        s.recording.audio.bypass_pdc_while_recording =
+                            !s.recording.audio.bypass_pdc_while_recording
+                    }),
+                ),
+            ))
             .row(PrefRow::field(
                 "Build waveforms when recording stops",
                 &["waveform", "record"],

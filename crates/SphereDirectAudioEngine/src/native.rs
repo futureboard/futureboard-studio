@@ -1473,6 +1473,12 @@ impl AudioEngine {
         self.inner.set_pdc_enabled(enabled);
     }
 
+    /// Whether a take started from a stopped transport records with delay
+    /// compensation bypassed (Settings → Recording).
+    pub fn set_record_pdc_bypass_enabled(&self, enabled: bool) {
+        self.inner.set_record_pdc_bypass_enabled(enabled);
+    }
+
     pub fn latency_graph_version(&self) -> u64 {
         self.inner.latency_graph_version()
     }

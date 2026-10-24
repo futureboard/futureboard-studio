@@ -202,6 +202,11 @@ pub struct LocalAudioState {
     count_in_beats_per_bar: u32,
     /// Standalone File Browser audition, owned by this stream/callback.
     pub audition: AuditionPlayer,
+    /// Delay compensation is off on the graph for a take recording with it
+    /// bypassed; see [`Self::follow_record_pdc_bypass`].
+    pdc_bypass_applied: bool,
+    /// Whether the graph compensated before the bypass, so it does again after.
+    pdc_bypass_restore: bool,
 }
 
 impl LocalAudioState {
@@ -252,6 +257,51 @@ impl LocalAudioState {
             count_in_beat_index: 0,
             count_in_beats_per_bar: 4,
             audition: AuditionPlayer::default(),
+            pdc_bypass_applied: false,
+            pdc_bypass_restore: false,
+        }
+    }
+
+    /// Follows [`SharedState::record_pdc_bypass`] on the graph, once per
+    /// callback after the command drain.
+    ///
+    /// A take that bypasses compensation turns it off on the graph as it
+    /// starts, so nothing is held back behind the slowest plug-in path: the
+    /// mix, the click and the monitored input are heard from the first block.
+    /// It comes back only once the transport has stopped as well, so a take
+    /// stopped while playback runs on does not jump the tracks mid-play. A
+    /// graph swapped in during the take was planned with compensation, and is
+    /// turned off the same way. Realtime-safe: an in-place replan.
+    pub fn follow_record_pdc_bypass(
+        &mut self,
+        runtime: &mut RuntimeProject,
+        shared: &SharedState,
+        playing: bool,
+    ) {
+        let wanted = shared.record_pdc_bypass.load(Ordering::Relaxed);
+        if self.pdc_bypass_applied {
+            if wanted || playing {
+                if runtime.pdc_enabled {
+                    self.pdc_bypass_restore = true;
+                    runtime.set_pdc_enabled_realtime(false);
+                }
+                return;
+            }
+            self.pdc_bypass_applied = false;
+            if self.pdc_bypass_restore
+                && !runtime.pdc_enabled
+                && shared.pdc_enabled.load(Ordering::Relaxed)
+            {
+                runtime.set_pdc_enabled_realtime(true);
+            }
+            return;
+        }
+        if wanted {
+            self.pdc_bypass_applied = true;
+            self.pdc_bypass_restore = runtime.pdc_enabled;
+            if runtime.pdc_enabled {
+                runtime.set_pdc_enabled_realtime(false);
+            }
         }
     }
 
@@ -1161,6 +1211,8 @@ pub fn drain_commands(
     shared
         .count_in_remaining_samples
         .store(local.count_in_remaining, Ordering::Relaxed);
+    let playing = local.playing_local;
+    local.follow_record_pdc_bypass(runtime, shared, playing);
     false
 }
 

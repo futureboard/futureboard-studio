@@ -411,6 +411,7 @@ pub(crate) fn build_and_warm_audio_engine(
     }
 
     engine.set_pdc_enabled(schema.playback.latency_compensation);
+    engine.set_record_pdc_bypass_enabled(schema.recording.audio.bypass_pdc_while_recording);
     engine.set_dropout_protection_mode(engine_dropout_mode(schema.playback.dropout_protection));
     apply_audio_processing_settings(&schema.performance.audio_processing);
 
@@ -3282,6 +3283,9 @@ impl StudioLayout {
                 schema.playback.dropout_protection,
             ));
 
+            engine.set_record_pdc_bypass_enabled(
+                schema.recording.audio.bypass_pdc_while_recording,
+            );
             let desired_pdc = schema.playback.latency_compensation;
             if engine.pdc_enabled() != desired_pdc {
                 engine.set_pdc_enabled(desired_pdc);

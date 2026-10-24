@@ -2913,6 +2913,24 @@ impl RuntimeProject {
         samples
     }
 
+    /// Turns delay compensation on or off in place, from the audio thread.
+    ///
+    /// Replans the existing latency graph and refits the rings inside the
+    /// capacity the control thread reserved (path latencies are planned and
+    /// reserved for with compensation off too), then clears them so no track
+    /// replays audio delayed by the old plan. Realtime-safe.
+    pub fn set_pdc_enabled_realtime(&mut self, enabled: bool) {
+        self.pdc_enabled = enabled;
+        recompute_runtime_latency_graph(
+            &mut self.latency_graph,
+            &self.tracks,
+            &self.audio_graph,
+            enabled,
+        );
+        self.fit_pdc_delay_capacity_realtime();
+        self.reset_pdc_delay_lines();
+    }
+
     /// Ring length one track needs to serve the planned compensation.
     #[inline]
     fn pdc_buffer_frames(max_path_latency_samples: u32) -> usize {

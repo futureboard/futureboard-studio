@@ -597,6 +597,11 @@ pub struct AudioRecordingSettings {
     pub save_before_recording: bool,
     #[serde(default = "default_true")]
     pub generate_waveform_after_record: bool,
+    /// A take started from a stopped transport turns plug-in delay
+    /// compensation off until the transport stops, so nothing is held back
+    /// behind the slowest plug-in while the performer plays along.
+    #[serde(default = "default_true")]
+    pub bypass_pdc_while_recording: bool,
 }
 
 impl Default for AudioRecordingSettings {
@@ -609,6 +614,7 @@ impl Default for AudioRecordingSettings {
             auto_offset_from_jam: true,
             save_before_recording: true,
             generate_waveform_after_record: true,
+            bypass_pdc_while_recording: true,
         }
     }
 }

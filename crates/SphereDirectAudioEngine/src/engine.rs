@@ -664,6 +664,12 @@ pub struct SharedState {
     pub device_lost: AtomicBool,
     /// Playback plugin delay compensation (Phase W). Settings → Playback.
     pub pdc_enabled: AtomicBool,
+    /// Whether a take bypasses delay compensation while it records
+    /// (Settings → Recording). Read when a take starts.
+    pub record_pdc_bypass_enabled: AtomicBool,
+    /// A take is recording with delay compensation bypassed. The audio
+    /// thread follows it in place ([`crate::runtime::RuntimeProject::follow_pdc_bypass`]).
+    pub record_pdc_bypass: AtomicBool,
     /// Monotonic generation of the latency-compensation graph (bumped on PDC
     /// toggle). Stamped into the offline-export snapshot for graph-version parity.
     pub latency_graph_version: AtomicU64,
@@ -776,6 +782,8 @@ impl Default for SharedState {
             mmcss_active: AtomicBool::new(false),
             device_lost: AtomicBool::new(false),
             pdc_enabled: AtomicBool::new(true),
+            record_pdc_bypass_enabled: AtomicBool::new(true),
+            record_pdc_bypass: AtomicBool::new(false),
             latency_graph_version: AtomicU64::new(1),
             audition_request_token: AtomicU64::new(0),
             audition_position_us: AtomicU64::new(AUDITION_POSITION_IDLE),
@@ -1104,6 +1112,9 @@ struct TakePlacement {
     armed_start_sample: u64,
     first_capture_sample: u64,
     live_tap: bool,
+    /// The take recorded with delay compensation bypassed, so the mix the
+    /// performer played to was not held back behind the slowest path.
+    pdc_bypassed: bool,
     #[cfg(all(target_os = "windows", feature = "asio"))]
     asio_tap: bool,
 }
@@ -1224,6 +1235,19 @@ impl EngineInner {
                 .latency_graph_version
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Whether the next take bypasses delay compensation while it records.
+    ///
+    /// Bypassed, nothing is held back to line up with the slowest plug-in
+    /// path: the mix and the click are heard the moment the transport starts
+    /// and the input is monitored without the project's compensation delay.
+    /// Tracks behind high-latency plug-ins are heard late by that latency for
+    /// the take; compensation comes back once the transport stops.
+    pub fn set_record_pdc_bypass_enabled(&self, enabled: bool) {
+        self.shared
+            .record_pdc_bypass_enabled
+            .store(enabled, Ordering::Relaxed);
     }
 
     /// Monotonic generation of the realtime latency-compensation graph. Bumped
@@ -3929,6 +3953,25 @@ impl EngineInner {
     /// dedicated capture stream; the ASIO backend installs a record sink into
     /// the already-running duplex session (the driver/stream is never touched).
     pub fn start_recording(&self, config: JsStartRecordingConfig) -> Result<(), SphereAudioError> {
+        // Decided as the take arms. A take started while the transport already
+        // runs keeps the compensation it is being heard with: turning it off
+        // mid-play would jump every compensated track by its delay.
+        let bypass_pdc = self
+            .shared
+            .record_pdc_bypass_enabled
+            .load(Ordering::Relaxed)
+            && !self.shared.playing.load(Ordering::Relaxed);
+        self.start_recording_session(config)?;
+        self.shared
+            .record_pdc_bypass
+            .store(bypass_pdc, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn start_recording_session(
+        &self,
+        config: JsStartRecordingConfig,
+    ) -> Result<(), SphereAudioError> {
         let mut guard = self.recording.lock();
         if guard.is_some() {
             return Err(SphereAudioError::NativeError(
@@ -4189,6 +4232,7 @@ impl EngineInner {
         // stopped consuming input before a single sample of finalization work.
         session.recording_active.store(false, Ordering::Relaxed);
         self.shared.recording_active.store(false, Ordering::Relaxed);
+        let pdc_bypassed = self.shared.record_pdc_bypass.swap(false, Ordering::Relaxed);
         if recording_debug_enabled() {
             eprintln!(
                 "[recording] session finalizing after {:.3}s",
@@ -4239,6 +4283,7 @@ impl EngineInner {
                 armed_start_sample,
                 first_capture_sample,
                 live_tap,
+                pdc_bypassed,
                 #[cfg(all(target_os = "windows", feature = "asio"))]
                 asio_tap,
             },
@@ -4359,17 +4404,24 @@ impl EngineInner {
             else {
                 continue;
             };
-            let path_samples = runtime
-                .latency_graph
-                .max_path_latency_samples
-                .saturating_sub(
-                    runtime
-                        .latency_graph
-                        .track_pdc_delay
-                        .get(track_idx)
-                        .copied()
-                        .unwrap_or(0),
-                );
+            // Bypassed, nothing was held back behind the slowest path: the
+            // performer heard the mix as soon as the master inserts let it
+            // through, which is when the click sounded as well.
+            let path_samples = if placement.pdc_bypassed {
+                runtime.latency_graph.master_plugin_latency
+            } else {
+                runtime
+                    .latency_graph
+                    .max_path_latency_samples
+                    .saturating_sub(
+                        runtime
+                            .latency_graph
+                            .track_pdc_delay
+                            .get(track_idx)
+                            .copied()
+                            .unwrap_or(0),
+                    )
+            };
             let measured_round_trip = (result.latency_seconds * sample_rate).round() as u64;
             let round_trip = if measured_round_trip > 0 {
                 measured_round_trip
@@ -6645,6 +6697,7 @@ where
                         }
                     }
                 }
+                metronome.follow_record_pdc_bypass(&mut runtime, &shared, playing_local);
 
                 // ── 2. Read shared control state (Relaxed OK for audio) ──────
                 let master_vol = f32_load(shared.master_volume.load(Ordering::Relaxed));
@@ -7746,6 +7799,40 @@ mod bridge_insert_tests {
         assert_eq!(p.latency_graph.track_pdc_delay[0], 32);
         assert_eq!(p.latency_graph.track_pdc_delay[1], 0);
         assert!(!p.refresh_runtime_latency_graph(frames as u32));
+
+        // A take recording with compensation bypassed holds nothing back,
+        // keeps it off while playback runs on after the take, and puts it back
+        // once the transport stops.
+        let shared = SharedState::default();
+        let mut local = crate::backend::render::LocalAudioState::new(48_000.0);
+        shared.record_pdc_bypass.store(true, Ordering::Relaxed);
+        local.follow_record_pdc_bypass(&mut p, &shared, false);
+        assert!(!p.pdc_enabled);
+        assert_eq!(p.latency_graph.track_pdc_delay[0], 0);
+        assert_eq!(
+            crate::backend::render::metronome_compensation_delay_samples(&p),
+            0
+        );
+        // Bridge latency refreshes during the take keep it bypassed.
+        p.latency_graph.track_plugin_latency[1] = 0;
+        assert!(p.refresh_runtime_latency_graph(frames as u32));
+        assert_eq!(p.latency_graph.track_pdc_delay[0], 0);
+
+        shared.record_pdc_bypass.store(false, Ordering::Relaxed);
+        local.follow_record_pdc_bypass(&mut p, &shared, true);
+        assert!(!p.pdc_enabled, "compensation came back mid-play");
+        local.follow_record_pdc_bypass(&mut p, &shared, false);
+        assert!(p.pdc_enabled);
+        assert_eq!(p.latency_graph.track_pdc_delay[0], 32);
+
+        // A graph swapped in during the take was planned with compensation.
+        shared.record_pdc_bypass.store(true, Ordering::Relaxed);
+        local.follow_record_pdc_bypass(&mut p, &shared, true);
+        assert!(!p.pdc_enabled);
+        p.set_pdc_enabled_realtime(true);
+        local.follow_record_pdc_bypass(&mut p, &shared, true);
+        assert!(!p.pdc_enabled);
+        assert_eq!(p.latency_graph.track_pdc_delay[0], 0);
     }
 
     /// A bridged plugin whose reported latency moves while the graph stays put —
