@@ -278,6 +278,10 @@ pub const AUDIO_REPAIR_ICONS: [(&str, &str); 8] = [
     ),
 ];
 
+/// WhiteSharp's wordmark, for its editor's faceplate.
+pub const WHITESHARP_WORDMARK_PATH: &str = "plugins/whitesharp/wordmark.svg";
+pub const WHITESHARP_WORDMARK: &str = include_str!("../assets/whitesharp/wordmark.svg");
+
 /// Resolve an Audio Repair glyph by its virtual asset path.
 pub fn audio_repair_icon(path: &str) -> Option<&'static str> {
     AUDIO_REPAIR_ICONS

@@ -1,16 +1,20 @@
 //! The native editor window of a WhiteSharp insert.
 //!
-//! Two views, so the live displays can run every frame without rebuilding
+//! Three layers, so the live displays can run every frame without rebuilding
 //! the controls:
 //!
-//! * [`WhiteSharpEditor`] owns every edit — params, presets, A/B, the menus'
-//!   state — and renders the panel. Studio's window renders it `.cached()`,
-//!   so it rebuilds only when it is notified: on an edit.
-//! * [`WhiteSharpWindow`] is the window's root: the plug-in shell, the open
-//!   menu, and an overlay that paints the [`LiveDisplay`] — the correction
-//!   meter and the keyboard's sung and target notes — into the bounds the
-//!   panel recorded. It asks for a frame every frame while open, and that
-//!   redraw reaches only it and the overlay.
+//! * the **stage** — the plate, the pitch band and the dial — drawn by wgpu
+//!   ([`LiveDisplay::paint_stage`]) under everything;
+//! * [`WhiteSharpEditor`], which owns every edit — params, presets, A/B, the
+//!   dock and the preset menu — and renders the faceplate's controls over
+//!   the stage. The window renders it `.cached()`, so it rebuilds only when
+//!   it is notified: on an edit;
+//! * an overlay over both: the note in the ring, the band's note names, the
+//!   meters and the keyboard's lit note ([`LiveDisplay::paint_overlay`]).
+//!
+//! [`WhiteSharpWindow`] is the window's root: it asks for a frame every
+//! frame while open, and that redraw reaches only it and the live layers,
+//! which paint into the bounds the panel recorded.
 //!
 //! Every edit is a wire param sent with `forward_param` (folded into the
 //! state mirror, saved with the project, replayed into a restarted host),
@@ -29,29 +33,22 @@ use gpui::{
 use whitesharp::Params;
 
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
-use crate::components::context_menu::{context_menu_overlay, ContextMenuEntry};
 use crate::components::fx_model::KnobSpec;
 use crate::components::native_plugin_shell::{
     native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter,
 };
-use crate::components::white_sharp_meter::{paint_text, LiveDisplay};
+use crate::components::white_sharp_meter::{LiveBounds, LiveDisplay, LiveInputs};
 use crate::components::white_sharp_model::{
     matching_preset, preset_applied, presets, wire_diff, with,
 };
-use crate::components::white_sharp_panel::white_sharp_panel;
-use crate::theme::Colors;
+use crate::components::white_sharp_panel::{white_sharp_panel, DOCK_H, SHELL_CHROME_H};
+use crate::components::white_sharp_style::{ensure_fonts, PLATE_H, PLATE_W};
 
 /// How long a passing word ("Copied A to B") stays up.
 const NOTICE: Duration = Duration::from_millis(2_200);
-
-/// A menu the panel opened, at a window-space point.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Menu {
-    Preset(f32, f32),
-    Input(f32, f32),
-    Key(f32, f32),
-    Scale(f32, f32),
-}
+/// A press on the preset chip this soon after the menu closed is the one
+/// that closed it.
+const MENU_REOPEN_GUARD: Duration = Duration::from_millis(250);
 
 /// The A/B comparison: the snapshot not playing, and which letter plays.
 #[derive(Clone, Debug)]
@@ -67,6 +64,36 @@ pub(crate) enum NoteList {
     Bypassed,
 }
 
+/// The panel under the plate: one at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dock {
+    Keys,
+    Voice,
+    Vibrato,
+}
+
+/// Where the panel laid out what the live layers paint into.
+#[derive(Clone, Default)]
+pub(crate) struct LiveCells {
+    pub stage: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub orb: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub meter_in: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub meter_out: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub keyboard: Rc<Cell<Option<Bounds<Pixels>>>>,
+}
+
+impl LiveCells {
+    fn bounds(&self, keys_open: bool) -> LiveBounds {
+        LiveBounds {
+            stage: self.stage.get(),
+            orb: self.orb.get(),
+            meter_in: self.meter_in.get(),
+            meter_out: self.meter_out.get(),
+            keyboard: self.keyboard.get().filter(|_| keys_open),
+        }
+    }
+}
+
 pub struct WhiteSharpEditor {
     key: PluginInstanceKey,
     host_ops: BuiltinEditorHostOps,
@@ -74,13 +101,12 @@ pub struct WhiteSharpEditor {
     pub(crate) preset: Option<usize>,
     pub(crate) compare: Compare,
     notice: Option<(String, Instant)>,
-    pub(crate) menu: Option<Menu>,
+    pub(crate) preset_open: bool,
+    preset_closed_at: Option<Instant>,
+    pub(crate) dock: Option<Dock>,
     /// Which list a click on the keyboard puts a note on.
     pub(crate) key_edit: NoteList,
-    /// The meter's and the keyboard's bounds, recorded each time the panel
-    /// lays out; the window's overlay paints into them.
-    pub(crate) meter_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    pub(crate) keyboard_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub(crate) cells: LiveCells,
 }
 
 impl WhiteSharpEditor {
@@ -96,10 +122,11 @@ impl WhiteSharpEditor {
             params,
             preset: None,
             notice: None,
-            menu: None,
+            preset_open: false,
+            preset_closed_at: None,
+            dock: None,
             key_edit: NoteList::Removed,
-            meter_bounds: Rc::new(Cell::new(None)),
-            keyboard_bounds: Rc::new(Cell::new(None)),
+            cells: LiveCells::default(),
         };
         editor.sync_from_mirror(cx);
         editor.compare.other = editor.params.clone();
@@ -125,7 +152,7 @@ impl WhiteSharpEditor {
     ) {
         if key != self.key {
             self.key = key;
-            self.menu = None;
+            self.preset_open = false;
         }
         self.host_ops = host_ops;
         self.sync_from_mirror(cx);
@@ -199,9 +226,7 @@ impl WhiteSharpEditor {
         next.key = key.min(11);
         next.remove_mask = 0;
         next.bypass_mask = 0;
-        self.menu = None;
         self.set_params(next, cx);
-        cx.notify();
     }
 
     pub(crate) fn set_scale(&mut self, scale: whitesharp::Scale, cx: &mut Context<Self>) {
@@ -209,9 +234,7 @@ impl WhiteSharpEditor {
         next.scale = scale;
         next.remove_mask = 0;
         next.bypass_mask = 0;
-        self.menu = None;
         self.set_params(next, cx);
-        cx.notify();
     }
 
     fn show_notice(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -225,9 +248,9 @@ impl WhiteSharpEditor {
         .detach();
     }
 
-    /// The rate the insert's host runs at, for the latency readout; a
-    /// nominal 48 kHz where no host reports one (LiveStage, previews) —
-    /// the readout in milliseconds barely moves with the rate.
+    /// The rate the insert's host runs at, for the latency readout and the
+    /// trace's time scale; a nominal 48 kHz where no host reports one
+    /// (LiveStage, previews).
     pub(crate) fn sample_rate(&self) -> f32 {
         self.host_ops
             .host_status_source
@@ -247,23 +270,16 @@ impl WhiteSharpEditor {
 
     // ── Presets and A/B ─────────────────────────────────────────────────
 
-    pub(crate) fn load_preset(&mut self, index: isize, cx: &mut Context<Self>) {
+    pub(crate) fn load_preset(&mut self, index: usize, cx: &mut Context<Self>) {
         let bank = presets();
-        let wrapped = index.rem_euclid(bank.len() as isize) as usize;
-        let next = preset_applied(&self.params, &bank[wrapped].params);
-        self.menu = None;
-        self.set_params(next, cx);
-        self.preset = Some(wrapped);
-        cx.notify();
-    }
-
-    pub(crate) fn step_preset(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let from = match self.preset {
-            Some(index) => index as isize,
-            None if delta > 0 => -1,
-            None => 0,
+        let Some(preset) = bank.get(index) else {
+            return;
         };
-        self.load_preset(from + delta, cx);
+        let next = preset_applied(&self.params, &preset.params);
+        self.close_menu(cx);
+        self.set_params(next, cx);
+        self.preset = Some(index);
+        cx.notify();
     }
 
     pub(crate) fn preset_label(&self) -> String {
@@ -273,98 +289,44 @@ impl WhiteSharpEditor {
             .to_string()
     }
 
-    pub(crate) fn open_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
-        self.menu = Some(menu);
-        cx.notify();
-    }
-
-    fn close_menu(&mut self, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() {
+    pub(crate) fn toggle_menu(&mut self, cx: &mut Context<Self>) {
+        let just_closed = self
+            .preset_closed_at
+            .is_some_and(|at| at.elapsed() < MENU_REOPEN_GUARD);
+        if self.preset_open {
+            self.close_menu(cx);
+        } else if !just_closed {
+            self.preset_open = true;
             cx.notify();
         }
     }
 
-    fn menu_entries(&self) -> Vec<ContextMenuEntry> {
-        match self.menu {
-            Some(Menu::Preset(..)) => {
-                let mut entries = vec![ContextMenuEntry::Header("WhiteSharp presets".into())];
-                entries.extend(presets().iter().enumerate().map(|(index, preset)| {
-                    ContextMenuEntry::checked_item(
-                        preset.name,
-                        format!("preset:{index}"),
-                        self.preset == Some(index),
-                    )
-                }));
-                entries
-            }
-            Some(Menu::Input(..)) => {
-                let mut entries = vec![ContextMenuEntry::Header("Input type".into())];
-                entries.extend(whitesharp::InputType::ALL.iter().enumerate().map(
-                    |(index, input)| {
-                        ContextMenuEntry::checked_item(
-                            input.label(),
-                            format!("input:{index}"),
-                            self.params.input_type == *input,
-                        )
-                    },
-                ));
-                entries
-            }
-            Some(Menu::Key(..)) => {
-                let mut entries = vec![ContextMenuEntry::Header("Key".into())];
-                entries.extend(
-                    whitesharp::NOTE_NAMES
-                        .iter()
-                        .enumerate()
-                        .map(|(index, name)| {
-                            ContextMenuEntry::checked_item(
-                                *name,
-                                format!("key:{index}"),
-                                usize::from(self.params.key) == index,
-                            )
-                        }),
-                );
-                entries
-            }
-            Some(Menu::Scale(..)) => {
-                let mut entries = vec![ContextMenuEntry::Header("Scale".into())];
-                entries.extend(
-                    whitesharp::Scale::ALL
-                        .iter()
-                        .enumerate()
-                        .map(|(index, scale)| {
-                            ContextMenuEntry::checked_item(
-                                scale.label(),
-                                format!("scale:{index}"),
-                                self.params.scale == *scale,
-                            )
-                        }),
-                );
-                entries
-            }
-            None => Vec::new(),
+    pub(crate) fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.preset_open {
+            self.preset_open = false;
+            self.preset_closed_at = Some(Instant::now());
+            cx.notify();
         }
     }
 
-    fn run_menu_command(&mut self, command: &str, cx: &mut Context<Self>) {
-        self.menu = None;
-        let number = |prefix: &str| {
-            command
-                .strip_prefix(prefix)
-                .and_then(|index| index.parse::<usize>().ok())
+    /// Opens `dock` under the plate, or closes it when it is the open one.
+    /// The window grows by the dock's height rather than squeezing the
+    /// plate.
+    pub(crate) fn toggle_dock(&mut self, dock: Dock, window: &mut Window, cx: &mut Context<Self>) {
+        let was_open = self.dock.is_some();
+        self.dock = if self.dock == Some(dock) {
+            None
+        } else {
+            Some(dock)
         };
-        if let Some(index) = number("preset:") {
-            self.load_preset(index as isize, cx);
-        } else if let Some(index) = number("input:") {
-            if let Some(input) = whitesharp::InputType::ALL.get(index) {
-                self.set_value("inputType", input.to_wire(), cx);
-            }
-        } else if let Some(key) = number("key:") {
-            self.set_key(key as u8, cx);
-        } else if let Some(index) = number("scale:") {
-            if let Some(scale) = whitesharp::Scale::ALL.get(index) {
-                self.set_scale(*scale, cx);
-            }
+        let delta = match (was_open, self.dock.is_some()) {
+            (false, true) => DOCK_H,
+            (true, false) => -DOCK_H,
+            _ => 0.0,
+        };
+        if delta != 0.0 && !window.is_maximized() && !window.is_fullscreen() {
+            let viewport = window.viewport_size();
+            window.resize(size(viewport.width, viewport.height + px(delta)));
         }
         cx.notify();
     }
@@ -402,6 +364,17 @@ impl WhiteSharpEditor {
         }
     }
 
+    pub(crate) fn click_window_cb(
+        &self,
+        cx: &Context<Self>,
+        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |_event, window, app: &mut App| {
+            let _ = entity.update(app, |this, cx| action(this, window, cx));
+        }
+    }
+
     pub(crate) fn knob_cb(
         &self,
         cx: &Context<Self>,
@@ -413,11 +386,21 @@ impl WhiteSharpEditor {
             let _ = entity.update(app, |this, cx| this.set_value(knob.id, value, cx));
         }
     }
+
+    fn live_inputs(&self) -> LiveInputs {
+        LiveInputs {
+            key: self.params.key,
+            scale: self.params.scale,
+            allowed: self.params.allowed_notes(),
+            power: self.params.power,
+            sample_rate: self.sample_rate(),
+        }
+    }
 }
 
 impl Render for WhiteSharpEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        white_sharp_panel(self, cx)
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        white_sharp_panel(self, window, cx)
     }
 }
 
@@ -441,6 +424,7 @@ impl WhiteSharpWindow {
         on_close: Arc<dyn Fn(&mut Window, &mut App)>,
         cx: &mut Context<Self>,
     ) -> Self {
+        ensure_fonts(cx);
         let editor = cx.new(|cx| WhiteSharpEditor::new(key.clone(), host_ops.clone(), cx));
         let live = Rc::new(RefCell::new(LiveDisplay::default()));
         let window = Self {
@@ -459,9 +443,11 @@ impl WhiteSharpWindow {
     }
 
     fn bind_live(&self) {
-        self.live
-            .borrow_mut()
-            .bind(self.key.clone(), self.host_ops.pad_level_source.clone());
+        self.live.borrow_mut().bind(
+            self.key.clone(),
+            self.host_ops.pad_level_source.clone(),
+            self.host_ops.meter_source.clone(),
+        );
     }
 
     pub fn key(&self) -> &PluginInstanceKey {
@@ -483,8 +469,16 @@ impl WhiteSharpWindow {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        if event.keystroke.key == "escape" {
-            self.editor.update(cx, |editor, cx| editor.close_menu(cx));
+        let keystroke = &event.keystroke;
+        let plain = !keystroke.modifiers.control
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.platform;
+        match keystroke.key.as_str() {
+            "escape" => self.editor.update(cx, |editor, cx| editor.close_menu(cx)),
+            "b" if plain && !event.is_held => self
+                .editor
+                .update(cx, |editor, cx| editor.toggle("power", cx)),
+            _ => {}
         }
     }
 }
@@ -513,69 +507,58 @@ impl Render for WhiteSharpWindow {
             self.focused_once = true;
             self.focus_handle.focus(window, cx);
         }
-        // The meter follows the voice: a frame every frame, which reaches
-        // this view and the overlay, not the cached panel.
+        // The stage and the meters follow the voice: a frame every frame,
+        // which reaches this view and the live layers, not the cached panel.
         window.request_animation_frame();
         self.meter
             .poll(self.host_ops.meter_source.as_ref(), &self.key);
 
-        let (meter_bounds, keyboard_bounds, menu, entries) = {
+        let (inputs, cells, keys_open) = {
             let editor = self.editor.read(cx);
             (
-                editor.meter_bounds.clone(),
-                editor.keyboard_bounds.clone(),
-                editor.menu,
-                editor.menu_entries(),
+                editor.live_inputs(),
+                editor.cells.clone(),
+                editor.dock == Some(Dock::Keys),
             )
         };
-        let live = self.live.clone();
+        let stage_live = self.live.clone();
+        let stage_cells = cells.clone();
+        let stage = canvas(
+            |_, _, _| (),
+            move |_, _, window, cx| {
+                let bounds = stage_cells.bounds(keys_open);
+                stage_live
+                    .borrow_mut()
+                    .paint_stage(&inputs, &bounds, window, cx);
+            },
+        )
+        .absolute()
+        .size_full();
+        let overlay_live = self.live.clone();
         let overlay = canvas(
             |_, _, _| (),
             move |_, _, window, cx| {
-                let (meter, keyboard) = (meter_bounds.get(), keyboard_bounds.get());
-                let mut live = live.borrow_mut();
-                live.paint(meter, keyboard, window, cx);
-                // What is sung against its note, over the meter's middle.
-                if let (Some(bounds), Some(text)) = (meter, live.readout()) {
-                    let origin =
-                        bounds.origin + gpui::point(bounds.size.width * 0.5 - px(64.0), px(-22.0));
-                    paint_text(window, cx, &text, Colors::text_primary().into(), origin);
-                }
+                let bounds = cells.bounds(keys_open);
+                overlay_live
+                    .borrow()
+                    .paint_overlay(&inputs, &bounds, window, cx);
             },
         )
         .absolute()
         .size_full();
 
-        let menu = menu.map(|menu| {
-            let (x, y) = match menu {
-                Menu::Preset(x, y) | Menu::Input(x, y) | Menu::Key(x, y) | Menu::Scale(x, y) => {
-                    (x, y)
-                }
-            };
-            let viewport = window.viewport_size();
-            let command_target = self.editor.clone();
-            let close_target = self.editor.clone();
-            context_menu_overlay(
-                entries,
-                x,
-                y,
-                viewport.width.into(),
-                viewport.height.into(),
-                Arc::new(move |command: &String, _window, cx| {
-                    let command = command.clone();
-                    let _ =
-                        command_target.update(cx, |this, cx| this.run_menu_command(&command, cx));
-                }),
-                Arc::new(move |_: &(), _window, cx| {
-                    let _ = close_target.update(cx, |this, cx| this.close_menu(cx));
-                }),
-            )
-        });
-
-        let on_close = self.on_close.clone();
-        let content = AnyView::from(self.editor.clone())
+        let panel = AnyView::from(self.editor.clone())
             .cached(gpui::StyleRefinement::default().size_full())
             .into_any_element();
+        let content = div()
+            .relative()
+            .size_full()
+            .child(stage)
+            .child(panel)
+            .child(overlay)
+            .into_any_element();
+
+        let on_close = self.on_close.clone();
         div()
             .relative()
             .size_full()
@@ -593,14 +576,13 @@ impl Render for WhiteSharpWindow {
                 },
                 content,
             ))
-            .child(overlay)
-            .children(menu)
     }
 }
 
-pub const WHITESHARP_WINDOW_SIZE: (f32, f32) = (1_000.0, 820.0);
-const MIN_WIDTH: f32 = 900.0;
-const MIN_HEIGHT: f32 = 800.0;
+/// The plate at its design size, under the shell's title bar and strip.
+pub const WHITESHARP_WINDOW_SIZE: (f32, f32) = (PLATE_W, PLATE_H + SHELL_CHROME_H);
+const MIN_WIDTH: f32 = 720.0;
+const MIN_HEIGHT: f32 = 450.0 + SHELL_CHROME_H;
 
 /// Opens with a track's WhiteSharp insert.
 pub fn open_whitesharp_editor(

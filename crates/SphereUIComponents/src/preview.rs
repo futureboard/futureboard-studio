@@ -30,7 +30,8 @@ use crate::components::gate_panel::WayGateModel;
 use crate::components::mix_station_panel::MixStationModel;
 use crate::components::native_plugin_shell::ShellIdentity;
 use crate::components::plugin_kit::{KitModel, KitWindow};
-use crate::components::white_sharp_window::{WhiteSharpWindow, WHITESHARP_WINDOW_SIZE};
+use crate::components::white_sharp_panel::DOCK_H as WHITESHARP_DOCK_H;
+use crate::components::white_sharp_window::{Dock, WhiteSharpWindow, WHITESHARP_WINDOW_SIZE};
 
 /// One view to render.
 pub struct Scene {
@@ -194,8 +195,20 @@ pub fn scenes() -> Vec<Scene> {
         Scene {
             name: "whitesharp-live",
             width: WHITESHARP_WINDOW_SIZE.0,
-            height: WHITESHARP_WINDOW_SIZE.1,
+            height: WHITESHARP_WINDOW_SIZE.1 + WHITESHARP_DOCK_H,
             open: whitesharp_live_scene,
+        },
+        Scene {
+            name: "whitesharp-keys",
+            width: WHITESHARP_WINDOW_SIZE.0,
+            height: WHITESHARP_WINDOW_SIZE.1 + WHITESHARP_DOCK_H,
+            open: whitesharp_keys_scene,
+        },
+        Scene {
+            name: "whitesharp-vibrato",
+            width: WHITESHARP_WINDOW_SIZE.0,
+            height: WHITESHARP_WINDOW_SIZE.1 + WHITESHARP_DOCK_H,
+            open: whitesharp_vibrato_scene,
         },
         Scene {
             name: "fa2a",
@@ -434,19 +447,55 @@ fn open_eq(
 // ── WhiteSharp ─────────────────────────────────────────────────────────────
 
 fn whitesharp_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    whitesharp_window(options, cx, whitesharp::LatencyMode::Quality)
+    whitesharp_window(
+        options,
+        cx,
+        "whitesharp",
+        whitesharp::LatencyMode::Quality,
+        None,
+    )
 }
 
-/// The same insert on the live path: no added delay, formant controls
-/// unavailable.
+/// The same insert on the live path, with the Voice dock open: no added
+/// delay, formant controls unavailable.
 fn whitesharp_live_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    whitesharp_window(options, cx, whitesharp::LatencyMode::Live)
+    whitesharp_window(
+        options,
+        cx,
+        "whitesharp-live",
+        whitesharp::LatencyMode::Live,
+        Some(Dock::Voice),
+    )
 }
 
+fn whitesharp_keys_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    whitesharp_window(
+        options,
+        cx,
+        "whitesharp-keys",
+        whitesharp::LatencyMode::Quality,
+        Some(Dock::Keys),
+    )
+}
+
+fn whitesharp_vibrato_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    whitesharp_window(
+        options,
+        cx,
+        "whitesharp-vibrato",
+        whitesharp::LatencyMode::Quality,
+        Some(Dock::Vibrato),
+    )
+}
+
+/// `insert` is the scene's own: the state mirror keeps the first state
+/// seeded for an insert.
 fn whitesharp_window(
     options: WindowOptions,
     cx: &mut App,
+    insert: &'static str,
     latency: whitesharp::LatencyMode,
+    dock: Option<Dock>,
 ) -> Result<AnyWindowHandle> {
     let mut params = whitesharp::default_params();
     params.latency = latency;
@@ -459,12 +508,12 @@ fn whitesharp_window(
     params.remove_mask = 1 << 4; // E
     params.vibrato_shape = whitesharp::VibratoShape::Sine;
     if let Ok(json) = whitesharp::ipc::WhiteSharpState::new(params).to_json() {
-        seed("whitesharp", "whitesharp", json);
+        seed("whitesharp", insert, json);
     }
     let handle = cx.open_window(options, move |_, cx| {
         cx.new(|cx| {
             let window = WhiteSharpWindow::new(
-                key("whitesharp"),
+                key(insert),
                 identity("WhiteSharp"),
                 preview_host_ops(),
                 no_close(),
@@ -480,6 +529,7 @@ fn whitesharp_window(
                     output: Some(69.0),
                     target: Some(69),
                 });
+            window.editor().update(cx, |editor, _| editor.dock = dock);
             window
         })
     })?;

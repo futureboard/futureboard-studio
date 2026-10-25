@@ -67,6 +67,9 @@ impl AssetSource for EmbeddedAssets {
         if let Some(svg) = assets::audio_repair_icon(path) {
             return Ok(Some(Cow::Borrowed(svg.as_bytes())));
         }
+        if path == assets::WHITESHARP_WORDMARK_PATH {
+            return Ok(Some(Cow::Borrowed(assets::WHITESHARP_WORDMARK.as_bytes())));
+        }
         let bytes = match path {
             assets::ICON_PLAY_PATH => Some(assets::icons::PLAY.as_bytes()),
             assets::ICON_LAYERS_PATH => Some(assets::icons::LAYERS.as_bytes()),
@@ -245,6 +248,7 @@ impl AssetSource for EmbeddedAssets {
             assets::ICON_PLUGIN_CLAP_PATH,
             assets::ICON_PLUGIN_VST3_PATH,
             assets::TIMELINE_SCROLL_PATH,
+            assets::WHITESHARP_WORDMARK_PATH,
         ];
         let mut list = Vec::new();
         for p in all_paths

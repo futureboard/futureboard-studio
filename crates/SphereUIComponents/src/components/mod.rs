@@ -172,6 +172,10 @@ pub mod white_sharp_model;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod white_sharp_panel;
 #[cfg(feature = "builtin-plugin-editor")]
+pub mod white_sharp_stage;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod white_sharp_style;
+#[cfg(feature = "builtin-plugin-editor")]
 pub mod white_sharp_window;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod wrap_synth_panel;
