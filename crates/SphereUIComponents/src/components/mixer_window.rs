@@ -135,6 +135,10 @@ pub struct MixerContextMenu {
 pub struct MixerWindow {
     body: Entity<MixerWindowBody>,
     meter_overlay: Entity<MixerMeterOverlay>,
+    /// The overlay reads the Studio while it paints. `open_window` draws the
+    /// window once synchronously, from inside the Studio's own update, so the
+    /// overlay joins only once the Studio has sent a meter tick.
+    meters_live: bool,
     context_menu: Option<MixerContextMenu>,
     tree_sidebar: Entity<MixerTreeSidebar>,
     /// Runs a context-menu command back in the Studio, which owns the state
@@ -192,6 +196,7 @@ impl MixerWindow {
         Self {
             body,
             meter_overlay,
+            meters_live: false,
             context_menu,
             tree_sidebar,
             on_menu_command,
@@ -217,6 +222,10 @@ impl MixerWindow {
 
     /// A meter tick: repaint the levels, not the strips.
     pub fn notify_meters(&mut self, cx: &mut Context<Self>) {
+        if !self.meters_live {
+            self.meters_live = true;
+            cx.notify();
+        }
         self.meter_overlay.update(cx, |_, cx| cx.notify());
     }
 }
@@ -355,7 +364,9 @@ impl Render for MixerWindow {
                         .w_full(),
                 ),
             )
-            .child(self.meter_overlay.clone())
+            .when(self.meters_live, |root| {
+                root.child(self.meter_overlay.clone())
+            })
             // The menu this window's own controls opened. Drawn here so it
             // lands where the pointer is, over the strip that opened it.
             .children(context_menu.map(|menu| {

@@ -3041,6 +3041,7 @@ impl StudioLayout {
             cx,
         ) {
             Ok(handle) => {
+                let _ = handle.update(cx, |mixer, _window, cx| mixer.notify_meters(cx));
                 self.external_windows.mixer = Some(handle);
                 // Removing the docked mixer changes the arrangement's client
                 // rectangle. Refresh the timeline's own reserved-chrome
