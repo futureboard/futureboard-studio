@@ -763,27 +763,20 @@ impl StudioLayout {
                 if crate::shutdown::ShutdownState::global().is_shutting_down() {
                     break;
                 }
-                let Ok((changed, mixer_handle, active, midi_recording)) =
-                    this.update(cx, |this, cx| {
-                        if crate::shutdown::ShutdownState::global().is_shutting_down() {
-                            return (false, None, false, false);
-                        }
-                        let changed = this.poll_native_audio(cx);
-                        let active = this
-                            .audio_bridge
-                            .stats
-                            .as_ref()
-                            .map(|stats| stats.transport_playing)
-                            .unwrap_or(false);
-                        let midi_recording = this.recording.midi.is_some();
-                        (
-                            changed,
-                            this.external_windows.mixer.clone(),
-                            active,
-                            midi_recording,
-                        )
-                    })
-                else {
+                let Ok((changed, active, midi_recording)) = this.update(cx, |this, cx| {
+                    if crate::shutdown::ShutdownState::global().is_shutting_down() {
+                        return (false, false, false);
+                    }
+                    let changed = this.poll_native_audio(cx);
+                    let active = this
+                        .audio_bridge
+                        .stats
+                        .as_ref()
+                        .map(|stats| stats.transport_playing)
+                        .unwrap_or(false);
+                    let midi_recording = this.recording.midi.is_some();
+                    (changed, active, midi_recording)
+                }) else {
                     continue;
                 };
                 transport_active = active;
@@ -792,11 +785,6 @@ impl StudioLayout {
                     crate::perf::record_notify("transport");
                     let studio_id = this.entity_id();
                     let _ = cx.update(|app| app.notify(studio_id));
-                    if mixer_handle.is_some() {
-                        let _ = this.update(cx, |layout, cx| {
-                            layout.push_mixer_meter_snapshot_throttled(cx);
-                        });
-                    }
                 }
                 let _ = this.update(cx, |layout, cx| {
                     layout.push_video_player_snapshot_to_window(cx);

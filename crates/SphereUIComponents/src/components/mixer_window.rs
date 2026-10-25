@@ -7,20 +7,23 @@ use std::{collections::HashSet, sync::Arc};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    div, px, size, App, AppContext, Bounds, Context, Entity, FocusHandle, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Point, Render, Styled, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    div, px, size, AnyView, App, AppContext, Bounds, Context, Entity, FocusHandle,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Point, Render, StyleRefinement,
+    Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
 };
 
+use crate::components::mixer_meter_layer::{MixerMeterOverlay, SharedMeterLayout};
 use crate::components::mixer_panel::{
     clamp_mixer_section_height_px, mixer_panel, MixerCallbacks, MixerSplit, MixerSplitAction,
     MixerSplitTarget, VstiOutputMeterState,
 };
 use crate::components::mixer_tree_sidebar::MIXER_TREE_COLLAPSED_RAIL_WIDTH;
 use crate::components::mixer_tree_sidebar_view::MixerTreeSidebar;
+use crate::components::timeline::timeline::Timeline;
 use crate::components::timeline::timeline_state::{MasterBusState, MonitorBusState, TrackState};
 use crate::components::title_bar::{external_window_titlebar, TITLEBAR_HEIGHT};
 use crate::i18n::I18n;
+use crate::layout::StudioLayout;
 use crate::theme::Colors;
 
 pub const MIXER_WINDOW_WIDTH: f32 = 1180.0;
@@ -121,10 +124,19 @@ pub struct MixerContextMenu {
     pub entries: Vec<crate::components::context_menu::ContextMenuEntry>,
 }
 
+/// The window's root: chrome, focus, the context menu, and the meter overlay
+/// beside the cached strips.
+///
+/// Levels move at the display refresh while anything is audible; the strips
+/// change when the user does something. The strips live in a cached
+/// [`MixerWindowBody`] that rebuilds only when a new snapshot arrives, and
+/// [`MixerMeterOverlay`] paints the levels into the slots they leave — the
+/// same split the docked mixer uses.
 pub struct MixerWindow {
-    snapshot: MixerSnapshot,
+    body: Entity<MixerWindowBody>,
+    meter_overlay: Entity<MixerMeterOverlay>,
+    context_menu: Option<MixerContextMenu>,
     tree_sidebar: Entity<MixerTreeSidebar>,
-    callbacks: MixerCallbacks,
     /// Runs a context-menu command back in the Studio, which owns the state
     /// every entry acts on.
     on_menu_command: Arc<dyn Fn(&str, &mut Window, &mut App) + Send + Sync>,
@@ -132,10 +144,18 @@ pub struct MixerWindow {
     /// menu, it does not own whether one is open.
     on_menu_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
     on_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
-    on_mixer_scroll: Arc<dyn Fn(f32, &mut Window, &mut App) + Send + Sync>,
-    on_mixer_split: Arc<dyn Fn(MixerSplitAction, &mut Window, &mut App) + Send + Sync>,
     dispatch_key: Arc<dyn Fn(&KeyDownEvent, &mut App) -> bool + Send + Sync>,
     focus_handle: FocusHandle,
+}
+
+/// The strips, rebuilt only when the Studio pushes a new snapshot.
+pub struct MixerWindowBody {
+    snapshot: MixerSnapshot,
+    tree_sidebar: Entity<MixerTreeSidebar>,
+    callbacks: MixerCallbacks,
+    on_mixer_scroll: Arc<dyn Fn(f32, &mut Window, &mut App) + Send + Sync>,
+    on_mixer_split: Arc<dyn Fn(MixerSplitAction, &mut Window, &mut App) + Send + Sync>,
+    meter_layout: SharedMeterLayout,
 }
 
 impl MixerWindow {
@@ -149,32 +169,124 @@ impl MixerWindow {
         on_mixer_scroll: Arc<dyn Fn(f32, &mut Window, &mut App) + Send + Sync>,
         on_mixer_split: Arc<dyn Fn(MixerSplitAction, &mut Window, &mut App) + Send + Sync>,
         dispatch_key: Arc<dyn Fn(&KeyDownEvent, &mut App) -> bool + Send + Sync>,
+        meter_owner: Entity<StudioLayout>,
+        meter_timeline: Entity<Timeline>,
         cx: &mut Context<Self>,
     ) -> Self {
         external_mixer_debug(&format!(
             "external mixer window created tracks={}",
             snapshot.tracks.len()
         ));
-        Self {
+        let meter_layout = SharedMeterLayout::default();
+        let meter_overlay =
+            cx.new(|_| MixerMeterOverlay::new(meter_owner, meter_timeline, meter_layout.clone()));
+        let context_menu = snapshot.context_menu.clone();
+        let body = cx.new(|_| MixerWindowBody {
             snapshot,
-            tree_sidebar,
+            tree_sidebar: tree_sidebar.clone(),
             callbacks,
+            on_mixer_scroll,
+            on_mixer_split,
+            meter_layout,
+        });
+        Self {
+            body,
+            meter_overlay,
+            context_menu,
+            tree_sidebar,
             on_menu_command,
             on_menu_close,
             on_close,
-            on_mixer_scroll,
-            on_mixer_split,
             dispatch_key,
             focus_handle: cx.focus_handle(),
         }
     }
 
-    pub fn set_snapshot(&mut self, snapshot: MixerSnapshot) {
+    pub fn set_snapshot(&mut self, snapshot: MixerSnapshot, cx: &mut Context<Self>) {
         external_mixer_debug(&format!(
             "external mixer snapshot updated tracks={}",
             snapshot.tracks.len()
         ));
-        self.snapshot = snapshot;
+        self.context_menu = snapshot.context_menu.clone();
+        self.body.update(cx, |body, cx| {
+            body.snapshot = snapshot;
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// A meter tick: repaint the levels, not the strips.
+    pub fn notify_meters(&mut self, cx: &mut Context<Self>) {
+        self.meter_overlay.update(cx, |_, cx| cx.notify());
+    }
+}
+
+impl Render for MixerWindowBody {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _scope = crate::perf::PerfScope::enter("MixerWindowBody");
+        // The strips record their meter slots again as they lay out; a strip
+        // gone from view must not leave its old one.
+        self.meter_layout.borrow_mut().clear();
+        let viewport_width: f32 = window.bounds().size.width.into();
+        let viewport_height: f32 = window.bounds().size.height.into();
+        let snapshot = &self.snapshot;
+        let tree_width = if snapshot.tree_sidebar_enabled {
+            if snapshot.tree_sidebar_collapsed {
+                MIXER_TREE_COLLAPSED_RAIL_WIDTH
+            } else {
+                crate::components::mixer_tree_sidebar::clamp_mixer_tree_sidebar_width(
+                    snapshot.tree_sidebar_width_px,
+                )
+            }
+        } else {
+            0.0
+        };
+        let mixer_viewport_width = (viewport_width - tree_width - 90.0).max(100.0);
+        let mixer_viewport_height = (viewport_height - mixer_window_chrome_height()).max(0.0);
+        let mixer_split = MixerSplit {
+            insert_px: clamp_mixer_section_height_px(snapshot.mixer_insert_section_px),
+            send_px: clamp_mixer_section_height_px(snapshot.mixer_send_section_px),
+            active_target: snapshot.mixer_split_active_target,
+            on_action: self.on_mixer_split.clone(),
+        };
+        let i18n = I18n::from_app(cx);
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h_0()
+            .bg(Colors::bottom_panel_bg())
+            .child(mixer_panel(
+                &snapshot.tracks,
+                &snapshot.master,
+                &snapshot.monitor,
+                snapshot.selected_track_id.as_deref(),
+                &snapshot.selected_track_ids,
+                self.callbacks.clone(),
+                &snapshot.collapsed_vsti_output_groups,
+                &snapshot.hidden_mixer_channels,
+                &snapshot.vsti_output_meters,
+                snapshot.mixer_scroll_x,
+                mixer_viewport_width,
+                mixer_viewport_height,
+                self.on_mixer_scroll.clone(),
+                mixer_split,
+                Some(self.tree_sidebar.clone()),
+                snapshot.tree_sidebar_enabled,
+                Some(&self.meter_layout),
+                i18n,
+            ))
+    }
+}
+
+/// With the platform's frame the caption and the menu bar are outside the
+/// client area.
+fn mixer_window_chrome_height() -> f32 {
+    if crate::platform_chrome::native_tool_window_frame() {
+        0.0
+    } else {
+        TITLEBAR_HEIGHT + MIXER_MENU_BAR_HEIGHT
     }
 }
 
@@ -189,61 +301,16 @@ impl Render for MixerWindow {
         }
         let viewport_width: f32 = window.bounds().size.width.into();
         let viewport_height: f32 = window.bounds().size.height.into();
-        let MixerSnapshot {
-            tracks,
-            master,
-            monitor,
-            selected_track_id,
-            selected_track_ids,
-            mixer_scroll_x,
-            mixer_insert_section_px,
-            mixer_send_section_px,
-            mixer_split_active_target,
-            collapsed_vsti_output_groups,
-            hidden_mixer_channels,
-            vsti_output_meters,
-            tree_sidebar_enabled,
-            tree_sidebar_collapsed,
-            tree_sidebar_width_px,
-            context_menu,
-        } = self.snapshot.clone();
-        let mixer_callbacks = self.callbacks.clone();
-        let on_mixer_scroll = self.on_mixer_scroll.clone();
-        let on_mixer_split = self.on_mixer_split.clone();
+        let context_menu = self.context_menu.clone();
         let on_close = self.on_close.clone();
         let dispatch_key = self.dispatch_key.clone();
         let shortcut_focus = self.focus_handle.clone();
         let focus_on_pointer = self.focus_handle.clone();
-        let tree_width = if tree_sidebar_enabled {
-            if tree_sidebar_collapsed {
-                MIXER_TREE_COLLAPSED_RAIL_WIDTH
-            } else {
-                crate::components::mixer_tree_sidebar::clamp_mixer_tree_sidebar_width(
-                    tree_sidebar_width_px,
-                )
-            }
-        } else {
-            0.0
-        };
-        let mixer_viewport_width = (viewport_width - tree_width - 90.0).max(100.0);
-        // With the platform's frame the caption and the menu bar are outside
-        // the client area.
         let native_frame = crate::platform_chrome::native_tool_window_frame();
-        let chrome_height = if native_frame {
-            0.0
-        } else {
-            TITLEBAR_HEIGHT + MIXER_MENU_BAR_HEIGHT
-        };
-        let mixer_viewport_height = (viewport_height - chrome_height).max(0.0);
-        let mixer_split = MixerSplit {
-            insert_px: clamp_mixer_section_height_px(mixer_insert_section_px),
-            send_px: clamp_mixer_section_height_px(mixer_send_section_px),
-            active_target: mixer_split_active_target,
-            on_action: on_mixer_split,
-        };
         let i18n = I18n::from_app(cx);
 
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -279,32 +346,16 @@ impl Render for MixerWindow {
                 .child(mixer_menu_bar(i18n))
             })
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .bg(Colors::bottom_panel_bg())
-                    .child(mixer_panel(
-                        &tracks,
-                        &master,
-                        &monitor,
-                        selected_track_id.as_deref(),
-                        &selected_track_ids,
-                        mixer_callbacks,
-                        &collapsed_vsti_output_groups,
-                        &hidden_mixer_channels,
-                        &vsti_output_meters,
-                        mixer_scroll_x,
-                        mixer_viewport_width,
-                        mixer_viewport_height,
-                        on_mixer_scroll,
-                        mixer_split,
-                        Some(self.tree_sidebar.clone()),
-                        tree_sidebar_enabled,
-                        i18n,
-                    )),
+                AnyView::from(self.body.clone()).cached(
+                    StyleRefinement::default()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full(),
+                ),
             )
+            .child(self.meter_overlay.clone())
             // The menu this window's own controls opened. Drawn here so it
             // lands where the pointer is, over the strip that opened it.
             .children(context_menu.map(|menu| {
@@ -338,6 +389,8 @@ pub fn open_mixer_window(
     dispatch_key: Arc<dyn Fn(&KeyDownEvent, &mut App) -> bool + Send + Sync>,
     on_menu_command: Arc<dyn Fn(&str, &mut Window, &mut App) + Send + Sync>,
     on_menu_close: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
+    meter_owner: Entity<StudioLayout>,
+    meter_timeline: Entity<Timeline>,
     cx: &mut App,
 ) -> Result<WindowHandle<MixerWindow>, String> {
     external_mixer_debug(&format!(
@@ -393,6 +446,8 @@ pub fn open_mixer_window(
                 on_mixer_scroll,
                 on_mixer_split,
                 dispatch_key,
+                meter_owner,
+                meter_timeline,
                 cx,
             )
         })

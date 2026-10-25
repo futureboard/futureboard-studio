@@ -3298,6 +3298,7 @@ pub fn mixer_panel(
     split: MixerSplit,
     tree_sidebar: Option<Entity<MixerTreeSidebar>>,
     tree_sidebar_enabled: bool,
+    meter_layer: Option<&SharedMeterLayout>,
     i18n: I18n,
 ) -> impl IntoElement {
     let _shell = crate::perf::PerfScope::enter("MixerShell");
@@ -3349,7 +3350,7 @@ pub fn mixer_panel(
                 &callbacks,
                 &split,
                 strip_available_px,
-                None,
+                meter_layer,
                 i18n,
             ));
 
@@ -3363,7 +3364,8 @@ pub fn mixer_panel(
             channel_row
         };
 
-        let content_row = mixer_body_scroller(content_row, body_scrolls);
+        let content_row =
+            mixer_meter_body(mixer_body_scroller(content_row, body_scrolls), meter_layer);
         let split_for_move = split.clone();
         let split_for_end = split.clone();
         return div()
@@ -3408,7 +3410,7 @@ pub fn mixer_panel(
         &split,
         on_scroll,
         gpu_active,
-        None,
+        meter_layer,
         i18n,
     );
 
@@ -3419,7 +3421,7 @@ pub fn mixer_panel(
         &callbacks,
         &split,
         strip_available_px,
-        None,
+        meter_layer,
         i18n,
     );
 
@@ -3479,7 +3481,7 @@ pub fn mixer_panel(
     } else {
         channel_row
     };
-    let content_row = mixer_body_scroller(content_row, body_scrolls);
+    let content_row = mixer_meter_body(mixer_body_scroller(content_row, body_scrolls), meter_layer);
 
     let split_for_move = split.clone();
     let split_for_end = split.clone();
@@ -3524,6 +3526,28 @@ fn mixer_body_scroller(body: gpui::Div, scrolls: bool) -> gpui::AnyElement {
         .id("mixer-body-scroll")
         .overflow_y_scroll()
         .child(body)
+        .into_any_element()
+}
+
+/// The region a meter layer may paint in: the body as far as it is on screen.
+/// It sits beside the vertical scroller, not in it, so a scrolled body never
+/// lets a meter paint over the header.
+fn mixer_meter_body(
+    body: gpui::AnyElement,
+    meter_layer: Option<&SharedMeterLayout>,
+) -> gpui::AnyElement {
+    let Some(layer) = meter_layer else {
+        return body;
+    };
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .min_h_0()
+        .child(body)
+        .child(clip_region(layer, ClipRegion::Body))
         .into_any_element()
 }
 

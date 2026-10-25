@@ -802,6 +802,10 @@ pub struct StudioLayout {
     /// immediately via [`Self::push_mixer_snapshot_to_window`] and are never
     /// throttled. See [`Self::push_mixer_meter_snapshot_throttled`].
     last_external_mixer_meter_push: std::time::Instant,
+    /// What a playing project last moved on the detached mixer's strips
+    /// (automated faders). Levels are its meter overlay's; a meter tick pushes
+    /// a new snapshot only when this changes.
+    last_external_mixer_display_sig: u64,
     /// The timeline's `track_names_revision` the name-copying surfaces were
     /// last refreshed for. See [`Self::sync_track_name_surfaces`].
     track_names_revision_seen: u64,
@@ -1494,6 +1498,7 @@ impl StudioLayout {
             project_saves: project_ops::ProjectSaveState::default(),
             session_generation: 0,
             last_external_mixer_meter_push: std::time::Instant::now(),
+            last_external_mixer_display_sig: u64::MAX,
             track_names_revision_seen: 0,
             created_track_stamp_seen: None,
             selected_track_seen: None,

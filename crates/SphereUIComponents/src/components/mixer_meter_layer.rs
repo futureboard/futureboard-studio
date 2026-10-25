@@ -200,8 +200,9 @@ pub(crate) fn clip_region(layout: &SharedMeterLayout, region: ClipRegion) -> imp
     .size_full()
 }
 
-/// Paints the recorded meters with the current levels. Rendered by the
-/// studio root over the whole window while the docked mixer is showing.
+/// Paints the recorded meters with the current levels. Rendered over the whole
+/// window, beside the strips' cached view: by the studio root while the docked
+/// mixer is showing, and by the detached Mixer window's root for its own.
 pub struct MixerMeterOverlay {
     owner: Entity<StudioLayout>,
     timeline: Entity<Timeline>,
@@ -233,94 +234,100 @@ struct MeterLevels {
 }
 
 impl Render for MixerMeterOverlay {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let _scope = crate::perf::PerfScope::enter("MixerMeterOverlay");
-        // Resolve the levels here, where the entities can be read; the canvas
-        // only paints.
-        let (strip_clip, body_clip, meters) = {
-            let layout = self.layout.borrow();
-            let state = &self.timeline.read(cx).state;
-            let vsti_meters = self
-                .owner
-                .read(cx)
-                .docked_mixer_panel_state(cx)
-                .vsti_output_meters;
-            let meters: Vec<(SlotKind, bool, Bounds<Pixels>, MeterLevels)> = layout
-                .slots
-                .iter()
-                .map(|((kind, _), (source, bounds))| {
-                    let levels = match source {
-                        MeterSource::Track { id, index, vsti } => {
-                            let track = state
-                                .tracks
-                                .get(*index)
-                                .filter(|track| &track.id == id)
-                                .or_else(|| state.tracks.iter().find(|track| &track.id == id));
-                            let mut levels = track
-                                .map(|track| MeterLevels {
-                                    level_l: track.meter_level_l,
-                                    level_r: track.meter_level_r,
-                                    hold_l: track.meter_peak_hold_l,
-                                    hold_r: track.meter_peak_hold_r,
-                                    clip: track.meter_clip,
-                                })
-                                .unwrap_or_default();
-                            if let Some(vsti) = vsti.as_ref() {
-                                apply_vsti_fallback(&mut levels, vsti, vsti_meters);
-                            }
-                            levels
-                        }
-                        MeterSource::Master => MeterLevels {
-                            level_l: state.master.meter_level_l,
-                            level_r: state.master.meter_level_r,
-                            hold_l: state.master.meter_peak_hold_l,
-                            hold_r: state.master.meter_peak_hold_r,
-                            clip: state.master.meter_clip,
-                        },
-                        MeterSource::Monitor => MeterLevels {
-                            level_l: state.monitor.meter_level_l,
-                            level_r: state.monitor.meter_level_r,
-                            hold_l: state.monitor.meter_peak_hold_l,
-                            hold_r: state.monitor.meter_peak_hold_r,
-                            clip: state.monitor.meter_clip,
-                        },
-                    };
-                    (*kind, source.is_pinned(), *bounds, levels)
-                })
-                .collect();
-            (layout.strip_clip, layout.body_clip, meters)
-        };
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let owner = self.owner.clone();
+        let timeline = self.timeline.clone();
+        let layout = self.layout.clone();
+        // Levels and slots are resolved at paint, after the strips beside this
+        // overlay have recorded where their meters went in this same frame.
         canvas(
             |_bounds, _window, _cx| (),
             move |_bounds, _state, window, cx| {
-                let Some(body) = body_clip else {
-                    return;
-                };
-                for (kind, pinned, slot, m) in &meters {
-                    let clip = if *pinned {
-                        body
-                    } else {
-                        match strip_clip {
-                            Some(strips) => strips.intersect(&body),
-                            None => continue,
-                        }
-                    };
-                    window.with_content_mask(
-                        Some(ContentMask { bounds: clip }),
-                        |window| match kind {
-                            SlotKind::Meter => paint_stereo_meter(
-                                *slot, m.level_l, m.level_r, m.hold_l, m.hold_r, m.clip, window,
-                            ),
-                            SlotKind::Peak => paint_peak_readout(*slot, m, window, cx),
-                        },
-                    );
-                }
+                let _scope = crate::perf::PerfScope::enter("MixerMeterOverlay");
+                paint_meter_layer(&owner, &timeline, &layout, window, cx);
             },
         )
         .absolute()
         .top_0()
         .left_0()
         .size_full()
+    }
+}
+
+fn paint_meter_layer(
+    owner: &Entity<StudioLayout>,
+    timeline: &Entity<Timeline>,
+    layout: &SharedMeterLayout,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    let (strip_clip, body_clip, meters) = {
+        let layout = layout.borrow();
+        let state = &timeline.read(cx).state;
+        let vsti_meters = owner.read(cx).mixer_vsti_output_meters();
+        let meters: Vec<(SlotKind, bool, Bounds<Pixels>, MeterLevels)> = layout
+            .slots
+            .iter()
+            .map(|((kind, _), (source, bounds))| {
+                let levels = match source {
+                    MeterSource::Track { id, index, vsti } => {
+                        let track = state
+                            .tracks
+                            .get(*index)
+                            .filter(|track| &track.id == id)
+                            .or_else(|| state.tracks.iter().find(|track| &track.id == id));
+                        let mut levels = track
+                            .map(|track| MeterLevels {
+                                level_l: track.meter_level_l,
+                                level_r: track.meter_level_r,
+                                hold_l: track.meter_peak_hold_l,
+                                hold_r: track.meter_peak_hold_r,
+                                clip: track.meter_clip,
+                            })
+                            .unwrap_or_default();
+                        if let Some(vsti) = vsti.as_ref() {
+                            apply_vsti_fallback(&mut levels, vsti, vsti_meters);
+                        }
+                        levels
+                    }
+                    MeterSource::Master => MeterLevels {
+                        level_l: state.master.meter_level_l,
+                        level_r: state.master.meter_level_r,
+                        hold_l: state.master.meter_peak_hold_l,
+                        hold_r: state.master.meter_peak_hold_r,
+                        clip: state.master.meter_clip,
+                    },
+                    MeterSource::Monitor => MeterLevels {
+                        level_l: state.monitor.meter_level_l,
+                        level_r: state.monitor.meter_level_r,
+                        hold_l: state.monitor.meter_peak_hold_l,
+                        hold_r: state.monitor.meter_peak_hold_r,
+                        clip: state.monitor.meter_clip,
+                    },
+                };
+                (*kind, source.is_pinned(), *bounds, levels)
+            })
+            .collect();
+        (layout.strip_clip, layout.body_clip, meters)
+    };
+    let Some(body) = body_clip else {
+        return;
+    };
+    for (kind, pinned, slot, m) in &meters {
+        let clip = if *pinned {
+            body
+        } else {
+            match strip_clip {
+                Some(strips) => strips.intersect(&body),
+                None => continue,
+            }
+        };
+        window.with_content_mask(Some(ContentMask { bounds: clip }), |window| match kind {
+            SlotKind::Meter => paint_stereo_meter(
+                *slot, m.level_l, m.level_r, m.hold_l, m.hold_r, m.clip, window,
+            ),
+            SlotKind::Peak => paint_peak_readout(*slot, m, window, cx),
+        });
     }
 }
 

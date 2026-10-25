@@ -3036,6 +3036,8 @@ impl StudioLayout {
             dispatch_key,
             on_menu_command,
             on_menu_close,
+            cx.entity(),
+            self.timeline.clone(),
             cx,
         ) {
             Ok(handle) => {

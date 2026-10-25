@@ -429,7 +429,7 @@ fn build_scroll_handler(
 /// What a playing project moves on the channel strips without anyone
 /// notifying the mixer: a fader following its volume automation. Levels are
 /// not in it — the meter layer paints those.
-fn channel_display_signature(
+pub(crate) fn channel_display_signature(
     state: &crate::components::timeline::timeline_state::TimelineState,
 ) -> u64 {
     use std::hash::{Hash, Hasher};

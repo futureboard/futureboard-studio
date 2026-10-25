@@ -176,6 +176,12 @@ impl StudioLayout {
         }
     }
 
+    pub(crate) fn mixer_vsti_output_meters(
+        &self,
+    ) -> &HashMap<String, crate::components::mixer_panel::VstiOutputMeterState> {
+        &self.mixer_view.vsti_output_meters
+    }
+
     /// Meter-only UI refresh — isolated regions, never the StudioLayout root.
     pub(crate) fn notify_mixer_meter_regions(&mut self, cx: &mut Context<Self>) {
         let timeline = self.timeline.read(cx);
@@ -238,8 +244,24 @@ impl StudioLayout {
             let _ = self
                 .mixer_panel
                 .update(cx, |panel, cx| panel.on_meter_tick(cx));
-            if self.external_windows.mixer.is_some() {
-                self.push_mixer_snapshot_to_window(cx);
+            if let Some(handle) = self.external_windows.mixer.clone() {
+                // Same split as the docked mixer: the window's overlay repaints
+                // the levels, and the strips are rebuilt only when something
+                // else they print moved (an automated fader).
+                let display_sig = {
+                    let state = &self.timeline.read(cx).state;
+                    crate::components::mixer_master_strip_view::mixer_master_display_signature(
+                        &state.master,
+                        &state.monitor,
+                    ) ^ crate::components::mixer_panel_view::channel_display_signature(state)
+                        .rotate_left(17)
+                };
+                if display_sig != self.last_external_mixer_display_sig {
+                    self.last_external_mixer_display_sig = display_sig;
+                    self.push_mixer_snapshot_to_window(cx);
+                } else {
+                    let _ = handle.update(cx, |mixer, _window, cx| mixer.notify_meters(cx));
+                }
             }
         } else {
             crate::perf::count("mixer_repaint_while_inactive_count", 1);
@@ -344,10 +366,7 @@ impl StudioLayout {
         };
         let mut snapshot = self.build_mixer_snapshot(cx);
         snapshot.context_menu = self.mixer_window_context_menu(cx);
-        let _ = handle.update(cx, |mixer, _window, cx| {
-            mixer.set_snapshot(snapshot);
-            cx.notify();
-        });
+        let _ = handle.update(cx, |mixer, _window, cx| mixer.set_snapshot(snapshot, cx));
     }
 
     /// Meter-driven push to the detached mixer from the audio poll, rate-capped
