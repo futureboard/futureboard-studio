@@ -7545,6 +7545,7 @@ mod bridge_insert_tests {
                 scratch_r: vec![0.0; 8],
                 vsti_output_children: Vec::new(),
                 scratch_multi: Vec::new(),
+                chain_latency_samples: 0,
             }],
             sends: Vec::new(),
             automation_lanes: Vec::new(),
@@ -7956,6 +7957,65 @@ mod bridge_insert_tests {
         }
     }
 
+    /// A multi-out instrument's "Out Ch" strip is fed from the bridged insert,
+    /// so it carries the plug-in's latency plus one block. Planned as a
+    /// zero-latency bus it took the full compensation on top and played late
+    /// by exactly that — an amount that moved with the buffer size.
+    #[test]
+    fn multi_out_child_strip_is_compensated_from_its_instrument() {
+        let mut inst = bridge_effect_track(1.0);
+        inst.id = "inst".to_string();
+        inst.inserts[0].id = "inst-vsti".to_string();
+        inst.inserts[0].vsti_output_children = vec![crate::runtime::RuntimeVstiOutputChild {
+            dest_track_id: "child".to_string(),
+            dest_track_index: None,
+            bus_index: 1,
+            channel_count: 2,
+            channel_l: 3,
+            channel_r: 4,
+        }];
+        let mut child = bridge_effect_track(1.0);
+        child.id = "child".to_string();
+        child.track_type = "bus".to_string();
+        child.inserts.clear();
+        let mut dry = bridge_effect_track(1.0);
+        dry.id = "dry".to_string();
+        dry.inserts.clear();
+        let mut master = bridge_effect_track(1.0);
+        master.id = "master".to_string();
+        master.track_type = "master".to_string();
+        master.inserts.clear();
+
+        let tracks = vec![inst, child, dry, master];
+        let audio_graph = crate::audio_graph::plan_runtime_audio_graph(&tracks).unwrap();
+        let mut p = RuntimeProject {
+            spatial: Default::default(),
+            tracks,
+            audio_graph,
+            pdc_enabled: true,
+            ..Default::default()
+        };
+        p.resolve_indices();
+        let sink = Arc::new(DriftingLatencySink::default());
+        sink.latency_samples.store(100, Ordering::Relaxed);
+        p.plugin_bridge_sinks
+            .insert("inst-vsti".to_string(), sink.clone());
+        p.resolve_bridge_sinks();
+        p.plan_latency_and_pdc();
+
+        for block in [256u32, 1024] {
+            assert!(p.refresh_runtime_latency_graph(block));
+            let lg = &p.latency_graph;
+            let instrument = 100 + block;
+            assert_eq!(lg.track_output_latency[1], instrument, "block {block}");
+            assert_eq!(lg.max_path_latency_samples, instrument, "block {block}");
+            // The child arrives with the instrument: nothing more to add.
+            assert_eq!(lg.track_pdc_delay[1], 0, "block {block}");
+            // A dry track waits for it.
+            assert_eq!(lg.track_pdc_delay[2], instrument, "block {block}");
+        }
+    }
+
     #[test]
     fn external_bridge_effect_stays_dry_without_sink() {
         let mut track = bridge_effect_track(1.0);
@@ -7987,6 +8047,7 @@ mod bridge_insert_tests {
             scratch_r: vec![0.0; 8],
             vsti_output_children: Vec::new(),
             scratch_multi: Vec::new(),
+            chain_latency_samples: 0,
         }
     }
 

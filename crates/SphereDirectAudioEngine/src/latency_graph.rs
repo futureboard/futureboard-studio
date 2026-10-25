@@ -299,6 +299,21 @@ pub fn recompute_runtime_latency_graph(
             if resolve_output_target_index(src_idx, tracks) == Some(idx) {
                 feed_max = feed_max.max(output_latency[src_idx]);
             }
+            // A multi-out instrument's child strip is fed from the instrument
+            // insert itself, with the latency of the chain up to it — its own
+            // plug-in latency plus, when bridged, one audio block. Left out,
+            // the child planned as a zero-latency path and took the full
+            // compensation on top, landing late by the instrument's latency,
+            // which moved with every buffer-size change.
+            for insert in track.inserts.iter().filter(|insert| insert.enabled) {
+                if insert
+                    .vsti_output_children
+                    .iter()
+                    .any(|child| child.dest_track_index == Some(idx))
+                {
+                    feed_max = feed_max.max(insert.chain_latency_samples);
+                }
+            }
         }
         output_latency[idx] = plugin_latency[idx].saturating_add(feed_max);
     }

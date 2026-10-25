@@ -331,7 +331,33 @@ fn render_offline_impl(
     // plugin latency flushed — instead of a latency ramp. This mirrors playback
     // exactly (same graph, same per-track delays); it only strips the constant
     // output latency so the bounce stays sample-aligned to the timeline.
-    let warmup_frames = export_warmup_frames(&runtime.latency_graph, runtime.pdc_enabled);
+    let mix_latency = export_warmup_frames(&runtime.latency_graph, runtime.pdc_enabled);
+    // A channel tap is taken after the channel's own compensation and before
+    // the master inserts, so it lags the timeline by its own path — not the
+    // mixdown's. Each output is delayed up to the latest one and the shared
+    // warmup trims them all to the timeline: the mixdown exactly as before,
+    // and a channel (a stem, a freeze, a render in place) by its own latency,
+    // with compensation on or off.
+    let tap_latency: Vec<u64> = if capture_tracks {
+        (0..runtime.tracks.len())
+            .map(|idx| {
+                tap_latency_frames(
+                    &runtime.latency_graph,
+                    idx,
+                    runtime.audio_graph.master_index,
+                    mix_latency,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let warmup_frames = tap_latency.iter().copied().fold(mix_latency, u64::max);
+    let mut mix_delay = StereoFrameDelay::new(warmup_frames - mix_latency);
+    let mut tap_delays: Vec<StereoFrameDelay> = tap_latency
+        .iter()
+        .map(|&latency| StereoFrameDelay::new(warmup_frames - latency))
+        .collect();
 
     runtime.reset_midi_playback(request.start_sample);
 
@@ -480,6 +506,12 @@ fn render_offline_impl(
             // Defensive: avoid an infinite loop if the kernel returns nothing.
             break;
         }
+        mix_delay.process(&mut stereo_slice[..frames * 2]);
+        for (tap, delay) in track_taps.iter_mut().zip(tap_delays.iter_mut()) {
+            if let Some(block) = tap.get_mut(..frames * 2) {
+                delay.process(block);
+            }
+        }
         let frames_u64 = frames as u64;
         let block_end = produced.saturating_add(frames_u64);
         let mut stop_for_silence = false;
@@ -576,6 +608,56 @@ pub(crate) fn export_warmup_frames(latency_graph: &RuntimeLatencyGraph, pdc_enab
     latency_graph
         .max_path_latency_samples
         .saturating_add(latency_graph.master_plugin_latency) as u64
+}
+
+/// How far channel `idx`'s tap lags the timeline. The master's tap is the
+/// mixdown; every other tap is taken after the channel's compensation delay,
+/// which is 0 with compensation off.
+fn tap_latency_frames(
+    latency_graph: &RuntimeLatencyGraph,
+    idx: usize,
+    master_index: Option<usize>,
+    mix_latency: u64,
+) -> u64 {
+    if master_index == Some(idx) {
+        return mix_latency;
+    }
+    let output = latency_graph
+        .track_output_latency
+        .get(idx)
+        .copied()
+        .unwrap_or(0);
+    let pdc = latency_graph.track_pdc_delay.get(idx).copied().unwrap_or(0);
+    u64::from(output) + u64::from(pdc)
+}
+
+/// A fixed delay over interleaved stereo frames.
+struct StereoFrameDelay {
+    ring: Vec<f32>,
+    pos: usize,
+}
+
+impl StereoFrameDelay {
+    fn new(frames: u64) -> Self {
+        Self {
+            ring: vec![0.0; frames as usize * 2],
+            pos: 0,
+        }
+    }
+
+    fn process(&mut self, block: &mut [f32]) {
+        if self.ring.is_empty() {
+            return;
+        }
+        for frame in block.chunks_exact_mut(2) {
+            let slot = &mut self.ring[self.pos..self.pos + 2];
+            let (l, r) = (slot[0], slot[1]);
+            slot.copy_from_slice(frame);
+            frame[0] = l;
+            frame[1] = r;
+            self.pos = (self.pos + 2) % self.ring.len();
+        }
+    }
 }
 
 #[inline]
@@ -746,6 +828,39 @@ mod tests {
         let lg = RuntimeLatencyGraph::default();
         assert_eq!(export_warmup_frames(&lg, true), 0);
         assert_eq!(export_warmup_frames(&lg, false), 0);
+    }
+
+    /// A channel tap lags by its own path and compensation, never by the
+    /// master inserts it does not pass through; the master tap is the mixdown.
+    #[test]
+    fn a_tap_lags_by_its_own_path_not_the_mixdowns() {
+        let lg = RuntimeLatencyGraph {
+            track_plugin_latency: vec![512, 0, 128],
+            track_output_latency: vec![512, 0, 128],
+            track_pdc_delay: vec![0, 512, 0],
+            max_path_latency_samples: 512,
+            master_plugin_latency: 128,
+        };
+        let mix = export_warmup_frames(&lg, true);
+        assert_eq!(mix, 640);
+        assert_eq!(tap_latency_frames(&lg, 0, Some(2), mix), 512);
+        assert_eq!(tap_latency_frames(&lg, 1, Some(2), mix), 512);
+        assert_eq!(tap_latency_frames(&lg, 2, Some(2), mix), 640);
+    }
+
+    #[test]
+    fn stereo_frame_delay_holds_back_whole_frames() {
+        let mut delay = StereoFrameDelay::new(2);
+        let mut a = [1.0, -1.0, 2.0, -2.0, 3.0, -3.0];
+        delay.process(&mut a);
+        assert_eq!(a, [0.0, 0.0, 0.0, 0.0, 1.0, -1.0]);
+        let mut b = [4.0, -4.0];
+        delay.process(&mut b);
+        assert_eq!(b, [2.0, -2.0]);
+        let mut none = StereoFrameDelay::new(0);
+        let mut c = [5.0, -5.0];
+        none.process(&mut c);
+        assert_eq!(c, [5.0, -5.0]);
     }
 
     #[test]

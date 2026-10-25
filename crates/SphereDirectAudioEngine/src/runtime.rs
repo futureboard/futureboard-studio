@@ -1564,6 +1564,11 @@ pub struct RuntimeInsert {
     /// only when [`Self::vsti_output_children`] is non-empty (no allocation on
     /// the default path).
     pub scratch_multi: Vec<f32>,
+    /// Latency from the track's input through this insert, inclusive, as last
+    /// observed by [`RuntimeProject::refresh_runtime_latency_graph`]. A
+    /// multi-out instrument's child strips are fed from right here, so their
+    /// compensation is planned from it.
+    pub chain_latency_samples: u32,
 }
 
 /// One multi-out route: a 1-based plugin output channel pair (`channel_l`,
@@ -2893,24 +2898,44 @@ impl RuntimeProject {
         if track.inserts.is_empty() {
             return track.plugin_latency_samples.max(instrument);
         }
-        let mut samples = instrument;
-        for insert in &track.inserts {
-            if !insert.enabled {
-                continue;
-            }
-            if insert.kind_tag == RuntimeInsertKind::ExternalBridge {
-                if let Some(sink) = insert.bridge_sink.as_ref() {
-                    samples = samples
-                        .saturating_add(bridge_block_frames)
-                        .saturating_add(sink.reported_latency_samples());
-                }
-                continue;
-            }
-            if let Some(vst3) = insert.vst3.as_ref().filter(|vst3| vst3.is_ready()) {
-                samples = samples.saturating_add(vst3.get_latency_samples().max(0) as u32);
-            }
+        track.inserts.iter().fold(instrument, |samples, insert| {
+            samples.saturating_add(Self::insert_latency_samples(insert, bridge_block_frames))
+        })
+    }
+
+    /// Latency one insert adds to its track, or 0 while it is disabled.
+    #[inline]
+    fn insert_latency_samples(insert: &RuntimeInsert, bridge_block_frames: u32) -> u32 {
+        if !insert.enabled {
+            return 0;
         }
-        samples
+        if insert.kind_tag == RuntimeInsertKind::ExternalBridge {
+            return insert.bridge_sink.as_ref().map_or(0, |sink| {
+                bridge_block_frames.saturating_add(sink.reported_latency_samples())
+            });
+        }
+        insert
+            .vst3
+            .as_ref()
+            .filter(|vst3| vst3.is_ready())
+            .map_or(0, |vst3| vst3.get_latency_samples().max(0) as u32)
+    }
+
+    /// [`Self::track_insert_latency_samples`], also recording on every insert
+    /// the latency up to and including it, which is where a multi-out
+    /// instrument's child strips are fed from.
+    fn observe_track_latency_samples(track: &mut RuntimeTrack, bridge_block_frames: u32) -> u32 {
+        let total = Self::track_insert_latency_samples(track, bridge_block_frames);
+        let mut chain = track
+            .soundfont_player
+            .as_ref()
+            .map(RuntimeSoundfontPlayer::latency_samples)
+            .unwrap_or(0);
+        for insert in &mut track.inserts {
+            chain = chain.saturating_add(Self::insert_latency_samples(insert, bridge_block_frames));
+            insert.chain_latency_samples = chain;
+        }
+        total
     }
 
     /// Turns delay compensation on or off in place, from the audio thread.
@@ -2997,8 +3022,17 @@ impl RuntimeProject {
         if !fits {
             return false;
         }
+        // Grow only. A ring's length is not its delay, so a shorter plan is
+        // served as well by the longer ring, and keeping the length keeps every
+        // sample at the position it was written to. Resizing it — as a bridged
+        // plug-in's latency following the buffer size used to on every change —
+        // rewound the cursor over stale audio, replayed at the wrong offset.
         for track in &mut self.tracks {
-            Self::fit_track_pdc_len(track, frames);
+            if track.pdc_delay_l.len() < frames {
+                Self::fit_track_pdc_len(track, frames);
+                track.pdc_delay_l.fill(0.0);
+                track.pdc_delay_r.fill(0.0);
+            }
         }
         true
     }
@@ -3105,7 +3139,7 @@ impl RuntimeProject {
 
         for track in &mut self.tracks {
             track.plugin_latency_samples =
-                Self::track_insert_latency_samples(track, bridge_block_frames);
+                Self::observe_track_latency_samples(track, bridge_block_frames);
         }
         recompute_runtime_latency_graph(
             &mut self.latency_graph,
@@ -3384,6 +3418,7 @@ impl RuntimeProject {
                     // the default single-track fold path is unchanged.
                     vsti_output_children: vsti_output_children_from_params(&insert.params),
                     scratch_multi: Vec::new(),
+                    chain_latency_samples: 0,
                 });
             }
 
@@ -8335,6 +8370,7 @@ mod midi_tests {
                 scratch_r: vec![0.0; 64],
                 vsti_output_children: Vec::new(),
                 scratch_multi: Vec::new(),
+                chain_latency_samples: 0,
             }],
             sends: Vec::new(),
             automation_lanes: Vec::new(),
