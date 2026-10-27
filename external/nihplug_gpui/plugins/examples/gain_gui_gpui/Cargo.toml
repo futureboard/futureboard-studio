@@ -1,0 +1,18 @@
+[package]
+name = "gain_gui_gpui"
+version = "0.1.0"
+edition = "2021"
+authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>"]
+license = "ISC"
+
+description = "A simple gain plugin with a GPUI GUI"
+
+[lib]
+# The `lib` artifact is needed for the standalone target
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug = { path = "../../../", features = ["assert_process_allocs", "standalone"] }
+nih_plug_gpui = { path = "../../../nih_plug_gpui" }
+
+atomic_float = "0.1"

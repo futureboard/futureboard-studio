@@ -1,0 +1,95 @@
+#top-bar {
+  background-color: #e5e5e5;
+  height: 50px;
+  width: 100%;
+}
+
+#param-sliders .param-label {
+  width: 140px;
+  height: 30px;
+  child-top: 1s;
+  child-right: 10px;
+  child-bottom: 1s;
+  child-left: 1s;
+}
+
+/* The safe mode button reuses the param-button element's style with a different class */
+param-button.safe-mode {
+  background-color: #fff28000;
+  transition: background-color 100ms;
+}
+param-button.safe-mode:hover {
+  background-color: #fff28020;
+  transition: background-color 100ms;
+}
+param-button.safe-mode:checked {
+  background-color: #fff280;
+  transition: background-color 100ms;
+}
+
+#automation-precision {
+  /* Can't use width: auto here, but we'll try to roughly match the padding of the top bar buttons */
+  width: 170px;
+}
+
+spectrum-analyzer {
+  color: #0a0a0a;
+}
+
+xy-pad {
+  overflow: hidden;
+}
+
+xy-pad .xy-pad__tooltip {
+  opacity: 0;
+  transition: opacity 100ms;
+
+  background-color: #e5e5e5;
+  border-color: #0a0a0a;
+  border-width: 1px;
+  /* This mimics the text box border radius, everything else is squared off so this adds a bit of flair */
+  border-radius: 3px;
+  width: auto;
+  height: auto;
+  child-right: 5px;
+  child-left: 5px;
+}
+
+xy-pad:hover .xy-pad__tooltip {
+  opacity: 1;
+  transition: opacity 100ms;
+}
+
+/* This is a textbox, we want it to somewhat resemble the tooltip */
+xy-pad .xy-pad__value-entry {
+  background-color: #e5e5e5;
+  border-color: #0a0a0a;
+  border-width: 1px;
+  child-right: 5px;
+  child-left: 5px;
+}
+xy-pad .xy-pad__value-entry .textbox_container {
+  overflow: visible;
+  text-wrap: false;
+  width: auto;
+}
+xy-pad .xy-pad__value-entry .caret {
+  background-color: #0a0a0a;
+}
+xy-pad .xy-pad__value-entry .selection {
+  background-color: #0a0a0a30;
+}
+
+xy-pad__handle {
+  background-color: #e5e5e5;
+  border-color: #0a0a0a;
+  border-radius: 50%;
+  border-width: 1px;
+  height: 20px;
+  translate: -50% -50%;
+  width: 20px;
+}
+.xy-pad__handle--modulated {
+  background-color: #a4eafc69;
+  border-color: #a4eafc96;
+}

@@ -1,0 +1,28 @@
+[package]
+name = "diopser"
+version = "0.4.0"
+edition = "2021"
+authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>"]
+license = "GPL-3.0-or-later"
+homepage = "https://github.com/robbert-vdh/nih-plug/tree/master/plugins/diopser"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["simd"]
+# Make it go fast, vroom. Requires a nightly compiler. Support for the non-SIMD
+# version has been removed at the moment.
+simd = ["nih_plug/simd"]
+
+[dependencies]
+nih_plug = { path = "../../", features = ["assert_process_allocs"] }
+nih_plug_vizia = { path = "../../nih_plug_vizia" }
+
+atomic_float = "0.1"
+semver = "1.0.14"
+
+# For the GUI
+realfft = "3.0"
+open = "3.0"
+triple_buffer = "6.0"

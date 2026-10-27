@@ -1,0 +1,32 @@
+# This provides metadata for NIH-plug's `cargo xtask bundle <foo>` plugin
+# bundler. This file's syntax is as follows:
+#
+# [package_name]
+# name = "Human Readable Plugin Name"  # defaults to <package_name>
+
+[soft_vacuum]
+name = "Soft Vacuum"
+
+[buffr_glitch]
+name = "Buffr Glitch"
+
+[crisp]
+name = "Crisp"
+
+[crossover]
+name = "Crossover"
+
+[diopser]
+name = "Diopser"
+
+[loudness_war_winner]
+name = "Loudness War Winner"
+
+[puberty_simulator]
+name = "Puberty Simulator"
+
+[safety_limiter]
+name = "Safety Limiter"
+
+[spectral_compressor]
+name = "Spectral Compressor"

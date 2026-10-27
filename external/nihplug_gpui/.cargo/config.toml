@@ -1,0 +1,5 @@
+[alias]
+# `xtask` is intentionally not defined here. The Futureboard repo root already
+# defines that alias, and Cargo merges parent configs; a second definition
+# with a different type makes every build in this tree fail to load.
+xtask-debug = "run --package xtask --"

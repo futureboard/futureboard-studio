@@ -1,0 +1,154 @@
+[package]
+name = "nih_plug"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>"]
+license = "ISC"
+
+keywords = ["audio", "plugin", "vst", "vst3"]
+description = "A simple but modern API-agnostic audio plugin framework"
+repository = "https://github.com/robbert-vdh/nih-plug"
+
+[workspace]
+resolver = "2"
+# NOTE: `nih_plug_iced` and `plugins/examples/gain_gui_iced` are intentionally not members of this
+#       workspace. The iced_baseview fork they pin brings in `font-kit 0.10`, which links against
+#       `freetype` and `fontconfig`. GPUI links against those same libraries through newer crates,
+#       and Cargo permits only one crate per dependency graph to link a given native library. The
+#       crates are still part of this repository and can be added back here once `nih_plug_iced` is
+#       updated to a modern iced release.
+members = [
+  "nih_plug_derive",
+  "nih_plug_egui",
+  "nih_plug_gpui",
+  "nih_plug_vizia",
+  "nih_plug_xtask",
+
+  "cargo_nih_plug",
+  "xtask",
+
+  "plugins/examples/byo_gui_gl",
+  "plugins/examples/byo_gui_softbuffer",
+  "plugins/examples/byo_gui_wgpu",
+  "plugins/examples/gain",
+  "plugins/examples/gain_gui_egui",
+  "plugins/examples/gain_gui_gpui",
+  "plugins/examples/gain_gui_vizia",
+  "plugins/examples/midi_inverter",
+  "plugins/examples/poly_mod_synth",
+  "plugins/examples/sine",
+  "plugins/examples/stft",
+  "plugins/examples/sysex",
+
+  "plugins/soft_vacuum",
+  "plugins/buffr_glitch",
+  "plugins/crisp",
+  "plugins/crossover",
+  "plugins/diopser",
+  "plugins/loudness_war_winner",
+  "plugins/puberty_simulator",
+  "plugins/safety_limiter",
+  "plugins/spectral_compressor",
+]
+
+[features]
+default = ["vst3"]
+
+# Enabling this feature will cause the plugin to terminate when allocations
+# occur in the processing function during debug builds. Keep in mind that panics
+# may also allocate if they use string formatting, so temporarily disabling this
+# feature may be necessary when debugging panics in DSP code.
+assert_process_allocs = ["dep:assert_no_alloc"]
+# Enables an export target for standalone binaries through the
+# `nih_export_standalone()` function. Disabled by default as this requires
+# building additional dependencies for audio and MIDI handling.
+standalone = ["dep:baseview", "dep:clap", "dep:cpal", "dep:jack", "dep:midir", "dep:rtrb"]
+# Enables the `nih_export_vst3!()` macro. Enabled by default. This feature
+# exists mostly for GPL-compliance reasons, since even if you don't use the VST3
+# wrapper you might otherwise still include a couple (unused) symbols from the
+# `vst3-sys` crate.
+vst3 = ["dep:vst3-sys"]
+# Add adapters to the Buffer object for reading the channel data to and from
+# `std::simd` vectors. Requires a nightly compiler.
+simd = []
+# Compress plugin state using the Zstandard algorithm. Loading uncompressed
+# state is still supported so existing state will still load after enabling this
+# feature for a plugin, but it can not be disabled again without losing state
+# compatibility.
+zstd = ["dep:zstd"]
+
+# Only relevant when generating docs, adds the `doc_cfg` nightly feature
+docs = []
+
+[dependencies]
+nih_plug_derive = { path = "nih_plug_derive" }
+
+anyhow = "1.0"
+anymap3 = "1.0.1"
+atomic_float = "0.1"
+atomic_refcell = "0.1"
+backtrace = "0.3.65"
+bitflags = "1.3"
+cfg-if = "1.0"
+# This supports CLAP 1.2.2
+clap-sys = {  git = "https://github.com/micahrj/clap-sys.git", rev = "25d7f53fdb6363ad63fbd80049cb7a42a97ac156" }
+crossbeam = "0.8"
+log = { version = "0.4", features = ["std", "release_max_level_info"] }
+midi-consts = "0.1"
+nih_log = "0.3.1"
+parking_lot = "0.12"
+raw-window-handle = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+widestring = "1.0.0-beta.1"
+
+# Used for the `assert_process_allocs` feature
+assert_no_alloc = { git = "https://github.com/robbert-vdh/rust-assert-no-alloc.git", branch = "feature/nested-permit-forbid", features = ["backtrace", "log"], optional = true }
+
+# Used for the `standalone` feature
+# NOTE: OpenGL support is not needed here, but rust-analyzer gets confused when
+#       some crates do use it and others don't
+baseview = { git = "https://github.com/RustAudio/baseview.git", rev = "579130ecb4f9f315ae52190af42f0ea46aeaa4a2", features = ["opengl"], optional = true }
+# All the claps!
+clap = { version = "4.1.8", features = ["derive", "wrap_help"], optional = true }
+cpal = { version = "0.15", optional = true }
+jack = { version = "0.11.4", optional = true }
+midir = { version = "0.9.1", optional = true }
+rtrb = { version = "0.2.2", optional = true }
+
+# Used for the `vst3` feature
+vst3-sys = { git = "https://github.com/robbert-vdh/vst3-sys.git", branch = "fix/drop-box-from-raw", optional = true }
+
+# Used for the `zstd` feature
+zstd = { version = "0.12.3", optional = true }
+
+[dev-dependencies]
+approx = "0.5.1"
+
+[target.'cfg(all(target_family = "unix", not(target_os = "macos")))'.dependencies]
+libc = "0.2.124"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2.7"
+core-foundation = "0.9.3"
+
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.44"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Performance",
+]
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"
+

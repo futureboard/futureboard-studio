@@ -1,0 +1,20 @@
+[package]
+name = "crossover"
+version = "0.1.0"
+edition = "2021"
+authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>"]
+license = "GPL-3.0-or-later"
+homepage = "https://github.com/robbert-vdh/nih-plug/tree/master/plugins/crossover"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["simd"]
+# Make it go fast, vroom. Requires a nightly compiler. Non-SIMD builds are
+# currently unsupported.
+simd = ["nih_plug/simd"]
+
+[dependencies]
+nih_plug = { path = "../../", features = ["assert_process_allocs"] }
+realfft = "3.0.0"

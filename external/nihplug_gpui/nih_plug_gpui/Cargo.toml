@@ -1,0 +1,45 @@
+[package]
+name = "nih_plug_gpui"
+version = "0.0.0"
+edition = "2021"
+authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>"]
+license = "ISC"
+
+description = "An adapter to use GPUI GUIs with NIH-plug"
+
+[dependencies]
+nih_plug = { path = "..", default-features = false }
+
+# GPUI Standalone Edition.
+#
+# GPUI's default features are deliberately disabled. They enable `font-kit`, which is only used by
+# the macOS backend but which pulls in a crate that links against `fontconfig`. Cargo allows only
+# one crate linking against a given native library per dependency graph, and `nih_plug_iced` already
+# brings a different one in. The platform backends below are depended on directly rather than
+# through the `gpui_platform` convenience crate for the same reason: that crate depends on `gpui`
+# with its default features enabled.
+gpui = { git = "https://github.com/futureboard/gpui-se.git", default-features = false }
+
+async-channel = "2.3"
+crossbeam = "0.8"
+parking_lot = "0.12"
+# This must match the version GPUI uses, not the version NIH-plug uses. NIH-plug's
+# `ParentWindowHandle` is matched on directly so it doesn't need the trait.
+raw-window-handle = "0.6"
+# To make the state persistable
+serde = { version = "1.0", features = ["derive"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_linux = { git = "https://github.com/futureboard/gpui-se.git", default-features = false, features = [
+  "wayland",
+  "x11",
+] }
+x11rb = "0.13"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_windows = { git = "https://github.com/futureboard/gpui-se.git", default-features = false }
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+] }
