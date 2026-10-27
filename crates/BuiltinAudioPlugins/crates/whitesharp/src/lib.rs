@@ -718,22 +718,26 @@ impl Dsp {
         self.silent = 0.0;
 
         let midi = midi_of(self.sample_rate / period, t.reference_hz);
-        let slow = match self.slow_pitch {
-            Some(slow) => slow + (midi - slow) * self.vibrato_step,
-            None => midi,
-        };
-        self.slow_pitch = Some(slow);
-        let vibrato = clamp(midi - slow, -2.0, 2.0);
 
         // Classic snaps to whichever note is nearest now; the modern response
         // holds a note until the voice is clearly past the boundary.
         let held_note = if t.classic { None } else { self.target };
         let target = nearest_target(midi, t.allowed, held_note);
-        if target != self.target {
+        let new_note = target != self.target;
+        if new_note {
             self.held = 0.0;
         }
         self.target = target;
         self.held += hop;
+
+        // The vibrato is measured within a note: a new one restarts the slow
+        // pitch, or the glide into it would be scaled as vibrato.
+        let slow = match self.slow_pitch {
+            Some(slow) if !new_note => slow + (midi - slow) * self.vibrato_step,
+            _ => midi,
+        };
+        self.slow_pitch = Some(slow);
+        let vibrato = clamp(midi - slow, -2.0, 2.0);
 
         let corrected = target.filter(|note| t.bypass & (1 << pitch_class(*note)) == 0);
         let desired = match corrected {

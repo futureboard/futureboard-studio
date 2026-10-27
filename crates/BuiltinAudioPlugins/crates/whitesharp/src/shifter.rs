@@ -230,25 +230,49 @@ impl Shifter {
         self.control_count = (self.control_count + 1).min(CONTROL_FRAMES);
     }
 
-    /// The newest frame measured at or before `at`.
+    /// The control at `at`: between two voiced frames, the line between
+    /// them — the pitch glides rather than stepping each frame; otherwise
+    /// the newest frame measured at or before `at`.
     fn control_at(&self, at: f64) -> Control {
         let mut index = self.control_head;
-        let mut fallback = None;
+        let mut later: Option<Control> = None;
         for _ in 0..self.control_count {
             let control = self.controls[index];
             if control.centre as f64 <= at {
-                return control;
+                return match later {
+                    Some(next) => Self::between(control, next, at),
+                    None => control,
+                };
             }
-            fallback = Some(control);
+            later = Some(control);
             index = (index + CONTROL_FRAMES - 1) % CONTROL_FRAMES;
         }
-        fallback.unwrap_or(Control {
+        later.unwrap_or(Control {
             centre: 0,
             period: None,
             ratio: 1.0,
             formant: 1.0,
             gain: 1.0,
         })
+    }
+
+    fn between(earlier: Control, later: Control, at: f64) -> Control {
+        let (Some(from), Some(to)) = (earlier.period, later.period) else {
+            return earlier;
+        };
+        let span = later.centre.saturating_sub(earlier.centre) as f64;
+        if span <= 0.0 {
+            return earlier;
+        }
+        let t = ((at - earlier.centre as f64) / span).clamp(0.0, 1.0) as f32;
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+        Control {
+            centre: earlier.centre,
+            period: Some(lerp(from, to)),
+            ratio: lerp(earlier.ratio, later.ratio),
+            formant: lerp(earlier.formant, later.formant),
+            gain: lerp(earlier.gain, later.gain),
+        }
     }
 
     /// Takes one input frame and returns the shifted frame from
@@ -385,6 +409,27 @@ mod tests {
         }
         periods.sort_by(f32::total_cmp);
         SR / periods[periods.len() / 2]
+    }
+
+    #[test]
+    fn controls_glide_between_voiced_frames_and_hold_into_unvoiced() {
+        let mut shifter = Shifter::new(SR, SR / 60.0);
+        let frame = |centre, period, ratio| Control {
+            centre,
+            period,
+            ratio,
+            formant: 1.0,
+            gain: 1.0,
+        };
+        shifter.push_control(frame(0, Some(200.0), 1.0));
+        shifter.push_control(frame(100, Some(220.0), 1.2));
+        shifter.push_control(frame(200, None, 1.0));
+        let mid = shifter.control_at(50.0);
+        assert!((mid.ratio - 1.1).abs() < 1.0e-6, "{mid:?}");
+        assert!((mid.period.unwrap() - 210.0).abs() < 1.0e-4, "{mid:?}");
+        // Into an unvoiced frame the voiced one holds until it lands.
+        assert_eq!(shifter.control_at(150.0).ratio, 1.2);
+        assert_eq!(shifter.control_at(250.0).period, None);
     }
 
     #[test]

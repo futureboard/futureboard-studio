@@ -247,6 +247,38 @@ fn noise_passes_through_at_its_own_level() {
 }
 
 #[test]
+fn a_sibilant_is_not_shifted() {
+    // Hiss over a quiet tone, transposed a fifth: the tone alone would be
+    // tracked, but the frame is a sibilant and comes out as it went in.
+    let mut params = default_params();
+    params.retune_ms = 0.0;
+    params.transpose = 7.0;
+    let mut dsp = dsp_with(params);
+    let latency = dsp.latency_samples();
+    let mut seed = 11u32;
+    let (mut previous, mut before) = (0.0f32, 0.0f32);
+    let mut input = Vec::new();
+    let mut output = Vec::new();
+    for n in 0..48_000 {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let white = (seed >> 9) as f32 / (1u32 << 23) as f32 - 0.5;
+        let hiss = white - 2.0 * previous + before;
+        (before, previous) = (previous, white);
+        let x = 0.3 * hiss + 0.02 * (std::f32::consts::TAU * 220.0 * n as f32 / SR).sin();
+        let (l, _) = dsp.process_stereo(x, x);
+        input.push(x);
+        output.push(l);
+    }
+    let (mut error, mut energy) = (0.0f32, 0.0f32);
+    for n in 12_000..output.len() {
+        error += (output[n] - input[n - latency]).powi(2);
+        energy += input[n - latency].powi(2);
+    }
+    let residual = 10.0 * (error / energy).log10();
+    assert!(residual < -30.0, "residual {residual:.1} dB");
+}
+
+#[test]
 fn the_input_type_sets_the_latency() {
     let mut dsp = Dsp::new(SR);
     let mut latencies = Vec::new();
