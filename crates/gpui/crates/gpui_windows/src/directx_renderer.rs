@@ -318,9 +318,10 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        if self.skip_draws {
-            // skip drawing this frame, we just recovered from a device lost event
-            // and so likely do not have the textures anymore that are required for drawing
+        if self.skip_draws || self.devices.is_none() || self.resources.is_none() {
+            // Skip this frame after a device loss: the recovery either just
+            // dropped the textures, or it failed and left the renderer with
+            // nothing to draw. Drawing anyway panics inside the host.
             return Ok(());
         }
         let _frame = gpui::osr_profile::span(gpui::osr_profile::Stage::CompositorFrame);

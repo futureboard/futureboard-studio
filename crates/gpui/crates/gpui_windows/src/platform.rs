@@ -414,7 +414,10 @@ impl WindowsPlatform {
                             &all_windows,
                             &text_system,
                         ) {
-                            panic!("Device lost: {err}");
+                            // A failed recovery used to panic this thread, which
+                            // aborts the host process. The renderer skips frames
+                            // until a later attempt succeeds.
+                            log::error!("GPU device lost and could not be restored: {err}");
                         }
                     }
                     let Some(all_windows) = all_windows.upgrade() else {
@@ -1029,10 +1032,15 @@ impl WindowsPlatformInner {
             return false;
         };
         let mut lock = all_windows.write();
-        let index = lock
+        // The host destroys an embedded editor's window itself, and our own
+        // teardown destroys it again. The second close finds nothing here;
+        // panicking takes the whole DAW down with the plug-in.
+        let Some(index) = lock
             .iter()
             .position(|handle| handle.as_raw() == target_window)
-            .unwrap();
+        else {
+            return false;
+        };
         lock.remove(index);
 
         lock.is_empty()
