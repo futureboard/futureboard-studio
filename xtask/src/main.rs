@@ -73,6 +73,14 @@ enum XtaskCommand {
 
     /// Build and stage the standalone Audio Jam client (`FutureboardJam`).
     Jam(JamArgs),
+
+    /// Bundle a standalone plug-in. The plug-in workspace is not a member of
+    /// this one; the arguments are forwarded to its own xtask. For WhiteSharp:
+    /// `cargo xtask bundle whitesharp_vst3 --release`.
+    Bundle {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -151,7 +159,49 @@ fn main() -> ExitCode {
             run_aliases(&["check-ce", "check-professional-win"], &args)
         }
         Some(XtaskCommand::Jam(args)) => run_jam(args),
+        Some(XtaskCommand::Bundle { args }) => run_plugin_bundle(&args),
         None => run_package(cli.package),
+    }
+}
+
+/// Run the WhiteSharp plug-in's own xtask. That package is a separate
+/// workspace under `vstplugins/`, so this does not compile it into the DAW
+/// target directory.
+fn run_plugin_bundle(args: &[String]) -> ExitCode {
+    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    let manifest = root.join("vstplugins/whitesharp_vst3/Cargo.toml");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    eprintln!(
+        "[xtask] cargo run --manifest-path {} --package xtask --release -- bundle {}",
+        manifest.display(),
+        args.join(" ")
+    );
+    let status = Command::new(&cargo)
+        .arg("run")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .arg("--package")
+        .arg("xtask")
+        .arg("--release")
+        .arg("--")
+        .arg("bundle")
+        .args(args)
+        .current_dir(root)
+        .status();
+    match status {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => {
+            eprintln!("[xtask] plug-in bundle failed with {status}");
+            let code = status
+                .code()
+                .and_then(|code| u8::try_from(code).ok())
+                .unwrap_or(1);
+            ExitCode::from(code)
+        }
+        Err(error) => {
+            eprintln!("[xtask] failed to spawn `{cargo}`: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

@@ -57,6 +57,19 @@ test-ce = [
 #   cargo xtask build-all --target x86_64-pc-windows-msvc → include Windows
 xtask = ["run", "--package", "xtask", "--"]
 
+# WhiteSharp VST3/CLAP is a separate workspace. Same arguments as `cargo xtask`
+# inside `vstplugins/whitesharp_vst3`:
+#   cargo whitesharp-vst3 bundle whitesharp_vst3 --release
+whitesharp-vst3 = [
+    "run",
+    "--manifest-path",
+    "vstplugins/whitesharp_vst3/Cargo.toml",
+    "--package",
+    "xtask",
+    "--release",
+    "--",
+]
+
 # Binary packaging / staging into `out/` (see xtask/README.md). These build the
 # app and stage a clean runnable tree separate from the Cargo `target/` cache.
 #   cargo package-dev         → out/dev/<platform>

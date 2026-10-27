@@ -72,6 +72,14 @@ exclude = [
     # but must not be claimed as a member of the Futureboard root workspace.
     "crates/gpui",
 
+    # Standalone VST3/CLAP plug-ins. Each is its own workspace with its own
+    # target directory; `cargo build --workspace` does not build them. From
+    # the repo root: `cargo xtask bundle whitesharp_vst3 --release`.
+    "vstplugins/whitesharp_vst3",
+
+    # Vendored NIH-plug fork used by those plug-ins. Not part of the DAW build.
+    "external/nihplug_gpui",
+
     # Experimental / placeholder crates. Promote only when implementation is real.
     "crates/SphereVoiceTune",
 ]
