@@ -19,7 +19,7 @@
 //!   allocations during DSP code in debug mode.
 //!
 //! - An NIH-plug plugin consists of an implementation of the [`Plugin`][prelude::Plugin] trait and
-//!   a call to [`nih_export_vst3!()`] and/or [`nih_export_clap!()`] in your `lib.rs` file to expose
+//!   a call to [`nih_export_vst3!()`], `nih_export_vst2!()` (crate feature `vst2`), and/or [`nih_export_clap!()`] in your `lib.rs` file to expose
 //!   the plugin functionality. Some of these traits will require you to implement an additional
 //!   trait containing API-specific information for the plugin.
 //!

@@ -5,6 +5,8 @@ pub use std::num::NonZeroU32;
 pub use crate::debug::*;
 
 pub use crate::nih_export_clap;
+#[cfg(feature = "vst2")]
+pub use crate::nih_export_vst2;
 #[cfg(feature = "vst3")]
 pub use crate::nih_export_vst3;
 #[cfg(feature = "standalone")]
@@ -35,6 +37,8 @@ pub use crate::params::smoothing::{AtomicF32, Smoothable, Smoother, SmoothingSty
 pub use crate::params::Params;
 pub use crate::params::{BoolParam, FloatParam, IntParam, Param, ParamFlags};
 pub use crate::plugin::clap::{ClapPlugin, PolyModulationConfig};
+#[cfg(feature = "vst2")]
+pub use crate::plugin::vst2::Vst2Plugin;
 #[cfg(feature = "vst3")]
 pub use crate::plugin::vst3::Vst3Plugin;
 pub use crate::plugin::{Plugin, ProcessStatus, TaskExecutor};

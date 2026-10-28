@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "WhiteSharp realtime pitch correction as a VST3 and CLAP plug-in"
+description = "WhiteSharp realtime pitch correction as a VST2, VST3, and CLAP plug-in"
 
 [lib]
 # `lib` too, so tests can link the plug-in.
@@ -32,7 +32,7 @@ ui-preview = []
 builtin-plugin-editor = []
 
 [dependencies]
-nih_plug = { git = "https://github.com/arizkami/nihplug_gpui", features = ["assert_process_allocs"] }
+nih_plug = { git = "https://github.com/arizkami/nihplug_gpui", features = ["assert_process_allocs", "vst2"] }
 nih_plug_gpui = { git = "https://github.com/arizkami/nihplug_gpui" }
 # The DSP core, unchanged from the DAW, and the effect trait it implements.
 whitesharp = { path = "../../crates/BuiltinAudioPlugins/crates/whitesharp" }

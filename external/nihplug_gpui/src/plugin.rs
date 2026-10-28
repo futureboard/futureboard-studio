@@ -9,6 +9,8 @@ use crate::prelude::{
 };
 
 pub mod clap;
+#[cfg(feature = "vst2")]
+pub mod vst2;
 #[cfg(feature = "vst3")]
 pub mod vst3;
 

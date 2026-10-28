@@ -1,4 +1,4 @@
-//! WhiteSharp as a VST3 and CLAP plug-in.
+//! WhiteSharp as a VST2, VST3, and CLAP plug-in.
 //!
 //! The DSP is Futureboard Studio's `whitesharp` crate and the editor is
 //! Studio's own WhiteSharp window, compiled from its source tree. The modules
@@ -233,5 +233,11 @@ impl Vst3Plugin for WhiteSharp {
         &[Vst3SubCategory::Fx, Vst3SubCategory::PitchShift];
 }
 
+impl Vst2Plugin for WhiteSharp {
+    /// FourCC `FbWS`. Projects and hosts identify this VST2 plug-in by this id.
+    const VST2_UID: [u8; 4] = *b"FbWS";
+}
+
 nih_export_clap!(WhiteSharp);
 nih_export_vst3!(WhiteSharp);
+nih_export_vst2!(WhiteSharp);

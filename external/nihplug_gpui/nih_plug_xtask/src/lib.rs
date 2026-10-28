@@ -152,9 +152,10 @@ pub fn main_with_args(command_name: &str, args: impl IntoIterator<Item = String>
 
 /// Change the current directory into the Cargo workspace's root.
 ///
-/// This is using a heuristic to find the workspace root. It considers all ancestor directories of
-/// either `CARGO_MANIFEST_DIR` or the current directory, and finds the leftmost one containing a
-/// `Cargo.toml` file.
+/// Walks ancestors of `CARGO_MANIFEST_DIR` (or the current directory) and stops at the nearest
+/// manifest that declares a `[workspace]` table. A plug-in workspace nested inside a larger repo
+/// has its own table; walking all the way to the outer repo would build the wrong package set.
+/// If no ancestor is a workspace, the furthest ancestor that still has a `Cargo.toml` is used.
 pub fn chdir_workspace_root() -> Result<()> {
     // This is either the directory of the xtask binary when using `nih_plug_xtask` normally, or any
     // random project when using it through `cargo nih-plug`.
@@ -168,10 +169,13 @@ pub fn chdir_workspace_root() -> Result<()> {
 
     let workspace_root = project_dir
         .ancestors()
-        .filter(|dir| dir.join("Cargo.toml").exists())
-        // The ancestors are ordered starting from `project_dir` going up to the filesystem root. So
-        // this is the leftmost matching ancestor.
-        .last()
+        .find(|dir| manifest_is_workspace(&dir.join("Cargo.toml")))
+        .or_else(|| {
+            project_dir
+                .ancestors()
+                .filter(|dir| dir.join("Cargo.toml").exists())
+                .last()
+        })
         .with_context(|| {
             format!(
                 "Could not find a 'Cargo.toml' file in '{}' or any of its parent directories",
@@ -181,6 +185,12 @@ pub fn chdir_workspace_root() -> Result<()> {
 
     std::env::set_current_dir(workspace_root)
         .context("Could not change to workspace root directory")
+}
+
+fn manifest_is_workspace(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|text| text.lines().any(|line| line.trim() == "[workspace]"))
+        .unwrap_or(false)
 }
 
 /// Build one or more packages using the provided `cargo build` arguments. This should be called
@@ -419,9 +429,8 @@ fn bundle_plugin(
     let bundle_clap = symbols::exported(first_lib_path, "clap_entry")
         .with_context(|| format!("Could not parse '{}'", first_lib_path.display()))?;
     // We'll ignore the platform-specific entry points for VST2 plugins since there's no reason to
-    // create a new Rust VST2 plugin that doesn't work in modern DAWs
-    // NOTE: NIH-plug does not support VST2, but we'll support bundling VST2 plugins anyways because
-    //       this bundler can also be used standalone.
+    // create a new Rust VST2 plugin that doesn't work in modern DAWs. The `vst2` feature exports
+    // `VSTPluginMain`; this bundler also picks that symbol up from other libraries.
     let bundle_vst2 = symbols::exported(first_lib_path, "VSTPluginMain")
         .with_context(|| format!("Could not parse '{}'", first_lib_path.display()))?;
     let bundle_vst3 = symbols::exported(first_lib_path, "GetPluginFactory")

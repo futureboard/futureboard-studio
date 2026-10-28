@@ -7,6 +7,8 @@ pub(crate) mod util;
 
 #[cfg(feature = "standalone")]
 pub mod standalone;
+#[cfg(feature = "vst2")]
+pub mod vst2;
 #[cfg(feature = "vst3")]
 pub mod vst3;
 

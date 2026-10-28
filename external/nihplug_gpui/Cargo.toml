@@ -69,6 +69,10 @@ standalone = ["dep:baseview", "dep:clap", "dep:cpal", "dep:jack", "dep:midir", "
 # wrapper you might otherwise still include a couple (unused) symbols from the
 # `vst3-sys` crate.
 vst3 = ["dep:vst3-sys"]
+# Enables the `nih_export_vst2!()` macro. VST2 is a legacy format with a public
+# C ABI, so this wrapper does not link the Steinberg SDK. The bundler emits a
+# VST2 plug-in when the library exports `VSTPluginMain`.
+vst2 = []
 # Add adapters to the Buffer object for reading the channel data to and from
 # `std::simd` vectors. Requires a nightly compiler.
 simd = []
