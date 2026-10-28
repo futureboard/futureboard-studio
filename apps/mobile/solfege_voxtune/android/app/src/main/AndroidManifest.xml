@@ -1,6 +1,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Projects are saved in Documents/Solfege Voxtune. Only Android 10 and
+         older need this; newer versions let the app write its own files. -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <!-- Live recording of vocal takes. Asked the first time Record is used. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <application
-        android:label="solfege_voxtune"
+        android:label="Solfege Voxtune"
+        android:requestLegacyExternalStorage="true"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
