@@ -13,6 +13,9 @@ dependencies:
   lucide_icons_flutter: ^4.0.1
   google_fonts: ^9.0.0
   ffi: ^2.2.0
+  flutter_localizations:
+    sdk: flutter
+  intl: any
 
 dev_dependencies:
   flutter_test:
@@ -21,14 +24,27 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  generate: true
 
   assets:
     - assets/fonts/
 
   fonts:
-    - family: SpaceGrotesk
+    - family: MonaSans
       fonts:
-        - asset: assets/fonts/SpaceGrotesk-Regular.ttf
-    - family: JetBrainsMono
+        - asset: assets/fonts/MonaSansVF.ttf
+    - family: Barlow
       fonts:
-        - asset: assets/fonts/JetBrainsMono-Regular.ttf
+        - asset: assets/fonts/Barlow-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Barlow-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Barlow-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Barlow-Bold.ttf
+          weight: 700
+    # Thai glyphs only (subset of Google Sans, wght 400-700); used as the
+    # fallback behind Mona Sans and Barlow.
+    - family: GoogleSans
+      fonts:
+        - asset: assets/fonts/GoogleSans-Thai.ttf
