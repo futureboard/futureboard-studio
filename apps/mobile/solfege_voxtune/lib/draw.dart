@@ -1,6 +1,9 @@
 import 'dart:math' as math;
 import 'dart:ui' as ui;
+
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
+
 import 'music.dart';
 import 'theme.dart';
 
@@ -36,9 +39,9 @@ class EditorLayout {
     required double pitchHi,
     required double viewDuration,
   }) {
-    const padL = 36.0;
-    const padT = 20.0;
-    const padB = 18.0;
+    const padL = 42.0;
+    const padT = 22.0;
+    const padB = 22.0;
     const padR = 6.0;
     final gridW = math.max(1.0, width - padL - padR);
     final gridH = math.max(1.0, height - padT - padB);
@@ -118,7 +121,8 @@ HitResult hitTestEditor({
     return HitResult(type: 'pitch-ruler', layout: layout);
   }
   if (y >= layout.padT && y <= gridBottom && x >= layout.padL) {
-    final selectedFirst = [...notes]..sort((a, b) {
+    final selectedFirst = [...notes]
+      ..sort((a, b) {
         if (a.id == selectedId) return -1;
         if (b.id == selectedId) return 1;
         return b.start.compareTo(a.start);
@@ -145,7 +149,12 @@ HitResult hitTestEditor({
       final x0 = layout.timeToX(viewStart, shown.start);
       final x1 = layout.timeToX(viewStart, shown.start + shown.dur);
       if (x >= x0 && x <= x1) {
-        return HitResult(type: 'note', note: note, edge: 'body', layout: layout);
+        return HitResult(
+          type: 'note',
+          note: note,
+          edge: 'body',
+          layout: layout,
+        );
       }
     }
   }
@@ -173,7 +182,8 @@ HitResult? _noteHit({
   final curveY = layout.pitchToY(pitchHi, pitchAt(shown, t));
   final boxHalf = math.max(13.0, layout.pxPerSemi * 0.44 + 5.0);
   final hitBox = (y - boxCenterY).abs() <= boxHalf;
-  final hitCurve = (y - curveY).abs() <= math.max(10.0, layout.pxPerSemi * 0.35);
+  final hitCurve =
+      (y - curveY).abs() <= math.max(10.0, layout.pxPerSemi * 0.35);
   if (!hitBox && !hitCurve) return null;
   String edge = 'body';
   if (tool == 'time' && !note.unpitched && x1 - x0 >= 38) {
@@ -210,18 +220,14 @@ Offset noteAnchorOffset({
   );
 }
 
+/// Note colour: theme accent when in key, status.error when off (same ±15¢
+/// threshold as the off-key count). Two distinct hues read better than a
+/// blue-to-red blend, which turns muddy purple in between.
 List<int> _rgbFor(int cents) {
-  final absCents = cents.abs();
-  if (absCents <= 6) {
-    // Crisp in-tune warm amber-gold
-    return [229, 156, 94];
+  if (cents.abs() < 15) {
+    return [77, 156, 248]; // accent.primary #4D9CF8
   }
-  final t = clampVal((absCents - 6.0) / 42.0, 0.0, 1.0);
-  return [
-    (229 + (214 - 229) * t).round(),
-    (156 + (100 - 156) * t).round(),
-    (94 + (82 - 94) * t).round(),
-  ];
+  return [242, 100, 95]; // status.error #F2645F
 }
 
 List<int> _lighten(List<int> rgb, double amount) {
@@ -231,6 +237,11 @@ List<int> _lighten(List<int> rgb, double amount) {
 }
 
 int _samplesFor(VocalNote note) {
+  // A ลูกคอ moves fast (a shake is up to 9 Hz): sample it finely enough
+  // that the drawn curve is the real shape, not a jagged outline.
+  if (note.ornStyle != kOrnNone) {
+    return math.max(48, math.min(320, (note.dur * 240).round()));
+  }
   return math.max(28, math.min(96, (note.dur * 72).round()));
 }
 
@@ -289,7 +300,10 @@ _BuiltNoteVisual _buildNoteVisual(
 ) {
   final count = _samplesFor(shown);
   final x0 = layout.timeToX(viewStart, shown.start);
-  final x1 = math.max(x0 + 3.0, layout.timeToX(viewStart, shown.start + shown.dur));
+  final x1 = math.max(
+    x0 + 3.0,
+    layout.timeToX(viewStart, shown.start + shown.dur),
+  );
   final centerY = layout.pitchToY(pitchHi, shown.pitch);
 
   final levelScale = clampVal(
@@ -298,17 +312,19 @@ _BuiltNoteVisual _buildNoteVisual(
     1.35,
   );
   final boxHalfH = clampVal(layout.pxPerSemi * 0.37 * levelScale, 6.0, 14.5);
-  final radius = math.min(4.5, math.min(boxHalfH, (x1 - x0) * 0.35));
+  final radius = math.min(boxHalfH, (x1 - x0) * 0.5);
   final blockRRect = RRect.fromRectAndRadius(
     Rect.fromLTRB(x0, centerY - boxHalfH, x1, centerY + boxHalfH),
     Radius.circular(radius),
   );
 
   final pitchMoved = (shown.pitch - rawNote.detected).abs() > 0.045;
-  final timeMoved = (shown.start - rawNote.detectedStart).abs() > 0.012 ||
+  final timeMoved =
+      (shown.start - rawNote.detectedStart).abs() > 0.012 ||
       (shown.dur - rawNote.detectedDur).abs() > 0.012;
   final modChanged = (shown.modulation - 1.0).abs() > 0.05;
-  final hasGhost = !bypass && !rawNote.unpitched && (pitchMoved || timeMoved || modChanged);
+  final hasGhost =
+      !bypass && !rawNote.unpitched && (pitchMoved || timeMoved || modChanged);
 
   final ghostCenterY = layout.pitchToY(pitchHi, rawNote.detected);
   RRect? ghostRRect;
@@ -377,7 +393,6 @@ class EditorPainter extends CustomPainter {
   final String mode;
   final double bpm;
   final double duration;
-  final double playhead;
   final bool loop;
   final bool bypass;
   final String? selectedId;
@@ -389,6 +404,11 @@ class EditorPainter extends CustomPainter {
   final double pitchHi;
   final bool isDraggingPitch;
   final String? dragNoteId;
+  final String bypassLabel;
+
+  /// Cut mode: the note being cut and where the cut line is (seconds).
+  final String? cutNoteId;
+  final double? cutTime;
 
   EditorPainter({
     required this.notes,
@@ -396,7 +416,6 @@ class EditorPainter extends CustomPainter {
     required this.mode,
     required this.bpm,
     required this.duration,
-    required this.playhead,
     required this.loop,
     required this.bypass,
     required this.selectedId,
@@ -408,6 +427,9 @@ class EditorPainter extends CustomPainter {
     required this.pitchHi,
     required this.isDraggingPitch,
     required this.dragNoteId,
+    this.bypassLabel = 'BYPASS',
+    this.cutNoteId,
+    this.cutTime,
   });
 
   @override
@@ -434,7 +456,8 @@ class EditorPainter extends CustomPainter {
     );
 
     final timeOrdered = [...notes]..sort((a, b) => a.start.compareTo(b.start));
-    final ordered = [...notes]..sort((a, b) {
+    final ordered = [...notes]
+      ..sort((a, b) {
         if (a.id == selectedId) return 1;
         if (b.id == selectedId) return -1;
         return a.start.compareTo(b.start);
@@ -446,7 +469,14 @@ class EditorPainter extends CustomPainter {
       final x0 = layout.timeToX(viewStart, shown.start);
       final x1 = layout.timeToX(viewStart, shown.start + shown.dur);
       if (x1 < layout.padL - 30 || x0 > layout.w + 30) continue;
-      visuals[note.id] = _buildNoteVisual(shown, note, layout, viewStart, pitchHi, bypass);
+      visuals[note.id] = _buildNoteVisual(
+        shown,
+        note,
+        layout,
+        viewStart,
+        pitchHi,
+        bypass,
+      );
     }
 
     // 1. Draw ghost original note boxes and original pitch traces first
@@ -477,9 +507,14 @@ class EditorPainter extends CustomPainter {
         rgb,
         reading.cents,
         selected,
-        note.unpitched,
+        // Muted notes reuse the neutral (unpitched) look, plus a strike.
+        note.unpitched || shown.muted,
         note.pinned,
       );
+      if (shown.muted) _drawMutedStrike(canvas, vis);
+      if (shown.accent > 0 && !note.unpitched) {
+        _drawAccentMark(canvas, vis, shown.accent);
+      }
     }
 
     // 3. Draw smooth inter-note pitch transition threads
@@ -489,28 +524,35 @@ class EditorPainter extends CustomPainter {
     for (final note in ordered) {
       final vis = visuals[note.id];
       if (vis == null) continue;
-      _strokeCurve(canvas, vis.curve, note.id == selectedId, note.unpitched);
+      _strokeCurve(
+        canvas,
+        vis.curve,
+        note.id == selectedId,
+        note.unpitched,
+        faint: presentNote(note, bypass).muted,
+      );
     }
+
+    _drawOffKeyTags(canvas, layout, timeOrdered, visuals);
 
     final selectedNote = notes.where((n) => n.id == selectedId).firstOrNull;
     _drawTargetGuide(canvas, layout, selectedNote);
     _drawHandles(canvas, layout, selectedNote);
     _drawDragGuide(canvas, layout);
-    _drawSelectedBadge(canvas, layout, selectedNote, visuals[selectedId]);
+    // While cutting, the cut markers take the badge's place.
+    if (cutNoteId == null) {
+      _drawSelectedBadge(canvas, layout, selectedNote, visuals[selectedId]);
+    }
+    _drawCutLine(canvas, layout, visuals);
     canvas.restore();
 
     _drawRulers(canvas, layout);
     _drawLyrics(canvas, layout);
     _drawLoop(canvas, layout);
-    _drawPlayhead(canvas, layout);
     if (bypass) _drawBypassTag(canvas, layout);
   }
 
-  void _drawGhostNote(
-    Canvas canvas,
-    _BuiltNoteVisual vis,
-    bool selected,
-  ) {
+  void _drawGhostNote(Canvas canvas, _BuiltNoteVisual vis, bool selected) {
     final ghostRRect = vis.ghostRRect;
     if (ghostRRect != null) {
       final rect = ghostRRect.outerRect;
@@ -523,8 +565,8 @@ class EditorPainter extends CustomPainter {
           Paint()
             ..strokeWidth = 1.0
             ..color = selected
-                ? const Color.fromRGBO(227, 154, 98, 0.36)
-                : const Color.fromRGBO(255, 246, 232, 0.14),
+                ? const Color.fromRGBO(77, 156, 248, 0.36)
+                : const Color.fromRGBO(255, 255, 255, 0.14),
         );
       }
       canvas.drawRRect(
@@ -532,8 +574,8 @@ class EditorPainter extends CustomPainter {
         Paint()
           ..style = PaintingStyle.fill
           ..color = selected
-              ? const Color.fromRGBO(227, 154, 98, 0.09)
-              : const Color.fromRGBO(255, 246, 232, 0.045),
+              ? const Color.fromRGBO(77, 156, 248, 0.09)
+              : const Color.fromRGBO(255, 255, 255, 0.045),
       );
       canvas.drawRRect(
         ghostRRect,
@@ -541,8 +583,8 @@ class EditorPainter extends CustomPainter {
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1.0
           ..color = selected
-              ? const Color.fromRGBO(227, 154, 98, 0.34)
-              : const Color.fromRGBO(255, 246, 232, 0.16),
+              ? const Color.fromRGBO(77, 156, 248, 0.34)
+              : const Color.fromRGBO(255, 255, 255, 0.16),
       );
       // Center line inside ghost box
       canvas.drawLine(
@@ -550,7 +592,7 @@ class EditorPainter extends CustomPainter {
         Offset(rect.right - 3, vis.ghostCenterY),
         Paint()
           ..strokeWidth = 1.0
-          ..color = const Color.fromRGBO(255, 246, 232, 0.10),
+          ..color = const Color.fromRGBO(255, 255, 255, 0.10),
       );
     }
 
@@ -565,8 +607,8 @@ class EditorPainter extends CustomPainter {
           ..strokeCap = StrokeCap.round
           ..strokeWidth = 1.0
           ..color = selected
-              ? const Color.fromRGBO(244, 239, 230, 0.28)
-              : const Color.fromRGBO(244, 239, 230, 0.15),
+              ? const Color.fromRGBO(255, 255, 255, 0.28)
+              : const Color.fromRGBO(255, 255, 255, 0.15),
       );
     }
   }
@@ -589,7 +631,7 @@ class EditorPainter extends CustomPainter {
         rrect.inflate(1.5),
         Paint()
           ..style = PaintingStyle.fill
-          ..color = const Color.fromRGBO(227, 154, 98, 0.16),
+          ..color = const Color.fromRGBO(77, 156, 248, 0.16),
       );
     }
 
@@ -599,8 +641,8 @@ class EditorPainter extends CustomPainter {
       Offset(0, rect.bottom),
       unpitched
           ? const [
-              Color.fromRGBO(110, 106, 100, 0.36),
-              Color.fromRGBO(82, 78, 74, 0.36),
+              Color.fromRGBO(108, 108, 108, 0.36),
+              Color.fromRGBO(80, 80, 80, 0.36),
             ]
           : [
               Color.fromRGBO(rgb[0], rgb[1], rgb[2], selected ? 0.46 : 0.34),
@@ -629,7 +671,7 @@ class EditorPainter extends CustomPainter {
       Offset(rect.right, vis.centerY),
       Paint()
         ..strokeWidth = 1.0
-        ..color = const Color.fromRGBO(255, 248, 238, 0.16),
+        ..color = const Color.fromRGBO(255, 255, 255, 0.16),
     );
 
     // Symmetric inner vocal energy waveform blob
@@ -640,8 +682,8 @@ class EditorPainter extends CustomPainter {
         Offset(0, rect.bottom),
         unpitched
             ? const [
-                Color.fromRGBO(146, 140, 132, 0.45),
-                Color.fromRGBO(116, 110, 104, 0.45),
+                Color.fromRGBO(140, 140, 140, 0.45),
+                Color.fromRGBO(112, 112, 112, 0.45),
               ]
             : [
                 Color.fromRGBO(
@@ -671,51 +713,12 @@ class EditorPainter extends CustomPainter {
           Offset(0, rect.top + rect.height * 0.38),
           [
             selected
-                ? const Color.fromRGBO(255, 250, 242, 0.30)
-                : const Color.fromRGBO(255, 246, 236, 0.18),
-            const Color.fromRGBO(255, 246, 236, 0.0),
+                ? const Color.fromRGBO(255, 255, 255, 0.30)
+                : const Color.fromRGBO(255, 255, 255, 0.18),
+            const Color.fromRGBO(255, 255, 255, 0.0),
           ],
         ),
     );
-
-    // In-block note name & tuning status (only when note block is wide enough)
-    if (!unpitched && rect.width >= 26 && rect.height >= 12) {
-      final noteName = spellMidi(shown.pitch, keyName);
-      _drawText(
-        canvas,
-        text: noteName,
-        style: CantoTypography.mono(
-          size: 8.5,
-          weight: FontWeight.w700,
-          color: selected
-              ? const Color.fromRGBO(28, 16, 10, 0.92)
-              : const Color.fromRGBO(32, 18, 10, 0.82),
-        ),
-        position: Offset(rect.left + 5.0, vis.centerY),
-        centerVertically: true,
-      );
-
-      if (rect.width >= 60 && !selected) {
-        final absCents = cents.abs();
-        final centsLabel = absCents <= 4
-            ? '0¢'
-            : '${cents > 0 ? '+' : '−'}$absCents¢';
-        _drawText(
-          canvas,
-          text: centsLabel,
-          style: CantoTypography.mono(
-            size: 8.0,
-            weight: FontWeight.w600,
-            color: absCents <= 6
-                ? const Color.fromRGBO(30, 18, 10, 0.68)
-                : const Color.fromRGBO(42, 14, 10, 0.82),
-          ),
-          position: Offset(rect.right - 5.0, vis.centerY),
-          alignRight: true,
-          centerVertically: true,
-        );
-      }
-    }
 
     canvas.restore();
 
@@ -726,10 +729,10 @@ class EditorPainter extends CustomPainter {
       ..color = unpitched
           ? const Color.fromRGBO(255, 255, 255, 0.10)
           : selected
-              ? const Color.fromRGBO(250, 245, 236, 0.96)
-              : pinned
-                  ? const Color.fromRGBO(255, 236, 210, 0.62)
-                  : const Color.fromRGBO(44, 22, 10, 0.55);
+          ? const Color.fromRGBO(232, 232, 232, 0.96)
+          : pinned
+          ? const Color.fromRGBO(255, 255, 255, 0.62)
+          : const Color.fromRGBO(10, 10, 10, 0.55);
     canvas.drawRRect(rrect, borderPaint);
   }
 
@@ -742,7 +745,7 @@ class EditorPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.0
       ..strokeCap = StrokeCap.round
-      ..color = const Color.fromRGBO(244, 236, 224, 0.28);
+      ..color = const Color.fromRGBO(255, 255, 255, 0.28);
 
     for (int i = 0; i < timeOrdered.length - 1; i++) {
       final a = timeOrdered[i];
@@ -767,15 +770,146 @@ class EditorPainter extends CustomPainter {
     }
   }
 
+  /// Diagonal strike across a muted note: its audio is cut from the output.
+  void _drawMutedStrike(Canvas canvas, _BuiltNoteVisual vis) {
+    final r = vis.blockRRect.outerRect;
+    canvas.save();
+    canvas.clipRRect(vis.blockRRect);
+    canvas.drawLine(
+      r.bottomLeft,
+      r.topRight,
+      Paint()
+        ..strokeWidth = 1.5
+        ..color = const Color.fromRGBO(255, 255, 255, 0.45),
+    );
+    canvas.restore();
+  }
+
+  /// Musical accent sign (>) at the note's onset, below the note so it never
+  /// meets the off-key tag or the selected badge above it. Stronger accents
+  /// draw more opaque.
+  void _drawAccentMark(Canvas canvas, _BuiltNoteVisual vis, double amount) {
+    final r = vis.blockRRect.outerRect;
+    final x = r.left + 7;
+    final y = r.bottom + 8;
+    final path = Path()
+      ..moveTo(x - 4, y - 3.5)
+      ..lineTo(x + 4, y)
+      ..lineTo(x - 4, y + 3.5);
+    canvas.drawPath(
+      path,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.8
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round
+        ..color = CantoColors.ink.withValues(
+          alpha: 0.45 + 0.55 * amount.clamp(0.0, 1.0),
+        ),
+    );
+  }
+
+  /// Cut mode: a line across the note at the cut position with markers
+  /// above and below, so the finger doesn't hide where the cut lands.
+  void _drawCutLine(
+    Canvas canvas,
+    EditorLayout layout,
+    Map<String, _BuiltNoteVisual> visuals,
+  ) {
+    final id = cutNoteId;
+    final time = cutTime;
+    if (id == null || time == null) return;
+    final vis = visuals[id];
+    if (vis == null) return;
+    final r = vis.blockRRect.outerRect;
+    final x = layout.timeToX(viewStart, time).roundToDouble() + 0.5;
+    final top = r.top - 18;
+    final bottom = r.bottom + 18;
+    final paint = Paint()
+      ..color = CantoColors.accent
+      ..strokeWidth = 2;
+    canvas.drawLine(Offset(x, top), Offset(x, bottom), paint);
+    for (final (y, dir) in [(top, 1.0), (bottom, -1.0)]) {
+      canvas.drawPath(
+        Path()
+          ..moveTo(x - 6, y - dir * 6)
+          ..lineTo(x + 6, y - dir * 6)
+          ..lineTo(x, y)
+          ..close(),
+        Paint()..color = CantoColors.accent,
+      );
+    }
+  }
+
+  /// Small cents tags above notes that sit off the scale, so problems are
+  /// visible without selecting each note. The selected note has its own badge.
+  void _drawOffKeyTags(
+    Canvas canvas,
+    EditorLayout layout,
+    List<VocalNote> timeOrdered,
+    Map<String, _BuiltNoteVisual> visuals,
+  ) {
+    final placed = <Rect>[];
+    for (final note in timeOrdered) {
+      if (note.unpitched || note.muted || note.id == selectedId) continue;
+      final vis = visuals[note.id];
+      if (vis == null) continue;
+      final shown = presentNote(note, bypass);
+      final cents = centsFromTarget(shown.pitch, keyName, mode).cents;
+      if (cents.abs() < 15) continue;
+      final rect = vis.blockRRect.outerRect;
+      if (rect.width < 14) continue;
+      final tp = TextPainter(
+        text: TextSpan(
+          text: formatCents(cents),
+          style: CantoTypography.num(
+            size: 9,
+            weight: FontWeight.w600,
+            color: CantoColors.heat,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      final w = tp.width + 8;
+      final h = tp.height + 2;
+      final cx = clampVal(
+        rect.center.dx,
+        layout.padL + w / 2 + 2,
+        layout.w - w / 2 - 2,
+      );
+      var top = rect.top - h - 3;
+      if (top < layout.padT + 2) top = rect.bottom + 3;
+      final tag = Rect.fromLTWH(cx - w / 2, top, w, h);
+      if (placed.any((r) => r.inflate(2).overlaps(tag))) continue;
+      placed.add(tag);
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(tag, Radius.circular(h / 2)),
+        Paint()..color = const Color.fromRGBO(22, 22, 22, 0.9),
+      );
+      tp.paint(canvas, Offset(tag.left + 4, tag.top + 1));
+    }
+  }
+
   void _strokeCurve(
     Canvas canvas,
     List<Offset> curve,
     bool selected,
-    bool unpitched,
-  ) {
+    bool unpitched, {
+    bool faint = false,
+  }) {
     if (unpitched || curve.length < 2) return;
     final path = Path();
     _curveThrough(path, curve);
+    if (faint) {
+      canvas.drawPath(
+        path,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.0
+          ..color = const Color.fromRGBO(255, 255, 255, 0.3),
+      );
+      return;
+    }
 
     // Subtle dark halo so the pitch trace reads clearly over bright note fills and dark grid lines
     canvas.drawPath(
@@ -785,7 +919,7 @@ class EditorPainter extends CustomPainter {
         ..strokeJoin = StrokeJoin.round
         ..strokeCap = StrokeCap.round
         ..strokeWidth = selected ? 3.0 : 2.4
-        ..color = const Color.fromRGBO(24, 14, 8, 0.52),
+        ..color = const Color.fromRGBO(0, 0, 0, 0.52),
     );
 
     final paint = Paint()
@@ -794,8 +928,8 @@ class EditorPainter extends CustomPainter {
       ..strokeCap = StrokeCap.round
       ..strokeWidth = selected ? 1.65 : 1.25
       ..color = selected
-          ? const Color.fromRGBO(255, 252, 246, 0.98)
-          : const Color.fromRGBO(250, 242, 230, 0.86);
+          ? const Color.fromRGBO(255, 255, 255, 0.98)
+          : const Color.fromRGBO(232, 232, 232, 0.86);
     canvas.drawPath(path, paint);
   }
 
@@ -811,13 +945,53 @@ class EditorPainter extends CustomPainter {
       Rect.fromLTWH(0, 0, w, h),
       Paint()..color = CantoColors.well,
     );
-    final chromePaint = Paint()..color = CantoColors.panel;
-    canvas.drawRect(Rect.fromLTWH(0, 0, w, padT), chromePaint);
+    final chromePaint = Paint()..color = CantoColors.surface;
+    canvas.drawRect(
+      Rect.fromLTWH(0, 0, w, padT),
+      Paint()..color = CantoColors.rulerBg,
+    );
     canvas.drawRect(Rect.fromLTWH(0, gridBottom, w, padB), chromePaint);
     canvas.drawRect(Rect.fromLTWH(0, 0, padL, h), chromePaint);
 
     final pcs = scalePcs(keyName, mode).toSet();
     final tonic = keyPc(keyName);
+
+    // Pitch ruler drawn as the DAW's piano keyboard (piano.* tokens), with an
+    // accent tick on the scale degrees.
+    canvas.save();
+    canvas.clipRect(Rect.fromLTWH(0, padT, padL, gridBottom - padT));
+    for (
+      int pitch = pitchLo.floor() - 1;
+      pitch <= pitchHi.ceil() + 1;
+      pitch++
+    ) {
+      final pc = ((pitch % 12) + 12) % 12;
+      final y1 = layout.pitchToY(pitchHi, pitch + 0.5);
+      final y2 = layout.pitchToY(pitchHi, pitch - 0.5);
+      const black = {1, 3, 6, 8, 10};
+      canvas.drawRect(
+        Rect.fromLTRB(0, y1, padL - 1, y2),
+        Paint()
+          ..color = black.contains(pc)
+              ? CantoColors.keyBlack
+              : CantoColors.keyWhite,
+      );
+      canvas.drawLine(
+        Offset(0, y2.roundToDouble() - 0.5),
+        Offset(padL - 1, y2.roundToDouble() - 0.5),
+        Paint()
+          ..strokeWidth = 1
+          ..color = CantoColors.keySeam,
+      );
+      if (pcs.contains(pc)) {
+        canvas.drawRect(
+          Rect.fromLTRB(padL - 4, y1 + 1, padL - 1, y2 - 1),
+          Paint()
+            ..color = pc == tonic ? CantoColors.accent : CantoColors.accentLine,
+        );
+      }
+    }
+    canvas.restore();
 
     canvas.save();
     canvas.clipRect(Rect.fromLTWH(padL, padT, w - padL, gridBottom - padT));
@@ -831,8 +1005,8 @@ class EditorPainter extends CustomPainter {
       final y2 = layout.pitchToY(pitchHi, pitch - 0.5);
       final rowPaint = Paint()
         ..color = pc == tonic
-            ? const Color.fromRGBO(227, 154, 98, 0.06)
-            : const Color.fromRGBO(255, 246, 232, 0.03);
+            ? const Color.fromRGBO(77, 156, 248, 0.06)
+            : CantoColors.laneRow;
       canvas.drawRect(Rect.fromLTWH(padL, y1, w - padL, y2 - y1), rowPaint);
     }
 
@@ -847,9 +1021,7 @@ class EditorPainter extends CustomPainter {
       final barLine = beatIndex % 4 == 0;
       final linePaint = Paint()
         ..strokeWidth = 1
-        ..color = barLine
-            ? const Color.fromRGBO(255, 255, 255, 0.09)
-            : const Color.fromRGBO(255, 255, 255, 0.035);
+        ..color = barLine ? CantoColors.gridBar : CantoColors.gridMajor;
       final cx = x.roundToDouble() + 0.5;
       canvas.drawLine(Offset(cx, padT), Offset(cx, gridBottom), linePaint);
 
@@ -861,7 +1033,7 @@ class EditorPainter extends CustomPainter {
           Offset(midX, gridBottom),
           Paint()
             ..strokeWidth = 1
-            ..color = const Color.fromRGBO(255, 255, 255, 0.025),
+            ..color = CantoColors.gridMinor,
         );
       }
     }
@@ -872,10 +1044,10 @@ class EditorPainter extends CustomPainter {
       final isTonic = pc == tonic;
       final isC = pc == 0;
       final lineColor = isTonic
-          ? const Color.fromRGBO(227, 154, 98, 0.32)
+          ? const Color.fromRGBO(77, 156, 248, 0.32)
           : isC
-              ? const Color.fromRGBO(255, 255, 255, 0.12)
-              : const Color.fromRGBO(255, 255, 255, 0.045);
+          ? CantoColors.gridMajor
+          : CantoColors.gridMinor;
       final cy = y.roundToDouble() + 0.5;
       canvas.drawLine(
         Offset(padL, cy),
@@ -890,9 +1062,17 @@ class EditorPainter extends CustomPainter {
 
     final borderPaint = Paint()
       ..strokeWidth = 1
-      ..color = const Color.fromRGBO(255, 255, 255, 0.06);
-    canvas.drawLine(Offset(padL + 0.5, padT), Offset(padL + 0.5, h), borderPaint);
-    canvas.drawLine(Offset(padL, padT + 0.5), Offset(w, padT + 0.5), borderPaint);
+      ..color = CantoColors.line;
+    canvas.drawLine(
+      Offset(padL + 0.5, padT),
+      Offset(padL + 0.5, h),
+      borderPaint,
+    );
+    canvas.drawLine(
+      Offset(padL, padT + 0.5),
+      Offset(w, padT + 0.5),
+      borderPaint,
+    );
     canvas.drawLine(
       Offset(0, gridBottom + 0.5),
       Offset(w, gridBottom + 0.5),
@@ -919,20 +1099,21 @@ class EditorPainter extends CustomPainter {
       final inScale = pcs.contains(pc);
       final isC = pc == 0;
       if (layout.pxPerSemi < 15 && !inScale && !isC) continue;
-      final color = pc == tonic
-          ? CantoColors.accent
-          : inScale
-              ? const Color(0xFFC9C3B8)
-              : CantoColors.canvasFaint;
+      // Labels sit on the keys: dark on white keys, muted on black keys.
+      const black = {1, 3, 6, 8, 10};
+      final onBlack = black.contains(pc);
+      final color = onBlack
+          ? (inScale ? CantoColors.canvasMuted : CantoColors.muted)
+          : (inScale ? CantoColors.keyBlack : CantoColors.keyLabel);
       _drawText(
         canvas,
         text: spellMidi(pitch, keyName),
-        style: CantoTypography.mono(
+        style: CantoTypography.num(
           size: 9,
-          weight: FontWeight.w500,
+          weight: pc == tonic ? FontWeight.w700 : FontWeight.w500,
           color: color,
         ),
-        position: Offset(padL - 5, y),
+        position: Offset(padL - 8, y),
         alignRight: true,
         centerVertically: true,
       );
@@ -942,17 +1123,26 @@ class EditorPainter extends CustomPainter {
     final startBeat = (viewStart / beat).floor();
     final endBeat = ((viewStart + viewDuration) / beat).ceil();
     for (int beatIndex = startBeat; beatIndex <= endBeat; beatIndex += 1) {
-      if (beatIndex % 4 != 0) continue;
       final x = layout.timeToX(viewStart, beatIndex * beat);
-      if (x < padL || x > w - 12) continue;
+      if (x < padL || x > w) continue;
+      final tickX = x.roundToDouble() + 0.5;
+      final isBar = beatIndex % 4 == 0;
+      canvas.drawLine(
+        Offset(tickX, isBar ? 4 : padT - 5),
+        Offset(tickX, padT),
+        Paint()
+          ..strokeWidth = 1
+          ..color = isBar ? CantoColors.rulerTick : CantoColors.line,
+      );
+      if (!isBar || x > w - 12) continue;
       final bar = (beatIndex ~/ 4) + 1;
       _drawText(
         canvas,
         text: '$bar',
-        style: CantoTypography.mono(
+        style: CantoTypography.num(
           size: 9,
           weight: FontWeight.w500,
-          color: CantoColors.canvasMuted,
+          color: CantoColors.rulerText,
         ),
         position: Offset(x.roundToDouble() + 4, padT / 2.0),
         centerVertically: true,
@@ -984,13 +1174,26 @@ class EditorPainter extends CustomPainter {
           text: note.lyric,
           style: CantoTypography.sans(
             size: 10.5,
-            weight: selected ? FontWeight.w600 : FontWeight.w500,
-            color: selected ? CantoColors.ink : CantoColors.canvasMuted,
+            weight: selected ? FontWeight.w700 : FontWeight.w500,
+            color: selected ? CantoColors.accentInk : CantoColors.canvasMuted,
           ),
         ),
         textDirection: TextDirection.ltr,
       )..layout();
       if (center - tp.width / 2.0 < lastRight + 3) continue;
+      if (selected) {
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(
+            Rect.fromCenter(
+              center: Offset(center, baseline),
+              width: tp.width + 12,
+              height: tp.height + 3,
+            ),
+            Radius.circular((tp.height + 3) / 2),
+          ),
+          Paint()..color = CantoColors.accent,
+        );
+      }
       tp.paint(
         canvas,
         Offset(center - tp.width / 2.0, baseline - tp.height / 2.0),
@@ -1018,19 +1221,17 @@ class EditorPainter extends CustomPainter {
     final tp = TextPainter(
       text: TextSpan(
         text: badgeText,
-        style: CantoTypography.mono(
-          size: 9.0,
+        style: CantoTypography.num(
+          size: 10.0,
           weight: FontWeight.w600,
-          color: reading.cents.abs() <= 6
-              ? const Color(0xFFF5EFE6)
-              : CantoColors.heat,
+          color: reading.cents.abs() < 15 ? CantoColors.ink : CantoColors.heat,
         ),
       ),
       textDirection: TextDirection.ltr,
     )..layout();
 
-    final pillW = tp.width + 10.0;
-    final pillH = tp.height + 4.0;
+    final pillW = tp.width + 14.0;
+    final pillH = tp.height + 6.0;
     final centerX = clampVal(
       rect.center.dx,
       layout.padL + pillW / 2.0 + 4.0,
@@ -1043,20 +1244,20 @@ class EditorPainter extends CustomPainter {
 
     final pillRRect = RRect.fromRectAndRadius(
       Rect.fromLTWH(centerX - pillW / 2.0, topY, pillW, pillH),
-      const Radius.circular(3.5),
+      Radius.circular(pillH / 2.0),
     );
     canvas.drawRRect(
       pillRRect,
-      Paint()..color = const Color.fromRGBO(22, 18, 15, 0.90),
+      Paint()..color = const Color.fromRGBO(22, 22, 22, 0.94),
     );
     canvas.drawRRect(
       pillRRect,
       Paint()
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1.0
-        ..color = reading.cents.abs() <= 6
-            ? const Color.fromRGBO(227, 154, 98, 0.55)
-            : const Color.fromRGBO(224, 112, 92, 0.65),
+        ..color = reading.cents.abs() < 15
+            ? CantoColors.accentLine
+            : const Color.fromRGBO(242, 100, 95, 0.7),
     );
     tp.paint(
       canvas,
@@ -1064,37 +1265,18 @@ class EditorPainter extends CustomPainter {
     );
   }
 
-  void _drawPlayhead(Canvas canvas, EditorLayout layout) {
-    final x = layout.timeToX(viewStart, playhead);
-    if (x < layout.padL - 1 || x > layout.w + 1) return;
-    final crisp = x.roundToDouble() + 0.5;
-    final linePaint = Paint()
-      ..color = CantoColors.playhead
-      ..strokeWidth = 1;
-    canvas.drawLine(Offset(crisp, 2), Offset(crisp, layout.h - 1), linePaint);
-
-    final headPath = Path()
-      ..moveTo(crisp - 4, layout.padT)
-      ..lineTo(crisp + 4, layout.padT)
-      ..lineTo(crisp, layout.padT + 6)
-      ..close();
-    canvas.drawPath(headPath, Paint()..color = CantoColors.playhead);
-  }
-
-  void _drawTargetGuide(
-    Canvas canvas,
-    EditorLayout layout,
-    VocalNote? note,
-  ) {
+  void _drawTargetGuide(Canvas canvas, EditorLayout layout, VocalNote? note) {
     if (note == null || note.unpitched) return;
     final shown = presentNote(note, bypass);
     final reading = centsFromTarget(shown.pitch, keyName, mode);
     if (reading.cents.abs() < 6) return;
     final x0 = layout.timeToX(viewStart, shown.start);
     final x1 = layout.timeToX(viewStart, shown.start + shown.dur);
-    final y = layout.pitchToY(pitchHi, reading.target.toDouble()).roundToDouble() + 0.5;
+    final y =
+        layout.pitchToY(pitchHi, reading.target.toDouble()).roundToDouble() +
+        0.5;
     final paint = Paint()
-      ..color = const Color.fromRGBO(227, 154, 98, 0.55)
+      ..color = const Color.fromRGBO(77, 156, 248, 0.55)
       ..strokeWidth = 1;
     double cx = x0;
     while (cx < x1) {
@@ -1114,7 +1296,7 @@ class EditorPainter extends CustomPainter {
       Offset(layout.padL, y),
       Offset(layout.w, y),
       Paint()
-        ..color = const Color.fromRGBO(236, 231, 222, 0.28)
+        ..color = const Color.fromRGBO(232, 232, 232, 0.28)
         ..strokeWidth = 1,
     );
   }
@@ -1133,14 +1315,14 @@ class EditorPainter extends CustomPainter {
       );
       canvas.drawRRect(
         RRect.fromRectAndRadius(rect, const Radius.circular(1.5)),
-        Paint()..color = const Color(0xFFF3EEE6),
+        Paint()..color = CantoColors.ink,
       );
       canvas.drawRRect(
         RRect.fromRectAndRadius(rect, const Radius.circular(1.5)),
         Paint()
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1
-          ..color = const Color(0xFF1A1612),
+          ..color = CantoColors.bg,
       );
     }
   }
@@ -1148,11 +1330,11 @@ class EditorPainter extends CustomPainter {
   void _drawBypassTag(Canvas canvas, EditorLayout layout) {
     final tp = TextPainter(
       text: TextSpan(
-        text: 'BYPASS',
+        text: bypassLabel,
         style: CantoTypography.sans(
           size: 9,
           weight: FontWeight.w600,
-          color: const Color(0xFFF0B8A4),
+          color: CantoColors.bypass,
           letterSpacing: 0.5,
         ),
       ),
@@ -1163,7 +1345,7 @@ class EditorPainter extends CustomPainter {
     final y = layout.padT + 8;
     canvas.drawRect(
       Rect.fromLTWH(x, y, width, 16),
-      Paint()..color = const Color.fromRGBO(58, 28, 24, 0.92),
+      Paint()..color = CantoColors.bypassSoft,
     );
     tp.paint(canvas, Offset(x + 6, y + (16 - tp.height) / 2.0));
   }
@@ -1176,7 +1358,7 @@ class EditorPainter extends CustomPainter {
     if (x1 <= x0) return;
     canvas.drawRect(
       Rect.fromLTWH(x0, 0, x1 - x0, 2),
-      Paint()..color = const Color.fromRGBO(227, 154, 98, 0.9),
+      Paint()..color = const Color.fromRGBO(77, 156, 248, 0.9),
     );
   }
 
@@ -1214,7 +1396,6 @@ class OverviewPainter extends CustomPainter {
   final String mode;
   final double bpm;
   final double duration;
-  final double playhead;
   final bool bypass;
   final String? selectedId;
   final double viewStart;
@@ -1229,7 +1410,6 @@ class OverviewPainter extends CustomPainter {
     required this.mode,
     required this.bpm,
     required this.duration,
-    required this.playhead,
     required this.bypass,
     required this.selectedId,
     required this.viewStart,
@@ -1246,7 +1426,7 @@ class OverviewPainter extends CustomPainter {
 
     canvas.drawRect(
       Rect.fromLTWH(0, 0, width, height),
-      Paint()..color = CantoColors.transportBg,
+      Paint()..color = CantoColors.well,
     );
 
     final dur = math.max(0.5, duration);
@@ -1272,7 +1452,7 @@ class OverviewPainter extends CustomPainter {
       final maxHalf = (height - 8) * 0.45;
       final wavePaint = Paint()
         ..strokeWidth = math.max(1.0, width / waveformPeaks.length * 0.65)
-        ..color = const Color.fromRGBO(255, 246, 232, 0.11);
+        ..color = const Color.fromRGBO(255, 255, 255, 0.11);
       for (int i = 0; i < waveformPeaks.length; i++) {
         final x = ((i + 0.5) / waveformPeaks.length) * width;
         final h = math.max(1.0, waveformPeaks[i] * maxHalf);
@@ -1287,7 +1467,9 @@ class OverviewPainter extends CustomPainter {
       final w = math.max(1.5, xOf(shown.dur));
       final y = ((pitchHi - shown.pitch) / span) * (height - 12) + 6;
       final reading = centsFromTarget(shown.pitch, keyName, mode);
-      final rgb = note.unpitched ? [120, 116, 110] : _rgbFor(reading.cents);
+      final rgb = note.unpitched || shown.muted
+          ? [116, 116, 116]
+          : _rgbFor(reading.cents);
       final selected = note.id == selectedId;
       final opacity = note.unpitched ? 0.45 : (selected ? 1.0 : 0.9);
       final radius = math.min(3.0, w / 2.0);
@@ -1302,22 +1484,94 @@ class OverviewPainter extends CustomPainter {
 
     final vx = xOf(viewStart);
     final vw = math.max(8.0, xOf(viewDuration));
-    canvas.drawRect(
-      Rect.fromLTWH(vx, 0, vw, height),
-      Paint()..color = const Color.fromRGBO(255, 255, 255, 0.04),
+    final viewRect = RRect.fromRectAndRadius(
+      Rect.fromLTWH(vx + 0.75, 0.75, math.max(1.0, vw - 1.5), height - 1.5),
+      const Radius.circular(6),
     );
-    canvas.drawRect(
-      Rect.fromLTWH(vx + 0.5, 0.5, math.max(1.0, vw - 1), height - 1),
+    canvas.drawRRect(
+      viewRect,
+      Paint()..color = const Color.fromRGBO(255, 255, 255, 0.05),
+    );
+    canvas.drawRRect(
+      viewRect,
       Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 1
-        ..color = const Color.fromRGBO(244, 239, 230, 0.72),
+        ..strokeWidth = 1.5
+        ..color = const Color.fromRGBO(255, 255, 255, 0.6),
     );
+  }
 
-    final play = xOf(playhead).roundToDouble() + 0.5;
+  @override
+  bool shouldRepaint(covariant OverviewPainter oldDelegate) => true;
+}
+
+/// Editor playhead, painted on its own layer and driven by [playhead] so
+/// playback repaints one line instead of the whole note canvas.
+class PlayheadPainter extends CustomPainter {
+  final ValueListenable<double> playhead;
+  final double viewStart;
+  final double viewDuration;
+  final double pitchLo;
+  final double pitchHi;
+
+  PlayheadPainter({
+    required this.playhead,
+    required this.viewStart,
+    required this.viewDuration,
+    required this.pitchLo,
+    required this.pitchHi,
+  }) : super(repaint: playhead);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.width < 8 || size.height < 8) return;
+    final layout = EditorLayout.compute(
+      size.width,
+      size.height,
+      pitchLo: pitchLo,
+      pitchHi: pitchHi,
+      viewDuration: viewDuration,
+    );
+    final x = layout.timeToX(viewStart, playhead.value);
+    if (x < layout.padL - 1 || x > layout.w + 1) return;
+    final crisp = x.roundToDouble() + 0.5;
+    final paint = Paint()
+      ..color = CantoColors.playhead
+      ..strokeWidth = 1;
+    canvas.drawLine(Offset(crisp, 2), Offset(crisp, layout.h - 1), paint);
+    final headPath = Path()
+      ..moveTo(crisp - 4, layout.padT)
+      ..lineTo(crisp + 4, layout.padT)
+      ..lineTo(crisp, layout.padT + 6)
+      ..close();
+    canvas.drawPath(headPath, Paint()..color = CantoColors.playhead);
+  }
+
+  @override
+  bool shouldRepaint(covariant PlayheadPainter old) =>
+      old.playhead != playhead ||
+      old.viewStart != viewStart ||
+      old.viewDuration != viewDuration ||
+      old.pitchLo != pitchLo ||
+      old.pitchHi != pitchHi;
+}
+
+/// Overview playhead line, same idea as [PlayheadPainter].
+class OverviewPlayheadPainter extends CustomPainter {
+  final ValueListenable<double> playhead;
+  final double duration;
+
+  OverviewPlayheadPainter({required this.playhead, required this.duration})
+    : super(repaint: playhead);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.width < 8) return;
+    final dur = math.max(0.5, duration);
+    final x = (playhead.value / dur * size.width).roundToDouble() + 0.5;
     canvas.drawLine(
-      Offset(play, 0),
-      Offset(play, height),
+      Offset(x, 0),
+      Offset(x, size.height),
       Paint()
         ..strokeWidth = 1
         ..color = CantoColors.playhead,
@@ -1325,5 +1579,6 @@ class OverviewPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant OverviewPainter oldDelegate) => true;
+  bool shouldRepaint(covariant OverviewPlayheadPainter old) =>
+      old.playhead != playhead || old.duration != duration;
 }
