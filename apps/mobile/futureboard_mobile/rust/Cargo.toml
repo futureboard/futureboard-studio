@@ -1,0 +1,85 @@
+[package]
+name = "fb_studio_mobile_engine"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Futureboard Studio Mobile — Standalone Rust Audio, Arrangement, MIDI, Mixer & Built-in Plugin DSP Engine"
+
+[workspace]
+
+[lib]
+name = "fb_studio_mobile_engine"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+# Core Futureboard Studio Built-in DSP & Instrument Crates
+builtin_dsp_core = { path = "../../../../crates/BuiltinAudioPlugins/crates/builtin_dsp_core" }
+equz8 = { path = "../../../../crates/BuiltinAudioPlugins/crates/equz8" }
+equzx = { path = "../../../../crates/BuiltinAudioPlugins/crates/equzx" }
+compresser = { path = "../../../../crates/BuiltinAudioPlugins/crates/compresser" }
+fa2a = { path = "../../../../crates/BuiltinAudioPlugins/crates/fa2a" }
+fa76 = { path = "../../../../crates/BuiltinAudioPlugins/crates/fa76" }
+zcomp = { path = "../../../../crates/BuiltinAudioPlugins/crates/zcomp" }
+echospace = { path = "../../../../crates/BuiltinAudioPlugins/crates/echospace" }
+verbspace = { path = "../../../../crates/BuiltinAudioPlugins/crates/verbspace" }
+imager = { path = "../../../../crates/BuiltinAudioPlugins/crates/imager" }
+burnlimit = { path = "../../../../crates/BuiltinAudioPlugins/crates/burnLimit" }
+clipper67 = { path = "../../../../crates/BuiltinAudioPlugins/crates/67Clipper" }
+transient = { path = "../../../../crates/BuiltinAudioPlugins/crates/Transient" }
+waygate = { path = "../../../../crates/BuiltinAudioPlugins/crates/waygate" }
+drumsilencer = { path = "../../../../crates/BuiltinAudioPlugins/crates/drumsilencer" }
+c1073 = { path = "../../../../crates/BuiltinAudioPlugins/crates/c1073" }
+mixstation = { path = "../../../../crates/BuiltinAudioPlugins/crates/mixstation" }
+whitesharp = { path = "../../../../crates/BuiltinAudioPlugins/crates/whitesharp" }
+rodharerist = { path = "../../../../crates/BuiltinAudioPlugins/crates/rodharerist" }
+meowsyn = { path = "../../../../crates/BuiltinAudioPlugins/crates/meowsyn" }
+wrapsynth = { path = "../../../../crates/BuiltinAudioPlugins/crates/wrapsynth" }
+drumsampler = { path = "../../../../crates/BuiltinAudioPlugins/crates/drumsampler" }
+quicksampler = { path = "../../../../crates/BuiltinAudioPlugins/crates/quicksampler" }
+slicer = { path = "../../../../crates/BuiltinAudioPlugins/crates/slicer" }
+
+# Core Sphere Audio Engine Crates
+sphere-audio-plugins = { path = "../../../../crates/SphereAudioPlugins" }
+sphere-soundfont-player = { path = "../../../../crates/SphereSoundfontPlayer", package = "SphereSoundfontPlayer", features = ["test-support"] }
+solfege_spatialaudio = { path = "../../../../crates/solfege_spatialaudio" }
+
+# DSP & Audio I/O Libraries
+biquad = "0.6"
+rustfft = "6"
+ebur128 = "0.1"
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+symphonia = { version = "0.5", default-features = false, features = [
+    "wav",
+    "pcm",
+    "aiff",
+    "mp3",
+    "flac",
+    "ogg",
+    "vorbis",
+    "isomp4",
+    "aac",
+    "alac",
+] }
+
+[patch.crates-io]
+rustysynth = { path = "../../../../external/rustysynth" }
+
+[profile.dev.package.nam-rs]
+opt-level = 3
+
+[profile.dev.package.rodharerist]
+opt-level = 3
+
+[profile.dev.package.builtin_dsp_core]
+opt-level = 3
+
+[profile.dev.package.biquad]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
