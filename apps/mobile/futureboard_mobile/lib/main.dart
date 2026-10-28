@@ -1,122 +1,283 @@
+// Futureboard Studio Mobile — Standalone Rust DSP & Flutter DAW Entrypoint.
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
+
+import 'engine/studio_controller.dart';
+import 'panels/app_chrome.dart';
+import 'panels/arrangement_panel.dart';
+import 'panels/browser_panel.dart';
+import 'panels/editor_panel.dart';
+import 'panels/inspector_panel.dart';
+import 'panels/mixer_panel.dart';
+import 'panels/perform_panel.dart';
+import 'panels/plugin_editor_panel.dart';
+import 'panels/status_bar.dart';
+import 'theme/fb_tokens.dart';
 
 void main() {
-  runApp(const MyApp());
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setPreferredOrientations([
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+    DeviceOrientation.portraitUp,
+  ]);
+  runApp(const FutureboardStudioMobileApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class FutureboardStudioMobileApp extends StatefulWidget {
+  final StudioController? controller;
 
-  // This widget is the root of your application.
+  const FutureboardStudioMobileApp({super.key, this.controller});
+
+  @override
+  State<FutureboardStudioMobileApp> createState() =>
+      _FutureboardStudioMobileAppState();
+}
+
+class _FutureboardStudioMobileAppState
+    extends State<FutureboardStudioMobileApp> {
+  late final StudioController _controller;
+  late final bool _ownsController;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.controller != null) {
+      _controller = widget.controller!;
+      _ownsController = false;
+    } else {
+      _controller = StudioController();
+      _ownsController = true;
+    }
+  }
+
+  @override
+  void dispose() {
+    if (_ownsController) {
+      _controller.dispose();
+    }
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+    return ListenableBuilder(
+      listenable: _controller,
+      builder: (context, _) {
+        final c = _controller.colors;
+        return MaterialApp(
+          title: 'Futureboard Studio Mobile',
+          debugShowCheckedModeBanner: false,
+          theme: ThemeData(
+            brightness: c.isDark ? Brightness.dark : Brightness.light,
+            scaffoldBackgroundColor: c.bgCanvas,
+            fontFamily: FbTypography.fontSans,
+            colorScheme: ColorScheme.fromSeed(
+              seedColor: c.accentPrimary,
+              brightness: c.isDark ? Brightness.dark : Brightness.light,
+            ),
+          ),
+          home: Scaffold(
+            backgroundColor: c.bgCanvas,
+            body: SafeArea(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // 1. Top App Chrome (Titlebar + Transport Cluster)
+                  AppChrome(controller: _controller),
+
+                  // 2. Center Studio Shell (Browser + Arrangement/Dock + Inspector)
+                  Expanded(
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        final isWide = constraints.maxWidth >= 900;
+                        return Row(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            if (_controller.isBrowserOpen)
+                              BrowserPanel(controller: _controller),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  // Top Half: Arrangement Timeline
+                                  Expanded(
+                                    flex: _controller.isBottomDockOpen ? 52 : 100,
+                                    child: ArrangementPanel(
+                                        controller: _controller),
+                                  ),
+
+                                  // Dock Tab Strip Header
+                                  _buildBottomDockTabBar(c, isWide),
+
+                                  // Bottom Half: Active Dock Panel
+                                  if (_controller.isBottomDockOpen)
+                                    Expanded(
+                                      flex: 48,
+                                      child: _buildActiveDockContent(),
+                                    ),
+                                ],
+                              ),
+                            ),
+                            if (_controller.isInspectorOpen && isWide)
+                              InspectorPanel(controller: _controller),
+                          ],
+                        );
+                      },
+                    ),
+                  ),
+
+                  // 3. Bottom Studio Status Bar
+                  StatusBar(controller: _controller),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
-}
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
-
-  @override
-  State<MyHomePage> createState() => _MyHomePageState();
-}
-
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
-
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
-    return Scaffold(
-      appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+  Widget _buildBottomDockTabBar(FbColors c, bool isWide) {
+    return Container(
+      height: 28,
+      padding: const EdgeInsets.symmetric(horizontal: FbSpace.s3),
+      decoration: BoxDecoration(
+        color: c.bgPrimary,
+        border: Border(
+          top: BorderSide(color: c.borderDefault, width: 1.0),
+          bottom: BorderSide(color: c.borderSubtle, width: 1.0),
+        ),
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
           children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+            _dockTabChip(
+              label: 'Mixer',
+              icon: LucideIcons.slidersVertical,
+              tab: StudioDockTab.mixer,
+              c: c,
+            ),
+            const SizedBox(width: 4),
+            _dockTabChip(
+              label: 'Piano Roll / Clip',
+              icon: LucideIcons.piano,
+              tab: StudioDockTab.pianoRoll,
+              c: c,
+            ),
+            const SizedBox(width: 4),
+            _dockTabChip(
+              label: 'Plugin DSP Editor',
+              icon: LucideIcons.slidersHorizontal,
+              tab: StudioDockTab.pluginEditor,
+              c: c,
+            ),
+            const SizedBox(width: 4),
+            _dockTabChip(
+              label: 'Perform Pads & Keys',
+              icon: LucideIcons.keyboardMusic,
+              tab: StudioDockTab.perform,
+              c: c,
+            ),
+            if (!isWide) ...[
+              const SizedBox(width: 4),
+              _dockTabChip(
+                label: '3D Spatial & Chain',
+                icon: LucideIcons.compass,
+                tab: StudioDockTab.inspector,
+                c: c,
+              ),
+            ],
+            const SizedBox(width: FbSpace.s4),
+            InkWell(
+              onTap: _controller.toggleBottomDock,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                child: Row(
+                  children: [
+                    Icon(
+                      _controller.isBottomDockOpen
+                          ? LucideIcons.chevronDown
+                          : LucideIcons.chevronUp,
+                      size: 13,
+                      color: c.textMuted,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      _controller.isBottomDockOpen ? 'Hide Dock' : 'Show Dock',
+                      style: FbTypography.micro(c),
+                    ),
+                  ],
+                ),
+              ),
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
+    );
+  }
+
+  Widget _dockTabChip({
+    required String label,
+    required IconData icon,
+    required StudioDockTab tab,
+    required FbColors c,
+  }) {
+    final active =
+        _controller.isBottomDockOpen && _controller.activeDockTab == tab;
+
+    return InkWell(
+      onTap: () => _controller.setDockTab(tab),
+      borderRadius: BorderRadius.circular(FbRadius.xs),
+      child: Container(
+        height: 22,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: active ? c.accentSoft : Colors.transparent,
+          borderRadius: BorderRadius.circular(FbRadius.xs),
+          border: Border.all(
+            color: active ? c.accentPrimary : Colors.transparent,
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              icon,
+              size: 12,
+              color: active ? c.accentPrimary : c.textSecondary,
+            ),
+            const SizedBox(width: 5),
+            Text(
+              label,
+              style: TextStyle(
+                fontFamily: FbTypography.fontSans,
+                fontSize: 11.0,
+                fontWeight: active ? FontWeight.w700 : FontWeight.w500,
+                color: active ? c.accentPrimary : c.textSecondary,
+              ),
+            ),
+          ],
+        ),
       ),
     );
+  }
+
+  Widget _buildActiveDockContent() {
+    switch (_controller.activeDockTab) {
+      case StudioDockTab.mixer:
+        return MixerPanel(controller: _controller);
+      case StudioDockTab.pianoRoll:
+        return EditorPanel(controller: _controller);
+      case StudioDockTab.pluginEditor:
+        return PluginEditorPanel(controller: _controller);
+      case StudioDockTab.perform:
+        return PerformPanel(controller: _controller);
+      case StudioDockTab.inspector:
+        return InspectorPanel(controller: _controller);
+    }
   }
 }
