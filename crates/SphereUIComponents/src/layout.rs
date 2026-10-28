@@ -904,6 +904,15 @@ impl StudioLayout {
             let owner = cx.entity();
             cx.new(|cx| components::AraEditorHost::new(owner, cx))
         };
+        let voxtune_panel = {
+            let timeline = timeline.clone();
+            let callbacks = Self::voxtune_panel_callbacks(&cx.entity());
+            cx.new(|cx| {
+                let mut panel = components::voxtune_panel::VoxtunePanel::new(timeline, cx);
+                panel.set_callbacks(callbacks);
+                panel
+            })
+        };
         let clip_editor_panel = cx.new(|cx| {
             components::ClipEditorPanel::new(
                 timeline.clone(),
@@ -911,6 +920,7 @@ impl StudioLayout {
                 solfege_editor.clone(),
                 audio_editor.clone(),
                 ara_editor.clone(),
+                voxtune_panel,
                 cx,
             )
         });

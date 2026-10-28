@@ -12,6 +12,7 @@ use crate::components::piano_roll::PianoRoll;
 use crate::components::solfege_editor::SolfegeEditorPanel;
 use crate::components::timeline::timeline::Timeline;
 use crate::components::timeline::timeline_state::ClipType;
+use crate::components::voxtune_panel::VoxtunePanel;
 use crate::theme::Colors;
 
 /// The two audio-facing surfaces hosted by the bottom Editor tab.
@@ -23,15 +24,18 @@ enum EditorSurfaceTab {
     #[default]
     AudioEditor,
     Ara,
+    /// The built-in vocal tuner (Solfege Voxtune) on the selected audio clip.
+    Voxtune,
 }
 
 impl EditorSurfaceTab {
-    const ALL: [Self; 2] = [Self::Ara, Self::AudioEditor];
+    const ALL: [Self; 3] = [Self::Ara, Self::AudioEditor, Self::Voxtune];
 
     fn label(self) -> &'static str {
         match self {
             Self::Ara => "ARA",
             Self::AudioEditor => "Audio Editor",
+            Self::Voxtune => "Voxtune",
         }
     }
 }
@@ -48,6 +52,7 @@ pub struct ClipEditorPanel {
     solfege_editor: Entity<SolfegeEditorPanel>,
     audio_editor: Entity<AudioEditorHost>,
     ara_editor: Entity<AraEditorHost>,
+    voxtune: Entity<VoxtunePanel>,
     active_surface_tab: EditorSurfaceTab,
     last_selection_target: Option<EditorSelectionTarget>,
     /// Last branch reported by the trace, so the choice is logged on change
@@ -63,6 +68,7 @@ impl ClipEditorPanel {
         solfege_editor: Entity<SolfegeEditorPanel>,
         audio_editor: Entity<AudioEditorHost>,
         ara_editor: Entity<AraEditorHost>,
+        voxtune: Entity<VoxtunePanel>,
         cx: &mut Context<Self>,
     ) -> Self {
         let _timeline_observer = cx.observe(&timeline, |_, _, cx| cx.notify());
@@ -72,6 +78,7 @@ impl ClipEditorPanel {
             solfege_editor,
             audio_editor,
             ara_editor,
+            voxtune,
             active_surface_tab: EditorSurfaceTab::default(),
             last_selection_target: None,
             traced: None,
@@ -168,13 +175,17 @@ impl ClipEditorPanel {
                     .and_then(|track_id| state.tracks.iter().find(|track| track.id == track_id))
             })
             .is_some_and(|track| track.ara.is_some());
-        let default_tab = if audio_clip_selected {
-            EditorSurfaceTab::AudioEditor
-        } else if ara_track_selected {
-            EditorSurfaceTab::Ara
-        } else {
-            EditorSurfaceTab::AudioEditor
-        };
+        let default_tab =
+            if audio_clip_selected && self.active_surface_tab == EditorSurfaceTab::Voxtune {
+                // Tuning one take after another: stay on the tuner.
+                EditorSurfaceTab::Voxtune
+            } else if audio_clip_selected {
+                EditorSurfaceTab::AudioEditor
+            } else if ara_track_selected {
+                EditorSurfaceTab::Ara
+            } else {
+                EditorSurfaceTab::AudioEditor
+            };
         if self.active_surface_tab != default_tab {
             self.active_surface_tab = default_tab;
             if default_tab != EditorSurfaceTab::Ara {
@@ -215,7 +226,15 @@ impl ClipEditorPanel {
             .border_color(Colors::border_subtle())
             .bg(Colors::surface_titlebar());
 
+        // The tuner works on an audio clip's take; an ARA track without one
+        // has nothing for it.
+        let audio_clip_selected =
+            editor_kind_for_clip(clip_type_hint_for_selection(&self.timeline.read(cx).state))
+                == ClipEditorKind::Audio;
         for (index, tab) in EditorSurfaceTab::ALL.into_iter().enumerate() {
+            if tab == EditorSurfaceTab::Voxtune && !audio_clip_selected {
+                continue;
+            }
             let active = self.active_surface_tab == tab;
             row = row.child(
                 div()
@@ -263,6 +282,11 @@ impl Render for ClipEditorPanel {
                 EditorSurfaceTab::AudioEditor => {
                     self.trace("audio-tab");
                     self.audio_editor.clone().into_any_element()
+                }
+                EditorSurfaceTab::Voxtune => {
+                    self.trace("voxtune-tab");
+                    self.audio_editor.read(cx).mark_hidden();
+                    self.voxtune.clone().into_any_element()
                 }
             };
             return div()

@@ -65,6 +65,44 @@ impl StudioLayout {
         }
     }
 
+    /// What the Voxtune tab edits the project through: the same source swap
+    /// (and undo step) as the Audio Editor, plus Studio's transport.
+    pub(super) fn voxtune_panel_callbacks(
+        layout: &Entity<Self>,
+    ) -> crate::components::voxtune_panel::VoxtunePanelCallbacks {
+        let weak = layout.downgrade();
+        crate::components::voxtune_panel::VoxtunePanelCallbacks {
+            project_folder: {
+                let weak = weak.clone();
+                Rc::new(move |cx: &App| {
+                    weak.upgrade()
+                        .and_then(|layout| layout.read(cx).project_folder.clone())
+                })
+            },
+            replace_source: {
+                let layout = layout.clone();
+                Rc::new(move |clip_id, source, cx: &mut App| {
+                    StudioLayout::defer_update(&layout, cx, move |this, cx| {
+                        this.replace_clip_source(&clip_id, source, cx);
+                        cx.notify();
+                    });
+                })
+            },
+            set_playing: {
+                let layout = layout.clone();
+                Rc::new(move |playing, cx: &mut App| {
+                    StudioLayout::defer_update(&layout, cx, move |this, cx| {
+                        if playing {
+                            this.start_native_playback(cx);
+                        } else {
+                            this.stop_native_playback(cx);
+                        }
+                    });
+                })
+            },
+        }
+    }
+
     /// Send an Edit command to the Audio Editor when it owns the keyboard.
     /// Returns whether the editor took it.
     pub(super) fn route_edit_command_to_audio_editor(
