@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT"
 description = "CANTO / Solfege VoxTune — Rust Audio Engine & Vocal Pitch/Formant DSP (TD-PSOLA, YIN, WhiteSharp, VoiceTune)"
 
+# Standalone crate (built per Android ABI and copied into jniLibs); keep it out
+# of the Futureboard root workspace.
+[workspace]
+
 [lib]
 name = "canto_dsp"
 crate-type = ["rlib", "cdylib", "staticlib"]

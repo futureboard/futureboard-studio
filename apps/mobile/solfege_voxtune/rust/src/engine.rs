@@ -5,10 +5,11 @@
 //! streams real-time TD-PSOLA pitch/formant/time/level shifted audio via `Shifter`.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio_io::{decode_audio_bytes_to_mono, decode_audio_file_to_mono};
+use crate::audio_io::{DecodedAudio, decode_audio_bytes_to_mono, decode_audio_file_to_mono};
 use crate::dsp_core::{
     SoftKneeCompressor, StereoEffect, clamp, db_to_linear,
 };
@@ -20,6 +21,8 @@ use crate::whitesharp_dsp::WhiteSharpDsp;
 pub const DEFAULT_BPM: f32 = 120.0;
 pub const BEATS_PER_BAR: f32 = 4.0;
 pub const CONTOUR_POINTS: usize = 32;
+/// Ramp length for note-preview starts, loop points and stops.
+const AUDITION_FADE_SEC: f32 = 0.008;
 
 const KEY_NAMES: [&str; 12] = [
     "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
@@ -53,6 +56,21 @@ pub struct CantoNote {
     pub gain_db: f32,
     pub detected_gain: f32,
     pub pinned: bool,
+    /// Cut from the output: plays silence over its span. Older saves lack it.
+    #[serde(default)]
+    pub muted: bool,
+    /// ลูกคอ (vocal ornament) style, one of `ORN_*`. Older saves lack it.
+    #[serde(default)]
+    pub orn_style: u8,
+    /// Ornament width in semitones.
+    #[serde(default)]
+    pub orn_depth: f32,
+    /// Ornament speed 0 (slow, wide) ..= 1 (fast, tight).
+    #[serde(default)]
+    pub orn_speed: f32,
+    /// Onset emphasis 0..=1: up to +6 dB over the note's attack.
+    #[serde(default)]
+    pub accent: f32,
     pub scoop: f32,
     pub drift: f32,
     pub vib: f32,
@@ -76,6 +94,8 @@ impl CantoNote {
             modulation: 1.0,
             formant: 0.0,
             gain_db: self.detected_gain,
+            orn_style: ORN_NONE,
+            accent: 0.0,
             ..self.clone()
         }
     }
@@ -167,7 +187,87 @@ pub fn contour_cents(note: &CantoNote, t: f32, modulation: f32) -> f32 {
 }
 
 pub fn pitch_at(note: &CantoNote, t: f32) -> f32 {
-    note.pitch + contour_cents(note, t, note.modulation) / 100.0
+    note.pitch + contour_cents(note, t, note.modulation) / 100.0 + ornament_semis(note, t)
+}
+
+/// ลูกคอ styles (Thai vocal ornaments), added on top of the sung contour.
+pub const ORN_NONE: u8 = 0;
+/// Quick flick up to the upper neighbour and back, right after the onset.
+pub const ORN_TURN_UP: u8 = 1;
+/// The same flick down to the lower neighbour.
+pub const ORN_TURN_DOWN: u8 = 2;
+/// Alternates with the upper neighbour through the note (trill-like).
+pub const ORN_SHAKE: u8 = 3;
+/// Drops away at the end of the note.
+pub const ORN_FALL: u8 = 4;
+
+#[inline]
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * clamp(t, 0.0, 1.0)
+}
+
+/// Raised-cosine bump: 0 outside `start..start + len`, 1 at its middle.
+#[inline]
+fn bump(t: f32, start: f32, len: f32) -> f32 {
+    if len <= 0.0 || t <= start || t >= start + len {
+        return 0.0;
+    }
+    0.5 - 0.5 * ((t - start) / len * std::f32::consts::TAU).cos()
+}
+
+/// Ornament pitch offset in semitones at normalized position `t`. Shapes are
+/// timed in seconds (so speed sounds the same on long and short notes) and
+/// shrink to fit short notes.
+pub fn ornament_semis(note: &CantoNote, t: f32) -> f32 {
+    if note.orn_style == ORN_NONE || note.unpitched || note.orn_depth == 0.0 {
+        return 0.0;
+    }
+    let dur = note.dur.max(0.05);
+    let sec = clamp(t, 0.0, 1.0) * dur;
+    let depth = clamp(note.orn_depth, -4.0, 4.0);
+    let speed = clamp(note.orn_speed, 0.0, 1.0);
+    match note.orn_style {
+        ORN_TURN_UP | ORN_TURN_DOWN => {
+            let len = lerp(0.26, 0.09, speed).min(dur * 0.6);
+            let start = 0.03f32.min(dur * 0.1);
+            let sign = if note.orn_style == ORN_TURN_UP {
+                1.0
+            } else {
+                -1.0
+            };
+            sign * depth * bump(sec, start, len)
+        }
+        ORN_SHAKE => {
+            let hz = lerp(4.5, 9.0, speed);
+            let start = (dur * 0.25).max(0.08).min(dur * 0.5);
+            let end = dur - 0.05f32.min(dur * 0.1);
+            if sec <= start || sec >= end {
+                return 0.0;
+            }
+            let fade_in = smoothstep((sec - start) / 0.08);
+            let fade_out = smoothstep((end - sec) / 0.05);
+            let wave = 0.5 - 0.5 * ((sec - start) * hz * std::f32::consts::TAU).cos();
+            depth * wave * fade_in * fade_out
+        }
+        ORN_FALL => {
+            let len = lerp(0.32, 0.12, speed).min(dur * 0.5);
+            -depth * smoothstep((sec - (dur - len)) / len)
+        }
+        _ => 0.0,
+    }
+}
+
+/// Accent gain at normalized position `t`: a boost over the attack that
+/// eases back to the note's own level.
+pub fn accent_gain(note: &CantoNote, t: f32) -> f32 {
+    if note.accent <= 0.0 || note.unpitched {
+        return 1.0;
+    }
+    let dur = note.dur.max(0.05);
+    let attack = (dur * 0.15).clamp(0.06, 0.2);
+    let sec = clamp(t, 0.0, 1.0) * dur;
+    let boost_db = 6.0 * clamp(note.accent, 0.0, 1.0) * (1.0 - smoothstep(sec / attack));
+    db_to_linear(boost_db)
 }
 
 pub fn detected_pitch_at(note: &CantoNote, t: f32) -> f32 {
@@ -178,6 +278,67 @@ pub fn solfege_for_midi(midi: f32, key_pc: u8) -> String {
     let pc = (midi.round() as i32).rem_euclid(12) as usize;
     let rel = (pc + 12 - (key_pc as usize % 12)) % 12;
     SOLFEGE_SYLLABLES[rel].to_string()
+}
+
+/// Live progress of an analysis running on another thread, and a way to
+/// stop it early.
+#[derive(Debug, Default)]
+pub struct AnalysisProgress {
+    /// 0..=1000 through pitch extraction (the slow part).
+    pub permille: AtomicU32,
+    pub cancel: AtomicBool,
+}
+
+/// What analysis finds in a vocal take.
+#[derive(Debug, Clone)]
+pub struct Analysis {
+    pub key: u8,
+    pub scale: Scale,
+    pub bpm: f32,
+    pub notes: Vec<CantoNote>,
+}
+
+impl Analysis {
+    /// Takes back an earlier result (the app's cache) for audio lasting
+    /// `duration_sec`. None if it doesn't fit that audio, so a stale entry
+    /// falls back to a fresh analysis.
+    pub fn from_cached(result: CantoAnalysisResult, duration_sec: f64) -> Option<Self> {
+        if !result.ok || (result.duration_sec - duration_sec).abs() > 0.05 {
+            return None;
+        }
+        let key = KEY_NAMES.iter().position(|k| *k == result.key)? as u8;
+        let scale = match result.mode.as_str() {
+            "major" => Scale::Major,
+            "penta" => Scale::MinorPentatonic,
+            _ => Scale::Minor,
+        };
+        Some(Self {
+            key,
+            scale,
+            bpm: result.bpm.clamp(68.0, 172.0),
+            notes: result.notes,
+        })
+    }
+}
+
+/// Pitch, notes, key and tempo of mono `samples`. Pure, so it runs without
+/// the engine lock; returns None once `progress.cancel` is set.
+pub fn analyze_samples(
+    samples: &[f32],
+    sample_rate: f32,
+    progress: &AnalysisProgress,
+) -> Option<Analysis> {
+    let frames = extract_pitch_frames(samples, sample_rate as u32, progress)?;
+    let (key, scale) = estimate_key_and_mode(&frames);
+    let bpm = estimate_bpm_from_frames(&frames).clamp(68.0, 172.0);
+    let notes = segment_canto_notes(&frames, key);
+    progress.permille.store(1000, Ordering::Relaxed);
+    Some(Analysis {
+        key,
+        scale,
+        bpm,
+        notes,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -207,10 +368,22 @@ pub struct CantoEngine {
     pub whitesharp: WhiteSharpDsp,
     control_counter: usize,
     meter_level: f32,
-    /// Optional note index currently being auditioned while dragging in the editor.
+    /// Note being previewed (press-to-hear in the editor), if any.
     audition_note_index: Option<usize>,
+    /// Read position in the source audio (input side of the shifter).
     audition_cursor_sec: f64,
-    audition_remaining_frames: usize,
+    /// While held the note loops; once released it plays to its end.
+    audition_held: bool,
+    /// After the last input sample: frames left to flush the shifter's
+    /// latency so the note's ending is heard instead of cut.
+    audition_tail: Option<usize>,
+    /// Immediate stop: output fade frames left.
+    audition_fade: Option<usize>,
+    /// Index of the note that contained the playhead last sample; checked
+    /// first so the per-sample lookup is O(1) inside a note.
+    active_hint: usize,
+    /// Reused by `render_stereo_i16`; grows only when a larger block arrives.
+    scratch: Vec<f32>,
 }
 
 impl CantoEngine {
@@ -245,7 +418,11 @@ impl CantoEngine {
             meter_level: 0.0,
             audition_note_index: None,
             audition_cursor_sec: 0.0,
-            audition_remaining_frames: 0,
+            audition_held: false,
+            audition_tail: None,
+            audition_fade: None,
+            active_hint: 0,
+            scratch: Vec::new(),
         }
     }
 
@@ -265,15 +442,7 @@ impl CantoEngine {
     /// and immediately runs full vocal pitch/note/key/BPM analysis.
     pub fn load_audio_file(&mut self, path: &Path) -> Result<CantoAnalysisResult, String> {
         let decoded = decode_audio_file_to_mono(path, self.sample_rate as u32)?;
-        self.playing = false;
-        self.playhead_sec = 0.0;
-        self.correct_amount = 0.0;
-        self.audio_samples = decoded.samples;
-        self.duration_sec = decoded.duration_sec;
-        self.waveform_peaks = decoded.waveform_peaks;
-        self.shifter.reset();
-        self.compressor.reset();
-        self.analyze_loaded_audio()
+        self.install_decoded(decoded)
     }
 
     /// Loads audio from raw file bytes in memory, decodes + resamples it to `self.sample_rate`,
@@ -284,6 +453,34 @@ impl CantoEngine {
         ext_hint: Option<&str>,
     ) -> Result<CantoAnalysisResult, String> {
         let decoded = decode_audio_bytes_to_mono(bytes, ext_hint, self.sample_rate as u32)?;
+        self.install_decoded(decoded)
+    }
+
+    /// Swaps in already-decoded audio (decoded at `self.sample_rate`) and runs
+    /// analysis. Split from decoding so callers sharing the engine with an
+    /// audio thread can decode without holding the engine lock.
+    pub fn install_decoded(&mut self, decoded: DecodedAudio) -> Result<CantoAnalysisResult, String> {
+        self.swap_audio(decoded);
+        self.analyze_loaded_audio()
+    }
+
+    /// Swaps in decoded audio and adopts an earlier analysis of the same
+    /// file (the app's analysis cache) instead of re-running it. Analysis is
+    /// the slow part of opening a file; decoding is not.
+    ///
+    /// Rejects an analysis whose duration doesn't match the audio, so a
+    /// stale cache entry falls back to a fresh analysis.
+    pub fn install_decoded_with_analysis(
+        &mut self,
+        decoded: DecodedAudio,
+        analysis: CantoAnalysisResult,
+    ) -> Result<CantoAnalysisResult, String> {
+        let analysis = Analysis::from_cached(analysis, decoded.duration_sec)
+            .ok_or_else(|| "Cached analysis does not match the audio".to_string())?;
+        Ok(self.install_analyzed(decoded, analysis))
+    }
+
+    fn swap_audio(&mut self, decoded: DecodedAudio) {
         self.playing = false;
         self.playhead_sec = 0.0;
         self.correct_amount = 0.0;
@@ -292,7 +489,8 @@ impl CantoEngine {
         self.waveform_peaks = decoded.waveform_peaks;
         self.shifter.reset();
         self.compressor.reset();
-        self.analyze_loaded_audio()
+        self.clear_audition();
+        self.active_hint = 0;
     }
 
     /// Loads raw mono `f32` samples directly into the engine and runs analysis.
@@ -323,39 +521,59 @@ impl CantoEngine {
 
     /// Analyzes `self.audio_samples` to extract vocal notes, real pitch contours,
     /// amplitude envelopes, musical key/scale, and tempo (BPM).
+    ///
+    /// The app caches this result per file: bump `kAnalysisCacheVersion` in
+    /// `lib/cache.dart` whenever the output for the same audio changes.
     pub fn analyze_loaded_audio(&mut self) -> Result<CantoAnalysisResult, String> {
         if self.audio_samples.is_empty() {
             return Err("No audio loaded to analyze".to_string());
         }
+        let analysis = analyze_samples(
+            &self.audio_samples,
+            self.sample_rate,
+            &AnalysisProgress::default(),
+        )
+        .ok_or_else(|| "Analysis cancelled".to_string())?;
+        Ok(self.adopt(analysis))
+    }
 
-        let sr = self.sample_rate as u32;
-        let frames = extract_pitch_frames(&self.audio_samples, sr);
-
-        let (key_pc, scale_mode) = estimate_key_and_mode(&frames);
-        self.key = key_pc;
-        self.scale = scale_mode;
-        self.bpm = estimate_bpm_from_frames(&frames).clamp(68.0, 172.0);
+    /// Takes over an analysis made off the engine lock (see `analyze_samples`).
+    pub fn adopt(&mut self, analysis: Analysis) -> CantoAnalysisResult {
+        self.key = analysis.key;
+        self.scale = analysis.scale;
+        self.bpm = analysis.bpm;
         self.correct_amount = 0.0;
+        self.notes = analysis.notes;
+        self.analysis_result()
+    }
 
-        self.notes = segment_canto_notes(&frames, self.key);
+    /// Swaps in decoded audio together with its analysis.
+    pub fn install_analyzed(
+        &mut self,
+        decoded: DecodedAudio,
+        analysis: Analysis,
+    ) -> CantoAnalysisResult {
+        self.swap_audio(decoded);
+        self.adopt(analysis)
+    }
 
+    fn analysis_result(&self) -> CantoAnalysisResult {
         let mode_str = match self.scale {
             Scale::Major => "major",
             Scale::MinorPentatonic => "penta",
             _ => "minor",
         };
-
-        Ok(CantoAnalysisResult {
+        CantoAnalysisResult {
             ok: true,
             error: None,
-            sample_rate: sr,
+            sample_rate: self.sample_rate as u32,
             duration_sec: self.duration_sec,
             bpm: self.bpm,
             key: KEY_NAMES[(self.key as usize) % 12].to_string(),
             mode: mode_str.to_string(),
             notes: self.notes.clone(),
             waveform_peaks: self.waveform_peaks.clone(),
-        })
+        }
     }
 
     pub fn set_key_and_scale(&mut self, key: u8, scale: Scale) {
@@ -396,8 +614,12 @@ impl CantoEngine {
         formant: f32,
         gain_db: f32,
         pinned: bool,
+        muted: bool,
     ) {
         if let Some(note) = self.notes.get_mut(index) {
+            // The lyric only depends on the rounded pitch; skip the String
+            // rebuild while a drag keeps the note on the same semitone.
+            let relabel = note.pitch.round() != pitch.round();
             note.pitch = pitch;
             note.start = start;
             note.dur = dur.max(0.05);
@@ -405,28 +627,206 @@ impl CantoEngine {
             note.formant = clamp(formant, -12.0, 12.0);
             note.gain_db = clamp(gain_db, -18.0, 6.0);
             note.pinned = pinned;
-            if !note.unpitched {
+            note.muted = muted;
+            if relabel && !note.unpitched {
                 note.lyric = solfege_for_midi(note.pitch, self.key);
             }
         }
     }
 
-    /// Triggers short real-audio audition of a note when dragging it while paused.
-    pub fn trigger_note_audition(&mut self, note_index: usize) {
-        if note_index < self.notes.len() && !self.audio_samples.is_empty() {
-            if self.audition_note_index != Some(note_index) {
-                let n = &self.notes[note_index];
-                self.audition_cursor_sec = n.detected_start as f64;
-                self.audition_note_index = Some(note_index);
-            }
-            // Keep audition alive for ~140ms after the last pointer move update
-            self.audition_remaining_frames = (self.sample_rate * 0.14) as usize;
+    /// Sets a note's ลูกคอ (ornament) and accent.
+    pub fn set_expression(
+        &mut self,
+        index: usize,
+        orn_style: u8,
+        orn_depth: f32,
+        orn_speed: f32,
+        accent: f32,
+    ) {
+        if let Some(note) = self.notes.get_mut(index) {
+            note.orn_style = if orn_style <= ORN_FALL {
+                orn_style
+            } else {
+                ORN_NONE
+            };
+            note.orn_depth = clamp(orn_depth, 0.0, 4.0);
+            note.orn_speed = clamp(orn_speed, 0.0, 1.0);
+            note.accent = clamp(accent, 0.0, 1.0);
         }
     }
 
+    /// Replaces the note list after structural edits (cut, join) or undo.
+    /// Notes must stay in time order; the UI keeps them sorted.
+    pub fn set_notes(&mut self, notes: Vec<CantoNote>) {
+        self.notes = notes;
+        self.active_hint = 0;
+        if self
+            .audition_note_index
+            .is_some_and(|i| i >= self.notes.len())
+        {
+            self.clear_audition();
+        }
+    }
+
+    /// Starts previewing a note from its beginning (press on a note).
+    ///
+    /// The shifter is reset and pre-rolled through its latency here, on the
+    /// caller's thread, so the first rendered sample is already the note's
+    /// onset: the preview sounds the moment the finger lands.
+    pub fn trigger_note_audition(&mut self, note_index: usize) {
+        if note_index >= self.notes.len() || self.audio_samples.is_empty() {
+            return;
+        }
+        self.audition_note_index = Some(note_index);
+        self.audition_cursor_sec = self.notes[note_index].detected_start as f64;
+        self.audition_held = true;
+        self.audition_tail = None;
+        self.audition_fade = None;
+        self.shifter.reset();
+        self.compressor.reset();
+        self.control_counter = 0;
+        for _ in 0..self.shifter.latency() {
+            if self.audition_step().is_none() {
+                break;
+            }
+        }
+    }
+
+    /// Finger lifted: finish the current pass of the note, then stop.
+    pub fn release_audition(&mut self) {
+        self.audition_held = false;
+    }
+
+    /// Stops the preview with a short fade (no click).
     pub fn stop_audition(&mut self) {
+        if self.audition_note_index.is_some() && self.audition_fade.is_none() {
+            self.audition_fade = Some(self.audition_fade_frames());
+        }
+    }
+
+    /// Drops the preview immediately (transport start, new audio).
+    fn clear_audition(&mut self) {
         self.audition_note_index = None;
-        self.audition_remaining_frames = 0;
+        self.audition_tail = None;
+        self.audition_fade = None;
+    }
+
+    /// Renders the whole clip with all edits applied, mono, for export.
+    ///
+    /// Works on a clone so the live engine (and its audio thread) is never
+    /// touched. The shifter's latency is rendered past the end and trimmed
+    /// from the start so the export lines up with the source sample-exactly.
+    pub fn render_offline(&self) -> Vec<f32> {
+        if self.audio_samples.is_empty() || self.duration_sec <= 0.0 {
+            return Vec::new();
+        }
+        let mut e = self.clone();
+        e.clear_audition();
+        e.bypass = false;
+        e.loop_enabled = false;
+        e.playing = true;
+        e.playhead_sec = 0.0;
+        e.shifter.reset();
+        e.compressor.reset();
+        e.control_counter = 0;
+        e.active_hint = 0;
+        let latency = e.shifter.latency() as usize;
+        let total = (self.duration_sec * self.sample_rate as f64).round() as usize;
+        // Past the source end `sample_interpolated` returns silence, which
+        // flushes the shifter's tail.
+        e.duration_sec = self.duration_sec + latency as f64 / self.sample_rate as f64;
+
+        let mut out = Vec::with_capacity(total + latency);
+        let mut block = vec![0.0f32; 1024 * 2];
+        while out.len() < total + latency && e.playing {
+            e.render_stereo_f32(&mut block);
+            out.extend(block.chunks_exact(2).map(|f| f[0]));
+        }
+        out.drain(..latency.min(out.len()));
+        out.truncate(total);
+        out
+    }
+
+    pub fn is_auditioning(&self) -> bool {
+        self.audition_note_index.is_some()
+    }
+
+    /// Starts or stops the transport. Starting playback drops any preview.
+    pub fn set_playing(&mut self, playing: bool) {
+        self.playing = playing;
+        if playing {
+            self.clear_audition();
+        }
+    }
+
+    fn audition_fade_frames(&self) -> usize {
+        ((self.sample_rate * AUDITION_FADE_SEC) as usize).max(1)
+    }
+
+    /// One preview sample, or `None` once the preview has finished.
+    fn audition_step(&mut self) -> Option<(f32, f32)> {
+        let idx = self.audition_note_index?;
+        if idx >= self.notes.len() {
+            self.clear_audition();
+            return None;
+        }
+        let (det_start, det_end) = {
+            let n = &self.notes[idx];
+            let start = n.detected_start as f64;
+            (start, start + n.detected_dur.max(0.05) as f64)
+        };
+
+        let (dry, local_t) = match self.audition_tail {
+            Some(0) => {
+                self.clear_audition();
+                return None;
+            }
+            Some(left) => {
+                self.audition_tail = Some(left - 1);
+                (0.0, 1.0)
+            }
+            None => {
+                let cursor = self.audition_cursor_sec;
+                // Short ramps at both ends of the source region keep loop
+                // restarts and the final stop free of clicks.
+                let fade = AUDITION_FADE_SEC as f64;
+                let env = ((cursor - det_start) / fade)
+                    .min((det_end - cursor) / fade)
+                    .clamp(0.0, 1.0) as f32;
+                let local_t =
+                    ((cursor - det_start) / (det_end - det_start).max(0.01)).clamp(0.0, 1.0) as f32;
+                let dry = self.sample_interpolated(cursor) * env;
+                self.audition_cursor_sec += 1.0 / self.sample_rate as f64;
+                if self.audition_cursor_sec >= det_end {
+                    if self.audition_held {
+                        self.audition_cursor_sec = det_start;
+                    } else {
+                        self.audition_tail = Some(self.shifter.latency() as usize);
+                    }
+                }
+                (dry, local_t)
+            }
+        };
+
+        let bypass = self.bypass;
+        let (mut l, mut r) = self.shift_sample(dry, |e| {
+            if bypass {
+                e.neutral_control()
+            } else {
+                e.note_control(idx, local_t)
+            }
+        });
+        if let Some(left) = self.audition_fade {
+            if left == 0 {
+                self.clear_audition();
+                return None;
+            }
+            let gain = left as f32 / self.audition_fade_frames() as f32;
+            l *= gain;
+            r *= gain;
+            self.audition_fade = Some(left - 1);
+        }
+        Some((l, r))
     }
 
     pub fn set_direct_voice(&mut self, _hz: f32, _cutoff: f32, gain: f32) {
@@ -440,14 +840,76 @@ impl CantoEngine {
         self.playhead_sec = time_sec.clamp(0.0, dur);
     }
 
-    fn note_at(&self, time_sec: f32) -> Option<CantoNote> {
-        for note in self.notes.iter().rev() {
-            let shown = note.present(self.bypass);
-            if time_sec >= shown.start && time_sec <= shown.start + shown.dur {
-                return Some(shown);
+    /// Index of the edited note covering `time_sec` (last one wins, matching
+    /// draw order). Only used on the non-bypass path, where the presented note
+    /// is the note itself, so nothing is cloned.
+    fn note_index_at(&mut self, time_sec: f32) -> Option<usize> {
+        if let Some(note) = self.notes.get(self.active_hint) {
+            if time_sec >= note.start && time_sec <= note.start + note.dur {
+                return Some(self.active_hint);
             }
         }
-        None
+        let found = self
+            .notes
+            .iter()
+            .rposition(|n| time_sec >= n.start && time_sec <= n.start + n.dur);
+        if let Some(index) = found {
+            self.active_hint = index;
+        }
+        found
+    }
+
+    /// Shifter control for `note_index` at normalized position `local_t`.
+    /// Called once per control tick (every 64 samples), not per sample.
+    fn note_control(&self, note_index: usize, local_t: f32) -> Control {
+        let note = &self.notes[note_index];
+        let gain = db_to_linear(note.gain_db - note.detected_gain).clamp(0.05, 4.0)
+            * accent_gain(note, local_t);
+        let centre = self.shifter.now();
+        if note.unpitched {
+            return Control {
+                centre,
+                period: None,
+                ratio: 1.0,
+                formant: 1.0,
+                gain,
+            };
+        }
+        let src_hz = midi_to_hz(detected_pitch_at(note, local_t)).clamp(55.0, 1400.0);
+        let dst_hz = midi_to_hz(pitch_at(note, local_t)).clamp(55.0, 1400.0);
+        Control {
+            centre,
+            period: Some(self.sample_rate / src_hz),
+            ratio: (dst_hz / src_hz).clamp(0.25, 4.0),
+            formant: 2.0f32
+                .powf(note.formant / 12.0)
+                .clamp(1.0 / MAX_FORMANT, MAX_FORMANT),
+            gain,
+        }
+    }
+
+    fn neutral_control(&self) -> Control {
+        Control {
+            centre: self.shifter.now(),
+            period: None,
+            ratio: 1.0,
+            formant: 1.0,
+            gain: 1.0,
+        }
+    }
+
+    /// Runs one sample through the shifter and compressor, pushing `control`
+    /// on control ticks. Returns the clipped output sample pair.
+    #[inline]
+    fn shift_sample(&mut self, dry: f32, control: impl FnOnce(&Self) -> Control) -> (f32, f32) {
+        if self.control_counter == 0 {
+            let c = control(self);
+            self.shifter.push_control(c);
+        }
+        self.control_counter = (self.control_counter + 1) & 63;
+        let (wet, _) = self.shifter.process(dry, dry);
+        let (l, r) = self.compressor.process_stereo_linked(wet[0], wet[1]);
+        (clamp(l, -0.98, 0.98), clamp(r, -0.98, 0.98))
     }
 
     fn is_vacated_original_region(&self, time_sec: f32) -> bool {
@@ -497,155 +959,65 @@ impl CantoEngine {
             return 0.0;
         }
 
-        let sr = self.sample_rate;
-        let dt = 1.0 / sr as f64;
+        let dt = 1.0 / self.sample_rate as f64;
         let total_dur = self.duration_sec;
         let mut block_peak = 0.0f32;
 
-        for i in 0..frames {
-            if !self.playing {
-                if let Some(note_idx) = self.audition_note_index {
-                    if self.audition_remaining_frames > 0 && note_idx < self.notes.len() {
-                        self.audition_remaining_frames -= 1;
-                        let note = self.notes[note_idx].clone();
-                        let det_start = note.detected_start as f64;
-                        let det_end = (note.detected_start + note.detected_dur.max(0.05)) as f64;
-                        self.audition_cursor_sec += dt;
-                        if self.audition_cursor_sec >= det_end
-                            || self.audition_cursor_sec < det_start
-                        {
-                            self.audition_cursor_sec = det_start;
-                        }
-                        let local_t = ((self.audition_cursor_sec - det_start)
-                            / (det_end - det_start).max(0.01))
-                        .clamp(0.0, 1.0) as f32;
-                        let dry = self.sample_interpolated(self.audition_cursor_sec);
-
-                        let src_midi = detected_pitch_at(&note, local_t);
-                        let dst_midi = pitch_at(&note, local_t);
-                        let src_hz = midi_to_hz(src_midi).clamp(55.0, 1400.0);
-                        let dst_hz = midi_to_hz(dst_midi).clamp(55.0, 1400.0);
-                        let ratio = (dst_hz / src_hz).clamp(0.25, 4.0);
-                        let formant = 2.0f32
-                            .powf(note.formant / 12.0)
-                            .clamp(1.0 / MAX_FORMANT, MAX_FORMANT);
-                        let gain_lin =
-                            db_to_linear(note.gain_db - note.detected_gain).clamp(0.05, 4.0);
-
-                        if self.control_counter == 0 {
-                            self.shifter.push_control(Control {
-                                centre: self.shifter.now(),
-                                period: Some(sr / src_hz),
-                                ratio,
-                                formant,
-                                gain: gain_lin,
-                            });
-                        }
-                        self.control_counter = (self.control_counter + 1) & 63;
-
-                        let (wet, _) = self.shifter.process(dry, dry);
-                        let (l, r) = self.compressor.process_stereo_linked(wet[0], wet[1]);
-                        let out_l = clamp(l, -0.98, 0.98);
-                        let out_r = clamp(r, -0.98, 0.98);
-                        out_interleaved[i * 2] = out_l;
-                        out_interleaved[i * 2 + 1] = out_r;
-                        block_peak = block_peak.max(out_l.abs().max(out_r.abs()));
+        // Allocation-free per-sample loop: notes are read by index and the
+        // pitch/formant math runs only on control ticks inside `shift_sample`.
+        for frame in out_interleaved.chunks_exact_mut(2) {
+            let (out_l, out_r) = if !self.playing {
+                match self.audition_step() {
+                    Some(sample) => sample,
+                    None => {
+                        frame[0] = 0.0;
+                        frame[1] = 0.0;
                         continue;
-                    } else {
-                        self.audition_note_index = None;
                     }
                 }
-
-                out_interleaved[i * 2] = 0.0;
-                out_interleaved[i * 2 + 1] = 0.0;
-                continue;
-            }
-
-            self.playhead_sec += dt;
-            if self.playhead_sec >= total_dur {
-                if self.loop_enabled {
-                    self.playhead_sec %= total_dur;
-                } else {
-                    self.playhead_sec = total_dur;
-                    self.playing = false;
-                    out_interleaved[i * 2] = 0.0;
-                    out_interleaved[i * 2 + 1] = 0.0;
-                    continue;
-                }
-            }
-
-            if self.bypass {
-                let raw = self.sample_interpolated(self.playhead_sec);
-                if self.control_counter == 0 {
-                    self.shifter.push_control(Control {
-                        centre: self.shifter.now(),
-                        period: None,
-                        ratio: 1.0,
-                        formant: 1.0,
-                        gain: 1.0,
-                    });
-                }
-                self.control_counter = (self.control_counter + 1) & 63;
-                let _ = self.shifter.process(raw, raw);
-                let s = clamp(raw, -0.98, 0.98);
-                out_interleaved[i * 2] = s;
-                out_interleaved[i * 2 + 1] = s;
-                block_peak = block_peak.max(s.abs());
-                continue;
-            }
-
-            let active = self.note_at(self.playhead_sec as f32);
-
-            let mut target_ratio = 1.0f32;
-            let mut target_formant = 1.0f32;
-            let mut period_opt = None;
-            let mut psola_gain = 1.0f32;
-            let dry_sample: f32;
-
-            if let Some(note) = &active {
-                let local_t = ((self.playhead_sec as f32 - note.start) / note.dur.max(0.01))
-                    .clamp(0.0, 1.0);
-                let src_time_sec =
-                    (note.detected_start + local_t * note.detected_dur) as f64;
-                dry_sample = self.sample_interpolated(src_time_sec);
-                psola_gain = db_to_linear(note.gain_db - note.detected_gain).clamp(0.05, 4.0);
-
-                if !note.unpitched {
-                    let src_midi = detected_pitch_at(note, local_t);
-                    let dst_midi = pitch_at(note, local_t);
-                    let src_hz = midi_to_hz(src_midi).clamp(55.0, 1400.0);
-                    let dst_hz = midi_to_hz(dst_midi).clamp(55.0, 1400.0);
-
-                    period_opt = Some(sr / src_hz);
-                    target_ratio = (dst_hz / src_hz).clamp(0.25, 4.0);
-                    target_formant = 2.0f32
-                        .powf(note.formant / 12.0)
-                        .clamp(1.0 / MAX_FORMANT, MAX_FORMANT);
-                }
-            } else if self.is_vacated_original_region(self.playhead_sec as f32) {
-                dry_sample = 0.0;
             } else {
-                dry_sample = self.sample_interpolated(self.playhead_sec);
-            }
+                self.playhead_sec += dt;
+                if self.playhead_sec >= total_dur {
+                    if self.loop_enabled {
+                        self.playhead_sec %= total_dur;
+                    } else {
+                        self.playhead_sec = total_dur;
+                        self.playing = false;
+                        frame[0] = 0.0;
+                        frame[1] = 0.0;
+                        continue;
+                    }
+                }
+                let t = self.playhead_sec as f32;
 
-            if self.control_counter == 0 {
-                self.shifter.push_control(Control {
-                    centre: self.shifter.now(),
-                    period: period_opt,
-                    ratio: target_ratio,
-                    formant: target_formant,
-                    gain: psola_gain,
-                });
-            }
-            self.control_counter = (self.control_counter + 1) & 63;
-
-            let (wet, _) = self.shifter.process(dry_sample, dry_sample);
-            let (l, r) = self.compressor.process_stereo_linked(wet[0], wet[1]);
-
-            let out_l = clamp(l, -0.98, 0.98);
-            let out_r = clamp(r, -0.98, 0.98);
-            out_interleaved[i * 2] = out_l;
-            out_interleaved[i * 2 + 1] = out_r;
+                if self.bypass {
+                    // Keep the shifter's timeline running so leaving bypass
+                    // doesn't replay stale grains.
+                    let raw = self.sample_interpolated(self.playhead_sec);
+                    let _ = self.shift_sample(raw, |e| e.neutral_control());
+                    let s = clamp(raw, -0.98, 0.98);
+                    (s, s)
+                } else if let Some(idx) = self.note_index_at(t) {
+                    let (local_t, src_time) = {
+                        let n = &self.notes[idx];
+                        let local_t = ((t - n.start) / n.dur.max(0.01)).clamp(0.0, 1.0);
+                        let src = (n.detected_start + local_t * n.detected_dur) as f64;
+                        // Muted notes keep the timeline running but feed silence.
+                        (local_t, if n.muted { -1.0 } else { src })
+                    };
+                    let dry = self.sample_interpolated(src_time);
+                    self.shift_sample(dry, |e| e.note_control(idx, local_t))
+                } else {
+                    let dry = if self.is_vacated_original_region(t) {
+                        0.0
+                    } else {
+                        self.sample_interpolated(self.playhead_sec)
+                    };
+                    self.shift_sample(dry, |e| e.neutral_control())
+                }
+            };
+            frame[0] = out_l;
+            frame[1] = out_r;
             block_peak = block_peak.max(out_l.abs().max(out_r.abs()));
         }
 
@@ -654,11 +1026,16 @@ impl CantoEngine {
     }
 
     pub fn render_stereo_i16(&mut self, out_interleaved: &mut [i16]) -> f32 {
-        let mut float_buf = vec![0.0f32; out_interleaved.len()];
-        let level = self.render_stereo_f32(&mut float_buf);
+        let mut scratch = std::mem::take(&mut self.scratch);
+        if scratch.len() < out_interleaved.len() {
+            scratch.resize(out_interleaved.len(), 0.0);
+        }
+        let float_buf = &mut scratch[..out_interleaved.len()];
+        let level = self.render_stereo_f32(float_buf);
         for (dst, &src) in out_interleaved.iter_mut().zip(float_buf.iter()) {
             *dst = (clamp(src, -0.99, 0.99) * i16::MAX as f32) as i16;
         }
+        self.scratch = scratch;
         level
     }
 
@@ -676,7 +1053,11 @@ impl CantoEngine {
 
 // ── Fast YIN Pitch Frame Extraction & Studio Note Segmentation ────────────────
 
-fn extract_pitch_frames(samples: &[f32], sample_rate: u32) -> Vec<PitchFrame> {
+fn extract_pitch_frames(
+    samples: &[f32],
+    sample_rate: u32,
+    progress: &AnalysisProgress,
+) -> Option<Vec<PitchFrame>> {
     let hop_size = ((sample_rate as usize) / 100).max(128); // ~10 ms hop
     let frame_size = ((sample_rate as usize) * 42 / 1000).max(1024); // ~42 ms window
     let min_freq = 65.0;
@@ -698,8 +1079,17 @@ fn extract_pitch_frames(samples: &[f32], sample_rate: u32) -> Vec<PitchFrame> {
 
     let rms_gate = (peak_rms * 0.045).max(0.003);
     let mut frames = Vec::with_capacity(raw_rms.len());
+    let total = raw_rms.len().max(1);
 
-    for (start, end, rms) in raw_rms {
+    for (n, (start, end, rms)) in raw_rms.into_iter().enumerate() {
+        // Report and honour cancel every ~2.5 s of audio, not per frame.
+        if n % 256 == 0 {
+            if progress.cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let permille = (n * 1000 / total) as u32;
+            progress.permille.store(permille, Ordering::Relaxed);
+        }
         let time_seconds = start as f64 / sample_rate as f64;
         let (frequency_hz, confidence) = if rms >= rms_gate && (end - start) >= frame_size / 2 {
             detect_pitch_yin_fast(
@@ -720,7 +1110,7 @@ fn extract_pitch_frames(samples: &[f32], sample_rate: u32) -> Vec<PitchFrame> {
         });
     }
 
-    frames
+    Some(frames)
 }
 
 fn detect_pitch_yin_fast(
@@ -1140,6 +1530,11 @@ fn build_pitched_note(
         gain_db,
         detected_gain: gain_db,
         pinned: false,
+        muted: false,
+        orn_style: ORN_NONE,
+        orn_depth: 1.0,
+        orn_speed: 0.5,
+        accent: 0.0,
         scoop,
         drift,
         vib,
