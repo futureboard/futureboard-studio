@@ -8,6 +8,7 @@ members = [
     "apps/native/livestage",
     "apps/native/singer",
     "apps/native/jamsession",
+    "apps/native/voxtune",
 
     "crates/SphereAudioEditor",
     "crates/SphereAudioPlugins",

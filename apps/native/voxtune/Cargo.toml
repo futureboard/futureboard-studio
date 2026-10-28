@@ -1,0 +1,36 @@
+[package]
+name = "voxtune"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Solfege Voxtune — the vocal note editor as a standalone desktop app."
+
+[[bin]]
+name = "SolfegeVoxtune"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+cpal.workspace = true
+dirs.workspace = true
+serde_json.workspace = true
+sphere_voxtune.workspace = true
+sphere_ui_components = { workspace = true, default-features = false, features = [
+    "gpu-renderer",
+] }
+
+[build-dependencies]
+embed-resource.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_windows.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_macos.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui = { workspace = true, features = ["wayland", "x11"] }
+gpui_linux = { workspace = true, features = ["wayland", "x11"] }
+
+[lints]
+workspace = true

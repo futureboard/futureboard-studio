@@ -8603,6 +8603,7 @@ dependencies = [
  "sphere-plugin-host",
  "sphere-video-player",
  "sphere_directaudioengine",
+ "sphere_voxtune",
  "transient",
  "unicode-segmentation",
  "verbspace",
@@ -8617,6 +8618,17 @@ dependencies = [
  "zcomp",
  "zed-reqwest",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "sphere_voxtune"
+version = "0.1.0"
+dependencies = [
+ "biquad",
+ "serde",
+ "serde_json",
+ "symphonia",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -10171,6 +10183,22 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "voxtune"
+version = "2026.10.16-beta1.4.4"
+dependencies = [
+ "cpal",
+ "dirs 5.0.1",
+ "embed-resource",
+ "gpui",
+ "gpui_linux",
+ "gpui_macos",
+ "gpui_windows",
+ "serde_json",
+ "sphere_ui_components",
+ "sphere_voxtune",
+]
 
 [[package]]
 name = "vswhom"
