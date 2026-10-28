@@ -121,6 +121,42 @@ pub fn init(cx: &mut App, theme: Option<&str>) -> String {
 pub fn scenes() -> Vec<Scene> {
     vec![
         Scene {
+            name: "voxtune-editor",
+            width: 1280.0,
+            height: 720.0,
+            open: voxtune_editor,
+        },
+        Scene {
+            name: "voxtune-shape",
+            width: 1280.0,
+            height: 720.0,
+            open: |o, cx| voxtune_scene(o, cx, "panel-shape"),
+        },
+        Scene {
+            name: "voxtune-take",
+            width: 1280.0,
+            height: 720.0,
+            open: |o, cx| voxtune_scene(o, cx, "panel-take"),
+        },
+        Scene {
+            name: "voxtune-pitch-drag",
+            width: 1280.0,
+            height: 720.0,
+            open: |o, cx| voxtune_scene(o, cx, "tool:pitch"),
+        },
+        Scene {
+            name: "voxtune-time-tool",
+            width: 1280.0,
+            height: 720.0,
+            open: |o, cx| voxtune_scene(o, cx, "tool:time"),
+        },
+        Scene {
+            name: "voxtune-cut-tool",
+            width: 1280.0,
+            height: 720.0,
+            open: |o, cx| voxtune_scene(o, cx, "tool:cut"),
+        },
+        Scene {
             name: "equz8-empty",
             width: 980.0,
             height: 720.0,
@@ -1093,6 +1129,111 @@ fn echospace_ambient(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHa
 }
 
 // ── EQ scenes ──────────────────────────────────────────────────────────────
+
+/// A synthetic sung phrase — six notes with scoops and vibrato, gaps between
+/// them — analysed by the real engine, with a few edits made through the
+/// document (a raised note, a shake, an accent, a muted note) so every layer
+/// of the canvas shows.
+fn voxtune_editor(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    voxtune_scene(options, cx, "panel-note")
+}
+
+fn voxtune_scene(
+    options: WindowOptions,
+    cx: &mut App,
+    panel: &'static str,
+) -> Result<AnyWindowHandle> {
+    use crate::components::voxtune::{EngineTransport, VoxtuneEditor};
+    use sphere_voxtune::engine::{CantoEngine, ORN_SHAKE};
+    use sphere_voxtune::session::VoxDocument;
+    use sphere_voxtune::shared::Shared;
+
+    let sr = 48_000u32;
+    let melody: [(f32, f32, f32); 6] = [
+        (57.0, 0.20, 0.55),
+        (60.0, 0.85, 0.50),
+        (64.3, 1.45, 0.80),
+        (62.0, 2.40, 0.45),
+        (60.0, 2.95, 0.55),
+        (57.0, 3.65, 1.10),
+    ];
+    let total = (5.0 * sr as f32) as usize;
+    let mut samples = vec![0.0f32; total];
+    let mut phase = 0.0f32;
+    for (i, s) in samples.iter_mut().enumerate() {
+        let t = i as f32 / sr as f32;
+        let Some(&(midi, start, dur)) = melody.iter().find(|(_, a, d)| t >= *a && t < a + d) else {
+            continue;
+        };
+        let u = (t - start) / dur;
+        let scoop = -0.6 * (1.0 - (u * 8.0).min(1.0));
+        let vib = 0.25 * (u * 2.0).min(1.0) * (std::f32::consts::TAU * 5.5 * t).sin();
+        let hz = 440.0 * 2f32.powf((midi + scoop + vib - 69.0) / 12.0);
+        phase += hz / sr as f32;
+        let env = (u * 12.0).min(1.0) * ((1.0 - u) * 8.0).min(1.0);
+        *s = env
+            * 0.35
+            * (1..6)
+                .map(|k| (std::f32::consts::TAU * phase * k as f32).sin() / k as f32)
+                .sum::<f32>();
+    }
+    let shared = Arc::new(Shared::new(CantoEngine::new(sr as f32)));
+    let analysis = shared
+        .lock()
+        .load_mono_samples(samples, sr)
+        .map_err(gpui::private::anyhow::Error::msg)?;
+    let mut doc = VoxDocument::from_analysis(&analysis);
+    let pitched: Vec<usize> = (0..doc.notes.len())
+        .filter(|&i| !doc.notes[i].unpitched)
+        .collect();
+    if let Some(&i) = pitched.get(2) {
+        let n = &mut doc.notes[i];
+        n.pitch = n.detected.round();
+        n.pinned = true;
+    }
+    if let Some(&i) = pitched.get(5) {
+        let n = &mut doc.notes[i];
+        n.orn_style = ORN_SHAKE;
+        n.orn_depth = 1.0;
+        n.orn_speed = 0.5;
+    }
+    if let Some(&i) = pitched.get(1) {
+        doc.notes[i].accent = 0.7;
+    }
+    // One note sung flat, so the off-key colour and tag show.
+    if let Some(&i) = pitched.get(4) {
+        let n = &mut doc.notes[i];
+        n.detected -= 0.34;
+        n.pitch = n.detected;
+    }
+    if let Some(&i) = pitched.get(3) {
+        doc.notes[i].muted = true;
+    }
+    let select = pitched.get(2).copied();
+    Ok(cx
+        .open_window(options, move |_window, cx| {
+            cx.new(|cx| {
+                let host = EngineTransport {
+                    shared: shared.clone(),
+                    on_change: None,
+                };
+                let mut editor = VoxtuneEditor::new(shared.clone(), Box::new(host), cx);
+                editor.adopt(doc, "vocal-take.wav", cx);
+                editor.select_note(select, cx);
+                use crate::components::voxtune::VoxTool;
+                match panel {
+                    "tool:pitch" => editor.preview_gesture(VoxTool::Pitch, 1.0, cx),
+                    "tool:time" => editor.preview_gesture(VoxTool::Time, 0.0, cx),
+                    "tool:cut" => editor.preview_gesture(VoxTool::Cut, 0.0, cx),
+                    panel => {
+                        editor.run_command(panel, cx);
+                    }
+                }
+                editor
+            })
+        })?
+        .into())
+}
 
 fn equz8_empty(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     seed_eq("equz8-empty", &EqParams::defaults(EqKind::Z8));

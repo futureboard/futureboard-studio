@@ -145,6 +145,7 @@ pub mod slicer_panel;
 pub mod slicer_window;
 pub mod slider;
 pub mod solfege_editor;
+pub mod voxtune;
 pub mod song_text_panel;
 pub mod soundfont_player_mdi;
 pub mod soundfont_player_window;

@@ -85,6 +85,8 @@ sphere_directaudioengine.workspace = true
 solfege_spatialaudio.workspace = true
 sphere-audio-processor.workspace = true
 sphere-audio-editor.workspace = true
+# Solfege Voxtune engine behind the vocal tuner editor (components/voxtune).
+sphere_voxtune.workspace = true
 sphere-plugin-host.workspace = true
 # Audio Jam: control plane, media plane and session clock. Network only — the
 # bridge in `src/jam` is what connects it to the engine's own audio bus.

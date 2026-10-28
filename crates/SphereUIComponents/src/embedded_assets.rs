@@ -64,6 +64,9 @@ impl AssetSource for EmbeddedAssets {
         if path == LOGO_TEXT_PATH {
             return Ok(Some(Cow::Borrowed(LOGO_TEXT_PNG)));
         }
+        if let Some(svg) = crate::components::voxtune::icons::svg(path) {
+            return Ok(Some(Cow::Borrowed(svg.as_bytes())));
+        }
         if let Some(svg) = assets::audio_repair_icon(path) {
             return Ok(Some(Cow::Borrowed(svg.as_bytes())));
         }
@@ -117,6 +120,9 @@ impl AssetSource for EmbeddedAssets {
             assets::ICON_MOUSE_POINTER_PATH => Some(assets::icons::MOUSE_POINTER.as_bytes()),
             assets::ICON_PENCIL_PATH => Some(assets::icons::PENCIL.as_bytes()),
             assets::ICON_SCISSORS_PATH => Some(assets::icons::SCISSORS.as_bytes()),
+            assets::ICON_UNDO_PATH => Some(assets::icons::UNDO.as_bytes()),
+            assets::ICON_REDO_PATH => Some(assets::icons::REDO.as_bytes()),
+            assets::ICON_HISTORY_PATH => Some(assets::icons::HISTORY.as_bytes()),
             assets::ICON_ERASER_PATH => Some(assets::icons::ERASER.as_bytes()),
             assets::ICON_PEN_LINE_PATH => Some(assets::icons::PEN_LINE.as_bytes()),
             assets::ICON_ZOOM_IN_PATH => Some(assets::icons::ZOOM_IN.as_bytes()),
@@ -207,6 +213,9 @@ impl AssetSource for EmbeddedAssets {
             assets::ICON_MOUSE_POINTER_PATH,
             assets::ICON_PENCIL_PATH,
             assets::ICON_SCISSORS_PATH,
+            assets::ICON_UNDO_PATH,
+            assets::ICON_REDO_PATH,
+            assets::ICON_HISTORY_PATH,
             assets::ICON_ERASER_PATH,
             assets::ICON_PEN_LINE_PATH,
             assets::ICON_ZOOM_IN_PATH,
