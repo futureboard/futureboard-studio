@@ -16,18 +16,24 @@
 //! - `whitesharp_dsp`: real-time pitch correction / vibrato / formant processor
 //! - `voicetune`: offline YIN analysis, note segmentation and TD-PSOLA render plan
 //! - `engine`: note analysis, editing state and the TD-PSOLA phrase renderer
+//! - `edit`: note edit operations (cut, join, macros) shared by the editors
+//! - `session`: the edited document, undo history and engine sync
 //! - `load_job`: background decode + analysis with progress and cancel
+//! - `store`: per-file disk cache of analyses and edits
 //! - `shared`: the engine shared between a UI thread and an audio callback
 
 pub mod audio_io;
 pub mod detect;
 pub mod dsp_core;
+pub mod edit;
 pub mod engine;
 pub mod load_job;
 pub mod scale;
+pub mod session;
 pub mod shared;
 pub mod shifter;
 pub mod splice;
+pub mod store;
 pub mod voicetune;
 pub mod whitesharp_dsp;
 pub use audio_io::{
