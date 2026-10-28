@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = [".", "xtask"]
+
+[package]
+name = "voxtune_vst3"
+version = "0.1.0"
+# The editor is Studio's own Voxtune editor, compiled from its source tree
+# (`src/components`); those files are written against edition 2021.
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Solfege Voxtune vocal note editor as a VST3 plug-in with ARA 2"
+
+[lib]
+# `lib` too, so tests can link the plug-in.
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+# Named only so the shared editor files' `cfg`s are known; nothing enables
+# them here.
+gpu-renderer = []
+ui-preview = []
+builtin-plugin-editor = []
+
+[dependencies]
+# `ara`: the VST3 wrapper's ARA 2 entry points (IPlugInEntryPoint(2) and the
+# ARA main factory class), from the vendored NIH-plug fork.
+nih_plug = { git = "https://github.com/arizkami/nihplug_gpui", features = ["assert_process_allocs", "ara"] }
+nih_plug_gpui = { git = "https://github.com/arizkami/nihplug_gpui" }
+# The engine, unchanged from Studio / the Android app.
+sphere_voxtune = { path = "../../crates/SphereVoxtune" }
+# ARA 2 C ABI (pregenerated bindings, no SDK needed to build).
+ara2-bridge-sys = { path = "../../crates/Ara2Bridge/ara2-bridge-sys" }
+
+# The shared editor files name `gpui` directly. Patched below to the DAW's
+# GPUI, so these and `nih_plug_gpui` are the same crate.
+gpui = { git = "https://github.com/futureboard/gpui-se.git", default-features = false }
+
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+dirs = "5"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_DirectWrite",
+    "Win32_UI_HiDpi",
+] }
+
+[patch."https://github.com/futureboard/gpui-se.git"]
+gpui = { path = "../../crates/gpui" }
+gpui_linux = { path = "../../crates/gpui/crates/gpui_linux" }
+gpui_windows = { path = "../../crates/gpui/crates/gpui_windows" }
+
+[patch."https://github.com/arizkami/nihplug_gpui"]
+# Vendored into this repo (with the ARA patch) so a build does not depend on a
+# checkout outside it.
+nih_plug = { path = "../../external/nihplug_gpui" }
+nih_plug_gpui = { path = "../../external/nihplug_gpui/nih_plug_gpui" }
+nih_plug_xtask = { path = "../../external/nihplug_gpui/nih_plug_xtask" }
+
+[patch.crates-io]
+# As in the DAW: GPUI is built against these.
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+calloop = { git = "https://github.com/zed-industries/calloop" }
+
+[profile.dev.package.sphere_voxtune]
+opt-level = 3
+
+[profile.dev.package.biquad]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

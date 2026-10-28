@@ -78,6 +78,7 @@ exclude = [
     # target directory; `cargo build --workspace` does not build them. From
     # the repo root: `cargo xtask bundle whitesharp_vst3 --release`.
     "vstplugins/whitesharp_vst3",
+    "vstplugins/voxtune_vst3",
 
     # Vendored NIH-plug fork used by those plug-ins. Not part of the DAW build.
     "external/nihplug_gpui",
