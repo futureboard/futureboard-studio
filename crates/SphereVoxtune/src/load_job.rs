@@ -9,7 +9,7 @@ use std::thread;
 
 use crate::audio_io::decode_audio_file_to_mono;
 use crate::engine::{Analysis, AnalysisProgress, CantoAnalysisResult, analyze_samples};
-use crate::output::Shared;
+use crate::shared::Shared;
 
 pub const STAGE_DECODING: u32 = 0;
 pub const STAGE_ANALYZING: u32 = 1;

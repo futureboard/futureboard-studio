@@ -39,11 +39,8 @@ checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 name = "canto_dsp"
 version = "0.1.0"
 dependencies = [
- "biquad",
- "serde",
  "serde_json",
- "symphonia",
- "thiserror",
+ "sphere_voxtune",
 ]
 
 [[package]]
@@ -202,6 +199,17 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "sphere_voxtune"
+version = "0.1.0"
+dependencies = [
+ "biquad",
+ "serde",
+ "serde_json",
+ "symphonia",
+ "thiserror",
+]
 
 [[package]]
 name = "symphonia"

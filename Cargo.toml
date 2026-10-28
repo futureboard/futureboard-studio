@@ -28,6 +28,7 @@ members = [
     "crates/SphereWebView",
     "crates/SphereJamClient",
     "crates/SphereAraHost",
+    "crates/SphereVoxtune",
     "crates/LiveStageEngine",
 
     # Vendored ARA 2 bindings, trimmed to the host-side crates Futureboard uses.
@@ -125,6 +126,9 @@ sphere-webview = { path = "crates/SphereWebView", package = "SphereWebView" }
 sphere-jam-client = { path = "crates/SphereJamClient", package = "sphere-jam-client" }
 # ARA 2 host runtime. Real implementation on Windows/macOS, stub elsewhere.
 sphere-ara-host = { path = "crates/SphereAraHost", package = "SphereAraHost" }
+# Solfege Voxtune vocal engine (analysis, notes, TD-PSOLA render), shared with
+# the Android app. No device, UI or FFI.
+sphere_voxtune = { path = "crates/SphereVoxtune" }
 
 # Vendored ARA 2 SDK bindings (from futureboard/ara2-bridge v0.3.0). Source lives
 # in-tree under `crates/Ara2Bridge`; its C++ VST3 shim compiles against the

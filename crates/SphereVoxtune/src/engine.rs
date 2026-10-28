@@ -24,7 +24,8 @@ pub const CONTOUR_POINTS: usize = 32;
 /// Ramp length for note-preview starts, loop points and stops.
 const AUDITION_FADE_SEC: f32 = 0.008;
 
-const KEY_NAMES: [&str; 12] = [
+/// Key names by pitch class, as analysis reports them.
+pub const KEY_NAMES: [&str; 12] = [
     "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
 ];
 

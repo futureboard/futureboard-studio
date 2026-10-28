@@ -3,7 +3,7 @@ name = "canto_dsp"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "CANTO / Solfege VoxTune — Rust Audio Engine & Vocal Pitch/Formant DSP (TD-PSOLA, YIN, WhiteSharp, VoiceTune)"
+description = "Solfege Voxtune for Android: FFI, AAudio output and recorder around the sphere_voxtune engine"
 
 # Standalone crate (built per Android ABI and copied into jniLibs); keep it out
 # of the Futureboard root workspace.
@@ -14,19 +14,6 @@ name = "canto_dsp"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
-biquad = "0.6"
-serde = { version = "1.0", features = ["derive"] }
+# The engine, shared with the desktop app, Studio and the plug-in.
+sphere_voxtune = { path = "../../../../crates/SphereVoxtune" }
 serde_json = "1.0"
-thiserror = "2.0"
-symphonia = { version = "0.5", default-features = false, features = [
-    "wav",
-    "pcm",
-    "aiff",
-    "mp3",
-    "flac",
-    "ogg",
-    "vorbis",
-    "isomp4",
-    "aac",
-    "alac",
-] }
