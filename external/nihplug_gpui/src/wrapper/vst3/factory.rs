@@ -23,6 +23,8 @@ pub const VST3_SDK_VERSION: &str = "VST 3.6.14";
 #[derive(Debug)]
 pub struct PluginInfo {
     pub cid: &'static [u8; 16],
+    /// VST3 class category: `Audio Module Class`, or the ARA main factory's.
+    pub category: &'static str,
     pub name: &'static str,
     pub subcategories: String,
     pub vendor: &'static str,
@@ -37,6 +39,7 @@ impl PluginInfo {
     pub fn for_plugin<P: Vst3Plugin>() -> PluginInfo {
         PluginInfo {
             cid: &P::PLATFORM_VST3_CLASS_ID,
+            category: "Audio Module Class",
             name: P::NAME,
             subcategories: make_subcategories_string::<P>(),
             vendor: P::VENDOR,
@@ -64,7 +67,7 @@ impl PluginInfo {
         let mut info: PClassInfo = unsafe { std::mem::zeroed() };
         info.cid.data = *self.cid;
         info.cardinality = ClassCardinality::kManyInstances as i32;
-        strlcpy(&mut info.category, "Audio Module Class");
+        strlcpy(&mut info.category, self.category);
         strlcpy(&mut info.name, self.name);
 
         info
@@ -76,7 +79,7 @@ impl PluginInfo {
         let mut info: PClassInfo2 = unsafe { std::mem::zeroed() };
         info.cid.data = *self.cid;
         info.cardinality = ClassCardinality::kManyInstances as i32;
-        strlcpy(&mut info.category, "Audio Module Class");
+        strlcpy(&mut info.category, self.category);
         strlcpy(&mut info.name, self.name);
         info.class_flags = 1 << 1; // kSimpleModeSupported
         strlcpy(&mut info.subcategories, &self.subcategories);
@@ -93,7 +96,7 @@ impl PluginInfo {
         let mut info: PClassInfoW = unsafe { std::mem::zeroed() };
         info.cid.data = *self.cid;
         info.cardinality = ClassCardinality::kManyInstances as i32;
-        strlcpy(&mut info.category, "Audio Module Class");
+        strlcpy(&mut info.category, self.category);
         u16strlcpy(&mut info.name, self.name);
         info.class_flags = 1 << 1; // kSimpleModeSupported
         strlcpy(&mut info.subcategories, &self.subcategories);

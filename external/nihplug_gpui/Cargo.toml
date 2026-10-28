@@ -69,6 +69,9 @@ standalone = ["dep:baseview", "dep:clap", "dep:cpal", "dep:jack", "dep:midir", "
 # wrapper you might otherwise still include a couple (unused) symbols from the
 # `vst3-sys` crate.
 vst3 = ["dep:vst3-sys"]
+# ARA 2 for VST3: IPlugInEntryPoint(2) on the component and an "ARA Main
+# Factory Class" in the factory, driven by Vst3Plugin::ara_*.
+ara = ["vst3"]
 # Enables the `nih_export_vst2!()` macro. VST2 is a legacy format with a public
 # C ABI, so this wrapper does not link the Steinberg SDK. The bundler emits a
 # VST2 plug-in when the library exports `VSTPluginMain`.

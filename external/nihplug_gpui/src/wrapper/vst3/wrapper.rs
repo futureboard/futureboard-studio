@@ -38,15 +38,33 @@ use crate::wrapper::util::{clamp_input_event_timing, clamp_output_event_timing, 
 // Alias needed for the VST3 attribute macro
 use vst3_sys as vst3_com;
 
-#[VST3(implements(
-    IComponent,
-    IEditController,
-    IAudioProcessor,
-    IMidiMapping,
-    INoteExpressionController,
-    IProcessContextRequirements,
-    IUnitInfo
-))]
+#[cfg_attr(
+    not(feature = "ara"),
+    VST3(implements(
+        IComponent,
+        IEditController,
+        IAudioProcessor,
+        IMidiMapping,
+        INoteExpressionController,
+        IProcessContextRequirements,
+        IUnitInfo
+    ))
+)]
+// With ARA the component is also the ARA entry point (`ARAVST3.h`).
+#[cfg_attr(
+    feature = "ara",
+    VST3(implements(
+        IComponent,
+        IEditController,
+        IAudioProcessor,
+        IMidiMapping,
+        INoteExpressionController,
+        IProcessContextRequirements,
+        IUnitInfo,
+        IPlugInEntryPoint,
+        IPlugInEntryPoint2
+    ))
+)]
 pub struct Wrapper<P: Vst3Plugin> {
     inner: Arc<WrapperInner<P>>,
 }
@@ -54,6 +72,43 @@ pub struct Wrapper<P: Vst3Plugin> {
 impl<P: Vst3Plugin> Wrapper<P> {
     pub fn new() -> Box<Self> {
         Self::allocate(WrapperInner::new())
+    }
+}
+
+#[cfg(feature = "ara")]
+use super::ara::{IPlugInEntryPoint, IPlugInEntryPoint2, ALL_ROLES};
+
+#[cfg(feature = "ara")]
+impl<P: Vst3Plugin> IPlugInEntryPoint for Wrapper<P> {
+    unsafe fn get_factory(&self) -> *const c_void {
+        P::ara_factory()
+    }
+
+    unsafe fn bind_to_document_controller(
+        &self,
+        document_controller_ref: *mut c_void,
+    ) -> *const c_void {
+        self.inner.plugin.lock().ara_bind_to_document_controller(
+            document_controller_ref,
+            ALL_ROLES,
+            ALL_ROLES,
+        )
+    }
+}
+
+#[cfg(feature = "ara")]
+impl<P: Vst3Plugin> IPlugInEntryPoint2 for Wrapper<P> {
+    unsafe fn bind_to_document_controller_with_roles(
+        &self,
+        document_controller_ref: *mut c_void,
+        known_roles: i32,
+        assigned_roles: i32,
+    ) -> *const c_void {
+        self.inner.plugin.lock().ara_bind_to_document_controller(
+            document_controller_ref,
+            known_roles,
+            assigned_roles,
+        )
     }
 }
 

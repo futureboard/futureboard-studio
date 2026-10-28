@@ -1,6 +1,8 @@
 #[macro_use]
 mod util;
 
+#[cfg(feature = "ara")]
+pub mod ara;
 mod context;
 mod factory;
 mod inner;
@@ -14,6 +16,41 @@ mod wrapper;
 pub use factory::PluginInfo;
 pub use vst3_sys;
 pub use wrapper::Wrapper;
+
+/// Factory classes beyond the plug-in itself that `P` exports: its ARA main
+/// factory when it has one (`ara` feature).
+pub fn extra_class_infos<P: crate::prelude::Vst3Plugin>() -> Vec<PluginInfo> {
+    #[cfg(feature = "ara")]
+    {
+        ara::class_infos::<P>()
+    }
+    #[cfg(not(feature = "ara"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Creates one of `P`'s extra factory classes if `cid` names one; None
+/// otherwise.
+///
+/// # Safety
+///
+/// As `IPluginFactory::createInstance`: `cid`, `iid` and `obj` are valid.
+pub unsafe fn create_extra_instance<P: crate::prelude::Vst3Plugin>(
+    cid: *const vst3_sys::IID,
+    iid: *const vst3_sys::IID,
+    obj: *mut *mut vst3_sys::c_void,
+) -> Option<vst3_sys::base::tresult> {
+    #[cfg(feature = "ara")]
+    {
+        ara::create_instance::<P>(cid, iid, obj)
+    }
+    #[cfg(not(feature = "ara"))]
+    {
+        let _ = (cid, iid, obj);
+        None
+    }
+}
 
 /// Export one or more VST3 plugins from this library using the provided plugin types. The first
 /// plugin's vendor information is used for the factory's information.
@@ -29,6 +66,7 @@ macro_rules! nih_export_vst3 {
 
             // `vst3_sys` is imported from the VST3 wrapper module
             use $crate::wrapper::vst3::{vst3_sys, PluginInfo, Wrapper};
+            use $crate::wrapper::vst3::{create_extra_instance, extra_class_infos};
             use vst3_sys::base::{kInvalidArgument, kResultOk, tresult};
             use vst3_sys::base::{
                 FactoryFlags, IPluginFactory, IPluginFactory2, IPluginFactory3, IUnknown,
@@ -51,6 +89,9 @@ macro_rules! nih_export_vst3 {
             pub struct Factory {
                 // This is a type erased version of the information stored on the plugin types
                 plugin_infos: [PluginInfo; PLUGIN_COUNT],
+                // Further classes the plugins export (an ARA main factory), listed after the
+                // plugins themselves
+                extra_infos: Vec<PluginInfo>,
             }
 
             impl Factory {
@@ -66,7 +107,18 @@ macro_rules! nih_export_vst3 {
                         );
                     }
 
-                    Self::allocate(plugin_infos)
+                    let mut extra_infos = Vec::new();
+                    $(extra_infos.extend(extra_class_infos::<$plugin_ty>());)+
+
+                    Self::allocate(plugin_infos, extra_infos)
+                }
+
+                /// Class `index`: the plugins first, then the extra classes.
+                fn class(&self, index: i32) -> Option<&PluginInfo> {
+                    let index = usize::try_from(index).ok()?;
+                    self.plugin_infos.get(index).or_else(|| {
+                        self.extra_infos.get(index.checked_sub(self.plugin_infos.len())?)
+                    })
                 }
             }
 
@@ -83,15 +135,15 @@ macro_rules! nih_export_vst3 {
                 }
 
                 unsafe fn count_classes(&self) -> i32 {
-                    self.plugin_infos.len() as i32
+                    (self.plugin_infos.len() + self.extra_infos.len()) as i32
                 }
 
                 unsafe fn get_class_info(&self, index: i32, info: *mut PClassInfo) -> tresult {
-                    if index < 0 || index >= self.plugin_infos.len() as i32 {
+                    let Some(class) = self.class(index) else {
                         return kInvalidArgument;
-                    }
+                    };
 
-                    *info = self.plugin_infos[index as usize].create_class_info();
+                    *info = class.create_class_info();
 
                     kResultOk
                 }
@@ -143,17 +195,23 @@ macro_rules! nih_export_vst3 {
                         plugin_idx += 1;
                     })+
 
+                    $(
+                        if let Some(result) = create_extra_instance::<$plugin_ty>(cid, iid, obj) {
+                            return result;
+                        }
+                    )+
+
                     kInvalidArgument
                 }
             }
 
             impl IPluginFactory2 for Factory {
                 unsafe fn get_class_info2(&self, index: i32, info: *mut PClassInfo2) -> tresult {
-                    if index < 0 || index >= self.plugin_infos.len() as i32 {
+                    let Some(class) = self.class(index) else {
                         return kInvalidArgument;
-                    }
+                    };
 
-                    *info = self.plugin_infos[index as usize].create_class_info_2();
+                    *info = class.create_class_info_2();
 
                     kResultOk
                 }
@@ -165,11 +223,11 @@ macro_rules! nih_export_vst3 {
                     index: i32,
                     info: *mut PClassInfoW,
                 ) -> tresult {
-                    if index < 0 || index >= self.plugin_infos.len() as i32 {
+                    let Some(class) = self.class(index) else {
                         return kInvalidArgument;
-                    }
+                    };
 
-                    *info = self.plugin_infos[index as usize].create_class_info_unicode();
+                    *info = class.create_class_info_unicode();
 
                     kResultOk
                 }

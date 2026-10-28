@@ -17,6 +17,40 @@ pub trait Vst3Plugin: Plugin {
     /// [`VST3_CLASS_ID`][Self::VST3_CLASS_ID`] in the correct order for the current platform so
     /// projects and presets can be shared between platforms. This should not be overridden.
     const PLATFORM_VST3_CLASS_ID: [u8; 16] = swap_vst3_uid_byte_order(Self::VST3_CLASS_ID);
+
+    /// ARA 2: the class ID of the factory class that implements `ARA::IMainFactory`. `Some`
+    /// (together with [`ara_factory()`][Self::ara_factory()] returning a factory) exports that
+    /// class next to the plug-in and makes the plug-in instances answer `IPlugInEntryPoint` and
+    /// `IPlugInEntryPoint2`. Needs the `ara` feature to have any effect.
+    const VST3_ARA_FACTORY_CLASS_ID: Option<[u8; 16]> = None;
+
+    /// [`VST3_ARA_FACTORY_CLASS_ID`][Self::VST3_ARA_FACTORY_CLASS_ID] in the current platform's
+    /// byte order. This should not be overridden.
+    const PLATFORM_VST3_ARA_FACTORY_CLASS_ID: Option<[u8; 16]> =
+        match Self::VST3_ARA_FACTORY_CLASS_ID {
+            Some(uid) => Some(swap_vst3_uid_byte_order(uid)),
+            None => None,
+        };
+
+    /// ARA 2: this plug-in's `const ARAFactory*`, valid for the life of the library, or null when
+    /// it doesn't support ARA. NIH-plug treats it as an opaque pointer.
+    fn ara_factory() -> *const std::ffi::c_void {
+        std::ptr::null()
+    }
+
+    /// ARA 2: binds this instance to the document controller `document_controller_ref` (an
+    /// `ARADocumentControllerRef`) in the given `ARAPlugInInstanceRoleFlags`, returning its
+    /// `const ARAPlugInExtensionInstance*` (null to refuse). Called on the host's main thread,
+    /// once, before the plug-in is activated.
+    fn ara_bind_to_document_controller(
+        &mut self,
+        document_controller_ref: *mut std::ffi::c_void,
+        known_roles: i32,
+        assigned_roles: i32,
+    ) -> *const std::ffi::c_void {
+        let _ = (document_controller_ref, known_roles, assigned_roles);
+        std::ptr::null()
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
