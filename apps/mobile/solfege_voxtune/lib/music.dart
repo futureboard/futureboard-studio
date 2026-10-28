@@ -112,6 +112,18 @@ class VocalNote {
   double gainDb;
   final double detectedGain;
   bool pinned;
+
+  /// Cut from the output (plays silence). Still shown and editable.
+  bool muted;
+
+  /// ลูกคอ (vocal ornament): style ([kOrnNone]…[kOrnFall]), width in
+  /// semitones and speed 0 (slow) … 1 (fast). Rendered by the engine.
+  int ornStyle;
+  double ornDepth;
+  double ornSpeed;
+
+  /// Onset emphasis 0…1: up to +6 dB over the note's attack.
+  double accent;
   final double scoop;
   final double drift;
   final double vib;
@@ -135,6 +147,11 @@ class VocalNote {
     required this.gainDb,
     required this.detectedGain,
     this.pinned = false,
+    this.muted = false,
+    this.ornStyle = kOrnNone,
+    this.ornDepth = 1.0,
+    this.ornSpeed = 0.5,
+    this.accent = 0.0,
     this.scoop = 0.0,
     this.drift = 0.0,
     this.vib = 0.0,
@@ -162,6 +179,11 @@ class VocalNote {
       gainDb: ((json['gain_db'] as num?) ?? 0.0).toDouble(),
       detectedGain: ((json['detected_gain'] as num?) ?? 0.0).toDouble(),
       pinned: (json['pinned'] as bool?) ?? false,
+      muted: (json['muted'] as bool?) ?? false,
+      ornStyle: ((json['orn_style'] as num?) ?? kOrnNone).toInt(),
+      ornDepth: ((json['orn_depth'] as num?) ?? 1.0).toDouble(),
+      ornSpeed: ((json['orn_speed'] as num?) ?? 0.5).toDouble(),
+      accent: ((json['accent'] as num?) ?? 0.0).toDouble(),
       scoop: ((json['scoop'] as num?) ?? 0.0).toDouble(),
       drift: ((json['drift'] as num?) ?? 0.0).toDouble(),
       vib: ((json['vib'] as num?) ?? 0.0).toDouble(),
@@ -181,6 +203,11 @@ class VocalNote {
     double? formant,
     double? gainDb,
     bool? pinned,
+    bool? muted,
+    int? ornStyle,
+    double? ornDepth,
+    double? ornSpeed,
+    double? accent,
   }) {
     return VocalNote(
       id: id,
@@ -197,6 +224,11 @@ class VocalNote {
       gainDb: gainDb ?? this.gainDb,
       detectedGain: detectedGain,
       pinned: pinned ?? this.pinned,
+      muted: muted ?? this.muted,
+      ornStyle: ornStyle ?? this.ornStyle,
+      ornDepth: ornDepth ?? this.ornDepth,
+      ornSpeed: ornSpeed ?? this.ornSpeed,
+      accent: accent ?? this.accent,
       scoop: scoop,
       drift: drift,
       vib: vib,
@@ -206,6 +238,252 @@ class VocalNote {
       envelope: envelope,
     );
   }
+
+  /// Independent copy (contour/envelope lists are never mutated in place,
+  /// so they are shared).
+  VocalNote copy() => copyWith();
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'lyric': lyric,
+    'unpitched': unpitched,
+    'detected': detected,
+    'pitch': pitch,
+    'detected_start': detectedStart,
+    'start': start,
+    'detected_dur': detectedDur,
+    'dur': dur,
+    'modulation': modulation,
+    'formant': formant,
+    'gain_db': gainDb,
+    'detected_gain': detectedGain,
+    'pinned': pinned,
+    'muted': muted,
+    'orn_style': ornStyle,
+    'orn_depth': ornDepth,
+    'orn_speed': ornSpeed,
+    'accent': accent,
+    'scoop': scoop,
+    'drift': drift,
+    'vib': vib,
+    'vib_cycles': vibCycles,
+    'vib_phase': vibPhase,
+    'contour': contour,
+    'envelope': envelope,
+  };
+
+  /// Same structure and edit state (used to drop no-op undo steps).
+  bool sameAs(VocalNote o) =>
+      id == o.id &&
+      detected == o.detected &&
+      detectedStart == o.detectedStart &&
+      detectedDur == o.detectedDur &&
+      pitch == o.pitch &&
+      start == o.start &&
+      dur == o.dur &&
+      modulation == o.modulation &&
+      formant == o.formant &&
+      gainDb == o.gainDb &&
+      pinned == o.pinned &&
+      muted == o.muted &&
+      ornStyle == o.ornStyle &&
+      ornDepth == o.ornDepth &&
+      ornSpeed == o.ornSpeed &&
+      accent == o.accent;
+
+  /// Has a ลูกคอ or an accent.
+  bool get hasExpression => ornStyle != kOrnNone || accent > 0;
+}
+
+/// ลูกคอ styles; must match `ORN_*` in the Rust engine.
+const int kOrnNone = 0;
+
+/// Quick flick up to the upper neighbour and back, right after the onset.
+const int kOrnTurnUp = 1;
+
+/// The same flick down to the lower neighbour.
+const int kOrnTurnDown = 2;
+
+/// Alternates with the upper neighbour through the note (trill-like).
+const int kOrnShake = 3;
+
+/// Drops away at the end of the note.
+const int kOrnFall = 4;
+
+double _lerp(double a, double b, double t) => a + (b - a) * clampVal(t, 0, 1);
+
+double _bump(double t, double start, double len) {
+  if (len <= 0 || t <= start || t >= start + len) return 0;
+  return 0.5 - 0.5 * math.cos((t - start) / len * math.pi * 2);
+}
+
+/// Ornament pitch offset in semitones at normalized position [t]. Mirrors
+/// `ornament_semis` in the engine, so the drawn curve is what plays.
+double ornamentSemis(VocalNote note, double t) {
+  if (note.ornStyle == kOrnNone || note.unpitched || note.ornDepth == 0) {
+    return 0;
+  }
+  final dur = math.max(0.05, note.dur);
+  final sec = clampVal(t, 0, 1) * dur;
+  final depth = clampVal(note.ornDepth, -4, 4);
+  final speed = clampVal(note.ornSpeed, 0, 1);
+  switch (note.ornStyle) {
+    case kOrnTurnUp:
+    case kOrnTurnDown:
+      final len = math.min(_lerp(0.26, 0.09, speed), dur * 0.6);
+      final start = math.min(0.03, dur * 0.1);
+      final sign = note.ornStyle == kOrnTurnUp ? 1.0 : -1.0;
+      return sign * depth * _bump(sec, start, len);
+    case kOrnShake:
+      final hz = _lerp(4.5, 9.0, speed);
+      final start = math.min(math.max(dur * 0.25, 0.08), dur * 0.5);
+      final end = dur - math.min(0.05, dur * 0.1);
+      if (sec <= start || sec >= end) return 0;
+      final fadeIn = smoothstep((sec - start) / 0.08);
+      final fadeOut = smoothstep((end - sec) / 0.05);
+      final wave = 0.5 - 0.5 * math.cos((sec - start) * hz * math.pi * 2);
+      return depth * wave * fadeIn * fadeOut;
+    case kOrnFall:
+      final len = math.min(_lerp(0.32, 0.12, speed), dur * 0.5);
+      return -depth * smoothstep((sec - (dur - len)) / len);
+  }
+  return 0;
+}
+
+/// Cuts [note] at [time] (seconds, inside the note) into two notes that
+/// each play their own part of the source. Each half gets its own pitch
+/// centre from its part of the contour, so after a cut across a slide both
+/// halves sit on their own pitch. Edits (offset from the detected pitch,
+/// modulation, formant, level, mute) carry over to both halves.
+///
+/// Returns null when either half would be shorter than [minDur] seconds.
+(VocalNote, VocalNote)? splitNote(
+  VocalNote note,
+  double time,
+  String Function(String base) newId, {
+  double minDur = 0.04,
+}) {
+  final r = (time - note.start) / note.dur;
+  if (note.dur * r < minDur || note.dur * (1 - r) < minDur) return null;
+
+  (double detected, List<double> contour, List<double> envelope) part(
+    double from,
+    double to,
+  ) {
+    const points = 32;
+    final c = [
+      for (var k = 0; k < points; k++)
+        _sampleCurve(note.contour, from + (to - from) * k / (points - 1)),
+    ];
+    final e = [
+      for (var k = 0; k < points; k++)
+        _sampleCurve(note.envelope, from + (to - from) * k / (points - 1)),
+    ];
+    if (note.contour.isEmpty || note.unpitched) {
+      return (
+        note.detected,
+        const <double>[],
+        note.envelope.isEmpty ? const <double>[] : e,
+      );
+    }
+    // Re-centre: this half's mean deviation becomes its detected pitch.
+    final mean = c.reduce((a, b) => a + b) / c.length;
+    return (
+      note.detected + mean / 100.0,
+      [for (final v in c) v - mean],
+      note.envelope.isEmpty ? const <double>[] : e,
+    );
+  }
+
+  final offset = note.pitch - note.detected; // the user's pitch edit
+  VocalNote half(String id, double from, double to) {
+    final (detected, contour, envelope) = part(from, to);
+    return VocalNote(
+      id: id,
+      lyric: note.lyric,
+      unpitched: note.unpitched,
+      detected: detected,
+      pitch: detected + offset,
+      detectedStart: note.detectedStart + note.detectedDur * from,
+      start: note.start + note.dur * from,
+      detectedDur: note.detectedDur * (to - from),
+      dur: note.dur * (to - from),
+      modulation: note.modulation,
+      formant: note.formant,
+      gainDb: note.gainDb,
+      detectedGain: note.detectedGain,
+      pinned: note.pinned,
+      muted: note.muted,
+      // The onset flick and accent stay with the first half, the fall with
+      // the second; a shake continues in both.
+      ornStyle: switch (note.ornStyle) {
+        kOrnTurnUp || kOrnTurnDown => from == 0 ? note.ornStyle : kOrnNone,
+        kOrnFall => to == 1 ? kOrnFall : kOrnNone,
+        _ => note.ornStyle,
+      },
+      ornDepth: note.ornDepth,
+      ornSpeed: note.ornSpeed,
+      accent: from == 0 ? note.accent : 0,
+      contour: contour,
+      envelope: envelope,
+    );
+  }
+
+  return (half(newId(note.id), 0, r), half(newId(note.id), r, 1));
+}
+
+/// Joins [a] with the following note [b] into one note spanning both
+/// (including any gap). The pitch centre is the duration-weighted mean; the
+/// contour is rebuilt relative to it so the sung curve is unchanged.
+VocalNote joinNotes(VocalNote a, VocalNote b, String id) {
+  final start = a.start;
+  final end = b.start + b.dur;
+  final dur = end - start;
+  final detStart = a.detectedStart;
+  final detEnd = b.detectedStart + b.detectedDur;
+  final detDur = detEnd - detStart;
+  final detected = (a.detected * a.dur + b.detected * b.dur) / (a.dur + b.dur);
+  const points = 32;
+  final contour = <double>[];
+  final envelope = <double>[];
+  for (var k = 0; k < points; k++) {
+    // Position in source time, so the curve follows the audio.
+    final t = detStart + detDur * k / (points - 1);
+    final inA = t <= a.detectedStart + a.detectedDur;
+    final n = inA ? a : b;
+    final u = ((t - n.detectedStart) / n.detectedDur).clamp(0.0, 1.0);
+    final cents = n.contour.isEmpty ? 0.0 : _sampleCurve(n.contour, u);
+    contour.add(cents + (n.detected - detected) * 100.0);
+    envelope.add(n.envelope.isEmpty ? 1.0 : _sampleCurve(n.envelope, u));
+  }
+  final offset =
+      ((a.pitch - a.detected) * a.dur + (b.pitch - b.detected) * b.dur) /
+      (a.dur + b.dur);
+  return VocalNote(
+    id: id,
+    lyric: a.lyric,
+    unpitched: a.unpitched && b.unpitched,
+    detected: detected,
+    pitch: detected + offset,
+    detectedStart: detStart,
+    start: start,
+    detectedDur: detDur,
+    dur: dur,
+    modulation: (a.modulation + b.modulation) / 2,
+    formant: (a.formant + b.formant) / 2,
+    gainDb: (a.gainDb * a.dur + b.gainDb * b.dur) / (a.dur + b.dur),
+    detectedGain:
+        (a.detectedGain * a.dur + b.detectedGain * b.dur) / (a.dur + b.dur),
+    pinned: a.pinned || b.pinned,
+    muted: a.muted && b.muted,
+    // The joined note starts like a and ends like b.
+    ornStyle: b.ornStyle == kOrnFall ? kOrnFall : a.ornStyle,
+    ornDepth: b.ornStyle == kOrnFall ? b.ornDepth : a.ornDepth,
+    ornSpeed: b.ornStyle == kOrnFall ? b.ornSpeed : a.ornSpeed,
+    accent: a.accent,
+    contour: contour,
+    envelope: envelope,
+  );
 }
 
 class NoteSnapshot {
@@ -230,15 +508,15 @@ class NoteSnapshot {
   });
 
   factory NoteSnapshot.fromNote(VocalNote note) => NoteSnapshot(
-        id: note.id,
-        pitch: note.pitch,
-        modulation: note.modulation,
-        formant: note.formant,
-        gainDb: note.gainDb,
-        start: note.start,
-        dur: note.dur,
-        pinned: note.pinned,
-      );
+    id: note.id,
+    pitch: note.pitch,
+    modulation: note.modulation,
+    formant: note.formant,
+    gainDb: note.gainDb,
+    start: note.start,
+    dur: note.dur,
+    pinned: note.pinned,
+  );
 
   bool matches(NoteSnapshot other) =>
       id == other.id &&
@@ -251,18 +529,25 @@ class NoteSnapshot {
       pinned == other.pinned;
 }
 
+/// One undo step: the full note list (structure included, so cuts and joins
+/// undo too) plus key/scale/correction.
 class EditorSnapshot {
   final double correct;
   final String key;
   final String mode;
-  final List<NoteSnapshot> notes;
+  final List<VocalNote> notes;
 
-  const EditorSnapshot({
+  /// Code of the edit made after this state (see `history.dart`), e.g.
+  /// `cut` or `adv:transpose:2`. Shown in the History list and undo toast.
+  final String label;
+
+  EditorSnapshot({
     required this.correct,
     required this.key,
     required this.mode,
-    required this.notes,
-  });
+    required List<VocalNote> notes,
+    this.label = '',
+  }) : notes = [for (final n in notes) n.copy()];
 
   bool matches(EditorSnapshot other) {
     if (correct != other.correct || key != other.key || mode != other.mode) {
@@ -270,7 +555,7 @@ class EditorSnapshot {
     }
     if (notes.length != other.notes.length) return false;
     for (int i = 0; i < notes.length; i++) {
-      if (!notes[i].matches(other.notes[i])) return false;
+      if (!notes[i].sameAs(other.notes[i])) return false;
     }
     return true;
   }
@@ -331,7 +616,11 @@ int nearestScale(double midi, String key, String mode) {
   return best;
 }
 
-({int target, int cents}) centsFromTarget(double midi, String key, String mode) {
+({int target, int cents}) centsFromTarget(
+  double midi,
+  String key,
+  String mode,
+) {
   final target = nearestScale(midi, key, mode);
   return (target: target, cents: ((midi - target) * 100).round());
 }
@@ -399,8 +688,8 @@ double energy(VocalNote note, double t) {
     final edge = t < 0.06
         ? smoothstep(t / 0.06)
         : t > 0.92
-            ? smoothstep((1.0 - t) / 0.08)
-            : 1.0;
+        ? smoothstep((1.0 - t) / 0.08)
+        : 1.0;
     return math.max(note.unpitched ? 0.30 : 0.18, raw * edge);
   }
   final attack = note.unpitched ? 0.4 : 0.07;
@@ -442,7 +731,7 @@ double contourCents(VocalNote note, double t) {
 }
 
 double pitchAt(VocalNote note, double t) {
-  return note.pitch + contourCents(note, t) / 100.0;
+  return note.pitch + contourCents(note, t) / 100.0 + ornamentSemis(note, t);
 }
 
 double halfSemi(VocalNote note, double t) {
@@ -462,5 +751,8 @@ VocalNote presentNote(VocalNote note, bool bypass) {
     modulation: 1.0,
     formant: 0.0,
     gainDb: note.detectedGain,
+    muted: false,
+    ornStyle: kOrnNone,
+    accent: 0,
   );
 }
