@@ -5,9 +5,7 @@
 //! pixels and scaled to the window by [`plate_scale`]; every size below is
 //! at the design size.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use gpui::{hsla, px, rgb, rgba, App, Font, FontFallbacks, FontWeight, Hsla, Pixels, Rgba};
+use gpui::{hsla, px, rgb, rgba, App, Font, FontWeight, Hsla, Pixels, Rgba};
 
 pub const PLATE_W: f32 = 1024.0;
 pub const PLATE_H: f32 = 640.0;
@@ -142,38 +140,16 @@ pub fn type_px(size: f32, scale: f32) -> Pixels {
     px(size * scale / crate::theme::UI_TEXT_SCALE)
 }
 
-const OUTFIT_FAMILY: &str = "Outfit";
-static OUTFIT_LIGHT: &[u8] = include_bytes!("../../assets/fonts/outfit/Outfit-Light.ttf");
-static OUTFIT_REGULAR: &[u8] = include_bytes!("../../assets/fonts/outfit/Outfit-Regular.ttf");
-static OUTFIT_MEDIUM: &[u8] = include_bytes!("../../assets/fonts/outfit/Outfit-Medium.ttf");
-static OUTFIT_REGISTERED: AtomicBool = AtomicBool::new(false);
-
-/// Adds the embedded Outfit faces (300, 400, 500) to the text system, once
-/// per process.
+/// Adds the embedded Outfit faces to the text system, once per process. The
+/// plate editors embed the same faces; one registration serves both.
 pub fn ensure_fonts(cx: &App) {
-    if OUTFIT_REGISTERED.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let faces = [OUTFIT_LIGHT, OUTFIT_REGULAR, OUTFIT_MEDIUM]
-        .map(std::borrow::Cow::Borrowed)
-        .to_vec();
-    if let Err(error) = cx.text_system().add_fonts(faces) {
-        eprintln!("[whitesharp] Outfit could not be registered: {error}");
-        OUTFIT_REGISTERED.store(false, Ordering::Release);
-    }
+    crate::components::plate::ensure_fonts(cx);
 }
 
 /// Outfit at `weight`, falling back to Studio's UI chain for anything it
 /// lacks (the hair space, non-Latin text).
 pub fn outfit(weight: FontWeight) -> Font {
-    let mut font = crate::theme::ui_font_weight(weight);
-    let mut chain = vec![font.family.to_string()];
-    if let Some(fallbacks) = font.fallbacks.as_ref() {
-        chain.extend(fallbacks.fallback_list().iter().cloned());
-    }
-    font.family = OUTFIT_FAMILY.into();
-    font.fallbacks = Some(FontFallbacks::from_fonts(chain));
-    font
+    crate::components::plate::outfit(weight)
 }
 
 /// The plate's scale for a content area of `width` × `height`: the design

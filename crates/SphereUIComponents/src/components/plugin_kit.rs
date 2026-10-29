@@ -46,6 +46,14 @@ use crate::theme::{radius, space, state, typography, Colors};
 
 /// How long a passing word ("Copied A to B") stays up.
 const NOTICE: Duration = Duration::from_millis(2_200);
+/// Edits closer together than this are one undo step: a knob drag sends a
+/// stream of them, and one undo should take back the whole drag.
+const UNDO_COALESCE: Duration = Duration::from_millis(450);
+/// Undo steps an editor keeps.
+const UNDO_DEPTH: usize = 128;
+/// A press on the preset chip this soon after its menu closed is the press
+/// that closed it.
+const MENU_REOPEN_GUARD: Duration = Duration::from_millis(250);
 /// A knob cell's width plus the gap after it, for sizing a card.
 pub(crate) const KNOB_PITCH: f32 = 58.0 + space::TIGHT;
 /// The knob size most cards use.
@@ -75,6 +83,8 @@ pub enum LiveSlot {
     Reduction(usize),
     Stage(usize),
     Fader(usize),
+    /// A plate editor's own displays (`plate`), numbered by the editor.
+    Plate(usize),
 }
 
 /// Where each live display sat at the panel's last layout. The panel clears
@@ -152,6 +162,10 @@ pub trait KitModel: Copy + PartialEq + 'static {
     fn window_size(self) -> (f32, f32);
     fn min_size(self) -> (f32, f32);
 
+    /// Whether a pointer move over the window repaints the live overlay —
+    /// for a family that paints a hover readout there.
+    const REPAINT_ON_HOVER: bool = false;
+
     /// The edit to make as the window closes: a soloed band is let go, so a
     /// closed editor never leaves a track playing one band.
     fn on_close(self, _params: &Self::Params) -> Option<Self::Params> {
@@ -203,6 +217,17 @@ pub struct KitEditor<M: KitModel> {
     pub live_bounds: LiveBounds,
     /// The host's sample rate, for displays drawn from the DSP's filters.
     pub sample_rate: f32,
+    /// The window's size at the last render, for panels laid out at a design
+    /// size and scaled to fit.
+    pub viewport: (f32, f32),
+    /// What the params were before each undoable edit, oldest first, and
+    /// what undo took back, newest last.
+    undo: Vec<M::Params>,
+    redo: Vec<M::Params>,
+    last_edit: Option<Instant>,
+    /// A plate editor's own preset list, open under its chip.
+    pub preset_open: bool,
+    preset_closed_at: Option<Instant>,
 }
 
 impl<M: KitModel> KitEditor<M> {
@@ -228,6 +253,12 @@ impl<M: KitModel> KitEditor<M> {
             ui: M::Ui::default(),
             live_bounds: LiveBounds::default(),
             sample_rate: 48_000.0,
+            viewport: model.window_size(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            last_edit: None,
+            preset_open: false,
+            preset_closed_at: None,
         };
         editor.sync_from_mirror(cx);
         editor.compare.other = editor.params.clone();
@@ -254,7 +285,12 @@ impl<M: KitModel> KitEditor<M> {
         if key != self.key {
             self.key = key;
             self.menu = None;
+            self.preset_open = false;
             self.ui = M::Ui::default();
+            // Another insert's history is not this one's.
+            self.undo.clear();
+            self.redo.clear();
+            self.last_edit = None;
         }
         self.host_ops = host_ops;
         self.sync_from_mirror(cx);
@@ -283,9 +319,28 @@ impl<M: KitModel> KitEditor<M> {
     /// reaches the host DSP, the state mirror, and the project's dirty flag
     /// through `forward_param`.
     pub fn set_params(&mut self, next: M::Params, cx: &mut Context<Self>) {
+        self.commit(next, true, cx);
+    }
+
+    /// [`Self::set_params`], recording an undo step when `record`: edits
+    /// within [`UNDO_COALESCE`] of the last one join its step.
+    fn commit(&mut self, next: M::Params, record: bool, cx: &mut Context<Self>) {
         let edits = self.wire_diff(&next);
         if edits.is_empty() {
             return;
+        }
+        if record {
+            let joins = self
+                .last_edit
+                .is_some_and(|at| at.elapsed() < UNDO_COALESCE);
+            if !joins || self.undo.is_empty() {
+                if self.undo.len() == UNDO_DEPTH {
+                    self.undo.remove(0);
+                }
+                self.undo.push(self.params.clone());
+            }
+            self.redo.clear();
+            self.last_edit = Some(Instant::now());
         }
         self.params = next;
         if let Some(forward) = self.host_ops.forward_param.clone() {
@@ -318,6 +373,57 @@ impl<M: KitModel> KitEditor<M> {
 
     pub fn power(&self) -> bool {
         self.flag("power")
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Takes back the last edit step — sent as wire edits like any other, so
+    /// the host, the mirror and the saved project follow.
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
+        let Some(previous) = self.undo.pop() else {
+            return;
+        };
+        self.redo.push(self.params.clone());
+        self.last_edit = None;
+        self.commit(previous, false, cx);
+        cx.notify();
+    }
+
+    pub fn redo(&mut self, cx: &mut Context<Self>) {
+        let Some(next) = self.redo.pop() else {
+            return;
+        };
+        self.undo.push(self.params.clone());
+        self.last_edit = None;
+        self.commit(next, false, cx);
+        cx.notify();
+    }
+
+    /// Opens or closes a plate editor's preset list.
+    pub fn toggle_preset_menu(&mut self, cx: &mut Context<Self>) {
+        let just_closed = self
+            .preset_closed_at
+            .is_some_and(|at| at.elapsed() < MENU_REOPEN_GUARD);
+        if self.preset_open {
+            self.close_preset_menu(cx);
+        } else if !just_closed {
+            self.preset_open = true;
+            cx.notify();
+        }
+    }
+
+    pub fn close_preset_menu(&mut self, cx: &mut Context<Self>) {
+        if self.preset_open {
+            self.preset_open = false;
+            self.preset_closed_at = Some(Instant::now());
+            cx.notify();
+        }
     }
 
     pub fn show_notice(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -370,6 +476,7 @@ impl<M: KitModel> KitEditor<M> {
             .model
             .preset_applied(&self.params, &bank[wrapped].params);
         self.menu = None;
+        self.close_preset_menu(cx);
         self.set_params(next, cx);
         self.preset = Some(wrapped);
         cx.notify();
@@ -515,9 +622,11 @@ impl<M: KitModel> KitEditor<M> {
 }
 
 impl<M: KitModel> Render for KitEditor<M> {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The canvases below record where the live displays sit now.
         self.live_bounds.clear();
+        let viewport = window.viewport_size();
+        self.viewport = (f32::from(viewport.width), f32::from(viewport.height));
         M::panel(self, cx)
     }
 }
@@ -620,7 +729,9 @@ impl<M: KitModel> KitWindow<M> {
     fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.clone();
         self.editor.update(cx, |editor, cx| {
-            if key == "escape" && editor.menu.is_some() {
+            if key == "escape" && editor.preset_open {
+                editor.close_preset_menu(cx);
+            } else if key == "escape" && editor.menu.is_some() {
                 editor.close_menu(cx);
             } else {
                 M::key_down(editor, &key, cx);
@@ -715,8 +826,11 @@ impl<M: KitModel> Render for KitWindow<M> {
             )
             // Gestures that start on a display follow the pointer anywhere
             // over the window.
-            .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
+            .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
                 let _ = move_target.update(cx, |editor, cx| M::mouse_move(editor, event, cx));
+                if M::REPAINT_ON_HOVER {
+                    window.refresh();
+                }
             })
             .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _window, cx| {
                 let _ = up_target.update(cx, |editor, cx| M::mouse_up(editor, cx));

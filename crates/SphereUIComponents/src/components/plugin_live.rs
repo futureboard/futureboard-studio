@@ -14,13 +14,14 @@ use gpui::{
     fill, point, px, App, Bounds, Hsla, Pixels, Rgba, SharedString, TextAlign, TextRun, Window,
 };
 use SpherePluginHost::audio_bridge::{
-    BuiltinMeterFrame, StereoImageFrame, BUILTIN_RACK_SLOTS, IMAGE_SCOPE_POINTS, REDUCTION_BANDS,
+    BuiltinMeterFrame, StereoImageFrame, BUILTIN_PAD_SLOTS, BUILTIN_RACK_SLOTS, IMAGE_SCOPE_POINTS,
+    REDUCTION_BANDS,
 };
 use SpherePluginHost::spectrum::SPECTRUM_BINS;
 
 use crate::components::builtin_plugin_editor_window::{
     BuiltinBandReductionSource, BuiltinEditorHostOps, BuiltinHostStatusSource, BuiltinMeterSource,
-    BuiltinSpectrumSource, BuiltinStereoImageSource, PluginInstanceKey,
+    BuiltinPadLevelSource, BuiltinSpectrumSource, BuiltinStereoImageSource, PluginInstanceKey,
 };
 use crate::components::eq_graph::{freq_fraction, paint_area, paint_line};
 use crate::components::quick_sampler_panel::rect;
@@ -73,6 +74,7 @@ pub struct Live {
     image_source: Option<BuiltinStereoImageSource>,
     reduction_source: Option<BuiltinBandReductionSource>,
     status_source: Option<BuiltinHostStatusSource>,
+    pad_source: Option<BuiltinPadLevelSource>,
     /// The newest meter frame; `None` until one arrives.
     pub frame: Option<BuiltinMeterFrame>,
     history: Box<[HistoryPoint; HISTORY]>,
@@ -85,6 +87,9 @@ pub struct Live {
     needle_output: f32,
     spectrum: Option<(u32, [f32; SPECTRUM_BINS])>,
     reduction: Option<(u32, [f32; REDUCTION_BANDS])>,
+    /// A built-in's own telemetry block (its `telemetry` module says what
+    /// each slot holds).
+    pads: Option<(u32, [f32; BUILTIN_PAD_SLOTS])>,
     image_seq: Option<u32>,
     image: VecDeque<StereoImageFrame>,
     /// The vectorscope's auto-gain.
@@ -104,6 +109,7 @@ impl Live {
             image_source: host_ops.stereo_image_source.clone(),
             reduction_source: host_ops.band_reduction_source.clone(),
             status_source: host_ops.host_status_source.clone(),
+            pad_source: host_ops.pad_level_source.clone(),
             frame: None,
             history: Box::new([HistoryPoint::default(); HISTORY]),
             write: 0,
@@ -113,6 +119,7 @@ impl Live {
             needle_output: -20.0,
             spectrum: None,
             reduction: None,
+            pads: None,
             image_seq: None,
             image: VecDeque::with_capacity(SCOPE_FRAMES),
             scope_gain: 1.0,
@@ -140,6 +147,11 @@ impl Live {
     ) {
         self.spectrum = spectrum.map(|bins| (0, bins));
         self.reduction = reduction.map(|bands| (0, bands));
+    }
+
+    /// A telemetry block for the preview tool and the tests.
+    pub fn show_pads(&mut self, block: [f32; BUILTIN_PAD_SLOTS]) {
+        self.pads = Some((0, block));
     }
 
     pub fn sample_rate(&self) -> Option<f32> {
@@ -180,6 +192,12 @@ impl Live {
         if let Some((seq, bands)) = self.reduction_source.as_ref().and_then(|s| s(&self.key)) {
             if self.reduction.is_none_or(|(old, _)| old != seq) {
                 self.reduction = Some((seq, bands));
+                moved = true;
+            }
+        }
+        if let Some((seq, block)) = self.pad_source.as_ref().and_then(|s| s(&self.key)) {
+            if self.pads.is_none_or(|(old, _)| old != seq) {
+                self.pads = Some((seq, block));
                 moved = true;
             }
         }
@@ -274,6 +292,11 @@ impl Live {
 
     pub fn band_reduction(&self) -> Option<[f32; REDUCTION_BANDS]> {
         self.reduction.map(|(_, bands)| bands)
+    }
+
+    /// The newest telemetry block, if the built-in publishes one.
+    pub fn pads(&self) -> Option<&[f32; BUILTIN_PAD_SLOTS]> {
+        self.pads.as_ref().map(|(_, block)| block)
     }
 
     pub fn image(&self) -> Option<&StereoImageFrame> {
