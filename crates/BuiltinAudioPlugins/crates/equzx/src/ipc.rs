@@ -14,6 +14,9 @@
 //! 2                       soloBand
 //! 3   .. 3+24*7           per-band static block  (stride 7)
 //! 171 .. 171+24*6         per-band dynamics block (stride 6)
+//! 315                     mix
+//! 316                     autoGain
+//! 317 .. 317+24           per-band dynamic ratio  (stride 1)
 //! ```
 //!
 //! Both per-band blocks are addressed by arithmetic on their base index, so new
@@ -25,7 +28,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BAND_COUNT, BandChannel, BandType, DynMode, Params, clamp, default_params};
+use crate::{
+    BAND_COUNT, BandChannel, BandType, DynMode, Params, RATIO_LEGACY, clamp, default_params,
+};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const STATE_VERSION: u32 = 1;
@@ -55,7 +60,15 @@ pub const BAND_DYN_RANGE: u32 = 3;
 pub const BAND_DYN_ATTACK: u32 = 4;
 pub const BAND_DYN_RELEASE: u32 = 5;
 
-pub const PARAM_COUNT: usize = DYN_BASE_INDEX as usize + BAND_COUNT * DYN_STRIDE as usize;
+/// Mix and auto gain, appended after the dynamics block so every index before
+/// them keeps its meaning.
+pub const MIX_INDEX: u32 = DYN_BASE_INDEX + BAND_COUNT as u32 * DYN_STRIDE;
+pub const AUTO_GAIN_INDEX: u32 = MIX_INDEX + 1;
+
+/// `RATIO_BASE_INDEX + band`: each band's dynamic ratio.
+pub const RATIO_BASE_INDEX: u32 = AUTO_GAIN_INDEX + 1;
+
+pub const PARAM_COUNT: usize = RATIO_BASE_INDEX as usize + BAND_COUNT;
 
 /// `solo_band` value meaning "no band is auditioned".
 pub const SOLO_NONE: i32 = -1;
@@ -69,15 +82,16 @@ pub const SOLO_NONE: i32 = -1;
 
 pub const FREQ_MIN: f32 = 20.0;
 pub const FREQ_MAX: f32 = 20_000.0;
-/// Gain and Q stay inside the envelope `builtin_dsp_core` documents as stable
-/// (see `MAX_FILTER_FREQUENCY_RATIO`'s note: Q = 12 at ±18 dB already puts the
-/// poles near radius 0.998). The shared coefficient builder clamps Q to this
-/// range internally regardless, so widening it here would only desynchronise
-/// the editor's drawn curve from the filter that actually runs.
-pub const GAIN_MIN_DB: f32 = -18.0;
-pub const GAIN_MAX_DB: f32 = 18.0;
+/// The shared coefficient builder pins Q at 12; above that the crate designs
+/// the filter itself (`design`, the same RBJ formulas), so the drawn curve and
+/// the running filter stay one design across the whole range. Q 30 at ±30 dB
+/// keeps the poles inside the unit circle at every centre a band can reach;
+/// the cascade runs in direct form 1, whose only cost at such narrow,
+/// low-centred bells is a little more rounding noise.
+pub const GAIN_MIN_DB: f32 = -30.0;
+pub const GAIN_MAX_DB: f32 = 30.0;
 pub const Q_MIN: f32 = 0.1;
-pub const Q_MAX: f32 = 12.0;
+pub const Q_MAX: f32 = 30.0;
 pub const THRESHOLD_MIN_DB: f32 = -60.0;
 pub const THRESHOLD_MAX_DB: f32 = 0.0;
 pub const RANGE_MIN_DB: f32 = -24.0;
@@ -87,11 +101,25 @@ pub const ATTACK_MAX_MS: f32 = 500.0;
 pub const RELEASE_MIN_MS: f32 = 1.0;
 pub const RELEASE_MAX_MS: f32 = 5_000.0;
 pub const OUTPUT_MIN_DB: f32 = -24.0;
-pub const OUTPUT_MAX_DB: f32 = 12.0;
+pub const OUTPUT_MAX_DB: f32 = 18.0;
+pub const RATIO_MIN: f32 = 1.0;
+pub const RATIO_MAX: f32 = 10.0;
 
-/// Cut slopes the filter cascade can realize, in dB/oct. Only even filter
-/// orders exist, so every entry is a multiple of 12.
-pub const SLOPES: [f32; 6] = [12.0, 24.0, 36.0, 48.0, 72.0, 96.0];
+/// Cut slopes the filter cascade can realize, in dB/oct: 6 is a single
+/// first-order section, the rest even-order Butterworth cascades. (36 and
+/// 72 are not offered by the editor but stay valid for saved projects.)
+pub const SLOPES: [f32; 7] = [6.0, 12.0, 24.0, 36.0, 48.0, 72.0, 96.0];
+
+/// A wire or stored ratio: anything under 0.5 is [`RATIO_LEGACY`] — the
+/// value a project saved before the ratio control replays with, which must
+/// keep its law rather than be pinned to 1:1 — otherwise 1..10.
+pub fn decode_ratio(value: f32) -> f32 {
+    if value < 0.5 {
+        RATIO_LEGACY
+    } else {
+        clamp(value, RATIO_MIN, RATIO_MAX)
+    }
+}
 
 /// Snap an arbitrary wire value to the nearest supported slope.
 ///
@@ -152,11 +180,28 @@ const DYN_IDS: [&str; BAND_COUNT * DYN_STRIDE as usize] = dyn_ids!(
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
 );
 
+macro_rules! ratio_ids {
+    ($($n:literal),* $(,)?) => {
+        [$(concat!("band", $n, "_ratio"),)*]
+    };
+}
+
+const RATIO_IDS: [&str; BAND_COUNT] = ratio_ids!(
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+);
+
 const fn build_ui_param_ids() -> [&'static str; PARAM_COUNT] {
     let mut ids = [""; PARAM_COUNT];
     ids[POWER_INDEX as usize] = "power";
     ids[OUTPUT_INDEX as usize] = "outputDb";
     ids[SOLO_INDEX as usize] = "soloBand";
+    ids[MIX_INDEX as usize] = "mix";
+    ids[AUTO_GAIN_INDEX as usize] = "autoGain";
+    let mut i = 0;
+    while i < RATIO_IDS.len() {
+        ids[RATIO_BASE_INDEX as usize + i] = RATIO_IDS[i];
+        i += 1;
+    }
 
     let mut i = 0;
     while i < BAND_IDS.len() {
@@ -233,14 +278,28 @@ pub fn decode_band_wire(index: u32) -> Option<(usize, u32)> {
 }
 
 pub fn decode_dyn_wire(index: u32) -> Option<(usize, u32)> {
+    if index >= MIX_INDEX {
+        return None;
+    }
     let offset = index.checked_sub(DYN_BASE_INDEX)?;
     let band = (offset / DYN_STRIDE) as usize;
     let field = offset % DYN_STRIDE;
     (band < BAND_COUNT).then_some((band, field))
 }
 
+pub const fn ratio_wire_index(band: usize) -> u32 {
+    RATIO_BASE_INDEX + band as u32
+}
+
+/// The band a ratio wire index addresses.
+pub fn decode_ratio_wire(index: u32) -> Option<usize> {
+    let band = index.checked_sub(RATIO_BASE_INDEX)? as usize;
+    (band < BAND_COUNT).then_some(band)
+}
+
 pub fn sanitize_params(params: &mut Params) {
     params.output_db = clamp(params.output_db, OUTPUT_MIN_DB, OUTPUT_MAX_DB);
+    params.mix = clamp(params.mix, 0.0, 100.0);
     if params.solo_band < 0 || params.solo_band >= BAND_COUNT as i32 {
         params.solo_band = SOLO_NONE;
     }
@@ -253,6 +312,7 @@ pub fn sanitize_params(params: &mut Params) {
         band.range_db = clamp(band.range_db, RANGE_MIN_DB, RANGE_MAX_DB);
         band.attack_ms = clamp(band.attack_ms, ATTACK_MIN_MS, ATTACK_MAX_MS);
         band.release_ms = clamp(band.release_ms, RELEASE_MIN_MS, RELEASE_MAX_MS);
+        band.ratio = decode_ratio(band.ratio);
         if !band.band_type.has_gain() {
             band.dynamic = false;
         }
@@ -283,8 +343,12 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
         POWER_INDEX => params.power = value >= 0.5,
         OUTPUT_INDEX => params.output_db = clamp(value, OUTPUT_MIN_DB, OUTPUT_MAX_DB),
         SOLO_INDEX => params.solo_band = decode_solo_band(value),
+        MIX_INDEX => params.mix = clamp(value, 0.0, 100.0),
+        AUTO_GAIN_INDEX => params.auto_gain = value >= 0.5,
         _ => {
-            if let Some((band_index, field)) = decode_band_wire(index) {
+            if let Some(band_index) = decode_ratio_wire(index) {
+                params.bands[band_index].ratio = decode_ratio(value);
+            } else if let Some((band_index, field)) = decode_band_wire(index) {
                 let band = &mut params.bands[band_index];
                 match field {
                     BAND_ENABLED => band.active = value >= 0.5,
@@ -358,6 +422,11 @@ pub fn ui_values(params: &Params) -> Vec<(&'static str, f32)> {
         values.push((UI_PARAM_IDS[base + 3], band.range_db));
         values.push((UI_PARAM_IDS[base + 4], band.attack_ms));
         values.push((UI_PARAM_IDS[base + 5], band.release_ms));
+    }
+    values.push(("mix", params.mix));
+    values.push(("autoGain", f32::from(params.auto_gain)));
+    for (index, band) in params.bands.iter().enumerate() {
+        values.push((RATIO_IDS[index], band.ratio));
     }
     values
 }
@@ -453,7 +522,64 @@ mod tests {
         assert_eq!(snap_slope(11.0), 12.0);
         assert_eq!(snap_slope(30.0), 24.0);
         assert_eq!(snap_slope(1_000.0), 96.0);
-        assert_eq!(snap_slope(-40.0), 12.0);
+        assert_eq!(snap_slope(-40.0), 6.0);
+        assert_eq!(snap_slope(7.0), 6.0);
+        // Every slope a project saved before 6 dB/oct could hold is kept.
+        for old in [12.0, 24.0, 36.0, 48.0, 72.0, 96.0] {
+            assert_eq!(snap_slope(old), old);
+        }
+    }
+
+    /// The indices a host already resolves keep their meaning: mix, auto
+    /// gain and the ratios only extend the table.
+    #[test]
+    fn existing_wire_indices_are_unchanged() {
+        for (index, id) in [
+            (0, "power"),
+            (1, "outputDb"),
+            (2, "soloBand"),
+            (3, "band1_enabled"),
+            (9, "band1_channel"),
+            (10, "band2_enabled"),
+            (170, "band24_channel"),
+            (171, "band1_dynEnabled"),
+            (176, "band1_releaseMs"),
+            (314, "band24_releaseMs"),
+        ] {
+            assert_eq!(ui_param_id(index), Some(id), "{index}");
+        }
+        assert_eq!(ui_param_index("mix"), Some(315));
+        assert_eq!(ui_param_index("autoGain"), Some(316));
+        assert_eq!(ui_param_index("band1_ratio"), Some(317));
+        assert_eq!(ui_param_index("band24_ratio"), Some(340));
+        assert_eq!(PARAM_COUNT, 341);
+        for index in 0..PARAM_COUNT as u32 {
+            let hits = [
+                decode_band_wire(index).is_some(),
+                decode_dyn_wire(index).is_some(),
+                decode_ratio_wire(index).is_some(),
+            ];
+            assert!(hits.iter().filter(|hit| **hit).count() <= 1, "{index}");
+        }
+    }
+
+    #[test]
+    fn new_globals_and_ratios_apply() {
+        let mut params = default_params();
+        assert!(apply_wire_param(&mut params, MIX_INDEX, 140.0));
+        assert_eq!(params.mix, 100.0);
+        assert!(apply_wire_param(&mut params, AUTO_GAIN_INDEX, 1.0));
+        assert!(params.auto_gain);
+        assert!(apply_wire_param(&mut params, ratio_wire_index(5), 0.0));
+        assert_eq!(params.bands[5].ratio, RATIO_LEGACY);
+        assert!(apply_wire_param(&mut params, ratio_wire_index(5), 0.7));
+        assert_eq!(params.bands[5].ratio, RATIO_MIN);
+        assert!(apply_ui_param(&mut params, "band6_channel", 4.0));
+        assert_eq!(params.bands[5].channel, BandChannel::Right);
+        let json = EquzxState::new(params).to_json().unwrap();
+        let decoded = EquzxState::from_json(&json).unwrap();
+        assert!(decoded.params.auto_gain);
+        assert_eq!(decoded.params.bands[5].channel, BandChannel::Right);
     }
 
     #[test]

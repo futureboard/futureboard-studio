@@ -2,12 +2,16 @@
 //!
 //! Phase 1 (easy). Filter coefficients and runtime state use the MIT/Apache
 //! [`biquad`] crate. No DirectAudioEngine dependency.
+//!
+//! Cut bands (high/low pass) expand into a Butterworth cascade of up to
+//! [`MAX_SECTIONS`] biquads for 24 and 48 dB/oct; a 12 dB/oct cut is the
+//! single section it always was, at the band's own Q.
 
-use biquad::{Biquad, DirectForm1};
+use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type};
 use builtin_dsp_core::delay::{Smoothed, smoothing_step};
 use builtin_dsp_core::{
     ParamDescriptor, PluginCategory, PluginDescriptor, StereoEffect, biquad_response_db, clamp,
-    db_to_linear, flush_denormal, linear_to_db, make_eq_biquad, make_eq_coefficients, mix,
+    db_to_linear, flush_denormal, linear_to_db, make_eq_coefficients, max_filter_frequency, mix,
     time_constant,
 };
 use serde::{Deserialize, Serialize};
@@ -24,9 +28,113 @@ pub use presets::{FactoryPreset, factory_presets};
 pub const PLUGIN_ID: &str = "futureboard.equz8";
 pub const BAND_COUNT: usize = 8;
 
+/// Biquad sections one band can expand into: 48 dB/oct is an 8th-order
+/// Butterworth cascade, four second-order sections.
+pub const MAX_SECTIONS: usize = 4;
+
 /// Soft span (dB) from threshold to full dynamic amount. Pro-Q-style: the
 /// envelope does not hard-switch at the threshold, it ramps over this window.
+/// The law of a band whose `ratio` is [`RATIO_LEGACY`].
 const DYNAMIC_SPAN_DB: f32 = 24.0;
+
+/// `ratio` value meaning "the fixed-span law projects saved before the ratio
+/// control existed were mixed with": the dynamic amount ramps linearly from
+/// nothing at the threshold to the full range [`DYNAMIC_SPAN_DB`] past it.
+/// A missing `ratio` field deserializes to this, so those projects sound as
+/// they always did.
+pub const RATIO_LEGACY: f32 = 0.0;
+
+/// The ratio a band the editor creates starts at.
+pub const DEFAULT_RATIO: f32 = 2.0;
+
+/// Output peak meters fall back over about this long.
+const PEAK_FALL_SECONDS: f32 = 0.4;
+
+/// Which side of the threshold engages a dynamic band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DynMode {
+    /// Engage as the band's level rises past the threshold — a de-esser.
+    Above,
+    /// Engage as it falls below — upward tone shaping.
+    Below,
+}
+
+impl DynMode {
+    pub const fn to_wire(self) -> f32 {
+        match self {
+            Self::Above => 0.0,
+            Self::Below => 1.0,
+        }
+    }
+
+    pub fn from_wire(value: f32) -> Self {
+        if value.round() as i32 == 1 {
+            Self::Below
+        } else {
+            Self::Above
+        }
+    }
+}
+
+/// How far toward its full range a dynamic band is pulled, 0..1, by a
+/// detector reading `level_db` — the steady state the band's attack and
+/// release glide toward.
+///
+/// With a ratio (1..10) the gain moves like a compressor's: `Above`, by
+/// `(level − threshold)·(1 − 1/ratio)` dB; `Below`, by
+/// `(threshold − level)·(ratio − 1)·0.5` dB; either way never past the range.
+/// With [`RATIO_LEGACY`] it is the fixed linear ramp over
+/// [`DYNAMIC_SPAN_DB`].
+pub fn dynamic_fraction(band: &BandParams, level_db: f32) -> f32 {
+    let over = match band.dyn_mode {
+        DynMode::Above => level_db - band.threshold_db,
+        DynMode::Below => band.threshold_db - level_db,
+    };
+    if over <= 0.0 {
+        return 0.0;
+    }
+    if band.ratio < 1.0 {
+        return clamp(over / DYNAMIC_SPAN_DB, 0.0, 1.0);
+    }
+    let range = band.range_db.abs();
+    if range <= 1.0e-6 {
+        return 0.0;
+    }
+    let moved = match band.dyn_mode {
+        DynMode::Above => over * (1.0 - 1.0 / band.ratio),
+        DynMode::Below => over * (band.ratio - 1.0) * 0.5,
+    };
+    clamp(moved / range, 0.0, 1.0)
+}
+
+/// The gain offset, in dB, a dynamic band settles at for a detector reading
+/// `level_db` (signed like its range). 0 for a band that is not dynamic.
+pub fn dynamic_offset_db(band: &BandParams, level_db: f32) -> f32 {
+    if !(band.active && band.dynamic && band.band_type.has_gain()) {
+        return 0.0;
+    }
+    dynamic_fraction(band, level_db) * band.range_db
+}
+
+/// The live readings the editor polls through the host's level block.
+pub mod telemetry {
+    use super::BAND_COUNT;
+
+    /// Slots in one block.
+    pub const SLOTS: usize = 64;
+    /// Output peak, left and right, linear, falling over ~400 ms.
+    pub const OUT_L: usize = 0;
+    pub const OUT_R: usize = 1;
+    /// `DETECTOR_BASE + band`: the band's detector level in dBFS; −120 for a
+    /// band that is off or not dynamic.
+    pub const DETECTOR_BASE: usize = 2;
+    /// `GAIN_BASE + band`: the band's current dynamic gain offset in dB; 0
+    /// for a band that is not dynamic.
+    pub const GAIN_BASE: usize = 2 + BAND_COUNT;
+    /// The reading of a detector that is not listening.
+    pub const SILENT_DB: f32 = -120.0;
+}
 
 /// Rebuild the peaking/shelf filter when applied gain moves by at least this
 /// much — avoids per-sample coefficient work on a quiet envelope.
@@ -168,6 +276,11 @@ impl BandType {
     pub const fn has_gain(self) -> bool {
         matches!(self, Self::LowShelf | Self::Bell | Self::HighShelf)
     }
+
+    /// Cut shapes take a slope and expand into a cascade.
+    pub const fn is_cut(self) -> bool {
+        matches!(self, Self::HighPass | Self::LowPass)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -191,6 +304,26 @@ pub struct BandParams {
     pub attack_ms: f32,
     #[serde(default = "default_release_ms")]
     pub release_ms: f32,
+    /// dB/oct for the cut shapes — 12, 24 or 48; ignored by the others.
+    /// `serde(default)` 12: the single section every cut was before slopes.
+    #[serde(default = "legacy_slope")]
+    pub slope: f32,
+    /// Which side of the threshold engages the dynamics. Projects saved
+    /// before the mode existed load as `Above`, the only mode there was.
+    #[serde(default = "default_dyn_mode")]
+    pub dyn_mode: DynMode,
+    /// Dynamic ratio 1..10, or [`RATIO_LEGACY`] for the fixed-span law
+    /// (what a missing field loads as).
+    #[serde(default)]
+    pub ratio: f32,
+}
+
+fn legacy_slope() -> f32 {
+    12.0
+}
+
+fn default_dyn_mode() -> DynMode {
+    DynMode::Above
 }
 
 fn default_threshold_db() -> f32 {
@@ -217,6 +350,9 @@ fn flat_band(band_type: BandType, freq: f32, q: f32) -> BandParams {
         range_db: 0.0,
         attack_ms: default_attack_ms(),
         release_ms: default_release_ms(),
+        slope: legacy_slope(),
+        dyn_mode: default_dyn_mode(),
+        ratio: DEFAULT_RATIO,
     }
 }
 
@@ -273,16 +409,77 @@ pub fn band_response_at_gain_db(
     if !band.active {
         return 0.0;
     }
-    make_eq_coefficients(
-        band.band_type.as_str(),
-        band.freq,
-        gain_db,
-        band.q,
-        sample_rate,
-    )
-    .map_or(0.0, |coefficients| {
-        biquad_response_db(&coefficients, freq_hz, sample_rate)
-    })
+    (0..section_count(band))
+        .map(|section| {
+            section_coefficients(band, section, gain_db, sample_rate).map_or(0.0, |coefficients| {
+                biquad_response_db(&coefficients, freq_hz, sample_rate)
+            })
+        })
+        .sum()
+}
+
+/// Biquad coefficients for one EQ shape: the shared
+/// [`make_eq_coefficients`], with the Q ceiling raised to [`ipc::Q_MAX`].
+/// Below the shared builder's own ceiling of 12 it *is* the shared builder,
+/// so bands saved before the range widened design the same filters.
+fn design(
+    kind: &str,
+    freq_hz: f32,
+    gain_db: f32,
+    q: f32,
+    sample_rate: f32,
+) -> Option<Coefficients<f32>> {
+    if q <= 12.0 {
+        return make_eq_coefficients(kind, freq_hz, gain_db, q, sample_rate);
+    }
+    let fs = sample_rate.max(1.0);
+    let f0 = clamp(freq_hz, 10.0, max_filter_frequency(fs));
+    let filter_type = match kind {
+        "bell" => Type::PeakingEQ(gain_db),
+        "lowshelf" => Type::LowShelf(gain_db),
+        "highshelf" => Type::HighShelf(gain_db),
+        "lowpass" => Type::LowPass,
+        "highpass" => Type::HighPass,
+        "notch" => Type::Notch,
+        "bandpass" => Type::BandPass,
+        _ => return None,
+    };
+    Coefficients::<f32>::from_params(filter_type, fs.hz(), f0.hz(), q.min(ipc::Q_MAX)).ok()
+}
+
+/// Butterworth section Qs for a cascade of the given (even) filter order:
+/// the k-th of `order/2` sections at `1 / (2 cos((2k+1)π / 2·order))`.
+fn butterworth_q(order: usize, k: usize) -> f32 {
+    let angle = (2.0 * k as f32 + 1.0) * std::f32::consts::PI / (2.0 * order as f32);
+    1.0 / (2.0 * angle.cos())
+}
+
+/// How many biquad sections a band expands into: one, except a cut at 24
+/// (two) or 48 dB/oct (four).
+pub fn section_count(band: &BandParams) -> usize {
+    if !band.band_type.is_cut() {
+        return 1;
+    }
+    let order = (band.slope / 6.0).round().max(2.0) as usize;
+    (order / 2).clamp(1, MAX_SECTIONS)
+}
+
+/// The coefficients of section `section` of `band` at gain `gain_db`. A
+/// 12 dB/oct cut keeps the band's own Q, exactly as before slopes; a steeper
+/// one is a Butterworth cascade.
+fn section_coefficients(
+    band: &BandParams,
+    section: usize,
+    gain_db: f32,
+    sample_rate: f32,
+) -> Option<Coefficients<f32>> {
+    let count = section_count(band);
+    let q = if band.band_type.is_cut() && count > 1 {
+        butterworth_q(count * 2, section)
+    } else {
+        band.q
+    };
+    design(band.band_type.as_str(), band.freq, gain_db, q, sample_rate)
 }
 
 /// [`band_response_at_gain_db`] at the band's own gain.
@@ -330,8 +527,8 @@ pub fn descriptor() -> PluginDescriptor {
                 id: "outputDb",
                 name: "Output",
                 default_value: 0.0,
-                min: -24.0,
-                max: 12.0,
+                min: ipc::OUTPUT_MIN_DB,
+                max: ipc::OUTPUT_MAX_DB,
                 unit: "dB",
             },
         ],
@@ -344,6 +541,9 @@ struct DynamicBandState {
     attack_coeff: f32,
     release_coeff: f32,
     last_applied_db: f32,
+    /// The detector's last reading and the offset it produced, for telemetry.
+    level_db: f32,
+    offset_db: f32,
 }
 
 impl DynamicBandState {
@@ -353,16 +553,27 @@ impl DynamicBandState {
             attack_coeff: 0.0,
             release_coeff: 0.0,
             last_applied_db: 0.0,
+            level_db: telemetry::SILENT_DB,
+            offset_db: 0.0,
         }
     }
 }
+
+type Cascade = [Option<DirectForm1<f32>>; MAX_SECTIONS];
+
+const EMPTY_CASCADE: Cascade = [None; MAX_SECTIONS];
 
 #[derive(Debug, Clone)]
 pub struct Dsp {
     sample_rate: f32,
     params: Params,
-    left: [Option<DirectForm1<f32>>; BAND_COUNT],
-    right: [Option<DirectForm1<f32>>; BAND_COUNT],
+    left: [Cascade; BAND_COUNT],
+    right: [Cascade; BAND_COUNT],
+    /// Sections each band actually runs.
+    sections: [u8; BAND_COUNT],
+    /// Output peaks, left and right, and their per-sample fall.
+    out_peak: [f32; 2],
+    peak_fall: f32,
     /// Band-local detector for dynamic EQ (bandpass around the band centre).
     detector: [Option<DirectForm1<f32>>; BAND_COUNT],
     dyn_state: [DynamicBandState; BAND_COUNT],
@@ -392,8 +603,11 @@ impl Dsp {
         let mut dsp = Self {
             sample_rate: sample_rate.max(1.0),
             params: default_params(),
-            left: [None, None, None, None, None, None, None, None],
-            right: [None, None, None, None, None, None, None, None],
+            left: [EMPTY_CASCADE; BAND_COUNT],
+            right: [EMPTY_CASCADE; BAND_COUNT],
+            sections: [0; BAND_COUNT],
+            out_peak: [0.0; 2],
+            peak_fall: time_constant(sample_rate.max(1.0), PEAK_FALL_SECONDS),
             detector: [None, None, None, None, None, None, None, None],
             dyn_state: [DynamicBandState::new(); BAND_COUNT],
             solo_left: None,
@@ -463,13 +677,54 @@ impl Dsp {
                         }
                         _ => {}
                     }
+                } else if let Some((band, field)) = ipc::decode_ext_wire(wire_index) {
+                    // Slope reshapes the cascade; mode and ratio only the
+                    // envelope law, which runs sample by sample.
+                    if field == ipc::BAND_SLOPE {
+                        self.rebuild_band(band);
+                        if self.params.solo_band == band as i32 {
+                            self.rebuild_solo();
+                        }
+                    }
                 }
             }
         }
         true
     }
 
+    /// The editor's live readings ([`telemetry`]). Realtime-safe: a copy of
+    /// state the audio path keeps anyway.
+    pub fn telemetry(&self) -> [f32; telemetry::SLOTS] {
+        let mut block = [0.0; telemetry::SLOTS];
+        block[telemetry::OUT_L] = self.out_peak[0];
+        block[telemetry::OUT_R] = self.out_peak[1];
+        for (index, band) in self.params.bands.iter().enumerate() {
+            let listening = self.params.power
+                && band.active
+                && band.dynamic
+                && band.band_type.has_gain()
+                && band.range_db.abs() > 1.0e-6;
+            let state = &self.dyn_state[index];
+            block[telemetry::DETECTOR_BASE + index] = if listening {
+                state.level_db
+            } else {
+                telemetry::SILENT_DB
+            };
+            block[telemetry::GAIN_BASE + index] = if listening { state.offset_db } else { 0.0 };
+        }
+        block
+    }
+
+    #[inline]
+    fn track_peaks(&mut self, left: f32, right: f32) {
+        let fall = self.peak_fall;
+        let [l, r] = &mut self.out_peak;
+        *l = flush_denormal(left.abs().max(*l * fall));
+        *r = flush_denormal(right.abs().max(*r * fall));
+    }
+
     fn rebuild(&mut self) {
+        self.peak_fall = time_constant(self.sample_rate, PEAK_FALL_SECONDS);
         self.output_gain
             .set_time(GAIN_SMOOTHING_MS, self.sample_rate);
         self.mix.set_time(GAIN_SMOOTHING_MS, self.sample_rate);
@@ -506,7 +761,7 @@ impl Dsp {
                 BandType::Bell | BandType::Notch => band.q,
                 _ => SOLO_WIDE_Q,
             };
-            make_eq_biquad("bandpass", band.freq, 0.0, q, self.sample_rate)
+            design("bandpass", band.freq, 0.0, q, self.sample_rate).map(DirectForm1::<f32>::new)
         } else {
             None
         };
@@ -518,21 +773,25 @@ impl Dsp {
         let band = self.params.bands[index];
         self.refresh_dyn_timing(index);
         if !band.active {
-            self.left[index] = None;
-            self.right[index] = None;
+            self.left[index] = EMPTY_CASCADE;
+            self.right[index] = EMPTY_CASCADE;
+            self.sections[index] = 0;
             self.detector[index] = None;
             return;
         }
         let applied = band.gain_db;
-        let filter = make_eq_biquad(
-            band.band_type.as_str(),
-            band.freq,
-            applied,
-            band.q,
-            self.sample_rate,
-        );
-        self.left[index] = filter;
-        self.right[index] = filter;
+        let count = section_count(&band);
+        self.sections[index] = count as u8;
+        for section in 0..MAX_SECTIONS {
+            let filter = if section < count {
+                section_coefficients(&band, section, applied, self.sample_rate)
+                    .map(DirectForm1::<f32>::new)
+            } else {
+                None
+            };
+            self.left[index][section] = filter;
+            self.right[index][section] = filter;
+        }
         self.dyn_state[index].last_applied_db = applied;
 
         let wants_detector = band.dynamic && band.band_type.has_gain();
@@ -541,15 +800,17 @@ impl Dsp {
                 BandType::Bell => band.q,
                 _ => SOLO_WIDE_Q,
             };
-            make_eq_biquad("bandpass", band.freq, 0.0, q, self.sample_rate)
+            design("bandpass", band.freq, 0.0, q, self.sample_rate).map(DirectForm1::<f32>::new)
         } else {
             None
         };
     }
 
+    /// Retunes a dynamic band to a new applied gain. Only gain-bearing shapes
+    /// reach this, and those are always one section.
     fn set_band_applied_gain(&mut self, index: usize, applied_db: f32) {
         let band = self.params.bands[index];
-        let Some(coeffs) = make_eq_coefficients(
+        let Some(coeffs) = design(
             band.band_type.as_str(),
             band.freq,
             applied_db,
@@ -560,40 +821,32 @@ impl Dsp {
         };
         // Retune in place so filter history survives — installing a fresh
         // DirectForm1 would zero the delay line and click on every gain step.
-        if let Some(filter) = self.left[index].as_mut() {
+        if let Some(filter) = self.left[index][0].as_mut() {
             filter.update_coefficients(coeffs);
         }
-        if let Some(filter) = self.right[index].as_mut() {
+        if let Some(filter) = self.right[index][0].as_mut() {
             filter.update_coefficients(coeffs);
         }
         self.dyn_state[index].last_applied_db = applied_db;
-    }
-
-    #[inline]
-    fn dynamic_amount(env_db: f32, threshold_db: f32) -> f32 {
-        let over = env_db - threshold_db;
-        if over <= 0.0 {
-            0.0
-        } else {
-            clamp(over / DYNAMIC_SPAN_DB, 0.0, 1.0)
-        }
     }
 }
 
 impl StereoEffect for Dsp {
     fn reset(&mut self) {
-        for filter in self.left.iter_mut().flatten() {
-            filter.reset_state();
-        }
-        for filter in self.right.iter_mut().flatten() {
-            filter.reset_state();
+        for cascade in self.left.iter_mut().chain(self.right.iter_mut()) {
+            for filter in cascade.iter_mut().flatten() {
+                filter.reset_state();
+            }
         }
         for filter in self.detector.iter_mut().flatten() {
             filter.reset_state();
         }
         for state in &mut self.dyn_state {
             state.envelope = 0.0;
+            state.level_db = telemetry::SILENT_DB;
+            state.offset_db = 0.0;
         }
+        self.out_peak = [0.0; 2];
         for filter in self.solo_left.iter_mut().chain(self.solo_right.iter_mut()) {
             filter.reset_state();
         }
@@ -609,19 +862,22 @@ impl StereoEffect for Dsp {
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
         // Fully off and settled: the chain is not run at all, as before.
         if self.power.is_settled() && !self.params.power {
+            self.track_peaks(left, right);
             return (left, right);
         }
         let on = self.power.next();
         let gain = self.output_gain.next();
         let amount = self.mix.next();
         let (wet_l, wet_r) = self.process_on(left, right, gain, amount);
-        if on == 1.0 {
+        let out = if on == 1.0 {
             (wet_l, wet_r)
         } else {
             // A step from dry, so a chain that leaves the signal untouched
             // stays bit-exact through the fade.
             (left + (wet_l - left) * on, right + (wet_r - right) * on)
-        }
+        };
+        self.track_peaks(out.0, out.1);
+        out
     }
 }
 
@@ -676,18 +932,16 @@ impl Dsp {
                         state.envelope
                     };
                     let env_db = linear_to_db(envelope.max(1.0e-12));
-                    let amount = Self::dynamic_amount(env_db, band.threshold_db);
-                    let applied = band.gain_db + amount * band.range_db;
+                    let offset = dynamic_fraction(&band, env_db) * band.range_db;
+                    let state = &mut self.dyn_state[index];
+                    state.level_db = env_db;
+                    state.offset_db = offset;
+                    let applied = band.gain_db + offset;
                     if (applied - last).abs() >= DYNAMIC_GAIN_EPS_DB {
                         self.set_band_applied_gain(index, applied);
                     }
                 }
-                if let Some(filter) = self.left[index].as_mut() {
-                    wet_l = filter.run(wet_l);
-                }
-                if let Some(filter) = self.right[index].as_mut() {
-                    wet_r = filter.run(wet_r);
-                }
+                self.run_band(index, &mut wet_l, &mut wet_r);
             }
             wet_l *= gain;
             wet_r *= gain;
@@ -696,15 +950,25 @@ impl Dsp {
 
         let mut wet_l = left;
         let mut wet_r = right;
-        for filter in self.left.iter_mut().flatten() {
-            wet_l = filter.run(wet_l);
-        }
-        for filter in self.right.iter_mut().flatten() {
-            wet_r = filter.run(wet_r);
+        for index in 0..BAND_COUNT {
+            self.run_band(index, &mut wet_l, &mut wet_r);
         }
         wet_l *= gain;
         wet_r *= gain;
         (mix(left, wet_l, amount), mix(right, wet_r, amount))
+    }
+
+    /// One band's cascade over both channels; nothing for an empty slot.
+    #[inline]
+    fn run_band(&mut self, index: usize, left: &mut f32, right: &mut f32) {
+        for section in 0..self.sections[index] as usize {
+            if let Some(filter) = self.left[index][section].as_mut() {
+                *left = filter.run(*left);
+            }
+            if let Some(filter) = self.right[index][section].as_mut() {
+                *right = filter.run(*right);
+            }
+        }
     }
 }
 
@@ -922,6 +1186,180 @@ mod tests {
         assert!(!state.params.bands[0].dynamic);
         assert_eq!(state.params.bands[0].threshold_db, -24.0);
         assert_eq!(state.params.bands[0].range_db, 0.0);
+    }
+
+    /// A project saved before slopes, modes and ratios plays exactly as it
+    /// did: the new fields load as their legacy values, and a static chain
+    /// is bit-identical to one built straight from the shared builder.
+    #[test]
+    fn legacy_state_plays_exactly_as_before() {
+        let band = |kind: &str, freq: f32, gain: f32, q: f32| {
+            format!(
+                r#"{{"active":true,"bandType":"{kind}","freq":{freq},"gainDb":{gain},"q":{q}}}"#
+            )
+        };
+        let bands = [
+            band("highpass", 80.0, 0.0, 0.9),
+            band("lowshelf", 120.0, 3.0, 0.8),
+            band("bell", 900.0, -4.0, 2.0),
+            band("bell", 2500.0, 2.5, 1.0),
+            band("notch", 4000.0, 0.0, 6.0),
+            band("highshelf", 9000.0, -2.0, 0.7),
+            band("lowpass", 15000.0, 0.0, 0.7),
+            band("bell", 300.0, 1.0, 1.4),
+        ];
+        let json = format!(
+            r#"{{"version":1,"params":{{"power":true,"outputDb":-1.5,"mix":100.0,"bands":[{}]}}}}"#,
+            bands.join(",")
+        );
+        let state = ipc::Equz8State::from_json(&json).expect("legacy json");
+        for band in &state.params.bands {
+            assert_eq!(band.slope, 12.0);
+            assert_eq!(band.dyn_mode, DynMode::Above);
+            assert_eq!(band.ratio, RATIO_LEGACY);
+        }
+        let mut reference: Vec<DirectForm1<f32>> = state
+            .params
+            .bands
+            .iter()
+            .map(|band| {
+                builtin_dsp_core::make_eq_biquad(
+                    band.band_type.as_str(),
+                    band.freq,
+                    band.gain_db,
+                    band.q,
+                    48_000.0,
+                )
+                .expect("filter")
+            })
+            .collect();
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(state.params);
+        let gain = db_to_linear(-1.5);
+        for n in 0..4_000 {
+            let x = ((n as f32) * 0.037).sin() * 0.5 + ((n as f32) * 0.31).sin() * 0.2;
+            let mut expected = x;
+            for filter in &mut reference {
+                expected = filter.run(expected);
+            }
+            let (l, _) = dsp.process_stereo(x, 0.0);
+            assert_eq!(l, expected * gain, "sample {n}");
+        }
+    }
+
+    /// The legacy law is the fixed 24 dB ramp; a ratio replaces it with a
+    /// compressor's.
+    #[test]
+    fn the_ratio_law_replaces_the_legacy_ramp() {
+        let mut band = default_params().bands[2];
+        band.active = true;
+        band.dynamic = true;
+        band.threshold_db = -30.0;
+        band.range_db = -12.0;
+        band.ratio = RATIO_LEGACY;
+        assert!((dynamic_fraction(&band, -18.0) - 0.5).abs() < 1.0e-6);
+        band.ratio = 4.0;
+        // 8 dB over at 4:1 moves 6 dB: half of a 12 dB range.
+        assert!((dynamic_offset_db(&band, -22.0) + 6.0).abs() < 1.0e-5);
+        // Never past the range.
+        assert!((dynamic_offset_db(&band, 0.0) + 12.0).abs() < 1.0e-5);
+        assert_eq!(dynamic_offset_db(&band, -40.0), 0.0);
+        band.dyn_mode = DynMode::Below;
+        // 4 dB under at 4:1 moves 4·3·0.5 = 6 dB.
+        assert!((dynamic_offset_db(&band, -34.0) + 6.0).abs() < 1.0e-5);
+        assert_eq!(dynamic_offset_db(&band, -20.0), 0.0);
+    }
+
+    #[test]
+    fn cut_slopes_steepen_the_cascade() {
+        let mut band = default_params().bands[0];
+        band.active = true;
+        band.freq = 1_000.0;
+        band.q = std::f32::consts::FRAC_1_SQRT_2;
+        let at = |band: &BandParams, hz: f32| band_response_db(band, hz, 48_000.0);
+        // 12 dB/oct: one section at the band's own Q, −3 dB at the corner.
+        assert_eq!(section_count(&band), 1);
+        assert!((at(&band, 1_000.0) + 3.0).abs() < 0.1);
+        band.slope = 24.0;
+        assert_eq!(section_count(&band), 2);
+        assert!((at(&band, 1_000.0) + 3.0).abs() < 0.1);
+        assert!(
+            (at(&band, 250.0) + 48.0).abs() < 2.0,
+            "{}",
+            at(&band, 250.0)
+        );
+        band.slope = 48.0;
+        assert_eq!(section_count(&band), MAX_SECTIONS);
+        assert!(
+            (at(&band, 500.0) + 48.0).abs() < 2.0,
+            "{}",
+            at(&band, 500.0)
+        );
+
+        // And what plays is what is drawn.
+        let mut params = default_params();
+        params.bands[0] = band;
+        params.bands[7].active = true;
+        params.bands[7].slope = 24.0;
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(params.clone());
+        for hz in [613.0, 1_013.0, 3_011.0, 15_013.0] {
+            let heard = linear_to_db(level_at(&mut dsp, hz));
+            let drawn = response_db(&params, hz, 48_000.0);
+            assert!((heard - drawn).abs() < 0.3, "{hz}: {heard} vs {drawn}");
+        }
+    }
+
+    #[test]
+    fn a_wide_q_designs_past_the_shared_ceiling() {
+        let mut band = default_params().bands[3];
+        band.active = true;
+        band.gain_db = 12.0;
+        band.q = ipc::Q_MAX;
+        // Half a semitone off the centre a Q-18 bell is well down from 12 dB;
+        // the shared builder's Q-12 one would still be higher.
+        let narrow = band_response_db(&band, 750.0 * 1.03, 48_000.0);
+        band.q = 12.0;
+        let capped = band_response_db(&band, 750.0 * 1.03, 48_000.0);
+        assert!(narrow < capped - 0.5, "{narrow} vs {capped}");
+    }
+
+    #[test]
+    fn telemetry_reports_peaks_and_dynamics() {
+        let mut params = default_params();
+        params.bands[4] = BandParams {
+            active: true,
+            band_type: BandType::Bell,
+            freq: 1_000.0,
+            q: 2.0,
+            dynamic: true,
+            threshold_db: -40.0,
+            range_db: -12.0,
+            attack_ms: 0.1,
+            ratio: 4.0,
+            ..params.bands[4]
+        };
+        let mut dsp = Dsp::new(48_000.0);
+        dsp.set_params(params);
+        let _ = level_at(&mut dsp, 1_000.0);
+        let block = dsp.telemetry();
+        assert!(block[telemetry::OUT_L] > 0.1, "{}", block[telemetry::OUT_L]);
+        assert_eq!(block[telemetry::OUT_R], 0.0, "silent right");
+        assert!(block[telemetry::DETECTOR_BASE + 4] > -40.0);
+        assert!(block[telemetry::GAIN_BASE + 4] < -1.0);
+        assert_eq!(block[telemetry::DETECTOR_BASE], telemetry::SILENT_DB);
+        assert_eq!(block[telemetry::GAIN_BASE], 0.0);
+    }
+
+    #[test]
+    fn mix_zero_is_dry() {
+        let mut dsp = shaping();
+        assert!(dsp.apply_wire_param(ipc::MIX_INDEX, 0.0));
+        for _ in 0..4_800 {
+            let _ = dsp.process_stereo(0.1, 0.1);
+        }
+        let (l, r) = dsp.process_stereo(0.3, -0.2);
+        assert!((l - 0.3).abs() < 1.0e-6 && (r + 0.2).abs() < 1.0e-6);
     }
 
     const BLOCK: usize = 128;

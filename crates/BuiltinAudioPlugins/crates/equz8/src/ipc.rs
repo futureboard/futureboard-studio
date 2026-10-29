@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BAND_COUNT, BandType, Params, clamp, default_params};
+use crate::{BAND_COUNT, BandType, DynMode, Params, RATIO_LEGACY, clamp, default_params};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const STATE_VERSION: u32 = 1;
@@ -46,7 +46,66 @@ pub const BAND_DYN_RANGE: u32 = 2;
 pub const BAND_DYN_ATTACK: u32 = 3;
 pub const BAND_DYN_RELEASE: u32 = 4;
 
-pub const PARAM_COUNT: usize = DYN_BASE_INDEX as usize + BAND_COUNT * DYN_STRIDE as usize;
+/// Per-band slope, dynamic mode and ratio, appended after the dynamics block
+/// for the same reason the dynamics block follows solo: every index before
+/// it keeps its meaning. `EXT_BASE_INDEX + band * EXT_STRIDE + field`.
+pub const EXT_BASE_INDEX: u32 = DYN_BASE_INDEX + BAND_COUNT as u32 * DYN_STRIDE;
+pub const EXT_STRIDE: u32 = 3;
+
+pub const BAND_SLOPE: u32 = 0;
+pub const BAND_DYN_MODE: u32 = 1;
+pub const BAND_RATIO: u32 = 2;
+
+pub const PARAM_COUNT: usize = EXT_BASE_INDEX as usize + BAND_COUNT * EXT_STRIDE as usize;
+
+// --- value ranges, shared by the wire and restored state --------------------
+
+pub const FREQ_MIN: f32 = 20.0;
+pub const FREQ_MAX: f32 = 20_000.0;
+pub const GAIN_MIN_DB: f32 = -18.0;
+pub const GAIN_MAX_DB: f32 = 18.0;
+pub const Q_MIN: f32 = 0.1;
+/// Above the shared coefficient builder's 12: the crate designs those
+/// filters itself (`design`). ±18 dB at Q 18 still keeps the poles inside
+/// the unit circle with margin at every centre the band can reach.
+pub const Q_MAX: f32 = 18.0;
+pub const THRESHOLD_MIN_DB: f32 = -60.0;
+pub const THRESHOLD_MAX_DB: f32 = 0.0;
+pub const RANGE_MIN_DB: f32 = -24.0;
+pub const RANGE_MAX_DB: f32 = 24.0;
+pub const ATTACK_MIN_MS: f32 = 0.1;
+pub const ATTACK_MAX_MS: f32 = 500.0;
+pub const RELEASE_MIN_MS: f32 = 1.0;
+pub const RELEASE_MAX_MS: f32 = 5_000.0;
+pub const OUTPUT_MIN_DB: f32 = -24.0;
+pub const OUTPUT_MAX_DB: f32 = 18.0;
+pub const RATIO_MIN: f32 = 1.0;
+pub const RATIO_MAX: f32 = 10.0;
+
+/// The cut slopes, in dB/oct.
+pub const SLOPES: [f32; 3] = [12.0, 24.0, 48.0];
+
+/// The supported slope nearest `value`.
+pub fn snap_slope(value: f32) -> f32 {
+    let mut best = SLOPES[0];
+    for slope in SLOPES {
+        if (slope - value).abs() < (best - value).abs() {
+            best = slope;
+        }
+    }
+    best
+}
+
+/// A wire or stored ratio: anything under 0.5 is [`RATIO_LEGACY`] — the
+/// value a project saved before the ratio control replays with, which must
+/// keep its law rather than be pinned to 1:1 — otherwise 1..10.
+pub fn decode_ratio(value: f32) -> f32 {
+    if value < 0.5 {
+        RATIO_LEGACY
+    } else {
+        clamp(value, RATIO_MIN, RATIO_MAX)
+    }
+}
 
 pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = [
     "power",
@@ -133,6 +192,30 @@ pub const UI_PARAM_IDS: [&str; PARAM_COUNT] = [
     "band8_rangeDb",
     "band8_attackMs",
     "band8_releaseMs",
+    "band1_slope",
+    "band1_dynMode",
+    "band1_ratio",
+    "band2_slope",
+    "band2_dynMode",
+    "band2_ratio",
+    "band3_slope",
+    "band3_dynMode",
+    "band3_ratio",
+    "band4_slope",
+    "band4_dynMode",
+    "band4_ratio",
+    "band5_slope",
+    "band5_dynMode",
+    "band5_ratio",
+    "band6_slope",
+    "band6_dynMode",
+    "band6_ratio",
+    "band7_slope",
+    "band7_dynMode",
+    "band7_ratio",
+    "band8_slope",
+    "band8_dynMode",
+    "band8_ratio",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,25 +279,41 @@ pub fn decode_band_wire(index: u32) -> Option<(usize, u32)> {
 
 pub fn decode_dyn_wire(index: u32) -> Option<(usize, u32)> {
     let offset = index.checked_sub(DYN_BASE_INDEX)?;
+    if index >= EXT_BASE_INDEX {
+        return None;
+    }
     let band = (offset / DYN_STRIDE) as usize;
     let field = offset % DYN_STRIDE;
     (band < BAND_COUNT).then_some((band, field))
 }
 
+pub const fn ext_wire_index(band: usize, field: u32) -> u32 {
+    EXT_BASE_INDEX + band as u32 * EXT_STRIDE + field
+}
+
+pub fn decode_ext_wire(index: u32) -> Option<(usize, u32)> {
+    let offset = index.checked_sub(EXT_BASE_INDEX)?;
+    let band = (offset / EXT_STRIDE) as usize;
+    let field = offset % EXT_STRIDE;
+    (band < BAND_COUNT).then_some((band, field))
+}
+
 pub fn sanitize_params(params: &mut Params) {
-    params.output_db = clamp(params.output_db, -24.0, 12.0);
+    params.output_db = clamp(params.output_db, OUTPUT_MIN_DB, OUTPUT_MAX_DB);
     params.mix = clamp(params.mix, 0.0, 100.0);
     if params.solo_band < 0 || params.solo_band >= BAND_COUNT as i32 {
         params.solo_band = SOLO_NONE;
     }
     for band in &mut params.bands {
-        band.freq = clamp(band.freq, 20.0, 20_000.0);
-        band.gain_db = clamp(band.gain_db, -18.0, 18.0);
-        band.q = clamp(band.q, 0.1, 12.0);
-        band.threshold_db = clamp(band.threshold_db, -60.0, 0.0);
-        band.range_db = clamp(band.range_db, -24.0, 24.0);
-        band.attack_ms = clamp(band.attack_ms, 0.1, 500.0);
-        band.release_ms = clamp(band.release_ms, 1.0, 5_000.0);
+        band.freq = clamp(band.freq, FREQ_MIN, FREQ_MAX);
+        band.gain_db = clamp(band.gain_db, GAIN_MIN_DB, GAIN_MAX_DB);
+        band.q = clamp(band.q, Q_MIN, Q_MAX);
+        band.threshold_db = clamp(band.threshold_db, THRESHOLD_MIN_DB, THRESHOLD_MAX_DB);
+        band.range_db = clamp(band.range_db, RANGE_MIN_DB, RANGE_MAX_DB);
+        band.attack_ms = clamp(band.attack_ms, ATTACK_MIN_MS, ATTACK_MAX_MS);
+        band.release_ms = clamp(band.release_ms, RELEASE_MIN_MS, RELEASE_MAX_MS);
+        band.slope = snap_slope(band.slope);
+        band.ratio = decode_ratio(band.ratio);
         if !band.band_type.has_gain() {
             band.dynamic = false;
         }
@@ -244,7 +343,7 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
     match index {
         POWER_INDEX => params.power = value >= 0.5,
         MIX_INDEX => params.mix = clamp(value, 0.0, 100.0),
-        OUTPUT_INDEX => params.output_db = clamp(value, -24.0, 12.0),
+        OUTPUT_INDEX => params.output_db = clamp(value, OUTPUT_MIN_DB, OUTPUT_MAX_DB),
         SOLO_INDEX => params.solo_band = decode_solo_band(value),
         _ => {
             if let Some((band_index, field)) = decode_band_wire(index) {
@@ -257,9 +356,9 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
                             band.dynamic = false;
                         }
                     }
-                    BAND_FREQ => band.freq = clamp(value, 20.0, 20_000.0),
-                    BAND_GAIN => band.gain_db = clamp(value, -18.0, 18.0),
-                    BAND_Q => band.q = clamp(value, 0.1, 12.0),
+                    BAND_FREQ => band.freq = clamp(value, FREQ_MIN, FREQ_MAX),
+                    BAND_GAIN => band.gain_db = clamp(value, GAIN_MIN_DB, GAIN_MAX_DB),
+                    BAND_Q => band.q = clamp(value, Q_MIN, Q_MAX),
                     _ => return false,
                 }
             } else if let Some((band_index, field)) = decode_dyn_wire(index) {
@@ -268,10 +367,22 @@ pub fn apply_wire_param(params: &mut Params, index: u32, value: f32) -> bool {
                     BAND_DYN_ENABLED => {
                         band.dynamic = value >= 0.5 && band.band_type.has_gain();
                     }
-                    BAND_DYN_THRESHOLD => band.threshold_db = clamp(value, -60.0, 0.0),
-                    BAND_DYN_RANGE => band.range_db = clamp(value, -24.0, 24.0),
-                    BAND_DYN_ATTACK => band.attack_ms = clamp(value, 0.1, 500.0),
-                    BAND_DYN_RELEASE => band.release_ms = clamp(value, 1.0, 5_000.0),
+                    BAND_DYN_THRESHOLD => {
+                        band.threshold_db = clamp(value, THRESHOLD_MIN_DB, THRESHOLD_MAX_DB);
+                    }
+                    BAND_DYN_RANGE => band.range_db = clamp(value, RANGE_MIN_DB, RANGE_MAX_DB),
+                    BAND_DYN_ATTACK => band.attack_ms = clamp(value, ATTACK_MIN_MS, ATTACK_MAX_MS),
+                    BAND_DYN_RELEASE => {
+                        band.release_ms = clamp(value, RELEASE_MIN_MS, RELEASE_MAX_MS);
+                    }
+                    _ => return false,
+                }
+            } else if let Some((band_index, field)) = decode_ext_wire(index) {
+                let band = &mut params.bands[band_index];
+                match field {
+                    BAND_SLOPE => band.slope = snap_slope(value),
+                    BAND_DYN_MODE => band.dyn_mode = DynMode::from_wire(value),
+                    BAND_RATIO => band.ratio = decode_ratio(value),
                     _ => return false,
                 }
             } else {
@@ -311,6 +422,12 @@ pub fn ui_values(params: &Params) -> Vec<(&'static str, f32)> {
         values.push((UI_PARAM_IDS[base + 2], band.range_db));
         values.push((UI_PARAM_IDS[base + 3], band.attack_ms));
         values.push((UI_PARAM_IDS[base + 4], band.release_ms));
+    }
+    for (index, band) in params.bands.iter().enumerate() {
+        let base = EXT_BASE_INDEX as usize + index * EXT_STRIDE as usize;
+        values.push((UI_PARAM_IDS[base], band.slope));
+        values.push((UI_PARAM_IDS[base + 1], band.dyn_mode.to_wire()));
+        values.push((UI_PARAM_IDS[base + 2], band.ratio));
     }
     values
 }
@@ -386,6 +503,71 @@ mod tests {
             assert!(apply_wire_param(&mut params, SOLO_INDEX, bogus));
             assert_eq!(params.solo_band, SOLO_NONE, "{bogus} should clear solo");
         }
+    }
+
+    /// The indices a host already resolves keep their meaning: the new
+    /// per-band fields only extend the table.
+    #[test]
+    fn existing_wire_indices_are_unchanged() {
+        for (index, id) in [
+            (0, "power"),
+            (1, "mix"),
+            (2, "outputDb"),
+            (3, "band1_enabled"),
+            (6, "band1_gainDb"),
+            (42, "band8_q"),
+            (43, "soloBand"),
+            (44, "band1_dynEnabled"),
+            (63, "band4_releaseMs"),
+            (83, "band8_releaseMs"),
+        ] {
+            assert_eq!(ui_param_id(index), Some(id), "{index}");
+        }
+        assert_eq!(EXT_BASE_INDEX, 84);
+        assert_eq!(ui_param_index("band1_slope"), Some(84));
+        assert_eq!(
+            ui_param_index("band8_ratio"),
+            Some(ext_wire_index(BAND_COUNT - 1, BAND_RATIO))
+        );
+        assert_eq!(PARAM_COUNT, 108);
+        for index in 0..PARAM_COUNT as u32 {
+            let decoded = [
+                decode_band_wire(index).is_some(),
+                decode_dyn_wire(index).is_some(),
+                decode_ext_wire(index).is_some(),
+            ];
+            assert!(decoded.iter().filter(|hit| **hit).count() <= 1, "{index}");
+        }
+    }
+
+    /// A ratio of 0 is the legacy law and must survive a replay over the wire.
+    #[test]
+    fn the_legacy_ratio_survives_the_wire() {
+        let mut params = default_params();
+        assert!(apply_wire_param(
+            &mut params,
+            ext_wire_index(2, BAND_RATIO),
+            0.0
+        ));
+        assert_eq!(params.bands[2].ratio, RATIO_LEGACY);
+        assert!(apply_wire_param(
+            &mut params,
+            ext_wire_index(2, BAND_RATIO),
+            40.0
+        ));
+        assert_eq!(params.bands[2].ratio, RATIO_MAX);
+        assert!(apply_wire_param(
+            &mut params,
+            ext_wire_index(2, BAND_SLOPE),
+            30.0
+        ));
+        assert_eq!(params.bands[2].slope, 24.0);
+        assert!(apply_wire_param(
+            &mut params,
+            ext_wire_index(2, BAND_DYN_MODE),
+            1.0
+        ));
+        assert_eq!(params.bands[2].dyn_mode, DynMode::Below);
     }
 
     #[test]
