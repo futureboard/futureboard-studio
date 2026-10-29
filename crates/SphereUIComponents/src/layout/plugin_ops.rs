@@ -701,6 +701,15 @@ impl StudioLayout {
                     eprintln!(
                         "[plugin-bridge] event BuiltinNamCaptureResult instance={plugin_instance_id} ok={ok} name={name} error={error:?} family={family}"
                     );
+                    self.record_builtin_file_load(
+                        &plugin_instance_id,
+                        crate::components::builtin_plugin_editor::RodhareistFile::Capture,
+                        ok,
+                        &name,
+                        error.as_deref(),
+                        0,
+                        cx,
+                    );
                     // Route into whichever shared built-in editor is bound to
                     // this insert; the window checks the match itself.
                     for handle in self.plugin_editors.builtin.values() {
@@ -743,6 +752,15 @@ impl StudioLayout {
                 }) => {
                     eprintln!(
                         "[plugin-bridge] event BuiltinIrResult instance={plugin_instance_id} ok={ok} name={name} error={error:?}"
+                    );
+                    self.record_builtin_file_load(
+                        &plugin_instance_id,
+                        crate::components::builtin_plugin_editor::RodhareistFile::Impulse,
+                        ok,
+                        &name,
+                        error.as_deref(),
+                        frames,
+                        cx,
                     );
                     for handle in self.plugin_editors.builtin.values() {
                         let _ = handle.update(cx, |editor, _window, _cx| {
@@ -6231,6 +6249,110 @@ impl StudioLayout {
             .and_then(|slot| slot.plugin_id.clone())
     }
 
+    /// Records the host's answer to a Rodhareist capture or IR load: the
+    /// answer for any editor to show, and — when it loaded — the file as the
+    /// one the insert uses, which the project saves and a restarted DSP is
+    /// sent again. A reload of the file the insert already names is not an
+    /// edit.
+    #[allow(clippy::too_many_arguments)]
+    fn record_builtin_file_load(
+        &mut self,
+        insert_id: &str,
+        file: crate::components::builtin_plugin_editor::RodhareistFile,
+        ok: bool,
+        name: &str,
+        error: Option<&str>,
+        frames: u64,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::builtin_plugin_editor as host;
+        host::file_load_store(
+            insert_id,
+            file,
+            host::FileLoad {
+                name: name.to_string(),
+                error: (!ok).then(|| error.unwrap_or("load failed").to_string()),
+                frames,
+            },
+        );
+        if ok && host::builtin_state_set_rodhareist_file(insert_id, file, Some(name.to_string())) {
+            self.note_plugin_state_edited(cx);
+        }
+    }
+
+    /// Sends a restarted Rodhareist DSP the capture and IR its insert names,
+    /// from Rodhareist's folder. A file that is gone is recorded as a failed
+    /// load, so the editor says which file is missing.
+    fn reload_builtin_files(&self, insert_id: &str, plugin_id: &str) {
+        use crate::components::builtin_plugin_editor::{self as host, RodhareistFile};
+        use crate::components::builtin_plugin_files as files;
+        use base64::Engine as _;
+        if SpherePluginHost::resolve_builtin_stem(plugin_id) != Some(rodharerist::ui::UI_ORIGIN) {
+            return;
+        }
+        let (capture, impulse) = host::builtin_rodhareist_files(insert_id);
+        let Some(runtime) = self.plugin_editors.bridge_runtime.as_ref() else {
+            return;
+        };
+        let root = files::plugin_files_root(host::RODHAREIST_FILES_FOLDER);
+        for (file, name) in [
+            (RodhareistFile::Capture, capture),
+            (RodhareistFile::Impulse, impulse),
+        ] {
+            let Some(name) = name else {
+                continue;
+            };
+            let bytes = match files::read_file_bytes(&root, file.kind(), &name) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!(
+                        "[PluginRestore] rodhareist file missing instance={insert_id} file={name} error={error}"
+                    );
+                    host::file_load_store(
+                        insert_id,
+                        file,
+                        host::FileLoad {
+                            name,
+                            error: Some(format!(
+                                "file not found in {}",
+                                root.join(file.kind().dir_name()).display()
+                            )),
+                            frames: 0,
+                        },
+                    );
+                    continue;
+                }
+            };
+            let command = match file {
+                RodhareistFile::Capture => match String::from_utf8(bytes) {
+                    Ok(json) => SpherePluginHost::ipc::HostCommand::LoadBuiltinNamCapture {
+                        plugin_instance_id: insert_id.to_string(),
+                        name,
+                        json,
+                        stereo: false,
+                        full_rig: false,
+                    },
+                    Err(_) => continue,
+                },
+                RodhareistFile::Impulse => SpherePluginHost::ipc::HostCommand::LoadBuiltinIr {
+                    plugin_instance_id: insert_id.to_string(),
+                    name,
+                    wav_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                },
+            };
+            match runtime.lock() {
+                Ok(mut bridge) => {
+                    if let Err(error) = bridge.send_raw(&command) {
+                        eprintln!(
+                            "[PluginRestore] rodhareist file reload send failed instance={insert_id} error={error}"
+                        );
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
     fn reload_builtin_samples(&self, insert_id: &str, cx: &Context<Self>) {
         use crate::components::builtin_plugin_files as files;
         use base64::Engine as _;
@@ -6245,6 +6367,8 @@ impl StudioLayout {
         let Some(plugin_id) = slot.plugin_id.as_deref() else {
             return;
         };
+        // A guitar rig's capture and cabinet IR come back the same way.
+        self.reload_builtin_files(insert_id, plugin_id);
         let display_name = slot.display_name.as_str();
         let names =
             crate::components::builtin_plugin_editor::builtin_sample_names(plugin_id, insert_id);

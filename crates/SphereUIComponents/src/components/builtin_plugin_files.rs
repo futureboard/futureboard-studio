@@ -57,7 +57,7 @@ impl BuiltinFileKind {
     fn allowed_exts(self) -> &'static [&'static str] {
         match self {
             Self::Presets => &["json"],
-            Self::Irs => &["wav", "aiff", "aif"],
+            Self::Irs => &["wav", "wave", "aiff", "aif"],
             Self::Nams => &["nam"],
             Self::Samples => &["wav", "aiff", "aif", "mp3", "flac"],
         }

@@ -197,10 +197,31 @@ pub(crate) fn import_sample_bytes(
     file_name: &str,
     bytes: &[u8],
 ) -> Result<String, String> {
-    use crate::components::builtin_plugin_files::{sanitize_file_name, BuiltinFileKind};
+    import_user_file_bytes(
+        samples_dir,
+        crate::components::builtin_plugin_files::BuiltinFileKind::Samples,
+        file_name,
+        bytes,
+    )
+}
 
-    let clean = sanitize_file_name(BuiltinFileKind::Samples, file_name)
-        .ok_or_else(|| format!("'{file_name}' is not a supported audio file name"))?;
+/// [`import_sample_bytes`] for any kind of user file — a NAM capture into a
+/// plug-in's NAMs folder, an impulse response into its IRs folder: written
+/// under `dir` as `file_name`, deduped by name, a byte-identical file reused.
+/// Background-thread only (filesystem I/O).
+pub(crate) fn import_user_file_bytes(
+    dir: &std::path::Path,
+    kind: crate::components::builtin_plugin_files::BuiltinFileKind,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    use crate::components::builtin_plugin_files::sanitize_file_name;
+
+    let samples_dir = dir;
+    std::fs::create_dir_all(samples_dir)
+        .map_err(|e| format!("could not create {}: {e}", samples_dir.display()))?;
+    let clean = sanitize_file_name(kind, file_name)
+        .ok_or_else(|| format!("'{file_name}' is not a supported file name"))?;
     let (stem, ext) = clean
         .rsplit_once('.')
         .map(|(stem, ext)| (stem.to_string(), ext.to_string()))
@@ -4987,6 +5008,33 @@ mod tests {
         assert!(read_dropped_sample(&samples, &elsewhere.join("missing.wav")).is_err());
 
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn captures_and_irs_import_into_their_own_folders() {
+        use crate::components::builtin_plugin_files::BuiltinFileKind;
+        let root =
+            std::env::temp_dir().join(format!("fb-rodhareist-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let nams = root.join("NAMs");
+        // The folder is made on first use.
+        let name = import_user_file_bytes(&nams, BuiltinFileKind::Nams, "Amp.nam", b"{}").unwrap();
+        assert_eq!(name, "Amp.nam");
+        assert_eq!(
+            import_user_file_bytes(&nams, BuiltinFileKind::Nams, "Amp.nam", b"{}").unwrap(),
+            "Amp.nam"
+        );
+        assert_eq!(
+            import_user_file_bytes(&nams, BuiltinFileKind::Nams, "Amp.nam", b"{\"x\":1}").unwrap(),
+            "Amp 2.nam"
+        );
+        let irs = root.join("IRs");
+        assert_eq!(
+            import_user_file_bytes(&irs, BuiltinFileKind::Irs, "Cab.wave", b"RIFF").unwrap(),
+            "Cab.wave"
+        );
+        assert!(import_user_file_bytes(&irs, BuiltinFileKind::Irs, "Cab.nam", b"x").is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

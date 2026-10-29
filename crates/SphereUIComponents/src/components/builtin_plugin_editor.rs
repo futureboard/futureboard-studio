@@ -828,6 +828,46 @@ mod state_mirror {
         }
     }
 
+    /// Records which capture or IR file a Rodhareist insert loads, so the
+    /// project saves it and a restarted DSP gets it back. True when it
+    /// changed — an edit worth marking the project for.
+    pub fn builtin_state_set_rodhareist_file(
+        insert_id: &str,
+        file: super::RodhareistFile,
+        name: Option<String>,
+    ) -> bool {
+        let Ok(mut states) = map().lock() else {
+            return false;
+        };
+        let Some(BuiltinParams::Rodhareist(params)) =
+            entry_for(&mut states, insert_id, rodharerist::ui::UI_ORIGIN)
+        else {
+            return false;
+        };
+        let slot = match file {
+            super::RodhareistFile::Capture => &mut params.nam_file,
+            super::RodhareistFile::Impulse => &mut params.ir_file,
+        };
+        if *slot == name {
+            return false;
+        }
+        *slot = name;
+        true
+    }
+
+    /// The capture and IR files a Rodhareist insert loads, as mirrored.
+    pub fn builtin_rodhareist_files(insert_id: &str) -> (Option<String>, Option<String>) {
+        let Ok(states) = map().lock() else {
+            return (None, None);
+        };
+        match states.get(insert_id) {
+            Some(BuiltinParams::Rodhareist(params)) => {
+                (params.nam_file.clone(), params.ir_file.clone())
+            }
+            _ => (None, None),
+        }
+    }
+
     /// A Quick Sampler insert's mirrored params, or `None` when the slot holds
     /// none (a fresh insert plays the defaults). Read by its native editor.
     pub fn builtin_quick_sampler_params(insert_id: &str) -> Option<quicksampler::Params> {
@@ -1065,6 +1105,7 @@ mod state_mirror {
             states.remove(insert_id);
         }
         super::drum_waveforms_remove(insert_id);
+        super::file_load_cache::remove(insert_id);
     }
 
     /// Drop everything (project close).
@@ -1073,6 +1114,7 @@ mod state_mirror {
             states.clear();
         }
         super::drum_waveforms_clear();
+        super::file_load_cache::clear();
     }
 }
 
@@ -1082,9 +1124,10 @@ pub use state_mirror::{
     builtin_default_replay, builtin_drum_sampler_params, builtin_echospace_params,
     builtin_equz8_params, builtin_equzx_params, builtin_fa2a_params, builtin_fa76_params,
     builtin_imager_params, builtin_mixstation_params, builtin_quick_sampler_params,
-    builtin_replay_changes, builtin_rodhareist_params, builtin_sample_names, builtin_slicer_params,
-    builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
-    builtin_state_replay, builtin_state_seed, builtin_state_set_sample, builtin_transient_params,
+    builtin_replay_changes, builtin_rodhareist_files, builtin_rodhareist_params,
+    builtin_sample_names, builtin_slicer_params, builtin_state_apply, builtin_state_bytes,
+    builtin_state_clear, builtin_state_remove, builtin_state_replay, builtin_state_seed,
+    builtin_state_set_rodhareist_file, builtin_state_set_sample, builtin_transient_params,
     builtin_used_output_buses, builtin_verbspace_params, builtin_waygate_params,
     builtin_whitesharp_params, builtin_wrapsynth_params, builtin_zapp_params, builtin_zcomp_params,
 };
@@ -1112,9 +1155,11 @@ mod state_mirror_stubs {
     }
     pub fn builtin_state_remove(insert_id: &str) {
         super::drum_waveforms_remove(insert_id);
+        super::file_load_cache::remove(insert_id);
     }
     pub fn builtin_state_clear() {
         super::drum_waveforms_clear();
+        super::file_load_cache::clear();
     }
     pub fn builtin_sample_names(_plugin_id: &str, _insert_id: &str) -> Vec<(u32, String)> {
         Vec::new()
@@ -1127,14 +1172,103 @@ mod state_mirror_stubs {
     ) -> bool {
         false
     }
+    pub fn builtin_state_set_rodhareist_file(
+        _insert_id: &str,
+        _file: super::RodhareistFile,
+        _name: Option<String>,
+    ) -> bool {
+        false
+    }
+    pub fn builtin_rodhareist_files(_insert_id: &str) -> (Option<String>, Option<String>) {
+        (None, None)
+    }
 }
 
 #[cfg(not(feature = "builtin-plugin-editor"))]
 pub use state_mirror_stubs::{
-    builtin_default_replay, builtin_replay_changes, builtin_sample_names, builtin_state_apply,
-    builtin_state_bytes, builtin_state_clear, builtin_state_remove, builtin_state_replay,
-    builtin_state_seed, builtin_state_set_sample,
+    builtin_default_replay, builtin_replay_changes, builtin_rodhareist_files, builtin_sample_names,
+    builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
+    builtin_state_replay, builtin_state_seed, builtin_state_set_rodhareist_file,
+    builtin_state_set_sample,
 };
+
+/// The two files a Rodhareist insert loads into its DSP: the amp's NAM
+/// capture and the cabinet's impulse response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RodhareistFile {
+    Capture,
+    Impulse,
+}
+
+impl RodhareistFile {
+    /// The plug-in's user folder the file is kept in.
+    pub fn kind(self) -> crate::components::builtin_plugin_files::BuiltinFileKind {
+        match self {
+            Self::Capture => crate::components::builtin_plugin_files::BuiltinFileKind::Nams,
+            Self::Impulse => crate::components::builtin_plugin_files::BuiltinFileKind::Irs,
+        }
+    }
+}
+
+/// The folder under `Documents/Futureboard Studio` Rodhareist keeps its
+/// captures and impulse responses in, whatever an insert is named.
+pub const RODHAREIST_FILES_FOLDER: &str = "Rodhareist";
+
+/// What the host last answered for one Rodhareist file load.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileLoad {
+    /// The file it was asked to load.
+    pub name: String,
+    /// `None` when it loaded; why not otherwise.
+    pub error: Option<String>,
+    /// An IR's length in frames (0 for a capture).
+    pub frames: u64,
+}
+
+/// The host's last answer per (insert, file), kept process-wide so an editor
+/// opened after a load — or after Studio reloaded the files into a restarted
+/// DSP — shows what the DSP actually holds.
+mod file_load_cache {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use super::{FileLoad, RodhareistFile};
+
+    type Cache = HashMap<(String, RodhareistFile), FileLoad>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+
+    fn cache() -> &'static Mutex<Cache> {
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn store(insert_id: &str, file: RodhareistFile, load: FileLoad) {
+        if let Ok(mut cache) = cache().lock() {
+            cache.insert((insert_id.to_string(), file), load);
+        }
+    }
+
+    pub fn get(insert_id: &str, file: RodhareistFile) -> Option<FileLoad> {
+        cache()
+            .lock()
+            .ok()?
+            .get(&(insert_id.to_string(), file))
+            .cloned()
+    }
+
+    pub fn remove(insert_id: &str) {
+        if let Ok(mut cache) = cache().lock() {
+            cache.retain(|(id, _), _| id != insert_id);
+        }
+    }
+
+    pub fn clear() {
+        if let Ok(mut cache) = cache().lock() {
+            cache.clear();
+        }
+    }
+}
+
+pub use file_load_cache::{get as file_load, store as file_load_store};
 
 /// A Drum Sampler pad's loaded sample, as its editor draws it: the file, its
 /// shape and the waveform overview the host computed while decoding.
@@ -3338,6 +3472,66 @@ mod tests {
     /// blob, and replay in wire order — the three paths a project save, a
     /// reopen, and a host respawn each take.
     #[cfg(feature = "builtin-plugin-editor")]
+    #[test]
+    fn rodhareist_files_are_mirrored_saved_and_seeded() {
+        let insert = "test-insert-rodhareist-files";
+        assert!(builtin_state_set_rodhareist_file(
+            insert,
+            RodhareistFile::Capture,
+            Some("Plexi Lead.nam".into())
+        ));
+        // The same file again is not an edit.
+        assert!(!builtin_state_set_rodhareist_file(
+            insert,
+            RodhareistFile::Capture,
+            Some("Plexi Lead.nam".into())
+        ));
+        assert!(builtin_state_set_rodhareist_file(
+            insert,
+            RodhareistFile::Impulse,
+            Some("4x12 SM57.wav".into())
+        ));
+        assert_eq!(
+            builtin_rodhareist_files(insert),
+            (Some("Plexi Lead.nam".into()), Some("4x12 SM57.wav".into()))
+        );
+
+        // The project saves them, and a project open brings them back.
+        let bytes = builtin_state_bytes("rodharerist", insert).expect("Rodhareist state");
+        builtin_state_remove(insert);
+        assert_eq!(builtin_rodhareist_files(insert), (None, None));
+        builtin_state_seed("rodharerist", insert, &bytes);
+        assert_eq!(
+            builtin_rodhareist_files(insert),
+            (Some("Plexi Lead.nam".into()), Some("4x12 SM57.wav".into()))
+        );
+
+        // A parameter edit keeps them.
+        let gain = builtin_param_index("rodharerist", "amp_gain").expect("amp_gain");
+        builtin_state_apply("rodharerist", insert, gain, 7.0);
+        assert_eq!(
+            builtin_rodhareist_files(insert).0.as_deref(),
+            Some("Plexi Lead.nam")
+        );
+
+        // The host's answers are kept per insert and go with it.
+        file_load_store(
+            insert,
+            RodhareistFile::Impulse,
+            FileLoad {
+                name: "4x12 SM57.wav".into(),
+                error: None,
+                frames: 9_600,
+            },
+        );
+        assert_eq!(
+            file_load(insert, RodhareistFile::Impulse).map(|load| load.frames),
+            Some(9_600)
+        );
+        builtin_state_remove(insert);
+        assert!(file_load(insert, RodhareistFile::Impulse).is_none());
+    }
+
     #[test]
     fn imager_state_is_mirrored_persisted_and_replayed() {
         let insert = "test-insert-imager-mirror";
