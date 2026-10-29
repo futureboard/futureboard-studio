@@ -3,7 +3,7 @@
 //! Each is a whole `Params` with power on; an editor loads one by sending the
 //! wire values that differ, so a preset saves and undoes like any other edit.
 
-use crate::{Params, Style, default_params};
+use crate::{Oversampling, Params, Style, default_params};
 
 pub struct FactoryPreset {
     pub name: &'static str,
@@ -47,6 +47,15 @@ pub fn factory_presets() -> Vec<FactoryPreset> {
         }),
         preset("Parallel Glue", Punch, 10.0, -0.5, 120.0, 2.0, |p| {
             p.mix = 45.0
+        }),
+        preset("Loud Master", Loud, 9.0, -0.3, 120.0, 2.0, |p| {
+            p.oversampling = Oversampling::X4;
+            p.target_lufs = -9.0;
+        }),
+        preset("Safe Streaming", Safe, 4.0, -1.0, 250.0, 5.0, |p| {
+            p.knee_db = 2.0;
+            p.oversampling = Oversampling::X2;
+            p.target_lufs = -14.0;
         }),
     ]
 }
