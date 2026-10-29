@@ -48,6 +48,7 @@ builtin-plugin-editor = [
     "dep:verbspace",
     "dep:echospace",
     "dep:whitesharp",
+    "dep:zapp",
     "dep:imager",
     "dep:fa2a",
     "dep:fa76",
@@ -107,6 +108,7 @@ equzx = { workspace = true, optional = true }
 verbspace = { workspace = true, optional = true }
 echospace = { workspace = true, optional = true }
 whitesharp = { workspace = true, optional = true }
+zapp = { workspace = true, optional = true }
 imager = { workspace = true, optional = true }
 fa2a = { workspace = true, optional = true }
 fa76 = { workspace = true, optional = true }

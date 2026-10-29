@@ -76,6 +76,7 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
         equzx::ui::UI_ORIGIN => equzx::ui_param_index(param_id),
         verbspace::ui::UI_ORIGIN => verbspace::ui_param_index(param_id),
         whitesharp::ui::UI_ORIGIN => whitesharp::ui_param_index(param_id),
+        zapp::ui::UI_ORIGIN => zapp::ui_param_index(param_id),
         echospace::ui::UI_ORIGIN => echospace::ui_param_index(param_id),
         imager::ui::UI_ORIGIN => imager::ui_param_index(param_id),
         fa2a::ui::UI_ORIGIN => fa2a::ui_param_index(param_id),
@@ -130,6 +131,7 @@ mod state_mirror {
         Equzx(Box<equzx::Params>),
         Verbspace(Box<verbspace::Params>),
         WhiteSharp(Box<whitesharp::Params>),
+        Zapp(Box<zapp::Params>),
         Echospace(Box<echospace::Params>),
         Imager(Box<imager::Params>),
         Fa2a(Box<fa2a::Params>),
@@ -155,6 +157,7 @@ mod state_mirror {
                 Self::Equzx(_) => equzx::ui::UI_ORIGIN,
                 Self::Verbspace(_) => verbspace::ui::UI_ORIGIN,
                 Self::WhiteSharp(_) => whitesharp::ui::UI_ORIGIN,
+                Self::Zapp(_) => zapp::ui::UI_ORIGIN,
                 Self::Echospace(_) => echospace::ui::UI_ORIGIN,
                 Self::Imager(_) => imager::ui::UI_ORIGIN,
                 Self::Fa2a(_) => fa2a::ui::UI_ORIGIN,
@@ -187,6 +190,7 @@ mod state_mirror {
                 whitesharp::ui::UI_ORIGIN => {
                     Some(Self::WhiteSharp(Box::new(whitesharp::default_params())))
                 }
+                zapp::ui::UI_ORIGIN => Some(Self::Zapp(Box::new(zapp::default_params()))),
                 echospace::ui::UI_ORIGIN => {
                     Some(Self::Echospace(Box::new(echospace::default_params())))
                 }
@@ -259,6 +263,7 @@ mod state_mirror {
             equzx::ui::UI_ORIGIN => equzx::ui_param_id(wire_index).is_some(),
             verbspace::ui::UI_ORIGIN => verbspace::ui_param_id(wire_index).is_some(),
             whitesharp::ui::UI_ORIGIN => whitesharp::ui_param_id(wire_index).is_some(),
+            zapp::ui::UI_ORIGIN => zapp::ui_param_id(wire_index).is_some(),
             echospace::ui::UI_ORIGIN => echospace::ui_param_id(wire_index).is_some(),
             imager::ui::UI_ORIGIN => imager::ui_param_id(wire_index).is_some(),
             fa2a::ui::UI_ORIGIN => fa2a::ui_param_id(wire_index).is_some(),
@@ -299,6 +304,9 @@ mod state_mirror {
             }
             Some(BuiltinParams::WhiteSharp(params)) => {
                 let _ = whitesharp::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::Zapp(params)) => {
+                let _ = zapp::ipc::apply_wire_param(params, wire_index, value);
             }
             Some(BuiltinParams::Echospace(params)) => {
                 let _ = echospace::ipc::apply_wire_param(params, wire_index, value);
@@ -374,6 +382,9 @@ mod state_mirror {
             whitesharp::ui::UI_ORIGIN => whitesharp::ipc::WhiteSharpState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::WhiteSharp(Box::new(state.params))),
+            zapp::ui::UI_ORIGIN => zapp::ipc::ZappState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::Zapp(Box::new(state.params))),
             echospace::ui::UI_ORIGIN => echospace::ipc::EchospaceState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Echospace(Box::new(state.params))),
@@ -465,6 +476,11 @@ mod state_mirror {
             }
             BuiltinParams::WhiteSharp(params) if origin == whitesharp::ui::UI_ORIGIN => {
                 whitesharp::ipc::WhiteSharpState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::Zapp(params) if origin == zapp::ui::UI_ORIGIN => {
+                zapp::ipc::ZappState::new((**params).clone())
                     .to_json()
                     .ok()?
             }
@@ -617,6 +633,12 @@ mod state_mirror {
                 whitesharp::ipc::ui_values(params)
                     .into_iter()
                     .filter_map(|(id, value)| whitesharp::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
+            Some(BuiltinParams::Zapp(params)) if origin == zapp::ui::UI_ORIGIN => {
+                zapp::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| zapp::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
             Some(BuiltinParams::Echospace(params)) if origin == echospace::ui::UI_ORIGIN => {
@@ -966,6 +988,15 @@ mod state_mirror {
         }
     }
 
+    /// A Zapp insert's mirrored params, like [`builtin_verbspace_params`].
+    pub fn builtin_zapp_params(insert_id: &str) -> Option<zapp::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Zapp(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
     /// An EchoSpace insert's mirrored params, like
     /// [`builtin_verbspace_params`].
     pub fn builtin_echospace_params(insert_id: &str) -> Option<echospace::Params> {
@@ -1055,7 +1086,7 @@ pub use state_mirror::{
     builtin_state_apply, builtin_state_bytes, builtin_state_clear, builtin_state_remove,
     builtin_state_replay, builtin_state_seed, builtin_state_set_sample, builtin_transient_params,
     builtin_used_output_buses, builtin_verbspace_params, builtin_waygate_params,
-    builtin_whitesharp_params, builtin_wrapsynth_params, builtin_zcomp_params,
+    builtin_whitesharp_params, builtin_wrapsynth_params, builtin_zapp_params, builtin_zcomp_params,
 };
 
 /// Featureless no-ops: without the editor there is no param wire, so there is

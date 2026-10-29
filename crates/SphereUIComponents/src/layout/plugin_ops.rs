@@ -113,12 +113,30 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::wrap_synth_window::WrapSynthEditorWindow>,
     >,
-    /// Open native EQ-Z8 and EQ-ZX editors (one window type for both),
-    /// keyed by insert id, like `quick_sampler`.
+    /// Open native EQUZ8 editors, keyed by insert id, like `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
-    pub eq: std::collections::HashMap<
+    pub equz8: std::collections::HashMap<
         String,
-        gpui::WindowHandle<crate::components::eq_window::EqEditorWindow>,
+        gpui::WindowHandle<crate::components::equz8_plate::Equz8Window>,
+    >,
+    /// Open native EQUZX editors, keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub equzx: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::equzx_plate::EquzxWindow>,
+    >,
+    /// Open native BurnLimit editors, keyed by insert id, like
+    /// `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub burn_limit: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::burn_limit_plate::BurnLimitWindow>,
+    >,
+    /// Open native Zapp editors, keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub zapp: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::zapp_plate::ZappWindow>,
     >,
     /// Open native VerbSpace and EchoSpace editors (one window type for
     /// both), keyed by insert id, like `quick_sampler`.
@@ -134,8 +152,8 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::white_sharp_window::WhiteSharpWindow>,
     >,
-    /// Open native dynamics editors — FA-2A, FA-76, Z-Comp, BurnLimit,
-    /// 67Clipper and Transient share one window type — keyed by insert id,
+    /// Open native dynamics editors — FA-2A, FA-76, Z-Comp, 67Clipper and
+    /// Transient share one window type — keyed by insert id,
     /// like `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
     pub dynamics: std::collections::HashMap<
@@ -3227,15 +3245,15 @@ impl StudioLayout {
                 cx,
             ),
             Some(equz8::ui::UI_ORIGIN) => self.open_native_editor(
-                |windows| &mut windows.eq,
-                crate::components::eq_window::open_equz8_editor,
+                |windows| &mut windows.equz8,
+                crate::components::equz8_plate::open_equz8_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
             ),
             Some(equzx::ui::UI_ORIGIN) => self.open_native_editor(
-                |windows| &mut windows.eq,
-                crate::components::eq_window::open_equzx_editor,
+                |windows| &mut windows.equzx,
+                crate::components::equzx_plate::open_equzx_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
@@ -3283,8 +3301,15 @@ impl StudioLayout {
                 cx,
             ),
             Some(burnlimit::ui::UI_ORIGIN) => self.open_native_editor(
-                |windows| &mut windows.dynamics,
-                crate::components::dyn_panel::open_burnlimit_editor,
+                |windows| &mut windows.burn_limit,
+                crate::components::burn_limit_plate::open_burnlimit_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(zapp::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.zapp,
+                crate::components::zapp_plate::open_zapp_editor,
                 (target, identity, host_ops),
                 window,
                 cx,
@@ -3484,8 +3509,20 @@ impl StudioLayout {
             for handle in synths {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
-            let eqs: Vec<_> = self.plugin_editors.eq.values().copied().collect();
+            let eqs: Vec<_> = self.plugin_editors.equz8.values().copied().collect();
             for handle in eqs {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let wide_eqs: Vec<_> = self.plugin_editors.equzx.values().copied().collect();
+            for handle in wide_eqs {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let limiters: Vec<_> = self.plugin_editors.burn_limit.values().copied().collect();
+            for handle in limiters {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let saturators: Vec<_> = self.plugin_editors.zapp.values().copied().collect();
+            for handle in saturators {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
             let fxs: Vec<_> = self.plugin_editors.fx.values().copied().collect();

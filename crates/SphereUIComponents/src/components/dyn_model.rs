@@ -1,5 +1,5 @@
-//! What the native dynamics editors edit: FA-2A, FA-76, Z-Comp, BurnLimit,
-//! 67Clipper and Transient — their params behind one type, their wire table,
+//! What the native dynamics editors edit: FA-2A, FA-76, Z-Comp, 67Clipper
+//! and Transient — their params behind one type, their wire table,
 //! presets and knobs.
 //!
 //! No GPUI here. Every value goes back to the plug-in as wire edits the DSP
@@ -16,17 +16,15 @@ pub enum DynKind {
     Fa2a,
     Fa76,
     Zcomp,
-    BurnLimit,
     Clipper,
     Transient,
 }
 
 impl DynKind {
-    pub const ALL: [DynKind; 6] = [
+    pub const ALL: [DynKind; 5] = [
         DynKind::Fa2a,
         DynKind::Fa76,
         DynKind::Zcomp,
-        DynKind::BurnLimit,
         DynKind::Clipper,
         DynKind::Transient,
     ];
@@ -36,7 +34,6 @@ impl DynKind {
             Self::Fa2a => "FA-2A",
             Self::Fa76 => "FA-76",
             Self::Zcomp => "Z-Comp",
-            Self::BurnLimit => "BurnLimit",
             Self::Clipper => "67Clipper",
             Self::Transient => "Transient",
         }
@@ -47,7 +44,6 @@ impl DynKind {
             Self::Fa2a => "fa2a",
             Self::Fa76 => "fa76",
             Self::Zcomp => "zcomp",
-            Self::BurnLimit => "burnlimit",
             Self::Clipper => "clipper67",
             Self::Transient => "transient",
         }
@@ -73,7 +69,6 @@ pub enum DynParams {
     Fa2a(fa2a::Params),
     Fa76(fa76::Params),
     Zcomp(zcomp::Params),
-    BurnLimit(burnlimit::Params),
     Clipper(clipper67::Params),
     Transient(transient::Params),
 }
@@ -95,7 +90,6 @@ impl DynParams {
             DynKind::Fa2a => Self::Fa2a(fa2a::default_params()),
             DynKind::Fa76 => Self::Fa76(fa76::default_params()),
             DynKind::Zcomp => Self::Zcomp(zcomp::default_params()),
-            DynKind::BurnLimit => Self::BurnLimit(burnlimit::default_params()),
             DynKind::Clipper => Self::Clipper(clipper67::default_params()),
             DynKind::Transient => Self::Transient(transient::default_params()),
         }
@@ -106,7 +100,6 @@ impl DynParams {
             Self::Fa2a(_) => DynKind::Fa2a,
             Self::Fa76(_) => DynKind::Fa76,
             Self::Zcomp(_) => DynKind::Zcomp,
-            Self::BurnLimit(_) => DynKind::BurnLimit,
             Self::Clipper(_) => DynKind::Clipper,
             Self::Transient(_) => DynKind::Transient,
         }
@@ -117,7 +110,6 @@ impl DynParams {
             Self::Fa2a(p) => fa2a::ipc::ui_values(p),
             Self::Fa76(p) => fa76::ipc::ui_values(p),
             Self::Zcomp(p) => zcomp::ipc::ui_values(p),
-            Self::BurnLimit(p) => burnlimit::ipc::ui_values(p),
             Self::Clipper(p) => clipper67::ipc::ui_values(p),
             Self::Transient(p) => transient::ipc::ui_values(p),
         }
@@ -130,7 +122,6 @@ impl DynParams {
             Self::Fa2a(_) => indexed(values, fa2a::ui_param_index),
             Self::Fa76(_) => indexed(values, fa76::ui_param_index),
             Self::Zcomp(_) => indexed(values, zcomp::ui_param_index),
-            Self::BurnLimit(_) => indexed(values, burnlimit::ui_param_index),
             Self::Clipper(_) => indexed(values, clipper67::ui_param_index),
             Self::Transient(_) => indexed(values, transient::ui_param_index),
         }
@@ -148,9 +139,6 @@ impl DynParams {
             }
             Self::Zcomp(p) => {
                 zcomp::ipc::apply_ui_param(p, id, value);
-            }
-            Self::BurnLimit(p) => {
-                burnlimit::ipc::apply_ui_param(p, id, value);
             }
             Self::Clipper(p) => {
                 clipper67::ipc::apply_ui_param(p, id, value);
@@ -179,19 +167,15 @@ impl DynParams {
     pub fn transfer_db(&self, input_db: f32) -> Option<f32> {
         match self {
             Self::Zcomp(p) => Some(zcomp::transfer_db(p, input_db)),
-            Self::BurnLimit(p) => Some(burnlimit::transfer_db(p, input_db)),
             Self::Clipper(p) => Some(clipper67::transfer_db(p, input_db)),
             _ => None,
         }
     }
 
     /// The input the meters' "In" reads, relative to what enters the
-    /// plug-in: BurnLimit meters its input after the drive.
+    /// plug-in: none of these meter after a drive stage.
     pub fn metered_input_offset_db(&self) -> f32 {
-        match self {
-            Self::BurnLimit(p) => p.gain_db,
-            _ => 0.0,
-        }
+        0.0
     }
 }
 
@@ -210,9 +194,6 @@ pub fn presets(kind: DynKind) -> Arc<Vec<KitPreset<DynParams>>> {
             }),
             bank(zcomp::factory_presets(), |p| {
                 (p.name, DynParams::Zcomp(p.params))
-            }),
-            bank(burnlimit::factory_presets(), |p| {
-                (p.name, DynParams::BurnLimit(p.params))
             }),
             bank(clipper67::factory_presets(), |p| {
                 (p.name, DynParams::Clipper(p.params))
@@ -252,7 +233,6 @@ pub fn knob(kind: DynKind, id: &str) -> Option<KnobSpec> {
         DynKind::Fa2a => fa2a::descriptor(),
         DynKind::Fa76 => fa76::descriptor(),
         DynKind::Zcomp => zcomp::descriptor(),
-        DynKind::BurnLimit => burnlimit::descriptor(),
         DynKind::Clipper => clipper67::descriptor(),
         DynKind::Transient => transient::descriptor(),
     };
@@ -279,10 +259,6 @@ pub fn knob(kind: DynKind, id: &str) -> Option<KnobSpec> {
         (Zcomp, "sidechainHpfHz") => ("SC HPF", Taper::Log, Unit::Hz),
         (Zcomp, "stereoLink") => ("Link", Taper::Linear, Unit::Percent),
         (Zcomp, "color") => ("Color", Taper::Linear, Unit::Percent),
-        (BurnLimit, "gainDb") => ("Gain", Taper::Linear, Unit::Db),
-        (BurnLimit, "ceilingDb") => ("Ceiling", Taper::Linear, Unit::Db),
-        (BurnLimit, "releaseMs") => ("Release", Taper::Log, Unit::Ms),
-        (BurnLimit, "lookaheadMs") => ("Lookahead", Taper::Linear, Unit::Ms),
         (Clipper, "inputDb") => ("Input", Taper::Linear, Unit::Db),
         (Clipper, "thresholdDb") => ("Threshold", Taper::Linear, Unit::Db),
         (Clipper, "shape") => ("Shape", Taper::Linear, Unit::Percent),
@@ -299,7 +275,6 @@ pub fn knob(kind: DynKind, id: &str) -> Option<KnobSpec> {
         (kind, id),
         (Fa2a, "gainDb" | "outputTrimDb")
             | (Zcomp, "makeupDb")
-            | (BurnLimit, "gainDb")
             | (Clipper, "inputDb")
             | (Transient, "attack" | "sustain")
     );
@@ -342,7 +317,6 @@ pub fn knob_ids(kind: DynKind) -> &'static [&'static str] {
             "color",
             "mix",
         ],
-        DynKind::BurnLimit => &["gainDb", "ceilingDb", "releaseMs", "lookaheadMs", "mix"],
         DynKind::Clipper => &["inputDb", "thresholdDb", "shape", "ceilingDb", "mix"],
         DynKind::Transient => &["attack", "sustain", "speed", "mix"],
     }
@@ -354,7 +328,6 @@ pub fn choice_labels(kind: DynKind) -> Option<(&'static str, &'static [&'static 
         DynKind::Fa2a => Some(("mode", &["Compress", "Limit"])),
         DynKind::Fa76 => Some(("ratio", &["4", "8", "12", "20", "All"])),
         DynKind::Zcomp => Some(("model", &["2500", "Distress", "Avalon", "SSL"])),
-        DynKind::BurnLimit => Some(("style", &["Clean", "Punch", "Modern", "Clip"])),
         DynKind::Clipper => Some(("mode", &["Clip", "Hybrid", "Limit"])),
         DynKind::Transient => None,
     }
@@ -377,12 +350,6 @@ pub fn choice_hint(params: &DynParams) -> &'static str {
             zcomp::CompModel::Avalon => "Opto · Class-A · over-easy ratio",
             zcomp::CompModel::Ssl => "Bus VCA · dual time-constant release",
         },
-        DynParams::BurnLimit(p) => match p.style {
-            burnlimit::Style::Clean => "4 dB knee, 2 ms attack",
-            burnlimit::Style::Punch => "2 dB knee, 0.8 ms attack",
-            burnlimit::Style::Modern => "1.5 dB knee, 0.4 ms attack",
-            burnlimit::Style::Clip => "Near-hard 0.2 dB knee, 0.05 ms attack",
-        },
         DynParams::Clipper(p) => match p.mode {
             clipper67::Mode::Clip => "Clips at the threshold, untouched below the knee",
             clipper67::Mode::Hybrid => "Clips 3 dB past the knee, 1 ms limiter beyond",
@@ -401,7 +368,6 @@ mod tests {
             DynKind::Fa2a => fa2a::ui_param_id(index),
             DynKind::Fa76 => fa76::ui_param_id(index),
             DynKind::Zcomp => zcomp::ui_param_id(index),
-            DynKind::BurnLimit => burnlimit::ui_param_id(index),
             DynKind::Clipper => clipper67::ui_param_id(index),
             DynKind::Transient => transient::ui_param_id(index),
         }
@@ -506,13 +472,10 @@ mod tests {
     fn transfer_curves_rest_on_unity_below_the_action() {
         // Far under every threshold, the static curves pass the level as is.
         let quiet = -70.0;
-        for kind in [DynKind::Zcomp, DynKind::BurnLimit, DynKind::Clipper] {
+        for kind in [DynKind::Zcomp, DynKind::Clipper] {
             let params = DynParams::defaults(kind);
             let out = params.transfer_db(quiet).unwrap();
             assert!((out - quiet).abs() < 0.2, "{kind:?}: {out}");
         }
-        // A limiter never passes its ceiling.
-        let limiter = DynParams::defaults(DynKind::BurnLimit).with("gainDb", 12.0);
-        assert!(limiter.transfer_db(0.0).unwrap() <= -0.3 + 1.0e-3);
     }
 }

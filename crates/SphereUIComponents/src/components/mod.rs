@@ -68,6 +68,8 @@ pub mod band_model;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod band_panel;
 #[cfg(feature = "builtin-plugin-editor")]
+pub mod burn_limit_plate;
+#[cfg(feature = "builtin-plugin-editor")]
 pub mod dyn_model;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod dyn_panel;
@@ -75,11 +77,11 @@ pub mod dyn_panel;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod eq_graph;
 #[cfg(feature = "builtin-plugin-editor")]
-pub mod eq_model;
+pub mod eq_plate;
 #[cfg(feature = "builtin-plugin-editor")]
-pub mod eq_panel;
+pub mod equz8_plate;
 #[cfg(feature = "builtin-plugin-editor")]
-pub mod eq_window;
+pub mod equzx_plate;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod fx_model;
 #[cfg(feature = "builtin-plugin-editor")]
@@ -106,6 +108,8 @@ mod performance_overlay;
 pub mod performance_window;
 pub mod piano_roll;
 pub(crate) mod pitch_wheel;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod plate;
 pub mod plugin_content_host;
 pub mod plugin_editor_backend;
 pub mod plugin_editor_chrome;
@@ -183,6 +187,8 @@ pub mod white_sharp_window;
 pub mod wrap_synth_panel;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod wrap_synth_window;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod zapp_plate;
 
 pub use about_window::{open_about_window, AboutWindow};
 pub use add_track_dialog::{

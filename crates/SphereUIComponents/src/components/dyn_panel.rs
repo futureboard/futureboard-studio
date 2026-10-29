@@ -1,5 +1,5 @@
 //! The native editors of the dynamics built-ins — FA-2A, FA-76, Z-Comp,
-//! BurnLimit, 67Clipper and Transient — as one [`KitModel`] family.
+//! 67Clipper and Transient — as one [`KitModel`] family.
 //!
 //! Each has a row of displays over a row of control cards:
 //!
@@ -65,7 +65,6 @@ impl KitModel for DynKind {
             DynParams::Fa2a(_) => "Optical leveling amplifier".into(),
             DynParams::Fa76(_) => "FET limiting amplifier".into(),
             DynParams::Zcomp(p) => format!("Multi-circuit dynamics · {}", p.model.display_name()),
-            DynParams::BurnLimit(_) => "Loudness maximizer".into(),
             DynParams::Clipper(_) => "Oversampled clipper and peak limiter".into(),
             DynParams::Transient(_) => "Attack and sustain shaper".into(),
         }
@@ -85,9 +84,6 @@ impl KitModel for DynKind {
             DynKind::Fa2a => DynParams::Fa2a(mirror::builtin_fa2a_params(insert_id)?),
             DynKind::Fa76 => DynParams::Fa76(mirror::builtin_fa76_params(insert_id)?),
             DynKind::Zcomp => DynParams::Zcomp(mirror::builtin_zcomp_params(insert_id)?),
-            DynKind::BurnLimit => {
-                DynParams::BurnLimit(mirror::builtin_burnlimit_params(insert_id)?)
-            }
             DynKind::Clipper => DynParams::Clipper(mirror::builtin_clipper67_params(insert_id)?),
             DynKind::Transient => {
                 DynParams::Transient(mirror::builtin_transient_params(insert_id)?)
@@ -145,7 +141,6 @@ impl KitModel for DynKind {
             DynKind::Fa2a => (1_000.0, 640.0),
             DynKind::Fa76 => (1_040.0, 640.0),
             DynKind::Zcomp => (1_100.0, 720.0),
-            DynKind::BurnLimit => (1_040.0, 620.0),
             DynKind::Clipper => (1_000.0, 620.0),
             DynKind::Transient => (960.0, 600.0),
         }
@@ -241,7 +236,7 @@ fn displays(e: &KitEditor<DynKind>) -> AnyElement {
     let row = match kind {
         DynKind::Fa2a | DynKind::Fa76 => row.child(vu()).child(history(4.0)),
         DynKind::Zcomp => row.child(vu()).child(transfer(e)),
-        DynKind::BurnLimit | DynKind::Clipper => row.child(history(4.0)).child(transfer(e)),
+        DynKind::Clipper => row.child(history(4.0)).child(transfer(e)),
         DynKind::Transient => row.child(history(4.0)).child(envelope(e)),
     };
     row.child(meters).into_any_element()
@@ -266,7 +261,6 @@ fn transfer(e: &KitEditor<DynKind>) -> gpui::Div {
             let c = zcomp::model_coeffs(p);
             format!("{:.1} dB · {:.1}:1", c.threshold_db, c.ratio)
         }
-        DynParams::BurnLimit(p) => format!("Ceiling {:.1} dB", p.ceiling_db),
         DynParams::Clipper(p) => format!(
             "Clip {:.1} dB · {}",
             clipper67::clip_level_db(p),
@@ -360,7 +354,6 @@ fn paint_transfer(
             Some(zcomp::model_coeffs(p).threshold_db),
             Colors::accent_primary(),
         ),
-        DynParams::BurnLimit(p) => (Some(p.ceiling_db), Colors::accent_warning()),
         DynParams::Clipper(p) => (Some(p.ceiling_db), Colors::accent_warning()),
         _ => (None, ink),
     };
@@ -691,36 +684,6 @@ fn controls(e: &KitEditor<DynKind>, cx: &mut Cx<DynKind>) -> AnyElement {
                 .child(first)
                 .child(second)
         }
-        DynParams::BurnLimit(_) => {
-            let style = mode_card(e, cx, "STYLE");
-            let options = div()
-                .flex()
-                .flex_col()
-                .gap(px(space::SNUG))
-                .child(flag(e, cx, "truePeak", "True Peak", true))
-                .child(flag(e, cx, "stereoLink", "Stereo Link", true));
-            row.children(style)
-                .child(knob_card(
-                    "LOUDNESS",
-                    vec![hero(e, cx, "gainDb"), hero(e, cx, "ceilingDb")],
-                ))
-                .child(knob_card(
-                    "TIMING",
-                    vec![k(e, cx, "releaseMs"), k(e, cx, "lookaheadMs")],
-                ))
-                .child(card(
-                    "OUTPUT",
-                    2.0,
-                    KNOB_PITCH + 150.0,
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_start()
-                        .gap(px(space::LOOSE))
-                        .child(k(e, cx, "mix"))
-                        .child(options),
-                ))
-        }
         DynParams::Clipper(p) => {
             let limiting = p.mode == clipper67::Mode::Limit;
             let latency = clipper_latency_hint(p);
@@ -816,11 +779,6 @@ fn vu_face(params: &DynParams) -> VuFace {
 /// History markers: the levels the plug-in holds the output to.
 fn markers(params: &DynParams) -> Vec<Marker> {
     match params {
-        DynParams::BurnLimit(p) => vec![Marker {
-            db: p.ceiling_db,
-            label: format!("Ceiling {:.1} dB", p.ceiling_db),
-            color: Colors::accent_warning(),
-        }],
         // The threshold only marks a level when it sits under the ceiling.
         DynParams::Clipper(p) => (p.threshold_db < p.ceiling_db)
             .then(|| Marker {
@@ -922,11 +880,6 @@ opener!(
     open_zcomp_editor,
     DynKind::Zcomp,
     "Opens with a track's Z-Comp insert."
-);
-opener!(
-    open_burnlimit_editor,
-    DynKind::BurnLimit,
-    "Opens with a track's BurnLimit insert."
 );
 opener!(
     open_clipper67_editor,
