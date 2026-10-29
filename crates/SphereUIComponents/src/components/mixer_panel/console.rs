@@ -1,59 +1,46 @@
 //! The console vocabulary every mixer strip is built from.
 //!
-//! # What changed and why
-//!
-//! The mixer used to identify a channel with its track colour: a 2 px bar
-//! across the top of the strip, a 3 px edge down the header, a coloured border
-//! when selected. Twenty channels of that is twenty vertical stripes competing
-//! with the meters — and the strip is 88 px wide, so the colour was spending
-//! width the controls needed. Worse, selection was *also* a coloured border
-//! (cyan), so the two meanings collided: a border could be identity or state.
-//!
-//! This follows Logic's console instead. The strip body is neutral end to end,
-//! and the track colour appears exactly once, as the fill of the **name plate
-//! at the bottom** — the one place the eye already goes to read which channel
-//! it is looking at. Selection is then free to mean one thing: a lifted strip
-//! surface and a bright rule on the plate.
-//!
-//! A coloured header at the *top* was tried and taken out again. On paper it
-//! labels the head of a column that scrolling would otherwise leave anonymous;
-//! on screen the strips are flush, so five channels' headers merge into one
-//! unbroken band of saturated colour across the panel — the same wall of stripes
-//! the plate-only rule was written to stop, turned on its side.
+//! The strips follow the mixer design (the "DAW Mixer" mockup): strips stand
+//! on the recessed canvas with a 2 px gap between them, the track colour runs
+//! as a bar across the top of each, and the sections below it are captioned,
+//! each the same height on every strip:
 //!
 //! ```txt
 //! ┌──────────┐
-//! │ AUD    ⌄ │  top row — channel type, group expander
-//! │ INSERTS +│  rack label
-//! │ ▭ EQ     │  slot
+//! │▓▓▓▓▓▓▓▓▓▓│  colour bar — the track's colour
+//! │ AUDIO  ⌄ │  channel type, group expander
+//! │ In 1     │  I/O: the input …
+//! │ → Main ⌄ │       … and the output picker
+//! │ INSERTS +│  rack caption
+//! │ • EQ   × │  slot: bypass lamp, name, remove
 //! │ SENDS    │
-//! │ ▭ → Verb │
-//! │ Main   ⌄ │  I/O
-//! │   ( )    │  pan
-//! │ 0┤▮   █  │  fader + meter, against a printed dB scale
-//! │10┤▮   █  │
-//! │20┤▮   █  │
-//! │  -3.4    │  value
+//! │ Verb −12 │  send: a bar that fills with the level
+//! │   ( )    │  pan, its arc in the track colour
+//! │ ▮ █ ┤0   │  fader, meter, printed dB scale
+//! │ ▮ █ ┤−10 │
+//! │ −3.4 −7.1│  gain and held peak
 //! │ M S R I  │
+//! │ PFL  AFL │
 //! ├──────────┤
-//! │▓▓ 1 Vocal│  name plate — the only colour on the strip
+//! │ 1 Vocal  │  name plate — the accent when selected
 //! └──────────┘
 //! ```
 //!
+//! The header's SHOW buttons hide I/O, Inserts or Sends on every strip at
+//! once, and STRIPS switches Narrow and Wide; the fader takes whatever height
+//! the hidden sections leave.
+//!
 //! # Rules the kit enforces
 //!
-//! * **Colour is meaning.** Track colour: identity, plate only. Blue/amber/red
-//!   /green: mute/solo/record/input, matching the console conventions players
-//!   already know. Accent cyan: selection and drag targets. Nothing decorative.
+//! * **Colour is meaning.** Track colour: identity — the bar and the pan arc.
+//!   Blue/amber/red/green: mute/solo/record/input, the theme's latched hues.
+//!   Accent: selection (the plate) and drag targets.
 //! * **A scale is a promise.** The dB numbers beside the meter and the meter's
 //!   own fill are positioned by one function (`vu_meter::db_fraction`). A scale
 //!   printed against a bar drawn some other way is worse than no scale, because
 //!   it is read as fact.
-//! * **Flat, not chipped.** Controls are flat fills with no border at rest;
-//!   depth comes from the recess of the rack area, not from outlining every
-//!   element. Eight bordered chips in an 88 px column read as noise.
-//! * **One type ramp.** 10.5 px for values the user reads, 9.5 px for control
-//!   labels, 8.5 px uppercase for section names. Nothing else.
+//! * **One type ramp.** 10.5 px for values the user reads, 10 px for control
+//!   labels, 8.5 px uppercase for section names, 11.5 px for the plate's name.
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -71,55 +58,62 @@ use crate::theme::Colors;
 // bay, all the plates on one baseline. The two racks (inserts, sends) are the
 // only rows the user can resize, which is why they are the only ones passed in.
 
-/// Channel type + group expander. Logic's "Setting" row sits here; this is the
-/// same slot spent on what the model actually has.
-pub(crate) const TOP_ROW_H: f32 = 16.0;
+/// The track-colour bar across the top of the strip.
+pub(crate) const COLOR_BAR_H: f32 = 3.0;
+/// The strip body's padding above the first section and below the last.
+pub(crate) const BODY_PAD_T: f32 = 5.0;
+pub(crate) const BODY_PAD_B: f32 = 5.0;
+/// Between two sections of the strip. The racks' splitter handles take this
+/// same height, so a strip reads the same with or without them.
+pub(crate) const SECTION_GAP: f32 = 6.0;
+/// Channel type + group expander, as a section caption.
+pub(crate) const TOP_ROW_H: f32 = 12.0;
 /// Rack caption ("INSERTS", "SENDS").
 pub(crate) const RACK_LABEL_H: f32 = 14.0;
-/// One insert slot.
-pub(crate) const SLOT_H: f32 = 17.0;
-/// One send slot: a target line over its level bar. Taller than an insert
-/// because it carries a control as well as a name.
-pub(crate) const SEND_SLOT_H: f32 = 28.0;
-/// Output / routing row.
-pub(crate) const IO_ROW_H: f32 = 20.0;
+/// One insert slot, and the gap under it.
+pub(crate) const SLOT_H: f32 = 18.0;
+/// One send: its target and level over a bar that fills with the level.
+pub(crate) const SEND_SLOT_H: f32 = 18.0;
+/// One I/O row: the input it records from, or the output it plays to.
+pub(crate) const IO_ROW_H: f32 = 17.0;
+/// Between the two I/O rows.
+pub(crate) const IO_ROW_GAP: f32 = 2.0;
+/// The I/O block: input over output.
+pub(crate) const IO_BLOCK_H: f32 = IO_ROW_H * 2.0 + IO_ROW_GAP;
 /// The pan row: the knob and its readout under it.
-///
-/// Sized to what it holds: the section's 4 px top and bottom, the knob, 2 px,
-/// and the readout's line box.
-pub(crate) const PAN_H: f32 = 4.0 + PAN_KNOB_SIZE + 2.0 + 12.0 + 4.0;
+pub(crate) const PAN_H: f32 = PAN_KNOB_SIZE + 2.0 + 11.0;
 /// The pan knob's diameter.
 pub(crate) const PAN_KNOB_SIZE: f32 = 28.0;
 
-/// The strip's horizontal inset.
-///
-/// The racks set it: their slots sit 3 px from the strip edge, and they are
-/// most of the strip's height, so everything else lines up with them rather
-/// than the other way round. The output row used to inset 4 px *and* pad its
-/// button another 4, which put its edge and its text each a pixel inside the
-/// slots above — not enough to name, enough to look unaligned in a column 88 px
-/// wide.
-pub(crate) const STRIP_GUTTER: f32 = 3.0;
+/// The strip body's horizontal inset. Every section — the I/O rows, the racks,
+/// the readout, the toggles — lines up on it.
+pub(crate) const STRIP_GUTTER: f32 = 5.0;
 /// Smallest fader bay that still leaves the cap somewhere to travel.
-pub(crate) const FADER_MIN_H: f32 = 86.0;
+pub(crate) const FADER_MIN_H: f32 = 80.0;
+/// Between the fader bay and its readout.
+pub(crate) const READOUT_GAP: f32 = 3.0;
 /// The fader bay's readout row: gain and held peak, side by side.
-pub(crate) const READOUT_H: f32 = 15.0;
-/// Two rows of channel toggles.
-pub(crate) const BUTTONS_H: f32 = 34.0;
-/// The coloured name plate.
+pub(crate) const READOUT_H: f32 = 13.0;
+/// The channel toggles: M S R I over the Listen taps.
+pub(crate) const TOGGLE_H: f32 = 17.0;
+pub(crate) const LISTEN_TOGGLE_H: f32 = 13.0;
+pub(crate) const BUTTONS_H: f32 = TOGGLE_H + 2.0 + LISTEN_TOGGLE_H;
+/// The name plate.
 pub(crate) const PLATE_H: f32 = 24.0;
-/// Width of the printed dB scale beside the meter. Two digits and a minus at
-/// 8.5 px; anything wider is spending strip on a number nobody reads twice.
-pub(crate) const METER_SCALE_W: f32 = 17.0;
+/// Width of the printed dB scale beside the meter: a tick, two digits and a
+/// minus at 8.5 px.
+pub(crate) const METER_SCALE_W: f32 = 20.0;
 
 /// Text sizes. Three of them, deliberately.
 pub(crate) mod type_scale {
     /// Values the user reads at a glance: the dB number, the plate name.
     pub const VALUE: f32 = 10.5;
     /// Control labels: slot names, routing, toggles.
-    pub const LABEL: f32 = 9.5;
+    pub const LABEL: f32 = 10.0;
     /// Section captions and units.
     pub const CAPTION: f32 = 8.5;
+    /// The plate's channel name.
+    pub const NAME: f32 = 11.5;
 }
 
 // ── Surfaces ────────────────────────────────────────────────────────────────
@@ -160,10 +154,34 @@ pub(crate) fn well(base: gpui::Rgba) -> gpui::Rgba {
     Colors::composite(base, Colors::state_recessed())
 }
 
+/// A control's plate on the strip — an insert slot: one step up from the strip.
+pub(crate) fn raised(base: gpui::Rgba) -> gpui::Rgba {
+    Colors::composite(base, Colors::state_hover())
+}
+
 /// The hairline between two sections. Not a border colour — a single quiet rule
 /// that reads as a fold in one surface rather than a boundary between two.
 pub(crate) fn rule() -> gpui::Rgba {
     Colors::border_subtle()
+}
+
+/// The gap between two strips: the recessed canvas the strips stand on.
+pub(crate) fn strip_gap() -> gpui::Rgba {
+    Colors::surface_canvas()
+}
+
+/// Width of [`strip_gap`], at each strip's right edge.
+pub(crate) const STRIP_GAP_W: f32 = 2.0;
+
+/// The name plate's fill: neutral, or the selection accent when the strip is
+/// selected. The track's colour is the bar across the top of the strip, so
+/// the plate is free to say one thing — which strip is selected.
+pub(crate) fn plate_fill(selected: bool) -> gpui::Rgba {
+    if selected {
+        Colors::accent_primary()
+    } else {
+        Colors::surface_raised()
+    }
 }
 
 // ── Section captions ────────────────────────────────────────────────────────
@@ -237,18 +255,8 @@ pub(crate) fn rack_label(
         .justify_between()
         .flex_none()
         .h(px(RACK_LABEL_H))
-        .pl(px(5.0))
-        .pr(px(3.0))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .truncate()
-                .text_size(px(type_scale::CAPTION))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(Colors::text_faint())
-                .child(label.to_uppercase()),
-        )
+        .pl(px(1.0))
+        .child(section_caption(label))
         .children(bypass)
         .children(plus.map(|RackPlus { id, on_click }| {
             div()
@@ -272,6 +280,19 @@ pub(crate) fn rack_label(
                 .on_mouse_down(gpui::MouseButton::Left, move |_e, w, cx| on_click(w, cx))
                 .occlude()
         }))
+}
+
+/// A section's name — "I/O", "INSERTS", "SENDS", the channel type — in the
+/// strip's caption style: small, uppercase, quiet.
+pub(crate) fn section_caption(label: impl Into<String>) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .truncate()
+        .text_size(px(type_scale::CAPTION))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(Colors::text_faint())
+        .child(label.into().to_uppercase())
 }
 
 /// A fact the strip states rather than a control it offers — the Master's
@@ -310,13 +331,11 @@ impl SlotTone {
     /// `(fill, text)` for this state on `base`.
     pub(crate) fn colors(self, base: gpui::Rgba) -> (gpui::Rgba, gpui::Rgba) {
         match self {
-            // Logic's loaded slot is the *lighter* thing in a dark rack — the
-            // plug-in is the content, the rack is the container.
-            Self::Active => (
-                Colors::composite(base, Colors::state_selected()),
-                Colors::text_primary(),
-            ),
-            Self::Bypassed => (well(base), Colors::text_disabled()),
+            // A loaded slot is a raised plate on the strip; a bypassed one
+            // keeps the plate and dims its name, so the chain keeps its shape
+            // and reads which plug-ins are in the path by their text.
+            Self::Active => (raised(base), Colors::text_primary()),
+            Self::Bypassed => (raised(base), Colors::text_muted()),
             Self::Pending => (well(base), Colors::text_muted()),
             Self::Failed => (
                 Colors::with_alpha(Colors::status_error(), 0.16),
@@ -359,12 +378,14 @@ impl From<bool> for ToggleState {
 /// green input — not the app accent. Those four are close to universal across
 /// consoles and DAWs, and a player glancing at a strip reads the colour before
 /// the letter.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn toggle(
     id: gpui::ElementId,
     label: &'static str,
     state: ToggleState,
     semantic: gpui::Rgba,
     base: gpui::Rgba,
+    height: f32,
     on_click: impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
     let rest = well(base);
@@ -375,9 +396,14 @@ pub(crate) fn toggle(
         .min_w(px(0.0))
         .items_center()
         .justify_center()
-        .h(px(15.0))
+        .h(px(height))
         .rounded(px(crate::theme::radius::MICRO))
-        .text_size(px(type_scale::CAPTION))
+        .border(px(1.0))
+        .text_size(px(if height >= TOGGLE_H {
+            type_scale::LABEL
+        } else {
+            type_scale::CAPTION
+        }))
         .font_weight(gpui::FontWeight::BOLD)
         .cursor(gpui::CursorStyle::PointingHand)
         .on_mouse_down(gpui::MouseButton::Left, on_click)
@@ -385,16 +411,19 @@ pub(crate) fn toggle(
 
     match state {
         ToggleState::On => {
+            let hover = Colors::composite(semantic, Colors::state_hover());
             btn = btn
                 .bg(semantic)
+                .border_color(semantic)
                 .text_color(Colors::on_color(semantic))
-                .hover(|s| s.bg(Colors::state_hover()));
+                .hover(move |s| s.bg(hover));
         }
         ToggleState::Implied => {
-            let (fill, _) = Colors::latched(rest, semantic);
+            let (fill, border) = Colors::latched(rest, semantic);
             let hover = Colors::composite(fill, Colors::state_hover());
             btn = btn
                 .bg(fill)
+                .border_color(border)
                 .text_color(semantic)
                 .hover(move |s| s.bg(hover));
         }
@@ -402,7 +431,8 @@ pub(crate) fn toggle(
             let hover = Colors::composite(rest, Colors::state_hover());
             btn = btn
                 .bg(rest)
-                .text_color(Colors::text_muted())
+                .border_color(Colors::border_default())
+                .text_color(Colors::text_secondary())
                 .hover(move |s| s.bg(hover));
         }
     }
@@ -425,56 +455,75 @@ pub(crate) fn io_button(
 ) -> impl IntoElement {
     let rest = well(base);
     let hover = Colors::composite(rest, Colors::state_hover());
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .h(px(IO_ROW_H))
-        .px(px(STRIP_GUTTER))
+    io_row_box(rest, leading)
+        .id(id)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(move |s| s.bg(hover))
         .child(
             div()
-                .id(id)
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(3.0))
-                .w_full()
+                .flex_1()
                 .min_w(px(0.0))
-                .h(px(16.0))
-                .px(px(4.0))
-                .rounded(px(crate::theme::radius::MICRO))
-                .bg(rest)
-                .cursor(gpui::CursorStyle::PointingHand)
-                .hover(move |s| s.bg(hover))
-                .children(leading.map(|text| {
-                    div()
-                        .flex_none()
-                        .text_size(px(type_scale::CAPTION))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(Colors::text_faint())
-                        .child(text)
-                }))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .text_size(px(type_scale::LABEL))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(Colors::text_secondary())
-                        .child(value),
-                )
-                .child(
-                    svg()
-                        .path(assets::ICON_CHEVRON_DOWN_PATH)
-                        .w(px(8.0))
-                        .h(px(8.0))
-                        .flex_shrink_0()
-                        .text_color(Colors::text_faint()),
-                )
-                .on_mouse_down(gpui::MouseButton::Left, on_open)
-                .occlude(),
+                .truncate()
+                .text_size(px(type_scale::LABEL))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(Colors::text_primary())
+                .child(value),
         )
+        .child(
+            svg()
+                .path(assets::ICON_CHEVRON_DOWN_PATH)
+                .w(px(8.0))
+                .h(px(8.0))
+                .flex_shrink_0()
+                .text_color(Colors::text_faint()),
+        )
+        .on_mouse_down(gpui::MouseButton::Left, on_open)
+        .occlude()
+}
+
+/// An I/O row that states where the signal comes from rather than offering a
+/// choice: the input row, whose picker is the Inspector's. The same box as
+/// [`io_button`], without the chevron, so it never reads as pressable.
+pub(crate) fn io_label(
+    leading: Option<String>,
+    value: String,
+    base: gpui::Rgba,
+) -> impl IntoElement {
+    io_row_box(well(base), leading).child(
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .truncate()
+            .text_size(px(type_scale::LABEL))
+            .text_color(Colors::text_secondary())
+            .child(value),
+    )
+}
+
+/// The box an I/O row is drawn in, with its optional leading caption.
+fn io_row_box(fill: gpui::Rgba, leading: Option<String>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(3.0))
+        .w_full()
+        .min_w(px(0.0))
+        .h(px(IO_ROW_H))
+        .px(px(5.0))
+        .rounded(px(crate::theme::radius::MICRO))
+        .bg(fill)
+        .border(px(1.0))
+        .border_color(Colors::border_subtle())
+        .children(leading.map(|text| {
+            div()
+                .flex_none()
+                .text_size(px(type_scale::CAPTION))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(Colors::text_faint())
+                .child(text)
+        }))
 }
 
 // ── Pan ─────────────────────────────────────────────────────────────────────
@@ -496,7 +545,7 @@ pub(crate) fn format_pan(pan: f32) -> String {
 // ── Room panner ─────────────────────────────────────────────────────────────
 
 /// The room panner's side: square, filling the pan row's height.
-pub(crate) const ROOM_PAD_SIZE: f32 = PAN_H - 8.0;
+pub(crate) const ROOM_PAD_SIZE: f32 = PAN_H - 2.0;
 
 /// Drag payload for the room panner. Shift drags finely from where the pointer
 /// was when Shift went down; a plain drag places the source under the pointer.
@@ -648,9 +697,6 @@ pub(crate) fn room_panner(
         .items_center()
         .justify_center()
         .h(px(PAN_H))
-        .px(px(STRIP_GUTTER))
-        .border_b(px(1.0))
-        .border_color(rule())
         .child(
             div()
                 .id(id.clone())
@@ -784,19 +830,17 @@ pub(crate) fn room_panner(
 
 // ── Name plate ──────────────────────────────────────────────────────────────
 
-/// The bottom plate: the channel's number, its name, and the one place its
-/// colour appears.
+/// The bottom plate: the channel's number and its name.
 ///
-/// `number` is `None` for the pinned strips, which are not numbered channels.
-/// Selection puts a bright rule along the top of the plate rather than tinting
-/// the fill, because the fill is already saying something else — which track
-/// this is — and two meanings in one channel is how the old coloured border
-/// became unreadable.
+/// `fill` is the plate's colour — [`plate_fill`] for a channel, which turns
+/// the selection accent when the strip is selected; the pinned strips pass
+/// their own. `number` is `None` for the pinned strips, which are not
+/// numbered channels. A hairline along the top separates it from the strip
+/// above whatever the two fills are.
 pub(crate) fn name_plate(
     fill: gpui::Rgba,
     number: Option<usize>,
     name: impl Into<String>,
-    selected: bool,
     // The GPU primitive layer also paints the plate fill for scrolling
     // channel strips. The plate paints it too — the same opaque colour — so
     // its text can never end up on whatever happens to be drawn over that
@@ -809,21 +853,20 @@ pub(crate) fn name_plate(
         .flex_row()
         .items_center()
         .flex_none()
-        .gap(px(3.0))
+        .gap(px(5.0))
         .h(px(PLATE_H))
-        .px(px(5.0))
+        .px(px(6.0))
         .bg(fill)
-        .when(selected, |s| {
-            s.border_t(px(2.0)).border_color(Colors::text_primary())
-        })
+        .border_t(px(1.0))
+        .border_color(rule())
         .children(number.map(|n| {
             div()
                 .flex_none()
-                .text_size(px(type_scale::CAPTION))
-                .font_weight(gpui::FontWeight::BOLD)
+                .text_size(px(type_scale::CAPTION + 1.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
                 // The number is a locator, not a label: it stays legible but
                 // never competes with the name beside it.
-                .text_color(Colors::with_alpha(text, 0.65))
+                .text_color(Colors::with_alpha(text, 0.7))
                 .child(format!("{n}"))
         }))
         .child(
@@ -831,11 +874,17 @@ pub(crate) fn name_plate(
                 .flex_1()
                 .min_w(px(0.0))
                 .truncate()
-                .text_size(px(type_scale::VALUE))
+                .text_size(px(type_scale::NAME))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(text)
                 .child(name.into()),
         )
+}
+
+/// The track colour across the top of a strip: the strip's identity, read
+/// down a row of strips before any name is.
+pub(crate) fn color_bar(color: gpui::Rgba) -> impl IntoElement {
+    div().flex_none().w_full().h(px(COLOR_BAR_H)).bg(color)
 }
 
 /// The dB scale printed beside the meter.
@@ -864,6 +913,8 @@ pub(crate) fn meter_scale() -> impl IntoElement {
         // `db_fraction` measures up from the floor; the strip measures down
         // from the top, so a tick's y is the remainder of the height.
         let from_top = 1.0 - db_fraction(db);
+        // Read from the meter outward: the tick against the bar, then its
+        // number.
         let mut row = div()
             .absolute()
             .left_0()
@@ -875,27 +926,30 @@ pub(crate) fn meter_scale() -> impl IntoElement {
             .flex()
             .flex_row()
             .items_center()
-            .justify_end()
-            .gap(px(2.0));
+            .justify_start()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(if labelled { 3.0 } else { 2.0 }))
+                    .h(px(1.0))
+                    .bg(Colors::border_default()),
+            );
 
         if labelled {
             row = row.child(
                 div()
                     .text_size(px(type_scale::CAPTION))
                     .text_color(Colors::text_faint())
-                    .child(format!("{}", db as i32)),
+                    .child(if db == 0.0 {
+                        "0".to_string()
+                    } else {
+                        format!("\u{2212}{}", -(db as i32))
+                    }),
             );
         }
 
-        column = column.child(
-            row.child(
-                div()
-                    .flex_none()
-                    .w(px(if labelled { 3.0 } else { 2.0 }))
-                    .h(px(1.0))
-                    .bg(Colors::border_subtle()),
-            ),
-        );
+        column = column.child(row);
     }
     column
 }

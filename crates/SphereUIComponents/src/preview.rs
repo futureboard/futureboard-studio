@@ -413,8 +413,34 @@ pub fn scenes() -> Vec<Scene> {
             height: 760.0,
             open: slicer,
         },
+        Scene {
+            name: "mixer",
+            width: 1_680.0,
+            height: 760.0,
+            open: mixer::mixer,
+        },
+        Scene {
+            name: "mixer-wide",
+            width: 1_880.0,
+            height: 760.0,
+            open: mixer::mixer_wide,
+        },
+        Scene {
+            name: "mixer-compact",
+            width: 1_100.0,
+            height: 560.0,
+            open: mixer::mixer_compact,
+        },
+        Scene {
+            name: "mixer-short",
+            width: 1_100.0,
+            height: 460.0,
+            open: mixer::mixer,
+        },
     ]
 }
+
+mod mixer;
 
 // ── Plug-in editor plumbing ────────────────────────────────────────────────
 

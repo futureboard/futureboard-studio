@@ -5,8 +5,8 @@ use crate::components::edit::EditCommand;
 use crate::components::mixer_panel::{
     clamp_mixer_section_height_px, mixer_render_item_count, mixer_scroll_x_for_strip_index,
     mixer_scroll_x_to_reveal, mixer_strip_index_for_channel, MixerCallbacks, MixerSplitAction,
-    MixerSplitTarget, VstiOutputMeterState, MIXER_INSERT_SECTION_DEFAULT_PX,
-    MIXER_SEND_SECTION_DEFAULT_PX, MIXER_SUB_HEADER_H, STRIP_MIN_HEIGHT, STRIP_WIDTH,
+    MixerSplitTarget, MixerView, VstiOutputMeterState, MIXER_INSERT_SECTION_DEFAULT_PX,
+    MIXER_SEND_SECTION_DEFAULT_PX, MIXER_SUB_HEADER_H, STRIP_MIN_HEIGHT,
 };
 use crate::components::mixer_tree_model::{
     ensure_timeline_mixer_tree_defaults, expand_ancestors_for_channel, MixerTreeModel,
@@ -41,6 +41,8 @@ pub(crate) struct MixerViewState {
     pub split_resize_start_send_px: f32,
     /// Active splitter-drag target, if a drag is in progress.
     pub split_active_target: Option<MixerSplitTarget>,
+    /// Which strip sections show, and Narrow or Wide strips (session-only).
+    pub view: MixerView,
     pub vsti_output_meters: HashMap<String, VstiOutputMeterState>,
     /// Monotonic meter-tick counter. Each published plugin-output meter stamps
     /// its entry with the current value, so the prune pass can tell live
@@ -96,6 +98,7 @@ impl Default for MixerViewState {
             split_resize_start_insert_px: 0.0,
             split_resize_start_send_px: 0.0,
             split_active_target: None,
+            view: MixerView::default(),
             vsti_output_meters: HashMap::new(),
             vsti_meter_generation: 0,
             vsti_meter_key_buf: String::new(),
@@ -145,7 +148,7 @@ impl StudioLayout {
             .map(|b| f32::from(b.size.width))
             .unwrap_or(1280.0);
         // The pinned Master and Control Room strips and the rule before them.
-        let pinned_w = 2.0 * STRIP_WIDTH + 1.0;
+        let pinned_w = crate::components::mixer_panel::mixer_pinned_width();
         let mixer_viewport_width = (window_w - tree_w - pinned_w).max(100.0);
         // The dock's top rule, its tab strip and the mixer's own sub-header.
         let chrome_h = 1.0 + crate::theme::size::COMFORTABLE + MIXER_SUB_HEADER_H;
@@ -299,6 +302,11 @@ impl StudioLayout {
             ),
             mixer_send_section_px: clamp_mixer_section_height_px(self.mixer_view.send_section_px),
             mixer_split_active_target: self.mixer_view.split_active_target,
+            mixer_view: self.mixer_view.view,
+            input_labels: crate::components::mixer_panel::mixer_input_labels(
+                &timeline.state.tracks,
+                &timeline.state.audio_connections,
+            ),
             // Derived from the persisted per-instrument collapse flag (single
             // source of truth) — never a separate, drift-prone view cache.
             collapsed_vsti_output_groups: timeline.state.collapsed_vsti_output_group_keys(),
@@ -844,7 +852,8 @@ impl StudioLayout {
             let window_w: f32 = window.bounds().size.width.into();
             StudioLayout::defer_update(&owner_focus, cx, move |layout, cx| {
                 let tree_w = layout.mixer_tree_sidebar_width();
-                let viewport = (window_w - tree_w - 90.0).max(STRIP_WIDTH);
+                let viewport =
+                    (window_w - tree_w - 90.0).max(crate::components::mixer_panel::strip_width());
                 layout.mixer_focus_channel(&id, viewport, cx);
             });
         });
@@ -1011,6 +1020,11 @@ impl StudioLayout {
         self.mixer_view.split_active_target
     }
 
+    /// The strips' sections and width, as the header's SHOW / STRIPS set them.
+    pub(crate) fn mixer_view_prefs(&self) -> MixerView {
+        self.mixer_view.view
+    }
+
     pub(crate) fn toggle_vsti_output_group(&mut self, group_key: &str, cx: &mut Context<Self>) {
         // Group key is `{track_id}:{insert_id}`; insert ids contain no ':' so the
         // last ':' splits the pair. Collapse/expand is a VIEW concern stored on the
@@ -1133,6 +1147,21 @@ impl StudioLayout {
                     }
                 }
                 self.mixer_view.split_active_target = None;
+            }
+            MixerSplitAction::ToggleSection(section) => {
+                self.mixer_view.view = self.mixer_view.view.toggled(section);
+            }
+            MixerSplitAction::SetWide(wide) => {
+                if self.mixer_view.view.wide == wide {
+                    return;
+                }
+                let old_width = crate::components::mixer_panel::strip_width();
+                self.mixer_view.view.wide = wide;
+                crate::components::mixer_panel::set_mixer_strips_wide(wide);
+                // The strips change width under the scroll: keep the same strip
+                // at the left edge. The scroller clamps it to the new range.
+                self.mixer_view.scroll_x *=
+                    crate::components::mixer_panel::strip_width() / old_width;
             }
         }
         self.push_mixer_snapshot_to_window(cx);
@@ -2367,6 +2396,20 @@ impl StudioLayout {
             on_remove_send,
             on_send_gain_change,
             on_reorder_send,
+            on_clear_solos: Some({
+                let timeline = self.timeline.clone();
+                std::sync::Arc::new(move |_w: &mut Window, cx: &mut gpui::App| {
+                    let _ = timeline.update(cx, |timeline, cx| timeline.clear_all_solos(cx));
+                })
+            }),
+            on_add_track: Some({
+                let this = owner.clone();
+                std::sync::Arc::new(move |_w: &mut Window, cx: &mut gpui::App| {
+                    StudioLayout::defer_update(&this, cx, |this, cx| {
+                        this.dispatch_command_id("track:add", cx);
+                    });
+                })
+            }),
         }
     }
 

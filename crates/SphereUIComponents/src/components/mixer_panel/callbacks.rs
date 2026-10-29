@@ -121,6 +121,11 @@ pub struct MixerCallbacks {
         dyn Fn(&(String, String, crate::components::reorder::DropAnchor), &mut Window, &mut App)
             + 'static,
     >,
+    /// Clear every channel's solo, from the mixer header. `None` hides the
+    /// header's Clear solo action.
+    pub on_clear_solos: Option<std::sync::Arc<dyn Fn(&mut Window, &mut App) + 'static>>,
+    /// Open Add Track, from the mixer header. `None` hides the button.
+    pub on_add_track: Option<std::sync::Arc<dyn Fn(&mut Window, &mut App) + 'static>>,
 }
 
 /// Inert callbacks for fallback UI when the studio entity is unavailable.
@@ -197,5 +202,7 @@ pub fn noop_mixer_callbacks() -> MixerCallbacks {
         on_remove_send: noop_insert_pair,
         on_send_gain_change: noop_send_gain,
         on_reorder_send: noop_send_reorder,
+        on_clear_solos: None,
+        on_add_track: None,
     }
 }

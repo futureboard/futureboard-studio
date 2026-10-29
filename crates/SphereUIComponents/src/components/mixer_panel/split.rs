@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use gpui::{App, Empty, IntoElement, Render, Window};
 
 // ── Section dimensions ─────────────────────────────────────────────────────
@@ -5,7 +7,79 @@ use gpui::{App, Empty, IntoElement, Render, Window};
 // The per-section heights themselves live in [`super::console`], which owns the
 // look; what lives here is what the splitter arithmetic needs — the strip's
 // overall bounds and the fixed height it must leave alone.
-pub const STRIP_WIDTH: f32 = 88.0;
+
+/// A channel strip's width in the mixer's Narrow and Wide layouts.
+pub const STRIP_WIDTH_NARROW: f32 = 84.0;
+pub const STRIP_WIDTH_WIDE: f32 = 118.0;
+
+/// Whether the mixer lays its strips out Wide. A mirror of the layout's
+/// [`MixerView::wide`], kept here because the strip width is read by the
+/// virtualizer, the scroll arithmetic and the GPU decoration as well as by the
+/// strips — every mixer surface (the docked panel, the Mixer window) shares
+/// the one setting. UI thread only; the owner writes it with
+/// [`set_mixer_strips_wide`] when the setting changes.
+static STRIPS_WIDE: AtomicBool = AtomicBool::new(false);
+
+/// The width every channel, Master and Control Room strip is laid out at.
+pub fn strip_width() -> f32 {
+    if STRIPS_WIDE.load(Ordering::Relaxed) {
+        STRIP_WIDTH_WIDE
+    } else {
+        STRIP_WIDTH_NARROW
+    }
+}
+
+pub(crate) fn set_mixer_strips_wide(wide: bool) {
+    STRIPS_WIDE.store(wide, Ordering::Relaxed);
+}
+
+/// The strip sections the mixer header's SHOW buttons turn on and off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MixerSection {
+    Io,
+    Inserts,
+    Sends,
+}
+
+/// How the strips are laid out: which sections show, and Narrow or Wide.
+/// View state, shared by every mixer surface and never saved with a project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MixerView {
+    pub show_io: bool,
+    pub show_inserts: bool,
+    pub show_sends: bool,
+    pub wide: bool,
+}
+
+impl Default for MixerView {
+    fn default() -> Self {
+        Self {
+            show_io: true,
+            show_inserts: true,
+            show_sends: true,
+            wide: false,
+        }
+    }
+}
+
+impl MixerView {
+    pub fn shows(self, section: MixerSection) -> bool {
+        match section {
+            MixerSection::Io => self.show_io,
+            MixerSection::Inserts => self.show_inserts,
+            MixerSection::Sends => self.show_sends,
+        }
+    }
+
+    pub fn toggled(mut self, section: MixerSection) -> Self {
+        match section {
+            MixerSection::Io => self.show_io = !self.show_io,
+            MixerSection::Inserts => self.show_inserts = !self.show_inserts,
+            MixerSection::Sends => self.show_sends = !self.show_sends,
+        }
+        self
+    }
+}
 /// Minimum height for a channel strip: everything on it that cannot give way.
 /// Below this the mixer scrolls rather than compressing the pan/fader controls
 /// into unusability.
@@ -24,22 +98,33 @@ pub const STRIP_WIDTH: f32 = 88.0;
 /// again — moving any of them moves this.
 pub const STRIP_MIN_HEIGHT: f32 = STRIP_FIXED_H + (SECTION_VIEWPORT_MIN_H * 2.0);
 
-/// Everything below the racks: I/O, pan, the fader bay at its floor, and the
-/// toggle row. Fixed on every strip, which is what keeps the four kinds of
-/// strip on one set of baselines.
-pub(crate) const LOWER_CONTROL_MIN_H: f32 = super::console::IO_ROW_H
-    + super::console::PAN_H
+/// Everything below the racks: pan, the fader bay at its floor with its
+/// readout, and the toggle rows. Fixed on every strip, which is what keeps the
+/// four kinds of strip on one set of baselines.
+pub(crate) const LOWER_CONTROL_MIN_H: f32 = super::console::PAN_H
+    + super::console::SECTION_GAP
     + super::console::FADER_MIN_H
+    + super::console::READOUT_GAP
+    + super::console::READOUT_H
+    + super::console::SECTION_GAP
     + super::console::BUTTONS_H;
 
-/// Everything on a strip that is not the two racks: the type row, both splitter
-/// handles, the lower console at its floor, and the name plate. The racks are
-/// the only sections that resize, so this is the height they may never eat
-/// into — and, with both racks at their own floor, the whole of what a strip
-/// cannot be shorter than (see [`STRIP_MIN_HEIGHT`]).
-pub(crate) const STRIP_FIXED_H: f32 = super::console::TOP_ROW_H
+/// Everything on a strip that is not the two racks: the colour bar, the body's
+/// padding, the type row, the I/O block, both splitter handles, the lower
+/// console at its floor, and the name plate. The racks are the only sections
+/// that resize, so this is the height they may never eat into — and, with both
+/// racks at their own floor, the whole of what a strip cannot be shorter than
+/// (see [`STRIP_MIN_HEIGHT`]). Hiding a section only gives its height to the
+/// fader; the floor stays the floor of the fullest strip.
+pub(crate) const STRIP_FIXED_H: f32 = super::console::COLOR_BAR_H
+    + super::console::BODY_PAD_T
+    + super::console::TOP_ROW_H
+    + super::console::SECTION_GAP
+    + super::console::IO_BLOCK_H
+    + super::console::SECTION_GAP
     + (SEC_SPLITTER_H * 2.0)
     + LOWER_CONTROL_MIN_H
+    + super::console::BODY_PAD_B
     + super::console::PLATE_H;
 
 // ── Vertical mixer section resizing ─────────────────────────────────────────
@@ -51,16 +136,11 @@ pub(crate) const STRIP_FIXED_H: f32 = super::console::TOP_ROW_H
 pub(crate) const SEC_SPLITTER_H: f32 = 6.0;
 const SECTION_VIEWPORT_MIN_H: f32 = 42.0;
 const SECTION_VIEWPORT_MAX_H: f32 = 180.0;
-/// Default height of the inserts viewport.
-///
-/// A fresh session has no inserts, so this reserves a visible gap between
-/// INSERTS and SENDS — but it cannot simply be lowered. The Monitor strip's
-/// Source selector deliberately occupies this same slot to keep the two pinned
-/// strips on matching baselines (`monitor_strip`), and shortening it collapses
-/// that selector to an ellipsis. Tightening the empty bay needs the Monitor's
-/// routing block decoupled from the inserts height first.
-pub const MIXER_INSERT_SECTION_DEFAULT_PX: f32 = 72.0;
-pub const MIXER_SEND_SECTION_DEFAULT_PX: f32 = 54.0;
+/// Default height of the inserts rack: its caption, three slots and
+/// "+ Insert".
+pub const MIXER_INSERT_SECTION_DEFAULT_PX: f32 = 94.0;
+/// Default height of the sends rack: its caption, two sends and "+ Send".
+pub const MIXER_SEND_SECTION_DEFAULT_PX: f32 = 74.0;
 
 /// Clamp one insert/send section height into the static supported range.
 pub fn clamp_mixer_section_height_px(value: f32) -> f32 {
@@ -117,6 +197,10 @@ pub enum MixerSplitAction {
     ResizeEnd,
     /// Double-click — reset the targeted section to its default height.
     Reset(MixerSplitTarget),
+    /// A header SHOW button — show or hide one strip section on every strip.
+    ToggleSection(MixerSection),
+    /// A header STRIPS button — Narrow (`false`) or Wide (`true`) strips.
+    SetWide(bool),
 }
 
 /// Shared split layout passed into the mixer. Insert/send heights are already
@@ -127,6 +211,8 @@ pub struct MixerSplit {
     pub insert_px: f32,
     pub send_px: f32,
     pub active_target: Option<MixerSplitTarget>,
+    /// Which sections the strips show, and how wide they are.
+    pub view: MixerView,
     pub on_action: std::sync::Arc<dyn Fn(MixerSplitAction, &mut Window, &mut App) + 'static>,
 }
 
@@ -137,6 +223,7 @@ impl MixerSplit {
             insert_px: MIXER_INSERT_SECTION_DEFAULT_PX,
             send_px: MIXER_SEND_SECTION_DEFAULT_PX,
             active_target: None,
+            view: MixerView::default(),
             on_action: std::sync::Arc::new(|_, _, _| {}),
         }
     }
@@ -161,14 +248,25 @@ mod tests {
     use super::super::console;
     use super::*;
 
+    /// Everything above the racks on a strip showing every section.
+    fn head() -> f32 {
+        console::COLOR_BAR_H
+            + console::BODY_PAD_T
+            + console::TOP_ROW_H
+            + console::SECTION_GAP
+            + console::IO_BLOCK_H
+            + console::SECTION_GAP
+    }
+
     /// The height a strip actually lays out at, given a pair of rack heights.
     fn laid_out_height(insert_px: f32, send_px: f32) -> f32 {
-        console::TOP_ROW_H
+        head()
             + insert_px
             + SEC_SPLITTER_H
             + send_px
             + SEC_SPLITTER_H
             + LOWER_CONTROL_MIN_H
+            + console::BODY_PAD_B
             + console::PLATE_H
     }
 
@@ -176,12 +274,19 @@ mod tests {
     fn the_strip_minimum_is_the_sum_of_the_sections_it_is_made_of() {
         // Spelled out independently of the constant, so a section that moves
         // without the minimum moving is caught here rather than on screen.
-        let sections = console::TOP_ROW_H
+        let sections = head()
             + SECTION_VIEWPORT_MIN_H
             + SEC_SPLITTER_H
             + SECTION_VIEWPORT_MIN_H
             + SEC_SPLITTER_H
-            + LOWER_CONTROL_MIN_H
+            + console::PAN_H
+            + console::SECTION_GAP
+            + console::FADER_MIN_H
+            + console::READOUT_GAP
+            + console::READOUT_H
+            + console::SECTION_GAP
+            + console::BUTTONS_H
+            + console::BODY_PAD_B
             + console::PLATE_H;
         assert_eq!(
             STRIP_MIN_HEIGHT, sections,

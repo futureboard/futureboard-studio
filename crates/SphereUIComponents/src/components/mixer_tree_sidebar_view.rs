@@ -21,6 +21,7 @@ use crate::components::text_input::{
     TextInputState,
 };
 use crate::components::timeline::timeline::Timeline;
+use crate::components::timeline::timeline_state::TimelineState;
 use crate::layout::StudioLayout;
 use crate::theme::Colors;
 
@@ -30,9 +31,17 @@ const TREE_LEFT_PAD: f32 = 4.0;
 const DISCLOSURE_W: f32 = 12.0;
 const TREE_PANEL_BG: fn() -> gpui::Rgba = Colors::surface_panel_alt;
 
+/// Where the tree reads its channels from.
+enum TreeSource {
+    /// The session's timeline.
+    Timeline(Entity<Timeline>),
+    /// A fixed session, for the offscreen UI preview.
+    #[cfg(feature = "ui-preview")]
+    Fixed(Box<TimelineState>),
+}
+
 pub struct MixerTreeSidebar {
-    owner: Entity<StudioLayout>,
-    timeline: Entity<Timeline>,
+    source: TreeSource,
     cache: MixerTreeRenderCache,
     collapsed: bool,
     width_px: f32,
@@ -50,14 +59,59 @@ pub struct MixerTreeSidebar {
 
 impl MixerTreeSidebar {
     pub fn new(
-        owner: Entity<StudioLayout>,
+        _owner: Entity<StudioLayout>,
         timeline: Entity<Timeline>,
         focus_handle: FocusHandle,
         _cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_source(TreeSource::Timeline(timeline), focus_handle)
+    }
+
+    /// The tree over a fixed session, for the offscreen UI preview.
+    #[cfg(feature = "ui-preview")]
+    pub(crate) fn for_preview(
+        state: TimelineState,
+        callbacks: MixerTreeCallbacks,
+        focus_handle: FocusHandle,
+    ) -> Self {
+        let mut sidebar = Self::with_source(TreeSource::Fixed(Box::new(state)), focus_handle);
+        sidebar.callbacks = Some(callbacks);
+        if let TreeSource::Fixed(state) = &sidebar.source {
+            // The first sync the layout makes for a session: a stereo output.
+            sidebar.cache.sync_routing_key(
+                1,
+                state.track_names_revision,
+                2,
+                "",
+                false,
+                state.selection.selected_track_id.as_deref(),
+            );
+            sidebar.cache.recompute(&state.tracks, &state.mixer_tree);
+        }
+        sidebar
+    }
+
+    /// Runs `f` on the session the tree shows.
+    fn with_state<R>(&self, cx: &App, f: impl FnOnce(&TimelineState) -> R) -> R {
+        match &self.source {
+            TreeSource::Timeline(timeline) => f(&timeline.read(cx).state),
+            #[cfg(feature = "ui-preview")]
+            TreeSource::Fixed(state) => f(state),
+        }
+    }
+
+    /// Recomputes the cached rows from the session.
+    fn recompute(&mut self, cx: &App) {
+        let mut cache = std::mem::take(&mut self.cache);
+        self.with_state(cx, |state| {
+            cache.recompute(&state.tracks, &state.mixer_tree);
+        });
+        self.cache = cache;
+    }
+
+    fn with_source(source: TreeSource, focus_handle: FocusHandle) -> Self {
         Self {
-            owner,
-            timeline,
+            source,
             cache: MixerTreeRenderCache::default(),
             collapsed: false,
             width_px: crate::components::mixer_tree_sidebar::MIXER_TREE_SIDEBAR_DEFAULT_WIDTH,
@@ -115,16 +169,12 @@ impl MixerTreeSidebar {
 
     pub fn recompute_expansion(&mut self, cx: &Context<Self>) {
         self.cache.mark_expansion_dirty();
-        let timeline = self.timeline.read(cx);
-        self.cache
-            .recompute(&timeline.state.tracks, &timeline.state.mixer_tree);
+        self.recompute(cx);
     }
 
     pub fn recompute_selection(&mut self, cx: &Context<Self>) {
         self.cache.mark_selection_dirty();
-        let timeline = self.timeline.read(cx);
-        self.cache
-            .recompute(&timeline.state.tracks, &timeline.state.mixer_tree);
+        self.recompute(cx);
     }
 
     pub fn sync_routing_from_layout(
@@ -133,22 +183,25 @@ impl MixerTreeSidebar {
         routing_gen: u64,
         output_channels: u32,
     ) -> bool {
-        let timeline = self.timeline.read(cx);
         let filter = self.filter_input.value.trim().to_string();
-        let selected = timeline.state.selection.selected_track_id.as_deref();
+        let (selected, names_revision) = self.with_state(cx, |state| {
+            (
+                state.selection.selected_track_id.clone(),
+                state.track_names_revision,
+            )
+        });
         self.cache.sync_routing_key(
             routing_gen,
-            timeline.state.track_names_revision,
+            names_revision,
             output_channels,
             &filter,
             self.show_only_selected_group,
-            selected,
+            selected.as_deref(),
         );
         if !self.cache.dirty.any() {
             return false;
         }
-        self.cache
-            .recompute(&timeline.state.tracks, &timeline.state.mixer_tree);
+        self.recompute(cx);
         true
     }
 
@@ -160,9 +213,7 @@ impl MixerTreeSidebar {
         self.last_filter_applied = current.clone();
         self.cache.filter = current;
         self.cache.mark_filter_dirty();
-        let timeline = self.timeline.read(cx);
-        self.cache
-            .recompute(&timeline.state.tracks, &timeline.state.mixer_tree);
+        self.recompute(cx);
     }
 }
 
@@ -246,7 +297,9 @@ impl Render for MixerTreeSidebar {
                     .text_size(px(10.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(Colors::text_secondary())
-                    .child("MIX"),
+                    .child(
+                        crate::i18n::I18n::from_app(cx).tr_or("mixer.tree.channels", "CHANNELS"),
+                    ),
             )
             .child(div().flex_1())
             .child(toolbar_icon(
@@ -393,7 +446,6 @@ fn tree_row_element(
     let node_id = row.node_id.as_str();
     let channel_id = row.channel_id.as_deref();
     let depth = row.depth as usize;
-    let accent = row.accent;
     let text_color = if row.selected {
         Colors::text_primary()
     } else if !row.visible_in_mixer {
@@ -407,6 +459,7 @@ fn tree_row_element(
     let on_focus = callbacks.on_focus_channel.clone();
     let on_mute = callbacks.on_toggle_mute.clone();
     let on_solo = callbacks.on_toggle_solo.clone();
+    let on_visibility = callbacks.on_toggle_visibility.clone();
 
     let disclosure = div()
         .w(px(DISCLOSURE_W))
@@ -432,7 +485,11 @@ fn tree_row_element(
     let select_id = channel_id.map(str::to_string);
     let mute_id = channel_id.map(str::to_string);
     let solo_id = channel_id.map(str::to_string);
+    let visibility_id = channel_id.map(str::to_string);
     let label = row.label.clone();
+    let is_group = channel_id.is_none();
+    let rest = TREE_PANEL_BG();
+    let selected_bg = Colors::composite(rest, Colors::state_selected());
 
     let mut row_el = div()
         .flex()
@@ -443,7 +500,7 @@ fn tree_row_element(
         .h(px(TREE_ROW_HEIGHT))
         .pl(px(TREE_LEFT_PAD + depth as f32 * TREE_INDENT))
         .pr(px(4.0))
-        .gap(px(2.0))
+        .gap(px(4.0))
         .id(("mixer-tree-row", row_index))
         .cursor(gpui::CursorStyle::PointingHand)
         .on_mouse_move({
@@ -458,23 +515,59 @@ fn tree_row_element(
             }
         })
         .when(hovered && !row.selected, |el| {
-            el.bg(Colors::surface_hover())
+            el.bg(Colors::composite(rest, Colors::state_hover()))
         })
-        .when(row.selected, |el| {
-            el.bg(Colors::accent_soft())
-                .border_l(px(2.0))
-                .border_color(Colors::accent_primary())
+        // Selected: the lifted row and the accent edge, as everywhere else.
+        .border_l(px(2.0))
+        .border_color(if row.selected {
+            Colors::accent_primary()
+        } else {
+            gpui::transparent_black().into()
         })
-        .when(!row.selected, |el| {
-            el.border_l(px(2.0)).border_color(accent)
-        })
+        .when(row.selected, |el| el.bg(selected_bg))
         .child(disclosure)
+        // Shown in the mixer, or hidden from it: the strip's own switch.
+        .children(visibility_id.clone().map(|id| {
+            let visible = row.visible_in_mixer;
+            div()
+                .id(("mixer-tree-visibility", row_index))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(18.0))
+                .rounded(px(crate::theme::radius::MICRO))
+                .hover(|s| s.bg(Colors::state_hover()))
+                .tooltip(crate::components::controls::fb_tooltip(if visible {
+                    "Hide this channel's strip"
+                } else {
+                    "Show this channel's strip"
+                }))
+                .child(
+                    gpui::svg()
+                        .path(if visible {
+                            assets::ICON_EYE_PATH
+                        } else {
+                            assets::ICON_EYE_OFF_PATH
+                        })
+                        .size(px(12.0))
+                        .text_color(if visible {
+                            Colors::text_secondary()
+                        } else {
+                            Colors::text_faint()
+                        }),
+                )
+                .on_click(move |_e, w, app| {
+                    app.stop_propagation();
+                    on_visibility(&id, w, app);
+                })
+        }))
         .when_some(row.track_color, |el, color| {
             el.child(
                 div()
-                    .w(px(6.0))
-                    .h(px(6.0))
-                    .rounded(px(crate::theme::radius::PILL))
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .rounded(px(crate::theme::radius::MICRO))
                     .bg(color)
                     .flex_shrink_0(),
             )
@@ -484,74 +577,58 @@ fn tree_row_element(
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(px(11.0))
+                .text_size(px(if is_group { 11.5 } else { 12.0 }))
+                .when(is_group, |el| el.font_weight(gpui::FontWeight::SEMIBOLD))
                 .text_color(text_color)
                 .child(label),
         )
         .children(channel_id.is_some().then(|| {
             div()
                 .flex_shrink_0()
-                .w(px(31.0))
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_between()
-                .gap(px(1.0))
-                .child(
-                    icon_button(
-                        None,
-                        "M",
-                        px(14.0),
-                        px(14.0),
-                        px(9.0),
-                        if row.muted {
-                            Colors::accent_primary()
-                        } else {
-                            Colors::text_faint()
-                        },
-                    )
-                    .text_size(px(9.0))
-                    .id(("mixer-tree-mute", row_index))
-                    .on_click({
+                .gap(px(3.0))
+                .child(tree_toggle(
+                    ("mixer-tree-mute", row_index).into(),
+                    "M",
+                    if row.muted {
+                        TreeToggle::On
+                    } else {
+                        TreeToggle::Off
+                    },
+                    Colors::state_mute(),
+                    {
                         let mute_id = mute_id.clone();
-                        move |_e, w, app| {
+                        move |w, app| {
                             if let Some(id) = mute_id.as_ref() {
                                 on_mute(id, w, app);
                             }
                         }
-                    })
-                    .into_any_element(),
-                )
-                .child(
-                    icon_button(
-                        None,
-                        "S",
-                        px(14.0),
-                        px(14.0),
-                        px(9.0),
-                        // Three states, matching the strip's S button: engaged,
-                        // sounded by a soloed parent instrument (dimmed accent),
-                        // and off.
-                        if row.solo {
-                            Colors::accent_primary()
-                        } else if row.solo_implied {
-                            Colors::with_alpha(Colors::accent_primary(), 0.55)
-                        } else {
-                            Colors::text_faint()
-                        },
-                    )
-                    .text_size(px(9.0))
-                    .id(("mixer-tree-solo", row_index))
-                    .on_click({
+                    },
+                ))
+                .child(tree_toggle(
+                    ("mixer-tree-solo", row_index).into(),
+                    "S",
+                    // Three states, matching the strip's S button: engaged,
+                    // sounded by a soloed parent instrument, and off.
+                    if row.solo {
+                        TreeToggle::On
+                    } else if row.solo_implied {
+                        TreeToggle::Implied
+                    } else {
+                        TreeToggle::Off
+                    },
+                    Colors::state_solo(),
+                    {
                         let solo_id = solo_id.clone();
-                        move |_e, w, app| {
+                        move |w, app| {
                             if let Some(id) = solo_id.as_ref() {
                                 on_solo(id, w, app);
                             }
                         }
-                    })
-                    .into_any_element(),
-                )
+                    },
+                ))
                 .into_any_element()
         }));
 
@@ -571,4 +648,55 @@ fn tree_row_element(
     });
 
     row_el
+}
+
+/// A tree row's M or S state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeToggle {
+    Off,
+    /// Engaged because a parent decided for it: a VSTi output channel under
+    /// its soloed instrument.
+    Implied,
+    On,
+}
+
+/// A tree row's M / S button, in the strips' latched colours: solid when on,
+/// washed when implied, outlined when off.
+fn tree_toggle(
+    id: gpui::ElementId,
+    label: &'static str,
+    state: TreeToggle,
+    semantic: gpui::Rgba,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let (bg, border, text) = match state {
+        TreeToggle::On => (semantic, semantic, Colors::on_color(semantic)),
+        TreeToggle::Implied => {
+            let (fill, border) = Colors::latched(TREE_PANEL_BG(), semantic);
+            (fill, border, semantic)
+        }
+        TreeToggle::Off => (
+            gpui::transparent_black().into(),
+            Colors::border_default(),
+            Colors::text_muted(),
+        ),
+    };
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(16.0))
+        .rounded(px(crate::theme::radius::MICRO))
+        .bg(bg)
+        .border(px(1.0))
+        .border_color(border)
+        .text_size(px(9.0))
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_color(text)
+        .cursor(gpui::CursorStyle::PointingHand)
+        .hover(|s| s.border_color(Colors::border_strong()))
+        .child(label)
+        .on_click(move |_e, w, app| on_click(w, app))
 }

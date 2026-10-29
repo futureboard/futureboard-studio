@@ -108,6 +108,7 @@ fn structure_key(split: &MixerSplit, strip_available_px: f32) -> u64 {
     q(split.insert_px).hash(&mut hasher);
     q(split.send_px).hash(&mut hasher);
     split.active_target.hash(&mut hasher);
+    split.view.hash(&mut hasher);
     q(strip_available_px).hash(&mut hasher);
     hasher.finish()
 }

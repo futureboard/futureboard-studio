@@ -20,7 +20,7 @@ use crate::components::mixer_master_strip_view::{
 use crate::components::mixer_meter_layer::{clip_region, ClipRegion, SharedMeterLayout};
 use crate::components::mixer_panel::{
     build_mixer_render_snapshot, collect_mixer_render_items, mixer_center_lightweight,
-    mixer_reserves_scrollbar, mixer_scrollbar_row, mixer_strip_height_with_scrollbar,
+    mixer_header, mixer_reserves_scrollbar, mixer_scrollbar_row, mixer_strip_height_with_scrollbar,
     mixer_strip_scroller, mixer_sub_header, mixer_visible_item_range, MixerRenderItem, MixerSplit,
     MixerSplitAction, MixerSplitDrag, VstiOutputMeterState, MIXER_SCROLLBAR_ROW,
 };
@@ -95,6 +95,10 @@ impl MixerPanelView {
                 &timeline.state.tracks,
             );
         let hidden = timeline.state.mixer_tree.hidden_channel_ids.clone();
+        let input_labels = crate::components::mixer_panel::mixer_input_labels(
+            &timeline.state.tracks,
+            &timeline.state.audio_connections,
+        );
         let render_items = collect_mixer_render_items(&timeline.state.tracks, &collapsed, &hidden);
         let strip_count = render_items.len();
         let visible_range =
@@ -153,6 +157,7 @@ impl MixerPanelView {
             selected_track_ids: timeline.state.selection.selected_track_ids.clone(),
             collapsed,
             hidden,
+            input_labels,
             vsti_output_meters: chrome.vsti_output_meters.clone(),
             scroll_x: chrome.scroll_x,
             viewport_width: chrome.viewport_width,
@@ -182,6 +187,7 @@ impl MixerPanelView {
         q(split.insert_px).hash(&mut hasher);
         q(split.send_px).hash(&mut hasher);
         split.active_target.hash(&mut hasher);
+        split.view.hash(&mut hasher);
         state.hidden.len().hash(&mut hasher);
         state.collapsed.len().hash(&mut hasher);
         hasher.finish()
@@ -195,6 +201,7 @@ struct MixerPanelViewState {
     selected_track_ids: Vec<String>,
     collapsed: HashSet<String>,
     hidden: HashSet<String>,
+    input_labels: HashMap<String, String>,
     vsti_output_meters: HashMap<String, VstiOutputMeterState>,
     scroll_x: f32,
     viewport_width: f32,
@@ -283,6 +290,7 @@ impl Render for MixerPanelView {
                 &state.collapsed,
                 &state.hidden,
                 &state.vsti_output_meters,
+                &state.input_labels,
                 state.scroll_x,
                 state.viewport_width,
                 state.strip_available_px,
@@ -381,14 +389,7 @@ impl Render for MixerPanelView {
                 (split_for_end.on_action)(MixerSplitAction::ResizeEnd, w, cx);
             })
             .child(mixer_sub_header(
-                state.track_count,
-                state.tracks.iter().filter(|track| track.solo).count(),
-                Some({
-                    let timeline = self.timeline.clone();
-                    std::sync::Arc::new(move |_window: &mut Window, cx: &mut App| {
-                        let _ = timeline.update(cx, |timeline, cx| timeline.clear_all_solos(cx));
-                    })
-                }),
+                mixer_header(&state.tracks, state.strip_count, &callbacks, &split),
                 i18n,
             ))
             .child(body)
@@ -408,6 +409,7 @@ fn build_mixer_split(owner: &Entity<StudioLayout>, cx: &App) -> MixerSplit {
         insert_px: layout.mixer_insert_section_px(),
         send_px: layout.mixer_send_section_px(),
         active_target: layout.mixer_split_active_target(),
+        view: layout.mixer_view_prefs(),
         on_action,
     }
 }
