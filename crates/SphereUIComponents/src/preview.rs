@@ -22,13 +22,12 @@ use crate::components::band_model::BandKind;
 use crate::components::builtin_plugin_editor::builtin_state_seed;
 use crate::components::builtin_plugin_editor_window::{BuiltinEditorHostOps, PluginInstanceKey};
 use crate::components::dyn_model::DynKind;
-use crate::components::eq_model::{EqKind, EqParams, Placement, Shape};
-use crate::components::eq_window::EqEditorWindow;
 use crate::components::fx_model::{presets, FxKind, FxParams};
 use crate::components::fx_window::{fx_window_size, FxEditorWindow};
 use crate::components::gate_panel::WayGateModel;
 use crate::components::mix_station_panel::MixStationModel;
 use crate::components::native_plugin_shell::ShellIdentity;
+use crate::components::plate;
 use crate::components::plugin_kit::{KitModel, KitWindow};
 use crate::components::white_sharp_panel::DOCK_H as WHITESHARP_DOCK_H;
 use crate::components::white_sharp_window::{Dock, WhiteSharpWindow, WHITESHARP_WINDOW_SIZE};
@@ -158,39 +157,45 @@ pub fn scenes() -> Vec<Scene> {
         },
         Scene {
             name: "equz8-empty",
-            width: 980.0,
-            height: 720.0,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: equz8_empty,
         },
         Scene {
             name: "equz8-vocal",
-            width: 980.0,
-            height: 720.0,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: equz8_vocal,
         },
         Scene {
-            name: "equz8-bypassed",
-            width: 980.0,
-            height: 720.0,
-            open: equz8_bypassed,
-        },
-        Scene {
             name: "equzx-empty",
-            width: 1_080.0,
-            height: 740.0,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: equzx_empty,
         },
         Scene {
             name: "equzx-mix",
-            width: 1_080.0,
-            height: 740.0,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: equzx_mix,
         },
         Scene {
-            name: "equzx-side-view",
-            width: 1_080.0,
-            height: 740.0,
-            open: equzx_side_view,
+            name: "zapp",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: zapp_scene,
+        },
+        Scene {
+            name: "zapp-fold",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: zapp_fold_scene,
+        },
+        Scene {
+            name: "zapp-small",
+            width: 760.0,
+            height: 570.0 + plate::SHELL_CHROME_H,
+            open: zapp_scene,
         },
         Scene {
             name: "verbspace-hall",
@@ -266,8 +271,8 @@ pub fn scenes() -> Vec<Scene> {
         },
         Scene {
             name: "burnlimit",
-            width: DynKind::BurnLimit.window_size().0,
-            height: DynKind::BurnLimit.window_size().1,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: burnlimit_scene,
         },
         Scene {
@@ -439,45 +444,6 @@ fn preview_host_ops() -> BuiltinEditorHostOps {
 /// the editor reads them on open.
 fn seed(plugin: &str, insert: &str, json: String) {
     builtin_state_seed(plugin, &key(insert).insert_id, json.as_bytes());
-}
-
-fn seed_eq(insert: &str, params: &EqParams) {
-    let json = match params {
-        EqParams::Z8(p) => equz8::ipc::Equz8State::new(p.clone()).to_json(),
-        EqParams::Zx(p) => equzx::ipc::EquzxState::new(p.clone()).to_json(),
-    };
-    let plugin = match params.kind() {
-        EqKind::Z8 => "equz8",
-        EqKind::Zx => "equzx",
-    };
-    if let Ok(json) = json {
-        seed(plugin, insert, json);
-    }
-}
-
-fn open_eq(
-    options: WindowOptions,
-    cx: &mut App,
-    kind: EqKind,
-    insert: &'static str,
-    then: impl FnOnce(&mut EqEditorWindow, &mut Context<EqEditorWindow>) + 'static,
-) -> Result<AnyWindowHandle> {
-    let title = kind.title();
-    let handle = cx.open_window(options, move |_, cx| {
-        cx.new(|cx| {
-            let mut editor = EqEditorWindow::new(
-                kind,
-                key(insert),
-                identity(title),
-                preview_host_ops(),
-                no_close(),
-                cx,
-            );
-            then(&mut editor, cx);
-            editor
-        })
-    })?;
-    Ok(handle.into())
 }
 
 // ── WhiteSharp ─────────────────────────────────────────────────────────────
@@ -696,7 +662,6 @@ fn dyn_json(
         DynParams::Fa2a(p) => fa2a::ipc::Fa2aState::new(p).to_json(),
         DynParams::Fa76(p) => fa76::ipc::Fa76State::new(p).to_json(),
         DynParams::Zcomp(p) => zcomp::ipc::ZcompState::new(p).to_json(),
-        DynParams::BurnLimit(p) => burnlimit::ipc::BurnLimitState::new(p).to_json(),
         DynParams::Clipper(p) => clipper67::ipc::Clipper67State::new(p).to_json(),
         DynParams::Transient(p) => transient::ipc::TransientState::new(p).to_json(),
     }
@@ -732,10 +697,6 @@ fn fa76_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
 
 fn zcomp_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     open_dyn(options, cx, DynKind::Zcomp, "Vocal Catch", 5.0)
-}
-
-fn burnlimit_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    open_dyn(options, cx, DynKind::BurnLimit, "Loud Punch", 4.0)
 }
 
 fn clipper67_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
@@ -1128,7 +1089,7 @@ fn echospace_ambient(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHa
     )
 }
 
-// ── EQ scenes ──────────────────────────────────────────────────────────────
+// ── Solfege Voxtune ────────────────────────────────────────────────────────
 
 /// A synthetic sung phrase — six notes with scoops and vibrato, gaps between
 /// them — analysed by the real engine, with a few edits made through the
@@ -1235,94 +1196,359 @@ fn voxtune_scene(
         .into())
 }
 
-fn equz8_empty(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    seed_eq("equz8-empty", &EqParams::defaults(EqKind::Z8));
-    open_eq(options, cx, EqKind::Z8, "equz8-empty", |_, _| {})
+// ── Plate editors: BurnLimit, EQUZ8, EQUZX and Zapp ───────────────────────
+
+/// Samples per telemetry frame at 48 kHz: the host publishes about every
+/// 33 ms.
+const PREVIEW_BLOCK: usize = 1_600;
+/// Ten seconds of frames, as the history keeps.
+const PREVIEW_BLOCKS: usize = 300;
+
+/// A drum-bus-like stereo signal at sample `n`: a kick every half second, a
+/// snare on the off-beat and a bed of noise — synthetic, for previews only.
+fn preview_signal(n: usize, noise: &mut u32) -> (f32, f32) {
+    const SR: f32 = 48_000.0;
+    let t = n as f32 / SR;
+    let beat = t * 2.0;
+    let phase = beat.fract();
+    let kick = (std::f32::consts::TAU * 55.0 * phase / 2.0).sin() * (-phase * 9.0).exp();
+    *noise ^= *noise << 13;
+    *noise ^= *noise >> 17;
+    *noise ^= *noise << 5;
+    let white = (*noise as f32 / u32::MAX as f32) * 2.0 - 1.0;
+    let off = (beat + 0.5).fract();
+    let snare = white * (-off * 14.0).exp() * if (beat as u32) % 2 == 1 { 0.5 } else { 0.0 };
+    let swell = 0.6 + 0.4 * (t * 0.7).sin();
+    let bed = white * 0.04 * swell;
+    let left = 0.5 * kick + 0.35 * snare + bed;
+    let right = 0.5 * kick + 0.3 * snare - bed * 0.6;
+    (left, right)
 }
 
-/// The "Vocal Clarity" preset with its 4.8 kHz band made a dynamic
-/// de-esser and selected, so the dynamics and their reach show.
-fn equz8_vocal_params() -> EqParams {
-    let preset = equz8::factory_presets()
+/// Runs `process` over ten seconds of [`preview_signal`], reading `meter`
+/// after every block as the host would.
+fn run_preview(
+    mut process: impl FnMut(f32, f32) -> (f32, f32),
+    mut meter: impl FnMut() -> SpherePluginHost::audio_bridge::BuiltinMeterFrame,
+) -> Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame> {
+    let mut noise = 0x2545_f491u32;
+    let mut frames = Vec::with_capacity(PREVIEW_BLOCKS);
+    for block in 0..PREVIEW_BLOCKS {
+        for i in 0..PREVIEW_BLOCK {
+            let (l, r) = preview_signal(block * PREVIEW_BLOCK + i, &mut noise);
+            let _ = process(l, r);
+        }
+        frames.push(meter());
+    }
+    frames
+}
+
+type PreviewBlock = [f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS];
+
+fn burnlimit_telemetry(
+    params: &burnlimit::Params,
+) -> (
+    Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame>,
+    PreviewBlock,
+) {
+    use waygate::StereoEffect;
+    let dsp = std::cell::RefCell::new(burnlimit::Dsp::new(48_000.0));
+    dsp.borrow_mut().set_params(params.clone());
+    let frames = run_preview(
+        |l, r| dsp.borrow_mut().process_stereo(l, r),
+        || {
+            let f = dsp.borrow().meter_frame();
+            SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                in_peak: f.in_peak,
+                in_rms: f.in_rms,
+                out_peak: f.out_peak,
+                out_rms: f.out_rms,
+                gain_reduction_db: f.gain_reduction_db,
+                in_clip: f.in_clip,
+                out_clip: f.out_clip,
+                ..Default::default()
+            }
+        },
+    );
+    let block = dsp.borrow().telemetry();
+    (frames, block)
+}
+
+fn zapp_telemetry(
+    params: &zapp::Params,
+) -> (
+    Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame>,
+    PreviewBlock,
+) {
+    use waygate::StereoEffect;
+    let dsp = std::cell::RefCell::new(zapp::Dsp::new(48_000.0));
+    dsp.borrow_mut().set_params(params.clone());
+    let frames = run_preview(
+        |l, r| dsp.borrow_mut().process_stereo(l, r),
+        || {
+            let f = dsp.borrow().meter_frame();
+            SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                in_peak: f.in_peak,
+                in_rms: f.in_rms,
+                out_peak: f.out_peak,
+                out_rms: f.out_rms,
+                in_clip: f.in_clip,
+                out_clip: f.out_clip,
+                ..Default::default()
+            }
+        },
+    );
+    let block = dsp.borrow().telemetry();
+    (frames, block)
+}
+
+fn equz8_telemetry(params: &equz8::Params) -> PreviewBlock {
+    use waygate::StereoEffect;
+    let dsp = std::cell::RefCell::new(equz8::Dsp::new(48_000.0));
+    dsp.borrow_mut().set_params(params.clone());
+    run_preview(
+        |l, r| dsp.borrow_mut().process_stereo(l, r),
+        Default::default,
+    );
+    let block = dsp.borrow().telemetry();
+    block
+}
+
+fn equzx_telemetry(params: &equzx::Params) -> PreviewBlock {
+    use waygate::StereoEffect;
+    let dsp = std::cell::RefCell::new(equzx::Dsp::new(48_000.0));
+    dsp.borrow_mut().set_params(params.clone());
+    run_preview(
+        |l, r| dsp.borrow_mut().process_stereo(l, r),
+        Default::default,
+    );
+    let block = dsp.borrow().telemetry();
+    block
+}
+
+/// Seeds `json` for `plugin` and opens plate editor `model` on it, its
+/// history and telemetry block filled from a run of the real DSP.
+#[allow(clippy::too_many_arguments)]
+fn open_plate<M: KitModel>(
+    options: WindowOptions,
+    cx: &mut App,
+    model: M,
+    plugin: &'static str,
+    insert: &'static str,
+    json: std::result::Result<String, serde_json::Error>,
+    frames: Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame>,
+    block: PreviewBlock,
+    then: impl FnOnce(&mut crate::components::plugin_kit::KitEditor<M>) + 'static,
+) -> Result<AnyWindowHandle> {
+    if let Ok(json) = json {
+        seed(plugin, insert, json);
+    }
+    plate::ensure_fonts(cx);
+    let last = frames.last().copied();
+    let host_ops = BuiltinEditorHostOps {
+        meter_source: last.map(|frame| {
+            Arc::new(move |_: &PluginInstanceKey| Some(frame))
+                as crate::components::builtin_plugin_editor_window::BuiltinMeterSource
+        }),
+        pad_level_source: Some(Arc::new(move |_| Some((1, block)))),
+        ..preview_host_ops()
+    };
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let window = KitWindow::new(
+                model,
+                key(insert),
+                identity(model.title()),
+                host_ops,
+                no_close(),
+                cx,
+            );
+            {
+                let mut live = window.live().borrow_mut();
+                for frame in frames {
+                    live.show(frame);
+                }
+                live.show_pads(block);
+                live.show_bands(Some(preview_spectrum()), None);
+            }
+            window.editor().update(cx, |editor, cx| {
+                then(editor);
+                cx.notify();
+            });
+            window
+        })
+    })?;
+    Ok(handle.into())
+}
+
+/// BurnLimit driven hard enough to limit: its Loud Master preset.
+fn burnlimit_preview_params() -> burnlimit::Params {
+    burnlimit::factory_presets()
+        .into_iter()
+        .find(|preset| preset.name == "Loud Master")
+        .map_or_else(burnlimit::default_params, |preset| preset.params)
+}
+
+fn burnlimit_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::burn_limit_plate::BurnLimitPlate;
+    let params = burnlimit_preview_params();
+    let (frames, block) = burnlimit_telemetry(&params);
+    let json = burnlimit::ipc::BurnLimitState::new(params).to_json();
+    open_plate(
+        options,
+        cx,
+        BurnLimitPlate,
+        "burnlimit",
+        "burnlimit-plate",
+        json,
+        frames,
+        block,
+        |_| {},
+    )
+}
+
+fn zapp_with(
+    options: WindowOptions,
+    cx: &mut App,
+    insert: &'static str,
+    params: zapp::Params,
+) -> Result<AnyWindowHandle> {
+    use crate::components::zapp_plate::ZappPlate;
+    let (frames, block) = zapp_telemetry(&params);
+    let json = zapp::ipc::ZappState::new(params).to_json();
+    open_plate(
+        options,
+        cx,
+        ZappPlate,
+        "zapp",
+        insert,
+        json,
+        frames,
+        block,
+        |_| {},
+    )
+}
+
+fn zapp_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    zapp_with(options, cx, "zapp", zapp::default_params())
+}
+
+fn zapp_fold_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let params = zapp::factory_presets()
+        .into_iter()
+        .find(|preset| preset.name == "Wavefolder")
+        .map_or_else(zapp::default_params, |preset| preset.params);
+    zapp_with(options, cx, "zapp-fold", params)
+}
+
+/// EQUZ8's vocal preset with band 5 riding its detector.
+fn equz8_vocal_params() -> equz8::Params {
+    let mut params = equz8::factory_presets()
         .iter()
-        .find(|preset| preset.name == "Vocal Clarity")
-        .map(|preset| preset.params.clone())
-        .unwrap_or_else(equz8::default_params);
-    let mut params = EqParams::Z8(preset);
-    let mut band = params.band(5);
+        .find(|preset| preset.name.contains("Vocal"))
+        .map_or_else(equz8::default_params, |preset| preset.params.clone());
+    let band = &mut params.bands[4];
+    band.active = true;
+    band.band_type = equz8::BandType::Bell;
     band.dynamic = true;
-    band.threshold_db = -30.0;
+    band.threshold_db = -40.0;
     band.range_db = -6.0;
-    band.attack_ms = 2.0;
-    band.release_ms = 80.0;
-    params.set_band(5, band);
+    band.ratio = 3.0;
     params
+}
+
+fn open_equz8(
+    options: WindowOptions,
+    cx: &mut App,
+    insert: &'static str,
+    params: equz8::Params,
+    selected: usize,
+) -> Result<AnyWindowHandle> {
+    use crate::components::equz8_plate::Equz8Plate;
+    let block = equz8_telemetry(&params);
+    let json = equz8::ipc::Equz8State::new(params).to_json();
+    open_plate(
+        options,
+        cx,
+        Equz8Plate,
+        "equz8",
+        insert,
+        json,
+        Vec::new(),
+        block,
+        move |editor| editor.ui.select(selected),
+    )
+}
+
+fn equz8_empty(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_equz8(options, cx, "equz8-empty", equz8::default_params(), 2)
 }
 
 fn equz8_vocal(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    seed_eq("equz8-vocal", &equz8_vocal_params());
-    open_eq(options, cx, EqKind::Z8, "equz8-vocal", |editor, cx| {
-        editor.select(5, cx)
-    })
+    open_equz8(options, cx, "equz8-vocal", equz8_vocal_params(), 4)
 }
 
-fn equz8_bypassed(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    let mut params = equz8_vocal_params();
-    params.set_power(false);
-    seed_eq("equz8-bypassed", &params);
-    open_eq(options, cx, EqKind::Z8, "equz8-bypassed", |_, _| {})
-}
-
-fn equzx_empty(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    seed_eq("equzx-empty", &EqParams::defaults(EqKind::Zx));
-    open_eq(options, cx, EqKind::Zx, "equzx-empty", |_, _| {})
-}
-
-/// A mix-bus layout: a steep low cut, a mid scoop on the mid only, a
-/// presence lift, a side-only air shelf and a dynamic de-esser.
-fn equzx_mix_params() -> EqParams {
-    use crate::components::eq_model::new_band;
-    let mut params = EqParams::defaults(EqKind::Zx);
-    let mut cut = new_band(EqKind::Zx, 32.0, 0.0, Placement::Stereo);
-    cut.shape = Shape::LowCut;
-    cut.slope = 48.0;
-    params.set_band(0, cut);
-    let mut scoop = new_band(EqKind::Zx, 380.0, -3.5, Placement::Mid);
-    scoop.q = 1.4;
-    params.set_band(1, scoop);
-    params.set_band(2, new_band(EqKind::Zx, 2_400.0, 2.0, Placement::Stereo));
-    let mut air = new_band(EqKind::Zx, 9_000.0, 4.0, Placement::Side);
-    air.shape = Shape::HighShelf;
-    air.q = 0.7;
-    params.set_band(3, air);
-    let mut ess = new_band(EqKind::Zx, 6_500.0, 0.0, Placement::Stereo);
-    ess.q = 3.0;
-    ess.dynamic = true;
-    ess.threshold_db = -28.0;
-    ess.range_db = -7.0;
-    params.set_band(4, ess);
-    let mut top = new_band(EqKind::Zx, 18_000.0, 0.0, Placement::Stereo);
-    top.shape = Shape::HighCut;
-    top.slope = 24.0;
-    params.set_band(5, top);
+/// A mix-bus EQUZX: a low cut, a mid scoop, presence, a dynamic de-esser,
+/// side air and a high cut.
+fn equzx_mix_params() -> equzx::Params {
+    use equzx::{BandChannel, BandType};
+    let mut params = equzx::default_params();
+    let mut band = |slot: usize, kind: BandType, freq: f32, gain: f32, q: f32| {
+        let b = &mut params.bands[slot];
+        b.active = true;
+        b.band_type = kind;
+        b.freq = freq;
+        b.gain_db = gain;
+        b.q = q;
+        b.ratio = 2.5;
+        b.threshold_db = -30.0;
+        b.range_db = -6.0;
+    };
+    band(0, BandType::LowCut, 30.0, 0.0, 0.71);
+    band(1, BandType::Bell, 180.0, -1.8, 2.0);
+    band(2, BandType::Bell, 380.0, -3.0, 4.0);
+    band(3, BandType::Bell, 2_400.0, 2.0, 1.0);
+    band(4, BandType::Bell, 6_800.0, -2.5, 6.0);
+    band(5, BandType::HighShelf, 11_000.0, 2.5, 0.71);
+    band(6, BandType::HighCut, 19_000.0, 0.0, 0.71);
+    params.bands[0].slope = 48.0;
+    params.bands[2].channel = BandChannel::Mid;
+    params.bands[4].dynamic = true;
+    params.bands[4].threshold_db = -45.0;
+    params.bands[5].channel = BandChannel::Side;
     params
 }
 
+fn open_equzx(
+    options: WindowOptions,
+    cx: &mut App,
+    insert: &'static str,
+    params: equzx::Params,
+    selected: Option<usize>,
+) -> Result<AnyWindowHandle> {
+    use crate::components::equzx_plate::EquzxPlate;
+    let block = equzx_telemetry(&params);
+    let json = equzx::ipc::EquzxState::new(params).to_json();
+    open_plate(
+        options,
+        cx,
+        EquzxPlate,
+        "equzx",
+        insert,
+        json,
+        Vec::new(),
+        block,
+        move |editor| editor.ui.select(selected),
+    )
+}
+
+fn equzx_empty(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    open_equzx(options, cx, "equzx-empty", equzx::default_params(), None)
+}
+
 fn equzx_mix(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    seed_eq("equzx-mix", &equzx_mix_params());
-    open_eq(options, cx, EqKind::Zx, "equzx-mix", |editor, cx| {
-        editor.select(4, cx)
-    })
+    open_equzx(options, cx, "equzx-mix", equzx_mix_params(), Some(4))
 }
-
-fn equzx_side_view(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    seed_eq("equzx-side-view", &equzx_mix_params());
-    open_eq(options, cx, EqKind::Zx, "equzx-side-view", |editor, cx| {
-        editor.set_view(Placement::Side, cx);
-        editor.select(3, cx);
-    })
-}
-
 // ── The other native plug-in editors, at their defaults ────────────────────
 
 macro_rules! default_editor {
@@ -1443,13 +1669,11 @@ mod tests {
     }
 
     #[test]
-    fn the_eq_scenes_hold_valid_params() {
-        for params in [equz8_vocal_params(), equzx_mix_params()] {
-            assert!(params
-                .listed()
-                .iter()
-                .any(|i| params.band(*i).dynamics_live()));
-        }
-        assert!(equzx_mix_params().uses_mid_side());
+    fn the_plate_previews_run_the_real_dsps() {
+        let (frames, block) = burnlimit_telemetry(&burnlimit_preview_params());
+        assert!(frames.iter().any(|frame| frame.gain_reduction_db > 0.0));
+        assert!(block[burnlimit::telemetry::SHORT_LUFS] > -60.0);
+        let (frames, _) = zapp_telemetry(&zapp::default_params());
+        assert!(frames.iter().any(|frame| frame.out_peak > 0.0));
     }
 }
