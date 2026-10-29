@@ -325,6 +325,7 @@ enum BuiltinDsp {
     Zcomp(zcomp::Dsp),
     MixStation(mixstation::Dsp),
     Compresser(compresser::Dsp),
+    Zapp(zapp::Dsp),
 }
 
 /// A built-in processor is created on the IPC thread and then owned exclusively
@@ -404,6 +405,7 @@ impl BuiltinHostProcessor {
             "zcomp" => Some(Self::zcomp(sample_rate, state_json)),
             "mixstation" => Some(Self::mixstation(sample_rate, state_json)),
             "compresser" => Some(Self::compresser(sample_rate, state_json)),
+            "zapp" => Some(Self::zapp(sample_rate, state_json)),
             _ => None,
         }
     }
@@ -971,6 +973,30 @@ impl BuiltinHostProcessor {
         }
     }
 
+    fn zapp(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = zapp::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match zapp::ipc::ZappState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] Zapp state rejected: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::Zapp(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            // Saturation loads nothing from disk.
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
     fn process_block(&self, in_l: &[f32], in_r: &[f32], interleaved: &mut [f32], frames: usize) {
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &mut *self.dsp.get() } {
@@ -1097,6 +1123,13 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
+            BuiltinDsp::Zapp(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
         }
     }
 
@@ -1142,6 +1175,10 @@ impl BuiltinHostProcessor {
         const _: () = assert!(drumsampler::PADS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(slicer::telemetry::SLOTS <= BUILTIN_PAD_SLOTS);
         const _: () = assert!(whitesharp::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
+        const _: () = assert!(zapp::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
+        const _: () = assert!(burnlimit::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
+        const _: () = assert!(equz8::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
+        const _: () = assert!(equzx::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &*self.dsp.get() } {
             BuiltinDsp::DrumSampler(dsp) => Some(dsp.pad_levels()),
@@ -1153,6 +1190,14 @@ impl BuiltinHostProcessor {
             }
             // WhiteSharp's newest pitch readings fill it (`whitesharp::telemetry`).
             BuiltinDsp::WhiteSharp(dsp) => Some(dsp.telemetry()),
+            // The auto gain Zapp applies (`zapp::telemetry`).
+            BuiltinDsp::Zapp(dsp) => Some(dsp.telemetry()),
+            // Per-channel peaks and loudness (`burnlimit::telemetry`).
+            BuiltinDsp::BurnLimit(dsp) => Some(dsp.telemetry()),
+            // Output peaks and each band's detector and dynamic gain
+            // (`equz8::telemetry`, `equzx::telemetry`).
+            BuiltinDsp::Equz8(dsp) => Some(dsp.telemetry()),
+            BuiltinDsp::Equzx(dsp) => Some(dsp.telemetry()),
             _ => None,
         }
     }
@@ -1420,6 +1465,22 @@ impl BuiltinHostProcessor {
                     slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
                 })
             }
+            BuiltinDsp::Zapp(dsp) => {
+                let f = dsp.meter_frame();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    in_peak: f.in_peak,
+                    in_rms: f.in_rms,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    // Saturation shapes the waveform; nothing is taken off.
+                    gain_reduction_db: 0.0,
+                    in_clip: f.in_clip,
+                    out_clip: f.out_clip,
+                    // Single fixed stage, not a user-ordered rack.
+                    slot_in_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
             BuiltinDsp::Equz8(_)
             | BuiltinDsp::Equzx(_)
             | BuiltinDsp::Verbspace(_)
@@ -1458,6 +1519,8 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Zcomp(dsp) => dsp.latency_samples(),
             BuiltinDsp::MixStation(dsp) => dsp.latency_samples(),
             BuiltinDsp::Compresser(dsp) => dsp.latency_samples(),
+            // The oversampler's filter delay, when it is on.
+            BuiltinDsp::Zapp(dsp) => dsp.latency_samples(),
         }
     }
 
@@ -1530,6 +1593,9 @@ impl BuiltinHostProcessor {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::Compresser(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::Zapp(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
         }
@@ -2272,8 +2338,68 @@ mod builtin_processor_tests {
         );
     }
 
-    /// Like the reverb, a delay's output outlives its input: the check that
-    /// matters is that repeats keep arriving across block boundaries, which a
+    /// Zapp restores its params, reports its oversampler's delay, meters
+    /// what it shapes and publishes the auto gain it applies.
+    #[test]
+    fn zapp_restores_state_reports_latency_and_publishes_auto_gain() {
+        let mut params = zapp::default_params();
+        params.drive_db = 18.0;
+        params.oversampling = zapp::Oversampling::X4;
+        let json = zapp::ipc::ZappState::new(params)
+            .to_json()
+            .expect("state serializes");
+        let processor = BuiltinHostProcessor::zapp(48_000, Some(&json));
+        assert_eq!(processor.latency_samples(), 32);
+        let mut phase = 0.0f32;
+        let mut output = [0.0f32; 256];
+        for _ in 0..400 {
+            let block: [f32; 128] = std::array::from_fn(|_| {
+                phase = (phase + 220.0 / 48_000.0).fract();
+                (std::f32::consts::TAU * phase).sin() * 0.5
+            });
+            processor.process_block(&block, &block, &mut output, 128);
+            assert!(output.iter().all(|s| s.is_finite()));
+        }
+        let frame = processor.meter_frame().expect("Zapp meters itself");
+        assert!(frame.in_peak > 0.4 && frame.out_peak > 0.0);
+        let block = processor
+            .pad_levels()
+            .expect("Zapp publishes its telemetry");
+        // Driven 18 dB, it is louder than its input: auto gain takes some off.
+        assert!(block[zapp::telemetry::AUTO_GAIN_DB] < -0.5);
+
+        let oversampling = zapp::ui_param_index("oversampling").expect("in the wire table");
+        processor.apply_param(oversampling, zapp::Oversampling::Off.to_wire());
+        assert_eq!(processor.latency_samples(), 0);
+    }
+
+    /// BurnLimit and both EQs publish their editor telemetry blocks:
+    /// BurnLimit's per-channel peaks and loudness, the EQs' output peaks.
+    #[test]
+    fn limiter_and_eqs_publish_their_telemetry_blocks() {
+        let mut phase = 0.0f32;
+        let mut run = |processor: &BuiltinHostProcessor| {
+            let mut output = [0.0f32; 256];
+            for _ in 0..600 {
+                let block: [f32; 128] = std::array::from_fn(|_| {
+                    phase = (phase + 1_000.0 / 48_000.0).fract();
+                    (std::f32::consts::TAU * phase).sin() * 0.25
+                });
+                processor.process_block(&block, &block, &mut output, 128);
+            }
+            processor.pad_levels().expect("a telemetry block")
+        };
+        let limiter = BuiltinHostProcessor::burnlimit(48_000, None);
+        let block = run(&limiter);
+        assert!(block[burnlimit::telemetry::OUT_L] > 0.1);
+        assert!(block[burnlimit::telemetry::SHORT_LUFS] > -40.0);
+        let eq = BuiltinHostProcessor::equz8(48_000, None);
+        assert!(run(&eq)[equz8::telemetry::OUT_L] > 0.1);
+        let wide = BuiltinHostProcessor::equzx(48_000, None);
+        assert!(run(&wide)[equzx::telemetry::OUT_R] > 0.1);
+    }
+
+    /// Like the reverb, a delay's output outlives its input: the check that    /// matters is that repeats keep arriving across block boundaries, which a
     /// per-block DSP rebuild would silence after the first one.
     #[test]
     fn echospace_repeats_survive_block_boundaries() {

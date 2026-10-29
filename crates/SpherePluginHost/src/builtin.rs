@@ -136,6 +136,13 @@ const CATALOG: &[BuiltinEntry] = &[
         editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
+        stem: "zapp",
+        name: "Zapp",
+        category: "Effect",
+        kind: PluginKind::Effect,
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
         stem: "clipper67",
         name: "67Clipper",
         category: "Dynamics",
@@ -275,6 +282,7 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "compresser",
     "quicksampler",
     "slicer",
+    "zapp",
 ];
 
 /// Whether this built-in currently has an out-of-process audio DSP runtime.
@@ -411,6 +419,7 @@ mod tests {
             "compresser",
             "imager",
             "mixstation",
+            "zapp",
         ] {
             assert_eq!(
                 builtin_editor_kind(&builtin_id(stem)),
