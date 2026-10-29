@@ -126,6 +126,8 @@ pub const UI_PARAM_IDS: &[&str] = &[
     "eq_model",      // 107
     "eq2_model",     // 108
     "nam_slim_size", // 109
+    // Runtime-only: the editor's tuner. Not saved with the state.
+    "tuner_on", // 110
 ];
 
 /// String id → wire index. Linear scan over a small table — control/UI
@@ -177,7 +179,7 @@ mod tests {
     /// accidental reorder/insert must fail here, loudly.
     #[test]
     fn wire_indices_are_pinned() {
-        assert_eq!(UI_PARAM_IDS.len(), 110);
+        assert_eq!(UI_PARAM_IDS.len(), 111);
         assert_eq!(ui_param_index("power"), Some(0));
         assert_eq!(ui_param_index("gate_on"), Some(3));
         assert_eq!(ui_param_index("drive_model"), Some(10));
@@ -224,6 +226,8 @@ mod tests {
         assert_eq!(ui_param_index("eq_model"), Some(107));
         assert_eq!(ui_param_index("eq2_model"), Some(108));
         assert_eq!(ui_param_index("nam_slim_size"), Some(109));
+        // Appended after the last pre-tuner id, which keeps its index.
+        assert_eq!(ui_param_index("tuner_on"), Some(110));
     }
 
     /// `ui_values` must cover every wire id except `clear_clip` (an action,

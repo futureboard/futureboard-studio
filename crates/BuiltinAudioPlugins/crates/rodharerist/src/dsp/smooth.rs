@@ -44,6 +44,12 @@ impl Smoothed {
         self.current = self.target;
     }
 
+    /// Where the glide is now, without advancing it.
+    #[inline]
+    pub(super) fn value(&self) -> f32 {
+        self.current
+    }
+
     #[inline]
     pub(super) fn tick(&mut self) -> f32 {
         self.current = self.target + (self.current - self.target) * self.coeff;

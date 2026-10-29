@@ -80,6 +80,36 @@ mod tests {
     }
 
     #[test]
+    fn capture_and_ir_file_names_are_saved_and_optional() {
+        let mut params = default_params();
+        params.nam_file = Some("Plexi Lead.nam".into());
+        params.ir_file = Some("Vintage 4x12 SM57.wav".into());
+        let json = RodhareistState::new(params.clone()).to_json().unwrap();
+        let restored = RodhareistState::from_json(&json).unwrap();
+        assert_eq!(restored.params.nam_file, params.nam_file);
+        assert_eq!(restored.params.ir_file, params.ir_file);
+
+        // A save from before the fields existed, and one with nothing loaded,
+        // carry no key at all and load with nothing.
+        let empty = RodhareistState::new(default_params()).to_json().unwrap();
+        assert!(!empty.contains("nam_file") && !empty.contains("ir_file"));
+        let restored = RodhareistState::from_json(&empty).unwrap();
+        assert_eq!(restored.params.nam_file, None);
+        assert_eq!(restored.params.ir_file, None);
+    }
+
+    #[test]
+    fn the_dsp_keeps_no_file_names() {
+        let mut params = default_params();
+        params.nam_file = Some("amp.nam".into());
+        params.ir_file = Some("cab.wav".into());
+        let mut dsp = crate::Dsp::new(48_000.0);
+        dsp.set_params(params);
+        assert_eq!(dsp.params().nam_file, None);
+        assert_eq!(dsp.params().ir_file, None);
+    }
+
+    #[test]
     fn malformed_json_is_a_clean_error_not_a_panic() {
         assert!(RodhareistState::from_json("not json").is_err());
         assert!(RodhareistState::from_json("{}").is_err());

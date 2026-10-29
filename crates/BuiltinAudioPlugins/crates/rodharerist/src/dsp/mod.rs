@@ -44,6 +44,7 @@ mod reverb;
 mod smooth;
 mod tone_stage;
 mod tremolo;
+mod tuner;
 mod wah;
 mod wav;
 
@@ -70,6 +71,7 @@ pub use nam::{
 use reverb::PlateReverb;
 pub use tone_stage::ToneEngineKind;
 use tone_stage::ToneStage;
+use tuner::Tuner;
 use wah::Wah;
 
 pub const PLUGIN_ID: &str = "futureboard.rodharerist";
@@ -859,6 +861,25 @@ pub struct Params {
     /// legal set which no path references, so an old project loads unchanged.
     #[serde(default)]
     pub stage_b: StageBParams,
+
+    /// The editor's tuner is listening to the input. A view of the rig, not
+    /// part of the tone: never saved, so a project or preset always opens
+    /// with it off.
+    #[serde(skip)]
+    pub tuner_on: bool,
+
+    /// The `.nam` capture the amp's capture engine runs, as a file name in
+    /// the editor's NAMs folder, and the cabinet IR the cab's convolver runs,
+    /// in its IRs folder. Saved with the project so Studio can send the
+    /// files to a DSP that starts empty (a project open, a host restart) —
+    /// a capture or IR only ever reaches the DSP as a load, never as a
+    /// parameter. The DSP never reads them and keeps neither in its own copy
+    /// (see [`Dsp::set_params`]), so its audio-thread parameter path stays
+    /// allocation-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nam_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ir_file: Option<String>,
 }
 
 /// Read the saved path, accepting the shorter array an older project wrote.
@@ -1146,6 +1167,9 @@ pub fn default_params() -> Params {
         nam_loudness_norm: true,
         nam_slim_size: default_nam_slim_size(),
         stage_b: StageBParams::default(),
+        tuner_on: false,
+        nam_file: None,
+        ir_file: None,
     }
 }
 
@@ -1522,6 +1546,8 @@ pub struct Dsp {
     in_gain: smooth::Smoothed,
     out_gain: smooth::Smoothed,
     meters: Meters,
+    /// Pitch of the input while the editor's tuner is on.
+    tuner: Tuner,
     /// Dry (0) to the running rig (1). Power fades rather than cuts; once
     /// off and settled nothing runs.
     power: PowerFade,
@@ -1599,6 +1625,12 @@ pub struct MeterFrame {
 struct Meters {
     in_peak: f32,
     out_peak: f32,
+    /// Each channel's peak and mean square, for the editor's L/R meters —
+    /// the same ballistics as the both-channel readings.
+    in_peak_lr: [f32; 2],
+    out_peak_lr: [f32; 2],
+    in_ms_lr: [f32; 2],
+    out_ms_lr: [f32; 2],
     /// Mean-square running averages; `sqrt` is deferred to the reader so the
     /// audio path stays a multiply-add.
     in_ms: f32,
@@ -1614,6 +1646,10 @@ impl Meters {
         Self {
             in_peak: 0.0,
             out_peak: 0.0,
+            in_peak_lr: [0.0; 2],
+            out_peak_lr: [0.0; 2],
+            in_ms_lr: [0.0; 2],
+            out_ms_lr: [0.0; 2],
             in_ms: 0.0,
             out_ms: 0.0,
             rms_coeff: time_constant(sample_rate, 0.300),
@@ -1625,6 +1661,10 @@ impl Meters {
     fn reset(&mut self) {
         self.in_peak = 0.0;
         self.out_peak = 0.0;
+        self.in_peak_lr = [0.0; 2];
+        self.out_peak_lr = [0.0; 2];
+        self.in_ms_lr = [0.0; 2];
+        self.out_ms_lr = [0.0; 2];
         self.in_ms = 0.0;
         self.out_ms = 0.0;
         self.in_clip = false;
@@ -1672,6 +1712,7 @@ impl Dsp {
             in_gain: smooth::Smoothed::new(sr, TRIM_SMOOTH_SECONDS, 1.0),
             out_gain: smooth::Smoothed::new(sr, TRIM_SMOOTH_SECONDS, 1.0),
             meters: Meters::new(sr),
+            tuner: Tuner::new(sr),
             power: PowerFade::new(true, sr),
             fresh: true,
         };
@@ -1704,6 +1745,28 @@ impl Dsp {
             in_clip: self.meters.in_clip,
             out_clip: self.meters.out_clip,
         }
+    }
+
+    /// The editor's telemetry block ([`telemetry`]): each channel's input and
+    /// output peak and RMS, and the tuner's reading. Plain copies of scalar
+    /// state — cheap enough for the producer thread once a block.
+    pub fn telemetry(&self) -> [f32; telemetry::SLOTS] {
+        let m = &self.meters;
+        let mut block = [0.0; telemetry::SLOTS];
+        block[telemetry::IN_L] = m.in_peak_lr[0];
+        block[telemetry::IN_R] = m.in_peak_lr[1];
+        block[telemetry::OUT_L] = m.out_peak_lr[0];
+        block[telemetry::OUT_R] = m.out_peak_lr[1];
+        block[telemetry::IN_RMS_L] = m.in_ms_lr[0].max(0.0).sqrt();
+        block[telemetry::IN_RMS_R] = m.in_ms_lr[1].max(0.0).sqrt();
+        block[telemetry::OUT_RMS_L] = m.out_ms_lr[0].max(0.0).sqrt();
+        block[telemetry::OUT_RMS_R] = m.out_ms_lr[1].max(0.0).sqrt();
+        if self.params.tuner_on {
+            let reading = self.tuner.reading();
+            block[telemetry::TUNER_HZ] = reading.hz;
+            block[telemetry::TUNER_CLARITY] = reading.clarity;
+        }
+        block
     }
 
     /// Clear the sticky clip indicators (editor click-to-reset).
@@ -1790,7 +1853,17 @@ impl Dsp {
             nam_loudness_norm: params.nam_loudness_norm,
             nam_slim_size: clamp(params.nam_slim_size, 0.0, 100.0),
             stage_b: params.stage_b.clamped(),
+            tuner_on: params.tuner_on,
+            // File names are Studio's business, not the DSP's: dropping them
+            // here keeps every later clone of these params (the per-edit
+            // path on the audio thread) free of heap data.
+            nam_file: None,
+            ir_file: None,
         };
+        if next.tuner_on && !self.params.tuner_on {
+            // Listening again: what it heard last time is not this note.
+            self.tuner.reset();
+        }
         let old = std::mem::replace(&mut self.params, next);
         self.configure_stages(Some(&old));
         self.apply_power();
@@ -2340,6 +2413,7 @@ pub fn apply_to_params(p: &mut Params, id: &str, value: f32) -> bool {
         "nam_mix" => p.nam_mix = value,
         "nam_loudness_norm" => p.nam_loudness_norm = on,
         "nam_slim_size" => p.nam_slim_size = value,
+        "tuner_on" => p.tuner_on = value >= 0.5,
 
         // Second instances. Same knob names with the stage's `2` suffix, so an
         // id reads as "which block" then "which knob" — `chorus2_rate` is the
@@ -2516,6 +2590,7 @@ pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
     out.push(("comp2_attack", sb.comp_attack_ms));
     out.push(("comp2_release", sb.comp_release_ms));
     out.push(("comp2_makeup", sb.comp_makeup_db));
+    out.push(("tuner_on", b(p.tuner_on)));
     out
 }
 
@@ -2561,6 +2636,7 @@ impl StereoEffect for Dsp {
         self.mod_b.reset();
         self.delay_b.reset();
         self.meters.reset();
+        self.tuner.reset();
         self.in_gain.snap();
         self.out_gain.snap();
         self.power.settle();
@@ -2590,12 +2666,21 @@ impl StereoEffect for Dsp {
         self.delay_b.set_sample_rate(sr);
         self.cab_ir_step = 1.0 / (sr * CAB_ENGINE_FADE_SECONDS).max(1.0);
         self.meters.rms_coeff = time_constant(sr, 0.300);
+        if self.tuner.sample_rate() != sr {
+            // Control thread: the tuner's buffers are sized for its rate.
+            self.tuner = Tuner::new(sr);
+        }
         self.power.step = PowerFade::step_for(sr);
         self.power.settle();
         self.apply_params();
     }
 
     fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        // The tuner hears the input whether or not the rig is on — a player
+        // tunes with the board bypassed as often as not.
+        if self.params.tuner_on {
+            self.tuner.push((left + right) * 0.5 * self.in_gain.value());
+        }
         if self.power.is_off() {
             return (left, right);
         }
@@ -2629,6 +2714,12 @@ impl Dsp {
         if in_level >= CLIP_THRESHOLD {
             self.meters.in_clip = true;
         }
+        Self::meter_channels(
+            &mut self.meters.in_peak_lr,
+            &mut self.meters.in_ms_lr,
+            [l, r],
+            self.meters.rms_coeff,
+        );
 
         for slot in self.params.stage_order {
             let Some(stage) = slot else { continue };
@@ -2728,8 +2819,48 @@ impl Dsp {
         if out_level >= CLIP_THRESHOLD {
             self.meters.out_clip = true;
         }
+        Self::meter_channels(
+            &mut self.meters.out_peak_lr,
+            &mut self.meters.out_ms_lr,
+            [l, r],
+            self.meters.rms_coeff,
+        );
         (l, r)
     }
+
+    /// One frame into a per-channel peak and mean square, with the
+    /// both-channel meters' fall and window.
+    #[inline]
+    fn meter_channels(peak: &mut [f32; 2], ms: &mut [f32; 2], frame: [f32; 2], rms_coeff: f32) {
+        for ((peak, ms), x) in peak.iter_mut().zip(ms.iter_mut()).zip(frame) {
+            let level = x.abs();
+            *peak = level.max(*peak - *peak * 0.0005);
+            *ms = level * level + rms_coeff * (*ms - level * level);
+        }
+    }
+}
+
+/// The editor's telemetry block, published through the host's 64-slot
+/// pad-level channel ([`Dsp::telemetry`]).
+pub mod telemetry {
+    /// Slots in the block.
+    pub const SLOTS: usize = 64;
+    /// Input peak per channel, linear, after the input trim; the meter
+    /// frame's fall.
+    pub const IN_L: usize = 0;
+    pub const IN_R: usize = 1;
+    /// Output peak per channel, linear, after the output trim.
+    pub const OUT_L: usize = 2;
+    pub const OUT_R: usize = 3;
+    /// RMS per channel, linear, over the meter frame's ~300 ms window.
+    pub const IN_RMS_L: usize = 4;
+    pub const IN_RMS_R: usize = 5;
+    pub const OUT_RMS_L: usize = 6;
+    pub const OUT_RMS_R: usize = 7;
+    /// The tuner's reading in Hz; 0 for no confident pitch or the tuner off.
+    pub const TUNER_HZ: usize = 8;
+    /// How periodic the tuner's last frame was, 0–1.
+    pub const TUNER_CLARITY: usize = 9;
 }
 
 // ---------------------------------------------------------------------------
@@ -4551,5 +4682,102 @@ mod tests {
         let a = render(&mut edited, 9_600);
         let b = render(&mut full, 9_600);
         assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+
+    /// Plays `seconds` of a sine at `hz` (left only when `left_only`) and
+    /// returns the telemetry block.
+    fn play(dsp: &mut Dsp, sr: f32, hz: f32, seconds: f32, left_only: bool) -> [f32; 64] {
+        for n in 0..(sr * seconds) as usize {
+            let x = 0.3 * (std::f32::consts::TAU * hz * n as f32 / sr).sin();
+            let _ = dsp.process_stereo(x, if left_only { 0.0 } else { x });
+        }
+        dsp.telemetry()
+    }
+
+    #[test]
+    fn the_tuner_reads_the_input_only_while_on() {
+        let sr = 48_000.0;
+        let mut dsp = Dsp::new(sr);
+        let block = play(&mut dsp, sr, 110.0, 0.6, false);
+        assert_eq!(block[telemetry::TUNER_HZ], 0.0, "off reports no pitch");
+
+        assert!(dsp.apply_ui_param("tuner_on", 1.0));
+        for hz in [41.2f32, 82.4, 110.0, 196.0, 329.6, 440.0, 1_000.0] {
+            let block = play(&mut dsp, sr, hz, 0.75, false);
+            let found = block[telemetry::TUNER_HZ];
+            assert!(found > 0.0, "{hz} Hz: no pitch");
+            let cents = 1_200.0 * (found / hz).log2();
+            assert!(cents.abs() < 2.0, "{hz} Hz: {cents:+.2} c");
+            assert!(block[telemetry::TUNER_CLARITY] > 0.8);
+        }
+
+        // Silence lets the note go.
+        for _ in 0..(sr as usize / 2) {
+            let _ = dsp.process_stereo(0.0, 0.0);
+        }
+        assert_eq!(dsp.telemetry()[telemetry::TUNER_HZ], 0.0);
+
+        // And it hears the input with the rig bypassed.
+        assert!(dsp.apply_ui_param("power", 0.0));
+        let block = play(&mut dsp, sr, 220.0, 0.75, false);
+        assert!((1_200.0 * (block[telemetry::TUNER_HZ] / 220.0).log2()).abs() < 2.0);
+
+        assert!(dsp.apply_ui_param("tuner_on", 0.0));
+        assert_eq!(dsp.telemetry()[telemetry::TUNER_HZ], 0.0);
+    }
+
+    #[test]
+    fn noise_has_no_pitch() {
+        let mut dsp = Dsp::new(48_000.0);
+        assert!(dsp.apply_ui_param("tuner_on", 1.0));
+        let mut seed = 7u32;
+        for _ in 0..36_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let x = (seed as f32 / u32::MAX as f32 - 0.5) * 0.6;
+            let _ = dsp.process_stereo(x, x);
+        }
+        let block = dsp.telemetry();
+        assert!(
+            block[telemetry::TUNER_HZ] == 0.0 || block[telemetry::TUNER_CLARITY] < 0.3,
+            "noise read as {} Hz",
+            block[telemetry::TUNER_HZ]
+        );
+    }
+
+    #[test]
+    fn each_channel_meters_its_own_level() {
+        let sr = 48_000.0;
+        let mut dsp = Dsp::new(sr);
+        let block = play(&mut dsp, sr, 220.0, 0.3, true);
+        assert!(block[telemetry::IN_L] > 0.2);
+        assert!(block[telemetry::IN_R] < 1.0e-6);
+        assert!(block[telemetry::IN_RMS_L] > 0.1);
+        assert!(block[telemetry::IN_RMS_R] < 1.0e-6);
+        assert!(block[telemetry::OUT_L].is_finite() && block[telemetry::OUT_R].is_finite());
+        // The both-channel frame still reads the louder side.
+        let frame = dsp.meter_frame();
+        assert!((frame.in_peak - block[telemetry::IN_L]).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn the_tuner_switch_is_never_saved() {
+        let mut params = default_params();
+        params.tuner_on = true;
+        let json = crate::RodhareistState::new(params)
+            .to_json()
+            .expect("serializes");
+        assert!(!json.contains("tuner"), "{json}");
+        let restored = crate::RodhareistState::from_json(&json).expect("parses");
+        assert!(!restored.params.tuner_on);
+        for preset in crate::factory_presets() {
+            assert!(!preset.params.tuner_on, "{}", preset.name);
+        }
     }
 }
