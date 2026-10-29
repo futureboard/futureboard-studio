@@ -8496,6 +8496,7 @@ dependencies = [
  "whitesharp",
  "windows 0.61.3",
  "wrapsynth",
+ "zapp",
  "zcomp",
 ]
 
@@ -8615,6 +8616,7 @@ dependencies = [
  "windows-core 0.61.2",
  "wrapsynth",
  "x11-dl",
+ "zapp",
  "zcomp",
  "zed-reqwest",
  "zip 2.4.2",
@@ -11744,6 +11746,16 @@ dependencies = [
  "quote",
  "syn 2.0.117",
  "synstructure",
+]
+
+[[package]]
+name = "zapp"
+version = "2026.10.16-beta1.4.4"
+dependencies = [
+ "biquad",
+ "builtin_dsp_core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

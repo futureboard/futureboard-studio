@@ -65,6 +65,7 @@ members = [
     "crates/BuiltinAudioPlugins/crates/rodharerist",
     "crates/BuiltinAudioPlugins/crates/verbspace",
     "crates/BuiltinAudioPlugins/crates/whitesharp",
+    "crates/BuiltinAudioPlugins/crates/zapp",
     "crates/solfege_spatialaudio",
     "xtask"
 ]
@@ -169,6 +170,7 @@ mixstation = { path = "crates/BuiltinAudioPlugins/crates/mixstation" }
 rodharerist = { path = "crates/BuiltinAudioPlugins/crates/rodharerist" }
 verbspace = { path = "crates/BuiltinAudioPlugins/crates/verbspace" }
 whitesharp = { path = "crates/BuiltinAudioPlugins/crates/whitesharp" }
+zapp = { path = "crates/BuiltinAudioPlugins/crates/zapp" }
 
 # MIT/Apache-2.0 DSP libraries used by BuiltinAudioPlugins.
 biquad = "0.6"
