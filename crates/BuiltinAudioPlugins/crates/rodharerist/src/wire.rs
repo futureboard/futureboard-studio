@@ -128,6 +128,26 @@ pub const UI_PARAM_IDS: &[&str] = &[
     "nam_slim_size", // 109
     // Runtime-only: the editor's tuner. Not saved with the state.
     "tuner_on", // 110
+    // The Stereo delay model's right side, on each delay block.
+    "delay_time_r",  // 111
+    "delay_fb_r",    // 112
+    "delay2_time_r", // 113
+    "delay2_fb_r",   // 114
+    // Which side of the path each block runs on (`StageChannel`), in
+    // `StageKind::ALL` order; the amp and cabinet always run on both.
+    "gate_channel",   // 115
+    "drive_channel",  // 116
+    "mod_channel",    // 117
+    "delay_channel",  // 118
+    "reverb_channel", // 119
+    "comp_channel",   // 120
+    "eq_channel",     // 121
+    "wah_channel",    // 122
+    "drive2_channel", // 123
+    "mod2_channel",   // 124
+    "delay2_channel", // 125
+    "eq2_channel",    // 126
+    "comp2_channel",  // 127
 ];
 
 /// String id → wire index. Linear scan over a small table — control/UI
@@ -179,7 +199,7 @@ mod tests {
     /// accidental reorder/insert must fail here, loudly.
     #[test]
     fn wire_indices_are_pinned() {
-        assert_eq!(UI_PARAM_IDS.len(), 111);
+        assert_eq!(UI_PARAM_IDS.len(), 128);
         assert_eq!(ui_param_index("power"), Some(0));
         assert_eq!(ui_param_index("gate_on"), Some(3));
         assert_eq!(ui_param_index("drive_model"), Some(10));
@@ -228,6 +248,26 @@ mod tests {
         assert_eq!(ui_param_index("nam_slim_size"), Some(109));
         // Appended after the last pre-tuner id, which keeps its index.
         assert_eq!(ui_param_index("tuner_on"), Some(110));
+        assert_eq!(ui_param_index("delay_time_r"), Some(111));
+        assert_eq!(ui_param_index("delay2_fb_r"), Some(114));
+        assert_eq!(ui_param_index("gate_channel"), Some(115));
+        assert_eq!(ui_param_index("delay_channel"), Some(118));
+        assert_eq!(ui_param_index("comp2_channel"), Some(127));
+    }
+
+    /// Every block that can run on one side has its channel on the wire,
+    /// and the amp and cabinet have none.
+    #[test]
+    fn every_splitting_block_has_a_channel_id() {
+        for kind in StageKind::ALL {
+            match kind.channel_id() {
+                Some(id) => {
+                    assert!(kind.splits(), "{kind:?}");
+                    assert!(ui_param_index(id).is_some(), "`{id}` not on the wire");
+                }
+                None => assert!(!kind.splits(), "{kind:?} splits but has no id"),
+            }
+        }
     }
 
     /// `ui_values` must cover every wire id except `clear_clip` (an action,
@@ -282,6 +322,10 @@ mod tests {
         src.eq_mid2_gain_db = -9.0;
         src.nam_loudness_norm = false;
         src.nam_slim_size = 40.0;
+        src.delay_time_r_ms = 260.0;
+        src.stage_b.delay_fb_r = 70.0;
+        src.stage_channel[StageKind::Delay as usize] = crate::StageChannel::Left;
+        src.stage_channel[StageKind::Wah as usize] = crate::StageChannel::Right;
 
         let mut restored = default_params();
         for (id, value) in ui_values(&src) {
@@ -398,7 +442,7 @@ mod tests {
                 "mod `{id}`"
             );
         }
-        let delay = ["tape", "digital", "analog", "ping_pong", "dual"];
+        let delay = ["tape", "digital", "analog", "ping_pong", "dual", "stereo"];
         for (i, id) in delay.iter().enumerate() {
             assert_eq!(
                 DelayModel::from_model_id(id),

@@ -360,6 +360,18 @@ pub fn scenes() -> Vec<Scene> {
             open: rodhareist_pedalboard,
         },
         Scene {
+            name: "rodhareist-nam",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_nam,
+        },
+        Scene {
+            name: "rodhareist-stereo",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_stereo,
+        },
+        Scene {
             name: "rodhareist-settings",
             width: plate::WINDOW_SIZE.0,
             height: plate::WINDOW_SIZE.1,
@@ -1592,6 +1604,19 @@ macro_rules! default_editor {
 /// the preview drum bus.
 fn rodhareist_on(
     page: crate::components::rodhareist_panel::Page,
+    edit: fn(&mut rodharerist::Params),
+    options: WindowOptions,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    // On the Pedalboard, the busiest block: the amp, six knobs.
+    rodhareist_focused(page, edit, rodharerist::StageKind::Amp, options, cx)
+}
+
+/// [`rodhareist_on`], the Pedalboard showing `focus`.
+fn rodhareist_focused(
+    page: crate::components::rodhareist_panel::Page,
+    edit: fn(&mut rodharerist::Params),
+    focus: rodharerist::StageKind,
     options: WindowOptions,
     cx: &mut App,
 ) -> Result<AnyWindowHandle> {
@@ -1614,10 +1639,12 @@ fn rodhareist_on(
             );
             window.show_pads(block);
             window.show_page(page);
+            let mut params = window.params_snapshot();
+            edit(&mut params);
+            window.set_params(params, cx);
             if page == crate::components::rodhareist_panel::Page::Pedalboard {
-                // The busiest block: the amp, six knobs.
                 window.chain_focus = Some(crate::components::rodhareist_panel::ChainFocus::Block(
-                    rodharerist::StageKind::Amp,
+                    focus,
                 ));
             }
             window
@@ -1627,12 +1654,21 @@ fn rodhareist_on(
 }
 
 fn rodhareist(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
-    rodhareist_on(crate::components::rodhareist_panel::Page::Home, options, cx)
+    rodhareist_on(
+        crate::components::rodhareist_panel::Page::Home,
+        |p| {
+            p.input_trim_db = 4.5;
+            p.output_trim_db = -3.0;
+        },
+        options,
+        cx,
+    )
 }
 
 fn rodhareist_explore(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     rodhareist_on(
         crate::components::rodhareist_panel::Page::Explore,
+        |_| {},
         options,
         cx,
     )
@@ -1641,6 +1677,50 @@ fn rodhareist_explore(options: WindowOptions, cx: &mut App) -> Result<AnyWindowH
 fn rodhareist_pedalboard(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     rodhareist_on(
         crate::components::rodhareist_panel::Page::Pedalboard,
+        |_| {},
+        options,
+        cx,
+    )
+}
+
+/// The amp running a NAM capture, on a chain long enough to narrow the
+/// blocks.
+fn rodhareist_nam(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_on(
+        crate::components::rodhareist_panel::Page::Pedalboard,
+        |p| {
+            p.tone_engine = rodharerist::ToneEngineKind::NamCapture;
+            let used: Vec<_> = p.stage_order.iter().flatten().copied().collect();
+            let spare = rodharerist::StageKind::ALL
+                .iter()
+                .copied()
+                .filter(|kind| !used.contains(kind));
+            let free: Vec<usize> = (0..rodharerist::PATH_SLOTS)
+                .filter(|&slot| p.stage_order[slot].is_none())
+                .take(3)
+                .collect();
+            for (slot, kind) in free.into_iter().zip(spare) {
+                p.stage_order[slot] = Some(kind);
+            }
+        },
+        options,
+        cx,
+    )
+}
+
+/// The Stereo delay focused, with Mod on the left side only and Reverb on
+/// the right.
+fn rodhareist_stereo(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use rodharerist::{DelayModel, StageChannel, StageKind};
+    rodhareist_focused(
+        crate::components::rodhareist_panel::Page::Pedalboard,
+        |p| {
+            p.delay_model = DelayModel::Stereo;
+            p.delay_time_r_ms = 280.0;
+            p.stage_channel[StageKind::Mod as usize] = StageChannel::Left;
+            p.stage_channel[StageKind::Reverb as usize] = StageChannel::Right;
+        },
+        StageKind::Delay,
         options,
         cx,
     )
@@ -1649,6 +1729,7 @@ fn rodhareist_pedalboard(options: WindowOptions, cx: &mut App) -> Result<AnyWind
 fn rodhareist_settings(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     rodhareist_on(
         crate::components::rodhareist_panel::Page::Settings,
+        |_| {},
         options,
         cx,
     )

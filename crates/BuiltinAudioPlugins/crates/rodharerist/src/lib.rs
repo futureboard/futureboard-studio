@@ -16,7 +16,7 @@ pub use dsp::{
     AmpModel, CabModel, DelayModel, DriveModel, Dsp, EqModel, IR_PARTITION_SAMPLES, IrInfo,
     IrLoadError, IrLoader, MAX_IR_SECONDS, MicModel, ModModel, NAM_BLOCK_SAMPLES, NamCaptureInfo,
     NamLoadError, NamLoader, PATH_SLOTS, PLUGIN_ID, Params, PreparedIrRuntime, PreparedNamRuntime,
-    ReverbModel, StageBParams, StageKind, ToneEngineKind, WahModel, apply_to_params,
+    ReverbModel, StageBParams, StageChannel, StageKind, ToneEngineKind, WahModel, apply_to_params,
     default_params, descriptor, prepare_ir_runtime, prepare_nam_runtime, telemetry, ui_values,
 };
 pub use presets::{FactoryPreset, factory_presets};

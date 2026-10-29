@@ -195,6 +195,60 @@ impl StageKind {
             _ => None,
         }
     }
+
+    /// Whether the block can run on one side of the path only. The amp and
+    /// the cabinet always run on both: a NAM capture or an IR adds latency,
+    /// and one delayed side against one dry side would drift the image
+    /// apart by exactly that much.
+    pub fn splits(self) -> bool {
+        !matches!(self, Self::Amp | Self::Cab)
+    }
+
+    /// The wire id of this block's [`StageChannel`], for the blocks that
+    /// [`splits`](Self::splits).
+    pub fn channel_id(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Gate => "gate_channel",
+            Self::Drive => "drive_channel",
+            Self::Mod => "mod_channel",
+            Self::Delay => "delay_channel",
+            Self::Reverb => "reverb_channel",
+            Self::Comp => "comp_channel",
+            Self::Eq => "eq_channel",
+            Self::Wah => "wah_channel",
+            Self::Drive2 => "drive2_channel",
+            Self::Mod2 => "mod2_channel",
+            Self::Delay2 => "delay2_channel",
+            Self::Eq2 => "eq2_channel",
+            Self::Comp2 => "comp2_channel",
+            Self::Amp | Self::Cab => return None,
+        })
+    }
+}
+
+/// Which side of the stereo path a block processes. A block on one side
+/// takes that side's signal alone and hands only that side on; the other
+/// side passes it untouched.
+///
+/// APPEND-ONLY: the index is the `*_channel` wire value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum StageChannel {
+    #[default]
+    Both,
+    Left,
+    Right,
+}
+
+impl StageChannel {
+    pub const ALL: &'static [Self] = &[Self::Both, Self::Left, Self::Right];
+
+    pub fn from_index(i: u32) -> Self {
+        Self::ALL.get(i as usize).copied().unwrap_or(Self::Both)
+    }
+
+    pub fn index(self) -> u32 {
+        self as u32
+    }
 }
 
 /// Overdrive/boost voicing, matching the editor's `dist` models.
@@ -680,6 +734,9 @@ pub enum DelayModel {
     PingPong,
     /// "Dual Delay" — quarter note left against a dotted eighth right.
     Dual,
+    /// "Stereo Delay" — clean repeats, each side on its own Time and
+    /// Feedback (`delay_time_r` / `delay_fb_r` set the right one).
+    Stereo,
 }
 
 impl DelayModel {
@@ -689,6 +746,7 @@ impl DelayModel {
         Self::Analog,
         Self::PingPong,
         Self::Dual,
+        Self::Stereo,
     ];
 
     pub fn from_model_id(id: &str) -> Option<Self> {
@@ -698,6 +756,7 @@ impl DelayModel {
             "analog" => Some(Self::Analog),
             "ping_pong" => Some(Self::PingPong),
             "dual" => Some(Self::Dual),
+            "stereo" => Some(Self::Stereo),
             _ => None,
         }
     }
@@ -770,6 +829,13 @@ pub struct Params {
     #[serde(deserialize_with = "deserialize_stage_order")]
     pub stage_order: [Option<StageKind>; PATH_SLOTS],
 
+    /// The side of the path each block runs on, indexed by [`StageKind`]
+    /// discriminant — it belongs to the block, so it moves with it. The amp
+    /// and cabinet entries stay [`StageChannel::Both`] (see
+    /// [`StageKind::splits`]). Absent from older saves: every block on both.
+    #[serde(default, deserialize_with = "deserialize_stage_channels")]
+    pub stage_channel: [StageChannel; StageKind::COUNT],
+
     /// Noise gate threshold (dB, -80..0).
     pub gate_thresh_db: f32,
 
@@ -799,6 +865,13 @@ pub struct Params {
     /// centre). Every model reads it; each stays centred on its own colour.
     #[serde(default = "default_delay_tone")]
     pub delay_tone: f32,
+    /// The right side's Time (40..1200 ms) and Feedback (0..100 %) for the
+    /// Stereo model. Every other model runs both sides from the knobs above
+    /// and keeps these for a switch back.
+    #[serde(default = "default_delay_time_r")]
+    pub delay_time_r_ms: f32,
+    #[serde(default = "default_delay_fb_r")]
+    pub delay_fb_r: f32,
 
     // Reverb.
     pub reverb_decay_s: f32, // 0.5..15
@@ -911,6 +984,42 @@ where
     Ok(out)
 }
 
+/// Read the saved block channels, padding a shorter array (a save from
+/// before a stage was appended) with [`StageChannel::Both`], as
+/// [`deserialize_stage_order`] does for the path.
+fn deserialize_stage_channels<'de, D>(d: D) -> Result<[StageChannel; StageKind::COUNT], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let saved = Vec::<StageChannel>::deserialize(d)?;
+    if saved.len() > StageKind::COUNT {
+        return Err(serde::de::Error::invalid_length(
+            saved.len(),
+            &"a channel for at most StageKind::COUNT stages",
+        ));
+    }
+    let mut out = [StageChannel::Both; StageKind::COUNT];
+    for (channel, saved) in out.iter_mut().zip(saved) {
+        *channel = saved;
+    }
+    Ok(out)
+}
+
+/// Every block on both sides, except where `channels` names a side for a
+/// block that [`StageKind::splits`].
+fn sanitize_stage_channels(
+    channels: [StageChannel; StageKind::COUNT],
+) -> [StageChannel; StageKind::COUNT] {
+    let mut out = channels;
+    for kind in StageKind::ALL {
+        if !kind.splits() {
+            out[*kind as usize] = StageChannel::Both;
+        }
+    }
+    out
+}
+
 /// Knobs, model and enable for the *second* instance of each doublable stage.
 ///
 /// Nested rather than flattened into 29 more `*2_*` fields on [`Params`]: this
@@ -943,6 +1052,8 @@ pub struct StageBParams {
     pub delay_fb: f32,
     pub delay_mix: f32,
     pub delay_tone: f32,
+    pub delay_time_r_ms: f32,
+    pub delay_fb_r: f32,
 
     pub eq_on: bool,
     pub eq_model: EqModel,
@@ -994,6 +1105,8 @@ impl Default for StageBParams {
             delay_fb: 35.0,
             delay_mix: 30.0,
             delay_tone: default_delay_tone(),
+            delay_time_r_ms: default_delay_time_r(),
+            delay_fb_r: default_delay_fb_r(),
 
             eq_on: true,
             eq_model: EqModel::Studio,
@@ -1038,6 +1151,8 @@ impl StageBParams {
             delay_fb: clamp(self.delay_fb, 0.0, 100.0),
             delay_mix: clamp(self.delay_mix, 0.0, 100.0),
             delay_tone: clamp(self.delay_tone, 0.0, 10.0),
+            delay_time_r_ms: clamp(self.delay_time_r_ms, 40.0, 1_200.0),
+            delay_fb_r: clamp(self.delay_fb_r, 0.0, 100.0),
 
             eq_on: self.eq_on,
             eq_model: self.eq_model,
@@ -1063,6 +1178,14 @@ fn default_true() -> bool {
 }
 fn default_delay_tone() -> f32 {
     5.0
+}
+/// A dotted eighth against the left side's quarter note at the default
+/// 420 ms, the classic stereo spread.
+fn default_delay_time_r() -> f32 {
+    315.0
+}
+fn default_delay_fb_r() -> f32 {
+    35.0
 }
 fn default_reverb_shimmer() -> f32 {
     62.0
@@ -1125,6 +1248,7 @@ pub fn default_params() -> Params {
         delay_model: DelayModel::Tape,
         tone_engine: ToneEngineKind::Classic,
         stage_order: StageKind::default_path(),
+        stage_channel: [StageChannel::Both; StageKind::COUNT],
         gate_thresh_db: -55.0,
         drive_gain: 6.0,
         drive_tone: 5.5,
@@ -1142,6 +1266,8 @@ pub fn default_params() -> Params {
         delay_fb: 35.0,
         delay_mix: 30.0,
         delay_tone: default_delay_tone(),
+        delay_time_r_ms: default_delay_time_r(),
+        delay_fb_r: default_delay_fb_r(),
         reverb_decay_s: 8.5,
         reverb_mix: 55.0,
         reverb_shimmer: default_reverb_shimmer(),
@@ -1341,6 +1467,22 @@ pub fn descriptor() -> PluginDescriptor {
                 min: 0.0,
                 max: 10.0,
                 unit: "",
+            },
+            ParamDescriptor {
+                id: "delay_time_r",
+                name: "Delay Time R",
+                default_value: 315.0,
+                min: 40.0,
+                max: 1200.0,
+                unit: "ms",
+            },
+            ParamDescriptor {
+                id: "delay_fb_r",
+                name: "Delay FB R",
+                default_value: 35.0,
+                min: 0.0,
+                max: 100.0,
+                unit: "%",
             },
             ParamDescriptor {
                 id: "reverb_decay",
@@ -1811,6 +1953,7 @@ impl Dsp {
             delay_model: params.delay_model,
             tone_engine: params.tone_engine,
             stage_order: sanitize_stage_order(params.stage_order),
+            stage_channel: sanitize_stage_channels(params.stage_channel),
             gate_thresh_db: clamp(params.gate_thresh_db, -80.0, 0.0),
             drive_gain: clamp(params.drive_gain, 0.0, 10.0),
             drive_tone: clamp(params.drive_tone, 0.0, 10.0),
@@ -1828,6 +1971,8 @@ impl Dsp {
             delay_fb: clamp(params.delay_fb, 0.0, 100.0),
             delay_mix: clamp(params.delay_mix, 0.0, 100.0),
             delay_tone: clamp(params.delay_tone, 0.0, 10.0),
+            delay_time_r_ms: clamp(params.delay_time_r_ms, 40.0, 1200.0),
+            delay_fb_r: clamp(params.delay_fb_r, 0.0, 100.0),
             reverb_decay_s: clamp(params.reverb_decay_s, 0.5, 15.0),
             reverb_mix: clamp(params.reverb_mix, 0.0, 100.0),
             reverb_shimmer: clamp(params.reverb_shimmer, 0.0, 100.0),
@@ -2098,13 +2243,23 @@ impl Dsp {
             self.wah
                 .configure(p.wah_model, p.wah_pos, p.wah_res, p.wah_sens);
         }
-        if moved!(delay_model, delay_time_ms, delay_fb, delay_mix, delay_tone) {
+        if moved!(
+            delay_model,
+            delay_time_ms,
+            delay_fb,
+            delay_mix,
+            delay_tone,
+            delay_time_r_ms,
+            delay_fb_r
+        ) {
             self.delay.configure(
                 p.delay_model,
                 p.delay_time_ms,
                 p.delay_fb,
                 p.delay_mix,
                 p.delay_tone,
+                p.delay_time_r_ms,
+                p.delay_fb_r,
             );
         }
         if moved!(reverb_model, reverb_decay_s, reverb_mix, reverb_shimmer) {
@@ -2180,7 +2335,9 @@ impl Dsp {
             stage_b.delay_time_ms,
             stage_b.delay_fb,
             stage_b.delay_mix,
-            stage_b.delay_tone
+            stage_b.delay_tone,
+            stage_b.delay_time_r_ms,
+            stage_b.delay_fb_r
         ) {
             self.delay_b.configure(
                 b.delay_model,
@@ -2188,6 +2345,8 @@ impl Dsp {
                 b.delay_fb,
                 b.delay_mix,
                 b.delay_tone,
+                b.delay_time_r_ms,
+                b.delay_fb_r,
             );
         }
     }
@@ -2449,9 +2608,34 @@ pub fn apply_to_params(p: &mut Params, id: &str, value: f32) -> bool {
         "comp2_release" => p.stage_b.comp_release_ms = value,
         "comp2_makeup" => p.stage_b.comp_makeup_db = value,
 
+        // The Stereo delay's right side.
+        "delay_time_r" => p.delay_time_r_ms = value,
+        "delay_fb_r" => p.delay_fb_r = value,
+        "delay2_time_r" => p.stage_b.delay_time_r_ms = value,
+        "delay2_fb_r" => p.stage_b.delay_fb_r = value,
+
+        // Which side of the path each block runs on.
+        "gate_channel" => set_channel(p, StageKind::Gate, value),
+        "drive_channel" => set_channel(p, StageKind::Drive, value),
+        "mod_channel" => set_channel(p, StageKind::Mod, value),
+        "delay_channel" => set_channel(p, StageKind::Delay, value),
+        "reverb_channel" => set_channel(p, StageKind::Reverb, value),
+        "comp_channel" => set_channel(p, StageKind::Comp, value),
+        "eq_channel" => set_channel(p, StageKind::Eq, value),
+        "wah_channel" => set_channel(p, StageKind::Wah, value),
+        "drive2_channel" => set_channel(p, StageKind::Drive2, value),
+        "mod2_channel" => set_channel(p, StageKind::Mod2, value),
+        "delay2_channel" => set_channel(p, StageKind::Delay2, value),
+        "eq2_channel" => set_channel(p, StageKind::Eq2, value),
+        "comp2_channel" => set_channel(p, StageKind::Comp2, value),
+
         _ => return false,
     }
     true
+}
+
+fn set_channel(p: &mut Params, kind: StageKind, value: f32) {
+    p.stage_channel[kind as usize] = StageChannel::from_index(value.round().max(0.0) as u32);
 }
 
 /// Enumerate a `Params` as `(ui id, raw value)` pairs covering every wire id
@@ -2591,6 +2775,15 @@ pub fn ui_values(p: &Params) -> Vec<(&'static str, f32)> {
     out.push(("comp2_release", sb.comp_release_ms));
     out.push(("comp2_makeup", sb.comp_makeup_db));
     out.push(("tuner_on", b(p.tuner_on)));
+    out.push(("delay_time_r", p.delay_time_r_ms));
+    out.push(("delay_fb_r", p.delay_fb_r));
+    out.push(("delay2_time_r", sb.delay_time_r_ms));
+    out.push(("delay2_fb_r", sb.delay_fb_r));
+    for kind in StageKind::ALL {
+        if let Some(id) = kind.channel_id() {
+            out.push((id, p.stage_channel[*kind as usize].index() as f32));
+        }
+    }
     out
 }
 
@@ -2723,81 +2916,23 @@ impl Dsp {
 
         for slot in self.params.stage_order {
             let Some(stage) = slot else { continue };
-            match stage {
-                StageKind::Gate if self.params.gate_on => {
-                    (l, r) = self.gate.process(l, r);
-                }
-                StageKind::Drive if self.params.drive_on => {
-                    (l, r) = self.drive.process(l, r);
-                }
-                StageKind::Amp if self.params.amp_on => {
-                    (l, r) = self.amp_stage.process(l, r);
-                }
-                StageKind::Mod if self.params.mod_on => {
-                    (l, r) = self.mod_stage.process(l, r);
-                }
-                StageKind::Wah if self.params.wah_on => {
-                    (l, r) = self.wah.process(l, r);
-                }
-                StageKind::Delay if self.params.delay_on => {
-                    (l, r) = self.delay.process(l, r);
-                }
-                StageKind::Reverb if self.params.reverb_on => {
-                    (l, r) = self.reverb.process(l, r);
-                }
-                StageKind::Cab if self.params.cab_on => {
-                    // Two cabinet engines behind one slot: the modeled
-                    // voicings and the IR convolution. Only the selected one
-                    // runs once the crossfade has resolved.
-                    let target = if self.params.cab_model == CabModel::Ir {
-                        1.0
-                    } else {
-                        0.0
-                    };
-                    self.cab_ir_blend = if self.cab_ir_blend < target {
-                        (self.cab_ir_blend + self.cab_ir_step).min(target)
-                    } else {
-                        (self.cab_ir_blend - self.cab_ir_step).max(target)
-                    };
-                    let blend = self.cab_ir_blend;
-                    (l, r) = if blend <= 0.0 {
-                        self.cab.process(l, r)
-                    } else if blend >= 1.0 {
-                        self.ir.process(l, r)
-                    } else {
-                        let modeled = self.cab.process(l, r);
-                        let convolved = self.ir.process(l, r);
-                        let modeled_gain = (1.0 - blend).sqrt();
-                        let ir_gain = blend.sqrt();
-                        (
-                            modeled.0 * modeled_gain + convolved.0 * ir_gain,
-                            modeled.1 * modeled_gain + convolved.1 * ir_gain,
-                        )
-                    };
-                }
-                StageKind::Comp if self.params.comp_on => {
-                    (l, r) = self.comp_stage.process(l, r);
-                }
-                StageKind::Eq if self.params.eq_on => {
-                    (l, r) = self.eq_stage.process(l, r);
-                }
-                StageKind::Drive2 if self.params.stage_b.drive_on => {
-                    (l, r) = self.drive_b.process(l, r);
-                }
-                StageKind::Mod2 if self.params.stage_b.mod_on => {
-                    (l, r) = self.mod_b.process(l, r);
-                }
-                StageKind::Delay2 if self.params.stage_b.delay_on => {
-                    (l, r) = self.delay_b.process(l, r);
-                }
-                StageKind::Eq2 if self.params.stage_b.eq_on => {
-                    (l, r) = self.eq_b.process(l, r);
-                }
-                StageKind::Comp2 if self.params.stage_b.comp_on => {
-                    (l, r) = self.comp_b.process(l, r);
-                }
-                _ => {}
-            }
+            // A block on one side hears that side alone (as a mono pair, so
+            // a stereo block still sees a signal on both its inputs) and
+            // only that side takes its output; the other side passes by.
+            let channel = self.params.stage_channel[stage as usize];
+            let (in_l, in_r) = match channel {
+                StageChannel::Both => (l, r),
+                StageChannel::Left => (l, l),
+                StageChannel::Right => (r, r),
+            };
+            let Some((out_l, out_r)) = self.run_stage(stage, in_l, in_r) else {
+                continue;
+            };
+            (l, r) = match channel {
+                StageChannel::Both => (out_l, out_r),
+                StageChannel::Left => (out_l, r),
+                StageChannel::Right => (l, out_r),
+            };
         }
 
         // Guard against denormals / NaNs escaping into the engine.
@@ -2826,6 +2961,58 @@ impl Dsp {
             self.meters.rms_coeff,
         );
         (l, r)
+    }
+
+    /// One frame through `stage`, or `None` while it is switched off.
+    #[inline]
+    fn run_stage(&mut self, stage: StageKind, l: f32, r: f32) -> Option<(f32, f32)> {
+        Some(match stage {
+            StageKind::Gate if self.params.gate_on => self.gate.process(l, r),
+            StageKind::Drive if self.params.drive_on => self.drive.process(l, r),
+            StageKind::Amp if self.params.amp_on => self.amp_stage.process(l, r),
+            StageKind::Mod if self.params.mod_on => self.mod_stage.process(l, r),
+            StageKind::Wah if self.params.wah_on => self.wah.process(l, r),
+            StageKind::Delay if self.params.delay_on => self.delay.process(l, r),
+            StageKind::Reverb if self.params.reverb_on => self.reverb.process(l, r),
+            StageKind::Cab if self.params.cab_on => {
+                // Two cabinet engines behind one slot: the modeled
+                // voicings and the IR convolution. Only the selected one
+                // runs once the crossfade has resolved.
+                let target = if self.params.cab_model == CabModel::Ir {
+                    1.0
+                } else {
+                    0.0
+                };
+                self.cab_ir_blend = if self.cab_ir_blend < target {
+                    (self.cab_ir_blend + self.cab_ir_step).min(target)
+                } else {
+                    (self.cab_ir_blend - self.cab_ir_step).max(target)
+                };
+                let blend = self.cab_ir_blend;
+                if blend <= 0.0 {
+                    self.cab.process(l, r)
+                } else if blend >= 1.0 {
+                    self.ir.process(l, r)
+                } else {
+                    let modeled = self.cab.process(l, r);
+                    let convolved = self.ir.process(l, r);
+                    let modeled_gain = (1.0 - blend).sqrt();
+                    let ir_gain = blend.sqrt();
+                    (
+                        modeled.0 * modeled_gain + convolved.0 * ir_gain,
+                        modeled.1 * modeled_gain + convolved.1 * ir_gain,
+                    )
+                }
+            }
+            StageKind::Comp if self.params.comp_on => self.comp_stage.process(l, r),
+            StageKind::Eq if self.params.eq_on => self.eq_stage.process(l, r),
+            StageKind::Drive2 if self.params.stage_b.drive_on => self.drive_b.process(l, r),
+            StageKind::Mod2 if self.params.stage_b.mod_on => self.mod_b.process(l, r),
+            StageKind::Delay2 if self.params.stage_b.delay_on => self.delay_b.process(l, r),
+            StageKind::Eq2 if self.params.stage_b.eq_on => self.eq_b.process(l, r),
+            StageKind::Comp2 if self.params.stage_b.comp_on => self.comp_b.process(l, r),
+            _ => return None,
+        })
     }
 
     /// One frame into a per-channel peak and mean square, with the
@@ -4252,6 +4439,89 @@ mod tests {
         let (l, _) = dsp.process_stereo(0.1, 0.1);
         // +6 dB ≈ ×1.9953.
         assert!((l - 0.199_53).abs() < 1.0e-3, "input trim not applied: {l}");
+    }
+
+    /// A bare chain with only a fully wet 100 ms digital delay in it, on
+    /// `channel`; returns each side's output at 0 and at 100 ms after an
+    /// impulse on both.
+    fn delay_on(channel: StageChannel) -> ((f32, f32), (f32, f32)) {
+        let mut dsp = Dsp::new(48_000.0);
+        let mut p = default_params();
+        p.stage_order = [None; PATH_SLOTS];
+        p.stage_order[0] = Some(StageKind::Delay);
+        p.delay_model = DelayModel::Digital;
+        p.delay_time_ms = 100.0;
+        p.delay_fb = 0.0;
+        p.delay_mix = 100.0;
+        p.stage_channel[StageKind::Delay as usize] = channel;
+        dsp.set_params(p);
+        dsp.reset();
+        let first = dsp.process_stereo(1.0, 1.0);
+        let (mut late_l, mut late_r) = (0.0f32, 0.0f32);
+        for _ in 1..6_000 {
+            let (l, r) = dsp.process_stereo(0.0, 0.0);
+            late_l = late_l.max(l.abs());
+            late_r = late_r.max(r.abs());
+        }
+        (first, (late_l, late_r))
+    }
+
+    #[test]
+    fn a_block_on_one_side_leaves_the_other_dry() {
+        // Fully wet: the processed side drops the impulse and echoes it;
+        // the other side passes the impulse and stays silent after.
+        let ((now_l, now_r), (late_l, late_r)) = delay_on(StageChannel::Left);
+        assert!(now_l.abs() < 1.0e-3 && late_l > 0.5, "left not delayed");
+        assert!(
+            (now_r - 1.0).abs() < 1.0e-3 && late_r < 1.0e-3,
+            "right not dry"
+        );
+
+        let ((now_l, now_r), (late_l, late_r)) = delay_on(StageChannel::Right);
+        assert!(
+            (now_l - 1.0).abs() < 1.0e-3 && late_l < 1.0e-3,
+            "left not dry"
+        );
+        assert!(now_r.abs() < 1.0e-3 && late_r > 0.5, "right not delayed");
+
+        let ((now_l, now_r), (late_l, late_r)) = delay_on(StageChannel::Both);
+        assert!(now_l.abs() < 1.0e-3 && now_r.abs() < 1.0e-3);
+        assert!(late_l > 0.5 && late_r > 0.5, "both sides should echo");
+    }
+
+    #[test]
+    fn the_amp_and_cab_always_run_on_both_sides() {
+        let mut dsp = Dsp::new(48_000.0);
+        let mut p = default_params();
+        p.stage_channel[StageKind::Amp as usize] = StageChannel::Left;
+        p.stage_channel[StageKind::Cab as usize] = StageChannel::Right;
+        p.stage_channel[StageKind::Gate as usize] = StageChannel::Right;
+        dsp.set_params(p);
+        let channels = dsp.params().stage_channel;
+        assert_eq!(channels[StageKind::Amp as usize], StageChannel::Both);
+        assert_eq!(channels[StageKind::Cab as usize], StageChannel::Both);
+        assert_eq!(channels[StageKind::Gate as usize], StageChannel::Right);
+    }
+
+    #[test]
+    fn a_save_without_channels_or_right_delay_knobs_loads_with_defaults() {
+        let mut value = serde_json::to_value(default_params()).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("stage_channel");
+        fields.remove("delay_time_r_ms");
+        fields.remove("delay_fb_r");
+        let p: Params = serde_json::from_value(value).unwrap();
+        assert_eq!(p.stage_channel, [StageChannel::Both; StageKind::COUNT]);
+        assert_eq!(p.delay_time_r_ms, 315.0);
+        assert_eq!(p.delay_fb_r, 35.0);
+
+        // A shorter channel list (from before a stage was appended) pads.
+        let mut value = serde_json::to_value(default_params()).unwrap();
+        value["stage_channel"] = serde_json::json!(["Left", "Right"]);
+        let p: Params = serde_json::from_value(value).unwrap();
+        assert_eq!(p.stage_channel[0], StageChannel::Left);
+        assert_eq!(p.stage_channel[1], StageChannel::Right);
+        assert_eq!(p.stage_channel[2], StageChannel::Both);
     }
 
     #[test]

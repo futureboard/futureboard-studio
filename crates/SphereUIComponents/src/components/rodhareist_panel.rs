@@ -26,7 +26,7 @@ use gpui::{
     div, px, AnyElement, App, Context, FontWeight, InteractiveElement, IntoElement, ParentElement,
     Rgba, StatefulInteractiveElement, Styled, Window,
 };
-use rodharerist::{CabModel, Params, StageKind, ToneEngineKind};
+use rodharerist::{CabModel, Params, StageChannel, StageKind, ToneEngineKind};
 
 use crate::components::controls::fb_tooltip;
 use crate::components::plate::{
@@ -41,9 +41,10 @@ type Cx<'a> = Context<'a, RodhareistEditorWindow>;
 /// Rodhareist's accent.
 const ACCENT: u32 = 0xf25c54;
 /// Chain geometry, at the design size: where the path starts, its width,
-/// one block and the pitch between blocks.
+/// the wire's centre line, one block and the pitch between blocks.
 const CHAIN_LEFT: f32 = 108.0;
 const CHAIN_W: f32 = 795.0;
+const CHAIN_MID: f32 = 162.5;
 const BLOCK: f32 = 99.0;
 const PITCH: f32 = 116.0;
 /// Positions the chain shows before it scrolls.
@@ -316,6 +317,7 @@ fn model_desc(label: &str) -> &'static str {
         "Analog Delay" => "Dark repeats that sit behind the guitar.",
         "Ping-Pong" => "Repeats alternating across the stereo image.",
         "Dual Delay" => "Quarter note left against a dotted eighth right.",
+        "Stereo Delay" => "Clean repeats, each side on its own time and feedback.",
         "Studio Plate" => "Bright, dense studio plate.",
         "Tracking Room" => "Short, damped room that adds depth.",
         "Concert Hall" => "Big, slow-blooming space.",
@@ -522,13 +524,16 @@ fn top_strip(ink: u32, height: f32, radius: f32, s: f32) -> gpui::Div {
         .bg(color(ink))
 }
 
-/// A knob for a block parameter, in its family's colour.
+/// A knob for a block parameter, in its family's colour, in a cell `width`
+/// wide for its label.
+#[allow(clippy::too_many_arguments)]
 fn block_knob(
     cx: &mut Cx,
     spec: ParamSpec,
     value: f32,
     ink: Rgba,
     size: f32,
+    width: f32,
     s: f32,
 ) -> AnyElement {
     let unit = match spec.unit {
@@ -550,7 +555,7 @@ fn block_knob(
         dial = dial.bipolar();
     }
     let look = KnobLook::small(size).styled(3.6, 18.0, 0x1a1a1a, 0x555555, 1.0, 6.0, 2.0);
-    let cell = KnobCell::new(size + 20.0, 11.0, 12.5)
+    let cell = KnobCell::new(width, 11.0, 12.5)
         .gap(3.0)
         .label(0.08, PALE)
         .label_below();
@@ -707,6 +712,43 @@ fn meters(w: &RodhareistEditorWindow, s: f32) -> Vec<AnyElement> {
         .collect()
 }
 
+/// The input or output level under its meter pair, centred on `mid`: a
+/// small knob on the global trim `id`, labelled like the meter.
+fn level_knob(
+    id: &'static str,
+    label: &'static str,
+    value: f32,
+    mid: f32,
+    cx: &mut Cx,
+    s: f32,
+) -> AnyElement {
+    let Some(spec) = blocks::trim_spec(id, label) else {
+        return div().into_any_element();
+    };
+    const WIDTH: f32 = 60.0;
+    let dial = Dial::new(spec.id, label, spec.min, spec.max, 0.0, DialUnit::Db).bipolar();
+    let look =
+        KnobLook::small(40.0).styled(3.8, 14.0, plate::FACE, plate::FACE_EDGE, 1.3, 5.5, 2.2);
+    let cell = KnobCell::new(WIDTH, 10.0, 11.0).gap(2.0).label(0.08, FAINT);
+    div()
+        .absolute()
+        .left(px((mid - WIDTH / 2.0) * s))
+        .top(px(236.0 * s))
+        .child(knob(
+            cx,
+            format!("rodhareist-level-{id}"),
+            dial,
+            value,
+            look,
+            cell,
+            accent(),
+            true,
+            s,
+            move |this: &mut RodhareistEditorWindow, v, cx| this.set_wire_value(id, v, cx),
+        ))
+        .into_any_element()
+}
+
 fn chain_block(
     w: &RodhareistEditorWindow,
     p: &Params,
@@ -721,6 +763,11 @@ fn chain_block(
     let type_k = k.max(0.82);
     let entry = p.stage_order[slot];
     let names = w.ui.show_names;
+    // A block on one side only says which.
+    let side = entry
+        .and_then(|kind| blocks::channel(p, kind))
+        .filter(|channel| *channel != StageChannel::Both)
+        .map(blocks::channel_label);
     let (bg, border, fg, tag, led, icon_path, name, dashed) = match entry {
         Some(kind) => {
             let family = Family::of(Category::of(kind));
@@ -771,7 +818,25 @@ fn chain_block(
                         .text_color(fg)
                         .font_weight(FontWeight::SEMIBOLD),
                 )
-                .child(div().size(px(8.0 * k * s)).rounded_full().bg(led)),
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(3.0 * k * s))
+                        .children(side.map(|label| {
+                            div()
+                                .px(px(2.0 * s))
+                                .rounded(px(2.0 * s))
+                                .bg(color(0x111111))
+                                .text_size(type_px(8.5 * type_k, s))
+                                .line_height(px(10.0 * type_k * s))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(color(WHITE))
+                                .child(label)
+                        }))
+                        .child(div().size(px(8.0 * k * s)).rounded_full().bg(led)),
+                ),
         )
         .child(div().flex().justify_center().child(icon(
             icon_path,
@@ -822,7 +887,8 @@ fn chain_block(
             }
         });
     let left = CHAIN_LEFT + slot as f32 * pitch;
-    let top = 113.0;
+    // Centred on the wire, so narrower blocks stay threaded on it.
+    let top = CHAIN_MID - size / 2.0;
     if selected {
         // The design's ring: a dark gap, then the accent.
         div()
@@ -852,11 +918,17 @@ fn caption_line(p: &Params, focus: ChainFocus) -> String {
     match focus {
         ChainFocus::Block(kind) => {
             let family = Family::of(Category::of(kind));
+            let side = match blocks::channel(p, kind) {
+                Some(StageChannel::Left) => " \u{00B7} left only",
+                Some(StageChannel::Right) => " \u{00B7} right only",
+                _ => "",
+            };
             format!(
-                "Slot {} \u{00B7} {} \u{00B7} {}{}",
+                "Slot {} \u{00B7} {} \u{00B7} {}{}{}",
                 slot + 1,
                 family.label(),
                 blocks::model_name(p, kind).unwrap_or("No amp"),
+                side,
                 if blocks::is_on(p, kind) {
                     ""
                 } else {
@@ -881,23 +953,15 @@ fn display(
     let wire = div()
         .absolute()
         .left(px(CHAIN_LEFT * s))
-        .top(px(162.0 * s))
+        .top(px((CHAIN_MID - 1.5) * s))
         .w(px(CHAIN_W * s))
         .h(px(3.0 * s))
         .bg(color(0xb5b5b5));
     let chain: Vec<AnyElement> = (0..shown)
         .map(|slot| chain_block(w, p, slot, slot == selected_slot, geometry, cx, s))
         .collect();
-    let label = |text: &str, left: f32, width: f32| {
-        div()
-            .absolute()
-            .left(px(left * s))
-            .top(px(238.0 * s))
-            .w(px(width * s))
-            .flex()
-            .justify_center()
-            .child(words(plate::spaced(text, 0.08), 10.0, FAINT, s))
-    };
+    let input = level_knob("input_trim", "IN", p.input_trim_db, 31.0, cx, s);
+    let output = level_knob("output_trim", "OUT", p.output_trim_db, 964.0, cx, s);
     div()
         .absolute()
         .left(px(6.0 * s))
@@ -909,8 +973,8 @@ fn display(
         .border_color(color(plate::WELL_EDGE))
         .child(header(w, p, cx, s))
         .children(meters(w, s))
-        .child(label("IN", 21.0, 20.0))
-        .child(label("OUT", 950.0, 28.0))
+        .child(input)
+        .child(output)
         .child(wire)
         .children(chain)
         .child(
@@ -1723,17 +1787,48 @@ fn block_card(
     let values: std::collections::HashMap<&'static str, f32> =
         rodharerist::ui_values(p).into_iter().collect();
     let specs = blocks::params(p, kind);
-    let size = if specs.len() > 6 { 56.0 } else { 76.0 };
+    // More than one row of knobs: smaller knobs in cells wide enough for
+    // labels such as "Capture out", six to a row.
+    let dense = specs.len() > 6;
+    let (size, width, knob_gap) = if dense {
+        (52.0, 96.0, 10.0)
+    } else {
+        (76.0, 96.0, 14.0)
+    };
     let knobs: Vec<AnyElement> = specs
         .into_iter()
         .map(|spec| {
             let value = values.get(spec.id).copied().unwrap_or(spec.min);
-            block_knob(cx, spec, value, ink, size, s)
+            block_knob(cx, spec, value, ink, size, width, s)
         })
         .collect();
 
-    // The cabinet's microphone and IR, and the amp's NAM capture.
+    // The side of the path the block runs on, the cabinet's microphone and
+    // IR, and the amp's NAM capture.
     let mut extras: Vec<AnyElement> = Vec::new();
+    if let (Some(current), Some(id)) = (blocks::channel(p, kind), kind.channel_id()) {
+        extras.push(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0 * s))
+                .child(caption("Channel", 10.5, 0.1, SOFT, s).mr(px(4.0 * s)))
+                .children(StageChannel::ALL.iter().map(|&channel| {
+                    plate::pill(
+                        ("rodhareist-channel", channel.index() as usize),
+                        blocks::channel_label(channel),
+                        current == channel,
+                        accent(),
+                        plate::PillLook::words(28.0, 12.0, 12.5),
+                        true,
+                        s,
+                        w.set_cb(cx, id, channel.index() as f32),
+                    )
+                }))
+                .into_any_element(),
+        );
+    }
     if kind == StageKind::Cab {
         let current = blocks::mic_index(p);
         extras.push(
@@ -1776,26 +1871,36 @@ fn block_card(
                 w.ir_loading(),
                 w.ir_error(),
                 w.load_ir_cb(cx),
+                360.0,
                 s,
             ));
         }
     }
     if kind == StageKind::Amp && p.tone_engine == ToneEngineKind::NamCapture {
-        extras.push(load_row(
-            "rodhareist-load-nam",
-            "Load capture\u{2026}",
-            w.nam_loaded_info(),
-            w.nam_loading(),
-            w.nam_error(),
-            w.load_nam_cb(cx),
-            s,
-        ));
+        // The capture and its loudness share one row, under the knobs.
         extras.push(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(6.0 * s))
+                .child(load_row(
+                    "rodhareist-load-nam",
+                    "Load capture\u{2026}",
+                    w.nam_loaded_info(),
+                    w.nam_loading(),
+                    w.nam_error(),
+                    w.load_nam_cb(cx),
+                    220.0,
+                    s,
+                ))
+                .child(
+                    div()
+                        .w(px(1.0))
+                        .h(px(20.0 * s))
+                        .mx(px(12.0 * s))
+                        .bg(color(0x454545)),
+                )
                 .child(caption("Loudness", 10.5, 0.1, SOFT, s).mr(px(4.0 * s)))
                 .child(plate::pill(
                     "rodhareist-nam-raw",
@@ -1836,6 +1941,12 @@ fn block_card(
         }]);
     }
     let name = blocks::model_name(p, kind).unwrap_or("No amp");
+    // A smaller footswitch when the card is full, so it stays inside it.
+    let switch = if dense || extras.len() > 1 {
+        52.0
+    } else {
+        66.0
+    };
     tile(s)
         .relative()
         .size_full()
@@ -1875,7 +1986,7 @@ fn block_card(
                 .flex_row()
                 .flex_wrap()
                 .justify_center()
-                .gap(px(14.0 * s))
+                .gap(px(knob_gap * s))
                 .opacity(if on { 1.0 } else { 0.6 })
                 .children(knobs),
         )
@@ -1894,7 +2005,7 @@ fn block_card(
                 .child(
                     div()
                         .id("rodhareist-block-bypass")
-                        .size(px(66.0 * s))
+                        .size(px(switch * s))
                         .rounded_full()
                         .bg(color(0x1a1a1a))
                         .border(px(3.0 * s))
@@ -1916,7 +2027,8 @@ fn block_card(
         .into_any_element()
 }
 
-/// A file slot (IR or NAM capture): its load button and what is loaded.
+/// A file slot (IR or NAM capture): its load button and what is loaded,
+/// cut to `status_w`.
 #[allow(clippy::too_many_arguments)]
 fn load_row(
     id: &'static str,
@@ -1925,6 +2037,7 @@ fn load_row(
     loading: bool,
     error: Option<String>,
     on_load: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    status_w: f32,
     s: f32,
 ) -> AnyElement {
     let (status, ink) = if loading {
@@ -1961,7 +2074,11 @@ fn load_row(
         .items_center()
         .gap(px(12.0 * s))
         .child(load)
-        .child(words(status, 12.5, ink, s).max_w(px(360.0 * s)).truncate())
+        .child(
+            words(status, 12.5, ink, s)
+                .max_w(px(status_w * s))
+                .truncate(),
+        )
         .into_any_element()
 }
 

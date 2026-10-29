@@ -10,7 +10,7 @@
 
 use rodharerist::{
     AmpModel, CabModel, DelayModel, DriveModel, EqModel, MicModel, ModModel, Params, ReverbModel,
-    StageKind, ToneEngineKind, WahModel,
+    StageChannel, StageKind, ToneEngineKind, WahModel,
 };
 
 /// The block categories the editor lists, in signal-chain order.
@@ -185,6 +185,21 @@ pub(crate) fn is_on(p: &Params, kind: StageKind) -> bool {
         StageKind::Delay => p.delay_on,
         StageKind::Delay2 => b.delay_on,
         StageKind::Reverb => p.reverb_on,
+    }
+}
+
+/// The side of the path a block runs on, or `None` for the amp and
+/// cabinet, which always run on both.
+pub(crate) fn channel(p: &Params, kind: StageKind) -> Option<StageChannel> {
+    kind.channel_id()?;
+    Some(p.stage_channel[kind as usize])
+}
+
+pub(crate) fn channel_label(channel: StageChannel) -> &'static str {
+    match channel {
+        StageChannel::Both => "L+R",
+        StageChannel::Left => "L",
+        StageChannel::Right => "R",
     }
 }
 
@@ -402,12 +417,16 @@ fn rows(kind: StageKind) -> &'static [Row] {
         StageKind::Delay => &[
             ("delay_time", "delay_time", "Time"),
             ("delay_fb", "delay_fb", "Feedback"),
+            ("delay_time_r", "delay_time_r", "Time R"),
+            ("delay_fb_r", "delay_fb_r", "Feedback R"),
             ("delay_tone", "delay_tone", "Tone"),
             ("delay_mix", "delay_mix", "Mix"),
         ],
         StageKind::Delay2 => &[
             ("delay2_time", "delay_time", "Time"),
             ("delay2_fb", "delay_fb", "Feedback"),
+            ("delay2_time_r", "delay_time_r", "Time R"),
+            ("delay2_fb_r", "delay_fb_r", "Feedback R"),
             ("delay2_tone", "delay_tone", "Tone"),
             ("delay2_mix", "delay_mix", "Mix"),
         ],
@@ -455,15 +474,29 @@ fn describe(
 
 /// The slider rows for a block, in order.
 pub(crate) fn params(p: &Params, kind: StageKind) -> Vec<ParamSpec> {
+    let stereo_a = p.delay_model == DelayModel::Stereo;
+    let stereo_b = p.stage_b.delay_model == DelayModel::Stereo;
     let inactive = |id: &str| match id {
         "wah_sens" => p.wah_model != WahModel::TouchWah,
         "reverb_shimmer" => p.reverb_model != ReverbModel::Shimmer,
         "cab_mic" | "cab_dist" => p.cab_model == CabModel::Ir,
+        "delay_time_r" | "delay_fb_r" => !stereo_a,
+        "delay2_time_r" | "delay2_fb_r" => !stereo_b,
         _ => false,
+    };
+    // On the Stereo model the first Time and Feedback are the left side's.
+    let label = |id: &str, label: &'static str| match id {
+        "delay_time" if stereo_a => "Time L",
+        "delay_fb" if stereo_a => "Feedback L",
+        "delay2_time" if stereo_b => "Time L",
+        "delay2_fb" if stereo_b => "Feedback L",
+        _ => label,
     };
     let mut out: Vec<ParamSpec> = rows(kind)
         .iter()
-        .filter_map(|(id, descriptor_id, label)| describe(id, descriptor_id, label, inactive(id)))
+        .filter_map(|(id, descriptor_id, text)| {
+            describe(id, descriptor_id, label(id, text), inactive(id))
+        })
         .collect();
     if kind == StageKind::Amp && p.tone_engine == ToneEngineKind::NamCapture {
         out.extend(
@@ -590,6 +623,7 @@ pub(crate) fn delay_model_label(model: DelayModel) -> &'static str {
         DelayModel::Analog => "Analog Delay",
         DelayModel::PingPong => "Ping-Pong",
         DelayModel::Dual => "Dual Delay",
+        DelayModel::Stereo => "Stereo Delay",
     }
 }
 

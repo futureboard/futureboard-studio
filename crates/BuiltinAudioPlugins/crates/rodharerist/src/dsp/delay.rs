@@ -37,6 +37,9 @@ enum Routing {
     /// Independent lines like `Stereo`, but the right tap runs at
     /// [`DUAL_RIGHT_RATIO`] of the Time knob.
     Dual,
+    /// Independent lines like `Stereo`, the right one on its own Time and
+    /// Feedback knobs.
+    Split,
 }
 
 /// Per-voicing tuning. A model switch replaces these wholesale; nothing
@@ -112,6 +115,15 @@ impl Voicing {
                 time_slew_s: 0.030,
                 routing: Routing::Dual,
             },
+            // Clean repeats, each side on its own time and feedback.
+            DelayModel::Stereo => Self {
+                tone_hz: 12_000.0,
+                body_hz: 0.0,
+                flutter_s: 0.0,
+                drive: 0.35,
+                time_slew_s: 0.020,
+                routing: Routing::Split,
+            },
         }
     }
 }
@@ -133,6 +145,9 @@ pub(super) struct DelayStage {
     line_r: InterpDelay,
     delay_samples: Smoothed,
     feedback: Smoothed,
+    /// The right side's own time and feedback, read by the Split routing.
+    delay_samples_r: Smoothed,
+    feedback_r: Smoothed,
     mix: Smoothed,
     flutter: Lfo,
     flutter_depth: f32,
@@ -164,6 +179,8 @@ impl DelayStage {
             line_r: InterpDelay::new(capacity),
             delay_samples: Smoothed::new(sr, voicing.time_slew_s, 0.42 * sr),
             feedback: Smoothed::new(sr, SMOOTH_SECONDS, 0.35),
+            delay_samples_r: Smoothed::new(sr, voicing.time_slew_s, 0.315 * sr),
+            feedback_r: Smoothed::new(sr, SMOOTH_SECONDS, 0.35),
             mix: Smoothed::new(sr, SMOOTH_SECONDS, 0.3),
             flutter,
             flutter_depth: voicing.flutter_s * sr,
@@ -186,6 +203,8 @@ impl DelayStage {
         self.flutter_depth = self.voicing.flutter_s * sr;
         self.delay_samples.set_time(sr, self.voicing.time_slew_s);
         self.feedback.set_time(sr, SMOOTH_SECONDS);
+        self.delay_samples_r.set_time(sr, self.voicing.time_slew_s);
+        self.feedback_r.set_time(sr, SMOOTH_SECONDS);
         self.mix.set_time(sr, SMOOTH_SECONDS);
         // Coefficients are rate-dependent; force a rebuild on the next
         // `configure` rather than keeping filters tuned for the old rate.
@@ -203,13 +222,18 @@ impl DelayStage {
         self.fb_r = 0.0;
         self.delay_samples.snap();
         self.feedback.snap();
+        self.delay_samples_r.snap();
+        self.feedback_r.snap();
         self.mix.snap();
     }
 
     /// `time_ms` 40..1200, `fb` 0..100 %, `mix` 0..100 %, `tone` 0..10 (5 is
-    /// the voicing's own centre). Switching models clears the lines: the old
-    /// tail was written under a different routing and colour, and letting it
-    /// bleed into the new voicing sounds like a fault, not a crossfade.
+    /// the voicing's own centre); `time_r_ms` and `fb_r` are the right
+    /// side's, read only by the Stereo model. Switching models clears the
+    /// lines: the old tail was written under a different routing and colour,
+    /// and letting it bleed into the new voicing sounds like a fault, not a
+    /// crossfade.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn configure(
         &mut self,
         model: DelayModel,
@@ -217,6 +241,8 @@ impl DelayStage {
         fb: f32,
         mix: f32,
         tone: f32,
+        time_r_ms: f32,
+        fb_r: f32,
     ) {
         if self.model != model {
             self.model = model;
@@ -224,12 +250,16 @@ impl DelayStage {
             self.flutter_depth = self.voicing.flutter_s * self.sample_rate;
             self.delay_samples
                 .set_time(self.sample_rate, self.voicing.time_slew_s);
+            self.delay_samples_r
+                .set_time(self.sample_rate, self.voicing.time_slew_s);
             self.reset();
         }
 
-        self.delay_samples
-            .set_target((time_ms.clamp(40.0, 1_200.0) * 0.001 * self.sample_rate).max(1.0));
+        let samples = |ms: f32| (ms.clamp(40.0, 1_200.0) * 0.001 * self.sample_rate).max(1.0);
+        self.delay_samples.set_target(samples(time_ms));
+        self.delay_samples_r.set_target(samples(time_r_ms));
         self.feedback.set_target((fb / 100.0).clamp(0.0, 0.95));
+        self.feedback_r.set_target((fb_r / 100.0).clamp(0.0, 0.95));
         self.mix.set_target((mix / 100.0).clamp(0.0, 1.0));
 
         // Tone rides the voicing's own centre: ±2 octaves around `tone_hz`.
@@ -264,12 +294,14 @@ impl DelayStage {
         // flutter ride on top with opposite modulation per channel for width.
         let delay_samples = self.delay_samples.tick();
         let feedback = self.feedback.tick();
+        let delay_samples_r = self.delay_samples_r.tick();
+        let feedback_r = self.feedback_r.tick();
         let mix_amount = self.mix.tick();
         let flut = self.flutter.tick() * self.flutter_depth;
-        let right_samples = if self.voicing.routing == Routing::Dual {
-            delay_samples * DUAL_RIGHT_RATIO
-        } else {
-            delay_samples
+        let (right_samples, right_feedback) = match self.voicing.routing {
+            Routing::Dual => (delay_samples * DUAL_RIGHT_RATIO, feedback),
+            Routing::Split => (delay_samples_r, feedback_r),
+            Routing::Stereo | Routing::PingPong => (delay_samples, feedback),
         };
         let read_l = delay_samples + flut;
         let read_r = right_samples - flut;
@@ -282,10 +314,10 @@ impl DelayStage {
         let (fb_l, fb_r) = self.body.run(tone_l, tone_r);
         let drive = self.voicing.drive;
         self.fb_l = saturate(fb_l * feedback, drive);
-        self.fb_r = saturate(fb_r * feedback, drive);
+        self.fb_r = saturate(fb_r * right_feedback, drive);
 
         match self.voicing.routing {
-            Routing::Stereo | Routing::Dual => {
+            Routing::Stereo | Routing::Dual | Routing::Split => {
                 self.line_l.write_sample(left + self.fb_l);
                 self.line_r.write_sample(right + self.fb_r);
             }
@@ -329,7 +361,7 @@ mod tests {
             let mut stage = DelayStage::new(SR);
             // 100 % feedback is clamped to 0.95 internally; a hot, sustained
             // input on top of that is the worst case a runaway loop can see.
-            stage.configure(model, 120.0, 100.0, 100.0, 5.0);
+            stage.configure(model, 120.0, 100.0, 100.0, 5.0, 120.0, 100.0);
             for n in 0..(SR as usize) {
                 let x = ((n as f32) * 0.05).sin();
                 let (l, r) = stage.process(x, x);
@@ -345,7 +377,7 @@ mod tests {
     #[test]
     fn ping_pong_puts_the_first_repeat_on_one_side_only() {
         let mut stage = DelayStage::new(SR);
-        stage.configure(DelayModel::PingPong, 100.0, 60.0, 100.0, 5.0);
+        stage.configure(DelayModel::PingPong, 100.0, 60.0, 100.0, 5.0, 100.0, 60.0);
         // Long enough for the first repeat (100 ms) but not the second.
         let mut first_l = 0.0f32;
         let mut first_r = 0.0f32;
@@ -367,7 +399,7 @@ mod tests {
     #[test]
     fn dual_places_the_right_tap_before_the_left_one() {
         let mut stage = DelayStage::new(SR);
-        stage.configure(DelayModel::Dual, 400.0, 0.0, 100.0, 5.0);
+        stage.configure(DelayModel::Dual, 400.0, 0.0, 100.0, 5.0, 400.0, 0.0);
         let mut peak_l_at = 0usize;
         let mut peak_r_at = 0usize;
         let mut peak_l = 0.0f32;
@@ -404,7 +436,7 @@ mod tests {
         // thinner feedback path must lose more energy per pass.
         fn tail_energy(model: DelayModel) -> f32 {
             let mut stage = DelayStage::new(SR);
-            stage.configure(model, 60.0, 80.0, 100.0, 5.0);
+            stage.configure(model, 60.0, 80.0, 100.0, 5.0, 60.0, 80.0);
             let mut energy = 0.0f32;
             for n in 0..((SR * 0.5) as usize) {
                 let x = if n == 0 { 1.0 } else { 0.0 };
@@ -427,9 +459,9 @@ mod tests {
     #[test]
     fn a_model_switch_clears_the_previous_tail() {
         let mut stage = DelayStage::new(SR);
-        stage.configure(DelayModel::Tape, 400.0, 90.0, 100.0, 5.0);
+        stage.configure(DelayModel::Tape, 400.0, 90.0, 100.0, 5.0, 400.0, 90.0);
         let _ = run(&mut stage, (SR * 0.2) as usize);
-        stage.configure(DelayModel::Digital, 400.0, 90.0, 100.0, 5.0);
+        stage.configure(DelayModel::Digital, 400.0, 90.0, 100.0, 5.0, 400.0, 90.0);
         // With the lines cleared and no new input, the wet path is silent.
         for _ in 0..64 {
             let (l, r) = stage.process(0.0, 0.0);
@@ -444,7 +476,7 @@ mod tests {
     fn tone_knob_darkens_the_repeats() {
         fn tail_energy(tone: f32) -> f32 {
             let mut stage = DelayStage::new(SR);
-            stage.configure(DelayModel::Digital, 60.0, 80.0, 100.0, tone);
+            stage.configure(DelayModel::Digital, 60.0, 80.0, 100.0, tone, 60.0, 80.0);
             let mut energy = 0.0f32;
             for n in 0..((SR * 0.5) as usize) {
                 let x = if n == 0 { 1.0 } else { 0.0 };
@@ -456,5 +488,72 @@ mod tests {
             energy
         }
         assert!(tail_energy(10.0) > tail_energy(0.0));
+    }
+
+    /// Where each side's first repeat lands, in samples after the impulse.
+    fn first_taps(stage: &mut DelayStage, seconds: f32) -> (usize, usize) {
+        let (mut peak_l, mut peak_r) = (0.0f32, 0.0f32);
+        let (mut at_l, mut at_r) = (0usize, 0usize);
+        for n in 0..((SR * seconds) as usize) {
+            let x = if n == 0 { 1.0 } else { 0.0 };
+            let (l, r) = stage.process(x, x);
+            if n > 100 {
+                if l.abs() > peak_l {
+                    (peak_l, at_l) = (l.abs(), n);
+                }
+                if r.abs() > peak_r {
+                    (peak_r, at_r) = (r.abs(), n);
+                }
+            }
+        }
+        (at_l, at_r)
+    }
+
+    #[test]
+    fn stereo_runs_each_side_on_its_own_time() {
+        let mut stage = DelayStage::new(SR);
+        stage.configure(DelayModel::Stereo, 200.0, 0.0, 100.0, 5.0, 500.0, 0.0);
+        let (at_l, at_r) = first_taps(&mut stage, 0.7);
+        let (want_l, want_r) = ((SR * 0.2) as usize, (SR * 0.5) as usize);
+        assert!(
+            at_l.abs_diff(want_l) < 600,
+            "left at {at_l}, want ~{want_l}"
+        );
+        assert!(
+            at_r.abs_diff(want_r) < 600,
+            "right at {at_r}, want ~{want_r}"
+        );
+    }
+
+    #[test]
+    fn stereo_feedback_is_per_side() {
+        // Left repeats regenerate, right ones die after the first.
+        let mut stage = DelayStage::new(SR);
+        stage.configure(DelayModel::Stereo, 100.0, 80.0, 100.0, 5.0, 100.0, 0.0);
+        let (mut late_l, mut late_r) = (0.0f32, 0.0f32);
+        for n in 0..((SR * 0.5) as usize) {
+            let x = if n == 0 { 1.0 } else { 0.0 };
+            let (l, r) = stage.process(x, x);
+            // Past the first repeat (100 ms): only regenerated echoes.
+            if n > (SR * 0.15) as usize {
+                late_l = late_l.max(l.abs());
+                late_r = late_r.max(r.abs());
+            }
+        }
+        assert!(late_l > 0.1, "left did not regenerate: {late_l}");
+        assert!(
+            late_r < 1.0e-3,
+            "right regenerated with 0 feedback: {late_r}"
+        );
+    }
+
+    #[test]
+    fn only_stereo_reads_the_right_side_knobs() {
+        // Same left knobs, wildly different right ones: Digital ignores them.
+        let mut a = DelayStage::new(SR);
+        let mut b = DelayStage::new(SR);
+        a.configure(DelayModel::Digital, 300.0, 40.0, 100.0, 5.0, 300.0, 40.0);
+        b.configure(DelayModel::Digital, 300.0, 40.0, 100.0, 5.0, 900.0, 0.0);
+        assert_eq!(first_taps(&mut a, 0.5), first_taps(&mut b, 0.5));
     }
 }
