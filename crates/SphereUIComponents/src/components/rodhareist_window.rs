@@ -32,23 +32,30 @@ use std::sync::Arc;
 
 use gpui::{
     div, px, size, App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
-    WindowKind,
+    KeyDownEvent, ParentElement, Render, Styled, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowKind,
 };
 use rodharerist::Params;
 
+use crate::components::builtin_plugin_editor::{
+    file_load, FileLoad, RodhareistFile, RODHAREIST_FILES_FOLDER,
+};
 use crate::components::builtin_plugin_editor_window::{
     BuiltinEditorHostOps, BuiltinIrLoadRequest, BuiltinNamLoadRequest, PluginInstanceKey,
 };
 use crate::components::native_plugin_shell::{
     native_plugin_shell, NativeBuiltinEditor, ShellIdentity, ShellMeter, SHELL_METER_INTERVAL,
 };
-use crate::components::rodhareist_panel::{rodhareist_panel, ChainFocus};
+use crate::components::plate;
+use crate::components::rodhareist_panel::{
+    rodhareist_panel, tapped_interval, ChainFocus, Page, RodUi,
+};
 
-pub const RODHAREIST_WINDOW_WIDTH: f32 = 1_280.0;
-pub const RODHAREIST_WINDOW_HEIGHT: f32 = 880.0;
-pub const RODHAREIST_WINDOW_MIN_WIDTH: f32 = 1_040.0;
-pub const RODHAREIST_WINDOW_MIN_HEIGHT: f32 = 680.0;
+/// The editor at its design size, and the smallest it may get.
+pub const RODHAREIST_WINDOW_WIDTH: f32 = plate::WINDOW_SIZE.0;
+pub const RODHAREIST_WINDOW_HEIGHT: f32 = plate::WINDOW_SIZE.1;
+pub const RODHAREIST_WINDOW_MIN_WIDTH: f32 = plate::MIN_WINDOW_SIZE.0;
+pub const RODHAREIST_WINDOW_MIN_HEIGHT: f32 = plate::MIN_WINDOW_SIZE.1;
 
 /// `next` as wire edits against `current`: every wire id whose value
 /// differs, mapped to its wire index. Generic over the *entire* parameter
@@ -116,24 +123,58 @@ fn matching_preset(params: &Params) -> Option<usize> {
 }
 
 /// `preset` as loaded over `current`: everything from the preset except the
-/// insert's power and input trim, which belong to the player's rig, not the
-/// tone.
+/// insert's power, input trim and loaded capture and IR, which belong to the
+/// player's rig, not the tone.
 fn preset_applied(current: &Params, preset: &Params) -> Params {
     let mut next = preset.clone();
     next.power = current.power;
     next.input_trim_db = current.input_trim_db;
+    next.nam_file = current.nam_file.clone();
+    next.ir_file = current.ir_file.clone();
     next
 }
 
-/// A file load in flight for the Cabinet IR or the NAM Capture slot.
+/// A file load this window started for the Cabinet IR or the NAM Capture
+/// slot: in flight, or failed before it reached the host. What is loaded
+/// is the project's (the mirrored file names) and the host's answer
+/// (`builtin_plugin_editor::file_load`), not this window's.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LoadStatus {
     pub loading: bool,
     pub error: Option<String>,
-    /// The loaded file's display name (IR) — paired with its length in
-    /// `ir_seconds` once the host answers.
-    pub loaded_name: Option<String>,
-    pub ir_seconds: f32,
+}
+
+/// A stored file's name as the editor shows it: without its extension.
+fn display_name(file_name: &str) -> String {
+    std::path::Path::new(file_name)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_name.to_string())
+}
+
+/// Reads a picked capture or IR and keeps a copy in Rodhareist's folder,
+/// reusing an identical file already there. Returns the stored name and the
+/// bytes. Background-thread only (filesystem I/O).
+#[cfg(feature = "native-dialogs")]
+fn store_user_file(
+    file: RodhareistFile,
+    source: &std::path::Path,
+) -> Result<(String, Vec<u8>), String> {
+    use crate::components::builtin_plugin_files as files;
+    let source_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "the selected file has no name".to_string())?;
+    let bytes =
+        std::fs::read(source).map_err(|e| format!("could not read {}: {e}", source.display()))?;
+    let dir = files::plugin_files_root(RODHAREIST_FILES_FOLDER).join(file.kind().dir_name());
+    let name = crate::components::builtin_plugin_editor_window::import_user_file_bytes(
+        &dir,
+        file.kind(),
+        source_name,
+        &bytes,
+    )?;
+    Ok((name, bytes))
 }
 
 pub struct RodhareistEditorWindow {
@@ -153,7 +194,12 @@ pub struct RodhareistEditorWindow {
     preset: Option<usize>,
     /// The chain slot the block editor shows. Editor-local view state —
     /// never saved, never sent to the plug-in.
-    chain_focus: Option<ChainFocus>,
+    pub(crate) chain_focus: Option<ChainFocus>,
+    /// The page, footswitch map and display options — view state too.
+    pub(crate) ui: RodUi,
+    /// The insert's telemetry block (`rodharerist::telemetry`): per-channel
+    /// levels and the tuner.
+    pads: Option<[f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS]>,
     /// Cleared when the window closes, ending the meter timer.
     alive: Rc<Cell<bool>>,
 }
@@ -180,8 +226,11 @@ impl RodhareistEditorWindow {
             io: IoMeter::default(),
             preset: None,
             chain_focus: None,
+            ui: RodUi::default(),
+            pads: None,
             alive: Rc::new(Cell::new(true)),
         };
+        plate::ensure_fonts(cx);
         window.sync_from_mirror(cx);
         window.preset = matching_preset(&window.params);
         window.start_meter(cx);
@@ -216,6 +265,8 @@ impl RodhareistEditorWindow {
             self.nam_status = LoadStatus::default();
             self.chain_focus = None;
             self.preset = None;
+            self.pads = None;
+            self.ui = RodUi::default();
         }
         self.identity = identity;
         self.host_ops = host_ops;
@@ -295,6 +346,87 @@ impl RodhareistEditorWindow {
                 this.set_wire(id, if on { 0.0 } else { 1.0 }, cx);
             });
         }
+    }
+
+    /// Sets one wire parameter, the way the DSP takes it.
+    pub(crate) fn set_wire_value(&mut self, id: &str, value: f32, cx: &mut Context<Self>) {
+        self.set_wire(id, value, cx);
+    }
+
+    /// Flips one on/off wire parameter.
+    pub(crate) fn toggle_wire(&mut self, id: &str, cx: &mut Context<Self>) {
+        let on = wire_value(&self.params, id) >= 0.5;
+        self.set_wire(id, if on { 0.0 } else { 1.0 }, cx);
+    }
+
+    /// A tap of the tempo button: two taps close enough together set Delay
+    /// A's time to the interval between them, a quarter note.
+    pub(crate) fn tap_tempo(&mut self, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        if let Some(interval) = tapped_interval(self.ui.last_tap, now) {
+            self.set_wire("delay_time", interval.as_secs_f32() * 1_000.0, cx);
+        }
+        self.ui.last_tap = Some(now);
+        cx.notify();
+    }
+
+    /// The newest telemetry block, if the host publishes one.
+    pub(crate) fn pads(&self) -> Option<&[f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS]> {
+        self.pads.as_ref()
+    }
+
+    /// A telemetry block for the preview tool, as if the host had sent it.
+    pub fn show_pads(&mut self, block: [f32; SpherePluginHost::audio_bridge::BUILTIN_PAD_SLOTS]) {
+        self.pads = Some(block);
+    }
+
+    /// Shows page (the preview tool's way in).
+    pub fn show_page(&mut self, page: Page) {
+        self.ui.page = page;
+    }
+
+    /// The host's sample rate and block size, when it reports them.
+    pub(crate) fn host_status(&self) -> Option<(u32, u32)> {
+        self.host_ops
+            .host_status_source
+            .as_ref()
+            .and_then(|source| source(&self.key))
+            .map(|(rate, block, _, _)| (rate, block))
+            .filter(|(rate, _)| *rate > 0)
+    }
+
+    /// Typing into the Explore page's search field.
+    fn on_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if !self.ui.search_focus || self.ui.page != Page::Explore {
+            return;
+        }
+        let keystroke = &event.keystroke;
+        match keystroke.key.as_str() {
+            "escape" => {
+                if self.ui.query.is_empty() {
+                    self.ui.search_focus = false;
+                }
+                self.ui.query.clear();
+            }
+            "backspace" => {
+                self.ui.query.pop();
+            }
+            "enter" => self.ui.search_focus = false,
+            _ => {
+                if keystroke.modifiers.control || keystroke.modifiers.platform {
+                    return;
+                }
+                match keystroke.key_char.as_deref() {
+                    Some(text) if !text.chars().any(char::is_control) => {
+                        if self.ui.query.chars().count() < 40 {
+                            self.ui.query.push_str(text);
+                        }
+                    }
+                    _ => return,
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn set_wire(&mut self, id: &str, value: f32, cx: &mut Context<Self>) {
@@ -412,26 +544,81 @@ impl RodhareistEditorWindow {
         self.params.clone()
     }
 
+    /// The host's last answer for `file`, if it is about the file this
+    /// insert loads now.
+    fn current_load(&self, file: RodhareistFile) -> Option<FileLoad> {
+        let wanted = self.file_name(file)?;
+        file_load(&self.key.insert_id, file).filter(|load| load.name == wanted)
+    }
+
+    /// The file `file` loads, as the project saves it.
+    fn file_name(&self, file: RodhareistFile) -> Option<String> {
+        match file {
+            RodhareistFile::Capture => self.params.nam_file.clone(),
+            RodhareistFile::Impulse => self.params.ir_file.clone(),
+        }
+    }
+
+    fn status(&self, file: RodhareistFile) -> &LoadStatus {
+        match file {
+            RodhareistFile::Capture => &self.nam_status,
+            RodhareistFile::Impulse => &self.ir_status,
+        }
+    }
+
+    fn status_mut(&mut self, file: RodhareistFile) -> &mut LoadStatus {
+        match file {
+            RodhareistFile::Capture => &mut self.nam_status,
+            RodhareistFile::Impulse => &mut self.ir_status,
+        }
+    }
+
+    /// What `file` shows as loaded: its saved name, unless the host turned
+    /// it down.
+    fn loaded_name(&self, file: RodhareistFile) -> Option<String> {
+        let name = self.file_name(file)?;
+        if self
+            .current_load(file)
+            .is_some_and(|load| load.error.is_some())
+        {
+            return None;
+        }
+        Some(name)
+    }
+
+    /// Why `file` is not loaded: a pick or read that failed here, or the
+    /// host's refusal (a missing or unreadable file after a project open).
+    fn load_error(&self, file: RodhareistFile) -> Option<String> {
+        self.status(file).error.clone().or_else(|| {
+            self.current_load(file).and_then(|load| {
+                load.error
+                    .map(|error| format!("{}: {error}", display_name(&load.name)))
+            })
+        })
+    }
+
     pub(crate) fn ir_loaded_info(&self) -> Option<(String, f32)> {
-        self.ir_status
-            .loaded_name
-            .clone()
-            .map(|name| (name, self.ir_status.ir_seconds))
+        let name = self.loaded_name(RodhareistFile::Impulse)?;
+        let seconds = self
+            .current_load(RodhareistFile::Impulse)
+            .map_or(0.0, |load| load.frames as f32 / self.sample_rate_hint());
+        Some((display_name(&name), seconds))
     }
     pub(crate) fn ir_loading(&self) -> bool {
         self.ir_status.loading
     }
     pub(crate) fn ir_error(&self) -> Option<String> {
-        self.ir_status.error.clone()
+        self.load_error(RodhareistFile::Impulse)
     }
     pub(crate) fn nam_loaded_info(&self) -> Option<String> {
-        self.nam_status.loaded_name.clone()
+        self.loaded_name(RodhareistFile::Capture)
+            .map(|name| display_name(&name))
     }
     pub(crate) fn nam_loading(&self) -> bool {
         self.nam_status.loading
     }
     pub(crate) fn nam_error(&self) -> Option<String> {
-        self.nam_status.error.clone()
+        self.load_error(RodhareistFile::Capture)
     }
 
     /// Click handler that opens the IR file picker, for the Cabinet card's
@@ -442,188 +629,147 @@ impl RodhareistEditorWindow {
     ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
         let entity = cx.entity().clone();
         move |_event, _window, app: &mut App| {
-            let _ = entity.update(app, |this, cx| this.start_ir_load(cx));
+            let _ = entity.update(app, |this, cx| {
+                this.start_file_load(RodhareistFile::Impulse, cx)
+            });
         }
     }
 
-    /// Click handler that opens the NAM capture file picker, for the NAM
-    /// card's "Load Capture…" button.
+    /// Click handler that opens the NAM capture file picker, for the amp
+    /// card's "Load capture…" button.
     pub(crate) fn load_nam_cb(
         &self,
         cx: &Context<Self>,
     ) -> impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static {
         let entity = cx.entity().clone();
         move |_event, _window, app: &mut App| {
-            let _ = entity.update(app, |this, cx| this.start_nam_load(cx));
+            let _ = entity.update(app, |this, cx| {
+                this.start_file_load(RodhareistFile::Capture, cx)
+            });
         }
     }
 
-    fn start_ir_load(&mut self, cx: &mut Context<Self>) {
+    /// Picks a capture or an IR, keeps a copy in Rodhareist's own folder —
+    /// what the project names and what Studio reloads it from — and sends
+    /// it to the host. The host's answer arrives through
+    /// [`Self::notify_nam_capture_result`] / [`Self::notify_ir_load_result`].
+    fn start_file_load(&mut self, file: RodhareistFile, cx: &mut Context<Self>) {
         #[cfg(feature = "native-dialogs")]
         {
-            self.ir_status = LoadStatus::default();
-            self.ir_status.loading = true;
+            let (title, filter, extensions): (&str, &str, &[&str]) = match file {
+                RodhareistFile::Capture => ("Load NAM Capture", "Neural Amp Modeler", &["nam"]),
+                RodhareistFile::Impulse => {
+                    ("Load Impulse Response", "Cabinet IR", &["wav", "wave"])
+                }
+            };
+            *self.status_mut(file) = LoadStatus {
+                loading: true,
+                ..LoadStatus::default()
+            };
             cx.notify();
             cx.spawn(async move |this, cx| {
                 let Some(handle) = rfd::AsyncFileDialog::new()
-                    .set_title("Load Impulse Response")
-                    .add_filter("Cabinet IR", &["wav", "wave"])
+                    .set_title(title)
+                    .add_filter(filter, extensions)
                     .pick_file()
                     .await
                 else {
                     let _ = this.update(cx, |this, cx| {
-                        this.ir_status.loading = false;
-                        cx.notify();
-                    });
-                    return;
-                };
-                let path = handle.path().to_path_buf();
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "impulse.wav".to_string());
-                let read = cx
-                    .background_spawn({
-                        let path = path.clone();
-                        async move { std::fs::read(&path) }
-                    })
-                    .await;
-                let _ = this.update(cx, |this, cx| match read {
-                    Ok(bytes) => {
-                        if let Some(load) = this.host_ops.load_ir.clone() {
-                            load(&this.key.clone(), BuiltinIrLoadRequest { name, bytes });
-                        } else {
-                            this.ir_status.loading = false;
-                            this.ir_status.error =
-                                Some("The plug-in host is not running yet.".into());
-                        }
-                        cx.notify();
-                    }
-                    Err(error) => {
-                        this.ir_status.loading = false;
-                        this.ir_status.error = Some(format!("{}", error));
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
-        }
-        #[cfg(not(feature = "native-dialogs"))]
-        {
-            self.ir_status.error =
-                Some("Native file dialogs are unavailable in this build.".into());
-            cx.notify();
-        }
-    }
-
-    fn start_nam_load(&mut self, cx: &mut Context<Self>) {
-        #[cfg(feature = "native-dialogs")]
-        {
-            self.nam_status = LoadStatus::default();
-            self.nam_status.loading = true;
-            cx.notify();
-            cx.spawn(async move |this, cx| {
-                let Some(handle) = rfd::AsyncFileDialog::new()
-                    .set_title("Load NAM Capture")
-                    .add_filter("Neural Amp Modeler", &["nam"])
-                    .pick_file()
-                    .await
-                else {
-                    let _ = this.update(cx, |this, cx| {
-                        this.nam_status.loading = false;
+                        this.status_mut(file).loading = false;
                         cx.notify();
                     });
                     return;
                 };
                 let path: PathBuf = handle.path().to_path_buf();
-                let name = path
-                    .file_stem()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "capture".to_string());
-                let read = cx
-                    .background_spawn({
-                        let path = path.clone();
-                        async move { std::fs::read_to_string(&path) }
-                    })
+                let stored = cx
+                    .background_spawn(async move { store_user_file(file, &path) })
                     .await;
-                let _ = this.update(cx, |this, cx| match read {
-                    Ok(json) => {
-                        if let Some(load) = this.host_ops.load_nam_capture.clone() {
-                            load(
-                                &this.key.clone(),
-                                BuiltinNamLoadRequest {
-                                    name,
-                                    json,
-                                    // Auto-upgraded by the DSP when the model
-                                    // includes a cab; a stereo-width toggle
-                                    // can be added to the card later.
-                                    stereo: false,
-                                    full_rig: false,
-                                },
-                            );
-                        } else {
-                            this.nam_status.loading = false;
-                            this.nam_status.error =
-                                Some("The plug-in host is not running yet.".into());
+                let _ = this.update(cx, |this, cx| {
+                    match stored {
+                        Ok((name, bytes)) => this.send_file(file, name, bytes),
+                        Err(error) => {
+                            let status = this.status_mut(file);
+                            status.loading = false;
+                            status.error = Some(error);
                         }
-                        cx.notify();
                     }
-                    Err(error) => {
-                        this.nam_status.loading = false;
-                        this.nam_status.error = Some(format!("{}", error));
-                        cx.notify();
-                    }
+                    cx.notify();
                 });
             })
             .detach();
         }
         #[cfg(not(feature = "native-dialogs"))]
         {
-            self.nam_status.error =
+            self.status_mut(file).error =
                 Some("Native file dialogs are unavailable in this build.".into());
             cx.notify();
         }
     }
 
-    /// Routed from `plugin_ops.rs` when the host answers a `load_ir` call.
+    /// Sends a stored file's bytes to the host under `name`.
+    fn send_file(&mut self, file: RodhareistFile, name: String, bytes: Vec<u8>) {
+        let key = self.key.clone();
+        let sent = match file {
+            RodhareistFile::Capture => match String::from_utf8(bytes) {
+                Ok(json) => self.host_ops.load_nam_capture.clone().map(|load| {
+                    load(
+                        &key,
+                        BuiltinNamLoadRequest {
+                            name,
+                            json,
+                            // The DSP upgrades a capture that includes a cab
+                            // to full rig itself.
+                            stereo: false,
+                            full_rig: false,
+                        },
+                    )
+                }),
+                Err(_) => {
+                    let status = self.status_mut(file);
+                    status.loading = false;
+                    status.error = Some("This .nam file is not text.".into());
+                    return;
+                }
+            },
+            RodhareistFile::Impulse => self
+                .host_ops
+                .load_ir
+                .clone()
+                .map(|load| load(&key, BuiltinIrLoadRequest { name, bytes })),
+        };
+        if sent.is_none() {
+            let status = self.status_mut(file);
+            status.loading = false;
+            status.error = Some("The plug-in host is not running yet.".into());
+        }
+    }
+
+    /// Routed from `plugin_ops.rs` when the host answers a `load_ir` call,
+    /// after Studio recorded the answer and the file name.
     pub fn notify_ir_load_result(
         &mut self,
-        ok: bool,
-        name: &str,
-        error: Option<&str>,
-        frames: u64,
+        _ok: bool,
+        _name: &str,
+        _error: Option<&str>,
+        _frames: u64,
         cx: &mut Context<Self>,
     ) {
-        self.ir_status.loading = false;
-        if ok {
-            self.ir_status.loaded_name = Some(name.to_string());
-            self.ir_status.ir_seconds = frames as f32 / self.sample_rate_hint();
-            self.ir_status.error = None;
-        } else {
-            self.ir_status.error = Some(error.unwrap_or("load failed").to_string());
-        }
-        cx.notify();
+        self.ir_status = LoadStatus::default();
+        self.sync_from_mirror(cx);
     }
 
-    /// Routed from `plugin_ops.rs` when the host answers a `load_nam_capture`
-    /// call.
+    /// Routed from `plugin_ops.rs` when the host answers a
+    /// `load_nam_capture` call, after Studio recorded it.
     pub fn notify_nam_capture_result(
         &mut self,
-        ok: bool,
-        name: &str,
-        error: Option<&str>,
+        _ok: bool,
+        _name: &str,
+        _error: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        self.nam_status.loading = false;
-        if ok {
-            self.nam_status.loaded_name = Some(name.to_string());
-            self.nam_status.error = None;
-        } else {
-            self.nam_status.error = Some(error.unwrap_or("load failed").to_string());
-        }
-        cx.notify();
+        self.nam_status = LoadStatus::default();
+        self.sync_from_mirror(cx);
     }
-
     /// Best-effort sample rate for turning an IR's frame count into seconds
     /// for display only — never used by the audio path.
     fn sample_rate_hint(&self) -> f32 {
@@ -648,7 +794,17 @@ impl RodhareistEditorWindow {
                     let source = this.host_ops.meter_source.as_ref();
                     let shell_moved = this.meter.poll(source, &key);
                     let io_moved = this.io.poll(source, &key);
-                    if shell_moved || io_moved {
+                    let block = this
+                        .host_ops
+                        .pad_level_source
+                        .as_ref()
+                        .and_then(|source| source(&key))
+                        .map(|(_, block)| block);
+                    let pads_moved = block.is_some() && block != this.pads;
+                    if pads_moved {
+                        this.pads = block;
+                    }
+                    if shell_moved || io_moved || pads_moved {
                         cx.notify();
                     }
                 });
@@ -681,12 +837,15 @@ impl Render for RodhareistEditorWindow {
         }
         let on_close = self.on_close.clone();
         let alive = self.alive.clone();
-        let content = rodhareist_panel(self, cx);
+        let content = rodhareist_panel(self, window, cx);
 
         div()
             .relative()
             .size_full()
             .track_focus(&self.focus_handle)
+            .on_key_down(
+                cx.listener(|this, event: &KeyDownEvent, _window, cx| this.on_key_down(event, cx)),
+            )
             .child(native_plugin_shell(
                 "rodhareist-window-close",
                 &self.identity,
