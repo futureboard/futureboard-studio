@@ -1179,6 +1179,7 @@ impl BuiltinHostProcessor {
         const _: () = assert!(burnlimit::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(equz8::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(equzx::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
+        const _: () = assert!(rodharerist::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &*self.dsp.get() } {
             BuiltinDsp::DrumSampler(dsp) => Some(dsp.pad_levels()),
@@ -1198,6 +1199,8 @@ impl BuiltinHostProcessor {
             // (`equz8::telemetry`, `equzx::telemetry`).
             BuiltinDsp::Equz8(dsp) => Some(dsp.telemetry()),
             BuiltinDsp::Equzx(dsp) => Some(dsp.telemetry()),
+            // Per-channel levels and the tuner (`rodharerist::telemetry`).
+            BuiltinDsp::Rodhareist(dsp) => Some(dsp.telemetry()),
             _ => None,
         }
     }
