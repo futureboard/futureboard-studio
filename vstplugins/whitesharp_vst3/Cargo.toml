@@ -4,7 +4,7 @@ members = [".", "xtask"]
 
 [package]
 name = "whitesharp_vst3"
-version = "0.1.0"
+version = "0.1.3"
 # The editor is the DAW's own WhiteSharp UI, compiled in from its source tree
 # (`src/components`); those files are written against edition 2021.
 edition = "2021"
