@@ -343,9 +343,27 @@ pub fn scenes() -> Vec<Scene> {
         },
         Scene {
             name: "rodhareist",
-            width: 1_280.0,
-            height: 880.0,
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
             open: rodhareist,
+        },
+        Scene {
+            name: "rodhareist-explore",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_explore,
+        },
+        Scene {
+            name: "rodhareist-pedalboard",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_pedalboard,
+        },
+        Scene {
+            name: "rodhareist-settings",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: rodhareist_settings,
         },
         Scene {
             name: "wrapsynth",
@@ -1570,12 +1588,71 @@ macro_rules! default_editor {
     };
 }
 
-default_editor!(
-    rodhareist,
-    crate::components::rodhareist_window::RodhareistEditorWindow,
-    "rodharerist",
-    "Rodhareist"
-);
+/// Rodhareist on `page`, its meters filled from a run of the real DSP over
+/// the preview drum bus.
+fn rodhareist_on(
+    page: crate::components::rodhareist_panel::Page,
+    options: WindowOptions,
+    cx: &mut App,
+) -> Result<AnyWindowHandle> {
+    use waygate::StereoEffect;
+    let dsp = std::cell::RefCell::new(rodharerist::Dsp::new(48_000.0));
+    let _ = run_preview(
+        |l, r| dsp.borrow_mut().process_stereo(l, r),
+        Default::default,
+    );
+    let block = dsp.borrow().telemetry();
+    plate::ensure_fonts(cx);
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| {
+            let mut window = crate::components::rodhareist_window::RodhareistEditorWindow::new(
+                key("rodharerist"),
+                identity("Rodhareist"),
+                preview_host_ops(),
+                no_close(),
+                cx,
+            );
+            window.show_pads(block);
+            window.show_page(page);
+            if page == crate::components::rodhareist_panel::Page::Pedalboard {
+                // The busiest block: the amp, six knobs.
+                window.chain_focus = Some(crate::components::rodhareist_panel::ChainFocus::Block(
+                    rodharerist::StageKind::Amp,
+                ));
+            }
+            window
+        })
+    })?;
+    Ok(handle.into())
+}
+
+fn rodhareist(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_on(crate::components::rodhareist_panel::Page::Home, options, cx)
+}
+
+fn rodhareist_explore(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_on(
+        crate::components::rodhareist_panel::Page::Explore,
+        options,
+        cx,
+    )
+}
+
+fn rodhareist_pedalboard(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_on(
+        crate::components::rodhareist_panel::Page::Pedalboard,
+        options,
+        cx,
+    )
+}
+
+fn rodhareist_settings(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    rodhareist_on(
+        crate::components::rodhareist_panel::Page::Settings,
+        options,
+        cx,
+    )
+}
 default_editor!(
     wrap_synth,
     crate::components::wrap_synth_window::WrapSynthEditorWindow,
