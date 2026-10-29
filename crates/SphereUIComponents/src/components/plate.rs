@@ -19,9 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
     anchored, canvas, deferred, div, fill, point, px, rgb, rgba, Anchor, AnyElement, App,
-    AppContext, Bounds, ElementId, Font, FontFallbacks, FontWeight, Hsla, InteractiveElement,
-    IntoElement, ParentElement, PathBuilder, Pixels, Point, Rgba, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, TextAlign, TextRun, Window,
+    AppContext, Bounds, Context, ElementId, Font, FontFallbacks, FontWeight, Hsla,
+    InteractiveElement, IntoElement, ParentElement, PathBuilder, Pixels, Point, Rgba,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, TextAlign, TextRun, Window,
 };
 
 use crate::components::fader::{drag_to, is_reset_click, FaderDrag};
@@ -253,6 +253,9 @@ pub enum DialUnit {
     Q,
     /// −1…1 shown as a signed percentage.
     Bias,
+    Seconds,
+    /// A bare number to one decimal: a 0–10 knob.
+    Plain,
 }
 
 impl DialUnit {
@@ -266,6 +269,8 @@ impl DialUnit {
             Self::Ratio => format!("{v:.1}:1"),
             Self::Q => format!("{v:.2}"),
             Self::Bias => format!("{}%", signed(v * 100.0).replace(".0", "")),
+            Self::Seconds => format!("{v:.1} s"),
+            Self::Plain => format!("{v:.1}"),
         }
     }
 
@@ -281,7 +286,8 @@ impl DialUnit {
             Self::Hz | Self::HzRound if v < 10_000.0 => 10.0,
             Self::Hz | Self::HzRound => 100.0,
             Self::Percent => 1.0,
-            Self::Ratio => 0.1,
+            Self::Ratio | Self::Plain => 0.1,
+            Self::Seconds => 0.01,
             Self::Q | Self::Bias => 0.01,
         };
         (v / step).round() * step
@@ -634,6 +640,10 @@ pub struct KnobLook {
     pub face_r: f32,
     pub face_w: f32,
     pub needle_w: f32,
+    /// The face's fill and rim, and where the needle starts from the centre.
+    pub face: u32,
+    pub face_edge: u32,
+    pub needle_from: f32,
 }
 
 impl KnobLook {
@@ -645,6 +655,9 @@ impl KnobLook {
             face_r: 17.0,
             face_w: 1.0,
             needle_w: 2.0,
+            face: FACE,
+            face_edge: FACE_EDGE,
+            needle_from: 7.0,
         }
     }
 
@@ -656,6 +669,32 @@ impl KnobLook {
             face_r: 18.0,
             face_w: 0.7,
             needle_w,
+            face: FACE,
+            face_edge: FACE_EDGE,
+            needle_from: 7.0,
+        }
+    }
+
+    /// The same drawing with its own track, face and needle.
+    pub const fn styled(
+        self,
+        track_w: f32,
+        face_r: f32,
+        face: u32,
+        face_edge: u32,
+        face_w: f32,
+        needle_from: f32,
+        needle_w: f32,
+    ) -> Self {
+        Self {
+            track_w,
+            face_r,
+            face,
+            face_edge,
+            face_w,
+            needle_from,
+            needle_w,
+            ..self
         }
     }
 }
@@ -670,6 +709,8 @@ pub struct KnobCell {
     pub label_em: f32,
     pub label_ink: u32,
     pub value_size: f32,
+    /// The label under the knob rather than over it.
+    pub label_below: bool,
 }
 
 impl KnobCell {
@@ -681,6 +722,14 @@ impl KnobCell {
             label_em: 0.06,
             label_ink: SOFT,
             value_size,
+            label_below: false,
+        }
+    }
+
+    pub const fn label_below(self) -> Self {
+        Self {
+            label_below: true,
+            ..self
         }
     }
 
@@ -756,12 +805,12 @@ pub fn paint_knob(
     );
     let r = look.face_r * k;
     window.paint_quad(
-        fill(rect(cx - r, cy - r, 2.0 * r, 2.0 * r), color(FACE))
+        fill(rect(cx - r, cy - r, 2.0 * r, 2.0 * r), color(look.face))
             .corner_radii(px(r))
             .border_widths(px(look.face_w * k))
-            .border_color(color(FACE_EDGE)),
+            .border_color(color(look.face_edge)),
     );
-    let p1 = angle_point(cx, cy, a, 7.0 * k);
+    let p1 = angle_point(cx, cy, a, look.needle_from * k);
     let p2 = angle_point(cx, cy, a, 15.0 * k);
     let w = look.needle_w * k;
     paint_polyline(window, &[p1, p2], w, color(WHITE), None);
@@ -777,8 +826,8 @@ const KNOB_DRAG_SPAN: f32 = 180.0;
 /// it to `dial.default`; `set` takes each new value. Greyed and inert when
 /// not `enabled`.
 #[allow(clippy::too_many_arguments)]
-pub fn knob<M: KitModel>(
-    cx: &mut Cx<M>,
+pub fn knob<T: 'static>(
+    cx: &mut Context<T>,
     key: impl Into<SharedString>,
     dial: Dial,
     value: f32,
@@ -787,7 +836,7 @@ pub fn knob<M: KitModel>(
     ink: Rgba,
     enabled: bool,
     s: f32,
-    set: impl Fn(&mut KitEditor<M>, f32, &mut Cx<M>) + 'static,
+    set: impl Fn(&mut T, f32, &mut Context<T>) + 'static,
 ) -> AnyElement {
     knob_reading(cx, key, dial, value, None, look, cell, ink, enabled, s, set)
 }
@@ -795,8 +844,8 @@ pub fn knob<M: KitModel>(
 /// [`knob`], its value printed as `readout` when given — a reading the
 /// dial's own format cannot show.
 #[allow(clippy::too_many_arguments)]
-pub fn knob_reading<M: KitModel>(
-    cx: &mut Cx<M>,
+pub fn knob_reading<T: 'static>(
+    cx: &mut Context<T>,
     key: impl Into<SharedString>,
     dial: Dial,
     value: f32,
@@ -806,7 +855,7 @@ pub fn knob_reading<M: KitModel>(
     ink: Rgba,
     enabled: bool,
     s: f32,
-    set: impl Fn(&mut KitEditor<M>, f32, &mut Cx<M>) + 'static,
+    set: impl Fn(&mut T, f32, &mut Context<T>) + 'static,
 ) -> AnyElement {
     let key: SharedString = key.into();
     let n = dial.norm(value);
@@ -878,21 +927,25 @@ pub fn knob_reading<M: KitModel>(
         .items_center()
         .flex_shrink_0()
         .w(px(cell.width * s))
-        .gap(px(cell.gap * s))
-        .child(caption(
-            dial.label,
-            cell.label_size,
-            cell.label_em,
-            cell.label_ink,
-            s,
-        ))
-        .child(button)
-        .child(numbers(
-            readout.unwrap_or_else(|| dial.text(value)),
-            cell.value_size,
-            WHITE,
-            s,
-        ));
+        .gap(px(cell.gap * s));
+    let label = caption(
+        dial.label,
+        cell.label_size,
+        cell.label_em,
+        cell.label_ink,
+        s,
+    );
+    let reading = numbers(
+        readout.unwrap_or_else(|| dial.text(value)),
+        cell.value_size,
+        WHITE,
+        s,
+    );
+    let cell_div = if cell.label_below {
+        cell_div.child(button).child(label).child(reading)
+    } else {
+        cell_div.child(label).child(button).child(reading)
+    };
     if enabled {
         cell_div.into_any_element()
     } else {
