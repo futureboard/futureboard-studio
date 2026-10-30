@@ -335,6 +335,7 @@ impl KitModel for Equz8Plate {
         let (hz, db) = drag_target(b, SCALE, plate::xy(event.position));
         let mut next = e.params.clone();
         let band = &mut next.bands[slot];
+        band.active = true;
         band.freq = DialUnit::Hz.round(hz).clamp(20.0, 20_000.0);
         if band.band_type.has_gain() {
             band.gain_db = DialUnit::Db.round(db).clamp(-18.0, 18.0);
