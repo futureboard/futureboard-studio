@@ -2408,49 +2408,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
-name = "daux"
-version = "0.4.0"
-dependencies = [
- "daux-sys",
- "libc",
-]
-
-[[package]]
-name = "daux-engine"
-version = "0.4.0"
-dependencies = [
- "daux-ks",
- "daux-usb",
- "windows 0.62.2",
-]
-
-[[package]]
-name = "daux-ks"
-version = "0.4.0"
-dependencies = [
- "windows 0.62.2",
-]
-
-[[package]]
-name = "daux-sdk"
-version = "0.4.0"
-dependencies = [
- "daux",
- "daux-engine",
-]
-
-[[package]]
-name = "daux-sys"
-version = "0.4.0"
-
-[[package]]
-name = "daux-usb"
-version = "0.4.0"
-dependencies = [
- "windows 0.62.2",
-]
-
-[[package]]
 name = "deflate64"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8522,7 +8479,6 @@ dependencies = [
  "cc",
  "cpal",
  "crossbeam-channel",
- "daux-sdk",
  "ebur128",
  "fbmx-runtime",
  "libc",
