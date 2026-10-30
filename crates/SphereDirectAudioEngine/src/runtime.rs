@@ -972,12 +972,10 @@ pub struct RuntimeTrack {
     pub pdc_delay_r: Vec<f32>,
     pub pdc_write_pos: usize,
     /// Smoothed per-channel fader gain (volume × pan) actually applied to audio.
-    /// In the realtime path the applied gain ramps from these values toward the
-    /// new target across each block so dragging the fader/pan knob does not step
-    /// at block boundaries (zipper noise / clicks). Initialized to the build-time
-    /// target so playback starts at the correct level with no startup fade. Only
-    /// consulted when [`RuntimeProject::fader_smoothing`] is set (realtime);
-    /// offline export applies the exact constant per-block gain unchanged.
+    /// The applied gain ramps from these values toward the new target across
+    /// each block so playback and offline export handle fader automation alike.
+    /// Initialized to the build-time target to avoid a startup fade. When
+    /// [`RuntimeProject::fader_smoothing`] is off, the target applies directly.
     pub smoothed_gain_l: f32,
     pub smoothed_gain_r: f32,
 }
@@ -2433,10 +2431,8 @@ pub struct RuntimeProject {
     /// Effective playback PDC flag used when this runtime graph was built.
     pub pdc_enabled: bool,
     /// When set, the render path ramps track/master fader gains across each block
-    /// toward their target (anti-zipper smoothing for live fader/pan drags). The
-    /// realtime engine sets this `true`; the offline exporter sets it `false` so
-    /// the bounce applies the exact constant per-block gain (deterministic, and
-    /// byte-for-byte unchanged from before smoothing existed). See `apply_fader`.
+    /// toward their target. Playback and offline export enable this so fader
+    /// automation follows the same envelope. See `apply_fader`.
     pub fader_smoothing: bool,
     /// Smoothed master gain, ramped toward the live master volume each block when
     /// [`Self::fader_smoothing`] is set. Mirrors per-track `smoothed_gain_*`.

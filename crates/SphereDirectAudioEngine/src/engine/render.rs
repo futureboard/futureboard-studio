@@ -487,9 +487,8 @@ fn apply_fader(track: &mut RuntimeTrack, frames: usize, beat: f64, smooth: bool)
     });
     let (block_l, block_r) = (&mut track.block_l[..frames], &mut track.block_r[..frames]);
     if !smooth {
-        // Offline export / tests: exact constant per-block gain (unchanged
-        // behavior, deterministic bounce). Keep the smoother aligned with the
-        // applied gain so a later realtime block starts without a jump.
+        // Tests and callers without smoothing still apply a deterministic
+        // constant gain, then keep the smoother aligned for the next block.
         simd::gain_stereo(block_l, block_r, target_l, target_r);
         fold_preview_mode_block(block_l, block_r, track.preview_mode);
         track.smoothed_gain_l = target_l;
@@ -497,10 +496,8 @@ fn apply_fader(track: &mut RuntimeTrack, frames: usize, beat: f64, smooth: bool)
         log_fader_trace(track, frames, fader_trace_pre, volume, &automation);
         return;
     }
-    // Realtime: ramp from the previously applied gain to the new target across
-    // the block (≈ one block ≈ 10 ms @ 48 k / 512). Each block ends on the
-    // target, so successive blocks are continuous — no step at block boundaries,
-    // no zipper noise when the fader/pan is dragged. Allocation-free.
+    // Ramp from the previously applied gain to the new target across the block.
+    // Each block ends on the target, so successive blocks are continuous.
     let start_l = track.smoothed_gain_l;
     let start_r = track.smoothed_gain_r;
     let inv = 1.0 / frames as f32;
@@ -2047,8 +2044,8 @@ fn render_project_block_interleaved_core(
     // Final master volume — gain and nothing else. The output stage does not
     // limit or clip: a mix that runs hot leaves here hot, and reads hot on the
     // meter, instead of being quietly reshaped on its way to the device.
-    // In realtime the gain ramps across the block so dragging the master fader
-    // does not zipper; offline export applies the exact constant gain.
+    // Playback and offline export use the same block ramp so master automation
+    // follows the same envelope.
     // Every channel the mix occupies: the stereo pair, or a discrete
     // surround layout's full width.
     let mix_width = discrete_channels.unwrap_or(2).min(channels);

@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::audio_source::ClipAudioSource;
 use crate::engine::{render_project_block_interleaved_with_taps, schedule_midi_render_block};
@@ -31,22 +32,73 @@ pub struct OfflineRenderSummary {
 /// the external host to finish the requested block. This prevents a faster-than-
 /// realtime bounce from outrunning the shared-memory producer and writing zeros.
 ///
-/// The wait is cancellation-aware: cancelling the export aborts a pending wait
-/// immediately (the read returns 0 and the render loop's cancel check exits)
-/// instead of stalling until the per-read deadline when a host is wedged.
+/// The wait is cancellation-aware. A timeout or partial response marks the
+/// render failed so an incomplete block can never be written to the export.
 #[derive(Debug)]
 struct OfflineBridgeSink {
     live: crate::plugin_bridge::SharedPluginBridgeSink,
     cancel: ExportCancelToken,
+    instance_id: String,
+    failure: Arc<OfflineBridgeFailure>,
+}
+
+#[derive(Debug, Default)]
+struct OfflineBridgeFailure {
+    message: Mutex<Option<String>>,
+}
+
+impl OfflineBridgeFailure {
+    fn record(&self, message: String) {
+        let mut failure = self
+            .message
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failure.is_none() {
+            *failure = Some(message);
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.message
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    fn message(&self) -> Option<String> {
+        self.message
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl OfflineBridgeSink {
     fn wait_step(&self, deadline: std::time::Instant) -> bool {
-        if self.cancel.is_cancelled() || std::time::Instant::now() >= deadline {
+        if self.cancel.is_cancelled()
+            || self.failure.is_set()
+            || std::time::Instant::now() >= deadline
+        {
             false
         } else {
             std::thread::sleep(std::time::Duration::from_micros(100));
             true
+        }
+    }
+
+    fn record_short_read(&self, got: usize, frames: usize) {
+        self.failure.record(format!(
+            "plugin bridge '{}' returned {got} of {frames} frames; export stopped to avoid a broken audio block",
+            self.instance_id
+        ));
+    }
+
+    fn record_timeout(&self, frames: usize) {
+        if !self.cancel.is_cancelled() && !self.failure.is_set() {
+            self.failure.record(format!(
+                "plugin bridge '{}' did not finish its {frames}-frame block within 5 seconds",
+                self.instance_id
+            ));
         }
     }
 }
@@ -65,17 +117,19 @@ impl PluginBridgeSink for OfflineBridgeSink {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let got = self.live.read_output(l, r, frames);
-            // Require a full block. A short read would wet|dry-splice in
-            // `apply_bridge_insert_output` and click in the bounce file.
+            // Require a full block. The renderer aborts on a short read instead
+            // of writing a wet/dry splice to the file.
             if got >= frames {
                 return frames;
             }
             if got > 0 {
                 // Freshness already consumed; refuse the partial rather than
                 // waiting forever for a second copy that will never arrive.
+                self.record_short_read(got, frames);
                 return 0;
             }
             if !self.wait_step(deadline) {
+                self.record_timeout(frames);
                 return 0;
             }
         }
@@ -94,9 +148,11 @@ impl PluginBridgeSink for OfflineBridgeSink {
                 return frames;
             }
             if got > 0 {
+                self.record_short_read(got, frames);
                 return 0;
             }
             if !self.wait_step(deadline) {
+                self.record_timeout(frames);
                 return 0;
             }
         }
@@ -108,13 +164,15 @@ impl PluginBridgeSink for OfflineBridgeSink {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let (got, channels) = self.live.read_output_multichannel(out, frames);
-            if got >= frames {
+            if got >= frames && channels > 0 {
                 return (frames, channels);
             }
             if got > 0 {
+                self.record_short_read(got, frames);
                 return (0, 0);
             }
             if !self.wait_step(deadline) {
+                self.record_timeout(frames);
                 return (0, 0);
             }
         }
@@ -279,7 +337,16 @@ fn render_offline_impl(
         snapshot.pdc_enabled,
     )
     .map_err(|e| ExportError::Build(e.to_string()))?;
+    let bridge_failure = Arc::new(OfflineBridgeFailure::default());
     runtime.sample_rate = request.sample_rate;
+    let block = if bridge_sinks.is_some() {
+        request
+            .block_size
+            .max(1)
+            .min(crate::plugin_bridge::MAX_BRIDGE_BLOCK_FRAMES)
+    } else {
+        request.block_size.max(1)
+    };
     if let Some(sinks) = bridge_sinks {
         runtime.plugin_bridge_sinks = sinks
             .iter()
@@ -289,32 +356,48 @@ fn render_offline_impl(
                     Arc::new(OfflineBridgeSink {
                         live: sink.clone(),
                         cancel: cancel.clone(),
+                        instance_id: id.clone(),
+                        failure: bridge_failure.clone(),
                     }) as crate::plugin_bridge::SharedPluginBridgeSink,
                 )
             })
             .collect();
         runtime.resolve_bridge_sinks();
+    }
+    if let Some((track_id, insert_id)) = runtime.tracks.iter().find_map(|track| {
+        track.inserts.iter().find_map(|insert| {
+            (insert.enabled
+                && insert.kind_tag == crate::runtime::RuntimeInsertKind::ExternalBridge
+                && insert.bridge_sink.is_none())
+            .then(|| (track.id.clone(), insert.id.clone()))
+        })
+    }) {
+        return Err(ExportError::PluginBridge(format!(
+            "insert '{insert_id}' on track '{track_id}' has no plugin host connection"
+        )));
+    }
+    if bridge_sinks.is_some() {
         // Prime the bridge's one-block pipeline with silence so the host does
         // not process leftover realtime `audio_in`. The first rendered block
         // consumes this silent response and requests the first timeline block,
         // matching realtime's one-block bridge latency (covered by PDC).
-        let prime_frames = request.block_size.max(1);
+        let prime_frames = block;
         let zeros = vec![0.0f32; prime_frames];
         for sink in runtime.plugin_bridge_sinks.values() {
             sink.write_input(&zeros, &zeros, prime_frames);
             sink.request_block(prime_frames as u32);
         }
     }
-    // Deterministic bounce: apply the exact constant per-block fader gain, never
-    // the realtime anti-zipper ramp (which is for live fader drags).
-    runtime.fader_smoothing = false;
+    // Use the same per-block fader ramps as playback so automated volume and pan
+    // reach the export on the same samples.
+    runtime.fader_smoothing = true;
+    runtime.smoothed_master_gain = request.master_volume;
     // Restore each in-process VST3 insert's saved state before any process() call
     // so instruments/effects render with the user's current tweaks. Runs once on
     // this worker thread, never the audio callback.
     restore_offline_plugin_states(snapshot, &mut runtime);
 
     let channels = request.channels.max(1) as usize;
-    let block = request.block_size.max(1);
     let ts_num = snapshot.time_signature[0].max(1);
     let ts_den = snapshot.time_signature[1].max(1);
 
@@ -490,6 +573,12 @@ fn render_offline_impl(
             None,
             capture_tracks.then_some(track_taps.as_mut_slice()),
         );
+        if cancel.is_cancelled() {
+            return Err(ExportError::Cancelled);
+        }
+        if let Some(message) = bridge_failure.message() {
+            return Err(ExportError::PluginBridge(message));
+        }
         // Match the realtime path: per-block MIDI events are consumed once,
         // and so are the Solfege pitch and articulation lists. An export that
         // let those accumulate re-applied every earlier pitch change on every
