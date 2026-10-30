@@ -270,22 +270,6 @@ impl EngineDeviceInfo {
         }
     }
 
-    #[cfg(target_os = "windows")]
-    fn from_daux_direct(d: crate::backend::daux_direct::DauxDirectDeviceInfo) -> Self {
-        let channel_info = generic_channel_info("output", d.channels);
-        Self {
-            device_id: AudioDeviceId::DauxKernelPin(d.id.clone()),
-            id: d.id,
-            name: d.name,
-            kind: "output".into(),
-            channels: d.channels,
-            channel_info,
-            default_sample_rate: d.default_sample_rate,
-            is_default: d.is_default,
-            backend: "DAUx Direct".into(),
-        }
-    }
-
     fn from_daux(d: crate::types::JsAudioDeviceInfo) -> Self {
         Self::from_daux_with_backend(d, None)
     }
@@ -412,15 +396,6 @@ fn list_wdm_ks_output_devices() -> Vec<EngineDeviceInfo> {
     Vec::new()
 }
 
-#[cfg(target_os = "windows")]
-fn list_daux_direct_output_devices() -> Vec<EngineDeviceInfo> {
-    crate::backend::daux_direct::list_output_devices()
-        .into_iter()
-        .map(EngineDeviceInfo::from_daux_direct)
-        .collect()
-}
-
-#[cfg(not(target_os = "windows"))]
 fn list_daux_direct_output_devices() -> Vec<EngineDeviceInfo> {
     Vec::new()
 }

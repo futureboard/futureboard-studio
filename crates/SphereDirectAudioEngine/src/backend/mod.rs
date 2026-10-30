@@ -8,7 +8,6 @@
 //! | `DauxCpalBackend`        | All          | cpal: WASAPI Shared / CoreAudio / ALSA |
 //! | `DauxWasapiExclBackend`  | Windows only | Raw WASAPI professional + MMCSS        |
 //! | `DauxWdmKsBackend`       | Windows only | WDM-KS low-level driver path        |
-//! | `DauxDirectBackend`      | Windows only | DAUx engine, DAUx-KS kernel streaming |
 //! | `DauxAsioBackend`        | Windows only | Host supplied by an edition provider |
 //! | `DauxMmeBackend`         | Windows only | Legacy MME stub (fallback only)     |
 //!
@@ -25,8 +24,6 @@ pub mod asio_session;
 pub mod cpal_backend;
 pub mod render;
 
-#[cfg(target_os = "windows")]
-pub mod daux_direct;
 #[cfg(target_os = "windows")]
 pub mod wasapi_exclusive;
 #[cfg(target_os = "windows")]
@@ -46,8 +43,7 @@ pub enum BackendKind {
     WasapiExclusive,
     /// Windows: WDM-KS low-level driver path (experimental).
     WdmKs,
-    /// Windows: the DAUx engine streaming straight to the driver's kernel
-    /// pins (DAUx-KS) — covers USB audio class devices WDM-KS cannot.
+    /// Legacy DAUx Direct identifier retained for saved settings.
     DauxDirect,
     /// Windows: Steinberg ASIO driver path supplied by Professional Edition.
     Asio,
@@ -113,7 +109,6 @@ impl BackendKind {
                 BackendKind::WasapiShared,
                 BackendKind::WasapiExclusive,
                 BackendKind::WdmKs,
-                BackendKind::DauxDirect,
                 BackendKind::MmeFallback,
             ];
             if asio_support_enabled() {
@@ -276,15 +271,6 @@ pub fn list_available_backends() -> Vec<BackendInfo> {
             available: true,
             is_default: false,
             description: "WDM-KS low-level Windows driver path — experimental".into(),
-        });
-        list.push(BackendInfo {
-            id: "daux-direct".into(),
-            name: "DAUx Direct".into(),
-            available: true,
-            is_default: false,
-            description: "DAUx engine — kernel streaming straight to the driver (USB audio), \
-                          bypassing the Windows audio engine"
-                .into(),
         });
         if asio_support_enabled() {
             list.push(BackendInfo {
@@ -470,12 +456,13 @@ mod tests {
     }
 
     #[test]
-    fn daux_direct_backend_id_round_trips() {
+    fn legacy_daux_direct_backend_falls_back_to_auto() {
         assert_eq!(BackendKind::from_id("daux-direct"), BackendKind::DauxDirect);
         assert_eq!(BackendKind::DauxDirect.id(), "daux-direct");
+        assert!(!BackendKind::DauxDirect.is_allowed_on_current_platform());
         assert_eq!(
-            BackendKind::DauxDirect.is_allowed_on_current_platform(),
-            cfg!(target_os = "windows")
+            BackendKind::sanitize_for_current_platform(BackendKind::DauxDirect),
+            BackendKind::Auto
         );
     }
 

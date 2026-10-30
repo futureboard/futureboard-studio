@@ -66,9 +66,6 @@ windows.workspace = true
 # ASIO driver enumeration reads HKLM\SOFTWARE\ASIO instead of instantiating
 # drivers (see src/asio_registry.rs).
 windows-registry.workspace = true
-# DAUx SDK: the DAUx engine behind the "DAUx Direct" backend (DAUx-KS kernel
-# streaming). Local checkout of the daux repository.
-daux-sdk = { path = "H:/daux/crates/daux-sdk" }
 
 # ── Linux-only: realtime scheduling for the ALSA callback thread ─────────────
 #
