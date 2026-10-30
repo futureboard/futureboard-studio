@@ -89,7 +89,7 @@ pub use crate::export::{
     render_block_size_for_sample_rate,
     export_arrangement_with_bridges, export_render_job, export_render_job_with_bridges,
     export_tracks_single_pass, export_tracks_single_pass_with_bridges, partial_path_for,
-    record_render_job, render_block_size_for_sample_rate, render_offline,
+    record_render_job, render_offline,
     render_offline_tracks, ArrangementExportRequest,
     ArrangementExportSummary, ExportCancelToken, ExportError, ExportNormalizeMode, ExportProgress,
     ExportStage, ExportTailMode, LevelReport, OfflineRenderRequest, OfflineRenderSummary,
