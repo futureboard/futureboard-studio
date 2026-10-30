@@ -70,7 +70,7 @@ impl StudioLayout {
         // Export detaches the live bridge sinks and drives them from the offline
         // worker; the snapshot must keep external-bridge inserts (not in-process
         // native-plugin stubs) so effects/built-ins render through the real DSP.
-        let snapshot = build_engine_project_snapshot_for_export(
+        let mut snapshot = build_engine_project_snapshot_for_export(
             &tl_state,
             sample_rate,
             project_root.as_deref(),
@@ -78,6 +78,13 @@ impl StudioLayout {
             pdc_enabled,
             latency_graph_version,
         );
+        snapshot.routing.buffer_size = self
+            .audio_bridge
+            .engine
+            .as_ref()
+            .map(|engine| engine.stats().buffer_size)
+            .filter(|size| *size > 0)
+            .unwrap_or(snapshot.routing.buffer_size.max(1));
         let master_volume = volume_norm_to_linear(tl_state.master.volume);
         let content_end_beat = snapshot
             .clips

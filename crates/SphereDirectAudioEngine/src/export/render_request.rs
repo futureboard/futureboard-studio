@@ -106,3 +106,21 @@ pub fn beats_to_samples(snapshot: &EngineProjectSnapshot, beat: f64, sample_rate
     let tempo_map = build_project_tempo_map(snapshot);
     tempo_map.samples_at_beat(beat.max(0.0), sr)
 }
+
+/// Scale the live device block duration to the output rate so block-driven
+/// automation is evaluated at the same time intervals during offline export.
+pub fn render_block_size_for_sample_rate(
+    snapshot: &EngineProjectSnapshot,
+    sample_rate: u32,
+) -> usize {
+    let source_rate = snapshot.sample_rate.max(1) as u64;
+    let output_rate = sample_rate.max(1) as u64;
+    let live_block = snapshot.routing.buffer_size.max(1) as u64;
+    let output_block = live_block
+        .saturating_mul(output_rate)
+        .saturating_add(source_rate / 2)
+        / source_rate;
+    output_block
+        .max(1)
+        .min(crate::plugin_bridge::MAX_BRIDGE_BLOCK_FRAMES as u64) as usize
+}

@@ -14,8 +14,9 @@ use gpui::{Context, WindowHandle};
 use sphere_encoder::{AudioEncodeOptions, AudioFileFormat, AudioSampleFormat};
 use DirectAudio::types::EngineProjectSnapshot;
 use DirectAudio::{
-    beats_to_samples, export_render_job_with_bridges, ArrangementExportRequest, ExportCancelToken,
-    ExportNormalizeMode, ExportTailMode, OfflineRenderRequest, RenderJob, TrackExportTarget,
+    beats_to_samples, export_render_job_with_bridges, render_block_size_for_sample_rate,
+    ArrangementExportRequest, ExportCancelToken, ExportNormalizeMode, ExportTailMode,
+    OfflineRenderRequest, RenderJob, TrackExportTarget,
 };
 
 use super::engine_snapshot::build_engine_project_snapshot_for_export;
@@ -176,7 +177,7 @@ fn bounce_request(
             start_sample: beats_to_samples(snapshot, target.start_beat, sample_rate),
             end_sample: beats_to_samples(snapshot, target.end_beat, sample_rate),
             master_volume: 1.0,
-            block_size: 1024,
+            block_size: render_block_size_for_sample_rate(snapshot, sample_rate),
             tail,
             normalize: ExportNormalizeMode::None,
         },
@@ -437,6 +438,13 @@ impl StudioLayout {
             pdc_enabled,
             latency_graph_version,
         );
+        snapshot.routing.buffer_size = self
+            .audio_bridge
+            .engine
+            .as_ref()
+            .map(|engine| engine.stats().buffer_size)
+            .filter(|size| *size > 0)
+            .unwrap_or(snapshot.routing.buffer_size.max(1));
 
         let targets = match bounce_targets(kind, &state, &snapshot, &track_ids, &dir) {
             Ok(targets) => targets,

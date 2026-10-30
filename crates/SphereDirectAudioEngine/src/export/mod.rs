@@ -43,8 +43,8 @@ pub use offline_renderer::{
 };
 pub use render_progress::{ExportCancelToken, ExportProgress, ExportStage};
 pub use render_request::{
-    arrangement_bounds_samples, beats_to_samples, ExportNormalizeMode, ExportTailMode,
-    OfflineRenderRequest,
+    arrangement_bounds_samples, beats_to_samples, render_block_size_for_sample_rate,
+    ExportNormalizeMode, ExportTailMode, OfflineRenderRequest,
 };
 
 /// Errors surfaced by the offline export pipeline. Never panics across the
@@ -53,6 +53,8 @@ pub use render_request::{
 pub enum ExportError {
     /// The runtime graph could not be built from the snapshot.
     Build(String),
+    /// A bridged plug-in did not return a complete block during offline render.
+    PluginBridge(String),
     /// The encoder rejected the spec or failed to write.
     Encode(sphere_encoder::EncodeError),
     Io(std::io::Error),
@@ -66,6 +68,7 @@ impl std::fmt::Display for ExportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Build(message) => write!(f, "render graph build failed: {message}"),
+            Self::PluginBridge(message) => write!(f, "offline plug-in bridge failed: {message}"),
             Self::Encode(error) => write!(f, "encode failed: {error}"),
             Self::Io(error) => write!(f, "io error: {error}"),
             Self::Cancelled => write!(f, "export cancelled"),

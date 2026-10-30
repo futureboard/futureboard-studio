@@ -13,8 +13,9 @@ use sphere_encoder::{
 };
 use DirectAudio::types::EngineProjectSnapshot;
 use DirectAudio::{
-    arrangement_bounds_samples, beats_to_samples, ArrangementExportRequest, ExportNormalizeMode,
-    ExportTailMode, OfflineRenderRequest, RenderJob, TrackExportTarget,
+    arrangement_bounds_samples, beats_to_samples, render_block_size_for_sample_rate,
+    ArrangementExportRequest, ExportNormalizeMode, ExportTailMode, OfflineRenderRequest, RenderJob,
+    TrackExportTarget,
 };
 
 /// Output sample-rate choice in the UI.
@@ -623,7 +624,7 @@ impl ExportSettings {
                 start_sample,
                 end_sample,
                 master_volume: defaults.master_volume,
-                block_size: 1024,
+                block_size: render_block_size_for_sample_rate(snapshot, sample_rate),
                 tail,
                 normalize,
             },
