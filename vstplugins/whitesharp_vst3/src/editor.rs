@@ -48,7 +48,7 @@ pub fn create(
     // Every editor in the process shares one GPUI app, and so one source;
     // after the first, this returns `false` and changes nothing.
     nih_plug_gpui::set_asset_source(Assets);
-    nih_plug_gpui::create_gpui_editor(state, move |context, _window, cx| {
+    nih_plug_gpui::create_gpui_editor_with_wayland_fallback(state, move |context, _window, cx| {
         let context = context.clone();
         let params = params.clone();
         let shared = shared.clone();
