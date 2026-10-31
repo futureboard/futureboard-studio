@@ -25,6 +25,9 @@ const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 pub(crate) struct GpuiEditor<V, B> {
     pub(crate) gpui_state: Arc<GpuiState>,
 
+    /// Whether to open an independent desktop window when GPUI selects Wayland.
+    pub(crate) standalone_on_wayland: bool,
+
     /// The user's build function, called every time the editor is opened to create the window's
     /// root view.
     pub(crate) build: Arc<B>,
@@ -48,9 +51,11 @@ where
         parent: ParentWindowHandle,
         context: Arc<dyn GuiContext>,
     ) -> Box<dyn Any + Send> {
+        let standalone = self.standalone_on_wayland && is_wayland_backend();
         let editor_context = EditorContext {
             context,
             gpui_state: self.gpui_state.clone(),
+            standalone,
         };
         let build = self.build.clone();
         let gpui_state = self.gpui_state.clone();
@@ -79,12 +84,13 @@ where
                 parent,
                 logical_size,
                 scaling_factor,
+                standalone,
             ) else {
                 return;
             };
 
             *window_slot.lock() = Some(handle);
-            spawn_frame_loop(cx, handle, gpui_state);
+            spawn_frame_loop(cx, handle, gpui_state, standalone);
         }));
         if !opened {
             self.gpui_state.open.store(false, Ordering::Release);
@@ -106,6 +112,12 @@ where
         // the corner of a 2x host window.
         if !factor.is_finite() || factor <= 0.0 {
             return false;
+        }
+
+        // A standalone Wayland window uses the compositor's scale. The host's
+        // embedded-view scale does not describe that window.
+        if self.standalone_on_wayland && is_wayland_backend() {
+            return true;
         }
 
         self.scaling_factor.store(Some(factor));
@@ -139,8 +151,18 @@ fn scale((width, height): (u32, u32), factor: f32) -> (u32, u32) {
     )
 }
 
-/// Open a GPUI window for the editor and embed it in the host's window. Returns `None` and logs an
-/// error if either step failed.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn is_wayland_backend() -> bool {
+    gpui::guess_compositor() == "Wayland"
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn is_wayland_backend() -> bool {
+    false
+}
+
+/// Open the editor as a standalone window or embed it in the host's window. Returns `None` and logs
+/// an error if opening or embedding failed.
 ///
 /// `logical_size` is the editor's size before scaling. GPUI's own geometry is in logical pixels,
 /// while the platform APIs used to embed the window deal in physical ones, so the host's scaling
@@ -152,6 +174,7 @@ fn open_window<V, B>(
     parent: ParentHandle,
     logical_size: (u32, u32),
     scaling_factor: f32,
+    standalone: bool,
 ) -> Option<AnyWindowHandle>
 where
     V: Render,
@@ -163,16 +186,23 @@ where
             origin: gpui::point(px(0.0), px(0.0)),
             size: gpui::size(px(logical_size.0 as f32), px(logical_size.1 as f32)),
         })),
-        // Any window decoration would end up being drawn inside of the host's window
+        // Embedded editors leave window chrome to the host.
         titlebar: None,
-        window_decorations: Some(WindowDecorations::Client),
-        // The host decides when the editor is focused and how large it is
-        focus: false,
-        show: false,
-        kind: WindowKind::PopUp,
-        is_movable: false,
-        is_resizable: false,
-        is_minimizable: false,
+        window_decorations: Some(if standalone {
+            WindowDecorations::Server
+        } else {
+            WindowDecorations::Client
+        }),
+        focus: standalone,
+        show: standalone,
+        kind: if standalone {
+            WindowKind::Normal
+        } else {
+            WindowKind::PopUp
+        },
+        is_movable: standalone,
+        is_resizable: standalone,
+        is_minimizable: standalone,
         ..Default::default()
     };
 
@@ -185,6 +215,11 @@ where
     };
 
     match handle.update(cx, |_, window, cx| {
+        if standalone {
+            window.set_window_title("WhiteSharp");
+            return Ok(());
+        }
+
         // The window's size is only the size the plugin asked for if GPUI draws it at the same
         // scaling factor the host used to compute that size, so this needs to happen first
         if let Err(err) = embed::set_scaling_factor(window, scaling_factor, physical_size) {
@@ -236,7 +271,12 @@ fn resized(window: &mut Window, cx: &mut App) {
 /// to open the editor's window before it is visible. Just like the other NIH-plug GUI adapters this
 /// therefore redraws unconditionally instead of trying to track what changed. The loop ends by
 /// itself once the window is gone.
-fn spawn_frame_loop(cx: &mut App, handle: AnyWindowHandle, gpui_state: Arc<GpuiState>) {
+fn spawn_frame_loop(
+    cx: &mut App,
+    handle: AnyWindowHandle,
+    gpui_state: Arc<GpuiState>,
+    standalone: bool,
+) {
     cx.spawn(async move |cx: &mut AsyncApp| loop {
         let timer = cx.background_executor().timer(FRAME_INTERVAL);
         timer.await;
@@ -262,9 +302,14 @@ fn spawn_frame_loop(cx: &mut App, handle: AnyWindowHandle, gpui_state: Arc<GpuiS
                     }
 
                     if let Some(size) = requested_size {
-                        match embed::resize(window, size) {
-                            Ok(()) => resized(window, cx),
-                            Err(err) => nih_error!("Could not resize the GPUI window: {err}"),
+                        if standalone {
+                            window.resize(gpui::size(px(size.0 as f32), px(size.1 as f32)));
+                            resized(window, cx);
+                        } else {
+                            match embed::resize(window, size) {
+                                Ok(()) => resized(window, cx),
+                                Err(err) => nih_error!("Could not resize the GPUI window: {err}"),
+                            }
                         }
                     }
 

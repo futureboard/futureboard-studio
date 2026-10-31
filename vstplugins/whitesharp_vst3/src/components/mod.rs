@@ -10,6 +10,7 @@ pub mod fader;
 pub mod fx_model;
 #[path = "../../../../crates/SphereUIComponents/src/components/knob.rs"]
 pub mod knob;
+pub mod plate;
 #[path = "../../../../crates/SphereUIComponents/src/components/white_sharp_meter.rs"]
 pub mod white_sharp_meter;
 #[path = "../../../../crates/SphereUIComponents/src/components/white_sharp_model.rs"]

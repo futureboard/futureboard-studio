@@ -77,10 +77,40 @@ where
     V: Render,
     B: Fn(&EditorContext, &mut Window, &mut App) -> Entity<V> + 'static + Send + Sync,
 {
+    create_gpui_editor_inner(gpui_state, build, false)
+}
+
+/// Create a GPUI editor that opens as a separate desktop window on Wayland.
+///
+/// Wayland does not allow a plugin to reparent its window into the host's
+/// window. When GPUI selects the Wayland backend, this editor therefore uses
+/// a normal titled window and resizes it directly. On X11 and Windows it keeps
+/// the usual embedded editor behavior.
+pub fn create_gpui_editor_with_wayland_fallback<V, B>(
+    gpui_state: Arc<GpuiState>,
+    build: B,
+) -> Option<Box<dyn Editor>>
+where
+    V: Render,
+    B: Fn(&EditorContext, &mut Window, &mut App) -> Entity<V> + 'static + Send + Sync,
+{
+    create_gpui_editor_inner(gpui_state, build, true)
+}
+
+fn create_gpui_editor_inner<V, B>(
+    gpui_state: Arc<GpuiState>,
+    build: B,
+    standalone_on_wayland: bool,
+) -> Option<Box<dyn Editor>>
+where
+    V: Render,
+    B: Fn(&EditorContext, &mut Window, &mut App) -> Entity<V> + 'static + Send + Sync,
+{
     Some(Box::new(editor::GpuiEditor {
         gpui_state,
         build: Arc::new(build),
         scaling_factor: AtomicCell::new(None),
+        standalone_on_wayland,
         _root_view: PhantomData,
     }))
 }
@@ -101,6 +131,7 @@ pub fn set_asset_source(source: impl gpui::AssetSource) -> bool {
 pub struct EditorContext {
     context: Arc<dyn GuiContext>,
     gpui_state: Arc<GpuiState>,
+    standalone: bool,
 }
 
 impl EditorContext {
@@ -124,6 +155,12 @@ impl EditorContext {
     /// host refused, in which case nothing changes. The window is resized on GPUI's thread shortly
     /// after this returns.
     pub fn request_resize(&self, width: u32, height: u32) -> bool {
+        if self.standalone {
+            self.gpui_state.size.store((width, height));
+            self.gpui_state.requested_size.store(Some((width, height)));
+            return true;
+        }
+
         // The host asks the editor for its new size while handling this request, so the new size
         // needs to be in place before asking and it needs to be rolled back if the host refuses
         let old_size = self.gpui_state.size.swap((width, height));
