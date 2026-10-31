@@ -42,6 +42,9 @@ pub const BUILTIN_PLUGIN_CRATES: &[&str] = &[
     "whitesharp",
     "wrapsynth",
     "zapp",
+    "airboost",
+    "deesser",
+    "duckstep",
 ];
 
 /// The platform-correct dynamic-library file names every built-in plugin is

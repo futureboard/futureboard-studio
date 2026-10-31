@@ -49,6 +49,9 @@ builtin-plugin-editor = [
     "dep:echospace",
     "dep:whitesharp",
     "dep:zapp",
+    "dep:airboost",
+    "dep:deesser",
+    "dep:duckstep",
     "dep:imager",
     "dep:fa2a",
     "dep:fa76",
@@ -109,6 +112,9 @@ verbspace = { workspace = true, optional = true }
 echospace = { workspace = true, optional = true }
 whitesharp = { workspace = true, optional = true }
 zapp = { workspace = true, optional = true }
+airboost = { workspace = true, optional = true }
+deesser = { workspace = true, optional = true }
+duckstep = { workspace = true, optional = true }
 imager = { workspace = true, optional = true }
 fa2a = { workspace = true, optional = true }
 fa76 = { workspace = true, optional = true }

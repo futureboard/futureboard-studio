@@ -259,6 +259,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "airboost"
+version = "2026.10.16-beta1.4.4"
+dependencies = [
+ "biquad",
+ "builtin_dsp_core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aligned"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2408,6 +2418,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
+name = "deesser"
+version = "2026.10.16-beta1.4.4"
+dependencies = [
+ "biquad",
+ "builtin_dsp_core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "deflate64"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2708,6 +2728,16 @@ name = "dtor-proc-macro"
 version = "0.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7454e41ff9012c00d53cf7f475c5e3afa3b91b7c90568495495e8d9bf47a1055"
+
+[[package]]
+name = "duckstep"
+version = "2026.10.16-beta1.4.4"
+dependencies = [
+ "biquad",
+ "builtin_dsp_core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "dunce"
@@ -8419,6 +8449,7 @@ dependencies = [
 name = "sphere-plugin-host"
 version = "2026.10.16-beta1.4.4"
 dependencies = [
+ "airboost",
  "base64",
  "builtin_dsp_core",
  "burnlimit",
@@ -8427,8 +8458,10 @@ dependencies = [
  "compresser",
  "cpal",
  "crossbeam-channel",
+ "deesser",
  "dirs 5.0.1",
  "drumsampler",
+ "duckstep",
  "echospace",
  "embed-resource",
  "equz8",
@@ -8512,14 +8545,17 @@ dependencies = [
  "SphereMidiService",
  "SphereSoundfontPlayer",
  "SphereWebView",
+ "airboost",
  "base64",
  "burnlimit",
  "clipper67",
  "compresser",
  "core-foundation-sys",
  "crc32fast",
+ "deesser",
  "dirs 5.0.1",
  "drumsampler",
+ "duckstep",
  "ebur128",
  "echospace",
  "equz8",

@@ -88,6 +88,18 @@ impl InputMonitorMode {
         }
     }
 
+    /// What one press of the I latch selects. The latch shows `is_active`, so
+    /// a press flips what is shown: monitoring off, or Input. Cycling through
+    /// Auto here instead made the first press on an unarmed track do nothing
+    /// visible or audible. Auto is still chosen when a track is created.
+    pub fn toggled(self, armed: bool) -> Self {
+        if self.is_active(armed) {
+            Self::Off
+        } else {
+            Self::Always
+        }
+    }
+
     pub fn is_active(self, armed: bool) -> bool {
         match self {
             Self::Off => false,
@@ -102,6 +114,30 @@ impl InputMonitorMode {
             Self::WhenRecordArmed => "Auto",
             Self::Always => "Input",
         }
+    }
+}
+
+#[cfg(test)]
+mod input_monitor_tests {
+    use super::InputMonitorMode;
+
+    #[test]
+    fn one_press_of_the_input_latch_turns_monitoring_on_or_off() {
+        for armed in [false, true] {
+            let on = InputMonitorMode::Off.toggled(armed);
+            assert!(on.is_active(armed), "armed={armed}");
+            assert!(!on.toggled(armed).is_active(armed), "armed={armed}");
+        }
+        // Auto that is lit (armed) is what the press turns off; Auto that is
+        // dark (unarmed) turns on, rather than seeming to ignore the press.
+        assert_eq!(
+            InputMonitorMode::WhenRecordArmed.toggled(true),
+            InputMonitorMode::Off
+        );
+        assert_eq!(
+            InputMonitorMode::WhenRecordArmed.toggled(false),
+            InputMonitorMode::Always
+        );
     }
 }
 

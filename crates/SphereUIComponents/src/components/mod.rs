@@ -189,6 +189,12 @@ pub mod wrap_synth_panel;
 pub mod wrap_synth_window;
 #[cfg(feature = "builtin-plugin-editor")]
 pub mod zapp_plate;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod airboost_plate;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod deesser_plate;
+#[cfg(feature = "builtin-plugin-editor")]
+pub mod duckstep_plate;
 
 pub use about_window::{open_about_window, AboutWindow};
 pub use add_track_dialog::{

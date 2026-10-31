@@ -138,6 +138,24 @@ pub(crate) struct PluginEditorWindows {
         String,
         gpui::WindowHandle<crate::components::zapp_plate::ZappWindow>,
     >,
+    /// Open native AirBoost editors, keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub airboost: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::airboost_plate::AirBoostWindow>,
+    >,
+    /// Open native De-Esser editors, keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub deesser: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::deesser_plate::DeEsserWindow>,
+    >,
+    /// Open native Duckstep editors, keyed by insert id, like `quick_sampler`.
+    #[cfg(feature = "builtin-plugin-editor")]
+    pub duckstep: std::collections::HashMap<
+        String,
+        gpui::WindowHandle<crate::components::duckstep_plate::DuckstepWindow>,
+    >,
     /// Open native VerbSpace and EchoSpace editors (one window type for
     /// both), keyed by insert id, like `quick_sampler`.
     #[cfg(feature = "builtin-plugin-editor")]
@@ -3332,6 +3350,27 @@ impl StudioLayout {
                 window,
                 cx,
             ),
+            Some(airboost::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.airboost,
+                crate::components::airboost_plate::open_airboost_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(deesser::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.deesser,
+                crate::components::deesser_plate::open_deesser_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
+            Some(duckstep::ui::UI_ORIGIN) => self.open_native_editor(
+                |windows| &mut windows.duckstep,
+                crate::components::duckstep_plate::open_duckstep_editor,
+                (target, identity, host_ops),
+                window,
+                cx,
+            ),
             Some(clipper67::ui::UI_ORIGIN) => self.open_native_editor(
                 |windows| &mut windows.dynamics,
                 crate::components::dyn_panel::open_clipper67_editor,
@@ -3541,6 +3580,18 @@ impl StudioLayout {
             }
             let saturators: Vec<_> = self.plugin_editors.zapp.values().copied().collect();
             for handle in saturators {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let air_eqs: Vec<_> = self.plugin_editors.airboost.values().copied().collect();
+            for handle in air_eqs {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let de_essers: Vec<_> = self.plugin_editors.deesser.values().copied().collect();
+            for handle in de_essers {
+                let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
+            }
+            let duckers: Vec<_> = self.plugin_editors.duckstep.values().copied().collect();
+            for handle in duckers {
                 let _ = handle.update(cx, |editor, _window, cx| editor.sync_from_mirror(cx));
             }
             let fxs: Vec<_> = self.plugin_editors.fx.values().copied().collect();

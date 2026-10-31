@@ -1299,10 +1299,41 @@ fn master_inserts_section(
 const SEND_FLOOR_DB: f32 = -60.0;
 const SEND_CEIL_DB: f32 = 6.0;
 
+/// Pointer travel per dB of send level, at the least. The bar is a strip's
+/// width — some 70 px for 66 dB — and moving the level by the bar's own
+/// width made every pixel about a dB, so a hand's ordinary 2–4 px per mouse
+/// event stepped the level in whole dB. Shift is ten times finer still.
+const SEND_DRAG_PX_PER_DB: f32 = 4.0;
+
 /// A send level as a fraction of the bar.
 fn send_norm(gain_db: f32) -> f32 {
     ((gain_db.clamp(SEND_FLOOR_DB, SEND_CEIL_DB) - SEND_FLOOR_DB) / (SEND_CEIL_DB - SEND_FLOOR_DB))
         .clamp(0.0, 1.0)
+}
+
+/// The travel, in pixels, that sweeps a send bar `width` wide end to end.
+fn send_drag_span(width: f32) -> f32 {
+    width.max((SEND_CEIL_DB - SEND_FLOOR_DB) * SEND_DRAG_PX_PER_DB)
+}
+
+/// The level a send-bar drag reaches at window x `pointer`, the drag having
+/// started from level fraction `start`.
+fn send_drag_db(
+    drag: &crate::components::fader::FaderDrag,
+    start: f32,
+    pointer: f32,
+    fine: bool,
+    width: f32,
+) -> f32 {
+    let next = crate::components::fader::drag_to(
+        drag,
+        start,
+        pointer,
+        fine,
+        send_drag_span(width),
+        |dx| dx,
+    );
+    SEND_FLOOR_DB + next * (SEND_CEIL_DB - SEND_FLOOR_DB)
 }
 
 /// A send level as the bar prints it: `−∞` at the floor, a signed dB
@@ -1334,7 +1365,7 @@ fn send_chip(
     callbacks: &MixerCallbacks,
     base: gpui::Rgba,
 ) -> impl IntoElement {
-    use crate::components::fader::{drag_to, is_reset_click, FaderDrag};
+    use crate::components::fader::{is_reset_click, FaderDrag};
 
     let remove_pair = (track_id.to_string(), send.id.clone());
     let on_remove = callbacks.on_remove_send.clone();
@@ -1392,9 +1423,8 @@ fn send_chip(
                 return;
             }
             let x: f32 = event.event.position.x.into();
-            let span = f32::from(event.bounds.size.width).max(1.0);
-            let next = drag_to(drag, norm, x, event.event.modifiers.shift, span, |dx| dx);
-            let gain_db = SEND_FLOOR_DB + next * (SEND_CEIL_DB - SEND_FLOOR_DB);
+            let width = f32::from(event.bounds.size.width);
+            let gain_db = send_drag_db(drag, norm, x, event.event.modifiers.shift, width);
             gain_change(
                 &(gain_pair.0.clone(), gain_pair.1.clone(), gain_db),
                 window,
@@ -1865,8 +1895,10 @@ fn fader_bay(
                 .min_h_0()
                 .w_full()
                 .child(fader)
-                .child(meter)
-                .child(console::meter_scale()),
+                .child(console::fader_aligned(meter))
+                .child(console::fader_aligned(
+                    console::meter_scale().into_any_element(),
+                )),
         )
         // Two readouts, like a console's: the fader's gain on the left, the
         // channel's held peak on the right — what it is set to, and what it
@@ -4145,6 +4177,40 @@ fn pinned_meter(
     match meter_layer {
         Some(layout) => meter_slot(layout, source).into_any_element(),
         None => meter_surface(level_l, level_r, hold_l, hold_r, clip).into_any_element(),
+    }
+}
+
+#[cfg(test)]
+mod send_drag_tests {
+    use super::{send_drag_db, send_norm};
+    use crate::components::fader::FaderDrag;
+
+    /// A drag on a strip-width bar from `start_db`, `travel` px to the right.
+    fn dragged(start_db: f32, travel: f32, fine: bool) -> f32 {
+        let drag = FaderDrag::new("send".into());
+        let start = send_norm(start_db);
+        // The first sample anchors the drag where the press landed.
+        let _ = send_drag_db(&drag, start, 500.0, fine, 70.0);
+        send_drag_db(&drag, start, 500.0 + travel, fine, 70.0)
+    }
+
+    #[test]
+    fn a_few_pixels_move_a_send_by_a_fraction_of_a_db() {
+        // A mouse event's usual 3 px: under a dB, not three whole dB.
+        let moved = dragged(-10.0, 3.0, false) - -10.0;
+        assert!((moved - 0.75).abs() < 0.01, "3 px moved {moved} dB");
+        let fine = dragged(-10.0, 3.0, true) - -10.0;
+        assert!(
+            (fine - 0.075).abs() < 0.01,
+            "3 px with Shift moved {fine} dB"
+        );
+    }
+
+    #[test]
+    fn a_press_does_not_move_the_level_and_the_ends_still_hold() {
+        assert!((dragged(-10.0, 0.0, false) - -10.0).abs() < 1.0e-4);
+        assert_eq!(dragged(-10.0, 10_000.0, false), 6.0);
+        assert_eq!(dragged(-10.0, -10_000.0, false), -60.0);
     }
 }
 

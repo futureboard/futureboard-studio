@@ -289,12 +289,21 @@ fn fader_rail(value_norm: f32) -> gpui::Div {
 
     // Scale ticks, left of the groove. Unity and the top of the range are the
     // two the eye returns to, so they are longer and brighter; the rest are
-    // there to make the tape read as continuous.
+    // there to make the tape read as continuous. They are placed along the
+    // cap's travel — inset half a cap at each end like the groove — so the
+    // grip line covers a tick exactly at the level it marks; along the whole
+    // bay they sat up to half a cap away from it.
+    let mut ticks = div()
+        .absolute()
+        .top(px(FADER_THUMB_HEIGHT / 2.0))
+        .bottom(px(FADER_THUMB_HEIGHT / 2.0))
+        .left_0()
+        .right_0();
     for &(db, _, _) in SCALE_MARKS.iter() {
         let pct = db_to_top_fraction(db);
         let anchor = db == 0.0 || db == volume::MAX_DB;
         let w = if anchor { 8.0_f32 } else { 5.0_f32 };
-        col = col.child(
+        ticks = ticks.child(
             div()
                 .absolute()
                 .top(relative(pct))
@@ -308,6 +317,7 @@ fn fader_rail(value_norm: f32) -> gpui::Div {
                 }),
         );
     }
+    col = col.child(ticks);
 
     // Flex flow: top spacer / cap / bottom spacer. Sizing the spacers by the
     // value keeps the cap on the groove at any bay height, which is what lets
@@ -383,6 +393,13 @@ fn horizontal_fader_rail(value_norm: f32, accent: gpui::Rgba) -> gpui::Div {
             .rounded(px(crate::theme::radius::PILL)),
     );
 
+    // Along the thumb's travel, inset like the rail, as on the vertical fader.
+    let mut ticks = div()
+        .absolute()
+        .left(px(HORIZONTAL_THUMB_W / 2.0))
+        .right(px(HORIZONTAL_THUMB_W / 2.0))
+        .top_0()
+        .bottom_0();
     for &(db, _, _) in SCALE_MARKS.iter() {
         let pct = volume::db_to_norm(db);
         let h = if db == 0.0 || db == volume::MAX_DB {
@@ -390,7 +407,7 @@ fn horizontal_fader_rail(value_norm: f32, accent: gpui::Rgba) -> gpui::Div {
         } else {
             9.0_f32
         };
-        row = row.child(
+        ticks = ticks.child(
             div()
                 .absolute()
                 .left(relative(pct))
@@ -405,6 +422,7 @@ fn horizontal_fader_rail(value_norm: f32, accent: gpui::Rgba) -> gpui::Div {
                 }),
         );
     }
+    row = row.child(ticks);
 
     row.child(div().h(px(0.0)).flex_basis(relative(value)))
         .child(

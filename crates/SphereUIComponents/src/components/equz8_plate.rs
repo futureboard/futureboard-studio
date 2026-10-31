@@ -435,7 +435,13 @@ fn display(e: &KitEditor<Equz8Plate>, cx: &mut Cx<Equz8Plate>, s: f32) -> AnyEle
                         this.ui.dragging = Some(slot);
                         cx.notify();
                     }),
-                ),
+                )
+                // The wheel over a node turns its Q, as the Q knob would.
+                .on_scroll_wheel(e.wheel_cb(cx, move |this, dy, fine, cx| {
+                    this.ui.selected = slot;
+                    let q = plate::wheel_turn(Q, this.params.bands[slot].q, dy, fine);
+                    edit_band(this, slot, cx, |b| b.q = q);
+                })),
         );
     }
     let label = |text: String, left: f32, top: f32, size: f32, ink: u32, centred: bool| {

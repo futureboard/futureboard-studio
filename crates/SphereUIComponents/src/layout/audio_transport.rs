@@ -2090,6 +2090,7 @@ impl StudioLayout {
             return false;
         };
         transport_freeze_debug::log("ensure_audio_stream_warm before engine.start");
+        let was_open = engine.stats().stream_open;
         // `AudioEngine::start` resumes an open stream without reopening the
         // device or rebuilding/decoding the runtime graph on this thread.
         match engine.start() {
@@ -2098,6 +2099,16 @@ impl StudioLayout {
                 self.audio_bridge.stats = Some(engine.stats());
                 self.audio_bridge.running = true;
                 self.audio_bridge.last_error = None;
+                // This opened the device rather than resuming it. The project's
+                // graph was built before there was a device to ask for its
+                // rate — an ASIO session is always opened this way, after the
+                // loader built the graph at the engine's placeholder rate — so
+                // rebuild it against the rate the stream actually runs at, as
+                // Restart Audio Engine does. Off this thread: the next engine
+                // poll queues the background sync.
+                if !was_open {
+                    self.audio_bridge.project_dirty = true;
+                }
                 true
             }
             Err(error) => {

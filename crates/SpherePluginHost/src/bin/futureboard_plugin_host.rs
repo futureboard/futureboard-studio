@@ -326,6 +326,9 @@ enum BuiltinDsp {
     MixStation(mixstation::Dsp),
     Compresser(compresser::Dsp),
     Zapp(zapp::Dsp),
+    AirBoost(airboost::Dsp),
+    DeEsser(deesser::Dsp),
+    Duckstep(duckstep::Dsp),
 }
 
 /// A built-in processor is created on the IPC thread and then owned exclusively
@@ -406,6 +409,9 @@ impl BuiltinHostProcessor {
             "mixstation" => Some(Self::mixstation(sample_rate, state_json)),
             "compresser" => Some(Self::compresser(sample_rate, state_json)),
             "zapp" => Some(Self::zapp(sample_rate, state_json)),
+            "airboost" => Some(Self::airboost(sample_rate, state_json)),
+            "deesser" => Some(Self::deesser(sample_rate, state_json)),
+            "duckstep" => Some(Self::duckstep(sample_rate, state_json)),
             _ => None,
         }
     }
@@ -997,6 +1003,78 @@ impl BuiltinHostProcessor {
         }
     }
 
+    fn airboost(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = airboost::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match airboost::ipc::AirBoostState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] AirBoost state rejected: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::AirBoost(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            // An EQ loads nothing from disk.
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn deesser(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = deesser::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match deesser::ipc::DeEsserState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] De-Esser state rejected: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::DeEsser(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            // Dynamics load nothing from disk.
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
+    fn duckstep(sample_rate: u32, state_json: Option<&str>) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let mut dsp = duckstep::Dsp::new(sr);
+        // Same pre-publish window as above: the IPC thread still owns the DSP.
+        if let Some(json) = state_json {
+            match duckstep::ipc::DuckstepState::from_json(json) {
+                Ok(state) => dsp.set_params(state.params),
+                Err(error) => {
+                    eprintln!("[plugin-host-builtin] Duckstep state rejected: {error}");
+                }
+            }
+        }
+        Self {
+            dsp: UnsafeCell::new(BuiltinDsp::Duckstep(dsp)),
+            spectrum: UnsafeCell::new(SpectrumAnalyzer::new(sr)),
+            // Dynamics load nothing from disk.
+            nam_loader: None,
+            ir_loader: None,
+            drum_pad_loaders: None,
+            sample_loader: None,
+            sample_rate: sr,
+        }
+    }
+
     fn process_block(&self, in_l: &[f32], in_r: &[f32], interleaved: &mut [f32], frames: usize) {
         // SAFETY: the dedicated producer thread is the sole DSP accessor.
         match unsafe { &mut *self.dsp.get() } {
@@ -1130,6 +1208,27 @@ impl BuiltinHostProcessor {
                     interleaved[i * 2 + 1] = r;
                 }
             }
+            BuiltinDsp::AirBoost(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
+            BuiltinDsp::DeEsser(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
+            BuiltinDsp::Duckstep(dsp) => {
+                for i in 0..frames {
+                    let (l, r) = dsp.process_stereo(in_l[i], in_r[i]);
+                    interleaved[i * 2] = l;
+                    interleaved[i * 2 + 1] = r;
+                }
+            }
         }
     }
 
@@ -1148,6 +1247,21 @@ impl BuiltinHostProcessor {
             // Its synced LFOs and delay.
             BuiltinDsp::WrapSynth(dsp) => dsp.set_tempo_bpm(tempo_bpm),
             _ => {}
+        }
+    }
+
+    /// Hand the block's whole transport to the cores that lock to the beat
+    /// grid rather than only to its tempo: Duckstep's shaper restarts on the
+    /// host's beats and its ducker's synced release follows the tempo.
+    /// Producer thread only, same contract as [`Self::set_transport_tempo`].
+    fn set_transport(&self, transport: &SpherePluginHost::audio_bridge::BridgeTransport) {
+        // SAFETY: the dedicated producer thread is the sole DSP accessor.
+        if let BuiltinDsp::Duckstep(dsp) = unsafe { &mut *self.dsp.get() } {
+            dsp.set_transport(
+                transport.tempo_bpm as f32,
+                transport.ppq_position,
+                transport.playing,
+            );
         }
     }
 
@@ -1176,6 +1290,9 @@ impl BuiltinHostProcessor {
         const _: () = assert!(slicer::telemetry::SLOTS <= BUILTIN_PAD_SLOTS);
         const _: () = assert!(whitesharp::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(zapp::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
+        const _: () = assert!(airboost::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
+        const _: () = assert!(deesser::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
+        const _: () = assert!(duckstep::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(burnlimit::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(equz8::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
         const _: () = assert!(equzx::telemetry::SLOTS == BUILTIN_PAD_SLOTS);
@@ -1193,6 +1310,11 @@ impl BuiltinHostProcessor {
             BuiltinDsp::WhiteSharp(dsp) => Some(dsp.telemetry()),
             // The auto gain Zapp applies (`zapp::telemetry`).
             BuiltinDsp::Zapp(dsp) => Some(dsp.telemetry()),
+            // What each editor draws live (`airboost::telemetry`,
+            // `deesser::telemetry`, `duckstep::telemetry`).
+            BuiltinDsp::AirBoost(dsp) => Some(dsp.telemetry()),
+            BuiltinDsp::DeEsser(dsp) => Some(dsp.telemetry()),
+            BuiltinDsp::Duckstep(dsp) => Some(dsp.telemetry()),
             // Per-channel peaks and loudness (`burnlimit::telemetry`).
             BuiltinDsp::BurnLimit(dsp) => Some(dsp.telemetry()),
             // Output peaks and each band's detector and dynamic gain
@@ -1484,6 +1606,58 @@ impl BuiltinHostProcessor {
                     slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
                 })
             }
+            BuiltinDsp::AirBoost(dsp) => {
+                let f = dsp.meter_frame();
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    in_peak: f.in_peak,
+                    in_rms: f.in_rms,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    // What its de-esser is taking off.
+                    gain_reduction_db: f.gain_reduction_db,
+                    in_clip: f.in_clip,
+                    out_clip: f.out_clip,
+                    // Single fixed stage, not a user-ordered rack.
+                    slot_in_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
+            BuiltinDsp::DeEsser(dsp) => {
+                let f = dsp.meter_frame();
+                // The detector's level rides slot 0's input peak, which the
+                // editor's level history records next to the reduction.
+                let mut slot_in_peak = [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS];
+                slot_in_peak[0] = f.detector_peak;
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    in_peak: f.in_peak,
+                    in_rms: f.in_rms,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    gain_reduction_db: f.gain_reduction_db,
+                    in_clip: f.in_clip,
+                    out_clip: f.out_clip,
+                    slot_in_peak,
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
+            BuiltinDsp::Duckstep(dsp) => {
+                let f = dsp.meter_frame();
+                // The detector's level rides slot 0's input peak, which the
+                // editor's level history records next to the reduction.
+                let mut slot_in_peak = [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS];
+                slot_in_peak[0] = f.detector_peak;
+                Some(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                    in_peak: f.in_peak,
+                    in_rms: f.in_rms,
+                    out_peak: f.out_peak,
+                    out_rms: f.out_rms,
+                    gain_reduction_db: f.gain_reduction_db,
+                    in_clip: f.in_clip,
+                    out_clip: f.out_clip,
+                    slot_in_peak,
+                    slot_out_peak: [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS],
+                })
+            }
             BuiltinDsp::Equz8(_)
             | BuiltinDsp::Equzx(_)
             | BuiltinDsp::Verbspace(_)
@@ -1524,6 +1698,10 @@ impl BuiltinHostProcessor {
             BuiltinDsp::Compresser(dsp) => dsp.latency_samples(),
             // The oversampler's filter delay, when it is on.
             BuiltinDsp::Zapp(dsp) => dsp.latency_samples(),
+            // The de-esser's and the ducker's lookahead.
+            BuiltinDsp::AirBoost(dsp) => dsp.latency_samples(),
+            BuiltinDsp::DeEsser(dsp) => dsp.latency_samples(),
+            BuiltinDsp::Duckstep(dsp) => dsp.latency_samples(),
         }
     }
 
@@ -1599,6 +1777,15 @@ impl BuiltinHostProcessor {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
             BuiltinDsp::Zapp(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::AirBoost(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::DeEsser(dsp) => {
+                let _ = dsp.apply_wire_param(param_id, value);
+            }
+            BuiltinDsp::Duckstep(dsp) => {
                 let _ = dsp.apply_wire_param(param_id, value);
             }
         }
@@ -2374,6 +2561,125 @@ mod builtin_processor_tests {
         let oversampling = zapp::ui_param_index("oversampling").expect("in the wire table");
         processor.apply_param(oversampling, zapp::Oversampling::Off.to_wire());
         assert_eq!(processor.latency_samples(), 0);
+    }
+
+    /// One block of a sine at `hz` and `level`, carrying `phase` on.
+    fn sine_block(phase: &mut f32, hz: f32, level: f32) -> [f32; 128] {
+        std::array::from_fn(|_| {
+            *phase = (*phase + hz / 48_000.0).fract();
+            (std::f32::consts::TAU * *phase).sin() * level
+        })
+    }
+
+    /// AirBoost restores its params, adds no latency, meters what it shapes
+    /// and publishes its exciter's level.
+    #[test]
+    fn airboost_restores_state_and_publishes_its_telemetry() {
+        let mut params = airboost::default_params();
+        params.air_db = 9.0;
+        params.excite = 80.0;
+        let json = airboost::ipc::AirBoostState::new(params)
+            .to_json()
+            .expect("state serializes");
+        let processor = BuiltinHostProcessor::airboost(48_000, Some(&json));
+        assert_eq!(processor.latency_samples(), 0);
+        let mut phase = 0.0f32;
+        let mut output = [0.0f32; 256];
+        for _ in 0..400 {
+            let block = sine_block(&mut phase, 9_000.0, 0.3);
+            processor.process_block(&block, &block, &mut output, 128);
+            assert!(output.iter().all(|s| s.is_finite()));
+        }
+        let frame = processor.meter_frame().expect("AirBoost meters itself");
+        assert!(frame.in_peak > 0.25 && frame.out_peak > 0.0);
+        let block = processor
+            .pad_levels()
+            .expect("AirBoost publishes its telemetry");
+        assert!(block[airboost::telemetry::EXCITE_DB] > airboost::EXCITE_FLOOR_DB);
+    }
+
+    /// The De-Esser reports its lookahead as latency, cuts a sibilant tone
+    /// and carries its detector level in slot 0 of the meter frame.
+    #[test]
+    fn deesser_reports_lookahead_cuts_sibilance_and_meters_its_detector() {
+        let mut params = deesser::default_params();
+        params.lookahead_ms = 5.0;
+        params.threshold_db = -40.0;
+        let json = deesser::ipc::DeEsserState::new(params)
+            .to_json()
+            .expect("state serializes");
+        let processor = BuiltinHostProcessor::deesser(48_000, Some(&json));
+        assert_eq!(processor.latency_samples(), 240);
+        let mut phase = 0.0f32;
+        let mut output = [0.0f32; 256];
+        for _ in 0..200 {
+            let block = sine_block(&mut phase, 7_500.0, 0.5);
+            processor.process_block(&block, &block, &mut output, 128);
+            assert!(output.iter().all(|s| s.is_finite()));
+        }
+        let frame = processor.meter_frame().expect("the De-Esser meters itself");
+        assert!(frame.gain_reduction_db > 1.0, "{}", frame.gain_reduction_db);
+        assert!(frame.slot_in_peak[0] > 0.01, "{}", frame.slot_in_peak[0]);
+        let block = processor
+            .pad_levels()
+            .expect("the De-Esser publishes its telemetry");
+        assert!(block[deesser::telemetry::GR_DB] > 1.0);
+
+        let lookahead = deesser::ui_param_index("lookaheadMs").expect("in the wire table");
+        processor.apply_param(lookahead, 0.0);
+        assert_eq!(processor.latency_samples(), 0);
+    }
+
+    /// Duckstep takes the block's transport: its shaper's phase follows the
+    /// host position, and its ducker reports lookahead and ducks a loud input.
+    #[test]
+    fn duckstep_follows_the_transport_and_ducks() {
+        let mut params = duckstep::default_params();
+        params.mode = duckstep::Mode::Shaper;
+        let json = duckstep::ipc::DuckstepState::new(params)
+            .to_json()
+            .expect("state serializes");
+        let processor = BuiltinHostProcessor::duckstep(48_000, Some(&json));
+        let transport = |ppq: f64| SpherePluginHost::audio_bridge::BridgeTransport {
+            tempo_bpm: 120.0,
+            time_sig_num: 4,
+            time_sig_den: 4,
+            project_time_samples: (ppq * 24_000.0) as i64,
+            ppq_position: ppq,
+            bar_position_ppq: 0.0,
+            playing: true,
+            recording: false,
+        };
+        let mut phase = 0.0f32;
+        let mut output = [0.0f32; 256];
+        let mut published = Vec::new();
+        for ppq in [0.25f64, 0.5] {
+            processor.set_transport(&transport(ppq));
+            let block = sine_block(&mut phase, 220.0, 0.5);
+            processor.process_block(&block, &block, &mut output, 128);
+            assert!(output.iter().all(|s| s.is_finite()));
+            let block = processor
+                .pad_levels()
+                .expect("Duckstep publishes its telemetry");
+            assert_eq!(block[duckstep::telemetry::TEMPO_BPM], 120.0);
+            published.push(block[duckstep::telemetry::PHASE]);
+        }
+        // A quarter-note cycle: a quarter beat apart is a quarter cycle.
+        let step = (published[1] - published[0]).rem_euclid(1.0);
+        assert!((step - 0.25).abs() < 0.02, "{published:?}");
+
+        let mode = duckstep::ui_param_index("mode").expect("in the wire table");
+        processor.apply_param(mode, duckstep::Mode::Sidechain.to_wire());
+        let lookahead = duckstep::ui_param_index("lookaheadMs").expect("in the wire table");
+        processor.apply_param(lookahead, 5.0);
+        assert_eq!(processor.latency_samples(), 240);
+        for _ in 0..200 {
+            let block = sine_block(&mut phase, 60.0, 0.9);
+            processor.process_block(&block, &block, &mut output, 128);
+        }
+        let frame = processor.meter_frame().expect("Duckstep meters itself");
+        assert!(frame.gain_reduction_db > 3.0, "{}", frame.gain_reduction_db);
+        assert!(frame.slot_in_peak[0] > 0.1, "{}", frame.slot_in_peak[0]);
     }
 
     /// BurnLimit and both EQs publish their editor telemetry blocks:
@@ -3378,7 +3684,9 @@ fn service_audio_bridge(
     // engine published for this block goes in at the same point, so a built-in
     // that locks to the grid uses the real project tempo rather than a stub.
     if let BlockRuntime::Builtin(b) = runtime {
-        b.set_transport_tempo(bridge.load_transport().tempo_bpm as f32);
+        let transport = bridge.load_transport();
+        b.set_transport_tempo(transport.tempo_bpm as f32);
+        b.set_transport(&transport);
         b.capture_spectrum(&in_l[..frames], &in_r[..frames]);
     }
     let output_channels = match runtime {

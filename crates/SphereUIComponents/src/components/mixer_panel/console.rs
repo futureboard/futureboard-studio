@@ -905,8 +905,9 @@ pub(crate) fn meter_scale() -> impl IntoElement {
         .relative()
         .flex_none()
         .w(px(METER_SCALE_W))
-        .h_full()
-        .overflow_hidden();
+        // Unclipped: the 0 and the floor's numbers sit centred on ticks at the
+        // column's ends, and [`fader_aligned`] leaves them room above and below.
+        .h_full();
 
     for db in meter_scale_ticks() {
         let labelled = (db as i32) % 10 == 0;
@@ -919,9 +920,11 @@ pub(crate) fn meter_scale() -> impl IntoElement {
             .absolute()
             .left_0()
             .right_0()
-            // Half the line box, so the text sits centred on its own tick
-            // rather than hanging below it.
+            // A row of fixed height pulled up by half of it, so the tick at its
+            // centre lands on the level it names. Sized by the text's line box
+            // instead, the row put every tick 3 px below its level.
             .top(gpui::relative(from_top))
+            .h(px(9.0))
             .mt(px(-4.5))
             .flex()
             .flex_row()
@@ -954,6 +957,45 @@ pub(crate) fn meter_scale() -> impl IntoElement {
     column
 }
 
+/// The share of the fader's travel above 0 dB, where the meter does not reach.
+fn fader_headroom() -> f32 {
+    use crate::components::timeline::timeline_state::volume;
+    volume::db_to_norm(volume::MAX_DB) - volume::db_to_norm(0.0)
+}
+
+/// Lines `content` — the meter, or the scale printed beside it — up with the
+/// fader it stands next to.
+///
+/// The fader runs from +6 dB down to the floor, its cap's grip line inset half
+/// a cap from each end of the bay; the meter and its scale run from 0 dBFS to
+/// the same floor. Drawn the full height of the bay, the scale's 0 sat beside
+/// the fader's +6 and its −30 beside −27, so a cap dragged to a printed number
+/// set the channel to some other one. Inset like the rail and started the
+/// fader's headroom down, both are linear in dB at the fader's own slope, and
+/// every number on the scale is the gain a grip line beside it reads.
+pub(crate) fn fader_aligned(content: gpui::AnyElement) -> impl IntoElement {
+    use crate::components::fader::FADER_THUMB_HEIGHT;
+
+    let headroom = fader_headroom();
+    div()
+        .flex_none()
+        .h_full()
+        .flex()
+        .flex_col()
+        .pt(px(FADER_THUMB_HEIGHT / 2.0))
+        .pb(px(FADER_THUMB_HEIGHT / 2.0))
+        .child(div().flex_basis(gpui::relative(headroom)))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_stretch()
+                .min_h_0()
+                .flex_basis(gpui::relative(1.0 - headroom))
+                .child(content),
+        )
+}
+
 /// Plate fill for a strip that is not a track: Master reads as the sum of every
 /// colour on the panel, the Control Room as none of them.
 pub(crate) fn master_plate_fill() -> gpui::Rgba {
@@ -974,6 +1016,24 @@ mod tests {
         assert_eq!(format_pan(0.004), "C");
         assert_eq!(format_pan(-0.34), "L34");
         assert_eq!(format_pan(1.0), "R100");
+    }
+
+    /// Every printed number sits where the fader's cap reads that number: the
+    /// scale, placed by [`fader_aligned`], and the rail agree along the travel.
+    #[test]
+    fn the_scale_beside_the_fader_names_the_gain_the_cap_reads() {
+        use crate::components::timeline::timeline_state::volume;
+        use crate::components::timeline::vu_meter::{db_fraction, meter_scale_ticks};
+
+        let headroom = fader_headroom();
+        for db in meter_scale_ticks() {
+            let on_rail = 1.0 - volume::db_to_norm(db);
+            let on_scale = headroom + (1.0 - headroom) * (1.0 - db_fraction(db));
+            assert!(
+                (on_rail - on_scale).abs() < 1.0e-5,
+                "{db} dB: rail at {on_rail}, scale at {on_scale}"
+            );
+        }
     }
 
     /// The plate picks its text from the fill, so every shipped track colour

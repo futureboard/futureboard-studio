@@ -608,7 +608,13 @@ fn display(e: &KitEditor<EquzxPlate>, cx: &mut Cx<EquzxPlate>, s: f32) -> AnyEle
                         this.ui.dragging = Some(slot);
                         cx.notify();
                     }),
-                ),
+                )
+                // The wheel over a node turns its Q, as the Q knob would.
+                .on_scroll_wheel(e.wheel_cb(cx, move |this, dy, fine, cx| {
+                    this.ui.selected = Some(slot);
+                    let q = plate::wheel_turn(Q, this.params.bands[slot].q, dy, fine);
+                    edit_band(this, slot, cx, |b| b.q = q);
+                })),
         );
     }
     if let Some(slot) = e.ui.selected.filter(|&slot| in_use(&e.params.bands[slot])) {

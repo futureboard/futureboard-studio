@@ -77,6 +77,9 @@ pub fn builtin_param_index(plugin_id: &str, param_id: &str) -> Option<u32> {
         verbspace::ui::UI_ORIGIN => verbspace::ui_param_index(param_id),
         whitesharp::ui::UI_ORIGIN => whitesharp::ui_param_index(param_id),
         zapp::ui::UI_ORIGIN => zapp::ui_param_index(param_id),
+        airboost::ui::UI_ORIGIN => airboost::ui_param_index(param_id),
+        deesser::ui::UI_ORIGIN => deesser::ui_param_index(param_id),
+        duckstep::ui::UI_ORIGIN => duckstep::ui_param_index(param_id),
         echospace::ui::UI_ORIGIN => echospace::ui_param_index(param_id),
         imager::ui::UI_ORIGIN => imager::ui_param_index(param_id),
         fa2a::ui::UI_ORIGIN => fa2a::ui_param_index(param_id),
@@ -132,6 +135,9 @@ mod state_mirror {
         Verbspace(Box<verbspace::Params>),
         WhiteSharp(Box<whitesharp::Params>),
         Zapp(Box<zapp::Params>),
+        AirBoost(Box<airboost::Params>),
+        DeEsser(Box<deesser::Params>),
+        Duckstep(Box<duckstep::Params>),
         Echospace(Box<echospace::Params>),
         Imager(Box<imager::Params>),
         Fa2a(Box<fa2a::Params>),
@@ -158,6 +164,9 @@ mod state_mirror {
                 Self::Verbspace(_) => verbspace::ui::UI_ORIGIN,
                 Self::WhiteSharp(_) => whitesharp::ui::UI_ORIGIN,
                 Self::Zapp(_) => zapp::ui::UI_ORIGIN,
+                Self::AirBoost(_) => airboost::ui::UI_ORIGIN,
+                Self::DeEsser(_) => deesser::ui::UI_ORIGIN,
+                Self::Duckstep(_) => duckstep::ui::UI_ORIGIN,
                 Self::Echospace(_) => echospace::ui::UI_ORIGIN,
                 Self::Imager(_) => imager::ui::UI_ORIGIN,
                 Self::Fa2a(_) => fa2a::ui::UI_ORIGIN,
@@ -191,6 +200,13 @@ mod state_mirror {
                     Some(Self::WhiteSharp(Box::new(whitesharp::default_params())))
                 }
                 zapp::ui::UI_ORIGIN => Some(Self::Zapp(Box::new(zapp::default_params()))),
+                airboost::ui::UI_ORIGIN => {
+                    Some(Self::AirBoost(Box::new(airboost::default_params())))
+                }
+                deesser::ui::UI_ORIGIN => Some(Self::DeEsser(Box::new(deesser::default_params()))),
+                duckstep::ui::UI_ORIGIN => {
+                    Some(Self::Duckstep(Box::new(duckstep::default_params())))
+                }
                 echospace::ui::UI_ORIGIN => {
                     Some(Self::Echospace(Box::new(echospace::default_params())))
                 }
@@ -264,6 +280,9 @@ mod state_mirror {
             verbspace::ui::UI_ORIGIN => verbspace::ui_param_id(wire_index).is_some(),
             whitesharp::ui::UI_ORIGIN => whitesharp::ui_param_id(wire_index).is_some(),
             zapp::ui::UI_ORIGIN => zapp::ui_param_id(wire_index).is_some(),
+            airboost::ui::UI_ORIGIN => airboost::ui_param_id(wire_index).is_some(),
+            deesser::ui::UI_ORIGIN => deesser::ui_param_id(wire_index).is_some(),
+            duckstep::ui::UI_ORIGIN => duckstep::ui_param_id(wire_index).is_some(),
             echospace::ui::UI_ORIGIN => echospace::ui_param_id(wire_index).is_some(),
             imager::ui::UI_ORIGIN => imager::ui_param_id(wire_index).is_some(),
             fa2a::ui::UI_ORIGIN => fa2a::ui_param_id(wire_index).is_some(),
@@ -307,6 +326,15 @@ mod state_mirror {
             }
             Some(BuiltinParams::Zapp(params)) => {
                 let _ = zapp::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::AirBoost(params)) => {
+                let _ = airboost::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::DeEsser(params)) => {
+                let _ = deesser::ipc::apply_wire_param(params, wire_index, value);
+            }
+            Some(BuiltinParams::Duckstep(params)) => {
+                let _ = duckstep::ipc::apply_wire_param(params, wire_index, value);
             }
             Some(BuiltinParams::Echospace(params)) => {
                 let _ = echospace::ipc::apply_wire_param(params, wire_index, value);
@@ -385,6 +413,15 @@ mod state_mirror {
             zapp::ui::UI_ORIGIN => zapp::ipc::ZappState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Zapp(Box::new(state.params))),
+            airboost::ui::UI_ORIGIN => airboost::ipc::AirBoostState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::AirBoost(Box::new(state.params))),
+            deesser::ui::UI_ORIGIN => deesser::ipc::DeEsserState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::DeEsser(Box::new(state.params))),
+            duckstep::ui::UI_ORIGIN => duckstep::ipc::DuckstepState::from_json(text)
+                .ok()
+                .map(|state| BuiltinParams::Duckstep(Box::new(state.params))),
             echospace::ui::UI_ORIGIN => echospace::ipc::EchospaceState::from_json(text)
                 .ok()
                 .map(|state| BuiltinParams::Echospace(Box::new(state.params))),
@@ -481,6 +518,21 @@ mod state_mirror {
             }
             BuiltinParams::Zapp(params) if origin == zapp::ui::UI_ORIGIN => {
                 zapp::ipc::ZappState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::AirBoost(params) if origin == airboost::ui::UI_ORIGIN => {
+                airboost::ipc::AirBoostState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::DeEsser(params) if origin == deesser::ui::UI_ORIGIN => {
+                deesser::ipc::DeEsserState::new((**params).clone())
+                    .to_json()
+                    .ok()?
+            }
+            BuiltinParams::Duckstep(params) if origin == duckstep::ui::UI_ORIGIN => {
+                duckstep::ipc::DuckstepState::new((**params).clone())
                     .to_json()
                     .ok()?
             }
@@ -639,6 +691,24 @@ mod state_mirror {
                 zapp::ipc::ui_values(params)
                     .into_iter()
                     .filter_map(|(id, value)| zapp::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
+            Some(BuiltinParams::AirBoost(params)) if origin == airboost::ui::UI_ORIGIN => {
+                airboost::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| airboost::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
+            Some(BuiltinParams::DeEsser(params)) if origin == deesser::ui::UI_ORIGIN => {
+                deesser::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| deesser::ui_param_index(id).map(|i| (i, value)))
+                    .collect()
+            }
+            Some(BuiltinParams::Duckstep(params)) if origin == duckstep::ui::UI_ORIGIN => {
+                duckstep::ipc::ui_values(params)
+                    .into_iter()
+                    .filter_map(|(id, value)| duckstep::ui_param_index(id).map(|i| (i, value)))
                     .collect()
             }
             Some(BuiltinParams::Echospace(params)) if origin == echospace::ui::UI_ORIGIN => {
@@ -1037,6 +1107,33 @@ mod state_mirror {
         }
     }
 
+    /// An AirBoost insert's mirrored params, like [`builtin_verbspace_params`].
+    pub fn builtin_airboost_params(insert_id: &str) -> Option<airboost::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::AirBoost(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A De-Esser insert's mirrored params, like [`builtin_verbspace_params`].
+    pub fn builtin_deesser_params(insert_id: &str) -> Option<deesser::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::DeEsser(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
+    /// A Duckstep insert's mirrored params, like [`builtin_verbspace_params`].
+    pub fn builtin_duckstep_params(insert_id: &str) -> Option<duckstep::Params> {
+        let states = map().lock().ok()?;
+        match states.get(insert_id)? {
+            BuiltinParams::Duckstep(params) => Some((**params).clone()),
+            _ => None,
+        }
+    }
+
     /// An EchoSpace insert's mirrored params, like
     /// [`builtin_verbspace_params`].
     pub fn builtin_echospace_params(insert_id: &str) -> Option<echospace::Params> {
@@ -1120,8 +1217,9 @@ mod state_mirror {
 
 #[cfg(feature = "builtin-plugin-editor")]
 pub use state_mirror::{
-    builtin_burnlimit_params, builtin_clipper67_params, builtin_compresser_params,
-    builtin_default_replay, builtin_drum_sampler_params, builtin_echospace_params,
+    builtin_airboost_params, builtin_burnlimit_params, builtin_clipper67_params,
+    builtin_compresser_params, builtin_deesser_params, builtin_default_replay,
+    builtin_drum_sampler_params, builtin_duckstep_params, builtin_echospace_params,
     builtin_equz8_params, builtin_equzx_params, builtin_fa2a_params, builtin_fa76_params,
     builtin_imager_params, builtin_mixstation_params, builtin_quick_sampler_params,
     builtin_replay_changes, builtin_rodhareist_files, builtin_rodhareist_params,

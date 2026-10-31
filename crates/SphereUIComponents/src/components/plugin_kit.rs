@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     canvas, div, px, size, AnyElement, AnyView, App, AppContext, Bounds, Context, Entity,
     FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Styled, Window,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent, Styled, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
 };
 
@@ -597,6 +597,26 @@ impl<M: KitModel> KitEditor<M> {
         move |event: &MouseDownEvent, _window, app: &mut App| {
             let at = (f32::from(event.position.x), f32::from(event.position.y));
             let _ = entity.update(app, |this, cx| action(this, at, event, cx));
+        }
+    }
+
+    /// A wheel handler that runs `action` with the wheel's vertical travel in
+    /// pixels (positive up) and whether Shift is held. The wheel stops here,
+    /// so nothing behind the target scrolls too.
+    pub fn wheel_cb(
+        &self,
+        cx: &Context<Self>,
+        action: impl Fn(&mut Self, f32, bool, &mut Context<Self>) + 'static,
+    ) -> impl Fn(&ScrollWheelEvent, &mut Window, &mut App) + 'static {
+        let entity = cx.entity().clone();
+        move |event: &ScrollWheelEvent, _window, app: &mut App| {
+            let dy = f32::from(event.delta.pixel_delta(px(20.0)).y);
+            if dy == 0.0 {
+                return;
+            }
+            app.stop_propagation();
+            let fine = event.modifiers.shift;
+            let _ = entity.update(app, |this, cx| action(this, dy, fine, cx));
         }
     }
 

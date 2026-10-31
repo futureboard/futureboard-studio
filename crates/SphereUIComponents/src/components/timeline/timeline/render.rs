@@ -343,7 +343,7 @@ impl Render for Timeline {
             let Some(mode) = this
                 .state
                 .find_track(track_id)
-                .map(|track| track.input_monitor.cycle())
+                .map(|track| track.input_monitor.toggled(track.armed))
             else {
                 return;
             };

@@ -143,6 +143,27 @@ const CATALOG: &[BuiltinEntry] = &[
         editor: BuiltinEditorKind::Native,
     },
     BuiltinEntry {
+        stem: "airboost",
+        name: "AirBoost",
+        category: "EQ",
+        kind: PluginKind::Effect,
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
+        stem: "deesser",
+        name: "De-Esser",
+        category: "Dynamics",
+        kind: PluginKind::Effect,
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
+        stem: "duckstep",
+        name: "Duckstep",
+        category: "Dynamics",
+        kind: PluginKind::Effect,
+        editor: BuiltinEditorKind::Native,
+    },
+    BuiltinEntry {
         stem: "clipper67",
         name: "67Clipper",
         category: "Dynamics",
@@ -283,6 +304,9 @@ pub const AUDIO_BRIDGE_STEMS: &[&str] = &[
     "quicksampler",
     "slicer",
     "zapp",
+    "airboost",
+    "deesser",
+    "duckstep",
 ];
 
 /// Whether this built-in currently has an out-of-process audio DSP runtime.
@@ -420,6 +444,9 @@ mod tests {
             "imager",
             "mixstation",
             "zapp",
+            "airboost",
+            "deesser",
+            "duckstep",
         ] {
             assert_eq!(
                 builtin_editor_kind(&builtin_id(stem)),

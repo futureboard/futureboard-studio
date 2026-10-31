@@ -9,7 +9,6 @@ members = [
     "apps/native/singer",
     "apps/native/jamsession",
     "apps/native/voxtune",
-
     "crates/SphereAudioEditor",
     "crates/SphereAudioPlugins",
     "crates/SphereDirectAudioEngine",
@@ -66,8 +65,11 @@ members = [
     "crates/BuiltinAudioPlugins/crates/verbspace",
     "crates/BuiltinAudioPlugins/crates/whitesharp",
     "crates/BuiltinAudioPlugins/crates/zapp",
+    "crates/BuiltinAudioPlugins/crates/airboost",
+    "crates/BuiltinAudioPlugins/crates/deesser",
+    "crates/BuiltinAudioPlugins/crates/duckstep",
     "crates/solfege_spatialaudio",
-    "xtask"
+    "xtask",
 ]
 
 exclude = [
@@ -171,6 +173,9 @@ rodharerist = { path = "crates/BuiltinAudioPlugins/crates/rodharerist" }
 verbspace = { path = "crates/BuiltinAudioPlugins/crates/verbspace" }
 whitesharp = { path = "crates/BuiltinAudioPlugins/crates/whitesharp" }
 zapp = { path = "crates/BuiltinAudioPlugins/crates/zapp" }
+airboost = { path = "crates/BuiltinAudioPlugins/crates/airboost" }
+deesser = { path = "crates/BuiltinAudioPlugins/crates/deesser" }
+duckstep = { path = "crates/BuiltinAudioPlugins/crates/duckstep" }
 
 # MIT/Apache-2.0 DSP libraries used by BuiltinAudioPlugins.
 biquad = "0.6"
@@ -197,7 +202,11 @@ ureq = "3"
 # Native UI / GPUI vendored stack
 # =============================================================================
 
-gpui = { path = "crates/gpui", version = "0.2.2", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui = { path = "crates/gpui", version = "0.2.2", default-features = false, features = [
+    "font-kit",
+    "wayland",
+    "x11",
+] }
 gpui_linux = { path = "crates/gpui/crates/gpui_linux", default-features = false }
 # `default-features = false` keeps the macOS backend from pulling `gpui/default`,
 # but it also strips `gpui_macos`'s own `font-kit` feature. Without that feature
@@ -235,7 +244,9 @@ ebur128 = "0.1"
 # fork here — and so a clone builds without a sibling `../dsp` checkout.
 solfege-audio = { git = "https://github.com/futureboard/solfage-engine" }
 solfege-core = { git = "https://github.com/futureboard/solfage-engine" }
-solfege-engine = { git = "https://github.com/futureboard/solfage-engine", default-features = false, features = ["fbmx"] }
+solfege-engine = { git = "https://github.com/futureboard/solfage-engine", default-features = false, features = [
+    "fbmx",
+] }
 solfege-event = { git = "https://github.com/futureboard/solfage-engine" }
 # SFM v1 container reader produced by the DSP workspace. This is format-only;
 # realtime inference still comes from the existing Solfege + FBMX runtimes.
@@ -281,7 +292,11 @@ symphonia = { version = "0.5", default-features = false, features = [
 # =============================================================================
 
 async-channel = "2.5.0"
-async-compression = { version = "0.4", features = ["bzip2", "gzip", "futures-io"] }
+async-compression = { version = "0.4", features = [
+    "bzip2",
+    "gzip",
+    "futures-io",
+] }
 async-fs = "2.1"
 async-tar = "0.5.1"
 async-task = "4.7"
@@ -309,7 +324,10 @@ schemars = { version = "1.0", features = ["indexmap2"] }
 semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-serde_json_lenient = { version = "0.2", features = ["preserve_order", "raw_value"] }
+serde_json_lenient = { version = "0.2", features = [
+    "preserve_order",
+    "raw_value",
+] }
 serde_urlencoded = "0.7"
 slotmap = "1.0.6"
 smol_str = "0.3.6"
@@ -372,7 +390,14 @@ which = "6.0.0"
 core-video = { version = "0.5.2", features = ["metal"] }
 image = "0.25.1"
 rust-embed = { version = "8.11", features = ["include-exclude"] }
-wgpu = { version = "29.0.3", default-features = false, features = ["std", "wgsl", "dx12", "vulkan", "metal", "gles"] }
+wgpu = { version = "29.0.3", default-features = false, features = [
+    "std",
+    "wgsl",
+    "dx12",
+    "vulkan",
+    "metal",
+    "gles",
+] }
 
 
 # =============================================================================
@@ -387,7 +412,9 @@ mach2 = "0.5"
 metal = "0.33"
 objc = "0.2"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSGraphics"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "NSGraphics",
+] }
 objc2-foundation = "0.3"
 
 
@@ -566,7 +593,9 @@ toml = "0.8"
 # =============================================================================
 
 criterion = { version = "0.5", features = ["html_reports"] }
-proptest = { git = "https://github.com/proptest-rs/proptest", rev = "3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b", features = ["attr-macro"] }
+proptest = { git = "https://github.com/proptest-rs/proptest", rev = "3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b", features = [
+    "attr-macro",
+] }
 
 
 # =============================================================================

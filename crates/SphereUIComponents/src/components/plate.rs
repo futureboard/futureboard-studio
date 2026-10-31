@@ -821,6 +821,15 @@ pub fn paint_knob(
 /// The vertical travel, at the design size, that sweeps a knob end to end.
 const KNOB_DRAG_SPAN: f32 = 180.0;
 
+/// `value` after `dy` pixels of wheel (positive up) on `dial`, through its
+/// taper: 600 px turns it end to end, 2000 px when `fine` (Shift). Shared
+/// by the knobs and anything else the wheel turns a dial on, so both feel
+/// the same.
+pub fn wheel_turn(dial: Dial, value: f32, dy: f32, fine: bool) -> f32 {
+    let span = if fine { 2_000.0 } else { 600.0 };
+    dial.at((dial.norm(value) + dy / span).clamp(0.0, 1.0))
+}
+
 /// A knob cell — label, knob, value — for `dial` at `value`. Dragging up
 /// turns it up (Shift for fine), the wheel nudges it, a double-click resets
 /// it to `dial.default`; `set` takes each new value. Greyed and inert when
@@ -904,14 +913,9 @@ pub fn knob_reading<T: 'static>(
                 if dy == 0.0 {
                     return;
                 }
-                let step = if event.modifiers.shift {
-                    2_000.0
-                } else {
-                    600.0
-                };
                 let set = wheel_set.clone();
                 let _ = on_wheel.update(app, |this, cx| {
-                    set(this, dial.at((n + dy / step).clamp(0.0, 1.0)), cx)
+                    set(this, wheel_turn(dial, value, dy, event.modifiers.shift), cx)
                 });
             })
             .on_click(move |event, _window, app| {
@@ -1541,6 +1545,18 @@ mod tests {
         assert!((dial.norm(20_000.0) - 1.0).abs() < 1e-6);
         assert!((dial.at(dial.norm(632.0)) - 632.0).abs() <= 1.0);
         assert_eq!(dial.at(2.0), 20_000.0);
+    }
+
+    #[test]
+    fn the_wheel_turns_a_log_dial_up_and_down_and_stops_at_its_ends() {
+        let q = Dial::new("q", "Q", 0.1, 18.0, 0.71, DialUnit::Q).log();
+        let up = wheel_turn(q, 1.0, 60.0, false);
+        let down = wheel_turn(q, 1.0, -60.0, false);
+        assert!(up > 1.0 && down < 1.0, "up {up}, down {down}");
+        // Fine moves less for the same travel.
+        assert!(wheel_turn(q, 1.0, 60.0, true) < up);
+        assert_eq!(wheel_turn(q, 18.0, 600.0, false), 18.0);
+        assert_eq!(wheel_turn(q, 0.1, -600.0, false), 0.1);
     }
 
     #[test]

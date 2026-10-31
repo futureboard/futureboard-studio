@@ -198,6 +198,42 @@ pub fn scenes() -> Vec<Scene> {
             open: zapp_scene,
         },
         Scene {
+            name: "duckstep",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: duckstep_scene,
+        },
+        Scene {
+            name: "duckstep-shaper",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: duckstep_shaper_scene,
+        },
+        Scene {
+            name: "airboost",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: airboost_scene,
+        },
+        Scene {
+            name: "airboost-bell",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: airboost_bell_scene,
+        },
+        Scene {
+            name: "deesser",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: deesser_scene,
+        },
+        Scene {
+            name: "deesser-wide",
+            width: plate::WINDOW_SIZE.0,
+            height: plate::WINDOW_SIZE.1,
+            open: deesser_wide_scene,
+        },
+        Scene {
             name: "verbspace-hall",
             width: fx_window_size(FxKind::Verb).0,
             height: fx_window_size(FxKind::Verb).1,
@@ -1495,6 +1531,246 @@ fn zapp_fold_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHand
         .find(|preset| preset.name == "Wavefolder")
         .map_or_else(zapp::default_params, |preset| preset.params);
     zapp_with(options, cx, "zapp-fold", params)
+}
+
+/// Duckstep over [`preview_signal`] with a 120 BPM transport rolling, the
+/// way the host drives it: the transport each block, the meter frame (its
+/// detector in slot 0's input) after it.
+fn duckstep_telemetry(
+    params: &duckstep::Params,
+) -> (
+    Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame>,
+    PreviewBlock,
+) {
+    use waygate::StereoEffect;
+    const TEMPO: f64 = 120.0;
+    let mut dsp = duckstep::Dsp::new(48_000.0);
+    dsp.set_params(params.clone());
+    let mut noise = 0x2545_f491u32;
+    let mut frames = Vec::with_capacity(PREVIEW_BLOCKS);
+    for block in 0..PREVIEW_BLOCKS {
+        let start = block * PREVIEW_BLOCK;
+        dsp.set_transport(TEMPO as f32, start as f64 / 48_000.0 * TEMPO / 60.0, true);
+        for i in 0..PREVIEW_BLOCK {
+            let (l, r) = preview_signal(start + i, &mut noise);
+            let _ = dsp.process_stereo(l, r);
+        }
+        let f = dsp.meter_frame();
+        let mut slot_in_peak = [0.0; SpherePluginHost::audio_bridge::BUILTIN_RACK_SLOTS];
+        slot_in_peak[0] = f.detector_peak;
+        frames.push(SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+            in_peak: f.in_peak,
+            in_rms: f.in_rms,
+            out_peak: f.out_peak,
+            out_rms: f.out_rms,
+            gain_reduction_db: f.gain_reduction_db,
+            in_clip: f.in_clip,
+            out_clip: f.out_clip,
+            slot_in_peak,
+            ..Default::default()
+        });
+    }
+    (frames, dsp.telemetry())
+}
+
+fn duckstep_with(
+    options: WindowOptions,
+    cx: &mut App,
+    insert: &'static str,
+    params: duckstep::Params,
+) -> Result<AnyWindowHandle> {
+    use crate::components::duckstep_plate::DuckstepPlate;
+    let (frames, block) = duckstep_telemetry(&params);
+    let json = duckstep::ipc::DuckstepState::new(params).to_json();
+    open_plate(
+        options,
+        cx,
+        DuckstepPlate,
+        "duckstep",
+        insert,
+        json,
+        frames,
+        block,
+        |_| {},
+    )
+}
+
+fn duckstep_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    duckstep_with(options, cx, "duckstep", duckstep::default_params())
+}
+
+fn duckstep_shaper_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let mut params = duckstep::factory_presets()
+        .into_iter()
+        .find(|preset| preset.name == "Dotted Bounce")
+        .map_or_else(duckstep::default_params, |preset| preset.params);
+    // Less than full depth, so the curve before depth shows too.
+    params.depth = 80.0;
+    params.offset = 10.0;
+    duckstep_with(options, cx, "duckstep-shaper", params)
+}
+
+// ── AirBoost ───────────────────────────────────────────────────────────────
+
+fn airboost_telemetry(
+    params: &airboost::Params,
+) -> (
+    Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame>,
+    PreviewBlock,
+) {
+    use waygate::StereoEffect;
+    let dsp = std::cell::RefCell::new(airboost::Dsp::new(48_000.0));
+    dsp.borrow_mut().set_params(params.clone());
+    let frames = run_preview(
+        |l, r| dsp.borrow_mut().process_stereo(l, r),
+        || {
+            let f = dsp.borrow().meter_frame();
+            SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+                in_peak: f.in_peak,
+                in_rms: f.in_rms,
+                out_peak: f.out_peak,
+                out_rms: f.out_rms,
+                gain_reduction_db: f.gain_reduction_db,
+                in_clip: f.in_clip,
+                out_clip: f.out_clip,
+                ..Default::default()
+            }
+        },
+    );
+    let block = dsp.borrow().telemetry();
+    (frames, block)
+}
+
+fn airboost_with(
+    options: WindowOptions,
+    cx: &mut App,
+    insert: &'static str,
+    params: airboost::Params,
+) -> Result<AnyWindowHandle> {
+    use crate::components::airboost_plate::AirBoostPlate;
+    let (frames, block) = airboost_telemetry(&params);
+    let json = airboost::ipc::AirBoostState::new(params).to_json();
+    open_plate(
+        options,
+        cx,
+        AirBoostPlate,
+        "airboost",
+        insert,
+        json,
+        frames,
+        block,
+        |_| {},
+    )
+}
+
+fn airboost_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    airboost_with(options, cx, "airboost", airboost::default_params())
+}
+
+/// A bell at 8 kHz with presence, from the Bright Guitar preset.
+fn airboost_bell_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let params = airboost::factory_presets()
+        .into_iter()
+        .find(|preset| preset.name == "Bright Guitar")
+        .map_or_else(airboost::default_params, |preset| preset.params);
+    airboost_with(options, cx, "airboost-bell", params)
+}
+
+// ── De-Esser ───────────────────────────────────────────────────────────────
+
+/// A voice-like signal at sample `n`: a 180 Hz buzz with its harmonics and,
+/// twice a second, a burst of hiss — sibilance — for previews only.
+fn deesser_preview_signal(n: usize, noise: &mut u32) -> (f32, f32) {
+    const SR: f32 = 48_000.0;
+    let t = n as f32 / SR;
+    let phase = std::f32::consts::TAU * 180.0 * t;
+    let voice = (1..=8)
+        .map(|h| (phase * h as f32).sin() / h as f32)
+        .sum::<f32>()
+        * 0.12
+        * (0.7 + 0.3 * (t * 1.3).sin());
+    *noise ^= *noise << 13;
+    *noise ^= *noise >> 17;
+    *noise ^= *noise << 5;
+    let white = (*noise as f32 / u32::MAX as f32) * 2.0 - 1.0;
+    let burst = ((t * 2.0).fract() * std::f32::consts::PI).sin().max(0.0).powi(6);
+    let hiss = white * 0.45 * burst;
+    (voice + hiss, voice + hiss * 0.9)
+}
+
+fn deesser_telemetry(
+    params: &deesser::Params,
+) -> (
+    Vec<SpherePluginHost::audio_bridge::BuiltinMeterFrame>,
+    PreviewBlock,
+) {
+    use waygate::StereoEffect;
+    let mut dsp = deesser::Dsp::new(48_000.0);
+    dsp.set_params(params.clone());
+    let mut noise = 0x2545_f491u32;
+    let mut frames = Vec::with_capacity(PREVIEW_BLOCKS);
+    for block in 0..PREVIEW_BLOCKS {
+        for i in 0..PREVIEW_BLOCK {
+            let (l, r) = deesser_preview_signal(block * PREVIEW_BLOCK + i, &mut noise);
+            let _ = dsp.process_stereo(l, r);
+        }
+        let f = dsp.meter_frame();
+        let mut frame = SpherePluginHost::audio_bridge::BuiltinMeterFrame {
+            in_peak: f.in_peak,
+            in_rms: f.in_rms,
+            out_peak: f.out_peak,
+            out_rms: f.out_rms,
+            gain_reduction_db: f.gain_reduction_db,
+            in_clip: f.in_clip,
+            out_clip: f.out_clip,
+            ..Default::default()
+        };
+        // As the host does: the detector rides slot 0's input peak.
+        frame.slot_in_peak[0] = f.detector_peak;
+        frames.push(frame);
+    }
+    // On to the middle of the next burst, so the snapshot catches a cut.
+    let end = PREVIEW_BLOCKS * PREVIEW_BLOCK;
+    for n in end..end + 12_000 {
+        let (l, r) = deesser_preview_signal(n, &mut noise);
+        let _ = dsp.process_stereo(l, r);
+    }
+    let block = dsp.telemetry();
+    (frames, block)
+}
+
+fn deesser_with(
+    options: WindowOptions,
+    cx: &mut App,
+    insert: &'static str,
+    params: deesser::Params,
+) -> Result<AnyWindowHandle> {
+    use crate::components::deesser_plate::DeEsserPlate;
+    let (frames, block) = deesser_telemetry(&params);
+    let json = deesser::ipc::DeEsserState::new(params).to_json();
+    open_plate(
+        options,
+        cx,
+        DeEsserPlate,
+        "deesser",
+        insert,
+        json,
+        frames,
+        block,
+        |_| {},
+    )
+}
+
+fn deesser_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    deesser_with(options, cx, "deesser", deesser::default_params())
+}
+
+fn deesser_wide_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let params = deesser::factory_presets()
+        .into_iter()
+        .find(|preset| preset.name == "Wideband Bright")
+        .map_or_else(deesser::default_params, |preset| preset.params);
+    deesser_with(options, cx, "deesser-wide", params)
 }
 
 /// EQUZ8's vocal preset with band 5 riding its detector.
