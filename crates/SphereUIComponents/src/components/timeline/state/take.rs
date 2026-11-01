@@ -93,9 +93,16 @@ impl TrackState {
     }
 }
 
-/// Whether two half-open beat ranges share any time at all.
+/// Whether two takes spanning these beat ranges are alternates of the same
+/// part: they share at least half of the shorter one. A take that only grazes
+/// another's edge (the round-trip latency, a Stop pressed a moment late, the
+/// next phrase picked up where the last one ended) is the next part of the
+/// track, and muting the whole earlier take for it would lose a performance
+/// nobody replaced.
 fn ranges_overlap(a: (f32, f32), b: (f32, f32)) -> bool {
-    a.0 < b.1 && b.0 < a.1
+    let shared = a.1.min(b.1) - a.0.max(b.0);
+    let shorter = (a.1 - a.0).min(b.1 - b.0);
+    shared > 0.0 && shared >= shorter * 0.5
 }
 
 /// The loop a recording ran under, in beats: each time the transport wraps
@@ -738,6 +745,46 @@ mod tests {
         assert!(!track.clips[0].muted);
         assert!(!track.clips[1].muted);
         assert_eq!(track.take_stack_depth(), 1, "nothing is being comped");
+    }
+
+    /// A take recorded right after another, overlapping only its last moment
+    /// (latency, a late Stop), is the next part: both stay heard and nothing
+    /// opens a comp.
+    #[test]
+    fn a_take_that_only_grazes_the_last_one_leaves_it_heard() {
+        let mut state = track_with_clips(&[(0.0, 16.0), (15.75, 16.0)]);
+        let id = track_id(&state);
+        let first = state
+            .register_recorded_take(&id, "clip-0", String::new())
+            .unwrap();
+        let second = state
+            .register_recorded_take(&id, "clip-1", String::new())
+            .unwrap();
+        let track = &state.tracks[0];
+        assert!(track.take(&first).unwrap().active);
+        assert!(track.take(&second).unwrap().active);
+        assert!(!track.clips[0].muted && !track.clips[1].muted);
+        assert_eq!(track.take_stack_depth(), 1);
+        assert!(!track.takes_expanded);
+        // Picking either changes nothing for the other.
+        state.set_active_take(&id, &first);
+        assert!(!state.tracks[0].clips[1].muted);
+    }
+
+    /// Covering most of an earlier take still makes it the alternate.
+    #[test]
+    fn a_take_over_most_of_another_replaces_it() {
+        let mut state = track_with_clips(&[(0.0, 16.0), (2.0, 16.0)]);
+        let id = track_id(&state);
+        let first = state
+            .register_recorded_take(&id, "clip-0", String::new())
+            .unwrap();
+        state
+            .register_recorded_take(&id, "clip-1", String::new())
+            .unwrap();
+        assert!(!state.tracks[0].take(&first).unwrap().active);
+        assert!(state.tracks[0].clips[0].muted);
+        assert!(state.tracks[0].takes_expanded);
     }
 
     #[test]

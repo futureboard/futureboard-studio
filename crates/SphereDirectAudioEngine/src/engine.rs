@@ -3960,6 +3960,15 @@ impl EngineInner {
                 "A recording session is already active".to_string(),
             ));
         }
+        // The last take's files are still closing. Its stop holds the one
+        // pending slot, and a second stop would overwrite it, losing that take;
+        // finalizing it also re-syncs the input stream under a running take.
+        // The caller collects it first (`poll_stop_recording`).
+        if self.pending_stop.lock().is_some() {
+            return Err(SphereAudioError::NativeError(
+                "The previous take is still being saved".to_string(),
+            ));
+        }
         let monitor_mix = config.monitor_mix;
 
         #[cfg(all(target_os = "windows", feature = "asio"))]

@@ -47,6 +47,10 @@ pub(crate) struct RecordingSessionState {
     /// which is now a state the user can actually see, because the thread that
     /// draws is no longer the thread waiting on the disk.
     pub awaiting_finalize: bool,
+    /// Record was pressed while the last take's files were still closing. The
+    /// new take starts the moment they are collected: started any earlier it
+    /// would race the old take's finalize (see `poll_recording_finalize`).
+    pub start_after_finalize: bool,
     /// Counts stopped takes. A take's MIDI (committed at Stop) and audio
     /// (committed when the writer hands the files over) carry the same number,
     /// which is how they become one undo step.
@@ -73,6 +77,7 @@ impl Default for RecordingSessionState {
             midi_preview_updated_at: Instant::now() - Duration::from_secs(1),
             count_in_token: 0,
             awaiting_finalize: false,
+            start_after_finalize: false,
             pass: 0,
             record_loop: None,
             jam_offset_ms: None,
@@ -149,7 +154,15 @@ impl StudioLayout {
             self.cancel_record_count_in(cx);
             return;
         }
-        let recording = self.is_recording_active(cx);
+        if self.recording.start_after_finalize {
+            // Pressed again before the queued take began: it is called off.
+            self.recording.start_after_finalize = false;
+            cx.notify();
+            return;
+        }
+        // Only the last take's files are still closing: nothing is recording,
+        // so Record means a new take, not a Stop that would do nothing.
+        let recording = self.is_recording_active(cx) && !self.recording_only_finalizing(cx);
         if recording {
             self.stop_native_recording(cx);
         } else {
@@ -157,7 +170,29 @@ impl StudioLayout {
         }
     }
 
+    /// Nothing records any more; the stopped take's files are just still
+    /// being closed by the disk writer.
+    pub(super) fn recording_only_finalizing(&self, cx: &mut Context<Self>) -> bool {
+        self.recording.awaiting_finalize
+            && matches!(self.recording.ui_state, RecordingUiState::Finalizing)
+            && self.recording.midi.is_none()
+            && !self.timeline.read(cx).state.transport.recording
+            && !self
+                .audio_bridge
+                .engine
+                .as_ref()
+                .is_some_and(|engine| engine.recording_status().active)
+    }
+
     pub(super) fn start_native_recording(&mut self, cx: &mut Context<Self>) {
+        // A take started now would race the last one's finalize, which holds
+        // the engine's pending stop and re-syncs the input stream. It starts
+        // the moment those files are collected instead.
+        if self.recording.awaiting_finalize {
+            self.recording.start_after_finalize = true;
+            cx.notify();
+            return;
+        }
         let (count_in_enabled, count_in_bars, playing, bpm, beats_per_bar, target_beat) = {
             let timeline = self.timeline.read(cx);
             let metronome = &self.settings.read(cx).current.recording.metronome;
@@ -833,6 +868,7 @@ impl StudioLayout {
         }
         let Some(engine) = self.audio_bridge.engine.clone() else {
             self.recording.awaiting_finalize = false;
+            self.recording.start_after_finalize = false;
             return;
         };
         let Some(outcome) = engine.poll_stop_recording() else {
@@ -857,6 +893,10 @@ impl StudioLayout {
                 };
                 eprintln!("[recording] finalize failed: {error}");
             }
+        }
+        // Record pressed while these files were closing: its take starts now.
+        if std::mem::take(&mut self.recording.start_after_finalize) {
+            self.start_native_recording(cx);
         }
         cx.notify();
     }

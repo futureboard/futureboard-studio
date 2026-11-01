@@ -4077,7 +4077,12 @@ impl StudioLayout {
     /// finalized, and `stop_native_recording` routes that case back through
     /// here, so excluding it is also what keeps the two from recursing.
     pub(super) fn stop_native_playback(&mut self, cx: &mut Context<Self>) {
-        if stop_must_finalize_recording(&self.recording.ui_state, self.is_recording_active(cx)) {
+        // Stop also calls off a take queued behind the last one's finalize.
+        self.recording.start_after_finalize = false;
+        // A take that is only closing its files has already been stopped;
+        // stopping it again would do nothing but split its undo step.
+        let taking = self.is_recording_active(cx) && !self.recording_only_finalizing(cx);
+        if stop_must_finalize_recording(&self.recording.ui_state, taking) {
             self.stop_native_recording(cx);
             return;
         }
