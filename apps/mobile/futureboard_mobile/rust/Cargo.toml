@@ -1,6 +1,6 @@
 [package]
 name = "fb_studio_mobile_engine"
-version = "0.1.0"
+version = "2026.11.1-beta2.0.0"
 edition = "2024"
 license = "MIT"
 description = "Futureboard Studio Mobile — Standalone Rust Audio, Arrangement, MIDI, Mixer & Built-in Plugin DSP Engine"
