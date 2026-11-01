@@ -506,6 +506,9 @@ class AppLocalizationsTh extends AppLocalizations {
   String get correctLabel => 'แก้เพี้ยน';
 
   @override
+  String get stretchLabel => 'ยืด-หด';
+
+  @override
   String get tuneAll => 'จูนทั้งหมด';
 
   @override

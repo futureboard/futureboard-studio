@@ -944,6 +944,12 @@ abstract class AppLocalizations {
   /// **'Correct'**
   String get correctLabel;
 
+  /// No description provided for @stretchLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Stretch'**
+  String get stretchLabel;
+
   /// No description provided for @tuneAll.
   ///
   /// In en, this message translates to:

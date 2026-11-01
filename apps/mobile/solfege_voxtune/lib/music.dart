@@ -649,6 +649,12 @@ String formatDb(double db) {
   return '${formatSigned(rounded, 1)} dB';
 }
 
+/// How much a note's length was stretched against what was sung (1 = as sung).
+double stretchRatio(VocalNote note) =>
+    note.detectedDur > 0 ? note.dur / note.detectedDur : 1.0;
+
+String formatStretch(double ratio) => '×${ratio.toStringAsFixed(2)}';
+
 String formatClock(double sec) {
   final safe = sec.isFinite ? math.max(0.0, sec) : 0.0;
   final minutes = (safe / 60).floor();

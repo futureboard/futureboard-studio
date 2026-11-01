@@ -19,7 +19,8 @@ import 'package:solfege_voxtune/ui/components.dart';
 /// Builds a valid 16-bit mono RIFF/WAVE byte buffer with two pitched vocal notes:
 /// Note 1: detuned A3 (~224.5 Hz, +35 cents) from 0.10s to 0.85s
 /// Note 2: C4 (261.63 Hz) from 1.05s to 1.85s
-Uint8List _buildTestVocalWav({int sampleRate = 48000}) {
+/// With [legato] the second note follows the first without a break.
+Uint8List _buildTestVocalWav({int sampleRate = 48000, bool legato = false}) {
   final numSamples = sampleRate * 2;
   final dataBytes = numSamples * 2;
   final header = ByteData(44 + dataBytes);
@@ -53,7 +54,7 @@ Uint8List _buildTestVocalWav({int sampleRate = 48000}) {
           0.45 * math.sin(2 * math.pi * f0 * t) +
           0.18 * math.sin(2 * math.pi * f0 * 2 * t) +
           0.08 * math.sin(2 * math.pi * f0 * 3 * t);
-    } else if (t >= 1.05 && t <= 1.85) {
+    } else if (t >= (legato ? 0.85 : 1.05) && t <= 1.85) {
       const f0 = 261.63; // C4
       sample =
           0.45 * math.sin(2 * math.pi * f0 * t) +
@@ -526,6 +527,67 @@ void main() {
     await tester.pump();
     expect(state.notes.first.muted, isFalse);
     expect(find.text('1 off'), findsOneWidget);
+  });
+
+  testWidgets('the Time tool stretches a note from its start, undoably', (
+    WidgetTester tester,
+  ) async {
+    final store = tempStore();
+    final state = await pumpEditor(tester, store, store.create('Stretch'));
+    state.loadAudioBytes(_buildTestVocalWav(), fileName: 'take.wav');
+    await settle(tester);
+    final note = state.notes.first;
+    final start = note.start;
+    expect(note.dur, closeTo(note.detectedDur, 1e-9));
+
+    await tester.tap(find.byKey(const Key('tool-time')));
+    await tester.pump();
+    expect(find.text('Stretch'), findsOneWidget);
+    expect(find.text('×1.00'), findsWidgets);
+
+    // Squeezing: the start stays, the end comes in, the ratio is shown.
+    await tester.drag(
+      find.byKey(const Key('param-slider')),
+      const Offset(-80, 0),
+    );
+    await tester.pump();
+    expect(note.start, start);
+    expect(note.dur, lessThan(note.detectedDur * 0.95));
+    expect(find.text(formatStretch(stretchRatio(note))), findsWidgets);
+
+    await tester.tap(find.byKey(const Key('undo-btn')));
+    await tester.pump();
+    final restored = state.notes.first;
+    expect(restored.dur, closeTo(restored.detectedDur, 1e-9));
+  });
+
+  testWidgets('stretching a legato note moves the next note’s start along', (
+    WidgetTester tester,
+  ) async {
+    final store = tempStore();
+    final state = await pumpEditor(tester, store, store.create('Legato'));
+    state.loadAudioBytes(_buildTestVocalWav(legato: true), fileName: 'l.wav');
+    await settle(tester);
+    expect(state.notes.length, 2);
+    final first = state.notes[0];
+    final second = state.notes[1];
+    final gap = second.start - (first.start + first.dur);
+    expect(gap, lessThan(0.04), reason: 'fixture should be legato');
+    final secondEnd = second.start + second.dur;
+
+    await tester.tap(find.byKey(const Key('tool-time')));
+    await tester.pump();
+    await tester.drag(
+      find.byKey(const Key('param-slider')),
+      const Offset(-80, 0),
+    );
+    await tester.pump();
+    // No hole: the next note starts as far after the squeezed one as before
+    // and keeps its end, so it is stretched to fill.
+    expect(first.dur, lessThan(first.detectedDur * 0.95));
+    expect(second.start, closeTo(first.start + first.dur + gap, 1e-9));
+    expect(second.start + second.dur, closeTo(secondEnd, 1e-9));
+    expect(stretchRatio(second), greaterThan(1.0));
   });
 
   testWidgets('advanced tools apply macros to selection or all notes', (

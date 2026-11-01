@@ -511,6 +511,9 @@ class AppLocalizationsEn extends AppLocalizations {
   String get correctLabel => 'Correct';
 
   @override
+  String get stretchLabel => 'Stretch';
+
+  @override
   String get tuneAll => 'Tune all';
 
   @override

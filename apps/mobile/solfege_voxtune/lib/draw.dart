@@ -186,10 +186,13 @@ HitResult? _noteHit({
       (y - curveY).abs() <= math.max(10.0, layout.pxPerSemi * 0.35);
   if (!hitBox && !hitCurve) return null;
   String edge = 'body';
-  if (tool == 'time' && !note.unpitched && x1 - x0 >= 38) {
-    if ((x - x0).abs() < 14) {
+  if (tool == 'time' && !note.unpitched && x1 - x0 >= 24) {
+    // A finger-sized zone at each end; a short note keeps its middle third
+    // for moving it.
+    final zone = math.min(20.0, (x1 - x0) / 3.0);
+    if (x < x0 + zone) {
       edge = 'start';
-    } else if ((x - x1).abs() < 14) {
+    } else if (x > x1 - zone) {
       edge = 'end';
     }
   }
@@ -1215,7 +1218,10 @@ class EditorPainter extends CustomPainter {
     if (rect.right < layout.padL || rect.left > layout.w) return;
 
     final noteText = spellMidi(shown.pitch, keyName);
-    final centsText = formatCents(reading.cents);
+    // The Time tool reads the note's stretch instead of its tuning.
+    final centsText = tool == 'time'
+        ? formatStretch(stretchRatio(selectedNote))
+        : formatCents(reading.cents);
     final badgeText = '$noteText · $centsText';
 
     final tp = TextPainter(
@@ -1305,20 +1311,21 @@ class EditorPainter extends CustomPainter {
     if (tool != 'time' || note == null || note.unpitched) return;
     final shown = presentNote(note, bypass);
     final y = layout.pitchToY(pitchHi, shown.pitch);
+    final height = math.max(18.0, layout.pxPerSemi * 0.9);
     for (final time in [shown.start, shown.start + shown.dur]) {
       final x = layout.timeToX(viewStart, time);
       final rect = Rect.fromLTWH(
-        x.roundToDouble() - 3,
-        y.roundToDouble() - 5,
-        6,
-        10,
+        x.roundToDouble() - 4,
+        (y - height / 2).roundToDouble(),
+        8,
+        height.roundToDouble(),
       );
       canvas.drawRRect(
-        RRect.fromRectAndRadius(rect, const Radius.circular(1.5)),
+        RRect.fromRectAndRadius(rect, const Radius.circular(4)),
         Paint()..color = CantoColors.ink,
       );
       canvas.drawRRect(
-        RRect.fromRectAndRadius(rect, const Radius.circular(1.5)),
+        RRect.fromRectAndRadius(rect, const Radius.circular(4)),
         Paint()
           ..style = PaintingStyle.stroke
           ..strokeWidth = 1

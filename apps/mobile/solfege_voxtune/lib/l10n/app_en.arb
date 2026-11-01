@@ -170,6 +170,7 @@
   "analyzing": "Analyzing…",
 
   "correctLabel": "Correct",
+  "stretchLabel": "Stretch",
   "tuneAll": "Tune all",
   "snap": "Snap",
   "revert": "Revert",

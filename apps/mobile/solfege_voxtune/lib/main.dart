@@ -404,6 +404,7 @@ class CantoScreenState extends State<CantoScreen>
   Duration _lastTickElapsed = Duration.zero;
   bool _compact = false;
   bool _narrow = false;
+  double _barWidth = 0;
   bool _wide = false;
   bool _pinnedSidebar = false;
   double _panelWidth = 340;
@@ -1168,6 +1169,51 @@ class CantoScreenState extends State<CantoScreen>
     }
   }
 
+  /// Notes closer than this were sung legato: resizing one moves the shared
+  /// edge for both, so no silent hole opens between them.
+  static const double _linkGap = 0.04;
+
+  /// Resizes [note] to [start]/[dur] by its [edge] ('start' or 'end'). A
+  /// touching neighbour on that side gives up or takes the time; otherwise
+  /// the note is kept clear of it. Returns the neighbour that changed.
+  VocalNote? _resizeEdge(
+    VocalNote note,
+    String edge,
+    double start,
+    double dur,
+  ) {
+    final sung = _sungOrder();
+    final i = sung.indexWhere((n) => n.id == note.id);
+    if (edge == 'end' && i >= 0 && i < sung.length - 1) {
+      final next = sung[i + 1];
+      final gap = next.start - (note.start + note.dur);
+      if (gap <= _linkGap) {
+        final nextEnd = next.start + next.dur;
+        final end = clampVal(start + dur, start + 0.06, nextEnd - 0.06 - gap);
+        note.start = start;
+        note.dur = end - start;
+        next.start = end + gap;
+        next.dur = nextEnd - next.start;
+        return next;
+      }
+    } else if (edge == 'start' && i > 0) {
+      final prev = sung[i - 1];
+      final gap = note.start - (prev.start + prev.dur);
+      if (gap <= _linkGap) {
+        final end = start + dur;
+        final from = clampVal(start, prev.start + 0.06 + gap, end - 0.06);
+        note.start = from;
+        note.dur = end - from;
+        prev.dur = from - gap - prev.start;
+        return prev;
+      }
+    }
+    note.start = start;
+    note.dur = dur;
+    _clampTiming(note, edge);
+    return null;
+  }
+
   void _setTool(String tool) {
     if (!_tools.contains(tool)) return;
     setState(() {
@@ -1437,15 +1483,17 @@ class CantoScreenState extends State<CantoScreen>
       );
     }
     if (_tool == 'time') {
-      final maxStart = math.max(0.01, _duration - note.dur);
+      // Length against the sung length, on a log scale: ×0.5 … ×2. The
+      // engine stretches the audio to it and keeps the pitch.
+      final ratio = stretchRatio(note);
       return _ParamModel(
-        name: name,
-        min: 0,
-        max: maxStart,
-        step: 0.01,
-        value: clampVal(note.start, 0.0, maxStart),
-        text: formatBars(note.start, _bpm),
-        bipolar: false,
+        name: _l.stretchLabel,
+        min: -100,
+        max: 100,
+        step: 1,
+        value: clampVal(math.log(ratio) / math.ln2 * 100, -100, 100),
+        text: formatStretch(ratio),
+        bipolar: true,
       );
     }
     final reading = centsFromTarget(note.pitch, _key, _mode);
@@ -1476,8 +1524,16 @@ class CantoScreenState extends State<CantoScreen>
       } else if (_tool == 'level') {
         note.gainDb = value;
       } else if (_tool == 'time') {
-        note.start = value;
-        _clampTiming(note, 'body');
+        // The start stays put; the end moves (a legato neighbour with it).
+        final neighbour = _resizeEdge(
+          note,
+          'end',
+          note.start,
+          note.detectedDur * math.pow(2.0, value / 100.0),
+        );
+        if (neighbour != null) {
+          _synth.syncNote(_notes.indexOf(neighbour), neighbour);
+        }
       }
       // Only this note changed; a full sync per slider tick is wasted work.
       _synth.syncNote(_notes.indexOf(note), note);
@@ -2076,18 +2132,25 @@ class CantoScreenState extends State<CantoScreen>
       note.gainDb = clampVal(origin.gainDb + dSemi * 2.4, -18.0, 6.0);
     } else if (drag.type == 'time') {
       final dt = (point.dx - drag.startX) / layout.pxPerSec;
+      VocalNote? neighbour;
       if (drag.edge == 'start') {
         final end = origin.start + origin.dur;
-        note.start = origin.start + dt;
-        note.dur = end - note.start;
+        neighbour = _resizeEdge(
+          note,
+          'start',
+          origin.start + dt,
+          end - (origin.start + dt),
+        );
       } else if (drag.edge == 'end') {
-        note.start = origin.start;
-        note.dur = origin.dur + dt;
+        neighbour = _resizeEdge(note, 'end', origin.start, origin.dur + dt);
       } else {
         note.start = origin.start + dt;
         note.dur = origin.dur;
+        _clampTiming(note, drag.edge);
       }
-      _clampTiming(note, drag.edge);
+      if (neighbour != null) {
+        _synth.syncNote(_notes.indexOf(neighbour), neighbour);
+      }
     }
 
     // Drags edit exactly one note; the full state is synced on release
@@ -2534,6 +2597,7 @@ class CantoScreenState extends State<CantoScreen>
         ? width - _panelWidth - (_pinnedSidebar ? _sidebarWidth : 0)
         : width;
     _narrow = editorWidth < 380;
+    _barWidth = editorWidth;
     if (_projectOpening) return _buildProjectLoading();
     // While an export renders on a background isolate the sessions' engines
     // must stay alive, so the editor can't be left until it finishes.
@@ -3140,7 +3204,8 @@ class CantoScreenState extends State<CantoScreen>
       'semi': _l.snapSemi,
       'scale': _l.snapScale,
     };
-    final Widget snapControl = _narrow
+    // With notes the bar also holds the tools button and the off-key pill.
+    final Widget snapControl = _narrow || (hasNotes && _barWidth < 480)
         // Not enough width for three segments: one chip that cycles.
         ? Pressable(
             key: const Key('snap-btn'),
@@ -3693,7 +3758,7 @@ class CantoScreenState extends State<CantoScreen>
         case 'drift':
           return '${(note.modulation * 100).round()}%';
         case 'time':
-          return formatBars(note.start, _bpm);
+          return formatStretch(stretchRatio(note));
         case 'formant':
           return '${formatSigned(note.formant, 1)} st';
         case 'level':

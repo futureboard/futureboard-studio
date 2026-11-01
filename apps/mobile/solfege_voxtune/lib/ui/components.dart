@@ -710,46 +710,29 @@ class CantoLogo extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // The launcher icon itself, so the app looks the same inside and out.
+    final radius = BorderRadius.circular(size * 0.26);
     return Container(
       width: size,
       height: size,
-      decoration: BoxDecoration(
-        color: CantoColors.raised,
-        borderRadius: BorderRadius.circular(size * 0.3),
+      foregroundDecoration: BoxDecoration(
+        borderRadius: radius,
         border: Border.all(color: CantoColors.line),
       ),
-      padding: EdgeInsets.all(size * 0.2),
-      child: const CustomPaint(painter: _LogoPainter()),
+      child: ClipRRect(
+        borderRadius: radius,
+        child: Image.asset(
+          'assets/brand/app_icon.png',
+          width: size,
+          height: size,
+          fit: BoxFit.cover,
+          filterQuality: FilterQuality.medium,
+          // The app name is always shown next to it.
+          excludeFromSemantics: true,
+        ),
+      ),
     );
   }
-}
-
-class _LogoPainter extends CustomPainter {
-  const _LogoPainter();
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    canvas.save();
-    canvas.scale(size.width / 16.0, size.height / 16.0);
-    final path = Path()
-      ..moveTo(1.4, 10.1)
-      ..relativeCubicTo(1.1, -2.5, 2.2, -3.6, 3.5, -2.1)
-      ..relativeCubicTo(1.1, 1.3, 1.6, 2.5, 2.9, 2.3)
-      ..relativeCubicTo(1.4, -0.2, 1.8, -2.3, 3.1, -2.1)
-      ..relativeCubicTo(1.2, 0.2, 1.8, 1.7, 2.9, 0.9);
-    canvas.drawPath(
-      path,
-      Paint()
-        ..color = CantoColors.accent
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.9
-        ..strokeCap = StrokeCap.round,
-    );
-    canvas.restore();
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
 /// Bottom-sheet scaffold shared by the key and session sheets.
