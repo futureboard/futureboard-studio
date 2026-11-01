@@ -373,8 +373,23 @@ fn presence_coefficients(presence_db: f32, rate: f32) -> Coefficients<f32> {
     make_eq_coefficients("bell", PRESENCE_HZ, presence_db, PRESENCE_Q, rate).unwrap_or(neutral())
 }
 
+/// The de-ess band, peaking at unity.
+///
+/// `biquad`'s band-pass peaks at Q, not 1. The cut is `x + (g − 1)·bp(x)`, so
+/// at Q 1.8 a requested −6 dB came out near −20 dB, −7 dB nulled the band,
+/// and the deepest settings flipped its phase and cut *less* — while the
+/// meter still read the requested figure. Scaled by 1/Q, the centre gets
+/// exactly `g`.
 fn deess_coefficients(rate: f32) -> Coefficients<f32> {
-    make_eq_coefficients("bandpass", DEESS_HZ, 0.0, DEESS_Q, rate).unwrap_or(neutral())
+    match make_eq_coefficients("bandpass", DEESS_HZ, 0.0, DEESS_Q, rate) {
+        Some(c) => Coefficients {
+            b0: c.b0 / DEESS_Q,
+            b1: c.b1 / DEESS_Q,
+            b2: c.b2 / DEESS_Q,
+            ..c
+        },
+        None => neutral(),
+    }
 }
 
 fn detect_coefficients(rate: f32) -> Coefficients<f32> {
@@ -1190,6 +1205,26 @@ mod tests {
             }
         }
         (sum / measure as f64).sqrt() as f32
+    }
+
+    /// The de-ess band cuts its centre by what is asked, and deeper asks cut
+    /// deeper — it used to overshoot to a null at −7 dB and flip past it.
+    #[test]
+    fn the_de_ess_band_cuts_its_centre_by_the_requested_amount() {
+        let params = Params {
+            presence_db: 0.0,
+            ..flat()
+        };
+        let mut previous = 0.0;
+        for cut in [-2.0f32, -4.0, -6.0, -7.0, -8.0] {
+            let at_centre = eq_response_with_cut_db(&params, cut, DEESS_HZ, SR);
+            assert!(
+                (at_centre - cut).abs() < 0.25,
+                "asked {cut} dB, the centre moved {at_centre} dB"
+            );
+            assert!(at_centre < previous, "{cut} dB cut less than the one before");
+            previous = at_centre;
+        }
     }
 
     fn rms_db(params: Params, signal: impl Fn(usize) -> f32) -> f32 {
