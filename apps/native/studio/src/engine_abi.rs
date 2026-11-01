@@ -29,6 +29,12 @@ pub const VERSION_SYMBOL: &CStr = c"futureboard_engine_version";
 /// code. Called once, on the process main thread.
 pub const MAIN_SYMBOL: &CStr = c"futureboard_engine_main";
 
+/// Launcher argument `--futureboard-crash-relaunch=<pid>`: rather than start
+/// Studio, ask whether to relaunch it after process `<pid>` crashed, and start
+/// it once that process is gone. The engine spawns this from a crash; the
+/// launcher answers it without loading the engine. Not part of the ABI above.
+pub const CRASH_RELAUNCH_ARG: &str = "--futureboard-crash-relaunch=";
+
 /// The engine library's file name on the platform this crate is built for.
 pub fn library_file_name() -> String {
     format!(

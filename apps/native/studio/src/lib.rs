@@ -50,6 +50,10 @@ pub extern "C" fn futureboard_engine_main() -> i32 {
 }
 
 fn run() {
+    // Before startup writes to its own environment (safe graphics mode, the
+    // GPU choice): a relaunch after a crash starts from this copy.
+    crash_reporting::capture_launch_environment();
+
     // A file-backed logger and startup marker must exist before CEF dispatch,
     // DirectX device creation, settings I/O, or any window construction.
     boot::init_process();
@@ -159,11 +163,14 @@ fn run() {
         eprintln!("[panic] {info}");
         let bt = std::backtrace::Backtrace::force_capture();
         eprintln!("[panic] backtrace:\n{bt}");
+        // A report and the relaunch prompt, before the abort that follows.
+        crash_reporting::on_panic();
         sphere_ui_components::plugin_host_lifecycle::PluginHostProcessManager::global()
             .shutdown_all(sphere_ui_components::plugin_host_lifecycle::HOST_SHUTDOWN_TIMEOUT)
             .ok();
         app::shutdown_discord_rpc();
     }));
+    crash_reporting::crash_now_if_asked();
 
     // GPUI's default DirectComposition target is created with topmost=true, which
     // draws above all WS_CHILD HWNDs. Plugin editors embed VST3 UI as children of
