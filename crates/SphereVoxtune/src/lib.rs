@@ -34,6 +34,7 @@ pub mod shared;
 pub mod shifter;
 pub mod splice;
 pub mod store;
+pub mod stretch;
 pub mod voicetune;
 pub mod whitesharp_dsp;
 pub use audio_io::{
@@ -248,6 +249,130 @@ mod tests {
             .take(40_000)
             .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(diff > 0.05, "edit not audible in export ({diff})");
+    }
+
+    fn median_hz(signal: &[f32]) -> f32 {
+        let mut detector = Detector::new(48_000.0, 30.0);
+        detector.set_range(50.0, 1_500.0);
+        let mut periods: Vec<f32> = signal
+            .iter()
+            .filter_map(|&s| detector.push(s, 0.2))
+            .filter_map(|e| e.period)
+            .collect();
+        periods.sort_by(f32::total_cmp);
+        48_000.0 / periods[periods.len() / 2]
+    }
+
+    #[test]
+    fn a_lengthened_or_shortened_note_keeps_its_pitch() {
+        let (mut engine, _) = two_note_engine();
+        let n0 = engine.notes[0].clone();
+        let n1 = engine.notes[1].clone();
+        // Note 0 (220 Hz) squeezed to 60 %; note 1 (C4) drawn out to fill
+        // the gap before it and the rest of the file.
+        engine.update_note(0, n0.pitch, n0.start, n0.dur * 0.6, 1.0, 0.0, n0.gain_db, false, false);
+        let start = n0.start + n0.dur * 0.6 + 0.05;
+        engine.update_note(1, n1.pitch, start, 1.95 - start, 1.0, 0.0, n1.gain_db, false, false);
+        let out = engine.render_offline();
+        let span = |a: f32, b: f32| &out[(a * 48_000.0) as usize..(b * 48_000.0) as usize];
+        let cents = |hz: f32, want: f32| 1_200.0 * (hz / want).log2();
+        let first = median_hz(span(n0.start + 0.05, n0.start + n0.dur * 0.55));
+        assert!(cents(first, 220.0).abs() < 15.0, "squeezed note at {first} Hz");
+        let second = median_hz(span(start + 0.1, 1.85));
+        assert!(cents(second, 261.63).abs() < 15.0, "stretched note at {second} Hz");
+        // Still tunable: +2 st on the stretched note lands on D4.
+        engine.update_note(1, n1.pitch + 2.0, start, 1.95 - start, 1.0, 0.0, n1.gain_db, true, false);
+        let out = engine.render_offline();
+        let tuned = median_hz(&out[((start + 0.1) * 48_000.0) as usize..(1.85 * 48_000.0) as usize]);
+        assert!(cents(tuned, 293.66).abs() < 20.0, "tuned stretched note at {tuned} Hz");
+    }
+
+    /// A legato phrase: G3, A3, B3 sung without breaks (gliding between).
+    fn legato_engine() -> CantoEngine {
+        let sr = 48_000u32;
+        let mut mono = vec![0.0f32; sr as usize * 3];
+        let mut phase = 0.0f32;
+        for (i, s) in mono.iter_mut().enumerate() {
+            let t = i as f32 / sr as f32;
+            if !(0.2..2.6).contains(&t) {
+                continue;
+            }
+            let step = |a: f32| ((t - a) / 0.04).clamp(0.0, 1.0);
+            let midi = 55.0 + 2.0 * step(1.0) + 2.0 * step(1.8)
+                + 0.35 * (std::f32::consts::TAU * 5.3 * t).sin();
+            phase = (phase + 440.0 * 2f32.powf((midi - 69.0) / 12.0) / sr as f32).fract();
+            let env = ((t - 0.2) / 0.03).min((2.6 - t) / 0.05).clamp(0.0, 1.0);
+            *s = env
+                * (1..12)
+                    .map(|k| (std::f32::consts::TAU * k as f32 * phase).sin() / k as f32)
+                    .sum::<f32>()
+                * 0.25;
+        }
+        let mut engine = CantoEngine::new(sr as f32);
+        engine
+            .load_audio_bytes(&encode_mono_wav_i16(&mono, sr), Some("wav"))
+            .expect("analyze");
+        engine
+    }
+
+    /// Largest one-sample jump in `x` relative to the local level, and the
+    /// longest silent run (ms) between `a` and `b` seconds.
+    fn joins(x: &[f32], a: f32, b: f32) -> (f32, f32) {
+        let (a, b) = ((a * 48_000.0) as usize, (b * 48_000.0) as usize);
+        let mut worst = 0.0f32;
+        let (mut run, mut longest) = (0usize, 0usize);
+        for i in a.max(241)..b {
+            let rms = (x[i - 240..i].iter().map(|s| s * s).sum::<f32>() / 240.0).sqrt();
+            let d2 = (x[i] - 2.0 * x[i - 1] + x[i - 2]).abs();
+            worst = worst.max(d2 / rms.max(0.02));
+            if x[i].abs() < 1e-3 {
+                run += 1;
+                longest = longest.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        (worst, longest as f32 / 48.0)
+    }
+
+    #[test]
+    fn resized_legato_notes_join_without_a_catch() {
+        let mut engine = legato_engine();
+        assert_eq!(engine.notes.len(), 3);
+        let (sung, _) = joins(&engine.render_offline(), 0.3, 2.5);
+        // Squeeze the middle note on its own: a hole opens, but it fades
+        // out and back in instead of cutting.
+        let n = engine.notes[1].clone();
+        engine.update_note(1, n.pitch, n.start, n.dur * 0.7, 1.0, 0.0, n.gain_db, false, false);
+        let (cut, hole_ms) = joins(&engine.render_offline(), 0.3, 2.5);
+        assert!(hole_ms > 100.0);
+        assert!(cut < 0.2, "hard cut into the hole: {cut}");
+        // As the editor does for legato notes, the next note takes the time:
+        // no hole, and the joins are as smooth as sung.
+        let m = engine.notes[2].clone();
+        let gap = m.start - (n.start + n.dur);
+        let start = n.start + n.dur * 0.7 + gap;
+        let end = m.start + m.dur;
+        engine.update_note(2, m.pitch, start, end - start, 1.0, 0.0, m.gain_db, false, false);
+        let (linked, silent_ms) = joins(&engine.render_offline(), 0.3, 2.5);
+        assert!(silent_ms < 1.0, "{silent_ms} ms of silence");
+        assert!(linked < sung * 1.5, "join {linked} vs sung {sung}");
+    }
+
+    #[test]
+    fn a_stretched_note_previews_at_its_new_length() {
+        let (mut engine, _) = two_note_engine();
+        let n0 = engine.notes[0].clone();
+        engine.update_note(0, n0.pitch, n0.start, n0.dur * 1.2, 1.0, 0.0, n0.gain_db, false, false);
+        engine.trigger_note_audition(0);
+        engine.release_audition();
+        // Past the old length it is still playing, at the old pitch.
+        let frames = (n0.dur * 1.1 * 48_000.0) as usize;
+        let heard = render(&mut engine, frames);
+        assert!(engine.is_auditioning());
+        let left: Vec<f32> = heard.iter().step_by(2).copied().collect();
+        let hz = median_hz(&left[frames / 4..]);
+        assert!((1_200.0 * (hz / 220.0).log2()).abs() < 15.0, "preview at {hz} Hz");
     }
 
     #[test]

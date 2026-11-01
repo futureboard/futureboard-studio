@@ -15,6 +15,7 @@ use crate::dsp_core::{
 };
 use crate::scale::{ALL_NOTES, Scale, nearest_target, scale_mask};
 use crate::shifter::{Control, MAX_FORMANT, Shifter};
+use crate::stretch::Stretcher;
 use crate::voicetune::{PitchFrame, calculate_rms, hz_to_midi_cents};
 use crate::whitesharp_dsp::WhiteSharpDsp;
 
@@ -23,6 +24,23 @@ pub const BEATS_PER_BAR: f32 = 4.0;
 pub const CONTOUR_POINTS: usize = 32;
 /// Ramp length for note-preview starts, loop points and stops.
 const AUDITION_FADE_SEC: f32 = 0.008;
+/// Length change below which a note is read directly instead of stretched.
+const STRETCH_EPSILON: f64 = 0.002;
+/// Crossfade over a jump in the source read position during playback.
+const SPLICE_FADE_SEC: f32 = 0.006;
+/// Source movement per sample that still counts as continuous (a stretched
+/// note's source runs at its own speed).
+const SPLICE_TOLERANCE_SEC: f64 = 0.004;
+
+/// What fades out across a splice.
+#[derive(Debug, Clone, Copy)]
+enum Tail {
+    Silence,
+    /// The source read straight on from here (seconds).
+    Source(f64),
+    /// This stretched note, carried on by the tail stretcher.
+    Stretched(usize),
+}
 
 /// Key names by pitch class, as analysis reports them.
 pub const KEY_NAMES: [&str; 12] = [
@@ -363,6 +381,17 @@ pub struct CantoEngine {
     pub notes: Vec<CantoNote>,
     /// Real-time TD-PSOLA pitch & formant shifter.
     shifter: Shifter,
+    /// Spreads a note whose length was edited over its new span, before
+    /// the shifter, keeping its pitch.
+    stretcher: Stretcher,
+    /// Source position of the last dry sample in playback (None: silence).
+    splice_src: Option<f64>,
+    /// Stretched note the last dry sample came through, if any.
+    splice_path: Option<usize>,
+    /// A crossfade in progress: what is fading out, frames left, total.
+    splice_fade: Option<(Tail, u32, u32)>,
+    /// Keeps a stretched note going while it fades out of a splice.
+    tail_stretcher: Stretcher,
     /// Studio vocal leveling compressor.
     compressor: SoftKneeCompressor,
     /// Embedded WhiteSharp live audio processor for external input buffers.
@@ -413,6 +442,11 @@ impl CantoEngine {
             waveform_peaks: Vec::new(),
             notes: Vec::new(),
             shifter,
+            stretcher: Stretcher::new(longest_period),
+            splice_src: None,
+            splice_path: None,
+            splice_fade: None,
+            tail_stretcher: Stretcher::new(longest_period),
             compressor,
             whitesharp: WhiteSharpDsp::new(sr),
             control_counter: 0,
@@ -679,7 +713,7 @@ impl CantoEngine {
             return;
         }
         self.audition_note_index = Some(note_index);
-        self.audition_cursor_sec = self.notes[note_index].detected_start as f64;
+        self.audition_cursor_sec = self.notes[note_index].start as f64;
         self.audition_held = true;
         self.audition_tail = None;
         self.audition_fade = None;
@@ -731,6 +765,11 @@ impl CantoEngine {
         e.compressor.reset();
         e.control_counter = 0;
         e.active_hint = 0;
+        e.stretcher.reset();
+        e.tail_stretcher.reset();
+        e.splice_src = None;
+        e.splice_path = None;
+        e.splice_fade = None;
         let latency = e.shifter.latency() as usize;
         let total = (self.duration_sec * self.sample_rate as f64).round() as usize;
         // Past the source end `sample_interpolated` returns silence, which
@@ -771,10 +810,11 @@ impl CantoEngine {
             self.clear_audition();
             return None;
         }
-        let (det_start, det_end) = {
+        // The note's edited span: a stretched note previews at its new length.
+        let (start, end) = {
             let n = &self.notes[idx];
-            let start = n.detected_start as f64;
-            (start, start + n.detected_dur.max(0.05) as f64)
+            let start = n.start as f64;
+            (start, start + n.dur.max(0.05) as f64)
         };
 
         let (dry, local_t) = match self.audition_tail {
@@ -787,20 +827,20 @@ impl CantoEngine {
                 (0.0, 1.0)
             }
             None => {
-                let cursor = self.audition_cursor_sec;
-                // Short ramps at both ends of the source region keep loop
-                // restarts and the final stop free of clicks.
+                // A drag may move the note's start past the cursor.
+                let cursor = self.audition_cursor_sec.clamp(start, end);
+                // Short ramps at both ends of the note keep loop restarts
+                // and the final stop free of clicks.
                 let fade = AUDITION_FADE_SEC as f64;
-                let env = ((cursor - det_start) / fade)
-                    .min((det_end - cursor) / fade)
+                let env = ((cursor - start) / fade)
+                    .min((end - cursor) / fade)
                     .clamp(0.0, 1.0) as f32;
-                let local_t =
-                    ((cursor - det_start) / (det_end - det_start).max(0.01)).clamp(0.0, 1.0) as f32;
-                let dry = self.sample_interpolated(cursor) * env;
-                self.audition_cursor_sec += 1.0 / self.sample_rate as f64;
-                if self.audition_cursor_sec >= det_end {
+                let local_t = ((cursor - start) / (end - start).max(0.01)).clamp(0.0, 1.0) as f32;
+                let dry = self.note_dry(idx, cursor) * env;
+                self.audition_cursor_sec = cursor + 1.0 / self.sample_rate as f64;
+                if self.audition_cursor_sec >= end {
                     if self.audition_held {
-                        self.audition_cursor_sec = det_start;
+                        self.audition_cursor_sec = start;
                     } else {
                         self.audition_tail = Some(self.shifter.latency() as usize);
                     }
@@ -931,6 +971,119 @@ impl CantoEngine {
         false
     }
 
+    /// Between notes: the audio that followed the note just played, for as
+    /// long as the gap after it was when sung. Resized or moved legato notes
+    /// thus keep the breath or glide between them instead of a silent hole.
+    /// For unedited notes this is the source at the playhead.
+    fn gap_source(&self, time_sec: f32) -> Option<f64> {
+        let prev = self.notes.get(self.active_hint)?;
+        let end = prev.start + prev.dur;
+        if time_sec < end {
+            return None;
+        }
+        let sung_end = prev.detected_start + prev.detected_dur;
+        let room = self
+            .notes
+            .get(self.active_hint + 1)
+            .map_or(self.duration_sec as f32 - sung_end, |n| {
+                n.detected_start - sung_end
+            });
+        let into = time_sec - end;
+        (into < room).then_some((sung_end + into) as f64)
+    }
+
+    /// Call before reading a playback sample: `src` is where it will be read
+    /// from in the source (None for silence) and `path` the stretched note
+    /// it goes through, if any. A jump (entering or leaving a moved or
+    /// resized note, a mute, a seek) starts a crossfade in which what was
+    /// playing carries on and fades out. The stretcher reads near, not at,
+    /// its source position, so switching it in or out is a jump too.
+    fn begin_splice(&mut self, src: Option<f64>, path: Option<usize>) {
+        let jumped = path != self.splice_path
+            || match (self.splice_src, src) {
+                (Some(a), Some(b)) => (b - a).abs() > SPLICE_TOLERANCE_SEC,
+                (None, None) => false,
+                _ => true,
+            };
+        if jumped {
+            let tail = match (self.splice_path, self.splice_src) {
+                (Some(note), _) => {
+                    // The outgoing note keeps its stretcher for the fade.
+                    std::mem::swap(&mut self.stretcher, &mut self.tail_stretcher);
+                    self.stretcher.reset();
+                    Tail::Stretched(note)
+                }
+                (None, Some(at)) => Tail::Source(at + 1.0 / self.sample_rate as f64),
+                (None, None) => Tail::Silence,
+            };
+            let frames = ((self.sample_rate * SPLICE_FADE_SEC) as u32).max(1);
+            self.splice_fade = Some((tail, frames, frames));
+        }
+        self.splice_src = src;
+        self.splice_path = path;
+    }
+
+    /// Mixes the fading-out tail of a splice under the new sample `dry`.
+    fn end_splice(&mut self, dry: f32) -> f32 {
+        let Some((tail, left, len)) = self.splice_fade else {
+            return dry;
+        };
+        let gain = 0.5 - 0.5 * (std::f32::consts::PI * (len - left) as f32 / len as f32).cos();
+        let (old, next) = match tail {
+            Tail::Silence => (0.0, tail),
+            Tail::Source(at) => (
+                self.sample_interpolated(at),
+                Tail::Source(at + 1.0 / self.sample_rate as f64),
+            ),
+            Tail::Stretched(note) => (self.stretched_sample(note, self.playhead_sec, true), tail),
+        };
+        self.splice_fade = (left > 1).then_some((next, left - 1, len));
+        dry * gain + old * (1.0 - gain)
+    }
+
+    fn is_stretched(&self, index: usize) -> bool {
+        let n = &self.notes[index];
+        (n.detected_dur as f64 / n.dur.max(0.01) as f64 - 1.0).abs() >= STRETCH_EPSILON
+    }
+
+    /// Source audio for note `index` at output time `time_sec`: the note's
+    /// sung region spread over its edited span. A note whose length changed
+    /// goes through the stretcher so its pitch stays put; any other note is
+    /// read directly.
+    fn note_dry(&mut self, index: usize, time_sec: f64) -> f32 {
+        if self.is_stretched(index) {
+            return self.stretched_sample(index, time_sec, false);
+        }
+        let n = &self.notes[index];
+        let local = ((time_sec - n.start as f64) / n.dur.max(0.01) as f64).clamp(0.0, 1.0);
+        self.sample_interpolated(n.detected_start as f64 + local * n.detected_dur as f64)
+    }
+
+    /// Note `index` stretched to its edited span, at output time `time_sec`,
+    /// through the main stretcher or the one finishing a splice (`tail`).
+    fn stretched_sample(&mut self, index: usize, time_sec: f64, tail: bool) -> f32 {
+        let Some(n) = self.notes.get(index) else {
+            return 0.0;
+        };
+        let (start, dur) = (n.start as f64, n.dur.max(0.01) as f64);
+        let (det_start, det_dur) = (n.detected_start as f64, n.detected_dur as f64);
+        let sr = self.sample_rate as f64;
+        let unvoiced = n.unpitched.then(|| self.shifter.unvoiced_period() as f64);
+        let at = (time_sec * sr).round() as i64;
+        let stretcher = if tail {
+            &mut self.tail_stretcher
+        } else {
+            &mut self.stretcher
+        };
+        stretcher.sample(index, at, &self.audio_samples, |pos| {
+            let local = ((pos / sr - start) / dur).clamp(0.0, 1.0);
+            let period = unvoiced.unwrap_or_else(|| {
+                sr / midi_to_hz(detected_pitch_at(n, local as f32)).clamp(55.0, 1400.0) as f64
+            });
+            ((det_start + local * det_dur) * sr, period)
+        })
+    }
+
     #[inline]
     fn sample_interpolated(&self, time_sec: f64) -> f32 {
         if self.audio_samples.is_empty() || time_sec < 0.0 {
@@ -999,21 +1152,33 @@ impl CantoEngine {
                     let s = clamp(raw, -0.98, 0.98);
                     (s, s)
                 } else if let Some(idx) = self.note_index_at(t) {
-                    let (local_t, src_time) = {
-                        let n = &self.notes[idx];
-                        let local_t = ((t - n.start) / n.dur.max(0.01)).clamp(0.0, 1.0);
+                    let n = &self.notes[idx];
+                    let local_t = ((t - n.start) / n.dur.max(0.01)).clamp(0.0, 1.0);
+                    // Muted notes keep the timeline running but feed silence.
+                    let muted = n.muted;
+                    let (src, path) = if muted {
+                        (None, None)
+                    } else {
                         let src = (n.detected_start + local_t * n.detected_dur) as f64;
-                        // Muted notes keep the timeline running but feed silence.
-                        (local_t, if n.muted { -1.0 } else { src })
+                        (Some(src), self.is_stretched(idx).then_some(idx))
                     };
-                    let dry = self.sample_interpolated(src_time);
-                    self.shift_sample(dry, |e| e.note_control(idx, local_t))
-                } else {
-                    let dry = if self.is_vacated_original_region(t) {
+                    self.begin_splice(src, path);
+                    let dry = if muted {
                         0.0
                     } else {
-                        self.sample_interpolated(self.playhead_sec)
+                        self.note_dry(idx, self.playhead_sec)
                     };
+                    let dry = self.end_splice(dry);
+                    self.shift_sample(dry, |e| e.note_control(idx, local_t))
+                } else {
+                    let src = match self.gap_source(t) {
+                        Some(at) => Some(at),
+                        None if self.is_vacated_original_region(t) => None,
+                        None => Some(self.playhead_sec),
+                    };
+                    self.begin_splice(src, None);
+                    let dry = src.map_or(0.0, |at| self.sample_interpolated(at));
+                    let dry = self.end_splice(dry);
                     self.shift_sample(dry, |e| e.neutral_control())
                 }
             };
