@@ -6809,12 +6809,25 @@ impl StudioLayout {
     /// After a project document is applied to the timeline, drop stale bridge
     /// instances before the awaitable restore batch runs.
     pub(super) fn prepare_bridge_plugin_restore_batch(&mut self, cx: &mut Context<Self>) {
-        // A new project document owns different insert ids — the built-in
-        // state mirror from the previous document must not leak across.
-        // Entries for the incoming project reseed from the loaded blobs.
+        self.reseed_builtin_state_mirror(cx);
+        if !super::plugin_bridge_runtime::bridge_enabled() {
+            eprintln!(
+                "[PluginRestore] in-process path — engine sync will instantiate native inserts"
+            );
+            return;
+        }
+        self.unload_stale_bridge_instances(cx);
+    }
+
+    /// Replaces the built-in state mirror with the loaded project's saved
+    /// states.
+    ///
+    /// A new project document owns different insert ids — the mirror from the
+    /// previous document must not leak across — and the incoming entries have
+    /// to be there before either the host runtime or an editor window can
+    /// observe defaults.
+    pub(super) fn reseed_builtin_state_mirror(&mut self, cx: &mut Context<Self>) {
         crate::components::builtin_plugin_editor::builtin_state_clear();
-        // Seed the incoming project's mirror before either the host runtime or
-        // an editor window can observe defaults.
         let persisted_builtin_states: Vec<(String, String, std::sync::Arc<Vec<u8>>)> = {
             let state = &self.timeline.read(cx).state;
             state
@@ -6842,13 +6855,9 @@ impl StudioLayout {
                 state.as_slice(),
             );
         }
-        if !super::plugin_bridge_runtime::bridge_enabled() {
-            eprintln!(
-                "[PluginRestore] in-process path — engine sync will instantiate native inserts"
-            );
-            return;
-        }
+    }
 
+    fn unload_stale_bridge_instances(&mut self, cx: &mut Context<Self>) {
         let inserts = self.bridge_audio_insert_slots(cx);
         let wanted: std::collections::HashSet<String> =
             inserts.iter().map(|(_, slot_id)| slot_id.clone()).collect();

@@ -226,6 +226,14 @@ impl StudioLayout {
             "install complete (pre-studio) warnings={}",
             self.session_install_warnings.len()
         );
+        // A native editor left open across the switch keeps its window when
+        // the new project has an insert of the same id, and went on showing
+        // what it read before the load: a WhiteSharp saved in Minor
+        // Pentatonic came up as Chromatic until it was closed and reopened.
+        // This path never seeded the built-in state mirror (only opening an
+        // editor did), so seed it from the loaded slots, then refresh.
+        self.reseed_builtin_state_mirror(cx);
+        self.refresh_builtin_editor_sidebars(cx);
 
         if !self.session_install_warnings.is_empty() {
             for warning in &self.session_install_warnings {

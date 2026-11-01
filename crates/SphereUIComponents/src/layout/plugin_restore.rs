@@ -452,6 +452,9 @@ impl StudioLayout {
             report.failed,
             report.warnings.len()
         );
+        // Open native editors re-read the loaded project's state, as after
+        // the pre-studio install (see `install_loaded_session_with_handoff`).
+        self.refresh_builtin_editor_sidebars(cx);
 
         if !report.warnings.is_empty() {
             for warning in &report.warnings {
