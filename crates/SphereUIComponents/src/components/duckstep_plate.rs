@@ -518,10 +518,8 @@ impl KitModel for DuckstepPlate {
                 next.point_y[index] = (y * 1_000.0).round() / 1_000.0;
                 if index > 0 && index < count - 1 {
                     let x = (fx * 1_000.0).round() / 1_000.0;
-                    next.point_x[index] = x.clamp(
-                        next.point_x[index - 1] + 0.005,
-                        next.point_x[index + 1] - 0.005,
-                    );
+                    next.point_x[index] =
+                        between_neighbours(x, next.point_x[index - 1], next.point_x[index + 1]);
                 }
                 e.set_params(next, cx);
             }
@@ -1509,6 +1507,25 @@ fn shaper_screen(
     screen
 }
 
+/// The spacing kept between neighbouring shape points, as a share of the
+/// cycle.
+const POINT_GAP: f32 = 0.005;
+
+/// `x` held between its neighbours `prev` and `next`, [`POINT_GAP`] clear of
+/// each where there is room.
+///
+/// A saved shape can hold points closer than two gaps, or on top of each
+/// other, and `f32::clamp` panics when its bounds cross — which took Studio
+/// down when such a point was dragged. A squeezed point stays mid-gap.
+fn between_neighbours(x: f32, prev: f32, next: f32) -> f32 {
+    let (lo, hi) = (prev + POINT_GAP, next - POINT_GAP);
+    if lo <= hi {
+        x.max(lo).min(hi)
+    } else {
+        (prev + next) * 0.5
+    }
+}
+
 /// A point where the double-click was, if there is room for one.
 fn add_point(e: &mut KitEditor<DuckstepPlate>, at: (f32, f32), cx: &mut Cx<DuckstepPlate>) {
     let Some(b) = e.live_bounds.get(LiveSlot::Plate(SLOT_GRAPH)) else {
@@ -1526,6 +1543,11 @@ fn add_point(e: &mut KitEditor<DuckstepPlate>, at: (f32, f32), cx: &mut Cx<Ducks
     let slot = (1..count)
         .find(|&i| next.point_x[i] > x)
         .unwrap_or(count - 1);
+    // A point on top of a neighbour could never be dragged apart from it.
+    if x - next.point_x[slot - 1] < POINT_GAP || next.point_x[slot] - x < POINT_GAP {
+        e.show_notice("Too close to another point", cx);
+        return;
+    }
     for i in (slot..count).rev() {
         next.point_x[i + 1] = next.point_x[i];
         next.point_y[i + 1] = next.point_y[i];
@@ -2195,6 +2217,18 @@ pub fn open_duckstep_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Points stacked by a saved shape: dragging one used to panic in
+    /// `f32::clamp` and take Studio down.
+    #[test]
+    fn a_point_squeezed_between_its_neighbours_drags_without_panicking() {
+        assert_eq!(between_neighbours(1.0, 0.995, 0.995), 0.995);
+        assert!((between_neighbours(0.2, 0.5, 0.505) - 0.5025).abs() < 1.0e-6);
+        // With room, the gap is kept on both sides.
+        assert_eq!(between_neighbours(0.0, 0.2, 0.8), 0.2 + POINT_GAP);
+        assert_eq!(between_neighbours(1.0, 0.2, 0.8), 0.8 - POINT_GAP);
+        assert_eq!(between_neighbours(0.5, 0.2, 0.8), 0.5);
+    }
 
     #[test]
     fn the_scales_match_the_design() {
