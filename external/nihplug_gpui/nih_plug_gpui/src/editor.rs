@@ -10,7 +10,7 @@ use nih_plug::prelude::{Editor, GuiContext, ParentWindowHandle};
 use parking_lot::Mutex;
 use std::any::Any;
 use std::marker::PhantomData;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,9 +70,20 @@ where
         // has happened. Tasks run in the order they were submitted, so the task that closes the
         // window again is guaranteed to observe it.
         let window: Arc<Mutex<Option<AnyWindowHandle>>> = Arc::default();
+        // Set when the handle is dropped. The host may close the editor before the task below
+        // gets to run, and may have destroyed `parent` by then.
+        let closed = Arc::new(AtomicBool::new(false));
+        // The view embedded in `parent`, so the handle can take it out synchronously on macOS.
+        let embedded_view: Arc<Mutex<Option<usize>>> = Arc::default();
 
         let window_slot = window.clone();
+        let task_closed = closed.clone();
+        let view_slot = embedded_view.clone();
         let opened = host::run_on_gpui_thread(Box::new(move |cx| {
+            if task_closed.load(Ordering::Acquire) {
+                return;
+            }
+
             // Read the scale here, not when `spawn` was called. The host may have reported it
             // while this task was waiting its turn.
             let scaling_factor = gpui_state.scale();
@@ -90,6 +101,15 @@ where
             };
 
             *window_slot.lock() = Some(handle);
+            #[cfg(target_os = "macos")]
+            {
+                *view_slot.lock() = handle
+                    .update(cx, |_, window, _| embed::view_of(window))
+                    .ok()
+                    .flatten();
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = &view_slot;
             spawn_frame_loop(cx, handle, gpui_state, standalone);
         }));
         if !opened {
@@ -99,6 +119,8 @@ where
         Box::new(GpuiEditorHandle {
             gpui_state: self.gpui_state.clone(),
             window,
+            closed,
+            embedded_view,
         })
     }
 
@@ -111,6 +133,12 @@ where
         // another monitor. Refusing the change while the editor is open leaves the GUI at 1x in
         // the corner of a 2x host window.
         if !factor.is_finite() || factor <= 0.0 {
+            return false;
+        }
+
+        // Sizes on macOS are in points and AppKit applies the backing scale itself. Hosts are not
+        // supposed to send one there; declining tells one that does to leave sizing to AppKit.
+        if cfg!(target_os = "macos") {
             return false;
         }
 
@@ -138,7 +166,13 @@ where
 }
 
 /// Multiply a logical size by a scaling factor to get a physical size.
+///
+/// On macOS both the host and GPUI measure in points, so the logical size is the size.
 fn scale((width, height): (u32, u32), factor: f32) -> (u32, u32) {
+    if cfg!(target_os = "macos") {
+        return (width, height);
+    }
+
     let factor = if factor.is_finite() && factor > 0.0 {
         factor
     } else {
@@ -328,11 +362,27 @@ fn spawn_frame_loop(
 struct GpuiEditorHandle {
     gpui_state: Arc<GpuiState>,
     window: Arc<Mutex<Option<AnyWindowHandle>>>,
+    /// Tells a window that hasn't been opened yet not to open.
+    closed: Arc<AtomicBool>,
+    /// The `NSView` embedded in the host's view on macOS, once the window is open.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    embedded_view: Arc<Mutex<Option<usize>>>,
 }
 
 impl Drop for GpuiEditorHandle {
     fn drop(&mut self) {
         self.gpui_state.open.store(false, Ordering::Release);
+        self.closed.store(true, Ordering::Release);
+
+        // The window closes on GPUI's schedule, after the host may already have destroyed the view
+        // it was embedded in. Hosts close editors on the main thread, so the view can leave the
+        // host's hierarchy right now.
+        #[cfg(target_os = "macos")]
+        if host::is_main_thread() {
+            if let Some(view) = self.embedded_view.lock().take() {
+                embed::detach_view(view);
+            }
+        }
 
         let window = self.window.clone();
         host::run_on_gpui_thread(Box::new(move |cx| {

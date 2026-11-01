@@ -53,6 +53,7 @@ windows = { version = "0.61", features = [
 [patch."https://github.com/futureboard/gpui-se.git"]
 gpui = { path = "../../crates/gpui" }
 gpui_linux = { path = "../../crates/gpui/crates/gpui_linux" }
+gpui_macos = { path = "../../crates/gpui/crates/gpui_macos" }
 gpui_windows = { path = "../../crates/gpui/crates/gpui_windows" }
 
 [patch."https://github.com/arizkami/nihplug_gpui"]

@@ -20,9 +20,7 @@ use gpui::{
 use media::core_media::{CMSampleBuffer, CMSampleBufferRef};
 use metal::NSInteger;
 use objc::{
-    class,
-    declare::ClassDecl,
-    msg_send,
+    class, msg_send,
     runtime::{Class, Object, Sel},
     sel, sel_impl,
 };
@@ -286,7 +284,7 @@ pub(crate) fn get_sources() -> oneshot::Receiver<Result<Vec<Rc<dyn ScreenCapture
 
 #[ctor]
 unsafe fn build_classes() {
-    let mut decl = ClassDecl::new("GPUIStreamDelegate", class!(NSObject)).unwrap();
+    let mut decl = crate::unique_class_decl("GPUIStreamDelegate", class!(NSObject));
     unsafe {
         decl.add_method(
             sel!(outputVideoEffectDidStartForStream:),
@@ -302,7 +300,7 @@ unsafe fn build_classes() {
         );
         DELEGATE_CLASS = decl.register();
 
-        let mut decl = ClassDecl::new("GPUIStreamOutput", class!(NSObject)).unwrap();
+        let mut decl = crate::unique_class_decl("GPUIStreamOutput", class!(NSObject));
         decl.add_method(
             sel!(stream:didOutputSampleBuffer:ofType:),
             stream_did_output_sample_buffer_of_type

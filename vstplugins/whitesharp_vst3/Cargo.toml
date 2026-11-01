@@ -84,6 +84,7 @@ windows-d3d12 = { package = "windows", version = "0.62", optional = true, defaul
 # for the wgpu shared texture).
 gpui = { path = "../../crates/gpui" }
 gpui_linux = { path = "../../crates/gpui/crates/gpui_linux" }
+gpui_macos = { path = "../../crates/gpui/crates/gpui_macos" }
 gpui_windows = { path = "../../crates/gpui/crates/gpui_windows" }
 
 [patch."https://github.com/arizkami/nihplug_gpui"]

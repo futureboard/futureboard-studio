@@ -43,9 +43,7 @@ use core_graphics::display::{CGDirectDisplayID, CGPoint, CGRect};
 use ctor::ctor;
 use futures::channel::oneshot;
 use objc::{
-    class,
-    declare::ClassDecl,
-    msg_send,
+    class, msg_send,
     runtime::{BOOL, Class, NO, Object, Protocol, Sel, YES},
     sel, sel_impl,
 };
@@ -130,13 +128,17 @@ unsafe fn build_classes() {
         WINDOW_CLASS = build_window_class("GPUIWindow", class!(NSWindow));
         PANEL_CLASS = build_window_class("GPUIPanel", class!(NSPanel));
         VIEW_CLASS = {
-            let mut decl = ClassDecl::new("GPUIView", class!(NSView)).unwrap();
+            let mut decl = crate::unique_class_decl("GPUIView", class!(NSView));
             decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
             decl.add_method(sel!(dealloc), dealloc_view as extern "C" fn(&Object, Sel));
 
             decl.add_method(
                 sel!(performKeyEquivalent:),
                 handle_key_equivalent as extern "C" fn(&Object, Sel, id) -> BOOL,
+            );
+            decl.add_method(
+                sel!(viewDidMoveToWindow),
+                view_did_move_to_window as extern "C" fn(&Object, Sel),
             );
             decl.add_method(
                 sel!(keyDown:),
@@ -293,7 +295,7 @@ unsafe fn build_classes() {
             decl.register()
         };
         BLURRED_VIEW_CLASS = {
-            let mut decl = ClassDecl::new("BlurredView", class!(NSVisualEffectView)).unwrap();
+            let mut decl = crate::unique_class_decl("BlurredView", class!(NSVisualEffectView));
             decl.add_method(
                 sel!(initWithFrame:),
                 blurred_view_init_with_frame as extern "C" fn(&Object, Sel, NSRect) -> id,
@@ -357,7 +359,7 @@ pub(crate) unsafe fn set_active_window_cursor_style(style: CursorStyle) {
 
 unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const Class {
     unsafe {
-        let mut decl = ClassDecl::new(name, superclass).unwrap();
+        let mut decl = crate::unique_class_decl(name, superclass);
         decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(&Object, Sel));
 
@@ -505,6 +507,11 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    /// The view has been moved into a view owned by another application. See
+    /// [`embed_in_parent_view`]. While set, `native_window` is GPUI's own, never shown, window: it
+    /// still owns the delegate and the renderer setup, but geometry, scale, focus and visibility
+    /// are those of the host window the view now lives in.
+    embedded: bool,
 }
 
 impl MacWindowState {
@@ -567,18 +574,38 @@ impl MacWindowState {
         }
     }
 
+    /// The window the view is drawn in: the host's once embedded, GPUI's own otherwise.
+    fn host_window(&self) -> id {
+        if self.embedded {
+            let window: id = unsafe { msg_send![self.native_view.as_ptr(), window] };
+            if !window.is_null() {
+                return window;
+            }
+        }
+        self.native_window
+    }
+
+    /// The view events are reported relative to, when that is not the whole window.
+    fn event_view(&self) -> Option<id> {
+        self.embedded.then(|| self.native_view.as_ptr() as id)
+    }
+
     fn start_display_link(&mut self) {
         self.stop_display_link();
+        let window = self.host_window();
         unsafe {
-            if !self
-                .native_window
+            // An embedded view detached from the host has no window to be visible in.
+            if self.embedded && window == self.native_window {
+                return;
+            }
+            if !window
                 .occlusionState()
                 .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
             {
                 return;
             }
         }
-        let display_id = unsafe { display_id_for_screen(self.native_window.screen()) };
+        let display_id = unsafe { display_id_for_screen(window.screen()) };
         if let Some(mut display_link) =
             DisplayLink::new(display_id, self.native_view.as_ptr() as *mut c_void, step).log_err()
         {
@@ -592,6 +619,9 @@ impl MacWindowState {
     }
 
     fn is_maximized(&self) -> bool {
+        if self.embedded {
+            return false;
+        }
         fn rect_to_size(rect: NSRect) -> Size<Pixels> {
             let NSSize { width, height } = rect.size;
             size(width.into(), height.into())
@@ -605,6 +635,9 @@ impl MacWindowState {
     }
 
     fn is_fullscreen(&self) -> bool {
+        if self.embedded {
+            return false;
+        }
         unsafe {
             let style_mask = self.native_window.styleMask();
             style_mask.contains(NSWindowStyleMask::NSFullScreenWindowMask)
@@ -612,6 +645,9 @@ impl MacWindowState {
     }
 
     fn bounds(&self) -> Bounds<Pixels> {
+        if self.embedded {
+            return self.embedded_bounds();
+        }
         let mut window_frame = unsafe { NSWindow::frame(self.native_window) };
         let screen = unsafe { NSWindow::screen(self.native_window) };
         if screen == nil {
@@ -635,17 +671,47 @@ impl MacWindowState {
         )
     }
 
+    /// The embedded view's rectangle on screen, top-left origin, like [`Self::bounds`].
+    fn embedded_bounds(&self) -> Bounds<Pixels> {
+        let content_size = self.content_size();
+        let window = self.host_window();
+        unsafe {
+            let screen = NSWindow::screen(window);
+            if window == self.native_window || screen == nil {
+                return Bounds::new(point(px(0.), px(0.)), content_size);
+            }
+            let view = self.native_view.as_ptr() as id;
+            let in_window: NSRect = msg_send![view, convertRect: NSView::bounds(view) toView: nil];
+            let on_screen: NSRect = msg_send![window, convertRectToScreen: in_window];
+            let screen_frame = NSScreen::frame(screen);
+            let top = screen_frame.size.height - on_screen.origin.y - on_screen.size.height;
+            Bounds::new(
+                point(
+                    px((on_screen.origin.x - screen_frame.origin.x) as f32),
+                    px((top + screen_frame.origin.y) as f32),
+                ),
+                content_size,
+            )
+        }
+    }
+
     fn content_size(&self) -> Size<Pixels> {
-        let NSSize { width, height, .. } =
-            unsafe { NSView::frame(self.native_window.contentView()) }.size;
+        let NSSize { width, height, .. } = if self.embedded {
+            unsafe { NSView::frame(self.native_view.as_ptr() as id) }.size
+        } else {
+            unsafe { NSView::frame(self.native_window.contentView()) }.size
+        };
         size(px(width as f32), px(height as f32))
     }
 
     fn scale_factor(&self) -> f32 {
-        get_scale_factor(self.native_window)
+        get_scale_factor(self.host_window())
     }
 
     fn titlebar_height(&self) -> Pixels {
+        if self.embedded {
+            return px(0.);
+        }
         unsafe {
             let frame = NSWindow::frame(self.native_window);
             let content_layout_rect: CGRect = msg_send![self.native_window, contentLayoutRect];
@@ -843,6 +909,7 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                embedded: false,
             })));
 
             (*native_window).set_ivar(
@@ -1086,6 +1153,14 @@ impl Drop for MacWindow {
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.display_link.take();
+        // Leave the host's view hierarchy now rather than from the task below: the host may
+        // destroy its view as soon as it has asked for the editor to close.
+        let embedded_view = this.embedded.then(|| this.native_view.as_ptr() as id);
+        if let Some(view) = embedded_view {
+            unsafe {
+                let _: () = msg_send![view, removeFromSuperview];
+            }
+        }
         unsafe {
             this.native_window.setDelegate_(nil);
         }
@@ -1098,6 +1173,10 @@ impl Drop for MacWindow {
                     }
                     window.close();
                     window.autorelease();
+                    // Balances the retain taken by `embed_in_parent_view`.
+                    if let Some(view) = embedded_view {
+                        let _: () = msg_send![view, release];
+                    }
                 }
             })
             .detach();
@@ -1134,6 +1213,22 @@ impl PlatformWindow for MacWindow {
 
     fn resize(&mut self, size: Size<Pixels>) {
         let this = self.0.lock();
+        if this.embedded {
+            let view = this.native_view.as_ptr() as id;
+            let closed = this.closed.clone();
+            this.foreground_executor
+                .spawn(async move {
+                    if_window_not_closed(closed, || unsafe {
+                        set_embedded_view_frame(
+                            view,
+                            size.width.as_f32() as f64,
+                            size.height.as_f32() as f64,
+                        );
+                    })
+                })
+                .detach();
+            return;
+        }
         let window = this.native_window;
         let closed = this.closed.clone();
         this.foreground_executor
@@ -1217,14 +1312,14 @@ impl PlatformWindow for MacWindow {
 
     fn appearance(&self) -> WindowAppearance {
         unsafe {
-            let appearance: id = msg_send![self.0.lock().native_window, effectiveAppearance];
+            let appearance: id = msg_send![self.0.lock().host_window(), effectiveAppearance];
             crate::window_appearance::window_appearance_from_native(appearance)
         }
     }
 
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         unsafe {
-            let screen = self.0.lock().native_window.screen();
+            let screen = self.0.lock().host_window().screen();
             if screen.is_null() {
                 return None;
             }
@@ -1240,10 +1335,12 @@ impl PlatformWindow for MacWindow {
 
     fn mouse_position(&self) -> Point<Pixels> {
         let position = unsafe {
-            self.0
-                .lock()
-                .native_window
-                .mouseLocationOutsideOfEventStream()
+            let lock = self.0.lock();
+            let position = lock.host_window().mouseLocationOutsideOfEventStream();
+            match lock.event_view() {
+                Some(view) => msg_send![view, convertPoint: position fromView: nil],
+                None => position,
+            }
         };
         convert_mouse_position(position, self.content_size().height)
     }
@@ -1372,6 +1469,18 @@ impl PlatformWindow for MacWindow {
 
     fn activate(&self) {
         let lock = self.0.lock();
+        if lock.embedded {
+            // The host decides which of its windows is key. Taking keyboard focus inside it is
+            // all an embedded view may do.
+            let view = lock.native_view.as_ptr() as id;
+            let window = lock.host_window();
+            if window != lock.native_window {
+                unsafe {
+                    let _: BOOL = msg_send![window, makeFirstResponder: view];
+                }
+            }
+            return;
+        }
         let window = lock.native_window;
         let closed = lock.closed.clone();
         let executor = lock.foreground_executor.clone();
@@ -1387,7 +1496,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn is_active(&self) -> bool {
-        unsafe { self.0.lock().native_window.isKeyWindow() == YES }
+        unsafe { self.0.lock().host_window().isKeyWindow() == YES }
     }
 
     // is_hovered is unused on macOS. See Window::is_window_hovered.
@@ -2012,7 +2121,8 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     let mut lock = window_state.as_ref().lock();
 
     let window_height = lock.content_size().height;
-    let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
+    let event =
+        unsafe { platform_input_from_native(native_event, Some(window_height), lock.event_view()) };
 
     let Some(event) = event else {
         return NO;
@@ -2151,9 +2261,31 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
+    // A view of GPUI's own window is made first responder when it is created. An embedded view
+    // only gets keyboard focus in the host's window when it asks, which it does on a click.
+    let embedded_window = {
+        let lock = window_state.lock();
+        lock.embedded.then(|| lock.host_window())
+    };
+    if let Some(window) = embedded_window {
+        unsafe {
+            let event_type = native_event.eventType();
+            let is_mouse_down = matches!(
+                event_type,
+                cocoa::appkit::NSEventType::NSLeftMouseDown
+                    | cocoa::appkit::NSEventType::NSRightMouseDown
+                    | cocoa::appkit::NSEventType::NSOtherMouseDown
+            );
+            let first_responder: id = msg_send![window, firstResponder];
+            if is_mouse_down && first_responder != this as *const Object as id {
+                let _: BOOL = msg_send![window, makeFirstResponder: this];
+            }
+        }
+    }
     let mut lock = window_state.as_ref().lock();
     let window_height = lock.content_size().height;
-    let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
+    let event =
+        unsafe { platform_input_from_native(native_event, Some(window_height), lock.event_view()) };
 
     if let Some(mut event) = event {
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
@@ -2372,13 +2504,41 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
     }
 
     lock.renderer.update_drawable_size(drawable_size);
+    drop(lock);
 
+    notify_resized(window_state);
+}
+
+/// Tell GPUI the view's size or scale changed.
+///
+/// An embedded view is resized by the code embedding it, which is usually itself running inside a
+/// GPUI update. GPUI drops a resize callback that arrives while it is updating, so an embedded view
+/// reports from the next turn of the main queue instead, with the size it has by then.
+fn notify_resized(window_state: &Arc<Mutex<MacWindowState>>) {
+    let lock = window_state.lock();
+    if lock.embedded {
+        let weak = Arc::downgrade(window_state);
+        lock.foreground_executor
+            .spawn(async move {
+                if let Some(window_state) = weak.upgrade() {
+                    run_resize_callback(&window_state);
+                }
+            })
+            .detach();
+        return;
+    }
+    drop(lock);
+    run_resize_callback(window_state);
+}
+
+fn run_resize_callback(window_state: &Arc<Mutex<MacWindowState>>) {
+    let mut lock = window_state.lock();
     if let Some(mut callback) = lock.resize_callback.take() {
         let content_size = lock.content_size();
         let scale_factor = lock.scale_factor();
         drop(lock);
         callback(content_size, scale_factor);
-        window_state.as_ref().lock().resize_callback = Some(callback);
+        window_state.lock().resize_callback = Some(callback);
     };
 }
 
@@ -2541,14 +2701,9 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
     let scale_factor = lock.scale_factor();
     let drawable_size = new_size.to_device_pixels(scale_factor);
     lock.renderer.update_drawable_size(drawable_size);
+    drop(lock);
 
-    if let Some(mut callback) = lock.resize_callback.take() {
-        let content_size = lock.content_size();
-        let scale_factor = lock.scale_factor();
-        drop(lock);
-        callback(content_size, scale_factor);
-        window_state.lock().resize_callback = Some(callback);
-    };
+    notify_resized(&window_state);
 }
 
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
@@ -2889,7 +3044,12 @@ fn send_file_drop_event(
 
 fn drag_event_position(window_state: &Mutex<MacWindowState>, dragging_info: id) -> Point<Pixels> {
     let drag_location: NSPoint = unsafe { msg_send![dragging_info, draggingLocation] };
-    convert_mouse_position(drag_location, window_state.lock().content_size().height)
+    let lock = window_state.lock();
+    let drag_location = match lock.event_view() {
+        Some(view) => unsafe { msg_send![view, convertPoint: drag_location fromView: nil] },
+        None => drag_location,
+    };
+    convert_mouse_position(drag_location, lock.content_size().height)
 }
 
 fn with_input_handler<F, R>(window: &Object, f: F) -> Option<R>
@@ -3064,5 +3224,157 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
             callback();
             window_state.lock().toggle_tab_bar_callback = Some(callback);
         }
+    }
+}
+
+extern "C" fn view_did_move_to_window(this: &Object, _: Sel) {
+    unsafe {
+        let _: () = msg_send![super(this, class!(NSView)), viewDidMoveToWindow];
+    }
+    let window_state = unsafe { get_window_state(this) };
+    if !window_state.lock().embedded {
+        return;
+    }
+    // The host moved its view into another window, or out of every window. Frames are paced by
+    // the display of the window the view is in, and drawn at its backing scale.
+    window_state.lock().start_display_link();
+    update_window_scale_factor(&window_state);
+}
+
+/// Place an embedded view at the top-left of its parent, `width` x `height` points large.
+unsafe fn set_embedded_view_frame(view: id, width: f64, height: f64) {
+    unsafe {
+        let parent: id = msg_send![view, superview];
+        let y = if parent.is_null() {
+            0.0
+        } else {
+            let flipped: BOOL = msg_send![parent, isFlipped];
+            if flipped == YES {
+                0.0
+            } else {
+                NSView::bounds(parent).size.height - height
+            }
+        };
+        let frame = NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, height));
+        let _: () = msg_send![view, setFrame: frame];
+    }
+}
+
+/// Whether `view` is the view of a GPUI window.
+unsafe fn is_gpui_view(view: id) -> bool {
+    unsafe {
+        !view.is_null() && {
+            let is_kind: BOOL = msg_send![view, isKindOfClass: VIEW_CLASS];
+            is_kind == YES
+        }
+    }
+}
+
+/// Move a GPUI window's view into `parent`, a view owned by another application, typically the
+/// view a plug-in host gives a plug-in editor. The view is `width` x `height` points large and
+/// sits at the parent's top-left.
+///
+/// `view` is the AppKit handle GPUI reports for the window
+/// (`raw_window_handle::RawWindowHandle::AppKit`). Open the window with `show: false` and
+/// `focus: false` so GPUI's own window never appears; it stays alive, off screen, for as long as
+/// the GPUI window does. Closing the GPUI window takes the view out of `parent` again, as does
+/// [`detach_embedded_view`].
+///
+/// # Safety
+///
+/// Main thread only. `view` must be a live GPUI window view and `parent` a live `NSView`.
+pub unsafe fn embed_in_parent_view(
+    view: *mut c_void,
+    parent: *mut c_void,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let view = view as id;
+    let parent = parent as id;
+    unsafe {
+        if !is_gpui_view(view) {
+            return Err("the window handle is not a GPUI view".to_owned());
+        }
+        let parent_is_view: BOOL = if parent.is_null() {
+            NO
+        } else {
+            msg_send![parent, isKindOfClass: class!(NSView)]
+        };
+        if parent_is_view != YES {
+            return Err("the parent handle is not an NSView".to_owned());
+        }
+
+        let window_state = get_window_state(&*view);
+        let already_embedded = window_state.lock().embedded;
+        if !already_embedded {
+            // Owned until the window is dropped. The host's view keeps its own reference only
+            // while the view is its subview, and it may let go first (`detach_embedded_view`).
+            let _: id = msg_send![view, retain];
+        }
+
+        // Positions are tracked in the view's coordinates from here on.
+        window_state.lock().embedded = true;
+        let _: () = msg_send![view, removeFromSuperview];
+        let flipped: BOOL = msg_send![parent, isFlipped];
+        // Keep the editor pinned to the parent's top edge if the host makes the parent larger.
+        let pin_top = if flipped == YES {
+            cocoa::appkit::NSViewMaxYMargin
+        } else {
+            cocoa::appkit::NSViewMinYMargin
+        };
+        view.setAutoresizingMask_(pin_top);
+        let _: () = msg_send![parent, addSubview: view];
+        set_embedded_view_frame(view, width, height);
+    }
+
+    let window_state = unsafe { get_window_state(&*view) };
+    window_state.lock().start_display_link();
+    update_window_scale_factor(&window_state);
+    Ok(())
+}
+
+/// Resize a view embedded with [`embed_in_parent_view`] to `width` x `height` points, keeping it
+/// at its parent's top-left.
+///
+/// # Safety
+///
+/// Main thread only. `view` must be a live GPUI window view.
+pub unsafe fn resize_embedded_view(
+    view: *mut c_void,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let view = view as id;
+    unsafe {
+        if !is_gpui_view(view) || !get_window_state(&*view).lock().embedded {
+            return Err("the window handle is not an embedded GPUI view".to_owned());
+        }
+        set_embedded_view_frame(view, width, height);
+    }
+    Ok(())
+}
+
+/// Take a view embedded with [`embed_in_parent_view`] out of its parent immediately and stop
+/// drawing it, ahead of closing its GPUI window.
+///
+/// Closing the window does this too, but that happens on GPUI's own schedule. A plug-in host may
+/// destroy the parent view as soon as it has told the editor to close, and a view left inside it
+/// would be drawn into, and receive events, after its parent was gone.
+///
+/// # Safety
+///
+/// Main thread only. `view` must be a live GPUI window view.
+pub unsafe fn detach_embedded_view(view: *mut c_void) {
+    let view = view as id;
+    unsafe {
+        if !is_gpui_view(view) {
+            return;
+        }
+        let window_state = get_window_state(&*view);
+        if !window_state.lock().embedded {
+            return;
+        }
+        window_state.lock().stop_display_link();
+        let _: () = msg_send![view, removeFromSuperview];
     }
 }
