@@ -72,6 +72,13 @@ pub(crate) enum Dock {
     Vibrato,
 }
 
+/// The header's two menus: one open at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Menu {
+    Preset,
+    Scale,
+}
+
 /// Where the panel laid out what the live layers paint into.
 #[derive(Clone, Default)]
 pub(crate) struct LiveCells {
@@ -101,8 +108,10 @@ pub struct WhiteSharpEditor {
     pub(crate) preset: Option<usize>,
     pub(crate) compare: Compare,
     notice: Option<(String, Instant)>,
-    pub(crate) preset_open: bool,
-    preset_closed_at: Option<Instant>,
+    pub(crate) open_menu: Option<Menu>,
+    /// The menu last closed, and when: the press that closes one by clicking
+    /// its own button must not reopen it.
+    menu_closed_at: Option<(Menu, Instant)>,
     pub(crate) dock: Option<Dock>,
     /// Which list a click on the keyboard puts a note on.
     pub(crate) key_edit: NoteList,
@@ -122,8 +131,8 @@ impl WhiteSharpEditor {
             params,
             preset: None,
             notice: None,
-            preset_open: false,
-            preset_closed_at: None,
+            open_menu: None,
+            menu_closed_at: None,
             dock: None,
             key_edit: NoteList::Removed,
             cells: LiveCells::default(),
@@ -152,7 +161,7 @@ impl WhiteSharpEditor {
     ) {
         if key != self.key {
             self.key = key;
-            self.preset_open = false;
+            self.open_menu = None;
         }
         self.host_ops = host_ops;
         self.sync_from_mirror(cx);
@@ -230,6 +239,7 @@ impl WhiteSharpEditor {
     }
 
     pub(crate) fn set_scale(&mut self, scale: whitesharp::Scale, cx: &mut Context<Self>) {
+        self.close_menu(cx);
         let mut next = self.params.clone();
         next.scale = scale;
         next.remove_mask = 0;
@@ -289,22 +299,21 @@ impl WhiteSharpEditor {
             .to_string()
     }
 
-    pub(crate) fn toggle_menu(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
         let just_closed = self
-            .preset_closed_at
-            .is_some_and(|at| at.elapsed() < MENU_REOPEN_GUARD);
-        if self.preset_open {
+            .menu_closed_at
+            .is_some_and(|(closed, at)| closed == menu && at.elapsed() < MENU_REOPEN_GUARD);
+        if self.open_menu == Some(menu) {
             self.close_menu(cx);
         } else if !just_closed {
-            self.preset_open = true;
+            self.open_menu = Some(menu);
             cx.notify();
         }
     }
 
     pub(crate) fn close_menu(&mut self, cx: &mut Context<Self>) {
-        if self.preset_open {
-            self.preset_open = false;
-            self.preset_closed_at = Some(Instant::now());
+        if let Some(menu) = self.open_menu.take() {
+            self.menu_closed_at = Some((menu, Instant::now()));
             cx.notify();
         }
     }

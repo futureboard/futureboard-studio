@@ -603,8 +603,7 @@ impl LiveDisplay {
         let size = (layout.band_h * 0.07).clamp(9.0, 12.0);
         let roomy = layout.px_per_semitone() >= 11.0;
         let grey = !inputs.power;
-        let mut rel = BAND_MIN_REL.ceil() as i32;
-        while rel as f32 <= BAND_MAX_REL {
+        for rel in StageLayout::band_semitones() {
             let step = rel.rem_euclid(12);
             let note = self.anchor + rel;
             let class = note.rem_euclid(12);
@@ -626,7 +625,6 @@ impl LiveDisplay {
                     TextAlign::Left,
                 );
             }
-            rel += 1;
         }
     }
 

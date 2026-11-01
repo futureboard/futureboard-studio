@@ -102,23 +102,26 @@ pub fn spell(midi: f32, key: u8) -> &'static str {
     }
 }
 
-/// The scale's name on the selector and under the note.
+/// The scale's name on the selector and under the note: its whole name, now
+/// that the selector is a menu with room for it. A row of twelve buttons
+/// needed "Pentatonic" and "Min Pent", which read as one scale and a stray.
 pub fn scale_short(scale: whitesharp::Scale) -> &'static str {
-    use whitesharp::Scale::*;
-    match scale {
-        Chromatic => "Chromatic",
-        Major => "Major",
-        Minor => "Minor",
-        HarmonicMinor => "Harmonic",
-        MelodicMinor => "Melodic",
-        MajorPentatonic => "Pentatonic",
-        MinorPentatonic => "Min Pent",
-        Blues => "Blues",
-        Dorian => "Dorian",
-        Phrygian => "Phrygian",
-        Lydian => "Lydian",
-        Mixolydian => "Mixolydian",
+    scale.label()
+}
+
+/// The notes of `scale` in `key`, spelled for that key: "D E F# G A B C#",
+/// en-spaced.
+pub fn scale_notes(scale: whitesharp::Scale, key: u8) -> String {
+    let mut notes = String::new();
+    for step in scale.steps() {
+        if !notes.is_empty() {
+            // An en space: the face's word space is too narrow to part
+            // "F#" from "G" at caption size.
+            notes.push('\u{2002}');
+        }
+        notes.push_str(spell(f32::from(key + step), key));
     }
+    notes
 }
 
 /// Upper-case `text` with a hair space between its letters: the plate's
@@ -161,6 +164,18 @@ pub fn plate_scale(width: f32, height: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pentatonics_are_named_apart_and_spelled_in_the_key() {
+        use whitesharp::Scale;
+        assert_eq!(scale_short(Scale::MajorPentatonic), "Major Pentatonic");
+        assert_eq!(scale_short(Scale::MinorPentatonic), "Minor Pentatonic");
+        let notes = |scale, key| scale_notes(scale, key).replace('\u{2002}', " ");
+        assert_eq!(notes(Scale::MajorPentatonic, 2), "D E F# A B");
+        assert_eq!(notes(Scale::MinorPentatonic, 9), "A C D E G");
+        // A flat key spells flats, wrapping past B.
+        assert_eq!(notes(Scale::Major, 10), "Bb C D Eb F G A");
+    }
 
     #[test]
     fn notes_are_spelled_for_their_key() {

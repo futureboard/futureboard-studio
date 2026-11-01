@@ -282,6 +282,12 @@ pub fn scenes() -> Vec<Scene> {
             open: whitesharp_keys_scene,
         },
         Scene {
+            name: "whitesharp-scale-menu",
+            width: WHITESHARP_WINDOW_SIZE.0,
+            height: WHITESHARP_WINDOW_SIZE.1,
+            open: whitesharp_scale_menu_scene,
+        },
+        Scene {
             name: "whitesharp-vibrato",
             width: WHITESHARP_WINDOW_SIZE.0,
             height: WHITESHARP_WINDOW_SIZE.1 + WHITESHARP_DOCK_H,
@@ -570,6 +576,27 @@ fn whitesharp_keys_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWind
         whitesharp::LatencyMode::Quality,
         Some(Dock::Keys),
     )
+}
+
+/// The scale menu open, on the plate's own key: each scale with its notes.
+fn whitesharp_scale_menu_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = whitesharp_window(
+        options,
+        cx,
+        "whitesharp-scale-menu",
+        whitesharp::LatencyMode::Quality,
+        None,
+    )?;
+    handle.update(cx, |view, _, cx| {
+        if let Ok(window) = view.downcast::<WhiteSharpWindow>() {
+            window.update(cx, |window, cx| {
+                window.editor().update(cx, |editor, cx| {
+                    editor.toggle_menu(crate::components::white_sharp_window::Menu::Scale, cx)
+                })
+            });
+        }
+    })?;
+    Ok(handle)
 }
 
 fn whitesharp_vibrato_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {

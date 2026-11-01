@@ -29,10 +29,10 @@ use crate::components::title_bar::TITLEBAR_HEIGHT;
 use crate::components::white_sharp_meter::{piano_key, BLACK_KEY_HEIGHT, PIANO_KEYS};
 use crate::components::white_sharp_model::{default_value, knob, presets, value};
 use crate::components::white_sharp_style::{
-    color, color_a, outfit, pitch_hsl, plate_scale, scale_short, tracked, type_px, DIM, FLOOR,
-    KEY_LABELS, ORB, PLATE, PLATE_W,
+    color, color_a, outfit, pitch_hsl, plate_scale, scale_notes, scale_short, tracked, type_px,
+    DIM, FLOOR, KEY_LABELS, ORB, PLATE, PLATE_W,
 };
-use crate::components::white_sharp_window::{Dock, NoteList, WhiteSharpEditor};
+use crate::components::white_sharp_window::{Dock, Menu, NoteList, WhiteSharpEditor};
 use crate::theme::{space, state, Colors};
 
 type Cx<'a> = Context<'a, WhiteSharpEditor>;
@@ -281,8 +281,7 @@ fn header(w: &WhiteSharpEditor, cx: &mut Cx, s: f32, plate_h: f32) -> AnyElement
                 .child(brand)
                 .child(transport),
         )
-        .child(key_row(w, cx, s))
-        .child(scale_row(w, cx, s))
+        .child(key_scale_row(w, cx, s))
         .into_any_element()
 }
 
@@ -321,10 +320,9 @@ fn chip(
     }
 }
 
-/// The factory presets, in a menu under their chip.
-fn preset_picker(w: &WhiteSharpEditor, cx: &mut Cx, s: f32) -> AnyElement {
-    let open = w.preset_open;
-    let chevron = canvas(
+/// The down chevron a menu's chip ends in.
+fn chevron(open: bool, s: f32) -> impl IntoElement {
+    canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
             let unit = f32::from(bounds.size.width) / 12.0;
@@ -339,15 +337,51 @@ fn preset_picker(w: &WhiteSharpEditor, cx: &mut Cx, s: f32) -> AnyElement {
         },
     )
     .w(px(10.0 * s))
-    .h(px(10.0 * s));
+    .h(px(10.0 * s))
+}
+
+/// A menu's drop-down panel, in the plate's style.
+/// It scrolls past `max_h`, at the design size.
+fn menu_panel(
+    id: &'static str,
+    s: f32,
+    max_h: f32,
+    items: impl IntoIterator<Item = AnyElement>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .occlude()
+        .flex()
+        .flex_col()
+        .min_w(px(196.0 * s))
+        .max_h(px(max_h * s))
+        .overflow_y_scroll()
+        .p(px(6.0 * s))
+        .bg(color(0x161616))
+        .border(px(1.0))
+        .border_color(color(0x2e2e2e))
+        .shadow(vec![gpui::BoxShadow {
+            color: color_a(0, 0.5).into(),
+            offset: point(px(0.0), px(18.0 * s)),
+            blur_radius: px(40.0 * s),
+            spread_radius: px(0.0),
+            inset: false,
+        }])
+        .font(outfit(FontWeight::NORMAL))
+        .children(items)
+}
+
+/// The factory presets, in a menu under their chip.
+fn preset_picker(w: &WhiteSharpEditor, cx: &mut Cx, s: f32) -> AnyElement {
+    let open = w.open_menu == Some(Menu::Preset);
     let button = chip(
         "whitesharp-preset",
         &w.preset_label(),
         open,
         s,
-        w.click_cb(cx, |this, cx| this.toggle_menu(cx)),
+        w.click_cb(cx, |this, cx| this.toggle_menu(Menu::Preset, cx)),
     )
-    .child(chevron);
+    .child(chevron(open, s));
 
     let mut picker = div().relative().flex_shrink_0().child(button);
     if open {
@@ -370,36 +404,20 @@ fn preset_picker(w: &WhiteSharpEditor, cx: &mut Cx, s: f32) -> AnyElement {
                     let _ = entity.update(app, |this, cx| this.load_preset(index, cx));
                 });
             if selected {
-                item.text_color(color(0xffffff)).bg(color(0x242424))
+                item.text_color(color(0xffffff))
+                    .bg(color(0x242424))
+                    .into_any_element()
             } else {
                 item.text_color(color(0xa6a6a6))
                     .hover(|style| style.text_color(color(0xffffff)).bg(color(0x242424)))
+                    .into_any_element()
             }
         });
-        let menu = div()
-            .id("whitesharp-preset-menu")
-            .occlude()
-            .flex()
-            .flex_col()
-            .min_w(px(196.0 * s))
-            .max_h(px(360.0 * s))
-            .overflow_y_scroll()
-            .p(px(6.0 * s))
-            .bg(color(0x161616))
-            .border(px(1.0))
-            .border_color(color(0x2e2e2e))
-            .shadow(vec![gpui::BoxShadow {
-                color: color_a(0, 0.5).into(),
-                offset: point(px(0.0), px(18.0 * s)),
-                blur_radius: px(40.0 * s),
-                spread_radius: px(0.0),
-                inset: false,
-            }])
-            .font(outfit(FontWeight::NORMAL))
-            .children(items)
-            .on_mouse_down_out(move |_, _, app| {
+        let menu = menu_panel("whitesharp-preset-menu", s, 360.0, items).on_mouse_down_out(
+            move |_, _, app| {
                 let _ = close.update(app, |this, cx| this.close_menu(cx));
-            });
+            },
+        );
         picker = picker.child(
             div().absolute().right_0().bottom_0().child(deferred(
                 anchored()
@@ -488,28 +506,98 @@ fn key_row(w: &WhiteSharpEditor, cx: &mut Cx, s: f32) -> AnyElement {
         .into_any_element()
 }
 
-fn scale_row(w: &WhiteSharpEditor, cx: &mut Cx, s: f32) -> AnyElement {
-    let current = w.params.scale;
-    selector_row()
-        .children(
-            whitesharp::Scale::ALL
-                .iter()
-                .enumerate()
-                .map(|(index, &scale)| {
-                    let pressed = (scale == current)
-                        .then(|| (color(0xf7f7f7).into(), color(0x6f6f6f).into()));
-                    text_button(
-                        ("whitesharp-scale", index),
-                        tracked(scale_short(scale)),
-                        10.0,
-                        pressed,
-                        7.0,
-                        s,
-                        w.click_cb(cx, move |this, cx| this.set_scale(scale, cx)),
-                    )
-                }),
-        )
+/// The key, then the scale: the twelve keys as before, and the scale as one
+/// chip that opens a menu. Twelve scales were a second row of twelve tracked
+/// captions, too many to read across and, for space, half of them clipped
+/// to nicknames.
+fn key_scale_row(w: &WhiteSharpEditor, cx: &mut Cx, s: f32) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .justify_center()
+        .gap(px(12.0 * s))
+        .child(key_row(w, cx, s))
+        .child(div().w(px(1.0)).h(px(16.0 * s)).bg(color(0x2e2e2e)))
+        .child(scale_picker(w, cx, s))
         .into_any_element()
+}
+
+/// The scale chip and its menu. Each entry spells its notes in the current
+/// key, so a scale can be chosen by what it contains as well as by name.
+fn scale_picker(w: &WhiteSharpEditor, cx: &mut Cx, s: f32) -> AnyElement {
+    let open = w.open_menu == Some(Menu::Scale);
+    let current = w.params.scale;
+    let key = w.params.key;
+    let button = chip(
+        "whitesharp-scale",
+        scale_short(current),
+        open,
+        s,
+        w.click_cb(cx, |this, cx| this.toggle_menu(Menu::Scale, cx)),
+    )
+    .child(chevron(open, s));
+
+    let mut picker = div().relative().flex_shrink_0().child(button);
+    if open {
+        let entity = cx.entity().clone();
+        let close = entity.clone();
+        let items = whitesharp::Scale::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, &scale)| {
+                let entity = entity.clone();
+                let selected = scale == current;
+                let item = div()
+                    .id(("whitesharp-scale-item", index))
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .justify_between()
+                    .gap(px(18.0 * s))
+                    .px(px(10.0 * s))
+                    .py(px(6.0 * s))
+                    .cursor(gpui::CursorStyle::PointingHand)
+                    .child(div().text_size(type_px(13.0, s)).child(scale_short(scale)))
+                    .child(
+                        div()
+                            .text_size(type_px(10.0, s))
+                            .text_color(color(0x6f6f6f))
+                            .child(scale_notes(scale, key)),
+                    )
+                    .on_click(move |_, _, app| {
+                        let _ = entity.update(app, |this, cx| this.set_scale(scale, cx));
+                    });
+                if selected {
+                    item.text_color(color(0xffffff))
+                        .bg(color(0x242424))
+                        .into_any_element()
+                } else {
+                    item.text_color(color(0xa6a6a6))
+                        .hover(|style| style.text_color(color(0xffffff)).bg(color(0x242424)))
+                        .into_any_element()
+                }
+            });
+        // Tall enough for all twelve: a scale list that has to be scrolled
+        // hides its last modes, and nothing says they are there.
+        let menu = menu_panel("whitesharp-scale-menu", s, 440.0, items).on_mouse_down_out(
+            move |_, _, app| {
+                let _ = close.update(app, |this, cx| this.close_menu(cx));
+            },
+        );
+        picker = picker.child(
+            div().absolute().left_0().bottom_0().child(deferred(
+                anchored()
+                    .anchor(Anchor::TopLeft)
+                    .offset(point(px(0.0), px(8.0 * s)))
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(menu),
+            )),
+        );
+    }
+    picker.into_any_element()
 }
 
 // ── Floor: knobs, meters, level ────────────────────────────────────────────

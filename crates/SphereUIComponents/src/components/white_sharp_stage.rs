@@ -88,6 +88,19 @@ impl StageLayout {
         self.band_top + pad + (1.0 - t) * inner
     }
 
+    /// The whole semitones the band shows, its padding included, as offsets
+    /// from its tonic: each gets a scale line and, room permitting, a name.
+    ///
+    /// The window `BAND_MIN_REL..=BAND_MAX_REL` fills the band's middle 80%;
+    /// the 10% above and below it shows another 1.35 semitones each way. Lines
+    /// drawn for the window alone left −2 and +10 — the ♭7 of every minor,
+    /// Dorian, Mixolydian and blues scale — bare, so a voice up there sang
+    /// over a band with its scale missing.
+    pub fn band_semitones() -> std::ops::RangeInclusive<i32> {
+        let pad = (BAND_MAX_REL - BAND_MIN_REL) * 0.1 / 0.8;
+        (BAND_MIN_REL - pad).ceil() as i32..=(BAND_MAX_REL + pad).floor() as i32
+    }
+
     pub fn px_per_semitone(&self) -> f32 {
         self.band_h * 0.8 / (BAND_MAX_REL - BAND_MIN_REL)
     }
@@ -407,8 +420,7 @@ pub fn build(frame: &StageFrame) -> Scene {
 fn band(pen: &mut Pen, frame: &StageFrame) {
     let l = frame.layout;
     let grey = frame.bypass;
-    let mut rel = BAND_MIN_REL.ceil() as i32;
-    while rel as f32 <= BAND_MAX_REL {
+    for rel in StageLayout::band_semitones() {
         let class = (frame.anchor + rel).rem_euclid(12);
         let tonic = rel.rem_euclid(12) == 0;
         let y = (l.y_of(rel as f32)).round() + 0.5;
@@ -427,7 +439,6 @@ fn band(pen: &mut Pen, frame: &StageFrame) {
             ([0.0, 0.0, 0.0, 0.32], 1.15)
         };
         pen.line((l.gutter, y), (l.w, y), width, color);
-        rel += 1;
     }
 
     // The trace, left of now: what was sung in silver, what is heard in the
@@ -616,6 +627,24 @@ fn dial(pen: &mut Pen, frame: &StageFrame) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_semitone_the_band_shows_gets_a_line_and_every_class_is_there() {
+        let l = StageLayout::new(1024.0, 640.0, None);
+        let semitones = StageLayout::band_semitones();
+        assert_eq!(semitones, -2..=10);
+        let (bottom, top) = (l.band_top + l.band_h, l.band_top);
+        let mut classes = 0u16;
+        for rel in semitones {
+            let y = l.y_of(rel as f32);
+            assert!(y > top && y < bottom, "{rel} is drawn off the band at {y}");
+            classes |= 1 << rel.rem_euclid(12);
+        }
+        // Each of the twelve has a line somewhere, so no scale degree is bare.
+        assert_eq!(classes, 0x0fff);
+        // And the next semitone out each way would be past the band's edge.
+        assert!(l.y_of(-3.0) > bottom && l.y_of(11.0) < top);
+    }
 
     #[test]
     fn the_band_spans_its_window_inside_its_padding() {
