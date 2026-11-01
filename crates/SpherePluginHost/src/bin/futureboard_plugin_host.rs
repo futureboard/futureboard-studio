@@ -3849,12 +3849,12 @@ fn service_audio_bridge(
     bridge.set_dsp_output_ready(dsp_ready);
     // Publish the plugin's reported latency so the engine can surface it (and,
     // later, compensate it). Refreshed periodically — latency rarely changes,
-    // so this avoids an FFI getter + voice lookup on every block.
-    static LATENCY_REPORT_BLOCKS: AtomicU64 = AtomicU64::new(0);
-    if LATENCY_REPORT_BLOCKS
-        .fetch_add(1, Ordering::Relaxed)
-        .is_multiple_of(64)
-    {
+    // so this avoids an FFI getter + voice lookup on every block. Counted on
+    // this region's own request sequence, from its first block: a counter
+    // shared by every instance this thread services landed on the same one
+    // each cycle whenever their number divided 64, and the others never
+    // reported — a second De-Esser's lookahead went uncompensated.
+    if req.wrapping_sub(1).is_multiple_of(64) {
         let latency = match runtime {
             // A loaded NAM capture's receptive field is the built-in chain's
             // only latency contributor today.
