@@ -1122,10 +1122,21 @@ impl Render for Timeline {
         let on_chord_toggle_collapsed: crate::components::timeline::region_track::GlobalLaneVoidCallback =
             std::sync::Arc::new(on_chord_toggle_collapsed);
         let on_loop_drag = cx.listener(|this, update: &TimelineLoopDragUpdate, _window, cx| {
+            if !update.enabled {
+                if this.state.transport.loop_enabled {
+                    this.state.transport.loop_enabled = false;
+                    this.mark_loop_changed(cx);
+                    cx.notify();
+                }
+                return;
+            }
             let start = update.start_beat.min(update.end_beat).max(0.0);
             let end = update.start_beat.max(update.end_beat).max(start + 1.0e-3);
             let transport = &mut this.state.transport;
-            if (transport.loop_start_beats - start).abs() > f32::EPSILON
+            // Off counts as a change too: a Ctrl-click on the bar the loop was
+            // left on, after it was switched off, has to switch it back on.
+            if !transport.loop_enabled
+                || (transport.loop_start_beats - start).abs() > f32::EPSILON
                 || (transport.loop_end_beats - end).abs() > f32::EPSILON
             {
                 transport.loop_start_beats = start;

@@ -126,6 +126,29 @@ pub enum RulerGesture {
     /// learns. Now Alt-drag always means the loop — over it, move it; anywhere
     /// else, draw a new one.
     LoopCreate { anchor_beat: f32 },
+    /// Looping whole bars: a Ctrl-click (Cmd on macOS) loops the bar it lands
+    /// in, and dragging on from there takes in every bar the pointer reaches.
+    ///
+    /// Drawing a loop with Alt-drag means landing both ends on the grid by
+    /// hand, and a bar is what a loop almost always is. `toggled_off` is set
+    /// when the press clicked the loop's own single bar again and so turned
+    /// looping off: a drag that never leaves that bar must not turn it back on.
+    LoopBars { anchor_beat: f64, toggled_off: bool },
+}
+
+/// The whole bars from the one holding beat `a` through the one holding `b`.
+fn bar_span(map: &TimeSignatureMap, a: f64, b: f64) -> (f32, f32) {
+    let first = map.bar_at_beat(a.min(b).max(0.0));
+    let last = map.bar_at_beat(a.max(b).max(0.0));
+    (
+        map.bar_start_beat(first) as f32,
+        map.bar_start_beat(last + 1) as f32,
+    )
+}
+
+/// Whether two loop spans are the same, to within float noise.
+fn same_span(a: (f32, f32), b: (f32, f32)) -> bool {
+    (a.0 - b.0).abs() < 1.0e-3 && (a.1 - b.1).abs() < 1.0e-3
 }
 
 /// How near an end of the loop counts as grabbing that end rather than the body.
@@ -160,6 +183,8 @@ fn loop_grab_mode(local_x: f32, left_x: f32, right_x: f32) -> Option<TimelineReg
 pub struct TimelineLoopDragUpdate {
     pub start_beat: f32,
     pub end_beat: f32,
+    /// `false` turns looping off and leaves the span where it is.
+    pub enabled: bool,
 }
 
 /// The ruler's tick marks as a single painted layer.
@@ -341,6 +366,7 @@ pub fn timeline_ruler(
     // this frame's geometry instead of a deep clone of the whole project.
     let gesture = std::rc::Rc::new(TimelineGestureContext::from_state(state));
     let state_for_region_drag = std::rc::Rc::clone(&gesture);
+    let on_loop_press = on_loop_drag.clone();
     let on_loop_drag_move = on_loop_drag.clone();
     let state_for_press = std::rc::Rc::clone(&gesture);
     let state_for_loop_drag = gesture;
@@ -586,6 +612,30 @@ pub fn timeline_ruler(
                             cx.stop_propagation();
                             return;
                         }
+                        // Ctrl-click loops the bar under the pointer; on the
+                        // bar that is already the loop, it turns looping off.
+                        if event.modifiers.control || event.modifiers.platform {
+                            let beat = state_for_press.x_to_beat(click_x).max(0.0);
+                            let bar = bar_span(&state_for_press.time_signature_map, beat, beat);
+                            let toggled_off = loop_span
+                                .is_some_and(|(start, end, _, _)| same_span((start, end), bar));
+                            gesture_down.set(RulerGesture::LoopBars {
+                                anchor_beat: beat,
+                                toggled_off,
+                            });
+                            on_loop_press(
+                                &TimelineLoopDragUpdate {
+                                    start_beat: bar.0,
+                                    end_beat: bar.1,
+                                    enabled: !toggled_off,
+                                },
+                                window,
+                                cx,
+                            );
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            return;
+                        }
                         // Unmodified, the loop's END HANDLES are still direct
                         // grab targets: dragging a brace edge resizes the loop
                         // the way every DAW does, no modifier to learn. A press
@@ -665,11 +715,44 @@ pub fn timeline_ruler(
                                     &TimelineLoopDragUpdate {
                                         start_beat,
                                         end_beat,
+                                        enabled: true,
                                     },
                                     window,
                                     cx,
                                 );
                             }
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if let RulerGesture::LoopBars {
+                            anchor_beat,
+                            toggled_off,
+                        } = gesture_move.get()
+                        {
+                            let here = state_for_loop_drag.x_to_beat(local_x).max(0.0);
+                            let span = bar_span(
+                                &state_for_loop_drag.time_signature_map,
+                                anchor_beat,
+                                here,
+                            );
+                            let anchor_bar = bar_span(
+                                &state_for_loop_drag.time_signature_map,
+                                anchor_beat,
+                                anchor_beat,
+                            );
+                            // Back on the bar whose loop the press turned off,
+                            // the loop is off again: the drag ends as the
+                            // click would have.
+                            on_loop_drag_move(
+                                &TimelineLoopDragUpdate {
+                                    start_beat: span.0,
+                                    end_beat: span.1,
+                                    enabled: !(toggled_off && same_span(span, anchor_bar)),
+                                },
+                                window,
+                                cx,
+                            );
                             window.prevent_default();
                             cx.stop_propagation();
                             return;
@@ -692,6 +775,7 @@ pub fn timeline_ruler(
                                 &TimelineLoopDragUpdate {
                                     start_beat,
                                     end_beat,
+                                    enabled: true,
                                 },
                                 window,
                                 cx,
@@ -1101,6 +1185,29 @@ mod loop_grab_tests {
             loop_grab_mode(198.0, 100.0, 200.0),
             Some(TimelineRegionDragMode::End)
         );
+    }
+
+    /// A Ctrl-click loops the bar it lands in, whichever way a drag from it
+    /// then runs, and the bars follow a meter change.
+    #[test]
+    fn a_bar_loop_takes_whole_bars_and_follows_the_meter() {
+        use crate::components::timeline::timeline_state::TimeSignaturePoint;
+
+        let four_four = TimeSignatureMap::with_points(vec![TimeSignaturePoint::new(0.0, 4, 4)]);
+        assert_eq!(bar_span(&four_four, 5.3, 5.3), (4.0, 8.0));
+        assert_eq!(bar_span(&four_four, 0.0, 0.0), (0.0, 4.0));
+        // Dragged back across two bars: still whole bars, start before end.
+        assert_eq!(bar_span(&four_four, 9.0, 1.5), (0.0, 12.0));
+
+        // Two bars of 4/4, then 3/4 from beat 8.
+        let changing = TimeSignatureMap::with_points(vec![
+            TimeSignaturePoint::new(0.0, 4, 4),
+            TimeSignaturePoint::new(8.0, 3, 4),
+        ]);
+        assert_eq!(bar_span(&changing, 9.0, 9.0), (8.0, 11.0));
+        assert_eq!(bar_span(&changing, 6.0, 12.0), (4.0, 14.0));
+        assert!(same_span((4.0, 8.0), (4.0, 8.000_1)));
+        assert!(!same_span((4.0, 8.0), (4.0, 12.0)));
     }
 
     /// Just outside an end still grabs that end: the loop's edge is a 2 px line,
