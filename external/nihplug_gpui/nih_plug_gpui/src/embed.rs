@@ -5,6 +5,11 @@
 //! We bridge that gap after the fact by taking the native window GPUI just created and reparenting
 //! it into the host's window using the platform's own APIs. GPUI keeps rendering into and
 //! receiving events for the same native window, it simply is no longer a top level window.
+//!
+//! On macOS the unit that moves is the window's `NSView`: it is taken out of GPUI's own (never
+//! shown) window and added to the host's view, through GPUI's embedding support in `gpui_macos`.
+//! Sizes there are in points, which is what both the host and GPUI's geometry use, so no scaling
+//! factor is ever applied by hand.
 
 use gpui::Window;
 use nih_plug::prelude::ParentWindowHandle;
@@ -68,6 +73,7 @@ pub(crate) fn resize(window: &Window, size: (u32, u32)) -> Result<(), String> {
 /// won't tell it about the display it actually ends up on either.
 ///
 /// This is called before the window is embedded, while it is still a regular top level window.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn set_scaling_factor(
     window: &Window,
     scaling_factor: f32,
@@ -86,6 +92,17 @@ pub(crate) fn set_scaling_factor(
     } else {
         resize_raw(handle.as_raw(), size)
     }
+}
+
+/// AppKit derives the backing scale from the screen the host's window is on, and GPUI follows it.
+/// Sizes are in points, which are the same at every scale, so there is nothing to apply.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_scaling_factor(
+    _window: &Window,
+    _scaling_factor: f32,
+    _size: (u32, u32),
+) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -312,33 +329,51 @@ fn set_scaling_factor_raw(
     Ok(())
 }
 
-// See [`crate::host`], GPUI can't be hosted inside a plugin on macOS yet so neither of these is
-// ever reached. They exist so the crate still compiles as part of the workspace.
+/// The `NSView` GPUI draws `child` into.
 #[cfg(target_os = "macos")]
-fn embed_raw(
-    _child: RawWindowHandle,
-    _parent: ParentHandle,
-    _size: (u32, u32),
-) -> Result<(), String> {
-    Err(String::from(
-        "Embedding GPUI windows is not supported on macOS",
-    ))
+fn ns_view(child: RawWindowHandle) -> Result<*mut std::ffi::c_void, String> {
+    match child {
+        RawWindowHandle::AppKit(handle) => Ok(handle.ns_view.as_ptr()),
+        other => Err(format!(
+            "Unsupported GPUI window handle on macOS: {other:?}"
+        )),
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn resize_raw(_child: RawWindowHandle, _size: (u32, u32)) -> Result<(), String> {
-    Err(String::from(
-        "Embedding GPUI windows is not supported on macOS",
-    ))
+fn embed_raw(child: RawWindowHandle, parent: ParentHandle, size: (u32, u32)) -> Result<(), String> {
+    let view = ns_view(child)?;
+    let parent = match parent {
+        ParentHandle::AppKitNsView(ns_view) => ns_view as *mut std::ffi::c_void,
+        other => {
+            return Err(format!(
+                "Unsupported parent window handle on macOS: {other:?}"
+            ))
+        }
+    };
+
+    // Runs on the main thread: the GPUI application lives there on macOS
+    unsafe { gpui_macos::embed_in_parent_view(view, parent, size.0 as f64, size.1 as f64) }
 }
 
 #[cfg(target_os = "macos")]
-fn set_scaling_factor_raw(
-    _child: RawWindowHandle,
-    _scaling_factor: f32,
-    _size: (u32, u32),
-) -> Result<(), String> {
-    Err(String::from(
-        "Embedding GPUI windows is not supported on macOS",
-    ))
+fn resize_raw(child: RawWindowHandle, size: (u32, u32)) -> Result<(), String> {
+    let view = ns_view(child)?;
+
+    unsafe { gpui_macos::resize_embedded_view(view, size.0 as f64, size.1 as f64) }
+}
+
+/// The view an embedded `window` draws into, as an integer so it can be kept by the editor's
+/// handle for [`detach_view()`].
+#[cfg(target_os = "macos")]
+pub(crate) fn view_of(window: &Window) -> Option<usize> {
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    ns_view(handle.as_raw()).ok().map(|view| view as usize)
+}
+
+/// Take an embedded view out of the host's view right now. See
+/// [`gpui_macos::detach_embedded_view()`].
+#[cfg(target_os = "macos")]
+pub(crate) fn detach_view(view: usize) {
+    unsafe { gpui_macos::detach_embedded_view(view as *mut std::ffi::c_void) }
 }

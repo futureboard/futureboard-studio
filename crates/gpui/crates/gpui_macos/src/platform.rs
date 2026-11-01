@@ -35,9 +35,7 @@ use gpui::{
 };
 use itertools::Itertools;
 use objc::{
-    class,
-    declare::ClassDecl,
-    msg_send,
+    class, msg_send,
     runtime::{self, Class, Object, Sel},
     sel, sel_impl,
 };
@@ -74,14 +72,14 @@ static CEF_HANDLING_SEND_EVENT: AtomicBool = AtomicBool::new(false);
 unsafe fn build_classes() {
     unsafe {
         APP_CLASS = {
-            let mut decl = ClassDecl::new("GPUIApplication", class!(NSApplication)).unwrap();
+            let mut decl = crate::unique_class_decl("GPUIApplication", class!(NSApplication));
             decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
             decl.register()
         }
     };
     unsafe {
         APP_DELEGATE_CLASS = {
-            let mut decl = ClassDecl::new("GPUIApplicationDelegate", class!(NSResponder)).unwrap();
+            let mut decl = crate::unique_class_decl("GPUIApplicationDelegate", class!(NSResponder));
             decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
             decl.add_method(
                 sel!(applicationWillFinishLaunching:),
@@ -286,6 +284,9 @@ pub(crate) struct MacPlatformState {
     text_system: Arc<dyn PlatformTextSystem>,
     renderer_context: renderer::Context,
     headless: bool,
+    /// Running inside a process whose `NSApplication` and main run loop belong to someone else
+    /// (a plug-in host). See [`MacPlatform::new_embedded`].
+    embedded: bool,
     general_pasteboard: Pasteboard,
     find_pasteboard: Pasteboard,
     reopen: Option<Box<dyn FnMut()>>,
@@ -307,6 +308,28 @@ pub(crate) struct MacPlatformState {
 
 impl MacPlatform {
     pub fn new(headless: bool) -> Self {
+        Self::with_mode(headless, false)
+    }
+
+    /// A platform for GPUI hosted inside another application's process, such as an audio
+    /// plug-in editor.
+    ///
+    /// The host owns `NSApplication`, its delegate, the menu bar and the main run loop, and is
+    /// already running all of them. An embedded platform never touches any of these:
+    /// [`Platform::run`](gpui::Platform::run) calls its callback straight away and returns
+    /// instead of entering `[NSApp run]`, and quitting, restarting, activating, hiding and menu
+    /// changes become no-ops, since each would act on the host. Foreground work is dispatched to
+    /// the main queue, which the host's run loop already services, so GPUI runs cooperatively on
+    /// it. Must be created and used on the main thread.
+    pub fn new_embedded() -> Self {
+        Self::with_mode(false, true)
+    }
+
+    fn is_embedded(&self) -> bool {
+        self.0.lock().embedded
+    }
+
+    fn with_mode(headless: bool, embedded: bool) -> Self {
         let dispatcher = Arc::new(MacDispatcher::new());
 
         #[cfg(feature = "font-kit")]
@@ -320,6 +343,7 @@ impl MacPlatform {
 
         Self(Mutex::new(MacPlatformState {
             headless,
+            embedded,
             text_system,
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
@@ -592,6 +616,12 @@ impl Platform for MacPlatform {
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
         let mut state = self.0.lock();
+        if state.embedded {
+            // The host's run loop is already running and keeps running after this returns.
+            drop(state);
+            on_finish_launching();
+            return;
+        }
         if state.headless {
             drop(state);
             on_finish_launching();
@@ -620,6 +650,10 @@ impl Platform for MacPlatform {
     }
 
     fn quit(&self) {
+        // Terminating would take the host application down with it.
+        if self.is_embedded() {
+            return;
+        }
         // Quitting the app causes us to close windows, which invokes `Window::on_close` callbacks
         // synchronously before this method terminates. If we call `Platform::quit` while holding a
         // borrow of the app state (which most of the time we will do), we will end up
@@ -640,6 +674,9 @@ impl Platform for MacPlatform {
     }
 
     fn restart(&self, binary_path: Option<PathBuf>) {
+        if self.is_embedded() {
+            return;
+        }
         use std::os::unix::process::CommandExt as _;
 
         let app_pid = std::process::id().to_string();
@@ -681,6 +718,9 @@ impl Platform for MacPlatform {
     }
 
     fn activate(&self, ignoring_other_apps: bool) {
+        if self.is_embedded() {
+            return;
+        }
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             app.activateIgnoringOtherApps_(ignoring_other_apps.to_objc());
@@ -688,6 +728,9 @@ impl Platform for MacPlatform {
     }
 
     fn hide(&self) {
+        if self.is_embedded() {
+            return;
+        }
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let _: () = msg_send![app, hide: nil];
@@ -695,6 +738,9 @@ impl Platform for MacPlatform {
     }
 
     fn hide_other_apps(&self) {
+        if self.is_embedded() {
+            return;
+        }
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let _: () = msg_send![app, hideOtherApplications: nil];
@@ -702,6 +748,9 @@ impl Platform for MacPlatform {
     }
 
     fn unhide_other_apps(&self) {
+        if self.is_embedded() {
+            return;
+        }
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let _: () = msg_send![app, unhideAllApplications: nil];
@@ -1064,6 +1113,10 @@ impl Platform for MacPlatform {
     }
 
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap) {
+        // The menu bar and the application delegate it would target belong to the host.
+        if self.is_embedded() {
+            return;
+        }
         unsafe {
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let mut state = self.0.lock();
@@ -1080,6 +1133,9 @@ impl Platform for MacPlatform {
     }
 
     fn set_dock_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap) {
+        if self.is_embedded() {
+            return;
+        }
         unsafe {
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let mut state = self.0.lock();

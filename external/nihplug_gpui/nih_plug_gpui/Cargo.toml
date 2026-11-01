@@ -36,6 +36,13 @@ gpui_linux = { git = "https://github.com/futureboard/gpui-se.git", default-featu
 ] }
 x11rb = "0.13"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# `font-kit` is the macOS text system; without it GPUI renders no text. It links no native library
+# on macOS, so the `fontconfig` concern above does not apply here.
+gpui_macos = { git = "https://github.com/futureboard/gpui-se.git", default-features = false, features = [
+  "font-kit",
+] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_windows = { git = "https://github.com/futureboard/gpui-se.git", default-features = false }
 windows = { version = "0.62", features = [

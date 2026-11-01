@@ -51,6 +51,7 @@ pub(crate) use window::*;
 pub(crate) use text_system::*;
 
 pub use platform::{MacPlatform, configure_cef_application};
+pub use window::{detach_embedded_view, embed_in_parent_view, resize_embedded_view};
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;
@@ -127,6 +128,26 @@ unsafe impl objc::Encode for NSRange {
         );
         unsafe { objc::Encoding::from_str(&encoding) }
     }
+}
+
+/// Declare an Objective-C class named `base`, or `base_<n>` when that name is taken.
+///
+/// Classes are registered process-wide by name. A plug-in built on GPUI is loaded into a host
+/// that may already contain GPUI — the host itself, or another GPUI plug-in — and each copy
+/// registers its classes from a constructor at load time. A fixed name makes the second copy's
+/// registration fail, and unwrapping that failure aborts the host. Every class this crate
+/// declares is used through the `Class` pointer it gets back, never looked up by name, so a
+/// suffixed name is equivalent.
+pub(crate) fn unique_class_decl(
+    base: &str,
+    superclass: &objc::runtime::Class,
+) -> objc::declare::ClassDecl {
+    if let Some(decl) = objc::declare::ClassDecl::new(base, superclass) {
+        return decl;
+    }
+    (1u32..)
+        .find_map(|n| objc::declare::ClassDecl::new(&format!("{base}_{n}"), superclass))
+        .expect("no free Objective-C class name")
 }
 
 /// Allow NSString::alloc use here because it sets autorelease

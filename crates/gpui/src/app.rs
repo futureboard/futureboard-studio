@@ -209,6 +209,23 @@ impl Application {
         }));
     }
 
+    /// Start the application on a platform that runs inside an event loop owned by someone else,
+    /// such as GPUI hosted in an audio plug-in's editor (`gpui_macos::MacPlatform::new_embedded`).
+    ///
+    /// Such a platform's `run` returns as soon as `on_finish_launching` has run, while the event
+    /// loop it lives on keeps running. [`Application::run`] would drop the application at that
+    /// point, so this keeps it alive instead, for the rest of the process: the foreign event loop
+    /// drives it from then on, through tasks spawned from `on_finish_launching`.
+    pub fn run_embedded<F>(self, on_finish_launching: F)
+    where
+        F: 'static + FnOnce(&mut App),
+    {
+        let app = self.0.clone();
+        self.run(on_finish_launching);
+        // Never released: there is no point at which an embedded application may end.
+        std::mem::forget(app);
+    }
+
     /// Register a handler to be invoked when the platform instructs the application
     /// to open one or more URLs.
     pub fn on_open_urls<F>(&self, mut callback: F) -> &Self

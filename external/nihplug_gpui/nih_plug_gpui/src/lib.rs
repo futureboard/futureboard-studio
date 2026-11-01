@@ -32,11 +32,12 @@
 //! # Platform support
 //!
 //! GPUI owns its event loop and always creates top level windows, so this adapter runs a single
-//! process-wide GPUI application on its own thread and reparents the windows it creates into the
-//! window supplied by the plugin host. That works on Windows and on X11, but not on macOS, where
-//! GPUI must drive `NSApplication` on the process' main thread that the host already owns. Opening
-//! an editor on macOS logs an error and does nothing. See the `host` and `embed` modules for the
-//! details.
+//! process-wide GPUI application and reparents the windows it creates into the window supplied by
+//! the plugin host. On Windows and on X11 that application runs on its own thread. On macOS, where
+//! AppKit is main-thread only and the host owns `NSApplication`, it runs on the host's main thread
+//! and run loop through GPUI's embedded platform, and each editor's `NSView` is moved into the
+//! host's view. Wayland can't reparent at all; see [`create_gpui_editor_with_wayland_fallback()`].
+//! See the `host` and `embed` modules for the details.
 
 // See the comment in the main `nih_plug` crate
 #![allow(clippy::type_complexity)]
