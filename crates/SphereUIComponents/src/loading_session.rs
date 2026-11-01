@@ -1077,17 +1077,42 @@ fn spawn_session_install(
     let recovered_from_autosave = package.recovered_from_autosave;
 
     cx.spawn(async move |cx| {
-        let install_result = cx
-            .background_executor()
-            .spawn(async move {
-                crate::pre_studio_install::run_pre_studio_session_install(package, |detail, bar| {
+        // The install runs on a background thread and reports each step —
+        // "Loading Plugin 3/12: <plugin> on <track>" among them — into this
+        // slot; the loop below copies it into the window, as the shutdown
+        // path does. The window needs the app, which that thread cannot have.
+        let progress_slot: Arc<std::sync::Mutex<Option<(String, ProgressBarValue)>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let progress_for_install = progress_slot.clone();
+        let install_done = Arc::new(AtomicBool::new(false));
+        let install_done_flag = install_done.clone();
+        let install_future = cx.background_executor().spawn(async move {
+            let result = crate::pre_studio_install::run_pre_studio_session_install(
+                package,
+                move |detail, bar| {
                     eprintln!(
                         "[SessionLoad] install progress: {detail} {:?}",
                         bar.fraction()
                     );
-                })
-            })
-            .await;
+                    if let Ok(mut slot) = progress_for_install.lock() {
+                        *slot = Some((detail.to_string(), bar));
+                    }
+                },
+            );
+            install_done_flag.store(true, Ordering::Release);
+            result
+        });
+        while !install_done.load(Ordering::Acquire) {
+            // Take the latest report and drop the guard before awaiting.
+            let progress = progress_slot.lock().ok().and_then(|mut slot| slot.take());
+            if let Some((detail, bar)) = progress {
+                let _ = cx.update(|cx| touch_loading_session_progress(cx, &detail, bar));
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+        let install_result = install_future.await;
 
         let _ = cx.update(|cx| {
             set_project_lifecycle_busy(false);
@@ -1279,6 +1304,20 @@ impl Render for LoadingSessionWindow {
             div().flex().flex_row().items_center().child(title)
         };
 
+        let mut detail_line = div()
+            .text_size(px(11.0))
+            .line_height(px(16.0))
+            .text_color(if has_error {
+                Colors::text_secondary()
+            } else {
+                Colors::text_muted()
+            })
+            .child(detail);
+        if !has_error {
+            // One line while loading: a long plugin or track name in "Loading
+            // Plugin 3/12: … on …" must not push the bar down a row and back.
+            detail_line = detail_line.truncate();
+        }
         let mut body = div()
             .flex()
             .flex_col()
@@ -1287,17 +1326,7 @@ impl Render for LoadingSessionWindow {
             .py(px(BODY_PAD_Y))
             .gap(px(BODY_GAP))
             .child(heading_row)
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .line_height(px(16.0))
-                    .text_color(if has_error {
-                        Colors::text_secondary()
-                    } else {
-                        Colors::text_muted()
-                    })
-                    .child(detail),
-            );
+            .child(detail_line);
 
         if has_error {
             body = body.child(
