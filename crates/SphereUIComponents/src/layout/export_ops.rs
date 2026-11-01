@@ -194,6 +194,7 @@ impl StudioLayout {
     fn realtime_render_hooks(&self, cx: &mut Context<Self>) -> RealtimeTransportHooks {
         let start_owner = cx.entity().downgrade();
         let finish_owner = start_owner.clone();
+        let pause_owner = start_owner.clone();
         RealtimeTransportHooks {
             start: Arc::new(move |start_seconds, arm, cx| {
                 start_owner
@@ -205,7 +206,18 @@ impl StudioLayout {
             finish: Arc::new(move |cx| {
                 let _ = finish_owner.update(cx, |this, cx| this.end_realtime_render_transport(cx));
             }),
+            pause: Arc::new(move |cx| {
+                let _ = pause_owner.update(cx, |this, cx| this.pause_playback_for_render(cx));
+            }),
         }
+    }
+
+    /// Before an offline render: stop the transport where it is (the one
+    /// Stop, so a running take is finalized) and any browser audition.
+    fn pause_playback_for_render(&mut self, cx: &mut Context<Self>) {
+        self.stop_native_playback(cx);
+        self.stop_browser_audition();
+        cx.notify();
     }
 
     /// Take the transport for a realtime render: stop whatever plays, turn the

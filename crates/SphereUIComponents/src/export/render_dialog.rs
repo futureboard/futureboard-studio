@@ -43,7 +43,8 @@ const RUNNING_FILE_LIST_MAX: usize = 8;
 /// Seconds of unread audio the realtime capture can hold before it drops.
 const REALTIME_CAPTURE_SECONDS: usize = 2;
 
-/// How a realtime render borrows the studio's transport.
+/// How a render borrows the studio's transport: a realtime render plays it,
+/// an offline render only pauses it.
 #[derive(Clone)]
 pub struct RealtimeTransportHooks {
     /// Stop whatever plays, turn the loop and click off, seek to
@@ -53,6 +54,9 @@ pub struct RealtimeTransportHooks {
     pub start: Arc<dyn Fn(f64, Box<dyn FnOnce()>, &mut App) -> Result<(), String>>,
     /// Stop playback and give the transport back as it was.
     pub finish: Arc<dyn Fn(&mut App)>,
+    /// Pause everything the studio is playing, leaving the playhead where
+    /// it is. Called as an offline render starts.
+    pub pause: Arc<dyn Fn(&mut App)>,
 }
 
 /// Everything a render needs, handed over by the Export dialog.
@@ -63,6 +67,8 @@ pub struct RenderLaunch {
     pub audio_engine: Option<DirectAudio::AudioEngine>,
     /// `Some` for a realtime render.
     pub realtime: Option<RealtimeTransportHooks>,
+    /// Pauses the studio's playback before an offline render.
+    pub pause_playback: Option<Arc<dyn Fn(&mut App)>>,
 }
 
 enum RenderState {
@@ -195,6 +201,11 @@ impl RenderDialog {
         let started = match launch.realtime.clone() {
             Some(hooks) => self.start_realtime(launch, hooks, cx),
             None => {
+                // The render reads the project, not the transport, but
+                // nothing should keep playing while it runs.
+                if let Some(pause) = launch.pause_playback.clone() {
+                    pause(cx);
+                }
                 self.start_offline(launch);
                 Ok(())
             }

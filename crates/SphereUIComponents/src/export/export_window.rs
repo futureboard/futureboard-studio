@@ -494,6 +494,10 @@ impl ExportArrangementWindow {
             } else {
                 None
             },
+            pause_playback: self
+                .realtime_hooks
+                .as_ref()
+                .map(|hooks| hooks.pause.clone()),
         };
         if realtime && launch.realtime.is_none() {
             self.failure = Some(localized_error(
