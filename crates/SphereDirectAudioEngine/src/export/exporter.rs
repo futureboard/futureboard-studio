@@ -1044,6 +1044,197 @@ mod tests {
         }
     }
 
+    /// A bridged effect that ignores its input and plays a constant.
+    #[derive(Debug)]
+    struct ConstantSink {
+        value: f32,
+        fresh: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::plugin_bridge::PluginBridgeSink for ConstantSink {
+        fn dsp_ready(&self) -> bool {
+            true
+        }
+        fn read_output(&self, out_l: &mut [f32], out_r: &mut [f32], frames: usize) -> usize {
+            if !self.fresh.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                return 0;
+            }
+            let n = frames.min(out_l.len()).min(out_r.len());
+            out_l[..n].fill(self.value);
+            out_r[..n].fill(self.value);
+            n
+        }
+        fn push_midi(&self, _: u8, _: u8, _: u8, _: u32) {}
+        fn write_input(&self, _: &[f32], _: &[f32], _: usize) {}
+        fn request_block(&self, _frames: u32) {
+            self.fresh.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn constant(value: f32) -> crate::plugin_bridge::SharedPluginBridgeSink {
+        std::sync::Arc::new(ConstantSink {
+            value,
+            fresh: Default::default(),
+        })
+    }
+
+    /// Peak of the offline mixdown of `snapshot` with these bridged inserts.
+    fn mixdown_peak(
+        snapshot: &EngineProjectSnapshot,
+        sinks: Vec<(&str, crate::plugin_bridge::SharedPluginBridgeSink)>,
+    ) -> f32 {
+        let sinks: crate::plugin_bridge::PluginBridgeSinkMap = sinks
+            .into_iter()
+            .map(|(id, sink)| (id.to_string(), sink))
+            .collect();
+        let out = temp_path("routing");
+        let summary = export_arrangement_with_bridges(
+            snapshot,
+            &wav_request(out.clone(), 9_600),
+            &ExportCancelToken::new(),
+            Some(&sinks),
+            |_progress| {},
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(out);
+        summary.peak_db.map(|d| 10f32.powf(d / 20.0)).unwrap_or(0.0)
+    }
+
+    fn constant_insert(id: &str) -> crate::types::EngineInsertSnapshot {
+        crate::types::EngineInsertSnapshot {
+            id: id.to_string(),
+            kind: "external-bridge-plugin".to_string(),
+            enabled: true,
+            params: Default::default(),
+            state: None,
+        }
+    }
+
+    fn effect_insert(id: &str) -> crate::types::EngineInsertSnapshot {
+        let mut insert = constant_insert(id);
+        insert
+            .params
+            .insert("role".to_string(), serde_json::json!("effect"));
+        insert
+    }
+
+    #[test]
+    fn the_mixdown_goes_through_buses_and_returns() {
+        use crate::types::{EngineSendSnapshot, EngineTrackSnapshot};
+
+        // A track into a bus at half volume.
+        let mut snapshot = silence_snapshot(48_000);
+        snapshot.tracks[0].inserts.push(constant_insert("src"));
+        snapshot.tracks[0].output_track_id = Some("bus-1".to_string());
+        snapshot.tracks.push(EngineTrackSnapshot {
+            track_type: "bus".to_string(),
+            volume: 0.5,
+            ..make_track_snapshot("bus-1")
+        });
+        let bus = mixdown_peak(&snapshot, vec![("src", constant(0.25))]);
+        assert!((bus - 0.125).abs() < 2e-3, "through the bus: {bus}");
+
+        // A track at full level with a send into a return.
+        let mut snapshot = silence_snapshot(48_000);
+        snapshot.tracks[0].inserts.push(constant_insert("src"));
+        snapshot.tracks[0].sends.push(EngineSendSnapshot {
+            id: "send-1".to_string(),
+            return_track_id: "ret-1".to_string(),
+            level: 1.0,
+            enabled: true,
+            pre_fader: false,
+        });
+        snapshot.tracks.push(EngineTrackSnapshot {
+            track_type: "return".to_string(),
+            ..make_track_snapshot("ret-1")
+        });
+        let sent = mixdown_peak(&snapshot, vec![("src", constant(0.2))]);
+        assert!((sent - 0.4).abs() < 2e-3, "dry plus the return: {sent}");
+    }
+
+    /// A bridged effect like the real host: the block written in is
+    /// processed (times `gain`) on `request_block` and read back once.
+    #[derive(Debug)]
+    struct GainSink {
+        gain: f32,
+        state: std::sync::Mutex<(Vec<f32>, Vec<f32>, bool)>,
+    }
+
+    impl GainSink {
+        fn new(gain: f32) -> Self {
+            Self {
+                gain,
+                state: Default::default(),
+            }
+        }
+    }
+
+    impl crate::plugin_bridge::PluginBridgeSink for GainSink {
+        fn dsp_ready(&self) -> bool {
+            true
+        }
+        fn read_output(&self, out_l: &mut [f32], out_r: &mut [f32], frames: usize) -> usize {
+            let mut state = self.state.lock().unwrap();
+            if !std::mem::take(&mut state.2) {
+                return 0;
+            }
+            let n = frames.min(state.0.len()).min(out_l.len()).min(out_r.len());
+            out_l[..n].copy_from_slice(&state.0[..n]);
+            out_r[..n].copy_from_slice(&state.1[..n]);
+            n
+        }
+        fn push_midi(&self, _: u8, _: u8, _: u8, _: u32) {}
+        fn write_input(&self, l: &[f32], r: &[f32], frames: usize) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = l[..frames].iter().map(|s| s * self.gain).collect();
+            state.1 = r[..frames].iter().map(|s| s * self.gain).collect();
+        }
+        fn request_block(&self, _frames: u32) {
+            self.state.lock().unwrap().2 = true;
+        }
+    }
+
+    #[test]
+    fn plugins_on_buses_and_returns_reach_the_mixdown() {
+        use crate::types::{EngineSendSnapshot, EngineTrackSnapshot};
+        let half = || std::sync::Arc::new(GainSink::new(0.5)) as _;
+
+        // Track → bus with a ×0.5 plug-in.
+        let mut snapshot = silence_snapshot(48_000);
+        snapshot.tracks[0].inserts.push(constant_insert("src"));
+        snapshot.tracks[0].output_track_id = Some("bus-1".to_string());
+        let mut bus = EngineTrackSnapshot {
+            track_type: "bus".to_string(),
+            ..make_track_snapshot("bus-1")
+        };
+        bus.inserts.push(effect_insert("bus-fx"));
+        snapshot.tracks.push(bus);
+        let peak = mixdown_peak(&snapshot, vec![("src", constant(0.25)), ("bus-fx", half())]);
+        assert!((peak - 0.125).abs() < 2e-3, "bus plug-in: {peak}");
+
+        // Track with a send → return with a ×0.5 plug-in.
+        let mut snapshot = silence_snapshot(48_000);
+        snapshot.tracks[0].inserts.push(constant_insert("src"));
+        snapshot.tracks[0].sends.push(EngineSendSnapshot {
+            id: "send-1".to_string(),
+            return_track_id: "ret-1".to_string(),
+            level: 1.0,
+            enabled: true,
+            pre_fader: false,
+        });
+        let mut ret = EngineTrackSnapshot {
+            track_type: "return".to_string(),
+            ..make_track_snapshot("ret-1")
+        };
+        ret.inserts.push(effect_insert("ret-fx"));
+        snapshot.tracks.push(ret);
+        let peak = mixdown_peak(&snapshot, vec![("src", constant(0.25)), ("ret-fx", half())]);
+        assert!(
+            (peak - 0.375).abs() < 2e-3,
+            "dry 0.25 + return 0.125: {peak}"
+        );
+    }
+
     /// 32-bit float keeps what went over: reported, but not clamped.
     #[test]
     fn a_float_file_keeps_its_overs() {
