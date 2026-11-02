@@ -58,11 +58,7 @@ impl VoxDocument {
     /// The document an analysis produced: detected notes, key and tempo.
     pub fn from_analysis(result: &CantoAnalysisResult) -> Self {
         let key = KEY_NAMES.iter().position(|k| *k == result.key).unwrap_or(9) as u8;
-        let scale = match result.mode.as_str() {
-            "major" => Scale::Major,
-            "penta" => Scale::MinorPentatonic,
-            _ => Scale::Minor,
-        };
+        let scale = Scale::from_name(&result.mode).unwrap_or(Scale::Minor);
         Self {
             notes: result.notes.clone(),
             key,

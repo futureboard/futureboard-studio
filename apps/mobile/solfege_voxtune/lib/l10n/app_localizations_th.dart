@@ -368,7 +368,7 @@ class AppLocalizationsTh extends AppLocalizations {
   String get modeMajor => 'เมเจอร์';
 
   @override
-  String get modePenta => 'เพนทาโทนิก';
+  String get modePenta => 'ไมเนอร์เพนทาโทนิก';
 
   @override
   String get modeTitleMinor => 'ไมเนอร์';
@@ -377,7 +377,55 @@ class AppLocalizationsTh extends AppLocalizations {
   String get modeTitleMajor => 'เมเจอร์';
 
   @override
-  String get modeTitlePenta => 'เพนทาโทนิก';
+  String get modeTitlePenta => 'ไมเนอร์\nเพนทาโทนิก';
+
+  @override
+  String get modeHarmonicMinor => 'ฮาร์โมนิกไมเนอร์';
+
+  @override
+  String get modeMelodicMinor => 'เมโลดิกไมเนอร์';
+
+  @override
+  String get modeDorian => 'โดเรียน';
+
+  @override
+  String get modePhrygian => 'ฟรีเจียน';
+
+  @override
+  String get modeLydian => 'ลิเดียน';
+
+  @override
+  String get modeMixolydian => 'มิกโซลิเดียน';
+
+  @override
+  String get modeMajorPentatonic => 'เมเจอร์เพนทาโทนิก';
+
+  @override
+  String get modeBlues => 'บลูส์';
+
+  @override
+  String get modeTitleHarmonicMinor => 'ฮาร์โมนิก ไมเนอร์';
+
+  @override
+  String get modeTitleMelodicMinor => 'เมโลดิก ไมเนอร์';
+
+  @override
+  String get modeTitleDorian => 'โดเรียน';
+
+  @override
+  String get modeTitlePhrygian => 'ฟรีเจียน';
+
+  @override
+  String get modeTitleLydian => 'ลิเดียน';
+
+  @override
+  String get modeTitleMixolydian => 'มิกโซลิเดียน';
+
+  @override
+  String get modeTitleMajorPentatonic => 'เมเจอร์\nเพนทาโทนิก';
+
+  @override
+  String get modeTitleBlues => 'บลูส์';
 
   @override
   String keyChip(String key, String mode) {
@@ -772,4 +820,17 @@ class AppLocalizationsTh extends AppLocalizations {
   @override
   String get advAccentBeatsHint =>
       'ใส่ accent ให้โน้ตที่เริ่มตรงจังหวะ ให้ groove แน่นขึ้น';
+
+  @override
+  String get licenseTitle => 'แอปนี้ยังไม่ได้ซื้อ';
+
+  @override
+  String get licenseBody =>
+      'Google Play แจ้งว่าบัญชีนี้ยังไม่ได้ซื้อ Solfege Voxtune ซื้อได้ที่ Google Play เพื่อใช้งานต่อ ถ้าซื้อแล้ว ให้เปิด Google Play ด้วยบัญชีที่ใช้ซื้อ แล้วกดตรวจสอบอีกครั้ง';
+
+  @override
+  String get licenseOpenStore => 'เปิด Google Play';
+
+  @override
+  String get licenseRetry => 'ตรวจสอบอีกครั้ง';
 }

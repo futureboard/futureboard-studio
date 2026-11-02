@@ -4,9 +4,11 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import 'package:solfege_voxtune/license.dart';
 import 'package:solfege_voxtune/locale_controller.dart';
 import 'package:solfege_voxtune/main.dart';
 import 'package:solfege_voxtune/music.dart';
@@ -182,6 +184,33 @@ void main() {
     await tester.tap(find.byKey(const Key('mode-major')));
     await tester.pump();
     expect(find.text('A major'), findsOneWidget);
+
+    // Every scale is offered, and picking one retargets the off-key count.
+    for (final mode in kModes.keys) {
+      expect(find.byKey(Key('mode-$mode')), findsOneWidget, reason: mode);
+    }
+    final lydian = find.byKey(const Key('mode-lydian'));
+    await tester.ensureVisible(lydian);
+    await tester.tap(lydian);
+    await tester.pump();
+    expect(find.text('A Lydian'), findsOneWidget);
+    expect(state.mode, 'lydian');
+    final pent = find.byKey(const Key('mode-majorPentatonic'));
+    await tester.ensureVisible(pent);
+    await tester.tap(pent);
+    await tester.pump();
+    expect(find.text('A major pentatonic'), findsOneWidget);
+  });
+
+  test('every scale the app offers is one the engine knows', () {
+    for (final mode in kModes.keys) {
+      expect(kModeWire.containsKey(mode), isTrue, reason: mode);
+    }
+    // The engine's Scale::ALL order.
+    expect(kModeWire.values.toSet().length, kModeWire.length);
+    expect(kModes['penta'], [0, 3, 5, 7, 10]);
+    expect(kModes['lydian'], [0, 2, 4, 6, 7, 9, 11]);
+    expect(kModes['melodicMinor'], [0, 2, 3, 5, 7, 9, 11]);
   });
 
   testWidgets('edits are saved to the project and restored on reopen', (
@@ -529,6 +558,45 @@ void main() {
     expect(find.text('1 off'), findsOneWidget);
   });
 
+  testWidgets('pinching zooms time sideways and pitch up and down', (
+    WidgetTester tester,
+  ) async {
+    final store = tempStore();
+    final state = await pumpEditor(tester, store, store.create('Zoom'));
+    state.loadAudioBytes(_buildTestVocalWav(), fileName: 'take.wav');
+    await settle(tester);
+    final centre = state.editorRectForTest!.center;
+
+    Future<void> pinch(Offset a, Offset b, Offset spread) async {
+      final one = await tester.startGesture(centre + a);
+      final two = await tester.startGesture(centre + b);
+      await tester.pump();
+      for (var i = 1; i <= 4; i++) {
+        await one.moveTo(centre + a - spread * (i / 4));
+        await two.moveTo(centre + b + spread * (i / 4));
+        await tester.pump();
+      }
+      await one.up();
+      await two.up();
+      await tester.pump();
+    }
+
+    // Fingers apart up and down: the pitch range narrows around them, the
+    // time window stays.
+    final before = state.viewForTest;
+    await pinch(const Offset(0, -30), const Offset(0, 30), const Offset(0, 40));
+    final tall = state.viewForTest;
+    expect(tall.duration, closeTo(before.duration, 1e-9));
+    expect(tall.hi - tall.lo, lessThan((before.hi - before.lo) * 0.8));
+    expect(tall.hi - tall.lo, greaterThanOrEqualTo(6.0));
+
+    // Fingers apart sideways: time zooms in, the pitch range stays.
+    await pinch(const Offset(-30, 0), const Offset(30, 0), const Offset(40, 0));
+    final wide = state.viewForTest;
+    expect(wide.duration, lessThan(tall.duration * 0.8));
+    expect(wide.hi - wide.lo, closeTo(tall.hi - tall.lo, 1e-9));
+  });
+
   testWidgets('the Time tool stretches a note from its start, undoably', (
     WidgetTester tester,
   ) async {
@@ -853,6 +921,19 @@ void main() {
           reason: reason,
         );
 
+        // Transport at the bottom: under the canvas (bottom-left) on
+        // landscape tablets, at the foot of the side panel on landscape
+        // phones, and a full-width bar below the inspector in portrait.
+        final play = tester.getRect(find.byKey(const Key('play-btn')));
+        expect(play.bottom, greaterThan(size.height - 80), reason: reason);
+        if (tablet && wide) {
+          final canvas = state.editorRectForTest!;
+          expect(play.center.dx, lessThan(canvas.right), reason: reason);
+        } else if (wide) {
+          final canvas = state.editorRectForTest!;
+          expect(play.center.dx, greaterThan(canvas.right), reason: reason);
+        }
+
         // Sheets fit too (landscape phones are short).
         await tester.tap(find.byKey(const Key('advanced-btn')));
         await tester.pumpAndSettle();
@@ -934,6 +1015,63 @@ void main() {
     await tester.pumpAndSettle();
     await settle(tester);
     expect(project.files, hasLength(1));
+  });
+
+  testWidgets('a not-licensed answer from Google Play blocks the app', (
+    WidgetTester tester,
+  ) async {
+    var answer = LicenseState.notLicensed;
+    await tester.pumpWidget(
+      CantoApp(store: tempStore(), licenseCheck: () async => answer),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('license-title')), findsOneWidget);
+    expect(find.byKey(const Key('home-settings')), findsNothing);
+
+    // Bought since: checking again lets the app in.
+    answer = LicenseState.licensed;
+    await tester.tap(find.byKey(const Key('license-retry')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('license-title')), findsNothing);
+    expect(find.byKey(const Key('home-settings')), findsOneWidget);
+  });
+
+  testWidgets('no answer from Google Play does not block the app', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      CantoApp(
+        store: tempStore(),
+        licenseCheck: () async => LicenseState.unknown,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('license-title')), findsNothing);
+    expect(find.byKey(const Key('home-settings')), findsOneWidget);
+  });
+
+  testWidgets('About shows the installed version, not a fixed one', (
+    WidgetTester tester,
+  ) async {
+    const channel = MethodChannel('canto/app');
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(
+      channel,
+      (call) async => call.method == 'version' ? '2026.11.1' : null,
+    );
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+
+    await tester.pumpWidget(CantoApp(store: tempStore()));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('home-settings')));
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('about-version')),
+      200,
+      scrollable: find.byType(Scrollable).last,
+    );
+    expect(find.text('Solfege Voxtune · Version 2026.11.1'), findsOneWidget);
   });
 
   testWidgets('Settings shows the cache size and clears it', (

@@ -11,8 +11,10 @@ import 'cache.dart';
 import 'draw.dart';
 import 'history.dart';
 import 'l10n/app_localizations.dart';
+import 'license.dart';
 import 'locale_controller.dart';
 import 'pages/home_page.dart';
+import 'pages/not_licensed_page.dart';
 import 'pages/record_page.dart';
 import 'pages/settings_page.dart';
 import 'recorder.dart';
@@ -53,12 +55,16 @@ class CantoApp extends StatefulWidget {
   /// Replaces the Home page (tests open the editor directly).
   final Widget? home;
 
+  /// The Google Play purchase check; tests pass their own answer.
+  final Future<LicenseState> Function() licenseCheck;
+
   const CantoApp({
     super.key,
     this.localeController,
     this.snapDefault,
     this.store,
     this.home,
+    this.licenseCheck = PlayLicense.check,
   });
 
   @override
@@ -70,6 +76,11 @@ class _CantoAppState extends State<CantoApp> {
   late final SnapDefaultController _snapDefault;
   late final Future<ProjectStore> _store;
 
+  /// Google Play's last answer. The app opens while it is asked; only a
+  /// "not licensed" answer replaces it with [NotLicensedPage].
+  LicenseState _license = LicenseState.unknown;
+  bool _checkingLicense = false;
+
   @override
   void initState() {
     super.initState();
@@ -78,6 +89,19 @@ class _CantoAppState extends State<CantoApp> {
     _store = widget.store != null
         ? Future.value(widget.store)
         : ProjectStore.open();
+    _checkLicense();
+  }
+
+  Future<void> _checkLicense() async {
+    // Not through setState: the first check starts from initState.
+    _checkingLicense = true;
+    if (_license == LicenseState.notLicensed) setState(() {});
+    final answer = await widget.licenseCheck();
+    if (!mounted) return;
+    setState(() {
+      _license = answer;
+      _checkingLicense = false;
+    });
   }
 
   @override
@@ -159,7 +183,9 @@ class _CantoAppState extends State<CantoApp> {
           ),
         ),
       ),
-      home: widget.home ?? _buildHome(),
+      home: _license == LicenseState.notLicensed
+          ? NotLicensedPage(onRetry: _checkLicense, checking: _checkingLicense)
+          : widget.home ?? _buildHome(),
     );
   }
 }
@@ -198,19 +224,37 @@ class _PressState {
   _PressState({required this.hit, this.moved = false, required this.timeMs});
 }
 
+/// A two-finger pinch, zooming each axis by the fingers' spread along it:
+/// apart sideways zooms time, apart up/down zooms pitch.
 class _PinchState {
-  final double dist;
+  final double spanX;
+  final double spanY;
   final double duration;
   final double start;
   final double anchor;
+  final double pitchLo;
+  final double pitchHi;
+  final double anchorPitch;
 
   const _PinchState({
-    required this.dist,
+    required this.spanX,
+    required this.spanY,
     required this.duration,
     required this.start,
     required this.anchor,
+    required this.pitchLo,
+    required this.pitchHi,
+    required this.anchorPitch,
   });
 }
+
+/// Fingers closer than this along an axis do not zoom it, so a sideways
+/// pinch leaves the pitch range alone (and the other way round).
+const double _kPinchAxisFloor = 48.0;
+
+/// Visible pitch range, in semitones, a vertical pinch stays within.
+const double _kMinPitchSpan = 6.0;
+const double _kMaxPitchSpan = 48.0;
 
 class _OverviewDragState {
   final String mode; // 'pan' | 'move'
@@ -264,12 +308,44 @@ String _toolLabel(AppLocalizations l, String id) => switch (id) {
   _ => l.toolPitch,
 };
 
-/// Lower-case mode name used after a key ("A minor").
+/// Mode name used after a key ("A minor", "D Dorian").
 String _modeLabel(AppLocalizations l, String mode) => switch (mode) {
   'major' => l.modeMajor,
+  'harmonicMinor' => l.modeHarmonicMinor,
+  'melodicMinor' => l.modeMelodicMinor,
+  'dorian' => l.modeDorian,
+  'phrygian' => l.modePhrygian,
+  'lydian' => l.modeLydian,
+  'mixolydian' => l.modeMixolydian,
+  'majorPentatonic' => l.modeMajorPentatonic,
   'penta' => l.modePenta,
+  'blues' => l.modeBlues,
   _ => l.modeMinor,
 };
+
+/// Scale name as a title, in the Key & scale sheet.
+String _modeTitle(AppLocalizations l, String mode) => switch (mode) {
+  'major' => l.modeTitleMajor,
+  'harmonicMinor' => l.modeTitleHarmonicMinor,
+  'melodicMinor' => l.modeTitleMelodicMinor,
+  'dorian' => l.modeTitleDorian,
+  'phrygian' => l.modeTitlePhrygian,
+  'lydian' => l.modeTitleLydian,
+  'mixolydian' => l.modeTitleMixolydian,
+  'majorPentatonic' => l.modeTitleMajorPentatonic,
+  'penta' => l.modeTitlePenta,
+  'blues' => l.modeTitleBlues,
+  _ => l.modeTitleMinor,
+};
+
+/// The Key & scale sheet's scale rows: major-type, minor-type, the other
+/// minor modes and blues, the pentatonics.
+const List<List<String>> _modeRows = [
+  ['major', 'lydian', 'mixolydian'],
+  ['minor', 'harmonicMinor', 'melodicMinor'],
+  ['dorian', 'phrygian', 'blues'],
+  ['majorPentatonic', 'penta'],
+];
 
 class CantoScreen extends StatefulWidget {
   final Project project;
@@ -406,6 +482,10 @@ class CantoScreenState extends State<CantoScreen>
   bool _narrow = false;
   double _barWidth = 0;
   bool _wide = false;
+
+  /// A tablet (shortest side 600 dp or more). In landscape its transport
+  /// sits bottom-left under the canvas instead of ending the side panel.
+  bool _tablet = false;
   bool _pinnedSidebar = false;
   double _panelWidth = 340;
 
@@ -416,9 +496,23 @@ class CantoScreenState extends State<CantoScreen>
   AppLocalizations get _l => AppLocalizations.of(context);
   String? get fileName => _fileName;
   bool get hasAudio => _hasAudio;
+  String get mode => _mode;
   Project get project => _project;
   @visibleForTesting
   List<FileSession> get sessionsForTest => List.unmodifiable(_sessions);
+
+  /// The visible window: time from [start] for [duration] seconds, pitch
+  /// from [lo] to [hi] (MIDI).
+  @visibleForTesting
+  ({double start, double duration, double lo, double hi}) get viewForTest =>
+      (start: _viewStart, duration: _viewDuration, lo: _pitchLo, hi: _pitchHi);
+
+  /// Global bounds of the note canvas.
+  @visibleForTesting
+  Rect? get editorRectForTest {
+    final box = _editorKey.currentContext?.findRenderObject() as RenderBox?;
+    return box == null ? null : box.localToGlobal(Offset.zero) & box.size;
+  }
 
   /// Global position of a note's centre on the canvas (same transform the
   /// painter and hit-testing use).
@@ -1907,14 +2001,18 @@ class CantoScreenState extends State<CantoScreen>
     _pointers[event.pointer] = point;
     if (_pointers.length >= 2) {
       final pts = _pointers.values.toList();
-      final dist = (pts[0] - pts[1]).distance;
-      final midX = (pts[0].dx + pts[1].dx) / 2.0;
+      final mid = (pts[0] + pts[1]) / 2.0;
+      final layout = _currentLayout();
       setState(() {
         _pinch = _PinchState(
-          dist: math.max(8.0, dist),
+          spanX: (pts[0].dx - pts[1].dx).abs(),
+          spanY: (pts[0].dy - pts[1].dy).abs(),
           duration: _viewDuration,
           start: _viewStart,
-          anchor: _currentLayout().xToTime(_viewStart, midX),
+          anchor: layout.xToTime(_viewStart, mid.dx),
+          pitchLo: _pitchLo,
+          pitchHi: _pitchHi,
+          anchorPitch: layout.yToPitch(_pitchHi, mid.dy),
         );
         _drag = null;
         _follow = false;
@@ -2022,19 +2120,37 @@ class CantoScreenState extends State<CantoScreen>
       _pointers[event.pointer] = point;
     }
     if (_pointers.length >= 2 && _pinch != null) {
+      final pinch = _pinch!;
       final pts = _pointers.values.toList();
-      final dist = math.max(8.0, (pts[0] - pts[1]).distance);
-      final fraction =
-          (_pinch!.anchor - _pinch!.start) / math.max(0.01, _pinch!.duration);
+      // Spread along each axis against the press, floored so the axis the
+      // fingers are not apart on stays put.
+      double zoom(double from, double now) =>
+          math.max(from, _kPinchAxisFloor) / math.max(now, _kPinchAxisFloor);
+      final zoomX = zoom(pinch.spanX, (pts[0].dx - pts[1].dx).abs());
+      final zoomY = zoom(pinch.spanY, (pts[0].dy - pts[1].dy).abs());
       setState(() {
+        final fraction =
+            (pinch.anchor - pinch.start) / math.max(0.01, pinch.duration);
         final minView = math.min(_duration, beatsToSec(1.5, _bpm));
-        _viewDuration = clampVal(
-          _pinch!.duration * (_pinch!.dist / dist),
-          minView,
-          _duration,
-        );
-        _viewStart = _pinch!.anchor - fraction * _viewDuration;
+        _viewDuration = clampVal(pinch.duration * zoomX, minView, _duration);
+        _viewStart = pinch.anchor - fraction * _viewDuration;
         _clampView();
+
+        // The pitch under the fingers stays under them.
+        final startSpan = pinch.pitchHi - pinch.pitchLo;
+        final span = clampVal(
+          startSpan * zoomY,
+          _kMinPitchSpan,
+          math.max(_kMaxPitchSpan, startSpan),
+        );
+        final above = (pinch.pitchHi - pinch.anchorPitch) / startSpan;
+        final lo = clampVal(
+          pinch.anchorPitch + above * span - span,
+          36.0,
+          math.max(36.0, 92.0 - span),
+        );
+        _pitchLo = lo;
+        _pitchHi = lo + span;
       });
       return;
     }
@@ -2422,13 +2538,20 @@ class CantoScreenState extends State<CantoScreen>
             style: CantoTypography.label(text: _l.scaleLabel),
           ),
           const SizedBox(height: 4),
-          Row(
-            children: [
-              modeTile('minor', _l.modeTitleMinor, degrees('minor')),
-              modeTile('major', _l.modeTitleMajor, degrees('major')),
-              modeTile('penta', _l.modeTitlePenta, degrees('penta')),
-            ],
-          ),
+          for (final row in _modeRows)
+            // Tiles in a row share a height when a name wraps.
+            IntrinsicHeight(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  for (final mode in row)
+                    modeTile(mode, _modeTitle(_l, mode), degrees(mode)),
+                  // Short rows keep the tile width of full ones.
+                  for (var i = row.length; i < 3; i++)
+                    const Expanded(child: SizedBox()),
+                ],
+              ),
+            ),
           const SizedBox(height: 12),
           Text(
             _l.keySheetNote,
@@ -2587,6 +2710,7 @@ class CantoScreenState extends State<CantoScreen>
     // Landscape phones and tablets put the inspector and transport in a side
     // panel so the canvas keeps its height; portrait stacks everything.
     _wide = width > height && width >= 560;
+    _tablet = size.shortestSide >= 600;
     _pinnedSidebar = _wide && width >= 1100;
     _panelWidth = clampVal(width * 0.34, 320, 380);
     _tightPanel = _wide && _panelWidth < 345;
@@ -2710,7 +2834,7 @@ class CantoScreenState extends State<CantoScreen>
           Container(height: 1, color: CantoColors.line),
         ],
         Expanded(child: _buildPanelBody()),
-        _buildTransport(),
+        if (!_tablet) _buildTransport(),
       ],
     );
     final workspace = Row(
@@ -2722,6 +2846,8 @@ class CantoScreenState extends State<CantoScreen>
               _buildContextBar(),
               Expanded(child: _buildEditorArea()),
               if (_hasAudio) _buildOverviewBar(),
+              // Tablets: bottom-left, under the canvas it plays.
+              if (_tablet) _buildTransport(),
             ],
           ),
         ),
@@ -4096,6 +4222,135 @@ class CantoScreenState extends State<CantoScreen>
     );
   }
 
+  /// Clock, bar position and tempo, updated per frame through notifiers.
+  Widget _buildClock() {
+    return ValueListenableBuilder<double>(
+      valueListenable: _playheadVN,
+      builder: (context, playhead, _) => Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            formatClock(playhead),
+            key: const Key('clock-text'),
+            style: CantoTypography.num(
+              size: 19,
+              weight: FontWeight.w600,
+              color: CantoColors.inkBright,
+              letterSpacing: -0.5,
+              height: 1.0,
+            ),
+          ),
+          const SizedBox(height: 5),
+          Text(
+            '${formatBars(playhead, _bpm)}   ${_bpm.round()} BPM',
+            key: const Key('bars-text'),
+            style: CantoTypography.num(
+              size: 10.5,
+              color: CantoColors.faint,
+              height: 1.0,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMeter() => ValueListenableBuilder<double>(
+    valueListenable: _levelVN,
+    builder: (context, level, _) => LevelMeter(level: level),
+  );
+
+  /// Back to start, play/pause and loop.
+  List<Widget> _buildPlayControls() {
+    return [
+      CantoIconButton(
+        key: const Key('rewind-btn'),
+        icon: LucideIcons.skipBack,
+        tooltip: _l.backToStart,
+        onTap: _rewind,
+      ),
+      const SizedBox(width: 4),
+      Pressable(
+        key: const Key('play-btn'),
+        onTap: _togglePlay,
+        semanticLabel: _playing ? _l.pause : _l.play,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          width: _compact ? 46 : 52,
+          height: _compact ? 46 : 52,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: _playing ? CantoColors.high : CantoColors.accent,
+            border: Border.all(
+              color: _playing ? CantoColors.accent : Colors.transparent,
+              width: 1.5,
+            ),
+          ),
+          child: Icon(
+            _playing ? LucideIcons.pause : LucideIcons.play,
+            size: 22,
+            color: _playing ? CantoColors.accent : CantoColors.accentInk,
+          ),
+        ),
+      ),
+      const SizedBox(width: 4),
+      CantoIconButton(
+        key: const Key('loop-btn'),
+        icon: LucideIcons.repeat,
+        tooltip: _l.loop,
+        active: _loop,
+        onTap: _toggleLoop,
+      ),
+    ];
+  }
+
+  TextStyle get _bypassLabelStyle => CantoTypography.sans(
+    size: 12,
+    weight: FontWeight.w600,
+    color: _bypass ? CantoColors.bypass : CantoColors.muted,
+  );
+
+  /// The Bypass toggle; with [showLabel] off only the icon shows (the
+  /// semantic label still names the button).
+  Widget _buildBypassButton({required bool showLabel}) {
+    return Pressable(
+      key: const Key('bypass-btn'),
+      onTap: _toggleBypass,
+      semanticLabel: _l.bypassSemantic,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 140),
+        height: 36,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        decoration: BoxDecoration(
+          color: _bypass ? CantoColors.bypassSoft : CantoColors.raised,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(
+            color: _bypass ? CantoColors.bypassLine : CantoColors.lineStrong,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              _bypass ? LucideIcons.earOff : LucideIcons.ear,
+              size: 14,
+              color: _bypass ? CantoColors.bypass : CantoColors.muted,
+            ),
+            if (showLabel) ...[
+              const SizedBox(width: 5),
+              Text(
+                _bypass ? _l.bypassOn : _l.bypassOff,
+                style: _bypassLabelStyle,
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildTransport() {
     return Container(
       height: _compact ? 60 : 68,
@@ -4112,97 +4367,24 @@ class CantoScreenState extends State<CantoScreen>
               alignment: Alignment.centerLeft,
               child: Row(
                 children: [
-                  ValueListenableBuilder<double>(
-                    valueListenable: _playheadVN,
-                    builder: (context, playhead, _) => Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Text(
-                          formatClock(playhead),
-                          key: const Key('clock-text'),
-                          style: CantoTypography.num(
-                            size: 19,
-                            weight: FontWeight.w600,
-                            color: CantoColors.inkBright,
-                            letterSpacing: -0.5,
-                            height: 1.0,
-                          ),
-                        ),
-                        const SizedBox(height: 5),
-                        Text(
-                          '${formatBars(playhead, _bpm)}   ${_bpm.round()} BPM',
-                          key: const Key('bars-text'),
-                          style: CantoTypography.num(
-                            size: 10.5,
-                            color: CantoColors.faint,
-                            height: 1.0,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                  _buildClock(),
                   const SizedBox(width: 10),
-                  ValueListenableBuilder<double>(
-                    valueListenable: _levelVN,
-                    builder: (context, level, _) => LevelMeter(level: level),
-                  ),
+                  _buildMeter(),
                 ],
               ),
             ),
           ),
-          CantoIconButton(
-            key: const Key('rewind-btn'),
-            icon: LucideIcons.skipBack,
-            tooltip: _l.backToStart,
-            onTap: _rewind,
-          ),
-          const SizedBox(width: 4),
-          Pressable(
-            key: const Key('play-btn'),
-            onTap: _togglePlay,
-            semanticLabel: _playing ? _l.pause : _l.play,
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 160),
-              width: _compact ? 46 : 52,
-              height: _compact ? 46 : 52,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: _playing ? CantoColors.high : CantoColors.accent,
-                border: Border.all(
-                  color: _playing ? CantoColors.accent : Colors.transparent,
-                  width: 1.5,
-                ),
-              ),
-              child: Icon(
-                _playing ? LucideIcons.pause : LucideIcons.play,
-                size: 22,
-                color: _playing ? CantoColors.accent : CantoColors.accentInk,
-              ),
-            ),
-          ),
-          const SizedBox(width: 4),
-          CantoIconButton(
-            key: const Key('loop-btn'),
-            icon: LucideIcons.repeat,
-            tooltip: _l.loop,
-            active: _loop,
-            onTap: _toggleLoop,
-          ),
+          ..._buildPlayControls(),
           Expanded(
             child: LayoutBuilder(
               builder: (context, constraints) {
-                final label = _bypass ? _l.bypassOn : _l.bypassOff;
-                final style = CantoTypography.sans(
-                  size: 12,
-                  weight: FontWeight.w600,
-                  color: _bypass ? CantoColors.bypass : CantoColors.muted,
-                );
-                // Keeps the label only where it fits (it doesn't beside the
-                // centred play button on narrow phones or the side panel);
-                // the semantic label still names the button.
+                // Keeps the label only where it fits (it does not beside the
+                // centred play button on narrow phones or the side panel).
                 final labelWidth = (TextPainter(
-                  text: TextSpan(text: label, style: style),
+                  text: TextSpan(
+                    text: _bypass ? _l.bypassOn : _l.bypassOff,
+                    style: _bypassLabelStyle,
+                  ),
                   textDirection: TextDirection.ltr,
                   textScaler: MediaQuery.textScalerOf(context),
                 )..layout()).width;
@@ -4210,43 +4392,7 @@ class CantoScreenState extends State<CantoScreen>
                     10 + 14 + 5 + labelWidth + 10 + 2 <= constraints.maxWidth;
                 return Align(
                   alignment: Alignment.centerRight,
-                  child: Pressable(
-                    key: const Key('bypass-btn'),
-                    onTap: _toggleBypass,
-                    semanticLabel: _l.bypassSemantic,
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 140),
-                      height: 36,
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
-                      decoration: BoxDecoration(
-                        color: _bypass
-                            ? CantoColors.bypassSoft
-                            : CantoColors.raised,
-                        borderRadius: BorderRadius.circular(18),
-                        border: Border.all(
-                          color: _bypass
-                              ? CantoColors.bypassLine
-                              : CantoColors.lineStrong,
-                        ),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            _bypass ? LucideIcons.earOff : LucideIcons.ear,
-                            size: 14,
-                            color: _bypass
-                                ? CantoColors.bypass
-                                : CantoColors.muted,
-                          ),
-                          if (showLabel) ...[
-                            const SizedBox(width: 5),
-                            Text(label, style: style),
-                          ],
-                        ],
-                      ),
-                    ),
-                  ),
+                  child: _buildBypassButton(showLabel: showLabel),
                 );
               },
             ),

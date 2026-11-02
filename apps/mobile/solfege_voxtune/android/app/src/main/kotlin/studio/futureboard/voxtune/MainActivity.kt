@@ -1,4 +1,4 @@
-package com.example.solfege_voxtune
+package studio.futureboard.voxtune
 
 import android.Manifest
 import android.app.Activity
@@ -73,6 +73,29 @@ class MainActivity : FlutterActivity() {
                                 micPermissionRequestCode
                             )
                         }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        // The installed build's version name (pubspec `version:` before `+`).
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "canto/app")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "version" -> result.success(
+                        packageManager.getPackageInfo(packageName, 0).versionName
+                    )
+                    else -> result.notImplemented()
+                }
+            }
+        // Google Play purchase check, and the store page to buy from.
+        val licensing = PlayLicensing(applicationContext)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "canto/license")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "check" -> licensing.check { state -> result.success(state.wire) }
+                    "openStore" -> {
+                        licensing.openStore()
+                        result.success(null)
                     }
                     else -> result.notImplemented()
                 }

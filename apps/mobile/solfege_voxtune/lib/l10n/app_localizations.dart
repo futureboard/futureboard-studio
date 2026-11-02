@@ -701,7 +701,7 @@ abstract class AppLocalizations {
   /// No description provided for @modePenta.
   ///
   /// In en, this message translates to:
-  /// **'pentatonic'**
+  /// **'minor pentatonic'**
   String get modePenta;
 
   /// No description provided for @modeTitleMinor.
@@ -719,8 +719,104 @@ abstract class AppLocalizations {
   /// No description provided for @modeTitlePenta.
   ///
   /// In en, this message translates to:
-  /// **'Pentatonic'**
+  /// **'Minor pentatonic'**
   String get modeTitlePenta;
+
+  /// No description provided for @modeHarmonicMinor.
+  ///
+  /// In en, this message translates to:
+  /// **'harmonic minor'**
+  String get modeHarmonicMinor;
+
+  /// No description provided for @modeMelodicMinor.
+  ///
+  /// In en, this message translates to:
+  /// **'melodic minor'**
+  String get modeMelodicMinor;
+
+  /// No description provided for @modeDorian.
+  ///
+  /// In en, this message translates to:
+  /// **'Dorian'**
+  String get modeDorian;
+
+  /// No description provided for @modePhrygian.
+  ///
+  /// In en, this message translates to:
+  /// **'Phrygian'**
+  String get modePhrygian;
+
+  /// No description provided for @modeLydian.
+  ///
+  /// In en, this message translates to:
+  /// **'Lydian'**
+  String get modeLydian;
+
+  /// No description provided for @modeMixolydian.
+  ///
+  /// In en, this message translates to:
+  /// **'Mixolydian'**
+  String get modeMixolydian;
+
+  /// No description provided for @modeMajorPentatonic.
+  ///
+  /// In en, this message translates to:
+  /// **'major pentatonic'**
+  String get modeMajorPentatonic;
+
+  /// No description provided for @modeBlues.
+  ///
+  /// In en, this message translates to:
+  /// **'blues'**
+  String get modeBlues;
+
+  /// No description provided for @modeTitleHarmonicMinor.
+  ///
+  /// In en, this message translates to:
+  /// **'Harmonic minor'**
+  String get modeTitleHarmonicMinor;
+
+  /// No description provided for @modeTitleMelodicMinor.
+  ///
+  /// In en, this message translates to:
+  /// **'Melodic minor'**
+  String get modeTitleMelodicMinor;
+
+  /// No description provided for @modeTitleDorian.
+  ///
+  /// In en, this message translates to:
+  /// **'Dorian'**
+  String get modeTitleDorian;
+
+  /// No description provided for @modeTitlePhrygian.
+  ///
+  /// In en, this message translates to:
+  /// **'Phrygian'**
+  String get modeTitlePhrygian;
+
+  /// No description provided for @modeTitleLydian.
+  ///
+  /// In en, this message translates to:
+  /// **'Lydian'**
+  String get modeTitleLydian;
+
+  /// No description provided for @modeTitleMixolydian.
+  ///
+  /// In en, this message translates to:
+  /// **'Mixolydian'**
+  String get modeTitleMixolydian;
+
+  /// No description provided for @modeTitleMajorPentatonic.
+  ///
+  /// In en, this message translates to:
+  /// **'Major pentatonic'**
+  String get modeTitleMajorPentatonic;
+
+  /// No description provided for @modeTitleBlues.
+  ///
+  /// In en, this message translates to:
+  /// **'Blues'**
+  String get modeTitleBlues;
 
   /// No description provided for @keyChip.
   ///
@@ -1405,6 +1501,30 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Accents notes that start on a beat, for a tighter groove'**
   String get advAccentBeatsHint;
+
+  /// No description provided for @licenseTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'This copy isn\'t licensed'**
+  String get licenseTitle;
+
+  /// No description provided for @licenseBody.
+  ///
+  /// In en, this message translates to:
+  /// **'Google Play says this account hasn\'t bought Solfege Voxtune. Get it on Google Play to keep using it. If you already bought it, open Google Play with the account you bought it with, then check again.'**
+  String get licenseBody;
+
+  /// No description provided for @licenseOpenStore.
+  ///
+  /// In en, this message translates to:
+  /// **'Open Google Play'**
+  String get licenseOpenStore;
+
+  /// No description provided for @licenseRetry.
+  ///
+  /// In en, this message translates to:
+  /// **'Check again'**
+  String get licenseRetry;
 }
 
 class _AppLocalizationsDelegate

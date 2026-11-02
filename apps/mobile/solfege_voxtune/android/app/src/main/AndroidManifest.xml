@@ -6,6 +6,8 @@
         android:maxSdkVersion="29" />
     <!-- Live recording of vocal takes. Asked the first time Record is used. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Google Play licensing: asks the Play Store whether the app was bought. -->
+    <uses-permission android:name="com.android.vending.CHECK_LICENSE" />
     <application
         android:label="Solfege Voxtune"
         android:requestLegacyExternalStorage="true"
@@ -45,6 +47,10 @@
 
          In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
     <queries>
+        <!-- The Play Store's licensing service (bound by PlayLicensing). -->
+        <intent>
+            <action android:name="com.android.vending.licensing.ILicensingService" />
+        </intent>
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>

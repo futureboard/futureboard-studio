@@ -1,7 +1,7 @@
 name: solfege_voxtune
 description: "CANTO — Mobile vocal pitch editor."
 publish_to: 'none'
-version: 1.0.0+1
+version: 2026.11.1+2
 
 environment:
   sdk: ^3.13.7

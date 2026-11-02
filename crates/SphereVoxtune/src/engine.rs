@@ -13,7 +13,7 @@ use crate::audio_io::{DecodedAudio, decode_audio_bytes_to_mono, decode_audio_fil
 use crate::dsp_core::{
     SoftKneeCompressor, StereoEffect, clamp, db_to_linear,
 };
-use crate::scale::{ALL_NOTES, Scale, nearest_target, scale_mask};
+use crate::scale::{ALL_NOTES, Scale, nearest_target, refine_scale, scale_mask};
 use crate::shifter::{Control, MAX_FORMANT, Shifter};
 use crate::stretch::Stretcher;
 use crate::voicetune::{PitchFrame, calculate_rms, hz_to_midi_cents};
@@ -326,11 +326,7 @@ impl Analysis {
             return None;
         }
         let key = KEY_NAMES.iter().position(|k| *k == result.key)? as u8;
-        let scale = match result.mode.as_str() {
-            "major" => Scale::Major,
-            "penta" => Scale::MinorPentatonic,
-            _ => Scale::Minor,
-        };
+        let scale = Scale::from_name(&result.mode).unwrap_or(Scale::Minor);
         Some(Self {
             key,
             scale,
@@ -593,11 +589,6 @@ impl CantoEngine {
     }
 
     fn analysis_result(&self) -> CantoAnalysisResult {
-        let mode_str = match self.scale {
-            Scale::Major => "major",
-            Scale::MinorPentatonic => "penta",
-            _ => "minor",
-        };
         CantoAnalysisResult {
             ok: true,
             error: None,
@@ -605,7 +596,7 @@ impl CantoEngine {
             duration_sec: self.duration_sec,
             bpm: self.bpm,
             key: KEY_NAMES[(self.key as usize) % 12].to_string(),
-            mode: mode_str.to_string(),
+            mode: self.scale.name().to_string(),
             notes: self.notes.clone(),
             waveform_peaks: self.waveform_peaks.clone(),
         }
@@ -1728,8 +1719,10 @@ fn smooth_curve_5tap(input: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Estimates musical Key (`0..11`) and Scale (`Scale::Minor` or `Scale::Major`)
-/// from voiced `PitchFrame`s using Krumhansl-Kessler profiles.
+/// Estimates musical Key (`0..11`) and Scale from voiced `PitchFrame`s: the
+/// tonic and major / minor from Krumhansl-Kessler profiles, then the scale
+/// the take actually uses (modes, harmonic / melodic minor, pentatonics,
+/// blues) from [`refine_scale`].
 fn estimate_key_and_mode(frames: &[PitchFrame]) -> (u8, Scale) {
     let mut chroma = [0.0f32; 12];
     let mut total_weight = 0.0f32;
@@ -1773,7 +1766,7 @@ fn estimate_key_and_mode(frames: &[PitchFrame]) -> (u8, Scale) {
         }
     }
 
-    (best_key, best_scale)
+    (best_key, refine_scale(&chroma, best_key, best_scale))
 }
 
 /// Estimates tempo (BPM) from the RMS onset flux autocorrelation of `frames`.

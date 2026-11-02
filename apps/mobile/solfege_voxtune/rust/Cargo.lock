@@ -37,7 +37,7 @@ checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 
 [[package]]
 name = "canto_dsp"
-version = "0.1.0"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "serde_json",
  "sphere_voxtune",
@@ -202,7 +202,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sphere_voxtune"
-version = "0.1.0"
+version = "2026.11.1-beta2.0.0"
 dependencies = [
  "biquad",
  "serde",

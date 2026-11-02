@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../cache.dart';
@@ -10,8 +11,19 @@ import '../project.dart';
 import '../theme.dart';
 import '../ui/components.dart';
 
-/// Shown in Settings → About; keep in step with `version:` in pubspec.yaml.
-const String kAppVersion = '1.0.0';
+String? _appVersion;
+
+/// The installed build's version name, read from Android through the
+/// `canto/app` channel (it comes from `version:` in pubspec.yaml). Null
+/// where the channel is missing (tests, desktop); kept once known.
+Future<String?> appVersion() async {
+  if (_appVersion != null) return _appVersion;
+  try {
+    _appVersion = await const MethodChannel('canto/app')
+        .invokeMethod<String>('version');
+  } catch (_) {}
+  return _appVersion;
+}
 
 class SettingsPage extends StatelessWidget {
   final ProjectStore store;
@@ -129,13 +141,23 @@ class SettingsPage extends StatelessWidget {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(
-                          '${l.appName} · ${l.version(kAppVersion)}',
-                          style: CantoTypography.sans(
-                            size: 13,
-                            weight: FontWeight.w600,
-                            color: CantoColors.ink,
-                          ),
+                        FutureBuilder<String?>(
+                          future: appVersion(),
+                          initialData: _appVersion,
+                          builder: (_, snapshot) {
+                            final version = snapshot.data;
+                            return Text(
+                              version == null
+                                  ? l.appName
+                                  : '${l.appName} · ${l.version(version)}',
+                              key: const Key('about-version'),
+                              style: CantoTypography.sans(
+                                size: 13,
+                                weight: FontWeight.w600,
+                                color: CantoColors.ink,
+                              ),
+                            );
+                          },
                         ),
                         const SizedBox(height: 6),
                         Text(

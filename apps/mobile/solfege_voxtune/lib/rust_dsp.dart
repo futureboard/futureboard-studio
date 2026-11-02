@@ -818,13 +818,7 @@ class RustCantoDsp {
   void setKeyMode(String keyName, String mode) {
     if (!isLoaded) return;
     final k = keyPc(keyName);
-    final m = switch (mode) {
-      'minor' => 0,
-      'major' => 1,
-      'penta' => 2,
-      _ => 3,
-    };
-    _setKeyMode(_handle, k, m);
+    _setKeyMode(_handle, k, kModeWire[mode] ?? kModeWire['chromatic']!);
   }
 
   void setCorrect(double amount) {

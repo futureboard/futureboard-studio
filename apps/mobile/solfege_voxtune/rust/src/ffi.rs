@@ -396,12 +396,8 @@ pub unsafe extern "C" fn canto_engine_set_key_mode(ptr: *mut CantoHandle, key: u
     let Some(handle) = (unsafe { ptr.as_ref() }) else {
         return;
     };
-    let scale = match mode_id {
-        0 => Scale::Minor,
-        1 => Scale::Major,
-        2 => Scale::MinorPentatonic,
-        _ => Scale::Chromatic,
-    };
+    // The scale's index in `Scale::ALL` (the app's `kModeWire`).
+    let scale = Scale::from_wire(f32::from(mode_id));
     handle.edit(|e| e.set_key_and_scale(key, scale));
 }
 

@@ -314,7 +314,14 @@ _BuiltNoteVisual _buildNoteVisual(
     0.55,
     1.35,
   );
-  final boxHalfH = clampVal(layout.pxPerSemi * 0.37 * levelScale, 6.0, 14.5);
+  // Notes keep their usual height up to ~64 px per semitone and only grow
+  // past that, when the pitch axis is zoomed in.
+  final zoomGrow = math.max(0.0, layout.pxPerSemi - 64.0) * 0.2;
+  final boxHalfH = clampVal(
+    layout.pxPerSemi * 0.37 * levelScale,
+    6.0,
+    14.5 + zoomGrow,
+  );
   final radius = math.min(boxHalfH, (x1 - x0) * 0.5);
   final blockRRect = RRect.fromRectAndRadius(
     Rect.fromLTRB(x0, centerY - boxHalfH, x1, centerY + boxHalfH),
@@ -337,7 +344,7 @@ _BuiltNoteVisual _buildNoteVisual(
       gx0 + 3.0,
       layout.timeToX(viewStart, rawNote.detectedStart + rawNote.detectedDur),
     );
-    final gHalfH = clampVal(layout.pxPerSemi * 0.34, 5.5, 13.0);
+    final gHalfH = clampVal(layout.pxPerSemi * 0.34, 5.5, 13.0 + zoomGrow);
     ghostRRect = RRect.fromRectAndRadius(
       Rect.fromLTRB(gx0, ghostCenterY - gHalfH, gx1, ghostCenterY + gHalfH),
       Radius.circular(math.min(4.0, gHalfH)),
