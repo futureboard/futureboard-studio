@@ -408,6 +408,7 @@ impl StudioLayout {
             Arc::new(move |(clip_id, value): &(String, f32), _w, cx| {
                 timeline_clip_gain_preview.update(cx, |timeline, cx| {
                     if timeline.state.set_clip_gain(clip_id, *value) {
+                        timeline.push_clip_gains_live([clip_id.as_str()], cx);
                         cx.notify();
                     }
                 });

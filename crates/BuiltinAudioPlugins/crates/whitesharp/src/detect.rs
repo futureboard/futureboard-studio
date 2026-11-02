@@ -80,6 +80,9 @@ pub struct Estimate {
     pub period: Option<f32>,
     /// 0–1: how periodic the frame is (1 − the YIN dip).
     pub clarity: f32,
+    /// The frame's RMS level in the detector's band: how loud the voice is
+    /// now, for telling a note's body from its decay.
+    pub level: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -202,17 +205,18 @@ impl Detector {
     }
 
     /// Silence or hiss: the note is over.
-    fn unvoiced(&mut self, clarity: f32) -> Estimate {
+    fn unvoiced(&mut self, clarity: f32, level: f32) -> Estimate {
         self.forget();
         Estimate {
             period: None,
             clarity,
+            level,
         }
     }
 
     /// Sound with no period found: unvoiced, but the note is kept through a
     /// frame or two of it.
-    fn lost(&mut self, clarity: f32) -> Estimate {
+    fn lost(&mut self, clarity: f32, level: f32) -> Estimate {
         self.lost += 1;
         if self.lost > LOST_HOPS {
             self.forget();
@@ -220,6 +224,7 @@ impl Detector {
         Estimate {
             period: None,
             clarity,
+            level,
         }
     }
 
@@ -267,8 +272,9 @@ impl Detector {
             self.frame[i] = x;
             energy += x * x;
         }
-        if (energy / len as f32).sqrt() < GATE || self.power_low < LOW_BAND_SHARE * self.power_all {
-            return self.unvoiced(0.0);
+        let level = (energy / len as f32).sqrt();
+        if level < GATE || self.power_low < LOW_BAND_SHARE * self.power_all {
+            return self.unvoiced(0.0, level);
         }
 
         // Difference function, then its cumulative-mean normalisation.
@@ -347,7 +353,7 @@ impl Detector {
         let tau = chosen.unwrap_or(deepest);
         let clarity = (1.0 - diff[tau]).clamp(0.0, 1.0);
         if chosen.is_none() || tau <= 1 || tau + 1 > tau_max {
-            return self.lost(clarity);
+            return self.lost(clarity, level);
         }
 
         let (a, b, c) = (diff[tau - 1], diff[tau], diff[tau + 1]);
@@ -370,6 +376,7 @@ impl Detector {
         Estimate {
             period: Some(self.refine(coarse)),
             clarity,
+            level,
         }
     }
 

@@ -456,14 +456,27 @@ impl StudioLayout {
         // the pre-studio install (see `install_loaded_session_with_handoff`).
         self.refresh_builtin_editor_sidebars(cx);
 
-        if !report.warnings.is_empty() {
-            for warning in &report.warnings {
-                eprintln!("[PluginRestore] warning: {warning}");
-            }
-            self.queue_session_load_warning_dialog(report.warnings, cx);
+        for warning in &report.warnings {
+            eprintln!("[PluginRestore] warning: {warning}");
         }
+        self.report_session_load_problems(report.warnings, cx);
 
         cx.notify();
+    }
+
+    /// After a project loads: what it refers to and cannot find goes to the
+    /// Missing Plug-ins and Files window, with the other warnings listed
+    /// under its table; with nothing missing, warnings get the message box.
+    pub(super) fn report_session_load_problems(
+        &mut self,
+        warnings: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.forget_missing_media();
+        let notes = super::missing_media_ops::missing_media_notes(&warnings);
+        if !self.show_missing_media(notes, cx) && !warnings.is_empty() {
+            self.queue_session_load_warning_dialog(warnings, cx);
+        }
     }
 
     pub(super) fn queue_session_load_warning_dialog(

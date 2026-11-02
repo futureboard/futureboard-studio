@@ -58,7 +58,9 @@ use super::export_settings::{
     FLAC_COMPRESSION_RANGE, PEAK_TARGETS_DB, TAIL_FIXED_SECONDS, TAIL_SILENCE_MAX_SECONDS,
     TAIL_SILENCE_THRESHOLD_DB,
 };
-use super::render_dialog::{open_render_dialog, RealtimeTransportHooks, RenderLaunch};
+use super::render_dialog::{
+    bypass_unloaded_bridge_inserts, open_render_dialog, RealtimeTransportHooks, RenderLaunch,
+};
 use super::ui_kit::*;
 
 // ── Window geometry ──────────────────────────────────────────────────────────
@@ -484,10 +486,37 @@ impl ExportArrangementWindow {
     /// remembered for the next time the window opens.
     fn launch_render(&mut self, job: RenderJob, window: &mut Window, cx: &mut Context<Self>) {
         let realtime = self.settings.render_mode == ExportRenderMode::Realtime;
+        // The plug-ins loaded now, not when this window opened: one that
+        // finished loading (or was reloaded) since is rendered too.
+        let bridge_sinks = self
+            .audio_engine
+            .as_ref()
+            .map(|engine| engine.plugin_bridge_sinks())
+            .unwrap_or_else(|| self.bridge_sinks.clone());
+        let mut snapshot = self.snapshot.clone();
+        let unloaded_plugins = bypass_unloaded_bridge_inserts(
+            &mut snapshot,
+            |id| bridge_sinks.contains_key(id),
+            |id| {
+                self.defaults
+                    .track_targets
+                    .iter()
+                    .find(|track| track.id == id)
+                    .map(|track| track.name.clone())
+                    .unwrap_or_else(|| {
+                        if id == crate::components::timeline::timeline_state::MASTER_TRACK_ID {
+                            "Master".to_string()
+                        } else {
+                            id.to_string()
+                        }
+                    })
+            },
+        );
         let launch = RenderLaunch {
             job,
-            snapshot: self.snapshot.clone(),
-            bridge_sinks: self.bridge_sinks.clone(),
+            snapshot,
+            bridge_sinks,
+            unloaded_plugins,
             audio_engine: self.audio_engine.clone(),
             realtime: if realtime {
                 self.realtime_hooks.clone()

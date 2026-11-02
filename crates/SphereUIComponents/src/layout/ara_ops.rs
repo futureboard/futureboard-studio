@@ -1388,6 +1388,23 @@ struct DepartedClip {
     source_pid: String,
 }
 
+/// The ARA state a new clip takes over from the clip it was made from: a
+/// split's half, a duplicate, a pasted or Alt-dragged copy. The copy has an id
+/// of its own, so the plug-in would give it an empty modification; the
+/// original's, stored with the document it lived in, is restored onto the
+/// copy instead, in whichever session the copy is built in.
+struct InheritedClip {
+    /// The copy.
+    clip: AraClipKey,
+    plugin_id: String,
+    /// The document the original's modification was stored in.
+    archive: Arc<SavedArchive>,
+    /// Archived persistent ID of the source the modification is on.
+    source_pid: String,
+    /// Archived persistent ID of the original's modification.
+    modification_pid: String,
+}
+
 /// The part of a kept-back archive whose audio is in the graph again.
 struct ReturningPart {
     /// Archived persistent IDs of the sources restored now.
@@ -1423,6 +1440,9 @@ pub struct AraState {
     /// Clips that left their session, oldest first, with the document they
     /// left (see [`Self::capture_departures`]).
     departed: Vec<DepartedClip>,
+    /// Copies waiting to take over their original's state, oldest first (see
+    /// [`Self::capture_departures`]).
+    inherited: Vec<InheritedClip>,
     /// Saved documents kept verbatim beside the live documents, and saved
     /// with the project: archives a restore did not show landed, and live
     /// documents of unconfirmed sessions whose plug-in was removed. One copy
@@ -1454,6 +1474,7 @@ impl Default for AraState {
             awaiting_media: HashSet::new(),
             deferred: HashMap::new(),
             departed: Vec::new(),
+            inherited: Vec::new(),
             orphans: Vec::new(),
             asset_fingerprints: HashMap::new(),
             generation: 0,
@@ -1532,6 +1553,7 @@ impl AraState {
         self.awaiting_media.clear();
         self.deferred.clear();
         self.departed.clear();
+        self.inherited.clear();
         self.orphans.clear();
         for (key, orphan) in saved.orphans {
             self.keep_orphan(&key, orphan);
@@ -1679,7 +1701,39 @@ impl AraState {
     /// [`Self::arrivals`]. Must run for every session before any of them
     /// syncs, so a clip moving between two tracks is stored by the one it
     /// leaves before the one it reaches is built.
-    pub fn capture_departures(&mut self, key: &AraSessionKey, on_track: &HashSet<&str>) {
+    ///
+    /// The document is stored too when a new clip anywhere in the project was
+    /// made from one this session renders: `copies` pairs each such clip with
+    /// its original (a split's halves, duplicates, pasted and Alt-dragged
+    /// copies; see `ClipLineage`). The copy has an id of its own, so it would
+    /// reach its plug-in empty; it takes over the original's modification
+    /// instead, in whichever session it is built in ([`Self::inheritances`]).
+    /// A split's original is leaving and being copied at once: one store
+    /// covers both.
+    pub fn capture_departures(
+        &mut self,
+        key: &AraSessionKey,
+        on_track: &HashSet<&str>,
+        copies: &[(AraClipKey, AraClipKey)],
+    ) {
+        let held_anywhere: HashSet<&AraClipKey> = self
+            .sessions
+            .values()
+            .flat_map(|session| session.clips.iter())
+            .collect();
+        let inheriting: Vec<(AraClipKey, AraClipKey)> = match self.sessions.get(key) {
+            Some(session) => copies
+                .iter()
+                .filter(|(copy, origin)| {
+                    session.clips.contains(origin)
+                        && !held_anywhere.contains(copy)
+                        && !self.inherited.iter().any(|held| held.clip == *copy)
+                        && !self.departed.iter().any(|held| held.clip == *copy)
+                })
+                .cloned()
+                .collect(),
+            None => return,
+        };
         let Some(session) = self.sessions.get_mut(key) else {
             return;
         };
@@ -1689,21 +1743,38 @@ impl AraState {
             .filter(|clip| !on_track.contains(clip.0.as_str()))
             .cloned()
             .collect();
-        if leaving.is_empty() {
+        if leaving.is_empty() && inheriting.is_empty() {
             return;
         }
         let stored = match session.plugin.store_archive() {
             Ok(stored) => stored,
             Err(error) => {
                 eprintln!(
-                    "[ARA] {} on {} could not store the state of {} clip(s) leaving it: {error}",
+                    "[ARA] {} on {} could not store the state of {} clip(s) leaving it and \
+                     {} copied from it: {error}",
                     session.plugin_name,
                     key.track_id,
-                    leaving.len()
+                    leaving.len(),
+                    inheriting.len()
                 );
                 return;
             }
         };
+        let inherited: Vec<(AraClipKey, String, String)> = inheriting
+            .into_iter()
+            .filter_map(|(copy, origin)| {
+                let modification = stored
+                    .identity
+                    .modifications
+                    .iter()
+                    .find(|modification| modification.clip == origin)?;
+                Some((
+                    copy,
+                    modification.source_persistent_id.clone(),
+                    modification.persistent_id.clone(),
+                ))
+            })
+            .collect();
         let departing: Vec<(AraClipKey, String)> = leaving
             .into_iter()
             .filter_map(|clip| {
@@ -1715,7 +1786,7 @@ impl AraState {
                 Some((clip, modification.source_persistent_id.clone()))
             })
             .collect();
-        if departing.is_empty() {
+        if departing.is_empty() && inherited.is_empty() {
             return;
         }
         let archive = Arc::new(SavedArchive {
@@ -1735,6 +1806,43 @@ impl AraState {
         }
         let excess = self.departed.len().saturating_sub(DEPARTED_CAPACITY);
         self.departed.drain(..excess);
+        for (clip, source_pid, modification_pid) in inherited {
+            self.inherited.push(InheritedClip {
+                clip,
+                plugin_id: key.plugin_id.clone(),
+                archive: Arc::clone(&archive),
+                source_pid,
+                modification_pid,
+            });
+        }
+        let excess = self.inherited.len().saturating_sub(DEPARTED_CAPACITY);
+        self.inherited.drain(..excess);
+    }
+
+    /// Takes out the copies that are built in this session with `graph` and
+    /// take over their original's state: bound to the same plug-in, in the
+    /// graph on the audio the original's modification is on, and not rendered
+    /// by the session yet.
+    fn inheritances(&mut self, key: &AraSessionKey, graph: &AraGraph) -> Vec<InheritedClip> {
+        let Some(session) = self.sessions.get(key) else {
+            return Vec::new();
+        };
+        let inheriting = |held: &InheritedClip| {
+            held.plugin_id == key.plugin_id
+                && !session.clips.contains(&held.clip)
+                && graph.regions.iter().any(|region| {
+                    region.key == held.clip
+                        && ara_persistent_id(region.source.as_str()) == held.source_pid.as_str()
+                })
+        };
+        if !self.inherited.iter().any(inheriting) {
+            return Vec::new();
+        }
+        let (taken, kept) = std::mem::take(&mut self.inherited)
+            .into_iter()
+            .partition(inheriting);
+        self.inherited = kept;
+        taken
     }
 
     /// Takes out the departed clips that arrive in this session with `graph`:
@@ -2175,12 +2283,15 @@ impl AraState {
         });
         let returning = self.returning_part(key, graph);
         let arriving = self.arrivals(key, graph);
+        let inheriting = self.inheritances(key, graph);
         let restore_due = parked.as_ref().is_some_and(ParkedRestore::due)
             || returning.is_some()
-            || !arriving.is_empty();
+            || !arriving.is_empty()
+            || !inheriting.is_empty();
         let Some(session) = self.sessions.get_mut(key) else {
             self.repark(key, parked.map(|parked| parked.archive));
             self.departed.extend(arriving);
+            self.inherited.extend(inheriting);
             return Err(AraHostError::invalid("ARA session disappeared mid-apply"));
         };
 
@@ -2244,6 +2355,7 @@ impl AraState {
             parked,
             returning,
             arriving,
+            inheriting,
         );
         if outcome.is_err() {
             // A failed edit must not leave the track silent until some later,
@@ -2322,6 +2434,7 @@ impl AraState {
         parked: Option<ParkedRestore>,
         returning: Option<ReturningPart>,
         arriving: Vec<DepartedClip>,
+        inheriting: Vec<InheritedClip>,
     ) -> AraResult<()> {
         // The kept-back archive restored in part here; a copy, so that a
         // failure below leaves the record exactly as it was.
@@ -2360,9 +2473,33 @@ impl AraState {
                     .map(ara_restore_plan::host_identity)
             })
             .collect();
+        // One restore per copy: each puts its original's modification onto
+        // the copy, and a request can place an archived modification only
+        // once, while a split places one on both halves.
+        let inheritance_scopes: Vec<[String; 1]> = inheriting
+            .iter()
+            .map(|held| [held.source_pid.clone()])
+            .collect();
+        let inheritance_maps: Vec<AraRestoreMap> = inheriting
+            .iter()
+            .map(|held| AraRestoreMap {
+                sources: Vec::new(),
+                modifications: vec![(held.modification_pid.clone(), held.clip.clone())],
+            })
+            .collect();
+        let inheritance_identities: Vec<_> = inheriting
+            .iter()
+            .map(|held| {
+                held.archive
+                    .written_with
+                    .as_ref()
+                    .map(ara_restore_plan::host_identity)
+            })
+            .collect();
         let Some(session) = self.sessions.get_mut(key) else {
             self.repark(key, parked.map(|parked| parked.archive));
             self.departed.extend(arriving);
+            self.inherited.extend(inheriting);
             return Err(AraHostError::invalid("ARA session disappeared mid-apply"));
         };
 
@@ -2378,6 +2515,7 @@ impl AraState {
         if let Err(error) = prepared {
             self.repark(key, parked.map(|parked| parked.archive));
             self.departed.extend(arriving);
+            self.inherited.extend(inheriting);
             return Err(error);
         }
 
@@ -2390,7 +2528,8 @@ impl AraState {
             .and_then(|parked| parked.archive.written_with.as_ref())
             .map(ara_restore_plan::host_identity);
         let parked_scope = asked.and_then(ParkedRestore::scope_now);
-        let mut requests: Vec<AraRestoreRequest<'_>> = Vec::with_capacity(2 + arrival_groups.len());
+        let mut requests: Vec<AraRestoreRequest<'_>> =
+            Vec::with_capacity(2 + arrival_groups.len() + inheriting.len());
         if let (Some(part), Some(archive)) = (returning.as_ref(), kept_back.as_ref()) {
             requests.push(AraRestoreRequest {
                 archive_id: &archive.archive_id,
@@ -2420,6 +2559,24 @@ impl AraState {
                 },
             });
         }
+        let inheritances_from = requests.len();
+        for (((held, scope), map), identity) in inheriting
+            .iter()
+            .zip(&inheritance_scopes)
+            .zip(&inheritance_maps)
+            .zip(&inheritance_identities)
+        {
+            requests.push(AraRestoreRequest {
+                archive_id: &held.archive.archive_id,
+                bytes: &held.archive.data,
+                identity: identity.as_ref(),
+                map: Some(map),
+                scope: AraRestoreScope::Sources {
+                    archived: scope,
+                    document_data: false,
+                },
+            });
+        }
         let parked_index = asked.map(|parked| {
             requests.push(AraRestoreRequest {
                 archive_id: &parked.archive.archive_id,
@@ -2445,6 +2602,7 @@ impl AraState {
                 // The graph was not applied and no restore counted.
                 self.repark(key, parked.map(|parked| parked.archive));
                 self.departed.extend(arriving);
+                self.inherited.extend(inheriting);
                 return Err(error);
             }
         };
@@ -2465,6 +2623,30 @@ impl AraState {
                     "[ARA] {plugin_name} on {}: the state of {clips} moved clip(s) did not \
                      carry over (sources {sources:?}): {}",
                     key.track_id,
+                    report
+                        .and_then(|report| report.error.as_ref())
+                        .map_or_else(|| "nothing restored".to_string(), ToString::to_string)
+                ),
+            }
+        }
+        for (index, held) in inheriting.iter().enumerate() {
+            match reports.get(inheritances_from + index) {
+                Some(report)
+                    if report.error.is_none() && report.outcome != AraRestoreOutcome::Missed =>
+                {
+                    trace(&format!(
+                        "{} took over the state of {} in {plugin_name} on {}",
+                        held.clip.as_str(),
+                        held.modification_pid,
+                        key.track_id
+                    ));
+                }
+                report => eprintln!(
+                    "[ARA] {plugin_name} on {}: {} did not take over the state of the clip it \
+                     was made from ({}): {}",
+                    key.track_id,
+                    held.clip.as_str(),
+                    held.modification_pid,
                     report
                         .and_then(|report| report.error.as_ref())
                         .map_or_else(|| "nothing restored".to_string(), ToString::to_string)
@@ -3102,6 +3284,7 @@ impl AraState {
         self.awaiting_media.clear();
         self.deferred.clear();
         self.departed.clear();
+        self.inherited.clear();
         self.orphans.clear();
         self.asset_fingerprints.clear();
         self.notices.clear();
@@ -3257,6 +3440,9 @@ mod tests {
         handle: Option<usize>,
         /// Each graph built: every restore asked for with it, in order.
         builds: Vec<Vec<Asked>>,
+        /// Every restore asked for: the archived modifications its map puts
+        /// onto other clips.
+        placed: Vec<Vec<(String, AraClipKey)>>,
         torn_down: bool,
     }
 
@@ -3289,6 +3475,7 @@ mod tests {
                 view_attached: false,
                 handle: None,
                 builds: Vec::new(),
+                placed: Vec::new(),
                 torn_down: false,
             }
         }
@@ -3346,6 +3533,12 @@ mod tests {
                     })
                     .collect(),
             );
+            script.placed.extend(restores.iter().map(|request| {
+                request
+                    .map
+                    .map(|map| map.modifications.clone())
+                    .unwrap_or_default()
+            }));
             Ok(restores
                 .iter()
                 .map(|_| {
@@ -3828,6 +4021,114 @@ mod tests {
     /// its live document at once, with a record, and the archive is kept once
     /// beside it. Nothing is known to be missing, so the user is not told.
     /// Unbinding keeps the live document too.
+    fn copies(pairs: &[(&str, &str)]) -> Vec<(AraClipKey, AraClipKey)> {
+        pairs
+            .iter()
+            .map(|(copy, origin)| (AraClipKey::from(*copy), AraClipKey::from(*origin)))
+            .collect()
+    }
+
+    fn on_track<'a>(clips: &[&'a str]) -> HashSet<&'a str> {
+        clips.iter().copied().collect()
+    }
+
+    /// The user's report: a split clip's halves opened empty in Melodyne.
+    /// Both halves get new ids, so each takes over the original's
+    /// modification, restored onto it from the document stored as the
+    /// original left, one restore per half.
+    #[test]
+    fn a_split_clip_gives_its_edits_to_both_halves() {
+        let mut state = AraState::default();
+        let key = evidence_key();
+        let script = open_fake(&mut state, &key);
+        sync(&mut state, &key, &track_graph(&[("clip-1", SOURCE)]), &[]).unwrap();
+        script.borrow_mut().stored = Some(b"edited".to_vec());
+        script.borrow_mut().stored_identity = host_record(&[("clip-1", SOURCE)]);
+
+        state.capture_departures(
+            &key,
+            &on_track(&["clip-2", "clip-3"]),
+            &copies(&[("clip-2", "clip-1"), ("clip-3", "clip-1")]),
+        );
+        sync(
+            &mut state,
+            &key,
+            &track_graph(&[("clip-2", SOURCE), ("clip-3", SOURCE)]),
+            &[],
+        )
+        .unwrap();
+
+        let script = script.borrow();
+        let build = script.builds.last().expect("the split rebuilt the graph");
+        let source = ara_persistent_id(SOURCE).into_owned();
+        assert_eq!(build.len(), 2, "one restore per half");
+        for asked in build {
+            assert_eq!(asked.data, b"edited".to_vec());
+            assert!(asked.mapped);
+            assert_eq!(asked.part, Some((vec![source.clone()], false)));
+        }
+        let original = ara_persistent_id("clip-1").into_owned();
+        let placed = &script.placed[script.placed.len() - 2..];
+        assert_eq!(
+            placed,
+            &[
+                vec![(original.clone(), AraClipKey::from("clip-2"))],
+                vec![(original, AraClipKey::from("clip-3"))],
+            ]
+        );
+    }
+
+    /// A duplicate, a pasted or an Alt-dragged copy: the original stays, and
+    /// the copy starts from its edits rather than from nothing. Once it has
+    /// them it is the session's own clip, and later syncs leave it alone.
+    #[test]
+    fn a_copy_starts_from_its_originals_edits_once() {
+        let mut state = AraState::default();
+        let key = evidence_key();
+        let script = open_fake(&mut state, &key);
+        sync(&mut state, &key, &track_graph(&[("clip-1", SOURCE)]), &[]).unwrap();
+        script.borrow_mut().stored_identity = host_record(&[("clip-1", SOURCE)]);
+        let lineage = copies(&[("clip-2", "clip-1")]);
+        let graph = track_graph(&[("clip-1", SOURCE), ("clip-2", SOURCE)]);
+
+        state.capture_departures(&key, &on_track(&["clip-1", "clip-2"]), &lineage);
+        sync(&mut state, &key, &graph, &[]).unwrap();
+        assert_eq!(
+            script.borrow().placed.last(),
+            Some(&vec![(
+                ara_persistent_id("clip-1").into_owned(),
+                AraClipKey::from("clip-2")
+            )])
+        );
+
+        let builds = script.borrow().builds.len();
+        state.capture_departures(&key, &on_track(&["clip-1", "clip-2"]), &lineage);
+        sync(&mut state, &key, &graph, &[]).unwrap();
+        let script = script.borrow();
+        assert!(
+            script.builds.len() == builds || script.builds.last().is_some_and(Vec::is_empty),
+            "nothing is restored onto the copy a second time"
+        );
+    }
+
+    /// A copy of a clip the plug-in never saw (no modification in its
+    /// document) has nothing to take over: it starts empty, as before.
+    #[test]
+    fn a_copy_of_an_unknown_clip_starts_empty() {
+        let mut state = AraState::default();
+        let key = evidence_key();
+        let script = open_fake(&mut state, &key);
+        sync(&mut state, &key, &track_graph(&[("clip-1", SOURCE)]), &[]).unwrap();
+        script.borrow_mut().stored_identity = host_record(&[]);
+
+        state.capture_departures(
+            &key,
+            &on_track(&["clip-1", "clip-2"]),
+            &copies(&[("clip-2", "clip-1")]),
+        );
+        assert!(state.inherited.is_empty());
+    }
+
     #[test]
     fn an_unconfirmed_legacy_restore_saves_the_live_document_and_keeps_the_archive_once() {
         let mut state = AraState::default();

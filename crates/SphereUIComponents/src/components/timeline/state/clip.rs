@@ -82,6 +82,93 @@ pub struct AraTrackBinding {
     pub class_id: String,
 }
 
+/// Words a copy or a split adds to the name it was made from.
+const DERIVED_SUFFIXES: [&str; 2] = ["Copy", "Split"];
+
+/// `name` without the words copying and splitting added to it: "Vocal Copy
+/// Split Copy 2" is "Vocal". A name that is nothing but such words is kept.
+fn base_name(name: &str) -> &str {
+    let mut base = name.trim_end();
+    loop {
+        // An optional number after the word ("Copy 2").
+        let without_number = base
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .trim_end();
+        let stripped = [base, without_number].into_iter().find_map(|candidate| {
+            DERIVED_SUFFIXES.iter().find_map(|suffix| {
+                let cut = candidate.len().checked_sub(suffix.len())?;
+                let (head, tail) = candidate.split_at_checked(cut)?;
+                (tail.eq_ignore_ascii_case(suffix) && head.ends_with(' ')).then(|| head.trim_end())
+            })
+        });
+        match stripped {
+            Some(head) if !head.is_empty() => base = head,
+            _ => return base,
+        }
+    }
+}
+
+/// The name a clip made from one named `name` gets: the original's name and
+/// `suffix` once. Copying a copy, or splitting a split, used to add the word
+/// again each time ("Vocal Copy Copy Copy").
+pub fn derived_clip_name(name: &str, suffix: &str) -> String {
+    format!("{} {suffix}", base_name(name))
+}
+
+/// Which clip each recently made clip was copied from: a split's halves, a
+/// duplicate, a pasted or Alt-dragged copy, newest last.
+///
+/// An ARA plug-in keeps its edits per clip id, and these clips are given new
+/// ids, so without this the copy reaches the plug-in empty and a split clip's
+/// edits are gone. The ARA sync carries the original's edits onto the copy
+/// from it (see `AraState::capture_departures`).
+///
+/// Session state, never saved, shared by every copy of the timeline state
+/// (undo snapshots included), and outside equality: it says where clips came
+/// from, not what the arrangement is.
+#[derive(Clone, Default)]
+pub struct ClipLineage(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+impl ClipLineage {
+    /// How many copies are remembered; older ones are forgotten.
+    const CAPACITY: usize = 256;
+
+    /// `copy` was made from `origin`, replacing anything said about `copy`
+    /// before (an id an undone copy had can be handed out again).
+    pub fn record(&self, copy: &str, origin: &str) {
+        let Ok(mut entries) = self.0.lock() else {
+            return;
+        };
+        entries.retain(|(held, _)| held != copy);
+        entries.push((copy.to_string(), origin.to_string()));
+        let excess = entries.len().saturating_sub(Self::CAPACITY);
+        entries.drain(..excess);
+    }
+
+    /// The clip `copy` was made from, if it is remembered.
+    pub fn origin_of(&self, copy: &str) -> Option<String> {
+        let entries = self.0.lock().ok()?;
+        entries
+            .iter()
+            .rev()
+            .find(|(held, _)| held == copy)
+            .map(|(_, origin)| origin.clone())
+    }
+}
+
+impl std::fmt::Debug for ClipLineage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self.0.lock().map_or(0, |entries| entries.len());
+        f.debug_tuple("ClipLineage").field(&count).finish()
+    }
+}
+
+impl PartialEq for ClipLineage {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClipState {
     pub id: String,
@@ -441,8 +528,12 @@ impl TimelineState {
         let mut left = self.clone_clip_for_insert(clip, left_id, clip.name.clone(), clip_start);
         left.duration_beats = left_len;
 
-        let mut right =
-            self.clone_clip_for_insert(clip, right_id, format!("{} Split", clip.name), split_beat);
+        let mut right = self.clone_clip_for_insert(
+            clip,
+            right_id,
+            derived_clip_name(&clip.name, "Split"),
+            split_beat,
+        );
         right.duration_beats = right_len;
         right.offset_beats = clip.offset_beats + left_len;
         if matches!(clip.clip_type, ClipType::Audio { .. }) {
@@ -780,7 +871,7 @@ impl TimelineState {
                 let duplicate = self.clone_clip_for_insert(
                     clip,
                     self.next_clip_id(),
-                    format!("{} Copy", clip.name),
+                    derived_clip_name(&clip.name, "Copy"),
                     start_beat,
                 );
                 return Some((track.id.clone(), duplicate));
@@ -796,6 +887,7 @@ impl TimelineState {
         name: String,
         start_beat: f32,
     ) -> ClipState {
+        self.clip_lineage.record(&id, &clip.id);
         let mut cloned = clip.clone();
         cloned.id = id;
         cloned.name = name;

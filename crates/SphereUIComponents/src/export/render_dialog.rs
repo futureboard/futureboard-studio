@@ -69,6 +69,45 @@ pub struct RenderLaunch {
     pub realtime: Option<RealtimeTransportHooks>,
     /// Pauses the studio's playback before an offline render.
     pub pause_playback: Option<Arc<dyn Fn(&mut App)>>,
+    /// Plug-ins the render goes without because none is loaded, as
+    /// "Name on Track", from [`bypass_unloaded_bridge_inserts`].
+    pub unloaded_plugins: Vec<String>,
+}
+
+/// Bypass every enabled bridged insert in `snapshot` whose id `is_loaded`
+/// says has no live plug-in behind it (no bridge sink), and name each one as
+/// "Name on Track".
+///
+/// Playback already passes such an insert through untouched — a plug-in whose
+/// file is not where the project says, or that failed to load — so a realtime
+/// render goes without it. An offline render refused instead, naming only the
+/// insert id. Bypassing it here renders what playback plays, and the names
+/// let the Render dialog say what was left out.
+pub(crate) fn bypass_unloaded_bridge_inserts(
+    snapshot: &mut EngineProjectSnapshot,
+    is_loaded: impl Fn(&str) -> bool,
+    track_name: impl Fn(&str) -> String,
+) -> Vec<String> {
+    let mut unloaded = Vec::new();
+    for track in &mut snapshot.tracks {
+        for insert in &mut track.inserts {
+            if !insert.enabled
+                || !insert.kind.eq_ignore_ascii_case("external-bridge-plugin")
+                || is_loaded(&insert.id)
+            {
+                continue;
+            }
+            insert.enabled = false;
+            let name = insert
+                .params
+                .get("displayName")
+                .and_then(|value| value.as_str())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(insert.id.as_str());
+            unloaded.push(format!("{name} on {}", track_name(&track.id)));
+        }
+    }
+    unloaded
 }
 
 enum RenderState {
@@ -135,6 +174,8 @@ pub struct RenderDialog {
     realtime: bool,
     /// What the job writes, in report order, for the running view.
     planned: Vec<PathBuf>,
+    /// Plug-ins this render goes without (see [`RenderLaunch::unloaded_plugins`]).
+    unloaded_plugins: Vec<String>,
     total_frames: u64,
     sample_rate: u32,
     state: RenderState,
@@ -170,6 +211,7 @@ impl RenderDialog {
             .map(|request| request.output_path.clone())
             .collect();
         let realtime = launch.realtime.is_some();
+        let unloaded_plugins = launch.unloaded_plugins.clone();
         // Started on the next turn: starting a realtime render reaches into the
         // studio, which must not happen from inside this window's creation.
         cx.spawn(async move |this, cx| {
@@ -184,6 +226,7 @@ impl RenderDialog {
             launch: Some(launch),
             realtime,
             planned,
+            unloaded_plugins,
             total_frames,
             sample_rate,
             state: RenderState::Starting,
@@ -571,6 +614,7 @@ impl RenderDialog {
                 i18n.tr_or("render.section.progress", "Progress"),
                 rows,
             ))
+            .children(self.unloaded_section(i18n))
             .child(form_section(
                 tr_vars_or(
                     i18n,
@@ -658,6 +702,7 @@ impl RenderDialog {
 
         body_scroll()
             .child(status_banner(tone, title, hint))
+            .children(self.unloaded_section(i18n))
             .child(form_section(
                 i18n.tr_or("export.section.summary", "Summary"),
                 summary_rows,
@@ -667,6 +712,35 @@ impl RenderDialog {
                 files,
             ))
             .into_any_element()
+    }
+
+    /// The plug-ins this render goes without, named, with why; `None` when
+    /// every plug-in is loaded.
+    fn unloaded_section(&self, i18n: I18n) -> Option<gpui::AnyElement> {
+        if self.unloaded_plugins.is_empty() {
+            return None;
+        }
+        let mut rows = vec![status_banner(
+            Colors::status_warning(),
+            tr_vars_or(
+                i18n,
+                "render.unloaded.title",
+                "{ $count } plug-in(s) not loaded, rendered bypassed",
+                &[("count", self.unloaded_plugins.len().to_string())],
+            ),
+            i18n.tr_or(
+                "render.unloaded.hint",
+                "Playback goes without these too. Their files are not where the project \
+                 says, or they failed to load. Load them from the mixer and render again \
+                 to include them.",
+            ),
+        )
+        .into_any_element()];
+        rows.extend(self.unloaded_plugins.iter().cloned().map(path_line));
+        Some(
+            form_section(i18n.tr_or("render.section.unloaded", "Not rendered"), rows)
+                .into_any_element(),
+        )
     }
 
     fn footer_running(&self, i18n: I18n, target: &Entity<Self>) -> gpui::AnyElement {

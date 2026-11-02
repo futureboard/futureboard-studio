@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use gpui::Context;
-use sphere_ara_host::AraTransportRequest;
+use sphere_ara_host::{AraClipKey, AraTransportRequest};
 
 use super::ara_graph;
 use super::ara_ops::{AraParked, AraSavedDocuments, AraSessionKey, DeferredRestore, SavedArchive};
@@ -394,21 +394,34 @@ impl StudioLayout {
             self.ara_binding_for_track(&key.track_id, cx)
                 .is_some_and(|(plugin_id, _)| plugin_id == key.plugin_id)
         });
-        // Every session that is losing a clip stores its document before any
-        // session syncs: a clip moved to another track takes its edits with
-        // it only if the track it left is stored before the one it reached is
-        // built (see `AraState::capture_departures`).
+        // Every session that is losing a clip, or whose clip was just split or
+        // copied, stores its document before any session syncs: a clip moved
+        // to another track takes its edits with it, and a copy takes over its
+        // original's, only if the track they come from is stored before the
+        // one they reach is built (see `AraState::capture_departures`).
         {
             let timeline = self.timeline.read(cx);
+            let state = &timeline.state;
+            let copies: Vec<(AraClipKey, AraClipKey)> = state
+                .tracks
+                .iter()
+                .flat_map(|track| track.clips.iter())
+                .filter_map(|clip| {
+                    let origin = state.clip_lineage.origin_of(&clip.id)?;
+                    Some((
+                        AraClipKey::from(clip.id.as_str()),
+                        AraClipKey::from(origin.as_str()),
+                    ))
+                })
+                .collect();
             for key in &keys {
-                let on_track: HashSet<&str> = timeline
-                    .state
+                let on_track: HashSet<&str> = state
                     .tracks
                     .iter()
                     .find(|track| track.id == key.track_id)
                     .map(|track| track.clips.iter().map(|clip| clip.id.as_str()).collect())
                     .unwrap_or_default();
-                self.ara.capture_departures(key, &on_track);
+                self.ara.capture_departures(key, &on_track, &copies);
             }
         }
         for key in keys {

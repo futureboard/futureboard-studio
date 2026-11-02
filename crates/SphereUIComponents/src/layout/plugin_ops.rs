@@ -5583,7 +5583,7 @@ impl StudioLayout {
         self.schedule_audio_project_sync(cx, true, source);
     }
 
-    fn registry_insert_descriptor(
+    pub(super) fn registry_insert_descriptor(
         reg: &SpherePluginHost::RegistryPlugin,
     ) -> (
         String,

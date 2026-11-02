@@ -1993,6 +1993,20 @@ impl StudioLayout {
         }
     }
 
+    /// Plays `gains` (clip id, linear gain) on the running graph now, during
+    /// a gain drag. Nothing is marked dirty: the drag's release commits the
+    /// gains, and that sync finds the engine already holding them.
+    pub(crate) fn play_clip_gains_live(&mut self, gains: &[(String, f32)]) {
+        let Some(engine) = self.audio_bridge.engine.as_ref() else {
+            return;
+        };
+        for (clip_id, gain) in gains {
+            if let Err(error) = engine.set_clip_gain(clip_id, *gain) {
+                eprintln!("[clip-gain] live gain for {clip_id} not sent: {error}");
+            }
+        }
+    }
+
     pub(crate) fn mark_engine_media_dirty(&mut self) {
         self.audio_bridge.project_dirty = true;
         self.audio_bridge.media_dirty = true;

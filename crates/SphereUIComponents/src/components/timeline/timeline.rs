@@ -216,6 +216,9 @@ pub struct Timeline {
     /// but live ARA documents have to be told.
     on_musical_context_changed: Option<TimelineProjectChangedCb>,
     on_media_changed: Option<TimelineProjectChangedCb>,
+    /// Fired on every move of a clip gain drag, with the gains the dragged
+    /// clips have now, so they are heard while the drag is still going.
+    on_clip_gain_live: Option<TimelineClipGainLiveCb>,
     on_add_track: Option<TimelineAddTrackCb>,
     on_plugin_preset_drop: Option<TimelinePluginPresetDropCb>,
     on_plugin_drag_drop: Option<TimelinePluginDragDropCb>,
@@ -595,6 +598,9 @@ pub type TimelineMidiImportPromptCb =
     std::sync::Arc<dyn Fn(&TimelineMidiImportPrompt, &mut gpui::Window, &mut gpui::App) + 'static>;
 
 pub type TimelineProjectChangedCb = std::sync::Arc<dyn Fn(&mut gpui::App) + 'static>;
+/// Clip gains to play now, as `(clip id, linear gain)`.
+pub type TimelineClipGainLiveCb =
+    std::sync::Arc<dyn Fn(Vec<(String, f32)>, &mut gpui::App) + 'static>;
 
 /// A named Studio command requested from inside the timeline.
 pub type TimelineCommandCb = std::sync::Arc<dyn Fn(&'static str, &mut gpui::App) + 'static>;

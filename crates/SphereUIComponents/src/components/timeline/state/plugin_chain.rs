@@ -781,6 +781,27 @@ impl TimelineState {
         }
     }
 
+    /// Point an insert at its plug-in's file in another place, keeping all
+    /// it has: saved state, parameters, bypass and automation. Unlike
+    /// [`Self::set_insert_plugin`], which puts a plug-in into a slot afresh.
+    /// The caller loads it from the new place. Answers whether the insert
+    /// exists.
+    pub fn relink_insert_plugin(
+        &mut self,
+        track_id: &str,
+        insert_id: &str,
+        plugin_path: std::path::PathBuf,
+    ) -> bool {
+        let Some(slot) = self
+            .insert_slots_mut(track_id)
+            .and_then(|slots| slots.iter_mut().find(|slot| slot.id == insert_id))
+        else {
+            return false;
+        };
+        slot.plugin_path = Some(plugin_path);
+        true
+    }
+
     pub fn set_insert_runtime(
         &mut self,
         track_id: &str,

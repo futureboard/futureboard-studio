@@ -1829,16 +1829,16 @@ fn byte_of_char(text: &str, index: usize) -> usize {
 }
 
 /// Shapes `text` the way a field draws it: the ambient UI font at 12 px, at
-/// `weight` when one is given.
+/// `weight` when one is given, in the field's text colour. The colour is not
+/// inherited: a window whose root sets none (Export, Render) would otherwise
+/// paint the value being edited black on the dark field.
 fn shape_field_text(
     text: &str,
     weight: Option<gpui::FontWeight>,
     window: &mut Window,
 ) -> (ShapedLine, gpui::Hsla) {
-    let (mut font, color) = {
-        let style = window.text_style();
-        (style.font(), style.color)
-    };
+    let mut font = window.text_style().font();
+    let color: gpui::Hsla = Colors::text_primary().into();
     if let Some(weight) = weight {
         font.weight = weight;
     }

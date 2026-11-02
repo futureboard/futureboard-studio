@@ -64,6 +64,7 @@ mod inspector_ops;
 mod midi_export_ops;
 mod midi_import_ops;
 mod midi_input_router;
+mod missing_media_ops;
 mod mixer_ops;
 mod stem_extract_ops;
 pub(crate) use mixer_ops::{clone_track_for_mixer, clone_track_for_mixer_summary};
@@ -1202,6 +1203,22 @@ impl StudioLayout {
                                 false,
                                 audio_transport::MIDI_EDIT_SYNC_REASON,
                             );
+                        });
+                    });
+                })));
+            });
+        }
+        {
+            let target = cx.entity().clone();
+            let _ = timeline.update(cx, |timeline, _cx| {
+                timeline.set_clip_gain_live_callback(Some(Arc::new(move |gains, cx| {
+                    // Deferred like the callbacks above: this runs inside the
+                    // Timeline's update. The gains go straight to the running
+                    // graph, which ramps to them; the release commits them.
+                    let target = target.clone();
+                    cx.defer(move |cx| {
+                        let _ = target.update(cx, |this, _cx| {
+                            this.play_clip_gains_live(&gains);
                         });
                     });
                 })));

@@ -442,10 +442,21 @@ fn project_structure_key(
             )
         })
         .collect();
+    // Nor is clip gain (see `AudioEngine::apply_clip_gain_changes`): a
+    // rebuild for it cut every sounding note and restarted every stretcher
+    // at the end of each gain drag.
+    let gains: Vec<f32> = snapshot
+        .clips
+        .iter_mut()
+        .map(|clip| std::mem::replace(&mut clip.gain, 1.0))
+        .collect();
     let value = serde_json::to_value(&*snapshot);
     snapshot.midi_clips = midi;
     for (track, parts) in snapshot.tracks.iter_mut().zip(parts) {
         track.soundfont_channels = parts;
+    }
+    for (clip, gain) in snapshot.clips.iter_mut().zip(gains) {
+        clip.gain = gain;
     }
     let mut key = format!("{output_sample_rate}:{pdc_enabled}:");
     write_canonical_json(&value.ok()?, &mut key);
@@ -2571,6 +2582,33 @@ impl EngineInner {
         })
     }
 
+    /// Set one clip's gain (linear, 0..4), live: the running graph ramps to
+    /// it over a few milliseconds, so it can follow a drag. The stored
+    /// snapshot and the graph mirror take it too, so the next sync matches
+    /// and a later rebuild keeps it. A clip not in the graph (muted, or not
+    /// built yet) is left to the next sync.
+    pub fn set_clip_gain(&self, clip_id: &str, gain: f32) -> Result<(), SphereAudioError> {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, 4.0)
+        } else {
+            return Ok(());
+        };
+        if let Some(project) = self.project.lock().as_mut() {
+            if let Some(clip) = project.clips.iter_mut().find(|clip| clip.id == clip_id) {
+                clip.gain = gain;
+            }
+        }
+        let clip_index = {
+            let mut runtime = self.runtime.lock();
+            let Some(clip_index) = runtime.clips.iter().position(|clip| clip.id == clip_id) else {
+                return Ok(());
+            };
+            runtime.update_clip_gain(clip_index, gain);
+            clip_index
+        };
+        self.send_command(EngineCommand::SetClipGain { clip_index, gain })
+    }
+
     /// Clear Listen on every channel — the Control Room returns to its
     /// selected source, normally the master bus.
     pub fn clear_all_listen(&self) -> Result<(), SphereAudioError> {
@@ -3385,6 +3423,32 @@ impl EngineInner {
         }
     }
 
+    /// Sends the running graph the gain of every clip whose gain differs
+    /// from the loaded project's.
+    ///
+    /// Clip gain is left out of the structure key, so committing a gain
+    /// drag, or undoing one, never rebuilds the graph: it reaches the clip
+    /// here, as a live command, like the drag itself did.
+    fn apply_clip_gain_changes(&self, snapshot: &EngineProjectSnapshot) {
+        let changed: Vec<(&str, f32)> = {
+            let project = self.project.lock();
+            let Some(project) = project.as_ref() else {
+                return;
+            };
+            snapshot
+                .clips
+                .iter()
+                .filter_map(|clip| {
+                    let previous = project.clips.iter().find(|c| c.id == clip.id)?;
+                    (previous.gain != clip.gain).then_some((clip.id.as_str(), clip.gain))
+                })
+                .collect()
+        };
+        for (clip_id, gain) in changed {
+            let _ = self.set_clip_gain(clip_id, gain);
+        }
+    }
+
     pub fn load_project(
         &self,
         mut snapshot: EngineProjectSnapshot,
@@ -3411,6 +3475,7 @@ impl EngineInner {
                 .engine_state
                 .store(old_state as u8, Ordering::Relaxed);
             self.apply_soundfont_channel_changes(&snapshot);
+            self.apply_clip_gain_changes(&snapshot);
             return self.replace_midi_schedule(snapshot);
         }
         // A full build from here on; until it lands, nothing matches.
@@ -5770,6 +5835,7 @@ impl EngineInner {
                 EngineCommand::SetHardwareOutputOwnership { .. } => "SetHardwareOutputOwnership",
                 EngineCommand::SetTrackListen { .. } => "SetTrackListen",
                 EngineCommand::SetTrackSpatial { .. } => "SetTrackSpatial",
+                EngineCommand::SetClipGain { .. } => "SetClipGain",
                 EngineCommand::ClearAllListen => "ClearAllListen",
                 EngineCommand::MidiPreviewNoteOn { .. } => "MidiPreviewNoteOn",
                 EngineCommand::MidiPreviewNoteOff { .. } => "MidiPreviewNoteOff",
@@ -6456,6 +6522,9 @@ where
                             params,
                         } => {
                             runtime.update_track_spatial(track_index, params);
+                        }
+                        EngineCommand::SetClipGain { clip_index, gain } => {
+                            runtime.update_clip_gain(clip_index, gain);
                         }
                         EngineCommand::SetTrackListen {
                             track_index,
@@ -8443,6 +8512,8 @@ mod routing_tests {
                 duration_samples: 8,
                 offset_seconds: 0.0,
                 gain: 1.0,
+                gain_target: 1.0,
+                gain_step: 1.0,
                 stretch: SphereAudioProcessor::StretchParams::default(),
                 speed_ratio: 1.0,
                 source_read_rate: 1.0,
@@ -8541,6 +8612,8 @@ mod routing_tests {
                 duration_samples: 8,
                 offset_seconds: 0.0,
                 gain: 1.0,
+                gain_target: 1.0,
+                gain_step: 1.0,
                 stretch: SphereAudioProcessor::StretchParams::default(),
                 speed_ratio: 1.0,
                 source_read_rate: 1.0,
@@ -8615,6 +8688,16 @@ mod routing_tests {
         let (l, r) = render(&|_| {});
         assert!(close(l, 0.4) && close(r, 0.1), "baseline {l} {r}");
 
+        // A live gain change ramps: the first sample has barely moved toward
+        // the new gain, where a step would land on it at once.
+        let (l, _) = render(&|c| {
+            c.gain_target = 0.5;
+            c.gain_step = crate::runtime::clip_gain_step(48_000);
+        });
+        assert!(l > 0.39 && l < 0.4, "gain ramp first sample {l}");
+        let (l, _) = render(&|c| c.gain_target = 0.5);
+        assert!(close(l, 0.2), "settled gain {l}");
+
         let (l, r) =
             render(&|c| c.channel_transform = SphereAudioProcessor::ChannelTransform::Swap);
         assert!(close(l, 0.1) && close(r, 0.4), "channel swap {l} {r}");
@@ -8678,6 +8761,8 @@ mod routing_tests {
                     duration_samples: 8,
                     offset_seconds: 0.0,
                     gain: 1.0,
+                    gain_target: 1.0,
+                    gain_step: 1.0,
                     stretch: SphereAudioProcessor::StretchParams::default(),
                     speed_ratio: speed,
                     source_read_rate: speed,
@@ -9417,12 +9502,48 @@ mod structure_key_tests {
         assert_ne!(key, project_structure_key(&mut single, 48_000, true));
     }
 
+    /// Clip gain is applied live (`SetClipGain`), so a gain change leaves the
+    /// key alone and the gains are put back; anything else about the clip
+    /// still changes it.
+    #[test]
+    fn clip_gain_is_left_out_of_the_key() {
+        let clip = |gain: f32, start_beat: f64| crate::types::EngineClipSnapshot {
+            id: "clip-1".to_string(),
+            track_id: "audio".to_string(),
+            asset_id: "asset-1".to_string(),
+            media_path: Some("take.wav".to_string()),
+            start_beat,
+            duration_beats: 4.0,
+            offset_seconds: 0.0,
+            gain,
+            muted: false,
+            ara_rendered: false,
+            fades: None,
+            stretch: Default::default(),
+            audio_process: None,
+        };
+        let mut a = snapshot(120.0, &[]);
+        a.clips.push(clip(1.0, 0.0));
+        let key = project_structure_key(&mut a, 48_000, true);
+
+        let mut louder = snapshot(120.0, &[]);
+        louder.clips.push(clip(1.4, 0.0));
+        assert_eq!(key, project_structure_key(&mut louder, 48_000, true));
+        assert_eq!(louder.clips[0].gain, 1.4, "the gain is put back");
+
+        let mut moved = snapshot(120.0, &[]);
+        moved.clips.push(clip(1.0, 2.0));
+        assert_ne!(key, project_structure_key(&mut moved, 48_000, true));
+    }
+
     /// Insert params are a `HashMap`: the same entries in another order must
     /// give the same key.
     #[test]
     fn object_key_order_does_not_change_the_key() {
-        let one: serde_json::Value = serde_json::from_str(r#"{"b":1,"a":{"y":2,"x":[3,{"q":4,"p":5}]}}"#).unwrap();
-        let two: serde_json::Value = serde_json::from_str(r#"{"a":{"x":[3,{"p":5,"q":4}],"y":2},"b":1}"#).unwrap();
+        let one: serde_json::Value =
+            serde_json::from_str(r#"{"b":1,"a":{"y":2,"x":[3,{"q":4,"p":5}]}}"#).unwrap();
+        let two: serde_json::Value =
+            serde_json::from_str(r#"{"a":{"x":[3,{"p":5,"q":4}],"y":2},"b":1}"#).unwrap();
         let (mut left, mut right) = (String::new(), String::new());
         write_canonical_json(&one, &mut left);
         write_canonical_json(&two, &mut right);

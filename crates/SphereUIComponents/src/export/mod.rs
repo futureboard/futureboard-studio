@@ -9,6 +9,7 @@ mod export_window;
 mod render_dialog;
 mod ui_kit;
 
+pub(crate) use export_settings::sanitize_file_stem;
 pub use export_settings::{
     ExportChannelMode, ExportChannelPreset, ExportEstimate, ExportNormalizeChoice,
     ExportProjectDefaults, ExportRangeChoice, ExportRenderMode, ExportSampleRateChoice,
@@ -17,7 +18,6 @@ pub use export_settings::{
 pub use export_window::{
     open_export_arrangement_window, ExportArrangementWindow, ExportIntent, EXPORT_WINDOW_WIDTH,
 };
-pub(crate) use export_settings::sanitize_file_stem;
 pub(crate) use render_dialog::BridgeSinkHandoff;
 pub use render_dialog::{RealtimeTransportHooks, RenderDialog};
 
@@ -124,6 +124,41 @@ mod tests {
         let mut s = ExportSettings::default();
         s.output_path = Some(std::env::temp_dir().join("fb-export-test.wav"));
         s
+    }
+
+    #[test]
+    fn a_render_bypasses_and_names_the_plugins_that_are_not_loaded() {
+        use DirectAudio::types::EngineInsertSnapshot;
+        let insert = |id: &str, kind: &str, name: &str, enabled: bool| EngineInsertSnapshot {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            enabled,
+            params: [("displayName".to_string(), serde_json::json!(name))]
+                .into_iter()
+                .collect(),
+            state: None,
+        };
+        let mut snapshot = snapshot_with_content(0.0);
+        snapshot.tracks[0].inserts = vec![
+            insert("loaded", "external-bridge-plugin", "RVox", true),
+            insert("missing", "external-bridge-plugin", "Saturn 2", true),
+            insert("off", "external-bridge-plugin", "Pro-Q", false),
+            insert("builtin", "eq", "EQ", true),
+        ];
+
+        let unloaded = render_dialog::bypass_unloaded_bridge_inserts(
+            &mut snapshot,
+            |id| id == "loaded",
+            |id| format!("<{id}>"),
+        );
+
+        assert_eq!(unloaded, vec!["Saturn 2 on <track-1>".to_string()]);
+        let enabled: Vec<bool> = snapshot.tracks[0]
+            .inserts
+            .iter()
+            .map(|insert| insert.enabled)
+            .collect();
+        assert_eq!(enabled, vec![true, false, false, true]);
     }
 
     #[test]

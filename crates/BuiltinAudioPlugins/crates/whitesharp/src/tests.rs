@@ -880,3 +880,164 @@ fn an_input_type_change_does_not_step() {
         );
     }
 }
+
+/// Sings `hz(t)` at level `amp(t)` and hands each sample's time and the DSP
+/// to `probe`, for reading the correction as it is decided.
+fn sing_probed(
+    dsp: &mut Dsp,
+    seconds: f32,
+    hz: impl Fn(f32) -> f32,
+    amp: impl Fn(f32) -> f32,
+    mut probe: impl FnMut(f32, &Dsp),
+) {
+    let frames = (SR * seconds) as usize;
+    let mut phase = 0.0f32;
+    for n in 0..frames {
+        let t = n as f32 / SR;
+        phase = (phase + hz(t) / SR).fract();
+        let x = (1..5)
+            .map(|k| (std::f32::consts::TAU * phase * k as f32).sin() / k as f32)
+            .sum::<f32>()
+            * 0.25
+            * amp(t);
+        let (l, r) = dsp.process_stereo(x, x);
+        assert!(l.is_finite() && r.is_finite(), "non-finite at {n}");
+        probe(t, dsp);
+    }
+}
+
+/// A note's tail keeps its own pitch: once the voice is decaying, the
+/// correction lets go as it falls instead of tuning the fall-off (and then
+/// stepping back to the raw pitch the moment the voice goes unvoiced).
+#[test]
+fn a_decaying_tail_is_let_go_of() {
+    let mut params = default_params();
+    params.retune_ms = 0.0;
+    let mut dsp = dsp_with(params);
+    // 30 cents sharp, held, then dying away at 40 dB a second.
+    let decay_from = 0.8;
+    let mut body = Vec::new();
+    let mut tail = Vec::new();
+    sing_probed(
+        &mut dsp,
+        1.5,
+        |_| hz_of(69.3),
+        |t| {
+            if t < decay_from {
+                1.0
+            } else {
+                10f32.powf(-40.0 * (t - decay_from) / 20.0)
+            }
+        },
+        |t, dsp| {
+            if (0.4..decay_from).contains(&t) {
+                body.push(dsp.correction);
+            } else if (decay_from + 0.55..decay_from + 0.65).contains(&t) {
+                tail.push(dsp.correction);
+            }
+        },
+    );
+    let body = body.iter().sum::<f32>() / body.len() as f32;
+    let tail = tail.iter().map(|c| c.abs()).fold(0.0f32, f32::max);
+    assert!((body + 30.0).abs() < 3.0, "the body is corrected: {body}");
+    assert!(tail < 3.0, "the tail is left as sung: {tail}");
+}
+
+/// A phrase's head keeps its own pitch for its first moments, even at the
+/// fastest retune: the correction eases in over the onset.
+#[test]
+fn a_phrase_onset_eases_in() {
+    let mut params = default_params();
+    params.retune_ms = 0.0;
+    let mut dsp = dsp_with(params);
+    let mut first: Option<f32> = None;
+    let mut settled = Vec::new();
+    let mut voiced_at: Option<f32> = None;
+    sing_probed(
+        &mut dsp,
+        0.6,
+        |_| hz_of(69.3),
+        |_| 1.0,
+        |t, dsp| {
+            if dsp.voiced_for > 0.0 {
+                let since = *voiced_at.get_or_insert(t);
+                if first.is_none() {
+                    first = Some(dsp.correction);
+                }
+                if t - since > 0.2 {
+                    settled.push(dsp.correction);
+                }
+            }
+        },
+    );
+    let first = first.expect("the voice was tracked");
+    assert!(first.abs() < 3.0, "the attack is tuned at once: {first}");
+    let settled = settled.iter().sum::<f32>() / settled.len() as f32;
+    assert!(
+        (settled + 30.0).abs() < 2.0,
+        "the note is not reached: {settled}"
+    );
+}
+
+/// Flex-Tune judges the note by its centre, not by where its vibrato swings:
+/// a note in tune at heart with a wide vibrato is corrected steadily instead
+/// of the correction cutting in and out with every swing.
+#[test]
+fn flex_tune_does_not_cut_in_and_out_with_the_vibrato() {
+    let mut params = default_params();
+    params.retune_ms = 0.0;
+    params.flex_tune = 100.0;
+    let mut dsp = dsp_with(params);
+    let mut strengths = Vec::new();
+    sing_probed(
+        &mut dsp,
+        1.5,
+        // 5 cents sharp at heart, swinging 60 cents either way at 5.5 Hz.
+        |t| hz_of(69.05 + 0.6 * (std::f32::consts::TAU * 5.5 * t).sin()),
+        |_| 1.0,
+        |t, dsp| {
+            if t > 0.5 {
+                strengths.push(dsp.strength);
+            }
+        },
+    );
+    let weakest = strengths.iter().copied().fold(1.0f32, f32::min);
+    assert!(weakest > 0.85, "the correction dropped to {weakest}");
+}
+
+/// Humanize leaves a held note a little of its own drift and relaxes its
+/// retune, but still brings a clearly off note onto pitch: it is no longer
+/// a quarter of a second of lag on every held note.
+#[test]
+fn humanize_relaxes_held_notes_without_leaving_them_off() {
+    let mut params = default_params();
+    params.retune_ms = 20.0;
+    params.humanize = 100.0;
+
+    // 20 cents flat, held: arrives anyway.
+    let mut dsp = dsp_with(params.clone());
+    let out = sing(&mut dsp, 1.6, |_| hz_of(68.8));
+    let latency = dsp.latency_samples() as f32 / SR;
+    let late = pitch_of(&out, latency + 1.1, latency + 1.5);
+    assert!((late - 69.0).abs() < 0.04, "held note left at {late}");
+
+    // 5 cents sharp, held: most of that drift is the singer's to keep.
+    let mut dsp = dsp_with(params);
+    let mut held = Vec::new();
+    sing_probed(
+        &mut dsp,
+        1.2,
+        |_| hz_of(69.05),
+        |_| 1.0,
+        |t, dsp| {
+            if t > 0.9 {
+                held.push(dsp.correction);
+            }
+        },
+    );
+    let held = held.iter().sum::<f32>() / held.len() as f32;
+    assert!(
+        (-4.0..-1.0).contains(&held),
+        "a 5-cent drift corrected by {held}"
+    );
+}

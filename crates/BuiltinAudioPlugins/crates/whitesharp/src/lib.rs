@@ -9,10 +9,14 @@
 //! ```
 //!
 //! Every few milliseconds the detector measures the voice's period. The note
-//! it is pulled to is the nearest one the key and scale allow; how fast the
-//! pitch gets there is the retune speed (zero is the hard, stepped effect),
-//! slowed by Humanize on held notes; Flex-Tune lets expressive notes that
-//! stray far from any target alone. The correction then drives a
+//! it is pulled to is the nearest one the key and scale allow to the voice's
+//! centre (its pitch without the vibrato, `centre`); how fast the pitch gets
+//! there is the retune speed (zero is the hard, stepped effect), relaxed by
+//! Humanize on held notes, which also keep a little drift of their own;
+//! Flex-Tune lets notes whose centre strays far from any target alone. A
+//! phrase's head eases into the correction and a decaying note's tail is let
+//! go of, so the attack's scoop and the fall-off stay as sung. The
+//! correction then drives a
 //! pitch-synchronous shifter that keeps the voice's formants — or, with
 //! formant correction off, moves them with the pitch — and Throat lengthens
 //! or shortens the vocal tract on top. Classic mode swaps that response for
@@ -34,6 +38,7 @@ use builtin_dsp_core::{
 };
 use serde::{Deserialize, Serialize};
 
+mod centre;
 pub mod detect;
 pub mod ipc;
 pub mod presets;
@@ -47,6 +52,7 @@ pub use ipc::{UI_PARAM_IDS, ui_param_id, ui_param_index};
 pub use presets::{FactoryPreset, factory_presets};
 pub use scale::{NOTE_NAMES, Scale, scale_mask};
 
+use centre::Centre;
 use detect::{Detector, Estimate};
 use scale::{ALL_NOTES, nearest_target, pitch_class};
 use shifter::{Control, MAX_FORMANT, Shifter};
@@ -57,10 +63,42 @@ pub const PLUGIN_ID: &str = "futureboard.whitesharp";
 
 /// Longest Retune Speed, in milliseconds.
 pub const MAX_RETUNE_MS: f32 = 400.0;
-/// How much Humanize at 100 % slows the retune of a long-held note.
-const HUMANIZE_MS: f32 = 350.0;
-/// How long a note must be held before Humanize slows it fully.
+/// A note held this long starts to count as held for Humanize; a shorter
+/// one keeps the retune speed as it is.
+const HUMANIZE_FROM_MS: f32 = 120.0;
+/// ...and counts as fully held from here.
 const HUMANIZE_HOLD_MS: f32 = 400.0;
+/// Humanize at 100 % makes a held note's retune this many times slower...
+const HUMANIZE_SLOWDOWN: f32 = 3.0;
+/// ...plus this, so that a zero retune speed relaxes on held notes too.
+const HUMANIZE_MS: f32 = 60.0;
+/// Humanize at 100 % leaves a held note this much drift of its own, in cents.
+const HUMANIZE_DRIFT_CENTS: f32 = 8.0;
+/// Flex-Tune's zone at its lowest and highest settings, in cents: full
+/// correction within the first number of the target, none past the sum.
+const FLEX_INNER_CENTS: (f32, f32) = (50.0, 15.0);
+const FLEX_FADE_CENTS: (f32, f32) = (50.0, 25.0);
+/// A phrase's first moments keep their own pitch: correction eases in over
+/// this from its first voiced estimate, so the scoop into the note and the
+/// consonant into the vowel are not tuned.
+const ONSET_MS: f32 = 60.0;
+/// A note whose level falls faster than this (dB a second)...
+const RELEASE_SLOPE_DB: f32 = -20.0;
+/// ...and is this far under the phrase's peak is decaying: its correction
+/// lets go as it falls...
+const RELEASE_FROM_DB: f32 = 6.0;
+/// ...and is gone this far under the peak, so a note's tail falls as sung.
+const RELEASE_TO_DB: f32 = 18.0;
+/// A level rising this fast (dB a second) is a note sung again: it is
+/// corrected again.
+const REATTACK_SLOPE_DB: f32 = 15.0;
+/// How fast the phrase's peak level falls back, in dB a second, so a phrase
+/// sung louder or softer is followed.
+const PEAK_FALL_DB: f32 = 6.0;
+/// The level's slope is smoothed over this.
+const SLOPE_MS: f32 = 30.0;
+/// The correction's strength (Flex-Tune, onset, release) moves this smoothly.
+const STRENGTH_MS: f32 = 25.0;
 /// The natural vibrato is what the pitch does above this rate.
 const VIBRATO_SPLIT_HZ: f32 = 3.0;
 /// A voice silent this long starts its next note uncorrected.
@@ -419,10 +457,11 @@ struct Tuning {
     threshold: f32,
     reference_hz: f32,
     retune_ms: f32,
-    humanize_ms: f32,
-    /// Flex-Tune's zone: full correction within `inner` cents of the
-    /// target, none beyond `outer`.
+    /// Flex-Tune's zone: full correction while the note's centre is within
+    /// `inner` cents of the target, none beyond `outer`.
     flex: Option<(f32, f32)>,
+    /// Humanize, 0-1.
+    humanize: f32,
     vibrato_extra: f32,
     transpose_cents: f32,
     preserve_formants: bool,
@@ -443,15 +482,16 @@ struct Tuning {
 impl Tuning {
     fn resolve(p: &Params) -> Self {
         let flex = clamp(p.flex_tune / 100.0, 0.0, 1.0);
-        let inner = 15.0 + (1.0 - flex) * 585.0;
+        let lerp = |(from, to): (f32, f32)| from + (to - from) * flex;
+        let inner = lerp(FLEX_INNER_CENTS);
         Self {
             allowed: p.allowed_notes(),
             bypass: p.bypass_mask & ALL_NOTES,
             threshold: 0.06 + 0.24 * clamp(p.tracking / 100.0, 0.0, 1.0),
             reference_hz: 440.0 * 2f32.powf(clamp(p.detune, -100.0, 100.0) / 1_200.0),
             retune_ms: clamp(p.retune_ms, 0.0, MAX_RETUNE_MS),
-            humanize_ms: clamp(p.humanize / 100.0, 0.0, 1.0) * HUMANIZE_MS,
-            flex: (flex > 0.0).then_some((inner, inner + 25.0)),
+            flex: (flex > 0.0).then_some((inner, inner + lerp(FLEX_FADE_CENTS))),
+            humanize: clamp(p.humanize / 100.0, 0.0, 1.0),
             vibrato_extra: db_to_linear(clamp(p.vibrato_db, -12.0, 12.0)) - 1.0,
             transpose_cents: clamp(p.transpose.round(), -24.0, 24.0) * 100.0,
             preserve_formants: p.formant,
@@ -469,6 +509,13 @@ impl Tuning {
             live: p.latency == LatencyMode::Live,
         }
     }
+}
+
+/// 0 below 0, 1 above 1, and an S-curve between: a soft knee.
+#[inline]
+fn smoothstep(x: f32) -> f32 {
+    let x = clamp(x, 0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
 }
 
 /// MIDI note number of `hz` against an A of `reference_hz`.
@@ -513,8 +560,26 @@ pub struct Dsp {
     silent: f32,
     /// The correction applied now, in cents.
     correction: f32,
+    /// Voiced since the phrase began, in seconds.
+    voiced_for: f32,
+    /// The phrase's peak level, in dB, falling back slowly.
+    peak_db: Option<f32>,
+    /// The last estimate's level, in dB, and the level's smoothed slope in
+    /// dB a second.
+    level_db: f32,
+    slope_db: f32,
+    slope_step: f32,
+    /// The note is decaying: its correction is letting go.
+    releasing: bool,
+    /// How much of the correction is applied, 0-1: Flex-Tune, the onset and
+    /// the release together, smoothed.
+    strength: f32,
+    strength_step: f32,
     /// The pitch's slow part, which the vibrato rides on.
     slow_pitch: Option<f32>,
+    /// The voice's centre pitch through the phrase, which the target and
+    /// Flex-Tune judge it by.
+    centre: Centre,
     vibrato_step: f32,
     /// The created vibrato: its phase in cycles, and this cycle's rate and
     /// depth factors.
@@ -559,7 +624,16 @@ impl Dsp {
             held: 0.0,
             silent: 0.0,
             correction: 0.0,
+            voiced_for: 0.0,
+            peak_db: None,
+            level_db: 0.0,
+            slope_db: 0.0,
+            slope_step: 1.0 - (-hop_seconds * 1_000.0 / SLOPE_MS).exp(),
+            releasing: false,
+            strength: 0.0,
+            strength_step: 1.0 - (-hop_seconds * 1_000.0 / STRENGTH_MS).exp(),
             slow_pitch: None,
+            centre: Centre::new(hop_seconds),
             vibrato_step: 1.0 - (-std::f32::consts::TAU * VIBRATO_SPLIT_HZ * hop_seconds).exp(),
             vibrato_phase: 0.0,
             vibrato_rate_factor: 1.0,
@@ -686,6 +760,18 @@ impl Dsp {
         self.target = None;
         self.correction = 0.0;
         self.slow_pitch = None;
+        self.end_phrase();
+    }
+
+    /// The phrase is over: the next voiced estimate starts a new one, with
+    /// its own onset and peak.
+    fn end_phrase(&mut self) {
+        self.centre.clear();
+        self.voiced_for = 0.0;
+        self.peak_db = None;
+        self.slope_db = 0.0;
+        self.releasing = false;
+        self.strength = 0.0;
     }
 
     /// One estimate's worth of correction: the target, the smoothed pull
@@ -699,8 +785,10 @@ impl Dsp {
             if self.silent * 1_000.0 >= RELEASE_MS {
                 self.target = None;
                 self.correction = 0.0;
+                self.end_phrase();
             }
             self.slow_pitch = None;
+            self.centre.clear();
             self.vibrato_phase = 0.0;
             let control = Control {
                 centre,
@@ -720,9 +808,13 @@ impl Dsp {
         let midi = midi_of(self.sample_rate / period, t.reference_hz);
 
         // Classic snaps to whichever note is nearest now; the modern response
-        // holds a note until the voice is clearly past the boundary.
+        // holds a note until the voice is clearly past the boundary, and
+        // judges it by the voice's centre (see `centre`), so a wide vibrato
+        // does not flip the target with every swing.
+        let centre_pitch = self.centre.push(midi);
         let held_note = if t.classic { None } else { self.target };
-        let target = nearest_target(midi, t.allowed, held_note);
+        let heard = if t.classic { midi } else { centre_pitch };
+        let target = nearest_target(heard, t.allowed, held_note);
         let new_note = target != self.target;
         if new_note {
             self.held = 0.0;
@@ -740,16 +832,21 @@ impl Dsp {
         let vibrato = clamp(midi - slow, -2.0, 2.0);
 
         let corrected = target.filter(|note| t.bypass & (1 << pitch_class(*note)) == 0);
+        let strength = self.strength_now(estimate.level, corrected, centre_pitch);
+        let hold = smoothstep(
+            (self.held * 1_000.0 - HUMANIZE_FROM_MS) / (HUMANIZE_HOLD_MS - HUMANIZE_FROM_MS),
+        );
         let desired = match corrected {
             Some(note) => {
-                let cents = (note as f32 - midi) * 100.0;
-                let weight = match t.flex.filter(|_| !t.classic) {
-                    Some((inner, outer)) => {
-                        clamp((outer - cents.abs()) / (outer - inner), 0.0, 1.0)
-                    }
-                    None => 1.0,
-                };
-                cents * weight
+                let mut cents = (note as f32 - midi) * 100.0;
+                // Humanize leaves a held note a little drift of its own: a
+                // deviation within it is mostly kept, one past it corrected
+                // in full, with no step between.
+                let drift = HUMANIZE_DRIFT_CENTS * t.humanize * hold;
+                if !t.classic && drift > 0.0 && cents.abs() < drift {
+                    cents *= cents.abs() / drift;
+                }
+                cents * strength
             }
             None => 0.0,
         };
@@ -762,8 +859,10 @@ impl Dsp {
             };
             self.correction += clamp(desired - self.correction, -step, step);
         } else {
-            let hold = clamp(self.held * 1_000.0 / HUMANIZE_HOLD_MS, 0.0, 1.0);
-            let tau_ms = t.retune_ms + t.humanize_ms * hold;
+            // Humanize slows only held notes, in step with the retune speed:
+            // a short note keeps it, a held one relaxes.
+            let relax = t.humanize * hold;
+            let tau_ms = t.retune_ms + relax * (t.retune_ms * HUMANIZE_SLOWDOWN + HUMANIZE_MS);
             let pull = if tau_ms <= 0.0 {
                 1.0
             } else {
@@ -799,6 +898,62 @@ impl Dsp {
             output: Some(midi + cents / 100.0),
             target: target.map(|note| note + (t.transpose_cents / 100.0) as i32),
         });
+    }
+
+    /// How much of the correction applies to this estimate, 0-1, smoothed:
+    /// Flex-Tune's weight for how far the voice's `centre` (its pitch
+    /// without the vibrato) sits from `target`, eased in over the phrase's
+    /// onset and let go through a note's decay. Classic takes no Flex-Tune
+    /// and no onset.
+    fn strength_now(&mut self, level: f32, target: Option<i32>, centre: f32) -> f32 {
+        let t = self.tuning;
+        let hop = self.hop_seconds;
+        let level_db = 20.0 * level.max(1.0e-6).log10();
+        let fresh = self.voiced_for == 0.0;
+        if !fresh {
+            let slope = (level_db - self.level_db) / hop;
+            self.slope_db += (slope - self.slope_db) * self.slope_step;
+        }
+        self.level_db = level_db;
+        self.voiced_for += hop;
+        let peak = match self.peak_db {
+            Some(peak) => (peak - PEAK_FALL_DB * hop).max(level_db),
+            None => level_db,
+        };
+        self.peak_db = Some(peak);
+        let below = peak - level_db;
+        if self.releasing {
+            if self.slope_db > REATTACK_SLOPE_DB {
+                self.releasing = false;
+                self.peak_db = Some(level_db);
+            }
+        } else if self.slope_db < RELEASE_SLOPE_DB && below > RELEASE_FROM_DB {
+            self.releasing = true;
+        }
+        let release = if self.releasing {
+            1.0 - smoothstep((below - RELEASE_FROM_DB) / (RELEASE_TO_DB - RELEASE_FROM_DB))
+        } else {
+            1.0
+        };
+        let onset = if t.classic {
+            1.0
+        } else {
+            smoothstep(self.voiced_for * 1_000.0 / ONSET_MS)
+        };
+        let flex = match (t.flex.filter(|_| !t.classic), target) {
+            (Some((inner, outer)), Some(note)) => {
+                let off = ((note as f32 - centre) * 100.0).abs();
+                1.0 - smoothstep((off - inner) / (outer - inner))
+            }
+            _ => 1.0,
+        };
+        let wanted = flex * onset * release;
+        self.strength = if fresh {
+            wanted
+        } else {
+            self.strength + (wanted - self.strength) * self.strength_step
+        };
+        self.strength
     }
 
     /// Runs whichever path the latency mode plays — both while one fades
@@ -922,6 +1077,7 @@ impl StereoEffect for Dsp {
         self.held = 0.0;
         self.silent = 0.0;
         self.vibrato_phase = 0.0;
+        self.end_phrase();
     }
 
     fn set_sample_rate(&mut self, sample_rate: f32) {

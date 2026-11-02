@@ -228,6 +228,12 @@ pub fn scenes() -> Vec<Scene> {
             open: deesser_scene,
         },
         Scene {
+            name: "missing-media",
+            width: crate::components::missing_media_window::MISSING_MEDIA_WINDOW_WIDTH,
+            height: crate::components::missing_media_window::MISSING_MEDIA_WINDOW_HEIGHT,
+            open: missing_media_scene,
+        },
+        Scene {
             name: "deesser-wide",
             width: plate::WINDOW_SIZE.0,
             height: plate::WINDOW_SIZE.1,
@@ -462,6 +468,12 @@ pub fn scenes() -> Vec<Scene> {
             open: mixer::mixer,
         },
         Scene {
+            name: "audio-clips",
+            width: 1_100.0,
+            height: 260.0,
+            open: audio_clips_scene,
+        },
+        Scene {
             name: "mixer-wide",
             width: 1_880.0,
             height: 760.0,
@@ -545,6 +557,90 @@ fn seed(plugin: &str, insert: &str, json: String) {
 }
 
 // ── WhiteSharp ─────────────────────────────────────────────────────────────
+
+/// A project opened on another machine: a CLAP the scan found under another
+/// folder, takes on a drive that is not there, one take already relinked,
+/// and a plug-in that is there but would not load.
+fn missing_media_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    use crate::components::missing_media_window::{
+        MissingKind, MissingMediaCallbacks, MissingMediaWindow, MissingRow, MissingStatus,
+    };
+    let row =
+        |id: &str, kind, name: &str, detail: &str, used_on: &str, path: &str, status| MissingRow {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            detail: detail.to_string(),
+            used_on: used_on.to_string(),
+            path: path.to_string(),
+            status,
+            installed_at: None,
+        };
+    let rows = vec![
+        MissingRow {
+            installed_at: Some(
+                r"C:\Program Files\Common Files\CLAP\FabFilter Saturn 2.clap".to_string(),
+            ),
+            ..row(
+                "plugin:saturn",
+                MissingKind::Plugin,
+                "Saturn 2",
+                "CLAP",
+                "har b",
+                r"C:\Program Files\Common Files\CLAP\FabFilter\FabFilter Saturn 2.clap",
+                MissingStatus::Missing,
+            )
+        },
+        row(
+            "plugin:kontakt",
+            MissingKind::Plugin,
+            "Kontakt 8",
+            "VST3",
+            "guitar strum",
+            r"C:\Program Files\Common Files\VST3\Kontakt 8.vst3",
+            MissingStatus::Failed("The plug-in refused the sample rate".to_string()),
+        ),
+        row(
+            "audio:vocal",
+            MissingKind::Audio,
+            "Vocal Take 3.wav",
+            "WAV",
+            "main, har · 4 clips",
+            r"D:\Sessions\011169\Recordings\Vocal Take 3.wav",
+            MissingStatus::Missing,
+        ),
+        row(
+            "audio:ad",
+            MissingKind::Audio,
+            "ad lib.wav",
+            "WAV",
+            "ad",
+            r"D:\Sessions\011169\Recordings\ad lib.wav",
+            MissingStatus::Missing,
+        ),
+        row(
+            "audio:guitar",
+            MissingKind::Audio,
+            "Guitar DI.flac",
+            "FLAC",
+            "Audio Track 1",
+            r"C:\Users\Studio\Music\011169\Guitar DI.flac",
+            MissingStatus::Found,
+        ),
+    ];
+    let collect_rows = rows.clone();
+    let callbacks = MissingMediaCallbacks {
+        collect: Arc::new(move |_cx: &mut App| collect_rows.clone()),
+        relocate: Arc::new(|_row: &str, _window: &mut Window, _cx: &mut App| {}),
+        use_installed: Arc::new(|_row: &str, _window: &mut Window, _cx: &mut App| {}),
+        search_folder: Arc::new(|_window: &mut Window, _cx: &mut App| {}),
+    };
+    let notes = vec!["Timed out restoring Kontakt 8 on guitar strum after 120s".to_string()];
+    let handle = cx.open_window(options, move |_, cx| {
+        cx.new(|cx| MissingMediaWindow::new(rows, callbacks, notes, cx))
+    })?;
+    Ok(handle.into())
+}
 
 fn whitesharp_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
     whitesharp_window(
@@ -1068,6 +1164,203 @@ fn mixstation_empty(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHan
 }
 
 // ── Inspector MIDI Input menu ───────────────────────────────────────────────
+
+// ── Audio clips ─────────────────────────────────────────────────────────────
+
+/// One track's audio clips at three row heights, as the arrangement draws
+/// them: a selected take with fades, a copy raised 3 dB, a short one cut
+/// 6 dB, and a breath too narrow for a label. The waveform is a synthetic
+/// phrase installed in the peak cache, so no file is read.
+struct AudioClipsPreview {
+    state: crate::components::timeline::timeline_state::TimelineState,
+}
+
+const AUDIO_CLIP_ROWS: [f32; 3] = [96.0, 64.0, 40.0];
+
+impl AudioClipsPreview {
+    fn new() -> Self {
+        use crate::components::timeline::timeline_state::{
+            AudioClipStretchState, AudioImportState, ClipState, ClipType, TimelineState,
+        };
+        use crate::components::timeline::waveform_cache::{
+            install_ready, WaveformLod, WaveformPeak, WaveformPreview, LOD_LEVELS,
+        };
+        const RATE: u32 = 48_000;
+        const SECONDS: f64 = 24.0;
+        let frames = (SECONDS * RATE as f64) as u64;
+
+        // A sung phrase: syllables swelling and dying away, with breaths.
+        let fine: Vec<WaveformPeak> = (0..(frames as usize).div_ceil(LOD_LEVELS[0]))
+            .map(|i| {
+                let t = i as f64 * LOD_LEVELS[0] as f64 / RATE as f64;
+                let syllable = (t * 1.7).fract();
+                let swell = (syllable * std::f64::consts::PI).sin().powf(0.6);
+                let phrase = 0.55 + 0.45 * (t * 0.31).sin().abs();
+                let texture = 0.75 + 0.25 * ((i as f64 * 12.9898).sin() * 43_758.545).fract();
+                let level = (swell * phrase * texture * 0.8) as f32;
+                WaveformPeak {
+                    min: -level,
+                    max: level * 0.92,
+                }
+            })
+            .collect();
+        let mut lods = vec![WaveformLod {
+            samples_per_peak: LOD_LEVELS[0],
+            peaks: fine,
+        }];
+        for &spp in &LOD_LEVELS[1..] {
+            let peaks = lods
+                .last()
+                .map(|lod| {
+                    lod.peaks
+                        .chunks(2)
+                        .map(|pair| WaveformPeak {
+                            min: pair.iter().map(|p| p.min).fold(0.0, f32::min),
+                            max: pair.iter().map(|p| p.max).fold(0.0, f32::max),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            lods.push(WaveformLod {
+                samples_per_peak: spp,
+                peaks,
+            });
+        }
+        install_ready(
+            "preview-vocal",
+            Arc::new(WaveformPreview {
+                sample_rate: RATE,
+                channels: 1,
+                duration_seconds: SECONDS,
+                total_frames: frames,
+                lods,
+            }),
+        );
+
+        let mut state = TimelineState::default();
+        state.tracks.clear();
+        state.viewport.viewport_width = 1_100.0;
+        state.viewport.pixels_per_second = 64.0;
+        state.sync_pixels_per_beat();
+        let clip = |id: &str, name: &str, start: f32, beats: f32, offset: f32, db: f32| {
+            let mut clip = ClipState {
+                id: id.to_string(),
+                name: name.to_string(),
+                start_beat: start,
+                duration_beats: beats,
+                source_duration_seconds: Some(SECONDS),
+                offset_beats: offset,
+                gain: 10f32.powf(db / 20.0),
+                clip_type: ClipType::Audio {
+                    file_id: "preview-vocal".to_string(),
+                    source_path: Some("preview-vocal".to_string()),
+                },
+                muted: false,
+                audio_import: AudioImportState::Ready,
+                stretch: AudioClipStretchState::default(),
+            };
+            clip.stretch.original_sample_rate = RATE;
+            clip.stretch.project_sample_rate = RATE;
+            clip.stretch.original_duration_samples = frames;
+            let beat_frames = RATE as f32 * 0.5;
+            clip.stretch.source_start_samples = (offset * beat_frames) as u64;
+            clip.stretch.source_end_samples = ((offset + beats) * beat_frames) as u64;
+            clip
+        };
+        let mut take = clip("clip-1", "Lead Vocal", 0.5, 14.0, 0.0, 0.0);
+        take.stretch.fade_in_ms = 400.0;
+        take.stretch.fade_out_ms = 900.0;
+        let clips = vec![
+            take,
+            clip("clip-2", "Lead Vocal Copy", 15.0, 10.0, 14.0, 3.0),
+            clip("clip-3", "Har b", 26.0, 4.0, 4.0, -6.0),
+            clip("clip-4", "Breath", 30.5, 0.75, 9.0, 0.0),
+        ];
+        for index in 0..AUDIO_CLIP_ROWS.len() {
+            use crate::components::timeline::timeline_state::{
+                CreateTrackOptions, InputMonitorMode, TrackType,
+            };
+            let id = state.create_track(CreateTrackOptions {
+                track_type: TrackType::Audio,
+                name: "Vocal".to_string(),
+                color: crate::theme::Colors::track_color_for_index(index * 2 + 1),
+                volume: 1.0,
+                pan: 0.0,
+                armed: false,
+                input_monitor: InputMonitorMode::Off,
+            });
+            let Some(track) = state.tracks.iter_mut().find(|track| track.id == id) else {
+                continue;
+            };
+            track.clips = clips
+                .iter()
+                .map(|clip| ClipState {
+                    id: format!("{}-{index}", clip.id),
+                    ..clip.clone()
+                })
+                .collect();
+        }
+        state.selection.selected_clip_ids = (0..AUDIO_CLIP_ROWS.len())
+            .map(|index| format!("clip-1-{index}"))
+            .collect();
+        Self { state }
+    }
+}
+
+impl gpui::Render for AudioClipsPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+        use crate::components::timeline::audio_clip::audio_clip;
+        use crate::theme::Colors;
+        use gpui::{div, IntoElement, ParentElement, Styled};
+        let state = &self.state;
+        let lanes = state
+            .tracks
+            .iter()
+            .zip(AUDIO_CLIP_ROWS)
+            .map(|(track, height)| {
+                let crossfades = state.audio_crossfades(track);
+                let clips = track.clips.iter().map(|clip| {
+                    audio_clip(
+                        clip,
+                        &track.id,
+                        track.color,
+                        state,
+                        height,
+                        Arc::new(|_, _, _| {}),
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        state.effective_clip_fades(clip, &crossfades),
+                        &state.clip_time_axis(clip),
+                        false,
+                        Arc::new(|_, _, _| {}),
+                        Arc::new(|_, _, _| {}),
+                    )
+                    .into_any_element()
+                });
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(height))
+                    .border_b(px(1.0))
+                    .border_color(Colors::divider())
+                    .children(clips)
+            });
+        div()
+            .size_full()
+            .font(crate::theme::ui_font())
+            .bg(Colors::surface_base())
+            .pt(px(12.0))
+            .children(lanes)
+    }
+}
+
+fn audio_clips_scene(options: WindowOptions, cx: &mut App) -> Result<AnyWindowHandle> {
+    let handle = cx.open_window(options, |_, cx| cx.new(|_| AudioClipsPreview::new()))?;
+    Ok(handle.into())
+}
 
 /// The Inspector's MIDI Input menu, open, with the ports from a real rig and
 /// two tracks whose plug-ins it can take MIDI from; the second is chosen.
@@ -1720,7 +2013,10 @@ fn deesser_preview_signal(n: usize, noise: &mut u32) -> (f32, f32) {
     *noise ^= *noise >> 17;
     *noise ^= *noise << 5;
     let white = (*noise as f32 / u32::MAX as f32) * 2.0 - 1.0;
-    let burst = ((t * 2.0).fract() * std::f32::consts::PI).sin().max(0.0).powi(6);
+    let burst = ((t * 2.0).fract() * std::f32::consts::PI)
+        .sin()
+        .max(0.0)
+        .powi(6);
     let hiss = white * 0.45 * burst;
     (voice + hiss, voice + hiss * 0.9)
 }

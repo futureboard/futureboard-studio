@@ -216,6 +216,12 @@ pub(crate) struct ExternalWindows {
         Option<gpui::WindowHandle<crate::components::plugin_manager::PluginManagerWindow>>,
     /// Export Arrangement window.
     pub export_arrangement: Option<gpui::WindowHandle<crate::export::ExportArrangementWindow>>,
+    /// Missing Plug-ins and Files window.
+    pub missing_media:
+        Option<gpui::WindowHandle<crate::components::missing_media_window::MissingMediaWindow>>,
+    /// What that window follows; outlives it, so reopening it keeps a row
+    /// that was relinked.
+    pub missing_media_tracked: super::missing_media_ops::SharedMissingTracked,
     /// Export MIDI File options dialog.
     pub export_midi:
         Option<gpui::WindowHandle<crate::components::midi_export_dialog::MidiExportDialog>>,

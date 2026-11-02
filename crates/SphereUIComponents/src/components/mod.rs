@@ -50,6 +50,7 @@ pub mod message_box_dialog;
 pub mod midi_editor_window;
 pub mod midi_export_dialog;
 pub mod midi_import_dialog;
+pub mod missing_media_window;
 pub mod mixer_master_strip_view;
 pub mod mixer_meter_layer;
 pub mod mixer_panel;

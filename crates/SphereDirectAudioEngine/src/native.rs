@@ -1262,6 +1262,11 @@ impl AudioEngine {
         self.inner.set_track_listen(track_id, listen)
     }
 
+    /// Set one clip's gain (linear, 0..4), live.
+    pub fn set_clip_gain(&self, clip_id: &str, gain: f32) -> Result<(), SphereAudioError> {
+        self.inner.set_clip_gain(clip_id, gain)
+    }
+
     /// Move one channel in the spatial mix's room, live.
     pub fn set_track_spatial(
         &self,

@@ -172,7 +172,7 @@ impl TimelineState {
             .collect();
         let clone = TrackState {
             id: track_id.clone(),
-            name: format!("{} Copy", source.name),
+            name: derived_clip_name(&source.name, "Copy"),
             ara: None,
             solo: false,
             armed: false,

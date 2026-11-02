@@ -337,6 +337,10 @@ impl Timeline {
     ) {
         let effect = self.clip_process_update_state(clip_id, update);
         if effect.redraw && matches!(update, AudioClipProcessUpdate::Gain(_)) {
+            let ids: Vec<String> = std::iter::once(clip_id.to_string())
+                .chain(self.clip_process_peers.iter().map(|peer| peer.id.clone()))
+                .collect();
+            self.push_clip_gains_live(ids.iter().map(String::as_str), cx);
             // A gain drag changes what the lanes of the dragged clips draw
             // and nothing else, so only those lanes repaint. Notifying the
             // Timeline instead rebuilt every visible lane and every view that
@@ -761,9 +765,18 @@ impl Timeline {
         window: Option<&mut gpui::Window>,
         cx: &mut Context<Self>,
     ) -> bool {
+        // The clips a gain drag was playing live go back to their gain as
+        // the press found it.
+        let touched: Vec<String> = self
+            .clip_process_origin
+            .iter()
+            .chain(self.clip_process_peers.iter())
+            .map(|clip| clip.id.clone())
+            .collect();
         if !self.cancel_clip_handle_state() {
             return false;
         }
+        self.push_clip_gains_live(touched.iter().map(String::as_str), cx);
         if let Some(window) = window {
             cx.stop_active_drag(window);
         }

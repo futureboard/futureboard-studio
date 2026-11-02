@@ -209,6 +209,7 @@ impl Timeline {
             on_time_signature_map_changed: None,
             on_musical_context_changed: None,
             on_media_changed: None,
+            on_clip_gain_live: None,
             on_add_track: None,
             on_plugin_preset_drop: None,
             on_plugin_drag_drop: None,
@@ -311,6 +312,7 @@ impl Timeline {
             on_time_signature_map_changed: None,
             on_musical_context_changed: None,
             on_media_changed: None,
+            on_clip_gain_live: None,
             on_add_track: None,
             on_plugin_preset_drop: None,
             on_plugin_drag_drop: None,
@@ -1499,6 +1501,35 @@ impl Timeline {
 
     pub fn set_media_changed_callback(&mut self, callback: Option<TimelineProjectChangedCb>) {
         self.on_media_changed = callback;
+    }
+
+    pub fn set_clip_gain_live_callback(
+        &mut self,
+        callback: Option<super::TimelineClipGainLiveCb>,
+    ) {
+        self.on_clip_gain_live = callback;
+    }
+
+    /// Hands the gains `clip_ids` have now to the engine, live: a gain drag
+    /// is heard as it moves, not only once it is released.
+    pub(crate) fn push_clip_gains_live<'a>(
+        &self,
+        clip_ids: impl IntoIterator<Item = &'a str>,
+        cx: &mut gpui::App,
+    ) {
+        let Some(callback) = self.on_clip_gain_live.as_ref() else {
+            return;
+        };
+        let gains: Vec<(String, f32)> = clip_ids
+            .into_iter()
+            .filter_map(|id| {
+                let (_, clip) = self.state.find_clip(id)?;
+                Some((clip.id.clone(), clip.gain))
+            })
+            .collect();
+        if !gains.is_empty() {
+            callback(gains, cx);
+        }
     }
 
     pub(crate) fn mark_tempo_map_changed(&self, cx: &mut gpui::App) {
@@ -3990,7 +4021,7 @@ impl Timeline {
         let clip = self.state.clone_clip_for_insert(
             source,
             self.state.next_clip_id(),
-            format!("{} Copy", source.name),
+            crate::components::timeline::timeline_state::derived_clip_name(&source.name, "Copy"),
             start_beat,
         );
         Some((target_track_id.to_string(), clip))
@@ -4091,7 +4122,10 @@ impl Timeline {
             let clip = self.state.clone_clip_for_insert(
                 source_clip,
                 next_clip_id(),
-                format!("{} Copy", source_clip.name),
+                crate::components::timeline::timeline_state::derived_clip_name(
+                    &source_clip.name,
+                    "Copy",
+                ),
                 start,
             );
             clips.push((track.id.clone(), clip));

@@ -3227,6 +3227,14 @@ pub(crate) fn process_clip_frame(
                 rel as f32 / clip.duration_samples.max(1) as f32,
             )
     };
+    // A live gain change (`SetClipGain`) ramps over a few milliseconds
+    // instead of stepping, which would click on every drag move.
+    if clip.gain != clip.gain_target {
+        clip.gain += (clip.gain_target - clip.gain) * clip.gain_step;
+        if (clip.gain_target - clip.gain).abs() < 1.0e-5 {
+            clip.gain = clip.gain_target;
+        }
+    }
     let g = clip.gain * fade * extra;
     l *= g;
     r *= g;

@@ -1901,6 +1901,81 @@ mod audio_clip_split_tests {
         // Fresh, distinct ids for both halves.
         assert_ne!(left.id, right.id);
         assert_ne!(left.id, clip.id);
+        // Both remember where they came from, for ARA edits to follow them.
+        assert_eq!(
+            state.clip_lineage.origin_of(&left.id).as_deref(),
+            Some("clip-5")
+        );
+        assert_eq!(
+            state.clip_lineage.origin_of(&right.id).as_deref(),
+            Some("clip-5")
+        );
+    }
+
+    #[test]
+    fn a_copy_remembers_its_newest_origin_in_every_snapshot() {
+        let state = TimelineState::default();
+        let snapshot = state.clone();
+        let first = audio_clip("clip-1", 0.0, 4.0, 0.0);
+        let second = audio_clip("clip-2", 0.0, 4.0, 0.0);
+        state.clone_clip_for_insert(&first, "clip-9".to_string(), "Copy".to_string(), 8.0);
+        assert_eq!(
+            snapshot.clip_lineage.origin_of("clip-9").as_deref(),
+            Some("clip-1")
+        );
+        // An undone copy's id handed out again belongs to the new copy.
+        state.clone_clip_for_insert(&second, "clip-9".to_string(), "Copy".to_string(), 8.0);
+        assert_eq!(
+            state.clip_lineage.origin_of("clip-9").as_deref(),
+            Some("clip-2")
+        );
+        assert_eq!(state, snapshot, "lineage is not part of the arrangement");
+    }
+
+    /// The user's report: a copy of a copy of a copy was named "Take Copy
+    /// Copy Copy". A copy takes the original's name and the word once.
+    #[test]
+    fn copies_and_splits_say_so_once() {
+        let mut name = "Take".to_string();
+        for _ in 0..4 {
+            name = derived_clip_name(&name, "Copy");
+        }
+        assert_eq!(name, "Take Copy");
+        assert_eq!(derived_clip_name("Take Copy", "Split"), "Take Split");
+        assert_eq!(derived_clip_name("Take Split Copy 2", "Copy"), "Take Copy");
+        assert_eq!(derived_clip_name("Vocal take 2", "Copy"), "Vocal take 2 Copy");
+        assert_eq!(derived_clip_name("Photocopy", "Copy"), "Photocopy Copy");
+        assert_eq!(derived_clip_name("Copy", "Copy"), "Copy Copy");
+
+        let state = TimelineState::default();
+        let clip = audio_clip("clip-5", 0.0, 8.0, 0.0);
+        let mut copy = state.build_clip_duplicate_after("missing");
+        assert!(copy.is_none());
+        let mut tracks_state = state.clone();
+        let track = tracks_state.create_track(CreateTrackOptions {
+            track_type: TrackType::Audio,
+            name: "Vocal".to_string(),
+            color: gpui::rgba(0x336699ff),
+            volume: 1.0,
+            pan: 0.0,
+            armed: false,
+            input_monitor: InputMonitorMode::Off,
+        });
+        tracks_state
+            .tracks
+            .iter_mut()
+            .find(|t| t.id == track)
+            .unwrap()
+            .clips
+            .push(clip);
+        for _ in 0..3 {
+            let (_, duplicate) = tracks_state.build_clip_duplicate_after("clip-5").unwrap();
+            copy = Some((String::new(), duplicate.clone()));
+            let track = tracks_state.tracks.iter_mut().find(|t| t.id == track).unwrap();
+            let original = track.clips.iter_mut().find(|c| c.id == "clip-5").unwrap();
+            original.name = duplicate.name;
+        }
+        assert_eq!(copy.unwrap().1.name, "Take Copy");
     }
 
     #[test]

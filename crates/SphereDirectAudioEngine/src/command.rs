@@ -54,6 +54,9 @@ pub enum EngineCommand {
         track_index: usize,
         params: solfege_spatialaudio::SourceParams,
     },
+    /// Set the gain one clip plays toward (linear, 0..4). `clip_index` is
+    /// resolved by the control thread so the payload owns no allocation.
+    SetClipGain { clip_index: usize, gain: f32 },
     /// Set one channel's Pre/After-Fader Listen state. `track_index` is
     /// resolved by the control thread so the payload owns no allocation.
     SetTrackListen {

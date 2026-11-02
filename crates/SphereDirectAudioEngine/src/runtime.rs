@@ -1753,7 +1753,14 @@ pub struct RuntimeClip {
     pub start_sample: u64,
     pub duration_samples: u64,
     pub offset_seconds: f64,
+    /// The clip gain being played now, moving toward [`Self::gain_target`]
+    /// a sample at a time (see [`clip_gain_step`]): a live change, dragged
+    /// in the arrangement, ramps instead of stepping.
     pub gain: f32,
+    /// The clip gain set (linear, 0..4). Live-updated by `SetClipGain`.
+    pub gain_target: f32,
+    /// How far `gain` moves toward the target each sample.
+    pub gain_step: f32,
     /// Immutable stretch parameters copied from the project snapshot for the
     /// audio thread. SphereAudioProcessor is the source of truth for all derived
     /// ratios/backend decisions.
@@ -1859,6 +1866,8 @@ impl Clone for RuntimeClip {
             duration_samples: self.duration_samples,
             offset_seconds: self.offset_seconds,
             gain: self.gain,
+            gain_target: self.gain_target,
+            gain_step: self.gain_step,
             stretch: self.stretch.clone(),
             speed_ratio: self.speed_ratio,
             source_read_rate: self.source_read_rate,
@@ -2792,6 +2801,7 @@ impl RuntimeProject {
                 segment.out_start = ((segment.out_start as f64) * ratio).round() as u64;
                 segment.out_end = ((segment.out_end as f64) * ratio).round() as u64;
             }
+            clip.gain_step = clip_gain_step(sample_rate);
             clip.fade_in_samples = ((old_fade_in as f64) * ratio).round() as u64;
             clip.fade_out_samples = ((old_fade_out as f64) * ratio).round() as u64;
             clip.fade_in_samples = clip.fade_in_samples.min(clip.duration_samples);
@@ -4977,6 +4987,13 @@ impl RuntimeProject {
         }
     }
 
+    /// Sets the gain `clip_index` plays toward (linear, clamped to 0..4).
+    pub fn update_clip_gain(&mut self, clip_index: usize, gain: f32) {
+        if let Some(clip) = self.clips.get_mut(clip_index) {
+            clip.gain_target = gain.clamp(0.0, 4.0);
+        }
+    }
+
     pub fn update_track_spatial(
         &mut self,
         track_index: usize,
@@ -6968,6 +6985,16 @@ fn create_runtime_stretch_processor(
 /// `tempo_map` is `Some` only when the project's tempo is not one flat value
 /// (see [`tempo_map_is_flat_at`]); a flat map keeps the base-tempo arithmetic
 /// below exactly as it was.
+/// How long a live clip gain change takes to arrive.
+const CLIP_GAIN_RAMP_SECONDS: f64 = 0.008;
+
+/// The per-sample step of a clip's gain toward its target at `sample_rate`:
+/// a one-pole that covers [`CLIP_GAIN_RAMP_SECONDS`].
+pub(crate) fn clip_gain_step(sample_rate: u32) -> f32 {
+    let samples = CLIP_GAIN_RAMP_SECONDS * f64::from(sample_rate.max(1));
+    (1.0 - (-1.0 / samples).exp()) as f32
+}
+
 fn build_clip_runtime(
     clip: &EngineClipSnapshot,
     source: Arc<ClipAudioSource>,
@@ -7179,6 +7206,8 @@ fn build_clip_runtime(
         duration_samples,
         offset_seconds: clip.offset_seconds.max(0.0),
         gain: clip.gain.clamp(0.0, 4.0),
+        gain_target: clip.gain.clamp(0.0, 4.0),
+        gain_step: clip_gain_step(output_sample_rate),
         ara_rendered: clip.ara_rendered,
         stretch,
         speed_ratio,
@@ -8611,7 +8640,10 @@ mod midi_tests {
         let mut next = schedule_of(vec![clip]);
         p.replace_midi_schedule(&mut next, 96_392);
 
-        assert!(sink.take().is_empty(), "the edit sent MIDI to the instrument");
+        assert!(
+            sink.take().is_empty(),
+            "the edit sent MIDI to the instrument"
+        );
         assert_eq!(p.midi_tracks[0].active, vec![(0, 60)]);
         // The old schedule is handed back for retiring.
         assert_eq!(next.midi_tracks[0].events.len(), 2);

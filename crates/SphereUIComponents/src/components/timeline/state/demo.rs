@@ -367,6 +367,7 @@ impl TimelineState {
             master_volume_preview: None,
             master_volume_gesture_origin: None,
             track_pan_gesture_origin: std::collections::HashMap::new(),
+            clip_lineage: ClipLineage::default(),
         }
     }
 

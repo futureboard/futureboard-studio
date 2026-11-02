@@ -372,6 +372,8 @@ pub struct TimelineState {
     /// Base pan captured at pointer-down so one completed scrub becomes one
     /// undo entry. Preview updates remain transient until release.
     pub track_pan_gesture_origin: std::collections::HashMap<TrackId, f32>,
+    /// Which clip each copied or split clip came from (see [`ClipLineage`]).
+    pub clip_lineage: ClipLineage,
 }
 
 impl Default for TimelineState {
@@ -526,6 +528,7 @@ impl Default for TimelineState {
             master_volume_preview: None,
             master_volume_gesture_origin: None,
             track_pan_gesture_origin: std::collections::HashMap::new(),
+            clip_lineage: ClipLineage::default(),
         }
     }
 }

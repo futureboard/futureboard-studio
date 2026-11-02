@@ -1001,6 +1001,9 @@ pub fn drain_commands(
             } => {
                 runtime.update_track_spatial(track_index, params);
             }
+            EngineCommand::SetClipGain { clip_index, gain } => {
+                runtime.update_clip_gain(clip_index, gain);
+            }
             EngineCommand::SetTrackListen {
                 track_index,
                 listen,

@@ -6,8 +6,8 @@ use crate::components::timeline::waveform_canvas::waveform_canvas;
 use crate::theme::Colors;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    canvas, div, point, px, relative, AppContext, DragMoveEvent, Empty, InteractiveElement,
-    IntoElement, ParentElement, PathBuilder, Render, StatefulInteractiveElement, Styled, Window,
+    canvas, div, point, px, AppContext, DragMoveEvent, Empty, InteractiveElement, IntoElement,
+    ParentElement, PathBuilder, Render, StatefulInteractiveElement, Styled, Window,
 };
 
 /// A clip-gain or fade gesture on an audio clip, resolved by the timeline.
@@ -121,6 +121,9 @@ pub(crate) const CLIP_STRIP_MIN_W: f32 = 44.0;
 /// of the way — they crowd the name out of a narrow clip while still being too
 /// small to read themselves.
 const CLIP_STRIP_DETAIL_MIN_W: f32 = 96.0;
+
+/// Narrowest clip whose label row carries its badges too.
+const CLIP_BADGES_MIN_W: f32 = 180.0;
 
 /// Narrowest clip that gets edge resize handles.
 ///
@@ -504,17 +507,21 @@ pub(crate) fn audio_clip_timeline_geometry(clip: &ClipState, state: &TimelineSta
 #[derive(Clone, Debug)]
 struct AudioClipProcessDrag {
     id: String,
-    /// Gain drags only: where in the control the press landed (px from its
-    /// left edge) and the gain the clip had then. The drag is relative to
-    /// them, so grabbing the control never jumps the level to the pointer.
-    start_x: f32,
+    /// Gain drags only: where in the chip the press landed (px from its top
+    /// edge) and the gain the clip had then. The drag is relative to them,
+    /// so grabbing the chip never jumps the level to the pointer.
+    start_y: f32,
     start_gain: f32,
 }
 
-/// dB per pixel of a gain drag: 40 dB across 160 px, and a fifth of that with
-/// Shift held for fine trims.
+/// dB per pixel of a gain drag: 40 dB across 160 px of travel, and a fifth
+/// of that with Shift held for fine trims.
 const GAIN_DRAG_DB_PER_PX: f32 = 0.25;
 const GAIN_DRAG_FINE_DB_PER_PX: f32 = 0.05;
+
+/// Height of the clip's label row: the name plate, the badges and the gain
+/// chip, along the clip's bottom edge.
+const LABEL_ROW_H: f32 = 16.0;
 
 impl Render for AudioClipProcessDrag {
     fn render(&mut self, _w: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
@@ -554,15 +561,65 @@ fn norm_to_gain(norm: f32) -> f32 {
     db_to_gain(db)
 }
 
-/// The strip's inline clip gain. `disabled` on an ARA track, where the engine
-/// does not apply clip gain: drawn muted, explained, and inert.
-fn compact_gain_control(
+/// The clip's gain, as a dB chip that is its own control: drag it up for
+/// louder, down for softer (Shift for fine), double-click for 0 dB. On a clip
+/// that is not selected it is a quiet readout, and only when the gain is not
+/// 0 dB; a press there selects the clip like a press on its body. `disabled`
+/// on an ARA track, where the engine does not apply clip gain: muted,
+/// explained, and inert.
+fn gain_chip(
     clip: &ClipState,
+    selected: bool,
     disabled: bool,
     on_preview: AudioClipProcessPreviewCb,
     on_commit: AudioClipProcessCommitCb,
-) -> gpui::AnyElement {
-    let value = gain_to_norm(clip.gain).clamp(0.0, 1.0);
+) -> Option<gpui::AnyElement> {
+    use crate::theme::{radius, space, typography};
+    let db = gain_to_db(clip.gain);
+    let neutral = db.abs() <= 0.05;
+    if !selected && neutral {
+        return None;
+    }
+    let label = if clip.gain <= 0.000_001 {
+        "-inf dB".to_string()
+    } else {
+        format!("{db:+.1} dB")
+    };
+    let hue = if neutral {
+        Colors::text_secondary()
+    } else {
+        Colors::accent_primary()
+    };
+    let chip = div()
+        .flex_none()
+        .h_full()
+        .px(px(space::TIGHT))
+        .flex()
+        .items_center()
+        .rounded(px(radius::CONTROL_SM))
+        .bg(label_plate())
+        .text_size(px(typography::DENSE_CAPTION))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .font_features(gpui::FontFeatures(std::sync::Arc::new(vec![(
+            "tnum".to_string(),
+            1,
+        )])))
+        .text_color(hue)
+        .child(label);
+    if disabled {
+        return Some(
+            chip.id(gpui::ElementId::Name(
+                format!("audio-clip-gain-{}", clip.id).into(),
+            ))
+            .opacity(crate::theme::state::DISABLED_CONTENT)
+            .tooltip(crate::components::fb_tooltip(ARA_CLIP_PROCESSING_TOOLTIP))
+            .into_any_element(),
+        );
+    }
+    if !selected {
+        return Some(chip.into_any_element());
+    }
+
     let id = format!("audio-clip-gain-{}", clip.id);
     let move_id = id.clone();
     let preview_id = clip.id.clone();
@@ -573,125 +630,109 @@ fn compact_gain_control(
     let on_commit_out = on_commit.clone();
     let reset_id = clip.id.clone();
     let reset_preview = on_preview.clone();
-
-    let control = div()
-        .id(gpui::ElementId::Name(id.into()))
-        .w(px(62.0))
-        .h(px(16.0))
-        .flex_none()
-        .relative()
-        .when(disabled, |this| {
-            this.opacity(crate::theme::state::DISABLED_CONTENT)
-        })
-        .child(
-            div()
-                .absolute()
-                .left(px(4.0))
-                .right(px(4.0))
-                .top(px(7.0))
-                .h(px(2.0))
-                .rounded(px(crate::theme::radius::PILL))
-                .bg(Colors::fader_rail())
-                .border(px(1.0))
-                .border_color(Colors::fader_groove()),
-        )
-        .child(
-            div()
-                .absolute()
-                .left(relative(value))
-                .ml(-px(3.0))
-                .top(px(2.0))
-                .w(px(6.0))
-                .h(px(12.0))
-                .rounded(px(crate::theme::radius::CONTROL))
-                .bg(Colors::surface_input())
-                .border(px(1.0))
-                .border_color(Colors::fader_thumb_border())
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(2.0))
-                        .bottom(px(2.0))
-                        .left(px(2.0))
-                        .w(px(1.0))
-                        .bg(Colors::accent_primary()),
-                ),
-        );
-    if disabled {
-        return control
-            .tooltip(crate::components::fb_tooltip(ARA_CLIP_PROCESSING_TOOLTIP))
-            .into_any_element();
-    }
-    control
-        .cursor(gpui::CursorStyle::ResizeLeftRight)
-        .tooltip(crate::components::fb_tooltip(
-            "Clip gain — drag left/right, Shift for fine, double-click for 0 dB",
-        ))
-        .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
-            cx.stop_propagation();
-            reset_preview(
-                &(reset_id.clone(), AudioClipProcessUpdate::GainPress),
-                window,
-                cx,
-            );
-            if event.click_count >= 2 {
-                // Clip gain is a bipolar dB control, independent of the track
-                // volume fader. Its neutral/reset value is always 0 dB.
+    let hover = Colors::composite(label_plate(), Colors::state_hover());
+    Some(
+        chip.id(gpui::ElementId::Name(id.into()))
+            .border(px(1.0))
+            .border_color(Colors::with_alpha(hue, 0.55))
+            .hover(move |style| style.bg(hover))
+            .cursor(gpui::CursorStyle::ResizeUpDown)
+            .tooltip(crate::components::fb_tooltip(
+                "Clip gain — drag up or down, Shift for fine, double-click for 0 dB",
+            ))
+            .on_mouse_down(gpui::MouseButton::Left, move |event, window, cx| {
+                cx.stop_propagation();
                 reset_preview(
-                    &(
-                        reset_id.clone(),
-                        AudioClipProcessUpdate::Gain(db_to_gain(0.0)),
-                    ),
+                    &(reset_id.clone(), AudioClipProcessUpdate::GainPress),
                     window,
                     cx,
                 );
-            }
-        })
-        .on_drag(
-            AudioClipProcessDrag {
-                id: move_id.clone(),
-                start_x: 0.0,
-                start_gain: clip.gain,
-            },
-            |drag, offset, _window, cx| {
-                let started = AudioClipProcessDrag {
-                    start_x: f32::from(offset.x),
-                    ..drag.clone()
-                };
-                cx.new(|_| started)
-            },
-        )
-        .on_drag_move::<AudioClipProcessDrag>(
-            move |event: &DragMoveEvent<AudioClipProcessDrag>, window, cx| {
-                let drag = event.drag(cx);
-                if drag.id != move_id {
-                    return;
+                if event.click_count >= 2 {
+                    // Clip gain is a bipolar dB control, independent of the
+                    // track fader. Its neutral value is always 0 dB.
+                    reset_preview(
+                        &(
+                            reset_id.clone(),
+                            AudioClipProcessUpdate::Gain(db_to_gain(0.0)),
+                        ),
+                        window,
+                        cx,
+                    );
                 }
-                // Relative to the press: the level moves with the pointer
-                // from wherever it was, instead of jumping to where the
-                // pointer landed on a 62 px slider.
-                let x = f32::from(event.event.position.x) - f32::from(event.bounds.origin.x);
-                let per_px = if event.event.modifiers.shift {
-                    GAIN_DRAG_FINE_DB_PER_PX
-                } else {
-                    GAIN_DRAG_DB_PER_PX
-                };
-                let db = gain_to_db(drag.start_gain) + (x - drag.start_x) * per_px;
-                let gain = db_to_gain(db);
-                on_preview(
-                    &(preview_id.clone(), AudioClipProcessUpdate::Gain(gain)),
-                    window,
-                    cx,
-                );
-            },
-        )
-        .on_mouse_up(gpui::MouseButton::Left, move |_, window, cx| {
-            on_commit(&(commit_id.clone(), original.clone()), window, cx);
-        })
-        .on_mouse_up_out(gpui::MouseButton::Left, move |_, window, cx| {
-            on_commit_out(&(commit_out_id.clone(), original_out.clone()), window, cx);
-        })
-        .into_any_element()
+            })
+            .on_drag(
+                AudioClipProcessDrag {
+                    id: move_id.clone(),
+                    start_y: 0.0,
+                    start_gain: clip.gain,
+                },
+                |drag, offset, _window, cx| {
+                    let started = AudioClipProcessDrag {
+                        start_y: f32::from(offset.y),
+                        ..drag.clone()
+                    };
+                    cx.new(|_| started)
+                },
+            )
+            .on_drag_move::<AudioClipProcessDrag>(
+                move |event: &DragMoveEvent<AudioClipProcessDrag>, window, cx| {
+                    let drag = event.drag(cx);
+                    if drag.id != move_id {
+                        return;
+                    }
+                    // Relative to the press, so grabbing the chip never jumps
+                    // the level; up is louder.
+                    let y = f32::from(event.event.position.y) - f32::from(event.bounds.origin.y);
+                    let per_px = if event.event.modifiers.shift {
+                        GAIN_DRAG_FINE_DB_PER_PX
+                    } else {
+                        GAIN_DRAG_DB_PER_PX
+                    };
+                    let db = gain_to_db(drag.start_gain) + (drag.start_y - y) * per_px;
+                    on_preview(
+                        &(
+                            preview_id.clone(),
+                            AudioClipProcessUpdate::Gain(db_to_gain(db)),
+                        ),
+                        window,
+                        cx,
+                    );
+                },
+            )
+            .on_mouse_up(gpui::MouseButton::Left, move |_, window, cx| {
+                on_commit(&(commit_id.clone(), original.clone()), window, cx);
+            })
+            .on_mouse_up_out(gpui::MouseButton::Left, move |_, window, cx| {
+                on_commit_out(&(commit_out_id.clone(), original_out.clone()), window, cx);
+            })
+            .into_any_element(),
+    )
+}
+
+/// The plate under the clip's labels, over whatever the waveform is doing.
+fn label_plate() -> gpui::Rgba {
+    Colors::with_alpha(Colors::surface_canvas(), 0.72)
+}
+
+/// One of the label row's badges: a short word on a tinted plate.
+fn clip_badge(hue: gpui::Rgba) -> gpui::Div {
+    use crate::theme::{radius, space, typography};
+    div()
+        .flex_none()
+        .h_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(space::HAIR))
+        .px(px(space::TIGHT))
+        .rounded(px(radius::CONTROL_SM))
+        .bg(Colors::composite(
+            label_plate(),
+            Colors::with_alpha(hue, 0.2),
+        ))
+        .text_size(px(typography::DENSE_CAPTION))
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_color(hue)
 }
 
 /// Height of the band along a clip's top edge the Smart Tool's cut zone leaves
@@ -906,7 +947,7 @@ fn fade_handle(
         .on_drag(
             AudioClipProcessDrag {
                 id: drag_id,
-                start_x: 0.0,
+                start_y: 0.0,
                 start_gain: 0.0,
             },
             |drag, _offset, _window, cx| cx.new(|_| drag.clone()),
@@ -1064,14 +1105,8 @@ pub fn audio_clip(
     let show_strip = width >= CLIP_STRIP_MIN_W;
     let show_strip_detail = width >= CLIP_STRIP_DETAIL_MIN_W;
     let show_resize_handles = width >= CLIP_RESIZE_HANDLE_MIN_W;
-    let show_inline_gain = selected
-        && width
-            >= if has_crossfade || stretch_badge.is_some() {
-                220.0
-            } else {
-                150.0
-            };
-    let gain_db = gain_to_db(clip.gain);
+    // The badges take room the name needs, so they wait for a wider clip.
+    let show_badges = width >= CLIP_BADGES_MIN_W;
 
     // Vertical geometry from the shared clip rectangle, the one the marquee
     // hit-tests against.
@@ -1106,10 +1141,9 @@ pub fn audio_clip(
         duration_beats: clip.duration_beats,
     };
     let resize_handle_w = clip_resize_handle_w(width);
-    const HEADER_H: f32 = 20.0;
-    // With no strip the waveform owns the whole clip, and the fade curves
-    // reach the bottom edge instead of stopping above a bar that is not there.
-    let strip_h = if show_strip { HEADER_H } else { 0.0 };
+    // The label row floats over the waveform, so the waveform has the whole
+    // clip and the fade curves reach its bottom edge.
+    let show_labels = show_strip && clip_h >= LABEL_ROW_H + 2.0 * crate::theme::space::HAIR;
     let pointer = active_tool == TimelineTool::Pointer;
     // Corner fade handles: Pointer only. Their hit areas are always there —
     // small and cheap — and a hovered clip's squares are painted by the
@@ -1258,123 +1292,92 @@ pub fn audio_clip(
                 .flatten()
                 .map(|cut| smart_cut_zone(&clip.id, id_num, resize_handle_w, cut)),
         )
-        // Processing strip: clip identity, inline gain, crossfade, and stretch.
-        // Absent on a clip too narrow to show any of it — see
-        // [`CLIP_STRIP_MIN_W`].
-        .children(show_strip.then(|| {
+        // The label row: the clip's name on a plate of its own fill, and at
+        // the far end the badges and the gain chip. It floats over the
+        // bottom of the waveform rather than taking a strip from it, and the
+        // top corners stay the fade handles'. Absent on a clip too narrow
+        // or short to show any of it -- see [`CLIP_STRIP_MIN_W`].
+        .children(show_labels.then(|| {
+            use crate::theme::{radius, space, typography};
+            // One plate for every label: the waveform's own colour under it
+            // varies with the track, so the plate is what keeps text legible.
+            let plate = label_plate();
             div()
-                .h(px(HEADER_H))
-                .flex_none()
-                .bg(if selected {
-                    Colors::surface_selected_soft()
-                } else {
-                    Colors::surface_panel_alt()
-                })
-                .border_t(px(1.0))
-                .border_color(Colors::divider())
-                .pl(px(6.0))
-                .pr(px(4.0))
+                .absolute()
+                .left(px(space::TIGHT))
+                .right(px(space::TIGHT))
+                .bottom(px(space::HAIR))
+                .h(px(LABEL_ROW_H))
                 .flex()
+                .flex_row()
                 .items_center()
-                .gap(px(5.0))
+                .gap(px(space::TIGHT))
                 .child(
-                    div()
-                        .w(px(2.0))
-                        .h(px(10.0))
-                        .rounded(px(crate::theme::radius::CONTROL))
-                        .bg(track_color),
+                    div().flex_1().min_w(px(0.0)).h_full().flex().child(
+                        div()
+                            .max_w_full()
+                            .min_w(px(0.0))
+                            .h_full()
+                            .px(px(space::TIGHT))
+                            .flex()
+                            .items_center()
+                            .rounded(px(radius::CONTROL_SM))
+                            .bg(plate)
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(typography::DENSE_LABEL))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(if selected {
+                                        Colors::text_primary()
+                                    } else {
+                                        Colors::text_secondary()
+                                    })
+                                    .child(clip.name.clone()),
+                            ),
+                    ),
                 )
-                .child(
-                    div()
-                        .text_size(px(9.0))
-                        .min_w(px(0.0))
-                        .flex_1()
-                        .truncate()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(if selected {
-                            Colors::text_primary()
-                        } else {
-                            Colors::text_secondary()
-                        })
-                        .child(clip.name.clone()),
-                )
-                .children(
-                    show_inline_gain
-                        .then(|| compact_gain_control(clip, ara, gain_preview, gain_commit)),
-                )
-                // The level readout is fixed width, so on a narrow clip it does
-                // not shrink — it takes the name's room and is still too small
-                // to read. See [`CLIP_STRIP_DETAIL_MIN_W`].
-                .children((show_strip_detail).then(|| {
-                    div()
-                        .flex_none()
-                        .text_size(px(8.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(if gain_db.abs() > 0.05 {
-                            Colors::accent_primary()
-                        } else {
-                            Colors::text_muted()
-                        })
-                        .child(format!("{gain_db:+.1} dB"))
-                }))
-                .children((show_strip_detail && has_crossfade).then(|| {
-                    let badge = div()
-                        .id(("audio-clip-xfade", id_num))
-                        .flex_none()
-                        .px(px(4.0))
-                        .rounded(px(crate::theme::radius::CONTROL))
-                        .text_size(px(7.5))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .child("XFADE");
+                .children((show_badges && has_crossfade).then(|| {
                     if ara {
-                        badge
-                            .bg(Colors::with_alpha(Colors::text_disabled(), 0.14))
-                            .text_color(Colors::text_disabled())
+                        clip_badge(Colors::text_disabled())
+                            .id(("audio-clip-xfade", id_num))
                             .tooltip(crate::components::fb_tooltip(ARA_CLIP_PROCESSING_TOOLTIP))
+                            .child("XFADE")
                             .into_any_element()
                     } else {
-                        badge
-                            .bg(Colors::accent_soft())
-                            .text_color(Colors::accent_primary())
+                        clip_badge(Colors::accent_primary())
+                            .child("XFADE")
                             .into_any_element()
                     }
                 }))
-                .children(stretch_badge.filter(|_| show_strip_detail).map(|badge| {
+                .children(stretch_badge.filter(|_| show_badges).map(|badge| {
                     // A tempo-locked clip is marked on two channels: the
-                    // automation hue (the same one the tempo lane uses, because
-                    // that is what owns the clip's length) plus a leading glyph.
-                    // A merely-stretched clip keeps the accent and no glyph.
+                    // automation hue (the same one the tempo lane uses, since
+                    // that is what owns the clip's length) plus a leading
+                    // glyph. A merely-stretched clip keeps the accent.
                     let hue = if badge.locked {
                         Colors::state_automation()
                     } else {
                         Colors::accent_primary()
                     };
-                    let mut chip = div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(2.0))
-                        .flex_none()
-                        .px(px(4.0))
-                        .rounded(px(crate::theme::radius::CONTROL))
-                        .bg(Colors::with_alpha(hue, 0.14))
-                        .text_size(px(8.0))
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(hue);
-                    if badge.locked {
-                        chip = chip.child(
-                            gpui::svg()
-                                .path(crate::assets::ICON_MAGNET_PATH)
-                                .w(px(8.0))
-                                .h(px(8.0))
-                                .text_color(hue),
-                        );
-                    }
-                    chip.child(badge.label)
+                    clip_badge(hue)
+                        .when(badge.locked, |chip| {
+                            chip.child(
+                                gpui::svg()
+                                    .path(crate::assets::ICON_MAGNET_PATH)
+                                    .w(px(typography::DENSE_CAPTION))
+                                    .h(px(typography::DENSE_CAPTION))
+                                    .text_color(hue),
+                            )
+                        })
+                        .child(badge.label)
                 }))
-            // Clip length text intentionally not rendered on the clip body — the
-            // name (flex_1) fills the bar, so no gap remains. Duration stays in the
-            // model and the inspector; resize/trim handles are unaffected.
+                .children(
+                    show_strip_detail
+                        .then(|| gain_chip(clip, selected, ara, gain_preview, gain_commit))
+                        .flatten(),
+                )
         }))
         // The fades as they play: the shaded part is what each one removes.
         .children((!curves.is_empty()).then(move || {
@@ -1398,7 +1401,7 @@ pub fn audio_clip(
             .top_0()
             .left_0()
             .right_0()
-            .bottom(px(strip_h))
+            .bottom_0()
         }))
         // Edge handles, on a clip wide enough to have edges *and* a body — see
         // [`CLIP_RESIZE_HANDLE_MIN_W`].

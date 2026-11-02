@@ -235,12 +235,10 @@ impl StudioLayout {
         self.reseed_builtin_state_mirror(cx);
         self.refresh_builtin_editor_sidebars(cx);
 
-        if !self.session_install_warnings.is_empty() {
-            for warning in &self.session_install_warnings {
-                eprintln!("[PluginRestore] warning: {warning}");
-            }
-            self.queue_session_load_warning_dialog(self.session_install_warnings.clone(), cx);
+        for warning in &self.session_install_warnings {
+            eprintln!("[PluginRestore] warning: {warning}");
         }
+        self.report_session_load_problems(self.session_install_warnings.clone(), cx);
 
         cx.notify();
     }
