@@ -89,6 +89,7 @@ impl VoxDocument {
             scale: self.scale,
             bpm: self.bpm,
             notes: self.notes.clone(),
+            pitch: Default::default(),
         }
     }
 

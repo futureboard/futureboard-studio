@@ -5,7 +5,7 @@ import 'project.dart';
 
 /// Bump when the Rust analysis output for the same audio changes
 /// (`CantoEngine::analyze_loaded_audio`), so old entries are re-analysed.
-const int kAnalysisCacheVersion = 1;
+const int kAnalysisCacheVersion = 2;
 
 /// Per-project cache in `<project>/Cache/`. Everything in it can be lost
 /// without losing work (the project file holds the edits); it exists so

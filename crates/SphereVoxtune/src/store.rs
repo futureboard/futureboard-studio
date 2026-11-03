@@ -16,7 +16,7 @@ use std::time::UNIX_EPOCH;
 use crate::session::VoxDocument;
 
 /// Bumped when the analysis changes so old entries miss.
-pub const ANALYSIS_VERSION: u32 = 1;
+pub const ANALYSIS_VERSION: u32 = 2;
 
 pub struct TakeStore {
     root: PathBuf,

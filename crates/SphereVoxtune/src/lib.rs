@@ -471,6 +471,184 @@ mod tests {
         hi - lo
     }
 
+    /// A sung-like tone: ten harmonics, a scoop into the note, vibrato of
+    /// ±`vib_cents` at 5.5 Hz, and a fall off the end. `shift_cents` moves
+    /// the whole pitch curve (the ideal output of a pitch shift).
+    fn sung_tone(shift_cents: f32, vib_cents: f32, bends: bool) -> Vec<f32> {
+        let sr = 48_000.0f32;
+        let (start, end) = (0.2f32, 2.6f32);
+        let mut out = vec![0.0f32; (2.8 * sr) as usize];
+        let mut phase = 0.0f32;
+        for (i, s) in out.iter_mut().enumerate() {
+            let t = i as f32 / sr;
+            if !(start..end).contains(&t) {
+                continue;
+            }
+            let into = t - start;
+            let left = end - t;
+            let mut cents = shift_cents;
+            if bends && into < 0.15 {
+                cents -= 120.0 * (1.0 - into / 0.15);
+            }
+            if bends && left < 0.15 {
+                cents -= 80.0 * (1.0 - left / 0.15);
+            }
+            if into > 0.35 {
+                let depth = vib_cents * ((into - 0.35) / 0.25).min(1.0);
+                cents += depth * (std::f32::consts::TAU * 5.5 * into).sin();
+            }
+            let hz = 220.0 * 2f32.powf(cents / 1_200.0);
+            phase += std::f32::consts::TAU * hz / sr;
+            let amp = (into / 0.03).min(1.0) * (left / 0.05).min(1.0) * 0.3;
+            let mut v = 0.0;
+            for k in 1..=10 {
+                v += (phase * k as f32).sin() / k as f32;
+            }
+            *s = amp * v;
+        }
+        out
+    }
+
+    /// The true pitch (MIDI) of `sung_tone` at `t`.
+    fn sung_truth(t: f32, shift_cents: f32, vib_cents: f32, bends: bool) -> f32 {
+        let into = t - 0.2;
+        let left = 2.6 - t;
+        let mut c = shift_cents;
+        if bends && into < 0.15 {
+            c -= 120.0 * (1.0 - into / 0.15);
+        }
+        if bends && left < 0.15 {
+            c -= 80.0 * (1.0 - left / 0.15);
+        }
+        if into > 0.35 {
+            let depth = vib_cents * ((into - 0.35) / 0.25).min(1.0);
+            c += depth * (std::f32::consts::TAU * 5.5 * into).sin();
+        }
+        57.0 + c / 100.0
+    }
+
+    /// Pitch of `x` at `t` (MIDI): autocorrelation peak within ±12 % of
+    /// the expected period over a 20 ms window, parabola-refined.
+    fn acf_pitch(x: &[f32], t: f32, expect_midi: f32) -> f32 {
+        let sr = 48_000.0f32;
+        let p = sr / (440.0 * 2f32.powf((expect_midi - 69.0) / 12.0));
+        let c = (t * sr) as isize;
+        let half = (0.010 * sr) as isize;
+        let (lo, hi) = ((p * 0.88) as isize, (p * 1.12) as isize + 1);
+        let score = |lag: isize| {
+            let (mut d, mut a, mut b) = (0.0f32, 0.0f32, 0.0f32);
+            for k in -half..half {
+                let u = x[(c + k - lag / 2) as usize];
+                let v = x[(c + k + lag - lag / 2) as usize];
+                d += u * v;
+                a += u * u;
+                b += v * v;
+            }
+            d / (a * b).sqrt().max(1e-9)
+        };
+        let mut best = (lo, f32::MIN);
+        for lag in lo..=hi {
+            let s = score(lag);
+            if s > best.1 {
+                best = (lag, s);
+            }
+        }
+        let (l, m, r) = (score(best.0 - 1), best.1, score(best.0 + 1));
+        let den = l - 2.0 * m + r;
+        let off = if den.abs() > 1e-9 {
+            (0.5 * (l - r) / den).clamp(-0.5, 0.5)
+        } else {
+            0.0
+        };
+        let period = best.0 as f32 + off;
+        69.0 + 12.0 * (sr / period / 440.0).log2()
+    }
+
+    /// Renders the vibrato tone with every note set to `pitch(note)` and
+    /// Drift `modulation`, and returns the output's pitch error against
+    /// `truth(t)` (cents: median, p95) through the held part of the note.
+    fn tuning_error(
+        pitch: impl Fn(&CantoNote) -> f32,
+        modulation: f32,
+        truth: impl Fn(f32) -> f32,
+    ) -> (f32, f32) {
+        let sr = 48_000u32;
+        let mut engine = CantoEngine::new(sr as f32);
+        engine
+            .load_audio_bytes(
+                &encode_mono_wav_i16(&sung_tone(0.0, 70.0, true), sr),
+                Some("wav"),
+            )
+            .expect("analyze");
+        for i in 0..engine.notes.len() {
+            let n = engine.notes[i].clone();
+            engine.update_note(
+                i,
+                pitch(&n),
+                n.start,
+                n.dur,
+                modulation,
+                0.0,
+                n.gain_db,
+                true,
+                false,
+            );
+        }
+        let out = engine.render_offline();
+        let mut errors = Vec::new();
+        let mut t = 0.6f32;
+        while t < 2.3 {
+            let want = truth(t);
+            errors.push(((acf_pitch(&out, t, want) - want) * 100.0).abs());
+            t += 0.005;
+        }
+        errors.sort_by(f32::total_cmp);
+        (errors[errors.len() / 2], errors[errors.len() * 95 / 100])
+    }
+
+    #[test]
+    fn tuning_follows_the_pitch_actually_sung() {
+        // Vibrato of ±70 cents is wider than a note's contour can hold; the
+        // render follows the sung pitch track, so a flattened note is flat…
+        let (median, p95) = tuning_error(|_| 57.0, 0.0, |_| 57.0);
+        assert!(
+            median < 6.0 && p95 < 12.0,
+            "flattened: median {median} c, p95 {p95} c"
+        );
+        // …and a retuned one keeps the singer's own movement, shifted.
+        let (median, p95) =
+            tuning_error(|n| n.pitch + 3.0, 1.0, |t| sung_truth(t, 300.0, 70.0, true));
+        assert!(
+            median < 4.0 && p95 < 8.0,
+            "+3 st: median {median} c, p95 {p95} c"
+        );
+    }
+
+    #[test]
+    fn a_cached_analysis_keeps_the_sung_pitch() {
+        let sr = 48_000u32;
+        let mut engine = CantoEngine::new(sr as f32);
+        let res = engine
+            .load_audio_bytes(
+                &encode_mono_wav_i16(&sung_tone(0.0, 70.0, true), sr),
+                Some("wav"),
+            )
+            .expect("analyze");
+        let at = |t: f32| res.pitch.at(t).expect("voiced");
+        assert!((at(1.0) - sung_truth(1.0, 0.0, 70.0, true)).abs() < 0.1);
+        assert!(res.pitch.at(0.05).is_none(), "silence has no pitch");
+        let json = serde_json::to_string(&res).unwrap();
+        let back: CantoAnalysisResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pitch, res.pitch);
+        // An entry cached before the track existed still loads.
+        let old = json.replace(
+            &format!(",\"pitch\":{}", serde_json::to_string(&res.pitch).unwrap()),
+            "",
+        );
+        let back: CantoAnalysisResult = serde_json::from_str(&old).unwrap();
+        assert!(back.pitch.midi.is_empty());
+    }
+
     #[test]
     fn ornament_shapes_follow_their_style() {
         let (_, res) = two_note_engine();

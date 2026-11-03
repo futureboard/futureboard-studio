@@ -55,6 +55,7 @@ fn result_to_c_json(res: Result<CantoAnalysisResult, String>) -> *mut c_char {
             mode: "minor".to_string(),
             notes: Vec::new(),
             waveform_peaks: Vec::new(),
+            pitch: Default::default(),
         },
     };
     let json = serde_json::to_string(&payload).unwrap_or_else(|e| {

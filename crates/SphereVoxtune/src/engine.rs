@@ -131,6 +131,78 @@ pub struct CantoAnalysisResult {
     pub mode: String,
     pub notes: Vec<CantoNote>,
     pub waveform_peaks: Vec<f32>,
+    /// The sung pitch through the take; older cached results have none.
+    #[serde(default)]
+    pub pitch: PitchTrack,
+}
+
+/// The pitch actually sung, one value per analysis hop: MIDI, or 0 where
+/// the voice is unvoiced or silent. A note's `contour` is a smoothed,
+/// clamped 32-point summary of this; rendering needs the real thing, since
+/// grains cut at the wrong period crackle and leave vibrato behind.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PitchTrack {
+    pub midi: Vec<f32>,
+    /// Seconds between values.
+    pub hop_sec: f32,
+    /// Time of the first value (the centre of its analysis window).
+    pub offset_sec: f32,
+}
+
+impl PitchTrack {
+    fn from_frames(frames: &[PitchFrame], sample_rate: u32) -> Self {
+        let midi = frames
+            .iter()
+            .map(|f| {
+                if f.frequency_hz > 0.0 && f.confidence >= PITCH_VOICED {
+                    (69.0 + 12.0 * (f.frequency_hz / 440.0).log2()) as f32
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        // Each value describes the stretch YIN compared: the first `span`
+        // samples of the window against the same shifted by one period, so
+        // its centre sits at (span + period) / 2, not mid-window. Using the
+        // take's typical period keeps every value within ~2 ms of its time.
+        let sr = sample_rate as f64;
+        let mut periods: Vec<f64> = frames
+            .iter()
+            .filter(|f| f.frequency_hz > 0.0 && f.confidence >= PITCH_VOICED)
+            .map(|f| sr / f.frequency_hz)
+            .collect();
+        periods.sort_by(f64::total_cmp);
+        let period = periods
+            .get(periods.len() / 2)
+            .copied()
+            .unwrap_or(sr / 220.0);
+        let span = yin_span(sample_rate) as f64;
+        Self {
+            midi,
+            hop_sec: pitch_hop(sample_rate) as f32 / sample_rate as f32,
+            offset_sec: ((span + period) / 2.0 / sr) as f32,
+        }
+    }
+
+    /// The sung pitch at `time` seconds, interpolated between hops; None
+    /// where either neighbour is unvoiced or `time` is outside the track.
+    /// Allocation-free: called on the audio thread.
+    #[inline]
+    pub fn at(&self, time: f32) -> Option<f32> {
+        if self.midi.len() < 2 || self.hop_sec <= 0.0 {
+            return None;
+        }
+        let pos = (time - self.offset_sec) / self.hop_sec;
+        if !(0.0..(self.midi.len() - 1) as f32).contains(&pos) {
+            return None;
+        }
+        let i = pos as usize;
+        let (a, b) = (self.midi[i], self.midi[i + 1]);
+        if a <= 0.0 || b <= 0.0 {
+            return None;
+        }
+        Some(a + (b - a) * (pos - i as f32))
+    }
 }
 
 #[inline]
@@ -315,6 +387,9 @@ pub struct Analysis {
     pub scale: Scale,
     pub bpm: f32,
     pub notes: Vec<CantoNote>,
+    /// Empty when the analysis came from a document rather than the audio:
+    /// rendering then falls back to each note's contour.
+    pub pitch: PitchTrack,
 }
 
 impl Analysis {
@@ -332,6 +407,7 @@ impl Analysis {
             scale,
             bpm: result.bpm.clamp(68.0, 172.0),
             notes: result.notes,
+            pitch: result.pitch,
         })
     }
 }
@@ -347,12 +423,14 @@ pub fn analyze_samples(
     let (key, scale) = estimate_key_and_mode(&frames);
     let bpm = estimate_bpm_from_frames(&frames).clamp(68.0, 172.0);
     let notes = segment_canto_notes(&frames, key);
+    let pitch = PitchTrack::from_frames(&frames, sample_rate as u32);
     progress.permille.store(1000, Ordering::Relaxed);
     Some(Analysis {
         key,
         scale,
         bpm,
         notes,
+        pitch,
     })
 }
 
@@ -410,6 +488,8 @@ pub struct CantoEngine {
     active_hint: usize,
     /// Reused by `render_stereo_i16`; grows only when a larger block arrives.
     scratch: Vec<f32>,
+    /// The sung pitch of the loaded audio (see [`PitchTrack`]).
+    pitch_track: PitchTrack,
 }
 
 impl CantoEngine {
@@ -454,6 +534,7 @@ impl CantoEngine {
             audition_fade: None,
             active_hint: 0,
             scratch: Vec::new(),
+            pitch_track: PitchTrack::default(),
         }
     }
 
@@ -575,6 +656,7 @@ impl CantoEngine {
         self.bpm = analysis.bpm;
         self.correct_amount = 0.0;
         self.notes = analysis.notes;
+        self.pitch_track = analysis.pitch;
         self.analysis_result()
     }
 
@@ -599,6 +681,7 @@ impl CantoEngine {
             mode: self.scale.name().to_string(),
             notes: self.notes.clone(),
             waveform_peaks: self.waveform_peaks.clone(),
+            pitch: self.pitch_track.clone(),
         }
     }
 
@@ -907,8 +990,22 @@ impl CantoEngine {
                 gain,
             };
         }
-        let src_hz = midi_to_hz(detected_pitch_at(note, local_t)).clamp(55.0, 1400.0);
-        let dst_hz = midi_to_hz(pitch_at(note, local_t)).clamp(55.0, 1400.0);
+        // The source period is the pitch actually sung at this point of the
+        // source, not the note's smoothed contour: that one misses fast
+        // vibrato and scoops, and grains cut at the wrong period crackle
+        // and wobble. The edit keeps (or, with Drift, scales) the same real
+        // movement. A track value far from the note (an octave slip) or a
+        // missing one falls back to the contour.
+        let contour = detected_pitch_at(note, local_t);
+        let src_time = note.detected_start + local_t * note.detected_dur;
+        let sung = self
+            .pitch_track
+            .at(src_time)
+            .filter(|m| (m - contour).abs() < 2.0)
+            .unwrap_or(contour);
+        let target = pitch_at(note, local_t) + (sung - contour) * note.modulation;
+        let src_hz = midi_to_hz(sung).clamp(55.0, 1400.0);
+        let dst_hz = midi_to_hz(target).clamp(55.0, 1400.0);
         Control {
             centre,
             period: Some(self.sample_rate / src_hz),
@@ -1210,16 +1307,39 @@ impl CantoEngine {
 
 // ── Fast YIN Pitch Frame Extraction & Studio Note Segmentation ────────────────
 
+/// Pitch analysis hop (~10 ms) and window (~42 ms), in samples.
+fn pitch_hop(sample_rate: u32) -> usize {
+    ((sample_rate as usize) / 100).max(128)
+}
+
+fn pitch_window(sample_rate: u32) -> usize {
+    ((sample_rate as usize) * 42 / 1000).max(1024)
+}
+
+/// YIN confidence from which a frame counts as voiced.
+const PITCH_VOICED: f64 = 0.42;
+
+/// Lowest and highest pitch the analysis looks for.
+const PITCH_MIN_HZ: f64 = 65.0;
+const PITCH_MAX_HZ: f64 = 950.0;
+
+/// Samples [`detect_pitch_yin_fast`] compares at each lag (from the start
+/// of the window).
+fn yin_span(sample_rate: u32) -> usize {
+    let tau_max = (sample_rate as f64 / PITCH_MIN_HZ).round() as usize;
+    pitch_window(sample_rate).saturating_sub(tau_max).min(1024)
+}
+
 fn extract_pitch_frames(
     samples: &[f32],
     sample_rate: u32,
     progress: &AnalysisProgress,
 ) -> Option<Vec<PitchFrame>> {
-    let hop_size = ((sample_rate as usize) / 100).max(128); // ~10 ms hop
-    let frame_size = ((sample_rate as usize) * 42 / 1000).max(1024); // ~42 ms window
-    let min_freq = 65.0;
-    let max_freq = 950.0;
-    let voiced_threshold = 0.42;
+    let hop_size = pitch_hop(sample_rate);
+    let frame_size = pitch_window(sample_rate);
+    let min_freq = PITCH_MIN_HZ;
+    let max_freq = PITCH_MAX_HZ;
+    let voiced_threshold = PITCH_VOICED;
 
     let mut peak_rms = 0.0f64;
     let mut raw_rms = Vec::with_capacity(samples.len() / hop_size + 1);
