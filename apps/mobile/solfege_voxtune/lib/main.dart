@@ -453,6 +453,24 @@ class CantoScreenState extends State<CantoScreen>
   // the playhead overlays, clock and meter instead of rebuilding the screen.
   final ValueNotifier<double> _playheadVN = ValueNotifier(0.0);
   final ValueNotifier<double> _levelVN = ValueNotifier(0.0);
+
+  // Gestures redraw only what they change: the canvas and overview strip
+  // (the view moved, a cut line moved) or those plus the inspector (a note
+  // is being dragged). The rest of the screen catches up when the finger
+  // lifts, which rebuilds everything.
+  final ValueNotifier<int> _canvasVersion = ValueNotifier(0);
+  final ValueNotifier<int> _inspectorVersion = ValueNotifier(0);
+
+  void _redrawView() => _canvasVersion.value++;
+
+  /// Counts full rebuilds of the screen (see [OverviewPainter.generation]).
+  int _generation = 0;
+
+  void _redrawLive() {
+    _canvasVersion.value++;
+    _inspectorVersion.value++;
+  }
+
   double get _playhead => _playheadVN.value;
   set _playhead(double value) => _playheadVN.value = value;
   set _level(double value) => _levelVN.value = value;
@@ -589,6 +607,8 @@ class CantoScreenState extends State<CantoScreen>
     _emptySession.dispose();
     _playheadVN.dispose();
     _levelVN.dispose();
+    _canvasVersion.dispose();
+    _inspectorVersion.dispose();
     super.dispose();
   }
 
@@ -1387,7 +1407,7 @@ class CantoScreenState extends State<CantoScreen>
       if (_follow && _drag == null && _pinch == null) {
         final before = _viewStart;
         _followPlayhead();
-        if (_viewStart != before) setState(() {});
+        if (_viewStart != before) _redrawView();
       }
     } else if (_synth.isAuditioning) {
       // Note preview: native output just reports the level; the fallback
@@ -1605,33 +1625,34 @@ class CantoScreenState extends State<CantoScreen>
   void _applyParam(double value) {
     final note = _selectedNote;
     if (note == null || note.unpitched || _bypass) return;
-    setState(() {
-      if (_tool == 'pitch') {
-        note.pitch = _sliderTarget + value / 100.0;
-        note.lyric = solfegeForMidi(note.pitch, _key);
-        note.pinned = true;
-        _ensurePitchVisible(note.pitch);
-      } else if (_tool == 'drift') {
-        note.modulation = value / 100.0;
-      } else if (_tool == 'formant') {
-        note.formant = value;
-      } else if (_tool == 'level') {
-        note.gainDb = value;
-      } else if (_tool == 'time') {
-        // The start stays put; the end moves (a legato neighbour with it).
-        final neighbour = _resizeEdge(
-          note,
-          'end',
-          note.start,
-          note.detectedDur * math.pow(2.0, value / 100.0),
-        );
-        if (neighbour != null) {
-          _synth.syncNote(_notes.indexOf(neighbour), neighbour);
-        }
+    // A slider drag redraws the canvas and inspector; its release rebuilds
+    // the rest (onChangeEnd).
+    if (_tool == 'pitch') {
+      note.pitch = _sliderTarget + value / 100.0;
+      note.lyric = solfegeForMidi(note.pitch, _key);
+      note.pinned = true;
+      _ensurePitchVisible(note.pitch);
+    } else if (_tool == 'drift') {
+      note.modulation = value / 100.0;
+    } else if (_tool == 'formant') {
+      note.formant = value;
+    } else if (_tool == 'level') {
+      note.gainDb = value;
+    } else if (_tool == 'time') {
+      // The start stays put; the end moves (a legato neighbour with it).
+      final neighbour = _resizeEdge(
+        note,
+        'end',
+        note.start,
+        note.detectedDur * math.pow(2.0, value / 100.0),
+      );
+      if (neighbour != null) {
+        _synth.syncNote(_notes.indexOf(neighbour), neighbour);
       }
-      // Only this note changed; a full sync per slider tick is wasted work.
-      _synth.syncNote(_notes.indexOf(note), note);
-    });
+    }
+    // Only this note changed; a full sync per slider tick is wasted work.
+    _synth.syncNote(_notes.indexOf(note), note);
+    _redrawLive();
   }
 
   // ---- Note structure: cut / join / mute / reset ----------------------------
@@ -2128,42 +2149,40 @@ class CantoScreenState extends State<CantoScreen>
           math.max(from, _kPinchAxisFloor) / math.max(now, _kPinchAxisFloor);
       final zoomX = zoom(pinch.spanX, (pts[0].dx - pts[1].dx).abs());
       final zoomY = zoom(pinch.spanY, (pts[0].dy - pts[1].dy).abs());
-      setState(() {
-        final fraction =
-            (pinch.anchor - pinch.start) / math.max(0.01, pinch.duration);
-        final minView = math.min(_duration, beatsToSec(1.5, _bpm));
-        _viewDuration = clampVal(pinch.duration * zoomX, minView, _duration);
-        _viewStart = pinch.anchor - fraction * _viewDuration;
-        _clampView();
+      final fraction =
+          (pinch.anchor - pinch.start) / math.max(0.01, pinch.duration);
+      final minView = math.min(_duration, beatsToSec(1.5, _bpm));
+      _viewDuration = clampVal(pinch.duration * zoomX, minView, _duration);
+      _viewStart = pinch.anchor - fraction * _viewDuration;
+      _clampView();
 
-        // The pitch under the fingers stays under them.
-        final startSpan = pinch.pitchHi - pinch.pitchLo;
-        final span = clampVal(
-          startSpan * zoomY,
-          _kMinPitchSpan,
-          math.max(_kMaxPitchSpan, startSpan),
-        );
-        final above = (pinch.pitchHi - pinch.anchorPitch) / startSpan;
-        final lo = clampVal(
-          pinch.anchorPitch + above * span - span,
-          36.0,
-          math.max(36.0, 92.0 - span),
-        );
-        _pitchLo = lo;
-        _pitchHi = lo + span;
-      });
+      // The pitch under the fingers stays under them.
+      final startSpan = pinch.pitchHi - pinch.pitchLo;
+      final span = clampVal(
+        startSpan * zoomY,
+        _kMinPitchSpan,
+        math.max(_kMaxPitchSpan, startSpan),
+      );
+      final above = (pinch.pitchHi - pinch.anchorPitch) / startSpan;
+      final lo = clampVal(
+        pinch.anchorPitch + above * span - span,
+        36.0,
+        math.max(36.0, 92.0 - span),
+      );
+      _pitchLo = lo;
+      _pitchHi = lo + span;
+      _redrawView();
       return;
     }
 
     if (_cutNoteId != null) {
       final note = _notes.where((n) => n.id == _cutNoteId).firstOrNull;
       if (note != null) {
-        setState(() {
-          _cutTime = _clampCut(
-            note,
-            _currentLayout().xToTime(_viewStart, point.dx),
-          );
-        });
+        _cutTime = _clampCut(
+          note,
+          _currentLayout().xToTime(_viewStart, point.dx),
+        );
+        _redrawView();
       }
       return;
     }
@@ -2172,8 +2191,10 @@ class CantoScreenState extends State<CantoScreen>
     if (drag == null) return;
     final dx = point.dx - drag.startX;
     final dy = point.dy - drag.startY;
+    var firstMove = false;
     if (!drag.moved && math.sqrt(dx * dx + dy * dy) >= 3.0) {
       drag.moved = true;
+      firstMove = true;
       _press?.moved = true;
       if (!const ['pan', 'scrub', 'pitch-scroll'].contains(drag.type)) {
         _pushUndo('tool:${drag.type}');
@@ -2183,9 +2204,15 @@ class CantoScreenState extends State<CantoScreen>
       }
     }
     if (drag.type == 'scrub' || drag.moved) {
-      setState(() {
-        _applyDrag(point);
-      });
+      _applyDrag(point);
+      if (firstMove) {
+        // Undo, the note toolbar and friends change as a drag starts.
+        setState(() {});
+      } else if (const ['pan', 'scrub', 'pitch-scroll'].contains(drag.type)) {
+        _redrawView();
+      } else {
+        _redrawLive();
+      }
     }
   }
 
@@ -2347,21 +2374,20 @@ class CantoScreenState extends State<CantoScreen>
     final dx = event.localPosition.dx - ov.startX;
     if (dx.abs() > 3) ov.moved = true;
     final dt = (dx / math.max(1.0, width)) * _duration;
-    setState(() {
-      if (ov.mode == 'pan') {
-        _viewStart = ov.startView + dt;
-        _clampView();
-      } else {
-        final time = clampVal(
-          (event.localPosition.dx / width) * _duration,
-          0.0,
-          _duration,
-        );
-        _seek(time);
-        _viewStart = time - _viewDuration / 2.0;
-        _clampView();
-      }
-    });
+    if (ov.mode == 'pan') {
+      _viewStart = ov.startView + dt;
+      _clampView();
+    } else {
+      final time = clampVal(
+        (event.localPosition.dx / width) * _duration,
+        0.0,
+        _duration,
+      );
+      _seek(time);
+      _viewStart = time - _viewDuration / 2.0;
+      _clampView();
+    }
+    _redrawView();
   }
 
   void _onOverviewUp(PointerEvent event, double width) {
@@ -2703,6 +2729,7 @@ class CantoScreenState extends State<CantoScreen>
 
   @override
   Widget build(BuildContext context) {
+    _generation++;
     final size = MediaQuery.sizeOf(context);
     final insets = MediaQuery.paddingOf(context);
     final width = size.width - insets.horizontal;
@@ -3504,7 +3531,12 @@ class CantoScreenState extends State<CantoScreen>
     );
   }
 
-  Widget _buildEditorArea() {
+  Widget _buildEditorArea() => ValueListenableBuilder<int>(
+    valueListenable: _canvasVersion,
+    builder: (context, _, _) => _buildEditorCanvas(),
+  );
+
+  Widget _buildEditorCanvas() {
     return LayoutBuilder(
       builder: (context, constraints) {
         _editorWidth = math.max(1.0, constraints.maxWidth);
@@ -3792,7 +3824,12 @@ class CantoScreenState extends State<CantoScreen>
     );
   }
 
-  Widget _buildOverviewBar() {
+  Widget _buildOverviewBar() => ValueListenableBuilder<int>(
+    valueListenable: _canvasVersion,
+    builder: (context, _, _) => _buildOverviewStrip(),
+  );
+
+  Widget _buildOverviewStrip() {
     return Container(
       height: _compact ? 40 : 44,
       padding: const EdgeInsets.fromLTRB(12, 6, 4, 6),
@@ -3828,10 +3865,16 @@ class CantoScreenState extends State<CantoScreen>
                               duration: _duration,
                               bypass: _bypass,
                               selectedId: _selectedId,
+                              generation: _generation,
+                            ),
+                          ),
+                        ),
+                        RepaintBoundary(
+                          child: CustomPaint(
+                            painter: OverviewWindowPainter(
                               viewStart: _viewStart,
                               viewDuration: _viewDuration,
-                              pitchLo: _pitchLo,
-                              pitchHi: _pitchHi,
+                              duration: _duration,
                             ),
                           ),
                         ),
@@ -3873,7 +3916,12 @@ class CantoScreenState extends State<CantoScreen>
     );
   }
 
-  Widget _buildInspector() {
+  Widget _buildInspector() => ValueListenableBuilder<int>(
+    valueListenable: _inspectorVersion,
+    builder: (context, _, _) => _buildInspectorNow(),
+  );
+
+  Widget _buildInspectorNow() {
     final note = _selectedNote;
     final model = _paramModel(note);
     final pitched = note != null && !note.unpitched;
@@ -3943,7 +3991,7 @@ class CantoScreenState extends State<CantoScreen>
               onChangeStart: () {
                 final n = _selectedNote;
                 if (n == null || n.unpitched || _bypass) return;
-                _pushUndo('tool:$_tool');
+                setState(() => _pushUndo('tool:$_tool'));
                 if (_tool == 'pitch') {
                   _sliderTarget = centsFromTarget(n.pitch, _key, _mode).target;
                 }
@@ -3962,12 +4010,11 @@ class CantoScreenState extends State<CantoScreen>
               max: 100,
               bipolar: false,
               disabled: _notes.isEmpty || _bypass,
-              onChangeStart: () => _pushUndo('correct'),
+              onChangeStart: () => setState(() => _pushUndo('correct')),
               onChanged: (val) {
-                setState(() {
-                  _correct = val / 100.0;
-                  _reapplyCorrect();
-                });
+                _correct = val / 100.0;
+                _reapplyCorrect();
+                _redrawLive();
               },
               onChangeEnd: () => setState(() => _commitUndo()),
             ),

@@ -7,6 +7,28 @@ import 'package:flutter/material.dart';
 import 'music.dart';
 import 'theme.dart';
 
+/// Laid-out canvas labels by text and style. The canvas draws the same few
+/// dozen strings every frame (solfege, cents tags, bar numbers, key names);
+/// laying each out once rather than on every repaint is most of a frame's
+/// text cost. Bounded: the whole cache is dropped when it fills up.
+final Map<(String, TextStyle), TextPainter> _labelCache = {};
+
+TextPainter _label(String text, TextStyle style) {
+  final key = (text, style);
+  final hit = _labelCache[key];
+  if (hit != null) return hit;
+  if (_labelCache.length >= 512) {
+    for (final painter in _labelCache.values) {
+      painter.dispose();
+    }
+    _labelCache.clear();
+  }
+  return _labelCache[key] = TextPainter(
+    text: TextSpan(text: text, style: style),
+    textDirection: TextDirection.ltr,
+  )..layout();
+}
+
 class EditorLayout {
   final double w;
   final double h;
@@ -869,17 +891,14 @@ class EditorPainter extends CustomPainter {
       if (cents.abs() < 15) continue;
       final rect = vis.blockRRect.outerRect;
       if (rect.width < 14) continue;
-      final tp = TextPainter(
-        text: TextSpan(
-          text: formatCents(cents),
-          style: CantoTypography.num(
-            size: 9,
-            weight: FontWeight.w600,
-            color: CantoColors.heat,
-          ),
+      final tp = _label(
+        formatCents(cents),
+        CantoTypography.num(
+          size: 9,
+          weight: FontWeight.w600,
+          color: CantoColors.heat,
         ),
-        textDirection: TextDirection.ltr,
-      )..layout();
+      );
       final w = tp.width + 8;
       final h = tp.height + 2;
       final cx = clampVal(
@@ -1179,17 +1198,14 @@ class EditorPainter extends CustomPainter {
       final center = (math.max(x0, padL) + math.min(x1, layout.w)) / 2.0;
       if (x1 - x0 < 16) continue;
       final selected = note.id == selectedId;
-      final tp = TextPainter(
-        text: TextSpan(
-          text: note.lyric,
-          style: CantoTypography.sans(
-            size: 10.5,
-            weight: selected ? FontWeight.w700 : FontWeight.w500,
-            color: selected ? CantoColors.accentInk : CantoColors.canvasMuted,
-          ),
+      final tp = _label(
+        note.lyric,
+        CantoTypography.sans(
+          size: 10.5,
+          weight: selected ? FontWeight.w700 : FontWeight.w500,
+          color: selected ? CantoColors.accentInk : CantoColors.canvasMuted,
         ),
-        textDirection: TextDirection.ltr,
-      )..layout();
+      );
       if (center - tp.width / 2.0 < lastRight + 3) continue;
       if (selected) {
         canvas.drawRRect(
@@ -1231,17 +1247,14 @@ class EditorPainter extends CustomPainter {
         : formatCents(reading.cents);
     final badgeText = '$noteText · $centsText';
 
-    final tp = TextPainter(
-      text: TextSpan(
-        text: badgeText,
-        style: CantoTypography.num(
-          size: 10.0,
-          weight: FontWeight.w600,
-          color: reading.cents.abs() < 15 ? CantoColors.ink : CantoColors.heat,
-        ),
+    final tp = _label(
+      badgeText,
+      CantoTypography.num(
+        size: 10.0,
+        weight: FontWeight.w600,
+        color: reading.cents.abs() < 15 ? CantoColors.ink : CantoColors.heat,
       ),
-      textDirection: TextDirection.ltr,
-    )..layout();
+    );
 
     final pillW = tp.width + 14.0;
     final pillH = tp.height + 6.0;
@@ -1342,18 +1355,15 @@ class EditorPainter extends CustomPainter {
   }
 
   void _drawBypassTag(Canvas canvas, EditorLayout layout) {
-    final tp = TextPainter(
-      text: TextSpan(
-        text: bypassLabel,
-        style: CantoTypography.sans(
-          size: 9,
-          weight: FontWeight.w600,
-          color: CantoColors.bypass,
-          letterSpacing: 0.5,
-        ),
+    final tp = _label(
+      bypassLabel,
+      CantoTypography.sans(
+        size: 9,
+        weight: FontWeight.w600,
+        color: CantoColors.bypass,
+        letterSpacing: 0.5,
       ),
-      textDirection: TextDirection.ltr,
-    )..layout();
+    );
     final width = tp.width + 12;
     final x = layout.w - width - 8;
     final y = layout.padT + 8;
@@ -1386,10 +1396,7 @@ class EditorPainter extends CustomPainter {
     bool centerVertically = false,
     bool alignBottom = false,
   }) {
-    final tp = TextPainter(
-      text: TextSpan(text: text, style: style),
-      textDirection: TextDirection.ltr,
-    )..layout();
+    final tp = _label(text, style);
     double dx = position.dx;
     double dy = position.dy;
     if (alignRight) dx -= tp.width;
@@ -1412,10 +1419,11 @@ class OverviewPainter extends CustomPainter {
   final double duration;
   final bool bypass;
   final String? selectedId;
-  final double viewStart;
-  final double viewDuration;
-  final double pitchLo;
-  final double pitchHi;
+
+  /// The screen's full-rebuild count. Notes are edited in place, so this is
+  /// how a repaint tells new content from the same content: scrolling the
+  /// view does not change it, and the strip is not repainted for that.
+  final int generation;
 
   OverviewPainter({
     required this.notes,
@@ -1426,10 +1434,7 @@ class OverviewPainter extends CustomPainter {
     required this.duration,
     required this.bypass,
     required this.selectedId,
-    required this.viewStart,
-    required this.viewDuration,
-    required this.pitchLo,
-    required this.pitchHi,
+    required this.generation,
   });
 
   @override
@@ -1474,6 +1479,22 @@ class OverviewPainter extends CustomPainter {
       }
     }
 
+    // The whole take's range, not the editor's view: an overview that
+    // stays put while the editor scrolls through pitch.
+    var pitchLo = double.infinity;
+    var pitchHi = double.negativeInfinity;
+    for (final note in notes) {
+      if (note.unpitched) continue;
+      final pitch = presentNote(note, bypass).pitch;
+      pitchLo = math.min(pitchLo, pitch);
+      pitchHi = math.max(pitchHi, pitch);
+    }
+    if (!pitchLo.isFinite) {
+      pitchLo = 55;
+      pitchHi = 68;
+    }
+    pitchLo -= 1.5;
+    pitchHi += 1.5;
     final span = math.max(1.0, pitchHi - pitchLo);
     for (final note in notes) {
       final shown = presentNote(note, bypass);
@@ -1495,11 +1516,43 @@ class OverviewPainter extends CustomPainter {
         Paint()..color = Color.fromRGBO(rgb[0], rgb[1], rgb[2], opacity),
       );
     }
+  }
 
+  @override
+  bool shouldRepaint(covariant OverviewPainter old) =>
+      old.generation != generation ||
+      old.duration != duration ||
+      !identical(old.notes, notes) ||
+      !identical(old.waveformPeaks, waveformPeaks);
+}
+
+/// The overview's visible-window box, on its own layer above the strip, so
+/// scrolling the editor moves a box instead of repainting the waveform.
+class OverviewWindowPainter extends CustomPainter {
+  final double viewStart;
+  final double viewDuration;
+  final double duration;
+
+  OverviewWindowPainter({
+    required this.viewStart,
+    required this.viewDuration,
+    required this.duration,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.width < 8 || size.height < 8) return;
+    final dur = math.max(0.5, duration);
+    double xOf(double time) => (time / dur) * size.width;
     final vx = xOf(viewStart);
     final vw = math.max(8.0, xOf(viewDuration));
     final viewRect = RRect.fromRectAndRadius(
-      Rect.fromLTWH(vx + 0.75, 0.75, math.max(1.0, vw - 1.5), height - 1.5),
+      Rect.fromLTWH(
+        vx + 0.75,
+        0.75,
+        math.max(1.0, vw - 1.5),
+        size.height - 1.5,
+      ),
       const Radius.circular(6),
     );
     canvas.drawRRect(
@@ -1516,7 +1569,10 @@ class OverviewPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant OverviewPainter oldDelegate) => true;
+  bool shouldRepaint(covariant OverviewWindowPainter old) =>
+      old.viewStart != viewStart ||
+      old.viewDuration != viewDuration ||
+      old.duration != duration;
 }
 
 /// Editor playhead, painted on its own layer and driven by [playhead] so
