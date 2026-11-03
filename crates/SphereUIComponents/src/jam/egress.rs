@@ -104,6 +104,7 @@ pub fn available_ports() -> AvailablePorts {
                 direction: AudioConnectionDirection::Output,
             })
             .collect(),
+        ..AvailablePorts::default()
     }
 }
 

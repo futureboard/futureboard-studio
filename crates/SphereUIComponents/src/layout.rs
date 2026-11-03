@@ -3442,6 +3442,10 @@ impl StudioLayout {
                         self.audio_bridge.last_error = Some(message);
                     }
                 }
+            } else {
+                // An input change does not reopen the stream, but a bus whose
+                // device is missing runs on the selected input, so it moves.
+                self.revalidate_audio_connections(cx);
             }
             return;
         }

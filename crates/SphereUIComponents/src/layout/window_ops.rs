@@ -928,6 +928,30 @@ impl StudioLayout {
         }
     }
 
+    /// Re-resolve the project's connections against the cached inventory after
+    /// Audio Device Setup changed, without a rescan: a bus whose device is
+    /// missing follows the newly selected device (`StandIn`).
+    pub(crate) fn revalidate_audio_connections(&mut self, cx: &mut Context<Self>) {
+        let ports = crate::audio_connections::current_available_ports();
+        let mutation = self.timeline.update(cx, |timeline, cx| {
+            let mutation = timeline.state.audio_connections.validate_all(&ports);
+            if mutation.needs_routing_rebuild {
+                timeline.state.refresh_output_labels();
+                cx.notify();
+            }
+            mutation
+        });
+        if !mutation.needs_routing_rebuild {
+            return;
+        }
+        self.publish_audio_connection_routing(cx);
+        self.refresh_audio_connections_window(cx);
+        // Track input devices and channels travel in the engine project
+        // snapshot; that is what opens the capture stream.
+        self.audio_bridge.project_dirty = true;
+        self.schedule_audio_project_sync(cx, true, "audio_connections_revalidated");
+    }
+
     /// Push fresh project data into the open window, if any.
     pub(crate) fn refresh_audio_connections_window(&mut self, cx: &mut Context<Self>) {
         let Some(handle) = self.external_windows.audio_connections.clone() else {

@@ -96,7 +96,10 @@ pub fn available_ports() -> AvailablePorts {
             });
         }
     }
-    AvailablePorts { ports }
+    AvailablePorts {
+        ports,
+        ..AvailablePorts::default()
+    }
 }
 
 #[cfg(test)]

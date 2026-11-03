@@ -1163,6 +1163,9 @@ impl SettingsSchema {
         let path = FutureboardPaths::resolve().settings_file;
         let mut schema = SettingsModel::load_from_path(&path);
         persist_sanitized_audio_driver(&path, &mut schema);
+        // The pre-Studio session load reads settings here and resolves the
+        // project's Audio Connections before any settings entity exists.
+        publish_selected_audio_devices(&schema);
         schema
     }
 
@@ -1358,11 +1361,21 @@ fn persist_sanitized_audio_driver(path: &Path, schema: &mut SettingsSchema) {
     }
 }
 
+/// Tell Audio Connections which devices Audio Device Setup has selected: a
+/// bus whose own device is missing runs on them.
+fn publish_selected_audio_devices(schema: &SettingsSchema) {
+    crate::device_registry::set_selected_audio_devices(
+        &schema.hardware.audio.device_in,
+        &schema.hardware.audio.device_out,
+    );
+}
+
 impl SettingsModel {
     pub fn load_or_create(cx: &mut gpui::App) -> gpui::Entity<Self> {
         let path = FutureboardPaths::resolve().settings_file;
         let mut settings = Self::load_from_path(&path);
         persist_sanitized_audio_driver(&path, &mut settings);
+        publish_selected_audio_devices(&settings);
 
         cx.new(|_cx| Self {
             current: settings,
@@ -1430,6 +1443,7 @@ impl SettingsModel {
     {
         updater(&mut self.current);
         self.current.validate_and_clamp();
+        publish_selected_audio_devices(&self.current);
         if let Some(listener) = SETTINGS_CHANGE_LISTENER.get() {
             listener(&self.current);
         }

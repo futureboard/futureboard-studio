@@ -382,7 +382,11 @@ pub fn available_ports() -> AvailablePorts {
             });
         }
     }
-    AvailablePorts { ports }.merge(egress::available_ports())
+    AvailablePorts {
+        ports,
+        ..AvailablePorts::default()
+    }
+    .merge(egress::available_ports())
 }
 
 /// The process-wide controller.

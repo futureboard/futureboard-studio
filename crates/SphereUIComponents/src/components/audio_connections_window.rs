@@ -911,7 +911,11 @@ impl AudioConnectionsWindow {
             .clone()
             .unwrap_or_else(|| status_label.clone());
         let focused_cell = row.selected.then_some(self.panel.focused_cell).flatten();
-        let device_ok = !matches!(row.status, AudioConnectionStatus::DeviceMissing);
+        // A stand-in still means the assigned device is gone.
+        let device_ok = !matches!(
+            row.status,
+            AudioConnectionStatus::DeviceMissing | AudioConnectionStatus::StandIn
+        );
         let port_ok = !matches!(row.status, AudioConnectionStatus::PortMissing);
         // What this row is bound to, resolved once: the Device and both port
         // cells all show it, and for a jam stream it is a face rather than an

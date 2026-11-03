@@ -303,7 +303,7 @@ pub fn compile_routing(
                 }
                 Some(connection) => match registry.resolved_ports(id, ports) {
                     Some(channels) => {
-                        let device_id = connection.device_id.as_deref().unwrap_or_default();
+                        let device_id = connection.effective_device_id().unwrap_or_default();
                         Some(ResolvedInputSource {
                             device_runtime_id: devices.index_of(device_id),
                             channels: SmallChannelList::from_slice(&channels),
@@ -358,7 +358,7 @@ pub fn compile_routing(
                 return None;
             }
         };
-        let device_id = connection.device_id.as_deref().unwrap_or_default();
+        let device_id = connection.effective_device_id().unwrap_or_default();
         let device_runtime_id = devices.index_of(device_id);
         let channels = SmallChannelList::from_slice(&channels);
         // Reuse an identical resolved output rather than emitting a duplicate

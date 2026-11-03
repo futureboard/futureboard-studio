@@ -525,7 +525,7 @@ pub(crate) fn build_engine_input_source(
     };
     match connections.resolved_ports(connection_id, ports) {
         Some(channels) => EngineTrackInputSourceSnapshot {
-            device_id: connection.device_id.clone(),
+            device_id: connection.effective_device_id().map(str::to_string),
             channels,
         },
         None => empty(),

@@ -46,6 +46,8 @@ struct RegistryState {
     midi_consecutive_empty_scans: u8,
     audio: AudioDeviceSnapshot,
     audio_scanned: bool,
+    /// See [`set_selected_audio_devices`].
+    selected_audio_devices: (String, String),
 }
 
 fn state() -> &'static RwLock<RegistryState> {
@@ -264,6 +266,25 @@ pub fn audio_snapshot() -> AudioDeviceSnapshot {
         }
     }
     state().read().unwrap().audio.clone()
+}
+
+/// Publish the input and output devices selected in Audio Device Setup (as
+/// stored in settings). Audio Connections runs a bus whose own device is
+/// missing on these. Returns whether the selection changed.
+pub fn set_selected_audio_devices(input: &str, output: &str) -> bool {
+    let mut s = state().write().unwrap();
+    let selected = (input.trim().to_string(), output.trim().to_string());
+    if s.selected_audio_devices == selected {
+        return false;
+    }
+    s.selected_audio_devices = selected;
+    true
+}
+
+/// The `(input, output)` last published by [`set_selected_audio_devices`];
+/// empty strings before that.
+pub fn selected_audio_devices() -> (String, String) {
+    state().read().unwrap().selected_audio_devices.clone()
 }
 
 #[cfg(test)]

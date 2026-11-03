@@ -1704,7 +1704,7 @@ fn recording_input_channels_checked(
             connection.status.label()
         ));
     }
-    let Some(device_id) = connection.device_id.as_deref() else {
+    let Some(device_id) = connection.effective_device_id() else {
         return Err(format!(
             "{} input connection \"{}\" has no audio device assigned.",
             track.name, connection.name

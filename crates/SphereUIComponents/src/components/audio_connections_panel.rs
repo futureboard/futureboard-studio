@@ -670,6 +670,12 @@ pub fn status_detail(status: AudioConnectionStatus) -> Option<String> {
         AudioConnectionStatus::DeviceMissing => {
             Some("The assigned audio device is not currently available.".to_string())
         }
+        AudioConnectionStatus::StandIn => Some(
+            "The assigned audio device is not available, so this bus uses the same ports on \
+             the device selected in Audio Device Setup. The assignment is kept and takes over \
+             again when that device is back."
+                .to_string(),
+        ),
         AudioConnectionStatus::PortMissing => {
             Some("The device is available but an assigned port is not.".to_string())
         }

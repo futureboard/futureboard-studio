@@ -20,6 +20,13 @@
 //!   and every reference to it survive; only [`AudioConnectionStatus`] changes.
 //!   Reconnecting the same device restores the mapping exactly, because
 //!   bindings are keyed by a stable port identifier rather than by index.
+//!
+//! A bus whose device is missing still runs on the device the engine uses for
+//! its direction (the Audio Device Setup pick, or the system default): it
+//! reaches the same port numbers there ([`AudioConnectionStatus::StandIn`]). A project saved on one backend
+//! (an ASIO driver) therefore records and plays on another (WASAPI) without
+//! re-patching, and nothing stored changes, so the original device takes over
+//! again as soon as it is back.
 
 use std::collections::{HashMap, HashSet};
 
@@ -173,6 +180,10 @@ pub enum AudioConnectionStatus {
     /// The configured device is not present. The connection and every
     /// reference to it are preserved; it restores when the device returns.
     DeviceMissing,
+    /// The configured device is not present, so the bus runs on the device
+    /// selected in Audio Device Setup, at the same port numbers. Usable;
+    /// nothing stored changes.
+    StandIn,
     /// The device is present but a bound port is not.
     PortMissing,
     /// No ports are bound yet.
@@ -185,7 +196,7 @@ pub enum AudioConnectionStatus {
 
 impl AudioConnectionStatus {
     pub fn is_usable(self) -> bool {
-        matches!(self, Self::Active)
+        matches!(self, Self::Active | Self::StandIn)
     }
 
     /// Short label for the Status column.
@@ -193,6 +204,7 @@ impl AudioConnectionStatus {
         match self {
             Self::Active => "Active",
             Self::DeviceMissing => "Device Missing",
+            Self::StandIn => "Current Device",
             Self::PortMissing => "Port Missing",
             Self::Disconnected => "Disconnected",
             Self::Disabled => "Disabled",
@@ -214,6 +226,9 @@ pub struct AudioConnection {
     /// Recomputed by [`AudioConnectionRegistry::revalidate`]; never persisted,
     /// because it describes the current machine rather than the project.
     pub status: AudioConnectionStatus,
+    /// The device this bus runs on while [`AudioConnectionStatus::StandIn`].
+    /// Recomputed with `status`; never persisted.
+    pub stand_in_device: Option<String>,
 }
 
 impl AudioConnection {
@@ -231,7 +246,16 @@ impl AudioConnection {
             port_bindings: Vec::new(),
             enabled: true,
             status: AudioConnectionStatus::Disconnected,
+            stand_in_device: None,
         }
+    }
+
+    /// The device this bus reaches right now: the stand-in while its own
+    /// device is missing, otherwise its own.
+    pub fn effective_device_id(&self) -> Option<&str> {
+        self.stand_in_device
+            .as_deref()
+            .or(self.device_id.as_deref())
     }
 
     /// Bind consecutive device ports starting at `first_port`, one per logical
@@ -313,6 +337,11 @@ pub struct AvailablePort {
 #[derive(Debug, Clone, Default)]
 pub struct AvailablePorts {
     pub ports: Vec<AvailablePort>,
+    /// The devices the engine opens (the Audio Device Setup pick, else the
+    /// system default), by id. A bus whose own device is missing runs on
+    /// these; see [`AudioConnectionStatus::StandIn`].
+    pub stand_in_input: Option<String>,
+    pub stand_in_output: Option<String>,
 }
 
 impl AvailablePorts {
@@ -344,12 +373,57 @@ impl AvailablePorts {
                 direction: AudioConnectionDirection::Output,
             });
         }
-        Self { ports }
+        Self {
+            ports,
+            ..Self::default()
+        }
     }
 
     pub fn merge(mut self, other: AvailablePorts) -> Self {
         self.ports.extend(other.ports);
+        self.stand_in_input = self.stand_in_input.or(other.stand_in_input);
+        self.stand_in_output = self.stand_in_output.or(other.stand_in_output);
         self
+    }
+
+    /// Take the devices selected in Audio Device Setup (ids or display names)
+    /// as stand-ins. A selection that is not among these ports is dropped:
+    /// a stand-in has to exist.
+    pub fn with_stand_ins(mut self, input: &str, output: &str) -> Self {
+        let pick = |ports: &Self, selected: &str, direction| {
+            let selected = selected.trim();
+            (!selected.is_empty())
+                .then(|| ports.matching_device_id(selected, direction))
+                .flatten()
+                .map(str::to_string)
+        };
+        self.stand_in_input = pick(&self, input, AudioConnectionDirection::Input);
+        self.stand_in_output = pick(&self, output, AudioConnectionDirection::Output);
+        self
+    }
+
+    pub fn stand_in(&self, direction: AudioConnectionDirection) -> Option<&str> {
+        match direction {
+            AudioConnectionDirection::Input => self.stand_in_input.as_deref(),
+            AudioConnectionDirection::Output => self.stand_in_output.as_deref(),
+        }
+    }
+
+    /// Resolve one binding: on the stand-in by port number when one is given
+    /// (its port names belong to another device), otherwise as [`Self::resolve`].
+    fn resolve_binding(
+        &self,
+        binding: &AudioPortBinding,
+        direction: AudioConnectionDirection,
+        stand_in: Option<&str>,
+    ) -> Option<&AvailablePort> {
+        match stand_in {
+            Some(device_id) => self
+                .ports_for(device_id, direction)
+                .into_iter()
+                .find(|port| port.port_index == binding.physical_port_id.port_index),
+            None => self.resolve(&binding.physical_port_id, direction),
+        }
     }
 
     pub fn has_device(&self, device_id: &str) -> bool {
@@ -795,50 +869,77 @@ impl AudioConnectionRegistry {
         let mut claimed_output_ports: HashMap<(String, u32), usize> = HashMap::new();
 
         for index in 0..self.connections.len() {
-            let status = {
+            let (status, stand_in) = {
                 let connection = &self.connections[index];
                 Self::status_for(connection, ports, &claimed_output_ports)
             };
+            let direction = self.connections[index].direction;
             // Refresh port names for still-present ports so a driver rename
-            // shows through without changing which port is bound.
+            // shows through without changing which port is bound. A stand-in
+            // leaves the stored bindings alone: they belong to the missing
+            // device.
             if matches!(status, AudioConnectionStatus::Active) {
-                let direction = self.connections[index].direction;
                 for binding in self.connections[index].port_bindings.iter_mut() {
                     if let Some(port) = ports.resolve(&binding.physical_port_id, direction) {
                         binding.physical_port_id.port_name = port.port_name.clone();
                         binding.physical_port_id.port_index = port.port_index;
                     }
                 }
-                if direction == AudioConnectionDirection::Output {
-                    for binding in &self.connections[index].port_bindings {
-                        claimed_output_ports.insert(
-                            (
-                                binding.physical_port_id.device_id.clone(),
-                                binding.physical_port_id.port_index,
-                            ),
-                            index,
-                        );
-                    }
+            }
+            if status.is_usable() && direction == AudioConnectionDirection::Output {
+                for binding in &self.connections[index].port_bindings {
+                    let device_id = stand_in
+                        .clone()
+                        .unwrap_or_else(|| binding.physical_port_id.device_id.clone());
+                    claimed_output_ports
+                        .insert((device_id, binding.physical_port_id.port_index), index);
                 }
             }
             self.connections[index].status = status;
+            self.connections[index].stand_in_device = stand_in;
         }
     }
 
+    /// Status against `ports`, and the stand-in device when the bus runs on
+    /// one.
     fn status_for(
         connection: &AudioConnection,
         ports: &AvailablePorts,
         claimed_output_ports: &HashMap<(String, u32), usize>,
-    ) -> AudioConnectionStatus {
+    ) -> (AudioConnectionStatus, Option<String>) {
         if !connection.enabled {
-            return AudioConnectionStatus::Disabled;
+            return (AudioConnectionStatus::Disabled, None);
         }
         let Some(device_id) = connection.device_id.as_deref() else {
-            return AudioConnectionStatus::Disconnected;
+            return (AudioConnectionStatus::Disconnected, None);
         };
-        if !ports.has_device(device_id) {
-            return AudioConnectionStatus::DeviceMissing;
+        if ports.has_device(device_id) {
+            return (
+                Self::port_status(connection, ports, None, claimed_output_ports),
+                None,
+            );
         }
+        let Some(stand_in) = ports.stand_in(connection.direction) else {
+            return (AudioConnectionStatus::DeviceMissing, None);
+        };
+        match Self::port_status(connection, ports, Some(stand_in), claimed_output_ports) {
+            AudioConnectionStatus::Active => {
+                (AudioConnectionStatus::StandIn, Some(stand_in.to_string()))
+            }
+            // The stand-in cannot carry this bus (too few ports, or they are
+            // taken): the bus's own device is still what is missing.
+            _ => (AudioConnectionStatus::DeviceMissing, None),
+        }
+    }
+
+    /// Port-level status of a bus whose device is present — its own, or the
+    /// `stand_in` it runs on.
+    fn port_status(
+        connection: &AudioConnection,
+        ports: &AvailablePorts,
+        stand_in: Option<&str>,
+        claimed_output_ports: &HashMap<(String, u32), usize>,
+    ) -> AudioConnectionStatus {
         let channels = connection.channel_layout.channel_count();
         if connection.port_bindings.len() < channels {
             return AudioConnectionStatus::PortMissing;
@@ -849,7 +950,7 @@ impl AudioConnectionRegistry {
             let Some(binding) = connection.binding(channel) else {
                 return AudioConnectionStatus::PortMissing;
             };
-            let Some(port) = ports.resolve(&binding.physical_port_id, connection.direction) else {
+            let Some(port) = ports.resolve_binding(binding, connection.direction, stand_in) else {
                 return AudioConnectionStatus::PortMissing;
             };
             resolved.push((port.device_id.clone(), port.port_index));
@@ -888,10 +989,11 @@ impl AudioConnectionRegistry {
             return None;
         }
         let channels = connection.channel_layout.channel_count();
+        let stand_in = connection.stand_in_device.as_deref();
         let mut resolved = Vec::with_capacity(channels);
         for channel in 0..channels {
             let binding = connection.binding(channel)?;
-            let port = ports.resolve(&binding.physical_port_id, connection.direction)?;
+            let port = ports.resolve_binding(binding, connection.direction, stand_in)?;
             resolved.push(port.port_index);
         }
         Some(resolved)
@@ -1302,6 +1404,114 @@ mod tests {
         assert_eq!(registry.resolved_ports(&id, &ports), before);
     }
 
+    // ── Stand-in device ─────────────────────────────────────────────────────
+
+    /// What a project saved on an ASIO driver meets under WASAPI: its device
+    /// is gone, and Audio Device Setup has a USB interface selected.
+    fn usb_selected(inputs: u32) -> AvailablePorts {
+        AvailablePorts::for_device("usb", "USB Audio", inputs, 2)
+            .with_stand_ins("USB Audio", "USB Audio")
+    }
+
+    #[test]
+    fn a_missing_device_runs_on_the_selected_device_at_the_same_ports() {
+        let ports = usb_selected(2);
+        let mut registry = registry();
+        let input = registry.by_direction(AudioConnectionDirection::Input)[2]
+            .id
+            .clone();
+        let output = registry.by_direction(AudioConnectionDirection::Output)[0]
+            .id
+            .clone();
+        let bindings = registry.get(&input).unwrap().port_bindings.clone();
+
+        registry.revalidate(&ports);
+
+        let connection = registry.get(&input).unwrap();
+        assert_eq!(connection.status, AudioConnectionStatus::StandIn);
+        assert!(connection.status.is_usable());
+        assert_eq!(connection.effective_device_id(), Some("usb"));
+        assert_eq!(connection.device_id.as_deref(), Some("dev-1"));
+        assert_eq!(
+            connection.port_bindings, bindings,
+            "a stand-in must not rewrite what the project stores"
+        );
+        assert_eq!(registry.resolved_ports(&input, &ports), Some(vec![0, 1]));
+        assert_eq!(
+            registry.get(&output).unwrap().status,
+            AudioConnectionStatus::StandIn
+        );
+        assert_eq!(registry.resolved_ports(&output, &ports), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn the_assigned_device_takes_over_again_when_it_returns() {
+        let mut registry = registry();
+        let id = registry.by_direction(AudioConnectionDirection::Input)[2]
+            .id
+            .clone();
+        registry.revalidate(&usb_selected(2));
+
+        let ports = device().merge(usb_selected(2));
+        registry.revalidate(&ports);
+
+        let connection = registry.get(&id).unwrap();
+        assert_eq!(connection.status, AudioConnectionStatus::Active);
+        assert_eq!(connection.stand_in_device, None);
+        assert_eq!(connection.effective_device_id(), Some("dev-1"));
+    }
+
+    #[test]
+    fn a_stand_in_without_the_ports_leaves_the_bus_missing() {
+        let ports = usb_selected(1);
+        let mut registry = registry();
+        let stereo = registry.by_direction(AudioConnectionDirection::Input)[2]
+            .id
+            .clone();
+
+        registry.revalidate(&ports);
+
+        let connection = registry.get(&stereo).unwrap();
+        assert_eq!(connection.status, AudioConnectionStatus::DeviceMissing);
+        assert_eq!(connection.stand_in_device, None);
+        assert_eq!(registry.resolved_ports(&stereo, &ports), None);
+    }
+
+    #[test]
+    fn there_is_no_stand_in_without_a_present_selection() {
+        let unselected = AvailablePorts::for_device("usb", "USB Audio", 2, 2);
+        assert_eq!(unselected.with_stand_ins("", " ").stand_in_input, None);
+        assert_eq!(
+            AvailablePorts::for_device("usb", "USB Audio", 2, 2)
+                .with_stand_ins("Unplugged Mic", "Unplugged Speakers")
+                .stand_in_output,
+            None
+        );
+
+        let mut registry = registry();
+        registry.revalidate(&AvailablePorts::for_device("usb", "USB Audio", 2, 2));
+        assert!(registry
+            .all()
+            .iter()
+            .all(|connection| connection.status == AudioConnectionStatus::DeviceMissing));
+    }
+
+    #[test]
+    fn moving_to_another_stand_in_rebuilds_routing() {
+        let mut registry = registry();
+        registry.revalidate(&usb_selected(2));
+
+        let other = AvailablePorts::for_device("usb", "USB Audio", 2, 2)
+            .merge(AvailablePorts::for_device("usb-2", "Other USB", 2, 2))
+            .with_stand_ins("Other USB", "Other USB");
+        let mutation = registry.validate_all(&other);
+
+        assert!(mutation.needs_routing_rebuild);
+        let input = registry.by_direction(AudioConnectionDirection::Input)[2];
+        assert_eq!(input.status, AudioConnectionStatus::StandIn);
+        assert_eq!(input.effective_device_id(), Some("usb-2"));
+    }
+
     /// Restoration keys on the stable port *name* first, so a driver that
     /// re-orders its ports cannot silently move a bus onto another input.
     #[test]
@@ -1333,6 +1543,7 @@ mod tests {
                     direction: AudioConnectionDirection::Input,
                 },
             ],
+            ..AvailablePorts::default()
         };
         registry.revalidate(&reordered);
         assert_eq!(
@@ -1624,6 +1835,21 @@ pub fn current_available_ports() -> AvailablePorts {
             device.channels,
         ));
     }
+    // Stand-ins are the devices the engine actually opens: the Audio Device
+    // Setup pick, or the system default when that is left empty (which is
+    // what changing the driver leaves behind).
+    let (selected_input, selected_output) = crate::device_registry::selected_audio_devices();
+    let or_default = |selected: String, default: &Option<String>| {
+        if selected.is_empty() {
+            default.clone().unwrap_or_default()
+        } else {
+            selected
+        }
+    };
+    let ports = ports.with_stand_ins(
+        &or_default(selected_input, &snapshot.default_input),
+        &or_default(selected_output, &snapshot.default_output),
+    );
     // Audio Jam streams are input ports too. Routing a remote performer to a
     // track therefore goes through this same layer — stable ids, non-destructive
     // loss when they leave, one place that maps logical to physical — instead of
@@ -2240,10 +2466,12 @@ impl AudioConnectionRegistry {
     /// Recompute every status. Exposed so a device-inventory change can refresh
     /// the panel without going through an edit.
     pub fn validate_all(&mut self, ports: &AvailablePorts) -> ConnectionMutation {
+        // A bus moving from one stand-in device to another keeps its status
+        // but not its route, so the device is part of the comparison.
         let before: Vec<_> = self
             .all()
             .iter()
-            .map(|c| (c.id.clone(), c.status))
+            .map(|c| (c.id.clone(), c.status, c.stand_in_device.clone()))
             .collect();
         self.revalidate(ports);
         let changed: Vec<_> = self
@@ -2252,8 +2480,10 @@ impl AudioConnectionRegistry {
             .filter(|c| {
                 before
                     .iter()
-                    .find(|(id, _)| *id == c.id)
-                    .map(|(_, status)| *status != c.status)
+                    .find(|(id, _, _)| *id == c.id)
+                    .map(|(_, status, stand_in)| {
+                        *status != c.status || *stand_in != c.stand_in_device
+                    })
                     .unwrap_or(true)
             })
             .map(|c| c.id.clone())
