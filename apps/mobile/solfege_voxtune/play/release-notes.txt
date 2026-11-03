@@ -1,16 +1,14 @@
 <th>
-Solfege Voxtune เวอร์ชันแรก
-• แก้พิตช์และจังหวะเสียงร้องทีละโน้ต พร้อมตรวจหาคีย์และเทมโปให้
-• ตัด รวม ปิดเสียง และใส่ลูกคอ (สะบัดขึ้น สะบัดลง ลูกคอสั่น ปัดท้าย)
-• เครื่องมือขั้นสูง: แก้พิตช์กลางโน้ต ลดการส่ายของพิตช์ จัดจังหวะเข้ากริด ทรานสโพส เกลี่ยความดัง
-• อัดเสียงจากไมค์ หรือเปิดไฟล์ WAV, MP3, FLAC, OGG, M4A
-• บันทึกอัตโนมัติ ย้อนประวัติการแก้ไขได้ และส่งออกเป็น WAV
+• สเกลเพิ่มเป็น 11 แบบ: เมเจอร์, ไมเนอร์, ฮาร์โมนิกไมเนอร์, เมโลดิกไมเนอร์, โดเรียน, ฟรีเจียน, ลิเดียน, มิกโซลิเดียน, เมเจอร์/ไมเนอร์เพนทาโทนิก และบลูส์
+• วิเคราะห์สเกลจากเสียงร้องได้ละเอียดขึ้น ตรวจจับโหมด เมโลดิก/ฮาร์โมนิกไมเนอร์ เพนทาโทนิก และบลูส์ได้
+• ถ่างนิ้วขึ้นลงเพื่อซูมแนวตั้ง (ช่วงพิตช์) ได้แล้ว
+• แท็บเล็ตแนวนอน: ย้ายแถบเล่นเสียงไปไว้ใต้หน้าแก้ไข
+• หน้าตั้งค่าแสดงเวอร์ชันจริงของแอป
 </th>
 <en-US>
-First release of Solfege Voxtune.
-• Fix vocal pitch and timing note by note, with key and tempo detection
-• Cut, join, mute, and add luk khor ornaments: flick up, flick down, shake, fall
-• Advanced tools: correct pitch center, reduce drift, quantize timing, transpose, even out levels
-• Record from the mic, or open WAV, MP3, FLAC, OGG and M4A files
-• Auto-save, undo history and WAV export
+• 11 scales: major, minor, harmonic minor, melodic minor, Dorian, Phrygian, Lydian, Mixolydian, major and minor pentatonic, and blues
+• Smarter scale detection: finds modes, melodic and harmonic minor, pentatonics and blues in what you sang
+• Pinch up and down to zoom the pitch range
+• Landscape tablets: the transport now sits under the editor
+• Settings shows the app's real version
 </en-US>

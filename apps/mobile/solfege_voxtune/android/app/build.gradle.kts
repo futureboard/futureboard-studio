@@ -17,8 +17,8 @@ val uploadKey = Properties().apply {
 }
 
 // The app's `.env` (see `.env.example`): KEY=value lines, `#` comments. Only
-// PLAY_LICENSE_PUBLIC_KEY is used here; the upload settings are the upload
-// script's.
+// PLAY_LICENSE_PUBLIC_KEY and PLAY_LICENSE_BYPASS are used here; the upload
+// settings are the upload script's.
 val appEnv: Map<String, String> = rootProject.file("../.env").let { file ->
     if (!file.exists()) {
         emptyMap()
@@ -62,6 +62,12 @@ android {
             "String",
             "PLAY_LICENSE_PUBLIC_KEY",
             "\"${appEnv["PLAY_LICENSE_PUBLIC_KEY"].orEmpty()}\"",
+        )
+        // Test builds (internal / alpha) skip the purchase check.
+        buildConfigField(
+            "boolean",
+            "PLAY_LICENSE_BYPASS",
+            (appEnv["PLAY_LICENSE_BYPASS"]?.lowercase() == "true").toString(),
         )
     }
 

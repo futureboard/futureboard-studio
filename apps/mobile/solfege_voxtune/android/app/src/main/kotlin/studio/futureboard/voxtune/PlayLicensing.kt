@@ -40,7 +40,8 @@ class PlayLicensing(private val context: Context) {
     /** Runs one check; [done] is called once, on the main thread. */
     fun check(done: (State) -> Unit) {
         val key = BuildConfig.PLAY_LICENSE_PUBLIC_KEY
-        if (key.isBlank()) {
+        // Test builds (PLAY_LICENSE_BYPASS) and builds without a key skip it.
+        if (BuildConfig.PLAY_LICENSE_BYPASS || key.isBlank()) {
             done(State.DISABLED)
             return
         }

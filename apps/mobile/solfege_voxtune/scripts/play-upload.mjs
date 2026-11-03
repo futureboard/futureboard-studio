@@ -7,10 +7,16 @@
 //   node .../play-upload.mjs --aab path/to/app.aab --track alpha \
 //        --status draft --notes path/to/release-notes.txt
 //   node .../play-upload.mjs --check      # sign in and read the track only
+//   node .../play-upload.mjs --track alpha --code 3   # put an already
+//        uploaded versionCode on a track (Play takes each code only once)
 //
 // Defaults come from `.env`: PLAY_TRACK, PLAY_RELEASE_STATUS,
 // PLAY_PACKAGE_NAME. The bundle defaults to the one `flutter build appbundle`
-// writes. Release notes use Play Console's own paste format:
+// writes. The release is named "<versionName> (<versionCode>)" from
+// pubspec.yaml, so releases of the same version name stay apart in Play
+// Console. Release notes come from `play/release-notes.txt` (the notes of
+// the release being made) unless `--notes` names another file, in Play
+// Console's own paste format:
 //   <th>
 //   ...
 //   </th>
@@ -134,13 +140,29 @@ async function main() {
   if (!["draft", "completed", "inProgress", "halted"].includes(status)) {
     throw new Error(`unknown release status "${status}"`);
   }
+  // A bypassed build skips the purchase check: fine for testing tracks,
+  // never for the store.
+  if (track === "production" && String(env.PLAY_LICENSE_BYPASS).toLowerCase() === "true") {
+    throw new Error(
+      "PLAY_LICENSE_BYPASS=true builds skip the purchase check and cannot go to production; set it to false in .env and rebuild",
+    );
+  }
 
   const aab = path.resolve(
     arg("aab") ?? path.join(app, "build/app/outputs/bundle/release/app-release.aab"),
   );
-  const notesFile = arg("notes");
+  const defaultNotes = path.join(app, "play/release-notes.txt");
+  const notesFile = arg("notes") ?? (existsSync(defaultNotes) ? defaultNotes : undefined);
   const notes = notesFile ? parseNotes(notesFile) : undefined;
-  if (!checkOnly && !existsSync(aab)) throw new Error(`bundle not found: ${aab}`);
+  const versionName = readFileSync(path.join(app, "pubspec.yaml"), "utf8")
+    .match(/^version:\s*([^+\s]+)/m)?.[1];
+  const existingCode = arg("code");
+  if (existingCode !== undefined && !/^\d+$/.test(existingCode)) {
+    throw new Error(`--code must be a versionCode, got "${existingCode}"`);
+  }
+  if (!checkOnly && existingCode === undefined && !existsSync(aab)) {
+    throw new Error(`bundle not found: ${aab}`);
+  }
 
   const { token, email } = await accessToken(keyFile);
   console.log(`signed in as ${email}`);
@@ -152,26 +174,34 @@ async function main() {
     const current = await call(token, "GET", `${editUrl}/tracks/${track}`);
     console.log(`${pkg} · ${track}:`);
     for (const r of current.releases ?? []) {
-      console.log(`  ${r.name ?? "(unnamed)"} · ${r.status} · codes ${(r.versionCodes ?? []).join(", ")}`);
+      const langs = (r.releaseNotes ?? []).map((n) => n.language).join(", ") || "none";
+      console.log(`  ${r.name ?? "(unnamed)"} · ${r.status} · codes ${(r.versionCodes ?? []).join(", ")} · notes ${langs}`);
     }
     await call(token, "DELETE", editUrl);
     return;
   }
 
-  console.log(`uploading ${path.basename(aab)} (${(readFileSync(aab).length / 1048576).toFixed(1)} MB)...`);
-  const bundle = await call(
-    token,
-    "POST",
-    `${UPLOAD_API}/applications/${pkg}/edits/${edit.id}/bundles?uploadType=media`,
-    readFileSync(aab),
-    "application/octet-stream",
-  );
-  console.log(`uploaded versionCode ${bundle.versionCode}`);
+  let bundle;
+  if (existingCode !== undefined) {
+    bundle = { versionCode: Number(existingCode) };
+    console.log(`using uploaded versionCode ${existingCode}`);
+  } else {
+    console.log(`uploading ${path.basename(aab)} (${(readFileSync(aab).length / 1048576).toFixed(1)} MB)...`);
+    bundle = await call(
+      token,
+      "POST",
+      `${UPLOAD_API}/applications/${pkg}/edits/${edit.id}/bundles?uploadType=media`,
+      readFileSync(aab),
+      "application/octet-stream",
+    );
+    console.log(`uploaded versionCode ${bundle.versionCode}`);
+  }
 
   await call(token, "PUT", `${editUrl}/tracks/${track}`, {
     track,
     releases: [
       {
+        ...(versionName && { name: `${versionName} (${bundle.versionCode})` }),
         versionCodes: [String(bundle.versionCode)],
         status,
         ...(notes && { releaseNotes: notes }),
