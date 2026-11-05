@@ -2013,6 +2013,10 @@ pub fn app_chrome(
     let project_anchor_x = (viewport_width * 0.5 - PROJECT_CHIP_MAX_WIDTH * 0.5)
         .max(chrome_left + menu_width + crate::theme::space::BASE);
 
+    // Under the OS caption (Native windowed) this row is a menu and tool row
+    // in the client area: the caption above it moves and maximizes the window
+    // and carries the caption buttons.
+    let native_frame = crate::platform_chrome::studio_native_frame();
     let mut chrome = div()
         .flex()
         .flex_row()
@@ -2020,20 +2024,23 @@ pub fn app_chrome(
         .h(px(policy.titlebar_height_px))
         .w_full()
         .bg(Colors::surface_titlebar())
-        .pl(policy.traffic_light_left_padding())
-        // Windows: NCHITTEST callback returns `HTCAPTION` for hitboxes
-        // tagged Drag, letting DefWindowProc start the system move.
-        .window_control_area(WindowControlArea::Drag)
-        // Linux (Wayland / X11) and macOS: `begin_titlebar_drag` is the
-        // implemented drag API there; the WindowControlArea path is a
-        // no-op on those platforms. On macOS the second click zooms.
-        // Safe to attach here because every interactive child below
-        // (menu buttons, transport buttons, window controls, report-bug)
-        // calls `.occlude()`. Occlude is `HitboxBehavior::BlockMouse`,
-        // which breaks the `hit_test` iteration at that child — the
-        // chrome's id is then NOT in `mouse_hit_test.ids`, so this
-        // on_mouse_down does NOT fire for clicks on those buttons.
-        .on_mouse_down(MouseButton::Left, begin_titlebar_drag);
+        .pl(policy.traffic_light_left_padding());
+    if !native_frame {
+        chrome = chrome
+            // Windows: NCHITTEST callback returns `HTCAPTION` for hitboxes
+            // tagged Drag, letting DefWindowProc start the system move.
+            .window_control_area(WindowControlArea::Drag)
+            // Linux (Wayland / X11) and macOS: `begin_titlebar_drag` is the
+            // implemented drag API there; the WindowControlArea path is a
+            // no-op on those platforms. On macOS the second click zooms.
+            // Safe to attach here because every interactive child below
+            // (menu buttons, transport buttons, window controls, report-bug)
+            // calls `.occlude()`. Occlude is `HitboxBehavior::BlockMouse`,
+            // which breaks the `hit_test` iteration at that child — the
+            // chrome's id is then NOT in `mouse_hit_test.ids`, so this
+            // on_mouse_down does NOT fire for clicks on those buttons.
+            .on_mouse_down(MouseButton::Left, begin_titlebar_drag);
+    }
 
     // Three tracks, so the project control lands on the true window centre
     // regardless of how wide the menu bar or the right-hand cluster is. Both
@@ -2066,7 +2073,7 @@ pub fn app_chrome(
     if let Some(chip) = account_chip() {
         right = right.child(section_separator()).child(chip);
     }
-    if policy.show_window_controls {
+    if policy.show_window_controls && !native_frame {
         right = right.child(window_controls(window, on_window_close, i18n));
     }
 

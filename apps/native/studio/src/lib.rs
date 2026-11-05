@@ -187,6 +187,13 @@ fn run() {
     // Metal device while the platform is built below, so the choice has to be
     // in place before `application()` — the settings model does not exist yet.
     sphere_ui_components::startup::export_gpu_adapter_preference();
+    // The Studio window's frame is fixed when it is created, so the choice in
+    // Preferences → Appearance is latched for this run before any opens.
+    sphere_ui_components::platform_chrome::set_studio_window_style(
+        sphere_ui_components::settings::SettingsSchema::load_from_disk()
+            .appearance
+            .window_style,
+    );
 
     boot::log("process setup done");
     boot::log(

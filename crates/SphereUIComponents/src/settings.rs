@@ -437,6 +437,10 @@ pub struct AppearanceSettings {
     /// [`TextRenderingBackend`].
     #[serde(default)]
     pub text_rendering: TextRenderingBackend,
+    /// How the Studio window is framed on Windows. Read once at startup — see
+    /// [`StudioWindowStyle`].
+    #[serde(default)]
+    pub window_style: StudioWindowStyle,
     #[serde(default)]
     pub arrangement: ArrangementAppearanceSettings,
     #[serde(default)]
@@ -451,6 +455,7 @@ impl Default for AppearanceSettings {
             theme: default_theme(),
             ui_scale: default_ui_scale(),
             text_rendering: TextRenderingBackend::default(),
+            window_style: StudioWindowStyle::default(),
             arrangement: ArrangementAppearanceSettings::default(),
             piano_roll: PianoRollAppearanceSettings::default(),
             mixer: MixerAppearanceSettings::default(),
@@ -498,6 +503,28 @@ impl TextRenderingBackend {
             Self::Gdi => "gdi",
         }
     }
+}
+
+/// How the Studio window is framed on Windows.
+///
+/// Borderless is the drawn frame: Futureboard draws the caption buttons in its
+/// own titlebar row and the row is the window's drag area. Native windowed
+/// leaves the caption, its buttons, the resize border and snapping to the OS,
+/// and the row below keeps the menus, the project and the panel toggles.
+///
+/// A window's frame is fixed when it is created, so the choice is read once
+/// at startup and a change takes effect on the next launch. Only Windows reads
+/// it; the other platforms keep their own frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum StudioWindowStyle {
+    #[default]
+    Borderless,
+    NativeWindowed,
+}
+
+impl StudioWindowStyle {
+    pub const ALL: [Self; 2] = [Self::Borderless, Self::NativeWindowed];
 }
 
 fn default_theme() -> String {
@@ -1661,6 +1688,40 @@ mod text_rendering_settings_tests {
         assert_eq!(
             serde_json::to_string(&SpacebarAction::PlayStop).unwrap(),
             "\"play-stop\""
+        );
+    }
+
+    #[test]
+    fn the_studio_window_is_borderless_unless_chosen_otherwise() {
+        assert_eq!(
+            SettingsSchema::default().appearance.window_style,
+            StudioWindowStyle::Borderless
+        );
+        let schema: SettingsSchema =
+            serde_json::from_str(r#"{"appearance":{"theme":"futureboard.default"}}"#)
+                .expect("a settings file from before the option must still parse");
+        assert_eq!(
+            schema.appearance.window_style,
+            StudioWindowStyle::Borderless
+        );
+    }
+
+    #[test]
+    fn the_window_style_round_trips_with_stable_names() {
+        for style in StudioWindowStyle::ALL {
+            let mut schema = SettingsSchema::default();
+            schema.appearance.window_style = style;
+            let json = serde_json::to_string(&schema).expect("serialize");
+            let parsed: SettingsSchema = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(parsed.appearance.window_style, style);
+        }
+        assert_eq!(
+            serde_json::to_string(&StudioWindowStyle::NativeWindowed).unwrap(),
+            "\"native-windowed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StudioWindowStyle::Borderless).unwrap(),
+            "\"borderless\""
         );
     }
 

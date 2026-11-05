@@ -37,10 +37,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F10, VK_MENU};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateMenu, CreatePopupMenu, DefWindowProcW, DrawMenuBar, GetClientRect,
-    GetMenuBarInfo, GetMenuItemInfoW, GetWindowRect, SetMenu, SetWindowPos, HMENU, MENUBARINFO,
-    MENUITEMINFOW, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_STRING, OBJID_MENU, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOZORDER, WM_COMMAND, WM_NCACTIVATE, WM_NCDESTROY, WM_NCLBUTTONDBLCLK,
-    WM_NCLBUTTONDOWN, WM_NCPAINT, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    GetMenuBarInfo, GetMenuItemInfoW, GetWindowRect, IsWindow, SetMenu, SetWindowPos, HMENU,
+    MENUBARINFO, MENUITEMINFOW, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_STRING, OBJID_MENU,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WM_COMMAND, WM_NCACTIVATE, WM_NCDESTROY,
+    WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCPAINT, WM_SETTINGCHANGE, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use crate::theme::Colors;
@@ -152,6 +152,9 @@ struct Attached {
 thread_local! {
     /// Windows that carry a bar from here, for re-theming them all.
     static ATTACHED: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
+    /// Windows with the OS frame and no bar from here (the Studio window in
+    /// Native windowed), re-themed with the others.
+    static FRAMED: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
 }
 
 fn hwnd_of(window: &Window) -> Option<HWND> {
@@ -239,11 +242,39 @@ pub fn attach(window: &Window, menus: &[NativeMenu]) -> Option<Arc<MenuCommands>
     }
 }
 
+/// Gives `window`'s OS frame the app theme's appearance, as [`attach`] does
+/// for a window with a bar, and keeps it following theme changes. For a
+/// window that takes the OS frame without a native menu bar.
+pub fn theme_frame(window: &Window) {
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
+    FRAMED.with(|framed| {
+        let mut framed = framed.borrow_mut();
+        // Closed windows drop out here rather than on their own destruction:
+        // nothing subclasses a window that only has its frame themed.
+        // SAFETY: `IsWindow` only inspects the handle.
+        framed.retain(|&h| unsafe { IsWindow(Some(HWND(h as *mut _))) }.as_bool());
+        if !framed.contains(&(hwnd.0 as isize)) {
+            framed.push(hwnd.0 as isize);
+        }
+    });
+    apply_theme(hwnd);
+}
+
 /// Re-themes every window carrying a bar, after the app theme changed.
 pub fn apply_theme_to_all() {
     let windows: Vec<isize> = ATTACHED.with(|attached| attached.borrow().clone());
     for hwnd in windows {
         apply_theme(HWND(hwnd as *mut _));
+    }
+    let framed: Vec<isize> = FRAMED.with(|framed| framed.borrow().clone());
+    for hwnd in framed {
+        let hwnd = HWND(hwnd as *mut _);
+        // SAFETY: `IsWindow` only inspects the handle.
+        if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            apply_theme(hwnd);
+        }
     }
 }
 

@@ -335,7 +335,14 @@ pub fn menu_label_button(
         .items_center()
         .rounded(px(crate::theme::radius::CONTROL))
         .text_size(px(CHROME_TEXT_SIZE))
-        .font_weight(gpui::FontWeight::MEDIUM)
+        // Under the OS caption the row reads as the window's menu bar, set in
+        // the regular weight a Windows menu bar uses. The drawn titlebar keeps
+        // the medium weight of the rest of the chrome.
+        .font_weight(if crate::platform_chrome::studio_native_frame() {
+            gpui::FontWeight::NORMAL
+        } else {
+            gpui::FontWeight::MEDIUM
+        })
         .text_color(if active {
             Colors::text_primary()
         } else {

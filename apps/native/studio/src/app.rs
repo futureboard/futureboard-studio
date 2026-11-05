@@ -1292,6 +1292,12 @@ fn open_studio_workspace(init: WorkspaceInit, cx: &mut App) -> Result<(), String
     // has painted — `activate_window` applies the stored initial placement and shows
     // the window with real content instead of a black flash.
     let _ = studio.update(cx, |_layout, window, _cx| {
+        // Native windowed: the OS caption follows the app theme, not the OS
+        // one, and is themed before the window is first shown.
+        #[cfg(target_os = "windows")]
+        if sphere_ui_components::platform_chrome::studio_native_frame() {
+            sphere_ui_components::native_win32_menu::theme_frame(window);
+        }
         window.on_next_frame(|window, _cx| {
             boot::complete_startup();
             window.activate_window();

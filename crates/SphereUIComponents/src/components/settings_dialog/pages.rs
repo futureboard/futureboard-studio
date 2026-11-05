@@ -844,6 +844,29 @@ fn appearance(cx: &PageCtx) -> Vec<PrefGroup> {
                     |s, v| s.appearance.text_rendering = v,
                 ),
             ))
+            .row(PrefRow::described(
+                settings_restart_label(cx.tr("settings.field.window-style"), true),
+                cx.tr("settings.hint.window-style"),
+                &[
+                    "window", "frame", "border", "native", "title", "caption", "snap",
+                ],
+                choice(
+                    "settings-window-style",
+                    vec![
+                        (
+                            StudioWindowStyle::Borderless,
+                            cx.tr("settings.window-style.borderless"),
+                        ),
+                        (
+                            StudioWindowStyle::NativeWindowed,
+                            cx.tr("settings.window-style.native"),
+                        ),
+                    ],
+                    s.appearance.window_style,
+                    &up,
+                    |s, v| s.appearance.window_style = v,
+                ),
+            ))
             .note(RESTART_NOTE);
     }
     vec![interface]

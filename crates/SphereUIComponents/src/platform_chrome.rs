@@ -253,6 +253,43 @@ fn platform_policy() -> PlatformChromePolicy {
     }
 }
 
+/// The Studio window's frame, latched at startup from
+/// `appearance.window_style` (see [`crate::settings::StudioWindowStyle`]).
+static STUDIO_WINDOW_STYLE: std::sync::OnceLock<crate::settings::StudioWindowStyle> =
+    std::sync::OnceLock::new();
+
+/// Latch the Studio window style for this process. Called once at startup,
+/// before any Studio window opens; later calls are ignored, which is what
+/// makes a change in Settings wait for the next launch instead of reframing
+/// the next Studio window this process opens.
+pub fn set_studio_window_style(style: crate::settings::StudioWindowStyle) {
+    let _ = STUDIO_WINDOW_STYLE.set(style);
+}
+
+/// Whether the Studio window takes the platform's own frame: the OS draws the
+/// caption and its buttons, so the drawn titlebar row draws neither and is
+/// not a drag area. Only on Windows, and only when chosen in Settings.
+pub fn studio_native_frame() -> bool {
+    PlatformChromePolicy::current().kind == PlatformChromeKind::Windows
+        && STUDIO_WINDOW_STYLE.get().copied().unwrap_or_default()
+            == crate::settings::StudioWindowStyle::NativeWindowed
+}
+
+/// Give the Studio window's options the frame [`studio_native_frame`] picks:
+/// the OS caption titled `title`, as the native tool windows have it
+/// ([`native_tool_window_options_partial`]). Borderless leaves them as
+/// [`studio_window_options`] built them.
+pub fn apply_studio_window_style(options: &mut WindowOptions) {
+    if studio_native_frame() {
+        options.titlebar = Some(TitlebarOptions {
+            title: Some(APP_WINDOW_TITLE.into()),
+            appears_transparent: false,
+            traffic_light_position: None,
+        });
+        options.window_decorations = None;
+    }
+}
+
 /// Studio window options (main Futureboard window).
 pub fn studio_window_options() -> WindowOptions {
     WindowOptions {

@@ -557,6 +557,7 @@ pub fn studio_window_options(cx: &mut App) -> WindowOptions {
     ));
 
     let mut options = platform_chrome::studio_window_options();
+    platform_chrome::apply_studio_window_style(&mut options);
     options.window_bounds = Some(WindowBounds::Windowed(bounds));
     apply_owner_display(&mut options, Some(bounds), cx);
     options
