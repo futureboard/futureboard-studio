@@ -62,7 +62,7 @@ pub struct CellAnchor {
 /// Height of one table row, in logical GPUI units. Every geometry helper here
 /// works in logical units — never device pixels — so the same numbers are
 /// correct under Windows display scaling, Retina, and fractional scaling.
-pub const ROW_HEIGHT: f32 = 24.0;
+pub const ROW_HEIGHT: f32 = crate::theme::size::PROMINENT;
 
 /// Resolved width of every table column, in logical units.
 ///
@@ -82,15 +82,15 @@ pub struct ColumnWidths {
 impl ColumnWidths {
     /// Fixed, content-sized columns. These never grow — a checkbox and a
     /// short status word gain nothing from extra width.
-    pub const ENABLED: f32 = 34.0;
-    pub const CONFIGURATION: f32 = 92.0;
-    pub const STATUS: f32 = 104.0;
+    pub const ENABLED: f32 = 44.0;
+    pub const CONFIGURATION: f32 = 104.0;
+    pub const STATUS: f32 = 144.0;
 
     /// Floors for the flexible columns. Below these the table scrolls
     /// horizontally rather than letting cells collapse into each other.
-    pub const MIN_NAME: f32 = 120.0;
-    pub const MIN_DEVICE: f32 = 150.0;
-    pub const MIN_PORT: f32 = 110.0;
+    pub const MIN_NAME: f32 = 140.0;
+    pub const MIN_DEVICE: f32 = 170.0;
+    pub const MIN_PORT: f32 = 120.0;
 
     /// Narrowest table that still shows Device, Left, Right, and Status
     /// legibly. Drives the window's minimum width.
