@@ -79,7 +79,11 @@ impl PianoRoll {
             .collect()
     }
 
-    pub(super) fn build_draw_note_preview(&self) -> Vec<gpui::AnyElement> {
+    /// The note being drawn, painted as the note it will commit as: a new
+    /// note lands selected, so it shows in the track colour at full strength
+    /// with the accent edge from the press. A faint ghost here read as "not
+    /// there yet", and the solid note only arrived with the release.
+    pub(super) fn build_draw_note_preview(&self, track_color: gpui::Rgba) -> Vec<gpui::AnyElement> {
         let PianoDrag::DrawNote {
             pitch,
             start_beat,
@@ -100,22 +104,26 @@ impl PianoRoll {
         let x = self.clip_beat_to_x(lo);
         let w = (duration * self.ppb).max(3.0);
         let h = self.note_row_h() - 2.0;
+        let mut fill = track_color;
+        fill.a = 1.0;
         self.chord_draw_pitches(*pitch)
             .into_iter()
-            .enumerate()
-            .map(|(index, chord_pitch)| {
+            .map(|chord_pitch| {
                 let y = self.pitch_to_y(chord_pitch);
-                let alpha = if index == 0 { 0.35 } else { 0.22 };
                 div()
                     .absolute()
                     .left(px(x))
                     .top(px(y + 1.0))
                     .w(px(w))
                     .h(px(h))
-                    .rounded(px(crate::theme::radius::MICRO))
-                    .bg(Colors::with_alpha(Colors::accent_primary(), alpha))
-                    .border(px(1.0))
-                    .border_color(Colors::with_alpha(Colors::accent_primary(), 0.85))
+                    .rounded(px(crate::theme::radius::clamped(
+                        crate::theme::radius::MICRO,
+                        w,
+                        h,
+                    )))
+                    .bg(fill)
+                    .border(px(1.5))
+                    .border_color(Colors::accent_primary())
                     .into_any_element()
             })
             .collect()
@@ -498,6 +506,7 @@ impl Render for PianoRoll {
             self.cancel_active_gesture(cx);
         }
         self.prune_transient_state(cx, clip_id.as_deref());
+        self.drop_stale_tool_session(cx);
 
         if clip_id != self.last_editing_clip {
             // Editing target changed (clip/track switch) — stop any audition note
@@ -576,6 +585,12 @@ impl Render for PianoRoll {
                 gpui::CursorStyle::Arrow
             })
             .on_key_down(cx.listener(Self::on_key))
+            // A press anywhere in the editor keeps an open tool's result
+            // before the press does anything, so it acts on the notes as they
+            // look rather than on a preview that would later be reverted.
+            .capture_any_mouse_down(cx.listener(|this, _ev, _window, cx| {
+                this.accept_active_tool(cx);
+            }))
             .on_mouse_move(cx.listener(Self::on_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_up))
@@ -1355,6 +1370,38 @@ impl PianoRoll {
             this.quantize_preview = *hovered;
             cx.notify();
         }));
+        // Each tool opens a small window of its own that previews on the
+        // notes live; this menu is the editor's way in.
+        let active_tool = self.active_tool();
+        let tool_rows = crate::components::piano_roll::advanced_tools::AdvancedTool::ALL
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, tool)| {
+                menu_row(
+                    ("pr-tool-choice", idx),
+                    active_tool == Some(tool),
+                    format!("{}…", tool.label()),
+                )
+                .on_click(cx.listener(move |this, _ev, window, cx| {
+                    cx.stop_propagation();
+                    this.open_select_menu = None;
+                    this.open_tool_window(tool, window, cx);
+                }))
+                .into_any_element()
+            })
+            .collect();
+        let advanced = self.render_select_menu(
+            PianoSelectMenu::Tools,
+            "pr-tools-menu",
+            None,
+            "Tools".to_string(),
+            "Strum, Humanize, Length, Velocity and Clean Up, each in its own window",
+            168.0,
+            false,
+            tool_rows,
+            cx,
+        );
 
         // ── View ──
         let view = div()
@@ -1435,9 +1482,20 @@ impl PianoRoll {
             .child(channel_menu)
             .child(bar_divider())
             .child(quantize)
+            .child(advanced)
             .child(div().flex_1().min_w(px(space::BASE)))
             .child(view)
             .child(bar_divider())
+            .child(bar_icon_button(
+                "pr-tools",
+                assets::ICON_PANEL_LEFT_PATH,
+                "MIDI tools".into(),
+                Some(self.tools.open),
+                cx.listener(|this, _, _w, cx| {
+                    this.tools.open = !this.tools.open;
+                    cx.notify();
+                }),
+            ))
             .child(bar_icon_button(
                 "pr-inspector",
                 assets::ICON_PANEL_RIGHT_PATH,
@@ -1635,7 +1693,7 @@ impl PianoRoll {
         let notes_geo = self.build_note_elements(cx, clip_id, track_color);
         let quantize_preview = self.build_quantize_preview(cx, clip_id);
         let marquee_overlay = self.build_marquee_overlay();
-        let draw_preview = self.build_draw_note_preview();
+        let draw_preview = self.build_draw_note_preview(track_color);
         let erase_overlay = self.build_erase_overlay();
         let note_menu = self.build_note_context_menu(cx);
         let scrollbars = self.render_scrollbars(cx);
@@ -1657,6 +1715,42 @@ impl PianoRoll {
         let note_inspector = self
             .inspector_open
             .then(|| self.render_note_inspector(cx, clip_id).into_any_element());
+        let tools_panel = self
+            .tools
+            .open
+            .then(|| self.render_tools_panel(cx, clip_id).into_any_element());
+        // Global Tracks: the project's Chord Track under the ruler, with a
+        // matching corner over the keys so the key rows stay on the grid rows.
+        let chord_strip = self.tools.show_chord_strip.then(|| {
+            div()
+                .h(px(tools_panel::CHORD_STRIP_H))
+                .w_full()
+                .flex_shrink_0()
+                .relative()
+                .overflow_hidden()
+                .bg(Colors::surface_panel())
+                .border_b(px(1.0))
+                .border_color(Colors::panel_border())
+                .children(self.build_chord_strip(cx, view_w))
+                .into_any_element()
+        });
+        let chord_strip_corner = self.tools.show_chord_strip.then(|| {
+            div()
+                .h(px(tools_panel::CHORD_STRIP_H))
+                .w_full()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .px(px(space::TIGHT))
+                .bg(Colors::surface_panel())
+                .border_b(px(1.0))
+                .border_r(px(1.0))
+                .border_color(Colors::panel_border())
+                .text_size(px(typography::DENSE_CAPTION))
+                .text_color(Colors::text_faint())
+                .child("Chords")
+                .into_any_element()
+        });
 
         // ── Single unified controller lane ───────────────────────────────────
         // Exactly one lane is built per frame: velocity OR the active controller.
@@ -1834,6 +1928,8 @@ impl PianoRoll {
             .relative()
             .flex()
             .flex_row()
+            // Far left: MIDI Tools.
+            .children(tools_panel)
             // Left: piano keys.
             .child(
                 div()
@@ -1852,6 +1948,7 @@ impl PianoRoll {
                             .border_r(px(1.0))
                             .border_color(Colors::panel_border()),
                     )
+                    .children(chord_strip_corner)
                     .child(
                         div()
                             .flex_1()
@@ -1920,6 +2017,7 @@ impl PianoRoll {
                                 }),
                             ),
                     )
+                    .children(chord_strip)
                     // Note grid.
                     .child(
                         div()
@@ -2264,7 +2362,7 @@ impl PianoRoll {
     /// Articulation palette for the selected notes: one chip per articulation
     /// the instrument can play, plus "None". Applies to the whole selection as
     /// one undo entry.
-    fn articulation_assign_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    pub(super) fn articulation_assign_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         fn button_id(articulation: Option<ArticulationId>) -> &'static str {
             match articulation {
                 None => "pr-art-assign-none",
@@ -3053,20 +3151,35 @@ impl PianoRoll {
             return Vec::new();
         }
         let (view_w, view_h) = self.grid_view_size();
-        let step = self.quantize_res.beats().max(MIN_NOTE_BEATS);
-        let only_selected = !self.selection.is_empty();
         let accent = Colors::accent_primary();
         let row_h = self.note_row_h();
-        let tl = self.timeline.read(cx);
-        let Some(notes) = tl.state.midi_clip_notes(clip_id) else {
-            return Vec::new();
+        // The preview runs the very transform the click will: same targets,
+        // same grid, strength and swing.
+        let ids: HashSet<u64> = self.tool_target_ids(cx).into_iter().collect();
+        let mut notes: Vec<MidiNoteState> = {
+            let tl = self.timeline.read(cx);
+            let Some(notes) = tl.state.midi_clip_notes(clip_id) else {
+                return Vec::new();
+            };
+            notes
+                .iter()
+                .filter(|n| ids.contains(&n.id))
+                .cloned()
+                .collect()
         };
+        let before: Vec<f32> = notes.iter().map(|n| n.start).collect();
+        crate::components::timeline::timeline_state::quantize_notes(
+            &mut notes,
+            &ids,
+            self.quantize_spec(),
+            crate::components::timeline::timeline_state::QuantizeTarget::Start,
+        );
         notes
             .iter()
-            .filter(|n| !only_selected || self.selection.contains(&n.id))
-            .filter_map(|n| {
-                let q_start = (n.start / step).round() * step;
-                if (q_start - n.start).abs() < 1.0e-4 {
+            .zip(before)
+            .filter_map(|(n, old_start)| {
+                let q_start = n.start;
+                if (q_start - old_start).abs() < 1.0e-4 {
                     return None;
                 }
                 let x = self.clip_beat_to_x(q_start);

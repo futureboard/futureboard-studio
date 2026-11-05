@@ -17,7 +17,9 @@ use crate::components::title_bar::external_window_titlebar;
 use crate::components::virtual_keyboard::VirtualKeyboardPanel;
 use crate::theme::Colors;
 
-pub const MIDI_EDITOR_WINDOW_WIDTH: f32 = 960.0;
+/// Wide enough for the MIDI Tools column, the keys, a working grid and the
+/// note inspector side by side.
+pub const MIDI_EDITOR_WINDOW_WIDTH: f32 = 1200.0;
 pub const MIDI_EDITOR_WINDOW_HEIGHT: f32 = 560.0;
 pub const MIDI_EDITOR_WINDOW_MIN_WIDTH: f32 = 900.0;
 pub const MIDI_EDITOR_WINDOW_MIN_HEIGHT: f32 = 500.0;
@@ -94,8 +96,10 @@ impl MidiEditorWindow {
                 (dispatch_command)("editor:open-bottom", cx);
             }) as Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>
         };
-        piano_roll.update(cx, |roll, _cx| {
+        piano_roll.update(cx, |roll, cx| {
             roll.set_window_actions(Some(export), Some(dock));
+            // The window is the full editor, so it opens with its tools.
+            roll.set_tools_panel_open(true, cx);
         });
         Self {
             timeline,

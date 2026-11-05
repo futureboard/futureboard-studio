@@ -41,6 +41,7 @@ use crate::theme::Colors;
 use sphere_midi_service::{NoteExpression, NoteExpressionLane};
 
 // ── Layout constants (CSS px) ───────────────────────────────────────────────
+pub mod advanced_tools;
 mod articulation_lane;
 mod cc_lane;
 mod cc_lane_render;
@@ -48,6 +49,7 @@ mod grid_render;
 pub mod playhead;
 mod render;
 pub mod scope;
+mod tools_panel;
 
 /// Default note-row height (px per semitone). Reset-zoom restores this value so
 /// note height matches the editor's default density after Zoom Y changes.
@@ -901,6 +903,8 @@ enum PianoSelectMenu {
     /// Articulation palette for the lane's insert tool (which articulation a
     /// lane click inserts).
     Articulation,
+    /// The tool windows: Strum, Humanize, Length, Velocity, Clean Up.
+    Tools,
 }
 
 /// Which of the three unified-lane views is active. `Controller` shows/edits
@@ -1179,6 +1183,13 @@ pub struct PianoRoll {
     on_dock: Option<std::sync::Arc<dyn Fn(&mut Window, &mut gpui::App) + Send + Sync>>,
     /// Whether the note inspector column is shown.
     inspector_open: bool,
+    /// The MIDI Tools column on the left (quantize, transpose, chords…).
+    tools: tools_panel::ToolsPanelState,
+    /// Settings of the tool windows (Strum, Humanize…), kept here so a tool
+    /// reopens as it was left.
+    advanced: advanced_tools::AdvancedToolSettings,
+    /// The tool window that is open and the notes it is previewing on.
+    tool_session: Option<advanced_tools::ToolSession>,
     on_midi_preview:
         Option<std::sync::Arc<dyn Fn(UiMidiPreviewCommand, &mut gpui::App) + Send + Sync>>,
     tool: PianoTool,
@@ -1491,6 +1502,9 @@ impl PianoRoll {
             on_export_midi: None,
             on_dock: None,
             inspector_open: true,
+            tools: tools_panel::ToolsPanelState::default(),
+            advanced: advanced_tools::AdvancedToolSettings::default(),
+            tool_session: None,
             on_midi_preview: None,
             tool: PianoTool::Draw,
             ppb: 80.0,
@@ -4644,6 +4658,9 @@ impl PianoRoll {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // Typing in the editor while a tool previews keeps the tool's result
+        // first, so the key acts on the notes as they look.
+        self.accept_active_tool(cx);
         let Some(clip_id) = self.editing_clip_id(cx) else {
             return;
         };
@@ -4759,26 +4776,13 @@ impl PianoRoll {
         }
     }
 
+    /// Quantize note starts with the MIDI Tools panel's grid, strength and
+    /// swing. Empty selection means every shown note in the clip.
     fn quantize_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(clip_id) = self.editing_clip_id(cx) else {
-            return;
-        };
-        // Empty selection means quantize every note in the clip.
-        let mut ids: Vec<u64> = self.selection.iter().copied().collect();
-        if ids.is_empty() {
-            ids = self
-                .timeline
-                .read(cx)
-                .state
-                .midi_clip_notes(&clip_id)
-                .map(|notes| notes.iter().map(|n| n.id).collect())
-                .unwrap_or_default();
-        }
-        let step = self.quantize_res.beats();
-        let target_ids = ids.clone();
-        self.commit_note_transform(cx, &ids, move |state, cid| {
-            state.quantize_midi_notes(cid, &target_ids, step);
-        });
+        self.tool_quantize(
+            crate::components::timeline::timeline_state::QuantizeTarget::Start,
+            cx,
+        );
     }
 
     /// Pitches the Draw tool will create for `root`. Chord mode stacks diatonic
@@ -4810,9 +4814,16 @@ impl PianoRoll {
             return;
         }
         let scale = self.pitch_ctx.scale;
-        let target_ids = ids.clone();
-        self.commit_note_transform(cx, &ids, move |state, cid| {
-            state.snap_midi_notes_to_scale(cid, &target_ids, scale);
+        self.run_note_tool("Snap to Scale", cx, move |notes, ids| {
+            let mut changed = 0;
+            for note in notes.iter_mut().filter(|n| ids.contains(&n.id)) {
+                let pitch = scale.nearest_pitch(note.pitch);
+                if pitch != note.pitch {
+                    note.pitch = pitch;
+                    changed += 1;
+                }
+            }
+            changed
         });
     }
 

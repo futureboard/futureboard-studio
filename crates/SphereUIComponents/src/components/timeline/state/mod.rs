@@ -27,6 +27,7 @@ mod midi;
 mod midi_channel;
 mod midi_controller;
 mod midi_scale;
+mod midi_transform;
 mod mixer;
 mod mixer_tree_state;
 mod musical_snap;
@@ -78,6 +79,7 @@ pub use midi::*;
 pub use midi_channel::*;
 pub use midi_controller::*;
 pub use midi_scale::*;
+pub use midi_transform::*;
 pub use mixer::*;
 pub use mixer_tree_state::*;
 pub use musical_snap::{

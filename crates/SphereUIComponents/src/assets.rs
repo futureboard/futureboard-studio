@@ -31,6 +31,8 @@ pub mod icons {
         include_str!("../../../packages/shared/lucide/icons/panel-bottom.svg");
     pub const PANEL_RIGHT: &str =
         include_str!("../../../packages/shared/lucide/icons/panel-right.svg");
+    pub const PANEL_LEFT: &str =
+        include_str!("../../../packages/shared/lucide/icons/panel-left.svg");
     pub const BUG: &str = include_str!("../../../packages/shared/lucide/icons/bug.svg");
     pub const MINUS: &str = include_str!("../../../packages/shared/lucide/icons/minus.svg");
     pub const MENU: &str = include_str!("../../../packages/shared/lucide/icons/menu.svg");
@@ -154,6 +156,7 @@ pub const ICON_ELLIPSIS_PATH: &str = "icons/ellipsis.svg";
 pub const ICON_SHARE_PATH: &str = "icons/share.svg";
 pub const ICON_PANEL_BOTTOM_PATH: &str = "icons/panel-bottom.svg";
 pub const ICON_PANEL_RIGHT_PATH: &str = "icons/panel-right.svg";
+pub const ICON_PANEL_LEFT_PATH: &str = "icons/panel-left.svg";
 pub const ICON_BUG_PATH: &str = "icons/bug.svg";
 pub const ICON_MAXIMIZE_PATH: &str = "icons/generic_maximize.svg";
 pub const ICON_MINIMIZE_PATH: &str = "icons/generic_minimize.svg";

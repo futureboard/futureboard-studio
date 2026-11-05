@@ -203,6 +203,7 @@ impl Timeline {
             on_track_input_state_change: None,
             on_project_changed: None,
             on_midi_changed: None,
+            on_midi_preview_changed: None,
             on_control_state_changed: None,
             on_loop_changed: None,
             on_tempo_map_changed: None,
@@ -306,6 +307,7 @@ impl Timeline {
             on_track_input_state_change: None,
             on_project_changed: None,
             on_midi_changed: None,
+            on_midi_preview_changed: None,
             on_control_state_changed: None,
             on_loop_changed: None,
             on_tempo_map_changed: None,
@@ -1470,6 +1472,13 @@ impl Timeline {
         self.on_midi_changed = callback;
     }
 
+    pub fn set_midi_preview_changed_callback(
+        &mut self,
+        callback: Option<TimelineProjectChangedCb>,
+    ) {
+        self.on_midi_preview_changed = callback;
+    }
+
     pub fn set_control_state_changed_callback(
         &mut self,
         callback: Option<TimelineProjectChangedCb>,
@@ -1822,6 +1831,17 @@ impl Timeline {
     pub(crate) fn mark_project_changed(&self, cx: &mut gpui::App) {
         if let Some(callback) = self.on_project_changed.as_ref() {
             callback(cx);
+        }
+    }
+
+    /// A MIDI tool previewed on notes: the engine has to play the change,
+    /// but it is not an edit, so the project's saved state is left as it is.
+    /// Falls back to [`Self::mark_midi_changed`] when no owner listens.
+    pub(crate) fn mark_midi_preview_changed(&self, cx: &mut gpui::App) {
+        if let Some(callback) = self.on_midi_preview_changed.as_ref() {
+            callback(cx);
+        } else {
+            self.mark_midi_changed(cx);
         }
     }
 

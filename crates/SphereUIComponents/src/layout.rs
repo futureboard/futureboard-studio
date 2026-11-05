@@ -823,6 +823,28 @@ pub struct StudioLayout {
     pending_secondary_window_restore: crate::workspace_layout::SavedSecondaryWindows,
 }
 
+/// Publish a marked MIDI change to the engine two frames out, so the frame
+/// that paints the change is presented first (a frame callback runs at the
+/// start of the next frame, before it draws). Published now when no window is
+/// active to wait on.
+fn publish_midi_after_paint(target: Entity<StudioLayout>, cx: &mut gpui::App) {
+    let publish = target.clone();
+    let queued = cx.active_window().is_some_and(|window| {
+        window
+            .update(cx, |_, window, _| {
+                window.on_next_frame(move |window, _| {
+                    window.on_next_frame(move |_, cx| {
+                        let _ = publish.update(cx, |this, cx| this.publish_midi_edit(cx));
+                    });
+                });
+            })
+            .is_ok()
+    });
+    if !queued {
+        let _ = target.update(cx, |this, cx| this.publish_midi_edit(cx));
+    }
+}
+
 impl StudioLayout {
     pub(crate) fn defer_update(
         owner: &Entity<Self>,
@@ -1183,27 +1205,38 @@ impl StudioLayout {
                 timeline.set_midi_changed_callback(Some(Arc::new(move |cx| {
                     let target = target.clone();
                     cx.defer(move |cx| {
-                        let _ = target.update(cx, |this, cx| {
-                            // MIDI note edits must reach the native scheduler
-                            // promptly, and the throttle already delivers that:
-                            // it is leading-edge, so an isolated edit publishes
-                            // on the spot and only a burst waits out the window.
-                            //
-                            // This used to force the sync, which skipped the
-                            // throttle entirely and bought a full-project
-                            // snapshot plus a JSON serialize of every note in
-                            // the project, on the UI thread, per committed
-                            // note. Drawing a run of notes therefore paid that
-                            // once per click and the editor visibly stalled.
-                            // `mark_dirty` keeps the graph dirty, so the engine
-                            // poll publishes the last state of the burst.
-                            this.mark_dirty();
-                            this.schedule_audio_project_sync(
-                                cx,
-                                false,
-                                audio_transport::MIDI_EDIT_SYNC_REASON,
-                            );
-                        });
+                        // Dirty now (the project is unsaved and the graph
+                        // stale from this moment) but published after the
+                        // frame that paints the edit.
+                        //
+                        // Publishing builds a full engine snapshot on the UI
+                        // thread. Run here, in the same pass as the commit, it
+                        // sat between the mouse-up and the frame that draws
+                        // the new note, so every drawn note appeared late by
+                        // the cost of a whole-project snapshot. A frame
+                        // callback runs at the start of the next frame, before
+                        // that frame draws, so the publish is queued two
+                        // frames out and the frame holding the edit is
+                        // presented first. The engine hears the note a frame
+                        // later instead. The throttle and the engine poll
+                        // still coalesce a burst exactly as before.
+                        let _ = target.update(cx, |this, _cx| this.mark_midi_edit_dirty());
+                        publish_midi_after_paint(target, cx);
+                    });
+                })));
+            });
+        }
+        {
+            let target = cx.entity().clone();
+            let _ = timeline.update(cx, |timeline, _cx| {
+                timeline.set_midi_preview_changed_callback(Some(Arc::new(move |cx| {
+                    let target = target.clone();
+                    cx.defer(move |cx| {
+                        // A MIDI tool's live preview: heard like an edit,
+                        // published the same way, but the project's saved
+                        // state is untouched until the tool is accepted.
+                        let _ = target.update(cx, |this, _cx| this.mark_midi_preview_dirty());
+                        publish_midi_after_paint(target, cx);
                     });
                 })));
             });

@@ -1112,6 +1112,7 @@ impl StudioLayout {
     }
 
     pub(super) fn cmd_save_project(&mut self, cx: &mut Context<Self>) {
+        self.keep_open_midi_tools(cx);
         if self.project_session.needs_save_as() {
             project_lifecycle_log!("save requested: mode=save_as path=<none>");
             self.cmd_save_project_as(cx);
@@ -1125,6 +1126,7 @@ impl StudioLayout {
     }
 
     pub(super) fn cmd_save_project_as(&mut self, cx: &mut Context<Self>) {
+        self.keep_open_midi_tools(cx);
         #[cfg(feature = "native-dialogs")]
         {
             let default_dir = self

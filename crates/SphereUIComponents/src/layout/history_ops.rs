@@ -32,6 +32,15 @@ impl StudioLayout {
     /// ARA history is the host's (see `ara_ops::AraHistory`): Melodyne hands
     /// Ctrl+Z to the host in ARA mode rather than undoing anything itself.
     pub(super) fn undo_or_redo(&mut self, undoing: bool, cx: &mut Context<Self>) {
+        // A MIDI tool window previewing on notes holds a change that is not in
+        // the history yet. Stepping the history underneath it would undo an
+        // older edit while the preview stays on screen with no step of its
+        // own. Undo takes the preview back (closing the tool) and stops there;
+        // Redo puts the notes back the same way and then redoes.
+        if self.cancel_open_midi_tools(cx) && undoing {
+            cx.notify();
+            return;
+        }
         let ara_page = self.ara_page_on_screen(cx);
         if crate::components::transport_key::key_debug() {
             eprintln!(
@@ -74,6 +83,25 @@ impl StudioLayout {
                 self.show_ara_notice(message, cx);
             }
             Err(error) => self.show_ara_notice(error, cx),
+        }
+    }
+
+    /// Close any open MIDI tool window, putting its notes back. Returns
+    /// whether one was open.
+    pub(super) fn cancel_open_midi_tools(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut was_open = false;
+        for roll in [self.piano_roll.clone(), self.piano_roll_floating.clone()] {
+            was_open |= roll.update(cx, |roll, cx| roll.cancel_active_tool(cx));
+        }
+        was_open
+    }
+
+    /// Keep any open MIDI tool's result as an edit and close its window, so
+    /// what is saved is what is on screen and the saved project has the
+    /// step to undo it.
+    pub(super) fn keep_open_midi_tools(&mut self, cx: &mut Context<Self>) {
+        for roll in [self.piano_roll.clone(), self.piano_roll_floating.clone()] {
+            roll.update(cx, |roll, cx| roll.accept_active_tool(cx));
         }
     }
 

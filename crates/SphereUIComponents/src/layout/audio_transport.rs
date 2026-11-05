@@ -200,6 +200,12 @@ pub(crate) struct AudioBridgeState {
     /// or the engine poll's — knows the graph changed without serializing the
     /// whole project to find out.
     pub known_content_change: bool,
+    /// When a committed MIDI edit started waiting for the frame that paints
+    /// it. The edit is published to the engine after that frame, not before
+    /// it: the snapshot build is UI-thread work, and run in the same pass as
+    /// the commit it held the drawn note off screen until it finished. The
+    /// engine poll leaves a waiting edit alone for [`MIDI_EDIT_PAINT_GRACE`].
+    pub midi_publish_waiting_since: Option<Instant>,
     /// Counter behind the synthetic fingerprint a known content change gets.
     pub content_change_serial: u64,
     /// Monotonic id of the in-flight sync. A `complete_audio_project_sync` whose
@@ -308,6 +314,7 @@ impl Default for AudioBridgeState {
             pending_reason: None,
             pending_force: false,
             known_content_change: false,
+            midi_publish_waiting_since: None,
             content_change_serial: 0,
             sync_generation: 0,
             sync_started_at: None,
@@ -353,6 +360,12 @@ impl Default for AudioBridgeState {
 /// 64k-note session, per edit, on the UI thread — that exists only to detect
 /// "nothing changed".
 pub(crate) const MIDI_EDIT_SYNC_REASON: &str = "midi_edit";
+
+/// Longest the engine poll holds back a MIDI edit that is waiting for its
+/// frame to paint (see `midi_publish_waiting_since`). A backstop for a window
+/// that never draws (minimised, occluded); normally the frame callback
+/// publishes it a frame or two after the commit.
+const MIDI_EDIT_PAINT_GRACE: Duration = Duration::from_millis(50);
 
 pub(crate) fn graph_fingerprint_of(signature: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -934,7 +947,14 @@ impl StudioLayout {
         }
 
         if self.audio_bridge.project_dirty || self.audio_bridge.media_dirty {
-            self.schedule_audio_project_sync(cx, false, "engine_dirty_poll");
+            let held_for_paint = self
+                .audio_bridge
+                .midi_publish_waiting_since
+                .is_some_and(|since| since.elapsed() < MIDI_EDIT_PAINT_GRACE);
+            if !held_for_paint {
+                self.audio_bridge.midi_publish_waiting_since = None;
+                self.schedule_audio_project_sync(cx, false, "engine_dirty_poll");
+            }
         }
 
         let engine = self.audio_bridge.engine.as_ref().expect("checked above");
@@ -1736,14 +1756,16 @@ impl StudioLayout {
     }
 
     /// Re-send every live channel control that changed while a sync was in
-    /// flight. See [`SentTrackControls`].
-    fn reconcile_live_track_controls(&self, sent: &SentTrackControls, cx: &App) {
+    /// flight. See [`SentTrackControls`]. Returns whether a send level was
+    /// re-sent.
+    fn reconcile_live_track_controls(&self, sent: &SentTrackControls, cx: &App) -> bool {
         let Some(engine) = self.audio_bridge.engine.as_ref() else {
-            return;
+            return false;
         };
         let state = &self.timeline.read(cx).state;
+        let sent_sends = sent;
         let sent: std::collections::HashMap<&str, SentControl> = sent
-            .0
+            .tracks
             .iter()
             .map(|(id, control)| (id.as_str(), *control))
             .collect();
@@ -1767,6 +1789,21 @@ impl StudioLayout {
                 let _ = engine.update_track_param(&track.id, "volume", f64::from(now.volume));
             }
         }
+        // Send levels are live too (`SetTrackSendLevel`), with the same window.
+        let mut resent_send = false;
+        for (track_id, send_id, was) in &sent_sends.sends {
+            let now = state
+                .find_track(track_id)
+                .and_then(|track| track.sends.iter().find(|send| &send.id == send_id))
+                .map(|send| send.gain_linear());
+            if let Some(now) = now {
+                if (now - was).abs() > 1.0e-6 {
+                    let _ = engine.set_track_send_level(track_id, send_id, now);
+                    resent_send = true;
+                }
+            }
+        }
+        resent_send
     }
 
     pub(super) fn complete_audio_project_sync(
@@ -1818,7 +1855,11 @@ impl StudioLayout {
                     "native-sync",
                     Some("Engine graph ready".to_string()),
                 );
-                self.reconcile_live_track_controls(&sent_controls, cx);
+                if self.reconcile_live_track_controls(&sent_controls, cx) {
+                    // The engine now plays a send level the graph just
+                    // published does not hold; see `play_send_level_live`.
+                    self.audio_bridge.graph_fingerprint = None;
+                }
             }
             Err(error) => {
                 self.audio_bridge.sync_failed_count =
@@ -2005,6 +2046,80 @@ impl StudioLayout {
                 eprintln!("[clip-gain] live gain for {clip_id} not sent: {error}");
             }
         }
+    }
+
+    /// Plays one send's current level on the running graph now. `false` when
+    /// it could not (no engine, or the graph has no such send yet) and the
+    /// level has to wait for a project sync.
+    ///
+    /// A played level also drops the published graph's fingerprint: the
+    /// engine now holds a level that graph does not, so the next project sync
+    /// (an undo back to the synced level, say) must not be skipped as
+    /// unchanged. Nothing is marked dirty, so no sync runs because of it.
+    pub(crate) fn play_send_level_live(&mut self, track_id: &str, send_id: &str, cx: &App) -> bool {
+        let Some(engine) = self.audio_bridge.engine.as_ref() else {
+            return false;
+        };
+        let Some(level) = self
+            .timeline
+            .read(cx)
+            .state
+            .find_track(track_id)
+            .and_then(|track| track.sends.iter().find(|send| send.id == send_id))
+            .map(|send| send.gain_linear())
+        else {
+            return false;
+        };
+        match engine.set_track_send_level(track_id, send_id, level) {
+            Ok(applied) => {
+                if applied {
+                    self.audio_bridge.graph_fingerprint = None;
+                }
+                applied
+            }
+            Err(error) => {
+                eprintln!("[send-level] live level for {track_id}/{send_id} not sent: {error}");
+                false
+            }
+        }
+    }
+
+    /// A MIDI note/controller edit was committed: the project is unsaved and
+    /// the engine graph is stale, and the change is known to be real, so the
+    /// sync that publishes it skips the whole-project signature. Publishing
+    /// itself waits for [`Self::publish_midi_edit`], after the edit paints.
+    pub(super) fn mark_midi_edit_dirty(&mut self) {
+        self.mark_dirty();
+        self.audio_bridge.known_content_change = true;
+        self.audio_bridge
+            .midi_publish_waiting_since
+            .get_or_insert_with(Instant::now);
+    }
+
+    /// A MIDI tool's live preview changed notes: the engine graph is stale
+    /// and the change is known to be real, but it is not an edit, so the
+    /// project is not marked unsaved. Published like an edit, after it paints.
+    pub(super) fn mark_midi_preview_dirty(&mut self) {
+        self.mark_engine_project_dirty();
+        self.audio_bridge.known_content_change = true;
+        self.audio_bridge
+            .midi_publish_waiting_since
+            .get_or_insert_with(Instant::now);
+    }
+
+    /// Publish a MIDI edit marked by [`Self::mark_midi_edit_dirty`] now that
+    /// its frame has been drawn. A no-op when the engine poll already
+    /// published it (the grace ran out first).
+    pub(super) fn publish_midi_edit(&mut self, cx: &mut Context<Self>) {
+        if self
+            .audio_bridge
+            .midi_publish_waiting_since
+            .take()
+            .is_none()
+        {
+            return;
+        }
+        self.schedule_audio_project_sync(cx, false, MIDI_EDIT_SYNC_REASON);
     }
 
     pub(crate) fn mark_engine_media_dirty(&mut self) {
@@ -4093,6 +4208,17 @@ impl StudioLayout {
     pub(super) fn stop_native_playback(&mut self, cx: &mut Context<Self>) {
         // Stop also calls off a take queued behind the last one's finalize.
         self.recording.start_after_finalize = false;
+        // Stop during a count-in calls the take off. Only pausing the engine
+        // left the count running, and the take started when it reached zero.
+        // The cancel leaves `CountingIn` before it stops the transport, which
+        // is what keeps the two from recursing.
+        if matches!(
+            self.recording.ui_state,
+            crate::layout::RecordingUiState::CountingIn { .. }
+        ) {
+            self.cancel_record_count_in(cx);
+            return;
+        }
         // A take that is only closing its files has already been stopped;
         // stopping it again would do nothing but split its undo step.
         let taking = self.is_recording_active(cx) && !self.recording_only_finalizing(cx);
@@ -4733,7 +4859,11 @@ fn track_program_messages(
 ///
 /// Kept per sync and compared with the mixer when the sync lands; anything that
 /// moved since is sent again, after the new graph.
-pub(super) struct SentTrackControls(Vec<(String, SentControl)>);
+pub(super) struct SentTrackControls {
+    tracks: Vec<(String, SentControl)>,
+    /// (track id, send id, linear level) for every send the snapshot carried.
+    sends: Vec<(String, String, f32)>,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 struct SentControl {
@@ -4762,23 +4892,32 @@ impl SentControl {
 
 impl SentTrackControls {
     fn of(snapshot: &DirectAudio::types::EngineProjectSnapshot) -> Self {
-        Self(
-            snapshot
-                .tracks
-                .iter()
-                .filter(|track| track.track_type != "master")
-                .map(|track| {
-                    (
-                        track.id.clone(),
-                        SentControl {
-                            muted: track.muted,
-                            solo: track.solo,
-                            pan: track.pan,
-                            volume: track.volume,
-                        },
-                    )
-                })
-                .collect(),
-        )
+        let tracks = snapshot
+            .tracks
+            .iter()
+            .filter(|track| track.track_type != "master")
+            .map(|track| {
+                (
+                    track.id.clone(),
+                    SentControl {
+                        muted: track.muted,
+                        solo: track.solo,
+                        pan: track.pan,
+                        volume: track.volume,
+                    },
+                )
+            })
+            .collect();
+        let sends = snapshot
+            .tracks
+            .iter()
+            .flat_map(|track| {
+                track
+                    .sends
+                    .iter()
+                    .map(|send| (track.id.clone(), send.id.clone(), send.level))
+            })
+            .collect();
+        Self { tracks, sends }
     }
 }

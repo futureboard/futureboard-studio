@@ -313,6 +313,20 @@ pub enum EditCommand {
         prev: Vec<MidiNoteState>,
         next: Vec<MidiNoteState>,
     },
+    /// A MIDI tool run on a fixed set of notes (Quantize, Strum, Humanize…).
+    /// The same overwrite as [`Self::EditMidiNotes`], plus the tool's name,
+    /// so Edit > Undo says "Undo Strum" rather than a generic note edit, and
+    /// the clip's length on both sides: a tool that grew the clip to fit its
+    /// notes shrinks it back on undo instead of leaving it longer than the
+    /// project was.
+    TransformMidiNotes {
+        label: &'static str,
+        clip_id: String,
+        prev: Vec<MidiNoteState>,
+        next: Vec<MidiNoteState>,
+        prev_clip_beats: Option<f32>,
+        next_clip_beats: Option<f32>,
+    },
     /// Notes dragged out of one clip and into another, as one undo entry.
     ///
     /// The MIDI editor shows a whole track, so a note can be dragged past the
@@ -576,6 +590,7 @@ impl EditCommand {
             | EditCommand::DeleteMidiNotes { .. }
             | EditCommand::SetMidiNotesMuted { .. }
             | EditCommand::EditMidiNotes { .. }
+            | EditCommand::TransformMidiNotes { .. }
             | EditCommand::MoveMidiNotesBetweenClips { .. }
             | EditCommand::SetControllerPoints { .. }
             | EditCommand::SetMidiArticulations { .. }
@@ -838,6 +853,7 @@ impl EditCommand {
                 }
             }
             EditCommand::EditMidiNotes { .. } => "Edit MIDI Notes",
+            EditCommand::TransformMidiNotes { label, .. } => *label,
             EditCommand::MoveMidiNotesBetweenClips { .. } => "Move MIDI Notes to Clip",
             EditCommand::SetTrackAutomationLanes { .. } => "Edit Automation",
             EditCommand::SetControllerPoints { .. } => "Edit CC Lane",
@@ -1004,6 +1020,17 @@ impl EditCommand {
             }
             EditCommand::EditMidiNotes { clip_id, next, .. } => {
                 state.overwrite_midi_notes(clip_id, next);
+            }
+            EditCommand::TransformMidiNotes {
+                clip_id,
+                next,
+                next_clip_beats,
+                ..
+            } => {
+                state.overwrite_midi_notes(clip_id, next);
+                if let Some(beats) = next_clip_beats {
+                    state.set_clip_length_beats(clip_id, *beats);
+                }
             }
             EditCommand::MoveMidiNotesBetweenClips {
                 from_clip_id,
@@ -1224,6 +1251,17 @@ impl EditCommand {
             }
             EditCommand::EditMidiNotes { clip_id, prev, .. } => {
                 state.overwrite_midi_notes(clip_id, prev);
+            }
+            EditCommand::TransformMidiNotes {
+                clip_id,
+                prev,
+                prev_clip_beats,
+                ..
+            } => {
+                state.overwrite_midi_notes(clip_id, prev);
+                if let Some(beats) = prev_clip_beats {
+                    state.set_clip_length_beats(clip_id, *beats);
+                }
             }
             EditCommand::MoveMidiNotesBetweenClips {
                 from_clip_id,
@@ -1952,6 +1990,67 @@ mod articulation_command_tests {
         assert!(state.articulations_snapshot(&clip_id).is_empty());
         cmd.execute(&mut state);
         assert_eq!(state.articulations_snapshot(&clip_id), next);
+    }
+
+    #[test]
+    fn a_named_transform_undoes_notes_and_the_clip_length_it_grew() {
+        let (mut state, clip_id) = midi_state();
+        state.add_midi_note(&clip_id, 60, 0.0, 1.0, 100).unwrap();
+        let before_len = state.clip_duration_beats(&clip_id).unwrap();
+        let prev = state.midi_clip_notes(&clip_id).unwrap().clone();
+        let mut next = prev.clone();
+        // A tool that stretches the note far past the clip's end.
+        next[0].duration = before_len + 12.0;
+        state.overwrite_midi_notes(&clip_id, &next);
+        let grown = state.clip_duration_beats(&clip_id).unwrap();
+        assert!(grown > before_len);
+
+        let cmd = EditCommand::TransformMidiNotes {
+            label: "Length",
+            clip_id: clip_id.clone(),
+            prev: prev.clone(),
+            next: next.clone(),
+            prev_clip_beats: Some(before_len),
+            next_clip_beats: Some(grown),
+        };
+        assert_eq!(cmd.label(), "Length");
+        assert!(cmd.is_midi_edit());
+
+        cmd.undo(&mut state);
+        assert_eq!(state.midi_clip_notes(&clip_id).unwrap()[0].duration, 1.0);
+        assert_eq!(state.clip_duration_beats(&clip_id), Some(before_len));
+        cmd.execute(&mut state);
+        assert_eq!(
+            state.midi_clip_notes(&clip_id).unwrap()[0].duration,
+            before_len + 12.0
+        );
+        assert_eq!(state.clip_duration_beats(&clip_id), Some(grown));
+    }
+
+    #[test]
+    fn history_names_the_tool_for_undo_and_redo() {
+        let (mut state, clip_id) = midi_state();
+        state.add_midi_note(&clip_id, 60, 0.0, 1.0, 100).unwrap();
+        let prev = state.midi_clip_notes(&clip_id).unwrap().clone();
+        let mut next = prev.clone();
+        next[0].start = 0.1;
+        let mut history = EditHistory::new(16);
+        let cmd = EditCommand::TransformMidiNotes {
+            label: "Strum",
+            clip_id: clip_id.clone(),
+            prev,
+            next,
+            prev_clip_beats: None,
+            next_clip_beats: None,
+        };
+        cmd.execute(&mut state);
+        history.push(cmd);
+        assert_eq!(history.undo_label(), Some("Strum"));
+        assert!(history.undo(&mut state));
+        assert_eq!(state.midi_clip_notes(&clip_id).unwrap()[0].start, 0.0);
+        assert_eq!(history.redo_label(), Some("Strum"));
+        assert!(history.redo(&mut state));
+        assert!((state.midi_clip_notes(&clip_id).unwrap()[0].start - 0.1).abs() < 1e-6);
     }
 
     #[test]

@@ -204,6 +204,10 @@ pub struct Timeline {
     /// Fired for persisted MIDI edits so the owner can publish the new note
     /// schedule immediately rather than waiting for gesture throttling.
     on_midi_changed: Option<TimelineProjectChangedCb>,
+    /// Fired for a MIDI tool's live preview: notes the engine must play now
+    /// that are not an edit yet (Accept records one, a cancel puts the notes
+    /// back), so the owner republishes without marking the project unsaved.
+    on_midi_preview_changed: Option<TimelineProjectChangedCb>,
     /// Fired for live mixer-control edits (track mute/solo from the header)
     /// that are persisted in the project but reach the engine through the
     /// realtime command path — the owner marks view-only dirty instead of the
