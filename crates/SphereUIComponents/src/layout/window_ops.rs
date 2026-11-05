@@ -1943,7 +1943,7 @@ impl StudioLayout {
             return;
         };
 
-        let result = crate::jam::with_controller(|controller| {
+        let result = crate::jam::run_action(|controller| {
             if share {
                 controller.publish_track(&track_id, &track_name)
             } else {
@@ -2000,7 +2000,7 @@ impl StudioLayout {
             return;
         }
         let result =
-            crate::jam::with_controller(|controller| controller.publish_multitrack(&tracks));
+            crate::jam::run_action(|controller| controller.publish_multitrack(&tracks));
         if let Err(error) = result {
             eprintln!("[jam] multitrack share failed: {}", error.user_message());
         }

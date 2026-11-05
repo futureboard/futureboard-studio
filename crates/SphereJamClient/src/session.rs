@@ -479,6 +479,9 @@ impl Drop for JamSession {
 
 // ── worker ──────────────────────────────────────────────────────────────────
 
+/// Consecutive failed clock syncs that mark the signaling link dead.
+const MISSED_SYNCS_BEFORE_DROP: u32 = 2;
+
 /// Reconnect delays. Doubling from a quarter second, capped by configuration
 /// and jittered so a server restart does not bring every client back at once.
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
@@ -880,11 +883,16 @@ impl Worker {
 
         self.resume_token = joined.resume_token.clone();
         self.participant_id = Some(ParticipantId::new(joined.participant.id.clone()));
-        self.registry.reset(
+        let ended = self.registry.reset(
             joined.participants.clone(),
             joined.streams.clone(),
             joined.seq,
         );
+        // Streams that ended while this client was away; see `reset`.
+        for stream in ended {
+            self.options.sink.stream_ended(&stream);
+            self.emit(JamEvent::StreamRemoved(stream));
+        }
         if joined.clock.rate != 0 {
             if let Ok(mut clock) = self.clock.lock() {
                 clock.set_rate(joined.clock.rate);
@@ -921,8 +929,14 @@ impl Worker {
             self.config.connect_timeout,
         )?;
 
-        let opened =
-            transport::connect_first(&candidates.candidates, self.config.connect_timeout, resumed)?;
+        // Signaling is serviced between candidates so the server's heartbeat is
+        // answered while fallbacks are tried; see `connect_first_with`.
+        let opened = transport::connect_first_with(
+            &candidates.candidates,
+            self.config.connect_timeout,
+            resumed,
+            || signaling.service(),
+        )?;
         let kind = opened.kind;
         let node_id = opened.welcome.node_id.clone();
         let candidate_id = opened.candidate_id.clone();
@@ -1178,6 +1192,7 @@ impl Worker {
     fn pump(&mut self, signaling: &mut SignalingClient, jam_id: &JamId) -> Result<SessionEnd> {
         let mut next_sync = Instant::now();
         let mut next_snapshot = Instant::now();
+        let mut missed_syncs = 0u32;
 
         loop {
             if self.shutdown {
@@ -1259,11 +1274,23 @@ impl Worker {
 
             if Instant::now() >= next_sync {
                 next_sync = Instant::now() + clock::SYNC_INTERVAL;
-                if let Err(error) = self.sync_clock(signaling) {
-                    // A missed sync is not worth ending a session over; the
-                    // next one will land.
-                    if !error.recoverable() {
-                        return Err(error);
+                match self.sync_clock(signaling) {
+                    Ok(()) => missed_syncs = 0,
+                    Err(error) => {
+                        if !error.recoverable() {
+                            return Err(error);
+                        }
+                        // One missed sync is not worth ending a session over;
+                        // the next one will land. Missing them in a row is
+                        // what a half-open socket looks like — nothing comes
+                        // back, nothing errors — and the session would read
+                        // Connected until the OS gave up on the connection.
+                        // Reconnecting resumes the same participant, so it
+                        // costs far less than waiting.
+                        missed_syncs += 1;
+                        if missed_syncs >= MISSED_SYNCS_BEFORE_DROP {
+                            return Ok(SessionEnd::Dropped);
+                        }
                     }
                 }
             }

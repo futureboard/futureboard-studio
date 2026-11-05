@@ -250,6 +250,43 @@ pub fn connect_first(
     timeout: Duration,
     resumed: bool,
 ) -> Result<MediaTransport> {
+    connect_first_with(candidates, timeout, resumed, || Ok(()))
+}
+
+/// The longest one datagram candidate is given. A UDP hello that is going to
+/// be answered is answered within a round trip; a network that drops UDP
+/// drops it silently, and every second spent waiting on that is a second the
+/// TCP fallbacks are not being tried.
+pub const DATAGRAM_CANDIDATE_TIMEOUT: Duration = Duration::from_millis(3000);
+
+/// The longest one stream candidate (TCP, TLS, WebSocket) is given. Kept under
+/// the server's signaling pong deadline, so trying one never lets the
+/// heartbeat lapse.
+pub const STREAM_CANDIDATE_TIMEOUT: Duration = Duration::from_millis(6000);
+
+/// How long `candidate` may take to open, within the caller's `timeout`.
+pub fn candidate_timeout(candidate: &TransportCandidate, timeout: Duration) -> Duration {
+    timeout.min(if candidate.kind.datagram() {
+        DATAGRAM_CANDIDATE_TIMEOUT
+    } else {
+        STREAM_CANDIDATE_TIMEOUT
+    })
+}
+
+/// [`connect_first`], calling `between` after every failed candidate.
+///
+/// Trying candidates one after another used to block the session worker for up
+/// to a full connect timeout each, and nothing read the signaling socket
+/// meanwhile — so on a network that only lets port 443 out, the server's
+/// heartbeat went unanswered, it closed the socket, and the client reconnected
+/// into the same failure forever. The caller services signaling in `between`;
+/// an error from it ends the attempt.
+pub fn connect_first_with(
+    candidates: &[TransportCandidate],
+    timeout: Duration,
+    resumed: bool,
+    mut between: impl FnMut() -> Result<()>,
+) -> Result<MediaTransport> {
     let ordered = ordered_candidates(candidates);
     if ordered.is_empty() {
         return Err(JamError::Transport(
@@ -258,10 +295,11 @@ pub fn connect_first(
     }
     let mut last = None;
     for candidate in ordered {
-        match connect(candidate, timeout, resumed) {
+        match connect(candidate, candidate_timeout(candidate, timeout), resumed) {
             Ok(transport) => return Ok(transport),
             Err(error) => last = Some(error),
         }
+        between()?;
     }
     Err(last
         .unwrap_or_else(|| JamError::Transport("no media candidate could be opened".to_string())))
@@ -781,7 +819,8 @@ fn connect_websocket(
         JamError::Transport(format!("could not build the media upgrade: {error}"))
     })?;
     let started = Instant::now();
-    let (mut socket, response) = tungstenite::connect(request)
+    // Bounded at every stage; see `wsconnect`.
+    let (mut socket, response) = crate::wsconnect::connect(request, timeout)
         .map_err(|error| JamError::Transport(format!("could not open {url} for media: {error}")))?;
     if response.status().as_u16() != 101 {
         return Err(JamError::Transport(format!(

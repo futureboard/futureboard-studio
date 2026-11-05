@@ -284,14 +284,30 @@ fn receive_loop(
     let mut decoded: Vec<f32> = Vec::with_capacity(4096);
     let mut buffers: HashMap<u32, JitterBuffer> = HashMap::new();
     let mut last_keepalive = Instant::now();
+    let mut last_heard = Instant::now();
+    let silence_limit = silence_limit(keepalive);
     let ping = packet::encode_control::<()>(ControlType::Ping, None).unwrap_or_default();
 
     while !stop.load(Ordering::Acquire) {
         match receiver.recv_frame(&mut frame) {
             Ok(RecvOutcome::Frame) => {
+                last_heard = Instant::now();
                 handle_frame(&frame, &shared, &sink, &mut buffers, &mut decoded, &sender);
             }
-            Ok(RecvOutcome::Timeout) => {}
+            Ok(RecvOutcome::Timeout) => {
+                // A datagram socket never reports the far end gone. After the
+                // node reaps this session, or a NAT rebinding or a Wi-Fi roam
+                // changes this client's address, the node drops every packet
+                // silently and the jam would read Connected with no audio for
+                // good. The node answers every ping with a pong, so a live
+                // link always hears something within one keepalive; hearing
+                // nothing for several means the link is dead, and the session
+                // reconnects instead of waiting on it.
+                if last_heard.elapsed() >= silence_limit {
+                    shared.transport_lost.store(true, Ordering::Release);
+                    break;
+                }
+            }
             Ok(RecvOutcome::Closed) => {
                 shared.transport_lost.store(true, Ordering::Release);
                 break;
@@ -314,6 +330,12 @@ fn receive_loop(
             }
         }
     }
+}
+
+/// How long the media link may stay silent before it counts as lost: two and a
+/// half keepalives, so one lost pong is tolerated and two are not.
+fn silence_limit(keepalive: Duration) -> Duration {
+    keepalive.saturating_mul(5) / 2
 }
 
 fn handle_frame(

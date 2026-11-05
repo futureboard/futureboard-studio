@@ -62,16 +62,13 @@ pub fn routed_streams(registry: &AudioConnectionRegistry) -> Vec<String> {
 ///
 /// Idempotent and cheap: the controller diffs against what it last asked for,
 /// so calling this on every routing recompile — which is what the caller does —
-/// costs nothing when the routing did not touch a jam port. Does nothing when
-/// no jam is installed, so a project with no session open is unaffected.
+/// costs nothing when the routing did not touch a jam port.
+///
+/// Runs on the UI thread, so it never waits for the jam controller: the intent
+/// is queued and applied as soon as the controller is free (see
+/// `PendingRouting` in the jam module).
 pub fn sync(registry: &AudioConnectionRegistry) {
-    if !super::installed() {
-        return;
-    }
-    let routed = routed_streams(registry);
-    // A failure here is not worth surfacing: the controller records it, and the
-    // routing edit that triggered this succeeded either way.
-    let _ = super::with_controller(|controller| controller.set_routed_streams(&routed));
+    super::queue_routed_streams(routed_streams(registry));
 }
 
 #[cfg(test)]

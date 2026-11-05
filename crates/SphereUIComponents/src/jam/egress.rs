@@ -159,14 +159,12 @@ pub fn by_connection(sends: Vec<JamSend>) -> BTreeMap<String, JamSend> {
 /// Push the project's output routing at the jam session.
 ///
 /// Idempotent: the controller diffs by connection, so a routing recompile that
-/// moved a hardware port costs nothing here. Does nothing when no jam is
-/// installed.
+/// moved a hardware port costs nothing here.
+///
+/// Runs on the UI thread, so it never waits for the jam controller: the sends
+/// are queued and applied as soon as the controller is free.
 pub fn sync(registry: &AudioConnectionRegistry) {
-    if !super::installed() {
-        return;
-    }
-    let sends = sends(registry);
-    let _ = super::with_controller(|controller| controller.set_sends(&sends));
+    super::queue_sends(sends(registry));
 }
 
 #[cfg(test)]

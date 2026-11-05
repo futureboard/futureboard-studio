@@ -144,12 +144,19 @@ impl JamRegistry {
     }
 
     /// Replace everything with a fresh room snapshot.
+    ///
+    /// Returns the streams the old view had and the new one does not — those
+    /// that ended while this client was away. Nobody sends an unpublish for
+    /// them, so the caller must end them itself: a reconnect that only
+    /// replaced the view left their audio slots held, and after enough
+    /// dropouts there was no slot left for the next performer.
     pub fn reset(
         &mut self,
         participants: Vec<ParticipantSummary>,
         streams: Vec<StreamSummary>,
         seq: u64,
-    ) {
+    ) -> Vec<StreamId> {
+        let before: Vec<StreamId> = self.streams.keys().cloned().collect();
         self.participants.clear();
         self.streams.clear();
         self.by_alias.clear();
@@ -160,6 +167,10 @@ impl JamRegistry {
             self.upsert_stream(stream);
         }
         self.seq = seq;
+        before
+            .into_iter()
+            .filter(|id| !self.streams.contains_key(id))
+            .collect()
     }
 
     pub fn seq(&self) -> u64 {
@@ -445,6 +456,27 @@ mod tests {
         assert_eq!(mine.len(), 2);
         assert_eq!(mine[0].device_id.as_str(), "phone");
         assert_eq!(mine[1].device_id.as_str(), "studio-mac");
+    }
+
+    /// A reconnect's fresh snapshot reports, by omission, the streams that
+    /// ended while this client was away, so their audio slots can be freed.
+    #[test]
+    fn a_fresh_snapshot_reports_the_streams_that_ended_meanwhile() {
+        let mut registry = JamRegistry::new();
+        registry.upsert_participant(participant("pcp_1", "usr_1", "hachi224", "studio-mac"));
+        registry.upsert_stream(stream("str_1", 1, "pcp_1", "usr_1", "studio-mac", "Guitar"));
+        registry.upsert_stream(stream("str_2", 2, "pcp_1", "usr_1", "studio-mac", "Vocal"));
+
+        let ended = registry.reset(
+            vec![participant("pcp_1", "usr_1", "hachi224", "studio-mac")],
+            vec![stream("str_2", 2, "pcp_1", "usr_1", "studio-mac", "Vocal")],
+            7,
+        );
+        assert_eq!(ended, vec![StreamId::new("str_1")]);
+        assert_eq!(registry.streams().len(), 1);
+        assert!(registry
+            .reset(Vec::new(), Vec::new(), 8)
+            .contains(&StreamId::new("str_2")));
     }
 
     #[test]

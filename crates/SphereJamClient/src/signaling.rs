@@ -76,7 +76,9 @@ impl SignalingClient {
             http::HeaderValue::from_static(protocol::SUBPROTOCOL),
         );
 
-        let (socket, response) = tungstenite::connect(request).map_err(upgrade_error)?;
+        // Bounded at every stage; see `wsconnect`.
+        let (socket, response) =
+            crate::wsconnect::connect(request, timeout).map_err(upgrade_error)?;
         if response.status().as_u16() != 101 {
             return Err(JamError::WebSocket(format!(
                 "the jam service answered the upgrade with {}",
@@ -182,6 +184,17 @@ impl SignalingClient {
             return Ok(Some(envelope));
         }
         self.read_envelope()
+    }
+
+    /// Read whatever has arrived, keeping it for [`Self::poll`], so the socket
+    /// answers the server's heartbeat while the caller is busy elsewhere.
+    ///
+    /// Waits at most one read poll.
+    pub fn service(&mut self) -> Result<()> {
+        if let Some(envelope) = self.read_envelope()? {
+            self.pending.push_back(envelope);
+        }
+        Ok(())
     }
 
     /// Whether the peer has closed.

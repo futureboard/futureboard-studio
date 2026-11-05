@@ -101,6 +101,7 @@ pub mod registry;
 pub mod session;
 pub mod signaling;
 pub mod transport;
+mod wsconnect;
 
 pub use bridge::{
     ChannelMapping, JamAudioFrame, JamAudioSink, JamPublishRequest, JamPublishSource,

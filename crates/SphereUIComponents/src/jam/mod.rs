@@ -398,6 +398,52 @@ fn controller() -> &'static Mutex<Option<JamController>> {
     CONTROLLER.get_or_init(|| Mutex::new(None))
 }
 
+/// Routing the project wants the jam to follow, waiting to be applied.
+///
+/// The UI thread recompiles routing and must never wait for the controller:
+/// the controller lock is held for the length of a Create or Join REST call,
+/// and a routing edit made meanwhile froze the window until the server
+/// answered. So the UI thread only records the latest intent here — a short
+/// lock nothing slow ever holds — and applies it at once when the controller
+/// is free, or leaves it for the poll thread's next tick when it is not.
+#[derive(Default)]
+struct PendingRouting {
+    routed: Option<Vec<String>>,
+    sends: Option<Vec<JamSend>>,
+}
+
+fn pending_routing() -> &'static Mutex<PendingRouting> {
+    static PENDING: OnceLock<Mutex<PendingRouting>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(PendingRouting::default()))
+}
+
+/// Record which remote streams the project routes; see [`PendingRouting`].
+pub(crate) fn queue_routed_streams(routed: Vec<String>) {
+    if let Ok(mut pending) = pending_routing().lock() {
+        pending.routed = Some(routed);
+    }
+    apply_pending_routing_if_free();
+}
+
+/// Record which output buses the project sends to the jam; see
+/// [`PendingRouting`].
+pub(crate) fn queue_sends(sends: Vec<JamSend>) {
+    if let Ok(mut pending) = pending_routing().lock() {
+        pending.sends = Some(sends);
+    }
+    apply_pending_routing_if_free();
+}
+
+/// Apply queued routing now if nobody holds the controller. Never blocks.
+fn apply_pending_routing_if_free() {
+    let Ok(mut guard) = controller().try_lock() else {
+        return;
+    };
+    if let Some(controller) = guard.as_mut() {
+        controller.apply_pending_routing();
+    }
+}
+
 /// Install the controller once the engine exists. Idempotent.
 ///
 /// Installing also starts the poll thread, because the jam has to keep its
@@ -463,6 +509,8 @@ fn spawn_poll_thread() {
                 let live = match controller().lock() {
                     Ok(mut guard) => match guard.as_mut() {
                         Some(controller) => {
+                            // Routing edits made while the controller was busy.
+                            controller.apply_pending_routing();
                             controller.poll();
                             controller.state().live()
                         }
@@ -500,6 +548,31 @@ pub fn with_controller<T>(edit: impl FnOnce(&mut JamController) -> Result<T>) ->
             "the audio engine is not running yet".to_string(),
         )),
     }
+}
+
+/// Run something a person asked for — create, join, leave, send, invite —
+/// against the installed controller, keeping a failure as the panel's error.
+///
+/// [`with_controller`] hands the error back to its caller, and every caller
+/// that runs on a background task could only print it: a refused invite or an
+/// offline join showed "Joining…" for a few seconds and then nothing at all.
+/// Here the failure becomes the error banner, in the words
+/// [`JamError::user_message`] gives it, until the next action clears it.
+pub fn run_action<T>(edit: impl FnOnce(&mut JamController) -> Result<T>) -> Result<T> {
+    let mut guard = controller()
+        .lock()
+        .map_err(|_| JamError::Session("the jam controller lock was poisoned".to_string()))?;
+    let Some(controller) = guard.as_mut() else {
+        return Err(JamError::Session(
+            "the audio engine is not running yet".to_string(),
+        ));
+    };
+    let result = edit(controller);
+    if let Err(error) = &result {
+        controller.last_error = Some(error.user_message());
+        controller.publish_ui_state();
+    }
+    result
 }
 
 /// Drain jam events and refresh the published UI state.
@@ -768,6 +841,23 @@ impl JamController {
     /// a hardware port must not cost a round trip about jam streams that did not
     /// change. Streams no longer routed anywhere are unsubscribed, which is
     /// where the bandwidth is actually saved — see [`ingress`].
+    /// Apply whatever routing the UI thread queued; see [`PendingRouting`].
+    /// The queue's lock is released before any of it is applied.
+    fn apply_pending_routing(&mut self) {
+        let (routed, sends) = match pending_routing().lock() {
+            Ok(mut pending) => (pending.routed.take(), pending.sends.take()),
+            Err(_) => return,
+        };
+        // Failures are the controller's to record; the routing edit that
+        // queued them succeeded either way.
+        if let Some(routed) = routed {
+            let _ = self.set_routed_streams(&routed);
+        }
+        if let Some(sends) = sends {
+            let _ = self.set_sends(&sends);
+        }
+    }
+
     pub fn set_routed_streams(&mut self, streams: &[String]) -> Result<()> {
         let wanted: BTreeSet<String> = streams.iter().cloned().collect();
         if wanted == self.routed_streams {
@@ -1293,11 +1383,21 @@ impl JamController {
 
     /// Leave the jam, release every bus slot, and stop the worker.
     pub fn leave(&mut self) -> Result<()> {
-        if let Some(session) = self.session.as_ref() {
+        if let Some(session) = self.session.take() {
             let _ = session.leave();
+            // Dropping the handle stops the worker and joins its thread, which
+            // can take as long as whatever the worker is blocked in — a
+            // connect, a handshake. This runs under the controller lock the UI
+            // thread also takes (routing recompiles, the jam window), so the
+            // join happens on a thread of its own: Leave returns at once and
+            // nothing on screen waits for the network to give up.
+            if let Err(error) = std::thread::Builder::new()
+                .name("jam-session-reaper".to_string())
+                .spawn(move || drop(session))
+            {
+                eprintln!("[jam] could not stop the session off-thread: {error}");
+            }
         }
-        // Dropping the handle stops the worker and joins its threads.
-        self.session = None;
         // Stop the engine assembling a stream nothing will read. Releasing the
         // slot alone would leave every shared track still staging its block
         // into it, which costs a memcpy per track per callback for a jam that
