@@ -265,7 +265,7 @@ impl CaptureTapCallback {
         // The first block that is really captured stamps the take's true start.
         let _ = sink.first_capture_sample.compare_exchange(
             u64::MAX,
-            shared.position_samples.load(Ordering::Relaxed),
+            shared.render_position_now(),
             Ordering::Relaxed,
             Ordering::Relaxed,
         );

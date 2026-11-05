@@ -7009,8 +7009,8 @@ fn plugin_state_label(
 /// not answer in time keeps the session unsaved, and how the warning reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PluginStateCaptureFor {
-    /// Save / Save As, and the synchronous saves (a new project, save before
-    /// recording): the session is bound to the file written.
+    /// Save / Save As, the synchronous saves (a new project) and the save
+    /// before recording: the session is bound to the file written.
     Save,
     /// The Save answer to "Save changes?" on the way to closing or switching
     /// the project: the session is bound to the file, then left.

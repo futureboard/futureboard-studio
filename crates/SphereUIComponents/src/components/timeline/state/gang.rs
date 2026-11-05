@@ -139,6 +139,13 @@ impl TimelineState {
     }
 
     pub fn set_track_armed(&mut self, track_id: &str, armed: bool) -> bool {
+        // A take records the tracks that were armed when it started, and keeps
+        // recording them to the end. Arming or disarming one mid-take changed
+        // the button and nothing else: a disarmed track still got its clip, an
+        // armed one recorded nothing. Arm state holds until the take is over.
+        if self.transport.recording {
+            return false;
+        }
         match self.tracks.iter_mut().find(|track| track.id == track_id) {
             Some(track) if track.armed != armed => {
                 track.armed = armed;
@@ -175,6 +182,20 @@ mod tests {
         state.tracks.clear();
         let ids: Vec<String> = (0..3).map(|_| state.create_audio_track()).collect();
         (state, ids)
+    }
+
+    #[test]
+    fn arm_state_holds_while_a_take_records() {
+        let (mut state, ids) = three_tracks();
+        assert!(state.set_track_armed(&ids[0], true));
+        state.transport.recording = true;
+        // The take records the tracks armed when it began, to the end.
+        assert!(!state.set_track_armed(&ids[0], false));
+        assert!(!state.set_track_armed(&ids[1], true));
+        assert!(state.find_track(&ids[0]).unwrap().armed);
+        assert!(!state.find_track(&ids[1]).unwrap().armed);
+        state.transport.recording = false;
+        assert!(state.set_track_armed(&ids[0], false));
     }
 
     #[test]

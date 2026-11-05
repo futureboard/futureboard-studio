@@ -254,6 +254,12 @@ impl StudioLayout {
             }
             TransportCommand::ReturnToStart => self.seek_native_playhead(cx, 0.0),
             TransportCommand::ToggleLoop => {
+                // The take was started under this loop setting and is split
+                // into passes by it; switching it mid-take changed the button
+                // and not the take (see `RecordingSessionState::record_loop`).
+                if self.is_recording_active(cx) {
+                    return;
+                }
                 let _ = self.timeline.update(cx, |timeline, cx| {
                     let enabling = !timeline.state.transport.loop_enabled;
                     if enabling {

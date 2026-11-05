@@ -1122,6 +1122,11 @@ impl Render for Timeline {
         let on_chord_toggle_collapsed: crate::components::timeline::region_track::GlobalLaneVoidCallback =
             std::sync::Arc::new(on_chord_toggle_collapsed);
         let on_loop_drag = cx.listener(|this, update: &TimelineLoopDragUpdate, _window, cx| {
+            // A take splits into passes on the loop it started under; the
+            // loop on screen must stay the one it is recording.
+            if this.state.transport.recording {
+                return;
+            }
             if !update.enabled {
                 if this.state.transport.loop_enabled {
                     this.state.transport.loop_enabled = false;

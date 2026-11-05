@@ -202,15 +202,23 @@ impl TimelineState {
     }
 
     /// Grow the preview clip as recording proceeds. Returns `true` if changed.
-    pub fn set_recording_preview_clip_length(
+    /// Move and size the preview clip: it grows from where the take started,
+    /// and in a loop recording it is the pass being recorded, at the loop
+    /// start once the first pass is done. Returns `true` if it changed.
+    pub fn set_recording_preview_clip_window(
         &mut self,
         clip_id: &str,
+        start_beat: f32,
         duration_beats: f32,
     ) -> bool {
+        let start = start_beat.max(0.0);
         let next = duration_beats.max(0.01);
         for track in &mut self.tracks {
             if let Some(c) = track.clips.iter_mut().find(|c| c.id == clip_id) {
-                if (c.duration_beats - next).abs() > f32::EPSILON {
+                if (c.duration_beats - next).abs() > f32::EPSILON
+                    || (c.start_beat - start).abs() > f32::EPSILON
+                {
+                    c.start_beat = start;
                     c.duration_beats = next;
                     return true;
                 }

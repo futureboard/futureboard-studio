@@ -1765,6 +1765,7 @@ fn fill_output_f32_inner(
 
     // Advance transport position.
     if transport_playing && channels > 0 {
+        shared.note_output_block(base_sample, frames);
         let (next_position, _) = transport::advance_loop_position(base_sample, frames, loop_bounds);
         shared
             .position_samples

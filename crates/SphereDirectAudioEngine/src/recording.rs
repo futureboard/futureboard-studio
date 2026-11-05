@@ -53,6 +53,8 @@ struct TrackWriterState {
     take_id: String,
     project_start_sample: u64,
     error: Option<String>,
+    /// This track's channels picked out of one input block; reused per block.
+    selected: Vec<i32>,
 }
 
 pub struct RecordingResult {
@@ -260,6 +262,9 @@ pub(crate) fn find_input_device_for_host(
 
 // ── RAUF / disk writer thread ─────────────────────────────────────────────────
 
+/// How long the disk writer waits for a block before it looks at the stop flag.
+const WRITER_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 #[allow(clippy::too_many_arguments)]
 fn disk_writer_thread(
     audio_rx: crossbeam_channel::Receiver<Vec<i32>>,
@@ -274,13 +279,18 @@ fn disk_writer_thread(
     let mut total_frames = 0u64;
 
     // Drain audio blocks until the sender disconnects (own-stream capture) or
-    // the stop flag is raised with no data pending (ASIO tap capture, where a
-    // stalled driver could otherwise keep the sender alive forever).
+    // the stop flag is raised with no data pending. A tapped take (the ASIO
+    // session or the live input stream) never disconnects: the callback parks
+    // its sink, sender included, until the take has finalized. The take's
+    // `active` gate is cleared before the stop flag is raised, so once the flag
+    // is up nothing new is coming and an empty wait is the end of the take.
+    // The wait is short because it is how long Stop takes to close the files:
+    // at 200 ms every take sat out most of it after the last block.
     loop {
-        let mut block = match audio_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+        let mut block = match audio_rx.recv_timeout(WRITER_IDLE_POLL) {
             Ok(block) => block,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if stop_flag.load(Ordering::Relaxed) {
+                if stop_flag.load(Ordering::Acquire) {
                     break;
                 }
                 continue;
@@ -294,7 +304,7 @@ fn disk_writer_thread(
             continue;
         }
         for w in &mut writers {
-            let mut selected = Vec::with_capacity(frames * w.input_channels.len());
+            w.selected.clear();
             for f in 0..frames {
                 for &ch in &w.input_channels {
                     let s = if ch < input_ch {
@@ -302,11 +312,11 @@ fn disk_writer_thread(
                     } else {
                         0
                     };
-                    selected.push(s);
+                    w.selected.push(s);
                 }
             }
             if w.error.is_none() {
-                if let Err(error) = w.writer.write_s32le_interleaved(&selected) {
+                if let Err(error) = w.writer.write_s32le_interleaved(&w.selected) {
                     w.error = Some(error.to_string());
                 }
             }
@@ -611,7 +621,7 @@ fn build_f32_input_stream(
                     // `RecordingSession::first_capture_sample`.
                     let _ = first_capture_sample.compare_exchange(
                         u64::MAX,
-                        shared.position_samples.load(Ordering::Relaxed),
+                        shared.render_position_now(),
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                     );
@@ -876,6 +886,7 @@ fn build_track_writers(
             take_id: format_take_id(take_id),
             project_start_sample,
             error: None,
+            selected: Vec::new(),
         });
     }
     Ok(track_writers)
@@ -1525,7 +1536,7 @@ pub fn begin_stop_recording(session: RecordingSession) -> PendingRecordingStop {
     // driver stalls), then drop the capture source: for an own stream this
     // disconnects `audio_tx` (it lived inside the closure), which causes the
     // disk writer's `recv` to return Disconnected → loop exits.
-    session.stop_flag.store(true, Ordering::Relaxed);
+    session.stop_flag.store(true, Ordering::Release);
     drop(session.capture);
 
     PendingRecordingStop {

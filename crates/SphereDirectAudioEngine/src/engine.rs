@@ -512,6 +512,14 @@ pub struct SharedState {
     pub engine_state: AtomicU8,
     pub position_samples: AtomicU64, // samples elapsed from start
     pub sample_rate: AtomicU32,
+    /// The last transport block the output rendered: where it starts, how
+    /// long it is, and when it was rendered (ns since `output_clock_epoch`).
+    /// `position_samples` already points past that block for the whole time
+    /// between two callbacks; see [`SharedState::render_position_now`].
+    pub output_block_start: AtomicU64,
+    pub output_block_frames: AtomicU64,
+    pub output_block_at_ns: AtomicU64,
+    pub output_clock_epoch: std::time::Instant,
 
     // Transport clock (control ↔ audio via commands + Relaxed reads)
     pub bpm_bits: AtomicU64,
@@ -725,6 +733,10 @@ impl Default for SharedState {
             engine_state: AtomicU8::new(AudioEngineState::Paused as u8),
             position_samples: AtomicU64::new(0),
             sample_rate: AtomicU32::new(44100),
+            output_block_start: AtomicU64::new(0),
+            output_block_frames: AtomicU64::new(0),
+            output_block_at_ns: AtomicU64::new(0),
+            output_clock_epoch: std::time::Instant::now(),
             bpm_bits: AtomicU64::new(120.0_f64.to_bits()),
             time_sig_num: AtomicU32::new(4),
             time_sig_den: AtomicU32::new(4),
@@ -802,6 +814,47 @@ impl Default for SharedState {
 }
 
 impl SharedState {
+    /// Note the transport block the output callback is about to advance past.
+    /// Three atomic stores and a clock read; realtime-safe.
+    #[inline]
+    pub(crate) fn note_output_block(&self, start: u64, frames: u64) {
+        let at = self.output_clock_epoch.elapsed().as_nanos() as u64;
+        self.output_block_at_ns.store(at, Ordering::Relaxed);
+        self.output_block_frames.store(frames, Ordering::Relaxed);
+        self.output_block_start.store(start, Ordering::Release);
+    }
+
+    /// The transport sample the output is rendering right now.
+    ///
+    /// `position_samples` is advanced at the end of each output callback, so
+    /// between two callbacks it names the start of the *next* block. Read from
+    /// the input side, that is up to one block ahead of the block whose
+    /// play-out the measured output latency refers to, and a take stamped with
+    /// it landed that much late. This interpolates into the last rendered
+    /// block by the time since it was rendered instead.
+    ///
+    /// Falls back to `position_samples` whenever the block clock does not
+    /// describe the current position: nothing rendered yet, a seek or loop
+    /// wrap since, or a callback that is overdue.
+    pub(crate) fn render_position_now(&self) -> u64 {
+        let position = self.position_samples.load(Ordering::Relaxed);
+        let start = self.output_block_start.load(Ordering::Acquire);
+        let frames = self.output_block_frames.load(Ordering::Relaxed);
+        let at = self.output_block_at_ns.load(Ordering::Relaxed);
+        let sample_rate = self.sample_rate.load(Ordering::Relaxed) as u64;
+        if frames == 0 || sample_rate == 0 || start.saturating_add(frames) != position {
+            return position;
+        }
+        let now = self.output_clock_epoch.elapsed().as_nanos() as u64;
+        let elapsed = now.saturating_sub(at);
+        let block_ns = frames.saturating_mul(1_000_000_000) / sample_rate;
+        if elapsed > block_ns.saturating_mul(2) {
+            return position;
+        }
+        let offset = (elapsed.saturating_mul(sample_rate) / 1_000_000_000).min(frames);
+        start + offset
+    }
+
     /// Publish the Browser preview playhead from the render callback. One
     /// relaxed store per block; `None` parks the sentinel so the UI stops
     /// drawing a playhead the moment the voice retires.
@@ -2609,6 +2662,57 @@ impl EngineInner {
         self.send_command(EngineCommand::SetClipGain { clip_index, gain })
     }
 
+    /// Set one send's level (linear, 0..2), live, so a send fader can follow
+    /// a drag without a project sync per pointer sample. The stored snapshot
+    /// and the graph mirror take it too, so the next sync matches and a later
+    /// rebuild or device reopen keeps it.
+    ///
+    /// `Ok(false)` when the graph has no such send yet (a send added since the
+    /// last sync): the caller has to leave that one to a project sync.
+    pub fn set_track_send_level(
+        &self,
+        track_id: &str,
+        send_id: &str,
+        level: f32,
+    ) -> Result<bool, SphereAudioError> {
+        let level = if level.is_finite() {
+            level.clamp(0.0, 2.0)
+        } else {
+            return Ok(false);
+        };
+        if let Some(project) = self.project.lock().as_mut() {
+            if let Some(send) = project
+                .tracks
+                .iter_mut()
+                .find(|track| track.id == track_id)
+                .and_then(|track| track.sends.iter_mut().find(|send| send.id == send_id))
+            {
+                send.level = level;
+            }
+        }
+        let (track_index, send_index) = {
+            let mut runtime = self.runtime.lock();
+            let Some(track_index) = runtime.tracks.iter().position(|t| t.id == track_id) else {
+                return Ok(false);
+            };
+            let Some(send_index) = runtime.tracks[track_index]
+                .sends
+                .iter()
+                .position(|send| send.id == send_id)
+            else {
+                return Ok(false);
+            };
+            runtime.update_track_send_level(track_index, send_index, level);
+            (track_index, send_index)
+        };
+        self.send_command(EngineCommand::SetTrackSendLevel {
+            track_index,
+            send_index,
+            level,
+        })
+        .map(|()| true)
+    }
+
     /// Clear Listen on every channel — the Control Room returns to its
     /// selected source, normally the master bus.
     pub fn clear_all_listen(&self) -> Result<(), SphereAudioError> {
@@ -4316,9 +4420,10 @@ impl EngineInner {
             }
         }
 
-        // Live-stream tap: detach the record fan-out. The callback releases its
-        // senders on the next block, which disconnects the disk writer. The
-        // stream itself keeps running, so monitoring never drops out and the
+        // Live-stream tap: detach the record fan-out. The callback parks the
+        // sink (its sender with it) until the take has finalized, so the disk
+        // writer ends on the stop flag, not on a disconnect. The stream itself
+        // keeps running, so monitoring never drops out and the
         // end of a take is silent in the way it should be.
         let live_tap = session.is_live_stream_tap();
         if live_tap {
@@ -4452,32 +4557,27 @@ impl EngineInner {
             Some(latency) if latency > 0 => latency,
             _ => buffer_frames.saturating_mul(2),
         };
+        // How far behind the render position the performer heard the mix,
+        // which is how far the click is held back to sound with it. Bypassed,
+        // nothing waited for the slowest path: the mix came out as soon as
+        // the master inserts let it through. Compensated, every track waited
+        // for the slowest path and then went through the master inserts. That
+        // does not depend on the armed track: subtracting only the armed
+        // track's own plug-in latency put a take recorded while playing late
+        // by the rest of the compensation.
+        let path_samples = if placement.pdc_bypassed {
+            runtime.latency_graph.master_plugin_latency
+        } else {
+            crate::backend::render::metronome_compensation_delay_samples(&runtime)
+        };
         for result in &mut results {
-            let Some(track_idx) = runtime
+            if !runtime
                 .tracks
                 .iter()
-                .position(|track| track.id == result.track_id)
-            else {
+                .any(|track| track.id == result.track_id)
+            {
                 continue;
-            };
-            // Bypassed, nothing was held back behind the slowest path: the
-            // performer heard the mix as soon as the master inserts let it
-            // through, which is when the click sounded as well.
-            let path_samples = if placement.pdc_bypassed {
-                runtime.latency_graph.master_plugin_latency
-            } else {
-                runtime
-                    .latency_graph
-                    .max_path_latency_samples
-                    .saturating_sub(
-                        runtime
-                            .latency_graph
-                            .track_pdc_delay
-                            .get(track_idx)
-                            .copied()
-                            .unwrap_or(0),
-                    )
-            };
+            }
             let measured_round_trip = (result.latency_seconds * sample_rate).round() as u64;
             let round_trip = if measured_round_trip > 0 {
                 measured_round_trip
@@ -5836,6 +5936,7 @@ impl EngineInner {
                 EngineCommand::SetTrackListen { .. } => "SetTrackListen",
                 EngineCommand::SetTrackSpatial { .. } => "SetTrackSpatial",
                 EngineCommand::SetClipGain { .. } => "SetClipGain",
+                EngineCommand::SetTrackSendLevel { .. } => "SetTrackSendLevel",
                 EngineCommand::ClearAllListen => "ClearAllListen",
                 EngineCommand::MidiPreviewNoteOn { .. } => "MidiPreviewNoteOn",
                 EngineCommand::MidiPreviewNoteOff { .. } => "MidiPreviewNoteOff",
@@ -6526,6 +6627,13 @@ where
                         EngineCommand::SetClipGain { clip_index, gain } => {
                             runtime.update_clip_gain(clip_index, gain);
                         }
+                        EngineCommand::SetTrackSendLevel {
+                            track_index,
+                            send_index,
+                            level,
+                        } => {
+                            runtime.update_track_send_level(track_index, send_index, level);
+                        }
                         EngineCommand::SetTrackListen {
                             track_index,
                             listen,
@@ -7010,6 +7118,7 @@ where
 
                 // Advance position counter.
                 if playing_local && ch > 0 {
+                    shared.note_output_block(base_sample, frames);
                     let (next_position, _) =
                         transport::advance_loop_position(base_sample, frames, loop_bounds);
                     shared.position_samples.store(next_position, Ordering::Relaxed);
@@ -8918,6 +9027,34 @@ mod routing_tests {
             .all(|&v| (v + 1.0).abs() < 1e-6));
     }
 
+    /// A live send level (`SetTrackSendLevel`) is what the next block sends,
+    /// with no rebuild; an index the graph does not have changes nothing.
+    #[test]
+    fn a_live_send_level_reaches_the_next_block() {
+        let frames = 4;
+        let mut p = RuntimeProject {
+            spatial: Default::default(),
+            tracks: vec![
+                track("audio", "audio", vec![send("ret", 0.5)]),
+                track("ret", "return", vec![]),
+            ],
+            ..Default::default()
+        };
+        p.resolve_indices();
+        p.update_track_send_level(0, 0, 0.25);
+        p.update_track_send_level(0, 7, 1.0);
+        p.update_track_send_level(9, 0, 1.0);
+        p.tracks[0].block_l[..frames].fill(1.0);
+
+        accumulate_sends(&mut p, 0, frames, false);
+
+        assert!(p.tracks[1].recv_l[..frames]
+            .iter()
+            .all(|&v| (v - 0.25).abs() < 1e-6));
+        p.update_track_send_level(0, 0, 9.0);
+        assert_eq!(p.tracks[0].sends[0].level, 2.0, "clamped to +6 dB");
+    }
+
     #[test]
     fn pre_fader_filter_only_routes_matching_phase() {
         let frames = 4;
@@ -9549,5 +9686,52 @@ mod structure_key_tests {
         write_canonical_json(&two, &mut right);
         assert_eq!(left, right);
         assert_eq!(left, r#"{"a":{"x":[3,{"p":5,"q":4}],"y":2},"b":1}"#);
+    }
+}
+
+#[cfg(test)]
+mod render_position_tests {
+    use super::SharedState;
+    use std::sync::atomic::Ordering;
+
+    fn shared_at(position: u64) -> SharedState {
+        let shared = SharedState::default();
+        shared.sample_rate.store(48_000, Ordering::Relaxed);
+        shared.position_samples.store(position, Ordering::Relaxed);
+        shared
+    }
+
+    #[test]
+    fn nothing_rendered_yet_reads_the_position() {
+        let shared = shared_at(10_000);
+        assert_eq!(shared.render_position_now(), 10_000);
+    }
+
+    #[test]
+    fn between_callbacks_it_reads_inside_the_last_block() {
+        let shared = shared_at(10_000);
+        shared.note_output_block(10_000, 4_800);
+        shared.position_samples.store(14_800, Ordering::Relaxed);
+        let now = shared.render_position_now();
+        // Not the next block's start, which is what a stamp used to read.
+        assert!((10_000..14_800).contains(&now), "{now}");
+    }
+
+    #[test]
+    fn a_seek_since_the_block_reads_the_new_position() {
+        let shared = shared_at(10_000);
+        shared.note_output_block(10_000, 512);
+        shared.position_samples.store(96_000, Ordering::Relaxed);
+        assert_eq!(shared.render_position_now(), 96_000);
+    }
+
+    #[test]
+    fn an_overdue_callback_reads_the_position() {
+        let shared = shared_at(10_000);
+        shared.note_output_block(10_000, 256);
+        shared.position_samples.store(10_256, Ordering::Relaxed);
+        // Two blocks of 256 frames at 48 kHz are under 11 ms.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert_eq!(shared.render_position_now(), 10_256);
     }
 }

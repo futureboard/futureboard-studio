@@ -12,6 +12,7 @@ use crate::components::timeline::waveform_cache::{self, WaveformPeak};
 use sphere_midi_service::mpe::{MpeDecoder, MpeRecordingSession, RecordedNote};
 use sphere_midi_service::MidiInputEvent;
 
+use super::engine_snapshot::apply_engine_track_input_state;
 use super::{audio_recording_preview_clip_id, RecordingPreviewUi, RecordingUiState, StudioLayout};
 use DirectAudio::types::{JsRecordingTrackConfig, JsStartRecordingConfig};
 
@@ -64,6 +65,9 @@ pub(crate) struct RecordingSessionState {
     /// measurable, and with this one if the jam dropped before the files
     /// were closed.
     pub jam_offset_ms: Option<f64>,
+    /// The track this Record press armed because nothing was armed. Disarmed
+    /// again if the take does not start; kept armed once it does.
+    pub auto_armed: Option<String>,
 }
 
 impl Default for RecordingSessionState {
@@ -81,6 +85,7 @@ impl Default for RecordingSessionState {
             pass: 0,
             record_loop: None,
             jam_offset_ms: None,
+            auto_armed: None,
         }
     }
 }
@@ -319,8 +324,11 @@ impl StudioLayout {
 
         let owner = cx.entity().clone();
         cx.spawn(async move |_this, cx| {
-            let deadline =
-                std::time::Instant::now() + Duration::from_secs_f32(fallback_seconds + 1.0);
+            // Without the engine's click the count is timed here, and the take
+            // starts when the count would have ended. The second on top is only
+            // the safety net for an engine count that stalls.
+            let counted_out = std::time::Instant::now() + Duration::from_secs_f32(fallback_seconds);
+            let deadline = counted_out + Duration::from_secs(1);
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(if engine_clocked { 5 } else { 20 }))
@@ -358,7 +366,7 @@ impl StudioLayout {
                     // counting forever — the deadline always ends it.
                     let done = match remaining {
                         Some(remaining) if engine_clocked => remaining == 0,
-                        _ => std::time::Instant::now() >= deadline,
+                        _ => std::time::Instant::now() >= counted_out,
                     };
                     Some(done || std::time::Instant::now() >= deadline)
                 });
@@ -382,7 +390,10 @@ impl StudioLayout {
         .detach();
     }
 
-    fn cancel_record_count_in(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn cancel_record_count_in(&mut self, cx: &mut Context<Self>) {
+        // Out of `CountingIn` first: `stop_native_playback` below cancels a
+        // count-in it finds, and would call back here.
+        self.recording.ui_state = RecordingUiState::Idle;
         self.recording.count_in_token = self.recording.count_in_token.wrapping_add(1);
         if let Some(engine) = self.audio_bridge.engine.as_ref() {
             let _ = engine.cancel_count_in();
@@ -439,6 +450,7 @@ impl StudioLayout {
         if start_transport {
             self.recording.ui_state = RecordingUiState::Preparing;
         }
+        self.recording.auto_armed = None;
         cx.notify();
 
         // Clone the engine handle (cheap, Arc-backed) so the local `engine`
@@ -452,17 +464,6 @@ impl StudioLayout {
             return;
         };
         let engine = &engine_handle;
-
-        let input_devices: Vec<RecordingInputDevice> = engine
-            .list_input_devices()
-            .into_iter()
-            .map(|d| RecordingInputDevice {
-                id: d.id,
-                name: d.name,
-                channels: d.channels,
-                is_default: d.is_default,
-            })
-            .collect();
 
         // Auto-arm the record target. Both the "R" shortcut and the transport
         // Record button route here; the most common reason Record appears to do
@@ -502,10 +503,34 @@ impl StudioLayout {
                     })
             };
             if let Some(id) = arm_target {
-                self.timeline.update(cx, |timeline, cx| {
-                    timeline.state.toggle_track_arm(&id);
+                // Armed the way the arm button arms it, engine included: the
+                // engine opens the track's input when it is armed, and a take
+                // started on a track the engine did not know was armed had to
+                // open its own capture stream between Record and the downbeat.
+                let armed = self.timeline.update(cx, |timeline, cx| {
+                    let changed = timeline.state.set_track_armed(&id, true);
                     cx.notify();
+                    changed
                 });
+                if armed {
+                    self.recording.auto_armed = Some(id.clone());
+                    let error = {
+                        let timeline = self.timeline.read(cx);
+                        timeline.state.find_track(&id).and_then(|track| {
+                            apply_engine_track_input_state(
+                                engine,
+                                track,
+                                &timeline.state.audio_connections,
+                            )
+                            .err()
+                        })
+                    };
+                    if let Some(error) = error {
+                        self.fail_recording_start(&format!("could not arm the track: {error}"), cx);
+                        return;
+                    }
+                    self.mark_dirty_view_only();
+                }
             }
         }
 
@@ -548,61 +573,43 @@ impl StudioLayout {
             )
         };
 
+        // The input inventory comes from the device registry, which the engine
+        // refreshes on every device or backend change. Enumerating it here put
+        // a query of every input endpoint between Record and the downbeat; it
+        // is only done when the cached inventory cannot route an armed track,
+        // which is a device plugged in since the last refresh.
+        let resolved = {
+            let timeline = self.timeline.read(cx);
+            let resolve = |devices: Vec<RecordingInputDevice>| {
+                let routes = resolve_recording_routes(
+                    &timeline.state.tracks,
+                    &timeline.state.audio_connections,
+                    &devices,
+                    &input_device_name,
+                );
+                (devices, routes)
+            };
+            match resolve(cached_recording_input_devices()) {
+                (devices, Ok(routes)) if !devices.is_empty() || routes.tracks.is_empty() => {
+                    (devices, Ok(routes))
+                }
+                _ => resolve(live_recording_input_devices(engine)),
+            }
+        };
+        let (input_devices, routes) = match resolved {
+            (devices, Ok(routes)) => (devices, routes),
+            (_, Err(error)) => {
+                self.fail_recording_start(&error, cx);
+                return;
+            }
+        };
         let selected_input_device =
             select_recording_input_device(&input_devices, &input_device_name);
-
-        let (tracks, explicit_device_id, monitor_channels): (
-            Vec<JsRecordingTrackConfig>,
-            Option<String>,
-            Vec<u32>,
-        ) = {
-            let timeline = self.timeline.read(cx);
-            let connections_for_recording = timeline.state.audio_connections.clone();
-            let mut explicit_device_id: Option<String> = None;
-            let mut monitor_channels = Vec::new();
-            let mut configs = Vec::new();
-            for track in timeline
-                .state
-                .tracks
-                .iter()
-                .filter(|t| t.armed && t.track_type == TrackType::Audio)
-            {
-                let route = match recording_input_channels_checked(
-                    track,
-                    &connections_for_recording,
-                    &input_devices,
-                    selected_input_device,
-                ) {
-                    Ok(route) => route,
-                    Err(error) => {
-                        self.fail_recording_start(&error, cx);
-                        return;
-                    }
-                };
-                if let Some(device_id) = route.device_id.clone() {
-                    match explicit_device_id.as_ref() {
-                        Some(existing) if existing != &device_id => {
-                            self.fail_recording_start(
-                                "armed tracks use different input devices; record one input device at a time",
-                                cx,
-                            );
-                            return;
-                        }
-                        None => explicit_device_id = Some(device_id),
-                        _ => {}
-                    }
-                }
-                if monitor_channels.is_empty() && track.input_monitor.is_active(track.armed) {
-                    monitor_channels = route.channels.clone();
-                }
-                configs.push(JsRecordingTrackConfig {
-                    track_id: track.id.clone(),
-                    input_channels: route.channels,
-                    name: track.name.clone(),
-                });
-            }
-            (configs, explicit_device_id, monitor_channels)
-        };
+        let RecordingRoutes {
+            tracks,
+            explicit_device_id,
+            monitor_channels,
+        } = routes;
 
         if !tracks.is_empty() {
             let Some(_project_root) = self.project_folder.as_ref() else {
@@ -626,10 +633,11 @@ impl StudioLayout {
                     self.fail_recording_start("save the project to a folder before recording", cx);
                     return;
                 };
-                if !self.do_save_project(&project_path, cx) {
-                    self.fail_recording_start("could not save the project before recording", cx);
-                    return;
-                }
+                // Snapshotted now, written off this thread. The synchronous
+                // save wrote, synced and backed up the whole project between
+                // Record and the downbeat. A write that fails reports itself
+                // like any other save; the take it protects still records.
+                self.save_project_in_background(project_path, cx);
             }
         }
 
@@ -710,6 +718,8 @@ impl StudioLayout {
             }
         }
 
+        // The take started: a track Record armed for it stays armed.
+        self.recording.auto_armed = None;
         self.recording.start_beat = start_beat.max(0.0);
         if let Some(take) = self.recording.midi.as_ref() {
             let preview_tracks: Vec<(String, String)> = take
@@ -821,10 +831,20 @@ impl StudioLayout {
                 // and `poll_recording_finalize` picks them up.
                 if let Err(error) = engine.begin_stop_recording() {
                     self.audio_bridge.last_error = Some(error.to_string());
+                    eprintln!("[recording] stop failed: {error}");
+                    self.finish_recording_preview(cx);
+                    // The audio take is lost; the MIDI one was already read
+                    // off the take above and must not go with it.
+                    if midi_committed {
+                        self.commit_midi_recording_results(cx, midi_results);
+                        self.audio_bridge.project_dirty = true;
+                        self.audio_bridge.media_dirty = true;
+                        self.schedule_audio_project_sync(cx, true, "recording_commit");
+                    }
                     self.recording.ui_state = RecordingUiState::Failed {
                         reason: error.to_string(),
                     };
-                    eprintln!("[recording] stop failed: {error}");
+                    cx.notify();
                     return;
                 }
                 step("engine detach take");
@@ -838,6 +858,12 @@ impl StudioLayout {
             return;
         }
 
+        // The audio preview stays where it is until the take's clip replaces
+        // it in `commit_recording_results`: torn down here, the take vanished
+        // at Stop and came back when the writer had closed the files.
+        if !self.recording.awaiting_finalize {
+            self.finish_recording_preview(cx);
+        }
         self.commit_midi_recording_results(cx, midi_results);
         step("commit midi results");
 
@@ -887,6 +913,7 @@ impl StudioLayout {
                 }
             }
             Err(error) => {
+                self.finish_recording_preview(cx);
                 self.audio_bridge.last_error = Some(error.to_string());
                 self.recording.ui_state = RecordingUiState::Failed {
                     reason: error.to_string(),
@@ -916,7 +943,6 @@ impl StudioLayout {
                 cx.notify();
             }
         });
-        self.finish_recording_preview(cx);
     }
 
     pub(super) fn capture_midi_record_event(
@@ -937,6 +963,12 @@ impl StudioLayout {
     ) {
         let current_beat =
             event_beat.unwrap_or_else(|| self.timeline.read(cx).state.transport.playhead_beats);
+        // The MIDI take is armed for the whole count-in, so the player's
+        // pickup arrives here before the downbeat, all of it at beat 0. A note
+        // still held at the downbeat starts the take; one already released is
+        // not part of it. It used to become a minimum-length blip, every one of
+        // them stacked on the first beat.
+        let counting_in = matches!(self.recording.ui_state, RecordingUiState::CountingIn { .. });
         let Some(take) = self.recording.midi.as_mut() else {
             return;
         };
@@ -944,6 +976,36 @@ impl StudioLayout {
         let Some(track) = take.tracks.get_mut(track_id) else {
             return;
         };
+        if counting_in {
+            match *event {
+                MidiInputEvent::NoteOn {
+                    note,
+                    velocity,
+                    channel,
+                } => {
+                    let key = (channel.min(15), note.min(127));
+                    track.active_notes.remove(&key);
+                    if velocity > 0 {
+                        track.active_notes.insert(
+                            key,
+                            ActiveMidiNote {
+                                pitch: note.min(127),
+                                velocity: velocity.min(127),
+                                start_beat: 0.0,
+                            },
+                        );
+                    }
+                }
+                MidiInputEvent::NoteOff { note, channel } => {
+                    track.active_notes.remove(&(channel.min(15), note.min(127)));
+                }
+                MidiInputEvent::AllNotesOff | MidiInputEvent::Panic => {
+                    track.active_notes.clear();
+                }
+                _ => {}
+            }
+            return;
+        }
 
         match *event {
             MidiInputEvent::NoteOn {
@@ -1152,6 +1214,9 @@ impl StudioLayout {
         cx: &mut Context<Self>,
         results: Vec<DirectAudio::types::JsRecordingResult>,
     ) {
+        // Out before the take's undo snapshot is taken, so undo cannot bring
+        // the preview back.
+        self.finish_recording_preview(cx);
         let bpm = self.timeline.read(cx).state.bpm;
         let timeline = self.timeline.clone();
         let (generate_waveforms, recording_offset_ms, auto_offset_from_jam) = {
@@ -1294,6 +1359,11 @@ impl StudioLayout {
             self.audio_bridge.last_error = Some(reason.clone());
             self.recording.ui_state = RecordingUiState::Failed { reason };
             cx.notify();
+        }
+        // The tracks that did record are committed above either way, and they
+        // must reach the engine and get their waveforms: stopping here left
+        // them on the timeline, silent, until some other edit synced.
+        if !results.iter().any(|result| result.success) {
             return;
         }
 
@@ -1312,6 +1382,11 @@ impl StudioLayout {
     pub(super) fn update_recording_preview(&mut self, cx: &mut Context<Self>) {
         self.update_midi_recording_previews(cx);
         if !self.timeline.read(cx).state.transport.recording {
+            if self.recording.awaiting_finalize {
+                // Stopped, files still closing: the preview stands in for the
+                // take until its clip is committed.
+                return;
+            }
             if !self.recording.preview.is_empty()
                 && std::env::var_os("FUTUREBOARD_RECORDING_DEBUG").is_some()
             {
@@ -1390,20 +1465,17 @@ impl StudioLayout {
             );
         }
 
-        let bpm = {
-            let timeline = self.timeline.read(cx);
-            timeline.state.bpm
-        };
-
         // Drain newly produced peaks per track and republish each waveform.
-        let mut length_updates: Vec<(String, f32)> = Vec::new();
+        let record_loop = self.recording.record_loop;
+        let mut window_updates: Vec<(String, f32, f32)> = Vec::new();
         for info in &track_infos {
             let Some(p) = self.recording.preview.get_mut(&info.track_id) else {
                 continue;
             };
             let new = engine
                 .drain_recording_preview_peaks_for_track(info.track_id.clone(), p.drained as f64);
-            if !new.is_empty() {
+            let grew = !new.is_empty();
+            if grew {
                 p.drained += new.len() as u64;
                 if std::env::var_os("FUTUREBOARD_RECORDING_DEBUG").is_some() {
                     eprintln!(
@@ -1417,24 +1489,56 @@ impl StudioLayout {
                     min: q.min as f32,
                     max: q.max as f32,
                 }));
+            }
+            // The clip shows what the committed take will: the same split
+            // into passes, the same tempo map. It used to grow at the base
+            // tempo, so under tempo changes its edge drifted off the
+            // playhead, and in a loop it kept growing past the loop end
+            // while the playhead went back to the start.
+            let pps = p.peaks_per_second.max(1) as f64;
+            let elapsed_seconds = p.peaks.len() as f64 / pps;
+            let (clip_start, first_peak, length_beats) = {
+                let state = &self.timeline.read(cx).state;
+                let pass = state
+                    .audio_record_passes(p.start_beat, elapsed_seconds, record_loop)
+                    .pop();
+                let (pass_start, source_start, source_end) = pass
+                    .map(|pass| {
+                        (
+                            pass.start_beat,
+                            pass.source_start_seconds,
+                            pass.source_end_seconds,
+                        )
+                    })
+                    .unwrap_or((p.start_beat, 0.0, elapsed_seconds));
+                let start_seconds = state.seconds_at_beat(pass_start as f64);
+                let end_beat = state.beat_at_seconds(start_seconds + (source_end - source_start));
+                let first_peak = ((source_start * pps).round() as usize).min(p.peaks.len());
+                (
+                    pass_start,
+                    first_peak,
+                    (end_beat - pass_start as f64) as f32,
+                )
+            };
+            if grew {
                 let wf = waveform_cache::preview_from_recording_peaks(
-                    &p.peaks,
+                    &p.peaks[first_peak..],
                     p.sample_rate,
                     p.peaks_per_second,
                 );
                 waveform_cache::set_recording_preview(&p.clip_id, std::sync::Arc::new(wf));
             }
-            let length_seconds = p.peaks.len() as f64 / p.peaks_per_second.max(1) as f64;
-            let length_beats = (length_seconds * bpm.max(1.0) as f64 / 60.0) as f32;
-            length_updates.push((p.clip_id.clone(), length_beats));
+            window_updates.push((p.clip_id.clone(), clip_start, length_beats));
         }
-        if !length_updates.is_empty() {
+        if !window_updates.is_empty() {
             self.timeline.update(cx, |timeline, cx| {
                 let mut changed = false;
-                for (clip_id, length_beats) in length_updates {
-                    changed |= timeline
-                        .state
-                        .set_recording_preview_clip_length(&clip_id, length_beats);
+                for (clip_id, start_beat, length_beats) in window_updates {
+                    changed |= timeline.state.set_recording_preview_clip_window(
+                        &clip_id,
+                        start_beat,
+                        length_beats,
+                    );
                 }
                 if changed {
                     cx.notify();
@@ -1486,8 +1590,14 @@ impl StudioLayout {
         self.recording.midi_preview_dirty = false;
         self.recording.midi_preview_updated_at = Instant::now();
         let now = self.timeline.read(cx).state.transport.playhead_beats;
-        let previews = self.recording.midi.as_ref().map(|take| {
-            let relative_beat = (now - take.start_beat).max(0.0);
+        let previews = self.recording.midi.as_mut().map(|take| {
+            // On the take's unrolled clock, like the notes: after a loop wrap
+            // `now - start` is back near zero, which shrank the clip and its
+            // held notes and left the new pass's notes past its end. This tick
+            // also advances the wrap count, which otherwise only moved on MIDI
+            // events: a pass the player sat out was never counted, and the
+            // next pass's notes landed on top of the one before.
+            let relative_beat = take.relative_beat(now);
             take.tracks
                 .values()
                 .map(|track| {
@@ -1553,6 +1663,25 @@ impl StudioLayout {
     }
 
     fn fail_recording_start(&mut self, message: &str, cx: &mut Context<Self>) {
+        // A track Record armed for a take that did not start is disarmed
+        // again: nothing armed it but the Record press that failed.
+        if let Some(id) = self.recording.auto_armed.take() {
+            let disarmed = self.timeline.update(cx, |timeline, _cx| {
+                timeline.state.set_track_armed(&id, false)
+            });
+            if disarmed {
+                if let Some(engine) = self.audio_bridge.engine.as_ref() {
+                    let timeline = self.timeline.read(cx);
+                    if let Some(track) = timeline.state.find_track(&id) {
+                        let _ = apply_engine_track_input_state(
+                            engine,
+                            track,
+                            &timeline.state.audio_connections,
+                        );
+                    }
+                }
+            }
+        }
         self.audio_bridge.last_error = Some(message.to_string());
         self.recording.ui_state = RecordingUiState::Failed {
             reason: message.to_string(),
@@ -1668,6 +1797,83 @@ struct RecordingInputDevice {
 struct RecordingInputRoute {
     device_id: Option<String>,
     channels: Vec<u32>,
+}
+
+/// What a take records from: one engine track config per armed audio track,
+/// the single input device they share, and the channels to monitor.
+struct RecordingRoutes {
+    tracks: Vec<JsRecordingTrackConfig>,
+    explicit_device_id: Option<String>,
+    monitor_channels: Vec<u32>,
+}
+
+fn resolve_recording_routes(
+    tracks: &[TrackState],
+    connections: &crate::audio_connections::AudioConnectionRegistry,
+    devices: &[RecordingInputDevice],
+    input_device_name: &str,
+) -> Result<RecordingRoutes, String> {
+    let selected_device = select_recording_input_device(devices, input_device_name);
+    let mut explicit_device_id: Option<String> = None;
+    let mut monitor_channels = Vec::new();
+    let mut configs = Vec::new();
+    for track in tracks
+        .iter()
+        .filter(|t| t.armed && t.track_type == TrackType::Audio)
+    {
+        let route = recording_input_channels_checked(track, connections, devices, selected_device)?;
+        if let Some(device_id) = route.device_id.clone() {
+            match explicit_device_id.as_ref() {
+                Some(existing) if existing != &device_id => {
+                    return Err(
+                        "armed tracks use different input devices; record one input device at a time"
+                            .to_string(),
+                    );
+                }
+                None => explicit_device_id = Some(device_id),
+                _ => {}
+            }
+        }
+        if monitor_channels.is_empty() && track.input_monitor.is_active(track.armed) {
+            monitor_channels = route.channels.clone();
+        }
+        configs.push(JsRecordingTrackConfig {
+            track_id: track.id.clone(),
+            input_channels: route.channels,
+            name: track.name.clone(),
+        });
+    }
+    Ok(RecordingRoutes {
+        tracks: configs,
+        explicit_device_id,
+        monitor_channels,
+    })
+}
+
+fn cached_recording_input_devices() -> Vec<RecordingInputDevice> {
+    crate::device_registry::audio_snapshot()
+        .inputs
+        .into_iter()
+        .map(|d| RecordingInputDevice {
+            id: d.id,
+            name: d.name,
+            channels: d.channels,
+            is_default: d.is_default,
+        })
+        .collect()
+}
+
+fn live_recording_input_devices(engine: &DirectAudio::AudioEngine) -> Vec<RecordingInputDevice> {
+    engine
+        .list_input_devices()
+        .into_iter()
+        .map(|d| RecordingInputDevice {
+            id: d.id,
+            name: d.name,
+            channels: d.channels,
+            is_default: d.is_default,
+        })
+        .collect()
 }
 
 fn recording_input_channels_checked(

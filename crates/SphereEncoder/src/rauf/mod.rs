@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub type Result<T> = std::result::Result<T, RaufError>;
@@ -96,10 +96,20 @@ pub struct RaufReport {
     pub data_bytes: u64,
 }
 
+/// How much PCM the writer holds before it goes to the file: about 0.7 s of
+/// stereo s32 at 48 kHz. A take used to be written one sample per `write_all`
+/// straight to the file, close to a hundred thousand system calls a second
+/// per stereo track, which is how a recording's writer fell behind the input.
+/// A crash loses at most this much of the take; recovery reads the length
+/// back from the file size.
+const WRITE_BUFFER_BYTES: usize = 256 * 1024;
+
 pub struct RaufWriter {
     path: PathBuf,
-    file: File,
+    file: BufWriter<File>,
     header: RaufHeader,
+    /// One block's samples as little-endian bytes, reused for every block.
+    scratch: Vec<u8>,
 }
 
 impl RaufWriter {
@@ -144,7 +154,12 @@ impl RaufWriter {
         };
         write_header(&mut file, &header)?;
         file.seek(SeekFrom::Start(header.data_offset))?;
-        Ok(Self { path, file, header })
+        Ok(Self {
+            path,
+            file: BufWriter::with_capacity(WRITE_BUFFER_BYTES, file),
+            header,
+            scratch: Vec::new(),
+        })
     }
 
     pub fn write_s32le_interleaved(&mut self, samples: &[i32]) -> Result<()> {
@@ -161,9 +176,11 @@ impl RaufWriter {
                 channels
             )));
         }
+        self.scratch.clear();
         for sample in samples {
-            self.file.write_all(&sample.to_le_bytes())?;
+            self.scratch.extend_from_slice(&sample.to_le_bytes());
         }
+        self.file.write_all(&self.scratch)?;
         self.header.frames_written += (samples.len() / channels) as u64;
         Ok(())
     }
@@ -182,9 +199,11 @@ impl RaufWriter {
                 channels
             )));
         }
+        self.scratch.clear();
         for sample in samples {
-            self.file.write_all(&sample.to_le_bytes())?;
+            self.scratch.extend_from_slice(&sample.to_le_bytes());
         }
+        self.file.write_all(&self.scratch)?;
         self.header.frames_written += (samples.len() / channels) as u64;
         Ok(())
     }
@@ -200,10 +219,10 @@ impl RaufWriter {
     pub fn finalize(mut self) -> Result<RaufReport> {
         self.file.flush()?;
         self.header.flags |= RAUF_FLAG_FINALIZED;
-        self.file.seek(SeekFrom::Start(0))?;
-        write_header(&mut self.file, &self.header)?;
-        self.file.flush()?;
-        self.file.sync_all()?;
+        let file = self.file.get_mut();
+        write_header(file, &self.header)?;
+        file.flush()?;
+        file.sync_all()?;
         let data_bytes = self.header.frames_written
             * self.header.channels as u64
             * bytes_per_sample(self.header.sample_format);
@@ -568,6 +587,42 @@ mod tests {
             RaufReader::open(&path),
             Err(RaufError::InvalidMagic)
         ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn blocks_reach_the_file_in_order_through_the_write_buffer() {
+        let path = temp_path("blocks");
+        let mut writer = RaufWriter::create(&path, config(2)).unwrap();
+        writer.write_s32le_interleaved(&[1, -2]).unwrap();
+        writer
+            .write_s32le_interleaved(&[3, 4, i32::MIN, i32::MAX])
+            .unwrap();
+        let report = writer.finalize().unwrap();
+        assert_eq!(report.frames_written, 3);
+        assert_eq!(report.data_bytes, 24);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let samples: Vec<i32> = bytes[RAUF_DATA_OFFSET as usize..]
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(samples, [1, -2, 3, 4, i32::MIN, i32::MAX]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_writer_dropped_without_finalize_still_leaves_its_samples() {
+        // What a crash mid-take relies on: the buffer reaches the file, and
+        // recovery reads the length back from its size.
+        let path = temp_path("dropped");
+        let mut writer = RaufWriter::create(&path, config(1)).unwrap();
+        for block in 0..10 {
+            writer.write_s32le_interleaved(&[block; 64]).unwrap();
+        }
+        drop(writer);
+        let reader = RaufReader::open(&path).unwrap();
+        assert_eq!(reader.recover_frames_from_size().unwrap(), 640);
         let _ = std::fs::remove_file(path);
     }
 

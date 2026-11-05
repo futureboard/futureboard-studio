@@ -1412,7 +1412,7 @@ impl StudioLayout {
         }
     }
 
-    fn save_project_in_background(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub(super) fn save_project_in_background(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.save_project_in_background_then(path, None, cx);
     }
 
